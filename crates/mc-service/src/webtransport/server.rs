@@ -12,6 +12,7 @@
 use crate::actors::MeetingControllerActorHandle;
 use crate::auth::McJwtValidator;
 use crate::grpc::MhRegistrationClient;
+use crate::media_routing::PolicyGenerations;
 use crate::observability::metrics;
 use crate::redis::MhAssignmentStore;
 
@@ -55,6 +56,11 @@ pub struct WebTransportServer {
     redis_client: Arc<dyn MhAssignmentStore>,
     /// MH registration client for async RegisterMeeting RPCs.
     mh_client: Arc<dyn MhRegistrationClient>,
+    /// Per-(meeting, handler) `policy_generation` registry (ADR-0036 §8).
+    ///
+    /// Shared with the controller actor, which evicts a meeting's entries on
+    /// teardown.
+    policy_generations: Arc<PolicyGenerations>,
     /// This MC's identifier.
     mc_id: String,
     /// This MC's gRPC advertise address (for MH->MC callbacks).
@@ -86,6 +92,7 @@ impl WebTransportServer {
         jwt_validator: Arc<McJwtValidator>,
         redis_client: Arc<dyn MhAssignmentStore>,
         mh_client: Arc<dyn MhRegistrationClient>,
+        policy_generations: Arc<PolicyGenerations>,
         mc_id: String,
         mc_grpc_endpoint: String,
         max_connections: usize,
@@ -100,6 +107,7 @@ impl WebTransportServer {
             jwt_validator,
             redis_client,
             mh_client,
+            policy_generations,
             mc_id,
             mc_grpc_endpoint,
             max_connections,
@@ -237,6 +245,7 @@ impl WebTransportServer {
                     let jwt_validator = Arc::clone(&self.jwt_validator);
                     let redis_client = Arc::clone(&self.redis_client);
                     let mh_client = Arc::clone(&self.mh_client);
+                    let policy_generations = Arc::clone(&self.policy_generations);
                     let mc_id = self.mc_id.clone();
                     let mc_grpc_endpoint = self.mc_grpc_endpoint.clone();
                     let connection_token = self.cancel_token.child_token();
@@ -248,6 +257,7 @@ impl WebTransportServer {
                             jwt_validator,
                             redis_client,
                             mh_client,
+                            policy_generations,
                             mc_id,
                             mc_grpc_endpoint,
                             connection_token,

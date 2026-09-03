@@ -14,10 +14,11 @@ use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActor
 use mc_service::config::Config;
 use mc_service::errors::McError;
 use mc_service::grpc::GcClient;
+use mc_service::media_routing::PolicyGenerations;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
+use mc_test_utils::test_token_receiver;
 
 use common::secret::{SecretBox, SecretString};
-use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
 };
@@ -26,7 +27,7 @@ use proto_gen::dark_tower::internal::v1::{
     FastHeartbeatResponse, HealthStatus, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
     RegisterMcRequest, RegisterMcResponse,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -276,24 +277,6 @@ fn test_config(gc_url: &str) -> Config {
     }
 }
 
-/// Create a mock TokenReceiver for testing.
-///
-/// Uses a static sender to avoid memory leaks from `mem::forget`.
-/// The sender is kept alive for the duration of the test process.
-fn mock_token_receiver() -> TokenReceiver {
-    use std::sync::OnceLock;
-
-    // Static sender keeps the channel alive without memory leak
-    static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
-
-    let sender = TOKEN_SENDER.get_or_init(|| {
-        let (tx, _rx) = watch::channel(SecretString::from("test-service-token"));
-        tx
-    });
-
-    TokenReceiver::from_test_channel(sender.subscribe())
-}
-
 async fn start_mock_gc_server(mock_gc: MockGcServer) -> (SocketAddr, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -330,7 +313,7 @@ async fn test_gc_client_registration_success() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -350,7 +333,7 @@ async fn test_gc_client_registration_rejected() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -369,7 +352,7 @@ async fn test_gc_client_registration_content() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config.clone())
         .await
@@ -403,7 +386,7 @@ async fn test_gc_client_fast_heartbeat() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config.clone())
         .await
@@ -438,7 +421,7 @@ async fn test_gc_client_comprehensive_heartbeat() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config.clone())
         .await
@@ -476,7 +459,7 @@ async fn test_gc_client_heartbeat_skipped_when_not_registered() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -514,7 +497,7 @@ async fn test_gc_client_heartbeat_intervals_from_gc() {
 
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -585,6 +568,7 @@ async fn test_actor_handle_creation() {
         Arc::clone(&controller_metrics),
         master_secret,
         Arc::new(MhConnectionRegistry::new()),
+        Arc::new(PolicyGenerations::new()),
     ));
 
     // Controller should be created without error
@@ -605,7 +589,7 @@ async fn test_heartbeat_not_found_detection() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -637,7 +621,7 @@ async fn test_comprehensive_heartbeat_not_found_detection() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -669,7 +653,7 @@ async fn test_attempt_reregistration_success() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -698,7 +682,7 @@ async fn test_attempt_reregistration_after_not_found() {
 
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
 
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
 
@@ -745,7 +729,7 @@ async fn gc_fast_heartbeat_success_records_status_success_type_fast() {
     let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
     gc_client.register().await.unwrap();
 
@@ -784,7 +768,7 @@ async fn gc_comprehensive_heartbeat_success_records_status_success_type_comprehe
     let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
     gc_client.register().await.unwrap();
 
@@ -820,7 +804,7 @@ async fn gc_fast_heartbeat_error_records_status_error_type_fast() {
     let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
     gc_client.register().await.unwrap();
 
@@ -850,7 +834,7 @@ async fn gc_comprehensive_heartbeat_error_records_status_error_type_comprehensiv
     let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
     let gc_url = format!("http://{}", addr);
     let config = test_config(&gc_url);
-    let token_rx = mock_token_receiver();
+    let token_rx = test_token_receiver();
     let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
     gc_client.register().await.unwrap();
 

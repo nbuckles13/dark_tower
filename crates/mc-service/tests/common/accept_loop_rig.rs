@@ -48,6 +48,7 @@ use std::sync::Arc;
 use mc_service::actors::MeetingControllerActorHandle;
 use mc_service::auth::McJwtValidator;
 use mc_service::grpc::MhRegistrationClient;
+use mc_service::media_routing::PolicyGenerations;
 use mc_service::redis::MhAssignmentStore;
 use mc_service::webtransport::WebTransportServer;
 use tempfile::TempDir;
@@ -116,6 +117,7 @@ impl AcceptLoopRig {
             jwt_validator,
             mh_store,
             mh_reg_client,
+            Arc::new(PolicyGenerations::new()),
             mc_id,
             mc_grpc_endpoint,
             max_connections,

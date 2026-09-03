@@ -22,22 +22,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::secret::SecretString;
-use common::token_manager::TokenReceiver;
 use mc_service::config::Config;
-use mc_service::grpc::{GcClient, MhClient};
+use mc_service::grpc::{GcClient, MeetingProgramming, MhClient};
+use mc_test_utils::media::{loopback_assignment, TEST_HANDLER_ID};
+use mc_test_utils::mock_mh::MediaHandlerStub;
+use mc_test_utils::test_token_receiver;
 use proto_gen::dark_tower::internal::v1::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
 };
-use proto_gen::dark_tower::internal::v1::media_handler_service_server::{
-    MediaHandlerService, MediaHandlerServiceServer,
-};
+use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerServiceServer;
 use proto_gen::dark_tower::internal::v1::{
     ComprehensiveHeartbeatRequest, ComprehensiveHeartbeatResponse, FastHeartbeatRequest,
     FastHeartbeatResponse, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
-    RegisterMcRequest, RegisterMcResponse, RegisterMeetingRequest, RegisterMeetingResponse,
+    RegisterMcRequest, RegisterMcResponse,
 };
-use proto_gen::dark_tower::signaling::v1::TransportMode;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -103,32 +101,6 @@ impl GlobalControllerService for MockGc {
     }
 }
 
-#[derive(Default)]
-struct MockMh;
-
-#[tonic::async_trait]
-impl MediaHandlerService for MockMh {
-    async fn register_meeting(
-        &self,
-        _request: Request<RegisterMeetingRequest>,
-    ) -> Result<Response<RegisterMeetingResponse>, Status> {
-        Ok(Response::new(RegisterMeetingResponse {
-            accepted: true,
-            // Truthful zeros, deliberately NOT `applied_generation:
-            // req.policy_generation`. That would be inert today (the client
-            // reads only `accepted`) and that is exactly the danger: a
-            // fixture pre-baking the echo-a-received-value lie hands story
-            // task 6 a green success-test validating the precise ADR-0036 §8
-            // anti-pattern its check must catch. Task 6 must make this mock
-            // echo the sent generation DELIBERATELY, when it adds the check.
-            applied_generation: 0,
-            handler_id: String::new(),
-            process_start_epoch_ms: 0,
-            transport_mode: TransportMode::Unspecified as i32,
-        }))
-    }
-}
-
 async fn start_gc_server(store: Captured) -> (SocketAddr, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -156,7 +128,14 @@ async fn start_mh_server(store: Captured) -> (SocketAddr, CancellationToken) {
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let server = Server::builder()
         .add_service(MediaHandlerServiceServer::with_interceptor(
-            MockMh,
+            // The shared stub, wrapped in this test's capture interceptor
+            // rather than served by `MediaHandlerStub::spawn` — the subject
+            // here is the outbound `traceparent` metadata, which only the
+            // interceptor sees. Programmed successfully so the push confirms
+            // and the assertion is about tracing, not about divergence.
+            MediaHandlerStub::builder()
+                .programs_successfully(TEST_HANDLER_ID)
+                .build(),
             capture_interceptor(store),
         ))
         .serve_with_incoming_shutdown(incoming, async move { cancel_clone.cancelled().await });
@@ -165,16 +144,6 @@ async fn start_mh_server(store: Captured) -> (SocketAddr, CancellationToken) {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     (addr, cancel)
-}
-
-fn mock_token_receiver() -> TokenReceiver {
-    use std::sync::OnceLock;
-    static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
-    let sender = TOKEN_SENDER.get_or_init(|| {
-        let (tx, _rx) = watch::channel(SecretString::from("test-service-token"));
-        tx
-    });
-    TokenReceiver::from_test_channel(sender.subscribe())
 }
 
 fn test_config(gc_url: &str) -> Config {
@@ -237,7 +206,7 @@ async fn gc_client_register_injects_active_span_traceparent() {
     let store: Captured = Arc::new(Mutex::new(Vec::new()));
     let (addr, cancel) = start_gc_server(Arc::clone(&store)).await;
     let gc_url = format!("http://{addr}");
-    let gc_client = GcClient::new(gc_url.clone(), mock_token_receiver(), test_config(&gc_url))
+    let gc_client = GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
         .await
         .unwrap();
 
@@ -272,12 +241,21 @@ async fn mh_client_register_meeting_injects_active_span_traceparent() {
     let store: Captured = Arc::new(Mutex::new(Vec::new()));
     let (addr, cancel) = start_mh_server(Arc::clone(&store)).await;
     let mh_url = format!("http://{addr}");
-    let mh_client = MhClient::new(mock_token_receiver());
+    let mh_client = MhClient::new(test_token_receiver());
 
     let span = tracing::info_span!("mc.outbound.mh");
     span.set_parent(known_remote_context());
+    let assignment = loopback_assignment();
     mh_client
-        .register_meeting(&mh_url, "meeting-otel", "mc-test-001", "http://mc:50052")
+        .register_meeting(&MeetingProgramming {
+            mh_grpc_endpoint: &mh_url,
+            expected_handler_id: TEST_HANDLER_ID,
+            meeting_id: "meeting-otel",
+            mc_id: "mc-test-001",
+            mc_grpc_endpoint: "http://mc:50052",
+            assignment: &assignment,
+            policy_generation: std::num::NonZeroU64::MIN,
+        })
         .instrument(span)
         .await
         .unwrap();
@@ -312,7 +290,7 @@ async fn outbound_without_active_span_injects_no_traceparent() {
     let store: Captured = Arc::new(Mutex::new(Vec::new()));
     let (addr, cancel) = start_gc_server(Arc::clone(&store)).await;
     let gc_url = format!("http://{addr}");
-    let gc_client = GcClient::new(gc_url.clone(), mock_token_receiver(), test_config(&gc_url))
+    let gc_client = GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
         .await
         .unwrap();
 

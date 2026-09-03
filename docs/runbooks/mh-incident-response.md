@@ -768,11 +768,16 @@ histogram_quantile(0.95, rate(gc_rpc_duration_seconds_bucket{method="SendLoadRep
 >
 > **Discriminator**: `reason=total_egress_edge_cap_exceeded` on the `mh.session.policy` WARN, with `installed_total_edges` and `installed_meeting_count` on the same line — a single fat policy and an accumulation of finished meetings look identical on the metric and are told apart only there. Onset is intermittent and worsens with uptime: it clears when some unrelated meeting happens to shrink and returns when it does not, which is what gets it misfiled as a transient.
 >
-> **Interim remedy: restart the pod**, and it is recoverable rather than a second outage — the meetings that were healthy re-assert on MC's next ADR-0036 §8 cadence tick and reinstall at their current generation. **Raising `MH_MAX_TOTAL_EGRESS_EDGES` is not the remedy**: the ceiling is consumed by finished meetings at whatever rate meetings finish, independent of concurrent load, so doubling it doubles time-to-onset and changes nothing else. Reclamation is tracked in `docs/TODO.md` §Media Path Obligations.
+> **Interim remedy: restart the pod — but read the next sentence before you do, because the recovery it used to promise does not exist.** **MC's ADR-0036 §8 re-assert cadence is NOT YET IMPLEMENTED.** MC pushes forwarding policy exactly once, when the first participant joins, and story task 13 deliberately deferred the cadence to the handler-restart story (see `docs/observability/metrics/mh-service.md` §`mh_media_policy_applies_total` and ADR-0036 §8's deferral). So restarting the pod **drops forwarding policy for every live meeting on it, and they are NOT recovered automatically** — no MC-side signal fires either, because the one-shot push already happened and `mc_media_generation_divergence` holds its last healthy value. **Treat the restart as an outage for those meetings**, re-established only by their participants rejoining; prefer a low-occupancy window and expect the meetings on that pod to end. (There is no session-drain path that preserves forwarding policy: MH's `terminationGracePeriodSeconds` settle window drains **in-flight connection teardown** and does nothing for policy, so a graceful restart loses the same meetings a hard one does.) This caveat is retired by the cadence task, not before. **Raising `MH_MAX_TOTAL_EGRESS_EDGES` is not the remedy**: the ceiling is consumed by finished meetings at whatever rate meetings finish, independent of concurrent load, so doubling it doubles time-to-onset and changes nothing else. Reclamation is tracked in `docs/TODO.md` §Media Path Obligations.
 >
-> **Expected until story task 13 — do not open an incident for it.** MC does not yet emit `policy_generation` >= 1, so every registration carries 0 and the correct steady state is `outcome="no_generation"` counting up, `applied` flat at zero, and `applied_generation` pinned at 0. See `docs/observability/metrics/mh-service.md` §`mh_media_policy_applies_total`.
+> **`no_generation` is a ROLLOUT signal — expected during an MC rollout, actionable after one.** MC emits `policy_generation` >= 1 as of story task 13, so the healthy steady state is `applied` carrying the traffic and `outcome="no_generation"` at zero. **Do not open an incident while an MC rollout is in progress**: a not-yet-upgraded MC pod legitimately still sends 0, so the two series coexist and the mix shifts as pods cycle. **Sustained `no_generation` after the rollout completes is actionable and the owner is MC** — it means MC failed to compute a forwarding assignment. Check `mc_media_policy_pushes_total` and MC's `mc.register_meeting.trigger` logs, not this pod. Confirm which of the two you are looking at by asking whether **mixed MC versions are live right now** — that, not a rollout object's progress, is what the rule turns on:
+> ```bash
+> kubectl get pods -n dark-tower -l app=mc-service \
+>   -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u
+> ```
+> More than one image means a rollout is in progress; one means it has completed. **Do not reach for `kubectl rollout status deployment/mc-service`** — there is no Deployment by that name (MC ships as `mc-0` and `mc-1`; `mc-service` is a Service, a PDB and a container name), and the `NotFound` it returns reads as "no rollout in progress", which would flip you to actionable during exactly the legitimate mixed-version window this note exists to protect. See `docs/observability/metrics/mh-service.md` §`mh_media_policy_applies_total`.
 
-> **Rollback awareness**: During a deliberate rollback of MH to a pre-RegisterMeeting build, **`mh_register_meeting_timeouts_total` stays flat at zero on the rolled-back pods** (old MH never knew about RegisterMeeting and so never sets up the provisional-accept window) — but client-side coordination breaks silently because MC's `RegisterMeeting` retries are exhausting. If the metric is flat zero on some pods but the user impact is real, check `kubectl rollout history deployment/mh-service -n dark-tower` for an in-progress rollback before treating as an incident. See [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures) for the MC-side rollback-aware triage.
+> **Rollback awareness**: During a deliberate rollback of MH to a pre-RegisterMeeting build, **`mh_register_meeting_timeouts_total` stays flat at zero on the rolled-back pods** (old MH never knew about RegisterMeeting and so never sets up the provisional-accept window) — but client-side coordination breaks silently because MC's `RegisterMeeting` retries are exhausting. If the metric is flat zero on some pods but the user impact is real, check `kubectl rollout history deployment/mh-0 -n dark-tower` and `kubectl rollout history deployment/mh-1 -n dark-tower` for an in-progress rollback before treating as an incident (MH ships as two per-ordinal Deployments; a rollback can touch either, which is why the sentence above says "some pods"). See [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures) for the MC-side rollback-aware triage.
 
 **Immediate Response**:
 
@@ -789,11 +794,26 @@ histogram_quantile(0.95, rate(gc_rpc_duration_seconds_bucket{method="SendLoadRep
 **Root Cause Investigation**:
 
 ```bash
-# Confirm provisional-kick rate from raw /metrics (counter increase since pod start)
-kubectl port-forward -n dark-tower deployment/mh-service 8080:8080 &
-curl -s http://localhost:8080/metrics | grep mh_register_meeting_timeouts_total
+# Confirm provisional-kick rate from raw /metrics (counter increase since pod start).
+# THE COUNTER IS PER-POD. Use the AFFECTED pod (`mh-0` or `mh-1`) — a quiet pod
+# proves nothing about a loud one, and a kick rate read off the wrong ordinal is
+# how this gets closed as "not reproducing". For the fleet view use the
+# per-pod split of the rate query from Detection above:
+#   sum by(instance) (rate(mh_register_meeting_timeouts_total[5m]))
+# RATE, not the raw counter: the counter is cumulative since each pod's start,
+# so across pods with different uptimes the numbers are not comparable and a
+# recently-restarted pod reads LOW — i.e. the likeliest suspect in this
+# scenario would look cleanest.
+# PORT 8083, not 8080: MH_HEALTH_BIND_ADDRESS is 0.0.0.0:8083 (configmap.yaml)
+# and the pod exposes containerPort 8083 — there is no listener on 8080, so a
+# `8080:8080` forward yields connection-refused, not an empty grep.
+# `instance` is `<pod-ip>:8083`, not a pod name (the mh-service scrape job has
+# no pod-name relabel), so map it to an ordinal with:
+#   kubectl get pods -n dark-tower -l app=mh-service -o wide
+kubectl port-forward -n dark-tower deployment/mh-0 8083:8083 &
+curl -s http://localhost:8083/metrics | grep mh_register_meeting_timeouts_total
 # Cross-check receipt-side: how many RegisterMeeting RPCs is MH actually receiving?
-curl -s http://localhost:8080/metrics | grep 'mh_grpc_requests_total.*register_meeting'
+curl -s http://localhost:8083/metrics | grep 'mh_grpc_requests_total.*register_meeting'
 kill %1
 
 # Receipt-side rate by outcome (MC→MH RPC success/error from the MH receiver's view)
@@ -808,8 +828,10 @@ kubectl describe pod -n dark-tower -l app=mh-service \
   | grep MH_REGISTER_MEETING_TIMEOUT_SECONDS
 
 # MC→MH gRPC reachability (run from MC pod, since MC is the originator of RegisterMeeting)
-kubectl exec -it deployment/mc-service -n dark-tower -- \
+kubectl exec -it deployment/mc-0 -n dark-tower -- \
   grpcurl -plaintext mh-service.dark-tower.svc.cluster.local:50051 list
+# NOTE: the exec TARGET is a Deployment (`mc-0`/`mc-1`); the grpcurl ADDRESS is a
+# Service and `mh-service` is genuinely its name. Do not "correct" the address.
 ```
 
 **Common Root Causes**:
@@ -828,9 +850,10 @@ kubectl exec -it deployment/mc-service -n dark-tower -- \
 # 2. Once MC is delivering RegisterMeeting again, no MH action is needed:
 #    new client connections will be promoted normally; affected users
 #    re-establish via active/active fallback to other assigned MHs.
-# 3. Monitor for resolution
-kubectl port-forward -n dark-tower deployment/mh-service 8080:8080 &
-watch -n 15 'curl -s http://localhost:8080/metrics | grep mh_register_meeting_timeouts_total'
+# 3. Monitor for resolution — again PER-POD: watch the affected ordinal
+#    (`mh-0` or `mh-1`). Recovery on one pod is not recovery on the other.
+kubectl port-forward -n dark-tower deployment/mh-0 8083:8083 &
+watch -n 15 'curl -s http://localhost:8083/metrics | grep mh_register_meeting_timeouts_total'
 kill %1
 ```
 

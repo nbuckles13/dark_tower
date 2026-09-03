@@ -29,6 +29,9 @@ prost = { workspace = true }
 
 # gRPC for mock services
 tonic = { workspace = true }
+# Matches the in-tree idiom: `mc-service` and `mh-service` both declare this
+# directly rather than through `workspace.dependencies`, which has no entry.
+tokio-stream = "0.1"
 
 # Utilities
 uuid = { workspace = true }
@@ -50,7 +53,9 @@ thiserror = { workspace = true }
 # Local dependencies
 mc-service = { path = "../mc-service" }
 proto-gen = { path = "../proto-gen" }
-common = { path = "../common" }
+# `test-utils` exposes `TokenReceiver::from_test_channel`, which this crate
+# hands to every MC test that builds a GcClient or MhClient.
+common = { path = "../common", features = ["test-utils"] }
 
 [lib]
 name = "mc_test_utils"

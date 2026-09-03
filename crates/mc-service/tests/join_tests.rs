@@ -28,6 +28,7 @@ use ::common::secret::SecretBox;
 use bytes::{BufMut, BytesMut};
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::grpc::MhRegistrationClient;
+use mc_service::media_routing::PolicyGenerations;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::{make_expired_meeting_claims, make_meeting_claims, TestKeypair};
@@ -563,6 +564,7 @@ async fn test_actor_level_join_success() {
         controller_metrics,
         master_secret,
         Arc::new(MhConnectionRegistry::new()),
+        Arc::new(PolicyGenerations::new()),
     );
 
     controller
@@ -614,6 +616,7 @@ async fn test_actor_level_join_meeting_not_found() {
         controller_metrics,
         master_secret,
         Arc::new(MhConnectionRegistry::new()),
+        Arc::new(PolicyGenerations::new()),
     );
 
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(100);
@@ -663,6 +666,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
         controller_metrics,
         master_secret,
         Arc::new(MhConnectionRegistry::new()),
+        Arc::new(PolicyGenerations::new()),
     );
 
     controller
@@ -748,6 +752,7 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
         controller_metrics,
         master_secret,
         Arc::new(MhConnectionRegistry::new()),
+        Arc::new(PolicyGenerations::new()),
     );
     controller
         .create_meeting("meeting-dn-metric".to_string())

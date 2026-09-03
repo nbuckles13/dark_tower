@@ -1351,7 +1351,7 @@ Expected recovery time: bounded by the upstream MH/network fix; once resolved, i
 
 ### Scenario 12: RegisterMeeting Coordination Failures
 
-**Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. May also co-fire MH-side [Scenario 13: RegisterMeeting Timeout — Clients Kicked](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked).
+**Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. A second, distinct string — `RegisterMeeting failed terminally; not retried` — is a **different fault with the opposite remedy**; see Symptoms. May also co-fire MH-side [Scenario 13: RegisterMeeting Timeout — Clients Kicked](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked).
 **Severity**: warning
 **Runbook Section**: `#scenario-12-registermeeting-coordination-failures`
 
@@ -1362,7 +1362,8 @@ Expected recovery time: bounded by the upstream MH/network fix; once resolved, i
 **Symptoms**:
 - `mc_register_meeting_total{status="error"}` non-zero or rising vs baseline. MC retries each MH up to 3 attempts with 1s/2s backoffs (see `register_meeting_with_handlers` in `crates/mc-service/src/webtransport/connection.rs`); a steady error rate means retries are being exhausted.
 - `mc_register_meeting_duration_seconds` p95 climbing — RegisterMeeting RPCs are succeeding but slowly, eating into the MH-side 15s timeout budget.
-- MC error log: `"RegisterMeeting retries exhausted"` (target `mc.register_meeting.trigger`) with `mh_grpc_endpoint` and the underlying error.
+- MC error log: `"RegisterMeeting retries exhausted"` (target `mc.register_meeting.trigger`) with `mh_grpc_endpoint`, `attempts_made` and the underlying error. This is the **retryable** class — flaky MC→MH coordination; the symptoms and remedies in this scenario are written for it.
+- MC error log: `"RegisterMeeting failed terminally; not retried"` (same target, `terminal = true`; `attempts_made` is whichever attempt hit the terminal outcome, so it is **not** always 1 — a transport error on attempt 1 followed by a terminal divergence on attempt 2 reports 2. `terminal = true` is the discriminator, never the attempt count) — **a DIFFERENT fault with the OPPOSITE remedy; do not treat it as this scenario.** MC deliberately does not retry it, because a `transport_mode_mismatch` is a genuine two-ends version skew between MC and MH and backoff cannot make a skewed handler agree. **Roll MH FORWARD; do NOT roll MC back** — rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for, i.e. the pre-change media blackhole rather than a fix. See `mc-deployment.md` §"Post-Deploy Monitoring Checklist: MC↔MH Coordination" → Rollback (MC half). The two strings are deliberately distinct so a `grep` for one cannot silently match the other.
 - Concurrent MH-side `mh_register_meeting_timeouts_total` rising — same incident from the receiver's vantage.
 - New meetings fail to ever produce media; clients connect to MH, get JWT-validated, then disconnected ~15s later. From a user perspective: "I joined the meeting but media never came up."
 

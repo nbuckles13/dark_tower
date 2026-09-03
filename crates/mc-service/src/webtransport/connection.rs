@@ -12,7 +12,11 @@ use crate::actors::{
 };
 use crate::auth::McJwtValidator;
 use crate::errors::McError;
-use crate::grpc::MhRegistrationClient;
+use crate::grpc::{MeetingProgramming, MhRegistrationClient};
+use crate::media_routing::{
+    compute_assignment, HandlerId, MeetingAssignment, MeetingRoutingInput, PolicyGenerations,
+    PushDisposition, RoutingParticipant,
+};
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
 
@@ -183,6 +187,7 @@ pub async fn handle_connection(
     jwt_validator: Arc<McJwtValidator>,
     redis_client: Arc<dyn MhAssignmentStore>,
     mh_client: Arc<dyn MhRegistrationClient>,
+    policy_generations: Arc<PolicyGenerations>,
     mc_id: String,
     mc_grpc_endpoint: String,
     cancel_token: CancellationToken,
@@ -618,7 +623,14 @@ pub async fn handle_connection(
         "JoinResponse sent"
     );
 
-    // Step 9: [ASYNC, first participant only] Fire RegisterMeeting to each MH (R-12)
+    // Step 9: [ASYNC, first participant only] Program each assigned MH with the
+    // meeting's forwarding policy (R-12, ADR-0036 §7/§8/§9).
+    //
+    // The trigger is UNCHANGED and that is deliberate: one push on assignment,
+    // then confirm. Structural re-push on every join/leave, the periodic
+    // re-assert cadence, the connectivity-loss trigger and dispatch jitter are
+    // the handler-restart story and are NOT here — they land additively on
+    // `PolicyGenerations`.
     let is_first_participant = join_result.participants.is_empty();
     if is_first_participant {
         debug!(
@@ -627,30 +639,63 @@ pub async fn handle_connection(
             meeting_id = %meeting_id,
             "First participant joined — spawning async RegisterMeeting"
         );
-        let reg_mh_client = Arc::clone(&mh_client);
-        let reg_meeting_id = meeting_id.clone();
-        let reg_mc_id = mc_id.clone();
-        let reg_mc_grpc_endpoint = mc_grpc_endpoint.clone();
-        let reg_cancel_token = cancel_token.child_token();
-        let span = tracing::info_span!(
-            target: "mc.register_meeting.trigger",
-            "register_meeting_trigger",
-            meeting_id = %meeting_id,
-        );
-        tokio::spawn(
-            async move {
-                register_meeting_with_handlers(
-                    reg_mh_client.as_ref(),
-                    &mh_data,
-                    &reg_meeting_id,
-                    &reg_mc_id,
-                    &reg_mc_grpc_endpoint,
-                    &reg_cancel_token,
-                )
-                .await;
+
+        // Compute the assignment BEFORE the spawn, so a malformed one fails on
+        // the join path where it can be logged against this connection.
+        match build_routing_input(&join_result, &mh_data) {
+            Ok(routing_input) => match compute_assignment(&routing_input) {
+                Ok(assignment) => {
+                    let reg_mh_client = Arc::clone(&mh_client);
+                    let reg_generations = Arc::clone(&policy_generations);
+                    let reg_meeting_id = meeting_id.clone();
+                    let reg_mc_id = mc_id.clone();
+                    let reg_mc_grpc_endpoint = mc_grpc_endpoint.clone();
+                    let reg_cancel_token = cancel_token.child_token();
+                    let span = tracing::info_span!(
+                        target: "mc.register_meeting.trigger",
+                        "register_meeting_trigger",
+                        meeting_id = %meeting_id,
+                    );
+                    tokio::spawn(
+                        async move {
+                            register_meeting_with_handlers(
+                                reg_mh_client.as_ref(),
+                                &mh_data,
+                                &assignment,
+                                reg_generations.as_ref(),
+                                &reg_meeting_id,
+                                &reg_mc_id,
+                                &reg_mc_grpc_endpoint,
+                                &reg_cancel_token,
+                            )
+                            .await;
+                        }
+                        .instrument(span),
+                    );
+                }
+                Err(e) => {
+                    // Fail loud: no push at all is better than pushing a policy
+                    // MH will reject whole, and it must not be silent.
+                    error!(
+                        target: "mc.register_meeting.trigger",
+                        connection_id = %connection_id,
+                        meeting_id = %meeting_id,
+                        reason = e.label(),
+                        error = %e,
+                        "Forwarding assignment could not be computed; MH not programmed"
+                    );
+                }
+            },
+            Err(e) => {
+                error!(
+                    target: "mc.register_meeting.trigger",
+                    connection_id = %connection_id,
+                    meeting_id = %meeting_id,
+                    error = %e,
+                    "Routing input could not be built; MH not programmed"
+                );
             }
-            .instrument(span),
-        );
+        }
     } else {
         debug!(
             target: "mc.webtransport.connection",
@@ -1129,17 +1174,92 @@ async fn build_join_response(
     ))
 }
 
-/// Fire `RegisterMeeting` RPCs to each assigned MH (R-12).
+/// Build the routing computation's input from the join result and the
+/// meeting's handler assignment.
 ///
-/// Called as a spawned task after the first participant joins. Iterates over
-/// all MH handlers in the assignment data, calling `register_meeting()` on
-/// each. Retries with exponential backoff on failure.
+/// Participant->handler membership is an **input** to the computation, and this
+/// is where it is filled. Today every participant is on every handler assigned
+/// to the meeting (clients `connectAll()`), so every participant gets the full
+/// handler list. When real per-participant placement lands, only this function
+/// changes — [`compute_assignment`] does not.
+///
+/// The joiner is included alongside the existing roster, so at N=1 the input is
+/// a single participant and the general computation yields the loopback edge.
+///
+/// # Errors
+///
+/// [`McError::MhAssignmentMissing`] if the meeting has no assigned handlers —
+/// there is nothing to program, and silently pushing to zero handlers would
+/// make an unroutable meeting indistinguishable from a healthy one.
+fn build_routing_input(
+    join_result: &JoinResult,
+    mh_data: &MhAssignmentData,
+) -> Result<MeetingRoutingInput, McError> {
+    let handlers: Vec<HandlerId> = mh_data
+        .handlers
+        .iter()
+        .map(|h| HandlerId::new(&h.mh_id))
+        .collect();
+
+    if handlers.is_empty() {
+        return Err(McError::MhAssignmentMissing(
+            "no handlers assigned; cannot compute a forwarding assignment".to_string(),
+        ));
+    }
+
+    let mut participants = Vec::with_capacity(join_result.participants.len() + 1);
+    participants.push(RoutingParticipant {
+        sender_id: join_result.sender_id,
+        handlers: handlers.clone(),
+    });
+    participants.extend(join_result.participants.iter().map(|p| RoutingParticipant {
+        sender_id: p.sender_id,
+        handlers: handlers.clone(),
+    }));
+
+    Ok(MeetingRoutingInput {
+        participants,
+        handlers,
+    })
+}
+
+/// Program each assigned MH with its slice of the meeting's forwarding
+/// assignment, and confirm each push (R-12, ADR-0036 §8).
+///
+/// Called as a spawned task after the first participant joins. For each
+/// handler: take a generation, push, classify the reply.
 ///
 /// This function handles all errors internally (log + continue) since it runs
 /// as a fire-and-forget spawned task with no caller to propagate errors to.
+///
+/// # The generation is taken ONCE per handler, outside the retry loop
+///
+/// Deliberately not inside `MhClient::register_meeting`, where it would be
+/// recomputed on every attempt. ADR-0036 §8 requires an unchanged policy to
+/// carry an unchanged number; a per-attempt recomputation would still return the
+/// same number today (the assignment is unchanged, so `next_generation` is
+/// idempotent) but the guarantee would rest on that coincidence rather than on
+/// where the call sits, and the first structural re-push would break it.
+///
+/// # Retryable versus terminal
+///
+/// Split per [`PushDisposition`]: `generation_mismatch` and
+/// `no_applied_generation` are transient apply failures and consume retries (an
+/// identical re-send is an idempotent MH no-op), while
+/// `transport_mode_mismatch` is terminal — a version-skewed handler does not
+/// become correct after backoff, so MC fails immediately rather than delaying
+/// the loud failure by three attempts. `handler_id_mismatch` is neither: it is
+/// non-fatal for the interim and never reaches this loop as an error at all
+/// (see `media_routing::confirm::evaluate`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Spawned-task wiring; all params are distinct dependencies"
+)]
 async fn register_meeting_with_handlers(
     mh_client: &dyn MhRegistrationClient,
     mh_data: &MhAssignmentData,
+    assignment: &MeetingAssignment,
+    policy_generations: &PolicyGenerations,
     meeting_id: &str,
     mc_id: &str,
     mc_grpc_endpoint: &str,
@@ -1147,8 +1267,53 @@ async fn register_meeting_with_handlers(
 ) {
     for handler in &mh_data.handlers {
         let grpc_endpoint = &handler.grpc_endpoint;
+        let handler_id = HandlerId::new(&handler.mh_id);
+
+        let Some(handler_assignment) = assignment.for_handler(&handler_id) else {
+            // The assignment is computed from this same handler list, so this
+            // is unreachable. Log rather than skip silently: if it ever fires,
+            // a handler is going unprogrammed and that must be visible.
+            error!(
+                target: "mc.register_meeting.trigger",
+                mh_grpc_endpoint = %grpc_endpoint,
+                "No assignment computed for this handler; not programming it"
+            );
+            continue;
+        };
+
+        let policy_generation = match policy_generations
+            .next_generation(meeting_id, &handler_id, handler_assignment)
+            .await
+        {
+            Ok(generation) => generation,
+            Err(e) => {
+                error!(
+                    target: "mc.register_meeting.trigger",
+                    mh_grpc_endpoint = %grpc_endpoint,
+                    error = %e,
+                    "Could not derive a policy generation; MH not programmed"
+                );
+                continue;
+            }
+        };
+
+        let programming = MeetingProgramming {
+            mh_grpc_endpoint: grpc_endpoint,
+            expected_handler_id: &handler.mh_id,
+            meeting_id,
+            mc_id,
+            mc_grpc_endpoint,
+            assignment: handler_assignment,
+            policy_generation,
+        };
 
         let mut last_error = None;
+        // Attempts actually made, and whether the loop stopped because retrying
+        // could not help. Both feed the exit log: a terminal failure that
+        // deliberately did NOT retry must not report a retry history it never
+        // had (see the exit log below).
+        let mut attempts_made = 0_u32;
+        let mut ended_terminally = false;
         for attempt in 1..=MAX_REGISTER_ATTEMPTS {
             if cancel_token.is_cancelled() {
                 info!(
@@ -1157,10 +1322,8 @@ async fn register_meeting_with_handlers(
                 );
                 return;
             }
-            match mh_client
-                .register_meeting(grpc_endpoint, meeting_id, mc_id, mc_grpc_endpoint)
-                .await
-            {
+            attempts_made = attempt;
+            match mh_client.register_meeting(&programming).await {
                 Ok(()) => {
                     debug!(
                         target: "mc.register_meeting.trigger",
@@ -1171,15 +1334,28 @@ async fn register_meeting_with_handlers(
                     break;
                 }
                 Err(e) => {
+                    // A terminal divergence does not become correct after
+                    // backoff. Fail once, loudly, rather than three times
+                    // slowly.
+                    let terminal = matches!(
+                        &e,
+                        McError::MediaPolicyDivergence { outcome }
+                            if outcome.disposition() == PushDisposition::Terminal
+                    );
                     warn!(
                         target: "mc.register_meeting.trigger",
                         attempt = attempt,
                         max_attempts = MAX_REGISTER_ATTEMPTS,
                         mh_grpc_endpoint = %grpc_endpoint,
+                        terminal = terminal,
                         error = %e,
                         "RegisterMeeting attempt failed"
                     );
                     last_error = Some(e);
+                    if terminal {
+                        ended_terminally = true;
+                        break;
+                    }
 
                     // Backoff before next attempt (unless this was the last attempt)
                     if let Some(&delay) = REGISTER_BACKOFF_DELAYS.get(attempt as usize - 1) {
@@ -1198,14 +1374,42 @@ async fn register_meeting_with_handlers(
             }
         }
 
+        // TWO EXIT MESSAGES, because the two dispositions have OPPOSITE remedies
+        // and this log is where a responder learns which one they have.
+        //
+        // `mc-incident-response.md` Scenario 12 keys on the literal string
+        // "RegisterMeeting retries exhausted" and reads it as flaky coordination
+        // — investigate the transport. A terminal `transport_mode_mismatch` is
+        // the opposite: a genuine two-ends version skew whose remedy is to roll
+        // MH FORWARD, never to roll MC back (`mc-deployment.md`'s rollback
+        // carve-out). Reporting it as "retries exhausted" with
+        // `total_attempts = 3` would assert a retry history that never happened
+        // and route the responder to the wrong branch, under incident pressure.
+        //
+        // Both stay at `error!` on the same target, so the existing runbook
+        // string keeps matching the case it was written for and the new one is
+        // greppable for the case it was not.
         if let Some(e) = last_error {
-            error!(
-                target: "mc.register_meeting.trigger",
-                mh_grpc_endpoint = %grpc_endpoint,
-                total_attempts = MAX_REGISTER_ATTEMPTS,
-                error = %e,
-                "RegisterMeeting retries exhausted"
-            );
+            if ended_terminally {
+                error!(
+                    target: "mc.register_meeting.trigger",
+                    mh_grpc_endpoint = %grpc_endpoint,
+                    attempts_made = attempts_made,
+                    terminal = true,
+                    error = %e,
+                    "RegisterMeeting failed terminally; not retried"
+                );
+            } else {
+                error!(
+                    target: "mc.register_meeting.trigger",
+                    mh_grpc_endpoint = %grpc_endpoint,
+                    total_attempts = MAX_REGISTER_ATTEMPTS,
+                    attempts_made = attempts_made,
+                    terminal = false,
+                    error = %e,
+                    "RegisterMeeting retries exhausted"
+                );
+            }
         }
     }
 }
@@ -1218,6 +1422,7 @@ async fn register_meeting_with_handlers(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::media_routing::PolicyPushOutcome;
 
     // Full R-60 behavioral coverage (all-CONNECTED / partial / all-FAILED state
     // recording + metric + truncation + cap) lives in
@@ -1373,10 +1578,7 @@ mod tests {
     impl MhRegistrationClient for MockRegClient {
         fn register_meeting<'a>(
             &'a self,
-            _mh_grpc_endpoint: &'a str,
-            _meeting_id: &'a str,
-            _mc_id: &'a str,
-            _mc_grpc_endpoint: &'a str,
+            _programming: &'a MeetingProgramming<'a>,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>> {
             *self.call_count.lock().unwrap() += 1;
             let result = self.results.lock().unwrap().pop_front().unwrap_or(Ok(()));
@@ -1391,6 +1593,48 @@ mod tests {
         }
     }
 
+    /// A one-participant assignment covering exactly the handlers in `mh_data`,
+    /// which is the shape the trigger builds at N=1.
+    fn make_assignment(mh_data: &MhAssignmentData) -> MeetingAssignment {
+        use crate::media_admission::SenderId;
+        use std::num::NonZeroU16;
+
+        let handlers: Vec<HandlerId> = mh_data
+            .handlers
+            .iter()
+            .map(|h| HandlerId::new(&h.mh_id))
+            .collect();
+        compute_assignment(&MeetingRoutingInput {
+            participants: vec![RoutingParticipant {
+                sender_id: SenderId::from_nonzero(NonZeroU16::new(1).unwrap()),
+                handlers: handlers.clone(),
+            }],
+            handlers,
+        })
+        .expect("assignment")
+    }
+
+    /// Drive the trigger's fan-out with a fresh generation registry.
+    async fn run_register(
+        client: &MockRegClient,
+        mh_data: &MhAssignmentData,
+        cancel: &CancellationToken,
+    ) {
+        let assignment = make_assignment(mh_data);
+        let generations = PolicyGenerations::new();
+        register_meeting_with_handlers(
+            client,
+            mh_data,
+            &assignment,
+            &generations,
+            "m1",
+            "mc1",
+            "http://mc:50052",
+            cancel,
+        )
+        .await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_register_retry_succeeds_on_second_attempt() {
         let client = MockRegClient::new(vec![Err(McError::Grpc("transient".to_string())), Ok(())]);
@@ -1401,8 +1645,7 @@ mod tests {
         }]);
         let cancel = CancellationToken::new();
 
-        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
-            .await;
+        run_register(&client, &mh_data, &cancel).await;
 
         assert_eq!(client.call_count(), 2, "Should succeed on 2nd attempt");
     }
@@ -1421,13 +1664,80 @@ mod tests {
         }]);
         let cancel = CancellationToken::new();
 
-        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
-            .await;
+        run_register(&client, &mh_data, &cancel).await;
 
         assert_eq!(
             client.call_count(),
             MAX_REGISTER_ATTEMPTS,
             "Should attempt exactly MAX_REGISTER_ATTEMPTS times"
+        );
+    }
+
+    /// OPS-3's terminal split, pinned by USE rather than by value.
+    ///
+    /// `confirm.rs` pins what `disposition()` *returns*; nothing pinned that the
+    /// retry loop *acts* on it. Every other test here drives the loop with
+    /// `McError::Grpc`, which is non-terminal, so deleting `if terminal { break }`
+    /// left the whole suite green.
+    ///
+    /// A `transport_mode_mismatch` is a genuine two-ends version skew: backoff
+    /// cannot make a handler running a different transport mode agree, so
+    /// failing three times slowly is strictly worse than failing once loudly.
+    /// This also covers the terminal arm of the split exit log — the path that
+    /// must NOT report "retries exhausted" with `total_attempts = 3`.
+    #[tokio::test(start_paused = true)]
+    async fn test_register_terminal_divergence_fails_without_retrying() {
+        let client = MockRegClient::new(vec![Err(McError::MediaPolicyDivergence {
+            outcome: PolicyPushOutcome::TransportModeMismatch,
+        })]);
+        let mh_data = make_mh_data(vec![MhEndpointInfo {
+            mh_id: "mh-1".to_string(),
+            webtransport_endpoint: "wt://mh-1:4433".to_string(),
+            grpc_endpoint: "http://mh-1:50053".to_string(),
+        }]);
+        let cancel = CancellationToken::new();
+
+        run_register(&client, &mh_data, &cancel).await;
+
+        assert_eq!(
+            client.call_count(),
+            1,
+            "a terminal divergence must fail on the FIRST attempt; retrying a \
+             version-skewed handler only delays the loud failure"
+        );
+    }
+
+    /// The other arm of the same split: a retryable divergence must consume the
+    /// full retry budget. Asserted with a divergence input rather than a generic
+    /// gRPC error, so the two dispositions are pinned by the same input class and
+    /// a mis-classification cannot pass by landing on the other arm's test.
+    #[tokio::test(start_paused = true)]
+    async fn test_register_retryable_divergence_consumes_full_retry_budget() {
+        let client = MockRegClient::new(vec![
+            Err(McError::MediaPolicyDivergence {
+                outcome: PolicyPushOutcome::GenerationMismatch,
+            }),
+            Err(McError::MediaPolicyDivergence {
+                outcome: PolicyPushOutcome::GenerationMismatch,
+            }),
+            Err(McError::MediaPolicyDivergence {
+                outcome: PolicyPushOutcome::GenerationMismatch,
+            }),
+        ]);
+        let mh_data = make_mh_data(vec![MhEndpointInfo {
+            mh_id: "mh-1".to_string(),
+            webtransport_endpoint: "wt://mh-1:4433".to_string(),
+            grpc_endpoint: "http://mh-1:50053".to_string(),
+        }]);
+        let cancel = CancellationToken::new();
+
+        run_register(&client, &mh_data, &cancel).await;
+
+        assert_eq!(
+            client.call_count(),
+            MAX_REGISTER_ATTEMPTS,
+            "a transient apply failure is an idempotent re-send MH-side; it must \
+             consume the retry budget rather than fail once"
         );
     }
 
@@ -1454,8 +1764,7 @@ mod tests {
         ]);
         let cancel = CancellationToken::new();
 
-        register_meeting_with_handlers(&client, &mh_data, "m1", "mc1", "http://mc:50052", &cancel)
-            .await;
+        run_register(&client, &mh_data, &cancel).await;
 
         assert_eq!(
             client.call_count(),

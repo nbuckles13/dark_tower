@@ -819,14 +819,27 @@ echo "Join token obtained: $([ -n "$JOIN_TOKEN" ] && echo 'yes' || echo 'no')"
 # ParticipantJoined notification via their WebTransport session
 # Expected: Notification contains new participant's display name and ID
 
-# Step 5: Verify join metrics incremented
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
-curl -s http://localhost:8080/metrics | grep -E "mc_session_joins_total|mc_session_join_duration"
+# Step 5: Verify join metrics incremented.
+# PORT 8081 and Deployment `mc-0`, not `mc-service:8080`: MC_HEALTH_BIND_ADDRESS
+# is 0.0.0.0:8081 (configmap.yaml) and the pods declare containerPort 8081 —
+# there is no listener on 8080, and there is no Deployment named `mc-service`
+# (that string is a Service, a PDB and a container name). A `8080:8080` forward
+# to it yields connection-refused, which looks identical to "the metric did not
+# increment" — and this step is the designated producer for the post-deploy
+# "Forwarding policy confirmed live" gate below, so a broken command here makes
+# that gate permanently unrunnable rather than merely red.
+kubectl port-forward -n dark-tower deployment/mc-0 8081:8081 &
+curl -s http://localhost:8081/metrics | grep -E "mc_session_joins_total|mc_session_join_duration|mc_media_policy_pushes_total"
 kill %1
 
 # Expected:
 # mc_session_joins_total should have incremented
 # mc_session_join_duration_seconds should show recent observation
+# mc_media_policy_pushes_total{outcome="match"} should have incremented — this join
+#   programmed the assigned MH with the meeting's forwarding policy and the handler
+#   echoed back the generation MC sent (ADR-0036 §8). This is the producer for the
+#   post-deploy "Forwarding policy confirmed live" gate, so running Test 5 answers
+#   that gate without a second port-forward.
 ```
 
 **Success criteria:**
@@ -997,9 +1010,16 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 - [ ] `mc_participant_mh_status_total` **failed-share < 0.20** over 30m (R-60; canonical ratio query in MH runbook 30-min check). This is a *ratio*, NOT a `{state="failed"}` increase == 0 check — the counter increments on any single per-MH client hiccup, so a bare `== 0` false-fails every deploy. Any breach → investigate the client→MH media plane per `mc-incident-response.md` §"Scenario 11: Media Connection Failures".
 - [ ] No new `MCMediaConnectionAllFailed` alerts firing (`infra/docker/prometheus/rules/mc-alerts.yaml`)
 - [ ] No mc-service pod restarts since deploy completed
+- [ ] **Forwarding policy confirmed live** (ADR-0036 §8): `increase(mc_media_policy_pushes_total{outcome="match"}[30m]) > 0`. **If this is zero the gate is NOT green — it is unrun**: no meeting was programmed in the window, which is also what a broken deploy looks like. Run §Smoke Tests → [Test 5: Join Flow](#test-5-join-flow-webtransport--signaling) to drive one, then re-check. **Do not tick this on an absent series.**
+- [ ] **No unconfirmed pushes**: `increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[30m]) == 0`. **`handler_id_mismatch` is excluded deliberately**: `handler_id` is a per-incarnation token (MH derives it from `HOSTNAME` plus a fresh UUID at process start, and `MH_HANDLER_ID` is unset in all three manifests), so any deploy that rolls — or merely restarts — an MH pod produces that outcome **by construction**. A gate written "no non-`match` outcomes" false-fails every such deploy, and a gate that cries wolf stops being read, including for the real `no_applied_generation` it exists to catch. **Three sites hold this one expression** — this checklist, the metrics catalog entry, and story task 21's alert rule — and they are **one decision with one revert trigger**: remove the exclusion when `2026-09-02-mh-stable-handler-id` lands, in all three places together.
+- [ ] Read `mc_media_generation_divergence` **only after** the gate above has fired. It is the magnitude, never the detection signal, and it is written **only on a registration push** — with the ADR-0036 §8 re-assert cadence deferred, it does not observe a handler restart.
+
+> **Why these two PromQL expressions are inline here, against the section preamble.** That preamble says not to duplicate queries, and the rule is about two divergent copies of one query drifting apart. These two series are **MC-only with no MH-side counterpart**, so there is no second copy and nothing to diverge from — unlike the gates above, they are canonically owned here. Do not move or delete them to satisfy the preamble.
+>
+> **Scope of a green `match`**: it covers **only meetings programmed after the rollout**. Meetings already live on a pod when it rolled were programmed by the previous process, and there is no re-assert cadence to reprove them. Do not read `match > 0` as "forwarding is healthy fleet-wide".
 - [ ] Cross-check the MH-side checklist (link above) for the full set of MH-side checks (handshake, JWT, timeout, MH→MC delivery success rate, active connections)
 
-**Rollback (MC half)**: same as the join-flow rollback above — `kubectl rollout undo deployment/mc-service -n dark-tower`. If the issue is on the MH side (handshake, JWT, RegisterMeeting timeouts), follow the rollback criteria + `mh-service` rollback documented in `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "Rollback criteria".
+**Rollback (MC half)**: same as the join-flow rollback above — `kubectl rollout undo deployment/mc-0 -n dark-tower` and `kubectl rollout undo deployment/mc-1 -n dark-tower` (MC ships as two per-ordinal Deployments; there is no Deployment named `mc-service` — that string is a Service, a PDB and a container name. Form per `docs/runbooks/mh-deployment.md`). **Carve-out — do NOT roll MC back for sustained `no_applied_generation`.** If `mc_media_policy_pushes_total{outcome="no_applied_generation"}` is climbing with retries exhausted after a deploy, MH is below the ADR-0036 §8 contract and **the remedy is to roll MH forward, not MC back**: rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole, not a fix. If the issue is on the MH side (handshake, JWT, RegisterMeeting timeouts), follow the rollback criteria + `mh-service` rollback documented in `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "Rollback criteria".
 
 ---
 

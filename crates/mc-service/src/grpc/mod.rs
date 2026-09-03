@@ -30,4 +30,4 @@ pub use auth_interceptor::McAuthLayer;
 pub use gc_client::GcClient;
 pub use mc_service::McAssignmentService;
 pub use media_coordination::McMediaCoordinationService;
-pub use mh_client::{MhClient, MhRegistrationClient};
+pub use mh_client::{MeetingProgramming, MhClient, MhRegistrationClient};

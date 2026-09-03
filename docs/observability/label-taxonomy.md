@@ -11,7 +11,9 @@ Ownership: service specialists own the metric definitions in
 `crates/<svc>-service/src/observability/metrics.rs`; observability and
 security **co-own** this document and the guard that enforces it. Extensions
 to the PII denylist land via a PR touching this file AND
-`scripts/guards/simple/validate-metric-labels.sh` together.
+`crates/dt-guard/src/common/pii_vocabulary.rs` together — the vocabulary lives
+there, not in `scripts/guards/simple/validate-metric-labels.sh`, which has been
+a thin dt-guard wrapper since ADR-0034 §3.
 
 **Authoritative ADRs**:
 - [ADR-0011](../decisions/adr-0011-observability-framework.md) — metric
@@ -20,6 +22,8 @@ to the PII denylist land via a PR touching this file AND
   service-owned alert/dashboard/metric authorship; this doc; the guard.
 
 **Machine enforcement**: `scripts/guards/simple/validate-metric-labels.sh`
+(a wrapper; the matcher is `crates/dt-guard/src/metric_labels.rs` and the
+vocabulary is `crates/dt-guard/src/common/pii_vocabulary.rs`)
 runs on every CI pipeline. Rules in this document are tagged
 `[guard-enforced]` or `[reviewer-only]`; see the rule index at the end of
 this document for the full enforcement matrix.
@@ -277,11 +281,24 @@ A **hashed** meeting id is barred on exactly the same footing as a raw one. Hash
    per-meeting aggregation is nearly per-stream**, so a two-stream series is de-anonymising by
    inspection. Two-person is the *common* case, not the corner case.
 
-> **Do not reach for the vocabulary guard to enforce this.** Adding `meeting_id` to the Category B
-> denylist is **inert against the realistic spelling**: `meeting_id_hash` ends in `_id_hash`, which
-> `HASHED_SUFFIXES` exempts via `is_hashed_label()`, so the entry would be defeated by the very
-> mechanism it invokes — while reading as coverage. This is ADR-0036 §11's "vocabulary additions
-> cannot be cited as the protection" as a concrete instance rather than a general warning.
+> **The Category B denylist cannot enforce this; the prefix denylist can, for Rust metric labels
+> only.** Adding `meeting_id` to **Category B** is **inert against the realistic spelling**:
+> `meeting_id_hash` ends in `_id_hash`, which `HASHED_SUFFIXES` exempts via `is_hashed_label()`, so a
+> Category B entry would be defeated by the very mechanism it invokes — while reading as coverage.
+> `meeting_id` is therefore carried in **`PII_PREFIX_DENYLIST`** instead, which `pii_token_hit`
+> evaluates *before* `LABEL_ALLOWLIST` and before `is_hashed_label()` — so it catches
+> `meeting_id_hash` and every other `meeting_id*` spelling. **The partition is the whole of the
+> fix**: the prefix list has one consumer (`metric_labels`), so the bar lands on Rust *metric labels*
+> without firing on the legitimate control-plane `meeting_id = %meeting_id` *log* fields a Category B
+> entry would break across MC/GC/MH.
+>
+> **This covers Rust metric labels only, and it is bypassable.** The scanner reads `crates/`, so the
+> TS client SDK's grandfathered join label set is structurally out of reach, and a *trailing*
+> compound (`x_meeting_id`) is not a prefix match. Both remain `[reviewer-only]`. The
+> `PiiCategory::Prefix` arm is also gated on `pii_safe.is_none()`, so `# pii-safe: <reason>`
+> suppresses it — only Category A is non-bypassable. ADR-0036 §11's "vocabulary additions cannot be
+> cited as the protection" therefore still holds against the *unqualified* claim: this entry is
+> reviewer-gated coverage for one surface, not coverage for the rule's stated scope.
 
 **Grandfathered exception — closed, enumerated, and not extended.** The ADR-0028 join-flow metrics
 that already carry the client SDK's implicit join label set (including `meeting_id_hash`) are
@@ -346,10 +363,11 @@ by default, and doing nothing is what ships the violation.
 
 ### Enforcement reality — read this before citing these rules as coverage
 
-**R1, R2 and R3 are `[reviewer-only]`. No guard enforces them today.**
+**R2 and R3 are `[reviewer-only]`. R1 is `[guard-enforced, bypassable]` for Rust metric labels and `[reviewer-only]` everywhere else.** Read the scope bullets before citing any of them as coverage.
 
-- `meeting_id` appears in **no** guard vocabulary.
-- `meeting_id_hash` is **actively exempted** by `HASHED_SUFFIXES` → `is_hashed_label()`.
+- **R1, Rust metric labels — `[guard-enforced, bypassable]`.** `meeting_id` is in `PII_PREFIX_DENYLIST` (`crates/dt-guard/src/common/pii_vocabulary.rs`), whose single consumer is `metric_labels.rs::pii_token_hit`. The prefix scan runs first — before Category A, before `LABEL_ALLOWLIST`, before `is_hashed_label()` — so `meeting_id_hash` is **caught rather than exempted**, and a violation reports as `PiiCategory::Prefix`. A test pins that category *specifically*: relocating the term to Category B would keep a laxer "a finding was raised" test green while silently restoring the hashed exemption. **It is bypassable.** The `PiiCategory::Prefix` arm is gated on `pii_safe.is_none()`, so `# pii-safe: <reason>` suppresses it; only Category A is non-bypassable. The residual control is that the reason is `[reviewer-gated]` (security) and sits in the diff — this entry converts a silent pass into a reviewed one, which is not the same as making R1 unbreakable.
+- **R1, everywhere else — `[reviewer-only]`.** The match is `starts_with` and the scanner reads `crates/`. A **trailing** compound (`x_meeting_id`) is not a prefix match, and the TS client SDK — including the ADR-0028 grandfathered join label set that legitimately carries `meeting_id_hash` — is structurally out of a `crates/`-only scanner's reach. R1's stated scope is "any metric anywhere in this design"; the guard covers one surface of it, bypassably.
+- **R1 on log fields, deliberately unguarded.** The prefix partition was chosen over Category B precisely so the bar lands on metric labels alone: `meeting_id = %meeting_id` is a legitimate control-plane *log* field across MC/GC/MH, and a Category B entry would break it. The partition is the fix, not an implementation detail of it.
 - `sender_id_hash` is exempted by the same mechanism and is **not** covered by the Category B
   `sender_id` entry — `is_hashed_label()` is tested *before* the Category B lookup in
   `pii_token_hit`. **TRIGGER, not an inventory line**: that entry is sound today *only* because no
@@ -422,7 +440,7 @@ documented false positives.
 | `phone`, `phone_number` | Direct personal identifier. |
 | `display_name` | User-chosen identifier; often correlates to real name. |
 | `user_id` (raw) | Stable cross-session identifier. Hashed form (`user_id_hash`) is allowed. |
-| `sender_id` | ADR-0036 §2/§4 per-meeting media sender handle. Restores coverage the deleted proto `user_id` field provided incidentally. **Not the inert case R1 warns about** — see §Enforcement reality: for `meeting_id` the realistic spelling is the hashed one, so a plain entry is defeated on arrival; for `sender_id` the realistic spelling is the *plain* one, because nothing in the tree hashes a sender id. Inverse of that case, not an instance of it. |
+| `sender_id` | ADR-0036 §2/§4 per-meeting media sender handle. Restores coverage the deleted proto `user_id` field provided incidentally. **Not the inert case R1 warns about** — see §Enforcement reality: for `meeting_id` the realistic spelling is the hashed one, so a plain *Category B* entry is defeated on arrival, which is why `meeting_id` is carried as a **prefix** entry instead; for `sender_id` the realistic spelling is the *plain* one, because nothing in the tree hashes a sender id, so Category B holds. Inverse of that case, not an instance of it — **and the premise is load-bearing**: see the §Enforcement reality TRIGGER, which voids this row if a `sender_id_hash` spelling is ever proposed. |
 | `username`, `nickname`, `handle` | Account identifiers. |
 | `name` | Too broad to assume safe; `hostname` / `filename` allowlisted by specific exception. |
 | `address`, `postal_code`, `zip`, `zipcode` | Location PII. |
@@ -438,10 +456,18 @@ documented false positives.
 
 ### Prefix denylist `[guard-enforced, bypassable]`
 
-Labels whose key starts with `raw_` are flagged regardless of the suffix.
-The `raw_` prefix signals that the author knew the value was sensitive and
-opted out of sanitization — a pattern worth surfacing for review. Examples:
-`raw_email`, `raw_user_id`, `raw_request_id`.
+Labels whose key starts with a denylisted prefix are flagged regardless of the suffix. **The prefix
+scan runs before Category A, before `LABEL_ALLOWLIST` and before `is_hashed_label()`** — that
+ordering is the point of the partition, because it is what a hashed spelling cannot slip past.
+
+| Prefix | Why it is a prefix rather than a Category B token |
+|---|---|
+| `raw_` | Signals the author knew the value was sensitive and opted out of sanitization — a pattern worth surfacing for review. Examples: `raw_email`, `raw_user_id`, `raw_request_id`. |
+| `meeting_id` | R1 (§Media-path identity, ADR-0036 §11). A Category B entry would be **defeated on arrival** by `is_hashed_label()`, since the realistic spelling is `meeting_id_hash`. Prefix placement also confines the bar to metric labels — the prefix list's single consumer is `metric_labels` — leaving the legitimate control-plane `meeting_id = %meeting_id` **log** field untouched. |
+
+The two entries share a mechanism, not a rationale: `raw_` surfaces a deliberate opt-out for review;
+`meeting_id` enforces a prohibition. Both are suppressible by `# pii-safe: <reason>` — see §R1 for
+why that makes R1 a reviewer-gated control on this surface rather than an absolute one.
 
 ### Match semantics `[guard-enforced]`
 
@@ -483,9 +509,13 @@ counter!(
 
 > **This exemption does NOT cover `meeting_id_hash`, or any meeting identifier.** The suffix rule
 > above is a *PII* exemption; the meeting-identifier prohibition in §Media-path identity is a
-> *cardinality and aggregation* rule and is independent of it. A hashed meeting id ends in `_id_hash`
-> and is therefore waved through by `is_hashed_label()` — it is exempted **by construction** — while
-> still being prohibited. Read §Media-path identity before adding any meeting-scoped label.
+> *cardinality and aggregation* rule and is independent of it. On its own, `is_hashed_label()` would
+> wave a hashed meeting id through — it ends in `_id_hash` — but `meeting_id` sits in
+> `PII_PREFIX_DENYLIST`, which `pii_token_hit` evaluates **before** the suffix rule is ever consulted,
+> so `meeting_id_hash` is rejected as a Rust metric label. The prohibition does not depend on that
+> ordering; on that one surface it is now guard-backed by it, subject to the `# pii-safe` bypass that
+> applies to every non-Category-A finding. Read §Media-path identity before adding any
+> meeting-scoped label.
 
 **Reviewer-level requirements** `[reviewer-only]` for hashed labels:
 
@@ -502,7 +532,10 @@ counter!(
 
 Security reviewers may require additions to the denylist at review time
 (e.g., a new privacy-regulated field, a fresh incident learning). Additions
-land via a PR updating both this file AND `validate-metric-labels.sh`.
+land via a PR updating both this file AND
+`crates/dt-guard/src/common/pii_vocabulary.rs` — the vocabulary lives there, not in
+`scripts/guards/simple/validate-metric-labels.sh`, which has been a thin dt-guard wrapper
+since ADR-0034 §3.
 Removals require security sign-off on the PR.
 
 ---
@@ -621,7 +654,7 @@ Both `#` and `//` prefixes are accepted (Rust-native `//` is preferred).
 ### What the escape hatch suppresses `[guard-enforced]`
 
 - Category B PII-denylist match on a label key (user-PII).
-- Prefix denylist match (`raw_*`).
+- Prefix denylist match (`raw_*`, `meeting_id*`). **For `meeting_id*` this suppresses a prohibition, not a false positive** — ADR-0036 §11 states R1 absolutely, so a hatch here is an exception to a rule rather than a correction to a mismatch. Expect security to hold the reason to that standard; see §R1.
 
 ### What it does NOT suppress `[guard-enforced]`
 
@@ -706,7 +739,7 @@ series is the answer to a real operational question.
 |---|---|
 | Category A secret denylist on label keys | `[guard-enforced, non-bypassable]` |
 | Category B user-PII denylist on label keys | `[guard-enforced]` |
-| `raw_*` prefix denylist on label keys | `[guard-enforced]` |
+| Prefix denylist on label keys (`raw_*`, `meeting_id*`) | `[guard-enforced, bypassable]` — scanned before Category A/B and before `is_hashed_label()`; suppressible by `# pii-safe`, unlike Category A |
 | Hashed/opaque suffix allow for Category B (`_hash`, `_sha256`, ...) | `[guard-enforced]` |
 | Infrastructure-identity allowlist (`hostname`, etc.) | `[guard-enforced]` |
 | Canonical shared-label names (prefer over drift aliases) | `[reviewer-only]` |
@@ -729,7 +762,7 @@ series is the answer to a real operational question.
 | Shared-label-name additions | `[reviewer-only]` (land here before second-service use) |
 | `key_custody` bounded to the single value `operator` | `[reviewer-only]` (ADR-0036 §4 amendment required to extend) |
 | No end-to-end / zero-trust boolean on any carrier | `[reviewer-only]` |
-| **No meeting identifier — raw or hashed — on any metric** | `[reviewer-only]` — **NOT guard-enforced**; `meeting_id` is in no vocabulary and `meeting_id_hash` is actively exempted by `HASHED_SUFFIXES` |
+| **No meeting identifier — raw or hashed — on any metric** | **Split.** `[guard-enforced, bypassable]` for Rust metric labels — `meeting_id` in `PII_PREFIX_DENYLIST`, scanned before `is_hashed_label()` so `meeting_id_hash` is caught, but suppressible by `# pii-safe` (only Category A is not). `[reviewer-only]` for the TS client SDK (scanner reads `crates/`) and for trailing compounds like `x_meeting_id` (`starts_with`, not segment matching). See §Enforcement reality. |
 | No participant / stream identity on media-path labels, log fields, span attributes or **exemplars** | `[reviewer-only]` — the media-path half is enforced by shape via the directory-scoped macro deny, not by vocabulary |
 
 ---
@@ -738,8 +771,9 @@ series is the answer to a real operational question.
 
 **PII denylist**: security + observability co-own. Extensions land via a
 PR touching both this document AND
-`scripts/guards/simple/validate-metric-labels.sh`. Removals require
-security sign-off.
+`crates/dt-guard/src/common/pii_vocabulary.rs` — the vocabulary lives there,
+not in `scripts/guards/simple/validate-metric-labels.sh`, which has been a thin
+dt-guard wrapper since ADR-0034 §3. Removals require security sign-off.
 
 **Canonical shared labels**: observability owns the canonical table. Adding
 an entry before second-service use is the expected workflow; mark the

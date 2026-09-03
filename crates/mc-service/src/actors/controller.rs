@@ -17,6 +17,7 @@
 //! 4. Reports completion to GC
 
 use crate::errors::McError;
+use crate::media_routing::PolicyGenerations;
 use crate::mh_connection_registry::MhConnectionRegistry;
 
 use super::meeting::{MeetingActor, MeetingActorHandle};
@@ -59,6 +60,8 @@ impl MeetingControllerActorHandle {
     ///   Wrapped in SecretBox to ensure secure memory handling (zeroization on drop,
     ///   redacted Debug output).
     /// * `mh_connection_registry` - Registry tracking participant-to-MH connections.
+    /// * `policy_generations` - Per-(meeting, handler) `policy_generation`
+    ///   registry (ADR-0036 §8). Evicted on meeting teardown.
     #[must_use]
     pub fn new(
         mc_id: String,
@@ -66,6 +69,7 @@ impl MeetingControllerActorHandle {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         mh_connection_registry: Arc<MhConnectionRegistry>,
+        policy_generations: Arc<PolicyGenerations>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(CONTROLLER_CHANNEL_BUFFER);
         let cancel_token = CancellationToken::new();
@@ -78,6 +82,7 @@ impl MeetingControllerActorHandle {
             Arc::clone(&controller_metrics),
             master_secret,
             mh_connection_registry,
+            policy_generations,
         );
 
         tokio::spawn(actor.run());
@@ -282,6 +287,9 @@ pub struct MeetingControllerActor {
     /// Registry tracking participant-to-MH connection state.
     /// Cleaned up when meetings are removed.
     mh_connection_registry: Arc<MhConnectionRegistry>,
+    /// Per-(meeting, handler) `policy_generation` registry (ADR-0036 §8).
+    /// Cleaned up when meetings are removed, on the same choke point.
+    policy_generations: Arc<PolicyGenerations>,
 }
 
 impl MeetingControllerActor {
@@ -298,6 +306,12 @@ impl MeetingControllerActor {
     ///   Wrapped in SecretBox to ensure secure memory handling.
     /// * `mh_connection_registry` - Registry tracking participant-to-MH connections.
     ///   Cleaned up when meetings are removed.
+    /// * `policy_generations` - Per-(meeting, handler) `policy_generation`
+    ///   registry. Cleaned up when meetings are removed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Actor wiring; all params are distinct dependencies"
+    )]
     fn new(
         mc_id: String,
         receiver: mpsc::Receiver<ControllerMessage>,
@@ -306,6 +320,7 @@ impl MeetingControllerActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         mh_connection_registry: Arc<MhConnectionRegistry>,
+        policy_generations: Arc<PolicyGenerations>,
     ) -> Self {
         let mailbox = MailboxMonitor::new(ActorType::Controller, &mc_id);
 
@@ -320,6 +335,7 @@ impl MeetingControllerActor {
             mailbox,
             master_secret,
             mh_connection_registry,
+            policy_generations,
         }
     }
 
@@ -677,8 +693,19 @@ impl MeetingControllerActor {
 
                 self.metrics.meeting_removed();
 
-                // Clean up MH connection registry entries for this meeting
+                // Clean up MH connection registry entries for this meeting.
+                // SIBLING: `check_meeting_health()` reaps meetings on a second
+                // teardown path and must release the same two registries.
                 self.mh_connection_registry.remove_meeting(meeting_id).await;
+
+                // Release this meeting's `policy_generation` state (ADR-0036 §8).
+                // Same choke point, same line, for the same reason: without it
+                // the registry retains a whole `HandlerAssignment` per ended
+                // meeting for the pod's lifetime. Keyed on MEETING teardown
+                // only — a live meeting whose handler set changes keeps its
+                // generations, or it would restart at 1 mid-meeting and MH would
+                // correctly ignore the push as stale.
+                self.policy_generations.remove_meeting(meeting_id).await;
 
                 info!(
                     target: "mc.actor.controller",
@@ -831,6 +858,30 @@ impl MeetingControllerActor {
                 }
 
                 self.metrics.meeting_removed();
+
+                // SECOND TEARDOWN PATH — the registries must be released here
+                // too, and this is not the exotic one: the clean-exit arm above
+                // logs "Meeting actor exited cleanly", i.e. an ordinary
+                // end-of-meeting, and this reaper runs on every iteration of the
+                // controller loop. `meeting_removed()` already fires on both
+                // paths; before this, the metric counted the teardown and the
+                // registries did not observe it, so a meeting reaped here
+                // retained a whole `HandlerAssignment` for the pod's lifetime.
+                //
+                // Safe to evict rather than preserve: a reaped meeting is not
+                // restarted on this pod (migration is the Phase 6e TODO above),
+                // so the restart-at-1 hazard that makes eviction key on MEETING
+                // teardown rather than handler change does not arise — the
+                // meeting is gone.
+                //
+                // Keep these two calls together and in step with
+                // `remove_meeting()`: they are one teardown contract expressed
+                // at two sites, and the reason this gap existed is that only one
+                // site was wired.
+                self.mh_connection_registry
+                    .remove_meeting(&meeting_id)
+                    .await;
+                self.policy_generations.remove_meeting(&meeting_id).await;
             }
         }
     }
@@ -851,6 +902,131 @@ mod tests {
         Arc::new(MhConnectionRegistry::new())
     }
 
+    /// A non-empty assignment, distinct from `HandlerAssignment::default()`, so
+    /// eviction tests can tell "released" from "retained".
+    fn seeded_assignment() -> crate::media_routing::HandlerAssignment {
+        crate::media_routing::HandlerAssignment {
+            egress_streams: vec![crate::media_routing::EgressStreamPlan {
+                egress_stream_id: 0x0000_0100,
+                subscriber: crate::media_admission::SenderId::from_nonzero(
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+                slot_id: 0,
+                candidate_sources: Vec::new(),
+                stream_number: 0,
+                priority_group: 1,
+                supersede_on_independent_frame: false,
+                transport_mode: proto_gen::dark_tower::signaling::v1::TransportMode::Datagram,
+            }],
+        }
+    }
+
+    fn test_generations() -> Arc<PolicyGenerations> {
+        Arc::new(PolicyGenerations::new())
+    }
+
+    /// SEC-5 regression: the SECOND teardown path must release both registries.
+    ///
+    /// `remove_meeting()` was wired at Gate 1; `check_meeting_health()` — which
+    /// runs on every controller-loop iteration and reaps meetings whose actor
+    /// task has finished, including the ordinary "exited cleanly" case — was
+    /// not. A meeting reaped there retained a whole `HandlerAssignment` for the
+    /// pod's lifetime.
+    ///
+    /// This drives the reaper directly rather than through the handle, because
+    /// there is no public seam to end one meeting actor without going through
+    /// `remove_meeting()` — i.e. through the path that was already correct,
+    /// which is exactly why the existing eviction test stayed green with the bug
+    /// present. Adding a production seam to reach it would be a larger change
+    /// than the fix.
+    #[tokio::test]
+    async fn check_meeting_health_releases_both_registries_for_a_reaped_meeting() {
+        let registry = test_registry();
+        let generations = test_generations();
+        let (_tx, rx) = mpsc::channel(8);
+        let mut actor = MeetingControllerActor::new(
+            "mc-test-reap".to_string(),
+            rx,
+            CancellationToken::new(),
+            ActorMetrics::new(),
+            ControllerMetrics::new(),
+            test_secret(),
+            Arc::clone(&registry),
+            Arc::clone(&generations),
+        );
+
+        actor
+            .create_meeting("meeting-reaped".to_string())
+            .await
+            .expect("create");
+
+        // Seed both registries as a live meeting would.
+        registry
+            .add_connection("meeting-reaped", "participant-1", "mh-0")
+            .await;
+        // Seeded assignment must DIFFER from the one probed after the reap:
+        // `next_generation` returns the SAME number for an identical assignment,
+        // so seeding and probing with equal values would read 1 whether or not
+        // the entry survived — an assertion that cannot fail.
+        generations
+            .next_generation(
+                "meeting-reaped",
+                &crate::media_routing::HandlerId::new("mh-0"),
+                &seeded_assignment(),
+            )
+            .await
+            .expect("generation");
+
+        // End the meeting actor the way an ordinary meeting ends, then wait for
+        // its task to actually finish so the reaper sees it.
+        actor
+            .meetings
+            .get("meeting-reaped")
+            .expect("meeting present")
+            .handle
+            .cancel();
+        for _ in 0..200 {
+            if actor.meetings["meeting-reaped"].task_handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            actor.meetings["meeting-reaped"].task_handle.is_finished(),
+            "meeting actor task should have exited after cancel"
+        );
+
+        actor.check_meeting_health().await;
+
+        assert!(
+            !actor.meetings.contains_key("meeting-reaped"),
+            "the reaper should have removed the meeting"
+        );
+        assert!(
+            registry
+                .get_connections("meeting-reaped", "participant-1")
+                .await
+                .is_empty(),
+            "mh_connection_registry must be released on the reaping path too"
+        );
+        // Probe with an assignment DIFFERENT from the seeded one: evicted -> 1
+        // (first ever for the pair), retained -> 2 (a changed assignment
+        // advances). This is what makes the assertion able to fail.
+        let after = generations
+            .next_generation(
+                "meeting-reaped",
+                &crate::media_routing::HandlerId::new("mh-0"),
+                &crate::media_routing::HandlerAssignment::default(),
+            )
+            .await
+            .expect("generation");
+        assert_eq!(
+            after.get(),
+            1,
+            "policy_generations must be released on the reaping path too"
+        );
+    }
+
     #[tokio::test]
     async fn test_controller_handle_create_meeting() {
         let metrics = ActorMetrics::new();
@@ -861,6 +1037,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_registry(),
+            test_generations(),
         );
 
         // Create a meeting
@@ -887,6 +1064,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_registry(),
+            test_generations(),
         );
 
         // Create first meeting
@@ -911,6 +1089,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_registry(),
+            test_generations(),
         );
 
         let result = handle.get_meeting("nonexistent".to_string()).await;
@@ -930,6 +1109,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_registry(),
+            test_generations(),
         );
 
         // Create a meeting
@@ -958,6 +1138,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_registry(),
+            test_generations(),
         );
 
         // Get initial status
@@ -988,6 +1169,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_registry(),
+            test_generations(),
         );
 
         // Create a meeting
@@ -1017,6 +1199,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_registry(),
+            test_generations(),
         );
 
         assert!(!handle.is_cancelled());
