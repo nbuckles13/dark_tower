@@ -26,7 +26,8 @@ use ::common::secret::SecretBox;
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::auth::McJwtValidator;
 use mc_service::errors::McError;
-use mc_service::grpc::MhRegistrationClient;
+use mc_service::grpc::{MeetingProgramming, MhRegistrationClient};
+use mc_service::media_routing::PolicyGenerations;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_test_utils::jwt_test::{mount_jwks_mock, TestKeypair};
@@ -88,9 +89,16 @@ impl MhAssignmentStore for MockMhAssignmentStore {
 #[derive(Debug, Clone)]
 pub struct RegisterMeetingCall {
     pub mh_grpc_endpoint: String,
+    pub expected_handler_id: String,
     pub meeting_id: String,
     pub mc_id: String,
     pub mc_grpc_endpoint: String,
+    /// The generation MC derived for this push (ADR-0036 §8). Recorded so a
+    /// test can assert MC never sends 0 and that an unchanged assignment
+    /// re-asserts at the same number.
+    pub policy_generation: u64,
+    /// How many egress streams the pushed policy carried.
+    pub egress_stream_count: usize,
 }
 
 pub struct MockMhRegistrationClient {
@@ -166,19 +174,19 @@ impl Default for MockMhRegistrationClient {
 impl MhRegistrationClient for MockMhRegistrationClient {
     fn register_meeting<'a>(
         &'a self,
-        mh_grpc_endpoint: &'a str,
-        meeting_id: &'a str,
-        mc_id: &'a str,
-        mc_grpc_endpoint: &'a str,
+        programming: &'a MeetingProgramming<'a>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>> {
         self.calls
             .lock()
             .expect("MockMhRegistrationClient mutex poisoned")
             .push(RegisterMeetingCall {
-                mh_grpc_endpoint: mh_grpc_endpoint.to_string(),
-                meeting_id: meeting_id.to_string(),
-                mc_id: mc_id.to_string(),
-                mc_grpc_endpoint: mc_grpc_endpoint.to_string(),
+                mh_grpc_endpoint: programming.mh_grpc_endpoint.to_string(),
+                expected_handler_id: programming.expected_handler_id.to_string(),
+                meeting_id: programming.meeting_id.to_string(),
+                mc_id: programming.mc_id.to_string(),
+                mc_grpc_endpoint: programming.mc_grpc_endpoint.to_string(),
+                policy_generation: programming.policy_generation.get(),
+                egress_stream_count: programming.assignment.egress_streams.len(),
             });
         self.call_notify.notify_one();
         let result = match &self.result {
@@ -233,6 +241,7 @@ pub async fn build_test_stack(keypair_label: &str) -> TestStackHandles {
         controller_metrics,
         master_secret,
         Arc::new(MhConnectionRegistry::new()),
+        Arc::new(PolicyGenerations::new()),
     ));
 
     let mh_store: Arc<MockMhAssignmentStore> = Arc::new(MockMhAssignmentStore::new());

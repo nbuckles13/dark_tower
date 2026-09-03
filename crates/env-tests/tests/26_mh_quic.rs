@@ -23,6 +23,10 @@
 //!    `RegisterMeeting` to all assigned MHs after first join, so no MH stays
 //!    unregistered for a real meeting; (c) shortening the timeout requires
 //!    infra changes that would create a dev-vs-prod behavioral gap.
+//! 9. `test_mc_programs_live_handler_with_confirmed_forwarding_policy` —
+//!    `mc_media_policy_pushes_total{outcome="match"}` delta >= 1 after a real
+//!    join, with the four non-`match` outcome series flat. The positive
+//!    composition counterpart to MH's negative unit gates (ADR-0036 §8).
 //!
 //! # Prerequisites
 //!
@@ -55,7 +59,8 @@ use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeetingResponse};
 use env_tests::fixtures::media::sample_identity_public_key;
 use env_tests::fixtures::metrics::{
-    format_instance_map, instance_maps_equal, poll_until_any_instance_above, InstanceCounters,
+    any_instance_exceeds_baseline, format_instance_map, instance_maps_equal,
+    poll_until_any_instance_above, InstanceCounters,
 };
 use env_tests::fixtures::{AuthClient, PrometheusClient};
 use prost::Message;
@@ -962,6 +967,214 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
 #[ignore = "covered at component tier — see crates/mc-service/tests/otel_grpc_inbound_continuity.rs, otel_grpc_outbound_integration.rs, otel_webtransport_integration.rs"]
 async fn test_mc_trace_continuity_end_to_end() {
     // Intentionally unimplemented. See doc-comment above.
+}
+
+// ============================================================================
+// Scenario 9: MC programs a LIVE handler and the handler confirms the applied
+// generation (ADR-0036 §8)
+// ============================================================================
+
+/// The per-instance `PromQL` for `mc_media_policy_pushes_total` — the ONE
+/// string source shared by the baseline read, the stabilize loop and the delta
+/// assert, mirroring [`notification_promql`], so those three cannot disagree on
+/// the query.
+///
+/// `outcome_selector` is spliced in as a full label matcher (e.g.
+/// `outcome="match"` or `outcome!~"match|handler_id_mismatch"`) rather than a
+/// bare value, because the positive and negative halves of this test need
+/// different matcher OPERATORS over one metric.
+fn policy_push_promql(outcome_selector: &str) -> String {
+    format!(r#"sum by (instance) (mc_media_policy_pushes_total{{{outcome_selector}}})"#)
+}
+
+/// Read a PER-INSTANCE snapshot of `mc_media_policy_pushes_total` for an
+/// outcome selector. Same `instance`-grouping rationale and same fail-loud-on-
+/// query-error behaviour as [`mh_notification_counter`].
+async fn policy_push_counter(prom: &PrometheusClient, outcome_selector: &str) -> InstanceCounters {
+    prom.instance_counter_map(&policy_push_promql(outcome_selector))
+        .await
+}
+
+/// Wait for the per-instance `mc_media_policy_pushes_total{outcome="match"}`
+/// snapshot to stabilize, in the same two-reads-a-scrape-apart shape as
+/// [`wait_for_notification_counter_stable`].
+///
+/// Needed for the same reason: a sibling test in this binary drives a real join,
+/// every real join programs a handler, and a `match` still in flight to
+/// Prometheus when this test snapshots its baseline would make the delta assert
+/// pass on the predecessor's increment. The `#[serial]` group makes the
+/// predecessor *finished*, not *scraped*.
+///
+/// # Structural clone of `wait_for_notification_counter_stable`, extraction deferred
+///
+/// Same loop, same 90s deadline, same 16s inter-read wait, same
+/// `instance_maps_equal` exit, same `format_instance_map` panic shape — only the
+/// counter read and the metric name differ. The natural home is
+/// `env_tests::fixtures::metrics`, beside `poll_until_any_instance_above`, which
+/// was extracted for exactly this reason.
+///
+/// **Deliberately not extracted, and the reason is the SHAPE, not the process.**
+/// The extraction must generalise **both** stability-waits — this one and the
+/// pre-existing `wait_for_notification_counter_stable` that tests 4 and 5 use —
+/// and a second consumer alone does not determine the right interface. A helper
+/// shaped around this call site only would be **worse than this documented
+/// clone**: it would create a shared home that its two siblings do not both use,
+/// which *reads* as done and stops the next reader looking. @test owns that
+/// call and declined the extraction on exactly this ground.
+///
+/// (A secondary, weaker reason also held at the time: @test scoped
+/// `crates/env-tests/src/fixtures/**` to zero diff for this task and the plan's
+/// conditional row was removed on that ruling. That one would have been
+/// satisfied by @test simply saying yes; the shape argument would not, and is
+/// the one to re-read before extracting.)
+///
+/// Trigger: the next touch of either helper, a third stability-wait, or a change
+/// to the Prometheus scrape SLA — the last being the one that actually bites.
+/// Tracked in `docs/TODO.md` §Cross-Service Duplication, owned by @test. The
+/// load-bearing 16s rationale is carried onto the copy below so the two sites
+/// cannot diverge silently in the meantime.
+async fn wait_for_policy_push_counter_stable(prom: &PrometheusClient) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let v1 = policy_push_counter(prom, r#"outcome="match""#).await;
+        // One Prometheus scrape interval (15s SLA) — wait long enough that any
+        // outstanding scrape lands between v1 and v2. Same reasoning, same
+        // literal, as `wait_for_notification_counter_stable` above; if the
+        // scrape SLA moves, BOTH must move. The structural duplication is
+        // recorded for extraction — see this function's doc comment.
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        let v2 = policy_push_counter(prom, r#"outcome="match""#).await;
+        if instance_maps_equal(&v1, &v2) {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "mc_media_policy_pushes_total{{outcome=\"match\"}} per-instance snapshot did not \
+                 stabilize within 90s (last reads: v1={}, v2={})",
+                format_instance_map(&v1),
+                format_instance_map(&v2),
+            );
+        }
+    }
+}
+
+/// Test: a real join against the Kind cluster makes MC compute the meeting's
+/// forwarding assignment and program the assigned **live** MH, and the handler
+/// echoes back the exact `policy_generation` MC sent.
+///
+/// **This is the positive-composition counterpart to MH's negative unit gates**
+/// (`crates/mh-service` proves it *rejects* a bad policy; this proves the two
+/// services *agree* on a good one). Nothing below stubs either end: MC computes
+/// the assignment, the real `RegisterMeeting` RPC carries it, and a real
+/// `mh-service` process applies it and answers.
+///
+/// # Why the verdict is the counter and not the gauge
+///
+/// `outcome="match"` is reachable **only** when the handler echoed an
+/// `applied_generation` equal to what MC sent, with the transport mode agreeing
+/// — so a delta >= 1 on that series cannot be produced by an unprogrammed
+/// handler, which makes it non-vacuous. `mc_media_generation_divergence` is
+/// deliberately NOT asserted here: a gauge that has materialised no series makes
+/// absent-versus-zero ambiguous, and an instant read can be masked by an
+/// intervening scrape — a vacuous pass or a flake. Its assertion lives in
+/// `crates/mc-service/tests/media_policy_push_integration.rs`, where
+/// `MetricAssertion` gives deterministic absent-versus-zero.
+///
+/// # Why the negative guard uses the negated increase-predicate
+///
+/// `!any_instance_exceeds_baseline(..)` rather than `instance_maps_equal(..)`.
+/// A stale old-pod non-`match` series **expiring** between the baseline and
+/// current reads makes the maps unequal and would produce a rollover-induced
+/// false FAIL; the negated increase-predicate tolerates disappearing series by
+/// construction, and an absent series correctly reads as an empty map, i.e. 0.
+///
+/// `handler_id_mismatch` is NOT excluded from the negative guard here, unlike in
+/// the post-deploy checklist and the alert rule: this test drives a *fresh* join
+/// against a handler MC has just been assigned, so the ids agree and the outcome
+/// must not occur.
+///
+/// **Why they agree here, when OPS-17 says `handler_id` is per-incarnation.**
+/// Both are true and they are not in tension. The id MC compares against is
+/// captured into its Redis snapshot at assignment time, from the same MH
+/// incarnation that answers this push — no restart intervenes inside a single
+/// controlled join, so expected == echoed by construction. OPS-17's staleness
+/// bites only *post-restart*, when a frozen snapshot is compared against a new
+/// incarnation's fresh id. Fresh-join-agrees and post-restart-diverges are
+/// different situations. **Do not "align" this guard with the operational
+/// `outcome!~"match|handler_id_mismatch"` expression** — that exclusion exists
+/// for the rollout window, which this test does not exercise, and adopting it
+/// here would make the test tolerate an outcome that would be a genuine fault
+/// (an MH crashloop mid-test). If it does, something is genuinely wrong with this path — the
+/// rollout-window reasoning that justifies excluding it operationally does not
+/// apply to a single controlled join.
+///
+/// On-call: if this fails with `no_applied_generation`, MH received the policy
+/// and installed nothing — check MH's `mh_media_policy_applies_total{outcome}`
+/// and the `mh.session.policy` WARN log. If it fails with
+/// `transport_mode_mismatch`, MC and MH are version-skewed on
+/// `dark_tower.signaling.v1.TransportMode`.
+#[tokio::test]
+#[serial_test::serial(mh_notifications)]
+async fn test_mc_programs_live_handler_with_confirmed_forwarding_policy() {
+    let cluster = cluster().await;
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+
+    let auth_client = AuthClient::new(&cluster.ac_base_url);
+    let (user_token, display_name) = register_test_user(&auth_client, "MC Policy Push User").await;
+
+    wait_for_policy_push_counter_stable(&prom).await;
+    let match_baseline = policy_push_counter(&prom, r#"outcome="match""#).await;
+    let non_match_selector = r#"outcome!="match""#;
+    let non_match_baseline = policy_push_counter(&prom, non_match_selector).await;
+
+    // A real join: GC creates and assigns, MC admits the participant and — as
+    // the first participant — computes the assignment and programs every
+    // assigned MH. The MH WebTransport connect is not needed for the push, but
+    // driving it keeps this test on the same shape as its siblings and proves
+    // the meeting is genuinely usable.
+    let (jwt, mh_url) = join_with_registered_mh(
+        cluster,
+        &user_token,
+        &display_name,
+        "MC Policy Push Test Meeting",
+    )
+    .await;
+    let conn = connect_wt(&mh_url).await;
+    let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
+
+    // Positive: the handler confirmed the generation MC sent.
+    // 60s budget — the chain is MC's spawned RegisterMeeting task → gRPC to MH
+    // → MH apply → MC's confirm → counter → Prometheus scrape (15s SLA).
+    poll_until_any_instance_above(
+        &prom,
+        &policy_push_promql(r#"outcome="match""#),
+        &match_baseline,
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        |current| {
+            format!(
+                "mc_media_policy_pushes_total{{outcome=\"match\"}} did not increase past \
+                 baseline on any instance within 60s — MC never confirmed that the live handler \
+                 applied the generation it sent (baseline: {}, last observed: {}). Check the \
+                 non-match series and MC's mc.grpc.mh_client error log for the outcome.",
+                format_instance_map(&match_baseline),
+                format_instance_map(current),
+            )
+        },
+    )
+    .await;
+
+    // Negative guard: no non-`match` outcome moved. Read AFTER the positive so
+    // the same push is covered by both halves.
+    let non_match_current = policy_push_counter(&prom, non_match_selector).await;
+    assert!(
+        !any_instance_exceeds_baseline(&non_match_baseline, &non_match_current),
+        "a non-match policy-push outcome incremented during a controlled single join \
+         (baseline: {}, observed: {}) — the push was classified as something other than \
+         `match`; read MC's mc.grpc.mh_client error line for which outcome and both generations",
+        format_instance_map(&non_match_baseline),
+        format_instance_map(&non_match_current),
+    );
 }
 
 // ============================================================================

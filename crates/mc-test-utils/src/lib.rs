@@ -83,9 +83,11 @@ pub mod media;
 pub mod mock_gc;
 pub mod mock_mh;
 pub mod mock_redis;
+pub mod token;
 
 // Re-export commonly used items
 pub use fixtures::*;
 pub use mock_gc::*;
 pub use mock_mh::*;
 pub use mock_redis::*;
+pub use token::test_token_receiver;

@@ -271,14 +271,17 @@ because story task 21's media metrics need a section to extend.
 
 The idempotent re-assert counts as `applied`, not `rejected_stale`: §8's cadence re-asserts every meeting every ≤10 s in perfect health, so counting it as a rejection would drive that series monotonically upward in the steady state and make any alert on it dead on arrival.
 
-> **Expected steady state until story task 13 — read this before treating `no_generation` as an incident.**
+> **`no_generation` is now a ROLLOUT signal, not a steady state — read this before treating it as an incident, and before treating it as always-benign.**
 >
-> MC does not emit `policy_generation` >= 1 until story task 13. Until then **every** registration MC sends carries 0, so the correct and expected shape is:
-> `no_generation` counting up at the registration rate, `applied` flat at **zero**, and `RegisterMeetingResponse.applied_generation` pinned at **0**. None of that is an outage.
+> MC emits `policy_generation` >= 1 as of story task 13 (2026-09-02), so the healthy steady state is now `applied` carrying the traffic and `no_generation` at **zero**.
 >
-> MH deliberately does **not** reject `policy_generation` 0 yet. `internal.proto::RegisterMeetingRequest.policy_generation` carries the ordering constraint in full: enforcing the rejection before MC emits >= 1 would reject every registration for the whole window — no meeting registered, every client provisionally accepted and kicked at the registration timeout, which is ADR-0036 §8's opening paragraph almost verbatim, "a permanent media blackhole for that meeting until it emptied, reached through an ordinary rolling deploy".
+> **`no_generation` counting up is expected ONLY while an MC rollout is in progress.** A not-yet-upgraded MC pod legitimately still sends 0, so during a rolling deploy the two series coexist and the mix shifts as pods cycle. That is not an outage and is not worth an incident.
 >
-> **The shape inverts at story task 13**, and that is the signal to watch for: `no_generation` should fall to zero and `applied` should take over. `no_generation` is deliberately the same value the *rejection* will land on once enforcement turns on — two eras, one value, no rename, no dashboard edit.
+> **Sustained `no_generation` after the rollout completes means MC failed to compute a generation** for those meetings — an MC-side fault, not an MH one. The remedy is upstream: check MC's `mc_media_policy_pushes_total` and MC's `mc.register_meeting.trigger` logs for an assignment that could not be computed.
+>
+> MH still deliberately does **not** reject `policy_generation` 0. `internal.proto::RegisterMeetingRequest.policy_generation` carries the ordering constraint in full, and MC and MH roll independently: flipping the rejection in the same change would let whichever side rolls first decide, and MH-first rejects every registration from a not-yet-upgraded MC pod — no meeting registered, every client provisionally accepted and kicked at the registration timeout, which is ADR-0036 §8's opening paragraph almost verbatim, "a permanent media blackhole for that meeting until it emptied, reached through an ordinary rolling deploy". Enforcement is a separate change whose precondition — all MC pods emitting >= 1 — task 13 supplies but does not itself verify.
+>
+> `no_generation` is deliberately the same value the *rejection* will land on once that enforcement turns on — two eras, one value, no rename, no dashboard edit.
 
 **Not label material** (ADR-0036 §11): `policy_generation`, `applied_generation` and `process_start_epoch_ms` are unbounded — one new series per policy change or per restart — and go in the log line and in this metric's *value*, never in a label. Neither is any stream or meeting identity: `egress_stream_id`, `sender_id`, `slot_id`, `stream_number`, `participant_id`, or a meeting id **raw or hashed**. A `sender_id` label would be specifically hazardous: it is a per-meeting ordinal, so the same value recurs across every meeting on the handler and emitting it unqualified is a cross-meeting correlation handle. `handler_id` would be *permitted* (pod level is §11's stated aggregation floor) but is deliberately not added — the scrape already carries `instance`/`pod`.
 
@@ -296,7 +299,7 @@ sum(rate(mh_media_policy_applies_total{outcome=~"rejected_stale|rejected_invalid
 
 The denominator is meaningful because the counter increments on every post-boundary path: `sum(mh_media_policy_applies_total)` is "registrations whose policy MH considered". Pre-boundary rejects (a malformed `mc_grpc_endpoint`, an over-length `mc_id`) are **not** counted here — they land on `mh_grpc_requests_total{status="error"}` alone, because "MC's assignment computation produced a policy MH will not apply" and "this caller's endpoint is malformed" have different owners and different remedies.
 
-No alert rule ships with this metric. A useful threshold depends on MC's re-assert cadence, which lands with story task 13; alerting is story task 21's scope.
+No alert rule ships with this metric. A useful threshold depends on MC's re-assert cadence, which task 13 explicitly deferred to the handler-restart story; alerting is story task 21's scope.
 
 ---
 

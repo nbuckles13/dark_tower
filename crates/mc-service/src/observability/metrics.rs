@@ -14,8 +14,10 @@
 //!
 //! Maximum 1,000 unique label combinations per metric.
 
+use crate::media_routing::{divergence_magnitude, PolicyPushOutcome};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 /// Initialize Prometheus metrics recorder and return the handle
@@ -84,8 +86,10 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
 ///
 /// This is updated by the actor system when connections are established/closed.
 pub fn set_connections_active(count: u64) {
-    // u64 to f64 conversion is safe for realistic connection counts (< 2^53)
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "connection counts are far below 2^53; no precision loss in practice"
+    )]
     gauge!("mc_connections_active").set(count as f64);
 }
 
@@ -96,8 +100,10 @@ pub fn set_connections_active(count: u64) {
 ///
 /// This is updated by the actor system when meetings are created/removed.
 pub fn set_meetings_active(count: u64) {
-    // u64 to f64 conversion is safe for realistic meeting counts (< 2^53)
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "meeting counts are far below 2^53; no precision loss in practice"
+    )]
     gauge!("mc_meetings_active").set(count as f64);
 }
 
@@ -115,8 +121,10 @@ pub fn set_meetings_active(count: u64) {
 /// Used for backpressure monitoring. High values indicate the actor is
 /// falling behind in message processing.
 pub fn set_actor_mailbox_depth(actor_type: &str, depth: usize) {
-    // usize to f64 conversion is safe for realistic mailbox depths
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "mailbox depths are bounded by the channel capacity, far below 2^53"
+    )]
     gauge!("mc_actor_mailbox_depth", "actor_type" => actor_type.to_string()).set(depth as f64);
 }
 
@@ -344,6 +352,84 @@ pub fn record_register_meeting(status: &str, duration: Duration) {
         "status" => status.to_string()
     )
     .increment(1);
+}
+
+// ============================================================================
+// Media-Routing Control Plane Metrics (ADR-0036 §8, §11)
+// ============================================================================
+
+/// Record the outcome of one media-policy push to a handler (ADR-0036 §8).
+///
+/// Emits **both** media-path metrics, on **every** outcome including `match`:
+///
+/// * `mc_media_policy_pushes_total` — counter, labels `outcome` + `key_custody`.
+/// * `mc_media_generation_divergence` — gauge, label `key_custody`.
+///
+/// # `mc_media_policy_pushes_total`
+///
+/// `outcome` is `internal.proto`'s canonical five-value vocabulary, bounded by
+/// [`PolicyPushOutcome::ALL`] so a sixth value is a compile error rather than a
+/// time series discovered in production. The label **key** is `outcome`, not
+/// `status`, matching MH's `mh_media_policy_applies_total{outcome,key_custody}`
+/// so both ends of one handshake sit side by side in a query.
+///
+/// **Counts response evaluations, not meetings.** A retried push contributes one
+/// sample per attempt; a terminal outcome exactly one. A divergence *ratio*
+/// computed over this denominator is therefore per-attempt, not per-meeting.
+///
+/// **`handler_id_mismatch` is a diagnostic, not an alerting signal**, until
+/// `MH_HANDLER_ID` is stable per deployment: the id is a per-incarnation token,
+/// so every ordinary MH restart produces that outcome by construction. Alert
+/// expressions must read `outcome!~"match|handler_id_mismatch"`. Three sites
+/// hold that one expression — the alert rule, this catalog entry, and
+/// `mc-deployment.md`'s post-deploy checklist — and they are **one decision with
+/// one revert trigger**, `2026-09-02-mh-stable-handler-id`.
+///
+/// # `mc_media_generation_divergence`
+///
+/// Value is [`divergence_magnitude`]: an unsigned **magnitude**, not a
+/// difference, computed from the **applied** value in the response. Feeding it
+/// from the sent value yields a constant 0, which is precisely the silent
+/// regression ADR-0036 §8 names.
+///
+/// Semantics are *last-observed divergence magnitude*. Its clearing path is the
+/// next push of any (meeting, handler) on this pod — a value that is
+/// overwritten, never a latch, so it cannot wedge above zero for a pod's
+/// lifetime the way a count with no decrement would. The stated price: it is
+/// pod-level last-write-wins, so a healthy push can erase a diverged reading,
+/// and MC's scrape interval (the global `scrape_interval` config key, never a
+/// number here) is coarse relative to a one-shot-per-registration write, so a
+/// divergence can be overwritten before it is ever scraped.
+///
+/// **Therefore the detection signal is the counter; the gauge is the magnitude a
+/// responder reads next.**
+///
+/// **Written ONLY on a registration push.** With no re-assert cadence in this
+/// story it **does not observe a handler restart**: a handler can lose all
+/// policy while this gauge holds its last healthy value.
+pub fn record_media_policy_push(outcome: PolicyPushOutcome, sent: NonZeroU64, applied: u64) {
+    counter!(
+        "mc_media_policy_pushes_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+
+    // u64 -> f64 for the gauge. Lossy only above 2^53, which a generation
+    // magnitude reaches solely under the `u64::MAX` ratchet wedge — where the
+    // value is already "enormous, investigate" rather than a quantity anyone
+    // reads precisely.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "generation magnitude exceeds 2^53 only under the u64::MAX ratchet wedge, \
+                  where the value is 'enormous, investigate' not a precise quantity"
+    )]
+    let magnitude = divergence_magnitude(sent, applied) as f64;
+    gauge!(
+        "mc_media_generation_divergence",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(magnitude);
 }
 
 // ============================================================================

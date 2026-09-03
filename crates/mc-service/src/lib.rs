@@ -137,6 +137,7 @@ pub mod config;
 pub mod errors;
 pub mod grpc;
 pub mod media_admission;
+pub mod media_routing;
 pub mod mh_connection_registry;
 pub mod observability;
 pub mod redis;

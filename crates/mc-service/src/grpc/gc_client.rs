@@ -658,25 +658,6 @@ mod tests {
         assert_eq!(GC_CONNECT_TIMEOUT, Duration::from_secs(5));
     }
 
-    /// Helper to create a mock TokenReceiver for testing.
-    ///
-    /// Uses a static sender to avoid memory leaks from `mem::forget`.
-    fn mock_token_receiver() -> TokenReceiver {
-        use common::secret::SecretString;
-        use std::sync::OnceLock;
-        use tokio::sync::watch;
-
-        // Static sender keeps the channel alive without memory leak
-        static TOKEN_SENDER: OnceLock<watch::Sender<SecretString>> = OnceLock::new();
-
-        let sender = TOKEN_SENDER.get_or_init(|| {
-            let (tx, _rx) = watch::channel(SecretString::from("test-token"));
-            tx
-        });
-
-        TokenReceiver::from_test_channel(sender.subscribe())
-    }
-
     #[tokio::test]
     async fn test_new_with_invalid_endpoint() {
         use common::secret::SecretString;
@@ -711,7 +692,7 @@ mod tests {
             environment: "development".to_string(),
         };
 
-        let token_rx = mock_token_receiver();
+        let token_rx = mc_test_utils::test_token_receiver();
 
         // Empty endpoint should fail with Config error
         let result = GcClient::new(
@@ -760,7 +741,7 @@ mod tests {
             environment: "development".to_string(),
         };
 
-        let token_rx = mock_token_receiver();
+        let token_rx = mc_test_utils::test_token_receiver();
 
         // Valid endpoint but no server running - should fail with Grpc error
         let result = GcClient::new(

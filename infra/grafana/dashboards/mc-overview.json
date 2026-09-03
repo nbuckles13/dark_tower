@@ -4174,6 +4174,225 @@
       ],
       "title": "Display Name Resolution by Outcome",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 170
+      },
+      "id": 55,
+      "panels": [],
+      "title": "Media Routing (ADR-0036 \u00a78)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Forwarding-policy pushes to an MH, by what the handler's reply proved (ADR-0036 \u00a78). THIS IS THE DETECTION SIGNAL for a meeting whose policy MC could not confirm as live; the divergence stat beside it is only the magnitude a responder reads next. Counts response evaluations, NOT meetings: a retried push contributes one sample per attempt. handler_id_mismatch is a DIAGNOSTIC, not an alerting signal, until MH_HANDLER_ID is stable per deployment - the id is a per-incarnation token, so an ordinary MH pod restart produces that outcome by construction. Alert expressions must read outcome!~\"match|handler_id_mismatch\"; the alert rule, the metrics catalog and mc-deployment.md's post-deploy checklist hold one expression with one revert trigger (2026-09-02-mh-stable-handler-id). No meeting identifier, sender id or generation number appears as a label. COLOUR: red is the three Err outcomes only; handler_id_mismatch is YELLOW because it is expected by construction on any MH restart and is excluded from the alert expression - visible, expected, not your incident. The red regexp is anchored so a sixth outcome whose name contains \"mismatch\" cannot silently join the red set.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "match"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(generation_mismatch|transport_mode_mismatch|no_applied_generation)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "handler_id_mismatch"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 171
+      },
+      "id": 56,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_policy_pushes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media Policy Pushes by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Last-observed MAGNITUDE |sent - applied| by which a handler's live forwarding policy differed from the one MC pushed - an unsigned magnitude, never a signed difference, computed from the APPLIED value in the response. Any non-zero value means the live policy is not the one MC pushed, in either direction. AN ABSENT SERIES RENDERS AS ZERO here (noValue: 0), so this panel cannot distinguish \"never pushed\" from \"recorder regressed\" - read liveness from the Media Policy Pushes panel beside it, which is also the detection signal; this one is only the magnitude. Last-write-wins per pod: a healthy push overwrites a diverged reading, and MC inherits the global scrape_interval config key, which is coarse relative to a one-shot-per-registration write, so a divergence can be overwritten before it is ever scraped. WRITTEN ONLY ON A REGISTRATION PUSH: with the ADR-0036 section 8 re-assert cadence deferred, this does NOT observe a handler restart - a handler can lose all forwarding policy while this holds its last healthy value. COLOUR: orange at >= 1, not red - any non-zero means the live policy is not the one MC pushed, but this gauge is not page-worthy on its own (the counter is the detection signal). Green covers only 0, which with noValue: 0 also covers never-pushed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 171
+      },
+      "id": 57,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_generation_divergence)",
+          "legendFormat": "divergence magnitude",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media Generation Divergence (magnitude)",
+      "type": "stat"
     }
   ],
   "refresh": "10s",

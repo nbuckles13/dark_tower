@@ -10,84 +10,26 @@
 //! `mc_register_meeting_total` and `mc_register_meeting_duration_seconds`
 //! emissions per ADR-0032 Step 3 §Cluster E.
 //!
-//! Success path uses a stub `MediaHandlerService` gRPC server that returns
-//! `RegisterMeetingResponse { accepted: true }`. Error path uses an
-//! unreachable endpoint, which produces the production-equivalent
-//! "Failed to connect" McError::Grpc branch at `mh_client.rs:117`.
+//! Both paths run against `mc_test_utils::MediaHandlerStub`, the shared
+//! configurable MH. The success path needs
+//! `AppliedGenerationBehaviour::EchoSent` **selected deliberately**: under
+//! ADR-0036 §8, MC treats only `applied_generation == policy_generation` as
+//! success, so a stub reporting the honest default (0, "nothing installed")
+//! makes the push diverge and `mc_register_meeting_total{status="success"}`
+//! stay flat. The stub's default is that honest 0 precisely so a success test
+//! cannot inherit the echo-a-received-value lie by accident.
+//!
+//! The `outcome`-labelled media-path metrics have their own home in
+//! `media_policy_push_integration.rs`; this file stays on the two
+//! `mc_register_meeting_*` series it was written for.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::SocketAddr;
-use std::time::Duration;
-
 use ::common::observability::testing::MetricAssertion;
-use ::common::secret::SecretString;
-use ::common::token_manager::TokenReceiver;
-use mc_service::grpc::MhClient;
-use proto_gen::dark_tower::internal::v1::media_handler_service_server::{
-    MediaHandlerService, MediaHandlerServiceServer,
-};
-use proto_gen::dark_tower::internal::v1::{RegisterMeetingRequest, RegisterMeetingResponse};
-use proto_gen::dark_tower::signaling::v1::TransportMode;
-use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tonic::{Request, Response, Status};
-
-// ---------------------------------------------------------------------------
-// Stub MH gRPC server — accepts everything, used solely to prove the
-// MhClient::register_meeting() success path.
-// ---------------------------------------------------------------------------
-
-struct StubMediaHandler {
-    accept: bool,
-}
-
-#[tonic::async_trait]
-impl MediaHandlerService for StubMediaHandler {
-    async fn register_meeting(
-        &self,
-        _request: Request<RegisterMeetingRequest>,
-    ) -> Result<Response<RegisterMeetingResponse>, Status> {
-        Ok(Response::new(RegisterMeetingResponse {
-            accepted: self.accept,
-            // Truthful zeros, deliberately NOT `applied_generation:
-            // req.policy_generation`. That would be inert today (the client
-            // reads only `accepted`) and that is exactly the danger: a
-            // fixture pre-baking the echo-a-received-value lie hands story
-            // task 6 a green success-test validating the precise ADR-0036 §8
-            // anti-pattern its check must catch. Task 6 must make this mock
-            // echo the sent generation DELIBERATELY, when it adds the check.
-            applied_generation: 0,
-            handler_id: String::new(),
-            process_start_epoch_ms: 0,
-            transport_mode: TransportMode::Unspecified as i32,
-        }))
-    }
-}
-
-async fn start_stub_mh(accept: bool) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let svc = MediaHandlerServiceServer::new(StubMediaHandler { accept });
-    tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(stream)
-            .await;
-    });
-
-    // Brief settle so the server is ready to accept connections.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    addr
-}
-
-fn make_token_rx() -> TokenReceiver {
-    let (tx, rx) = watch::channel(SecretString::from("test-token"));
-    Box::leak(Box::new(tx));
-    TokenReceiver::from_test_channel(rx)
-}
+use mc_service::grpc::{MeetingProgramming, MhClient};
+use mc_test_utils::media::{loopback_assignment, TEST_HANDLER_ID};
+use mc_test_utils::mock_mh::{AppliedGenerationBehaviour, MediaHandlerStub};
+use mc_test_utils::test_token_receiver;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -95,18 +37,25 @@ fn make_token_rx() -> TokenReceiver {
 
 #[tokio::test(flavor = "current_thread")]
 async fn register_meeting_success_emits_status_success_and_duration_observation() {
-    let addr = start_stub_mh(true).await;
-    let endpoint = format!("http://{addr}");
-    let client = MhClient::new(make_token_rx());
+    let stub = MediaHandlerStub::builder()
+        .programs_successfully(TEST_HANDLER_ID)
+        .spawn()
+        .await;
+    let endpoint = stub.endpoint();
+    let assignment = loopback_assignment();
+    let client = MhClient::new(test_token_receiver());
 
     let snap = MetricAssertion::snapshot();
     let result = client
-        .register_meeting(
-            &endpoint,
-            "meeting-success",
-            "mc-test",
-            "http://mc-test:50052",
-        )
+        .register_meeting(&MeetingProgramming {
+            mh_grpc_endpoint: &endpoint,
+            expected_handler_id: TEST_HANDLER_ID,
+            meeting_id: "meeting-success",
+            mc_id: "mc-test",
+            mc_grpc_endpoint: "http://mc-test:50052",
+            assignment: &assignment,
+            policy_generation: std::num::NonZeroU64::MIN,
+        })
         .await;
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 
@@ -121,25 +70,37 @@ async fn register_meeting_success_emits_status_success_and_duration_observation(
         .assert_delta(0);
 }
 
+/// A handler that parses the registration but installs nothing. `accepted` is
+/// deliberately left `true`: ADR-0036 §8 says `accepted` is not evidence of
+/// application, so this asserts MC routes on the applied echo rather than on
+/// the acknowledgement.
 #[tokio::test(flavor = "current_thread")]
-async fn register_meeting_mh_rejects_emits_status_error() {
-    // Stub responds with `accepted: false` → mh_client.rs:144 records "error".
-    let addr = start_stub_mh(false).await;
-    let endpoint = format!("http://{addr}");
-    let client = MhClient::new(make_token_rx());
+async fn register_meeting_not_applied_emits_status_error() {
+    let stub = MediaHandlerStub::builder()
+        .accept(true)
+        .applied_generation(AppliedGenerationBehaviour::ReportZero)
+        .handler_id(TEST_HANDLER_ID)
+        .spawn()
+        .await;
+    let endpoint = stub.endpoint();
+    let assignment = loopback_assignment();
+    let client = MhClient::new(test_token_receiver());
 
     let snap = MetricAssertion::snapshot();
     let result = client
-        .register_meeting(
-            &endpoint,
-            "meeting-rejected",
-            "mc-test",
-            "http://mc-test:50052",
-        )
+        .register_meeting(&MeetingProgramming {
+            mh_grpc_endpoint: &endpoint,
+            expected_handler_id: TEST_HANDLER_ID,
+            meeting_id: "meeting-not-applied",
+            mc_id: "mc-test",
+            mc_grpc_endpoint: "http://mc-test:50052",
+            assignment: &assignment,
+            policy_generation: std::num::NonZeroU64::MIN,
+        })
         .await;
     assert!(
         result.is_err(),
-        "expected Err on MH rejection, got {result:?}"
+        "accepted==true must NOT be treated as success, got {result:?}"
     );
 
     snap.histogram("mc_register_meeting_duration_seconds")
@@ -154,10 +115,69 @@ async fn register_meeting_mh_rejects_emits_status_error() {
 
 // NOTE on the connect-failure branch:
 //
-// `MhClient::register_meeting()` at `mh_client.rs:97-118` returns
-// `McError::Grpc("Failed to connect: ...")` on connect failure BEFORE the
-// metric-recording block at `:131`. So an unreachable-endpoint test would
-// observe `mc_register_meeting_total` delta=0. This is a small fidelity gap
-// in the recorder placement (tracked as informational, not a Step-3 fix
-// target). The two tests above cover the two emission branches that DO fire:
-// (1) `accepted=true` → success, and (2) `accepted=false` → error.
+// `MhClient::register_meeting()` returns `McError::Grpc("Failed to connect:
+// ...")` on connect failure BEFORE the metric-recording block. So an
+// unreachable-endpoint test would observe `mc_register_meeting_total` delta=0.
+// This is a small fidelity gap in the recorder placement (tracked as
+// informational, not a Step-3 fix target). The two tests above cover the two
+// emission branches that DO fire: (1) the applied echo matches → success, and
+// (2) it does not → error.
+
+/// O-11 regression: a non-fatal `handler_id_mismatch` must record
+/// `status="success"`, because the meeting **is** programmed.
+///
+/// Neither test above distinguishes the two mappings — `Match` and
+/// `NoAppliedGeneration` agree under both `outcome == Match` and
+/// `disposition() == Programmed` — which is exactly why the contradiction
+/// between `mh_client.rs` and `confirm.rs::disposition()` survived review. This
+/// is the only input that tells them apart.
+///
+/// Why it matters beyond consistency: `handler_id` is a per-incarnation token,
+/// so this outcome fires on **every ordinary MH pod restart**. Keyed on
+/// `== Match`, that recorded a failure on `mc_register_meeting_total`, which is
+/// a plain success/error split with no yellow, no description caveat and no
+/// `outcome!~` escape — reintroducing on a pre-existing series the false
+/// positive OPS-17/OPS-18 disarmed on `mc_media_policy_pushes_total`. Story
+/// task 21 writes MC alert rules against this surface, so leaving it would have
+/// laid a trap for that task.
+#[tokio::test(flavor = "current_thread")]
+async fn non_fatal_handler_id_mismatch_records_status_success() {
+    // Programmed correctly, but the handler asserts a different id — an MH pod
+    // that restarted since MC captured its assignment snapshot.
+    let stub = MediaHandlerStub::builder()
+        .accept(true)
+        .applied_generation(AppliedGenerationBehaviour::EchoSent)
+        .handler_id("mh-test-0-restarted-a1b2c3d4")
+        .transport_mode(proto_gen::dark_tower::signaling::v1::TransportMode::Datagram)
+        .spawn()
+        .await;
+    let endpoint = stub.endpoint();
+    let assignment = loopback_assignment();
+    let client = MhClient::new(test_token_receiver());
+
+    let snap = MetricAssertion::snapshot();
+    let result = client
+        .register_meeting(&MeetingProgramming {
+            mh_grpc_endpoint: &endpoint,
+            expected_handler_id: TEST_HANDLER_ID,
+            meeting_id: "meeting-handler-restarted",
+            mc_id: "mc-test",
+            mc_grpc_endpoint: "http://mc-test:50052",
+            assignment: &assignment,
+            policy_generation: std::num::NonZeroU64::MIN,
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "handler_id_mismatch is non-fatal for the interim; got {result:?}"
+    );
+    snap.histogram("mc_register_meeting_duration_seconds")
+        .assert_observation_count_at_least(1);
+    snap.counter("mc_register_meeting_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
+    snap.counter("mc_register_meeting_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(0);
+}

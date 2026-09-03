@@ -310,6 +310,48 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Recorded in**: `mh_client.rs` measuring full RPC round-trip
 - **Dashboard**: MC Overview - RegisterMeeting RPC Latency P50/P95/P99 (MH Coordination row)
 
+## Media-Routing Control Plane Metrics (ADR-0036 §8, §11)
+
+Both metrics are emitted together, on **every** push outcome including `match`,
+by `MhClient::register_meeting`'s confirm step. Neither carries a meeting
+identifier, a `sender_id`, an `egress_stream_id` or a generation number as a
+label (ADR-0036 §11). Neither carries `handler_id`: it is a per-incarnation
+token (`mh-service` derives it from `HOSTNAME` plus a fresh UUID at process
+start, and `MH_HANDLER_ID` is unset in all three MH manifests), so as a label it
+would be one permanently-retained series per MH incarnation MC has ever pushed
+to — worst under a crashloop, which is exactly when the metric must work. The
+one-handler-versus-all-handlers triage query is answered from the `error!` line,
+which does carry `handler_id`. The label may return once
+`2026-09-02-mh-stable-handler-id` makes the id stable.
+
+### `mc_media_policy_pushes_total`
+- **Type**: Counter
+- **Description**: Forwarding-policy pushes to an MH, classified by what the handler's reply proved (ADR-0036 §8)
+- **Labels**:
+  - `outcome`: `match`, `no_applied_generation`, `generation_mismatch`, `transport_mode_mismatch`, `handler_id_mismatch`
+  - `key_custody`: single value `operator` (ADR-0036 §4 — MC can read media keys; that is accepted operator custody, never described as end-to-end)
+- **Cardinality**: 5 (bounded at the type level by `PolicyPushOutcome::ALL`; a sixth value is a compile error)
+- **Counts response evaluations, NOT meetings.** A retried push contributes one sample per attempt; a terminal outcome exactly one. A divergence *ratio* over this denominator is therefore per-attempt, not per-meeting.
+- **This is the detection signal.** `mc_media_generation_divergence` is the magnitude a responder reads next — see that entry for why the gauge cannot carry detection.
+- **`handler_id_mismatch` is a DIAGNOSTIC, not an alerting signal**, until `MH_HANDLER_ID` is stable per deployment: the id is per-incarnation, so an ordinary MH pod restart produces that outcome by construction and an `outcome!="match"` page would fire on every MH rollout. Alert expressions must read `outcome!~"match|handler_id_mismatch"`. **Three sites hold that one expression** — the alert rule (story task 21), this entry, and `docs/runbooks/mc-deployment.md`'s post-deploy checklist — and they are **one decision with one revert trigger**, `2026-09-02-mh-stable-handler-id`.
+- **Label key is `outcome`, not `status`**, matching MH's `mh_media_policy_applies_total{outcome,key_custody}` so both ends of one handshake sit side by side in a query.
+- **Usage**: Detect a meeting whose forwarding policy MC could not confirm as live
+- **Recorded in**: `grpc/mh_client.rs::confirm` via `observability/metrics.rs::record_media_policy_push`
+- **Dashboard**: MC Overview - Media Policy Pushes by Outcome (Media Routing row)
+
+### `mc_media_generation_divergence`
+- **Type**: Gauge
+- **Description**: Last-observed magnitude by which a handler's live forwarding policy differed from the one MC pushed
+- **Labels**:
+  - `key_custody`: single value `operator`
+- **Cardinality**: 1
+- **Value is an unsigned MAGNITUDE, not a difference**: `|sent - applied|`, computed from the **applied** value in the response. Feeding it from the sent value yields a constant 0 — the silent regression ADR-0036 §8 names. `saturating_sub` is equally wrong: `applied > sent` is reachable (an MC restart re-deriving from 1 against a handler holding a higher generation, or the `policy_generation: u64::MAX` ratchet wedge) and would render as a healthy 0 on the one response shape that proves the two ends disagree. Direction is not lost — the `error!` line carries both numbers.
+- **Last-write-wins, pod-level.** Its clearing path is the next push of any (meeting, handler) on this pod, so it is overwritten rather than latched and cannot wedge above zero for a pod's lifetime. The price: a healthy push can erase a diverged reading. MC also inherits the global `scrape_interval`, which is coarse relative to a one-shot-per-registration write, so a divergence can be overwritten before it is ever scraped. **Both are independent reasons this gauge is not the detection signal** — that is `mc_media_policy_pushes_total`.
+- **Written ONLY on a registration push.** With the ADR-0036 §8 re-assert cadence deferred, **this gauge does not observe a handler restart**: a handler can lose all forwarding policy while this value holds its last healthy reading.
+- **Usage**: Read the magnitude after `mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}` has fired; never page on it
+- **Recorded in**: `grpc/mh_client.rs::confirm` via `observability/metrics.rs::record_media_policy_push`
+- **Dashboard**: MC Overview - Media Generation Divergence (Media Routing row)
+
 ## MH Coordination Metrics (R-15, R-20)
 
 ### `mc_mh_notifications_received_total`

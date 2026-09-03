@@ -257,12 +257,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create MH connection registry for tracking participant→MH connections (R-18)
     let mh_connection_registry = Arc::new(MhConnectionRegistry::new());
 
+    // Per-(meeting, handler) `policy_generation` registry (ADR-0036 §8).
+    // Shared between the WebTransport push path (which takes generations) and
+    // the controller actor (which evicts them on meeting teardown).
+    let policy_generations = Arc::new(mc_service::media_routing::PolicyGenerations::new());
+
     let controller_handle = Arc::new(MeetingControllerActorHandle::new(
         config.mc_id.clone(),
         Arc::clone(&actor_metrics),
         Arc::clone(&controller_metrics),
         master_secret,
         Arc::clone(&mh_connection_registry),
+        Arc::clone(&policy_generations),
     ));
     info!("Actor system initialized");
 
@@ -415,6 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jwt_validator,
         Arc::clone(&redis_client) as Arc<dyn mc_service::redis::MhAssignmentStore>,
         mh_client,
+        Arc::clone(&policy_generations),
         config.mc_id.clone(),
         config.grpc_advertise_address.clone(),
         config.max_participants as usize,

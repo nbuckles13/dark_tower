@@ -359,9 +359,22 @@ pub(crate) const PII_TOKENS_CATEGORY_B: &[&str] = &[
     "user_name",
 ];
 
-/// Prefixes that force-fire as PII regardless of suffix (mirrors Wave-1
-/// Python `PII_PREFIX_DENYLIST`).
-pub(crate) const PII_PREFIX_DENYLIST: &[&str] = &["raw_"];
+/// Prefixes that force-fire as PII regardless of suffix.
+///
+/// **No longer a mirror of the retired Wave-1 Python list**, and the note is
+/// removed rather than updated: `meeting_id` was never in that list, so the
+/// parity the old comment claimed does not exist and cannot be restored.
+///
+/// `pii_token_hit` scans this list FIRST — before Category A, before
+/// `LABEL_ALLOWLIST` and before `is_hashed_label()` — which is what a hashed
+/// spelling cannot slip past. Per-entry meaning lives in
+/// `docs/observability/label-taxonomy.md` §Prefix denylist; the two entries
+/// share a mechanism, not a rationale.
+///
+/// **Bypassable.** The `PiiCategory::Prefix` finding arm is gated on
+/// `pii_safe.is_none()`, so `# pii-safe: <reason>` suppresses it. Only
+/// Category A is non-bypassable. Do not describe a term here as unbreakable.
+pub(crate) const PII_PREFIX_DENYLIST: &[&str] = &["raw_", "meeting_id"];
 
 /// Suffixes that exempt a CATEGORY_B match (hashed correlation IDs).
 /// CATEGORY_A is NOT eligible for the hashed-suffix exemption.

@@ -6,7 +6,9 @@
 //!   ruling 2026-04-17.
 //! * `CATEGORY_A_ALLOWLIST = {token_type}` (security co-owner sign-off required).
 //! * `PII_TOKENS_CATEGORY_B` + `HASHED_SUFFIXES` exemption (Cat B only).
-//! * `PII_PREFIX_DENYLIST = (raw_,)` fires regardless of suffix.
+//! * `PII_PREFIX_DENYLIST` fires regardless of suffix, scanned before Cat A/B
+//!   and before `is_hashed_label()`; membership and per-entry meaning live in
+//!   `pii_vocabulary.rs` and `docs/observability/label-taxonomy.md`.
 //! * `LABEL_ALLOWLIST` (Cat B substring false-positive suppression).
 //! * `MAX_LITERAL_VALUE_LENGTH = 64`; `UNBOUNDED_VALUE_PATTERNS`.
 //! * Match order: prefix → Cat A → Cat B (per Python L531-572).
@@ -935,8 +937,12 @@ fn check_source(
                             rule_id: LABEL_PII_RULE_ID,
                             message: format!(
                                 "label key {key:?} has denylisted prefix {tok:?} \
-                                     — the `raw_` prefix signals an unsanitized identifier; \
-                                     rename or add `# pii-safe: <reason>`"
+                                     — denylisted prefixes mark identifiers that must \
+                                     not reach a metric label; rename or remove the \
+                                     label. `# pii-safe: <reason>` suppresses this \
+                                     check, but whether a suppression is legitimate \
+                                     depends on the prefix: see \
+                                     docs/observability/label-taxonomy.md §Prefix denylist"
                             ),
                         }),
                         PiiCategory::B if pii_safe.is_none() => findings.push(Finding {
@@ -1049,6 +1055,73 @@ mod tests {
         let hit = pii_token_hit("raw_anything").unwrap();
         assert_eq!(hit.0, "raw_");
         assert_eq!(hit.1, PiiCategory::Prefix);
+    }
+
+    /// ADR-0036 §11 — "no meeting identifier on any metric anywhere in this
+    /// design" — as a guard rather than a review note. The partition is
+    /// load-bearing, not incidental:
+    ///
+    /// * `PII_PREFIX_DENYLIST` has exactly ONE consumer (`pii_token_hit`, and
+    ///   through it only the metric-label scanner), so this bars `meeting_id`
+    ///   on Rust *metric labels* without firing on the legitimate
+    ///   control-plane `meeting_id = %meeting_id` *log* fields that a
+    ///   CATEGORY_A or CATEGORY_B entry would break across MC, GC and MH —
+    ///   both of those have three consumers each, reaching the log and
+    ///   `#[instrument]` scanners.
+    /// * The prefix loop runs FIRST inside `pii_token_hit`, so neither
+    ///   `is_hashed_label()` nor `LABEL_ALLOWLIST` can rescue
+    ///   `meeting_id_hash`. (§11's grandfathered exception is the TS client
+    ///   SDK, structurally out of reach of a `crates/`-only scanner.)
+    ///
+    /// Asserting `PiiCategory::Prefix` SPECIFICALLY is the whole point: a
+    /// later move of the term into CATEGORY_B would keep a weaker
+    /// "something fired" assertion green while silently restoring both the
+    /// hashed-suffix exemption and `LABEL_ALLOWLIST` suppression.
+    ///
+    /// KNOWN LIMIT — recorded so this is not mistaken for non-bypassability:
+    /// the `PiiCategory::Prefix` arm at the finding site is gated on
+    /// `pii_safe.is_none()`, so `# pii-safe: <reason>` still suppresses it.
+    /// Only CATEGORY_A is non-bypassable. Making Prefix non-bypassable is a
+    /// change to the emission `match` — guard machinery, infrastructure-owned,
+    /// deliberately not done here.
+    #[test]
+    fn meeting_id_fires_as_prefix_on_metric_labels() {
+        let bare = pii_token_hit("meeting_id").expect("meeting_id must fire");
+        assert_eq!(bare.0, "meeting_id");
+        assert_eq!(
+            bare.1,
+            PiiCategory::Prefix,
+            "must be Prefix, not Cat B — Cat B would re-expose it to the \
+             hashed-suffix exemption and to LABEL_ALLOWLIST"
+        );
+
+        // The hashed spelling is what a well-meaning author reaches for, and
+        // catching it is precisely why the Prefix partition was chosen.
+        let hashed = pii_token_hit("meeting_id_hash").expect("meeting_id_hash must fire");
+        assert_eq!(hashed.1, PiiCategory::Prefix);
+    }
+
+    /// The scope limit R1 documents, pinned as a test rather than left in prose.
+    ///
+    /// The match is `starts_with`, not segment-splitting, so a **trailing**
+    /// compound does not fire. That is a real gap in R1's stated scope ("any
+    /// metric anywhere in this design") and it is tracked as `docs/TODO.md` D4,
+    /// whose real fix is a segment-splitting matcher — guard machinery,
+    /// infrastructure-owned, deliberately not done here.
+    ///
+    /// Asserted rather than described for the same reason
+    /// `sender_id_hash_is_not_covered` exists: a documented gap that no test
+    /// pins is invisible in test output, so the day the matcher gains segment
+    /// splitting nothing tells the author that this case changed behaviour.
+    /// **If this assertion starts failing, that is good news** — delete it and
+    /// close D4's `starts_with` bullet.
+    #[test]
+    fn trailing_meeting_id_compound_is_not_covered() {
+        assert!(
+            pii_token_hit("x_meeting_id").is_none(),
+            "documented scope limit: the prefix match is `starts_with`, so a trailing \
+             compound is NOT caught — see docs/TODO.md D4"
+        );
     }
 
     #[test]

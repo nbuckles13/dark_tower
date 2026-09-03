@@ -116,6 +116,30 @@ pub enum McError {
     #[error("Sender id space exhausted")]
     SenderIdSpaceExhausted,
 
+    /// A media-policy push did not confirm (ADR-0036 §8).
+    ///
+    /// The handler's reply did not prove that MC's forwarding policy is live:
+    /// `applied_generation` was absent or not the value MC sent, or the
+    /// transport mode MH echoed disagrees with the one MC declared.
+    ///
+    /// Fail loud, not warn-and-continue: an applied-not-received echo is what
+    /// distinguishes real programming from a partial blackhole reporting
+    /// healthy, so a push MC cannot confirm is an error even though the RPC
+    /// itself succeeded and `accepted` was true.
+    ///
+    /// Carries the classification rather than a message string: the bounded
+    /// `&'static str` the metric label needs is
+    /// [`crate::media_routing::PolicyPushOutcome::label`], and the caller's
+    /// retryable-versus-terminal decision needs the outcome itself
+    /// ([`crate::media_routing::PolicyPushOutcome::disposition`]). One field
+    /// serves both, and a sixth outcome is a compile error rather than a new
+    /// unbounded string.
+    #[error("Media policy push diverged: {}", .outcome.label())]
+    MediaPolicyDivergence {
+        /// Which of the five bounded outcomes the response classified as.
+        outcome: crate::media_routing::PolicyPushOutcome,
+    },
+
     /// Internal error with context.
     #[error("Internal error: {0}")]
     Internal(String),
@@ -168,7 +192,8 @@ impl McError {
             | McError::NotRegistered
             | McError::MhAssignmentMissing(_)
             | McError::TokenAcquisition(_)
-            | McError::TokenAcquisitionTimeout => {
+            | McError::TokenAcquisitionTimeout
+            | McError::MediaPolicyDivergence { .. } => {
                 6 // INTERNAL_ERROR
             }
             McError::SessionBinding(_) | McError::JwtValidation(_) => 2, // UNAUTHORIZED
@@ -226,6 +251,7 @@ impl McError {
             McError::TokenAcquisitionTimeout => "token_acquisition_timeout",
             McError::IdentityKeyInvalid => "identity_key_invalid",
             McError::SenderIdSpaceExhausted => "sender_id_space_exhausted",
+            McError::MediaPolicyDivergence { .. } => "media_policy_divergence",
         }
     }
 
@@ -241,7 +267,8 @@ impl McError {
             | McError::NotRegistered
             | McError::MhAssignmentMissing(_)
             | McError::TokenAcquisition(_)
-            | McError::TokenAcquisitionTimeout => "An internal error occurred".to_string(),
+            | McError::TokenAcquisitionTimeout
+            | McError::MediaPolicyDivergence { .. } => "An internal error occurred".to_string(),
             McError::SessionBinding(e) => e.to_string(),
             McError::MeetingNotFound(_) => "Meeting not found".to_string(),
             McError::ParticipantNotFound(_) => "Participant not found".to_string(),
