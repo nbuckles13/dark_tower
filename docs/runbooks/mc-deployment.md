@@ -7,6 +7,55 @@
 
 ---
 
+## MC Topology — Read This Before Any `kubectl` Command
+
+MC ships as **two singleton Deployments**, `mc-0` and `mc-1` (each `replicas: 1`).
+There is **no `deployment/mc-service`** — `mc-service` is a Service, a PDB and the
+container name, so `kubectl ... deployment/mc-service` fails with
+`deployments.apps "mc-service" not found`.
+
+- **Every command below names `mc-0`. Repeat it for `mc-1`.** A symptom on one
+  instance says nothing about the other; they are independent processes with
+  independent state.
+- **Health/metrics is port `8081`**, not 8080. Port-forwards here map local 8080
+  to remote 8081, so `curl localhost:8080/metrics` is correct once forwarded.
+  **Do not "simplify" these to `service/mc-service`.** The `mc-service` ClusterIP
+  in `infra/services/mc-service/service.yaml` selects on `app` + `component` and
+  deliberately omits `instance:`, so it fans across mc-0 and mc-1 both and would
+  scrape a nondeterministic instance — a silent wrong answer for a metrics check,
+  rather than an error. `deployment/mc-0` is the only form that names what you
+  are measuring.
+- **You cannot `curl` MC's health port from another pod, and the failure is a
+  TIMEOUT rather than a refusal.** MC's NetworkPolicy
+  (`infra/services/mc-service/network-policy.yaml`) admits TCP 8081 from
+  **Prometheus only**; GC and MH are admitted on gRPC 50052 and nothing else. So
+  `curl http://mc-service.dark-tower.svc.cluster.local:8081/health` from a GC,
+  MH or debug pod is silently dropped — and a hang, during an incident, reads as
+  "MC is wedged", which is precisely the conclusion a dependency-health check
+  exists to rule out. **The sibling services are not symmetric and that is what
+  makes this a trap**: AC admits 8082 from gc/mc/mh and GC admits 8080 from
+  everywhere, so in a block of three dependency curls the AC and GC lines
+  genuinely work and only the MC line cannot. Use the port-forward form below
+  from the operator's own machine, per instance. To answer "can GC reach MC at
+  all", read `kubectl get endpoints mc-service -n dark-tower` plus GC's own
+  registration/heartbeat metrics — MC's health endpoint is not the instrument.
+- **Do not add replicas.** `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` comes from a
+  per-instance ConfigMap, so extra replicas all advertise the same address to GC
+  and clients get routed to a pod that does not hold their session (ADR-0023
+  session binding). Capacity is added by adding an *instance*, not a replica.
+  The manifests state this at the `replicas: 1` field itself — see the comment
+  above `replicas:` in `infra/services/mc-service/mc-0-deployment.yaml`, which
+  carries the same arithmetic.
+- **`kubectl exec` depends on the image variant.** `infra/docker/mc-service/Dockerfile`
+  defines both a shell-free `runtime` stage (distroless `cc-debian12`) and a
+  `runtime-with-healthcheck` stage (`:debug` + busybox). The build passes no
+  `--target`, so the last stage wins and busybox is present *by stage ordering,
+  not by decision*. If a `--target runtime` ever lands, every `exec`-based step
+  in this runbook stops working at once — prefer the shell-free alternatives in
+  §Diagnostic Commands where they exist.
+
+---
+
 ## Overview
 
 This runbook covers deployment, rollback, and troubleshooting procedures for the Meeting Controller service. The MC service is responsible for WebTransport signaling, session management, and participant coordination within meetings.
@@ -147,7 +196,7 @@ Complete ALL items before deploying to production:
 
 ```bash
 # Check current deployment status
-kubectl get deployment mc-service -n dark-tower
+kubectl get deployment mc-0 mc-1 -n dark-tower
 
 # Check current pod status
 kubectl get pods -n dark-tower -l app=mc-service
@@ -156,7 +205,7 @@ kubectl get pods -n dark-tower -l app=mc-service
 kubectl top pods -n dark-tower -l app=mc-service
 
 # Check active meetings (critical - do not deploy if high)
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl -s http://localhost:8080/metrics | grep mc_meetings_active
 kill %1
 
@@ -182,39 +231,73 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meeting_controllers SET status = 'draining' WHERE id = '<MC_ID>';"
 
 # Wait for active meetings to decrease
-watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
+watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
 
 # Proceed when active meetings reach acceptable level (e.g., <10)
 ```
 
 ### 3. Update Container Image
 
-**Option A: Using kubectl (direct deployment)**
+> **Apply the manifests FIRST if the release changes `infra/services/mc-service/**`.**
+> MC reads fifteen required env vars via `ConfigError::MissingEnvVar` with no Rust
+> default, and each is injected by a per-key `configMapKeyRef` that lives in the
+> **Deployment**, not the ConfigMap. A release that adds a required key and is
+> shipped with `kubectl set image` alone puts **both MC pods into
+> `CrashLoopBackOff`** — new image, old pod template, no reference to the new key.
+> This is not hypothetical: it is what happened on 2026-09-03 when the five
+> ADR-0036 `MC_AUDIO_*` / `MC_MAX_RECEIVE_*` keys were introduced. Both pods fail
+> identically, so the PDB offers no protection and it is a full signalling-plane
+> outage. See §Config-failure triage for the two signals and their opposite first
+> steps.
+>
+> ```bash
+> # Does this release touch the manifests? If yes, Option B is the ONLY safe route.
+> git diff --name-only <PREVIOUS_TAG>..<NEW_TAG> -- infra/services/mc-service/
+> ```
+
+**Option A: Using kubectl (direct deployment) — image-only releases**
+
+Safe **only** when the diff above is empty. `set image` changes the image and
+nothing else; it cannot add a `configMapKeyRef`.
 
 ```bash
 # Set new image version
 export NEW_VERSION="v1.2.3"  # Replace with actual version tag
 
-# Update Deployment with new image
-kubectl set image deployment/mc-service \
+# Update BOTH instances -- mc-0 alone is half of MC
+kubectl set image deployment/mc-0 \
+  mc-service=mc-service:${NEW_VERSION} \
+  -n dark-tower
+kubectl set image deployment/mc-1 \
   mc-service=mc-service:${NEW_VERSION} \
   -n dark-tower
 
-# Verify image updated
-kubectl describe deployment mc-service -n dark-tower | grep Image:
+# Verify image updated on both
+kubectl describe deployment mc-0 -n dark-tower | grep Image:
+kubectl describe deployment mc-1 -n dark-tower | grep Image:
 ```
 
-**Option B: Using kubectl apply -k (declarative, Kustomize)**
+**Option B: Using kubectl apply -k (declarative, Kustomize) — always safe**
+
+Applies the ConfigMaps, both Deployments and the image together, which is the
+coupled set §Config-failure triage requires. Use this whenever the release
+touches `infra/services/mc-service/**`, and prefer it otherwise.
 
 ```bash
-# Update infra/services/mc-service/deployment.yaml
+# Update the image tag in BOTH per-instance Deployments:
+#   infra/services/mc-service/mc-0-deployment.yaml
+#   infra/services/mc-service/mc-1-deployment.yaml
 # Change image tag: mc-service:latest → mc-service:v1.2.3
+# (There is no `deployment.yaml` -- MC's workloads are per-instance files.)
 
-# Apply via Kustomize overlay (Kind environment)
+# Apply the overlay, NOT the base. The Kind overlay strategic-merge-patches
+# OTEL_ENABLED="true" into mc-service-config; applying the base directly would
+# silently revert it (see §Config-failure triage, Recovery).
 kubectl apply -k infra/kubernetes/overlays/kind/services/mc-service/
 
-# Verify change
-kubectl describe deployment mc-service -n dark-tower | grep Image:
+# Verify change on both instances
+kubectl describe deployment mc-0 -n dark-tower | grep Image:
+kubectl describe deployment mc-1 -n dark-tower | grep Image:
 ```
 
 ### 4. Rolling Update Monitoring
@@ -228,10 +311,10 @@ Deployments update pods via rolling strategy (maxSurge=1, maxUnavailable=0 for z
 kubectl get pods -n dark-tower -l app=mc-service -w
 
 # Check rollout status
-kubectl rollout status deployment/mc-service -n dark-tower
+kubectl rollout status deployment/mc-0 -n dark-tower
 
 # Monitor logs from new pod
-kubectl logs -f deployment/mc-service -n dark-tower
+kubectl logs -f deployment/mc-0 -n dark-tower
 ```
 
 **Expected sequence:**
@@ -264,7 +347,7 @@ kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod,involv
 
 ```bash
 # Check for startup errors
-kubectl logs deployment/mc-service -n dark-tower --tail=50
+kubectl logs deployment/mc-0 -n dark-tower --tail=50
 
 # Look for error patterns
 kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "error\|panic\|fatal"
@@ -281,6 +364,42 @@ WebTransport listener started on 0.0.0.0:4433
 Prometheus metrics recorder initialized
 Meeting Controller ready
 ```
+
+**Verify the EFFECTIVE config, not the ConfigMap.** A *missing* required key is
+loud (CrashLoop, `logs --previous` names it — §Config-failure triage). A
+**wrong-but-valid** one is silent: nothing fails, no counter moves, and the two
+MC pods can quietly disagree. The `Configuration loaded successfully` line is
+the only record of what the process actually received, and the ConfigMap cannot
+be its own evidence — the ConfigMap being out of step with what the Deployment
+injects *is* the failure mode these keys create.
+
+```bash
+# What each pod actually loaded (structured fields on the startup line):
+kubectl logs deployment/mc-0 -n dark-tower | grep "Configuration loaded successfully"
+kubectl logs deployment/mc-1 -n dark-tower | grep "Configuration loaded successfully"
+```
+
+- [ ] `max_receive_slots`, `max_receive_capability_declarations`, `audio_codec`,
+      `audio_max_bitrate_bps`, `audio_frame_rate_hz` are present on the line and
+      match `infra/services/mc-service/configmap.yaml`
+- [ ] **mc-0 and mc-1 report identical values.** They read one shared ConfigMap,
+      so a difference means one Deployment's `configMapKeyRef` block is stale —
+      the guard-green split-brain the ConfigMap banner warns about.
+- [ ] No `audio frame rate other than 20 ms frames` WARN, unless you set one
+      deliberately
+
+> **That WARN will not appear in the error grep above.** §Logs review greps
+> `error|panic|fatal`; this one is a `WARN`. `mc-service` emits it whenever
+> `MC_AUDIO_FRAME_RATE_HZ` is not 50 Hz, because `mh-service` sizes its datagram
+> send buffer in bytes against 20 ms frames and will then **understate** its
+> reported held latency. A non-50 value is legal (ADR-0036 §3's 40 ms
+> signature-overhead mitigation) but is a coordinated change with media-handler,
+> not a unilateral one. Grep for it explicitly:
+>
+> ```bash
+> kubectl logs deployment/mc-0 -n dark-tower | grep -i "frame rate"
+> kubectl logs deployment/mc-1 -n dark-tower | grep -i "frame rate"
+> ```
 
 ### 6. Run Smoke Tests
 
@@ -312,7 +431,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 
 ```bash
 # Port-forward to access metrics endpoint
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 
 # Fetch metrics
 curl http://localhost:8080/metrics
@@ -378,27 +497,75 @@ kill %1
 
 ### How to Rollback
 
+> **What is in the coupled set, and what may NOT be reverted alone.**
+> Since the ADR-0036 keys landed, MC's config is a hard startup dependency:
+> **the ConfigMap, BOTH Deployments and the image roll together, and none of them
+> may be reverted independently.** Concretely, for a rollback:
+>
+> - **`kubectl rollout undo` is safe** and is the recommended route. It reverts
+>   the *whole pod template*, not just the image, so the old image lands with the
+>   old `env` block — self-consistent by construction. Reverting only the image
+>   (`kubectl set image` to an older tag) is also safe: surplus env is ignored.
+> - **Do NOT revert the ConfigMap on its own.** A `git revert` of
+>   `infra/services/mc-service/configmap.yaml` followed by an apply leaves both
+>   Deployments holding a `configMapKeyRef` for a key that no longer exists. This
+>   fails **latently**: `kustomization.yaml` uses `resources:`, not
+>   `configMapGenerator:`, so there is no content hash and the apply does not roll
+>   the pods. The running pods keep working, and the next restart — a node drain,
+>   an eviction, an unrelated deploy, hours or days later — comes up
+>   `CreateContainerConfigError` with **empty logs**, disconnected in time from the
+>   change that caused it.
+> - **Do not revert the manifests without the image, or apply the image against
+>   stale manifests.** Both MC pods fail identically at startup, so the PDB offers
+>   no protection: this is a full signalling-plane outage, not a partial one.
+>
+> Full triage for both failure signals — which have **opposite first steps** —
+> and the verified recovery sequence are in §Config-failure triage below.
+
 **Step 1: Identify previous version**
 
 ```bash
-# Find previous image version
-kubectl rollout history deployment/mc-service -n dark-tower
+# Find previous image version -- read BOTH histories. Revision numbers are
+# per-Deployment; mc-0 revision 7 and mc-1 revision 7 are not the same release.
+kubectl rollout history deployment/mc-0 -n dark-tower
+kubectl rollout history deployment/mc-1 -n dark-tower
 
 # Get image from previous revision
-kubectl rollout history deployment/mc-service -n dark-tower --revision=<PREVIOUS_REVISION>
+kubectl rollout history deployment/mc-0 -n dark-tower --revision=<MC0_REVISION>
+kubectl rollout history deployment/mc-1 -n dark-tower --revision=<MC1_REVISION>
 ```
 
 **Step 2: Rollback Deployment**
 
+> **Roll back BOTH instances, and treat that as one step.** §Update Container
+> Image says the same thing for the forward direction ("mc-0 alone is half of
+> MC"); it matters more here, because the state you land in when you stop after
+> `mc-0` is a **mixed-version signalling plane** — mc-0 on the old image, mc-1 on
+> the new — and it is not self-announcing. Each instance holds its own sessions
+> and advertises its own client-facing URL, so GC keeps assigning meetings to
+> both: roughly half of new meetings get the behaviour you just rolled back
+> **away from**, and the symptom is intermittent and per-meeting rather than a
+> clean regression. Do not stop between the two commands to "see if that fixed
+> it" — a half-rolled pair cannot answer that question.
+
 ```bash
-# Rollback to previous revision
-kubectl rollout undo deployment/mc-service -n dark-tower
+# Rollback to previous revision -- BOTH instances.
+kubectl rollout undo deployment/mc-0 -n dark-tower
+kubectl rollout undo deployment/mc-1 -n dark-tower
 
-# Or rollback to specific revision
-kubectl rollout undo deployment/mc-service -n dark-tower --to-revision=<REVISION>
+# Or rollback to specific revision. Revision numbers are PER-DEPLOYMENT and are
+# not guaranteed to line up between mc-0 and mc-1 -- read each one's own history
+# (Step 1, repeated for mc-1) rather than reusing a number across both.
+kubectl rollout undo deployment/mc-0 -n dark-tower --to-revision=<MC0_REVISION>
+kubectl rollout undo deployment/mc-1 -n dark-tower --to-revision=<MC1_REVISION>
 
-# Monitor rollback
-kubectl rollout status deployment/mc-service -n dark-tower
+# Monitor rollback -- both, and do not declare success on one.
+kubectl rollout status deployment/mc-0 -n dark-tower
+kubectl rollout status deployment/mc-1 -n dark-tower
+
+# Confirm both landed on the SAME image before calling it done.
+kubectl get pods -n dark-tower -l app=mc-service \
+  -o custom-columns=POD:.metadata.name,INSTANCE:.metadata.labels.instance,IMAGE:.spec.containers[0].image
 ```
 
 **Step 3: Verify rollback success**
@@ -443,22 +610,174 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 
 | Variable | Required | Description | Default | Example |
 |----------|----------|-------------|---------|---------|
-| `GC_REGISTRATION_URL` | **Yes** | Global Controller registration endpoint | None | `http://gc-service.dark-tower.svc.cluster.local:8080/api/v1/mc/register` |
-| `MC_REGION` | **Yes** | Geographic region for this MC | None | `us-west-2` |
-| `MC_CAPACITY` | No | Maximum concurrent meetings | `100` | `100` |
-| `WEBTRANSPORT_BIND_ADDRESS` | No | WebTransport bind address | `0.0.0.0:4433` | `0.0.0.0:4433` |
-| `HTTP_BIND_ADDRESS` | No | HTTP/metrics bind address | `0.0.0.0:8080` | `0.0.0.0:8080` |
-| `ACTOR_MAILBOX_SIZE` | No | Default actor mailbox capacity | `1000` | `1000` |
-| `GC_HEARTBEAT_INTERVAL_SECS` | No | Heartbeat interval to GC | `10` | `10` |
-| `OTEL_ENABLED` | No | Enable MC's OTel SDK span export (R-55). Gated by this explicit flag, NOT by presence of `OTLP_ENDPOINT`. | `false` | `true` |
+| `REDIS_URL` | **Yes** | Redis connection URL for session state. Supplied from the `mc-service-secrets` Secret. | None | `redis://:pw@redis.dark-tower:6379` |
+| `MC_BINDING_TOKEN_SECRET` | **Yes** | Base64 master secret for binding-token HMAC (ADR-0023). From `mc-service-secrets`. | None | `openssl rand -base64 32` |
+| `AC_ENDPOINT` | **Yes** | Auth Controller endpoint for OAuth token acquisition (ADR-0010). | None | `http://ac-service.dark-tower:8082` |
+| `MC_CLIENT_ID` | **Yes** | OAuth client ID for MC's client-credentials flow to AC. | None | `meeting-controller` |
+| `MC_CLIENT_SECRET` | **Yes** | OAuth client secret. From `mc-service-secrets`. | None | `<secret>` |
+| `AC_JWKS_URL` | **Yes** | AC JWKS endpoint for meeting-token validation. Validated at load: must start `http://` or `https://`. | None | `http://ac-service.dark-tower:8082/.well-known/jwks.json` |
+| `MC_TLS_CERT_PATH` | **Yes** | PEM cert for the WebTransport server. File existence is checked at startup, so a *malformed or empty* Secret is a load failure rather than a runtime error. A **missing** `mc-service-tls` never reaches this check — the mount blocks first (`FailedMount`, no logs). | None | `/etc/mc-tls/tls.crt` |
+| `MC_TLS_KEY_PATH` | **Yes** | PEM private key for the WebTransport server. Existence checked at startup, with the same caveat as `MC_TLS_CERT_PATH` above. | None | `/etc/mc-tls/tls.key` |
+| `MC_GRPC_ADVERTISE_ADDRESS` | **Yes** | Address GC uses to reach this pod's gRPC. Built from the downward-API `POD_IP`. | None | `http://$(POD_IP):50052` |
+| `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` | **Yes** | Address GC hands clients for this pod. **Per-instance** — from `mc-0-config` / `mc-1-config`, not the shared ConfigMap. | None | `https://127.0.0.1:4433` |
+| `MC_MAX_RECEIVE_SLOTS` | **Yes** | Max receive slots one client may declare in a `ReceiveCapability` (ADR-0036 §6). Over-cap rejects the **whole declaration**. The value itself is validated `1..=64` at load — a cap whose own value is unbounded is not a cap. | `8` (in ConfigMap) | `8` |
+| `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` | **Yes** | Per-connection budget on *accepted* capability declarations. Bounds client-driven O(N) meeting-actor work; over-budget declarations are rejected and counted. | `64` (in ConfigMap) | `64` |
+| `MC_AUDIO_CODEC` | **Yes** | Codec MC directs clients to produce for main audio. Parsed to the `Codec` proto enum; unrecognised values, `unspecified`, and video codecs all fail at startup. | `opus` (in ConfigMap) | `opus` |
+| `MC_AUDIO_MAX_BITRATE_BPS` | **Yes** | Max audio bitrate MC directs. Top of the 32–48 kbps band `mh-service` sizes its datagram buffer against; validated against that band at load. | `48000` (in ConfigMap) | `48000` |
+| `MC_AUDIO_FRAME_RATE_HZ` | **Yes** | Audio frames per second MC directs (50 Hz = 20 ms frames). Same physical quantity as `mh-service`'s `AUDIO_FRAME_DURATION_MS = 20` in the reciprocal unit; changing it moves MH's "32 frames = 640 ms" latency budget. | `50` (in ConfigMap) | `50` |
+| `MC_REGION` | No | Geographic region for this MC. | `us-east-1` | `local` |
+| `GC_GRPC_URL` | No | Global Controller gRPC endpoint. | `http://localhost:50051` | `http://gc-service.dark-tower:50051` |
+| `MC_WEBTRANSPORT_BIND_ADDRESS` | No | WebTransport (QUIC/UDP) bind address. | `0.0.0.0:4433` | `0.0.0.0:4433` |
+| `MC_GRPC_BIND_ADDRESS` | No | gRPC bind address for GC communication. | `0.0.0.0:50052` | `0.0.0.0:50052` |
+| `MC_HEALTH_BIND_ADDRESS` | No | Health/metrics bind address. | `0.0.0.0:8081` | `0.0.0.0:8081` |
+| `MC_ID` | No | Instance identifier. Auto-generated when unset. | `mc-$HOSTNAME-<uuid8>` | `mc-0` |
+| `MC_MAX_MEETINGS` | No | Maximum concurrent meetings. | `1000` | `1000` |
+| `MC_MAX_PARTICIPANTS` | No | Maximum participants across all meetings. | `10000` | `10000` |
+| `MC_BINDING_TOKEN_TTL_SECONDS` | No | Binding token TTL (ADR-0023). | `30` | `30` |
+| `MC_CLOCK_SKEW_SECONDS` | No | Clock skew allowance (ADR-0023). | `5` | `5` |
+| `MC_NONCE_GRACE_WINDOW_SECONDS` | No | Nonce grace window (ADR-0023). | `5` | `5` |
+| `MC_DISCONNECT_GRACE_PERIOD_SECONDS` | No | Participant disconnect grace period (ADR-0023). | `30` | `30` |
+| `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` | No | QUIC max-idle-timeout. **Fail-loud parse**: non-numeric or `0` is rejected at load rather than falling back to the library default (`0` = infinite idle timeout, which leaves crash/network-loss departures undetected). | `10` | `10` |
+| `OTEL_ENABLED` | No | Enable MC's OTel SDK span export (R-55). Gated by this explicit flag, NOT by presence of `OTLP_ENDPOINT`. Unrecognised values fail at load. | `false` | `true` |
 | `OTLP_ENDPOINT` | No | OTLP-gRPC collector endpoint for MC's own span export. `http://` scheme required. Only consumed when `OTEL_ENABLED=true`. | None | `http://otel-collector.dark-tower:4317` |
 | `OTEL_SAMPLE_RATE` | No | Head-sampling ratio in `[0.0, 1.0]`; `init_otel` validates. | `1.0` | `1.0` |
 | `DEPLOYMENT_ENVIRONMENT` | No | `deployment.environment` resource attribute (ADR-0011). | `development` | `production` |
-| `RUST_LOG` | No | Logging level | `info` | `info,mc_service=debug` |
+| `RUST_LOG` | No | Logging level. Set as a literal in the Deployment, not via ConfigMap. | `info` | `info,mc_service=debug` |
+
+**The fifteen Required rows are the CrashLoop list.** Each is loaded via
+`ConfigError::MissingEnvVar` in `crates/mc-service/src/config.rs`, so absence
+fails config load before the server binds: the pod enters `CrashLoopBackOff`
+and the reason is the first line of the container log. `MC_TLS_CERT_PATH` and
+`MC_TLS_KEY_PATH` additionally fail when the *file* is absent — but **that check
+is only reachable once the container starts**, so it is the signal for a Secret
+that exists and is malformed or empty, **not** for a Secret that is missing. A
+missing `mc-service-tls` never gets that far: the volume is not `optional:`, so
+kubelet cannot complete the mount and the pod stays Pending in
+`ContainerCreating`. See §Config-failure triage, which lists all three signals.
+
+> **Maintenance.** This table is verified against `crates/mc-service/src/config.rs`.
+> It previously documented six variables that did not exist in any MC build
+> (`GC_REGISTRATION_URL`, `MC_CAPACITY`, `WEBTRANSPORT_BIND_ADDRESS`,
+> `HTTP_BIND_ADDRESS`, `ACTOR_MAILBOX_SIZE`, `GC_HEARTBEAT_INTERVAL_SECS`)
+> while omitting every genuinely required one — an inverted `Required` column
+> on the artifact an operator reads at 2am. `dt-guard env-config` checks
+> manifests against `config.rs` but does **not** read this runbook, so nothing
+> catches drift here automatically. Re-verify against `config.rs` whenever a
+> key is added or removed.
+
+> **`MC_AUDIO_*` has no observable effect until the client honours the send
+> directive** (story task 19). MC emits the directive today and the SDK still
+> uses its own encoder settings, so tuning these three changes the wire message
+> and nothing an operator can measure. Stated here because a live-looking knob
+> that does nothing generates support questions for a whole story.
+
+### Config-failure triage: three signals, and `kubectl logs` is wrong for all three
+
+Five required keys mean two distinct startup failures with **opposite first
+steps**; a third, the TLS Secret, produces neither and is listed with them
+because it presents at the same moment and reaches the same operator. What they
+have in common is the trap: **the standard `kubectl logs` reflex is wrong for
+every one of them.**
+
+| Cause | Signal | Where the answer is |
+|---|---|---|
+| Deployment has a `configMapKeyRef` the ConfigMap lacks (new Deployment applied against an old ConfigMap) | `CreateContainerConfigError` — **no container ever ran** | `kubectl describe pod`. `logs` is **empty** and `exec` is impossible — an operator reading only those concludes "the pod is wedged" when `describe` names the missing key |
+| New image with an old pod template lacking the new `env` entries (`kubectl set image`, a partial apply) | `CrashLoopBackOff` | `kubectl logs --previous` — `ConfigError::MissingEnvVar` names the variable |
+| `mc-service-tls` Secret absent (fresh namespace, `apply -k` only — it is created imperatively and is outside the coupled set) | `FailedMount`; pod Pending in `ContainerCreating` | `kubectl describe pod`. The `mc-tls` volume is not `optional:`, so kubelet blocks the mount and the container **never starts** — there is no config load, no `MC_TLS_CERT_PATH` error and no log at all. See §Kubernetes Secrets |
+
+**Three signals, and `kubectl logs` is empty or misleading for all three.** That
+is the generalisation worth carrying rather than the rows: the standard first
+reflex is wrong every time. `describe pod` is what names the artifact for the
+first and third; `logs --previous` is what names it for the second, and plain
+`logs` is empty for both of those. The three are also distinguishable *before*
+you read anything, by pod phase alone — Pending/`ContainerCreating` is the
+Secret, `CreateContainerConfigError` is the ConfigMap key, and a pod that runs
+and exits is the stale pod template.
+
+
+**Rollout ordering.** The manifest change and the code change roll **together**.
+The ConfigMap must never be reverted independently of the image, and the image
+must never be applied against a stale ConfigMap. Note that
+`infra/services/mc-service/kustomization.yaml` uses `resources:`, not
+`configMapGenerator:` — so there is **no content hash on the ConfigMap and
+editing it does not roll the pods**. Env is read once at process start, so a
+ConfigMap edit takes effect only on the next restart, and a wrong one is latent
+until then. Both MC pods fail identically at startup in either case, so the PDB
+offers no protection: this is a full signalling-plane outage, not a partial one.
+
+**Recovery — applying the ConfigMap alone is NOT enough.** This was observed on
+2026-09-03 during the validation of the change that introduced these five keys,
+so the sequence below is what actually worked rather than what ought to:
+
+```bash
+# 1. Confirm the cause before changing anything.
+kubectl get pods -n dark-tower -l app=mc-service          # CrashLoopBackOff?
+kubectl logs -n dark-tower deployment/mc-0 --previous | head -5
+#   -> Error: MissingEnvVar("MC_MAX_RECEIVE_SLOTS")
+
+# 2. Apply the OVERLAY, which carries the whole coupled set in one object
+#    stream: the ConfigMap supplies the value, and the Deployment supplies the
+#    configMapKeyRef that injects it. Applying only the ConfigMap leaves the
+#    pods crashing on the SAME key, because the running pod template still has
+#    no reference to it -- which reads as "my fix did nothing" and invites a
+#    second, wrong diagnosis.
+#
+#    APPLY THE OVERLAY, NOT THE BASE. `kubectl apply -f
+#    infra/services/mc-service/configmap.yaml` looks like the obvious move and
+#    is wrong: the Kind overlay strategic-merge-patches OTEL_ENABLED="true" into
+#    mc-service-config (infra/kubernetes/overlays/kind/services/mc-service/
+#    configmap-otel-patch.yaml), and `apply -f` on the base rewrites
+#    last-applied-configuration to the base content, so the three-way merge
+#    flips OTel export back OFF and drops the `environment: kind` /
+#    `managed-by: dark-tower` labels. Step 3's rollout then makes that take
+#    effect -- i.e. the documented recovery for a signalling-plane outage would
+#    disable MC's own span export at the moment you most need it, silently.
+#    This is the same overlay `dev-cluster deploy mc` and
+#    infra/kind/scripts/setup.sh use. Selectors are unaffected
+#    (includeSelectors: false), so there is no second, louder symptom to catch
+#    the mistake -- the pods come back healthy and the procedure reads as having
+#    worked, while the traces you would use for the post-incident review are
+#    gone.
+#
+# 2a. Devloop / Kind cluster -- go through the OVERLAY.
+kubectl apply -k infra/kubernetes/overlays/kind/services/mc-service/
+#     (equivalently, and preferred on a devloop cluster: dev-cluster deploy mc)
+
+# 2b. A cluster deployed from the base with NO overlay -- here the base IS the
+#     deployed artifact and the -f form is correct.
+kubectl apply -f infra/services/mc-service/configmap.yaml
+kubectl apply -f infra/services/mc-service/mc-0-deployment.yaml
+kubectl apply -f infra/services/mc-service/mc-1-deployment.yaml
+
+# 3. Roll. A ConfigMap edit alone does not restart anything (no content hash --
+#    see above), and env is read once at process start.
+kubectl rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
+kubectl rollout status deployment/mc-0 -n dark-tower
+kubectl rollout status deployment/mc-1 -n dark-tower
+```
+
+**On a devloop cluster, a rebuild does NOT apply manifests.** `dev-cluster
+rebuild` / `rebuild-all` build the image, load it and `rollout restart`
+(`crates/devloop-helper/src/commands.rs`); they never `kubectl apply`. Layer 7's
+infra-change detector watches `infra/kind/` only (`scripts/layer7.sh`), never
+`infra/services/`. So a diff that changes `infra/services/mc-service/**` and the
+image together produces the new image against the **old** ConfigMap and pod
+template by default — the CrashLoop above is the guaranteed outcome, not bad
+luck. Run `dev-cluster deploy mc` (which does `kubectl apply -k` the overlay)
+after any change under `infra/services/mc-service/`.
+
+**The symptom may not look like a config problem at all.** In the 2026-09-03
+occurrence the first error surfaced was a Layer 7 `PRECONDITION_FAILURE` on
+`port 24500 (prometheus) is already in use`. That was downstream noise: cluster
+`setup` re-ran *because* mc-0 and mc-1 were unhealthy, and the re-run collided
+with ports the existing cluster still held. Chasing the port would have been an
+hour spent nowhere. **If cluster setup re-runs unexpectedly, check MC pod health
+before believing any port or resource-conflict message it produces.**
 
 ### Kubernetes Secrets
 
-**Secret: `mc-service-secrets`** (namespace: `dark-tower`)
+**Secret: `mc-service-secrets`** (namespace: `dark-tower`) — supplies three env
+vars by `secretKeyRef`:
 
 ```yaml
 apiVersion: v1
@@ -467,14 +786,46 @@ metadata:
   name: mc-service-secrets
   namespace: dark-tower
 type: Opaque
-data:
-  TLS_CERT: <base64-encoded-cert>
-  TLS_KEY: <base64-encoded-key>
+stringData:
+  REDIS_URL: "redis://:<password>@redis.dark-tower:6379"
+  MC_BINDING_TOKEN_SECRET: "<openssl rand -base64 32>"
+  MC_CLIENT_SECRET: "<oauth client secret>"
 ```
+
+**Secret: `mc-service-tls`** (namespace: `dark-tower`) — a *separate* Secret,
+mounted as the `mc-tls` volume at `/etc/mc-tls` (mode `0400`), not injected as
+env vars. Keys are `tls.crt` and `tls.key`; `MC_TLS_CERT_PATH` /
+`MC_TLS_KEY_PATH` point at the mount paths.
+
+> **It is NOT in the kustomization and `apply -k` will not create it.**
+> `infra/services/mc-service/kustomization.yaml` lists `secret.yaml`, which
+> defines only `mc-service-secrets`. `mc-service-tls` is created *imperatively*
+> by `infra/kind/scripts/setup.sh::create_mc_tls_secret` — which runs
+> `scripts/generate-dev-certs.sh`, then `kubectl create secret tls` — so it is
+> outside the ConfigMap + Deployments + image coupled set and survives every
+> `apply -k`. **On a fresh namespace it must be created before the pods start.**
+>
+> **The signal is `FailedMount`, and there are NO LOGS.** The `mc-tls` volume is
+> not marked `optional:`, so a missing Secret blocks the mount outright: both MC
+> pods sit Pending in `ContainerCreating`, the process **never starts**, and
+> there is no `MC_TLS_CERT_PATH` error and no container log to read. Only
+> `kubectl describe pod` names the Secret. Do **not** go looking for a cert-load
+> failure — `Identity::load_pemfiles` failing is a *different* problem that
+> requires the Secret to exist and be malformed. See §Config-failure triage.
+>
+> ```bash
+> # Does it exist, and is the cert still valid? (No exec needed -- the runtime
+> # image is distroless and has no openssl.)
+> kubectl get secret mc-service-tls -n dark-tower
+> kubectl get secret mc-service-tls -n dark-tower \
+>   -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates
+> ```
 
 ### Kubernetes ConfigMap
 
-**ConfigMap: `mc-service-config`** (namespace: `dark-tower`)
+**ConfigMap: `mc-service-config`** (namespace: `dark-tower`) — shared across
+instances. See `infra/services/mc-service/configmap.yaml` for the deployed
+source of truth.
 
 ```yaml
 apiVersion: v1
@@ -483,11 +834,45 @@ metadata:
   name: mc-service-config
   namespace: dark-tower
 data:
-  GC_REGISTRATION_URL: "http://gc-service.dark-tower.svc.cluster.local:8080/api/v1/mc/register"
-  MC_REGION: "us-west-2"
-  MC_CAPACITY: "100"
-  GC_HEARTBEAT_INTERVAL_SECS: "10"
+  MC_GRPC_BIND_ADDRESS: "0.0.0.0:50052"
+  MC_HEALTH_BIND_ADDRESS: "0.0.0.0:8081"
+  MC_WEBTRANSPORT_BIND_ADDRESS: "0.0.0.0:4433"
+  MC_REGION: "local"
+  GC_GRPC_URL: "http://gc-service.dark-tower:50051"
+  AC_JWKS_URL: "http://ac-service.dark-tower:8082/.well-known/jwks.json"
+  MC_TLS_CERT_PATH: "/etc/mc-tls/tls.crt"
+  MC_TLS_KEY_PATH: "/etc/mc-tls/tls.key"
+  OTEL_ENABLED: "false"
+  OTLP_ENDPOINT: "http://otel-collector.dark-tower:4317"
+  OTEL_SAMPLE_RATE: "1.0"
+  DEPLOYMENT_ENVIRONMENT: "development"
+  # ---- ADR-0036 media signalling (all REQUIRED; absent = CrashLoop) ----
+  # Documented defaults live in infra/services/mc-service/configmap.yaml, not as
+  # Rust constants: the load path has no unwrap_or, so THAT file is the only
+  # statement of the intended value. THIS BLOCK IS A COPY — do not edit it to
+  # change a value; edit the ConfigMap and roll (see the ordering banner there).
+  # Same convention as the mc-alerts.yaml pointer further down this file.
+  MC_MAX_RECEIVE_SLOTS: "8"                    # validated 1..=64 at load
+  MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS: "64"
+  MC_AUDIO_CODEC: "opus"
+  MC_AUDIO_MAX_BITRATE_BPS: "48000"            # top of mh-service's 32-48 kbps band
+  MC_AUDIO_FRAME_RATE_HZ: "50"                 # 50 Hz = 20 ms frames
 ```
+
+**Per-instance ConfigMaps: `mc-0-config`, `mc-1-config`** — carry only
+`MC_WEBTRANSPORT_ADVERTISE_ADDRESS`, which necessarily differs per pod. Both
+Deployments use per-key `configMapKeyRef` (no `envFrom`), so **every new key
+needs an entry in both `mc-0-deployment.yaml` and `mc-1-deployment.yaml`**.
+`dt-guard env-config` enforces this **only for keys `config.rs` declares
+required** via `ConfigError::MissingEnvVar` — its per-workload check
+(`missing_in_manifest`) is built from those literals. `orphan_configmap_key`
+does **not** cover it: that rule fires only when *no* workload references the
+key at all, so one of two references satisfies it. A non-required key wired
+into one Deployment and forgotten on the other is therefore **guard-green while
+the two pods run different values**, which is why these five keys are required
+with no Rust default. A *required* key referenced by only one CrashLoops that
+pod alone, which presents as "the meeting works about half the time" depending
+on which pod GC assigned.
 
 ### OpenTelemetry (R-55) and Break-glass
 
@@ -552,9 +937,15 @@ resources:
 - Logs show: `Failed to register with GC`, `GC unreachable`
 - MC not appearing in GC database
 
+> **Registration is gRPC, not HTTP.** MC calls `RegisterMc` on GC's gRPC server at
+> `GC_GRPC_URL` (`crates/mc-service/src/grpc/gc_client.rs::register`). There is
+> **no `GC_REGISTRATION_URL`** — that variable is one of the six phantoms named in
+> the §Environment Variables maintenance note above and appears in no MC build.
+> Do not `curl` a registration endpoint; there isn't one.
+
 **Causes:**
 - GC service not running or not healthy
-- `GC_REGISTRATION_URL` incorrect in ConfigMap
+- `GC_GRPC_URL` incorrect in the `mc-service-config` ConfigMap
 - NetworkPolicy blocking MC → GC traffic
 - GC rejecting registration (capacity, region mismatch)
 
@@ -564,21 +955,29 @@ resources:
 # Check GC service is running
 kubectl get pods -n dark-tower -l app=gc-service
 
-# Test GC endpoint directly from MC pod
-kubectl exec -it deployment/mc-service -n dark-tower -- \
-  curl -i $GC_REGISTRATION_URL
+# Verify the gRPC endpoint MC was actually given, read from the pod spec rather
+# than the ConfigMap -- the ConfigMap being out of step with what the Deployment
+# injects is itself a failure mode, so the artifact under suspicion cannot also
+# be the evidence. No shell needed (the runtime image may be distroless).
+kubectl set env deployment/mc-0 --list -n dark-tower | grep GC_GRPC_URL
+kubectl set env deployment/mc-1 --list -n dark-tower | grep GC_GRPC_URL
 
-# Check MC logs for registration errors
-kubectl logs deployment/mc-service -n dark-tower --tail=100 | grep -i "register\|gc"
+# What MC logged at startup, including the effective config line
+kubectl logs deployment/mc-0 -n dark-tower --tail=100 | grep -i "register\|gc"
+kubectl logs deployment/mc-1 -n dark-tower --tail=100 | grep -i "register\|gc"
 
-# Verify GC_REGISTRATION_URL in ConfigMap
-kubectl get configmap mc-service-config -n dark-tower -o yaml | grep GC_REGISTRATION_URL
+# Confirm GC is actually serving gRPC on 50051
+kubectl get svc gc-service -n dark-tower -o jsonpath='{.spec.ports}'
 ```
 
 **Fix:**
 1. Ensure GC service is running and ready
-2. Correct `GC_REGISTRATION_URL` in ConfigMap
-3. Adjust NetworkPolicy to allow MC → GC traffic (TCP:8080)
+2. Correct `GC_GRPC_URL` in `infra/services/mc-service/configmap.yaml`, then apply
+   **and roll** — see §Config-failure triage; a ConfigMap edit alone does not
+   restart anything
+3. Adjust NetworkPolicy to allow MC → GC egress on **TCP:50051**
+   (`infra/services/mc-service/network-policy.yaml`); MC's gRPC *ingress* from GC
+   is TCP:50052
 
 ### Issue 2: WebTransport Listener Failures
 
@@ -604,7 +1003,7 @@ kubectl get pods -n dark-tower -l app=mc-service -o wide
 kubectl describe pod <mc-pod> -n dark-tower | grep -A 5 "Mounts:"
 
 # Check logs for TLS errors
-kubectl logs deployment/mc-service -n dark-tower --tail=100 | grep -i "tls\|cert\|webtransport"
+kubectl logs deployment/mc-0 -n dark-tower --tail=100 | grep -i "tls\|cert\|webtransport"
 ```
 
 **Fix:**
@@ -661,7 +1060,7 @@ kubectl get events -n dark-tower --field-selector involvedObject.name=<mc-pod>
 kubectl top pods -n dark-tower -l app=mc-service
 
 # Check for mailbox buildup
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 kill %1
 
@@ -686,7 +1085,7 @@ Run these tests immediately after deployment to verify core functionality.
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 
 # Test health endpoint
 curl -i http://localhost:8080/health
@@ -712,7 +1111,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 
 # Test readiness endpoint
 curl -i http://localhost:8080/ready
@@ -740,7 +1139,7 @@ kill %1
 
 ```bash
 # Port-forward to pod
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 
 # Fetch metrics
 curl -s http://localhost:8080/metrics | head -50
@@ -921,10 +1320,16 @@ See `infra/grafana/dashboards/mc-overview.json`.
 - `MCDown` - No MC pods running for >1 minute
 - `MCActorPanic` - Any actor panic
 - `MCHighMailboxDepthCritical` - Mailbox depth >500 for >2 minutes
-- `MCHighLatency` - p95 latency >500ms for >5 minutes
-- `MCHighMessageDropRate` - Drop rate >1% for >5 minutes
+- `MCMediaConnectionAllFailed` - Every client media connection attempt failing
 
-See `infra/docker/prometheus/rules/mc-alerts.yaml` for full list.
+`infra/docker/prometheus/rules/mc-alerts.yaml` is the source of truth; this list
+is a convenience copy. **Verify against that file before relying on a name here**
+— nothing checks this list, and it previously named two page alerts,
+`MCHighLatency` and `MCHighMessageDropRate`, that have never existed in the rule
+file. Believing a page alert covers you when no rule exists is worse than knowing
+you have no alert. (`MCHighJoinLatency`'s own description still refers to "the
+aggregate `MCHighLatency` page alert" — that reference is also stale; join
+latency is covered at `severity: info` only.)
 
 ### Post-Deploy Monitoring Checklist: Join Flow
 
@@ -976,8 +1381,12 @@ histogram_quantile(0.95,
 - `MCHighJoinFailureRate` or `MCHighJoinLatency` alert fires and does not resolve within 5 minutes
 
 ```bash
-# Rollback command
-kubectl rollout undo deployment/mc-service -n dark-tower
+# Rollback command -- BOTH instances, as one step. Stopping after mc-0 leaves a
+# mixed-version signalling plane: GC keeps assigning meetings to both, so about
+# half of new meetings still get the behaviour you are rolling back away from,
+# intermittently and per-meeting. See §How to Rollback for the full ordering.
+kubectl rollout undo deployment/mc-0 -n dark-tower
+kubectl rollout undo deployment/mc-1 -n dark-tower
 
 # Note: Active sessions on old pods will drain gracefully (60s).
 # New joins will route to rolled-back pods once they register with GC.

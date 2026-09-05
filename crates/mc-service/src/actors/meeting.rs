@@ -651,8 +651,7 @@ impl MeetingActor {
                 audio_muted,
                 video_muted,
             } => {
-                self.handle_self_mute(&participant_id, audio_muted, video_muted)
-                    .await;
+                self.handle_self_mute(&participant_id, audio_muted, video_muted);
             }
 
             MeetingMessage::ServerMute {
@@ -1236,8 +1235,7 @@ impl MeetingActor {
                 audio_muted,
                 video_muted,
             } => {
-                self.handle_self_mute(participant_id, audio_muted, video_muted)
-                    .await;
+                self.handle_self_mute(participant_id, audio_muted, video_muted);
             }
             SignalingPayload::LayoutSubscribe { .. } => {
                 // TODO: Handle layout subscription
@@ -1267,33 +1265,57 @@ impl MeetingActor {
         }
     }
 
-    /// Handle self-mute update.
-    async fn handle_self_mute(
-        &mut self,
-        participant_id: &str,
-        audio_muted: bool,
-        video_muted: bool,
-    ) {
-        // Update mute state and extract values for broadcast
-        let update = if let Some(participant) = self.participants.get_mut(participant_id) {
-            participant.audio_self_muted = audio_muted;
-            participant.video_self_muted = video_muted;
-
-            Some(ParticipantStateUpdate::MuteChanged {
-                participant_id: participant_id.to_string(),
-                audio_self_muted: participant.audio_self_muted,
-                video_self_muted: participant.video_self_muted,
-                audio_server_muted: participant.audio_server_muted,
-                video_server_muted: participant.video_server_muted,
-            })
-        } else {
-            None
+    /// Handle self-mute update — records the reported state and does NOT fan out.
+    ///
+    /// # Why there is no `broadcast_update` here
+    ///
+    /// `MuteChanged` has no consumer.
+    /// `webtransport::handler::encode_participant_update` returns `None` for it
+    /// and the roster `Participant` proto carries no mute field, so a broadcast
+    /// from this path delivers **zero bytes to zero clients**: it would clone the
+    /// update N times and await N `send_update`s *on this actor's own task*,
+    /// head-of-line-blocking joins, leaves and every other connection's
+    /// `get_state()`, so that N participant actors could each wake, call the
+    /// encoder, get `None` and emit a DEBUG line.
+    ///
+    /// That cost was latent while nothing client-driven reached here. The
+    /// client-facing `MuteRequest` dispatch arm (ADR-0036 §5) makes this path
+    /// client-drivable, and a per-connection rate limit cannot bound a
+    /// **per-meeting** resource: N connections each within their own limit still
+    /// aggregate to O(N) awaited sends per report on one shared task, and a
+    /// buggy client *release* drives all N simultaneously. Removing the producer
+    /// is structural; rate-limiting it would only change the constant.
+    ///
+    /// The subscriber-visible mute signal is `SLOT_STATE_SOURCE_MUTED`, which
+    /// each subscriber composes from its **own** `get_state()` read on its own
+    /// task (`webtransport::connection::compose_and_emit`). Nothing is lost.
+    ///
+    /// # Retirement condition
+    ///
+    /// If `MuteChanged` ever becomes wire-serialized, the broadcast must come
+    /// back — and it needs a **per-meeting** bound at that point, not the
+    /// per-connection `ClientWorkLimiter` on the mute path, for the reason above.
+    ///
+    /// `handle_server_mute` deliberately still broadcasts: it is not
+    /// client-drivable in this story (enforcement is story 2), so it is not this
+    /// diff's amplifier to remove.
+    fn handle_self_mute(&mut self, participant_id: &str, audio_muted: bool, video_muted: bool) {
+        let Some(participant) = self.participants.get_mut(participant_id) else {
+            return;
         };
 
-        // Broadcast mute change after releasing the mutable borrow
-        if let Some(update) = update {
-            self.broadcast_update(participant_id, update).await;
+        // IDEMPOTENT: a report that changes neither flag is a no-op. Retained
+        // now that the fan-out is gone because it still states the contract —
+        // an unchanged pair is not a transition — and keeps the write off the
+        // hot path for a client repeating one state.
+        if participant.audio_self_muted == audio_muted
+            && participant.video_self_muted == video_muted
+        {
+            return;
         }
+
+        participant.audio_self_muted = audio_muted;
+        participant.video_self_muted = video_muted;
     }
 
     /// Handle a server-mute request (enforced, ADR-0036 §5).
@@ -2059,6 +2081,128 @@ mod tests {
                 crate::errors::SessionBindingError::InvalidToken
             ))
         ));
+
+        handle.cancel();
+    }
+
+    /// NO self-mute report fans out to the other participants — not a no-op,
+    /// and not a real transition either.
+    ///
+    /// # Why this is asserted through the actor message counter
+    ///
+    /// `MuteChanged` is not wire-serialized
+    /// (`webtransport::handler::encode_participant_update` returns `None` for
+    /// it), so there is no outbound frame to watch for. What is being pinned is
+    /// the absence of the O(N) `broadcast_update` — one message DELIVERED to
+    /// every other participant's actor — and that is exactly what
+    /// `ActorMetrics::total_messages_processed` counts. A dedicated
+    /// `ActorMetrics` per test means the meeting and its two participant actors
+    /// are the only contributors.
+    ///
+    /// Expected delta is **1 per report** — the meeting actor's own
+    /// `UpdateSelfMute`, which must stop there — for the no-op AND for the real
+    /// transition. Restoring `broadcast_update` in `handle_self_mute` makes the
+    /// transition cost 2 and fails this test.
+    ///
+    /// # The positive control is the state write, not a second broadcast
+    ///
+    /// Asserting only "the counter did not move" would pass just as well if the
+    /// actor had ignored the message entirely, or if the harness were broken —
+    /// the vacuous-control shape this devloop hit three times. So the real
+    /// transition is confirmed to have LANDED, via `get_state()` observing
+    /// `audio_self_muted`, on the same read path
+    /// `webtransport::connection::compose_and_emit` uses to derive
+    /// `SLOT_STATE_SOURCE_MUTED`. That is the mechanism that replaced the
+    /// broadcast, so the control exercises the actual delivery route.
+    ///
+    /// The connection-side `last_reported_mute` cache short-circuits BEFORE the
+    /// actor hop, so no integration test can reach the no-op branch; a redundant
+    /// first report after join can, and does here.
+    #[tokio::test]
+    async fn no_self_mute_report_is_broadcast_to_other_participants() {
+        use std::sync::atomic::Ordering;
+
+        let metrics = ActorMetrics::new();
+        let cancel_token = CancellationToken::new();
+        let (handle, _task) = must_spawn(
+            "meeting-mute-idempotence".to_string(),
+            cancel_token.clone(),
+            Arc::clone(&metrics),
+            ControllerMetrics::new(),
+            test_secret(),
+        );
+
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(16);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(16);
+        for (conn, part, tx) in [("conn-a", "part-a", tx_a), ("conn-b", "part-b", tx_b)] {
+            handle
+                .connection_join(
+                    conn.to_string(),
+                    format!("user-{part}"),
+                    part.to_string(),
+                    String::new(),
+                    false,
+                    test_identity_key(),
+                    Some(tx),
+                )
+                .await
+                .expect("join succeeds");
+        }
+        // Let the join fan-out drain before taking the baseline.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let base = metrics.total_messages_processed.load(Ordering::Relaxed);
+
+        // Both flags already false at join, so this changes nothing. It must
+        // reach the meeting actor and stop there.
+        handle
+            .update_self_mute("part-a".to_string(), false, false)
+            .await
+            .expect("send succeeds");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            metrics.total_messages_processed.load(Ordering::Relaxed) - base,
+            1,
+            "a no-op self-mute must not be broadcast: broadcasting a MuteChanged for a \
+             transition that did not occur states a change on the wire that never happened, \
+             and it is the cheapest client-driven O(N) fan-out in MC"
+        );
+
+        // A REAL transition must not fan out either: `MuteChanged` has no
+        // consumer, so the broadcast would deliver zero bytes to zero clients
+        // while awaiting N sends on the shared meeting-actor task.
+        handle
+            .update_self_mute("part-a".to_string(), true, false)
+            .await
+            .expect("send succeeds");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            metrics.total_messages_processed.load(Ordering::Relaxed) - base,
+            2,
+            "a real mute transition must reach the meeting actor and STOP there: \
+             `MuteChanged` is not wire-serialized, so a fan-out here delivers nothing \
+             to anyone while awaiting one send per participant on the shared actor task"
+        );
+
+        // POSITIVE CONTROL — the transition actually landed. Without this the
+        // assertions above would pass just as well if the actor had ignored
+        // both messages. This is also the path that REPLACED the broadcast:
+        // each subscriber derives `SLOT_STATE_SOURCE_MUTED` from its own
+        // `get_state()` read, so the control exercises the real delivery route.
+        let state = handle.get_state().await.expect("state read succeeds");
+        let part_a = state
+            .participants
+            .iter()
+            .find(|p| p.participant_id == "part-a")
+            .expect("part-a is on the roster");
+        assert!(
+            part_a.audio_self_muted,
+            "the mute transition must be observable via get_state, which is how \
+             subscribers learn about it now that there is no broadcast"
+        );
+        assert!(
+            !part_a.video_self_muted,
+            "only the audio flag was reported; video must not have moved"
+        );
 
         handle.cancel();
     }

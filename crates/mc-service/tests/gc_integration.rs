@@ -5,6 +5,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/mod.rs"]
+mod test_common;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -246,6 +249,12 @@ impl GlobalControllerService for MockGcServer {
 // ============================================================================
 
 fn test_config(gc_url: &str) -> Config {
+    // The media triple comes from the shared fixture, whose rustdoc carries the
+    // matches-the-ConfigMap claim. Restating it here would make this the second
+    // encoding of a value the ConfigMap owns — and would leave this function and
+    // `otel_grpc_outbound_integration.rs::test_config`, which were byte-identical
+    // before this diff, silently disagreeing about the source of truth.
+    let media = test_common::client_media_config();
     Config {
         mc_id: "mc-test-001".to_string(),
         region: "us-east-1".to_string(),
@@ -274,6 +283,9 @@ fn test_config(gc_url: &str) -> Config {
         otel_endpoint: String::new(),
         otel_sample_rate: 1.0,
         environment: "development".to_string(),
+        max_receive_slots: media.max_receive_slots,
+        max_receive_capability_declarations: media.max_receive_capability_declarations,
+        audio_encoding: media.audio_encoding,
     }
 }
 

@@ -62,6 +62,92 @@ pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
 /// Default deployment environment (R-55, OTel resource attribute).
 pub const DEFAULT_ENVIRONMENT: &str = "development";
 
+// ============================================================================
+// Bounds on the ADR-0036 client-signalling knobs
+//
+// These are BOUNDS, not defaults. There are deliberately no `DEFAULT_*`
+// constants for the five `MC_*` media-signalling keys — they are required, and
+// their documented values live in `infra/services/mc-service/configmap.yaml`.
+// ============================================================================
+
+/// Smallest legal `MC_MAX_RECEIVE_SLOTS`.
+///
+/// Zero would mean no client can ever receive media — a silent total outage
+/// that reads as a valid configuration.
+const MIN_RECEIVE_SLOTS: usize = 1;
+
+/// Largest legal `MC_MAX_RECEIVE_SLOTS`.
+///
+/// ADR-0036 §6 leans on this cap for *"resource-amplification-by-request
+/// becomes structurally impossible rather than rate-limited"*. A cap set to
+/// 100000 quietly retires that property while still looking like a cap, so the
+/// cap's own value is bounded. 64 is generous against the two media kinds §11
+/// ships and a realistic grid of ≤5 video plus audio.
+const MAX_RECEIVE_SLOTS: usize = 64;
+
+/// Smallest legal `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`.
+const MIN_RECEIVE_CAPABILITY_DECLARATIONS: u32 = 1;
+
+/// Largest legal `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`.
+///
+/// Same argument as the slot cap: a budget whose own value is unbounded is not
+/// a budget.
+const MAX_RECEIVE_CAPABILITY_DECLARATIONS: u32 = 4096;
+
+/// Bound an already-fetched REQUIRED env value as a `usize`, on both sides.
+///
+/// Fail-loud on every arm — non-numeric or out of range stops the process at
+/// load. A media-path knob that silently reverts to a library or code default is
+/// the failure mode ADR-0036 §11's "derive rather than guard" rule and R-32 both
+/// exist to prevent.
+///
+/// # The presence check is deliberately NOT in here
+///
+/// The caller constructs `ConfigError::MissingEnvVar` with a spelled-out string
+/// literal inline and passes the value in. That is not an oversight:
+/// `dt-guard env-config` discovers required variables by regex-matching that
+/// constructor and its literal in this file, so moving the presence check behind
+/// a helper would blind its per-workload check on every key routed through it
+/// while it kept printing STATUS=OK. Same shape, and the same reason, as
+/// `mh-service`'s five ADR-0036 §1 transport keys.
+///
+/// Two ways to break the discovery, both silent, both found by running the
+/// guard's own regex over this file rather than by reading it:
+/// - **wrapping** the constructor and its literal onto separate lines, since the
+///   pattern does not span lines; and
+/// - **writing an example of the pattern in a comment**, which registers a
+///   phantom required variable that no ConfigMap declares.
+///
+/// Neither is caught by `cargo check`, and the first is what an automatic
+/// reformat does.
+/// # Generic over the integer type, so a knob is bounded in its OWN domain
+///
+/// `T` is inferred from the bound constants at the call site, so a `u32`-valued
+/// knob passes `u32` bounds and gets a `u32` back. This is what removes the
+/// casts in each direction: routing a `u32` knob through a `usize`-only helper
+/// forced `MIN as usize` / `MAX as usize` going in and a `u32::try_from(..)`
+/// with an unreachable "does not fit u32" arm coming out — four lossless casts
+/// and three error messages an operator could never see. The generic keeps that
+/// property with one body and one pair of messages, where two monomorphic
+/// siblings were character-for-character identical modulo the type.
+fn bounded<T>(name: &str, raw: &str, min: T, max: T) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display,
+    T::Err: std::fmt::Display,
+{
+    let parsed = raw.trim().parse::<T>().map_err(|e| {
+        ConfigError::InvalidValue(format!(
+            "{name} must be a non-negative integer, got '{raw}': {e}"
+        ))
+    })?;
+    if parsed < min || parsed > max {
+        return Err(ConfigError::InvalidValue(format!(
+            "{name} must be in {min}..={max}, got {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
 /// Meeting Controller configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -171,6 +257,59 @@ pub struct Config {
     /// Deployment environment resource attribute (R-55, env
     /// `DEPLOYMENT_ENVIRONMENT`, default `"development"`).
     pub environment: String,
+
+    // ========================================================================
+    // Client-facing media signalling (ADR-0036 §5, §6)
+    //
+    // All five are REQUIRED — `ConfigError::MissingEnvVar`, no Rust default.
+    // A Rust-defaulted key wired into `mc-0` and forgotten on `mc-1` passes
+    // `dt-guard env-config` green (its `orphan_configmap_key` check fires only
+    // when NO workload references a key; per-workload enforcement exists only
+    // for keys it discovers from the spelled-out constructor literal), and the two
+    // MC instances would then direct DIFFERENT encoder parameters to their
+    // respective clients with nothing failing anywhere. Making them required IS
+    // the drift guard. Same shape and reasoning as mh-service's five ADR-0036 §1
+    // transport keys.
+    //
+    // The `MissingEnvVar("...")` literals below are deliberately written out at
+    // each site rather than extracted into a helper: the guard discovers
+    // required vars by matching that literal, so a helper would blind it on all
+    // five while it kept printing STATUS=OK.
+    //
+    // Documented defaults live in `infra/services/mc-service/configmap.yaml`,
+    // which is the artifact an operator actually reads — deliberately NOT in
+    // `DEFAULT_*` constants here, including in test fixtures, since a constant
+    // surviving only in a fixture reads as retired while remaining a live second
+    // encoding of the value.
+    // ========================================================================
+    /// Maximum receive slots one client may declare (`MC_MAX_RECEIVE_SLOTS`).
+    ///
+    /// ADR-0036 §6 caps slot count server-side by configuration; MC rejects a
+    /// whole declaration exceeding it. The cap is what makes
+    /// resource-amplification-by-request structurally impossible rather than
+    /// rate-limited, so the value itself is validated (`1..=64`) — a cap whose
+    /// own value is unbounded is not a cap.
+    pub max_receive_slots: usize,
+
+    /// Maximum ACCEPTED receive-capability declarations per connection
+    /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
+    ///
+    /// Bounds client-driven O(N) roster reads on the shared meeting actor.
+    /// Charged only on acceptance; every rejection is decided without touching
+    /// the actor, so a client looping rejects cannot bypass it. Validated
+    /// `1..=4096` for the same reason the slot cap is.
+    pub max_receive_capability_declarations: u32,
+
+    /// The audio encoding MC directs clients to produce (`MC_AUDIO_CODEC`,
+    /// `MC_AUDIO_MAX_BITRATE_BPS`, `MC_AUDIO_FRAME_RATE_HZ`).
+    ///
+    /// A parsed, validated value rather than three loose scalars:
+    /// `CODEC_UNSPECIFIED` is rejected at load, which is what makes it
+    /// structurally unrepresentable at the send-directive emit site.
+    ///
+    /// **No observable effect until the client honours the send directive**
+    /// (story task 19). An operator tuning these before then changes nothing.
+    pub audio_encoding: crate::media_signaling::AudioEncoding,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -216,6 +355,12 @@ impl fmt::Debug for Config {
             .field("otel_endpoint", &self.otel_endpoint)
             .field("otel_sample_rate", &self.otel_sample_rate)
             .field("environment", &self.environment)
+            .field("max_receive_slots", &self.max_receive_slots)
+            .field(
+                "max_receive_capability_declarations",
+                &self.max_receive_capability_declarations,
+            )
+            .field("audio_encoding", &self.audio_encoding)
             .finish()
     }
 }
@@ -447,6 +592,101 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| DEFAULT_ENVIRONMENT.to_string());
 
+        // ADR-0036 §6: the server-side receive-slot cap. Required, fail-loud,
+        // and bounded on BOTH sides — rejecting only 0 would stop the
+        // silent-total-outage direction while leaving the amplification bound
+        // an operator could retire with a typo.
+        let max_receive_slots = bounded(
+            "MC_MAX_RECEIVE_SLOTS",
+            vars.get("MC_MAX_RECEIVE_SLOTS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_MAX_RECEIVE_SLOTS".to_string()))?,
+            MIN_RECEIVE_SLOTS,
+            MAX_RECEIVE_SLOTS,
+        )?;
+
+        // Per-connection budget on ACCEPTED declarations (client-driven
+        // meeting-actor work). Bounded on both sides by the same argument.
+        let max_receive_capability_declarations = bounded(
+            "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS",
+            // DO NOT LET `cargo fmt` TIDY THE NEXT LINE, AND DO NOT LENGTHEN
+            // THIS KEY'S NAME. The `MissingEnvVar` constructor and its string
+            // literal must stay on ONE line: `dt-guard env-config` discovers
+            // required variables with a regex that does not span lines, so a
+            // rustfmt-shaped wrap between `MissingEnvVar(` and the string
+            // silently removes this key from the discovered required set — and
+            // the guard then prints STATUS=OK while the key is unenforced
+            // per-workload on every deployment. Verified by running that regex
+            // over this file: it missed this key before the hand-reflow.
+            //
+            // THE MARGIN IS EXACTLY ZERO. That line is **exactly 100
+            // characters**, which is rustfmt's default `max_width`, and there is
+            // no `rustfmt.toml` anywhere in the tree to change it. One more
+            // level of nesting, or one more character in the key name, and the
+            // formatter reflows it and the failure is silent. This comment is a
+            // warning, NOT a control — the formatter does not read it and acts
+            // on width, not intent. The real fix is guard-side and tracked in
+            // `docs/TODO.md` §Infrastructure Validation in Devloops.
+            vars.get("MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS".to_string())
+                })?,
+            MIN_RECEIVE_CAPABILITY_DECLARATIONS,
+            MAX_RECEIVE_CAPABILITY_DECLARATIONS,
+        )?;
+
+        // The audio encoding MC directs. Parsed and validated here so that
+        // `CODEC_UNSPECIFIED` and out-of-band values cannot reach the emit site
+        // at all — an unrecognised codec is an error, NEVER a fall-back to Opus,
+        // which would leave an operator believing they configured something they
+        // did not.
+        let audio_codec = crate::media_signaling::AudioEncoding::parse_codec(
+            vars.get("MC_AUDIO_CODEC")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_AUDIO_CODEC".to_string()))?,
+        )
+        .map_err(|e| ConfigError::InvalidValue(format!("MC_AUDIO_CODEC is invalid: {e}")))?;
+
+        let audio_max_bitrate_bps = bounded(
+            "MC_AUDIO_MAX_BITRATE_BPS",
+            vars.get("MC_AUDIO_MAX_BITRATE_BPS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_AUDIO_MAX_BITRATE_BPS".to_string())
+            })?,
+            crate::media_signaling::AUDIO_BITRATE_MIN_BPS,
+            crate::media_signaling::AUDIO_BITRATE_MAX_BPS,
+        )?;
+
+        let audio_frame_rate_hz = bounded(
+            "MC_AUDIO_FRAME_RATE_HZ",
+            vars.get("MC_AUDIO_FRAME_RATE_HZ")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_AUDIO_FRAME_RATE_HZ".to_string()))?,
+            crate::media_signaling::AUDIO_FRAME_RATE_MIN_HZ,
+            crate::media_signaling::AUDIO_FRAME_RATE_MAX_HZ,
+        )?;
+
+        // Codec, bitrate and frame rate become ONE validated value here. After
+        // this line an unspecified codec is unrepresentable, which is what makes
+        // the send-directive emit site structurally unable to violate
+        // `signaling.proto`'s "zero is not a silent Opus" rule.
+        let audio_encoding = crate::media_signaling::AudioEncoding::new(
+            audio_codec,
+            audio_max_bitrate_bps,
+            audio_frame_rate_hz,
+        )
+        .map_err(|e| {
+            // Name all THREE inputs, not just `MC_AUDIO_CODEC`. Today
+            // `CodecNotAudio` is the only reachable variant here — the bitrate
+            // and frame-rate bands are already enforced by `bounded` above,
+            // so `BitrateOutOfBand`/`FrameRateOutOfBand` cannot arrive — but
+            // hardcoding one key name would silently mislead the moment those
+            // bounds diverge. An operator reading this in a CrashLoop gets the
+            // effective value of every key that feeds the failure.
+            ConfigError::InvalidValue(format!(
+                "audio encoding configuration is invalid: {e} \
+                 (MC_AUDIO_CODEC={audio_codec:?}, \
+                  MC_AUDIO_MAX_BITRATE_BPS={audio_max_bitrate_bps}, \
+                  MC_AUDIO_FRAME_RATE_HZ={audio_frame_rate_hz})"
+            ))
+        })?;
+
         // Fail-fast: enabling OTel without an endpoint is a config bug — surface
         // it at startup rather than silently no-op'ing exports.
         if otel_enabled && otel_endpoint.trim().is_empty() {
@@ -483,7 +723,24 @@ impl Config {
             otel_endpoint,
             otel_sample_rate,
             environment,
+            max_receive_slots,
+            max_receive_capability_declarations,
+            audio_encoding,
         })
+    }
+
+    /// The client-facing media-signalling configuration, as one validated
+    /// value.
+    ///
+    /// Everything here was validated at load, so this is a projection rather
+    /// than a second parse.
+    #[must_use]
+    pub fn client_media_config(&self) -> crate::media_signaling::ClientMediaConfig {
+        crate::media_signaling::ClientMediaConfig {
+            max_receive_slots: self.max_receive_slots,
+            max_receive_capability_declarations: self.max_receive_capability_declarations,
+            audio_encoding: self.audio_encoding,
+        }
     }
 
     /// Build an [`OtelConfig`] iff OTel is enabled (R-55).
@@ -505,7 +762,7 @@ impl Config {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use common::secret::ExposeSecret;
@@ -543,7 +800,200 @@ mod tests {
                 "MC_WEBTRANSPORT_ADVERTISE_ADDRESS".to_string(),
                 "https://localhost:4433".to_string(),
             ),
+            // ADR-0036 §5/§6 client-signalling keys. Values are spelled out as
+            // LITERALS, never referenced from a `DEFAULT_*` constant: a constant
+            // surviving only in a fixture reads as retired to a grep of the load
+            // path while remaining a live second encoding of the value. Same
+            // discipline as `mh-service`, which deleted
+            // `DEFAULT_MAX_CONNECTIONS`, its `unwrap_or`, AND the fixture
+            // assertion against it.
+            ("MC_MAX_RECEIVE_SLOTS".to_string(), "8".to_string()),
+            (
+                "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS".to_string(),
+                "64".to_string(),
+            ),
+            ("MC_AUDIO_CODEC".to_string(), "opus".to_string()),
+            ("MC_AUDIO_MAX_BITRATE_BPS".to_string(), "48000".to_string()),
+            ("MC_AUDIO_FRAME_RATE_HZ".to_string(), "50".to_string()),
         ])
+    }
+
+    /// Every one of the five ADR-0036 client-signalling keys is REQUIRED.
+    ///
+    /// This is the sole runtime backstop for their presence: `dt-guard
+    /// env-config` discovers them by a single-line regex over this file that a
+    /// reformat can silently defeat (see `bounded`'s rustdoc and
+    /// `docs/TODO.md` §Infrastructure Validation in Devloops), so if the guard
+    /// stops seeing a key, this test is what still fails.
+    #[test]
+    fn test_from_vars_missing_each_media_signalling_key_fails() {
+        for key in [
+            "MC_MAX_RECEIVE_SLOTS",
+            "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS",
+            "MC_AUDIO_CODEC",
+            "MC_AUDIO_MAX_BITRATE_BPS",
+            "MC_AUDIO_FRAME_RATE_HZ",
+        ] {
+            let mut vars = base_vars();
+            vars.remove(key);
+            let err = Config::from_vars(&vars)
+                .expect_err(&format!("{key} must be required, not defaulted"));
+            match err {
+                ConfigError::MissingEnvVar(name) => assert_eq!(name, key),
+                other => panic!("{key}: expected MissingEnvVar, got {other:?}"),
+            }
+        }
+    }
+
+    /// Each bounded knob is rejected on BOTH sides.
+    ///
+    /// Rejecting only the low end would leave the value an operator could
+    /// retire with a typo — a cap whose own value is unbounded is not a cap.
+    #[test]
+    fn test_from_vars_media_signalling_bounds_reject_both_ends() {
+        // (key, below-range, above-range)
+        for (key, low, high) in [
+            ("MC_MAX_RECEIVE_SLOTS", "0", "65"),
+            ("MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS", "0", "4097"),
+            ("MC_AUDIO_MAX_BITRATE_BPS", "31999", "48001"),
+            ("MC_AUDIO_FRAME_RATE_HZ", "24", "51"),
+        ] {
+            for value in [low, high] {
+                let mut vars = base_vars();
+                vars.insert(key.to_string(), value.to_string());
+                let err =
+                    Config::from_vars(&vars).expect_err(&format!("{key}={value} must be rejected"));
+                assert!(
+                    matches!(err, ConfigError::InvalidValue(_)),
+                    "{key}={value}: expected InvalidValue, got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Non-numeric values fail loud rather than silently reverting.
+    #[test]
+    fn test_from_vars_media_signalling_non_numeric_fails_loud() {
+        for key in [
+            "MC_MAX_RECEIVE_SLOTS",
+            "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS",
+            "MC_AUDIO_MAX_BITRATE_BPS",
+            "MC_AUDIO_FRAME_RATE_HZ",
+        ] {
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), "not-a-number".to_string());
+            assert!(
+                matches!(Config::from_vars(&vars), Err(ConfigError::InvalidValue(_))),
+                "{key} must fail loud on a non-numeric value"
+            );
+        }
+    }
+
+    /// An unrecognised codec is an ERROR at load, never a fall-back to Opus.
+    ///
+    /// A silent coercion would leave an operator believing they had configured
+    /// something they had not — and `CODEC_UNSPECIFIED` reaching a send
+    /// directive is what `AudioEncoding`'s private fields make unrepresentable
+    /// downstream, so this load-time check is where that guarantee starts.
+    #[test]
+    fn test_from_vars_audio_codec_rejects_unknown_unspecified_and_video() {
+        // Two DIFFERENT failure paths, asserted separately because they produce
+        // different messages and the message is the point.
+        //
+        // Asserting only `InvalidValue(_)` would be satisfied by any text at
+        // all, including a message that names no key — so a refactor dropping
+        // the key name would pass unchanged. An operator reading this in a
+        // CrashLoop needs to know WHICH variable to edit, and this is the
+        // file's own convention (see the
+        // `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` assertions below).
+
+        // Path 1: rejected in `parse_codec` — not a codec name at all.
+        for value in ["oppus", "", "unspecified"] {
+            let mut vars = base_vars();
+            vars.insert("MC_AUDIO_CODEC".to_string(), value.to_string());
+            let err = Config::from_vars(&vars)
+                .expect_err("an unrecognised codec must be rejected, never coerced to Opus");
+            match err {
+                ConfigError::InvalidValue(msg) => assert!(
+                    msg.contains("MC_AUDIO_CODEC"),
+                    "MC_AUDIO_CODEC='{value}': message must name the key, got: {msg}"
+                ),
+                other => panic!("MC_AUDIO_CODEC='{value}': expected InvalidValue, got {other:?}"),
+            }
+        }
+
+        // Path 2: a REAL codec that is not an audio codec. `parse_codec`
+        // accepts it and `AudioEncoding::new` rejects it, so this takes the
+        // message that names all three `MC_AUDIO_*` inputs.
+        for value in ["vp9", "h264", "av1"] {
+            let mut vars = base_vars();
+            vars.insert("MC_AUDIO_CODEC".to_string(), value.to_string());
+            let err = Config::from_vars(&vars)
+                .expect_err("a video codec must be rejected for an audio-only knob");
+            match err {
+                ConfigError::InvalidValue(msg) => {
+                    assert!(
+                        msg.contains("not an audio codec"),
+                        "MC_AUDIO_CODEC='{value}': expected the audio-kind reason, got: {msg}"
+                    );
+                    // All three, not just the one that happened to be wrong:
+                    // the message must stay useful if the bounds ever diverge
+                    // and another variant becomes reachable here.
+                    for key in [
+                        "MC_AUDIO_CODEC",
+                        "MC_AUDIO_MAX_BITRATE_BPS",
+                        "MC_AUDIO_FRAME_RATE_HZ",
+                    ] {
+                        assert!(
+                            msg.contains(key),
+                            "MC_AUDIO_CODEC='{value}': message must name {key}, got: {msg}"
+                        );
+                    }
+                }
+                other => panic!("MC_AUDIO_CODEC='{value}': expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
+    /// The codec parse is trimmed and case-folded, so ordinary ConfigMap
+    /// whitespace and capitalisation are accepted rather than crashing a pod.
+    #[test]
+    fn test_from_vars_audio_codec_accepts_trimmed_and_case_folded() {
+        for value in ["opus", "  opus  ", "OPUS", "Opus"] {
+            let mut vars = base_vars();
+            vars.insert("MC_AUDIO_CODEC".to_string(), value.to_string());
+            let config = Config::from_vars(&vars)
+                .unwrap_or_else(|e| panic!("MC_AUDIO_CODEC='{value}' should load: {e:?}"));
+            assert_eq!(
+                config.audio_encoding.codec(),
+                proto_gen::dark_tower::signaling::v1::Codec::Opus
+            );
+        }
+    }
+
+    /// The effective values reach `Config`, since they are what MC directs every
+    /// client's encoder with and what the startup line reports.
+    #[test]
+    fn test_from_vars_media_signalling_values_are_effective() {
+        let mut vars = base_vars();
+        vars.insert("MC_MAX_RECEIVE_SLOTS".to_string(), "3".to_string());
+        vars.insert(
+            "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS".to_string(),
+            "7".to_string(),
+        );
+        vars.insert("MC_AUDIO_MAX_BITRATE_BPS".to_string(), "32000".to_string());
+        vars.insert("MC_AUDIO_FRAME_RATE_HZ".to_string(), "25".to_string());
+
+        let config = Config::from_vars(&vars).expect("in-range values load");
+        assert_eq!(config.max_receive_slots, 3);
+        assert_eq!(config.max_receive_capability_declarations, 7);
+        assert_eq!(config.audio_encoding.max_bitrate_bps(), 32_000);
+        assert_eq!(config.audio_encoding.frame_rate_hz(), 25);
+
+        let projected = config.client_media_config();
+        assert_eq!(projected.max_receive_slots, 3);
+        assert_eq!(projected.max_receive_capability_declarations, 7);
+        assert_eq!(projected.audio_encoding, config.audio_encoding);
     }
 
     #[test]

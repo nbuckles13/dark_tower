@@ -332,6 +332,31 @@ pub fn sample_identity_public_key() -> Vec<u8> {
     mc_test_utils::media::sample_identity_public_key()
 }
 
+/// The client media-signalling configuration the suite runs against
+/// (ADR-0036 §5, §6).
+///
+/// Values are spelled out as literals rather than referenced from a `DEFAULT_*`
+/// constant. There deliberately are no such constants for the five `MC_*`
+/// media-signalling keys — they are required env vars whose documented values
+/// live in `infra/services/mc-service/configmap.yaml` — and a constant surviving
+/// only in a test fixture reads as retired to a grep of the load path while
+/// remaining a live second encoding of the value.
+///
+/// These match the ConfigMap so a test asserting on a directive's encoding
+/// parameters is asserting the shipped configuration, not a test-only one.
+pub fn client_media_config() -> mc_service::media_signaling::ClientMediaConfig {
+    mc_service::media_signaling::ClientMediaConfig {
+        max_receive_slots: 8,
+        max_receive_capability_declarations: 64,
+        audio_encoding: mc_service::media_signaling::AudioEncoding::new(
+            proto_gen::dark_tower::signaling::v1::Codec::Opus,
+            48_000,
+            50,
+        )
+        .expect("suite audio encoding is in band"),
+    }
+}
+
 /// Typed form of [`sample_identity_public_key`], for actor-level call sites
 /// that take an `IdentityPublicKey` rather than raw wire bytes.
 pub fn test_identity_key() -> Option<mc_service::media_admission::IdentityPublicKey> {

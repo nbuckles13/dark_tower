@@ -710,6 +710,59 @@ impl CounterQuery<'_> {
         );
     }
 
+    /// Read the counter's delta instead of asserting a specific value.
+    ///
+    /// Absent → `0`, on the same "empty recorder means the value IS the delta"
+    /// basis as [`Self::assert_delta`].
+    ///
+    /// # When to reach for this over `assert_delta`
+    ///
+    /// Only when the exact per-label split is genuinely not determined by the
+    /// code under test, but a RELATION between labels is. The motivating case:
+    /// a rate limiter's suppressed messages divide between two outcome labels
+    /// according to how many refill boundaries the client's writes happened to
+    /// cross, so each label's individual delta is wall-clock dependent while
+    /// their SUM is exactly the number of suppressed messages. Asserting the
+    /// sum pins the partition — no message counted nowhere — without asserting
+    /// a timing artifact.
+    ///
+    /// Prefer `assert_delta` everywhere else: it names the expected value in
+    /// the test, and it dumps failure context on mismatch, which a bare read
+    /// followed by a hand-rolled `assert_eq!` does not.
+    ///
+    /// # Why `assert_delta` does NOT delegate to this, and must not
+    ///
+    /// The two bodies share a destructure-and-validate preamble, and collapsing
+    /// them looks free. It is not, and the reason is a correctness constraint
+    /// rather than a style preference: `assert_delta` calls
+    /// `dump_failure_context` on mismatch, which needs the entries a SECOND
+    /// time. `take_entries` is non-destructive for counters and gauges but
+    /// **DRAINS histograms** (`obs.drain(..)`; see the module doc §"Histograms
+    /// DRAIN on snapshot"). A delegating `assert_delta` would therefore take
+    /// entries twice on its failure path and empty the histogram maps for any
+    /// later `HistogramQuery` in the same test — a failing counter assertion
+    /// would silently produce a confusing second failure that masks the first.
+    ///
+    /// Note the exact scope: **non-destructive for counters and gauges;
+    /// histograms drain.** The unqualified reading — "`take_entries` is
+    /// misleadingly named but non-destructive" — is false, and it is false in
+    /// the direction that licenses the collapse above. The genuinely shared
+    /// logic (`counter_value`, `ensure_no_kind_mismatch`) is already extracted
+    /// into free functions with one home each; what remains duplicated is a
+    /// preamble whose extraction would need a helper that hands back its own
+    /// inputs.
+    #[must_use]
+    pub fn delta(self) -> u64 {
+        let Self {
+            snapshot,
+            name,
+            labels,
+        } = self;
+        let entries = snapshot.take_entries();
+        ensure_no_kind_mismatch(&entries, name, MetricKind::Counter);
+        counter_value(&entries, name, &labels).unwrap_or(0)
+    }
+
     /// Assert the counter was never registered for this (name, label-filter)
     /// tuple in this snapshot window.
     ///

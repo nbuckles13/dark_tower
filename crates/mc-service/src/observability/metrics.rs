@@ -15,6 +15,7 @@
 //! Maximum 1,000 unique label combinations per metric.
 
 use crate::media_routing::{divergence_magnitude, PolicyPushOutcome};
+use crate::media_signaling::{slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::num::NonZeroU64;
@@ -430,6 +431,257 @@ pub fn record_media_policy_push(outcome: PolicyPushOutcome, sent: NonZeroU64, ap
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(magnitude);
+}
+
+// ============================================================================
+// Client-facing media signalling (ADR-0036 §5, §6, §11)
+//
+// Every metric here carries `key_custody=operator`. Every label domain is an
+// exhaustive `match` over a Rust enum with an `ALL` constant, so cardinality is
+// bounded by the type rather than by review.
+//
+// The identity rules, stated at the width the code actually keeps them — an
+// invariant claimed more strongly than it is held is worse than none, because
+// the next person auditing ADR-0036 §11 from this comment concludes something
+// false and then has to relitigate which of the two is the defect:
+//
+//   - **Meeting identifier** (raw or hashed): barred from metric LABELS and
+//     SPAN ATTRIBUTES. NOT barred from logs — §11's flat prohibition is scoped
+//     to metrics, and connection-lifecycle logs across MC carry `meeting_id` by
+//     convention. The media-signalling WARNs and DEBUGs in
+//     `webtransport::connection` carry it deliberately: it is what makes the
+//     context-unavailable WARN actionable at all.
+//   - **Participant id and stream identity** (slot id, sender id, stream
+//     number, switch command id): barred from labels, span attributes AND logs.
+//     These are the per-stream dimensions §11's log bullet names.
+// ============================================================================
+
+/// Record the disposition of one client receive-capability declaration.
+///
+/// Metric: `mc_media_receive_capability_declarations_total`
+/// Labels: `outcome`, `key_custody`
+/// Cardinality: bounded by `CapabilityOutcome::ALL`
+///
+/// **Partitions declarations**: every declaration lands in exactly one bucket of
+/// this one metric — a rejection reported on some other metric would silently
+/// break the relationship, which is why every disposition lives here.
+///
+/// **The success set is `{accepted, accepted_unchanged}`**, so the complete
+/// rejection count is `outcome!~"accepted|accepted_unchanged"`. It is NOT
+/// `outcome!="accepted"`: that counts a success as a rejection, and the success
+/// it counts is the one value a client can inflate for free, which makes
+/// anything built on it evadable or spuriously firing.
+///
+/// **`accepted` alone is the ratio denominator** — see
+/// [`CapabilityOutcome::AcceptedUnchanged`] for why that distinction is a
+/// security property rather than an accounting nicety.
+///
+/// Most rejection values are client defects. **`slot_id_not_planned` is not**: the declaration is well-formed and the wire contract permits it, and
+/// MC cannot serve it only because the join-time forwarding-policy push fixes the
+/// egress slot id before the client can declare. Its rate carries roadmap
+/// information rather than a bug report — rising means real clients are choosing
+/// slot ids MC does not plan for, i.e. the story-1 limitation is biting.
+pub fn record_receive_capability(outcome: CapabilityOutcome) {
+    counter!(
+        "mc_media_receive_capability_declarations_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record the disposition of one send-directive composition.
+///
+/// Metric: `mc_media_send_directives_total`
+/// Labels: `outcome`, `key_custody`
+/// Cardinality: bounded by `DirectiveOutcome::ALL`
+///
+/// Answers *"is MC actually telling clients to send, and when it silently isn't,
+/// why?"* — the failure a missing directive would otherwise hide entirely, since
+/// a client that is never told to send simply produces nothing.
+///
+/// The success set is `{emitted, emitted_empty_targets}`, not `{emitted}`:
+/// ADR-0036 §5 makes an empty target set a *specified* success ("that means send
+/// nothing"), and it becomes routine rather than anomalous once §7 turns off
+/// publishers nobody watches. An alerting predicate of `outcome!="emitted"` would
+/// page on a legal state.
+///
+/// `unknown_stream_number` and `transport_mode_unspecified` are **MC defects** —
+/// any non-zero value indicates a bug. The other **four** failure values are
+/// environmental: `handler_url_unresolved`, `meeting_state_unavailable`,
+/// `assignment_failed` and `no_planned_egress_slot`. All are disjoint by
+/// construction: the emit path is sequential stages and the first failing stage
+/// returns its own value.
+///
+/// **Recorded at TWO sites**, which is the point of the vocabulary: per
+/// composition in `webtransport::connection::compose_and_emit`, and once per
+/// connection at join in `handle_connection`'s context-resolution step.
+/// `no_planned_egress_slot` is reachable ONLY from the join-time site and is the
+/// most severe value on the metric — it silences a client for its whole session
+/// rather than for one declaration.
+///
+/// # The one caveat before concluding anything from a healthy graph
+///
+/// COMPOSED, not DELIVERED. `emitted` fires before `send_signaling`, so a
+/// directive composed and then lost still reads as `emitted` here. This metric
+/// answers "did MC compose a directive, and if not why" — not "was the client
+/// told to send". The two hops after it are covered by
+/// `mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`
+/// (mailbox FULL) and the `mc.webtransport.connection` delivery WARN (mailbox
+/// CLOSED). The counter is deliberately NOT moved below the send: that would
+/// conflate composition failure with delivery failure and destroy the
+/// disjoint-by-construction property.
+pub fn record_send_directive(outcome: DirectiveOutcome) {
+    counter!(
+        "mc_media_send_directives_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record one slot state conveyed to a subscriber.
+///
+/// Metric: `mc_media_slot_states_total`
+/// Labels: `slot_state`, `key_custody`
+/// Cardinality: bounded by the proto `SlotState` enum
+///
+/// The bucketed slot-state signal ADR-0036 §11 mandates, joined to no identity:
+/// it answers *how many and how bad*, and MC's own assignment state answers
+/// *who*, at investigation time, in a system that legitimately holds that
+/// mapping.
+///
+/// The label domain **mirrors the wire enum exhaustively** — all eight
+/// `SlotState` variants, not the four reachable today. A hand-picked subset needs
+/// editing every time §7 makes `switch_pending` live, and a
+/// `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
+/// visible rather than absent. Keeping the vocabulary identical to the wire's is
+/// also what makes this distribution comparable with the client's.
+pub fn record_slot_state(state: proto_gen::dark_tower::signaling::v1::SlotState) {
+    counter!(
+        "mc_media_slot_states_total",
+        "slot_state" => slot_state_label(state),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record planned egress slots a subscriber never declared.
+///
+/// Metric: `mc_media_unmatched_plan_slots_total`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// MH is forwarding egress that this subscriber will never accept — wasted
+/// uplink and handler work. Reachable in this story through the zero-audio
+/// exemption: a subscriber declaring no audio slot is accepted (it is asking to
+/// send without receiving), and MC's planned audio slot then matches nothing.
+///
+/// **A non-zero value is client-conformance-driven, not necessarily an MC
+/// defect.** The mirror of `slot_id_not_planned` on the capability counter: the
+/// two are the directions of one join — *plan's slot was not declared* here,
+/// *client's slot has no plan* there. Do not transpose them.
+///
+/// Its denominator is per-planned-slot, not per-directive, which is why it is a
+/// separate series rather than a value on the slot-state counter.
+pub fn record_unmatched_plan_slots(count: usize) {
+    if count == 0 {
+        return;
+    }
+    // The facade owns the width conversion so no call site needs a cast. The
+    // saturation is unreachable (the count is bounded by the declared-slot cap,
+    // itself bounded at 64 by config) and is a total conversion rather than a
+    // panic on a metric path.
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    counter!(
+        "mc_media_unmatched_plan_slots_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(count);
+}
+
+/// Record the disposition of one client `MuteRequest`.
+///
+/// Metric: `mc_media_mute_requests_total`
+/// Labels: `outcome`, `key_custody`
+/// Cardinality: bounded by `MuteOutcome::ALL`
+///
+/// Answers *"is client mute being applied, and when it is not, why?"*, and it is
+/// the only visibility into the mute-work rate limiter. Mute is the one
+/// repeatable client-driven path that puts work on the SHARED meeting actor's
+/// mailbox — one `GetState` roster snapshot per composition — so `rate_limited`
+/// is the series that says a connection is driving mute recomposition hard
+/// enough to be clamped. That cost is dominated by the PER-CONNECTION
+/// composition; see the note below on why this is not a meeting-wide signal.
+///
+/// The success set is `{applied, applied_no_recompose}`. **`unchanged` is not a
+/// failure** — it is an identical repeat that MC correctly did no work for — and
+/// `applied_no_recompose` is likewise routine, being what an ordinary camera
+/// button produces. So the failure predicate is
+/// `outcome=~"rate_limited|actor_unavailable"`, NOT `outcome!="applied"`.
+///
+/// **`rate_limited` is not by itself an incident.** A human never reaches the
+/// limiter; a sustained non-zero rate means one connection is toggling far above
+/// human rates, which is a client defect or an abusive peer, and it is bounded
+/// to that connection either way.
+///
+/// **It is NOT a meeting-wide contention signal.** It was documented as one
+/// while `handle_self_mute` still drove an O(N) awaited `broadcast_update`;
+/// security's S-2 removed that fan-out (`MuteChanged` had no consumer), so what
+/// remains on the SHARED meeting actor is one `GetState` roster snapshot per
+/// composition — a queue slot, not head-of-line blocking. Do not route a
+/// meeting-wide latency investigation here.
+pub fn record_mute_request(outcome: MuteOutcome) {
+    counter!(
+        "mc_media_mute_requests_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+// ============================================================================
+// Participant outbound delivery
+//
+// DELIBERATELY OUTSIDE the media-path invariants stated in the section header
+// above, on both counts, and filed separately so neither exemption reads as an
+// oversight to a future reader:
+//
+//   - **No `key_custody` label.** This is the generic outbound signalling choke
+//     point, not a media-path metric. Fleet-wide `key_custody` rollout is
+//     R-26 / story task 22.
+//   - **The label domain is NOT an exhaustive enum.** `payload_kind` is a
+//     `&'static str` bounded by there being exactly two `try_send` sites in
+//     `actors/participant.rs`, each naming its own constant. A third call site
+//     must add a constant there rather than pass a literal.
+//
+// Mirrors the section split in `docs/observability/metrics/mc-service.md`.
+// ============================================================================
+
+/// Record an outbound signalling message dropped at the participant mailbox.
+///
+/// Metric: `mc_participant_outbound_messages_dropped_total`
+/// Labels: `payload_kind`
+/// Cardinality: bounded by the two `try_send` sites in `actors/participant.rs`
+///
+/// A full or closed participant outbound channel means the client did not
+/// receive something MC decided to send. Previously WARN-only, which made the
+/// loss unqueryable.
+///
+/// **Deliberately a new metric, not a fourth `actor_type` on
+/// `mc_messages_dropped_total`.** That one is fed by `MailboxMonitor` on the
+/// *inbound* actor path; a pseudo-`actor_type` value would corrupt the `topk`
+/// on the cross-service errors dashboard.
+///
+/// See the section header above for why this carries no `key_custody` and why
+/// its label domain is bounded by call sites rather than by an exhaustive enum.
+/// Not `reason` either — that key is spoken for by the frame reject vocabulary.
+pub fn record_participant_outbound_dropped(payload_kind: &'static str) {
+    counter!(
+        "mc_participant_outbound_messages_dropped_total",
+        "payload_kind" => payload_kind
+    )
+    .increment(1);
 }
 
 // ============================================================================

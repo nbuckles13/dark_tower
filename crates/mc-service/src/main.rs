@@ -131,8 +131,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_meetings = config.max_meetings,
         max_participants = config.max_participants,
         binding_token_ttl_seconds = config.binding_token_ttl_seconds,
+        // ADR-0036 §5/§6 client-signalling knobs, logged as EFFECTIVE values.
+        //
+        // The ConfigMap cannot answer "what did this process actually receive?" —
+        // the ConfigMap being out of step with what the Deployment injects IS the
+        // failure mode these required keys create, so the artifact under
+        // suspicion cannot also be the evidence. A missing key is loud
+        // (CrashLoop, `logs --previous` names it); a WRONG-BUT-VALID value is
+        // silent, and this line is the only record of it. Same discipline as
+        // mh-service, which logs every effective transport value and its derived
+        // drain window in one structured startup line.
+        max_receive_slots = config.max_receive_slots,
+        max_receive_capability_declarations = config.max_receive_capability_declarations,
+        audio_codec = ?config.audio_encoding.codec(),
+        audio_max_bitrate_bps = config.audio_encoding.max_bitrate_bps(),
+        audio_frame_rate_hz = config.audio_encoding.frame_rate_hz(),
         "Configuration loaded successfully"
     );
+
+    // A frame rate other than 50 Hz is LEGAL and deliberately reachable —
+    // ADR-0036 §3 names 40 ms frames (25 Hz) as the signature-overhead
+    // mitigation, so pinning this to 50 would block a designed route. But
+    // mh-service sizes its datagram send buffer in BYTES against 20 ms frames,
+    // and MC cannot validate against that constant (it is private, and importing
+    // mh-service would be worse than the problem). So the available control is
+    // to make the divergence LOUD at the moment an operator can still act on it,
+    // rather than leaving it to a comment in a file they may never open.
+    // Compared against the MH SIZING anchor, never against the band ceiling.
+    // The two are equal today; anchoring on the ceiling would invert this
+    // warning the moment the band is widened — see the constant's rustdoc.
+    if config.audio_encoding.frame_rate_hz()
+        != mc_service::media_signaling::AUDIO_FRAME_RATE_MH_SIZING_HZ
+    {
+        warn!(
+            audio_frame_rate_hz = config.audio_encoding.frame_rate_hz(),
+            expected_by_media_handler_sizing =
+                mc_service::media_signaling::AUDIO_FRAME_RATE_MH_SIZING_HZ,
+            "MC is directing an audio frame rate other than 20 ms frames. mh-service sizes its \
+             datagram send buffer against 20 ms frames, so its reported buffer latency will \
+             UNDERSTATE the real held latency until its AUDIO_FRAME_DURATION_MS is confirmed to \
+             match. This is a coordinated change with media-handler, not a unilateral one."
+        );
+    }
 
     // Initialize Prometheus metrics recorder (ADR-0011)
     // This must happen before any metrics are recorded
@@ -424,6 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&policy_generations),
         config.mc_id.clone(),
         config.grpc_advertise_address.clone(),
+        config.client_media_config(),
         config.max_participants as usize,
         std::time::Duration::from_secs(config.quic_max_idle_timeout_seconds),
         shutdown_token.child_token(),

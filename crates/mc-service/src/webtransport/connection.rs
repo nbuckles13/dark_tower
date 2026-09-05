@@ -8,7 +8,8 @@
 
 use crate::actors::messages::{DisconnectCause, JoinResult};
 use crate::actors::{
-    BoundedMhStatus, MeetingControllerActorHandle, MhState, ParticipantActorHandle,
+    BoundedMhStatus, MeetingActorHandle, MeetingControllerActorHandle, MhState,
+    ParticipantActorHandle,
 };
 use crate::auth::McJwtValidator;
 use crate::errors::McError;
@@ -17,11 +18,17 @@ use crate::media_routing::{
     compute_assignment, HandlerId, MeetingAssignment, MeetingRoutingInput, PolicyGenerations,
     PushDisposition, RoutingParticipant,
 };
+use crate::media_signaling::{
+    build_send_directive, build_stream_assignments, CapabilityOutcome, DirectiveOutcome,
+    HandlerUrls, MediaStreamPolicy, MuteOutcome, PlannedAudioSlot, ReceiveCapabilityDeclaration,
+    SlotId, SourceMuteView,
+};
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
 
 use super::trace::{inject_current_context, reparent_current_span};
 
+use crate::actors::messages::SignalingPayload;
 use bytes::{BufMut, BytesMut};
 use common::jwt::MeetingRole;
 use prost::Message;
@@ -190,6 +197,7 @@ pub async fn handle_connection(
     policy_generations: Arc<PolicyGenerations>,
     mc_id: String,
     mc_grpc_endpoint: String,
+    client_media_config: crate::media_signaling::ClientMediaConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), McError> {
     // Step 1: Accept the WebTransport session
@@ -645,6 +653,9 @@ pub async fn handle_connection(
         match build_routing_input(&join_result, &mh_data) {
             Ok(routing_input) => match compute_assignment(&routing_input) {
                 Ok(assignment) => {
+                    // Cloned for the spawned task: the caller still needs
+                    // `mh_data` below to resolve this connection's handler urls.
+                    let reg_mh_data = mh_data.clone();
                     let reg_mh_client = Arc::clone(&mh_client);
                     let reg_generations = Arc::clone(&policy_generations);
                     let reg_meeting_id = meeting_id.clone();
@@ -660,7 +671,7 @@ pub async fn handle_connection(
                         async move {
                             register_meeting_with_handlers(
                                 reg_mh_client.as_ref(),
-                                &mh_data,
+                                &reg_mh_data,
                                 &assignment,
                                 reg_generations.as_ref(),
                                 &reg_meeting_id,
@@ -705,6 +716,54 @@ pub async fn handle_connection(
         );
     }
 
+    // Step 9b: Resolve the per-connection media-signalling context (ADR-0036
+    // §5, §6).
+    //
+    // Everything the receive-capability validation path needs is resolved HERE,
+    // once, so that path never touches the meeting actor: the client-facing
+    // handler urls (server-derived, from the Redis assignment — never from a
+    // client's `MediaConnectionUpdate`) and the audio slot MC's forwarding
+    // assignment routes this subscriber into.
+    //
+    // The assignment is computed for EVERY connection, not just the first
+    // participant's. It is a pure function with no I/O and no actor hop, and
+    // reading the planned slot out of its output is what keeps
+    // `compute_assignment` the single producer of "which slot do I route into"
+    // rather than having MC reconstruct it from `MAIN_AUDIO_SLOT_ID` separately.
+    // The MH push remains first-participant-only and is unchanged.
+    let media_context = build_media_signaling_context(
+        &controller_handle,
+        &join_result,
+        &mh_data,
+        &meeting_id,
+        client_media_config,
+    )
+    .await;
+    let mut media_context = match media_context {
+        Ok(context) => Some(context),
+        Err(outcome) => {
+            // COUNTED, not merely warned. This is the one failure that silences
+            // a client for its entire session, so it is the last place the
+            // "every reason MC did not COMPOSE a directive lands on one counter"
+            // claim may be allowed to leak — a WARN alone would make it visible
+            // only to whoever happens to read the logs.
+            //
+            // Loud once, here, where it can be attributed to this connection —
+            // and NOT re-logged per client message. The session stays usable:
+            // the client simply is never directed to send.
+            metrics::record_send_directive(outcome);
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                outcome = outcome.label(),
+                "Media signalling context unavailable; this connection will not receive a send \
+                 directive or slot assignments"
+            );
+            None
+        }
+    };
+
     // Step 10: Run bridge loop — forward ParticipantActor updates to client
     // outbound_tx was passed through the join flow and is now owned by ParticipantActor.
     // outbound_rx receives encoded protobuf bytes written by ParticipantActor.
@@ -717,6 +776,7 @@ pub async fn handle_connection(
         &connection,
         &connection_id,
         &join_result.participant_handle,
+        &mut media_context,
     )
     .await;
 
@@ -761,6 +821,10 @@ pub async fn handle_connection(
 /// Each arm cleanly `return`s or `break`s — no busy-loop. A FRESH
 /// `connection.closed()` future is created each iteration (cancellation-safe to
 /// re-poll).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bridge-loop wiring; all params are distinct per-connection dependencies"
+)]
 async fn run_bridge_loop(
     send_stream: &mut SendStream,
     recv_stream: &mut RecvStream,
@@ -769,6 +833,7 @@ async fn run_bridge_loop(
     connection: &Connection,
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
+    media: &mut Option<MediaSignalingContext>,
 ) -> DisconnectCause {
     loop {
         tokio::select! {
@@ -830,7 +895,30 @@ async fn run_bridge_loop(
             result = read_framed_message(recv_stream) => {
                 match result {
                     Ok(data) => {
-                        handle_client_message(&data, connection_id, participant_handle).await;
+                        // Media signalling needs the per-connection context
+                        // resolved at join. If it could not be built, the
+                        // connection stays healthy and every other post-join
+                        // message keeps working — the failure was already logged
+                        // loudly at join and must not be re-logged per message.
+                        match media.as_mut() {
+                            Some(media) => {
+                                handle_client_message(
+                                    &data,
+                                    connection_id,
+                                    participant_handle,
+                                    media,
+                                )
+                                .await;
+                            }
+                            None => {
+                                handle_client_message_without_media(
+                                    &data,
+                                    connection_id,
+                                    participant_handle,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Err(e) => {
                         // The client's recv stream ended. Resolve the authoritative
@@ -857,11 +945,28 @@ async fn run_bridge_loop(
 /// - `MediaConnectionUpdate` (R-60): records per-MH state on the participant
 ///   actor under its own reparented child span (see
 ///   [`handle_media_connection_update`]).
+/// - `ReceiveCapability` (ADR-0036 §6): validates the declaration, then emits a
+///   send directive and the slot assignments composed from one meeting-state
+///   snapshot.
+/// - `MuteRequest` (ADR-0036 §5): records the reported client mute on the
+///   meeting actor and re-conveys slot state. **Never touches the send
+///   directive** — that invariant is enforced by the module boundary in
+///   `media_signaling::directive`, which has no path to mute state at all.
+/// - `ServerMuteRequest`: consumed as a rename of the former host-mute message
+///   with NO behaviour change. Enforcement is at MH ingress and is story 2.
 /// - All other messages: Ignored (logged at debug level).
+///
+/// # A client that never declares is never told to send
+///
+/// Directive emission is triggered by the capability declaration, not by the
+/// join, and that is contractual rather than incidental — see the
+/// `media_signaling` module doc. Such a connection stays healthy: no directive,
+/// no assignments, no error, and every other post-join message keeps working.
 async fn handle_client_message(
     data: &[u8],
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
 ) {
     let Ok(client_message) = ClientMessage::decode(data) else {
         debug!(
@@ -886,6 +991,20 @@ async fn handle_client_message(
                 participant_handle,
             )
             .await;
+        }
+        Some(client_message::Message::ReceiveCapability(capability)) => {
+            handle_receive_capability(
+                &capability,
+                &trace_parent,
+                &trace_state,
+                connection_id,
+                participant_handle,
+                media,
+            )
+            .await;
+        }
+        Some(client_message::Message::MuteRequest(request)) => {
+            handle_mute_request(&request, connection_id, participant_handle, media).await;
         }
         Some(_) => {
             debug!(
@@ -972,6 +1091,1002 @@ async fn handle_media_connection_update(
             error = %e,
             "Failed to deliver MediaConnectionUpdate to participant actor"
         );
+    }
+}
+
+/// Mute-work tokens a fresh connection may spend immediately.
+///
+/// Sized far above human behaviour: a push-to-talk user produces roughly one
+/// toggle per utterance, so a burst of 8 covers any realistic flurry (unmute,
+/// speak, mute, correct, unmute) without ever reaching the limiter.
+///
+/// A Rust constant rather than a config key, matching
+/// [`MAX_MH_STATUSES_PER_UPDATE`] and [`MAX_CLIENT_STRING_BYTES`] in this file:
+/// these are client-input security caps with no operator-tuning story.
+const MUTE_WORK_BURST: u32 = 8;
+
+/// Rejection RESPONSES a fresh connection may be sent immediately.
+///
+/// Sized for a client correcting itself, not for one looping: a legitimate SDK
+/// gets its declaration wrong a handful of times at most (wrong slot id, then a
+/// pin it should not have set, then right). 8 covers that with room.
+const CAPABILITY_REJECTION_BURST: u32 = 8;
+
+/// Milliseconds per refilled rejection-response token — 1 s.
+///
+/// Slower than the mute bucket because the two actions differ in kind: a mute
+/// toggle is an ongoing user action for the life of the session, whereas
+/// re-declaring capability is a correction that converges. A client still
+/// rejecting once a second after the burst is looping, not converging.
+const CAPABILITY_REJECTION_REFILL_INTERVAL_MS: u64 = 1_000;
+
+/// Milliseconds per refilled mute-work token — 250 ms, i.e. 4 per second
+/// sustained.
+///
+/// Above any human toggle rate and roughly three to four orders of magnitude
+/// below what a client can send on an idle QUIC connection.
+const MUTE_WORK_REFILL_INTERVAL_MS: u64 = 250;
+
+/// Per-connection token bucket bounding a repeatable client-driven action.
+///
+/// # Why a rate limit and NOT a budget
+///
+/// The receive-capability path takes a cumulative budget for ACCEPTED
+/// declarations because re-declaring is rare and a client that stops
+/// re-declaring loses nothing. The two actions bounded here are the opposite:
+/// repeatable steady-state paths that must keep working for the life of the
+/// session. A cumulative budget would spend out and then permanently deny —
+/// freezing `audio_self_muted` on the roster so every other participant renders
+/// a live speaker as muted, or silencing the error a client needs in order to
+/// correct its declaration.
+///
+/// A rate limit bounds work per unit time and never permanently denies. See
+/// `media_signaling`'s module doc for the criterion in general form.
+///
+/// # Two instances, deliberately not one shared bucket
+///
+/// [`MediaSignalingContext`] holds a separate bucket per bounded path, so a
+/// client flooding malformed declarations cannot also suppress its own mute
+/// reports (or the reverse). One shared bucket would make each path a denial
+/// vector against the other, which is the amplification problem one level down.
+#[derive(Debug)]
+struct ClientWorkLimiter {
+    tokens: u32,
+    burst: u32,
+    refill_interval_ms: u64,
+    refilled_at: Instant,
+}
+
+impl ClientWorkLimiter {
+    fn new(now: Instant, burst: u32, refill_interval_ms: u64) -> Self {
+        Self {
+            tokens: burst,
+            burst,
+            refill_interval_ms,
+            refilled_at: now,
+        }
+    }
+
+    /// Refill, then spend one token. `false` means the caller must do no work.
+    ///
+    /// Tokens are spent ONLY on work actually about to be done — the caller
+    /// short-circuits identical repeats before reaching here. Draining the
+    /// bucket on no-op messages would let a client spamming a steady state
+    /// suppress its own next genuine toggle, and would report `rate_limited`
+    /// while the expensive path was never approached.
+    fn try_spend(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed_ms = now.saturating_duration_since(self.refilled_at).as_millis();
+        let earned = elapsed_ms / u128::from(self.refill_interval_ms);
+        if earned == 0 {
+            return;
+        }
+        if earned >= u128::from(self.burst) {
+            // Long enough idle that the bucket is full however the arithmetic
+            // is rounded; reset the clock rather than advance it, which also
+            // keeps `Duration` multiplication away from overflow.
+            self.tokens = self.burst;
+            self.refilled_at = now;
+            return;
+        }
+        // `earned < self.burst` here, so the narrowing cannot lose a token.
+        let earned = u32::try_from(earned).unwrap_or(self.burst);
+        self.tokens = self.tokens.saturating_add(earned).min(self.burst);
+        // Advance by exactly what was granted, so a sub-interval remainder is
+        // carried rather than discarded — otherwise a client polling just under
+        // the interval would earn nothing forever.
+        self.refilled_at += Duration::from_millis(u64::from(earned) * self.refill_interval_ms);
+    }
+}
+
+/// `message_kind` for the rejection `ErrorMessage` on the capability path.
+const SIGNALING_KIND_CAPABILITY_REJECTION: &str = "capability_rejection";
+
+/// `message_kind` for the ADR-0036 §5 send directive.
+const SIGNALING_KIND_SEND_DIRECTIVE: &str = "send_directive";
+
+/// `message_kind` for the ADR-0036 §6 slot assignments.
+const SIGNALING_KIND_STREAM_ASSIGNMENTS: &str = "stream_assignments";
+
+/// Per-connection state for the ADR-0036 §5/§6 client-facing media signalling.
+///
+/// Owned by the single-threaded bridge loop, so no lock: every field is read and
+/// written from one task.
+///
+/// # Every rejection is decidable from this struct alone
+///
+/// [`Self::planned_audio_slot`] and [`Self::handler_urls`] are resolved ONCE, at
+/// join, from the same `compute_assignment` output the MC→MH control plane is
+/// programmed from. That is what lets the whole receive-capability validation
+/// path run without touching the meeting actor — a client looping unservable
+/// declarations cannot drive an O(N) roster clone per message through the shared
+/// mailbox, and only *accepted* declarations reach `get_state()`, bounded by
+/// [`Self::declaration_budget`].
+///
+/// Caching is sound because the values can only change if the pushed forwarding
+/// policy changes, and the only trigger for that in this story is the
+/// first-participant join, which precedes every post-join dispatch. The
+/// capability-triggered re-push story retires this cache.
+///
+/// # TWO client-driven paths reach `get_state()`, and BOTH are bounded
+///
+/// Naming both, because the bound is the security property and a third caller
+/// added without one would reinstate the amplification this struct exists to
+/// prevent:
+///
+/// - **capability** — only *accepted* declarations reach it, bounded per
+///   connection by [`Self::declaration_budget`]; every rejection is decided from
+///   this struct alone.
+/// - **client mute** — bounded by [`Self::mute_limiter`], a RATE limit rather
+///   than a budget, because mute is a repeatable steady-state user action and a
+///   cumulative budget would permanently deny it. Layered on two
+///   short-circuits that cost nothing: an identical repeat never reaches the
+///   actor, and a video-only change never reaches the recomposition.
+///
+/// **If you add a third caller of `compose_and_emit`, it needs its own bound** —
+/// and see `media_signaling`'s module doc for choosing which KIND of bound.
+struct MediaSignalingContext {
+    /// Live handle to the meeting actor, taken once at join.
+    meeting_handle: MeetingActorHandle,
+    /// This connection's participant id, for the self-mute report.
+    participant_id: String,
+    /// This connection's own sender handle.
+    sender_id: crate::media_admission::SenderId,
+    /// Server-derived client-facing handler urls. NEVER sourced from a client's
+    /// `MediaConnectionUpdate` — see [`HandlerUrls`].
+    handler_urls: HandlerUrls,
+    /// Handlers assigned to this meeting, for rebuilding the routing input.
+    ///
+    /// # A per-connection cache used as a MEETING-WIDE fact
+    ///
+    /// Unlike [`Self::handler_urls`] and [`Self::planned_audio_slot`], which are
+    /// this subscriber's own, this list is applied to EVERY participant on the
+    /// roster when the routing input is rebuilt. That is sound only because the
+    /// handler set is currently a property of the meeting rather than of a
+    /// participant: it is read from the meeting's `MhAssignmentData`, and every
+    /// participant is on every assigned handler (clients `connectAll()`), which
+    /// is the same assumption `routing_input_for` fills in one place.
+    ///
+    /// **It stops being sound the moment per-participant handler placement
+    /// lands** — participants on different handlers would all be described with
+    /// this connection's set, and the composed assignment would name handlers a
+    /// source is not actually on. The fix then is to carry membership on the
+    /// roster snapshot instead of caching it here; `routing_input_for` is the
+    /// single site that would consume it.
+    ///
+    /// Also stale if a meeting's handler assignment changes mid-session, which
+    /// nothing in this story does — the same soundness condition as
+    /// [`Self::planned_audio_slot`], retired by the same re-push story.
+    handlers: Vec<HandlerId>,
+    /// The audio slot MC's assignment routes this subscriber's audio into.
+    planned_audio_slot: PlannedAudioSlot,
+    /// The stream-number to media-kind/encoding table MC directs from.
+    stream_policy: MediaStreamPolicy,
+    /// Configured cap on declared slots per declaration.
+    max_receive_slots: usize,
+    /// Remaining budget of ACCEPTED declarations on this connection.
+    declaration_budget: u32,
+    /// The last accepted declaration, if any.
+    ///
+    /// Doubles as the identical-redeclaration short-circuit: an unchanged
+    /// declaration is answered without a meeting-state read.
+    declaration: Option<ReceiveCapabilityDeclaration>,
+    /// The last client-mute pair this connection reported.
+    ///
+    /// The mute-path counterpart of the identical-redeclaration short-circuit,
+    /// and it exists for the same reason: `MuteRequest` is otherwise the
+    /// cheapest way to drive an actor round trip plus an O(N) roster clone plus
+    /// an assignment computation, from a ~4-byte message, unbounded — because
+    /// the declaration budget charges only on the capability path.
+    ///
+    /// SOUND because `audio_self_muted`/`video_self_muted` have exactly ONE
+    /// writer in the tree (`MeetingActor::handle_self_mute`); `handle_server_mute`
+    /// writes only the `*_server_muted` fields. So a connection-local cache of
+    /// what this client last *reported* cannot drift from actor state.
+    ///
+    /// Behaviour-preserving: a genuine mute→unmute→mute cycle changes the pair
+    /// every time and passes straight through, so R-2's instantaneous unmute is
+    /// untouched. Only true no-ops are dropped. `None` at join, so the first
+    /// report always passes.
+    last_reported_mute: Option<(bool, bool)>,
+    /// Bounds client-driven mute work.
+    ///
+    /// Mute is the only repeatable client-driven path that puts work on the
+    /// SHARED meeting actor's mailbox — one `GetState` roster snapshot per
+    /// composition. The O(N) awaited `broadcast_update` this bound was
+    /// originally sized against was removed by S-2 (`MuteChanged` had no
+    /// consumer), so the meeting-wide blast radius is now a queue slot rather
+    /// than head-of-line blocking, and the dominant remaining cost is the
+    /// per-connection composition. The bound is still required — it is still
+    /// unbounded client-driven work — but it is no longer a meeting-wide
+    /// contention control, and `rate_limited` must not be read as one.
+    mute_limiter: ClientWorkLimiter,
+
+    /// Bounds the rejection RESPONSE, not the counting (ADR-0036 §6).
+    ///
+    /// A rejected declaration is ~12 bytes inbound and provokes a ~120-byte
+    /// `ErrorMessage` out (the static text plus a 55-byte W3C `traceparent`),
+    /// through a `ServerMessage` clone, a context injection, an encode, an
+    /// awaited participant-mailbox hop and a QUIC stream write — roughly 10x
+    /// egress amplification at 1:1 with inbound, and it shares the 200-slot
+    /// participant mailbox with roster broadcasts, so a flooding client can
+    /// drop its OWN `ParticipantJoined`/`Left` updates.
+    ///
+    /// The counter and the one-shot WARN are deliberately OUTSIDE this bound:
+    /// rejections stay fully observable however fast they arrive, and only the
+    /// reply is rationed. Rejections are also deliberately not budget-charged —
+    /// a budget here would permanently deny, which is the same objection that
+    /// ruled out a cumulative budget for mute.
+    ///
+    /// NOT one-shot per connection: a legitimate client's second rejection is
+    /// usually a genuinely different one it needs to see in order to converge.
+    rejection_reply_limiter: ClientWorkLimiter,
+    /// Whether the mute rate limit has already been logged on this connection.
+    ///
+    /// Same one-shot discipline as [`Self::rejection_logged`], and for the same
+    /// reason: the condition is client-driven, so a line per message is a
+    /// log-amplification vector and the counter is the complete record.
+    mute_rate_limit_logged: bool,
+    /// Whether a capability rejection has already been logged on this
+    /// connection.
+    ///
+    /// Rejections are ALWAYS counted; the WARN fires once. A per-message log on
+    /// a client-driven path is a log-amplification vector, and the second
+    /// identical line tells an operator nothing the counter does not.
+    rejection_logged: bool,
+
+    /// One-shot bound on the rejection-reply-suppressed WARN.
+    rejection_reply_suppressed_logged: bool,
+}
+
+impl MediaSignalingContext {
+    /// Consume one unit of declaration budget if any remains.
+    ///
+    /// Kept behind one function taking the declaration context and returning a
+    /// decision, deliberately NOT inlined into the dispatch arm: a token-bucket
+    /// rate limit — the better model once a real user re-lays-out a grid over a
+    /// long session — must be able to replace this without touching the call
+    /// site. That substitutability is what makes the cap-over-bucket choice
+    /// cheap to revisit rather than a claim nobody can act on.
+    fn budget_remaining(&self) -> bool {
+        self.declaration_budget > 0
+    }
+
+    fn charge_budget(&mut self) {
+        self.declaration_budget = self.declaration_budget.saturating_sub(1);
+    }
+}
+
+/// Resolve the audio slot MC's forwarding assignment routes `subscriber` into.
+///
+/// Read out of the assignment output rather than reconstructed from
+/// `MAIN_AUDIO_SLOT_ID`, so MC keeps exactly one answer to "which slot do I route
+/// into" — the assignment computation is the sole producer, here as on the MH
+/// control plane.
+fn planned_audio_slot_for(
+    assignment: &MeetingAssignment,
+    subscriber: crate::media_admission::SenderId,
+) -> Option<SlotId> {
+    assignment
+        .per_handler
+        .values()
+        .flat_map(|h| h.egress_streams.iter())
+        .find(|plan| plan.subscriber == subscriber)
+        .map(|plan| SlotId::from_u16(plan.slot_id))
+}
+
+/// Handle a post-join `ReceiveCapability` (ADR-0036 §6).
+///
+/// Validate, then compose and emit the send directive and the slot assignments
+/// from ONE meeting-state snapshot — which is what keeps the directive's target
+/// set and the assignments' sources from disagreeing, and costs one actor round
+/// trip rather than two.
+///
+/// Every rejection short-circuits before the snapshot is read.
+#[instrument(
+    target = "mc.webtransport.connection",
+    name = "mc.receive_capability",
+    skip_all,
+    fields(connection_id = %connection_id, slot_count = capability.slots.len())
+)]
+async fn handle_receive_capability(
+    capability: &v1::ReceiveCapability,
+    trace_parent: &str,
+    trace_state: &str,
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
+) {
+    reparent_current_span(trace_parent, trace_state);
+
+    let declaration = match ReceiveCapabilityDeclaration::parse(
+        capability,
+        media.max_receive_slots,
+        media.budget_remaining(),
+        media.planned_audio_slot,
+    ) {
+        Ok(declaration) => declaration,
+        Err(outcome) => {
+            reject_capability(outcome, connection_id, participant_handle, media).await;
+            return;
+        }
+    };
+
+    // Identical re-declaration: MC does NO work and sends NOTHING — it returns
+    // before `compose_and_emit`, before the meeting-state read, and charges no
+    // budget. Recorded under its own outcome rather than as `Accepted`, because
+    // `accepted` means "declarations MC acted on" and is the denominator for any
+    // rejection ratio; this arm is client-inflatable at near-zero server cost
+    // and must never inflate that denominator.
+    //
+    // No log line: this is a client-driven path, so one line per message is a
+    // log-amplification vector, and the counter is the complete record. Same
+    // reasoning as the one-shot rejection WARN.
+    if media.declaration.as_ref() == Some(&declaration) {
+        metrics::record_receive_capability(CapabilityOutcome::AcceptedUnchanged);
+        return;
+    }
+
+    media.charge_budget();
+    metrics::record_receive_capability(CapabilityOutcome::Accepted);
+
+    // ARM the identical-redeclaration short-circuit only if the composition
+    // actually delivered. Same ordering discipline as `last_reported_mute`
+    // below, and for a sharper reason.
+    //
+    // Arming it first and then failing to compose leaves the connection
+    // PERMANENTLY DARK: the client's natural recovery is to re-send the same
+    // declaration, that now matches the stored value, and it is answered
+    // `accepted_unchanged` — no directive, no assignments, no error, and the
+    // rejection WARN is one-shot so nothing is logged either. Only a full
+    // reconnect escapes. Restoring the previous declaration on failure makes the
+    // retry work.
+    //
+    // The budget is deliberately NOT refunded. Charging on every accepted
+    // declaration — including ones whose composition failed — is what keeps
+    // retries bounded, so this stays a retryable path rather than an unbounded
+    // one.
+    let previous = media.declaration.replace(declaration);
+    if !compose_and_emit(connection_id, participant_handle, media, true).await {
+        media.declaration = previous;
+    }
+}
+
+/// Count, bound-log, and answer a rejected declaration.
+///
+/// The counter always fires; the WARN fires once per connection. The rejection
+/// token is logged; the offending `slot_id` / `pinned_sender_id` value never is —
+/// those are stream identities (ADR-0036 §11) and a per-message log carrying
+/// client-chosen values is a log-amplification vector besides.
+async fn reject_capability(
+    outcome: CapabilityOutcome,
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
+) {
+    metrics::record_receive_capability(outcome);
+
+    if !media.rejection_logged {
+        media.rejection_logged = true;
+        if outcome == CapabilityOutcome::SlotIdNotPlanned {
+            // Not a client defect. The declaration is well-formed and the wire
+            // contract permits it: MH stamps the relay-region stream id from the
+            // policy pushed at first-participant join, before this client could
+            // declare, so MC cannot address a slot it did not plan. Named
+            // explicitly because the bare token reads as "bad client" and sends
+            // an operator into the SDK.
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                outcome = outcome.label(),
+                "Rejecting receive capability: the declared audio slot is not the one MC's \
+                 forwarding assignment routes this subscriber into. This is an MC limitation, \
+                 not a client defect — the join-time policy push fixes the egress slot id \
+                 before a client can declare. Further rejections on this connection are \
+                 counted, not logged."
+            );
+        } else {
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                outcome = outcome.label(),
+                "Rejecting receive capability declaration. Further rejections on this \
+                 connection are counted, not logged."
+            );
+        }
+    }
+
+    // Bound the REPLY only. The counter above already fired and the WARN has
+    // already had its one-shot chance, so a flooding client stays fully
+    // observable; what it stops buying is ~10x egress amplification and
+    // contention for its own participant mailbox. Spent here — after the
+    // counter, before the send — so a suppressed rejection is counted, not
+    // silent.
+    if !media.rejection_reply_limiter.try_spend(Instant::now()) {
+        if !media.rejection_reply_suppressed_logged {
+            media.rejection_reply_suppressed_logged = true;
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                "Capability rejection replies on this connection exceeded the sustained rate \
+                 limit and are being suppressed. Rejections are still counted on \
+                 mc_media_receive_capability_declarations_total. A converging client never \
+                 reaches this bound, so the likely cause is a client-side repeat loop."
+            );
+        }
+        return;
+    }
+
+    send_signaling(
+        participant_handle,
+        connection_id,
+        SIGNALING_KIND_CAPABILITY_REJECTION,
+        &ServerMessage {
+            message: Some(server_message::Message::Error(ErrorMessage {
+                code: v1::ErrorCode::InvalidRequest as i32,
+                // A bounded `&'static str`. No client-supplied value is echoed
+                // back on any path, so this cannot become a reflection vector.
+                message: outcome.client_message().to_string(),
+                details: Default::default(),
+            })),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        },
+    )
+    .await;
+}
+
+/// Handle a post-join `MuteRequest` (ADR-0036 §5 client mute).
+///
+/// Records the reported state on the meeting actor (the single home for mute)
+/// and re-conveys slot state so a subscriber sees `SLOT_STATE_SOURCE_MUTED`.
+///
+/// # Three guards, in this order, and the order is the security property
+///
+/// 1. **Identical repeat** — returns before the actor hop and before spending a
+///    token, so a client stuck on one state costs a tuple compare.
+/// 2. **Rate limit** ([`ClientWorkLimiter`]) — spent only on work about to be
+///    done. This is the bound on the only repeatable client-driven path that
+///    puts work on the SHARED meeting actor's mailbox (one `GetState` per
+///    composition). It is NOT a bound on an O(N) fan-out any more: S-2 removed
+///    `handle_self_mute`'s `broadcast_update`, so the cost is now dominated by
+///    the per-connection composition.
+/// 3. **Audio-only recomposition** — a video-only change is reported to the
+///    actor but never recomposed, because the slot view is derived from
+///    `audio_self_muted` alone.
+///
+/// # The send directive is not touched, and cannot be
+///
+/// This function calls [`compose_and_emit`] with `emit_directive = false`, but
+/// that flag is belt and braces: `media_signaling::directive` has no import
+/// through which mute state could arrive and `build_send_directive` takes no
+/// mute argument, so a mute/unmute cycle altering the directive is a compile
+/// error rather than a behaviour to be careful about. That is what keeps
+/// *"MC has not asked you to send"* and *"you have muted yourself"* distinct,
+/// and what makes unmute a purely local decision with no round trip.
+async fn handle_mute_request(
+    request: &v1::MuteRequest,
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
+) {
+    // Short-circuit a no-op BEFORE the actor hop, before the limiter, and
+    // before `compose_and_emit`.
+    //
+    // `MeetingActor::handle_self_mute` is already idempotent, which correctly
+    // suppresses a broadcast of a transition that did not occur — but
+    // `UpdateSelfMute` has no `respond_to`, so the caller cannot learn that
+    // nothing changed and would proceed to a full roster read regardless. The
+    // idempotence guard fixes the wire lie; this fixes the cost.
+    let reported = (request.audio_muted, request.video_muted);
+    if media.last_reported_mute == Some(reported) {
+        metrics::record_mute_request(MuteOutcome::Unchanged);
+        return;
+    }
+
+    // Spend a token only now — AFTER the no-op short-circuit, so tokens are
+    // spent on work actually about to be done. Draining the bucket on identical
+    // repeats would let a client spamming a steady state suppress its own next
+    // GENUINE toggle, and would report `rate_limited` for a path that was never
+    // approached.
+    if !media.mute_limiter.try_spend(Instant::now()) {
+        metrics::record_mute_request(MuteOutcome::RateLimited);
+
+        // The report is DROPPED, not queued. That is safe because ADR-0036 §5
+        // enforces client mute at CAPTURE on the client: a suppressed report
+        // means the audio genuinely stopped and only the indicator other
+        // participants see is stale. There is no window in which someone
+        // believes they have stopped transmitting and has not.
+        //
+        // This holds for a merely BROKEN client (a repeating button, a reactive
+        // loop) as much as a hostile one, which is why it is the stated reason
+        // rather than "the flag is client-controlled anyway".
+        //
+        // `last_reported_mute` is deliberately NOT updated, so the client's next
+        // report re-attempts instead of being swallowed by the no-op
+        // short-circuit above. The staleness is therefore bounded by that next
+        // toggle rather than lasting the session.
+        if !media.mute_rate_limit_logged {
+            media.mute_rate_limit_logged = true;
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                "Mute reports on this connection exceeded the sustained rate limit and are being \
+                 dropped. A human never reaches this bound, so the likely cause is a client-side \
+                 repeat loop. Further occurrences on this connection are counted, not logged."
+            );
+        }
+        return;
+    }
+
+    // Captured BEFORE the cache is overwritten. `None` — the first report after
+    // join — stands for `(false, false)`, which is the actual post-join actor
+    // state, so a first report of "not muted" correctly counts as no change.
+    let previously_audio_muted = media.last_reported_mute.is_some_and(|(audio, _)| audio);
+
+    if let Err(e) = media
+        .meeting_handle
+        .update_self_mute(
+            media.participant_id.clone(),
+            request.audio_muted,
+            request.video_muted,
+        )
+        .await
+    {
+        debug!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            error = %e,
+            "Failed to record client mute on the meeting actor"
+        );
+        metrics::record_mute_request(MuteOutcome::ActorUnavailable);
+        return;
+    }
+
+    // Cache only AFTER the actor accepted the report. Assigning before the await
+    // would record a report the actor never received, and an identical retry
+    // would then be short-circuited forever. The consequence is bounded — the
+    // send fails only when the meeting actor is gone, so the connection is
+    // already terminal, and ADR-0036 §5 enforces client mute at capture on the
+    // client regardless of what MC recorded — but the early return above makes
+    // ordering it correctly free.
+    media.last_reported_mute = Some(reported);
+
+    // RECOMPOSE ONLY IF THE AUDIO FLAG MOVED.
+    //
+    // `last_reported_mute` is the right dedupe key for "should I report this to
+    // the meeting actor" — the actor stores both flags — and the WRONG key for
+    // "should I recompose". `SourceMuteView` and `build_stream_assignments` read
+    // `audio_self_muted` alone, so a video-only toggle would spend an O(N)
+    // roster read, an assignment computation and an outbound message to produce
+    // a `StreamAssignments` byte-identical to the last one, and would move
+    // `mc_media_slot_states_total` with provably zero information delivered.
+    //
+    // Two consumers reading different fields of one pair is two questions; they
+    // now have two answers. This is not an attack mitigation — it fires the
+    // first time a client wires a camera button, with nobody hostile involved.
+    if media.declaration.is_none() || previously_audio_muted == request.audio_muted {
+        metrics::record_mute_request(MuteOutcome::AppliedNoRecompose);
+        return;
+    }
+
+    metrics::record_mute_request(MuteOutcome::Applied);
+
+    // Return value deliberately discarded: it reports whether the DIRECTIVE was
+    // delivered, and this path emits no directive. The declaration must stay
+    // armed regardless — a failed mute re-convey is self-healing on the next
+    // toggle, and disarming here would turn a transient actor hiccup into a
+    // client that gets re-sent a directive it already has.
+    let _ = compose_and_emit(connection_id, participant_handle, media, false).await;
+}
+
+/// Compose the client-facing media messages from one meeting-state snapshot.
+///
+/// `emit_directive` selects §5 plus §6 (a fresh capability declaration) versus
+/// §6 alone (a mute report). The directive is composed from the assignment and
+/// the configured encoding only; the mute view feeds the assignments alone.
+///
+/// # Return value is load-bearing
+///
+/// `true` iff MC delivered everything this call was supposed to deliver. The
+/// caller on the capability path uses it to decide whether to ARM the
+/// identical-redeclaration short-circuit: arming it after a failed composition
+/// would make the client's natural recovery — re-sending the same declaration —
+/// answer `accepted_unchanged` forever, leaving the connection silently dark and
+/// recoverable only by a full reconnect.
+///
+/// A directive failure returns `false` even though the assignments were still
+/// emitted: assignments without a directive still means the client is never told
+/// to send, which is the state the retry needs to be able to escape.
+async fn compose_and_emit(
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
+    emit_directive: bool,
+) -> bool {
+    let Some(declaration) = media.declaration.clone() else {
+        return false;
+    };
+
+    // ONE snapshot for both messages.
+    let state = match media.meeting_handle.get_state().await {
+        Ok(state) => state,
+        Err(e) => {
+            if emit_directive {
+                metrics::record_send_directive(DirectiveOutcome::MeetingStateUnavailable);
+            }
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                error = %e,
+                "Meeting state unavailable; not composing media signalling"
+            );
+            return false;
+        }
+    };
+
+    // Through the SINGLE routing-input constructor, not a second inline one:
+    // `compute_assignment` is the one producer of "which slot MC routes into",
+    // and that only holds if its input has one encoding too.
+    let routing_input = match routing_input_for(
+        state.participants.iter().map(|p| p.sender_id),
+        media.handlers.clone(),
+    ) {
+        Ok(routing_input) => routing_input,
+        Err(e) => {
+            if emit_directive {
+                metrics::record_send_directive(DirectiveOutcome::AssignmentFailed);
+            }
+            error!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                error = %e,
+                "Routing input could not be built; no media signalling emitted"
+            );
+            return false;
+        }
+    };
+
+    let assignment = match compute_assignment(&routing_input) {
+        Ok(assignment) => assignment,
+        Err(e) => {
+            if emit_directive {
+                metrics::record_send_directive(DirectiveOutcome::AssignmentFailed);
+            }
+            error!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                reason = e.label(),
+                "Forwarding assignment could not be computed; no media signalling emitted"
+            );
+            return false;
+        }
+    };
+
+    let mut directive_emitted = true;
+
+    if emit_directive {
+        match build_send_directive(
+            media.sender_id,
+            &assignment,
+            &media.handler_urls,
+            &media.stream_policy,
+        ) {
+            Ok((directive, outcome)) => {
+                metrics::record_send_directive(outcome);
+                send_signaling(
+                    participant_handle,
+                    connection_id,
+                    SIGNALING_KIND_SEND_DIRECTIVE,
+                    &ServerMessage {
+                        message: Some(server_message::Message::SendDirective(directive)),
+                        trace_parent: String::new(),
+                        trace_state: String::new(),
+                    },
+                )
+                .await;
+            }
+            Err(outcome) => {
+                metrics::record_send_directive(outcome);
+                directive_emitted = false;
+                error!(
+                    target: "mc.webtransport.connection",
+                    connection_id = %connection_id,
+                    outcome = outcome.label(),
+                    "Send directive could not be composed; client not directed to send"
+                );
+            }
+        }
+    }
+
+    let mute = SourceMuteView::from_pairs(
+        state
+            .participants
+            .iter()
+            .map(|p| (p.sender_id, p.audio_self_muted)),
+    );
+
+    let composition = build_stream_assignments(
+        media.sender_id,
+        &declaration,
+        &assignment,
+        &media.handler_urls,
+        &mute,
+    );
+
+    for state in &composition.slot_states {
+        metrics::record_slot_state(*state);
+    }
+    metrics::record_unmatched_plan_slots(composition.unmatched_plan_slots);
+
+    send_signaling(
+        participant_handle,
+        connection_id,
+        SIGNALING_KIND_STREAM_ASSIGNMENTS,
+        &ServerMessage {
+            message: Some(server_message::Message::StreamAssignments(
+                composition.assignments,
+            )),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        },
+    )
+    .await;
+
+    directive_emitted
+}
+
+/// Send a `ServerMessage` to the client through the participant actor.
+///
+/// Routed through the actor's outbound channel rather than written straight to
+/// the send stream, so ordering with roster broadcasts stays FIFO and there is
+/// one write choke point. A full mailbox is counted at that choke point.
+///
+/// `message_kind` is a bounded `&'static str` naming what failed to arrive, so
+/// the delivery WARN is triageable without carrying any client-supplied value.
+async fn send_signaling(
+    participant_handle: &ParticipantActorHandle,
+    connection_id: &str,
+    message_kind: &'static str,
+    message: &ServerMessage,
+) {
+    // R-57: carry the current server-side trace context (bounded W3C ids only).
+    let (trace_parent, trace_state) = inject_current_context();
+    let mut message = message.clone();
+    message.trace_parent = trace_parent;
+    message.trace_state = trace_state;
+
+    if let Err(e) = participant_handle
+        .send(SignalingPayload::Raw {
+            message_type: 0,
+            data: message.encode_to_vec(),
+        })
+        .await
+    {
+        // WARN, not DEBUG. `ParticipantActorHandle::send` is an awaited mpsc
+        // send, so an `Err` means the mailbox is CLOSED — the participant actor
+        // is gone. That is the one hop between "MC decided to direct this client
+        // to send" and "the client was told", and `record_send_directive` has
+        // ALREADY fired `emitted` by the time we get here.
+        //
+        // At the default `RUST_LOG=info` a DEBUG line is invisible, so a client
+        // that never publishes would present as `emitted` incrementing normally,
+        // `accepted` incrementing normally, and nothing anywhere disagreeing.
+        // This is the only evidence that contradicts the counter, so it must be
+        // visible at the level operators actually run.
+        //
+        // Deliberately NOT a delivery-outcome counter: the mailbox-FULL case is
+        // already counted downstream at the actor's `try_send` choke point by
+        // `mc_participant_outbound_messages_dropped_total{payload_kind}`. The
+        // uncovered case is actor-gone, and a WARN is proportionate to it.
+        warn!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            error = %e,
+            // `message_kind`, NOT `payload_kind`. The two name DISJOINT value
+            // domains across this exact hop: here the domain is
+            // {capability_rejection, send_directive, stream_assignments}, while
+            // the `payload_kind` label on
+            // `mc_participant_outbound_messages_dropped_total` is
+            // {signaling_raw, participant_update} — every `ServerMessage`
+            // leaves as `SignalingPayload::Raw`, so `send_directive` here
+            // becomes `signaling_raw` there. The catalog and the dashboard both
+            // tell an operator to correlate this WARN with that counter; naming
+            // both fields `payload_kind` would invite a pivot that silently
+            // joins on nothing.
+            message_kind = message_kind,
+            "Failed to deliver media signalling to participant actor; the client was NOT told \
+             what the counter says it was told"
+        );
+    }
+}
+
+/// Resolve the per-connection media-signalling context, or the
+/// [`DirectiveOutcome`] naming the stage that failed.
+///
+/// An `Err` is a **degraded but healthy** connection: signalling for everything
+/// else keeps working and the client is simply never directed to send. It is
+/// logged and COUNTED once at the call site, never per client message.
+///
+/// # Why the error type is `DirectiveOutcome` and not a local enum
+///
+/// This is the most severe way a client can end up never told to send — it
+/// silences the connection for its whole life, not for one declaration — so it
+/// must not be the one such failure that moves no counter. Reporting it on
+/// `mc_media_send_directives_total` keeps that counter's central claim true:
+/// *every* reason MC did not COMPOSE a directive lands on one series, so the 3am
+/// question "did MC compose a directive, and if not why" is one query.
+///
+/// It is NOT every reason a client was not told to send. `emitted` fires before
+/// `send_signaling`, so the two delivery hops after it are covered elsewhere:
+/// mailbox-FULL by
+/// `mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`
+/// and mailbox-CLOSED by the delivery WARN. See this file's `send_signaling`,
+/// which states the same split from the other side.
+///
+/// The stages below are the SAME sequential stages `compose_and_emit` runs, so
+/// the vocabulary's disjoint-by-construction property is preserved rather than
+/// stretched: the first failing stage returns, and later stages are unreachable.
+async fn build_media_signaling_context(
+    controller_handle: &MeetingControllerActorHandle,
+    join_result: &JoinResult,
+    mh_data: &MhAssignmentData,
+    meeting_id: &str,
+    config: crate::media_signaling::ClientMediaConfig,
+) -> Result<MediaSignalingContext, DirectiveOutcome> {
+    // Each stage keeps its underlying error at DEBUG: the outcome token on the
+    // call-site WARN says WHICH stage failed, and this says WHY. Join-time only
+    // — once per connection, never client-drivable — so there is no
+    // log-amplification concern here.
+    let meeting_handle = controller_handle
+        .get_meeting_handle(meeting_id.to_string())
+        .await
+        .map_err(|e| {
+            debug!(
+                target: "mc.webtransport.connection",
+                meeting_id = %meeting_id,
+                error = %e,
+                "Media signalling context: meeting handle unavailable"
+            );
+            DirectiveOutcome::MeetingStateUnavailable
+        })?;
+
+    let routing_input = build_routing_input(join_result, mh_data).map_err(|e| {
+        debug!(
+            target: "mc.webtransport.connection",
+            meeting_id = %meeting_id,
+            error = %e,
+            "Media signalling context: routing input could not be built"
+        );
+        DirectiveOutcome::AssignmentFailed
+    })?;
+
+    let assignment = compute_assignment(&routing_input).map_err(|e| {
+        debug!(
+            target: "mc.webtransport.connection",
+            meeting_id = %meeting_id,
+            reason = e.label(),
+            "Media signalling context: forwarding assignment could not be computed"
+        );
+        DirectiveOutcome::AssignmentFailed
+    })?;
+
+    // NOT `AssignmentFailed`: the assignment computed successfully and simply
+    // contains no egress plan naming this subscriber. "MC could not compute a
+    // plan" and "MC computed a plan that does not include you" have different
+    // causes and different remedies, so they get different tokens.
+    let planned_slot = planned_audio_slot_for(&assignment, join_result.sender_id)
+        .ok_or(DirectiveOutcome::NoPlannedEgressSlot)?;
+
+    // Server-derived urls only. The similar-looking client-supplied map is
+    // `ParticipantActor::mh_statuses`; it must never be a source here.
+    let handler_urls = HandlerUrls::from_pairs(
+        mh_data
+            .handlers
+            .iter()
+            .map(|h| (HandlerId::new(&h.mh_id), h.webtransport_endpoint.clone())),
+    );
+
+    // One clock reading for both buckets: they start together at join, so a
+    // skew between them would be meaningless state.
+    let limiter_start = Instant::now();
+
+    Ok(MediaSignalingContext {
+        meeting_handle,
+        participant_id: join_result.participant_id.clone(),
+        sender_id: join_result.sender_id,
+        handler_urls,
+        handlers: routing_input.handlers,
+        planned_audio_slot: PlannedAudioSlot::new(planned_slot),
+        stream_policy: MediaStreamPolicy::new(config.audio_encoding),
+        max_receive_slots: config.max_receive_slots,
+        declaration_budget: config.max_receive_capability_declarations,
+        declaration: None,
+        last_reported_mute: None,
+        mute_limiter: ClientWorkLimiter::new(
+            limiter_start,
+            MUTE_WORK_BURST,
+            MUTE_WORK_REFILL_INTERVAL_MS,
+        ),
+        rejection_reply_limiter: ClientWorkLimiter::new(
+            limiter_start,
+            CAPABILITY_REJECTION_BURST,
+            CAPABILITY_REJECTION_REFILL_INTERVAL_MS,
+        ),
+        mute_rate_limit_logged: false,
+        rejection_logged: false,
+        rejection_reply_suppressed_logged: false,
+    })
+}
+
+/// Post-join dispatch for a connection with no media-signalling context.
+///
+/// Identical to [`handle_client_message`] minus the two media arms. Split rather
+/// than branching inside each arm so the media handlers cannot be reached at all
+/// without a context, and so this path stays silent per message.
+async fn handle_client_message_without_media(
+    data: &[u8],
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+) {
+    let Ok(client_message) = ClientMessage::decode(data) else {
+        debug!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            "Failed to decode post-join client message, ignoring"
+        );
+        return;
+    };
+
+    let trace_parent = client_message.trace_parent;
+    let trace_state = client_message.trace_state;
+
+    match client_message.message {
+        Some(client_message::Message::MediaConnectionUpdate(update)) => {
+            handle_media_connection_update(
+                update,
+                &trace_parent,
+                &trace_state,
+                connection_id,
+                participant_handle,
+            )
+            .await;
+        }
+        _ => {
+            debug!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                "Post-join client message ignored (no media signalling context)"
+            );
+        }
     }
 }
 
@@ -1201,21 +2316,58 @@ fn build_routing_input(
         .map(|h| HandlerId::new(&h.mh_id))
         .collect();
 
+    // The joiner is not yet on the roster the join returned, so it is chained
+    // on rather than assumed present.
+    routing_input_for(
+        std::iter::once(join_result.sender_id)
+            .chain(join_result.participants.iter().map(|p| p.sender_id)),
+        handlers,
+    )
+}
+
+/// Build a [`MeetingRoutingInput`] from a set of sender ids and the meeting's
+/// handler list.
+///
+/// # The SINGLE constructor, and why that is load-bearing
+///
+/// The whole design rests on [`compute_assignment`] being the one producer of
+/// "which slot MC routes into". That guarantee is only as good as its INPUT
+/// having one encoding too: two constructors 500 lines apart in this file could
+/// each gain a field, a filter, or a guard the other did not, and the two sides
+/// would then disagree about the meeting while both looking correct. So both
+/// call sites — the join-time context/push path and the per-composition path —
+/// come through here.
+///
+/// Participant->handler membership is an **input** to the computation, and this
+/// is where it is filled. Today every participant is on every handler assigned
+/// to the meeting (clients `connectAll()`), so every participant gets the full
+/// handler list. When real per-participant placement lands, only this function
+/// changes — [`compute_assignment`] does not, and neither does either caller.
+///
+/// # Errors
+///
+/// [`McError::MhAssignmentMissing`] if the meeting has no assigned handlers —
+/// there is nothing to program, and silently pushing to zero handlers would
+/// make an unroutable meeting indistinguishable from a healthy one. The check
+/// lives HERE rather than at one call site precisely so it cannot hold at one
+/// and not the other.
+fn routing_input_for(
+    senders: impl IntoIterator<Item = crate::media_admission::SenderId>,
+    handlers: Vec<HandlerId>,
+) -> Result<MeetingRoutingInput, McError> {
     if handlers.is_empty() {
         return Err(McError::MhAssignmentMissing(
             "no handlers assigned; cannot compute a forwarding assignment".to_string(),
         ));
     }
 
-    let mut participants = Vec::with_capacity(join_result.participants.len() + 1);
-    participants.push(RoutingParticipant {
-        sender_id: join_result.sender_id,
-        handlers: handlers.clone(),
-    });
-    participants.extend(join_result.participants.iter().map(|p| RoutingParticipant {
-        sender_id: p.sender_id,
-        handlers: handlers.clone(),
-    }));
+    let participants = senders
+        .into_iter()
+        .map(|sender_id| RoutingParticipant {
+            sender_id,
+            handlers: handlers.clone(),
+        })
+        .collect();
 
     Ok(MeetingRoutingInput {
         participants,
@@ -1431,6 +2583,95 @@ mod tests {
     // These in-module tests only assert the non-`MediaConnectionUpdate` branches
     // don't panic and the char-boundary truncation helper is correct.
 
+    /// The limiter is driven with SYNTHETIC instants, not sleeps.
+    ///
+    /// A wall-clock test of a 250 ms refill would either sleep (slow, and an
+    /// implicit timing assertion in a suite that gates none) or race. Passing
+    /// `now` in makes the refill arithmetic exactly testable and keeps the
+    /// production call site a plain `Instant::now()`.
+    #[test]
+    fn mute_limiter_allows_a_burst_then_clamps_to_the_sustained_rate() {
+        let t0 = Instant::now();
+        let mut limiter = ClientWorkLimiter::new(t0, MUTE_WORK_BURST, MUTE_WORK_REFILL_INTERVAL_MS);
+
+        // The whole burst is available immediately: a human flurry never waits.
+        for i in 0..MUTE_WORK_BURST {
+            assert!(limiter.try_spend(t0), "burst token {i} should be available");
+        }
+        // Exhausted, and it stays exhausted while no time passes — this is the
+        // clamp on a client sending at line rate.
+        assert!(!limiter.try_spend(t0));
+        assert!(!limiter.try_spend(t0));
+    }
+
+    #[test]
+    fn mute_limiter_refills_at_the_sustained_rate_and_never_permanently_denies() {
+        let t0 = Instant::now();
+        let mut limiter = ClientWorkLimiter::new(t0, MUTE_WORK_BURST, MUTE_WORK_REFILL_INTERVAL_MS);
+        for _ in 0..MUTE_WORK_BURST {
+            assert!(limiter.try_spend(t0));
+        }
+        assert!(!limiter.try_spend(t0));
+
+        // One interval later exactly one token is back. THIS is the property
+        // that makes it a rate limit and not a budget: no amount of past
+        // spending can permanently deny a later legitimate toggle.
+        let t1 = t0 + Duration::from_millis(MUTE_WORK_REFILL_INTERVAL_MS);
+        assert!(limiter.try_spend(t1));
+        assert!(!limiter.try_spend(t1));
+
+        // Three intervals later, three tokens.
+        let t2 = t1 + Duration::from_millis(MUTE_WORK_REFILL_INTERVAL_MS * 3);
+        assert!(limiter.try_spend(t2));
+        assert!(limiter.try_spend(t2));
+        assert!(limiter.try_spend(t2));
+        assert!(!limiter.try_spend(t2));
+    }
+
+    #[test]
+    fn mute_limiter_caps_refill_at_the_burst_and_does_not_bank_idle_time() {
+        let t0 = Instant::now();
+        let mut limiter = ClientWorkLimiter::new(t0, MUTE_WORK_BURST, MUTE_WORK_REFILL_INTERVAL_MS);
+        for _ in 0..MUTE_WORK_BURST {
+            assert!(limiter.try_spend(t0));
+        }
+        // An hour idle must not bank an hour of tokens, or the limiter becomes
+        // a no-op for any client patient enough to wait once.
+        let much_later = t0 + Duration::from_secs(3600);
+        for _ in 0..MUTE_WORK_BURST {
+            assert!(limiter.try_spend(much_later));
+        }
+        assert!(!limiter.try_spend(much_later));
+    }
+
+    #[test]
+    fn mute_limiter_carries_a_sub_interval_remainder_rather_than_discarding_it() {
+        // A client polling just under the refill interval must still earn
+        // tokens over time. Discarding the remainder on every call would starve
+        // it forever while looking like a working limiter.
+        let t0 = Instant::now();
+        let mut limiter = ClientWorkLimiter::new(t0, MUTE_WORK_BURST, MUTE_WORK_REFILL_INTERVAL_MS);
+        for _ in 0..MUTE_WORK_BURST {
+            assert!(limiter.try_spend(t0));
+        }
+
+        let just_under = Duration::from_millis(MUTE_WORK_REFILL_INTERVAL_MS - 10);
+        let mut now = t0;
+        let mut granted = 0;
+        for _ in 0..30 {
+            now += just_under;
+            if limiter.try_spend(now) {
+                granted += 1;
+            }
+        }
+        // 30 x 240 ms = 7.2 s, so ~28 tokens are earned but only the burst-capped
+        // stream is spendable; the point is simply that it is NOT zero.
+        assert!(
+            granted > 0,
+            "a client polling just under the interval must still earn tokens"
+        );
+    }
+
     /// Spawn a throwaway participant actor for the dispatch-branch tests.
     fn test_participant_handle() -> (ParticipantActorHandle, tokio::task::JoinHandle<()>) {
         use crate::actors::{ActorMetrics, ParticipantActor};
@@ -1455,8 +2696,14 @@ mod tests {
             trace_state: String::new(),
         };
         let data = msg.encode_to_vec();
-        // Should not panic -- exercises the Some(_) branch
-        handle_client_message(&data, "test-conn-3", &handle).await;
+        // Should not panic -- exercises the catch-all branch.
+        //
+        // Driven through the no-media-context path deliberately: `MuteRequest`
+        // IS handled on the full path now (ADR-0036 §5), so asserting
+        // "unhandled" there would assert the opposite of the behaviour. What
+        // this still pins is that the decode+dispatch skeleton tolerates a
+        // message it has no arm for.
+        handle_client_message_without_media(&data, "test-conn-3", &handle).await;
     }
 
     #[tokio::test]
@@ -1464,7 +2711,7 @@ mod tests {
         let (handle, _task) = test_participant_handle();
         let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
         // Should not panic -- exercises the decode error branch
-        handle_client_message(&garbage, "test-conn-4", &handle).await;
+        handle_client_message_without_media(&garbage, "test-conn-4", &handle).await;
     }
 
     #[tokio::test]
@@ -1477,7 +2724,7 @@ mod tests {
         };
         let data = msg.encode_to_vec();
         // Should not panic -- exercises the None branch
-        handle_client_message(&data, "test-conn-5", &handle).await;
+        handle_client_message_without_media(&data, "test-conn-5", &handle).await;
     }
 
     #[test]

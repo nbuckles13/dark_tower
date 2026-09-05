@@ -52,6 +52,42 @@ const SERVICE_BASES: &[&str] = &[
 
 const ORPHAN_EXCLUSIONS: &[&str] = &["kustomization.yaml", "service-monitor.yaml"];
 
+/// Return the content of `line` with any inline `#` comment removed, trimmed.
+///
+/// # This is the whole mitigation for a class, not a helper for one caller
+///
+/// Both list parsers below are line-oriented, not YAML parses, and both decide
+/// membership with a suffix test on the tail of the line. A trailing comment —
+/// `- secret.yaml   # secrets ONLY` — leaves that tail ending in the comment
+/// text rather than in `.yaml`/`.json`, so the entry is never recorded as
+/// declared and the coverage walk then reports **a listed file as unlisted**.
+/// That message is true-shaped and points at the wrong artifact: it names the
+/// manifest, not the comment that actually broke the parse, so a responder goes
+/// and edits an innocent file.
+///
+/// Found 2026-09-03 by @operations when an inline comment added during review
+/// turned Layer 3 red. It is the third instance in that devloop of one class —
+/// a comment or a reformat silently defeating a guard's line-oriented parser
+/// (the others being `env_config`'s `MissingEnvVar` regex versus a rustfmt wrap,
+/// and a verification step that string-matched a since-reflowed line). Because
+/// the class is what recurs, the repair is shared by every parser that can trip
+/// on it rather than applied at the reported site. Tracked in `docs/TODO.md`
+/// §Infrastructure Validation in Devloops.
+fn strip_inline_comment(line: &str) -> &str {
+    line.split_once('#')
+        .map_or(line, |(before, _)| before)
+        .trim()
+}
+
+/// Collect the `*.yaml` filenames a kustomization declares under `resources:`.
+///
+/// A *standalone* comment line is harmless here because it never starts with
+/// `- ` — which is why the long-standing `# service-monitor.yaml NOT listed …`
+/// note in several kustomizations has always been safe. Same character,
+/// different position, and only one position was safe. Nothing in those files
+/// signalled the distinction, so the parser is the right place to remove it.
+/// (That asymmetry does **not** carry over to
+/// [`extract_declared_dashboards`] — see its own note.)
 fn extract_declared_resources(kustomization_content: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in kustomization_content.lines() {
@@ -59,7 +95,8 @@ fn extract_declared_resources(kustomization_content: &str) -> Vec<String> {
         let Some(rest) = trimmed.strip_prefix("- ") else {
             continue;
         };
-        let rest = rest.trim();
+        // Strip an inline comment BEFORE the suffix test — see the rustdoc.
+        let rest = strip_inline_comment(rest);
         if rest.ends_with(".yaml") {
             out.push(rest.to_string());
         }
@@ -135,6 +172,46 @@ fn check_orphan_manifests(repo_root: &Path) -> Result<Vec<Hit>> {
     Ok(hits)
 }
 
+/// Collect the dashboard basenames the Grafana kustomization declares under a
+/// `configMapGenerator` entry's `files:`.
+///
+/// # Two repairs, because this parser failed in both directions
+///
+/// It takes the shared [`strip_inline_comment`] for the same reason
+/// [`extract_declared_resources`] does. It additionally anchors on the `- `
+/// bullet, which that sibling got for free and this one did not: the original
+/// admitted **any** line containing a `/` whose tail ended in `.json`, so a
+/// standalone comment naming a dashboard path *declared* it. That direction is
+/// **fail-open** — a genuinely-unlisted dashboard mentioned in a nearby
+/// comment passes R-20 silently — and its mirror invents a direction-2 finding
+/// against a path that only ever existed in prose.
+///
+/// So the "standalone comments were always safe" reasoning recorded on the
+/// sibling was a property of *that* parser's `- ` anchor, not of comments. Two
+/// parsers, one mechanism, two different exposures; fixing only the reported
+/// one would have left the fail-open half in place.
+fn extract_declared_dashboards(kustomization_content: &str) -> Vec<String> {
+    let mut declared: Vec<String> = Vec::new();
+    for line in kustomization_content.lines() {
+        // Lines look like: `      - foo.json=../../../grafana/dashboards/foo.json`.
+        let Some(rest) = line.trim().strip_prefix("- ") else {
+            continue;
+        };
+        let rest = strip_inline_comment(rest);
+        // The `/` requirement is the original's, kept deliberately: every real
+        // entry is `name=<dir>/<name>`, and widening it here would be a third
+        // change riding on a two-change fix.
+        let Some(idx) = rest.rfind('/') else {
+            continue;
+        };
+        let candidate = &rest[idx + 1..];
+        if candidate.ends_with(".json") {
+            declared.push(candidate.to_string());
+        }
+    }
+    declared
+}
+
 /// R-20: dashboard coverage. Every `*.json` in `infra/grafana/dashboards/`
 /// (excluding `_template-*.json`) must appear in the Grafana kustomization;
 /// every kustomization reference must exist on disk.
@@ -147,17 +224,7 @@ fn check_dashboard_coverage(repo_root: &Path) -> Result<Vec<Hit>> {
     }
     let kust_content = std::fs::read_to_string(&kustomization)
         .with_context(|| format!("reading {}", kustomization.display()))?;
-    // Extract referenced JSON basenames.
-    let mut declared: Vec<String> = Vec::new();
-    for line in kust_content.lines() {
-        // Lines look like: `      - foo.json=../../../grafana/dashboards/foo.json`.
-        if let Some(idx) = line.rfind('/') {
-            let candidate = &line[idx + 1..];
-            if candidate.ends_with(".json") {
-                declared.push(candidate.to_string());
-            }
-        }
-    }
+    let mut declared = extract_declared_dashboards(&kust_content);
     declared.sort();
     declared.dedup();
 
@@ -426,6 +493,74 @@ resources:
         let out = extract_declared_resources(kust);
         assert_eq!(out.len(), 3);
         assert!(out.contains(&"deployment.yaml".to_string()));
+    }
+
+    /// A resource entry carrying a trailing `#` comment is still declared.
+    ///
+    /// Regression pin for the 2026-09-03 defect: without the `#` strip this
+    /// returns 1, and the orphan walk then reports `secret.yaml` and
+    /// `service.yaml` as unlisted when both are plainly listed — a true-shaped
+    /// finding naming the wrong file. Asserted as an EXACT set rather than a
+    /// count so that stripping too much (e.g. eating the whole line) fails here
+    /// too, not just stripping too little.
+    #[test]
+    fn extract_declared_resources_strips_inline_comments() {
+        let kust = r#"resources:
+  - deployment.yaml
+  - service.yaml   # per-instance NodePorts
+  - secret.yaml# no space before the hash
+  # standalone comments were always safe: they never start with "- "
+  # service-monitor.yaml NOT listed - requires Prometheus Operator CRD
+"#;
+        let mut out = extract_declared_resources(kust);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                "deployment.yaml".to_string(),
+                "secret.yaml".to_string(),
+                "service.yaml".to_string(),
+            ]
+        );
+    }
+
+    /// R-20's parser is the SAME line-oriented mechanism as R-16's, so it takes
+    /// the same two repairs — the `- ` anchor and the inline-comment strip.
+    ///
+    /// It was the more dangerous of the two before this pin, because it failed
+    /// in BOTH directions where R-16 failed in one:
+    ///
+    /// * **Fail-loud, wrong artifact** — an inline comment on a `files:` entry
+    ///   leaves the tail after the last `/` ending in the comment text, so the
+    ///   dashboard is not recorded as declared and direction 1 reports a listed
+    ///   dashboard as an orphan.
+    /// * **FAIL-OPEN** — the old parser anchored on nothing but "a line
+    ///   containing `/` whose tail ends in `.json`", so a *standalone comment*
+    ///   naming a dashboard path declared it. A genuinely-unlisted dashboard
+    ///   mentioned in a nearby comment therefore passed R-20 silently, and a
+    ///   comment naming a path that does not exist invented a direction-2
+    ///   finding against a file nobody had touched.
+    ///
+    /// The standalone-comment half has no R-16 counterpart: there, a comment
+    /// never starts with `- `. That asymmetry is exactly why fixing the
+    /// reported instance alone was insufficient.
+    #[test]
+    fn extract_declared_dashboards_anchors_on_bullets_and_strips_comments() {
+        let kust = r#"configMapGenerator:
+  - name: grafana-dashboards-mc
+    files:
+      - mc-logs.json=dashboards/mc-logs.json
+      - mc-overview.json=dashboards/mc-overview.json  # new media row, task 14
+      # mc-legacy.json is deliberately unlisted: see dashboards/mc-legacy.json
+"#;
+        let mut out = extract_declared_dashboards(kust);
+        out.sort();
+        assert_eq!(
+            out,
+            vec!["mc-logs.json".to_string(), "mc-overview.json".to_string()],
+            "inline comment must not un-declare a listed dashboard, and a \
+             standalone comment must not declare an unlisted one"
+        );
     }
 
     #[test]

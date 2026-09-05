@@ -352,6 +352,162 @@ which does carry `handler_id`. The label may return once
 - **Recorded in**: `grpc/mh_client.rs::confirm` via `observability/metrics.rs::record_media_policy_push`
 - **Dashboard**: MC Overview - Media Generation Divergence (Media Routing row)
 
+## Client-Facing Media Signalling Metrics (ADR-0036 §5, §6, §11)
+
+MC's client-facing half of the media path: the client declares what it can
+decode, MC composes what it must produce and what will fill its slots.
+
+**Identity rules, stated at the width MC actually keeps them.** An invariant
+claimed more strongly than it is held is worse than none: the next person
+auditing ADR-0036 §11 against this catalog would conclude something false and
+then have to relitigate which of the two is the defect.
+
+- **Meeting identifier** (raw or hashed) — barred from metric **labels** and
+  **span attributes**. **Not barred from logs.** §11's flat prohibition is scoped
+  to metrics, and MC's connection-lifecycle logs carry `meeting_id` by
+  convention throughout; the media-signalling WARNs and DEBUGs in
+  `webtransport/connection.rs` carry it deliberately, because it is what makes
+  the context-unavailable WARN actionable at all.
+- **Participant id and stream identity** — `slot_id`, `sender_id`, stream
+  number, `switch_command_id` — barred from labels, span attributes **and**
+  logs. These are the per-frame/per-stream dimensions §11's log bullet names.
+
+Every label domain is an exhaustive `match` over a Rust enum with an `ALL`
+constant, so a new value is a compile error rather than an unbounded series. There is deliberately
+no `#[instrument]` anywhere in `media_signaling`: its functions take
+`SlotId`/`SenderId`/`&ReceiveCapability` parameters that an auto-instrumented
+span would record as attributes, on a surface no guard covers.
+
+**Scrape periodicity**: MC inherits the global 10 s `scrape_interval` (R-36).
+
+### `mc_media_receive_capability_declarations_total`
+- **Type**: Counter
+- **Description**: Client receive-capability declarations, by disposition (ADR-0036 §6)
+- **Labels**:
+  - `outcome`: `accepted`, `accepted_unchanged`, `duplicate_slot_id`, `slot_count_over_cap`, `slot_id_out_of_range`, `pinned_sender_id_zero`, `pinned_sender_id_out_of_range`, `media_kind_unspecified`, `slot_id_not_planned`, `declaration_budget_exhausted`
+  - `key_custody`: single value `operator` (ADR-0036 §4 — MC can read media keys; that is accepted operator custody, never described as end-to-end)
+- **Cardinality**: 10 (bounded at the type level by `CapabilityOutcome::ALL`; an eleventh value is a compile error)
+- **This metric PARTITIONS declarations.** Every declaration lands in exactly one bucket of exactly one metric. A rejection reported on some other series would silently break that relationship — which is why `slot_id_not_planned` lives here despite its remedy differing in kind from its neighbours, and why the identical-re-declaration no-op is *counted* rather than dropped.
+- **THE SUCCESS SET IS `{accepted, accepted_unchanged}`.** The failure predicate is `outcome!~"accepted|accepted_unchanged"`. Same shape as `mc_media_send_directives_total`'s `{emitted, emitted_empty_targets}`: one pattern across both metrics in this family — the success set is the prefix-shared pair, the failure predicate is the negated alternation.
+- **PERMANENT — no revert trigger.** This alternation is a correct, permanent classification, not a defect workaround. If you have seen a similar-looking alternation elsewhere in this catalog that carries a revert trigger, that one is a temporary carve-out and this is not; do not fold them together, and do not strip this alternation as part of any cleanup.
+- **`accepted` ALONE means "declarations MC acted on", and that distinction is a security property.** `accepted_unchanged` records a re-declaration identical to the one already in force: MC does no work and sends nothing. It is therefore **client-inflatable at near-zero server cost**, and **must not appear in the denominator of any ratio a client has an incentive to deflate** — a rejection ratio computed over it is an evadable alert. Use `accepted` alone as that denominator. There is no alert on this metric today, which is exactly why the rule is written down now rather than discovered by whoever builds one.
+- **A non-zero `accepted_unchanged` is also real information**: nothing in story 1 re-declares at all, so a sustained rate means a client is re-declaring pointlessly.
+- **Rejection is always WHOLE-DECLARATION.** MC never accepts a prefix, never applies last-write-wins to a duplicate, and never clamps an out-of-range id.
+- **Remedies differ by value, and one of them is not a client bug:**
+  - `duplicate_slot_id`, `slot_count_over_cap`, `slot_id_out_of_range`, `pinned_sender_id_zero`, `pinned_sender_id_out_of_range` — **client defects.** Fix the client. `slot_count_over_cap` may instead mean `MC_MAX_RECEIVE_SLOTS` is set below what legitimate clients need.
+  - `media_kind_unspecified` — **read version skew first, not a forgotten field.** The proto's zero is what a pre-ADR-0036 peer's `AUDIO = 0` decodes to, so the likeliest producer is a client that *meant audio*. A fleet-wide rise correlates with a client rollback or a partial rollout. Treating it as "a kind we happen not to have" would have made that present as "everyone's meetings are empty" with no signal naming skew.
+  - `slot_id_not_planned` — **an MC limitation, NOT a client defect.** The declaration is well-formed and the wire contract permits it. MC cannot serve it because task 13's join-time forwarding-policy push fixes the egress slot id *before* the client can declare, and this story adds no re-push, so MC cannot address a slot it did not plan. **Do not send an operator into the SDK on this value.** The fix is the capability-triggered policy re-push (or making declared slots an input to the assignment computation) — see the devloop plan's §Open question options 1 and 2, and `docs/TODO.md` §Media Path Obligations. **Its rate carries roadmap information**: rising means real clients in the field are choosing slot ids MC does not plan for, i.e. the story-1 limitation is biting and the re-push needs to land.
+  - `declaration_budget_exhausted` — a client re-declaring more than `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` times on one connection. Nothing in story 1 re-declares at all, so any occurrence now is a client bug or an attack.
+- **PAIRED WITH `mc_media_unmatched_plan_slots_total`.** `slot_id_not_planned` (the client's slot has no plan) and that counter (the plan's slot was not declared) are the **two directions of one join**. They are easy to transpose under pressure; read the direction off the name.
+- **Logging**: every rejection increments this counter; the WARN fires **once per connection**, carries the outcome token, and never carries the offending `slot_id`/`pinned_sender_id` value.
+- **Usage**: Are clients' capability declarations landing, and if not, whose bug is it?
+- **Recorded in**: `webtransport/connection.rs::handle_receive_capability` via `observability/metrics.rs::record_receive_capability`
+- **Dashboard**: MC Overview - Receive Capability Declarations by Outcome (Client Media Signalling row)
+
+### `mc_media_send_directives_total`
+- **Type**: Counter
+- **Description**: Send-directive compositions, by disposition (ADR-0036 §5)
+- **Labels**:
+  - `outcome`: `emitted`, `emitted_empty_targets`, `unknown_stream_number`, `transport_mode_unspecified`, `handler_url_unresolved`, `meeting_state_unavailable`, `assignment_failed`, `no_planned_egress_slot`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded at the type level by `DirectiveOutcome::ALL`. Deliberately no restated integer — the list above is the operator-facing artifact and a second encoding of its length only rots.
+- **THE SUCCESS SET IS `{emitted, emitted_empty_targets}`, NOT `{emitted}`.** ADR-0036 §5 makes an empty target set a *specified success* — "A target set may be empty. That means send nothing." A failure predicate must read `outcome!~"emitted|emitted_empty_targets"`; `outcome!="emitted"` would page on a legal state. `emitted_empty_targets` also becomes **routine rather than anomalous** once §7 turns off publishers nobody watches, so its meaning does not move even though its rate will.
+- **PERMANENT — no revert trigger.** This alternation is a correct, permanent classification grounded in ADR-0036 §5, not a workaround. `mc_media_policy_pushes_total`'s superficially identical `outcome!~"match|handler_id_mismatch"` is a *temporary* carve-out with a recorded revert trigger; **the two share a shape and nothing else.** Do not fold this entry into that decision, and do not strip this alternation as part of any cleanup: doing so starts paging on a routine success while appearing to complete a documented task.
+- **Two values are MC defects — ANY non-zero value indicates a bug**: `unknown_stream_number` (a forwarding plan named a stream number MC has no policy entry for) and `transport_mode_unspecified` (a plan carried no transport mode; MC fails closed rather than defaulting to datagram). The remaining **four** failure values are environmental: `handler_url_unresolved`, `meeting_state_unavailable`, `assignment_failed` and `no_planned_egress_slot`.
+- **`no_planned_egress_slot` is the MOST SEVERE value on this metric, and the only one that is JOIN-TIME ONLY.** It means the forwarding assignment computed *successfully* and simply contains no egress plan naming this subscriber, so MC has no slot to route its audio into and cannot validate a declaration against one. The connection then never receives a send directive **for its entire session** — not for one declaration — and stays otherwise healthy, so nothing else about it looks wrong.
+  - **Not `assignment_failed`.** "MC could not compute a plan" and "MC computed a plan that does not include you" have different causes and different remedies; collapsing them hides the difference.
+  - **Not `slot_id_not_planned`** on the capability counter, which is a *client* naming a slot MC did not plan. This is MC planning no slot at all. Easy to transpose under pressure.
+  - Recorded once per connection at join, never per message.
+- **Recorded at TWO sites, and that is the point of the vocabulary.** Per composition in `compose_and_emit`, and once per connection at join in `handle_connection`'s context-resolution step. A join-time failure is the more severe of the two, so it must not be the one that moves no counter: every reason MC did not **compose** a directive lands on this one series, which is what makes "did MC compose a directive, and if not why" a single query rather than a join across two.
+- **Failure values are DISJOINT BY CONSTRUCTION.** The emit path is sequential stages — read meeting state, compute the assignment, resolve handler urls, build streams — and the first failing stage returns its own value. An assignment failure can never also be reported as an unresolved handler url, because url resolution is never reached.
+- **`emitted` MEANS COMPOSED, NOT DELIVERED — and this is the one caveat an operator must read before concluding anything from a healthy graph.** `record_send_directive` fires on the `Ok` branch of `compose_and_emit` **before** `send_signaling` is called, so the counter is incremented by the act of composing. **Two hops follow it, and neither is covered by this series:**
+  1. `ParticipantActorHandle::send`, an awaited mpsc — an `Err` means the mailbox is **CLOSED** (the participant actor is gone). **WARN only, deliberately not counted**, because the FULL case below already is; the WARN is at `mc.webtransport.connection` and says in terms that the client was not told what the counter says it was told.
+  2. the stream outbound `try_send` in `actors/participant.rs` — mailbox **FULL** or closed. Counted, but on a **different** metric: `mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`.
+- **So a directive composed and then lost reads as `emitted` here, with `accepted` healthy on the capability counter and nothing anywhere disagreeing.** That is precisely the scenario this entry exists for — "a client that is never told to send simply produces nothing; there is no error and no absent-frame signal to notice" — so **do not treat `emitted` alone as evidence that a client was directed.** Check `mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}` for the mailbox-full case and the `mc.webtransport.connection` delivery WARN for the actor-gone case.
+- **The counter is NOT moved below `send_signaling` to fix this, on purpose.** Doing so would conflate composition failure with delivery failure and destroy the disjoint-by-construction property above — the vocabulary describes *stages of composition*, and delivery is a separate hop with separate evidence. The completeness caveat is the correct fix; a merged counter would be a worse one.
+- **Usage**: Is MC actually directing clients to send, and when it silently is not, why?
+- **Recorded in**: `webtransport/connection.rs::compose_and_emit` (per composition) and `webtransport/connection.rs::handle_connection` on the `build_media_signaling_context` error path (`no_planned_egress_slot` and the join-time environmental values), both via `observability/metrics.rs::record_send_directive`
+- **Dashboard**: MC Overview - Send Directives by Outcome (Client Media Signalling row)
+
+### `mc_media_slot_states_total`
+- **Type**: Counter
+- **Description**: Slot states conveyed to subscribers (ADR-0036 §6)
+- **Labels**:
+  - `slot_state`: `unspecified`, `active`, `source_muted`, `withheld_by_congestion`, `fewer_sources_than_slots`, `zero_requested`, `source_unreachable`, `switch_pending`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded at the type level by the proto `SlotState` enum, mirrored exhaustively by `media_signaling::slot_state_label`
+- **The bucketed slot-state signal ADR-0036 §11 mandates**, joined to no identity: it answers *how many and how bad*; **MC's own assignment state answers *who***, at investigation time, in a system that legitimately holds that mapping. There is no per-slot series and must not be one.
+- **The label domain MIRRORS THE WIRE ENUM EXHAUSTIVELY** — all eight `SlotState` variants, not the four MC can reach today. A hand-picked subset needs editing the moment §7 makes `switch_pending` live, and a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be *visible* rather than absent. Keeping the vocabulary identical to the wire's is also what makes this distribution comparable with the client's.
+- **Reachable in story 1**: `active`, `source_muted`, `fewer_sources_than_slots`, `source_unreachable`. `withheld_by_congestion` is MH-observed (§6) and arrives with the slot-state notification; `switch_pending` arrives with §7 switching; `zero_requested` may be **unemittable in principle** — it means "requested zero of this kind" but rides a message whose `slot_id` echoes a slot the subscriber *declared*, and a subscriber who declared a slot of that kind did not request zero of it. That is an open protocol question recorded in `docs/TODO.md`, not a settled "reachable later".
+- **`source_muted` is client mute (§5)** — the source is present and has muted itself at capture. MC does **not** withdraw or re-issue that source's send directive; the slot state is the entire signal. A `source_muted`/`active` oscillation with a flat `mc_media_send_directives_total` is the healthy shape.
+- **THIS COUNTER IS PER-COMPOSITION, AND COMPOSITIONS ARE PARTLY CLIENT-TRIGGERED.** One increment per declared slot per composition, and a composition runs on an accepted declaration *or* on a mute report whose **audio** flag changed. So a client toggling mute weights this distribution, and a raw fleet-wide ratio over it is skewable by one participant. **Any SLO or ratio built on it must be per-connection-normalised, or restricted to the capability path.**
+  - The skew is **bounded**, not open-ended: mute-driven compositions are rate-limited per connection (`mc_media_mute_requests_total{outcome="rate_limited"}` is the visible edge of that bound), and a *video-only* toggle does not recompose at all, because the slot view derives from `audio_self_muted` alone. So a single connection can weight this counter at a few compositions per second, not at line rate.
+  - This is a weaker property than `mc_media_receive_capability_declarations_total`'s: there, `accepted_unchanged` is called out as client-inflatable and excluded from the denominator. Here there is no single value to exclude — the weighting is spread across whichever states that subscriber's slots are in — which is precisely why the normalisation has to happen in the query.
+- **Usage**: How many slots are filled versus dark, and in what way
+- **Recorded in**: `webtransport/connection.rs::compose_and_emit` via `observability/metrics.rs::record_slot_state`
+- **Dashboard**: MC Overview - Slot States (Client Media Signalling row)
+
+### `mc_media_mute_requests_total`
+- **Type**: Counter
+- **Description**: Client `MuteRequest` dispositions (ADR-0036 §5 client mute)
+- **Labels**:
+  - `outcome`: `applied`, `applied_no_recompose`, `unchanged`, `rate_limited`, `actor_unavailable`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded at the type level by `MuteOutcome::ALL`
+- **This metric PARTITIONS mute reports.** Every post-join `MuteRequest` on a connection with a media-signalling context lands in exactly one bucket.
+- **THE SUCCESS SET IS `{applied, applied_no_recompose}`.** The failure predicate is `outcome=~"rate_limited|actor_unavailable"`, **not** `outcome!="applied"` — that would count two routine states as failures.
+- **THIS PREDICATE IS STATED POSITIVELY WHILE ITS TWO NEIGHBOURS ARE NEGATED, AND THAT IS DELIBERATE — do not harmonise it.** `mc_media_receive_capability_declarations_total` and `mc_media_send_directives_total` both use `outcome!~"..."`, which is correct for *them* because their success sets are closed and small. Here the enumeration is on the failure side, so **a variant added later defaults to NOT being counted as a failure** rather than silently joining the failure set the way a negated predicate would. A new disposition should have to be classified deliberately, not inherit "page-worthy" by omission. If a later pass makes these three consistent, it should move the others to positive form, not this one to negative.
+  - `applied` — reported to the meeting actor, and recomposition **attempted**. Deliberately not "and recomposed": the counter is recorded before `compose_and_emit` runs and that call's result is discarded, so a recomposition that then fails on the meeting-state read or the assignment computation is still counted here. **A failed mute-path recomposition is currently visible only in logs** — every `record_send_directive` call in `compose_and_emit` is inside the `if emit_directive` guard, so the mute path records none of them. (No restated integer: the number of guarded call sites is not the number of outcomes they carry, and a second encoding of either only rots.) That gap is a tracked deferral in `docs/TODO.md`; moving this record site below `compose_and_emit` would force a sixth variant for "applied but recomposition failed", which is exactly the design question the deferral parks.
+  - `applied_no_recompose` — reported to the actor, with nothing to re-convey: either the subscriber has not declared a receive capability yet, or **only `video_muted` changed**. The slot view derives from `audio_self_muted` alone, so recomposing would spend an O(N) roster read and an assignment computation to emit a byte-identical `StreamAssignments`. **This is what an ordinary camera button produces** — expect it to be the largest bucket once clients wire video controls.
+  - `unchanged` — identical to the report already in force. No actor hop, no recomposition. Not a failure: MC correctly did nothing.
+- **`unchanged` IS CLIENT-INFLATABLE AT NEAR-ZERO SERVER COST, and must not appear in a ratio denominator.** Same property as `accepted_unchanged` on the capability counter, and the same rule: **the denominator is `applied` + `applied_no_recompose`**. The short-circuit fires before any actor hop, roster read or recomposition, so a client repeating one state drives this value at line rate for a tuple compare and a counter increment. "What fraction of mute reports are being applied", computed over `unchanged`, is a number one participant can drive to zero.
+- **`unchanged` is exempt from the rate limiter ON PURPOSE — do not "fix" the ordering.** The no-op check runs *before* the token is spent, so identical repeats do not drain the bucket. Reversing that would let a client spamming a steady state exhaust its own budget on messages that do no work and thereby suppress its next **genuine** toggle, while the metric reported `rate_limited` for an expensive path that was never approached.
+- **`rate_limited` is the visible edge of the mute-work bound, and is NOT by itself an incident.** Client mute is the only repeatable client-driven path that puts work on the **shared meeting actor's mailbox** — one `GetState` roster snapshot per composition. A per-connection token bucket (burst 8, sustained 4/s) bounds it.
+  - **This is NOT a meeting-wide contention signal, and it was documented as one.** The bound was originally sized against `handle_self_mute`'s O(N) awaited `broadcast_update`, which head-of-line-blocked joins, leaves and every other connection's state read. That fan-out was **removed** during the same devloop (security's S-2: `MuteChanged` has no consumer, so it delivered zero bytes to zero clients). What remains on the shared actor is a queue slot, not head-of-line blocking; the dominant cost is now the per-connection roster read, assignment computation and outbound message. The bound is still required — the work is still unbounded and client-driven — but do not route a meeting-wide latency investigation here.
+  - **A human never reaches the limiter.** A sustained non-zero rate means one connection is toggling far above human rates: a client-side repeat loop or a reactive-state bug first, an abusive peer second. It is bounded to that connection either way.
+  - **Why a rate limit and not a budget.** A cumulative budget would permanently deny a repeatable steady-state user action: once spent, that participant's `audio_self_muted` freezes and every other client renders a live speaker as muted for the rest of the session. That is a correctness failure strictly worse than the amplification it would prevent. See `media_signaling`'s module doc for the criterion in general form.
+  - **Dropping a report is safe, and here is why it is safe even for a merely broken client.** ADR-0036 §5 enforces client mute at **capture on the client**, so a suppressed report means the audio genuinely stopped and only the indicator other participants see is stale. There is no window in which someone believes they have stopped transmitting and has not. A suppressed report deliberately does not update MC's cache of the last reported pair, so the client's next toggle re-attempts rather than being swallowed — the staleness is bounded by that next action, not by the session.
+- **`actor_unavailable` is environmental and terminal**: the meeting actor's mailbox is closed, so the connection is already going away.
+- **Usage**: Is client mute being applied, and when it is not, why? Is any connection driving mute recomposition hard enough to be clamped? (Per-connection cost, not meeting-wide — see the `rate_limited` bullet.)
+- **Recorded in**: `webtransport/connection.rs::handle_mute_request` via `observability/metrics.rs::record_mute_request`
+- **Dashboard**: MC Overview - Mute Requests by Outcome (Client Media Signalling row)
+
+### `mc_media_unmatched_plan_slots_total`
+- **Type**: Counter
+- **Description**: Planned egress slots a subscriber never declared (ADR-0036 §6)
+- **Labels**:
+  - `key_custody`: single value `operator`
+- **Cardinality**: 1
+- **What it means operationally**: MH is forwarding egress the subscriber will never accept — wasted uplink and handler work for media nobody opened a slot for.
+- **A non-zero value is CLIENT-CONFORMANCE-DRIVEN, not necessarily an MC defect.** Reachable in story 1 through the zero-audio exemption: a subscriber declaring no audio slot (`{}` or video-only) is legitimately saying "I want to send but not receive audio", MC accepts it, and MC's planned audio slot then matches nothing.
+- **PAIRED WITH `mc_media_receive_capability_declarations_total{outcome="slot_id_not_planned"}`.** These are the **two directions of one join**: *the plan's slot was not declared* here, *the client's slot has no plan* there. Under whole-declaration rejection the two are mutually exclusive per declaration — a declaration asking for audio in an unplanned slot is rejected before composition, so it never reaches this counter. Read the direction off the name; they are easy to transpose.
+- **Its denominator is per-planned-slot, not per-directive**, which is why it is a separate series rather than a value on `mc_media_slot_states_total` — and why mixing it in would have broken that counter's "metric and wire cannot disagree" property, since it corresponds to no wire value.
+- **Usage**: Is MC programming handlers to forward media no subscriber will take?
+- **Recorded in**: `webtransport/connection.rs::compose_and_emit` via `observability/metrics.rs::record_unmatched_plan_slots`
+- **Dashboard**: MC Overview - Unmatched Plan Slots and Dropped Outbound Messages (Client Media Signalling row)
+
+---
+
+## Participant Outbound Delivery Metrics
+
+### `mc_participant_outbound_messages_dropped_total`
+- **Type**: Counter
+- **Description**: Server messages dropped because a participant's outbound channel was full or closed
+- **Labels**:
+  - `payload_kind`: `signaling_raw`, `participant_update`
+- **Cardinality**: 2
+- **The client did not receive something MC decided to send.**
+- **EVERY DROP IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER CONNECTION. A SINGLE WARN DOES NOT MEAN A SINGLE DROP.** The WARN at `mc.actor.participant` fires once per participant actor and is deliberately not repeated — a per-message log on a client-drivable path is a log-amplification vector, and a wedged outbound channel drops one message per roster broadcast, i.e. O(participants x events) from one bad connection. **So log-line volume understates drop volume by orders of magnitude, and this counter is the only complete record.** Triaging by `grep` first — which is what people actually do — shows one line and reads as an isolated blip; the truth is the opposite. Take the magnitude from here, never from the log.
+- The one-shot WARN only became safe *because* this counter exists: before it, the repeated line **was** the record.
+- **Deliberately a NEW metric, not a fourth `actor_type` on `mc_messages_dropped_total`.** That metric is fed by `MailboxMonitor` on the **inbound** actor path; a pseudo-`actor_type` value here would corrupt the `topk` on the cross-service `errors-overview.json` dashboard by mixing two different quantities.
+- **No `key_custody` label**, deliberately: this is the generic outbound signalling choke point, not a media-path metric. Fleet-wide `key_custody` rollout is R-26 / story task 22. The key is not `reason` either — that key is spoken for by the frame-reject vocabulary.
+- **RECIPROCAL WITH `mc_media_send_directives_total`.** That counter's `emitted` means a directive was **composed**, not delivered — it fires before the send. `payload_kind="signaling_raw"` is the mailbox-FULL half of the evidence for what happened next; the mailbox-CLOSED half is a WARN at `mc.webtransport.connection` and is deliberately uncounted, since the FULL case is covered here. **A non-zero `signaling_raw` rate against a healthy `emitted` rate is the specific shape of "MC composed a send directive the client never received".**
+- **Usage**: Detect a slow or wedged client connection losing server messages
+- **Recorded in**: `actors/participant.rs::handle_send` and `handle_update` via `observability/metrics.rs::record_participant_outbound_dropped`
+- **Dashboard**: MC Overview - Unmatched Plan Slots and Dropped Outbound Messages (Client Media Signalling row)
+
+---
+
 ## MH Coordination Metrics (R-15, R-20)
 
 ### `mc_mh_notifications_received_total`

@@ -8,7 +8,34 @@ resources:
   - mh-0-deployment.yaml
   - mh-1-deployment.yaml
   - service.yaml
+  # mh-service-secrets ONLY
   - secret.yaml
+  # mh-service-tls NOT listed — created imperatively by
+  # infra/kind/scripts/setup.sh:create_mh_tls_secret() from the certs
+  # scripts/generate-dev-certs.sh generates, because listing it would commit
+  # TLS key material to git. Consequence: `kubectl apply -k` alone does NOT
+  # produce startable pods on a fresh namespace — both mh-{0,1} mount it as
+  # the `mh-tls` volume, which is NOT `optional:`, so kubelet cannot complete
+  # the mount.
+  #
+  # THE SIGNAL IS `FailedMount`, NOT A CERT ERROR. The pod stays Pending in
+  # ContainerCreating and the process NEVER STARTS, so there is nothing in
+  # `kubectl logs` and no cert-loading error anywhere — mh-service's
+  # `Identity::load_pemfiles` is a DIFFERENT failure that needs the Secret to
+  # exist and be malformed. `kubectl describe pod` names the Secret; that is the
+  # only artifact that says so. All THREE startup-config signals are documented
+  # in the SIBLING service's runbook — docs/runbooks/mc-deployment.md
+  # §Config-failure triage (`CreateContainerConfigError` for a missing ConfigMap
+  # key, `CrashLoopBackOff` for a stale pod template, and this one). The first
+  # two apply verbatim to mh-service, whose five required MH_* transport keys
+  # have the same shape; this one applies with `mh-service-tls`/`mh-tls`
+  # substituted for their MC spellings. mh-deployment.md has no equivalent
+  # section yet, so the MC one is cited deliberately rather than by mistake.
+  # `kubectl logs` is empty or misleading for all three, and pod phase alone
+  # tells them apart before you read anything.
+  #
+  # setup.sh is the only supported bootstrap today; making this declarative is
+  # tracked in docs/TODO.md §Infrastructure Validation in Devloops.
   - pdb.yaml
   - network-policy.yaml
   # service-monitor.yaml NOT listed — requires Prometheus Operator CRD

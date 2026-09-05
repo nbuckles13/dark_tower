@@ -147,6 +147,7 @@ async fn start_mh_server(store: Captured) -> (SocketAddr, CancellationToken) {
 }
 
 fn test_config(gc_url: &str) -> Config {
+    let media = test_common::client_media_config();
     Config {
         mc_id: "mc-test-001".to_string(),
         region: "us-east-1".to_string(),
@@ -175,6 +176,14 @@ fn test_config(gc_url: &str) -> Config {
         otel_endpoint: String::new(),
         otel_sample_rate: 1.0,
         environment: "development".to_string(),
+        // Sourced from the shared fixture rather than restated. Its rustdoc
+        // carries the load-bearing claim — these values match the ConfigMap, so
+        // a test asserting on a directive's encoding parameters is asserting
+        // the SHIPPED configuration and not a test-only one. A local copy
+        // asserts that silently and drifts the moment the ConfigMap moves.
+        max_receive_slots: media.max_receive_slots,
+        max_receive_capability_declarations: media.max_receive_capability_declarations,
+        audio_encoding: media.audio_encoding,
     }
 }
 

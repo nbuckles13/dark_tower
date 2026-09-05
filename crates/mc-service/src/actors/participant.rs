@@ -31,6 +31,19 @@ use tracing::{debug, info, instrument, warn};
 /// Default channel buffer size for the participant mailbox.
 const PARTICIPANT_CHANNEL_BUFFER: usize = 200;
 
+/// `payload_kind` label for a raw signalling payload dropped on the outbound
+/// channel.
+///
+/// Two `&'static str` constants rather than an enum: there are exactly two
+/// `try_send` sites in this file and each names its own, so the label domain is
+/// bounded by there being no third call site. If a third arrives, it must add a
+/// constant here rather than pass a literal.
+const OUTBOUND_PAYLOAD_SIGNALING_RAW: &str = "signaling_raw";
+
+/// `payload_kind` label for a participant state update dropped on the outbound
+/// channel.
+const OUTBOUND_PAYLOAD_PARTICIPANT_UPDATE: &str = "participant_update";
+
 /// Maximum distinct MH statuses recorded per participant (R-60 security cap).
 ///
 /// Bounds per-participant map growth from a hostile client flooding distinct
@@ -178,6 +191,20 @@ pub struct ParticipantActor {
     /// Read once on exit to tell the meeting whether to skip or keep the grace
     /// period.
     disconnect_cause: Arc<AtomicU8>,
+    /// Whether an outbound drop has already been logged on this actor.
+    ///
+    /// The DROP ITSELF is always counted; only the WARN is one-shot. A wedged
+    /// outbound channel produces one drop per roster broadcast, i.e.
+    /// O(participants x events) identical lines from a single bad connection,
+    /// on a path a client can drive — and the second line tells an operator
+    /// nothing `mc_participant_outbound_messages_dropped_total` does not. One
+    /// per actor means one per connection, so the condition still announces
+    /// itself once with the connection id attached.
+    ///
+    /// Same discipline as the capability-rejection and mute-rate-limit WARNs in
+    /// `webtransport::connection`. This flag was only affordable once the
+    /// counter existed: before it, the repeated line WAS the record.
+    outbound_drop_logged: bool,
 }
 
 impl ParticipantActor {
@@ -282,6 +309,7 @@ impl ParticipantActor {
             meeting_handle,
             mh_statuses: HashMap::new(),
             disconnect_cause: Arc::clone(&disconnect_cause),
+            outbound_drop_logged: false,
         };
 
         let task_handle = tokio::spawn(actor.run());
@@ -448,14 +476,16 @@ impl ParticipantActor {
 
         // Encode as protobuf ServerMessage via the raw payload
         if let SignalingPayload::Raw { data, .. } = &message {
-            if let Some(tx) = &self.stream_tx {
-                if tx.try_send(bytes::Bytes::copy_from_slice(data)).is_err() {
-                    warn!(
-                        target: "mc.actor.participant",
-                        connection_id = %self.connection_id,
-                        "Stream outbound channel full or closed"
-                    );
-                }
+            // The `try_send` result is resolved BEFORE any `&mut self` use: the
+            // one-shot log flag is a field, and holding the `&self.stream_tx`
+            // borrow across it would not compile. Separating "did it drop" from
+            // "record and log the drop" is what makes the flag possible at all.
+            let dropped = match &self.stream_tx {
+                Some(tx) => tx.try_send(bytes::Bytes::copy_from_slice(data)).is_err(),
+                None => false,
+            };
+            if dropped {
+                self.record_outbound_drop(OUTBOUND_PAYLOAD_SIGNALING_RAW);
             }
         } else {
             debug!(
@@ -485,18 +515,47 @@ impl ParticipantActor {
 
         // Encode to protobuf if it's a wire-visible update
         if let Some(server_msg) = crate::webtransport::handler::encode_participant_update(&update) {
-            if let Some(tx) = &self.stream_tx {
-                use prost::Message;
-                let encoded = server_msg.encode_to_vec();
-                if tx.try_send(bytes::Bytes::from(encoded)).is_err() {
-                    warn!(
-                        target: "mc.actor.participant",
-                        connection_id = %self.connection_id,
-                        "Stream outbound channel full or closed"
-                    );
+            let dropped = match &self.stream_tx {
+                Some(tx) => {
+                    use prost::Message;
+                    let encoded = server_msg.encode_to_vec();
+                    tx.try_send(bytes::Bytes::from(encoded)).is_err()
                 }
+                None => false,
+            };
+            if dropped {
+                self.record_outbound_drop(OUTBOUND_PAYLOAD_PARTICIPANT_UPDATE);
             }
         }
+    }
+
+    /// Record one dropped outbound message: ALWAYS counted, logged ONCE.
+    ///
+    /// One function rather than two open-coded blocks so the count-always /
+    /// log-once asymmetry has a single home. Getting it wrong in one of two
+    /// copies is exactly how a bounded log becomes unbounded again.
+    fn record_outbound_drop(&mut self, payload_kind: &'static str) {
+        // Counted unconditionally: a full or closed outbound channel means the
+        // client did not receive something MC decided to send, and a log line
+        // alone makes that unqueryable.
+        crate::observability::metrics::record_participant_outbound_dropped(payload_kind);
+
+        // Logged once per actor, i.e. once per connection. A wedged channel
+        // drops one message per roster broadcast, so an unbounded WARN turns one
+        // bad connection into O(participants x events) identical lines on a
+        // client-drivable path. The second line tells an operator nothing the
+        // counter does not.
+        if self.outbound_drop_logged {
+            return;
+        }
+        self.outbound_drop_logged = true;
+        warn!(
+            target: "mc.actor.participant",
+            connection_id = %self.connection_id,
+            payload_kind = payload_kind,
+            "Stream outbound channel full or closed; the client did not receive a message MC \
+             sent. Further drops on this connection are counted, not logged."
+        );
     }
 
     /// Record per-MH connection statuses reported by the client (R-60).
@@ -552,6 +611,69 @@ mod tests {
     use crate::actors::messages::MhState;
     use common::observability::testing::MetricAssertion;
 
+    /// A bare actor wired to a stream channel of exactly `capacity`, so a test
+    /// can fill it and drive the outbound-drop path deterministically.
+    fn bare_actor_with_stream(capacity: usize) -> (ParticipantActor, mpsc::Receiver<bytes::Bytes>) {
+        let (stream_tx, stream_rx) = mpsc::channel(capacity);
+        let mut actor = bare_actor();
+        actor.stream_tx = Some(stream_tx);
+        (actor, stream_rx)
+    }
+
+    #[tokio::test]
+    async fn outbound_signaling_drop_is_counted_not_merely_warned() {
+        // A full outbound channel means the client did not receive something MC
+        // decided to send. Previously WARN-only, which made the loss
+        // unqueryable — this asserts it is now a counter with a bounded
+        // payload_kind.
+        let snap = MetricAssertion::snapshot();
+        let (mut actor, _rx) = bare_actor_with_stream(1);
+
+        let payload = || SignalingPayload::Raw {
+            message_type: 0,
+            data: vec![1, 2, 3],
+        };
+
+        // First send fits the one-slot channel.
+        actor.handle_send(payload()).await;
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "signaling_raw")])
+            .assert_delta(0);
+
+        // Second overflows it: `try_send` fails and the drop is recorded.
+        actor.handle_send(payload()).await;
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "signaling_raw")])
+            .assert_delta(1);
+
+        // The two payload kinds are separate series; a signalling drop must not
+        // be attributed to a participant update.
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "participant_update")])
+            .assert_delta(0);
+    }
+
+    #[tokio::test]
+    async fn outbound_participant_update_drop_is_counted_under_its_own_kind() {
+        let snap = MetricAssertion::snapshot();
+        let (mut actor, _rx) = bare_actor_with_stream(1);
+
+        let update = || ParticipantStateUpdate::Left {
+            participant_id: "gone".to_string(),
+            reason: super::super::messages::LeaveReason::Voluntary,
+        };
+
+        actor.handle_update(update()).await;
+        actor.handle_update(update()).await;
+
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "participant_update")])
+            .assert_delta(1);
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "signaling_raw")])
+            .assert_delta(0);
+    }
+
     /// Build a bare, un-spawned `ParticipantActor` for directly exercising the
     /// synchronous `handle_record_mh_statuses` handler and inspecting its
     /// private `mh_statuses` map (R-60).
@@ -570,6 +692,7 @@ mod tests {
             meeting_handle: None,
             mh_statuses: HashMap::new(),
             disconnect_cause: Arc::new(AtomicU8::new(0)),
+            outbound_drop_logged: false,
         }
     }
 

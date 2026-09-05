@@ -3,9 +3,7 @@
 ## Architecture & Design
 - MC architecture, actor model, session binding, capacity → ADR-0023
 - User auth, meeting access, join flow → ADR-0020
-- Observability pattern (metrics crate facade) → ADR-0011
-- Metric testability (component tests, `MetricAssertion`, presence guard, rollout SLO) → ADR-0032
-- Service-owned dashboards and alerts → ADR-0031
+- Observability: metrics facade → ADR-0011; testability (`MetricAssertion`, presence guard, rollout SLO) → ADR-0032; service-owned dashboards and alerts → ADR-0031
 
 ## Code Locations
 - Service entry point → `crates/mc-service/src/main.rs`
@@ -14,6 +12,7 @@
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
 - Media routing control plane (ADR-0036 §7/§8/§9): general visibility-graph assignment (no single-handler special case), `policy_generation` derived from output change, total confirm of the handler's reply → `crates/mc-service/src/media_routing/`; the push + fail-loud confirm → `crates/mc-service/src/grpc/mh_client.rs`; the one-shot trigger + retryable-vs-terminal split → `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`; generation eviction on meeting teardown → `crates/mc-service/src/actors/controller.rs:remove_meeting()`
+- Client-facing media signalling (ADR-0036 §5/§6): capability parse (whole-declaration rejection; `SlotId`; planned-slot namespace check), send directive (**no mute access — module-level invariant**), slot assignments (declared-vs-planned join), bounded outcome vocabularies → `crates/mc-service/src/media_signaling/`; post-join dispatch + `MediaSignalingContext` (planned slot and handler urls resolved once at join, so every rejection is decidable without touching the meeting actor) → `webtransport/connection.rs:handle_receive_capability()`/`handle_mute_request()`/`compose_and_emit()`; live meeting handle → `actors/controller.rs:get_meeting_handle()`; idempotent self-mute → `actors/meeting.rs:handle_self_mute()`
 - Media admission (ADR-0036 §4): meeting KEK + `u16` generation, roster `identity_public_key`, non-recycling `sender_id` allocator → `crates/mc-service/src/media_admission/`; KEK generated in `MeetingActor::spawn`, `sender_id` allocated in `handle_join` (`actors/meeting.rs`); key length-checked at the WebTransport boundary + `JoinResponse` fill (`webtransport/connection.rs`)
 - Join display-name plumbing: boundary truncate (connection.rs) → `display_name` field on `JoinConnection`/`ConnectionJoin` (messages.rs) → empty-claim fallback sink → `crates/mc-service/src/actors/meeting.rs:handle_join()`
 - Disconnect cause / leave latency: `DisconnectCause` enum → `crates/mc-service/src/actors/messages.rs`; skip-grace on clean close + `remove_and_broadcast_left()` choke-point → `crates/mc-service/src/actors/meeting.rs:handle_disconnect()`; cause-cell (AtomicU8) → `crates/mc-service/src/actors/participant.rs`
@@ -32,7 +31,7 @@
 - MC metrics catalog → `docs/observability/metrics/mc-service.md`
 
 ## Protocols
-- Client signaling (join, mute, session recovery, MediaConnectionUpdate) → `proto/dark_tower/signaling/v1/signaling.proto`
+- Client signaling (join, mute, session recovery, MediaConnectionUpdate, ReceiveCapability, SendDirective, StreamAssignments) → `proto/dark_tower/signaling/v1/signaling.proto`
 - Internal service RPCs (RegisterMc, AssignMeeting, MediaCoordinationService, RegisterMeeting) → `proto/dark_tower/internal/v1/internal.proto`
 
 ## Integration Seams
@@ -48,6 +47,7 @@
 - Shared bring-up (TestStackHandles, build_test_stack, seed_meeting_with_mh) + mock MH stores → `crates/mc-service/tests/common/mod.rs`
 - Accept-loop component rig → `crates/mc-service/tests/common/accept_loop_rig.rs`
 - Join flow tests (TestServer, MockMhRegistrationClient.wait_for_calls, multi-MH and skip-grpc-endpoint cases) → `crates/mc-service/tests/join_tests.rs`
+- Client media signalling integration (capability in → directive + assignments out; mute/unmute leaves the directive untouched; seven rejection paths; slot-id echo; client-url redirect guard) → `crates/mc-service/tests/media_client_signaling_integration.rs`
 - Media admission integration (KEK in join response, malformed-key reject, sender_id non-recycling + exhaustion, roster attribution) → `crates/mc-service/tests/media_admission_integration.rs`; reconnect continuity is actor-level in `actors/meeting.rs`
 - Accept-loop status + per-failure-class drilldown → `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
 - gRPC auth-layer per-failure-reason → `crates/mc-service/tests/auth_layer_integration.rs`
@@ -60,11 +60,11 @@
 - Heartbeat task tests → `crates/mc-service/tests/heartbeat_tasks.rs`
 - Per-cluster MetricAssertion tests + Cat B matrix → `crates/mc-service/src/observability/metrics.rs`
 - Test utilities (mock GC/Redis/MH, jwt_test) → `crates/mc-test-utils/src/`
-- Env-tests MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`
-- Env-tests MH QUIC + MC↔MH coordination metrics + live-handler policy-push confirm → `crates/env-tests/tests/26_mh_quic.rs`
+- Env-tests: MC-GC integration → `crates/env-tests/tests/22_mc_gc_integration.rs`; MH QUIC + MC↔MH coordination metrics + live-handler policy-push confirm → `crates/env-tests/tests/26_mh_quic.rs`
 
-## Advertise Address Config
-- Config fields `grpc_advertise_address` / `webtransport_advertise_address`; consumed by GC registration + MH RegisterMeeting → `crates/mc-service/src/config.rs`, `crates/mc-service/src/grpc/gc_client.rs`, `crates/mc-service/src/webtransport/connection.rs`
+## Config
+- Advertise addresses `grpc_advertise_address` / `webtransport_advertise_address`; consumed by GC registration + MH RegisterMeeting → `crates/mc-service/src/config.rs`, `crates/mc-service/src/grpc/gc_client.rs`, `crates/mc-service/src/webtransport/connection.rs`
+- ADR-0036 §5/§6 client-signalling keys (`MC_MAX_RECEIVE_SLOTS`, `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`, `MC_AUDIO_*`): REQUIRED, no Rust defaults, bounded both sides at load, documented values in the ConfigMap; the audio knobs are a documented inequality against `mh-service`'s datagram sizing, not a shared constant → `crates/mc-service/src/config.rs`, `infra/services/mc-service/configmap.yaml`, `docs/TODO.md` §Media Path Obligations
 
 ## Infrastructure
 - K8s deployment (POD_IP downward API, advertise addresses) → `infra/services/mc-service/mc-0-deployment.yaml`, `infra/services/mc-service/mc-1-deployment.yaml`

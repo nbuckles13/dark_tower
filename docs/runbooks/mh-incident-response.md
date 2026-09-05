@@ -471,8 +471,11 @@ kubectl top pods -n dark-tower -l app=mh-service
 # MH logs for caller rejection with service identity
 kubectl logs -n dark-tower -l app=mh-service --tail=500 | grep -iE "caller|service_type|rejected|layer 2|layer2"
 
-# Check recent MC deploys (MC is the only legitimate caller)
-kubectl rollout history deployment/mc-service -n dark-tower
+# Check recent MC deploys (MC is the only legitimate caller). MC is a PAIR of
+# singleton Deployments -- mc-0 alone is half the answer, and there is no
+# `deployment/mc-service`. See docs/runbooks/mc-incident-response.md §MC Topology.
+kubectl rollout history deployment/mc-0 -n dark-tower
+kubectl rollout history deployment/mc-1 -n dark-tower
 
 # gRPC call graph in traces (if Jaeger configured)
 ```
@@ -628,9 +631,16 @@ kubectl logs -n dark-tower -l app=mh-service --tail=500 | grep -iE "token|refres
 **Root Cause Investigation**:
 
 ```bash
-# MH -> MC connectivity
-kubectl exec -it deployment/mh-service -n dark-tower -- \
-  curl -i http://mc-service.dark-tower.svc.cluster.local:8080/health
+# MH -> MC connectivity. NOTE: MC's health port cannot be curled from an MH
+# pod at all -- health is 8081, not 8080, and MC's NetworkPolicy admits 8081
+# from Prometheus only, so the request is DROPPED and times out, which reads as
+# "MC is down". MH is admitted to MC on gRPC 50052 and nothing else, so 50052
+# is the only MC port an MH-side reachability check can legitimately probe.
+kubectl get endpoints mc-service -n dark-tower
+# MC health, from the operator's machine, per instance:
+#   kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
+#   curl -i http://localhost:8080/health   # repeat for mc-1
+# See docs/runbooks/mc-incident-response.md §MC Topology.
 
 # MH logs for MC notification errors
 kubectl logs -n dark-tower -l app=mh-service --tail=500 | grep -iE "mc notification|mh->mc|notify|connected|disconnected"
@@ -1035,9 +1045,15 @@ kubectl get events -n dark-tower --field-selector involvedObject.name=mh-service
 kubectl exec -it deployment/mh-service -n dark-tower -- \
   curl -i http://gc-service.dark-tower.svc.cluster.local:8080/health
 
-# MH -> MC
-kubectl exec -it deployment/mh-service -n dark-tower -- \
-  curl -i http://mc-service.dark-tower.svc.cluster.local:8080/health
+# MH -> MC. NOT checkable by curl: MC health is 8081 and MC's NetworkPolicy
+# admits 8081 from Prometheus only, so this DROPS and times out, reading as
+# "MC is down". The GC line above genuinely works (GC admits 8080 from
+# everywhere); MC is not symmetric. MH reaches MC only on gRPC 50052.
+kubectl get endpoints mc-service -n dark-tower
+# MC health, from the operator's machine, per instance:
+#   kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
+#   curl -i http://localhost:8080/health   # repeat for mc-1
+# See docs/runbooks/mc-incident-response.md §MC Topology.
 
 # MH -> AC
 kubectl exec -it deployment/mh-service -n dark-tower -- \
