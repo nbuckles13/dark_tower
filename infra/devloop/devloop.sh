@@ -599,6 +599,8 @@ if ! is_container_running "$DEV_CONTAINER"; then
     # lookups under Gate-2 parallel-test load — see DB_IP capture above.
     echo "Starting dev container..."
     podman run -d --name "$DEV_CONTAINER" \
+        --init \
+        --pids-limit 8192 \
         --userns=keep-id \
         --network "$NETWORK_NAME" \
         --add-host "${DB_CONTAINER}:${DB_IP}" \
