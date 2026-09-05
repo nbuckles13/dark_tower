@@ -106,6 +106,36 @@ impl AcceptLoopRig {
         mc_grpc_endpoint: String,
         max_connections: usize,
     ) -> Self {
+        Self::start_with_media_config(
+            controller_handle,
+            jwt_validator,
+            mh_store,
+            mh_reg_client,
+            mc_id,
+            mc_grpc_endpoint,
+            max_connections,
+            super::client_media_config(),
+        )
+        .await
+    }
+
+    /// Start with an explicit client media-signalling configuration.
+    ///
+    /// Separate from [`Self::start_with`] so a test can vary a cap (the slot cap
+    /// or the declaration budget) without every other caller restating the
+    /// default — and so the ADR-0036 §5/§6 knobs are exercised as configuration
+    /// rather than as constants the tests happen to agree with.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_media_config(
+        controller_handle: Arc<MeetingControllerActorHandle>,
+        jwt_validator: Arc<McJwtValidator>,
+        mh_store: Arc<dyn MhAssignmentStore>,
+        mh_reg_client: Arc<dyn MhRegistrationClient>,
+        mc_id: String,
+        mc_grpc_endpoint: String,
+        max_connections: usize,
+        client_media_config: mc_service::media_signaling::ClientMediaConfig,
+    ) -> Self {
         let (tempdir, cert_path, key_path) = Self::write_self_signed_pems();
 
         let cancel_token = CancellationToken::new();
@@ -120,6 +150,7 @@ impl AcceptLoopRig {
             Arc::new(PolicyGenerations::new()),
             mc_id,
             mc_grpc_endpoint,
+            client_media_config,
             max_connections,
             std::time::Duration::from_secs(10),
             cancel_token.clone(),

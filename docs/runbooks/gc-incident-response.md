@@ -284,11 +284,38 @@ kubectl exec -it -n dark-tower postgres-0 -- psql -c "SELECT pg_terminate_backen
 # Expected recovery time: Immediate
 
 # Scenario C: MC Assignment Slow
-# Check MC pod health and scale if needed
+# Check MC pod health -- BOTH instances. MC is a pair of singleton Deployments
+# (mc-0, mc-1); a symptom on one says nothing about the other, and there is no
+# `deployment/mc-service`. See docs/runbooks/mc-incident-response.md
+# §MC Topology before running any MC command from here.
 kubectl get pods -n dark-tower -l app=mc-service
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# Do NOT scale MC -- read the block below first.
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Expected recovery time: 30-60 seconds
+# Expected recovery time: NONE from scaling -- it is not an available lever.
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
+# plus a roll: minutes, and it takes effect only on restart (no content hash --
+# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# instance is a manifest change (ConfigMap + Deployment + Service + Kind port
+# mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
 # Scenario D: Token Refresh Slow
 # Check AC service health
@@ -380,10 +407,37 @@ kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "reject\|capac
 
 ```bash
 # Scenario A: No Healthy MCs (all at_capacity or unhealthy)
-# Scale up MC pods
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# MC has NO horizontal-scale option, so "scale up MC" is not an available move.
+# If the MCs are UNHEALTHY, fix them (see docs/runbooks/mc-incident-response.md).
+# If they are genuinely AT CAPACITY, the levers are: raise MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS (ConfigMap edit + roll), or add an mc-2 instance (manifest
+# change + deploy -- plan it, do not attempt it mid-incident).
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Expected recovery time: 30-60 seconds
+# Expected recovery time: NONE from scaling -- it is not an available lever.
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
+# plus a roll: minutes, and it takes effect only on restart (no content hash --
+# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# instance is a manifest change (ConfigMap + Deployment + Service + Kind port
+# mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
 # Scenario B: MC Pods Down or CrashLoopBackOff
 # Check crash reason
@@ -396,14 +450,26 @@ kubectl delete pod <MC_POD_NAME> -n dark-tower
 # Expected recovery time: 30-60 seconds
 
 # Scenario C: MC Heartbeats Failing (stale last_heartbeat)
-# Test database connection from MC pod
-kubectl exec -it deployment/mc-service -n dark-tower -- psql $DATABASE_URL -c "SELECT NOW();"
+# NOTE: MC does NOT talk to Postgres and has no DATABASE_URL -- its state store
+# is Redis, and GC owns the meeting_controllers table that carries
+# last_heartbeat. The MC runtime image is distroless with no psql. A
+# `psql` exec against an MC pod therefore fails for three independent reasons;
+# run the query from GC, which owns both the table and the connection.
 
-# Check MC logs for heartbeat errors
-kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "heartbeat"
+# 1. What GC believes about each MC (the authoritative view of last_heartbeat)
+kubectl exec -it deployment/gc-service -n dark-tower -- \
+  psql $DATABASE_URL -c "SELECT id, status, last_heartbeat FROM meeting_controllers ORDER BY last_heartbeat DESC;"
 
-# Restart MC to force re-registration
-kubectl rollout restart deployment/mc-service -n dark-tower
+# 2. What each MC thinks it is doing -- BOTH instances; mc-0 alone is half of MC
+kubectl logs deployment/mc-0 -n dark-tower --tail=100 | grep -i "heartbeat\|register"
+kubectl logs deployment/mc-1 -n dark-tower --tail=100 | grep -i "heartbeat\|register"
+
+# 3. If MC logs show the heartbeat RPC failing, it is the MC -> GC gRPC path.
+#    MC's egress to GC is TCP:50051 (infra/services/mc-service/network-policy.yaml).
+kubectl get networkpolicy mc-service -n dark-tower -o yaml | grep -A6 50051
+
+# Restart MC to force re-registration -- BOTH instances
+kubectl rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
 
 # Expected recovery time: 60 seconds
 
@@ -642,7 +708,17 @@ kubectl rollout history deployment/gc-service -n dark-tower
 
 # 5. Check dependency health
 curl http://ac-service.dark-tower.svc.cluster.local:8082/ready
-curl http://mc-service.dark-tower.svc.cluster.local:8080/ready
+# MC is NOT checkable this way: its health port is 8081, and its NetworkPolicy
+# admits 8081 from Prometheus only, so a curl from here is DROPPED and times out
+# -- which reads as "MC is down" when it may be perfectly healthy. The AC line
+# above genuinely works (AC admits 8082 from gc/mc/mh); MC is not symmetric.
+# Ask the question a different way:
+kubectl get endpoints mc-service -n dark-tower
+kubectl get pods -n dark-tower -l app=mc-service
+# and, from the operator's machine, per instance:
+#   kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
+#   curl -i http://localhost:8080/ready   # repeat for mc-1
+# See docs/runbooks/mc-incident-response.md §MC Topology.
 ```
 
 **Common Root Causes**:
@@ -698,8 +774,15 @@ kubectl exec -it deployment/gc-service -n dark-tower -- psql $DATABASE_URL -c "S
 # AC Service
 curl http://ac-service.dark-tower.svc.cluster.local:8082/ready
 
-# MC Service
-curl http://mc-service.dark-tower.svc.cluster.local:8080/ready
+# MC Service -- NOT checkable by curl from a GC pod. Health is 8081 and MC's
+# NetworkPolicy admits it from Prometheus only, so this DROPS and times out,
+# reading as "MC is down". The AC line above works; MC is not symmetric.
+kubectl get endpoints mc-service -n dark-tower
+kubectl get pods -n dark-tower -l app=mc-service
+# Per-instance health, from the operator's machine:
+#   kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
+#   curl -i http://localhost:8080/ready   # repeat for mc-1
+# See docs/runbooks/mc-incident-response.md §MC Topology.
 
 # Step 4: For 4xx errors - analyze request patterns
 # Check logs for validation errors

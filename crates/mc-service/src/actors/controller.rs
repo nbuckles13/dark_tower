@@ -154,6 +154,31 @@ impl MeetingControllerActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
+    /// Get a live handle to a meeting actor.
+    ///
+    /// Unlike [`Self::get_meeting`], which returns a state snapshot, this hands
+    /// back the handle so a caller can address the meeting directly.
+    ///
+    /// # Errors
+    ///
+    /// [`McError::MeetingNotFound`] if no such meeting is running on this MC.
+    pub async fn get_meeting_handle(
+        &self,
+        meeting_id: String,
+    ) -> Result<super::meeting::MeetingActorHandle, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ControllerMessage::GetMeetingHandle {
+                meeting_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
+    }
+
     /// Fire-and-forget: route a new connection to the correct meeting.
     ///
     /// The controller looks up the meeting and forwards the join request.
@@ -424,6 +449,18 @@ impl MeetingControllerActor {
                 respond_to,
             } => {
                 let result = self.get_meeting(&meeting_id).await;
+                let _ = respond_to.send(result);
+            }
+
+            ControllerMessage::GetMeetingHandle {
+                meeting_id,
+                respond_to,
+            } => {
+                let result = self
+                    .meetings
+                    .get(&meeting_id)
+                    .map(|managed| managed.handle.clone())
+                    .ok_or_else(|| McError::MeetingNotFound(meeting_id.clone()));
                 let _ = respond_to.send(result);
             }
 

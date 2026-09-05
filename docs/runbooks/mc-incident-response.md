@@ -7,6 +7,55 @@
 
 ---
 
+## MC Topology — Read This Before Any `kubectl` Command
+
+MC ships as **two singleton Deployments**, `mc-0` and `mc-1` (each `replicas: 1`).
+There is **no `deployment/mc-service`** — `mc-service` is a Service, a PDB and the
+container name, so `kubectl ... deployment/mc-service` fails with
+`deployments.apps "mc-service" not found`.
+
+- **Every command below names `mc-0`. Repeat it for `mc-1`.** A symptom on one
+  instance says nothing about the other; they are independent processes with
+  independent state.
+- **Health/metrics is port `8081`**, not 8080. Port-forwards here map local 8080
+  to remote 8081, so `curl localhost:8080/metrics` is correct once forwarded.
+  **Do not "simplify" these to `service/mc-service`.** The `mc-service` ClusterIP
+  in `infra/services/mc-service/service.yaml` selects on `app` + `component` and
+  deliberately omits `instance:`, so it fans across mc-0 and mc-1 both and would
+  scrape a nondeterministic instance — a silent wrong answer for a metrics check,
+  rather than an error. `deployment/mc-0` is the only form that names what you
+  are measuring.
+- **You cannot `curl` MC's health port from another pod, and the failure is a
+  TIMEOUT rather than a refusal.** MC's NetworkPolicy
+  (`infra/services/mc-service/network-policy.yaml`) admits TCP 8081 from
+  **Prometheus only**; GC and MH are admitted on gRPC 50052 and nothing else. So
+  `curl http://mc-service.dark-tower.svc.cluster.local:8081/health` from a GC,
+  MH or debug pod is silently dropped — and a hang, during an incident, reads as
+  "MC is wedged", which is precisely the conclusion a dependency-health check
+  exists to rule out. **The sibling services are not symmetric and that is what
+  makes this a trap**: AC admits 8082 from gc/mc/mh and GC admits 8080 from
+  everywhere, so in a block of three dependency curls the AC and GC lines
+  genuinely work and only the MC line cannot. Use the port-forward form below
+  from the operator's own machine, per instance. To answer "can GC reach MC at
+  all", read `kubectl get endpoints mc-service -n dark-tower` plus GC's own
+  registration/heartbeat metrics — MC's health endpoint is not the instrument.
+- **Do not add replicas.** `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` comes from a
+  per-instance ConfigMap, so extra replicas all advertise the same address to GC
+  and clients get routed to a pod that does not hold their session (ADR-0023
+  session binding). Capacity is added by adding an *instance*, not a replica.
+  The manifests state this at the `replicas: 1` field itself — see the comment
+  above `replicas:` in `infra/services/mc-service/mc-0-deployment.yaml`, which
+  carries the same arithmetic.
+- **`kubectl exec` depends on the image variant.** `infra/docker/mc-service/Dockerfile`
+  defines both a shell-free `runtime` stage (distroless `cc-debian12`) and a
+  `runtime-with-healthcheck` stage (`:debug` + busybox). The build passes no
+  `--target`, so the last stage wins and busybox is present *by stage ordering,
+  not by decision*. If a `--target runtime` ever lands, every `exec`-based step
+  in this runbook stops working at once — prefer the shell-free alternatives in
+  §Diagnostic Commands where they exist.
+
+---
+
 ## Table of Contents
 
 1. [Severity Classification](#severity-classification)
@@ -26,6 +75,7 @@
    - [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures)
    - [Scenario 13: Unexpected MH Notifications](#scenario-13-unexpected-mh-notifications)
    - [Scenario 14: Elevated Involuntary Departures / Slow Roster Removal](#scenario-14-elevated-involuntary-departures--slow-roster-removal)
+   - [Client media signalling — where to look](#client-media-signalling--where-to-look-no-scenario-number-yet) (unnumbered; story task 21 takes Scenarios 15/16)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -117,7 +167,7 @@ Infrastructure Team / SRE Lead
 
 ```bash
 # 1. Check mailbox depth by actor type
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 kill %1
 
@@ -139,11 +189,13 @@ curl http://localhost:8080/metrics | grep mc_messages_dropped_total
 
 1. **Slow Message Processing**: Message handler taking too long
    - Check: mailbox depth growth by actor type, Redis p99 latency, session join p95
-   - Fix: Investigate specific actor logic, optimize, or scale
+   - Fix: Investigate specific actor logic, optimize, or raise resource
+     limits. MC has no horizontal-scale option (see §MC Topology).
 
 2. **Message Storm**: Burst of messages from clients
    - Check: Connection count spike, message rate spike
-   - Fix: Implement rate limiting, scale horizontally
+   - Fix: Implement rate limiting, or cap admission via MC_MAX_MEETINGS /
+     MC_MAX_PARTICIPANTS. MC has no horizontal-scale option (see §MC Topology).
 
 3. **Blocking Operations**: Actor performing blocking I/O
    - Check: Logs for slow operations, trace spans
@@ -151,7 +203,7 @@ curl http://localhost:8080/metrics | grep mc_messages_dropped_total
 
 4. **Resource Contention**: CPU/memory pressure
    - Check: `kubectl top pods`
-   - Fix: Scale horizontally, increase resource limits
+   - Fix: Increase resource limits (`kubectl patch`, below). MC has no horizontal-scale option (see §MC Topology).
 
 5. **GC Integration Slow**: Slow responses from GC
    - Check: GC heartbeat latency
@@ -160,10 +212,35 @@ curl http://localhost:8080/metrics | grep mc_messages_dropped_total
 **Remediation**:
 
 ```bash
-# Option 1: Scale horizontally to distribute load
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# Option 1: SHED LOAD or ADD AN INSTANCE -- MC has NO horizontal-scale option.
+#           Read the block below BEFORE typing anything: the command an
+#           operator reaches for here makes the incident measurably worse.
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Expected recovery time: 30-60 seconds
+# Expected recovery time: NONE from scaling -- it is not an available lever.
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
+# plus a roll: minutes, and it takes effect only on restart (no content hash --
+# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# instance is a manifest change (ConfigMap + Deployment + Service + Kind port
+# mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
 # Option 2: Restart affected pods (clears mailbox but may drop messages)
 # CAUTION: This will disconnect active meetings on this pod
@@ -177,7 +254,12 @@ kubectl delete pod <MC_POD_NAME> -n dark-tower
 # Escalate to Service Owner
 
 # Option 4: Increase mailbox capacity (temporary, requires config change)
-# Update ACTOR_MAILBOX_SIZE in ConfigMap and restart pods
+# NOTE: there is no ACTOR_MAILBOX_SIZE variable -- it is one of the six
+# phantoms named in docs/runbooks/mc-deployment.md §Environment Variables.
+# Mailbox capacity is a compile-time constant in the actor modules; changing
+# it is a code change, not a ConfigMap edit -- CONTROLLER_CHANNEL_BUFFER,
+# MEETING_CHANNEL_BUFFER and PARTICIPANT_CHANNEL_BUFFER in crates/mc-service/
+# src/actors/. Depth thresholds are in src/actors/metrics.rs.
 # Not recommended as first action - address root cause first
 
 # Verify recovery
@@ -207,7 +289,7 @@ curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 
 ```bash
 # 1. Check panic metrics
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_actor_panics_total
 kill %1
 
@@ -224,7 +306,7 @@ kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -B 10 "panic" | g
 
 # 5. Check if panic is recurring
 # Watch panic counter
-watch -n 5 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
+watch -n 5 'kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
 ```
 
 **Common Root Causes**:
@@ -258,10 +340,10 @@ sum by(actor_type) (increase(mc_actor_panics_total[5m]))
 
 # Step 2: If panic is in critical actor and recurring, consider rollback
 # Check if recent deployment
-kubectl rollout history deployment/mc-service -n dark-tower
+kubectl rollout history deployment/mc-0 -n dark-tower
 
 # If panic started after deployment:
-kubectl rollout undo deployment/mc-service -n dark-tower
+kubectl rollout undo deployment/mc-0 -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
@@ -271,7 +353,7 @@ kubectl delete pod <MC_POD_NAME> -n dark-tower
 # Expected recovery time: 30 seconds
 
 # Step 4: Monitor for recurrence
-watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
+watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_actor_panics_total; kill %1 2>/dev/null'
 
 # Verify recovery
 # Panic count should stop incrementing
@@ -301,7 +383,7 @@ curl http://localhost:8080/metrics | grep mc_actor_panics_total
 
 ```bash
 # 1. Check meeting and connection counts
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 kill %1
 
@@ -398,7 +480,7 @@ kubectl describe pods -n dark-tower -l app=mc-service
 kubectl logs -n dark-tower -l app=mc-service --previous --tail=100
 
 # 4. Check deployment status
-kubectl describe deployment mc-service -n dark-tower
+kubectl describe deployment mc-0 -n dark-tower
 
 # 5. Check resource quotas
 kubectl describe resourcequota -n dark-tower
@@ -408,7 +490,7 @@ kubectl get nodes
 kubectl describe node <node-name>
 
 # 7. Check for recent deployments
-kubectl rollout history deployment/mc-service -n dark-tower
+kubectl rollout history deployment/mc-0 -n dark-tower
 ```
 
 **Common Root Causes**:
@@ -441,8 +523,8 @@ kubectl rollout history deployment/mc-service -n dark-tower
 
 ```bash
 # Option 1: Rollback deployment to last known good version
-kubectl rollout undo deployment/mc-service -n dark-tower
-kubectl rollout status deployment/mc-service -n dark-tower
+kubectl rollout undo deployment/mc-0 -n dark-tower
+kubectl rollout status deployment/mc-0 -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
@@ -458,7 +540,7 @@ kubectl get configmap -n dark-tower mc-service-config
 # If missing, recreate from secure backup
 
 # Option 4: Increase resource limits (if OOMKilled)
-kubectl patch deployment/mc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+kubectl patch deployment/mc-0 -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes
 
@@ -490,7 +572,7 @@ kubectl logs -n dark-tower -l app=mc-service --tail=50
 
 ```bash
 # 1. Check session join and Redis latency metrics
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep -E "mc_session_join_duration_seconds|mc_redis_latency_seconds"
 kill %1
 
@@ -510,7 +592,7 @@ histogram_quantile(0.95, sum by(le) (rate(mc_gc_heartbeat_latency_seconds_bucket
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "gc\|pause"
 
 # 7. Check network latency between pods
-kubectl exec -it deployment/mc-service -n dark-tower -- ping gc-service.dark-tower.svc.cluster.local
+kubectl exec -it deployment/mc-0 -n dark-tower -- ping gc-service.dark-tower.svc.cluster.local
 ```
 
 **Common Root Causes**:
@@ -521,7 +603,8 @@ kubectl exec -it deployment/mc-service -n dark-tower -- ping gc-service.dark-tow
 
 2. **CPU Contention**: High CPU usage causing processing delays
    - Check: `kubectl top pods`
-   - Fix: Scale horizontally, investigate CPU-intensive operations
+   - Fix: Raise the CPU limit and investigate CPU-intensive operations.
+     MC has no horizontal-scale option (see §MC Topology).
 
 3. **Blocking Operations**: Sync calls blocking actor processing
    - Check: Logs for slow operations, trace spans
@@ -542,16 +625,43 @@ kubectl exec -it deployment/mc-service -n dark-tower -- ping gc-service.dark-tow
 **Remediation**:
 
 ```bash
-# Scenario A: CPU Bound (CPU >80%)
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# Scenario A: CPU Bound (CPU >80%) -- raise the CPU limit; do NOT scale.
+kubectl patch deployment/mc-0 -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"cpu":"4000m"},"requests":{"cpu":"1000m"}}}]}}}}'
+kubectl patch deployment/mc-1 -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"cpu":"4000m"},"requests":{"cpu":"1000m"}}}]}}}}'
+# Expected recovery time: 2-3 minutes (rolling update, one pod at a time).
+#
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Expected recovery time: 30-60 seconds
+# Expected recovery time: NONE from scaling -- it is not an available lever.
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
+# plus a roll: minutes, and it takes effect only on restart (no content hash --
+# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# instance is a manifest change (ConfigMap + Deployment + Service + Kind port
+# mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
 # Scenario B: Mailbox Backpressure
 # See Scenario 1 remediation
 
 # Scenario C: Memory Pressure
-kubectl patch deployment/mc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+kubectl patch deployment/mc-0 -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes
 
@@ -589,7 +699,7 @@ histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucke
 
 ```bash
 # 1. Check heartbeat metrics
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_gc_heartbeat
 kill %1
 
@@ -601,7 +711,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "SELECT id, region, capacity, current_sessions, last_heartbeat, status FROM meeting_controllers ORDER BY last_heartbeat DESC LIMIT 10;"
 
 # 4. Test GC connectivity from MC pod
-kubectl exec -it deployment/mc-service -n dark-tower -- \
+kubectl exec -it deployment/mc-0 -n dark-tower -- \
   curl -i http://gc-service.dark-tower.svc.cluster.local:8080/health
 
 # 5. Check MC logs for GC errors
@@ -658,7 +768,7 @@ kubectl describe networkpolicy mc-service -n dark-tower
 
 ```bash
 # Option 1: Restart MC to force re-registration
-kubectl rollout restart deployment/mc-service -n dark-tower
+kubectl rollout restart deployment/mc-0 -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
@@ -709,7 +819,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 kubectl top pods -n dark-tower -l app=mc-service
 
 # 2. Check resource limits
-kubectl describe deployment mc-service -n dark-tower | grep -A 10 "Limits:"
+kubectl describe deployment mc-0 -n dark-tower | grep -A 10 "Limits:"
 
 # 3. Check for OOMKilled events
 kubectl get events -n dark-tower --field-selector involvedObject.kind=Pod | grep -i "oom\|killed"
@@ -722,7 +832,7 @@ container_spec_memory_limit_bytes{pod=~"mc-service-.*"}
 rate(container_cpu_usage_seconds_total{pod=~"mc-service-.*"}[5m])
 
 # 6. Check meeting/connection load
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 kill %1
 
@@ -734,11 +844,13 @@ curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 
 1. **High Meeting Load**: Too many meetings on one MC
    - Check: mc_meetings_active metric
-   - Fix: Scale horizontally, GC should distribute
+   - Fix: GC should distribute across mc-0/mc-1 — check GC's assignment, and
+     cap admission if both are loaded. MC has no horizontal-scale option (see §MC Topology).
 
 2. **Connection Surge**: Spike in WebTransport connections
    - Check: mc_connections_active metric
-   - Fix: Scale horizontally, implement rate limiting
+   - Fix: Implement rate limiting; cap admission via MC_MAX_PARTICIPANTS.
+     MC has no horizontal-scale option (see §MC Topology).
 
 3. **Mailbox Accumulation**: Messages queued in mailboxes
    - Check: mc_actor_mailbox_depth
@@ -750,23 +862,48 @@ curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 
 5. **CPU-Intensive Operations**: Heavy message processing
    - Check: Message processing latency by type
-   - Fix: Optimize processing, scale horizontally
+   - Fix: Optimize processing; raise resource limits. MC has no horizontal-scale option (see §MC Topology).
 
 **Remediation**:
 
 ```bash
-# Option 1: Scale horizontally to distribute load
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# Option 1: SHED LOAD or ADD AN INSTANCE -- MC has NO horizontal-scale option.
+#           Read the block below BEFORE typing anything: the command an
+#           operator reaches for here makes the incident measurably worse.
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Expected recovery time: 30-60 seconds
+# Expected recovery time: NONE from scaling -- it is not an available lever.
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
+# plus a roll: minutes, and it takes effect only on restart (no content hash --
+# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# instance is a manifest change (ConfigMap + Deployment + Service + Kind port
+# mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
 # Option 2: Increase resource limits
-kubectl patch deployment/mc-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"cpu":"4000m","memory":"2Gi"},"requests":{"cpu":"1000m","memory":"1Gi"}}}]}}}}'
+kubectl patch deployment/mc-0 -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"cpu":"4000m","memory":"2Gi"},"requests":{"cpu":"1000m","memory":"1Gi"}}}]}}}}'
 
 # Expected recovery time: 2-3 minutes (rolling update)
 
 # Option 3: Restart pods (temporary fix for memory issues)
-kubectl rollout restart deployment/mc-service -n dark-tower
+kubectl rollout restart deployment/mc-0 -n dark-tower
 
 # Expected recovery time: 2-3 minutes
 
@@ -803,7 +940,7 @@ kubectl top pods -n dark-tower -l app=mc-service
 
 ```bash
 # 1. Check overall join success/failure rate
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_session_joins_total
 kill %1
 
@@ -822,7 +959,7 @@ histogram_quantile(0.95, sum by(le) (rate(mc_session_join_duration_seconds_bucke
 )
 
 # 5. Check active meetings and capacity
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep -E "mc_meetings_active|mc_connections_active"
 kill %1
 
@@ -830,7 +967,7 @@ kill %1
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -i "join\|JoinRequest\|session"
 
 # 7. Check Redis health (session state depends on Redis)
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_redis_latency_seconds
 kill %1
 ```
@@ -849,7 +986,8 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
 
 3. **`mc_capacity_exceeded`**: MC instance at maximum meeting capacity
    - Check: `mc_meetings_active` metric vs configured capacity limit
-   - Fix: Scale horizontally, check GC load balancing
+   - Fix: Check GC load balancing across mc-0/mc-1; raise MC_MAX_MEETINGS if
+     the cap is genuinely too low. MC has no horizontal-scale option (see §MC Topology).
 
 4. **`meeting_capacity_exceeded`**: Individual meeting at participant limit
    - Check: Meeting participant count in logs
@@ -943,17 +1081,41 @@ kubectl get pods -n dark-tower -l app=redis
 kubectl exec -it deployment/redis -n dark-tower -- redis-cli ping
 # Expected: PONG
 
-# Step 4: If capacity exceeded — scale MC
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# Step 4: If capacity exceeded — SHED LOAD or ADD AN INSTANCE. MC has no
+#         horizontal-scale option; read the block below before acting.
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Expected recovery time: 30-60 seconds
+# Expected recovery time: NONE from scaling -- it is not an available lever.
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
+# plus a roll: minutes, and it takes effect only on restart (no content hash --
+# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# instance is a manifest change (ConfigMap + Deployment + Service + Kind port
+# mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
 # Step 5: If internal errors persist — restart as last resort
 # See Recovery Procedures: #service-restart-procedure
 # WARNING: Active meetings on restarted pods will be affected
 
 # Verify recovery
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_session_joins_total
 kill %1
 # Failure rate should be decreasing
@@ -983,7 +1145,7 @@ kill %1
 
 ```bash
 # 1. Check WebTransport connection counts by status
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_webtransport_connections_total
 kill %1
 
@@ -998,10 +1160,22 @@ sum by(status) (increase(mc_webtransport_connections_total[5m]))
   sum(increase(mc_webtransport_connections_total[5m]))
 )
 
-# 4. Check TLS certificate validity
-kubectl exec -it deployment/mc-service -n dark-tower -- \
-  openssl x509 -in /certs/tls.crt -noout -dates -subject
+# 4. Check TLS certificate validity.
+#    Read it from the SECRET, not from inside the pod: the mc-service runtime
+#    image is distroless and carries no `openssl` (and, per §MC Topology, may
+#    lose its shell entirely if a `--target runtime` build ever lands), so the
+#    exec form fails for a reason unrelated to the certificate.
+kubectl get secret mc-service-tls -n dark-tower \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+  openssl x509 -noout -dates -subject
 # Verify: notAfter is in the future
+#
+# The in-pod path, if you have a shell and want to confirm what the pod ACTUALLY
+# mounted rather than what the Secret holds: the mc-tls volume mounts at
+# /etc/mc-tls (mode 0400), so the file is /etc/mc-tls/tls.crt -- NOT /certs/,
+# which this step named for years and which has never existed. MC_TLS_CERT_PATH
+# in mc-service-config is the authoritative answer:
+#   kubectl set env deployment/mc-0 --list -n dark-tower | grep MC_TLS
 
 # 5. Check MC logs for TLS/QUIC errors
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -iE "tls|quic|certificate|handshake|reject"
@@ -1015,7 +1189,7 @@ kubectl get networkpolicy -n dark-tower
 kubectl describe networkpolicy mc-service -n dark-tower
 
 # 8. Check MC capacity (rejections may be due to connection limits)
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep -E "mc_connections_active|mc_meetings_active"
 kill %1
 
@@ -1039,7 +1213,8 @@ kubectl top pods -n dark-tower -l app=mc-service
 
 4. **Connection Capacity Exceeded**: Too many concurrent WebTransport connections
    - Check: `mc_connections_active` metric vs configured limit
-   - Fix: Scale horizontally to distribute connections
+   - Fix: Raise the connection cap (MC_MAX_PARTICIPANTS) or add an mc-2
+     instance. MC has no horizontal-scale option (see §MC Topology).
 
 5. **TLS Certificate Mismatch**: Client connecting with wrong SNI or hostname
    - Check: MC logs for TLS handshake errors mentioning SNI
@@ -1077,16 +1252,40 @@ kubectl edit networkpolicy mc-service -n dark-tower
 
 # Expected recovery time: immediate after policy update
 
-# Option 3: Scale horizontally (if capacity exceeded)
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# Option 3: If capacity exceeded — SHED LOAD or ADD AN INSTANCE. MC has no
+#           horizontal-scale option; read the block below before acting.
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Expected recovery time: 30-60 seconds
+# Expected recovery time: NONE from scaling -- it is not an available lever.
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
+# plus a roll: minutes, and it takes effect only on restart (no content hash --
+# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# instance is a manifest change (ConfigMap + Deployment + Service + Kind port
+# mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
 # Option 4: Restart MC (if QUIC listener crashed)
 # See Recovery Procedures: #service-restart-procedure
 
 # Verify recovery
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_webtransport_connections_total
 kill %1
 # Rejection rate should be decreasing, accepted rate increasing
@@ -1117,7 +1316,7 @@ kill %1
 
 ```bash
 # 1. Check JWT validation success/failure counts
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_jwt_validations_total
 kill %1
 
@@ -1136,18 +1335,18 @@ sum by(token_type) (increase(mc_jwt_validations_total{result="failure"}[5m]))
 
 # 4. Check AC service health (JWKS source)
 kubectl get pods -n dark-tower -l app=ac-service
-kubectl exec -it deployment/mc-service -n dark-tower -- \
+kubectl exec -it deployment/mc-0 -n dark-tower -- \
   curl -s http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json | head -c 500
 # Verify: returns JSON with "keys" array containing at least one key
 
 # 5. Check JWKS endpoint returns expected key IDs
-kubectl exec -it deployment/mc-service -n dark-tower -- \
+kubectl exec -it deployment/mc-0 -n dark-tower -- \
   curl -s http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json | grep '"kid"'
 # Expected format: kid values like "auth-prod-2026-01"
 # During key rotation: should see BOTH old and new kid values (overlap period)
 
 # 6. Check clock skew between MC and AC pods
-kubectl exec -it deployment/mc-service -n dark-tower -- date -u
+kubectl exec -it deployment/mc-0 -n dark-tower -- date -u
 kubectl exec -it deployment/ac-service -n dark-tower -- date -u
 # Compare timestamps — drift >5s may cause validation failures
 # (MC allows DEFAULT_CLOCK_SKEW_SECONDS = 5 for binding tokens;
@@ -1192,7 +1391,7 @@ sum by(error_type) (increase(mc_session_join_failures_total[5m]))
 
 ```bash
 # Step 1: Verify AC JWKS endpoint is healthy
-kubectl exec -it deployment/mc-service -n dark-tower -- \
+kubectl exec -it deployment/mc-0 -n dark-tower -- \
   curl -s -o /dev/null -w "%{http_code}" http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json
 # Expected: 200
 
@@ -1219,7 +1418,7 @@ kubectl get pods -n dark-tower -l app=mc-service -o wide
 # Do NOT restart services — preserve logs for forensic analysis
 
 # Verify recovery
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_jwt_validations_total
 kill %1
 # Failure rate should be decreasing
@@ -1395,7 +1594,7 @@ kubectl logs -n dark-tower -l app=mc-service --tail=500 \
 sum(rate(mh_register_meeting_timeouts_total[5m]))
 
 # 6. MC→MH gRPC reachability for the failing endpoint(s) from a fresh shell
-kubectl exec -it deployment/mc-service -n dark-tower -- \
+kubectl exec -it deployment/mc-0 -n dark-tower -- \
   grpcurl -plaintext mh-service.dark-tower.svc.cluster.local:50051 list
 
 # 7. Check if MC mailbox depth is queueing the trigger task (CPU/backpressure cause)
@@ -1422,14 +1621,33 @@ kubectl describe networkpolicy mc-service -n dark-tower
 # Step 2: If MH down — restore MH (MH Sc 1).
 # Step 3: If NetworkPolicy regression — Infrastructure Team. To verify before rollback:
 kubectl get networkpolicy -n dark-tower -o yaml | grep -A5 mh
-kubectl rollout undo deployment/mc-service -n dark-tower
+kubectl rollout undo deployment/mc-0 -n dark-tower
 # (Or revert the NetworkPolicy change — coordinate with Infrastructure.)
 
 # Step 4: If MH JWKS rejection — escalate AC Team (see MH Sc 2 + MC Sc 10);
 #          MC service token may need rotation if auth_rejected dominates.
 
-# Step 5: If MC mailbox backpressure — scale MC horizontally
-kubectl scale deployment/mc-service -n dark-tower --replicas=5
+# Step 5: If MC mailbox backpressure — see Scenario 1 remediation. Do NOT
+#         scale: MC has no horizontal-scale option (block below).
+# WRONG: kubectl scale deployment/mc-0 --replicas=5
+# MC DOES NOT SCALE BY REPLICAS -- scaling makes it WORSE, not better, and the
+# arithmetic is why. --replicas=5 gives five pods all labelled instance: mc-0:
+#   * the mc-service-0 NodePort selects instance: mc-0, so all five become
+#     endpoints and arriving QUIC/UDP connections spread across them;
+#   * all five read MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single
+#     mc-0-config, so they advertise an IDENTICAL client-facing URL;
+#   * but MC_ID and MC_GRPC_ADVERTISE_ADDRESS are generated PER POD.
+# So GC registers five distinct MCs advertising one client URL. GC assigns a
+# meeting to one; the NodePort then picks an endpoint independently of that
+# assignment. That is a 4-in-5 miss -- roughly 80% join failure for every mc-0
+# meeting -- and the miss rate RISES with each replica added. An operator
+# reaching for `scale` under load gets the exact opposite of what they expect.
+# The ADR-0023 session-binding failure is the symptom; the cause is that
+# instance identity is per-pod while the advertise address is per-instance.
+# Adding MC capacity means adding an INSTANCE (mc-2: its own ConfigMap,
+# Deployment, Service and UDP NodePort), not raising a replica count.
+# Shed load instead by capping admission -- see MC_MAX_MEETINGS /
+# MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Step 6: If stale Redis MH assignment data — escalate to MC Team to investigate
 #         MhAssignmentStore TTL / refresh logic. Affected meetings will recover
@@ -1544,7 +1762,7 @@ Triage by signal shape from Diagnosis step 5:
 kubectl logs -n dark-tower -l app=mc-service --tail=5000 \
   > /tmp/mc-incident-$(date -u +%Y%m%dT%H%M%SZ).log
 # 2. Snapshot the metric for forensic baseline.
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl -s http://localhost:8080/metrics | grep mc_mh_notifications_received_total \
   > /tmp/mc-metrics-$(date -u +%Y%m%dT%H%M%SZ).txt
 kill %1
@@ -1597,7 +1815,14 @@ worst_case_crash_removal =
 ```
 
 With defaults: **10 + 30 + 5 = 45 seconds**. If either env var is overridden, recompute
-from the pod's actual values (`kubectl exec ... env | grep -E 'MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS|MC_DISCONNECT_GRACE_PERIOD_SECONDS'`).
+from the pod's actual values. Read them **without a shell** — `kubectl exec` needs
+busybox, which is unavailable in exactly the `CreateContainerConfigError` case where you
+most want these values:
+```bash
+kubectl set env deployment/mc-0 --list -n dark-tower | grep -E 'MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS|MC_DISCONNECT_GRACE_PERIOD_SECONDS'
+# or, straight from the pod spec:
+kubectl get pod -n dark-tower -l instance=mc-0 -o jsonpath='{.spec.containers[0].env}'
+```
 `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` is operator-overridable (fail-loud: an invalid or `0`
 value crashes the pod at startup rather than silently reverting to a library default);
 the grace period is a code constant today.
@@ -1648,13 +1873,262 @@ misconfigured `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` is suspected.
 
 ---
 
+### Client media signalling — where to look (no scenario number yet)
+
+Deliberately **unnumbered**. Story task 21 owns numbered Scenarios 15/16 for the
+ADR-0036 media path and will key its triage off these same tokens; this section
+exists so the counters shipped in task 14 are reachable from this runbook in the
+meantime, rather than only from the metric catalog and the Grafana panel — both
+of which are found by someone who *already* suspects the media path.
+
+**Read this first: how much of it is live today.** MC composes and sends the
+`SendDirective` now, but the browser SDK does **not yet honour it** (story task
+19). Until task 19 lands, every failure below is **invisible to users** and none
+of it is pageable — treat this as diagnosis for a reported media problem, not as
+a signal to act on proactively. **When task 19 lands, that inverts**: a client
+never told to send simply produces nothing — no error, no join failure, no
+absent-frame signal — and these counters become the only evidence. See the alert
+obligation filed in `docs/TODO.md` §Media Path Obligations.
+
+**The symptom that leads here**: "I can't hear anyone" / one-way audio / a
+participant who joined successfully and is silent, with `mc_session_joins_total`
+showing success and no WebTransport rejection.
+
+**Five questions, in the order worth asking them.** Each has a primary counter;
+three further metrics appear below as companions or escalation pointers, so the
+five headings are **not** a complete list of the metrics named here. **Scope
+boundary**: this section covers the client-facing signalling path only. The
+MC->MH control plane (`mc_media_policy_pushes_total`,
+`mc_media_generation_divergence`) is cited below only to route you, and is
+triaged in Scenarios 12 and 13, not here. All primary counters are on the standard MC metrics
+endpoint (`deployment/mc-0`, port 8081 — see §MC Topology), and none carries any
+meeting, participant or stream identity.
+
+```bash
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
+curl -s http://localhost:8080/metrics | grep -E 'mc_media_(receive_capability_declarations|send_directives|slot_states|unmatched_plan_slots|mute_requests)_total|mc_participant_outbound_messages_dropped_total'
+kill %1
+# Repeat for mc-1 -- a symptom on one instance says nothing about the other.
+```
+
+**1. `mc_media_receive_capability_declarations_total{outcome}` — is the client
+asking correctly?** Note the failure predicate carefully:
+
+```promql
+# Rejections. NOT outcome!="accepted" -- `accepted_unchanged` is a SUCCESS
+# (an identical re-declaration; MC does no work and sends nothing).
+sum by (outcome) (rate(mc_media_receive_capability_declarations_total{outcome!~"accepted|accepted_unchanged"}[5m]))
+```
+
+Every rejection token except one names a **client** defect, so a rise is a client
+fleet problem and points at a client release, not an MC deploy:
+`duplicate_slot_id`, `slot_count_over_cap` (the client asked for more slots than
+`MC_MAX_RECEIVE_SLOTS`), `slot_id_out_of_range`, `pinned_sender_id_zero`,
+`pinned_sender_id_out_of_range`, `declaration_budget_exhausted` (the client blew
+`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` on one connection — a re-declaration
+loop). `media_kind_unspecified` most often means a **version-skewed** client, not
+one that forgot a field: read a rise as client-fleet skew first.
+
+The exception is **`slot_id_not_planned`**, which is **not** a client defect. The
+declaration is well-formed and MC cannot serve it, because the join-time
+forwarding-policy push fixes the egress slot id before the client can declare.
+The remedy is the capability-triggered re-push (a later story), not a client
+change. **Do not escalate this one to the client team.**
+
+Do **not** build a ratio whose denominator includes `accepted_unchanged`: it is
+client-inflatable at near-zero server cost, so any such ratio is evadable. Use
+`accepted` alone.
+
+**2. `mc_media_send_directives_total{outcome}` — is MC telling clients to send?**
+This is the one that answers "why is this participant silent". Failure predicate:
+
+```promql
+# NOT outcome!="emitted" -- `emitted_empty_targets` is a specified success
+# per ADR-0036 §5 and becomes routine once selective forwarding lands.
+sum by (outcome) (rate(mc_media_send_directives_total{outcome!~"emitted|emitted_empty_targets"}[5m]))
+```
+
+| Token | What it means | Where to go |
+|---|---|---|
+| `no_planned_egress_slot` | **The severe one.** Failed at join, so it silences the connection for its *whole life*, not one declaration. MC computed a forwarding assignment fine; that assignment simply contains no egress plan naming this subscriber. | MC↔MH coordination — Scenario 12 (`RegisterMeeting`) and `mc_media_policy_pushes_total`. The client is not at fault and reconnecting will not help. |
+| `meeting_state_unavailable` | MC could not get the meeting actor handle. | Actor health — Scenario 1 (mailbox depth) and Scenario 2 (actor panics). |
+| `assignment_failed` | MC could not compute a forwarding assignment at all — distinct from `no_planned_egress_slot`, where the computation succeeded. | Scenario 12; check MH registration and `mc_media_generation_divergence`. |
+| `handler_url_unresolved` | No MH WebTransport endpoint resolved for the assigned handler. | MH health and MC's view of it — Scenario 11 / Scenario 13. |
+| `unknown_stream_number`, `transport_mode_unspecified` | **MC-internal defects**, fail-closed. Not operator-actionable. | File against `meeting-controller`; these are diagnostics, not pageable. |
+
+Log coverage is **uneven across these values, and the counter is the complete
+record — the logs are not.** Stated precisely, because filtering on a token the
+line does not carry returns nothing and reads like "it never happened":
+
+- **Join-time failures** (`no_planned_egress_slot` and the other
+  context-resolution values) log a **WARN carrying `outcome`**, once at join,
+  never per message. This is the only case where filtering on the token works.
+- **Per-composition `build_send_directive` failures** (`unknown_stream_number`,
+  `transport_mode_unspecified`, `handler_url_unresolved`) log at **ERROR** and do
+  carry `outcome`. All three return through the same `Err(outcome)` arm, so the
+  list is the full set of values `build_send_directive` itself produces — do not
+  read the two MC-defect values as the whole of it.
+- **`meeting_state_unavailable`** logs a WARN with **no `outcome` field**, and
+  **`assignment_failed`** logs at ERROR with no `outcome` field (one of its two
+  sites carries `reason`, which is the assignment error's own label, not this
+  token).
+
+So `level=warn AND outcome=assignment_failed` matches nothing by construction.
+Search the message text, or read the counter:
+
+```bash
+kubectl logs deployment/mc-0 -n dark-tower --tail=500 | grep -i "media signalling\|send directive"
+```
+
+A connection whose context failed to build stays otherwise **healthy** — the
+participant remains joined, the roster is correct, mute and every other post-join
+message keep working. That is deliberate graceful degradation, and it is also why
+the failure has no other symptom.
+
+**3. `mc_media_slot_states_total{slot_state}` — are the slots MC filled actually
+carrying anything?** Note the label is **`slot_state`**, not `outcome` — this is
+the one of the three that is not an outcome vocabulary. Its domain mirrors the
+wire `SlotState` enum **exhaustively (all eight variants, not the four reachable
+today)**, which is what makes MC's distribution directly comparable with the
+client's.
+
+```promql
+sum by (slot_state) (rate(mc_media_slot_states_total[5m]))
+```
+
+`active` is the healthy value. `source_muted` is the sender's own mute and is
+normal. `fewer_sources_than_slots` means the client declared more slots than
+there are sources — normal in a small meeting, not a fault. `source_unreachable`
+is the one worth chasing: the source exists and MC cannot reach it. A non-zero
+`unspecified` is an **MC defect** — that value should never reach the wire —
+and is visible here precisely because the vocabulary was not pruned to the
+reachable subset.
+
+`mc_media_unmatched_plan_slots_total` counts the inverse: MC planning into a slot
+the client never declared. It carries **no** `slot_state`/`outcome` label (only
+`key_custody`, so cardinality 1), and it is incremented **by the slot count**,
+not by 1 per composition — so the series is a *slot* rate, not a *composition*
+rate, and it shares no denominator with the counters above. Do not ratio it
+against them. A sustained non-zero rate means MC's
+egress plan and the client's declared layout disagree — the same underlying
+mismatch as `slot_id_not_planned` seen from the other side. Do not transpose the
+two: *plan's slot was not declared* here, *client's slot has no plan* there.
+
+**4. `mc_media_mute_requests_total{outcome}` — is client mute landing, and is one
+connection driving meeting-wide work?** Note the failure predicate is stated
+**positively**, unlike the two above:
+
+```promql
+# POSITIVE form on purpose. Do NOT "harmonise" this to outcome!~"..." to match
+# its neighbours: stated positively, a variant added later defaults to
+# not-a-failure instead of silently joining the failure set.
+sum by (outcome) (rate(mc_media_mute_requests_total{outcome=~"rate_limited|actor_unavailable"}[5m]))
+```
+
+| Token | Meaning |
+|---|---|
+| `applied` | Reported to the meeting actor and recomposition **attempted** (not necessarily succeeded — see the mute-path gap in `docs/TODO.md`). |
+| `applied_no_recompose` | Reported, nothing to re-convey — no declaration yet, or a **video-only** change. **Expect this to be the largest bucket** once clients wire camera buttons: it is what an ordinary camera button produces, and it is healthy. |
+| `unchanged` | Identical to the report already in force; MC correctly did nothing. **Not a denominator — see below.** |
+| `rate_limited` | The per-connection mute-work token bucket is exhausted (burst 8, sustained 4/s — `MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
+| `actor_unavailable` | Environmental and terminal. Pairs with `meeting_state_unavailable` above — check actor health, Scenarios 1 and 2. |
+
+**`unchanged` must NOT appear in a ratio denominator** — same rule, same reason,
+as `accepted_unchanged` on the declarations counter. The no-op short-circuit
+fires *before* any actor hop, roster read or recomposition, so a client repeating
+one state drives `unchanged` at line rate for the cost of a tuple compare and a
+counter increment. "What fraction of mute reports are being applied", computed
+over it, is **a number one participant can drive to zero**. The denominator is
+`applied` + `applied_no_recompose`.
+
+**`unchanged` is exempt from the rate limiter on purpose — do not "fix" the
+ordering.** Reversing it would let a client spamming a steady state drain its own
+bucket on messages that do no work, suppressing its next *genuine* toggle, while
+the metric reported `rate_limited` for an expensive path that was never
+approached. Same family as the positive-predicate note above: an asymmetry that
+looks like an inconsistency and is load-bearing.
+
+**`rate_limited` is not by itself an incident.** A human never reaches the bound —
+8 toggles of burst is more than any push-to-talk flurry, and 4/s sustained is
+orders of magnitude above human rates. A sustained non-zero rate means **one
+connection** is toggling far above human rates: read it as a client-side repeat
+loop or reactive-state bug first, an abusive peer second. Either way the blast
+radius is that one connection.
+
+**The dropped report is safe, and this is why**: ADR-0036 §5 enforces client mute
+**at capture, on the client**, so when MC drops a report the audio genuinely
+stopped — only the indicator other participants see is stale, and it self-corrects
+on that client's next toggle. Do not escalate a `rate_limited` rate as an
+audio-leak risk; it is not one.
+
+**Why the bound exists at all, and what it protects**: this is the only
+repeatable client-driven path that puts work on the **shared meeting actor's
+mailbox** — one `GetState` roster snapshot per composition — plus a
+per-connection roster read, assignment computation and outbound message.
+Unbounded, one client toggling in a loop spends all of that at line rate.
+
+**This is NOT a meeting-wide latency pointer, and an earlier revision of this
+section said it was.** The bound was originally sized against
+`handle_self_mute`'s O(N) awaited `broadcast_update`, which did head-of-line-block
+joins, leaves and every other connection's state read. That fan-out was removed
+(`MuteChanged` has no consumer, so it delivered zero bytes to zero clients), and
+the meeting-wide blast radius went with it. The remaining cost is dominated by
+the one connection driving it. **Do not spend an incident here looking for the
+cause of meeting-wide latency** — that symptom's pointers are Scenario 12
+(MC↔MH coordination) and the actor mailbox-depth panels, not this counter.
+
+**Caveat that also applies to `mc_media_slot_states_total` above**: both counters
+are **per-composition**, and compositions are partly client-triggered, so a raw
+fleet-wide ratio over either is skewable by a single participant. Any SLO built on
+them needs per-connection normalisation. The skew is bounded by the same limiter.
+
+**5. `mc_participant_outbound_messages_dropped_total{payload_kind}` — did the
+client actually RECEIVE what MC decided to send?** Not a media-path metric (no
+`key_custody`, generic outbound choke point), and listed here anyway because it
+is **the completeness caveat on counter 2**.
+
+```promql
+sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[5m]))
+# payload_kind ∈ {signaling_raw, participant_update}
+```
+
+**`emitted` does not mean the client was told.** `record_send_directive` fires
+`emitted` **before** the message is handed to the participant actor, so two
+failure modes sit *after* the counter and neither moves it:
+
+- **Mailbox FULL** — `try_send` fails, the drop is counted **here** under
+  `payload_kind="signaling_raw"`. This is the only queryable evidence.
+- **Mailbox CLOSED** (actor gone) — a WARN in `webtransport::connection`, no
+  counter. Deliberate: the FULL case is already covered here, and a WARN is
+  proportionate to actor-gone.
+
+So the honest reading of a silent participant is: `accepted` incrementing,
+`emitted` incrementing, nothing disagreeing — **and a non-zero
+`signaling_raw` drop rate is the one signal that contradicts them.** Check it
+before concluding from counter 2 that the client was directed.
+
+**The WARN beside it is one-shot per connection; the counter is not.** Every drop
+is counted, only the first is logged, because a wedged outbound channel produces
+one drop per roster broadcast — O(participants x events) identical lines from a
+single bad connection, on a path a client can drive. **So log-line volume
+understates this badly**: one line can stand for thousands of drops, and the
+counter is the complete record of repeat occurrences.
+
+**Escalation**: `meeting-controller` for `unknown_stream_number` /
+`transport_mode_unspecified` and any `slot_id_not_planned` rate;
+`media-handler` for `no_planned_egress_slot`, `assignment_failed` and
+`handler_url_unresolved`; `client` for the capability rejection tokens and for a sustained `rate_limited`
+(a repeat loop in the SDK's mute path).
+
+---
+
 ## Diagnostic Commands
 
 ### Quick Health Check
 
 ```bash
 # Check service health
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/health      # Liveness
 curl http://localhost:8080/ready       # Readiness
 kill %1
@@ -1669,7 +2143,7 @@ kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i error
 ### Metrics Analysis
 
 ```bash
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 
 # Get all metrics
 curl http://localhost:8080/metrics
@@ -1730,7 +2204,7 @@ kubectl top pods -n dark-tower -l app=mc-service
 kubectl top nodes
 
 # Check resource limits
-kubectl describe deployment mc-service -n dark-tower | grep -A 5 "Limits:"
+kubectl describe deployment mc-0 -n dark-tower | grep -A 5 "Limits:"
 
 # Check events for resource issues
 kubectl get events -n dark-tower --field-selector involvedObject.name=mc-service --sort-by='.lastTimestamp'
@@ -1742,8 +2216,14 @@ kubectl get events -n dark-tower --field-selector involvedObject.name=mc-service
 # Test service connectivity
 kubectl run -it --rm debug --image=nicolaka/netshoot --restart=Never -- /bin/bash
 # From debug pod:
-curl http://mc-service.dark-tower.svc.cluster.local:8080/health
+# NOTE: do NOT curl MC's health port from this pod. Nothing listens on 8080,
+# and 8081 is admitted from Prometheus only -- the drop is a TIMEOUT, which
+# reads as "MC is wedged". See the netpol bullet in §MC Topology.
 nslookup mc-service.dark-tower.svc.cluster.local
+# Reachability that actually answers the question, from the operator's machine:
+#   kubectl get endpoints mc-service -n dark-tower
+#   kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
+#   curl -i http://localhost:8080/health   # repeat for mc-1
 
 # Check service endpoints
 kubectl get endpoints -n dark-tower mc-service
@@ -1752,7 +2232,7 @@ kubectl get endpoints -n dark-tower mc-service
 kubectl get networkpolicies -n dark-tower
 
 # Test GC connectivity
-kubectl exec -it deployment/mc-service -n dark-tower -- \
+kubectl exec -it deployment/mc-0 -n dark-tower -- \
   curl -i http://gc-service.dark-tower.svc.cluster.local:8080/health
 ```
 
@@ -1769,19 +2249,24 @@ kubectl exec -it deployment/mc-service -n dark-tower -- \
 kubectl get pods -n dark-tower -l app=mc-service
 
 # 2. Check active meetings (will be affected)
-kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 &
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
 curl http://localhost:8080/metrics | grep mc_meetings_active
 kill %1
 
 # 3. Perform rolling restart (zero-downtime if multiple pods)
-kubectl rollout restart deployment/mc-service -n dark-tower
+kubectl rollout restart deployment/mc-0 -n dark-tower
 
 # 4. Monitor rollout
-kubectl rollout status deployment/mc-service -n dark-tower
+kubectl rollout status deployment/mc-0 -n dark-tower
 
 # 5. Verify recovery
 kubectl get pods -n dark-tower -l app=mc-service
-curl http://mc-service.dark-tower.svc.cluster.local:8080/ready
+# Health is 8081 and is NOT reachable cross-pod (netpol admits Prometheus only)
+# -- port-forward from here rather than curling the ClusterIP. See §MC Topology.
+kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
+curl -i http://localhost:8080/ready
+kill %1
+# Repeat for mc-1 -- one instance ready says nothing about the other.
 
 # 6. Check logs for startup errors
 kubectl logs -n dark-tower -l app=mc-service --tail=50
@@ -1789,7 +2274,7 @@ kubectl logs -n dark-tower -l app=mc-service --tail=50
 
 **Rollback on failure**:
 ```bash
-kubectl rollout undo deployment/mc-service -n dark-tower
+kubectl rollout undo deployment/mc-0 -n dark-tower
 ```
 
 ---
@@ -1804,7 +2289,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c "UPDATE meeting_controllers SET status = 'draining' WHERE id = '<MC_ID>';"
 
 # 2. Wait for active meetings to complete (monitor metric)
-watch -n 30 'kubectl port-forward -n dark-tower deployment/mc-service 8080:8080 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
+watch -n 30 'kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 2>/dev/null & sleep 1; curl -s http://localhost:8080/metrics | grep mc_meetings_active; kill %1 2>/dev/null'
 
 # 3. When meetings are zero, proceed with maintenance
 

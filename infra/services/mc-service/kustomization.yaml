@@ -8,7 +8,30 @@ resources:
   - mc-0-deployment.yaml
   - mc-1-deployment.yaml
   - service.yaml
+  # mc-service-secrets ONLY
   - secret.yaml
+  # mc-service-tls NOT listed — created imperatively by
+  # infra/kind/scripts/setup.sh:create_mc_tls_secret() from the certs
+  # scripts/generate-dev-certs.sh generates, because listing it would commit
+  # TLS key material to git. Consequence: `kubectl apply -k` alone does NOT
+  # produce startable pods on a fresh namespace — both mc-{0,1} mount it as
+  # the `mc-tls` volume, which is NOT `optional:`, so kubelet cannot complete
+  # the mount.
+  #
+  # THE SIGNAL IS `FailedMount`, NOT A CERT ERROR. The pod stays Pending in
+  # ContainerCreating and the process NEVER STARTS, so there is nothing in
+  # `kubectl logs` and no cert-loading error anywhere — mc-service's
+  # `Identity::load_pemfiles` is a DIFFERENT failure that needs the Secret to
+  # exist and be malformed. `kubectl describe pod` names the Secret; that is the
+  # only artifact that says so. This is the THIRD of the three signals in
+  # docs/runbooks/mc-deployment.md §Config-failure triage, alongside
+  # `CreateContainerConfigError` for a missing ConfigMap key and
+  # `CrashLoopBackOff` for a stale pod template. `kubectl logs` is empty or
+  # misleading for all three, which is the generalisation worth carrying; pod
+  # phase alone tells them apart before you read anything.
+  #
+  # setup.sh is the only supported bootstrap today; making this declarative is
+  # tracked in docs/TODO.md §Infrastructure Validation in Devloops.
   - pdb.yaml
   - network-policy.yaml
   # service-monitor.yaml NOT listed — requires Prometheus Operator CRD

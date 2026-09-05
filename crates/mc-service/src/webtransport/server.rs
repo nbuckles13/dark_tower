@@ -67,6 +67,8 @@ pub struct WebTransportServer {
     mc_grpc_endpoint: String,
     /// Maximum concurrent connections (bounds resource exhaustion).
     max_connections: usize,
+    /// Client-facing media-signalling configuration (ADR-0036 §5, §6).
+    client_media_config: crate::media_signaling::ClientMediaConfig,
     /// QUIC max-idle-timeout for the WebTransport endpoint (config-driven).
     /// Bounds crash/network-loss departure detection; a keep-alive interval is
     /// derived from it so healthy-but-quiet connections are never idle-timed-out.
@@ -95,6 +97,7 @@ impl WebTransportServer {
         policy_generations: Arc<PolicyGenerations>,
         mc_id: String,
         mc_grpc_endpoint: String,
+        client_media_config: crate::media_signaling::ClientMediaConfig,
         max_connections: usize,
         quic_max_idle_timeout: Duration,
         cancel_token: CancellationToken,
@@ -110,6 +113,7 @@ impl WebTransportServer {
             policy_generations,
             mc_id,
             mc_grpc_endpoint,
+            client_media_config,
             max_connections,
             quic_max_idle_timeout,
             active_connections: Arc::new(AtomicUsize::new(0)),
@@ -248,6 +252,7 @@ impl WebTransportServer {
                     let policy_generations = Arc::clone(&self.policy_generations);
                     let mc_id = self.mc_id.clone();
                     let mc_grpc_endpoint = self.mc_grpc_endpoint.clone();
+                    let client_media_config = self.client_media_config;
                     let connection_token = self.cancel_token.child_token();
 
                     tokio::spawn(async move {
@@ -260,6 +265,7 @@ impl WebTransportServer {
                             policy_generations,
                             mc_id,
                             mc_grpc_endpoint,
+                            client_media_config,
                             connection_token,
                         )
                         .await;

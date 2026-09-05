@@ -376,12 +376,13 @@ tasks:
   slug: 2026-09-02-mc-media-routing-control-plane
   tag: story-2026-08-27-hear-yourself-through-handler-task-13
 - id: 14
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 3
   - 13
   prompt: 'Implement, in the Meeting Controller service, the client-facing signaling that drives the ADR-0036 loopback media session over the existing client-to-MC WebTransport channel (§5, §6). After a client joins, MC sends it a send directive naming exactly one audio media stream to produce, targeting the participant''s assigned media handler, carrying the stream''s encoding parameters, the meeting-wide header version (version 2, §2), and, in the target set, the transport mode (datagram) (§5). The send directive does not carry a priority group — that is a handler egress property assigned on the MC-to-MH registration, not on what the client produces (§5 versus §7). The client declares its receive capability as one audio slot, and MC composes the experience by assigning the participant''s own audio as that slot''s source and conveying the slot''s state explicitly on the wire, so that for the loopback the participant''s own audio fills its own slot (§6). The stream assignment identifies the slot''s source by its numeric sender_id — the same handle the frame key id encodes — so the receiver can map an arriving frame to the roster identity key it verifies against (§2, §3). MC''s post-join dispatch, which today handles only the media-connection update and ignores media signaling (`webtransport/connection.rs`), is extended to handle the receive-capability declaration and to emit the send directive and the slot assignment; the old layout-oriented messages are gone with the protocol reshape. Client mute is enforced client-side at capture and must silence audio instantly, and unmute must restore it instantly with no round trip to MC; MC''s part is that while a client reports itself audio-muted MC keeps the send directive active and unchanged — it does not withdraw or re-issue the directive across a mute/unmute cycle, which is what keeps the two states "MC has not asked you to send" and "you have muted yourself" distinct and makes unmute a local decision (§5). MC records the reported mute state but the directive is held; the far-end-muted slot state is conveyed. The existing HostMuteRequest message is renamed to server mute by protocol; MC consumes the rename with no behaviour change (server-mute enforcement is story 2). Integration tests: receive-capability in → send directive + slot assignment out with the expected fields; mute/unmute cycle leaves the directive untouched. MC telemetry carries key_custody=operator and no meeting identifier on media metrics (§11). Depends on the assignment computation task and on protocol''s signaling message shapes.'
+  slug: 2026-09-03-mc-client-media-signaling
   tag: story-2026-08-27-hear-yourself-through-handler-task-14
 - id: 15
   status: pending

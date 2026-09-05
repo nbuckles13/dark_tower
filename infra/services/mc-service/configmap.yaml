@@ -44,3 +44,141 @@ data:
   # prod telemetry is not mistagged (same tracked caveat as GC's task #26 —
   # see docs/TODO.md).
   DEPLOYMENT_ENVIRONMENT: "development"
+  # ==========================================================================
+  # Client-facing media signalling (ADR-0036 §5, §6) — story task 14
+  #
+  # ALL FIVE KEYS ARE REQUIRED. mc-service reads them via
+  # ConfigError::MissingEnvVar with NO Rust default, so a missing key
+  # CrashLoopBackOffs the pod rather than silently reverting to a value nobody
+  # chose. That is deliberate: a Rust-defaulted key wired into mc-0 and
+  # forgotten on mc-1 passes `dt-guard env-config` green while the two MC
+  # instances direct DIFFERENT encoder parameters to their clients. The
+  # documented default is the value below — this file is the source, not a
+  # constant in config.rs.
+  #
+  # ROLLBACK ORDERING, because these keys make the ConfigMap a hard startup
+  # dependency of the image: kustomization.yaml lists ConfigMaps under
+  # `resources:`, NOT `configMapGenerator:`, so there is no content hash and
+  # EDITING THIS FILE DOES NOT ROLL THE PODS — a wrong value stays latent until
+  # the next restart.
+  #
+  # THE COUPLED SET IS THREE ARTIFACTS, NOT TWO: this ConfigMap, BOTH
+  # Deployments, and the image. Apply all three with-or-before each other and
+  # never revert any of them independently. The Deployment is in the set because
+  # it carries the `configMapKeyRef` — it is what declares that a pod CONSUMES a
+  # key; this file only supplies the value. A key present here but unreferenced
+  # there is not consumed at all (the same fact the per-key `configMapKeyRef`
+  # requirement below rests on).
+  #
+  # APPLYING THIS FILE ALONE DOES NOT FIX A CRASHLOOP, and that failure is
+  # silent in the worst direction: the pods do not roll, the crash message is
+  # unchanged, and the natural next inference is "my apply did not take" or "the
+  # key name is wrong" — sending an operator hunting in the wrong artifact.
+  # Demonstrated in this change's own Gate 2 run. Mid-incident, apply the
+  # Deployments too.
+  #
+  # See docs/runbooks/mc-deployment.md §Config-failure triage: a new Deployment
+  # against an old ConfigMap gives CreateContainerConfigError (empty logs,
+  # `describe` names the key), while a new image against an old pod template
+  # gives CrashLoopBackOff (`logs --previous` names the variable) — opposite
+  # first steps.
+  # ==========================================================================
+  # Maximum receive slots one client may declare in a single ReceiveCapability
+  # (ADR-0036 §6). MC REJECTS THE WHOLE DECLARATION when exceeded — never
+  # clamps, never accepts a prefix. Story 1 is audio-only and a loopback client
+  # declares exactly 1, so 8 is generous headroom against §11's two media kinds
+  # and a realistic grid of <=5 video plus audio.
+  #
+  # THE VALUE ITSELF IS BOUNDED to 1..=64 and mc-service refuses to start
+  # outside that range. 0 would mean no client can ever receive media — a silent
+  # total outage that reads as valid configuration — and a large value quietly
+  # retires the property §6 relies on this cap for ("resource-amplification-by-
+  # request becomes structurally impossible rather than rate-limited"). A cap
+  # whose own value is unbounded is not a cap.
+  # Enforced by: mc-service, in-process, at receive-capability validation.
+  # Where an operator sees it: mc_media_receive_capability_declarations_total
+  # {outcome="slot_count_over_cap"}.
+  MC_MAX_RECEIVE_SLOTS: "8"
+  # Maximum ACCEPTED receive-capability declarations per WebTransport
+  # connection. Bounds client-driven O(N) roster reads on the shared meeting
+  # actor: a client alternating between two valid declarations would otherwise
+  # drive one roster clone per message. Charged ONLY on acceptance — every
+  # rejection is decided without touching the meeting actor, so a client looping
+  # rejects cannot bypass it. Bounded 1..=4096 at load, same reasoning as above.
+  # 64 is generous for legitimate layout changes over a long session; nothing in
+  # story 1 re-declares at all.
+  # Enforced by: mc-service, in-process, per connection.
+  # Where an operator sees it: mc_media_receive_capability_declarations_total
+  # {outcome="declaration_budget_exhausted"}.
+  MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS: "64"
+  # The codec MC directs clients to produce for main audio (ADR-0036 §5).
+  # Parsed into the closed `Codec` proto enum: trimmed and case-folded, then an
+  # unrecognised value, "unspecified", or a video codec FAILS AT STARTUP. It
+  # never falls back to Opus — a silent coercion would leave an operator
+  # believing they had configured something they had not.
+  # Enforced by: mc-service, at config load.
+  # Where an operator sees it: nothing today — takes effect only once the client
+  # honours the send directive (story task 19). See the note below.
+  MC_AUDIO_CODEC: "opus"
+  # Maximum audio bitrate MC directs, in bits per second.
+  #
+  # CROSS-SERVICE COUPLING, stated as an inequality rather than a lock:
+  # mh-service sizes NOMINAL_AUDIO_FRAME_BYTES — and therefore its
+  # operator-facing "N frames = M ms" datagram-buffer budget — at
+  # SUPPORTED_AUDIO_BITRATE_FLOOR_BPS (32000), the SMALLEST frame it expects.
+  # 48000 is the top of the 32000..48000 band mh-service documents and task 19
+  # specifies the SDK against, so MH's sizing stays conservative.
+  #
+  # `crates/mh-service/src/config.rs::SUPPORTED_AUDIO_BITRATE_FLOOR_BPS` is a
+  # RELATED BUT DIFFERENT constant — a minimum MH assumes, versus a maximum MC
+  # directs. DO NOT UNIFY THEM. The residual coupling (if the SDK's VBR floor
+  # ever lands below 32000, MH's constant must move with it) is recorded in
+  # docs/TODO.md §Media Path Obligations and is owned by media-handler/client.
+  # Enforced by: mc-service, at config load (rejects outside 32000..=48000).
+  # Where an operator sees it: nothing today — see the note below.
+  MC_AUDIO_MAX_BITRATE_BPS: "48000"
+  # Audio frames per second MC directs. 50 Hz IS 20 ms frames, which is the same
+  # physical quantity as `crates/mh-service/src/config.rs::
+  # AUDIO_FRAME_DURATION_MS` expressed in the reciprocal unit.
+  #
+  # WHAT BREAKS IF THIS MOVES: mh-service reports its datagram-buffer budget to
+  # operators as a LATENCY, derived by multiplying its configured frame count by
+  # AUDIO_FRAME_DURATION_MS. Directing a lower rate here inflates the real held
+  # latency past that reported figure — silently, with nothing failing and
+  # nothing counted, in the one service whose ADR-0036 §1 goal is to prefer loss
+  # to unbounded latency.
+  #
+  # Deliberately citing MH's constants BY NAME and no figures: restating MH's
+  # numbers here would make this operator-facing comment silently false the day
+  # MH changes them, and the next lines say that change is a live path. The
+  # magnitude is worth knowing though, so here is the RELATIONSHIP rather than a
+  # copied value: the buffer is a BYTE budget, and halving the frame rate doubles
+  # the Opus PAYLOAD but NOT the fixed header and crypto overhead — which is the
+  # larger share of a nominal audio frame (see mh-service's own derivation of
+  # NOMINAL_AUDIO_FRAME_BYTES from NOMINAL_OPUS_PAYLOAD_BYTES +
+  # SFRAME_OBJECT_OVERHEAD_BYTES + NOMINAL_HEADER_BYTES + SIGNATURE_SIZE). So
+  # each frame grows by roughly a THIRD, not double: about 0.75x as many frames
+  # are held, each worth twice as long, for roughly 1.5x the reported latency.
+  #
+  # (Two earlier revisions of this comment were wrong in OPPOSITE directions, so
+  # neither correction is the whole story. The first said 2x, assuming the frame
+  # COUNT was fixed rather than the byte budget. The second said each frame
+  # "doubles" — which, if it were true, would mean 0.5x as many frames each worth
+  # twice as long, i.e. exactly 1.0x and no latency change at all, the opposite
+  # of this comment's point. The fixed per-frame overhead is why it is neither.)
+  #
+  # Effective values are logged at MC startup, and a rate other than 20 ms frames
+  # emits a WARN naming this coupling — so an operator who sets it deliberately
+  # gets the reminder at boot rather than only here.
+  #
+  # Bounded 25..=50 at load. 25 Hz (40 ms) is ADR-0036 §3's named
+  # signature-overhead mitigation, so the low end is a live path rather than a
+  # theoretical bound, and moving there is a coordinated change with mh-service,
+  # not a unilateral one.
+  # Enforced by: mc-service, at config load (rejects outside 25..=50).
+  # Where an operator sees it: nothing today — see the note below.
+  MC_AUDIO_FRAME_RATE_HZ: "50"
+  # NOTE on the three MC_AUDIO_* keys: they have NO OBSERVABLE EFFECT until the
+  # client honours the send directive (story task 19). MC composes and sends the
+  # directive today; nothing consumes it yet. Tuning them before then changes
+  # nothing, and no metric moves.

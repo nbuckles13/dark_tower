@@ -293,6 +293,6 @@ groups:
           component: meeting-join
         annotations:
           summary: "MC session join p95 latency high ({{ $value }}s > 2s)"
-          description: "Session join p95 latency is {{ $value }}s, exceeding 2s threshold for 5 minutes. MC SLO is p99 <500ms, so p95 >2s is a leading indicator of degradation. Note: info severity because the aggregate MCHighLatency page alert covers the processing SLO; this tracks join-specific latency."
+          description: "Session join p95 latency is {{ $value }}s, exceeding 2s threshold for 5 minutes. MC SLO is p99 <500ms, so p95 >2s is a leading indicator of degradation. Note: info severity because this tracks join-specific latency, which is separate from the processing SLO. There is NO aggregate latency page alert - the processing SLO has no alert rule today, so do not read this note as saying something else already covers it."
           impact: "Slow meeting join experience. Investigate JWT validation, actor processing, and WebTransport session setup latency."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-5-high-latency"

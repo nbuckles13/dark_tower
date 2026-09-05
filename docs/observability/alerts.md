@@ -617,7 +617,7 @@ histogram_quantile(0.95,
 
 ### Critical Alerts
 
-Existing MC critical alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCHighLatency`, `MCHighMessageDropRate`, `MCGCHeartbeatFailure`. See `mc-alerts.yaml` for full definitions.
+Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
 
 ### Warning Alerts (Join Flow)
 
@@ -711,7 +711,7 @@ sum(rate(mc_jwt_validations_total[5m])) > 0
 
 **Severity**: Info
 **Condition**: Session join p95 latency >2s for >5 minutes (successful joins only)
-**Threshold Rationale**: MC SLO is p99 <500ms for message processing. The join flow is end-to-end (WebTransport accept to JoinResponse) and includes JWT validation and actor processing, so a 2s p95 threshold serves as a leading indicator. The aggregate `MCHighLatency` critical alert covers the processing SLO.
+**Threshold Rationale**: MC SLO is p99 <500ms for message processing. The join flow is end-to-end (WebTransport accept to JoinResponse) and includes JWT validation and actor processing, so a 2s p95 threshold serves as a leading indicator. There is **no** aggregate latency page alert: the processing SLO has no alert rule today, so do not read this threshold as backed up by something else. (`MCHighLatency` was cited here and in `MCHighJoinLatency`'s own annotation and has never existed.)
 **Impact**: Slow meeting join experience
 **Runbook**: [Scenario 5: High Latency](../runbooks/mc-incident-response.md#scenario-5-high-latency)
 

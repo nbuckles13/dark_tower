@@ -3278,7 +3278,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "RegisterMeeting RPC attempts by status (success/error). Tracks MC\u2192MH meeting registration volume and reliability.",
+      "description": "RegisterMeeting RPC attempts by status (success/error). Tracks MC→MH meeting registration volume and reliability.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3387,7 +3387,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "RegisterMeeting RPC latency percentiles (P50/P95/P99). Measures MC\u2192MH round-trip time for meeting registration.",
+      "description": "RegisterMeeting RPC latency percentiles (P50/P95/P99). Measures MC→MH round-trip time for meeting registration.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3525,7 +3525,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of MH\u2192MC participant connection/disconnection notifications by event type.",
+      "description": "Rate of MH→MC participant connection/disconnection notifications by event type.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3618,7 +3618,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration \u2014 a service is presenting a valid token but calling the wrong gRPC endpoint.",
+      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3901,7 +3901,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Roster removals by leave reason (task #64). voluntary = clean tab-close or explicit leave (grace skipped); timeout = disconnect grace period expired (crash/network-loss that did not reconnect); removed = host-removed; meeting_ended. A rising timeout share signals involuntary departures \u2014 see MC incident runbook Scenario 14.",
+      "description": "Roster removals by leave reason (task #64). voluntary = clean tab-close or explicit leave (grace skipped); timeout = disconnect grace period expired (crash/network-loss that did not reconnect); removed = host-removed; meeting_ended. A rising timeout share signals involuntary departures — see MC incident runbook Scenario 14.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4185,7 +4185,7 @@
       },
       "id": 55,
       "panels": [],
-      "title": "Media Routing (ADR-0036 \u00a78)",
+      "title": "Media Routing (ADR-0036 §8)",
       "type": "row"
     },
     {
@@ -4193,7 +4193,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Forwarding-policy pushes to an MH, by what the handler's reply proved (ADR-0036 \u00a78). THIS IS THE DETECTION SIGNAL for a meeting whose policy MC could not confirm as live; the divergence stat beside it is only the magnitude a responder reads next. Counts response evaluations, NOT meetings: a retried push contributes one sample per attempt. handler_id_mismatch is a DIAGNOSTIC, not an alerting signal, until MH_HANDLER_ID is stable per deployment - the id is a per-incarnation token, so an ordinary MH pod restart produces that outcome by construction. Alert expressions must read outcome!~\"match|handler_id_mismatch\"; the alert rule, the metrics catalog and mc-deployment.md's post-deploy checklist hold one expression with one revert trigger (2026-09-02-mh-stable-handler-id). No meeting identifier, sender id or generation number appears as a label. COLOUR: red is the three Err outcomes only; handler_id_mismatch is YELLOW because it is expected by construction on any MH restart and is excluded from the alert expression - visible, expected, not your incident. The red regexp is anchored so a sixth outcome whose name contains \"mismatch\" cannot silently join the red set.",
+      "description": "Forwarding-policy pushes to an MH, by what the handler's reply proved (ADR-0036 §8). THIS IS THE DETECTION SIGNAL for a meeting whose policy MC could not confirm as live; the divergence stat beside it is only the magnitude a responder reads next. Counts response evaluations, NOT meetings: a retried push contributes one sample per attempt. handler_id_mismatch is a DIAGNOSTIC, not an alerting signal, until MH_HANDLER_ID is stable per deployment - the id is a per-incarnation token, so an ordinary MH pod restart produces that outcome by construction. Alert expressions must read outcome!~\"match|handler_id_mismatch\"; the alert rule, the metrics catalog and mc-deployment.md's post-deploy checklist hold one expression with one revert trigger (2026-09-02-mh-stable-handler-id). No meeting identifier, sender id or generation number appears as a label. COLOUR: red is the three Err outcomes only; handler_id_mismatch is YELLOW because it is expected by construction on any MH restart and is excluded from the alert expression - visible, expected, not your incident. The red regexp is anchored so a sixth outcome whose name contains \"mismatch\" cannot silently join the red set.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4393,6 +4393,815 @@
       ],
       "title": "Media Generation Divergence (magnitude)",
       "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 179
+      },
+      "id": 157,
+      "panels": [],
+      "title": "Client Media Signalling (ADR-0036 §5, §6)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Client receive-capability declarations by disposition (ADR-0036 §6). This metric PARTITIONS declarations: every one lands in exactly one bucket. THE SUCCESS SET IS {accepted, accepted_unchanged}, so the complete rejection count is outcome!~\"accepted|accepted_unchanged\". DO NOT USE outcome!=\"accepted\": that counts a success as a rejection, and the success it counts is the one value a client can inflate for free. USE accepted ALONE AS ANY RATIO DENOMINATOR - accepted_unchanged is an identical re-declaration that MC does no work for, so it is client-inflatable at near-zero server cost and a ratio computed over it is an evadable alert. Rejection is always WHOLE-DECLARATION - MC never accepts a prefix, never applies last-write-wins to a duplicate, never clamps an out-of-range id. COLOUR, and read it carefully: GREEN is accepted; DARK GREEN is accepted_unchanged (also a success, but NOT the denominator); RED is the five CLIENT DEFECTS (duplicate_slot_id, slot_count_over_cap, slot_id_out_of_range, pinned_sender_id_zero, pinned_sender_id_out_of_range). YELLOW is media_kind_unspecified, whose likeliest producer is a VERSION-SKEWED client whose AUDIO=0 decodes as unspecified - correlate with a client rollout, not with a forgotten field. BLUE is slot_id_not_planned, which is NOT a client defect: the declaration is well-formed and the contract permits it, and MC cannot serve it because the join-time policy push fixes the egress slot id before a client can declare. Do not send anyone into the SDK on blue; the fix is the capability-triggered re-push (docs/TODO.md §Media Path Obligations), and a rising blue rate means that limitation is biting in the field. ORANGE is declaration_budget_exhausted - a client re-declaring past MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS on one connection; nothing in story 1 re-declares at all, so any occurrence is a client bug or an attack. No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "accepted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "accepted_unchanged"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "semi-dark-green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(duplicate_slot_id|slot_count_over_cap|slot_id_out_of_range|pinned_sender_id_zero|pinned_sender_id_out_of_range)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "media_kind_unspecified"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "slot_id_not_planned"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "declaration_budget_exhausted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 180
+      },
+      "id": 58,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_receive_capability_declarations_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Capability Declarations by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Send-directive compositions by disposition (ADR-0036 §5). EMITTED MEANS COMPOSED, NOT DELIVERED: the counter fires before the send, so a directive composed and then lost reads as emitted here with accepted healthy on the Declarations panel and nothing disagreeing. Before concluding from a healthy graph that clients were directed, check Unmatched Plan Slots and Dropped Outbound Messages for payload_kind=signaling_raw (mailbox FULL) and the mc.webtransport.connection delivery WARN (mailbox CLOSED, deliberately uncounted since FULL is covered). The counter is NOT moved below the send on purpose - that would conflate composition failure with delivery failure and destroy the disjoint-by-construction property. THE SUCCESS SET IS {emitted, emitted_empty_targets}, NOT {emitted}. §5 makes an empty target set a SPECIFIED success (\"that means send nothing\"), so both are GREEN and any failure predicate must read outcome!~\"emitted|emitted_empty_targets\". This alternation is PERMANENT with no revert trigger - it is grounded in §5, unlike the superficially identical carve-out on Media Policy Pushes above, which is a temporary workaround. The two share a shape and nothing else; do not fold them together or strip this one as cleanup, or you will start paging on a routine success. RED is the two MC DEFECTS (any non-zero value is a bug): unknown_stream_number and transport_mode_unspecified. ORANGE is the four ENVIRONMENTAL values: handler_url_unresolved, meeting_state_unavailable, assignment_failed and no_planned_egress_slot. no_planned_egress_slot is the MOST SEVERE value here and the only JOIN-TIME one - the assignment computed successfully but contains no egress plan naming that subscriber, so the connection is never told to send FOR ITS WHOLE SESSION rather than for one declaration, and looks healthy otherwise. Do not confuse it with slot_id_not_planned on the Declarations panel, which is a CLIENT naming a slot MC did not plan; this is MC planning no slot at all. The failure values are disjoint by construction: the emit path is sequential stages and the first failing stage returns its own value. Recorded at two sites - per composition, and once per connection at join.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(emitted|emitted_empty_targets)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(unknown_stream_number|transport_mode_unspecified)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(handler_url_unresolved|meeting_state_unavailable|assignment_failed|no_planned_egress_slot)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 180
+      },
+      "id": 59,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_send_directives_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Send Directives by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Slot states MC conveys to subscribers (ADR-0036 §6). The bucketed slot-state signal §11 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO, at investigation time. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (all eight SlotState variants, not the four reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. source_muted is CLIENT MUTE (§5): the source is present and has muted itself at capture, and MC does NOT withdraw or re-issue its send directive - a source_muted/active oscillation with a FLAT Send Directives panel above it is the healthy shape. zero_requested may be unemittable in principle (open protocol question, docs/TODO.md); withheld_by_congestion arrives with the MH slot-state notification and switch_pending with §7 switching.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "active"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "source_muted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(fewer_sources_than_slots|zero_requested)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(source_unreachable|unspecified)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "withheld_by_congestion"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "switch_pending"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "purple",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 188
+      },
+      "id": 60,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (slot_state) (rate(mc_media_slot_states_total[$__rate_interval]))",
+          "legendFormat": "{{slot_state}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Slot States",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES ABOVE IT IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - that counter's emitted fires before the send, so it means COMPOSED, not delivered, and this panel is the mailbox-FULL half of what happened next. The mailbox-CLOSED half (participant actor gone) is a WARN at mc.webtransport.connection and is deliberately uncounted, since the FULL case is covered here. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. TWO SIGNALS, both about media MC decided on that never reached the client. mc_media_unmatched_plan_slots_total: MH is forwarding egress the subscriber will never accept - wasted uplink and handler work. A non-zero value is CLIENT-CONFORMANCE-DRIVEN, not necessarily an MC defect: it is reachable through the zero-audio exemption, where a subscriber legitimately declares no audio slot (\"send but do not receive\") and MC's planned audio slot matches nothing. It is the MIRROR of slot_id_not_planned on the declarations panel - the plan's slot was not declared HERE, the client's slot has no plan THERE. The two are easy to transpose; read the direction off the name. Under whole-declaration rejection they are mutually exclusive per declaration. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unmatched plan slots"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 188
+      },
+      "id": 61,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_media_unmatched_plan_slots_total[$__rate_interval]))",
+          "legendFormat": "unmatched plan slots",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[$__rate_interval]))",
+          "legendFormat": "dropped: {{payload_kind}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Unmatched Plan Slots and Dropped Outbound Messages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Client MuteRequest dispositions (ADR-0036 §5). This metric PARTITIONS mute reports: every post-join MuteRequest lands in exactly one bucket. THE SUCCESS SET IS {applied, applied_no_recompose} - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count two routine states as failures. GREEN applied: reported to the meeting actor and recomposition ATTEMPTED - the counter is recorded before the composition runs and its result is discarded, so a failed mute-path recomposition is counted here and is visible only in logs (tracked deferral in docs/TODO.md). DARK GREEN applied_no_recompose: reported, with nothing to re-convey - either no receive capability has been declared yet, or ONLY video_muted changed, and the slot view derives from audio_self_muted alone, so recomposing would emit a byte-identical StreamAssignments. Expect applied_no_recompose to be the largest bucket once clients wire camera buttons; it is what an ordinary camera toggle produces. BLUE unchanged: identical to the report already in force - MC correctly did nothing, not a failure. USE applied + applied_no_recompose AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate for a tuple compare, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (burst 8, sustained 4/s per connection). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one GetState roster snapshot per composition. THIS IS NOT A MEETING-WIDE CONTENTION SIGNAL AND AN EARLIER REVISION SAID IT WAS: the bound was sized against handle_self_mute's O(N) awaited broadcast_update, which was REMOVED because MuteChanged has no consumer and delivered zero bytes to zero clients. The meeting-wide blast radius went with it; the dominant remaining cost is the per-connection roster read, assignment computation and outbound message. Do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's audio_self_muted once spent, leaving every other client rendering a live speaker as muted for the rest of the session. Dropping a report is safe because §5 enforces client mute at CAPTURE on the client, so the audio genuinely stops and only the indicator is stale. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied_no_recompose"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "semi-dark-green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unchanged"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rate_limited"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "actor_unavailable"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 196
+      },
+      "id": 62,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_mute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mute Requests by Outcome",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

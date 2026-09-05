@@ -25,6 +25,22 @@ pub enum ControllerMessage {
         respond_to: oneshot::Sender<Result<MeetingInfo, McError>>,
     },
 
+    /// Get a handle to a live meeting actor.
+    ///
+    /// Distinct from [`ControllerMessage::GetMeeting`], which returns a state
+    /// SNAPSHOT: this returns the handle itself, so a caller holding it can talk
+    /// to the meeting directly without a controller hop per message.
+    ///
+    /// Taken ONCE per WebTransport connection, at join. The post-join dispatch
+    /// path then reaches meeting state without routing through the controller's
+    /// single mailbox, which would otherwise make the controller a serialization
+    /// point for every client signalling message in the process.
+    GetMeetingHandle {
+        meeting_id: String,
+        /// Response channel for the live handle, or `MeetingNotFound`.
+        respond_to: oneshot::Sender<Result<super::meeting::MeetingActorHandle, McError>>,
+    },
+
     /// Remove a meeting (called when all participants leave or meeting ends).
     RemoveMeeting {
         meeting_id: String,

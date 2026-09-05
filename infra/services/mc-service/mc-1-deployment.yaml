@@ -8,6 +8,16 @@ metadata:
     component: signaling
     instance: mc-1
 spec:
+  # MUST STAY 1 — this is a CORRECTNESS constraint, not a capacity choice.
+  # The per-instance NodePort in service.yaml selects on `instance:`, so every
+  # replica becomes an endpoint, while all replicas read one client-facing
+  # MC_WEBTRANSPORT_ADVERTISE_ADDRESS from the single per-instance ConfigMap.
+  # GC would then register N MCs advertising one URL and the NodePort would pick
+  # an endpoint independently of GC's assignment — a 4-in-5 miss at
+  # --replicas=5, WORSENING as you scale, presenting as intermittent join
+  # failures (ADR-0023 session binding). Scale by adding an instance
+  # (Deployment + ConfigMap + Service + Kind port mapping), never by raising
+  # this. See service.yaml.
   replicas: 1
   strategy:
     type: RollingUpdate
@@ -129,6 +139,45 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: DEPLOYMENT_ENVIRONMENT
+        # ---- Client-facing media signalling (ADR-0036 §5, §6) ----
+        # All five REQUIRED: mc-service reads them via ConfigError::MissingEnvVar
+        # with no Rust default, so a missing key CrashLoopBackOffs the pod rather
+        # than silently reverting to a value nobody chose.
+        #
+        # THE COUPLED SET IS THREE ARTIFACTS: the ConfigMap, BOTH Deployments,
+        # and the image. THIS file is where the configMapKeyRef lives, so THIS
+        # file is what declares that the pod consumes a key — the ConfigMap only
+        # supplies the value. Applying the ConfigMap alone does not roll the pods
+        # (resources:, not configMapGenerator:, so no content hash) AND does not
+        # fix a CrashLoop caused by a missing ref here: same pods, same crash,
+        # same key in the message, which reads as "my apply did not take".
+        # Apply all three with-or-before each other; never revert any
+        # independently. See docs/runbooks/mc-deployment.md §Config-failure triage.
+        - name: MC_MAX_RECEIVE_SLOTS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MAX_RECEIVE_SLOTS
+        - name: MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS
+        - name: MC_AUDIO_CODEC
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_AUDIO_CODEC
+        - name: MC_AUDIO_MAX_BITRATE_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_AUDIO_MAX_BITRATE_BPS
+        - name: MC_AUDIO_FRAME_RATE_HZ
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_AUDIO_FRAME_RATE_HZ
         # Pod IP for gRPC advertise address (downward API)
         - name: POD_IP
           valueFrom:

@@ -44,7 +44,7 @@ Anchor examples:
 - `GCHighErrorRate` — 1% error SLO violation; availability target at risk.
 - `GCDatabaseDown` — 50% DB error rate; all GC operations failing.
 - `MCDown` — MC service unreachable; active meetings affected.
-- `MCHighLatency` — p95 latency above 500ms SLO for 5m.
+- `MCActorPanic` — an actor task panicked; the meeting or connection it owned is gone.
 
 ### `warning` — **degraded but contained, or approaching limits** `[guard-enforced value]`
 
