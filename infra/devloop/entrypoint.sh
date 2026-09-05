@@ -97,5 +97,14 @@ echo "=== Container ready. Attach with: podman exec -it <name> claude --dangerou
 if [ $# -gt 0 ]; then
     exec "$@"
 else
+    # `exec sleep infinity` as PID 1 never calls wait(), so every orphaned
+    # process from long multi-agent devloop sessions (headless chrome, node,
+    # bash) re-parents to it and stays a zombie holding a cgroup PID slot for
+    # the container's lifetime. Measured 2026-09-05: 1890 zombies against a
+    # pids.max of 2048, surfacing as rayon EAGAIN panics in nx and a claude
+    # CLI core dump — three failure signatures that all read as defects in
+    # the diff under test. devloop.sh now runs this container with `--init`,
+    # so PID 1 is podman's reaping init and this exec is its child; keep the
+    # sleep as the hold-open process, and keep --pids-limit as the backstop.
     exec sleep infinity
 fi
