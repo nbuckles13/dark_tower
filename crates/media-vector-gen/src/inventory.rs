@@ -19,9 +19,10 @@ use crate::{CIPHER_SUITE_ID, CIPHER_SUITE_NAME, NON_PRODUCTION_BANNER, SCHEMA_VE
 use media_protocol::codec::ALL_REJECT_REASONS;
 use media_protocol::extensions::{AcceptedValues, EXT_REGISTRY};
 use media_protocol::frame::{
-    AEAD_TAG_BYTES, EXT_LENGTH_FIELD_SIZE, KEY_ID_BYTES, KEY_ID_GENERATION_BITS,
-    KEY_ID_SENDER_ID_BITS, KEY_ID_STREAM_BITS, LEGAL_FLAG_MASK, MAX_EXT_BYTES, MAX_PAYLOAD_BYTES,
-    PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE, RELAY_REGION_SIZE, SIGNATURE_SIZE,
+    AEAD_TAG_BYTES, EXT_LENGTH_FIELD_SIZE, KEK_GENERATION_FIELD_BYTES, KEY_ID_BYTES,
+    KEY_ID_GENERATION_BITS, KEY_ID_SENDER_ID_BITS, KEY_ID_STREAM_BITS, LEGAL_FLAG_MASK,
+    MAX_EXT_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE,
+    RELAY_REGION_SIZE, SIGNATURE_SIZE, WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES,
     WRAPPED_TRANSMIT_KEY_SIZE,
 };
 
@@ -128,6 +129,8 @@ fn wire_constants() -> WireConstants {
         relay_region_bytes: u32_of(RELAY_REGION_SIZE),
         publisher_fixed_prefix_bytes: u32_of(PUBLISHER_FIXED_PREFIX_SIZE),
         wrapped_transmit_key_bytes: u32_of(WRAPPED_TRANSMIT_KEY_SIZE),
+        kek_generation_field_bytes: u32_of(KEK_GENERATION_FIELD_BYTES),
+        wrapped_transmit_key_material_bytes: u32_of(WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES),
         ext_length_field_bytes: u32_of(EXT_LENGTH_FIELD_SIZE),
         max_ext_bytes: u32_of(MAX_EXT_BYTES),
         key_id_layout: KeyIdLayout {
@@ -270,7 +273,30 @@ fn adversarial_rows() -> Result<Vec<Row>, GenError> {
         "wrap_cached": false,
         "decrypts": true,
         "_assert": "Observe the receiver's key cache: key id 0x0102030405060709 must be ABSENT \
-                    after processing. Do not assert a dropped frame or a reject reason."
+                    after processing. Do not assert a dropped frame or a reject reason.",
+        // Declared in the SSoT rather than left to harness convention, mirroring
+        // `replay_of`, so a codec in a third language cannot get this wrong by
+        // omission. `decrypts: true` is only satisfiable if the receiver already
+        // holds a usable transmit key for the frame's OWN key id 0x0102030405060708
+        // — this frame's wrap is bound to 0x0102030405060709 and is ignored, so it
+        // cannot supply that key.
+        "receiver_precondition": {
+            "cached_transmit_key_for_key_id": "0102030405060708",
+            "primed_by": "full_frame_compose",
+            "prime_via": "unwrap_only",
+            "replay_window_advanced": false,
+            "_assert": "Before processing this row, prime the receiver's transmit-key cache for key \
+                        id 0x0102030405060708 by unwrapping full_frame_compose's wrapped-key block \
+                        under its KEK — the UNWRAP PATH ONLY. Do NOT run full_frame_compose through \
+                        the replay-checked receive path: it shares (key_id, stream_sequence) = \
+                        (0x0102030405060708, 7) with this row, so processing it advances the replay \
+                        window to seq 7 and this row is then rejected as replay_detected. Unwrap-only \
+                        priming keeps the cached key originating from a genuine valid wrap (so \
+                        decrypts:true stays self-protecting) while leaving the replay window \
+                        unadvanced. The harness MUST fail loudly if this precondition is not \
+                        established — a wrap-binding row that silently no-ops when unprimed is \
+                        indistinguishable from a pass."
+        }
     }));
     out.push(build_frame(&wrap_spec)?.row);
 
@@ -449,12 +475,20 @@ pub fn build() -> Result<VectorFile, GenError> {
         max_payload_bytes: MAX_PAYLOAD_BYTES as u64,
         gated_by: GatedBy {
             rust: true,
-            // False until story task 15 lands the TypeScript codec. The file
-            // never claims a green it does not have; guard check g14 hard-fails
-            // on any drift between this flag and reality, in either direction.
-            typescript: false,
+            // Story task 15 landed the TypeScript codec and its conformance gate
+            // (`packages/sdk-core/src/media/frame/__tests__/vectors.conformance.test.ts`):
+            // every row is now checked from a second, independently-authored
+            // implementation. The AAD span, the signed range and the detached-tag
+            // split — which no external anchor gates — are cross-validated, so the
+            // file may claim the green it now has. Guard g14 hard-fails on any drift
+            // between this flag and reality, in either direction.
+            typescript: true,
         },
-        cross_language_property_established: false,
+        // Discharges ADR-0036 Assumption 4: the insider-forgery regression now runs
+        // in the second implementation and rejects the frame rather than attributing
+        // it, so the header is frozen in code. See the Assumption 4 annotation in
+        // `docs/decisions/adr-0036-media-flow.md`.
+        cross_language_property_established: true,
         wire_constants: wire_constants(),
         extension_registry: extension_registry(),
         reject_reasons: reject_reasons(),

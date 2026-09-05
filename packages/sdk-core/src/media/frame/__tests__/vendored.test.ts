@@ -28,6 +28,10 @@ function manifest(overrides: Partial<VendoredManifest> = {}): VendoredManifest {
     source: { repo: 'r', commit: 'c', path: 'p', sha256: 's', bytes: 1 },
     array: 'sframe',
     cipher_suites: [4, 5],
+    // Minimal but non-empty: every UPSTREAM row below carries `cipher_suite`, so
+    // the presence check passes. A dedicated test overrides this to prove it fails
+    // on a missing field.
+    required_fields: ['cipher_suite'],
     expectations: [
       {
         cipher_suite: 4,
@@ -114,6 +118,21 @@ describe('selectRows anti-vacuity', () => {
   it('rejects an upstream file with no array at the selected key', () => {
     expect(() => selectRows(manifest({ array: 'nope' }), UPSTREAM)).toThrow(
       /no array at key "nope"/,
+    );
+  });
+
+  it('rejects an empty required_fields list — the presence check would assert nothing', () => {
+    expect(() => selectRows(manifest({ required_fields: [] }), UPSTREAM)).toThrow(
+      /required_fields is empty/,
+    );
+  });
+
+  it('rejects a selected row missing a declared required field', () => {
+    // Anti-vacuity on the artifact: an upstream re-vendor that drops or renames a
+    // field must red here rather than have the gate compare nothing. Mirrors the
+    // Rust gate's `assert_required_fields_present`.
+    expect(() => selectRows(manifest({ required_fields: ['base_key'] }), UPSTREAM)).toThrow(
+      /missing required field `base_key`/,
     );
   });
 });

@@ -191,8 +191,12 @@ different questions and only one of them has the answer "all sixteen".** Which v
 `dt_client_media_frames_dropped_total{reason}` is carried by **`drops_frame`** in
 `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Fifteen are `true`.
 **`wrap_key_id_mismatch` is `false`, and is the only one**: it describes a correctly self-signed frame
-whose mis-bound wrapped key the receiver ignores (ADR-0036 §4), so the frame is otherwise processed
-and **played**. Counting it as a drop breaks R-25's `received = played + sum(drops)` for a frame that
+whose unusable wrapped key the receiver ignores (ADR-0036 §4), so the frame is otherwise processed
+and **played**. (The token *name* says mis-bound; the receiver cannot actually tell a mis-bound wrap
+from a wrong KEK, and the realistic production cause is a KEK-generation skew — see the
+`wrap_key_id_mismatch` bullet under §The discriminator below before triaging on it. That does not
+change its `drops_frame` status, which is what this paragraph is about.)
+Counting it as a drop breaks R-25's `received = played + sum(drops)` for a frame that
 *was* played — an identity that fails silently, only in aggregate, and long after the label set is
 frozen. Stated here rather than left to the array for the same reason this section gives about R2:
 **the reader who needs the constraint is the one least likely to go read the other artifact first.**
@@ -209,13 +213,37 @@ and not `has_vector`.** Those are all *nearly* the same distinction and none of 
 
 - The eight structural rejects are **byte-determined**.
 - `no_kek_for_generation`, `no_roster_entry`, `no_transmit_key`, `signature_invalid`,
-  `decrypt_failed` and `unwrap_failed` are **receiver-state-dependent**.
+  `decrypt_failed`, `unwrap_failed`, `replay_detected` and `wrap_key_id_mismatch` are
+  **receiver-state-dependent**.
+- **Eight and eight is all sixteen: the two families PARTITION the vocabulary.** Stated because an
+  earlier revision of this list classified fourteen and left `replay_detected` and
+  `wrap_key_id_mismatch` in neither — and an unclassified token is not read as unclassified, it is
+  read as byte-determined and therefore safe to slice, which is the permissive answer arrived at by
+  omission. If a token is added to `reject_reasons`, it lands in one of these two families here or
+  this section is wrong.
 - `no_transmit_key` is `layer: "codec"` yet fires on key-store membership, so an attacker choosing
   key ids reads it as *"does this receiver hold key id X?"* — which is why the layer-based version of
   this rule was wrong.
 - `signature_invalid` and `decrypt_failed` are byte-determined *given fixed key material*, so they
   carry `has_vector: true` while sitting on the restricted side — which is why the `has_vector`
   version is wrong too.
+- `replay_detected` fires on the sliding window, which is receiver state by definition: a party
+  replaying a captured frame reads it as *"has this receiver already advanced past sequence N?"*
+- `wrap_key_id_mismatch` is the subtlest of the set, and the one whose **name points away from its
+  firing condition**. The receiver cannot detect a mis-bound wrap. The wrap's bound key id is nowhere
+  on the wire — the key-bearing block is `kek_generation`, 32 wrapped bytes and a 16-byte tag, and
+  the binding exists only as the seal-time AAD — so the unwrap site observes one bit, a GCM tag
+  mismatch, exactly as it does for a wrong KEK. What selects this token over `unwrap_failed` is
+  **receiver key-cache state**: the unwrap failed *and* a usable transmit key for that key id is
+  already held, so the frame plays anyway. Two consequences, and the second is the operational one.
+  (1) It sits on the restricted side above, notwithstanding that `drops_frame: false` keeps it off
+  `dt_client_media_frames_dropped_total` — the oracle argument is about what a token *reveals*, not
+  which counter carries it. (2) **Its realistic production cause is a KEK-generation skew** on a
+  key-bearing frame from a sender whose transmit key the receiver already holds — *not* an attacker
+  or a peer mis-binding wraps. Triage on that; do not read the token name as a cause. A rename toward
+  the observable is filed as a **protocol-owned follow-up** — it is a `proto/**` GSA edit plus a
+  `crates/media-vector-gen` regenerate plus the g16 `spec_anchor`, which requires the token verbatim
+  in the story file — and this paragraph is written to be replaced when that lands.
 
 State the rule in its own terms. Do not derive it from a neighbouring field.
 

@@ -10,8 +10,9 @@
 // implementations plus an agreement, and agreements drift.
 
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+
+import { repoRoot } from './repoRoot.js';
 
 /** The vendored directory, relative to the repository root. */
 export const VENDORED_DIR = 'proto/test-vectors/external/sframe-wg';
@@ -53,6 +54,17 @@ export interface VendoredManifest {
    */
   readonly cipher_suites: readonly number[];
   readonly array: string;
+  /**
+   * Fields that MUST be present on every selected row before any comparison.
+   *
+   * Anti-vacuity on the ARTIFACT, distinct from the anti-vacuity on the selector:
+   * if an upstream re-vendor drops or renames a field, a gate that reads it as
+   * absent would compare nothing and report success. The Rust gate
+   * (`external_sframe_gate.rs::assert_required_fields_present`) enforces this, and
+   * the manifest's `$required_fields_why` claims BOTH gates do — so the TS gate
+   * must too, or the shared contract is false for this leg.
+   */
+  readonly required_fields: readonly string[];
   readonly expectations: readonly SuiteExpectation[];
 }
 
@@ -72,28 +84,6 @@ export interface UpstreamSframeRow {
   readonly aad: string;
   readonly pt: string;
   readonly ct: string;
-}
-
-/**
- * Walk up to the repository root.
- *
- * Anchored on `pnpm-workspace.yaml` rather than a fixed `../../../../../..`
- * count, so moving this file one directory does not silently resolve to the
- * wrong tree.
- */
-function repoRoot(): string {
-  let dir = dirname(fileURLToPath(import.meta.url));
-  for (let i = 0; i < 12; i += 1) {
-    try {
-      readFileSync(join(dir, 'pnpm-workspace.yaml'));
-      return dir;
-    } catch {
-      const parent = dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
-  }
-  throw new Error('could not locate repository root (no pnpm-workspace.yaml above this file)');
 }
 
 function readVendored(file: string): string {
@@ -159,6 +149,17 @@ export function selectRows(
     throw new Error(`upstream file has no array at key ${JSON.stringify(array)}`);
   }
 
+  // Anti-vacuity on the artifact: assert every declared required field is present
+  // on every selected row BEFORE comparing anything. Mirrors the Rust gate; reads
+  // the EXISTING shared manifest field rather than re-declaring the selector.
+  const required = manifest.required_fields;
+  if (!required || required.length === 0) {
+    throw new Error(
+      'manifest.required_fields is empty or absent: the presence check would assert nothing, ' +
+        'which is the exact vacuity the shared contract exists to prevent',
+    );
+  }
+
   const bySuite = new Map<number, UpstreamSframeRow[]>();
   for (const suite of suites) {
     const matching = (rows as UpstreamSframeRow[]).filter((r) => r.cipher_suite === suite);
@@ -171,6 +172,17 @@ export function selectRows(
           `the pinned commit — this is the degradation the anchor exists to catch, not a ` +
           `condition to relax.`,
       );
+    }
+    for (const row of matching) {
+      const record = row as unknown as Record<string, unknown>;
+      for (const field of required) {
+        if (record[field] === undefined || record[field] === null) {
+          throw new Error(
+            `upstream row (suite ${suite}) is missing required field \`${field}\`; an upstream ` +
+              `re-vendor changed the shape and the gate would otherwise compare nothing`,
+          );
+        }
+      }
     }
     bySuite.set(suite, matching);
   }

@@ -173,3 +173,69 @@ export type {
   RegisterCredentials,
   TokenCredentials,
 } from './session/events.js';
+
+// --- ADR-0036 §2/§3/§4 media frame v2 + SFrame stack (story task 15) ---
+//
+// Three separable modules, so the vendored external sframe-wg vectors reach the
+// exact code they validate: the RFC 9605 key schedule, the AEAD/SFrame object,
+// and the framing that owns our deviations from the RFC.
+//
+// NOTE the deliberate omissions. `TransmitKeyCache.set` is reachable only through
+// `openVerifiedFrame`, and there is no cache-priming or `unwrapAndCache` export:
+// ADR-0036 §4 requires that a wrap from a frame that fails verification is never
+// cached, and a bypass that exists only for tests is still a bypass.
+
+export {
+  decodeFrame,
+  buildUnsignedFrame,
+  finishFrame,
+  PROTOCOL_VERSION,
+} from './media/frame/frameCodec.js';
+export type {
+  DecodedFrame,
+  EncodeFrameInput,
+  FrameExtension,
+  FrameFlags,
+  UnsignedFrame,
+  WrappedTransmitKey,
+} from './media/frame/frameCodec.js';
+
+export {
+  MAX_PAYLOAD_BYTES,
+  CIPHER_SUITE_ID,
+  HEADER_VERSION,
+  WIRE_CONSTANTS,
+} from './media/frame/wireConstants.js';
+
+export { packKeyId, unpackKeyId, KeyIdRangeError } from './media/frame/keyId.js';
+export type { KeyIdParts } from './media/frame/keyId.js';
+
+export { deriveSframeKeys, sframeNonce } from './media/frame/sframeKeySchedule.js';
+export {
+  sealSframe,
+  openSframe,
+  parseSframe,
+  serializeSframe,
+  unwrapTransmitKey,
+  wrapNonce,
+  AES_256_KEY_BYTES,
+} from './media/frame/sframe.js';
+export type { SframeObject } from './media/frame/sframe.js';
+
+export { assertEd25519Available, signFrame, verifyFrameSignature } from './media/frame/ed25519.js';
+
+export {
+  ReplayWindow,
+  TransmitKeyCache,
+  openVerifiedFrame,
+  verifyFrame,
+} from './media/frame/receivePath.js';
+export type {
+  OpenedFrame,
+  ReceiverKeys,
+  VerifiedFrame,
+  WrapOutcome,
+} from './media/frame/receivePath.js';
+
+export { FrameRejectedError, ALL_REJECT_REASONS } from './media/frame/rejectReason.js';
+export type { RejectReason, RejectLayer, RejectDetail } from './media/frame/rejectReason.js';

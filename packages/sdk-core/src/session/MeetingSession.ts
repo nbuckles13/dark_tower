@@ -23,6 +23,7 @@
 // `crypto.subtle.digest`, never `Math.random`).
 
 import { AuthApiClient } from '../http/AuthApiClient.js';
+import { bytesToHex } from '../media/frame/hex.js';
 import { MeetingApiClient } from '../http/MeetingApiClient.js';
 import { SignalingClient } from '../signaling/SignalingClient.js';
 import type { SignalingClientOptions } from '../signaling/SignalingClient.js';
@@ -181,11 +182,13 @@ function signalingFailureStage(err: unknown): FailureStage {
 async function meetingIdHash(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', data));
-  let hex = '';
-  for (const byte of digest) {
-    hex += byte.toString(16).padStart(2, '0');
-  }
-  return hex.slice(0, 16);
+  // Uses the shared `bytesToHex` rather than an inline loop. This function
+  // previously carried a byte-for-byte copy of that loop, which
+  // `docs/TODO.md` §Cross-Service Duplication tracked as blocked on the story
+  // task-15 promotion of `media/frame/hex.ts` out of the test tree. That
+  // promotion landed with this change, so the duplication is closed here in the
+  // same pass rather than left for a future reader to rediscover.
+  return bytesToHex(digest).slice(0, 16);
 }
 
 /** Map a signaling failure to the bounded `close_reason` label (never the raw string). */
