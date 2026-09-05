@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const REPO_ROOT = join(PKG_ROOT, '..', '..');
 const DIST = join(PKG_ROOT, 'dist');
 
 // Both the browser trust-option key AND the build-time gate flag must be
@@ -38,7 +39,56 @@ const DIST = join(PKG_ROOT, 'dist');
 // (the value only ever flows from runtime config into `connect`, never into the
 // build). If a future test ever builds with a concrete fingerprint fixture,
 // add that literal to this list so it cannot slip through.
-const FORBIDDEN_TOKENS = ['serverCertificateHashes', '__DEV_TRUST_FINGERPRINT__'];
+// The frame-vector SSoT must never reach the shipped bundle. It is 94 KB, it
+// carries a `_non_production` banner, and every one of its rows holds `kek_hex`,
+// `transmit_key_hex` and `identity_private_seed_hex`. Production reads those
+// numbers through the RENDERED `wireConstants.ts` — ~15 integers, no `node:fs`,
+// no fixtures — so an appearance here would mean someone imported the JSON from
+// `src/`, and `vite.config.ts` externalises only `/^@opentelemetry\//`, so
+// anything imported from `src/` IS bundled.
+//
+// FORBID THE FIXTURE VALUES, NOT THE FILE PATH OR ITS FIELD NAMES, and derive the
+// values FROM the SSoT rather than copying them. Two lessons compressed into one
+// list:
+//
+//   * Assert on the thing, never on a name for the thing. An earlier version
+//     banned `frame-v2.vectors` (the path) and `identity_private_seed_hex` (a
+//     field name), both of which `vite-plugin-dts` carries into `.d.ts` via
+//     JSDoc — and g12 positively REQUIRES the path string in `frameCodec.ts` /
+//     `sframe.ts`, so a path-token ban put two correct controls in unsatisfiable
+//     conflict. The values below are data; they cannot appear in prose.
+//   * A hand-copied SUBSET of the thing is still a name for it (@dry-reviewer).
+//     An earlier list carried three of the four distinct key-material values by
+//     hand and silently omitted the fourth — incomplete on the day it landed,
+//     and it would go fully stale and green if the generator's fixture pattern
+//     ever changed. Deriving from `key_material_fields` across every row is
+//     exhaustive BY CONSTRUCTION and cannot drift from the SSoT.
+function forbiddenFixtureValues(): string[] {
+  const vectorsPath = join(REPO_ROOT, 'proto/test-vectors/frame-v2.vectors.json');
+  const ssot = JSON.parse(readFileSync(vectorsPath, 'utf8')) as {
+    key_material_fields: string[];
+    vectors: { crypto: Record<string, string> }[];
+  };
+  const values = new Set<string>();
+  for (const row of ssot.vectors) {
+    for (const field of ssot.key_material_fields) {
+      const v = row.crypto[field];
+      if (typeof v === 'string' && v.length > 0) values.add(v);
+    }
+  }
+  if (values.size === 0) {
+    throw new Error(
+      'no key-material fixture values found in the SSoT — the bundle scan would forbid nothing',
+    );
+  }
+  return [...values];
+}
+
+const FORBIDDEN_TOKENS = [
+  'serverCertificateHashes',
+  '__DEV_TRUST_FINGERPRINT__',
+  ...forbiddenFixtureValues(),
+];
 
 function listFiles(dir: string): string[] {
   const out: string[] = [];

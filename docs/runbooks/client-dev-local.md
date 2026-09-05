@@ -173,6 +173,33 @@ allocated by `crates/devloop-helper/src/ports.rs`.
 1. **Chrome.** WebTransport with `serverCertificateHashes` is a Chromium feature; the demo has no
    Firefox/Safari path.
 
+   **1a. WebCrypto Ed25519 must be available unflagged** — ADR-0036 §3 signs every media frame,
+   and the SDK sends and accepts NO unsigned frames under any degradation. If it is unavailable,
+   `packages/sdk-core/src/media/frame/ed25519.ts` throws a named `SdkError` at the capability
+   probe rather than degrading, and any failure to obtain or run a verifier maps to a DROPPED
+   frame, never to an accepted one.
+
+   **Three results, stated separately because two of them are what constrain the code.** All three
+   were **executed against Google Chrome for Testing 151.0.7922.34 on Linux/WSL2** (the
+   Playwright-pinned Chromium at `/opt/ms-playwright/chromium-1234`), **NOT on Windows Chrome** —
+   this environment cannot run it. The engine-version claim is empirical; the Windows-specific
+   claim below is documentary.
+
+   | # | Probe | Result | What it constrains |
+   |---|---|---|---|
+   | 1 | `crypto.subtle.generateKey({name:'Ed25519'})`, PKCS#8 seed import, raw public-key import, sign, verify | **All succeed, unflagged.** The pinned test seed reproduces its public key and signature byte for byte | No `@noble/ed25519` fallback ships. A fallback branch could never execute in any gate we run while still counting toward the coverage threshold, and it would put the private scalar in raw JS memory against ADR-0028 §5 |
+   | 2 | `crypto.subtle.importKey('raw', new Uint8Array(16), 'AES-GCM', …)` | **SUCCEEDS** — a 16-byte AES key is accepted | There is **no platform backstop** against AES-128. The refusal is ours, on seal, open *and* KEK unwrap (`sframe.ts::rejectWrongAesKeyLength`) |
+   | 3 | `crypto.subtle.importKey('raw', new Uint8Array(0), {name:'HMAC',…})` | **REFUSED** — `DataError: HMAC key data must not be empty` | RFC 9605's empty HKDF salt must be supplied as 64 ZERO BYTES. That is exact, not a workaround: HMAC zero-pads a short key to the hash block size, so an empty key and a HashLen-zero key are the same key by construction |
+
+   **Documentary, for the Windows half**: WebCrypto Ed25519 is a Blink/BoringSSL feature with no
+   platform-specific gate, and Chrome has shipped it unflagged since **Chrome 137**. The probe above
+   ran on Chrome 151. This is *not* written as "verified on Windows", because it was not.
+
+   **If you repeat this probe, serve the page over `http://127.0.0.1` or `https://`.** On a `data:`
+   URL the origin is opaque, so the page is not a secure context and `crypto.subtle` is
+   **`undefined`** — which reads exactly like "Ed25519 is missing". The first attempt at this probe
+   failed that way.
+
 2. **WSL2 mirrored networking is required.** In `%UserProfile%\.wslconfig`:
 
    ```ini

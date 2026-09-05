@@ -41,18 +41,24 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { bigUintToBytesBE, bytesToHex, concatBytes, hexToBytes } from './hex.js';
+import { bigUintToBytesBE, bytesToHex, concatBytes, hexToBytes } from '../hex.js';
 import {
   SFRAME_KEY_LABEL,
   SFRAME_SALT_LABEL,
-  aesGcmSeal,
   deriveSframeKeys,
   hkdfExpand,
   sframeInfo,
   sframeNonce,
   webCryptoHkdf,
   defaultHkdfSalt,
-} from './sframe-key-schedule.js';
+} from '../sframeKeySchedule.js';
+// `aesGcmSeal` and the AES-256-only key-length reject moved to `../sframe.js` at
+// the story-task-15 promotion, so seal sits with `aesGcmOpen` and the reject is
+// ONE rule with three call sites. This gate must point at the PROMOTED rule: an
+// anchor still asserting against a stale local copy would keep passing while
+// gating code that no longer ships — the promotion failure in miniature.
+import { AES_256_KEY_BYTES, aesGcmSeal } from '../sframe.js';
+import { WIRE_CONSTANTS } from '../wireConstants.js';
 import {
   expectationFor,
   loadManifest,
@@ -181,13 +187,12 @@ describe.each(manifest.cipher_suites)('ciphersuite 0x%s', (suite) => {
         const header = aad.subarray(0, aad.length - metadata.length);
         expect(bytesToHex(aad)).toBe(bytesToHex(concatBytes(header, metadata)));
 
-        const sealed = await aesGcmSeal({
-          key,
-          nonce,
-          aad,
-          plaintext: pt,
-          tagBytes: expectation.tag_bytes,
-        });
+        // Our seal reads its tag length from the SSoT rather than taking it as a
+        // parameter. Asserting the manifest's declared width against the SSoT
+        // keeps the task-8 three-way pin intact (our constant x the manifest's
+        // expectation x the vendored bytes) now that the parameter is gone.
+        expect(expectation.tag_bytes).toBe(WIRE_CONSTANTS.aead_tag_bytes);
+        const sealed = await aesGcmSeal({ key, nonce, aad, plaintext: pt });
 
         // Combined mode: `ciphertext || tag`. The detached-tag split ADR-0036
         // §2 requires is framing and is deliberately not exercised here.
@@ -214,15 +219,15 @@ describe.each(manifest.cipher_suites)('ciphersuite 0x%s', (suite) => {
       // does. Asserted here, against this suite's actual key length, so the
       // refusal is tied to the concrete hazard rather than to a generic
       // "rejects short keys" case that could drift apart from it.
+      expect(expectation.key_bytes).not.toBe(AES_256_KEY_BYTES);
       await expect(
         aesGcmSeal({
           key: new Uint8Array(expectation.key_bytes),
           nonce: new Uint8Array(12),
           aad: new Uint8Array(0),
           plaintext: new Uint8Array(1),
-          tagBytes: expectation.tag_bytes,
         }),
-      ).rejects.toThrow(/must be 32 bytes/);
+      ).rejects.toThrow(/must be exactly 32 bytes/);
     });
   }
 });

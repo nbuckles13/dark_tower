@@ -10,9 +10,9 @@
   "max_payload_bytes": 1048576,
   "gated_by": {
     "rust": true,
-    "typescript": false
+    "typescript": true
   },
-  "cross_language_property_established": false,
+  "cross_language_property_established": true,
   "wire_constants": {
     "legal_flag_mask": 7,
     "signature_bytes": 64,
@@ -21,6 +21,8 @@
     "relay_region_bytes": 6,
     "publisher_fixed_prefix_bytes": 10,
     "wrapped_transmit_key_bytes": 50,
+    "kek_generation_field_bytes": 2,
+    "wrapped_transmit_key_material_bytes": 32,
     "ext_length_field_bytes": 2,
     "max_ext_bytes": 3,
     "key_id_layout": {
@@ -609,6 +611,13 @@
         "decrypts": true,
         "frame_dropped": false,
         "outcome": "wrap_key_id_mismatch",
+        "receiver_precondition": {
+          "_assert": "Before processing this row, prime the receiver's transmit-key cache for key id 0x0102030405060708 by unwrapping full_frame_compose's wrapped-key block under its KEK — the UNWRAP PATH ONLY. Do NOT run full_frame_compose through the replay-checked receive path: it shares (key_id, stream_sequence) = (0x0102030405060708, 7) with this row, so processing it advances the replay window to seq 7 and this row is then rejected as replay_detected. Unwrap-only priming keeps the cached key originating from a genuine valid wrap (so decrypts:true stays self-protecting) while leaving the replay window unadvanced. The harness MUST fail loudly if this precondition is not established — a wrap-binding row that silently no-ops when unprimed is indistinguishable from a pass.",
+          "cached_transmit_key_for_key_id": "0102030405060708",
+          "prime_via": "unwrap_only",
+          "primed_by": "full_frame_compose",
+          "replay_window_advanced": false
+        },
         "signature_valid": true,
         "wrap_cached": false
       }

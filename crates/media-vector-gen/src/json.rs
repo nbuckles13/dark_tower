@@ -89,8 +89,18 @@ pub struct WireConstants {
     pub relay_region_bytes: u32,
     /// Unconditional publisher-region prefix length.
     pub publisher_fixed_prefix_bytes: u32,
-    /// Wrapped-transmit-key field length when key-bearing.
+    /// Wrapped-transmit-key field length when key-bearing. Equals
+    /// `kek_generation_field_bytes + wrapped_transmit_key_material_bytes +
+    /// aead_tag_bytes`; carried alongside its parts so the cross-language codec
+    /// slices the block from the `SSoT` instead of deriving one part by
+    /// subtraction (which would collapse two `media-protocol` constants that
+    /// agree only by coincidence).
     pub wrapped_transmit_key_bytes: u32,
+    /// KEK-generation field width, first field inside the wrapped-key block.
+    pub kek_generation_field_bytes: u32,
+    /// Wrapped transmit-key material length (AES-256), second field inside the
+    /// wrapped-key block, ahead of the 16-byte wrap tag.
+    pub wrapped_transmit_key_material_bytes: u32,
     /// Extension-length field width.
     pub ext_length_field_bytes: u32,
     /// Registry-derived maximum extension-region size.

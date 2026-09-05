@@ -73,21 +73,32 @@ layer_lifecycle_begin 3
   # NOT under guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run it as
   # a guard too. No cluster.
   run_and_emit "run-guards-selftest" "${__here}/guards/run-guards.test.sh" || true
-  # Frame-vector drift guard SELF-TEST (story task 8, R-7). The guard itself is
-  # auto-discovered by run-guards.sh above and passes on every devloop — but a
-  # passing guard exercises none of its failure branches, and those branches are
-  # its entire value. This drives all 33: every vacuity PRECONDITION, every
-  # VIOLATION, and g14's four arms (flag-true-marker-absent, claim-true-codec-
-  # ungated, the task-8 state that PASSES with a banner, and the task-15 state
-  # that passes without one). Two of those arms exist because the obvious
-  # "fixes" are wrong: making g14 exit nonzero at task 8 would make DELETING the
-  # guard the fastest route to green, and a guard that redded on the task-15
-  # state would only be discovered at task 15. It also pins that the banner
-  # keeps its `^WARN ` prefix, which run-guards.sh's exit-0 arm greps for —
-  # run-guards.test.sh's stub is synthetic and cannot reach that leg. Hermetic
-  # via the DEVLOOP_TEST-gated FRAME_VECTORS_ROOT seam; no cluster, no network,
-  # no cargo. Deliberately NOT under guards/simple/ for the same
-  # `find -name '*.sh'` reason as its neighbours above.
+  # Frame-vector drift guard SELF-TEST (story task 8, extended at task 15). The
+  # guard itself is auto-discovered by run-guards.sh above and passes on every
+  # devloop — but a passing guard exercises none of its failure branches, and
+  # those branches are its entire value. This drives every vacuity PRECONDITION,
+  # every VIOLATION, and all four g14 arms.
+  #
+  # NO CASE COUNT HERE ON PURPOSE. It used to say "all 33" against an actual 41,
+  # having drifted by eight without anything noticing — two encodings of one
+  # number, which is the defect this whole guard family exists to prevent. The
+  # count now lives in exactly one place, `EXPECTED_CASES` inside the suite, which
+  # fails loudly if the tally moves.
+  #
+  # Since task 15 both codecs are gated in tree, so g14's ungated arms describe a
+  # state the repository has LEFT BEHIND and the fixtures synthesize it. That
+  # includes `todo-tracking-entry-missing`, whose guard branch is now unreachable
+  # on any real run — this suite is its only exerciser.
+  #
+  # Two arms exist because the obvious "fixes" are wrong: making g14 exit nonzero
+  # while a codec was ungated would have made DELETING the guard the fastest route
+  # to green, and a guard that redded on the fully-gated end state would only have
+  # been discovered when reaching it. It also pins that the banner keeps its
+  # `^WARN ` prefix, which run-guards.sh's exit-0 arm greps for —
+  # run-guards.test.sh's stub is synthetic and cannot reach that leg. Hermetic via
+  # the DEVLOOP_TEST-gated FRAME_VECTORS_ROOT seam; no cluster, no network, no
+  # cargo. Deliberately NOT under guards/simple/ for the same `find -name '*.sh'`
+  # reason as its neighbours above.
   run_and_emit "frame-vectors-guard-selftest" "${__here}/guards/validate-frame-vectors.test.sh" || true
   # dev-web preflight contract self-test (release-premise-and-preflight-guards devloop):
   # pins the WARN→HARD-FAIL escalation of the MC/MH WebTransport checks, which an

@@ -1,57 +1,41 @@
-// File: packages/sdk-core/src/media/frame/__tests__/hex.ts
+// File: packages/sdk-core/src/media/frame/hex.ts
 //
-// Hex codec for the cross-language test vectors: lowercase, unprefixed,
-// even-length — the convention `proto/test-vectors/` uses for every byte-string
-// field.
+// Hex codec and byte primitives for the v2 media frame stack: lowercase,
+// unprefixed, even-length hex — the convention `proto/test-vectors/` uses for
+// every byte-string field — plus the concat / big-endian-encode / XOR helpers
+// the SFrame key schedule and the frame codec are built on.
 //
 // ---------------------------------------------------------------------------
-// SINGLE HOME — READ THIS BEFORE WRITING YOUR OWN
+// PROMOTED FROM THE TEST TREE AT STORY TASK 15 (moved, not copied)
 // ---------------------------------------------------------------------------
 //
-// This is the only hex implementation under `media/frame/**`, and the only
-// NAMED one in `sdk-core`. It is NOT the only one in the package:
-// `src/session/MeetingSession.ts` (`meetingIdHash`) carries an unnamed inline
-// byte->hex loop that is character-for-character the body of `bytesToHex`
-// below. That duplication predates this file and is untouched here; it is
-// named rather than glossed because the earlier draft of this notice claimed
-// to be the only implementation, and a reader who believes that has a reason
-// NOT to look — which is worse than no claim, since the sentence written to
-// prevent a second home would have redirected the scrutiny that finds the
-// existing one. (Found by @dry-reviewer at Gate 3; a Gate-1 sweep for the
-// NAMED helpers `toHex|fromHex|hexToBytes|bytesToHex` could not see an inline
-// loop, which is the form this duplication almost always takes, because nobody
-// extracts four lines until a second caller appears.)
+// This file was authored at story task 8 under `__tests__/`, because at that
+// point it had no production consumer: the TypeScript v2 codec did not exist.
+// Task 15 is that consumer, so the file MOVED here rather than being copied.
 //
-// So the promotion below has TWO consumers, not one: when this moves to `src/`,
-// fold `meetingIdHash`'s loop into it. Tracked in `docs/TODO.md`
-// §Cross-Service Duplication — deliberately not fixed now, because unifying
-// them today would require promoting this file to `src/` early, which is
-// exactly what the task-8 scope ruling forbids.
+// The reason a copy was forbidden, recorded because it still applies to the
+// next person who needs hex and does not find it: two implementations that
+// agree forever and diverge only when someone edits one are invisible while
+// they agree. No test fails, nothing is observably wrong, and it surfaces only
+// if a reviewer happens to look. Most duplication announces itself by drifting;
+// this kind does not.
 //
-// It sits in the test tree rather than `src/` because at story task 8 there is
-// no production consumer:
-// the TypeScript v2 codec lands at story task 15. A `src/` module now would be
-// production code with zero production callers, inside a directory the task-8
-// cross-boundary table deliberately excludes.
+// THIS IS THE ONLY BYTE<->HEX IMPLEMENTATION IN `sdk-core`. `MeetingSession.ts`
+// (`meetingIdHash`) previously carried an unnamed inline byte->hex loop that was
+// character-for-character `bytesToHex` below; it was folded into this file in
+// the same commit as the promotion, closing the `docs/TODO.md`
+// §Cross-Service Duplication entry that tracked it. `packages/test-utils/src/
+// deterministic-ids.ts` spells the same loop in a DIFFERENT PACKAGE for a
+// different purpose and is deliberately left alone — a real boundary, not
+// duplication.
 //
-// When task 15's codec needs hex, **MOVE this file to `src/` — do not copy it.**
-//
-// A copy would produce two implementations that agree forever and diverge only
-// when someone edits one. Their agreement is precisely what makes the
-// duplication invisible: no test fails, nothing is observably wrong, and it
-// surfaces only if a reviewer happens to look. Most duplication announces
-// itself by drifting; this kind does not.
-//
-// This notice lives here, and not only in the devloop output, because the
-// person who would create the second home is whoever writes task 15's codec,
-// reaches for hex, does not find it in `src/`, and writes four fresh lines.
-// They have no reason to open a devloop output. A deferral list is a record for
-// people auditing the task; it is not a control on the person who would violate
-// it.
-//
-// Tracked as a task-15 obligation ("promote, do not duplicate", this exact
-// path) in
-// `docs/devloop-outputs/2026-09-02-frame-v2-cross-language-vectors/main.md`.
+// The methodological note from that finding, which generalises past this file:
+// the Gate-1 sweep that declared this a first home grepped for NAMED helpers
+// (`bytesToHex|hexToBytes|toHex|fromHex`) and could not see an unnamed inline
+// loop — and the inline form is the majority case, because nobody extracts four
+// lines until a second caller exists. A DRY sweep for named helpers
+// systematically under-reports exactly the duplication class that is cheapest to
+// create.
 
 /**
  * A byte run backed by a plain `ArrayBuffer`.
@@ -82,10 +66,19 @@ export function hexToBytes(hex: string, what = 'value'): Bytes {
     throw new Error(`${what}: odd-length hex (${hex.length} chars) — not a whole number of bytes`);
   }
   if (!HEX_RE.test(hex)) {
+    // Report the OFFENDING INDEX, never the content. `what` already names the
+    // field, which is what locates a bad vector row; the input bytes add nothing
+    // a debugger needs. This matters because this file was promoted out of
+    // `__tests__` at story task 15 for production use: the natural task-19 caller
+    // is `hexToBytes(kekHex, 'kek')`, and an echo of the input here would put half
+    // a KEK into an `Error.message` and out to an embedder's Sentry hook —
+    // `ts_pii.rs` scans `console.*`/`logger.*` only, so nothing would catch it.
+    // Capped now, before a secret-bearing caller exists (@observability,
+    // @semantic-guard).
+    const badIndex = [...hex].findIndex((c) => !/[0-9a-f]/.test(c));
     throw new Error(
-      `${what}: not canonical vector hex (lowercase, unprefixed, [0-9a-f] only): ${JSON.stringify(
-        hex.slice(0, 32),
-      )}`,
+      `${what}: not canonical vector hex (lowercase, unprefixed, [0-9a-f] only); ` +
+        `first offending character at index ${badIndex === -1 ? hex.length : badIndex}`,
     );
   }
   const out = new Uint8Array(hex.length / 2);

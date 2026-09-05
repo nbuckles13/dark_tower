@@ -1,36 +1,48 @@
-// File: packages/sdk-core/src/media/frame/__tests__/sframe-key-schedule.ts
+// File: packages/sdk-core/src/media/frame/sframeKeySchedule.ts
 //
-// RFC 9605 §4.4 SFrame key schedule and the AEAD primitive, implemented from
-// the specification text. This is the code the vendored external sframe-wg
-// vectors gate (`external-anchor.test.ts`).
+// MODULE ONE of the SFrame stack: the RFC 9605 §4.4 key schedule, implemented
+// from the specification text.
+//
+// ---------------------------------------------------------------------------
+// PROMOTED FROM THE TEST TREE AT STORY TASK 15 (moved, not copied)
+// ---------------------------------------------------------------------------
+//
+// Authored at story task 8 under `__tests__/`, where it had no production
+// consumer. Task 15 is that consumer, so it MOVED here.
+//
+// **The move is what keeps the external anchor honest, and that is the whole
+// reason a copy was forbidden.** `__tests__/external-anchor.test.ts` gates this
+// module against the vendored sframe-wg vectors at commit 025d568. Had task 15
+// written a second key schedule in `src/` and left this one in place, the
+// anchor would have gone on passing while gating nothing that ships — a green
+// gate pointed at dead code. `external-anchor.test.ts` now imports from this
+// path.
 //
 // ---------------------------------------------------------------------------
 // DERIVED FROM THE SPEC, NOT FROM THE RUST REFERENCE GENERATOR
 // ---------------------------------------------------------------------------
 //
-// Written from RFC 9605 §4.4 and the ADR-0036 §4 ciphersuite choice. The Rust
-// reference generator in this same task was NOT read while authoring it. That
-// independence is the entire point: if the two implementations converge by one
-// mirroring the other, the vectors validate a shared error instead of catching
-// it. See `main.md` §Divergences.
+// Written from RFC 9605 §4.4 and the ADR-0036 §4 ciphersuite choice, without
+// reading `crates/media-vector-gen`. That independence is the point: if the two
+// implementations converge by one mirroring the other, the cross-language
+// vectors validate a shared error instead of catching it.
 //
 // ---------------------------------------------------------------------------
-// SINGLE HOME — AND A SCOPE LIMIT WORTH KNOWING
+// WHAT LIVES HERE, AND WHAT DELIBERATELY DOES NOT
 // ---------------------------------------------------------------------------
 //
-// Like `hex.ts`, this lives in the test tree because story task 8 has no
-// production consumer; the production crypto stack lands at story task 15.
-// **MOVE it to `src/` at task 15 — do not copy it.**
+// Here: HKDF-Extract/Expand, the `info` construction, the label bytes, and the
+// nonce derivation — the four things the external anchor actually gates
+// (`proto/test-vectors/external/sframe-wg/PROVENANCE.md`).
 //
-// The scope limit that matters more: until that move happens, the external
-// anchor gates THIS module, which is test-tier code — not the shipping key
-// schedule, because at task 8 no shipping key schedule exists. So "the external
-// gate is live at task 8" is true and narrower than it sounds. At task 15 the
-// gate must be re-pointed at the production module by promoting this file, not
-// by writing a second implementation and leaving the anchor aimed at the first.
-// If that happens, the external anchor silently stops gating anything that
-// ships, while continuing to pass. Recorded as a task-15 obligation in
-// `main.md`.
+// NOT here, and not by accident:
+//   * The AEAD primitives (`aesGcmSeal` / `aesGcmOpen`) and the AES-256-only key
+//     length reject moved to `./sframe.ts` at the promotion, so seal and open sit
+//     together and the length reject is ONE rule with three call sites (seal,
+//     open, KEK unwrap) rather than three copies of a rule.
+//   * The detached-tag split, the AAD span and the signed range. Those are
+//     framing (`./frameCodec.ts`), they are the computations the cross-language
+//     vectors exist to gate, and the external anchor covers NONE of them.
 
 import { bigUintToBytesBE, concatBytes, xorBytes, type Bytes } from './hex.js';
 
@@ -197,59 +209,6 @@ export async function webCryptoHkdf(
     length * 8,
   );
   return new Uint8Array(bits);
-}
-
-/**
- * The only AES key length this construction accepts.
- *
- * ADR-0036 §4 fixes the transmit key at AES-256, and RFC 9605 ciphersuite
- * 0x0005 is AES-256-GCM. Nothing here is suite-parameterised.
- */
-export const AES_256_KEY_BYTES = 32;
-
-/**
- * AES-GCM seal in COMBINED mode: returns `ciphertext || tag`.
- *
- * The detached-tag split that ADR-0036 §2 requires (tag moved into the SFrame
- * object's clear header) is deliberately NOT done here — it is framing, it is
- * one of the three computations the cross-language vectors exist to gate, and
- * the external vectors do not cover it. Keeping this primitive in combined mode
- * means the external anchor tests exactly what it can honestly claim to test.
- */
-export async function aesGcmSeal(params: {
-  readonly key: Uint8Array;
-  readonly nonce: Uint8Array;
-  readonly aad: Uint8Array;
-  readonly plaintext: Uint8Array;
-  readonly tagBytes: number;
-}): Promise<Bytes> {
-  const { key, nonce, aad, plaintext, tagBytes } = params;
-  // The key-length check is OURS because the platform does not make it.
-  // `crypto.subtle.importKey('raw', <16 bytes>, 'AES-GCM', ...)` succeeds
-  // without complaint (verified on Node 22 and specified by WebCrypto), so
-  // there is no backstop underneath this line. Without it, the AES-128
-  // contrast suite in the vendored external vectors could be driven through
-  // this function — which would mean building a weak-key acceptance path into
-  // our crypto in order to test that we do not have one.
-  if (key.length !== AES_256_KEY_BYTES) {
-    throw new RangeError(
-      `aesGcmSeal: key must be ${AES_256_KEY_BYTES} bytes (AES-256), got ${key.length}`,
-    );
-  }
-  const cryptoKey = await crypto.subtle.importKey('raw', Uint8Array.from(key), 'AES-GCM', false, [
-    'encrypt',
-  ]);
-  const sealed = await crypto.subtle.encrypt(
-    {
-      name: 'AES-GCM',
-      iv: Uint8Array.from(nonce),
-      additionalData: Uint8Array.from(aad),
-      tagLength: tagBytes * 8,
-    },
-    cryptoKey,
-    Uint8Array.from(plaintext),
-  );
-  return new Uint8Array(sealed);
 }
 
 /** HMAC-`hash` over `data` under `key`. */

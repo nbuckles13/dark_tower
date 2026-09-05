@@ -1305,6 +1305,38 @@ experiment; the header is not frozen in code until they have run.
    another's key id, and the test asserts the receiver **rejects the frame** rather than attributing
    it. It is the test that proves the signature layer is load-bearing rather than decorative.
 
+   > **DISCHARGED at story task 15 (2026-09-05, `docs/devloop-outputs/2026-09-05-sdk-frame-v2-sframe-stack/`).**
+   > The regression now runs in a **second, independently-authored implementation** — the TypeScript
+   > `@darktower/sdk-core` frame codec — against the same vectors the non-production Rust generator
+   > produces. Vector row `insider_forgery_other_sender_key_id`: a frame signed by Bob but sealed
+   > under Alice's transmit key and carrying Alice's key id is verified against the identity key
+   > resolved from `key_id.sender_id` (Alice's), and verification **fails before any decryption**; the
+   > row additionally asserts `would_decrypt_if_verification_skipped`, so the rejection *proves* the
+   > signature layer load-bearing rather than merely asserting it. **Authoring the row at task 8 did
+   > not discharge this — running it in a second implementation does**, which is exactly this
+   > section's "not frozen in code until they have run." The cross-language gate is now closed:
+   > `proto/test-vectors/frame-v2.vectors.json` carries `gated_by.typescript: true` and
+   > `cross_language_property_established: true`, enforced by
+   > `scripts/guards/simple/validate-frame-vectors.sh` check g14, which hard-fails on any drift
+   > between the flag and reality in either direction. The header is frozen in code for the
+   > signature/attribution property. (Assumptions 1–3 remain scaling/telemetry experiments, unaffected
+   > by this discharge.)
+   >
+   > **What the discharge rests on, and its limit — recorded so the limit travels with the claim.**
+   > Three of the computations these vectors gate have **no oracle outside this repository**: the AEAD
+   > associated-data span (publisher region only), the Ed25519 signed range (publisher ‖ payload, relay
+   > region excluded), and the detached-tag split. No RFC and no external vector checks them — the
+   > vendored sframe-wg anchor (`proto/test-vectors/external/sframe-wg/PROVENANCE.md`) gates only the
+   > key schedule, the nonce derivation, AES-256-GCM and the tag length, and the vectors file's own
+   > `_non_production` header says the same. So this discharge is **exactly as strong as the genuine
+   > independence of the two implementations** — the non-production Rust generator and the TypeScript
+   > codec, each written from this ADR and RFC 9605 rather than from the other. A green gate here is a
+   > cross-check between two independent derivations, **not** a proof against an external standard: were
+   > the two ever to converge by one mirroring the other, the vectors would validate a shared error
+   > instead of catching it. That independence is a property to preserve, not a fact to assume — it is
+   > why the codec was authored from the spec, not from the generator, and why replacing either side
+   > with a port of the other would silently hollow out this discharge while leaving every gate green.
+
 ### Ordering constraints that follow from the design
 
 - **Test vectors and the header precede the forward path.** Vectors are the drift guard between the
