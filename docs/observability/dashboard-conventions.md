@@ -264,7 +264,7 @@ cadence disagree.
 | MC scrape | same shape, `job_name=mc-service` — **absent**, inherits global | **15 s** (inherited) | 10 s (compose only) |
 | GC scrape | same shape, `job_name=gc-service` — **absent**, inherits global | **15 s** (inherited) | 10 s (compose only) |
 | Client SDK OTel export | *(no key exists)* — `PeriodicExportingMetricReader` in `packages/sdk-core/src/telemetry/telemetryConfig.ts` is constructed without `exportIntervalMillis` | **OTel JS default (60 s)** | 10 s — **open item**, lands with the SDK media pipeline (story task 19) |
-| MH latency histogram sample ratio | *(no key exists yet)* — lands with the MH forward path (story task 16), published as a gauge reading the same value the sampler reads | — | Forward reference; see `slos.md` |
+| MH latency histogram sample ratio | `MH_MEDIA_LATENCY_SAMPLE_RATIO` (`infra/services/mh-service/configmap.yaml`; optional, code default `mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`) | Published as `mh_media_latency_sample_ratio`, read from the same field the sampler draws against — **read the gauge, not this table**: a number written here would be the parallel constant the rule below forbids | As deployed |
 
 ### The deployed cadence is 15 s, and that is a gap
 
@@ -297,10 +297,16 @@ guard so the two files cannot silently rediverge again.
   encoding of a config value.
 - **State which config is authoritative** whenever a cadence is referenced.
 - **A config value published as a gauge must read the same value its consumer reads** — never a
-  parallel constant. The pattern this follows is story 2's
-  `mh_media_egress_budget_bytes_per_second{basis="unmeasured"}` gauge — a **forward reference**, not
-  in the tree today, landing with the egress-budget chain — and the MH sample-ratio gauge (story task
-  16) follows the same rule. Consistent with the Throughput subsection above: neither exists yet.
+  parallel constant. Story 2's `mh_media_egress_budget_bytes_per_second{basis="unmeasured"}` gauge is
+  a **forward reference**, not in the tree today, landing with the egress-budget chain. The MH
+  sample-ratio gauge **is** in the tree as of story task 16 and follows the rule structurally rather
+  than by convention: `mh_media_latency_sample_ratio` publishes
+  `Config::media_latency_sample_ratio`, the same field the sampler is constructed from, and a
+  component test asserts the published value equals it. A ratio computed separately from the one in
+  force is a gauge that lies exactly when someone is using it to interpret a histogram.
+- **Read the sample-ratio gauge before reading a rate off a sampled histogram's `_count`.**
+  `mh_media_forward_latency_seconds_count` is 1/N of `mh_media_frames_forwarded_total`; dividing the
+  two directly measures the sample ratio, not the media path.
 - **Do not tune a scrape interval to fix a dashboard.** A panel that needs finer resolution than the
   scrape provides is a cadence decision (cost, owner: operations), not a panel decision.
 

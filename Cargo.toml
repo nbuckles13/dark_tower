@@ -111,6 +111,15 @@ anyhow = "1.0"
 thiserror = "1.0"
 
 # Utilities
+# Hoisted to the workspace at story task 16 (@security S16). It was declared
+# directly at `crates/common/Cargo.toml`, and a second direct declaration in
+# `mh-service` would have created an independent pin on a crate whose 0.9
+# release RENAMED both APIs the MH latency sampler uses (`from_entropy` ->
+# `from_os_rng`, `gen_bool` -> `random_bool`): a later bump of one consumer
+# would leave the other compiling against the old API with nothing flagging
+# the split. `small_rng` is opted into per consumer, not here — only the
+# sampler needs it.
+rand = "0.8"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1.7"

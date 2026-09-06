@@ -12,10 +12,18 @@
 //! 7. On disconnect: notify MC, clean up session
 
 use crate::auth::MhJwtValidator;
+use crate::config::{EGRESS_QUEUE_FRAMES, INGRESS_QUEUE_FRAMES, NOMINAL_AUDIO_FRAME_BYTES};
 use crate::errors::MhError;
 use crate::grpc::McClient;
+use crate::media::forward::EgressQueue;
+use crate::media::forwarder::ConnectionForwarder;
+use crate::media::ingress::{run_egress, run_forward, run_ingress, IngressQueue, LoopExit};
+use crate::media::queue::SharedQueue;
+use crate::media::{MediaSetup, MediaTaskContext};
 use crate::observability::metrics;
+use crate::routing::{MeetingKey, SenderId};
 use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
+use crate::webtransport::WtMediaTransport;
 
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{mh_client_message, MhClientMessage};
@@ -124,6 +132,10 @@ async fn await_meeting_registration(
     clippy::too_many_lines,
     reason = "Connection lifecycle is sequential; splitting would fragment the accept-validate-register-notify-hold flow"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one lifecycle entry point; every argument is a collaborator resolved once at process setup and threaded through the accept loop"
+)]
 pub async fn handle_connection(
     incoming: IncomingSession,
     jwt_validator: Arc<MhJwtValidator>,
@@ -131,6 +143,7 @@ pub async fn handle_connection(
     mc_client: Arc<McClient>,
     handler_id: String,
     register_meeting_timeout: Duration,
+    media: MediaSetup,
     cancel_token: CancellationToken,
 ) -> Result<(), MhError> {
     let handshake_start = Instant::now();
@@ -162,6 +175,11 @@ pub async fn handle_connection(
         connection_id = %connection_id,
         "WebTransport session accepted"
     );
+
+    // Wrapped in an `Arc` because the media tasks below hold the same
+    // connection through `WtMediaTransport` (ADR-0036 §10's per-connection
+    // seam) while this function keeps driving the lifecycle.
+    let connection = Arc::new(connection);
 
     // Step 2: Accept bidirectional stream
     let (_, mut recv_stream) = connection.accept_bi().await.map_err(|e| {
@@ -344,6 +362,27 @@ pub async fn handle_connection(
         }
     }
 
+    // Step 5b: start the media forward path (ADR-0036 §2/§7/§11).
+    //
+    // AFTER the JWT gate, never before: the sender identity every forwarding
+    // decision is made against comes from the validated token's meeting, and
+    // starting media I/O on an accepted-but-unvalidated session would forward
+    // frames for a participant nobody authenticated.
+    //
+    // This is the SIBLING half of the layout constraint: spawning, logging and
+    // teardown live here, and `crate::media` holds only the loops.
+    let meeting_key = MeetingKey::new(meeting_id);
+    let media_cancel = cancel_token.child_token();
+    let media_session = start_media_session(
+        &session_manager,
+        &media,
+        &connection,
+        &meeting_key,
+        participant_id,
+        &connection_id,
+        &media_cancel,
+    );
+
     // Step 6: Hold connection open — monitor for disconnect or cancellation
     // The connection stays open for future media frame forwarding (separate story).
     // For now, we monitor the recv stream for closure and the cancellation token.
@@ -393,6 +432,44 @@ pub async fn handle_connection(
         }
     }
 
+    // Media teardown, before the session-state cleanup below: cancel the three
+    // loops and drop this connection's egress queue out of the subscriber
+    // registry, so no other connection's forward loop pushes into a queue
+    // nothing will ever drain.
+    media_cancel.cancel();
+    if let Some(session) = media_session {
+        session_manager
+            .subscribers()
+            .unregister(&meeting_key, session.sender);
+        for (name, task) in [
+            ("ingress", session.ingress),
+            ("forward", session.forward),
+            ("egress", session.egress),
+        ] {
+            match task.await {
+                Ok(LoopExit::ConnectionClosed) => debug!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    loop_name = name,
+                    "Media loop exited: connection closed"
+                ),
+                Ok(LoopExit::Cancelled) => debug!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    loop_name = name,
+                    "Media loop exited: cancelled"
+                ),
+                Err(e) => warn!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    loop_name = name,
+                    error = %e,
+                    "Media loop task failed"
+                ),
+            }
+        }
+    }
+
     // Step 7: Cleanup — remove connection from session manager and notify MC
     session_manager
         .remove_connection(meeting_id, &connection_id)
@@ -435,6 +512,102 @@ pub async fn handle_connection(
     );
 
     Ok(())
+}
+
+/// The three media tasks one connection owns, plus the sender they are bound
+/// to.
+struct MediaSession {
+    sender: SenderId,
+    ingress: tokio::task::JoinHandle<LoopExit>,
+    forward: tokio::task::JoinHandle<LoopExit>,
+    egress: tokio::task::JoinHandle<LoopExit>,
+}
+
+/// Start this connection's media forward path, if its publisher identity is
+/// known.
+///
+/// # Returns `None` when the sender binding is missing, and says so loudly
+///
+/// MH cannot forward for a connection whose `sender_id` it does not know: every
+/// routing decision is keyed on `(meeting, sender)`, and the alternatives —
+/// reading the ordinal out of the frame's `SFrame` key id, or accepting one the
+/// client asserts in its connect envelope — are cross-participant injection
+/// primitives, not shortcuts. See `crate::session::SenderBindings` for the
+/// contract field this is waiting on and `docs/TODO.md` §Media Path
+/// Obligations for its owner.
+///
+/// Declining is the fail-closed behaviour and it is deliberately noisy: the
+/// connection stays up (signalling and the control plane still work) and the
+/// log line names the missing input, rather than media silently never starting.
+fn start_media_session(
+    session_manager: &SessionManagerHandle,
+    media: &MediaSetup,
+    connection: &Arc<wtransport::Connection>,
+    meeting: &MeetingKey,
+    participant_id: &str,
+    connection_id: &str,
+    cancel: &CancellationToken,
+) -> Option<MediaSession> {
+    let Some(sender) = session_manager
+        .sender_bindings()
+        .resolve(meeting, participant_id)
+    else {
+        warn!(
+            target: "mh.webtransport.connection",
+            connection_id = %connection_id,
+            "Media forward path not started: no sender_id is bound for this participant. \
+             MH has no contract carrying the participant -> sender_id association yet; see \
+             docs/TODO.md Media Path Obligations. Signalling and the control plane are \
+             unaffected; this connection forwards no media."
+        );
+        return None;
+    };
+
+    let transport = Arc::new(WtMediaTransport::new(Arc::clone(connection)));
+    let context = Arc::new(MediaTaskContext {
+        routing: session_manager.routing_table(),
+        subscribers: Arc::clone(session_manager.subscribers()),
+        handles: Arc::clone(&media.handles),
+    });
+
+    let ingress_queue: Arc<IngressQueue> = Arc::new(SharedQueue::new(INGRESS_QUEUE_FRAMES));
+    let egress_queue: Arc<EgressQueue> = Arc::new(SharedQueue::new(EGRESS_QUEUE_FRAMES));
+
+    // Registered BEFORE the loops start: a frame arriving from another
+    // participant between spawn and registration would otherwise count as
+    // `no_local_subscriber` against a subscriber that is in fact connected.
+    session_manager
+        .subscribers()
+        .register(meeting.clone(), sender, &egress_queue);
+
+    let forwarder = ConnectionForwarder::new(
+        meeting.clone(),
+        sender,
+        Arc::clone(&media.handles),
+        media.latency_sample_ratio,
+        NOMINAL_AUDIO_FRAME_BYTES,
+    );
+
+    let ingress = tokio::spawn(run_ingress(
+        Arc::clone(&transport),
+        Arc::clone(&ingress_queue),
+        Arc::clone(&context),
+        cancel.clone(),
+    ));
+    let forward = tokio::spawn(run_forward(
+        Arc::clone(&ingress_queue),
+        forwarder,
+        Arc::clone(&context),
+        cancel.clone(),
+    ));
+    let egress = tokio::spawn(run_egress(transport, egress_queue, context, cancel.clone()));
+
+    Some(MediaSession {
+        sender,
+        ingress,
+        forward,
+        egress,
+    })
 }
 
 /// Spawn a best-effort `NotifyParticipantConnected` notification to MC.

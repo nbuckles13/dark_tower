@@ -23,6 +23,11 @@
 //!    `RegisterMeeting` to all assigned MHs after first join, so no MH stays
 //!    unregistered for a real meeting; (c) shortening the timeout requires
 //!    infra changes that would create a dev-vs-prod behavioral gap.
+//! 7. `test_mh_forwards_an_audio_datagram_back_to_its_sender` — R-15/R-18
+//!    loopback forward path. `#[ignore]`d: blocked on MH's `sender_id` ->
+//!    connection binding, which no contract carries yet. Authoritative
+//!    coverage at component tier:
+//!    `crates/mh-service/tests/media_forward_integration.rs`.
 //! 9. `test_mc_programs_live_handler_with_confirmed_forwarding_policy` —
 //!    `mc_media_policy_pushes_total{outcome="match"}` delta >= 1 after a real
 //!    join, with the four non-`match` outcome series flat. The positive
@@ -1206,4 +1211,239 @@ async fn test_mc_programs_live_handler_with_confirmed_forwarding_policy() {
 #[ignore = "covered at component tier — see crates/mh-service/tests/webtransport_integration.rs::provisional_connection_kicked_after_register_meeting_timeout"]
 async fn test_mh_disconnects_unregistered_meeting_after_timeout() {
     // Intentionally unimplemented. See doc-comment above.
+}
+
+// ============================================================================
+// Scenario C (R-15 / R-18): MH forwards a client's own audio back to it
+// ============================================================================
+
+/// A frame-v2 audio datagram, encoded through the production codec.
+///
+/// **Encoded through `media_protocol::codec::encode_frame`, deliberately.** A
+/// hand-rolled builder here would be a fifth home for the frame layout, and an
+/// env-test asserting against a frame it built from its own understanding of
+/// the wire format is a test that can agree with itself while disagreeing with
+/// production. `media-protocol` is a wire-format crate, the exact analogue of
+/// `proto-gen` which this suite already links — the suite still links zero
+/// service crates, which is the premise of its black-box validation.
+///
+/// `stream_id` and `hop_sequence` carry publisher-side values, so a relay that
+/// failed to rewrite them fails the assertion rather than passing by accident.
+/// The payload is opaque bytes and the signature a fixed pattern: MH is keyless
+/// and verifies nothing, so all that matters is that both survive the relay
+/// byte-identically.
+fn audio_datagram(stream_sequence: u32, marker: u8) -> bytes::Bytes {
+    use media_protocol::codec::{encode_frame, MediaFrameParts};
+    use media_protocol::frame::{FrameFlags, SIGNATURE_SIZE};
+
+    let payload = vec![marker; 160];
+    let mut signature = [0_u8; SIGNATURE_SIZE];
+    for (index, byte) in signature.iter_mut().enumerate() {
+        *byte = u8::try_from(index % 251).unwrap_or(0);
+    }
+    encode_frame(&MediaFrameParts {
+        flags: FrameFlags {
+            independently_decodable: true,
+            discardable: false,
+            key_bearing: false,
+        },
+        stream_sequence,
+        wrapped_transmit_key: None,
+        extensions: &[],
+        stream_id: 0xFFFF,
+        hop_sequence: 0xDEAD_BEEF,
+        payload: &payload,
+        signature: &signature,
+    })
+    .expect("fixture frame must encode")
+}
+
+/// `sum by (instance)` over MH's policy-apply counter for one outcome.
+fn policy_apply_promql(outcome: &str) -> String {
+    format!(r#"sum by (instance) (mh_media_policy_applies_total{{outcome="{outcome}"}})"#)
+}
+
+/// Per-instance snapshot of `mh_media_policy_applies_total` for an outcome.
+async fn policy_apply_counter(prom: &PrometheusClient, outcome: &str) -> InstanceCounters {
+    prom.instance_counter_map(&policy_apply_promql(outcome))
+        .await
+}
+
+/// R-15: a client's uplink audio datagram comes back to it, rewritten only in
+/// the relay region, purely from MC-pushed policy.
+///
+/// # `#[ignore]`d, and exactly why — this is NOT a flake quarantine
+///
+/// Same shape as the R-33 #6 stub above: the scenario cannot run here yet, the
+/// reason is structural, and the authoritative coverage at another tier is
+/// named. **MH has no `sender_id` -> live-connection binding**, and no contract
+/// in the tree carries one: the meeting JWT has no sender field,
+/// `internal.proto`'s `RegisterMeetingRequest` carries `sender_id` with no
+/// `participant_id` anywhere, `NotifyConnectedResponse` is `{acknowledged}`,
+/// and `MhConnectRequest` carries only `join_token`. Every remaining route is
+/// client-asserted and therefore a cross-participant injection primitive, so MH
+/// declines to start its forward path rather than guessing an ordinal — see
+/// `mh_service::session::SenderBindings` and `docs/TODO.md` §Media Path
+/// Obligations for the owed contract field.
+///
+/// **Authoritative coverage today, at component tier**, over the same code with
+/// the binding supplied directly:
+/// `crates/mh-service/tests/media_forward_integration.rs` —
+/// `only_the_relay_region_changes_and_every_other_byte_survives` (frames in
+/// equals frames out, publisher region / payload / signature byte-identical),
+/// `the_hop_sequence_advances_per_media_stream_not_per_connection`, and the
+/// fail-closed trio. What this env-test adds that those cannot is composition:
+/// that the real MC join programs the real MH, and that the real QUIC datagram
+/// path carries a real v2 frame.
+///
+/// **Un-ignore by deleting the attribute** once the binding lands — that
+/// deletion is part of the definition-of-done of the spun-out sender-binding
+/// devloop, not an optional follow-up, so the `#[ignore]` cannot outlive the gap
+/// it waits on. The ordering gate and the fixture need no change; whoever
+/// un-ignores it should re-read the assertions against MC's assignment as it
+/// stands then, rather than assume they are final.
+///
+/// # Ordering is gated on a metric delta, never a sleep
+///
+/// A datagram racing MC's `RegisterMeeting` is dropped as `no_policy` and the
+/// test flakes. The gate is a `mh_media_policy_applies_total{outcome="applied"}`
+/// delta: MH increments it only from the live snapshot after the apply, so the
+/// delta means the forward path reflects the generation MC sent.
+#[tokio::test]
+#[ignore = "blocked on MH's sender_id -> connection binding; no contract carries it (docs/TODO.md \
+            Media Path Obligations). Component-tier coverage: mh-service \
+            tests/media_forward_integration.rs"]
+#[serial_test::serial(mh_notifications)]
+async fn test_mh_forwards_an_audio_datagram_back_to_its_sender() {
+    let cluster = cluster().await;
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let auth_client = AuthClient::new(&cluster.ac_base_url);
+    let (user_token, display_name) = register_test_user(&auth_client, "MH Forward Path User").await;
+
+    let applied_baseline = policy_apply_counter(&prom, "applied").await;
+
+    // The real MC join: MC admits the participant, allocates the sender id,
+    // computes the loopback assignment with the general N=1 algorithm and
+    // programs every assigned MH. Deliberately NOT a hand-built
+    // `RegisterMeeting`: env-tests hold no MH gRPC client and no MC->MH
+    // credential, and `mh_test_utils::media_policy::egress` hardcodes
+    // `priority_group: 0` while MC emits the assigned value — so a
+    // fixture-built env-test would assert a shape MC cannot produce.
+    let gc_join = gc_create_and_join(cluster, &user_token, "MH Forward Path Meeting").await;
+    let mc_url = gc_join
+        .mc_assignment
+        .webtransport_endpoint
+        .clone()
+        .expect("MC assignment must include webtransport_endpoint");
+    let join_response = mc_join(
+        &mc_url,
+        &gc_join.meeting_id.to_string(),
+        &gc_join.token,
+        &display_name,
+    )
+    .await;
+    let sender_id = join_response
+        .sender_id
+        .expect("MC must allocate a sender_id for the joiner (ADR-0036 §2/§4)");
+    let mh_url = join_response
+        .media_servers
+        .first()
+        .map(|m| m.media_handler_url.clone())
+        .filter(|u| !u.is_empty())
+        .expect("MC JoinResponse must include at least one non-empty MH URL");
+
+    // The ordering gate. Never a sleep: a datagram that races the apply is
+    // dropped as `no_policy`, which is a correct MH behaviour and a flaky test.
+    poll_until_any_instance_above(
+        &prom,
+        &policy_apply_promql("applied"),
+        &applied_baseline,
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        |current| {
+            format!(
+                "mh_media_policy_applies_total{{outcome=\"applied\"}} did not increase past \
+                 baseline within 60s — MH never applied a policy for this meeting, so any \
+                 datagram sent now would be correctly dropped as `no_policy` (baseline: {}, \
+                 last observed: {})",
+                format_instance_map(&applied_baseline),
+                format_instance_map(current),
+            )
+        },
+    )
+    .await;
+
+    let conn = connect_wt(&mh_url).await;
+    let (_send, _recv) = send_jwt_on_bi_stream(&conn, &gc_join.token).await;
+
+    // QUIC datagrams are unreliable, so delivery is a rig precondition driven
+    // by repetition, not an assertion about the transport. The ASSERTION is
+    // about what comes back.
+    let returned = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let _ = conn.send_datagram(audio_datagram(1, 0x5A));
+            if let Ok(Ok(datagram)) =
+                tokio::time::timeout(Duration::from_millis(250), conn.receive_datagram()).await
+            {
+                break datagram.payload();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "MH returned no datagram within 15s. The forwarding policy applied, so check \
+                 MH's mh_media_frames_dropped_total{{reason}} series: `no_subscriber` means \
+                 MC's assignment carries no edge for this sender, `no_local_subscriber` means \
+                 the subscriber is not connected to this handler, and a flat drop series with \
+                 a flat forwarded series means the forward path never started."
+            );
+        }
+    };
+
+    // The relay region — and only the relay region — is rewritten. `stream_id`
+    // must be the SUBSCRIBER's slot, not the publisher-side sentinel the
+    // fixture sent.
+    let view = media_protocol::codec::decode_datagram(&returned)
+        .expect("the returned datagram must be a well-formed frame-v2 datagram");
+    // `assert_eq!`, not `assert_ne!` against the sentinel: "was rewritten off
+    // 0xFFFF" also passes for a rewrite to the WRONG slot. The loopback
+    // assignment gives the subscriber its own main-audio slot, which MC's
+    // `MAIN_AUDIO_SLOT_ID` fixes at 0. That const is MC-internal and not
+    // importable from a black-box env-test, so the literal plus this comment is
+    // the strongest available form.
+    assert_eq!(
+        view.stream_id(),
+        0,
+        "MH must rewrite the relay region's stream id to the subscriber's own main-audio slot \
+         (MC's MAIN_AUDIO_SLOT_ID = 0); a different value means the relay rewrote to the wrong \
+         slot, and the publisher-side sentinel 0xFFFF means it did not rewrite at all"
+    );
+    assert_ne!(
+        view.hop_sequence(),
+        0xDEAD_BEEF,
+        "MH must write its OWN downlink hop sequence; the publisher's uplink value survived"
+    );
+
+    let original = audio_datagram(1, 0x5A);
+    let sent =
+        media_protocol::codec::decode_datagram(&original).expect("the fixture frame must decode");
+    assert_eq!(
+        view.publisher_region(),
+        sent.publisher_region(),
+        "the publisher region is signed end to end: a relay that alters one byte of it silences \
+         the sender at every receiver, and MH — being keyless — counts nothing for it"
+    );
+    assert_eq!(
+        view.payload(),
+        sent.payload(),
+        "the payload must be opaque to MH"
+    );
+    assert_eq!(
+        view.signature(),
+        sent.signature(),
+        "the signature must be untouched"
+    );
+
+    // No tokens, JWTs or key material in any assertion message above; the
+    // sender id is used only to prove MC allocated one.
+    assert!(sender_id > 0, "sender_id 0 is never valid (ADR-0036 §2)");
 }

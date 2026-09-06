@@ -19,7 +19,8 @@
 //! *restates* an enumeration is a copy.
 
 use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
-use metrics::{counter, gauge, histogram};
+use media_protocol::codec::{RejectReason, ALL_REJECT_REASONS};
+use metrics::{counter, gauge, histogram, Counter, Gauge, Histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
 
@@ -62,6 +63,20 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             ],
         )
         .map_err(|e| format!("Failed to set WebTransport handshake buckets: {e}"))?
+        // Media forward-path latency (ADR-0036 §11). Registered in the same
+        // file as the `histogram!` that resolves the handle, which is what
+        // `dt-guard histogram-buckets` scans; a bucket set registered anywhere
+        // else fails Layer 3.
+        //
+        // The edge slice is [`MEDIA_FORWARD_LATENCY_BUCKETS`] rather than a
+        // literal here, so [`MEDIA_FORWARD_OBJECTIVE_SECONDS`] can be asserted
+        // to be one of the edges. The `Matcher::Prefix` argument stays a
+        // literal: the guard's regex captures a quoted first argument.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mh_media_forward_latency".to_string()),
+            &MEDIA_FORWARD_LATENCY_BUCKETS,
+        )
+        .map_err(|e| format!("Failed to set media forward latency buckets: {e}"))?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
 }
@@ -394,6 +409,474 @@ pub fn record_caller_type_rejected(grpc_service: &str, expected_type: &str, actu
     .increment(1);
 }
 
+// ---------------------------------------------------------------------------
+// Media forward path (ADR-0036 §2 / §7 / §11)
+// ---------------------------------------------------------------------------
+
+/// Whether a media-path event happened on the way IN to the relay or on the
+/// way OUT of it.
+///
+/// **Pipeline-relative, never participant-relative.** `ingress` is
+/// publisher→relay and `egress` is relay→subscriber; the participant-relative
+/// reading (`uplink`/`downlink`) is barred. Both readings are 2-valued and a
+/// catalog entry cannot tell them apart, but only the pipeline-relative one is
+/// *structurally incapable* of growing a third value that individuates a
+/// participant — which is the property ADR-0036 §11 needs, not the arity.
+///
+/// `direction` is admitted on a media-path metric **because the relay is
+/// keyless**: the leak a direction label would otherwise enable is an oracle
+/// over receiver key-cache state, and a relay holds none. **That acceptance
+/// does not generalise to the client's counter** (story task 19), which sits
+/// on the other side of exactly that state. See
+/// `docs/observability/label-taxonomy.md` §"Permitted partner: `direction`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaDirection {
+    /// Publisher → relay.
+    Ingress,
+    /// Relay → subscriber.
+    Egress,
+}
+
+impl MediaDirection {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 2] = [Self::Ingress, Self::Egress];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingress => "ingress",
+            Self::Egress => "egress",
+        }
+    }
+}
+
+/// The decomposition of MH's internal forward latency (ADR-0036 §11).
+///
+/// Service-local, not a fleet-shared vocabulary: these four names describe
+/// MH's own three stages plus their sum, and each has a *different remedy* —
+/// which is the whole reason §11 refuses an undifferentiated total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaLatencyPhase {
+    /// Datagram received from the transport → popped off the ingress queue.
+    ReceiveBuffer,
+    /// Popped off the ingress queue → pushed onto a subscriber's egress queue.
+    Processing,
+    /// Pushed onto the egress queue → the transport send call returned.
+    TransmitBuffer,
+    /// Received from the transport → the transport send call returned.
+    Total,
+}
+
+impl MediaLatencyPhase {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 4] = [
+        Self::ReceiveBuffer,
+        Self::Processing,
+        Self::TransmitBuffer,
+        Self::Total,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReceiveBuffer => "receive_buffer",
+            Self::Processing => "processing",
+            Self::TransmitBuffer => "transmit_buffer",
+            Self::Total => "total",
+        }
+    }
+}
+
+/// MH-local `reason` values for `mh_media_frames_dropped_total`.
+///
+/// # One label space, two families — not two vocabularies
+///
+/// `reason` is a **shared, layered** label space. `media_protocol`'s
+/// `reject_reasons!` macro documents its eight tokens as "the structural /
+/// parse subset of a **shared** `reason` label space", and **MH is a
+/// first-class member of the codec layer** —
+/// `RejectReason::producible_by()` names `rewrite_relay_region` as a producing
+/// entry point. So the codec tokens are emitted on this same metric, verbatim
+/// via `RejectReason::as_str()`, and the tokens below are MH's own additions to
+/// that space. Never re-spell a codec token here; never invent an MH spelling
+/// for a condition the codec already names.
+///
+/// **MH must never emit a crypto- or key-layer token** — `signature_invalid`,
+/// `decrypt_failed`, `unwrap_failed`, `replay_detected`,
+/// `wrap_key_id_mismatch`, `no_kek_for_generation`, `no_roster_entry`,
+/// `no_transmit_key`. MH is keyless and never opens a frame, so such a series
+/// asserts a verification MH is structurally incapable of performing, and an
+/// operator reads it as "MH validates frames" and then relies on a control that
+/// does not exist. The collision test in
+/// `crates/mh-service/tests/media_metrics_integration.rs` pins this against all
+/// sixteen tokens in `proto/test-vectors/frame-v2.vectors.json`.
+///
+/// ANCHOR (DRY): the operator-facing meaning of each token, and the split
+/// between the should-read-zero invariant-violation group and the
+/// saturation-or-input group, live in
+/// `docs/observability/metrics/mh-service.md` §Media Forward Path. That file is
+/// the single source of truth for what these mean; this enum is the single
+/// source of truth for how they are spelled.
+///
+/// Modelled on [`PolicyApplyOutcome`]: an `ALL` array plus a wildcard-free
+/// `as_str`, so a typo or a twelfth value is a compile error rather than a new
+/// time series discovered in production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaDropReason {
+    /// MH's bounded ingress queue shed its oldest frame. MH ingest is
+    /// saturated — the forward loop is not keeping up with the receive loop.
+    IngressQueueOverflow,
+    /// MH's bounded egress queue shed its oldest frame. A slow subscriber;
+    /// **this is expected load shedding**, not a fault.
+    EgressQueueOverflow,
+    /// The transport seam refused a datagram it should have accepted
+    /// (`TooLarge` or `DatagramsUnsupported`). **Invariant violation: should
+    /// read zero forever.**
+    TransportSendRefused,
+    /// The subscriber's connection closed mid-flight. **Routine** — a
+    /// participant leaves every meeting, many times — and deliberately not
+    /// folded into [`Self::TransportSendRefused`], which would make that
+    /// counter an unalertable mixture of "we have a bug" and "someone hung up".
+    ConnectionClosed,
+    /// The received datagram's **byte length** exceeded the wire-format frame
+    /// maximum, rejected before any parse.
+    ///
+    /// Deliberately **not** the codec's `payload_length_exceeds_max`, even
+    /// though the same constant is behind both: that token means "the declared
+    /// `payload_length` **field** exceeded the max during header validation",
+    /// which is identical to the client's condition and must keep the shared
+    /// spelling. This one is a pre-parse whole-datagram cap. Same constant, two
+    /// checks, two tokens, both implemented.
+    OversizeDatagram,
+    /// A connection exceeded its per-connection stream **creation-rate** cap.
+    ///
+    /// **UNREACHABLE UNTIL UNI-STREAM/VIDEO**, in the same sense as
+    /// [`Self::PartialFrameDiscard`] and for the same reason: MH opens no
+    /// unidirectional-stream accept loop, and audio is one frame per datagram
+    /// (ADR-0036 §1), so there is no stream-creation event to rate-limit. A
+    /// fixed-window limiter was built for this token at story task 16 and
+    /// **removed at review** — it was unreachable enforcement machinery behind a
+    /// catalog entry that described it as a live detector, which is a control
+    /// that reads as present and cannot fire.
+    ///
+    /// The token is kept so the author of the accept path inherits the spelling
+    /// rather than inventing a second one, and inherits no bound they did not
+    /// choose. Owner: whichever task lands the uni-stream accept path (video).
+    StreamRateLimited,
+    /// No forwarding policy is installed for this meeting. The remedy is the
+    /// control plane (ADR-0036 §8), not this handler.
+    NoPolicy,
+    /// A policy is installed but no egress edge names this sender. The remedy
+    /// is MC's assignment.
+    NoSubscriber,
+    /// An edge names a subscriber with no connection on this handler.
+    NoLocalSubscriber,
+    /// `rewrite_relay_region` failed on a frame that had already decoded
+    /// cleanly. **This is an MH bug**, never a sender fault: it is the
+    /// entry-point ambiguity `docs/TODO.md`'s reject-reason entry asks task 16
+    /// to resolve, resolved structurally (a distinct token) rather than with an
+    /// `entry_point` label. **Should read zero forever.**
+    RelayRewriteFailed,
+    /// A partially-read stream frame was discarded.
+    ///
+    /// **UNREACHABLE UNTIL VIDEO.** Audio is one frame per datagram (ADR-0036
+    /// §1), so the only producer is the stream-carried path's `Ok(None)`
+    /// caller obligation documented at `media_protocol::codec`'s
+    /// `decode_stream_frame`. It is defined now because that obligation names
+    /// MH as one of its two owners and a counted give-up is the whole point of
+    /// it; leaving the token out would make the video path's first author
+    /// invent a spelling.
+    PartialFrameDiscard,
+}
+
+impl MediaDropReason {
+    /// Every value, in catalog order. The length is written out so a twelfth
+    /// token cannot be added without the catalog and the dashboards being
+    /// revisited — this array fails to compile first.
+    pub const ALL: [Self; 11] = [
+        Self::IngressQueueOverflow,
+        Self::EgressQueueOverflow,
+        Self::TransportSendRefused,
+        Self::ConnectionClosed,
+        Self::OversizeDatagram,
+        Self::StreamRateLimited,
+        Self::NoPolicy,
+        Self::NoSubscriber,
+        Self::NoLocalSubscriber,
+        Self::RelayRewriteFailed,
+        Self::PartialFrameDiscard,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IngressQueueOverflow => "ingress_queue_overflow",
+            Self::EgressQueueOverflow => "egress_queue_overflow",
+            Self::TransportSendRefused => "transport_send_refused",
+            Self::ConnectionClosed => "connection_closed",
+            Self::OversizeDatagram => "oversize_datagram",
+            Self::StreamRateLimited => "stream_rate_limited",
+            Self::NoPolicy => "no_policy",
+            Self::NoSubscriber => "no_subscriber",
+            Self::NoLocalSubscriber => "no_local_subscriber",
+            Self::RelayRewriteFailed => "relay_rewrite_failed",
+            Self::PartialFrameDiscard => "partial_frame_discard",
+        }
+    }
+
+    /// The pipeline direction this token can occur in.
+    ///
+    /// Paired with the token at its definition site, so `reason` and
+    /// `direction` cannot disagree: each token has exactly ONE direction, which
+    /// is why the counter carries 11 MH-local series rather than 22. A token
+    /// that could legitimately occur in both directions would be two conditions
+    /// wearing one name.
+    #[must_use]
+    pub const fn direction(self) -> MediaDirection {
+        match self {
+            Self::IngressQueueOverflow
+            | Self::OversizeDatagram
+            | Self::StreamRateLimited
+            | Self::NoPolicy => MediaDirection::Ingress,
+            Self::EgressQueueOverflow
+            | Self::TransportSendRefused
+            | Self::ConnectionClosed
+            | Self::NoSubscriber
+            | Self::NoLocalSubscriber
+            | Self::RelayRewriteFailed
+            | Self::PartialFrameDiscard => MediaDirection::Egress,
+        }
+    }
+}
+
+/// Histogram bucket edges for `mh_media_forward_latency_seconds`, in seconds.
+///
+/// 50 µs to 100 ms. The bottom of the range has to resolve a forward path whose
+/// design target is tens of microseconds of processing, and the top has to
+/// still show something when a subscriber stalls; a bucket set that bottoms out
+/// at 1 ms would put every healthy observation in the first bucket and make the
+/// histogram unable to distinguish "fast" from "instant".
+///
+/// Named rather than inlined so [`MEDIA_FORWARD_OBJECTIVE_SECONDS`] can be
+/// asserted to be one of these edges.
+pub const MEDIA_FORWARD_LATENCY_BUCKETS: [f64; 11] = [
+    0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.010, 0.030, 0.050, 0.100,
+];
+
+/// The forwarding latency objective, in seconds — **provisional**.
+///
+/// ADR-0011 carries a `< 30 ms` figure, but it is **not ratified against this
+/// measurement point**: this histogram measures MH-internal
+/// ingress-from-network to egress-to-network, not an end-to-end path. Story 8
+/// ratifies the real objective. Recorded here as a named constant, and as
+/// provisional in `docs/observability/slos.md`, so the figure has one home
+/// while it is still moving.
+///
+/// **No burn-rate alert rests on it** until ratification — `slos.md` forbids
+/// one, and an alert on an unratified objective is an alert nobody can act on.
+///
+/// It is asserted to be exactly one of [`MEDIA_FORWARD_LATENCY_BUCKETS`] (see
+/// this module's tests): a histogram quantile at a non-edge value is
+/// interpolated between buckets, so an objective that drifted off an edge would
+/// silently become an estimate of an estimate, and nothing would fail.
+pub const MEDIA_FORWARD_OBJECTIVE_SECONDS: f64 = 0.030;
+
+/// Every metric handle the media forward path needs, resolved once at setup.
+///
+/// ADR-0036 §11: "Per-stream forwarders own metric handles resolved once at
+/// setup, so **no metric macro is reachable from the forward function**." This
+/// struct is the mechanism. `crates/mh-service/src/media/**` holds one of these
+/// and calls `.increment(1)` / `.record(..)` / `.set(..)` on it; it invokes no
+/// macro and performs no registry lookup per frame.
+///
+/// Handles are resolved through the base `counter!` / `histogram!` / `gauge!`
+/// macros, which **return** the handle — never `describe_*` alone, which
+/// documents without resolving and leaves `dt-guard metric-coverage` red while
+/// `application-metrics` reports green.
+///
+/// The metric NAME at each site is a string literal, never a hoisted `const`:
+/// `dt-guard`'s `MACRO_INVOCATION_WITH_FIRST_ARG_RE` captures a quoted literal
+/// first argument, so a `const` name would make `metric-coverage`,
+/// `histogram-buckets`, `application-metrics` and `dashboard-panels` all go
+/// silently blind to this metric **while reporting clean**. Label values are
+/// loop variables, which that regex does not care about.
+#[derive(Debug, Clone)]
+pub struct MediaMetricHandles {
+    /// Indexed by [`MediaDirection::ALL`] order.
+    forwarded: [Counter; 2],
+    /// Indexed by [`MediaDropReason::ALL`] order.
+    dropped: [Counter; 11],
+    /// `(reason, handle)` pairs for the codec family, built by iterating
+    /// `ALL_REJECT_REASONS` rather than a hand-written token list — that const
+    /// is generated by the same macro as the enum, so a ninth codec token added
+    /// upstream automatically gets an MH handle instead of silently missing
+    /// one.
+    codec_dropped: Vec<(RejectReason, Counter)>,
+    /// Indexed by [`MediaLatencyPhase::ALL`] order.
+    latency: [Histogram; 4],
+    /// Published once at setup from the same config field the sampler reads.
+    sample_ratio: Gauge,
+    /// MH's own application egress queue depth. **Not** quinn's send buffer,
+    /// which `wtransport` exposes no accessor for.
+    egress_queue_depth: Gauge,
+}
+
+impl MediaMetricHandles {
+    /// The forwarded counter for one direction.
+    ///
+    /// Array destructuring rather than indexing: `indexing_slicing` is denied
+    /// workspace-wide, and a `match` over the destructured handles is total by
+    /// construction — a new [`MediaDirection`] variant fails to compile here
+    /// AND in `ALL`, rather than resolving to a fallback handle that quietly
+    /// mislabels.
+    pub fn forwarded(&self, direction: MediaDirection) -> &Counter {
+        let [ingress, egress] = &self.forwarded;
+        match direction {
+            MediaDirection::Ingress => ingress,
+            MediaDirection::Egress => egress,
+        }
+    }
+
+    /// The drop counter for one MH-local reason.
+    pub fn dropped(&self, reason: MediaDropReason) -> &Counter {
+        let [ingress_overflow, egress_overflow, send_refused, closed, oversize, rate_limited, no_policy, no_subscriber, no_local, rewrite_failed, partial] =
+            &self.dropped;
+        match reason {
+            MediaDropReason::IngressQueueOverflow => ingress_overflow,
+            MediaDropReason::EgressQueueOverflow => egress_overflow,
+            MediaDropReason::TransportSendRefused => send_refused,
+            MediaDropReason::ConnectionClosed => closed,
+            MediaDropReason::OversizeDatagram => oversize,
+            MediaDropReason::StreamRateLimited => rate_limited,
+            MediaDropReason::NoPolicy => no_policy,
+            MediaDropReason::NoSubscriber => no_subscriber,
+            MediaDropReason::NoLocalSubscriber => no_local,
+            MediaDropReason::RelayRewriteFailed => rewrite_failed,
+            MediaDropReason::PartialFrameDiscard => partial,
+        }
+    }
+
+    /// The drop counter for one codec reject reason.
+    ///
+    /// `Option` rather than a fallback handle: the miss is unreachable by
+    /// construction (the list is built from `ALL_REJECT_REASONS`, which the
+    /// codec's own macro generates alongside the enum) and a fallback handle
+    /// would be a silent mislabel if it ever were reachable. A unit test in
+    /// this module asserts `Some` for every member, which is what makes the
+    /// `None` arm on the hot path provably dead rather than merely believed to
+    /// be.
+    #[must_use]
+    pub fn codec_dropped(&self, reason: RejectReason) -> Option<&Counter> {
+        self.codec_dropped
+            .iter()
+            .find(|(candidate, _)| *candidate == reason)
+            .map(|(_, handle)| handle)
+    }
+
+    /// The latency histogram for one phase.
+    pub fn latency(&self, phase: MediaLatencyPhase) -> &Histogram {
+        let [receive_buffer, processing, transmit_buffer, total] = &self.latency;
+        match phase {
+            MediaLatencyPhase::ReceiveBuffer => receive_buffer,
+            MediaLatencyPhase::Processing => processing,
+            MediaLatencyPhase::TransmitBuffer => transmit_buffer,
+            MediaLatencyPhase::Total => total,
+        }
+    }
+
+    /// The egress-queue-depth gauge.
+    pub const fn egress_queue_depth(&self) -> &Gauge {
+        &self.egress_queue_depth
+    }
+
+    /// Publish the sampling ratio the sampler was built with.
+    ///
+    /// Takes the value rather than reading config itself, because the ONE
+    /// property worth having here is that the published number and the number
+    /// the sampler draws against are the same value from the same field.
+    pub fn publish_sample_ratio(&self, ratio: f64) {
+        self.sample_ratio.set(ratio);
+    }
+}
+
+/// Resolve every media forward-path metric handle. Call once, at setup.
+///
+/// This is a **sibling** of `crates/mh-service/src/media/**` (ADR-0036 §11's
+/// layout constraint): setup lives here so the media directory holds only the
+/// hot path and the directory boundary is the hot-path boundary.
+#[must_use]
+pub fn resolve_media_handles() -> MediaMetricHandles {
+    // Names are literals; labels are loop variables. See `MediaMetricHandles`.
+    let forwarded = MediaDirection::ALL.map(|direction| {
+        counter!(
+            "mh_media_frames_forwarded_total",
+            "direction" => direction.as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+
+    let dropped = MediaDropReason::ALL.map(|reason| {
+        counter!(
+            "mh_media_frames_dropped_total",
+            "reason" => reason.as_str(),
+            "direction" => reason.direction().as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+
+    // The codec family, iterated from the codec's own generated list. Every
+    // token MH emits from this family comes from `decode_datagram`, i.e. is a
+    // sender-side condition, so the direction is `ingress` for all of them; a
+    // failure from `rewrite_relay_region` on an already-decoded frame is not a
+    // sender fault at all and carries `MediaDropReason::RelayRewriteFailed`
+    // instead. That is what discharges the entry-point ambiguity structurally,
+    // with no `entry_point` label.
+    let codec_dropped = ALL_REJECT_REASONS
+        .iter()
+        .map(|reason| {
+            (
+                *reason,
+                counter!(
+                    "mh_media_frames_dropped_total",
+                    "reason" => reason.as_str(),
+                    "direction" => MediaDirection::Ingress.as_str(),
+                    KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+                ),
+            )
+        })
+        .collect();
+
+    let latency = MediaLatencyPhase::ALL.map(|phase| {
+        histogram!(
+            "mh_media_forward_latency_seconds",
+            "phase" => phase.as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+
+    let sample_ratio = gauge!(
+        "mh_media_latency_sample_ratio",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+
+    let egress_queue_depth = gauge!(
+        "mh_media_egress_queue_depth",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+
+    MediaMetricHandles {
+        forwarded,
+        dropped,
+        codec_dropped,
+        latency,
+        sample_ratio,
+        egress_queue_depth,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +1067,59 @@ mod tests {
         for error_type in &valid_error_types {
             record_error("test_op", error_type, 500);
         }
+    }
+
+    #[test]
+    fn media_forward_objective_is_exactly_a_registered_bucket_edge() {
+        // A quantile read at a value that is not a bucket edge is interpolated
+        // between the neighbouring edges, so an objective that drifted off an
+        // edge would silently become an estimate of an estimate and nothing
+        // would fail. When story 8 ratifies a different figure it has to land
+        // on an edge or move one.
+        assert!(
+            MEDIA_FORWARD_LATENCY_BUCKETS.contains(&MEDIA_FORWARD_OBJECTIVE_SECONDS),
+            "objective {MEDIA_FORWARD_OBJECTIVE_SECONDS} is not one of \
+             {MEDIA_FORWARD_LATENCY_BUCKETS:?}"
+        );
+    }
+
+    #[test]
+    fn every_codec_reject_reason_has_a_resolved_handle() {
+        // This is what makes `codec_dropped`'s `None` arm provably dead on the
+        // hot path rather than merely believed to be: the list is built by
+        // iterating `ALL_REJECT_REASONS`, which the codec's own macro generates
+        // alongside the enum, so a ninth token upstream gets a handle
+        // automatically — and this test fails if that ever stops being true.
+        let handles = resolve_media_handles();
+        for reason in ALL_REJECT_REASONS {
+            assert!(
+                handles.codec_dropped(*reason).is_some(),
+                "no handle resolved for codec reject reason '{}'",
+                reason.as_str()
+            );
+        }
+        assert!(
+            !ALL_REJECT_REASONS.is_empty(),
+            "the codec vocabulary is empty; the loop above proves nothing"
+        );
+    }
+
+    #[test]
+    fn every_media_drop_reason_has_exactly_one_direction_and_a_distinct_token() {
+        let mut tokens = std::collections::BTreeSet::new();
+        for reason in MediaDropReason::ALL {
+            assert!(
+                tokens.insert(reason.as_str()),
+                "duplicate media drop token '{}'",
+                reason.as_str()
+            );
+            // Pairing the direction with the token at the definition site is
+            // what keeps `reason` and `direction` from disagreeing; a token
+            // legitimately occurring in both directions would be two conditions
+            // wearing one name.
+            let _: MediaDirection = reason.direction();
+        }
+        assert_eq!(tokens.len(), MediaDropReason::ALL.len());
     }
 
     #[test]

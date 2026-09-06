@@ -83,7 +83,7 @@ case future drift emerges from new services or metric additions.
 | `region` | Geographic/deployment region | Bounded by cloud region set |
 | `pod` | Kubernetes pod identifier | Per-pod — cardinality bounded by fleet size |
 | `key_custody` | Who holds media key material | **`operator` — single permitted value.** See §Key custody below. |
-| `reason` | Why a **frame** was dropped on the media path | Bounded by `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. **Points, never restates** — restating the tokens here would give each one two homes and they would drift. Distinct from `error_type` / `error_category`, which classify why a **service operation** failed: `reason` is per-frame and lives entirely on the media path. See §Frame reject reason below. |
+| `reason` | Why a **frame** was dropped on the media path | **ONE label space, TWO families, each with exactly one home.** (a) The *codec* family is bounded by `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`; (b) the *relay transport-and-routing* family is bounded by `mh_service::observability::metrics::MediaDropReason`. **Points, never restates** — restating either set here would give each token two homes and they would drift. Distinct from `error_type` / `error_category`, which classify why a **service operation** failed: `reason` is per-frame and lives entirely on the media path. See §Frame reject reason and §Media-path transport refusals below. |
 
 **`status` vs `outcome`.** Use `status` when the values are the coarse, shared
 set above and a responder compares them across services. Use `outcome` when the
@@ -286,6 +286,84 @@ environment or secret. Read the `reject_reasons` array; do not file an incident 
 
 **References, cited rather than restated** so they cannot drift: R2 (media-path label policy and the
 voice-activity-trace argument), the task-#7 meeting-dimension bar, and ADR-0036 R3's inertia note.
+
+## Media-path transport refusals `[reviewer-only]`
+
+**One `reason` label space, two families, and a relay is a first-class member of
+both.** The previous section governs the codec family. This one governs the
+tokens a **relay** adds to the same label space: the conditions under which MH
+did not forward a frame that had nothing wrong with its bytes.
+
+`media-protocol`'s `reject_reasons!` macro is the governing text and already
+says this — its eight tokens are *"the structural / parse subset of a **shared**
+`reason` label space"* — and `RejectReason::producible_by()` names
+`rewrite_relay_region` as a producing entry point, which is a relay call.
+Recorded here because an earlier draft of this file described the two families
+as occupying *disjoint domains*, and that framing was **withdrawn**: MH does
+produce codec tokens, verbatim, and the disjointness that matters is between
+*spellings*, not between *producers*.
+
+**Home of the relay family**: `mh_service::observability::metrics::MediaDropReason`
+— a closed enum with an `ALL` array and a wildcard-free `as_str`, so a typo or a
+new value is a compile error rather than a time series discovered in
+production. Operator meaning lives in `docs/observability/metrics/mh-service.md`
+§Media Forward Path. Neither is restated here.
+
+Three rules bind that family, and only the first is about spelling:
+
+1. **No relay token may collide with a codec token.** If a condition is one the
+   codec already names, the relay emits `RejectReason::as_str()` verbatim rather
+   than re-spelling it. The one deliberate near-miss is `oversize_datagram`
+   versus the codec's `payload_length_exceeds_max`: the codec token means the
+   declared *length field* exceeded the maximum during header validation, and
+   the relay token means the *received datagram's byte length* did, before any
+   parse. Same constant, two checks, two conditions, two tokens.
+2. **A relay may never emit a crypto- or key-layer token.** `signature_invalid`,
+   `decrypt_failed`, `unwrap_failed`, `replay_detected`, `wrap_key_id_mismatch`,
+   `no_kek_for_generation`, `no_roster_entry`, `no_transmit_key` are the
+   *receiver-state-dependent* family of the previous section, and a relay holds
+   no receiver state and never opens a frame. A relay series carrying one of
+   them asserts a verification the relay is structurally incapable of
+   performing, and an operator reads it as "the relay validates frames" — after
+   which someone relies on a control that does not exist. Note this is a
+   **stronger** bar than the oracle argument that governs the client: it is not
+   that the label would leak, it is that the value would be false.
+3. **Each relay token carries exactly one `direction`.** A token that could
+   legitimately occur in both directions is two conditions wearing one name;
+   pairing the direction with the token at its definition site is what keeps the
+   two labels from disagreeing.
+
+The executable bar for rule 1 and rule 2 is
+`crates/mh-service/tests/media_metrics_integration.rs`, which reads all sixteen
+tokens from the vector file **as data** and asserts MH's own vocabulary is
+disjoint from them. It reads the file rather than the Rust enum deliberately:
+the crypto and key tokens have **no Rust home at all**, so a test against
+`ALL_REJECT_REASONS` would let a relay-local enum define `replay_detected` and
+pass cleanly.
+
+### Permitted partner: `direction` `[reviewer-only]`
+
+`direction` ∈ {`ingress`, `egress`} is an admitted partner of `reason` **on
+relay media-path metrics only**, and the reasoning does not travel.
+
+**It is pipeline-relative, never participant-relative.** `ingress` is
+publisher→relay and `egress` is relay→subscriber. The participant-relative
+reading — `uplink` / `downlink` — is **barred**. Both readings are 2-valued and
+a catalog entry cannot tell them apart, so the choice looks cosmetic; it is not.
+Only the pipeline-relative one is *structurally incapable* of growing a third
+value that individuates a participant, and the property that matters is that
+incapacity rather than the current arity.
+
+**It is admitted because the relay is keyless.** The oracle argument of the
+previous section is about *receiver key-cache state*, and a relay holds none: it
+never opens a frame, so no partner label can turn its counters into a probe of
+key material. `direction` therefore adds no factor to an oracle that does not
+exist on this component.
+
+**This acceptance does not generalise to the client's counter** (story task 19).
+The client sits on exactly the state the oracle argument is about, and
+`reason × direction` there is a different question with a different answer. Do
+not cite this block as precedent for `dt_client_media_frames_dropped_total`.
 
 ## Media-path identity `[reviewer-only]`
 

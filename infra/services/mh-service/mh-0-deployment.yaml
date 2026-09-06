@@ -108,6 +108,34 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_CONNECTIONS
+        # OPTIONAL AT THE MANIFEST LAYER TOO, deliberately — the only key in
+        # this file that is.
+        #
+        # THE RULE, and it is NOT "required by config.rs": a hard
+        # configMapKeyRef is correct when a missing key must be a LOUD STARTUP
+        # FAILURE rather than a silent fallback. That covers both the keys
+        # config.rs requires AND keys whose code default is wrong for a cluster
+        # — GC_GRPC_URL defaults to http://localhost:50051 and MH_REGION to
+        # us-east-1, so under `optional: true` a missing key would give you a
+        # pod that starts, passes readiness and talks to nothing. Several keys
+        # in this file are optional-with-default in code and hard-referenced
+        # anyway, deliberately and correctly. DO NOT flip them.
+        #
+        # `optional: true` is correct only when the code default IS the intended
+        # production behaviour AND decoupling the manifest rollback from the
+        # image rollback matters. Today that is this key alone: mh-service falls
+        # back to DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO, which is the value we
+        # want, and a hard reference would make the kubelet refuse to start the
+        # container when the key is absent (CreateContainerConfigError), forcing
+        # the deployment and the ConfigMap to roll back together — the
+        # deploy-time coupling optional-with-default was chosen to avoid,
+        # reintroduced one layer down.
+        - name: MH_MEDIA_LATENCY_SAMPLE_RATIO
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MEDIA_LATENCY_SAMPLE_RATIO
+              optional: true
         # Drain window, DERIVED — do not hand-edit this value.
         #
         # The single source of truth is this deployment's own

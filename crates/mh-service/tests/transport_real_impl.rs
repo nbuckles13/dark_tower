@@ -255,3 +255,67 @@ async fn real_transport_delivers_over_the_reliable_stream_path() {
         "bytes written through the real MediaSendStream must arrive intact"
     );
 }
+
+/// **Measurement, not a contract**: does `wtransport::Datagram::payload()`
+/// hand out a *uniquely-owned* `Bytes`?
+///
+/// The forward path's fan-out takes a zero-copy path for one edge per frame:
+/// `Bytes::try_into_mut()` → rewrite the 6-byte relay region in place →
+/// `freeze()`. Whether that path is ever taken **in production** depends
+/// entirely on the vendor, because MH does not allocate the ingress buffer.
+/// Correctness does not: `media::forward` falls back to the per-connection
+/// arena when the buffer is shared, and the arena path is exercised by the
+/// N>=2 fan-out gates.
+///
+/// So this pins the *observed* answer rather than a required one. If a
+/// `wtransport` or `quinn` upgrade flips it, this fails loudly and the
+/// zero-copy claim in `docs/devloop-outputs/2026-09-05-mh-audio-datagram-forward-path/main.md`
+/// gets re-measured instead of quietly becoming false — which is exactly the
+/// failure mode `mh_service::transport`'s own docs warn about for properties
+/// asserted *through* the seam rather than measured at it.
+///
+/// Delivery is treated as a rig precondition, not as an assertion about QUIC:
+/// the datagram is sent repeatedly until one arrives, because (as this file's
+/// header records) QUIC datagrams are unreliable and no test here may assert
+/// delivery. If none arrives within the rig timeout the rig is broken and the
+/// test says so.
+#[tokio::test]
+async fn measure_whether_a_received_datagram_payload_is_uniquely_owned() {
+    let pair = RealTransportPair::establish().await;
+
+    let received = tokio::time::timeout(RIG_TIMEOUT, async {
+        loop {
+            // Repeated sends: unreliable transport, rig precondition.
+            let _ = pair
+                .client
+                .send_datagram(Bytes::from_static(b"measurement"));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Ok(payload) =
+                tokio::time::timeout(Duration::from_millis(50), pair.server.recv_datagram()).await
+            {
+                return payload.expect("connection must stay alive during the measurement");
+            }
+        }
+    })
+    .await
+    .expect("the rig must deliver at least one loopback datagram within the timeout");
+
+    // Consumed, NOT cloned: `received.clone().try_into_mut()` can never
+    // succeed, because the clone itself makes the refcount 2. Measuring
+    // through a clone would "prove" the shared answer no matter what the
+    // vendor does — a green measurement of nothing.
+    let uniquely_owned = received.try_into_mut().is_ok();
+
+    assert!(
+        uniquely_owned,
+        "MEASURED 2026-09-05 against wtransport 0.7.2 / quinn 0.11.11: the payload handed out \
+         by `WtMediaTransport::recv_datagram` IS uniquely owned, so the forward path's \
+         zero-copy edge takes `try_into_mut()` in production. The reason is load-bearing and \
+         fragile: `Datagram::payload()` returns `quic_dgram.slice(payload_offset..)`, which \
+         SHARES the refcount while the `Datagram` lives — it is unique only because \
+         `recv_datagram` drops the `Datagram` before returning. Holding the `Datagram` (to \
+         read `session_id`, say) would silently move every frame onto the arena copy. If this \
+         now fails, correctness is unaffected (the arena path is taken) but the zero-copy \
+         claim in main.md's §Devloop Verification Steps must be re-measured, not deleted."
+    );
+}

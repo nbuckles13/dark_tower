@@ -3,6 +3,8 @@
 //! This module centralizes the fixtures that the integration tests share:
 //!
 //! - [`TestKeypair`] / [`mount_jwks_mock`] — Ed25519 keypair + wiremock JWKS
+//! - [`media_frame`] — frame-v2 datagram fixtures, built through the codec
+//! - [`media_rig`] — the loopback forward-path rig the three media binaries share
 //! - [`mock_mc`] — MC gRPC mock (MediaCoordinationService) with channel capture
 //! - [`grpc_rig`] — Real `MhAuthLayer` + `MhMediaService` on `127.0.0.1:0`
 //! - [`accept_loop_rig`] — Real `WebTransportServer::bind() → accept_loop()`
@@ -41,6 +43,8 @@
 pub mod accept_loop_rig;
 pub mod grpc_rig;
 pub mod jwks_rig;
+pub mod media_frame;
+pub mod media_rig;
 pub mod mock_mc;
 pub mod otel_capture;
 pub mod tokens;

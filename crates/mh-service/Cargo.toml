@@ -58,6 +58,13 @@ metrics-exporter-prometheus = "0.16"
 # HTTP server for health endpoints and metrics
 axum = { workspace = true }
 
+# Random one-in-N latency sampling on the media forward path (ADR-0036 §11:
+# "Sampling must be random, not deterministic per stream" — the natural modulo
+# implementation reconstructs the voice-activity trace). `small_rng` is opted
+# into here rather than at the workspace: `SmallRng` is the per-connection PRNG
+# the sampler wants and no other consumer needs it.
+rand = { workspace = true, features = ["small_rng"] }
+
 # Time utilities
 chrono = { workspace = true }
 
@@ -65,6 +72,14 @@ chrono = { workspace = true }
 common = { path = "../common" }
 proto-gen = { path = "../proto-gen" }
 media-protocol = { path = "../media-protocol" }
+
+[features]
+# Development-only per-frame media tracing (ADR-0036 §11). NOT in `default`,
+# not enabled by any dev-dependency, and absent from
+# `infra/docker/mh-service/Dockerfile`. Enabling it in a release build is a
+# `compile_error!`; see `src/lib.rs` for the gate and for the
+# cross-reference to the mechanism's reasoning.
+per-frame-trace = []
 
 [[bin]]
 name = "mh-service"
