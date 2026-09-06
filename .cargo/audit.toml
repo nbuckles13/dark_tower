@@ -6,7 +6,7 @@
 #   RUSTSEC-2023-0071: rsa 0.9.10 Marvin timing side-channel; LOCKFILE-ONLY — not built at all (no mysql feature; `cargo tree -p rsa --invert --edges normal` prints nothing, verified 2026-09-02), present only because sqlx-mysql is a recorded optional dep; fail-closed if the verify command ever prints anything; no upstream fix and cargo-audit scans the lockfile not the build graph, so dropping this makes Layer 6 permanently red with no remedy. Full rationale in comment above + docs/TODO.md Cluster C.
 #     expires 2026-12-01 — re-verify per the reason line above before renewing; renewal workflow: docs/contributor/audit-suppressions.md.
 #   RUSTSEC-2025-0052: async-std unmaintained WARNING (non-gating; noise-only suppression). Test-build-graph-only via opentelemetry_sdk 0.24 `testing` feature (dev-dep of common) — verify with `cargo tree -i async-std -e normal` (must be empty); fail-closed if a normal-graph consumer appears. Fix = tracked OTel 0.29+ migration (rt-async-std persists through sdk 0.28.0).
-#     expires 2026-09-05 — re-verify per the reason line above before renewing; renewal workflow: docs/contributor/audit-suppressions.md.
+#     expires 2026-12-04 — re-verify per the reason line above before renewing; renewal workflow: docs/contributor/audit-suppressions.md.
 
 [advisories]
 ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2025-0052"]
