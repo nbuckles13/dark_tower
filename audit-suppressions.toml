@@ -124,7 +124,10 @@ reason = "rsa 0.9.10 Marvin timing side-channel; LOCKFILE-ONLY — not built at 
 [[suppression]]
 id = "RUSTSEC-2025-0052"
 ecosystem = "rust"
-expires = "2026-09-05"
+# Renewed 2026-09-06 at the ADR-0036 story-1 task-16 escalation: user re-accepted;
+# invariant re-verified (`cargo tree -i async-std -e normal` empty); OTel 0.29+
+# migration remains the fix, owners unchanged.
+expires = "2026-12-04"
 ticket = "docs/TODO.md -> section 'Polyglot Pipeline Follow-ups (ADR-0033 Wave 1 #1)' -> entry: async-std unmaintained warning from opentelemetry_sdk 0.24.1 transitive (RUSTSEC-2025-0052; fix = OTel 0.29+ migration, owner observability+operations)"
 reason = "async-std unmaintained WARNING (non-gating; noise-only suppression). Test-build-graph-only via opentelemetry_sdk 0.24 `testing` feature (dev-dep of common) — verify with `cargo tree -i async-std -e normal` (must be empty); fail-closed if a normal-graph consumer appears. Fix = tracked OTel 0.29+ migration (rt-async-std persists through sdk 0.28.0)."
 
