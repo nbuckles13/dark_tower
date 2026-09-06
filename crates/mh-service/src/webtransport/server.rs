@@ -15,6 +15,7 @@ use crate::config::{
     MAX_IDLE_TIMEOUT_SECONDS, STREAM_RECEIVE_WINDOW_BYTES,
 };
 use crate::grpc::McClient;
+use crate::media::MediaSetup;
 use crate::observability::metrics;
 use crate::session::SessionManagerHandle;
 
@@ -51,6 +52,9 @@ pub struct WebTransportServer {
     max_connections: usize,
     /// Explicit QUIC transport parameters (ADR-0036 §1).
     quic_transport: QuicTransportParams,
+    /// Media forward-path setup: handles resolved once at process start, and
+    /// the latency sample ratio. Cloned per connection, never re-resolved.
+    media: MediaSetup,
     /// Active connection count.
     active_connections: Arc<AtomicUsize>,
     /// Cancellation token for graceful shutdown.
@@ -75,6 +79,7 @@ impl WebTransportServer {
         register_meeting_timeout: Duration,
         max_connections: usize,
         quic_transport: QuicTransportParams,
+        media: MediaSetup,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
@@ -88,6 +93,7 @@ impl WebTransportServer {
             register_meeting_timeout,
             max_connections,
             quic_transport,
+            media,
             active_connections: Arc::new(AtomicUsize::new(0)),
             cancel_token,
         }
@@ -192,6 +198,7 @@ impl WebTransportServer {
                     let mc_client = Arc::clone(&self.mc_client);
                     let handler_id = self.handler_id.clone();
                     let register_meeting_timeout = self.register_meeting_timeout;
+                    let media = self.media.clone();
                     let connection_token = self.cancel_token.child_token();
 
                     tokio::spawn(async move {
@@ -202,6 +209,7 @@ impl WebTransportServer {
                             mc_client,
                             handler_id,
                             register_meeting_timeout,
+                            media,
                             connection_token,
                         )
                         .await;

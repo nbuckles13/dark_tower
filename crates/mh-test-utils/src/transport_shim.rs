@@ -469,12 +469,22 @@ impl LossDelayTransport {
     ///
     /// **The escape hatch, named because someone will look for it.** wtransport
     /// exposes the raw connection at `src/connection.rs:415`,
-    /// `quic_connection() -> &quinn::Connection`. It sits behind
-    /// `#[cfg(feature = "quinn")]`, which this workspace does not enable
-    /// (`Cargo.toml` declares `wtransport = "0.7"` with no `features` key; the
-    /// only feature either service names is dev-scoped
-    /// `dangerous-configuration`), so it does not compile today. And even after
-    /// a manifest edit it sends a **QUIC** datagram *below* WebTransport,
+    /// `quic_connection() -> &quinn::Connection`, behind
+    /// `#[cfg(feature = "quinn")]`.
+    ///
+    /// > **Corrected 2026-09-05 (story task 16).** This paragraph previously
+    /// > said the feature "is not enabled in this workspace, so it does not
+    /// > compile today". **That is no longer true**: `crates/mh-service`
+    /// > enables `wtransport/quinn`, because `with_custom_transport` — the only
+    /// > way to hand wtransport an explicit `quinn::TransportConfig`, which
+    /// > ADR-0036 §1 requires — is behind the same feature. The conclusion is
+    /// > unchanged and the reason below was always the stronger one; corrected
+    /// > rather than deleted because a reader who checked the compile claim,
+    /// > found it false, and discarded the paragraph would conclude the hatch
+    /// > is usable. The same correction is recorded at
+    /// > `crates/mh-service/src/transport/mod.rs`, which is the authority.
+    ///
+    /// Taking it sends a **QUIC** datagram *below* WebTransport,
     /// skipping the H3 session-id varint that `Datagram::write` prepends
     /// (`src/datagram.rs:35-48`) — producing frames a conforming peer drops.
     /// Taking the hatch means reimplementing H3 datagram framing inside MH.

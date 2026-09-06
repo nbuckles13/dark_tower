@@ -186,15 +186,41 @@ When story 8 ratifies the target, its single source of truth is a **named consta
 bucket slice, with a unit test asserting the constant equals one of the bucket edges — so a later
 change to the figure cannot silently drift the objective into a bucket interpolation.
 
-**That constant does not exist yet.** It lands with the MH forward path (story task 16), together
-with the forward-latency histogram itself and the sample-ratio gauge. Until then this section is a
-forward reference, not a citation: do not expect to `grep` it in the current tree.
+**The constant landed with the MH forward path (story task 16)**, together with the forward-latency
+histogram and the sample-ratio gauge. This section is now a **citation, not a forward reference**:
 
-Likewise the **sample ratio**. The histogram is observed one-in-N with **random** sampling — never
-per-stream deterministic, which would reconstruct the voice-activity trace ADR-0036 §11 prohibits —
-and the ratio is published as a gauge reading the same configuration value the sampler reads, so the
-published ratio cannot drift from the applied one. Gauge and config key land in task 16; see
-`dashboard-conventions.md` §Periodicity.
+- `crates/mh-service/src/observability/metrics.rs::MEDIA_FORWARD_OBJECTIVE_SECONDS` — **0.030,
+  documented in code as PROVISIONAL pending story 8**, sitting beside
+  `MEDIA_FORWARD_LATENCY_BUCKETS`, the same slice `set_buckets_for_metric` registers.
+- The bucket-edge assertion exists in both tiers:
+  `metrics.rs::tests::media_forward_objective_is_exactly_a_registered_bucket_edge` and
+  `crates/mh-service/tests/media_metrics_integration.rs::the_forwarding_objective_is_exactly_one_of_the_registered_bucket_edges`,
+  the latter also asserting the slice is non-degenerate and strictly ascending — a `contains` over an
+  empty slice passes vacuously.
+
+> **This SLI reads no data on a production pod today, and an empty histogram is
+> not a fast one.** MH declines to start its media tasks pending the participant
+> → `sender_id` binding, so `mh_media_forward_latency_seconds` records nothing
+> and any quantile over it is empty rather than comfortably inside the
+> objective — a distinction that matters most on the SLO dashboard, which is the
+> one that gets screenshotted into a status update. Stated once in full at
+> `docs/observability/metrics/mh-service.md` §Media Forward Path, with the
+> discriminator a responder can run; tracked in `docs/TODO.md` §Media Path
+> Obligations under "R-15 IS NOT SATISFIED IN PRODUCTION".
+
+**The presence of the constant does not ratify the target.** 0.030 is the ADR-0011 figure carried
+forward as a placeholder so the mechanism has something to hold; the table above is unchanged and
+story 8 still ratifies the number. **No burn-rate alert may rest on it**, per the rule above, and
+none ships.
+
+Likewise the **sample ratio**, also landed:
+`MH_MEDIA_LATENCY_SAMPLE_RATIO` (optional; default `mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`, cited rather than restated) is read once into
+`Config::media_latency_sample_ratio`, the sampler is constructed from that field, and
+`mh_media_latency_sample_ratio` publishes **that same field** — so the published ratio cannot drift
+from the applied one, and a component test asserts the equality. The sampling is **random per frame,
+never per-stream deterministic**, which would reconstruct the voice-activity trace ADR-0036 §11
+prohibits; a unit test asserts two samplers fed identical arrival patterns produce different sample
+sets. See `dashboard-conventions.md` §Periodicity.
 
 ---
 

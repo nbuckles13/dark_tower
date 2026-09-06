@@ -24,6 +24,7 @@
 
 pub mod health;
 pub mod metrics;
+pub mod per_frame_trace;
 
 // Re-exports for convenience
 pub use health::{health_router, HealthState};

@@ -379,6 +379,37 @@ pub const NOMINAL_AUDIO_FRAME_BYTES: usize = NOMINAL_OPUS_PAYLOAD_BYTES
 /// live today as the left-hand side of that startup validation.
 pub const EGRESS_QUEUE_FRAMES: usize = 8;
 
+/// Bound on MH's own per-connection **ingress** datagram queue, in frames.
+///
+/// ADR-0036 §11's ingress denial-of-service caps: "a bounded datagram queue
+/// with drop-oldest". Same ring type as the egress queue
+/// ([`crate::media::queue::BoundedDropOldest`]) with the opposite direction, so
+/// the two are one structure used twice rather than two hand-rolled rings.
+///
+/// A compile-time constant for the same reason [`EGRESS_QUEUE_FRAMES`] is: no
+/// manifest supplies it, and a newly-*required* env var with no manifest key is
+/// a deploy-time `CrashLoop`. It is deliberately **not** shared with
+/// [`EGRESS_QUEUE_FRAMES`]: the egress bound is fixed by the ADR-0036 §1
+/// ordering relationship against `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` and is
+/// startup-validated ([`ConfigError::EgressQueueDoesNotBindFirst`]), while this
+/// one answers a different question — how much scheduling jitter between the
+/// receive loop and the forward loop MH absorbs before shedding. Collapsing
+/// them into one constant would make the §1 validation start constraining a
+/// value it has nothing to say about.
+///
+/// Sized as one 20 ms audio frame per queued slot: 16 frames is ~320 ms of
+/// ingest backlog, which is far beyond any healthy scheduling gap and still a
+/// latency ceiling rather than a buffer.
+pub const INGRESS_QUEUE_FRAMES: usize = 16;
+
+/// Default fraction of forwarded frames whose latency is observed into
+/// `mh_media_forward_latency_seconds`.
+///
+/// One in a hundred. ADR-0036 §11: "timestamp always, observe one in N" — the
+/// clock read is a ~25 ns vDSO call and is taken on every frame; the histogram
+/// observation is the expensive part.
+pub const DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO: f64 = 0.01;
+
 /// Maximum queued-audio latency the datagram send buffer may be configured to
 /// hold, in milliseconds. Sole input to
 /// [`MAX_DATAGRAM_BUFFER_AUDIO_FRAMES_CEILING`].
@@ -1032,6 +1063,29 @@ pub struct Config {
     /// Forwarding-policy bounds for the ADR-0036 §8 control plane.
     pub policy_limits: PolicyLimits,
 
+    /// Fraction of forwarded frames whose latency is observed into
+    /// `mh_media_forward_latency_seconds` (env
+    /// `MH_MEDIA_LATENCY_SAMPLE_RATIO`, optional, default
+    /// [`DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`], ceiling-checked to `0.0..=1.0`).
+    ///
+    /// **ONE field, TWO readers, and that is the point.** The sampler
+    /// ([`crate::media::sampler`]) draws against it, and
+    /// `mh_media_latency_sample_ratio` publishes this same field once at setup.
+    /// A published ratio computed separately from the one the sampler reads is
+    /// a gauge that lies exactly when it matters — ADR-0036 §11's
+    /// derive-rather-than-guard rule, applied to a two-line temptation.
+    ///
+    /// **Not [`Self::otel_sample_rate`].** That is TRACE head-sampling and is
+    /// validated by `init_otel`; this is media-path histogram sampling. The two
+    /// have different owners, different consumers and different failure modes,
+    /// and collapsing them would put the media path's leak posture behind a
+    /// tracing knob.
+    ///
+    /// Optional-with-default rather than required: no newly *required* env var
+    /// this story, so `mh-deployment.md`'s "the image may roll back alone"
+    /// property survives and there is no deploy-time `CrashLoop` risk.
+    pub media_latency_sample_ratio: f64,
+
     /// Whether to initialize the OpenTelemetry SDK (R-55). Default `false`.
     /// When `true`, `main` calls `init_otel` (eager collector probe, fail-hard
     /// at init) and composes the tracing-opentelemetry layer; when `false`, no
@@ -1081,6 +1135,10 @@ impl fmt::Debug for Config {
             .field("drain_window", &self.drain_window)
             .field("drain_window_source", &self.drain_window_source)
             .field("policy_limits", &self.policy_limits)
+            .field(
+                "media_latency_sample_ratio",
+                &self.media_latency_sample_ratio,
+            )
             .field("otel_enabled", &self.otel_enabled)
             .field("otel_endpoint", &self.otel_endpoint)
             .field("otel_sample_rate", &self.otel_sample_rate)
@@ -1472,6 +1530,34 @@ impl Config {
             )?,
         };
 
+        // ADR-0036 §11 media latency sampling. Optional-with-default plus a
+        // hard code-level range check: a ratio outside `0.0..=1.0` is not a
+        // preference, it is a typo, and the two ends fail differently — above 1
+        // silently means "observe everything" (a per-frame histogram write on
+        // the hot path), below 0 silently means "observe nothing" (a histogram
+        // that is empty forever and reads as a healthy quiet path).
+        let media_latency_sample_ratio = match vars.get("MH_MEDIA_LATENCY_SAMPLE_RATIO") {
+            None => DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO,
+            Some(raw) => {
+                let parsed: f64 = raw.trim().parse().map_err(|e| {
+                    ConfigError::InvalidValue(format!(
+                        "MH_MEDIA_LATENCY_SAMPLE_RATIO must be a number in 0.0..=1.0, got \
+                         '{raw}': {e}"
+                    ))
+                })?;
+                if !(0.0..=1.0).contains(&parsed) {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "MH_MEDIA_LATENCY_SAMPLE_RATIO must be in 0.0..=1.0, got {parsed} — \
+                         above 1.0 observes every frame on the per-frame path and below 0.0 \
+                         observes none, which reads as a healthy quiet path. Remediation: set \
+                         MH_MEDIA_LATENCY_SAMPLE_RATIO in \
+                         infra/services/mh-service/configmap.yaml to a value in 0.0..=1.0"
+                    )));
+                }
+                parsed
+            }
+        };
+
         // R-55: OpenTelemetry SDK configuration.
         // Enablement is an explicit boolean (OTEL_ENABLED), NOT presence of the
         // endpoint — so a populated OTLP_ENDPOINT with OTEL_ENABLED unset/false
@@ -1554,6 +1640,7 @@ impl Config {
             drain_window,
             drain_window_source,
             policy_limits,
+            media_latency_sample_ratio,
             otel_enabled,
             otel_endpoint,
             otel_sample_rate,

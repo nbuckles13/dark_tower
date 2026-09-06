@@ -111,6 +111,15 @@ impl AcceptLoopRig {
                 datagram_send_buffer_bytes: 32 * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
                 keepalive_interval_ms: 10_000,
             },
+            // Handles resolved once, exactly as `main` does — the rig drives
+            // the real accept loop, so a media session started here uses the
+            // production setup path.
+            mh_service::media::MediaSetup {
+                handles: std::sync::Arc::new(
+                    mh_service::observability::metrics::resolve_media_handles(),
+                ),
+                latency_sample_ratio: mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO,
+            },
             cancel_token.clone(),
         );
 

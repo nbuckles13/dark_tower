@@ -437,10 +437,17 @@ location travels with it differs by refusal kind, and it is worth knowing which
 you are looking at, because in a CrashLoop the message is the only diagnostic an
 operator gets:
 
-- The three startup **validations** — egress-queue ordering, termination grace,
-  keepalive ratio — embed the remediation **inline**: the offending value, the
-  bound it was compared against, and which ConfigMap key or pod-spec field to
-  change.
+- The four startup **validations** — egress-queue ordering, termination grace,
+  keepalive ratio, and the media latency sample ratio's `0.0..=1.0` range —
+  embed the remediation **inline**: the offending value, the bound it was
+  compared against, and which ConfigMap key or pod-spec field to change.
+  - The fourth is **present-but-invalid**, not missing, so likelihood cause 1
+    below ("a required ConfigMap key is missing or renamed") does not cover it:
+    `MH_MEDIA_LATENCY_SAMPLE_RATIO` is optional, and an *absent* key is a clean
+    fallback to the code default. Only a present value that does not parse, or
+    parses outside `0.0..=1.0`, refuses — deliberately, because neither end
+    fails safe (above 1.0 silently observes every frame on the per-frame path;
+    below 0.0 silently observes none, which reads as a healthy quiet path).
 - A **missing variable** refuses with the variable name alone
   (`Missing required environment variable: MH_...`). That is by design, not an
   omission: its remediation is the

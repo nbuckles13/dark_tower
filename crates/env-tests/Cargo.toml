@@ -56,6 +56,12 @@ wtransport = { workspace = true, features = ["dangerous-configuration"] }
 
 # Protobuf encoding/decoding for signaling messages
 proto-gen = { path = "../proto-gen" }
+# The frame-v2 wire format, for building and decoding media datagrams. A
+# wire-format crate, not a service crate — this suite still links zero service
+# crates. Why depending on it is the DRY-CORRECT choice rather than a tolerated
+# boundary crossing is stated at the fixture that uses it:
+# `tests/26_mh_quic.rs::audio_datagram`.
+media-protocol = { path = "../media-protocol" }
 prost = { workspace = true }
 bytes = { workspace = true }
 

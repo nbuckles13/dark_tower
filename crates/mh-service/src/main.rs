@@ -359,6 +359,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!(addr = %grpc_addr, "gRPC server started");
 
+    // Media forward-path setup (ADR-0036 §11): every metric handle the hot
+    // path uses is resolved ONCE, here, before any connection exists — so no
+    // registry lookup can occur per frame. This is the sibling half of the
+    // layout constraint; `crate::media` never resolves a handle.
+    let media_setup = mh_service::media::MediaSetup {
+        handles: Arc::new(mh_service::observability::metrics::resolve_media_handles()),
+        latency_sample_ratio: config.media_latency_sample_ratio,
+    };
+    // Published ONCE, unconditionally, at process start — not per media session.
+    //
+    // The handle is resolved above, so the series exists from startup either
+    // way; publishing it only when a session starts means it renders **0**
+    // until then. `0.0` is not a neutral "unset" for this gauge: it is a legal
+    // configured value inside the accepted `0.0..=1.0` range meaning "observe
+    // no frames", which is the reading the ConfigMap comment describes. A
+    // responder could not tell "sampling is configured off" from "no media
+    // session has ever started on this pod" — opposite diagnoses. It is also
+    // the detector for a ConfigMap-only edit that never reached a running pod
+    // (env vars are injected at container start), and that only works if it is
+    // published unconditionally.
+    //
+    // The one-field-two-readers property is preserved and tightened: this and
+    // every `ConnectionForwarder` read `media_setup.latency_sample_ratio`, the
+    // same field, and this is the ONLY publish site.
+    //
+    // Do not add a second one per connection. Two writers to one gauge are
+    // harmless only while both compute the same number, and the moment anything
+    // clamps, rounds or otherwise transforms the ratio inside
+    // `ConnectionForwarder` — a locally harmless-looking change — the gauge
+    // starts alternating between the startup value and the per-connection value
+    // on every new connection, silently, with no failing test. A gauge that
+    // flaps between two readings of "the applied ratio" is worse than either
+    // reading alone and defeats the property this comment is claiming.
+    media_setup
+        .handles
+        .publish_sample_ratio(media_setup.latency_sample_ratio);
+
     // Start WebTransport server BEFORE GC registration (ADR-0010 ordering)
     // This ensures MH can accept client connections before GC starts routing traffic here
     let wt_server = WebTransportServer::new(
@@ -372,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(config.register_meeting_timeout_seconds),
         config.max_connections,
         config.quic_transport,
+        media_setup,
         shutdown_token.child_token(),
     );
 

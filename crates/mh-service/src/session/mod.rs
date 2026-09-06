@@ -42,7 +42,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use crate::routing::{MeetingPolicy, RoutingSnapshot, RoutingTable};
+use crate::media::forward::EgressQueue;
+use crate::routing::{MeetingKey, MeetingPolicy, RoutingSnapshot, RoutingTable, SenderId};
+use arc_swap::ArcSwap;
 
 /// Channel buffer size for the session manager actor mailbox.
 ///
@@ -614,6 +616,243 @@ impl SessionManagerActor {
 }
 
 // ---------------------------------------------------------------------------
+// Local subscriber registry (ADR-0036 §2/§7 forward path)
+// ---------------------------------------------------------------------------
+
+/// A subscriber, addressable only within one meeting.
+///
+/// **Unconstructible without a [`MeetingKey`]**, for the same reason
+/// [`crate::routing::RoutingSnapshot::for_each_source`] takes one: a
+/// `sender_id` is a 16-bit **per-meeting ordinal**, so `sender_id` 5 exists
+/// concurrently in every meeting on this handler and a flat
+/// `HashMap<SenderId, _>` would be a cross-meeting media-crossing primitive.
+/// The wrong index is a missing type here, not a remembered rule.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SubscriberKey {
+    meeting: MeetingKey,
+    sender: SenderId,
+}
+
+impl SubscriberKey {
+    /// The only constructor: naming a meeting is not optional.
+    #[must_use]
+    pub fn new(meeting: MeetingKey, sender: SenderId) -> Self {
+        Self { meeting, sender }
+    }
+}
+
+/// The set of subscriber connections live on this handler, as one snapshot.
+///
+/// Read by the forward path on every frame; replaced wholesale on connect and
+/// disconnect. Same shape and same reasoning as
+/// [`crate::routing::RoutingSnapshot`]: connect/disconnect is rare, per-frame
+/// reads are not, and a lock on this path would let one connection's teardown
+/// stall every other connection's audio.
+#[derive(Debug, Default)]
+pub struct LocalSubscriberSnapshot {
+    connections: HashMap<SubscriberKey, Arc<EgressQueue>>,
+}
+
+impl LocalSubscriberSnapshot {
+    /// The egress queue for one meeting-scoped subscriber, if it is connected
+    /// **to this handler**.
+    ///
+    /// `None` is a legitimate, counted outcome (`no_local_subscriber`): under
+    /// ADR-0036 §9 a meeting's participants can be spread across handlers, so
+    /// an edge naming a subscriber this handler does not hold is ordinary, not
+    /// an error.
+    #[must_use]
+    pub fn egress_queue(
+        &self,
+        meeting: &MeetingKey,
+        sender: SenderId,
+    ) -> Option<&Arc<EgressQueue>> {
+        // Cloning the key to probe costs one `Arc<str>` refcount bump and no
+        // allocation; `HashMap::get` needs an owned-shaped key here because
+        // `SubscriberKey` is a composite and `Borrow` cannot decompose it.
+        self.connections
+            .get(&SubscriberKey::new(meeting.clone(), sender))
+    }
+
+    /// How many subscriber connections this handler holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Whether this handler holds no subscriber connections.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.connections.is_empty()
+    }
+}
+
+/// Lock-free publication of [`LocalSubscriberSnapshot`] to the forward path.
+#[derive(Debug)]
+pub struct LocalSubscribers {
+    snapshot: ArcSwap<LocalSubscriberSnapshot>,
+}
+
+impl Default for LocalSubscribers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalSubscribers {
+    /// A registry with no connections.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            snapshot: ArcSwap::from_pointee(LocalSubscriberSnapshot::default()),
+        }
+    }
+
+    /// The current snapshot. Lock-free; safe to call per frame.
+    #[must_use]
+    pub fn load(&self) -> Arc<LocalSubscriberSnapshot> {
+        self.snapshot.load_full()
+    }
+
+    /// Register one connection's egress queue. Setup, not hot path.
+    ///
+    /// # `rcu`, not load-clone-store — the writers here RACE
+    ///
+    /// [`crate::routing::RoutingTable::install`] has the same outward shape and
+    /// is safe with a plain load-modify-store, because its only writer is the
+    /// session-manager actor and its writes are serialized by the actor loop.
+    /// **These writers are different**: `register` and `unregister` are called
+    /// from `handle_connection`, one task per connection, all racing on the same
+    /// runtime. A plain read-modify-write loses an update when two participants
+    /// connect concurrently.
+    ///
+    /// The lost update is a **silent availability failure wearing a
+    /// normal-looking label**: a dropped `register` leaves a participant
+    /// connected but absent from the snapshot, so every frame addressed to them
+    /// is counted `no_local_subscriber` — which the catalog documents as
+    /// ordinary, because a subscriber held by another handler produces it
+    /// legitimately. The participant hears nothing, permanently, and the only
+    /// signal says "this is normal". A dropped `unregister` leaves a departed
+    /// participant's queue being pushed into and never drained.
+    ///
+    /// `ArcSwap::rcu` is the compare-exchange retry loop for exactly this; the
+    /// closure body is the same work.
+    pub fn register(&self, meeting: MeetingKey, sender: SenderId, queue: &Arc<EgressQueue>) {
+        let key = SubscriberKey::new(meeting, sender);
+        self.snapshot.rcu(|current| {
+            let mut connections = current.connections.clone();
+            connections.insert(key.clone(), Arc::clone(queue));
+            LocalSubscriberSnapshot { connections }
+        });
+    }
+
+    /// Remove one connection's egress queue. Teardown, not hot path.
+    ///
+    /// `rcu` for the same reason as [`Self::register`].
+    pub fn unregister(&self, meeting: &MeetingKey, sender: SenderId) {
+        let key = SubscriberKey::new(meeting.clone(), sender);
+        self.snapshot.rcu(|current| {
+            let mut connections = current.connections.clone();
+            connections.remove(&key);
+            LocalSubscriberSnapshot { connections }
+        });
+    }
+}
+
+/// Meeting-scoped `participant_id` -> `sender_id` bindings.
+///
+/// # THE WRITER DOES NOT EXIST YET, AND THAT IS THE OPEN GAP
+///
+/// The forward path needs to know which `sender_id` a connection publishes as,
+/// because `EgressStream` references `sender_id` and the accept path knows only
+/// the JWT's `meeting_id` and `sub` (the participant UUID). **No contract in
+/// the tree carries that association to MH today**, verified at story task 16:
+///
+/// - `common::jwt::MeetingTokenClaims` has no sender field, and the token is
+///   minted by GC before MC allocates the ordinal;
+/// - `internal.proto`'s `RegisterMeetingRequest` carries `sender_id` on
+///   `SubscriberSlot` and `CandidateSource` and no `participant_id` anywhere;
+/// - `NotifyConnectedResponse` is `{ bool acknowledged }`;
+/// - `MhConnectRequest` carries only `join_token`, and the `connection_token`
+///   that once crossed client→MH was deleted by the task-4 reshape.
+///
+/// **The remaining routes are all client-asserted, and every one of them is a
+/// cross-participant injection primitive**: a patched client claims another
+/// participant's ordinal and MH forwards its frames onto that participant's
+/// edges. That includes reading the `sender_id` out of the `SFrame` key id in the
+/// payload, which is additionally barred because MH never inspects the payload.
+/// So the binding must arrive over the **control plane**, and the contract
+/// field for it is owed — see `docs/TODO.md` §Media Path Obligations.
+///
+/// This type is the complete mechanism minus that one input, and its own
+/// behaviour — including the meeting-scoping arm — is unit-tested below.
+/// [`Self::bind`] has no production caller; when the control-plane field lands,
+/// one call site is added and the forward path starts resolving. Until then
+/// [`Self::resolve`] returns `None` for every connection and
+/// `crate::webtransport::connection` declines to start media tasks, loudly,
+/// rather than guessing an ordinal.
+#[derive(Debug)]
+pub struct SenderBindings {
+    bindings: ArcSwap<HashMap<(MeetingKey, String), SenderId>>,
+}
+
+impl Default for SenderBindings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SenderBindings {
+    /// A registry with no bindings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            bindings: ArcSwap::from_pointee(HashMap::new()),
+        }
+    }
+
+    /// Bind `participant_id` to `sender` within `meeting`.
+    ///
+    /// **No production caller today** — see the type docs. The value must come
+    /// from the control plane; it must never be read off the wire from the
+    /// client, and it must never be inferred from the installed policy (in a
+    /// one-participant meeting every wrong inference is indistinguishable from
+    /// the right one, which is exactly the shape that ships a cross-tenant
+    /// defect no test in this story can catch).
+    pub fn bind(&self, meeting: MeetingKey, participant_id: &str, sender: SenderId) {
+        // `rcu` for the same reason as `LocalSubscribers::register`, and fixed
+        // now rather than when the first caller arrives: that caller comes with
+        // the control-plane contract field and will not re-derive the
+        // concurrency question from scratch.
+        let key = (meeting, participant_id.to_string());
+        self.bindings.rcu(|current| {
+            let mut bindings = current.as_ref().clone();
+            bindings.insert(key.clone(), sender);
+            bindings
+        });
+    }
+
+    /// Forget every binding for one participant in one meeting.
+    pub fn unbind(&self, meeting: &MeetingKey, participant_id: &str) {
+        let key = (meeting.clone(), participant_id.to_string());
+        self.bindings.rcu(|current| {
+            let mut bindings = current.as_ref().clone();
+            bindings.remove(&key);
+            bindings
+        });
+    }
+
+    /// The `sender_id` bound to `participant_id` in `meeting`, if any.
+    #[must_use]
+    pub fn resolve(&self, meeting: &MeetingKey, participant_id: &str) -> Option<SenderId> {
+        self.bindings
+            .load()
+            .get(&(meeting.clone(), participant_id.to_string()))
+            .copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handle (public API)
 // ---------------------------------------------------------------------------
 
@@ -631,6 +870,14 @@ pub struct SessionManagerHandle {
     /// response report the live applied generation even when the actor is
     /// unreachable.
     routing: Arc<RoutingTable>,
+    /// Which subscriber connections live on this handler, for the forward
+    /// path's egress lookup. Written at connect/disconnect, read per frame.
+    /// Not behind the mailbox for the same reason `routing` is not: a per-frame
+    /// read must not take a mailbox round trip.
+    subscribers: Arc<LocalSubscribers>,
+    /// Meeting-scoped `participant_id` -> `sender_id`. See [`SenderBindings`]
+    /// for why nothing writes to it yet.
+    sender_bindings: Arc<SenderBindings>,
 }
 
 impl SessionManagerHandle {
@@ -667,9 +914,34 @@ impl SessionManagerHandle {
                 sender,
                 config_sender,
                 routing,
+                subscribers: Arc::new(LocalSubscribers::new()),
+                sender_bindings: Arc::new(SenderBindings::new()),
             },
             actor,
         )
+    }
+
+    /// The lock-free routing table itself, for consumers that must re-read it
+    /// per frame rather than hold one snapshot.
+    ///
+    /// The forward path takes this, not [`Self::routing_snapshot`]: a snapshot
+    /// captured once and held would be a stale edge list, and ADR-0036 §7
+    /// enforces server mute and participant removal through this lookup.
+    #[must_use]
+    pub fn routing_table(&self) -> Arc<RoutingTable> {
+        Arc::clone(&self.routing)
+    }
+
+    /// The subscriber registry the forward path reads on every frame.
+    #[must_use]
+    pub fn subscribers(&self) -> &Arc<LocalSubscribers> {
+        &self.subscribers
+    }
+
+    /// The meeting-scoped `participant_id` -> `sender_id` bindings.
+    #[must_use]
+    pub fn sender_bindings(&self) -> &Arc<SenderBindings> {
+        &self.sender_bindings
     }
 
     /// Remaining headroom in the **connection-lifecycle** mailbox.
@@ -1170,5 +1442,130 @@ mod tests {
         let handle = SessionManagerHandle::default();
         assert!(!handle.is_meeting_registered("any").await);
         assert_eq!(handle.active_connection_count().await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscriber registry and sender bindings
+    // -----------------------------------------------------------------------
+
+    fn key(value: u32) -> SenderId {
+        SenderId::from_wire(value).unwrap()
+    }
+
+    fn queue() -> Arc<crate::media::forward::EgressQueue> {
+        Arc::new(crate::media::queue::SharedQueue::new(4))
+    }
+
+    #[test]
+    fn a_registered_subscriber_resolves_and_an_unregistered_one_does_not() {
+        // Both arms: the negative alone also passes for a registry that
+        // resolves nothing at all.
+        let subscribers = LocalSubscribers::new();
+        let meeting = MeetingKey::new("m-1");
+        subscribers.register(meeting.clone(), key(5), &queue());
+
+        assert!(subscribers.load().egress_queue(&meeting, key(5)).is_some());
+        assert!(
+            subscribers.load().egress_queue(&meeting, key(6)).is_none(),
+            "an unregistered ordinal must not resolve"
+        );
+        assert_eq!(subscribers.load().len(), 1);
+    }
+
+    #[test]
+    fn unregistering_removes_only_that_subscriber() {
+        let subscribers = LocalSubscribers::new();
+        let meeting = MeetingKey::new("m-1");
+        subscribers.register(meeting.clone(), key(5), &queue());
+        subscribers.register(meeting.clone(), key(6), &queue());
+
+        subscribers.unregister(&meeting, key(5));
+
+        assert!(subscribers.load().egress_queue(&meeting, key(5)).is_none());
+        assert!(
+            subscribers.load().egress_queue(&meeting, key(6)).is_some(),
+            "unregistering one subscriber must not disturb another"
+        );
+    }
+
+    #[test]
+    fn a_subscriber_registered_in_one_meeting_does_not_resolve_in_another() {
+        // The load-bearing arm. A `sender_id` is a 16-bit PER-MEETING ordinal,
+        // so ordinal 5 exists concurrently in every meeting on this handler; a
+        // registry keyed on the ordinal alone would resolve meeting B's frames
+        // onto meeting A's subscriber. Both arms, because the negative alone
+        // also passes for a registry that resolves nothing anywhere.
+        let subscribers = LocalSubscribers::new();
+        let meeting_a = MeetingKey::new("meeting-a");
+        let meeting_b = MeetingKey::new("meeting-b");
+        subscribers.register(meeting_a.clone(), key(5), &queue());
+
+        assert!(
+            subscribers
+                .load()
+                .egress_queue(&meeting_a, key(5))
+                .is_some(),
+            "ordinal 5 must resolve within its own meeting"
+        );
+        assert!(
+            subscribers
+                .load()
+                .egress_queue(&meeting_b, key(5))
+                .is_none(),
+            "ordinal 5 is meeting A's; resolving it in meeting B is cross-tenant leakage"
+        );
+    }
+
+    #[test]
+    fn a_bound_participant_resolves_and_an_unbound_one_does_not() {
+        let bindings = SenderBindings::new();
+        let meeting = MeetingKey::new("m-1");
+        bindings.bind(meeting.clone(), "participant-a", key(5));
+
+        assert_eq!(bindings.resolve(&meeting, "participant-a"), Some(key(5)));
+        assert_eq!(
+            bindings.resolve(&meeting, "participant-b"),
+            None,
+            "an unbound participant must resolve to nothing — the forward path reads this as \
+             'decline to start media', which is the fail-closed behaviour"
+        );
+    }
+
+    #[test]
+    fn unbinding_forgets_one_participant_and_leaves_the_rest() {
+        let bindings = SenderBindings::new();
+        let meeting = MeetingKey::new("m-1");
+        bindings.bind(meeting.clone(), "participant-a", key(5));
+        bindings.bind(meeting.clone(), "participant-b", key(6));
+
+        bindings.unbind(&meeting, "participant-a");
+
+        assert_eq!(bindings.resolve(&meeting, "participant-a"), None);
+        assert_eq!(bindings.resolve(&meeting, "participant-b"), Some(key(6)));
+    }
+
+    #[test]
+    fn a_participant_bound_in_one_meeting_does_not_resolve_in_another() {
+        // Same cross-tenant property as the subscriber registry, and the reason
+        // the key is the composite `(MeetingKey, participant_id)` rather than
+        // the participant id alone: a participant id is globally unique today,
+        // but the SENDER ORDINAL it maps to is per-meeting, so a global map
+        // would hand meeting B's forward path an ordinal minted in meeting A.
+        //
+        // This mechanism has no production writer yet — the control-plane field
+        // that supplies it is owed — so this test is what makes it trustworthy
+        // at the moment it IS wired, rather than one more thing to verify then.
+        let bindings = SenderBindings::new();
+        let meeting_a = MeetingKey::new("meeting-a");
+        let meeting_b = MeetingKey::new("meeting-b");
+        bindings.bind(meeting_a.clone(), "participant-a", key(5));
+
+        assert_eq!(bindings.resolve(&meeting_a, "participant-a"), Some(key(5)));
+        assert_eq!(
+            bindings.resolve(&meeting_b, "participant-a"),
+            None,
+            "a binding is meeting-scoped; resolving it in another meeting would hand that \
+             meeting's forward path an ordinal minted somewhere else"
+        );
     }
 }

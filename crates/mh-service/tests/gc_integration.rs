@@ -221,6 +221,7 @@ fn test_config(gc_url: &str) -> Config {
         ),
         drain_window_source: mh_service::config::DrainWindowSource::SettleTarget,
         policy_limits: mh_service::config::PolicyLimits::default(),
+        media_latency_sample_ratio: mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO,
         otel_enabled: false,
         otel_endpoint: String::new(),
         otel_sample_rate: 1.0,

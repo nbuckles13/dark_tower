@@ -25,10 +25,16 @@
 //! one threat class a keyless relay does not otherwise expose.
 //!
 //! So the snapshot is a nest of maps, every field is private, and
-//! [`RoutingSnapshot::sources_for`] is the only lookup. It takes a
+//! [`RoutingSnapshot::for_each_source`] is the only lookup. It takes a
 //! [`MeetingKey`] and a [`SenderId`] together; there is no function that
 //! accepts a `SenderId` alone. **The wrong index is a missing function, not a
 //! remembered rule.**
+//!
+//! The same discipline removed the traversal's earlier `Vec`-returning form at
+//! story task 16: an allocating traversal sitting beside a per-frame path that
+//! must not allocate is a footgun the hot path has to *remember* not to call,
+//! which is the shape this module exists to reject. A test wanting a `Vec`
+//! collects at the test site.
 //!
 //! No gate in this story can catch a global index by observation: loopback is
 //! one meeting with one participant, so a correctly meeting-scoped index and a
@@ -539,7 +545,7 @@ impl MeetingPolicy {
 /// All fields are private. A `pub by_sender` would degrade this module's
 /// structural guarantee back into a convention: the point is that no caller
 /// can reach a sender-keyed map except through
-/// [`RoutingSnapshot::sources_for`], which requires a [`MeetingKey`].
+/// [`RoutingSnapshot::for_each_source`], which requires a [`MeetingKey`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingRoutes {
     generation: u64,
@@ -614,29 +620,51 @@ pub struct RoutingSnapshot {
 }
 
 impl RoutingSnapshot {
-    /// Resolve which egress edges a sender's frames feed, **within one
-    /// meeting**.
+    /// Visit every egress edge a sender's frames feed, **within one meeting**.
     ///
     /// This is the only sender lookup in the crate, and it is impossible to
     /// call without naming a meeting. A `sender_id` valid in another meeting
     /// does not resolve here — not because a check rejects it, but because the
     /// lookup never leaves this meeting's routes. If you only ever look inside
     /// one meeting, you cannot cross meetings.
-    #[must_use]
-    pub fn sources_for(&self, meeting: &MeetingKey, sender: SenderId) -> Vec<&EgressEdge> {
+    ///
+    /// **Borrowing and non-allocating, because the forward path calls it on
+    /// every frame** (ADR-0036 §11: zero allocation per frame). Returning
+    /// `Vec<&EgressEdge>` would heap-allocate per frame; handing out
+    /// `by_sender` would make the maps public and turn this module's structural
+    /// guarantee back into a convention. The visitor is the shape that is both.
+    ///
+    /// The forward path **re-reads the table per frame and caches nothing**.
+    /// That is not a performance oversight: ADR-0036 §7 enforces server mute
+    /// and participant removal through this lookup, so a cached edge list that
+    /// outlives a policy change is a mute bypass with a staleness window.
+    ///
+    /// Returns the number of edges visited, so a caller can distinguish "no
+    /// edges for this sender" from "edges visited" without counting in the
+    /// closure — the two are different drop reasons on the forward path.
+    pub fn for_each_source<'a>(
+        &'a self,
+        meeting: &MeetingKey,
+        sender: SenderId,
+        mut visit: impl FnMut(&'a EgressEdge),
+    ) -> usize {
         let Some(routes) = self.meetings.get(meeting) else {
-            return Vec::new();
+            return 0;
         };
         let Some(indices) = routes.by_sender.get(&sender) else {
-            return Vec::new();
+            return 0;
         };
         // Resolve through the MEETING-LOCAL slice. `indexing_slicing = "deny"`
         // forces `.get`, which is also what keeps a stale index from reading a
         // neighbouring meeting's edge if the invariant above is ever broken.
-        indices
-            .iter()
-            .filter_map(|&i| routes.edges.get(i))
-            .collect()
+        let mut visited = 0;
+        for &i in indices {
+            if let Some(edge) = routes.edges.get(i) {
+                visit(edge);
+                visited += 1;
+            }
+        }
+        visited
     }
 
     /// The installed routes for one meeting, if any policy is installed.
@@ -796,6 +824,23 @@ mod tests {
         SenderId::from_wire(v).unwrap()
     }
 
+    /// Collect [`RoutingSnapshot::for_each_source`] into a `Vec` **at the test
+    /// site**.
+    ///
+    /// Deliberately here and not on the type: an allocating traversal on the
+    /// snapshot is a footgun the per-frame forward path would have to remember
+    /// not to call, and this module's whole posture is that the wrong call is a
+    /// missing function. A test may allocate; the hot path may not.
+    fn sources_for<'a>(
+        snapshot: &'a RoutingSnapshot,
+        meeting: &MeetingKey,
+        sender: SenderId,
+    ) -> Vec<&'a EgressEdge> {
+        let mut out = Vec::new();
+        snapshot.for_each_source(meeting, sender, |edge| out.push(edge));
+        out
+    }
+
     fn policy(meeting: &str, generation: u64, streams: Vec<EgressStream>) -> MeetingPolicy {
         MeetingPolicy::from_request(
             &request(meeting, generation, streams),
@@ -872,7 +917,7 @@ mod tests {
         let meeting_b = MeetingKey::new("meeting-b");
 
         // Positive arm: sender 5 DOES resolve inside meeting A.
-        let in_a = snapshot.sources_for(&meeting_a, sender(5));
+        let in_a = sources_for(&snapshot, &meeting_a, sender(5));
         assert_eq!(
             in_a.len(),
             1,
@@ -882,7 +927,7 @@ mod tests {
 
         // Negative arm: the same sender id resolves to NOTHING in meeting B,
         // even though meeting B has a live policy of its own.
-        let in_b = snapshot.sources_for(&meeting_b, sender(5));
+        let in_b = sources_for(&snapshot, &meeting_b, sender(5));
         assert!(
             in_b.is_empty(),
             "sender 5 is meeting A's ordinal; resolving it in meeting B is cross-tenant leakage"
@@ -890,8 +935,8 @@ mod tests {
 
         // And meeting B's own sender still resolves, so the negative arm above
         // is not just "meeting B is empty".
-        assert_eq!(snapshot.sources_for(&meeting_b, sender(7)).len(), 1);
-        assert!(snapshot.sources_for(&meeting_a, sender(7)).is_empty());
+        assert_eq!(sources_for(&snapshot, &meeting_b, sender(7)).len(), 1);
+        assert!(sources_for(&snapshot, &meeting_a, sender(7)).is_empty());
     }
 
     // -- structural rejects -----------------------------------------------
@@ -1154,8 +1199,8 @@ mod tests {
         table.install(&policy("m", 1, vec![stream]));
         let snapshot = table.load();
         let meeting = MeetingKey::new("m");
-        assert_eq!(snapshot.sources_for(&meeting, sender(5)).len(), 1);
-        assert_eq!(snapshot.sources_for(&meeting, sender(6)).len(), 1);
-        assert!(snapshot.sources_for(&meeting, sender(8)).is_empty());
+        assert_eq!(sources_for(&snapshot, &meeting, sender(5)).len(), 1);
+        assert_eq!(sources_for(&snapshot, &meeting, sender(6)).len(), 1);
+        assert!(sources_for(&snapshot, &meeting, sender(8)).is_empty());
     }
 }

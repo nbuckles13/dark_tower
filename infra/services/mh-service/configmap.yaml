@@ -95,28 +95,33 @@ data:
   # in our code rather than inside quinn; task #12 sets that bound to 8 frames
   # per connection and validates the ordering at startup. Keep this value
   # strictly ABOVE that bound or MH will refuse to start.
-  # Enforced by: quinn, in MH's process. NOTE quinn's *default* overflow
-  # behaviour is to silently discard the oldest datagram; MH deliberately does
-  # NOT use that path — see the observability note below, which is the
-  # authoritative statement of what MH does when this buffer fills.
-  # Where an operator sees it: NOTHING TODAY — every signal below LANDS WITH THE
-  # MH FORWARD PATH (story task 16) and does not exist in the tree yet.
+  # Enforced by: quinn, in MH's process. Its overflow behaviour here is to
+  # silently discard the oldest queued datagram, and MH cannot see it happen.
   #
-  # quinn's drop-oldest discard path is genuinely unobservable (it emits a trace
-  # and nothing else), and that is exactly WHY MH does not use it: task #16 uses
+  # Where an operator sees what MH itself sheds, what each media signal cannot
+  # see, and why no alert may rest on the queue-depth gauge alone:
+  # `docs/observability/metrics/mh-service.md` §Media Forward Path. That file is
+  # authoritative for all of it and this comment does not restate it.
+  #
+  # CORRECTED 2026-09-05 (story task 16). This block previously said MH "uses
   # the non-dropping send path, which returns a `Blocked` error when this buffer
-  # is full. A returned error is countable, so it — not the discard — is the
-  # authoritative saturation signal, and load-shedding surfaces as
-  # `mh_media_frames_dropped_total{reason="egress_queue_overflow"}`.
-  # Buffer occupancy is also readable and #16 publishes it as a trend gauge, but
-  # NO ALERT MAY REST ON THAT GAUGE ALONE: MH's scrape interval is orders of
-  # magnitude longer than the milliseconds these buffers take to fill and drain —
-  # whatever it is configured to — so an instantaneous gauge can read healthy
-  # across an entire incident while telling the truth about the instants it
-  # sampled. Counters cannot miss an event between scrapes; gauges can.
+  # is full", and that this buffer's occupancy is published as a gauge. Both
+  # were false. The correction is recorded rather than quietly applied because
+  # an operator-facing comment that is wrong AND authoritative-sounding recruits
+  # reviewers into repeating it, and no guard reads manifest comments. Kept to
+  # the one clause that stops an operator re-deriving the false version:
   #
-  # This is still why the application queue must trip first: back-pressure
-  # belongs in our code, where it is countable, rather than inside quinn.
+  #   THERE IS NO TRANSPORT ERROR TO COUNT, on either quinn path — the
+  #   non-blocking one treats the blocked arm as unreachable, and the
+  #   congestion-aware one expresses back-pressure by AWAITING rather than by
+  #   returning a value. MH's own bounded application queue is therefore the
+  #   ONLY observable shed, which is exactly why the startup validation requires
+  #   this value to sit strictly above it.
+  #
+  # Citations, quinn/wtransport versions and the accessor list live in
+  # `docs/TODO.md` §Media Path Obligations, which is the single home for this
+  # fact. Nothing here, in the catalog, on a dashboard or in a runbook may
+  # describe an MH egress signal as observing transport back-pressure.
   MH_DATAGRAM_BUFFER_AUDIO_FRAMES: "32"
 
   # QUIC connection-level keepalive, in milliseconds. This is what refreshes the
@@ -182,3 +187,40 @@ data:
   # alert `MHHighWebTransportRejections`, and
   # docs/runbooks/mh-incident-response.md Scenario 5.
   MH_MAX_CONNECTIONS: "500"
+
+  # ADR-0036 §11 media forward-path latency sampling: the fraction of forwarded
+  # frames whose latency is observed into `mh_media_forward_latency_seconds`.
+  #
+  # OPTIONAL. Absent, MH uses the code default
+  # (`mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`), so removing this
+  # key does not stop a pod starting — deliberately, so the image can roll back
+  # alone. Present, it must parse and lie in 0.0..=1.0; MH refuses to start
+  # otherwise, because neither end fails safely: above 1.0 silently means
+  # "observe every frame" (a histogram write on the per-frame path) and below
+  # 0.0 silently means "observe none" (a histogram that is empty forever and
+  # reads as a healthy quiet path).
+  #
+  # Timestamps are taken on EVERY frame regardless — a monotonic clock read is
+  # ~25 ns and the ingress timestamp is needed for frame age anyway. This ratio
+  # governs only the histogram observation, which is the expensive part.
+  #
+  # The sampling is RANDOM PER FRAME. Do not "optimise" it into a modulo on a
+  # sequence number or a per-stream hash: those meet the same CPU budget and
+  # perfectly reconstruct which frames of one stream were observed, which is the
+  # voice-activity trace ADR-0036 §11 prohibits.
+  #
+  # NOT `OTEL_SAMPLE_RATE`, which is trace head-sampling with a different owner
+  # and a different consumer.
+  # Enforced by: mh-service, in crates/mh-service/src/config.rs at load.
+  # Where an operator sees it: the `mh_media_latency_sample_ratio` gauge, which
+  # publishes THIS SAME FIELD — not a second reading of it — so the published
+  # ratio cannot drift from the applied one.
+  #
+  # Setting it explicitly here is DELIBERATE even though it currently equals the
+  # code default. It is an operator tuning surface, `dashboard-conventions.md`
+  # cites this key as the authority for the deployed cadence, and an absent key
+  # gives a responder nothing to read. The trade is real and worth naming: while
+  # this line exists, a future change to the code default does NOT reach this
+  # cluster — the manifest wins. If the default is ever re-chosen, revisit this
+  # line rather than assuming it follows.
+  MH_MEDIA_LATENCY_SAMPLE_RATIO: "0.01"

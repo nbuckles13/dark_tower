@@ -2145,6 +2145,298 @@
       ],
       "title": "Forwarding-Policy Applies by Outcome",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 83
+      },
+      "id": 34,
+      "panels": [],
+      "title": "Media Forward Path",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Frames MH accepted into the forward path (direction=ingress) and frames the transport accepted for a subscriber (direction=egress). `direction` is PIPELINE-relative (publisher->relay, relay->subscriber), never participant-relative. THIS IS THE DROP-RATE DENOMINATOR \u2014 the bytes counter cannot denominate a frame count, so do not delete this panel as redundant; build any drop rate on the ATTEMPTS SUM (forwarded + dropped), never on one addend. READ THIS FIRST IF EVERY MEDIA PANEL IS FLAT: MH declines to start its media tasks while no participant -> sender_id binding exists, and in that state this whole metric family reads present-and-flat-at-zero, which is byte-identical to an idle handler. Discriminator: accepted WebTransport connections > 0 while this counter and every mh_media_frames_dropped_total reason are all 0 means the media path never started. Confirm in the pod log: \"Media forward path not started: no sender_id is bound\". Full statement and the owed control: docs/observability/metrics/mh-service.md \u00a7Media Forward Path.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames/sec",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
+      "id": 35,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(direction) (rate(mh_media_frames_forwarded_total[$__rate_interval]))",
+          "legendFormat": "{{direction}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media Frames Forwarded by Direction",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Why MH did not forward a frame. ONE `reason` label space with TWO families: the shared codec vocabulary (emitted verbatim, always direction=ingress, always a SENDER-side condition) and MH's own transport/routing tokens. READ THIS WITH THE FORWARDED PANEL, NEVER ALONE \u2014 and note that a flat panel here does not mean forwarding is healthy. Which tokens should read zero forever, which are expected under load, which mean the remedy is upstream of this handler, and the two structural blind spots (relay-side corruption surfaces only as client-side signature_invalid; quinn evicts silently beneath the egress-overflow counter) are all stated once in docs/observability/metrics/mh-service.md \u00a7Media Forward Path. This description points at it rather than restating it. READS PRESENT-AND-FLAT-AT-ZERO TODAY: MH declines to start its media tasks pending the participant -> sender_id binding, so flat means \"not wired\", not \"healthy\". See docs/observability/metrics/mh-service.md \u00a7Media Forward Path.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames/sec",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 84
+      },
+      "id": 36,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(reason, direction) (rate(mh_media_frames_dropped_total[$__rate_interval]))",
+          "legendFormat": "{{reason}} ({{direction}})",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media Frame Drops by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MH's OWN application egress queue depth, in frames \u2014 not quinn's send buffer. TREND ONLY: no alert may rest on this panel alone, and it is one process-wide gauge fed by N per-subscriber queues (last writer wins), so a saturated queue can be masked by an idle one. The countable signal is mh_media_frames_dropped_total{reason=\"egress_queue_overflow\"}. Both caveats and the reasoning behind them are stated once in docs/observability/metrics/mh-service.md \u00a7Media Forward Path; this description points at it rather than restating it, because the two dashboards had already drifted on the wording. READS PRESENT-AND-FLAT-AT-ZERO TODAY: MH declines to start its media tasks pending the participant -> sender_id binding, so flat means \"not wired\", not \"healthy\". See docs/observability/metrics/mh-service.md \u00a7Media Forward Path.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 92
+      },
+      "id": 37,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by(instance) (mh_media_egress_queue_depth)",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media Egress Queue Depth (trend only)",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
