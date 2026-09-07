@@ -117,4 +117,33 @@ layer_lifecycle_begin 3
   # No cluster, no network. Deliberately NOT under guards/simple/ — run-guards.sh's
   # `find simple -name '*.sh'` would auto-run it as a guard.
   run_and_emit "dev-web-preflight-selftest" "${__here}/dev-web.test.sh" || true
+  # Media-path telemetry deny SELF-TEST (ADR-0036 §11). The guard itself is
+  # auto-discovered by run-guards.sh above and PASSES on every run — the media
+  # directory is clean and is meant to stay that way — so a real run exercises
+  # none of its failure branches, and those branches are its entire value. This
+  # drives them: every scope/parse token (missing, empty, no-directories,
+  # escapes-root, manifest-missing, manifest-unparseable), one plant per denied
+  # macro family into a COPY of the real media tree with a verbatim copy of the
+  # shipped manifest, and the REASON precedence ladder with two conditions live
+  # at once.
+  #
+  # It also carries the two assertions that cannot be made from inside the Rust
+  # module: that no `VIOLATION:`/`ERROR:` record spills onto a continuation line
+  # (run-guards.sh greps and `head -5`s, so a wrapped record is silently
+  # truncated), and that a planted macro's ARGUMENT text never reaches stdout,
+  # stderr or `--explain` — a guard that echoes what it detected has moved
+  # ADR-0036 §11's metadata leak into CI logs rather than closed it.
+  #
+  # The case with no counterpart anywhere else is the scope BOUNDARY one: a
+  # denied macro planted in two non-configured siblings must stay GREEN. A
+  # regression widening the walk root from the resolved directory to the crate
+  # or repo root passes every other case in the suite and surfaces only as a
+  # mystery red on an unrelated file in someone else's diff.
+  #
+  # Hermetic: throwaway roots under mktemp -d, real binary via `--root` (a
+  # production flag, so there is NO test seam to gate and no disarm switch to
+  # misuse). No cluster, no network, no cargo. Deliberately NOT under
+  # guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run
+  # it as a production guard as well as here.
+  run_and_emit "media-telemetry-deny-selftest" "${__here}/guards/media-telemetry-deny.test.sh" || true
 } | tee_collect_statuses

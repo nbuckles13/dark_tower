@@ -24,6 +24,61 @@ pub fn emit_fail(reason: impl Display) {
     println!("STATUS=FAIL REASON={reason}");
 }
 
+/// Emit a single-line `SCOPE: <detail>` record describing what the guard
+/// actually examined.
+///
+/// # Why this exists as a shared emitter
+///
+/// Two guards already emitted a scanned-scope line as a bare `println!` with
+/// a bespoke format string and no shared home: `release_build_profile` and
+/// `no_insecure_browser_flags`. The convention exists to guard against silent
+/// vacuity — a guard that scanned nothing and a guard that scanned everything
+/// and found nothing both print "clean". `media_telemetry_deny` is the third
+/// consumer and its entire purpose is making scope non-vacuous, so a third
+/// bare `println!` would have been the same duplication in the guard least
+/// entitled to it.
+///
+/// # What this helper does and does NOT own
+///
+/// # WHERE THIS LINE IS AND IS NOT VISIBLE — read before relying on it
+///
+/// **`SCOPE:` does NOT reach an operator in the pipeline.** `run-guards.sh`
+/// runs guards non-verbose and re-emits only lines matching
+/// `(VIOLATION|violation|ERROR|error|WARN)` on the failure arm, and `^WARN `
+/// on the pass arm. `SCOPE: ` carries none of those substrings, so in the mode
+/// `scripts/layer3.sh` actually uses it is **captured and discarded** — for
+/// all three consumers.
+///
+/// It is a **direct-invocation and `--verbose` diagnostic**: real value at
+/// `dt-guard <subcommand> --root . --explain`, which the runbook §6.3.1 names
+/// as the triage step, and none in Layer 3.
+///
+/// This is stated because the paragraph above describes what the convention is
+/// *for*, and a reader could otherwise conclude "the SCOPE line would have
+/// caught it" about a pipeline run. It would not have. The gap is tracked in
+/// `docs/TODO.md`; widening the filter or renaming the prefix touches two
+/// other guards and is deliberately not done here. (@operations F4, 2026-09-07.)
+///
+/// # What this helper owns
+///
+/// It owns the `SCOPE: ` prefix and the one-physical-line contract. It
+/// deliberately does **not** impose a common field shape: the call sites
+/// count genuinely different things (Dockerfiles and premise channels;
+/// candidate files and enumerated settings; directories and `.rs` files), and
+/// flattening them into a shared schema would be a value-changing edit
+/// wearing an extraction's clothes. Each site passes its own already-formatted
+/// detail and pins that string by equality in its own tests.
+///
+/// # Never file content
+///
+/// `detail` carries counts, labels and configured paths. It must never carry
+/// text read out of a scanned file — a guard that echoes what it detected has
+/// moved the finding into CI logs and their retention window rather than
+/// closing it (@semantic-guard, ADR-0036 §11).
+pub fn emit_scope(detail: impl Display) {
+    println!("SCOPE: {detail}");
+}
+
 /// Slugify an [`anyhow::Error`] chain into a kebab-case `REASON=` token.
 ///
 /// Per semantic-guard watch-point #2: a 3am reader sees the slug, opens the

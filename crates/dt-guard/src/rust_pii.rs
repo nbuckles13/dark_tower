@@ -36,32 +36,23 @@ const EXTENSIONS: &[&str] = &[".rs"];
 // Path-shape exclusions live in `common::test_code_filter::is_test_path` per
 // @team-lead Wave-2 port-fidelity fix 2026-05-21.
 
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static LOG_MACRO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b(info|debug|warn|error|trace)!\s*\(").expect("static pattern compiles")
-});
-
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static TRACING_NAMED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"tracing::(info|debug|warn|error|trace)!\s*\(|#\[instrument")
-        .expect("static pattern compiles")
-});
-
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static INSTRUMENT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"#\[instrument").expect("static pattern compiles"));
+// Promoted 2026-09-07: the level-macro vocabulary these two regexes are built
+// from now lives in `crate::telemetry_macros`, which is the canonical home for
+// the tracing/log/print/span family. Before the promotion `LOG_MACRO_RE` was
+// declared byte-identically here and in `rust_log_secrets`, and the media-path
+// deny guard would have been a third declaration.
+//
+// Behaviour is UNCHANGED. Both patterns are pinned as full compiled strings by
+// `telemetry_macros::tests`, with `TRACING_NAMED_RE`'s `|#\[instrument`
+// alternative written out explicitly there so that dropping it reds a test
+// rather than silently removing Check 2's attribute coverage.
+//
+// This module selects the `Level` group ONLY. `log!`, `event!`, span and print
+// macro names live in separate groups precisely so that this re-point cannot
+// widen a PII guard.
+use crate::telemetry_macros::{
+    INSTRUMENT_ATTR_BARE_RE as INSTRUMENT_RE, LOG_MACRO_RE, TRACING_NAMED_RE,
+};
 
 #[expect(
     clippy::disallowed_methods,

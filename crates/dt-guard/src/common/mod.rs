@@ -13,6 +13,7 @@ pub mod metric_catalog;
 pub mod path_safety;
 pub mod pii_vocabulary;
 pub mod scan;
+pub mod scope;
 pub mod services;
 pub mod status;
 pub mod test_code_filter;

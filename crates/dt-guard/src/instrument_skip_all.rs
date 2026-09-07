@@ -41,13 +41,17 @@ const EXTENSIONS: &[&str] = &[".rs"];
 // Path-shape exclusions live in `common::test_code_filter::is_test_path` per
 // @team-lead Wave-2 port-fidelity fix 2026-05-21.
 
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static INSTRUMENT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"#\[instrument").expect("static pattern compiles"));
+// Promoted 2026-09-07: `#\[instrument` was declared in three modules
+// (`instrument_skip_all`, `rust_pii`, `rust_log_secrets`). The canonical home
+// is `crate::telemetry_macros`, which hosts BOTH the narrow historical shape
+// used here and the correct wider one (`INSTRUMENT_ATTR_ANY_RE`) used by the
+// ADR-0036 §11 media-path deny.
+//
+// This module keeps the NARROW shape, deliberately. Widening it here is only
+// safe after the `rust_pii` Check-3 fields-scoping fix lands — see the
+// coupling note on `INSTRUMENT_ATTR_BARE_RE` and `docs/TODO.md`. Behaviour is
+// unchanged by this re-point.
+use crate::telemetry_macros::INSTRUMENT_ATTR_BARE_RE as INSTRUMENT_RE;
 
 #[expect(
     clippy::disallowed_methods,

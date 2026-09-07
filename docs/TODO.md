@@ -591,6 +591,48 @@
   **Already closed in the surfacing devloop, so do not re-report it**: the `MCHighJoinLatency` annotation in `mc-alerts.yaml` and the three MC prose sites (`alerts.md` "Existing MC critical alerts" and its §MCHighJoinLatency threshold rationale, `alert-conventions.md`'s `page` anchor) — that pair was fixed together precisely because fixing the YAML alone would have left the *more authoritative* copy carrying the falsehood.
   **Fix shape**: a `dt-guard` compare-only check that every `[A-Z]{2,3}[A-Z][A-Za-z]+`-shaped identifier in backticks under `docs/observability/*.md` either resolves to an `- alert:` name in `infra/docker/prometheus/rules/` or sits on an explicit allow-list of deliberately-proposed-but-unbuilt alerts. The allow-list is the load-bearing half: it converts "this name is a lie" into "this name is a documented intention", which is the distinction the current text erases.
 
+- [ ] **`user_id` reaches a span attribute on the GC→AC meeting-token path, and `skip_all` is not what protects it (owner: `global-controller`; trigger: the next edit to `crates/gc-service/src/services/ac_client.rs`, which makes it fire on its own; surfaced 2026-09-07 by @security while adjudicating a `rust_pii` question in `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`)**: `crates/gc-service/src/services/ac_client.rs:84` is `#[instrument(skip_all, fields(meeting_id = %request.meeting_id, user_id = %request.subject_user_id))]`. `user_id` is in `crates/dt-guard/src/common/pii_vocabulary.rs::PII_TOKENS_CATEGORY_B` (line 287), and it is recorded into the span and exported wherever spans go. This is an ADR-0011 PII-discipline violation.
+  **The misreading that has kept this green is worth naming explicitly, because three reviewers hit it in one loop**: `skip_all` does **not** protect a `fields(...)` entry. In `tracing`, `skip_all` skips **function-argument** capture; an explicit `fields(...)` list is recorded unconditionally. The two are independent, and `skip_all` + explicit `fields(...)` is in fact the idiomatic way to say "capture nothing automatically, record exactly these" — so the presence of `skip_all` is weak evidence the field list is *deliberate*, not evidence it is suppressed. A proposed fix to `rust_pii` Check 3 that would have added `!line.contains("skip_all")` to its gate was **rejected** for precisely this reason: it would have made this line permanently green. That reading is recorded here as rejected so the next reader does not re-derive it from the same plausible premise.
+  **Why it is not red today**: `crates/dt-guard/src/rust_pii.rs` scans **changed** files, not the tree (`run()` → `get_all_changed_files`). Check 3 fires the moment anyone edits this file. So this is latent, not currently failing anything — which is how it survived.
+  **Enumeration, so nobody redoes it**: 18 sites in-tree satisfy Check 3's conditions (instrument attribute + `fields(` + no `skip(` + a CATEGORY_B token). **17 are false positives** driven by the token `name` matching a *span-name argument* (`name = "mc.actor.meeting"` and similar — static string literals, never PII). **This line is the only true positive.** The 17-vs-1 split is what makes the case decisive and is why the guard cannot simply be relaxed.
+  **The owner's call, which is why this is not a mechanical edit**: whether `meeting_id` on the same line goes too (it is not in the vocabulary, but ADR-0036 §11 bars meeting identifiers on metrics and the span-attribute analogue deserves a decision), and what the span loses diagnostically if both fields go. Dropping the field, hashing it, or replacing it with a request-scoped correlation id are all plausible; that trade is GC's to make. Note the sibling at `ac_client.rs:135` uses `guest_id`, which is outside the vocabulary today — worth confirming it should be.
+  **Adjacent, and deliberately kept separate**: the fix to `rust_pii` Check 3's *false-positive* half — scoping the PII-token search to the contents of the `fields(...)` group rather than matching anywhere on the line — was designed and co-signed (@paired-observability + @security) in the surfacing devloop but ruled out of scope by the Lead, since it is a change to a PII guard riding inside a media-telemetry loop. Two conditions travel with it whenever it lands: **(a)** build it on `split_top_level_args`, currently private at `crates/dt-guard/src/metric_labels.rs:383` and already named as the intended API by `crates/dt-guard/src/metric_macros.rs:194`, rather than a fresh paren scan; **(b)** an unterminated multi-line `fields(` must fall back to treating the line remainder as in-scope — failing *toward* the finding — with the live five-line counter-example at `crates/mc-service/src/actors/participant.rs:332-336`. That fix removes all 17 false positives and preserves this true positive; it only ever removes hits, so it cannot red anything new.
+  **Correct while here**: `crates/dt-guard/src/common/pii_vocabulary.rs:317-320` asserts "the span bar stays `skip_all` discipline" as the documented reason CATEGORY_B is not applied to span params. This line is the standing disproof of that premise, and that comment is what generated the rejected fix above.
+
+- [ ] **Four `#[tracing::instrument` sites are invisible to every `#[instrument]` matcher in `dt-guard`, and widening the matcher is blocked on the `rust_pii` Check-3 fix (owner: security for the Check-3 half, infrastructure for the matcher; surfaced 2026-09-07 in `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`)**: the shared attribute matcher `crates/dt-guard/src/telemetry_macros.rs::INSTRUMENT_ATTR_BARE_RE` is the literal `#\[instrument`, so it does not match the qualified spelling. Live at `crates/gc-service/src/handlers/metrics.rs`, `crates/gc-service/src/handlers/health.rs`, `crates/mh-service/src/session/mod.rs`, `crates/mh-service/src/webtransport/connection.rs`. The three consumers — `instrument_skip_all`, `rust_pii` Check 2/3, `rust_log_secrets` — are therefore all blind to it, which reads as attribute coverage while the realistic spelling walks through.
+  **The correct matcher already exists beside the narrow one**: `INSTRUMENT_ATTR_ANY_RE` in the same module, used today only by `media_telemetry_deny`. Both are hosted together deliberately, so that no private copy survives and the narrowness is documented at the declaration rather than inherited silently by whoever reads the next consumer.
+  **COUPLING — this is the part that gets forgotten, not the site list.** Flipping any consumer from `BARE` to `ANY` is only safe **after** the `rust_pii` Check-3 fields-scoping fix lands (tracked in the `user_id`-reaches-a-span-attribute entry above — read that one, this does not restate it). Measured: widening costs **zero** new hits in `instrument_skip_all` (both checks) and `rust_log_secrets`, which are gated on the absence of `skip_all`, but **one false positive** in `rust_pii` Check 3 at `crates/mh-service/src/webtransport/connection.rs`, because `"skip_all"` does not contain `"skip("`. Flip today and a correct file reds.
+  **Also unpromoted, so the inventory is complete rather than silently partial**: `rust_pii.rs:99` and `rust_log_secrets.rs:230` test the attribute with a bare `line.contains("#[instrument")` — a substring test, not a regex, so a different construct with different semantics. Folding those into the promotion would be a behaviour-affecting change smuggled inside a value-neutral re-point, which is why they were left alone.
+  **Do NOT reach for the rejected `!line.contains("skip_all")` remedy** — the entry above records why it is wrong and what it would have silenced.
+
+- [ ] **`shellcheck` is a documented Gate-2 gate with no tooling behind it — the binary is absent and nothing invokes it (owner: infrastructure for the wrapper + container image, operations for the Gate-2 table row that over-claims; surfaced 2026-09-07 in `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`)**: `.claude/skills/devloop/SKILL.md`'s artifact-specific review table lists *"Shell scripts → `shellcheck` lint, triggered when `git diff --name-only` includes `*.sh`"* as mandatory at Gate 2. There is nothing behind that row.
+  **Enumerated evidence, so nobody re-derives it**: `command -v shellcheck` returns nothing in the devloop container; `grep -rn shellcheck scripts/lang/*/lint.sh scripts/layer5.sh .github/workflows/*.yml` returns **no** invocation — the only in-tree occurrences are `# shellcheck source=` and `# shellcheck disable=` **directives inside scripts**, which are annotations *for* a tool that never runs. `scripts/lang/rust/lint.sh` runs `cargo clippy`; there is no `scripts/lang/shell/` language directory at all, so the ADR-0033 §6 verb-discovery mechanism has nothing to discover and does not even emit the `FAIL-MISSING-VERB` it would for a deleted wrapper.
+  **Consequence, stated plainly**: every devloop that has touched a `.sh` file has ticked this box with nothing under it. This is the ADR-0036 §11 failure class applied to a **gate** rather than a guard — documented, believed, and never run — and it is worse than the guard version because a gate's whole authority is that someone checked. The directives scattered through the shell tree make it look more alive than it is: a reader who sees `# shellcheck disable=SC2053` at `scripts/lang/_changed_helpers.sh:107` reasonably concludes the tool runs.
+  **The fix has two halves that can land separately, and only the second one closes the gap**: (a) install the binary in `infra/devloop/Dockerfile` (host-side image change), and (b) **wire it into a layer so it actually gates** — either a `scripts/lang/shell/lint.sh` wrapper picked up by `for_each_lang_with_verb`, or a step in `scripts/layer5.sh`. Half (a) alone reproduces the current state with a binary present: available, believed, still not run. Until (b) lands, the SKILL.md row should say what is actually true rather than what we intended.
+  **Interim honesty**: shell changes in this loop were verified with `bash -n` plus convention-matching against sibling scripts, and reported as *unverified by tooling* rather than shellcheck-clean.
+
+- [ ] **Two concurrent `layer-all.sh` runs share `${DEVLOOP_TMP}` and produce a green run with a `GATE2=FAIL` verdict and silently missing layer rows (owner: infrastructure for a PID/flock guard + orchestrator teardown, operations for the runbook row; surfaced 2026-09-07 in `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`)**: `scripts/layer-all.sh` writes every layer's stdout to `${DEVLOOP_TMP}/layer-N.log`, its stderr to `layer-N.stderr.log`, and the authority verdict to `gate2-verdict`, with **no lock, no PID file and no staleness check**. Two invocations do not serialise and do not error — they interleave over the same paths.
+  **The failure mode, stated in the form it was found, because the form is the point**: `layer-all.sh:167` runs `status=$(parse_status_line "${DEVLOOP_TMP}/layer-${n}.log")` under `set -e`. When the other process clobbers or unlinks that log mid-loop, the command substitution fails, `set -e` aborts the loop, and the EXIT-trap verdict producer fires with a **partially-populated `layer_status` array**. The observed result was a run in which **every layer printed `STATUS=OK`** — including Layer 7 against a live cluster with 8/8 browser E2E — that emitted **no `LAYER_SUMMARY` block at all**, `WRAPPER_EXIT=2`, and a `gate2-verdict` carrying `GATE2=FAIL` with rows for `LAYER 1`–`LAYER 6` and **no `LAYER 7` row**. Nothing in that output says "another run interfered"; it reads as a legitimate failure.
+  **Why the orphan exists in the first place**: killing the wrapper shell (e.g. a harness `TaskStop`, or an agent turn ending) does **not** kill the detached `bash ./scripts/layer-all.sh` beneath it. The orchestrator keeps running, keeps writing, and keeps holding cluster resources — the same incident also produced `rejected_busy` on a subsequent `rebuild-all` and two `stream write failed: client disconnected` entries in `/tmp/devloop/helper.log` from podman builds severed mid-flight.
+  **Evidence, so it is a proof rather than a hypothesis**: the affected run's own stdout log stopped at 22:27:32, while `${DEVLOOP_TMP}/layer-6.log` carried mtime 22:28:41 and `layer-7.log` 22:29:00 — both written after the run that supposedly produced them had exited.
+  **The fix has two halves and BOTH are required**: (a) killing the wrapper must kill the orchestrator (process group / `trap`-based teardown, so an interrupted run leaves nothing behind); and (b) a second concurrent run must **fail loudly with `PRECONDITION_FAILURE`** rather than interleave — an flock on `${DEVLOOP_TMP}` or a PID file with a liveness check. Half (a) alone still allows two deliberate concurrent runs to corrupt each other; half (b) alone still leaves orphans holding cluster resources and burning CPU.
+
+
+  **CORRECTION 2026-09-07, and it matters because the wrong version was already written down here.** An earlier draft of this entry claimed the Layer-3 `run-story-selftest` red observed during this devloop's Gate 2 as its worked example — a `${DEVLOOP_TMP}`-contention false red. **That attribution was wrong.** @operations asked for a falsifier rather than accepting the plausible story, and `/tmp/devloop/layer-3.stderr.log` carried it: `HEAD` unchanged, `sha256(git status --porcelain)` unchanged (same file *list*), `sha256(git diff HEAD)` **changed** — same files, different contents, mid-run. That was the implementer editing `main.md` and `docs/TODO.md` inside the run's window, not this bug. **This entry keeps the mechanism and @operations' independent evidence for it (`tee` truncation plus `parse_status_line`'s `tail -n1` over a shared mutable file), and no longer claims that event.** The bug is real; that instance was not an instance of it. Anyone hunting a reproduction needs to construct one rather than reuse this date.
+
+  **Why this is worth a slug rather than a note**: the Gate-2 verdict is the authority artifact for the whole devloop pipeline, and this is a path by which **its verdict does not correspond to what actually ran**. That is the same class ADR-0036 §11 is written about — a control reporting a result decoupled from the thing it measures — occurring inside the machinery that enforces it. A `GATE2=FAIL` that is actually contention will be retried and will pass, teaching everyone that the gate is flaky; a `GATE2=PASS` produced the same way would be worse.
+
+- [ ] **The `SCOPE:` operator line is discarded by `run-guards.sh` in the mode Layer 3 runs, so it cannot do the job the convention exists for (owner: infrastructure for the emitter/filter, operations for the runbook row; surfaced 2026-09-07 by @operations in `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`)**: three guards emit `SCOPE: …` via `crates/dt-guard/src/common/status.rs::emit_scope` — `release_build_profile`, `no_insecure_browser_flags`, `media_telemetry_deny`. `scripts/guards/run-guards.sh` re-emits only lines matching `(VIOLATION|violation|ERROR|error|WARN)` on the failure arm and `^WARN ` on the pass arm. **`SCOPE: ` carries none of those substrings**, so on both arms it is captured into `$OUTPUT` and dropped. Verified by piping a real emitted line through the real filter.
+  **Why it matters rather than being cosmetic**: the convention exists to guard against *silent vacuity* — "a guard that scanned nothing and a guard that scanned everything and found nothing both print clean". In Layer 3, for all three consumers, it cannot. The line is real on the direct-invocation path (`dt-guard <sub> --root . --explain`, which runbook §6.3.1 names as the triage step) and under `--verbose`, and that is now stated in `emit_scope`'s doc-comment so nobody reasons "the SCOPE line would have caught it" about a pipeline run.
+  **Deliberately NOT fixed in the surfacing devloop**: widening the filter or renaming the prefix changes operator-facing output for two other guards, which is a bigger change than a media-telemetry loop should carry. **Options, with the trade stated**: (a) add `SCOPE` to the re-emission alternation — smallest, but it prints a scope line for every guard on every failing run, which risks burying findings under the `head -5` cap; (b) emit it as `WARN SCOPE: …` only when a vacuity-adjacent condition holds, keeping quiet runs quiet; (c) leave it as a direct-invocation diagnostic and stop describing it as a vacuity guard. **(c) is honest and free; (a) and (b) actually close the gap.** Pre-existing for the two older consumers; the 2026-09-07 diff is where the claim got written down, which is why it is filed here.
+
+- [ ] **`run-story.test.sh`'s containment trap detects correctly and ATTRIBUTES wrongly, and it says so emphatically (owner: infrastructure for the heuristic, operations for the runbook line; surfaced 2026-09-07 in `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`)**: the suite's `__on_exit` trap proves the real repository did not change during the run — `HEAD | sha256(git status --porcelain) | sha256(git diff HEAD)` sampled before and after — and forces `exit 2` on a mismatch, overriding the code `report_results` already chose. **The detection is correct and the override is correct safety behaviour; neither should be weakened.** The defect is the attribution layer on top of it.
+  **The bad inference**: the trap reads "post-run state is stable across two samples ⇒ no concurrent writer ⇒ the suite itself is the actor", then prints *"Treat as a real containment failure. Do NOT weaken this check."* That reasoning fails whenever the concurrent writer **stopped writing before the samples were taken** — which is precisely what happened on 2026-09-07: an agent edited `main.md` and `docs/TODO.md` during the run and finished before the post-sampling, so the stability check saw a quiet tree and concluded the suite had mutated the repo. It had not.
+  **Why this is worse than an ordinary wrong message**: the output is emphatic, specific, and names the wrong actor, while explicitly instructing the reader not to question it. Three people (@main, @test, and the implementer) accepted a *different* wrong cause for the same event before @operations' falsifier settled it — a confidently-worded misattribution is the failure mode most likely to end an investigation early.
+  **Fix direction: a NARROWER CLAIM, not a weaker check.** The trap should report what it actually knows — *"the repository at /work changed during this run; this suite may or may not be the cause"* — and enumerate the candidates (a concurrent agent edit, another `layer-all.sh`, the suite itself), rather than asserting the last one. Scoping the mutation proof to files the run owns would additionally stop it tripping on edits it has no stake in. **Do not** relax the exit-2 override: @test is right that a containment failure must outrank an all-green assertion count.
+  **Operational consequence that belongs beside it**: a `layer-all.sh` run needs a **quiet working tree**, not merely a tree whose changed files are excluded from the Gate-2 signature. Those are different properties and were conflated in this devloop — `gate2_is_excluded` covers `docs/devloop-outputs/**`, but `run-story.test.sh`'s containment proof does not, so an "excluded" edit still reds Layer 3. The runbook should say plainly: **do not edit any file, excluded or not, while a validation run is in flight.**
+  **Shape to copy for new self-tests**: `scripts/guards/media-telemetry-deny.test.sh` is structurally immune — private `mktemp -d`, never `${DEVLOOP_TMP}`, cleanup-only trap with no exit-code override.
+
 ## Documentation Hygiene
 
 - [ ] **Concurrent reviewers in one devloop each file `docs/TODO.md` entries with nothing detecting that two of them describe one gap (owner: `infrastructure` for any guard machinery, `dry-reviewer` for the policy content; filed 2026-09-03 by @dry-reviewer at Gate 2 of `docs/devloop-outputs/2026-09-03-mc-client-media-signaling/`)**: this file is written concurrently by four-to-six reviewers per devloop, each filing from their own lens, and a single gap reached from two lenses produces two entries that look independent. **The file already names this as a live failure mode** — the D8 entry above carries "folded here rather than opening a parallel entry, since two entries for one gap is the failure mode this file already suffers from", which is a fix applied *once, by hand, by a reviewer who happened to notice*. In the task-14 devloop two reviewers came within one turn of filing a second entry for the same gap while documenting an unrelated finding; it was caught by the two of them talking, not by any control. **Second arrival, same devloop, within the hour**: @observability reached this file with a structurally identical entry (the `ALL`-array-versus-catalog mirror problem), read this entry, and folded the new instance into the existing `gc_mc_assignments_total{rejection_reason}` entry at line ~200 instead of opening a parallel one — the right outcome, again produced by a reviewer noticing rather than by a control. Both halves are useful evidence: the near-miss shows the failure is live, and the successful fold shows the merge decision is cheap **once you know the sibling entry exists**, which is precisely the part a mechanical surfacing step would supply. **Why it matters more than tidiness**: duplicate entries split the evidence for one problem across two records, so each looks individually weaker than the combined case — the exact opposite of D8's "three independent arrivals is materially better prioritisation evidence". A future reader closing one copy also leaves the other open, which then reads as an unfixed problem. **This is a control that depends on an optional conversation, which is not a control** — the same shape as the runbook-commands entry in this section. **Cheap mechanical version**: at devloop close, diff the session's added `- [ ] **` headlines against each other and against the file, and surface pairs sharing a high proportion of significant tokens or citing the same `path:line` anchor, for a human to merge or keep. Not an auto-merge — deciding whether two entries are one gap is judgment, and the tree's own precedent (D8's widening, folded by hand) shows the merge usually needs rewriting rather than concatenation. **Related but distinct** from the `todo-tracking` guard-precision entry below, which is about what counts as a debt body, not about two bodies describing one debt.
@@ -1190,6 +1232,11 @@ the operations brief. Related: see "Skip unchanged service image builds" under
 - [ ] **`is_ts_build_artifact()` extraction** (2026-07-30, task #58, @dry-reviewer ADR-0019 extraction opportunity, NOT a blocker). `ts_secrets.rs` and `ts_pii.rs` carry byte-identical `TEST_PATH_PATTERNS` (8) + `TEST_FILE_SUFFIXES` (5) + `is_excluded_path()`; ~54% of those entries are already shadowed by the shared `is_scan_exempt`, leaving 6 genuinely additive build-artifact entries. Task #58's `ts_retained_credentials` is the 3rd caller and correctly layers on `is_scan_exempt` rather than reimplementing it, so this stays an extraction opportunity rather than a BLOCKER. Both existing files' comments defer to a 4th caller; that threshold is now one away. Net LoC goes down.
 
 - [ ] **Comment/string-aware line lexer duplicated 3× in `dt-guard`** (2026-07-30, task #58 Gate 2, @dry-reviewer ADR-0019 extraction opportunity, NOT a blocker). Three implementations now answer "walk a source line, ignoring comments and string-literal contents, so braces/parens inside them do not move a depth counter": `common/test_code_filter.rs::strip_comments` (private), `metric_labels.rs:320-345` (inline in a byte loop), and task #58's `ts_retained_credentials.rs::strip_noise` (private). **Why this is an extraction opportunity and not a BLOCKER**: `strip_comments` is not `pub`, so it could not have been imported — no shared code was bypassed, which is the ADR-0019 BLOCKER criterion. Third instance, so the extract-on-third-use threshold is reached. **Standardize on the `strip_noise` shape, not `strip_comments`**: `strip_comments` *preserves* string contents, which forces its caller (`DepthState::process_line`) to re-track string state on a second pass — the same lexing done twice, and the two passes can disagree. `strip_noise` drops string contents in one pass, so a single traversal is sufficient. Candidate home: `common/source_lexer.rs` (a named cross-cutting concern per ADR-0034 §Neutral — NOT `common/util.rs`). Constraint: `compute_test_block_ranges` is Rust-flavoured (`r#"…"#` raw strings) while `strip_noise` is TS-flavoured (backtick templates), so the extracted helper needs a flavour parameter or two thin callers over one core — do not collapse them into a single string-quote set. Owner: infrastructure.
+  **AMENDED 2026-09-07 (@dry-reviewer, Gate 2 of `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`) — this entry's non-BLOCKER premise is now VOID, and its recommended target shape was built in the module it told readers not to standardise on.** Three facts changed; the entry is amended rather than re-filed because it already owns this gap.
+  **(a) The ADR-0019 BLOCKER criterion now applies to future instances.** This entry's stated reason for being an extraction opportunity was: *"`strip_comments` is not `pub`, so it could not have been imported — no shared code was bypassed, which is the ADR-0019 BLOCKER criterion."* As of 2026-09-07 `crates/dt-guard/src/common/test_code_filter.rs` exposes `pub(crate) fn lex_line(line, in_block_comment, NonCodeMode)` plus the thin wrappers `strip_comments` and `blank_non_code`. **A fourth in-crate lexer is now a BLOCKER, not an extraction opportunity** — shared code exists and would be bypassed. The existing three instances stay an extraction opportunity (nothing was bypassed when they were written); only new ones change class.
+  **(b) The `strip_noise` shape this entry prescribed now exists — in `test_code_filter`.** The entry says "standardize on the `strip_noise` shape, not `strip_comments`" because `strip_comments` preserves string contents and forces the caller to re-track string state on a second pass. `NonCodeMode::BlankNonCode` blanks comment **and** string bodies while preserving column offsets, which is that shape. So the prescription is satisfiable today by extracting from `test_code_filter` rather than from `ts_retained_credentials`; the naming recommendation should be re-read as "the blanking *shape*", not "the `strip_noise` *implementation*".
+  **(c) A capability gap opened between the two Rust lexers, and it is the one that fails silently.** `test_code_filter::lex_line` gained raw-string handling (`r"…"`, `r#"…"#`, `r##"…"##`) on 2026-09-07, documented at `test_code_filter.rs:299` as "ABSENT before". `crates/dt-guard/src/metric_labels.rs:163 strip_comments_preserve_layout` still handles only ordinary strings and char literals, so an un-lexed raw string terminates early at its first inner `"` and the remainder is treated as code — an **under**-blank, i.e. a silent miss rather than a spurious hit. `metric_labels` is not obviously exposed today, but the asymmetry is the kind that gets discovered by a false negative, and it is a new argument for the extraction this entry already asks for: **two Rust lexers with different capabilities is strictly worse than two with the same gap**, because the gap is now a property of *which* module you happened to call.
+  **Sizing note**: the 2026-09-07 loop deliberately did NOT fold `strip_comments_preserve_layout` in — it refactored `test_code_filter` into one lexer with two modes (which is why (a) and (b) are true) and left `metric_labels` alone, correctly, since collapsing a *third* contract with different layout semantics into a value-neutral refactor would have been scope creep. That remains this entry's work.
 
 - [ ] **Semantic-check enumeration drift guard** (2026-07-30, task #58, credited to @semantic-guard). Task #58 dereferenced all 7 copies of the semantic-check list to `scripts/guards/semantic/checks.md`, taking CLAUDE.md §Single source of truth's *derive-one-from-the-other* branch. The *guard-on-drift* branch — a subcommand that parses `## Check:` headings out of `checks.md` and asserts each enumeration site matches, modelled on `validate-gsa-sync.sh` — was deliberately NOT built (a second new subcommand in a loop that already added one, and lower-value once only one list remains). Revisit if inline example lists reappear. **Scope it to live governance/operational docs**: run unscoped it would fail on `docs/devloop-outputs/**`, where historical records legitimately cite paths that were correct when written. Note the load-bearing pointer is `.claude/agents/semantic-guard.md`'s Review Procedure step 1 — if that path rots, the agent executes **zero** checks and reports CLEAR.
 
@@ -1947,6 +1994,38 @@ invisible to it. Unassessed root-path guards: `knowledge_index.rs:203`,
 `cross_boundary_classification.rs:233` is explicitly **unassessed, not counted** — it
 iterates diff paths where a missing path is plausibly a deletion.
 
+**One more instance, found 2026-09-07 by @dry-reviewer and NOT caught by either method
+above** — it is neither an `if !x.is_dir() { return }` nor an unassessed root, but an
+*explicit, commented, deliberate* fail-open: `crates/dt-guard/src/ts_metric_naming.rs:345-348`
+derives `any_target_present` from its `SCOPE_PREFIXES` roots
+(`packages/sdk-core/src/`, `packages/web-app/src/`) and exits **clean** when neither
+resolves, under the comment "Scaffold-now / fire-later: if neither target package exists
+yet, exit clean." That was correct when the packages did not exist; both exist today, so
+the rationale has expired while the code has not. It belongs in this entry's inventory
+because it is the same polarity — absence reads as success — and it is the **harder**
+variant to find: a reviewer grepping for missing assertions skips it, since it *has* one.
+The tell is not "is there a presence check" but "what does the check do when it fails".
+
+**REFERENCE IMPLEMENTATION NOW EXISTS** (2026-09-07, devloop
+`2026-09-07-media-telemetry-deny-guard`): `crates/dt-guard/src/common/scope.rs`
+`assert_scope_live(repo_root, &[rel_roots], extensions) -> Result<Vec<ScopeRoot>, Vec<ScopeFailure>>`.
+It was written for `media_telemetry_deny`, the first guard whose *purpose* is this
+assertion, and its signature is shaped for the general case rather than that guard's
+manifest — a single hardcoded root calls it with a one-element slice and no wrapper.
+It returns ALL failures rather than the first, and its `ScopeFailure` variants carry
+distinct token suffixes (`scope-directory-missing` / `-empty` /
+`-escapes-root` / `scope-no-directories-configured`), which is this entry's
+token-overloading point applied: `gsa_sync.rs`'s `CANON_MISSING_RULE_ID` means both
+"string absent from a mirror" and "path does not exist", and the module's own emitted
+behaviour teaches the wrong inference. `ScopeRoot` is a newtype with no public
+constructor, so a walker taking `&[ScopeRoot]` structurally cannot be pointed at an
+unvalidated path.
+
+**The 12 roots above were deliberately NOT re-pointed in that devloop** — @main scoped
+it to "write the predicate, consume it here only", because re-pointing ten modules is
+this entry's task and its owner's call, not a ride-along. Doing so should now be
+mechanical.
+
 **Owner**: observability (own row) + guard-family owner. **To be scheduled — no slug.**
 
 ### S17 — `rust_log_secrets` accepts a bare `guard:ignore` with no justification
@@ -1988,6 +2067,108 @@ substring tests, so `tracing::info!("token={}", token); // not REDACTED yet` pas
 
 **Owner**: security for the policy, guard-family owner for the change. **To be
 scheduled — no slug.**
+
+### S18 — `cite_extract`'s `IN_SCOPE_DIRS` is narrower than the property both its guards enforce
+
+`crates/dt-guard/src/cite_extract.rs` declares `IN_SCOPE_DIRS = ["docs/runbooks", ".claude/skills"]`,
+and its own comment says *"Doc trees the new guards walk. Single source of truth — both guards
+consume identical scope."* So **`cite-no-line-numbers` AND `cite-symbol-resolves` are both scoped to
+those two trees**, while the properties they enforce — a line cite rots on any edit above it, a
+symbol cite rots on rename — are not specific to those trees at all.
+
+**This is a different failure from S16/S17 above, and the section predicate needs widening to cover
+it.** S16/S17 are *path absent* — the root resolves to nothing and the guard scans an empty set.
+Here the root resolves fine and the guard passes honestly; the property simply is not enforced
+outside two directories. Extend the predicate to: *a guard's scope is an input; it must be asserted
+present **and** justified against the property the guard enforces. Present-but-narrower-than-its-
+premise is the silent case, because the guard reports clean and its scope is invisible from the
+document it is not reading.*
+
+**Measured 2026-09-07, both legs:**
+
+- **Line-cite leg.** `docs/runbooks/` + `.claude/skills/` — zero bare line-cites; the guard works and
+  holds its trees clean. `docs/specialist-knowledge/` — five INDEX files carry them
+  (`auth-controller`, `dry-reviewer`, `infrastructure`, `observability`, `security`), ungoverned.
+  Includes `docs/specialist-knowledge/security/INDEX.md`, which cites
+  `crates/dt-guard/src/ts_retained_credentials.rs` by line plus two bare test-line cites — the most
+  volatile kind, in the document every security reviewer is told to read first.
+- **Symbol-cite leg** (found by @operations). 257 `file.rs:symbol` cites across 15 INDEX files, none
+  resolved by anything. `docs/specialist-knowledge/operations/INDEX.md` has 18 symbol cites and
+  **zero** line cites — clean on the first leg, wholly unguarded on the second. Worth stating plainly
+  because reading only the line-cite measurement would license the conclusion "operations INDEX is
+  fine", and it is not.
+
+**Currently unexercised, and the entry should not imply otherwise.** Every symbol cite in the
+security INDEX was checked and all resolve; there is no live rot today. This is a gap with no current
+instance, which is a materially weaker claim than live staleness and is deliberately recorded as
+such. *(Two earlier passes of that check reported nine stale and then one stale; both were artifacts
+of the checker not replicating the guard's `BASENAME_SEARCH_ROOTS` fallback and then matching the
+wrong `mod.rs`. Recorded because the same mistake is the obvious way to re-derive this wrongly.)*
+
+**Why it is worth fixing rather than closing as won't-fix**: the affected files are navigation maps.
+A stale cite there sends a reader somewhere confidently wrong, and the reader's next move is to trust
+it rather than grep — the same "reads as coverage" failure ADR-0036 §11 names, one level up.
+
+**Sequencing — the two legs are not one task.** Line-cites are a bounded mechanical sweep: five
+files, delete or convert, then widen. Symbol-cites must each be *resolved* before widening, and any
+already stale surface as failures rather than a clean cut-over. So: widen for line-cites first, then
+resolve-and-widen for symbols. Widening `IN_SCOPE_DIRS` is not a config tweak — it reds five files
+immediately, so sweep-then-widen is the order.
+
+**Owner**: `infrastructure` / guard-family owner for the scope decision and machinery; policy input
+from `security` + `observability` as the specialists whose INDEX files carry the most cites.
+**Surfaced** 2026-09-07 by @paired-observability (line-cite leg) and @operations (symbol-cite leg) at
+Gate 1/2 of `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`; measured and filed by
+@security. **To be scheduled — no slug.**
+
+## Devloop tooling assumes one commit per devloop; two-commit shapes break one gate and silently skip another
+
+- [ ] **Two independent mechanisms assume a devloop is exactly one commit, and neither says so**
+  (owner: `operations` for the skill's commit-shape guidance, `infrastructure` for the guard and
+  hook machinery; surfaced 2026-09-07 in
+  `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`). The devloop skill offers a
+  multi-commit split so a risky change can be reverted without taking value-neutral refactors with
+  it. Both mechanisms below assume that never happens.
+
+  **(a) `validate-cross-boundary-scope` cannot pass a two-commit devloop — it reds.**
+  `cross_boundary_scope.rs::fetch_diff_paths` resolves scope as working-tree-vs-HEAD when dirty,
+  deliberately "narrower than the polyglot-pipeline merge-base … drift in THIS edit only". Once
+  commit 1 lands, its files are in HEAD and absent from the active edit, so the plan lists files
+  the edit does not touch and the guard emits `scope_drift_planned_untouched` for each. The plan
+  describes the whole changeset; the active edit is half of it. There is no multi-commit
+  provision, and the only exemption is the whole-file `docs/user-stories/*.md` carve-out.
+
+  **(b) The Gate-2 hook goes quiet — the opposite failure, same premise.**
+  `gate2_validate_commit` has two trigger conjuncts: a staged devloop `main.md` at
+  `Phase=complete`, then a non-empty staged set after `gate2_is_excluded`. A code commit without
+  `main.md` fails the first (matrix f); a `main.md`-only completion commit fails the second, since
+  `docs/devloop-outputs/**` is excluded tree-wide (matrix c). Split a devloop so every commit lands
+  in one cell and the local hook never demands a verdict. **Both cells are individually correct** —
+  a `main.md`-only edit should not demand a fresh pipeline run, and ordinary commits are not
+  devloop completions. Neither anticipated the split.
+
+  **Not a security defect (@security, 2026-09-07).** `_gate2_binding.sh`'s header states the
+  verdict is **anti-drift, not anti-forgery**, and the changeset digest is unkeyed, so a deliberate
+  route-around is outside the stated threat model by construction. `.github/workflows/ci.yml` runs
+  `layer-all.sh` from scratch and does not read the local verdict. **The residual is signal
+  degradation, not enforcement loss** — do not escalate this as a merge-path bypass.
+
+  **Cost of discovery**: (a) is silent until Gate 2, and `run-all` evaluates every layer — Layer 7
+  had already spent **498 seconds** on env-tests and browser E2E against the live cluster before
+  Layer 3 reported it.
+
+  **Why it is worth recording rather than shrugging at**: a gap reachable only by deliberate action
+  is uninteresting until the deliberate action becomes routine, and that transition is invisible
+  from inside the control. Three people were designing two-commit shapes for good reasons on the
+  evening this surfaced.
+
+  **Options**: (a) teach the scope guard a multi-commit posture (accept the union of `HEAD^..HEAD`
+  and working-tree when the plan is a superset); (b) drop the commit-split guidance from the skill
+  and make two-step revert the documented compensating control; (c) exempt the plan-listing check
+  when the branch carries commits sharing the devloop slug. **(b) is free and is what 2026-09-07
+  did under time pressure; (a) is the one that restores the capability.** **Any fix must address
+  both halves** — fixing only (a) would make two-commit devloops viable again *and* routine, which
+  is precisely when (b) starts to matter. **To be scheduled — no slug.**
 
 ## Guard STATUS Attribution — `run-guards.sh` knows things its STATUS line doesn't say
 

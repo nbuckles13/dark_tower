@@ -24,6 +24,7 @@ use dt_guard::infrastructure_metrics;
 use dt_guard::instrument_skip_all;
 use dt_guard::knowledge_index;
 use dt_guard::kustomize;
+use dt_guard::media_telemetry_deny;
 use dt_guard::metric_coverage;
 use dt_guard::metric_labels;
 use dt_guard::no_insecure_browser_flags;
@@ -107,6 +108,17 @@ enum Command {
     /// Release-build premise: assert shipped artifacts are built with
     /// debug-assertions off, so ADR-0036 §11's compile-time control is armed.
     ReleaseBuildProfile {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// ADR-0036 §11 media-path telemetry deny: no log, print, metric, event,
+    /// span or `#[instrument]` macro form inside the configured media
+    /// directories. Cached-handle method calls are allowed by construction.
+    MediaTelemetryDeny {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -406,6 +418,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::ReleaseBuildProfile { root, explain } => {
             release_build_profile::run(&root, explain)
         }
+        Command::MediaTelemetryDeny { root, explain } => media_telemetry_deny::run(&root, explain),
         Command::MetricLabels { root, explain } => metric_labels::run(&root, explain),
         Command::ApplicationMetrics { root, explain } => application_metrics::run(&root, explain),
         Command::InfrastructureMetrics { root, explain } => {
