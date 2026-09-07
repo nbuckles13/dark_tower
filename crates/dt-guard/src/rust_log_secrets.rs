@@ -43,14 +43,10 @@ const EXTENSIONS: &[&str] = &[".rs"];
 // Path-shape exclusions live in `common::test_code_filter::is_test_path` per
 // @team-lead Wave-2 port-fidelity fix 2026-05-21.
 
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static LOG_MACRO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b(info|debug|warn|error|trace)!\s*\(").expect("static pattern compiles")
-});
+// Promoted 2026-09-07 — see the note in `rust_pii.rs`. `Level` group only, so
+// this cannot widen onto `log!`, span or print macros. Behaviour unchanged and
+// pinned by a full-compiled-pattern equality test at the canonical home.
+use crate::telemetry_macros::{INSTRUMENT_ATTR_BARE_RE as INSTRUMENT_RE, LOG_MACRO_RE};
 
 #[expect(
     clippy::disallowed_methods,
@@ -91,14 +87,6 @@ static SECRET_IN_LOG_SHAPE_RE: Lazy<Regex> = Lazy::new(|| {
     ))
     .expect("vocab alternation compiles")
 });
-
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static INSTRUMENT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"#\[instrument").expect("static pattern compiles"));
 
 #[expect(
     clippy::disallowed_methods,

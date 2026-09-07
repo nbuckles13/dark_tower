@@ -404,11 +404,12 @@ tasks:
   slug: 2026-09-05-mh-audio-datagram-forward-path
   tag: story-2026-08-27-hear-yourself-through-handler-task-16
 - id: 17
-  status: pending
+  status: completed
   specialist: infrastructure
   deps:
   - 16
   prompt: 'Build the mechanism half of ADR-0036 §11''s media-path telemetry deny guard: a `dt-guard` subcommand plus an auto-discovered Layer-3 wrapper that denies log, print, metric, event and span macro invocation forms (including `event!`, `span!`, `*_span!` and `#[instrument]`) inside a config-driven directory list seeded with `crates/mh-service/src/media/`, while explicitly allowing cached-handle method calls — `.increment`, `.record`, `.set`, `.absolute`, `.decrement` — since §11 states that a guard touching handle methods bans the pattern it exists to enforce. Drive the metrics family off `metric_macros::MacroKind::ALL` rather than re-inlining the alternation; the tracing, log, print and span families get their own canonical-home list in the new module. The guard MUST FAIL on its own scope, with distinct reason tokens for a configured directory that does not exist and for one that exists with zero `.rs` files — a rename must not silently disarm it (§11 "alive, never applied"). Fixtures at `crates/dt-guard/tests/fixtures/media_telemetry_deny/` following the `cite_extract/` convention; self-test at `scripts/guards/media-telemetry-deny.test.sh` (NOT under `scripts/guards/simple/`, which `run-guards.sh` executes as production guards); config manifest beside the guard per the `cross-boundary-ownership.yaml` precedent, with a header recording why the manifest path and the on-disk directory are not drift-prone duplication — the scope-missing failure IS the drift guard. Observability owns the policy content and the fixtures proving both halves (a planted macro in the media directory reds it; the denied directory is the real forward path); pair with observability. Depends on media-handler''s task that creates `crates/mh-service/src/media/` with the §11 sibling layout (lifecycle, setup, teardown outside it).'
+  slug: 2026-09-07-media-telemetry-deny-guard
   tag: story-2026-08-27-hear-yourself-through-handler-task-17
 - id: 18
   status: pending

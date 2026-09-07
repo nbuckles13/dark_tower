@@ -80,7 +80,7 @@
 
 use crate::common::explain::{print_finding, Finding};
 use crate::common::scan::warn_skip;
-use crate::common::status::emit_ok;
+use crate::common::status::{emit_ok, emit_scope};
 use anyhow::Result;
 use std::path::Path;
 
@@ -432,13 +432,20 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     // which was true then and is not now; corrected here rather than left,
     // because a comment that overstates what stays hidden is how something
     // sensitive ends up printed on the assumption that nothing is.)
-    println!(
-        "SCOPE: {} candidate files, {} enumerated settings, {allowlisted_hits} allowlisted \
+    // Routed through `common::status::emit_scope` 2026-09-07 — see the note at
+    // the sibling call site in `release_build_profile`. The field list here is
+    // deliberately NOT harmonised with that one; the counts differ in kind.
+    // The formatted line is unchanged and pinned by
+    // `scope_line_matches_historical_literal` — worth keeping because this
+    // line has history: the comment above records a past bug where the SCOPE
+    // count and the real count disagreed.
+    emit_scope(format!(
+        "{} candidate files, {} enumerated settings, {allowlisted_hits} allowlisted \
          mentions, {} hits",
         files.len(),
         CERT_VALIDATION_FLAGS.len() + INSECURE_ORIGIN_FLAGS.len() + INSECURE_PROPERTIES.len(),
         hits.len()
-    );
+    ));
 
     if hits.is_empty() {
         // Token names the ENUMERATION, not the conclusion. "no-insecure-
@@ -766,6 +773,34 @@ mod tests {
         assert!(
             INSECURE_ORIGIN_FLAGS.contains(&"--unsafely-treat-insecure-origin-as-secure"),
             "insecure-origin clause"
+        );
+    }
+    /// The `SCOPE:` line's full formatted text, pinned against its
+    /// pre-extraction literal. See the sibling test in
+    /// `release_build_profile` for why the whole line is pinned rather than
+    /// the prefix — and note this line in particular has history: the comment
+    /// at the call site records a past bug where the SCOPE count and the real
+    /// count disagreed.
+    #[test]
+    fn scope_line_matches_historical_literal() {
+        let files = [0u8; 12];
+        let allowlisted_hits = 3usize;
+        let hits: Vec<u8> = vec![];
+        let rendered = format!(
+            "{} candidate files, {} enumerated settings, {allowlisted_hits} allowlisted \
+             mentions, {} hits",
+            files.len(),
+            CERT_VALIDATION_FLAGS.len() + INSECURE_ORIGIN_FLAGS.len() + INSECURE_PROPERTIES.len(),
+            hits.len()
+        );
+        assert_eq!(
+            rendered,
+            format!(
+                "12 candidate files, {} enumerated settings, 3 allowlisted mentions, 0 hits",
+                CERT_VALIDATION_FLAGS.len()
+                    + INSECURE_ORIGIN_FLAGS.len()
+                    + INSECURE_PROPERTIES.len()
+            )
         );
     }
 }

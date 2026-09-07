@@ -96,7 +96,13 @@ impl MacroKind {
 /// by both opener regexes below so adding a new variant updates the regex
 /// automatically. Variants are emitted in `ALL` order (describe-* first)
 /// so the regex engine prefers the longer alternative at each position.
-static MACRO_NAME_ALTERNATION: Lazy<String> = Lazy::new(|| {
+/// Made `pub` 2026-09-07 so `media_telemetry_deny` can `format!` it into its
+/// own deny-shape pattern (which accepts `(`, `[` and `{` delimiters, where
+/// the two regexes below accept only `(`). Exposing the alternation rather
+/// than having that guard rebuild its own `.iter().map(as_str).join("|")` is
+/// what keeps `MacroKind::ALL` the single source of truth: a seventh variant
+/// widens the media-path deny with zero edits in that module.
+pub static MACRO_NAME_ALTERNATION: Lazy<String> = Lazy::new(|| {
     MacroKind::ALL
         .iter()
         .map(|k| k.as_str())

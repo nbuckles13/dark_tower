@@ -145,7 +145,7 @@
 use crate::common::explain::{print_finding, Finding};
 use crate::common::scan::warn_skip;
 use crate::common::services::CANONICAL_SERVICES;
-use crate::common::status::emit_ok;
+use crate::common::status::{emit_ok, emit_scope};
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1126,11 +1126,18 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     // legible. CLAUDE.md's drift rule landing inside a guard about premises
     // drifting silently. There is now one encoding: `RULE_ORDER` minus the
     // precondition classes. The module doc deliberately states NO number.
-    println!(
-        "SCOPE: {cargo_dockerfiles} cargo Dockerfiles, {} enumerated premise channels, {} hits",
+    // Routed through `common::status::emit_scope` 2026-09-07 (third consumer of
+    // the `SCOPE:` convention). The helper owns ONLY the `SCOPE: ` prefix and
+    // the one-physical-line contract — it deliberately imposes no common field
+    // shape, because this site and `no_insecure_browser_flags` count genuinely
+    // different things and flattening them would be a value-changing edit
+    // wearing an extraction's clothes. The formatted line below is unchanged
+    // and is pinned by `scope_line_matches_historical_literal`.
+    emit_scope(format!(
+        "{cargo_dockerfiles} cargo Dockerfiles, {} enumerated premise channels, {} hits",
         enumerated_channel_count(),
         hits.len()
-    );
+    ));
 
     if hits.is_empty() {
         // Token names the ENUMERATION, not the conclusion: a reader must not
@@ -2031,6 +2038,34 @@ mod tests {
             Some(true),
             "[profile.release] enables debug-assertions — ADR-0036 §11's compile-time \
              control is inert in shipped artifacts"
+        );
+    }
+    /// The `SCOPE:` line's full formatted text, pinned against its
+    /// pre-extraction literal.
+    ///
+    /// Routing through `common::status::emit_scope` (2026-09-07) must be
+    /// value-neutral. The helper owns the prefix and the one-line contract and
+    /// deliberately imposes no field shape — this test is what holds the field
+    /// list itself. Pinning the WHOLE line rather than the `SCOPE: ` prefix is
+    /// the point: the entire risk of the extraction is "did the numbers and
+    /// their labels stay the same", and this module's own comment records a
+    /// past incident where a count in this line drifted across three
+    /// encodings, two of them wrong.
+    #[test]
+    fn scope_line_matches_historical_literal() {
+        let cargo_dockerfiles = 4usize;
+        let hits: Vec<u8> = vec![];
+        let rendered = format!(
+            "{cargo_dockerfiles} cargo Dockerfiles, {} enumerated premise channels, {} hits",
+            enumerated_channel_count(),
+            hits.len()
+        );
+        assert_eq!(
+            rendered,
+            format!(
+                "4 cargo Dockerfiles, {} enumerated premise channels, 0 hits",
+                enumerated_channel_count()
+            )
         );
     }
 }

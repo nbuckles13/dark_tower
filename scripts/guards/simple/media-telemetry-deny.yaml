@@ -1,0 +1,105 @@
+# Media-Path Telemetry Deny — scope manifest (ADR-0036 §11)
+#
+# Consumed by `dt-guard media-telemetry-deny` (crates/dt-guard/src/media_telemetry_deny.rs),
+# invoked by the wrapper beside this file. Typed `serde` deserialization with
+# `deny_unknown_fields`, so an unknown or misspelled key is a hard failure
+# rather than a silently-ignored line.
+#
+# SCHEMA
+#   denied_directories: a list of repo-relative directory paths, trailing
+#   slash, NO GLOBS. Every `.rs` file at or below each path is denied the
+#   telemetry macro forms enumerated in the guard module. A glob is refused
+#   deliberately: a glob that matches nothing is a silent disarm, and the two
+#   scope tokens below exist precisely to make that class impossible.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS PATH AND THE ON-DISK DIRECTORY ARE NOT DRIFT-PRONE DUPLICATION
+# ---------------------------------------------------------------------------
+# CLAUDE.md §Single source of truth says two places encoding the same value
+# will drift, and that the remedy is to derive one from the other. This file
+# and `crates/mh-service/src/media/` do look like two encodings of one thing.
+# They are not, and the reason is worth being precise about:
+#
+#   There is nothing to derive a POLICY SCOPE from. The set of directories we
+#   choose to deny is a DECISION, not a fact about the tree. No rule computes
+#   "which directories are the media hot path" from the filesystem — if one
+#   could, §11 would have specified that instead of a directory list.
+#
+# So the drift is closed not by derivation but by FAILURE:
+#
+#   media-telemetry-deny-scope-directory-missing
+#   media-telemetry-deny-scope-directory-empty
+#
+# THE SCOPE-MISSING FAILURE IS THE DRIFT GUARD. The moment the two encodings
+# disagree — someone renames the directory, moves the media path, or empties
+# it — the guard fails the build with one of those two tokens instead of
+# passing vacuously. A rename cannot silently disarm this control, which is
+# ADR-0036 §11's "alive, never applied" failure and the single thing this
+# manifest is designed to make impossible.
+#
+# The two tokens are deliberately DISTINCT rather than one overloaded token,
+# because their remediations are opposite: "missing" means restore the
+# directory or update the path below; "empty" means the path is right and the
+# guard's discovery broke, so start at the walk code, not at the media tree.
+# A third token, media-telemetry-deny-scope-no-directories-configured, covers
+# truncating this list to nothing — a one-line total disarm that the
+# per-directory tokens would not see, because they have nothing to check.
+#
+# ---------------------------------------------------------------------------
+# INCOMPLETE BY DESIGN — the §11 layout co-obligation this file cannot check
+# ---------------------------------------------------------------------------
+# ADR-0036 §11 requires one layout constraint alongside the directory scope:
+#
+#   "lifecycle, setup, and teardown are SIBLINGS of the media directory, not
+#    children, so the directory boundary and the hot-path boundary are the
+#    same boundary."
+#
+# That premise is stated in `crates/mh-service/src/media/mod.rs`'s module doc,
+# which is where it belongs. THIS GUARD CANNOT CHECK IT. Mechanically it
+# asserts only "the configured path resolves to a non-empty .rs tree"; it has
+# no way to know whether that tree is the hot path. If someone moves lifecycle
+# code INTO the media directory, the guard keeps passing and simply denies
+# telemetry in code that should have been allowed it — a false positive, which
+# is loud. If someone moves the forward path OUT, the guard keeps passing and
+# protects nothing — which is silent, and is the failure the layout constraint
+# exists to prevent. Reviewers hold that half; this file does not.
+#
+# ---------------------------------------------------------------------------
+# WHAT A PASS DOES NOT CERTIFY
+# ---------------------------------------------------------------------------
+# A green run says: "the enumerated macro forms do not appear, in code
+# position, in the configured directories." It does not say the media path is
+# free of telemetry. Two named residuals, both in the guard's module doc:
+#   - a re-export living in a sibling and reached as `crate::obs::note!(...)`
+#     is caught by neither the import deny nor the invocation deny;
+#   - the invocation matcher is a deny LIST, so an unlisted macro name passes.
+# Only inverting to an allowlist of macro names permitted inside the scope
+# would close both.
+#
+# ---------------------------------------------------------------------------
+# NO SUPPRESSION
+# ---------------------------------------------------------------------------
+# This guard honours NO `guard:ignore` annotation, no environment variable and
+# no flag, and the module deliberately does not import `crate::ignore`. §11's
+# argument is structural impossibility over a control that has to notice; an
+# in-file annotation is a one-line silent disarm sitting in the exact
+# directory the control protects, added by the same commit that adds the
+# violation. This is a decision, not an unimplemented feature.
+#
+# ---------------------------------------------------------------------------
+# OWNERSHIP
+# ---------------------------------------------------------------------------
+# The list below is POLICY CONTENT owned by `observability` (CLAUDE.md
+# §Specialists, guard-crate ownership). The schema, the header and the parsing
+# are `infrastructure` machinery. Extending the list beyond the seed requires
+# observability sign-off.
+#
+# This file is NOT a Guarded Shared Area mirror and must not be confused with
+# `cross-boundary-ownership.yaml`, which sits beside it. That file is under
+# five-way sync enforced by `validate-gsa-sync.sh`; this one has no mirror and
+# no key there. `run-guards.sh` discovers `simple/**/*.sh` only, so a `.yaml`
+# here is inert — the same reason `cross-boundary-ownership.yaml` can live at
+# this path.
+
+denied_directories:
+  - crates/mh-service/src/media/

@@ -316,7 +316,12 @@ pub(crate) const PII_TOKENS_CATEGORY_B: &[&str] = &[
     //     §Enforcement reality, which carries the trigger: if a `sender_id_hash` is
     //     ever proposed, this entry's premise is void.
     //   * `#[instrument]` span params are NOT covered — `instrument_skip_all` reads
-    //     CATEGORY_A only. The span bar stays `skip_all` discipline.
+    //     CATEGORY_A only. **Do not read `skip_all` as suppression here**: it bounds
+    //     *captured arguments* and does NOT bound an explicit `fields(...)` list,
+    //     which tracing records regardless. The explicit-field case belongs to
+    //     `rust_pii` Check 3, ON SINGLE-LINE ATTRIBUTES ONLY; a live instance, the
+    //     multi-line gap, and the open work to narrow that check to the
+    //     `fields(...)` group are in `docs/TODO.md` §Observability Debt.
     "sender_id",
     "name",
     "username",
