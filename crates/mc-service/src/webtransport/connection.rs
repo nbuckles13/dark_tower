@@ -1271,9 +1271,18 @@ struct MediaSignalingContext {
     /// this subscriber's own, this list is applied to EVERY participant on the
     /// roster when the routing input is rebuilt. That is sound only because the
     /// handler set is currently a property of the meeting rather than of a
-    /// participant: it is read from the meeting's `MhAssignmentData`, and every
-    /// participant is on every assigned handler (clients `connectAll()`), which
-    /// is the same assumption `routing_input_for` fills in one place.
+    /// participant: it is read from the meeting's `MhAssignmentData`, and **MC
+    /// has no per-participant placement input** — nothing on the roster records
+    /// which handler a given participant reached — so every participant is
+    /// described with the meeting's full handler set. That is the same premise
+    /// `routing_input_for` fills in one place.
+    ///
+    /// **The premise is about the routing INPUT, not about steering.** Since
+    /// story task 25 the client does not pick a handler: MC directs it to the one
+    /// `compute_assignment` placed its edges on (ADR-0036 §5). Do not read the
+    /// full-list fill as a surviving `connectAll()` assumption — a client's
+    /// transport bootstrap set and the handler MC directs it to SEND on are two
+    /// different things, and only the second is a routing decision.
     ///
     /// **It stops being sound the moment per-participant handler placement
     /// lands** — participants on different handlers would all be described with
@@ -2248,7 +2257,51 @@ async fn build_join_response(
             McError::MhAssignmentMissing(meeting_id.to_string())
         })?;
 
-    // Populate media_servers with WebTransport endpoints from MH assignment data
+    // Connection BOOTSTRAP data, and nothing else: the handlers this meeting is
+    // registered on, for the client to open transports to.
+    //
+    // # NON-AUTHORITATIVE. Selection is the send directive.
+    //
+    // ADR-0036 §5 is that MC directs where a client sends. That instruction is
+    // `SendTarget.media_handler_url` on the `SendDirective`, matching the active
+    // slot's `StreamAssignment.media_handler_url` — both read out of the same
+    // `MeetingAssignment` the MC→MH `RegisterMeeting` push is programmed from, so
+    // steering and placement cannot diverge. This list is not that instruction
+    // and must never be used as one.
+    //
+    // # The order is DELIBERATELY not sorted — a refusal, not an omission
+    //
+    // `edge_handler` places every edge on the lexicographically smallest shared
+    // `mh_id` (`media_routing/assignment.rs`). So ANY ordering of this list keyed
+    // on `mh_id` would correlate with the placement rule: ascending makes
+    // `.first()` accidentally correct, and descending merely relocates the same
+    // defect to `.last()`. The only order that is independent of placement is one
+    // keyed on something unrelated to it — which the Redis enumeration order
+    // already is. Leaving it alone is what keeps the two mechanisms independent
+    // and makes selecting off this list FAIL LOUDLY rather than pass for the
+    // wrong reason. That loudness is not hypothetical: it is how the defect this
+    // comment exists because of was found (three of four media connections on
+    // mh-1 while every edge sat on mh-0).
+    //
+    // # Sorting would silently disarm a live test, and this comment is its only guard
+    //
+    // `crates/mc-service/tests/media_client_signaling_integration.rs`'s
+    // `steering_follows_edge_placement_not_redis_order` seeds the handlers as
+    // `[mh-1, mh-0]` PRECISELY so that list-order selection yields mh-1 while the
+    // assignment places on mh-0. Sorting here collapses those two answers into
+    // one: the test keeps passing while no longer able to fail for the reason it
+    // exists, and nothing else in the tree notices. There is no type, guard or
+    // test that reds when someone sorts this list — this paragraph is the control.
+    //
+    // # The honest cost
+    //
+    // Two env-test sites (`crates/env-tests/tests/26_mh_quic.rs`) legitimately
+    // take `.first()` because they want "any handler this meeting is registered
+    // on", and they therefore get an arbitrary one. Both handlers answer their
+    // question identically (MC pushes `RegisterMeeting` to EVERY assigned
+    // handler), so that is tolerable — and it rotates them across pods over runs,
+    // which surfaces per-pod drift that a sort pinning every test to one handler
+    // would hide.
     let media_servers: Vec<MediaServerInfo> = mh_data
         .handlers
         .iter()
@@ -2293,10 +2346,16 @@ async fn build_join_response(
 /// meeting's handler assignment.
 ///
 /// Participant->handler membership is an **input** to the computation, and this
-/// is where it is filled. Today every participant is on every handler assigned
-/// to the meeting (clients `connectAll()`), so every participant gets the full
-/// handler list. When real per-participant placement lands, only this function
+/// is where it is filled. Every participant gets the meeting's full handler list
+/// — **because MC has no per-participant placement input**, not because a client
+/// chose to connect to all of them: `MhAssignmentData` is a property of the
+/// meeting and nothing on the roster records which handler a participant
+/// reached. When real per-participant placement lands, only this function
 /// changes — [`compute_assignment`] does not.
+///
+/// This is the routing INPUT and says nothing about steering. MC directs each
+/// client to the single handler the assignment places its edges on (ADR-0036
+/// §5); see [`RoutingParticipant::handlers`] for that contract.
 ///
 /// The joiner is included alongside the existing roster, so at N=1 the input is
 /// a single participant and the general computation yields the loopback edge.
@@ -2339,10 +2398,16 @@ fn build_routing_input(
 /// come through here.
 ///
 /// Participant->handler membership is an **input** to the computation, and this
-/// is where it is filled. Today every participant is on every handler assigned
-/// to the meeting (clients `connectAll()`), so every participant gets the full
-/// handler list. When real per-participant placement lands, only this function
+/// is where it is filled. Every participant gets the meeting's full handler list
+/// — **because MC has no per-participant placement input**, not because a client
+/// chose to connect to all of them: `MhAssignmentData` is a property of the
+/// meeting and nothing on the roster records which handler a participant
+/// reached. When real per-participant placement lands, only this function
 /// changes — [`compute_assignment`] does not, and neither does either caller.
+///
+/// This is the routing INPUT and says nothing about steering. MC directs each
+/// client to the single handler the assignment places its edges on (ADR-0036
+/// §5); see [`RoutingParticipant::handlers`] for that contract.
 ///
 /// # Errors
 ///

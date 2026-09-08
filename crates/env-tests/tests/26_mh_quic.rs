@@ -24,8 +24,9 @@
 //!    unregistered for a real meeting; (c) shortening the timeout requires
 //!    infra changes that would create a dev-vs-prod behavioral gap.
 //! 7. `test_mh_forwards_an_audio_datagram_back_to_its_sender` — R-15/R-18
-//!    loopback forward path, `#[ignore]`d pending story tasks 25 and 26 (the
-//!    reason is on the attribute). It proves COMPOSITION: real MC join programs
+//!    loopback forward path, `#[ignore]`d pending story task 26 alone — task 25
+//!    landed, so MC steering now follows the forwarding assignment and this
+//!    fixture follows the send directive (the reason is on the attribute). It proves COMPOSITION: real MC join programs
 //!    real MH, MC's `NotifyParticipantConnectedResponse` carries an ordinal MH
 //!    accepts, and a real v2 frame returns over real QUIC rewritten only in its
 //!    relay region. **The binding contract it depends on has LANDED and is not
@@ -76,8 +77,9 @@ use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeetingResponse};
 use env_tests::fixtures::media::sample_identity_public_key;
 use env_tests::fixtures::metrics::{
-    any_instance_exceeds_baseline, format_instance_map, instance_maps_equal,
-    poll_until_any_instance_above, InstanceCounters,
+    any_instance_exceeds_baseline, format_instance_map, poll_until_any_instance_above,
+    poll_until_exactly_one_instance_rose, poll_until_instance_above, poll_until_stable,
+    InstanceCounters,
 };
 use env_tests::fixtures::{AuthClient, PrometheusClient};
 use prost::Message;
@@ -286,8 +288,17 @@ async fn assert_mh_rejects(mh_url: &str, jwt: &str) {
 // ----------------------------------------------------------------------------
 
 /// The per-instance PromQL for `mc_mh_notifications_received_total` — the ONE
-/// string source shared by the reader, the stabilize loop, and the delta
-/// assert, so those three cannot disagree on the query.
+/// string source shared by the stabilize loop and the delta assert, so the two
+/// cannot disagree on the query.
+///
+/// See [`InstanceCounters`] for why the grouping label is `instance` (pod
+/// IP:port, fresh on every rollover) and the two traps that keep it
+/// load-bearing (the `pod` label lives only in the logs/Loki pipeline; a future
+/// `labelmap` in the metrics scrape config would silently break this). Reads
+/// through this query FAIL LOUDLY on a Prometheus error (naming the PromQL +
+/// error); an empty result (counter not yet observed) is a legitimate empty map
+/// — a per-pod zero distinct from a failed query (docs/TODO.md §Env-Test
+/// Resilience, defect #2).
 fn notification_promql(event_type: &str) -> String {
     format!(
         r#"sum by (instance) (mc_mh_notifications_received_total{{event_type="{event_type}"}})"#
@@ -301,41 +312,61 @@ fn notification_promql(event_type: &str) -> String {
 /// might still be in flight to Prometheus when the next test snapshots its
 /// baseline. After this returns, baseline-reads are safe.
 ///
-/// Per-instance treatment IS needed here, not only in the delta assert: the
-/// in-flight-increment race the stabilize guards against is per-pod, and
-/// comparing whole per-instance maps ([`instance_maps_equal`]) is ALSO
-/// churn-robust — if a stale old-pod series expires between the two reads the
-/// maps differ and we retry, and once the expired series is gone from both
-/// reads the maps match. (A cluster-wide scalar would self-heal the same way,
-/// but re-introduces the cross-pod `sum` this fix exists to remove; comparing
-/// maps keeps ONE idiom across the counter-delta helpers.) Fail-loud on a
-/// Prometheus query error is inherited from `instance_counter_map`.
+/// The loop is the shared [`poll_until_stable`]; the two numbers below are this
+/// caller's own decisions, argued here. **Read that helper's doc before changing
+/// either** — the settle interval in particular is a correctness precondition,
+/// not a budget, and shortening it makes the stabilize vacuous rather than fast.
 ///
-/// Budget: up to 90s. The chain that has to settle is MH's fire-and-forget
-/// `tokio::spawn(notify)` → gRPC RPC → MC counter increment → Prometheus scrape
-/// (15s SLA). Under cluster load this can exceed the 30s `MetricsScrape`
-/// category, so we use a longer custom budget here.
-async fn wait_for_notification_counter_stable(prom: &PrometheusClient, event_type: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        let v1 = mh_notification_counter(prom, event_type).await;
-        // One Prometheus scrape interval (15s SLA) — wait long enough that any
-        // outstanding scrape lands between v1 and v2.
-        tokio::time::sleep(Duration::from_secs(16)).await;
-        let v2 = mh_notification_counter(prom, event_type).await;
-        if instance_maps_equal(&v1, &v2) {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "mc_mh_notifications_received_total{{event_type=\"{event_type}\"}} \
-                 per-instance snapshot did not stabilize within 90s \
-                 (last reads: v1={}, v2={})",
-                format_instance_map(&v1),
-                format_instance_map(&v2),
-            );
-        }
-    }
+/// # Settle 16s — STATED HERE FOR BOTH event-visibility waits
+///
+/// One Prometheus scrape interval (15s SLA) plus margin, so any outstanding
+/// scrape lands between the two reads. This is **not a local decision**: it is
+/// the same decision `wait_for_policy_push_counter_stable` makes, which
+/// references this paragraph rather than restating it. Editing it changes both.
+///
+/// **Shared drift obligation — ONE trigger, three reasons.** All THREE 16s values
+/// in this binary derive from the same 15s scrape SLA, so a change to that SLA
+/// invalidates all three and they must move together. (It is also one of the
+/// three triggers the extraction deferral recorded — see
+/// `wait_for_policy_push_counter_stable`.) The *derivations* stay separate,
+/// because why each site waits genuinely differs and collapsing them would be a
+/// false SSoT: these two wait for an in-flight increment to become visible; the
+/// media-forward path's baseline-freshness gate waits for baseline completeness.
+///
+/// **Re-check the freshness gate FIRST, not last.** Its failure mode under a
+/// stale value is the worst of the three: too small a settle there puts both
+/// reads inside one scrape, `instance_maps_equal` compares them equal, and
+/// `poll_until_stable` returns having observed nothing — silently restoring the
+/// false-positive instance identification the gate exists to prevent. Here, too
+/// small a settle merely weakens a precondition and shows up as flake.
+///
+/// Budget 90s: the chain that has to settle is MH's fire-and-forget
+/// `tokio::spawn(notify)` -> gRPC RPC -> MC counter increment -> Prometheus
+/// scrape (15s SLA). Under cluster load this can exceed the 30s `MetricsScrape`
+/// category, so a longer custom budget is used here.
+/// Returns the STABILISED snapshot, which callers use as their baseline. Reading
+/// the counter again afterwards would baseline on a *different*, newer read than
+/// the one just proved stable — a small window, but the whole point of the wait
+/// is that the baseline is the settled value.
+async fn wait_for_notification_counter_stable(
+    prom: &PrometheusClient,
+    event_type: &str,
+) -> InstanceCounters {
+    poll_until_stable(
+        prom,
+        &notification_promql(event_type),
+        Duration::from_secs(16),
+        Duration::from_secs(90),
+        |v1, v2| {
+            format!(
+                "mc_mh_notifications_received_total{{event_type=\"{event_type}\"}} per-instance \
+                 snapshot did not stabilize within 90s (last reads: v1={}, v2={})",
+                format_instance_map(v1),
+                format_instance_map(v2),
+            )
+        },
+    )
+    .await
 }
 
 /// Poll until SOME currently-present instance's
@@ -367,21 +398,6 @@ async fn assert_notification_counter_increases_past(
         },
     )
     .await;
-}
-
-/// Read a PER-INSTANCE snapshot of `mc_mh_notifications_received_total` for a
-/// specific `event_type` label, via `sum by (instance)(...)`.
-///
-/// See [`InstanceCounters`] for why the grouping label is `instance` (pod
-/// IP:port, fresh on every rollover) and the two traps that keep it
-/// load-bearing (the `pod` label lives only in the logs/Loki pipeline; a future
-/// `labelmap` in the metrics scrape config would silently break this). FAILS
-/// LOUDLY on a Prometheus query error (naming the PromQL + error); an empty
-/// result (counter not yet observed) is a legitimate empty map — a per-pod zero
-/// distinct from a failed query (docs/TODO.md §Env-Test Resilience, defect #2).
-async fn mh_notification_counter(prom: &PrometheusClient, event_type: &str) -> InstanceCounters {
-    prom.instance_counter_map(&notification_promql(event_type))
-        .await
 }
 
 // ============================================================================
@@ -458,61 +474,126 @@ async fn mc_join(
     meeting_token: &str,
     participant_name: &str,
 ) -> proto_gen::dark_tower::signaling::v1::JoinResponse {
-    use bytes::{BufMut, BytesMut as MsgBuf};
-    use prost::Message;
+    mc_join_session(mc_url, meeting_id, meeting_token, participant_name)
+        .await
+        .join_response
+}
+
+/// A live post-join MC session: the WebTransport connection and its bidi stream
+/// stay OPEN, so post-join signalling (ADR-0036 §6 `ReceiveCapability` in,
+/// §5 `SendDirective` + `StreamAssignments` out) can be driven over it.
+///
+/// [`mc_join`] is the thin wrapper for callers that only want the
+/// `JoinResponse`; dropping this struct closes the session, which is what that
+/// wrapper does.
+struct McSession {
+    _conn: wtransport::Connection,
+    send: wtransport::SendStream,
+    recv: wtransport::RecvStream,
+    join_response: proto_gen::dark_tower::signaling::v1::JoinResponse,
+}
+
+impl McSession {
+    /// Write a length-prefixed `ClientMessage`.
+    async fn write(&mut self, message: &proto_gen::dark_tower::signaling::v1::ClientMessage) {
+        let encoded = message.encode_to_vec();
+        let mut frame = BytesMut::with_capacity(4 + encoded.len());
+        frame.put_u32(u32::try_from(encoded.len()).expect("message fits a u32 length prefix"));
+        frame.put_slice(&encoded);
+        self.send
+            .write_all(&frame)
+            .await
+            .expect("write ClientMessage to MC");
+    }
+
+    /// Read the next length-prefixed `ServerMessage`.
+    async fn read(&mut self) -> proto_gen::dark_tower::signaling::v1::ServerMessage {
+        read_framed_server_message(&mut self.recv).await
+    }
+}
+
+/// Read one length-prefixed `ServerMessage` off an MC bidi stream.
+///
+/// Local to this binary rather than in `env_tests::fixtures`: `proto-gen`,
+/// `wtransport`, `prost` and `bytes` are `[dev-dependencies]` of `env-tests`, so
+/// the lib target cannot name `ServerMessage` at all. Promoting them to fix that
+/// would make every consumer of the lib link `wtransport` — a real cost for a
+/// structural-duplication concern. The extraction is filed under
+/// `docs/TODO.md` §Cross-Service Duplication, owned by @test, along with that
+/// reachability constraint so nobody "fixes" it by promoting the dependencies.
+async fn read_framed_server_message(
+    recv: &mut wtransport::RecvStream,
+) -> proto_gen::dark_tower::signaling::v1::ServerMessage {
+    use proto_gen::dark_tower::signaling::v1::ServerMessage;
+
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut len_buf))
+        .await
+        .expect("MC ServerMessage timed out")
+        .expect("read MC ServerMessage length");
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    assert!(
+        msg_len > 0 && msg_len <= 65536,
+        "MC framed ServerMessage length out of range: {msg_len}"
+    );
+    let mut buf = vec![0u8; msg_len];
+    recv.read_exact(&mut buf)
+        .await
+        .expect("read MC ServerMessage body");
+    ServerMessage::decode(buf.as_slice()).expect("decode ServerMessage")
+}
+
+/// Send a `JoinRequest` to MC over a fresh WebTransport connection, read the
+/// framed `JoinResponse`, and **keep the session open**. Driving a real MC join
+/// is required to make MC fire `RegisterMeeting` to every assigned MH (R-12),
+/// which is the precondition for MH-side tests that expect a registered meeting.
+async fn mc_join_session(
+    mc_url: &str,
+    meeting_id: &str,
+    meeting_token: &str,
+    participant_name: &str,
+) -> McSession {
     use proto_gen::dark_tower::signaling::v1::{
-        client_message, server_message, ClientMessage, JoinRequest, ServerMessage,
+        client_message, server_message, ClientMessage, JoinRequest,
     };
 
     let conn = connect_wt(mc_url).await;
-    let (mut send, mut recv) = conn
+    let (send, recv) = conn
         .open_bi()
         .await
         .expect("open bi stream to MC")
         .await
         .expect("MC bi stream ready");
 
-    let join_msg = ClientMessage {
-        message: Some(client_message::Message::JoinRequest(JoinRequest {
-            meeting_id: meeting_id.to_string(),
-            join_token: meeting_token.to_string(),
-            participant_name: participant_name.to_string(),
-            capabilities: None,
-            correlation_id: String::new(),
-            binding_token: String::new(),
-            // ADR-0036 §4: raw Ed25519 identity signing public key. A valid
-            // 32-byte fixture — this test exercises the join path, not
-            // attribution, and MC performs no attestation check this story.
-            identity_public_key: sample_identity_public_key(),
-        })),
-        trace_parent: String::new(),
-        trace_state: String::new(),
+    let mut session = McSession {
+        _conn: conn,
+        send,
+        recv,
+        // Placeholder replaced immediately below; never observed.
+        join_response: proto_gen::dark_tower::signaling::v1::JoinResponse::default(),
     };
-    let encoded = join_msg.encode_to_vec();
-    let mut frame = MsgBuf::with_capacity(4 + encoded.len());
-    frame.put_u32(encoded.len() as u32);
-    frame.put_slice(&encoded);
-    send.write_all(&frame)
-        .await
-        .expect("send JoinRequest to MC");
 
-    let mut len_buf = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut len_buf))
-        .await
-        .expect("MC JoinResponse timed out")
-        .expect("read MC JoinResponse length");
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-    assert!(
-        msg_len > 0 && msg_len <= 65536,
-        "MC framed JoinResponse length out of range: {msg_len}"
-    );
-    let mut buf = vec![0u8; msg_len];
-    recv.read_exact(&mut buf)
-        .await
-        .expect("read MC JoinResponse body");
-    let server_msg = ServerMessage::decode(buf.as_slice()).expect("decode ServerMessage");
+    session
+        .write(&ClientMessage {
+            message: Some(client_message::Message::JoinRequest(JoinRequest {
+                meeting_id: meeting_id.to_string(),
+                join_token: meeting_token.to_string(),
+                participant_name: participant_name.to_string(),
+                capabilities: None,
+                correlation_id: String::new(),
+                binding_token: String::new(),
+                // ADR-0036 §4: raw Ed25519 identity signing public key. A valid
+                // 32-byte fixture — this test exercises the join path, not
+                // attribution, and MC performs no attestation check this story.
+                identity_public_key: sample_identity_public_key(),
+            })),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        })
+        .await;
 
-    match server_msg.message {
+    let server_msg = session.read().await;
+    session.join_response = match server_msg.message {
         Some(server_message::Message::JoinResponse(j)) => j,
         Some(server_message::Message::Error(e)) => panic!(
             "MC returned error instead of JoinResponse: code={} message={}",
@@ -523,7 +604,8 @@ async fn mc_join(
         // unexpected ParticipantJoined notifications, etc.) into CI logs.
         Some(_) => panic!("Expected JoinResponse from MC, got a different ServerMessage variant"),
         None => panic!("Expected JoinResponse from MC, got an empty ServerMessage"),
-    }
+    };
+    session
 }
 
 /// Drive the full GC→MC join so MC fires `RegisterMeeting` to all assigned MHs,
@@ -550,6 +632,20 @@ async fn join_with_registered_mh(
     )
     .await;
 
+    // ANY assigned handler, taken in ARBITRARY Redis enumeration order — NOT the
+    // steered one. `media_servers` is connection bootstrap data and is
+    // deliberately unsorted, so its head carries no relationship to placement.
+    //
+    // Legitimate here: this caller needs "some handler on which this meeting is
+    // registered", and MC pushes `RegisterMeeting` to EVERY assigned handler, so
+    // both answer the question identically. The two answers may nonetheless
+    // *appear* to agree on any given run — the steered handler is always the
+    // lexicographically smallest assigned `mh_id`, so an arbitrary pick
+    // coincides with it some of the time, by accident and never because they are
+    // the same question.
+    //
+    // A caller that needs the handler MC DIRECTED a client to send on must read
+    // the send directive instead — see `follow_mc_steering`.
     let mh_url = join_response
         .media_servers
         .first()
@@ -574,6 +670,17 @@ async fn join_with_registered_mh(
 /// On-call: if this fails, suspect AC JWKS misconfig on MH (`AC_JWKS_URL`),
 /// MH↔AC network policy, or MC→MH `RegisterMeeting` failure (the meeting may
 /// be in MH's provisional pool and time out before this test finishes).
+// This `#[serial]` key is LOAD-BEARING, not tidiness. This test opens a
+// WebTransport connection to MH, which increments
+// `mh_webtransport_connections_total` — the counter
+// `test_mh_forwards_an_audio_datagram_back_to_its_sender` uses to identify the
+// instance MC steered its client to. Running concurrently would put this
+// connection's increment in that test's risen set, and it would either trip the
+// ambiguity panic or (with our increment scraped and theirs not yet) name the
+// WRONG instance, so the policy-apply gate would then fail about a handler
+// nothing was ever steered to. Removing this attribute silently unsounds that
+// probe. See that test's STEP 2 for the full argument.
+#[serial_test::serial(mh_notifications)]
 #[tokio::test]
 async fn test_mh_accepts_valid_meeting_jwt() {
     let cluster = cluster().await;
@@ -614,6 +721,17 @@ async fn test_mh_accepts_valid_meeting_jwt() {
 /// On-call: if this passes when MH accepts the token (i.e., this test FAILS
 /// because we never observed a peer-close), suspect that MH's JWT validator
 /// is not enforcing signature verification — security-critical.
+// This `#[serial]` key is LOAD-BEARING, not tidiness. This test opens a
+// WebTransport connection to MH, which increments
+// `mh_webtransport_connections_total` — the counter
+// `test_mh_forwards_an_audio_datagram_back_to_its_sender` uses to identify the
+// instance MC steered its client to. Running concurrently would put this
+// connection's increment in that test's risen set, and it would either trip the
+// ambiguity panic or (with our increment scraped and theirs not yet) name the
+// WRONG instance, so the policy-apply gate would then fail about a handler
+// nothing was ever steered to. Removing this attribute silently unsounds that
+// probe. See that test's STEP 2 for the full argument.
+#[serial_test::serial(mh_notifications)]
 #[tokio::test]
 async fn test_mh_rejects_forged_jwt() {
     let cluster = cluster().await;
@@ -646,6 +764,17 @@ async fn test_mh_rejects_forged_jwt() {
 ///
 /// On-call: if this fails (i.e., MH does NOT close the connection), MH may
 /// be allocating per-byte memory before enforcing the size cap — DoS risk.
+// This `#[serial]` key is LOAD-BEARING, not tidiness. This test opens a
+// WebTransport connection to MH, which increments
+// `mh_webtransport_connections_total` — the counter
+// `test_mh_forwards_an_audio_datagram_back_to_its_sender` uses to identify the
+// instance MC steered its client to. Running concurrently would put this
+// connection's increment in that test's risen set, and it would either trip the
+// ambiguity panic or (with our increment scraped and theirs not yet) name the
+// WRONG instance, so the policy-apply gate would then fail about a handler
+// nothing was ever steered to. Removing this attribute silently unsounds that
+// probe. See that test's STEP 2 for the full argument.
+#[serial_test::serial(mh_notifications)]
 #[tokio::test]
 async fn test_mh_rejects_oversized_jwt() {
     let cluster = cluster().await;
@@ -698,8 +827,7 @@ async fn test_mh_connect_increments_mc_notification_metric_connected() {
     // group to finish scraping before we snapshot baseline. Baseline is a
     // per-instance map (`sum by (instance)`), robust to a mid-assertion pod
     // rollover — see the helper docs.
-    wait_for_notification_counter_stable(&prom, "connected").await;
-    let baseline = mh_notification_counter(&prom, "connected").await;
+    let baseline = wait_for_notification_counter_stable(&prom, "connected").await;
 
     let (jwt, mh_url) = join_with_registered_mh(
         cluster,
@@ -743,8 +871,7 @@ async fn test_mh_disconnect_increments_mc_notification_metric_disconnected() {
     // signal that is still in flight to Prometheus. If we snapshot baseline
     // before that signal lands, the eventual loop below would falsely succeed
     // on the leftover bump. Wait for the counter to settle before snapshotting.
-    wait_for_notification_counter_stable(&prom, "disconnected").await;
-    let baseline = mh_notification_counter(&prom, "disconnected").await;
+    let baseline = wait_for_notification_counter_stable(&prom, "disconnected").await;
 
     let (jwt, mh_url) = join_with_registered_mh(
         cluster,
@@ -780,7 +907,7 @@ fn participant_mh_status_promql(state: &str) -> String {
 
 /// Read a PER-INSTANCE snapshot of `mc_participant_mh_status_total` for a
 /// specific `state` label, via `sum by (instance)(...)`. Mirrors
-/// [`mh_notification_counter`]; see [`InstanceCounters`] for the `instance`
+/// [`notification_promql`]; see [`InstanceCounters`] for the `instance`
 /// grouping rationale + the two traps. FAILS LOUDLY on a Prometheus query
 /// error; an empty result (state not yet observed) is a legitimate empty map
 /// (per-pod zero), distinct from a failed query.
@@ -922,6 +1049,20 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
         Some(server_message::Message::JoinResponse(j)) => j,
         _ => panic!("expected JoinResponse from MC"),
     };
+    // ANY assigned handler, taken in ARBITRARY Redis enumeration order — NOT the
+    // steered one. `media_servers` is connection bootstrap data and is
+    // deliberately unsorted, so its head carries no relationship to placement.
+    //
+    // Legitimate here: this caller needs "some handler on which this meeting is
+    // registered", and MC pushes `RegisterMeeting` to EVERY assigned handler, so
+    // both answer the question identically. The two answers may nonetheless
+    // *appear* to agree on any given run — the steered handler is always the
+    // lexicographically smallest assigned `mh_id`, so an arbitrary pick
+    // coincides with it some of the time, by accident and never because they are
+    // the same question.
+    //
+    // A caller that needs the handler MC DIRECTED a client to send on must read
+    // the send directive instead — see `follow_mc_steering`.
     let mh_url = join_response
         .media_servers
         .first()
@@ -1006,7 +1147,7 @@ fn policy_push_promql(outcome_selector: &str) -> String {
 
 /// Read a PER-INSTANCE snapshot of `mc_media_policy_pushes_total` for an
 /// outcome selector. Same `instance`-grouping rationale and same fail-loud-on-
-/// query-error behaviour as [`mh_notification_counter`].
+/// query-error behaviour as [`notification_promql`]-based reads.
 async fn policy_push_counter(prom: &PrometheusClient, outcome_selector: &str) -> InstanceCounters {
     prom.instance_counter_map(&policy_push_promql(outcome_selector))
         .await
@@ -1022,57 +1163,51 @@ async fn policy_push_counter(prom: &PrometheusClient, outcome_selector: &str) ->
 /// pass on the predecessor's increment. The `#[serial]` group makes the
 /// predecessor *finished*, not *scraped*.
 ///
-/// # Structural clone of `wait_for_notification_counter_stable`, extraction deferred
+/// # The deferred extraction happened, because its own trigger fired
 ///
-/// Same loop, same 90s deadline, same 16s inter-read wait, same
-/// `instance_maps_equal` exit, same `format_instance_map` panic shape — only the
-/// counter read and the metric name differ. The natural home is
-/// `env_tests::fixtures::metrics`, beside `poll_until_any_instance_above`, which
-/// was extracted for exactly this reason.
+/// This was a documented structural clone of `wait_for_notification_counter_stable`,
+/// deliberately not extracted on the ground that a helper shaped around one call
+/// site would create a shared home its sibling did not use — which reads as done
+/// and stops the next reader looking. The recorded trigger was "the next touch of
+/// either helper, **a third stability-wait**, or a change to the Prometheus
+/// scrape SLA". Story task 25 added the third stability-wait (the media-forward
+/// path's baseline-freshness precondition), so the loop is now
+/// [`poll_until_stable`] in `env_tests::fixtures::metrics` and **all three**
+/// callers use it — which is exactly the condition the deferral was waiting on.
 ///
-/// **Deliberately not extracted, and the reason is the SHAPE, not the process.**
-/// The extraction must generalise **both** stability-waits — this one and the
-/// pre-existing `wait_for_notification_counter_stable` that tests 4 and 5 use —
-/// and a second consumer alone does not determine the right interface. A helper
-/// shaped around this call site only would be **worse than this documented
-/// clone**: it would create a shared home that its two siblings do not both use,
-/// which *reads* as done and stops the next reader looking. @test owns that
-/// call and declined the extraction on exactly this ground.
+/// # The 16s/90s here are the SAME decision as the notification path's, not a
+/// coincidence
 ///
-/// (A secondary, weaker reason also held at the time: @test scoped
-/// `crates/env-tests/src/fixtures/**` to zero diff for this task and the plan's
-/// conditional row was removed on that ruling. That one would have been
-/// satisfied by @test simply saying yes; the shape argument would not, and is
-/// the one to re-read before extracting.)
+/// This wait and [`wait_for_notification_counter_stable`] are one decision at
+/// two sites — both wait for an in-flight increment to become visible before a
+/// baseline read — so the rationale is stated ONCE, there, and this site
+/// references it. They carry a **shared** drift obligation: a change to the
+/// Prometheus scrape SLA invalidates both 16s values together. Do not restate
+/// the derivation here in different words; two separate wordings would
+/// manufacture the appearance of two independent decisions and license exactly
+/// the divergence the pre-extraction clone comment existed to prevent.
 ///
-/// Trigger: the next touch of either helper, a third stability-wait, or a change
-/// to the Prometheus scrape SLA — the last being the one that actually bites.
-/// Tracked in `docs/TODO.md` §Cross-Service Duplication, owned by @test. The
-/// load-bearing 16s rationale is carried onto the copy below so the two sites
-/// cannot diverge silently in the meantime.
-async fn wait_for_policy_push_counter_stable(prom: &PrometheusClient) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        let v1 = policy_push_counter(prom, r#"outcome="match""#).await;
-        // One Prometheus scrape interval (15s SLA) — wait long enough that any
-        // outstanding scrape lands between v1 and v2. Same reasoning, same
-        // literal, as `wait_for_notification_counter_stable` above; if the
-        // scrape SLA moves, BOTH must move. The structural duplication is
-        // recorded for extraction — see this function's doc comment.
-        tokio::time::sleep(Duration::from_secs(16)).await;
-        let v2 = policy_push_counter(prom, r#"outcome="match""#).await;
-        if instance_maps_equal(&v1, &v2) {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "mc_media_policy_pushes_total{{outcome=\"match\"}} per-instance snapshot did not \
-                 stabilize within 90s (last reads: v1={}, v2={})",
-                format_instance_map(&v1),
-                format_instance_map(&v2),
-            );
-        }
-    }
+/// Still no shared constant: `poll_until_stable` takes settle and budget as
+/// required parameters with no default, so the values stay visible at the sites
+/// that own them.
+/// Returns the STABILISED `outcome="match"` snapshot for the caller to baseline
+/// on, for the same reason as [`wait_for_notification_counter_stable`].
+async fn wait_for_policy_push_counter_stable(prom: &PrometheusClient) -> InstanceCounters {
+    poll_until_stable(
+        prom,
+        &policy_push_promql(r#"outcome="match""#),
+        Duration::from_secs(16),
+        Duration::from_secs(90),
+        |v1, v2| {
+            format!(
+                "mc_media_policy_pushes_total{{outcome=\"match\"}} per-instance snapshot did \
+                 not stabilize within 90s (last reads: v1={}, v2={})",
+                format_instance_map(v1),
+                format_instance_map(v2),
+            )
+        },
+    )
+    .await
 }
 
 /// Test: a real join against the Kind cluster makes MC compute the meeting's
@@ -1139,8 +1274,7 @@ async fn test_mc_programs_live_handler_with_confirmed_forwarding_policy() {
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) = register_test_user(&auth_client, "MC Policy Push User").await;
 
-    wait_for_policy_push_counter_stable(&prom).await;
-    let match_baseline = policy_push_counter(&prom, r#"outcome="match""#).await;
+    let match_baseline = wait_for_policy_push_counter_stable(&prom).await;
     let non_match_selector = r#"outcome!="match""#;
     let non_match_baseline = policy_push_counter(&prom, non_match_selector).await;
 
@@ -1275,10 +1409,135 @@ fn policy_apply_promql(outcome: &str) -> String {
     format!(r#"sum by (instance) (mh_media_policy_applies_total{{outcome="{outcome}"}})"#)
 }
 
-/// Per-instance snapshot of `mh_media_policy_applies_total` for an outcome.
-async fn policy_apply_counter(prom: &PrometheusClient, outcome: &str) -> InstanceCounters {
-    prom.instance_counter_map(&policy_apply_promql(outcome))
-        .await
+/// Follow MC's steering: declare a receive capability and read back the handler
+/// MC DIRECTS this client to send to (ADR-0036 §5).
+///
+/// # Why a declaration is needed at all
+///
+/// MC emits the send directive from `compose_and_emit`, which runs in response
+/// to a `ReceiveCapability` — **not** at join. A client that joins and never
+/// declares is never told to send, and the connection stays healthy in every
+/// other respect (`docs/TODO.md` §Media Path Obligations records this as the
+/// coupling it is). So the fixture declares one audio slot, exactly as the real
+/// SDK does before publishing.
+///
+/// # The expected value is MC's OWN OUTPUT, never recomputed here
+///
+/// There is deliberately no copy of `edge_handler`'s `shared.sort();
+/// shared.first()` in this file, and no fallback to `media_servers.first()`. A
+/// fixture that re-implements the placement rule asserts its own copy of the
+/// rule rather than what MC actually sent, and stays green through exactly the
+/// divergence it exists to catch.
+///
+/// Returns the directed handler url. Every degenerate shape panics with its own
+/// message rather than degrading:
+/// - **no directive / no stream** — MC declined to direct this client;
+/// - **zero targets** — a specified §5 success ("send nothing"), but not a state
+///   this test can proceed from;
+/// - **more than one target** — §9 multi-handler send landed, and this fixture
+///   must be revisited rather than silently `.first()`-ed.
+async fn follow_mc_steering(session: &mut McSession) -> String {
+    use proto_gen::dark_tower::signaling::v1::{
+        client_message, server_message, ClientMessage, MediaKind, ReceiveCapability, ReceiveSlot,
+        SlotState,
+    };
+
+    session
+        .write(&ClientMessage {
+            message: Some(client_message::Message::ReceiveCapability(
+                ReceiveCapability {
+                    slots: vec![ReceiveSlot {
+                        slot_id: 0,
+                        media_kind: MediaKind::Audio as i32,
+                        pinned_sender_id: None,
+                    }],
+                },
+            )),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        })
+        .await;
+
+    // MC may interleave roster broadcasts, so read until both media messages
+    // have arrived rather than assuming the next two frames are ours.
+    let mut directive = None;
+    let mut assignments = None;
+    for _ in 0..8 {
+        if directive.is_some() && assignments.is_some() {
+            break;
+        }
+        match session.read().await.message {
+            Some(server_message::Message::SendDirective(d)) => directive = Some(d),
+            Some(server_message::Message::StreamAssignments(a)) => assignments = Some(a),
+            Some(server_message::Message::Error(e)) => panic!(
+                "MC rejected the receive capability: code={} message={}",
+                e.code, e.message
+            ),
+            // Dropped silently, and deliberately without logging even the
+            // variant name: roster broadcasts legitimately interleave here, and
+            // a `ParticipantJoined` payload carries a display name. Nothing to
+            // report means nothing to leak.
+            _ => {}
+        }
+    }
+
+    let directive = directive.expect(
+        "MC must answer a ReceiveCapability with a SendDirective (ADR-0036 §5); its absence \
+         means this client was never told to send, which is silent on the client side",
+    );
+    let assignments = assignments
+        .expect("MC must answer a ReceiveCapability with StreamAssignments (ADR-0036 §6)");
+
+    assert_eq!(
+        directive.streams.len(),
+        1,
+        "expected exactly one publisher stream (main audio) in the send directive"
+    );
+    let targets = &directive.streams[0].targets;
+    assert_eq!(
+        targets.len(),
+        1,
+        "one client, one directed handler is story-1 scope. Zero targets is a specified §5 \
+         success (\"send nothing\") that this test cannot proceed from; more than one means \
+         ADR-0036 §9 \
+         multi-handler send landed and this fixture must be revisited, NOT silently .first()-ed"
+    );
+    let steered = targets[0].media_handler_url.clone();
+    assert!(
+        !steered.is_empty(),
+        "MC must never emit an empty send-target url; it fails closed on an unresolved handler"
+    );
+
+    // Cross-check MC's two client-facing sides against each other on the LIVE
+    // cluster. Both are read out of one MeetingAssignment, so a disagreement
+    // here means they grew separate answers to "which handler".
+    let active: Vec<&str> = assignments
+        .assignments
+        .iter()
+        .filter(|a| a.slot_state == SlotState::Active as i32)
+        .map(|a| a.media_handler_url.as_str())
+        .collect();
+    assert_eq!(
+        active,
+        vec![steered.as_str()],
+        "the send directive and the active stream assignment must name the SAME handler; they are \
+         derived from one forwarding assignment and cannot legitimately disagree"
+    );
+
+    steered
+}
+
+/// `sum by (instance)` over MH's WebTransport connection counter, with **no
+/// `status` selector on purpose**.
+///
+/// The instance that ACCEPTED a connection increments this regardless of what
+/// happens downstream (`crates/mh-service/src/webtransport/server.rs` records
+/// `accepted` before JWT validation and before the media-session decision), so
+/// the identity probe stays valid even when a sender binding is declined. That
+/// keeps "I could not identify the steered instance" separable from "the client
+/// was refused" — two failures with different owners.
+fn mh_connection_promql() -> String {
+    "sum by (instance) (mh_webtransport_connections_total)".to_string()
 }
 
 /// R-15: a client's uplink audio datagram comes back to it, rewritten only in
@@ -1315,59 +1574,74 @@ async fn policy_apply_counter(prom: &PrometheusClient, outcome: &str) -> Instanc
 /// # Why it is still `#[ignore]`d, and what that does NOT mean
 ///
 /// The `#[ignore]` this test carried is **no longer waiting on the contract
-/// field**: task 24 landed `internal.proto`
-/// `NotifyParticipantConnectedResponse.sender_id`, MC's send side and MH's
-/// receive side, and the live cluster shows the binding working end to end
-/// (`resolved` x4 → `started` x4, with the fail-closed arm counted
-/// `participant_unknown` x1 → `declined_no_sender_binding` x1). Two later,
-/// separately-owned defects keep it red, both diagnosed at task 24's escalation
-/// (`docs/devloop-outputs/2026-09-05-sender-id-binding-contract/main.md`
-/// §Resume third session, §Gate 2 Attempt 3):
+/// field, and no longer waiting on MC steering either**:
 ///
-/// - **Story task 25 (meeting-controller)** — steering and placement use
-///   different orderings. `edge_handler` puts every edge on the
-///   lexicographically smallest shared handler (`shared.sort();
-///   shared.first()`, `crates/mc-service/src/media_routing/assignment.rs:269-280`),
-///   while `media_servers` is built in unsorted Redis order
-///   (`crates/mc-service/src/webtransport/connection.rs:2251-2258`) and this
-///   test takes `.first()`. On the cluster three of four media connections
-///   landed on mh-1 while every edge sat on mh-0. The ordering gate below is
-///   instance-agnostic (`poll_until_any_instance_above`), so mh-0
-///   applying a policy satisfies it for a client connected to mh-1 — which is
-///   why the mismatch presents as a silent 15s timeout rather than a race.
+/// - **Task 24 landed** `internal.proto`
+///   `NotifyParticipantConnectedResponse.sender_id`, MC's send side and MH's
+///   receive side, and the live cluster shows the binding working end to end
+///   (`resolved` x4 -> `started` x4, with the fail-closed arm counted
+///   `participant_unknown` x1 -> `declined_no_sender_binding` x1).
+/// - **Story task 25 (meeting-controller) LANDED.** MC's forwarding assignment
+///   is now the single source of truth for BOTH client-facing sides, and this
+///   fixture follows the directive instead of `media_servers.first()`:
+///   [`follow_mc_steering`] declares a receive capability, reads the
+///   `SendDirective`, and cross-checks that the active `StreamAssignment` names
+///   the same handler. `JoinResponse.media_servers` remains connection bootstrap
+///   data and is explicitly non-authoritative — it is deliberately NOT sorted, so
+///   that selecting off its head fails loudly rather than passing for the wrong
+///   reason (see the refusal comment at MC's `media_servers` builder,
+///   `crates/mc-service/src/webtransport/connection.rs`). The instance-agnostic
+///   ordering gate is gone too: the gate below now keys on the SAME MH instance
+///   this client was steered to, discovered empirically from its own connection.
+///
+/// **One defect keeps this red**, and it is not this file's:
+///
 /// - **Story task 26 (media-handler)** — the datagram receive path. With the
 ///   session started and a policy installed, `mh_media_frames_forwarded_total`
 ///   is 0 **and every** `mh_media_frames_dropped_total{reason}` series is 0 on
 ///   both instances, so datagrams are not reaching the routing lookup at all.
 ///
 /// **Deleting this `#[ignore]` and this test passing is task 26's stated
-/// definition of done**; task 25's prompt says in terms to leave it `#[ignore]`d.
-/// The durable record is `docs/TODO.md`'s R-15 entry, which stays open until all
-/// four parts of its closure condition hold. Note also that the withdrawn
-/// root cause — "MC computes the assignment before the participant's media
-/// connection exists, so `edge_count: 0`" — is FALSE: `build_routing_input`
-/// chains the joiner on (`connection.rs:2321-2325`), N=1 yields a reflexive
-/// self-edge, and `edge_count: 0` on mh-1 is correct by design.
+/// definition of done.** The durable record is `docs/TODO.md`'s R-15 entry, which
+/// stays open until all four parts of its closure condition hold. Note also that
+/// the withdrawn root cause — "MC computes the assignment before the
+/// participant's media connection exists, so `edge_count: 0`" — is FALSE:
+/// `build_routing_input` chains the joiner on, N=1 yields a reflexive self-edge,
+/// and `edge_count: 0` on the non-placed handler is correct by design.
 ///
-/// # Ordering is gated on a metric delta, never a sleep
+/// # Ordering is gated on a metric delta, never a sleep — and on the RIGHT pod
 ///
 /// A datagram racing MC's `RegisterMeeting` is dropped as `no_policy` and the
 /// test flakes. The gate is a `mh_media_policy_applies_total{outcome="applied"}`
 /// delta: MH increments it only from the live snapshot after the apply, so the
 /// delta means the forward path reflects the generation MC sent.
+///
+/// The gate keys that delta on **the instance this client was steered to**. The
+/// previous form used `poll_until_any_instance_above`, which is satisfied by
+/// mh-0 applying a policy for a client connected to mh-1 — the gate FIRED
+/// correctly and never APPLIED, which is why the mismatch presented as a silent
+/// 15s timeout rather than a race, and why it took three sessions to find.
+///
+/// There is no shared key between the handler url (an MH NodePort advertise
+/// address) and the Prometheus `instance` label (pod IP:port), and a
+/// port-to-ordinal table would re-encode `infra/services/mh-service/mh-*-configmap.yaml`
+/// and fail OPEN. So the instance is **observed, not computed**: the test
+/// connects, then asks which instance's connection counter rose. See the three
+/// gate steps in the body for what each one proves and how it fails.
 #[tokio::test]
-#[ignore = "blocked on story tasks 25 + 26, NOT on the binding contract. Task 24 landed \
-            NotifyParticipantConnectedResponse.sender_id and the live cluster binds on it and \
-            starts the media session (resolved x4, started x4). Task 25 (meeting-controller): the \
-            client is steered to media_servers.first() in unsorted Redis order while edge_handler \
-            places every edge on the lexicographically smallest handler (mc-service \
-            media_routing/assignment.rs vs webtransport/connection.rs), and the ordering gate \
-            below is instance-agnostic, so the mismatch presents as a silent 15s timeout. Task 26 \
-            (media-handler): the MH datagram receive-path gap - mh_media_frames_forwarded_total is \
-            0 AND every mh_media_frames_dropped_total{reason} series is 0 on both instances, so \
-            datagrams never reach the routing lookup. Deleting this attribute and this test \
-            passing is task 26's definition of done; the durable record is docs/TODO.md's R-15 \
-            entry, which stays open. See this test's own doc comment for the file:line anchors"]
+#[ignore = "blocked on story task 26 ONLY, and neither on the binding contract nor on MC steering. \
+            Task 24 landed NotifyParticipantConnectedResponse.sender_id and the live cluster binds \
+            on it and starts the media session (resolved x4, started x4). Task 25 LANDED: MC's \
+            forwarding assignment is now the single source of truth for both the send directive's \
+            target and the stream assignment's handler address, this fixture follows the directive \
+            instead of media_servers.first(), and the ordering gate below keys on the SAME MH \
+            instance the client was steered to (discovered from its own connection, not from any \
+            topology table). Task 26 (media-handler) is the remaining defect: the MH datagram \
+            receive-path gap - mh_media_frames_forwarded_total is 0 AND every \
+            mh_media_frames_dropped_total{reason} series is 0 on both instances, so datagrams \
+            never reach the routing lookup. Deleting this attribute and this test passing is task \
+            26's definition of done; the durable record is docs/TODO.md's R-15 entry, which stays \
+            open. See this test's own doc comment for the anchors"]
 #[serial_test::serial(mh_notifications)]
 async fn test_mh_forwards_an_audio_datagram_back_to_its_sender() {
     let cluster = cluster().await;
@@ -1375,7 +1649,103 @@ async fn test_mh_forwards_an_audio_datagram_back_to_its_sender() {
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) = register_test_user(&auth_client, "MH Forward Path User").await;
 
-    let applied_baseline = policy_apply_counter(&prom, "applied").await;
+    // BOTH baselines are stabilised, and stabilised TOGETHER, before the join.
+    //
+    // `applied_baseline` needs it for the same reason `connect_baseline` does, on
+    // the counter the gate actually decides with: `instances_exceeding_baseline`
+    // treats an instance absent from the baseline as 0.0, so a steered instance
+    // that was merely unscraped here and reappears carrying its full prior value
+    // would satisfy STEP 3 immediately with nothing having been applied. That is
+    // a false PASS — silent — and it would hollow out STEP 3's "after baseline"
+    // claim rather than merely weakening it.
+    //
+    // Concurrently, and before the join, because nothing between here and the
+    // client's connect opens an MH WebTransport connection — the MC->MH control
+    // plane is gRPC — so neither baseline needs to be read late, and the pair
+    // costs one settle instead of two.
+    //
+    // ---- STEP 1 of the three-step ordering gate: make both baselines COMPLETE
+    // before reading them. (Steps 2 and 3 are below, after the client connects.)
+    //
+    // `instances_exceeding_baseline` treats an instance absent from the baseline
+    // as baseline 0.0, which is unsound for a pre-existing pod that was merely
+    // unscraped and then reappears carrying its full prior value: it shows as a
+    // rise nothing earned. That is reachable SINGLE-THREADED, so no amount of
+    // serialisation closes it.
+    //
+    // What two consecutive equal reads a scrape apart deliver — stated at the
+    // strength the loop actually has, NOT at "every target has been scraped":
+    // every target Prometheus is CURRENTLY REPORTING has settled, so "absent
+    // from baseline" means genuinely absent **for anything scraped within the
+    // lookback window**, and a later rise within that set is attributable to
+    // this test's own action. A target outside that set is slice (d) of the
+    // hazard enumeration below and is NOT covered; see `poll_until_stable`'s doc
+    // for why the window cannot be widened to reach it. Do not restate the
+    // residual here — point at it.
+    //
+    // Bound to `let` rather than inlined: `tokio::join!` holds its arguments as
+    // futures across an await, so a `&format!(...)` temporary inside the macro
+    // does not live long enough.
+    let applied_promql = policy_apply_promql("applied");
+    let connection_promql = mh_connection_promql();
+    let (applied_baseline, connect_baseline) = tokio::join!(
+        poll_until_stable(
+            &prom,
+            &applied_promql,
+            Duration::from_secs(16),
+            Duration::from_secs(90),
+            |v1, v2| {
+                format!(
+                    "mh_media_policy_applies_total{{outcome=\"applied\"}} per-instance snapshot \
+                     did not stabilize within 90s, so STEP 3 could not attribute an apply to this \
+                     test's join. ENVIRONMENT signal (policy-push churn from outside this test \
+                     binary, or a Prometheus scrape problem) — NOT an MC steering defect. Last \
+                     reads: v1={}, v2={}",
+                    format_instance_map(v1),
+                    format_instance_map(v2),
+                )
+            },
+        ),
+        poll_until_stable(
+            &prom,
+            &connection_promql,
+            // Correctness precondition, not a budget: one Prometheus scrape interval
+            // (15s SLA, infra/kubernetes/observability/prometheus-config.yaml) plus
+            // margin. At or below one interval both reads come from the SAME scrape,
+            // are trivially identical, and this proves nothing — vacuous rather than
+            // merely fast.
+            Duration::from_secs(16),
+            // 90s is ~5 rounds at a 16s settle, and the rounds are what it is
+            // budgeting. A non-equal round is ROUTINE, not interference: the
+            // stale-scrape case this exists to catch is absent from read one and
+            // present in read two BY CONSTRUCTION, so the success path consumes one
+            // round; a second absorbs a single concurrent transient; beyond that,
+            // non-convergence is an environment signal rather than a slow answer and
+            // more budget buys nothing.
+            //
+            // **This is NOT `wait_for_notification_counter_stable`'s 90s.** That one
+            // budgets a causal chain (`tokio::spawn(notify)` -> gRPC -> MC counter ->
+            // scrape); this budgets N rounds of a fixed-cost comparison. Same number,
+            // different reasons, opposite drift obligations: if the scrape SLA moved,
+            // theirs would grow by the chain's scrape term while this would grow by
+            // five times the settle. Neither follows the other, and neither may be
+            // hoisted onto the other. (Contrast the 16s values, which DO share one
+            // trigger — see `wait_for_notification_counter_stable`.)
+            Duration::from_secs(90),
+            |v1, v2| {
+                format!(
+                    "mh_webtransport_connections_total per-instance snapshot did not stabilize \
+                 within 90s, so a later rise could not be attributed to this test's own \
+                 connection. This is an ENVIRONMENT signal (connection churn from outside this \
+                 test binary, or a Prometheus scrape problem) — NOT an MC steering defect, and \
+                 NOT the same failure as 'could not identify the steered instance'. Last reads: \
+                 v1={}, v2={}",
+                    format_instance_map(v1),
+                    format_instance_map(v2),
+                )
+            },
+        ),
+    );
 
     // The real MC join: MC admits the participant, allocates the sender id,
     // computes the loopback assignment with the general N=1 algorithm and
@@ -1390,46 +1760,143 @@ async fn test_mh_forwards_an_audio_datagram_back_to_its_sender() {
         .webtransport_endpoint
         .clone()
         .expect("MC assignment must include webtransport_endpoint");
-    let join_response = mc_join(
+    let mut session = mc_join_session(
         &mc_url,
         &gc_join.meeting_id.to_string(),
         &gc_join.token,
         &display_name,
     )
     .await;
-    let sender_id = join_response
+    let sender_id = session
+        .join_response
         .sender_id
         .expect("MC must allocate a sender_id for the joiner (ADR-0036 §2/§4)");
-    let mh_url = join_response
-        .media_servers
-        .first()
-        .map(|m| m.media_handler_url.clone())
-        .filter(|u| !u.is_empty())
-        .expect("MC JoinResponse must include at least one non-empty MH URL");
 
-    // The ordering gate. Never a sleep: a datagram that races the apply is
-    // dropped as `no_policy`, which is a correct MH behaviour and a flaky test.
-    poll_until_any_instance_above(
+    // Follow MC's DIRECTIVE, not `media_servers.first()`. `media_servers` stays
+    // in scope only as the bootstrap set MC offered; the handler this client
+    // sends to is the one MC's forwarding assignment placed its edges on.
+    assert!(
+        !session.join_response.media_servers.is_empty(),
+        "MC JoinResponse must include the meeting's bootstrap handler set"
+    );
+    let mh_url = follow_mc_steering(&mut session).await;
+
+    // ------------------------------------------------------------------
+    // The ordering gate, in three steps with three distinct reason tokens.
+    //
+    // Steps 1 and 2 rest on DISJOINT controls over ONE hazard, and no control
+    // closes it alone. The slices, stated exhaustively so the enumeration cannot
+    // be mistaken for coverage:
+    //   (a) in-suite concurrency — closed by this test's `#[serial]` key (the
+    //       three MH-connecting tests above carry it for exactly this reason);
+    //   (b) a transient empty result in the baseline read — closed by step 1;
+    //   (c) a connector from OUTSIDE this test binary — closed by neither;
+    //   (d) an MH target unscraped beyond Prometheus's `query.lookback-delta`
+    //       (5m default, unset in `prometheus-config.yaml`) — closed by NEITHER,
+    //       and step 1 structurally cannot close it: such a target is absent
+    //       from BOTH stabilise reads, so the maps compare equal and step 1
+    //       returns having never observed it. If it is then re-scraped during
+    //       step 2 while our own increment has not yet landed, it presents as
+    //       exactly one unearned riser and step 2 names the WRONG instance —
+    //       the ambiguity panic does not fire, because there is no ambiguity to
+    //       see. See `poll_until_stable`'s doc for why the window cannot be
+    //       widened to cover it, and for the `up{job=...}` check that would.
+    // They are not belt-and-braces; do not remove any of them as redundant, and
+    // do not read this list as closed.
+    //
+    // NOTE: this orchestration is UNEXERCISED while the test is `#[ignore]`d.
+    // Nothing runs it until task 26 un-ignores R-15, so its correctness rests on
+    // review plus the unit coverage of the pure predicates it leans on
+    // (`instances_exceeding_baseline` and friends, in
+    // `env_tests::fixtures::metrics`). That is why as much decision logic as
+    // possible lives there rather than here.
+    // ------------------------------------------------------------------
+
+    // STEP 1 was performed ABOVE, before the MC join — see the `tokio::join!`
+    // block there for what it establishes and what it does not.
+    //
+    // Connect to the handler MC DIRECTED us to. This is the action STEP 2 below
+    // attributes; the two are split only because the connection must exist
+    // before any instance can be observed serving it.
+    let conn = connect_wt(&mh_url).await;
+    let (_send, _recv) = send_jwt_on_bi_stream(&conn, &gc_join.token).await;
+
+    // STEP 2 — identify the steered instance by OBSERVATION, and fail closed on
+    // ambiguity. This is also the positive control: it cannot pass unless this
+    // test's own connection was seen somewhere, so a wholesale-empty Prometheus
+    // reading is structurally distinguishable from "present but not incremented".
+    //
+    // Never `.first()` of the risen set: silently picking one would rebuild the
+    // very defect this task removed, one layer up.
+    let steered_instance = poll_until_exactly_one_instance_rose(
         &prom,
-        &policy_apply_promql("applied"),
-        &applied_baseline,
-        Duration::from_secs(60),
+        &mh_connection_promql(),
+        &connect_baseline,
+        // 3x the 15s `scrape_interval`
+        // (infra/kubernetes/observability/prometheus-config.yaml), so a single
+        // slow or missed scrape does not spend the budget and panic with a
+        // message that reads as a steering defect.
+        Duration::from_secs(45),
         Duration::from_secs(2),
         |current| {
             format!(
-                "mh_media_policy_applies_total{{outcome=\"applied\"}} did not increase past \
-                 baseline within 60s — MH never applied a policy for this meeting, so any \
-                 datagram sent now would be correctly dropped as `no_policy` (baseline: {}, \
-                 last observed: {})",
-                format_instance_map(&applied_baseline),
+                "could not identify the steered MH instance: no instance's \
+                 mh_webtransport_connections_total rose above its own baseline within 45s of \
+                 connecting to {mh_url}. Prometheus scrapes mh-service every 15s \
+                 (infra/kubernetes/observability/prometheus-config.yaml), so check scrape lag and \
+                 target health before suspecting MC steering. This is NOT the policy-apply gate \
+                 below. Baseline: {}, last observed: {}",
+                format_instance_map(&connect_baseline),
+                format_instance_map(current),
+            )
+        },
+        |risen, current| {
+            format!(
+                "could not identify the steered MH instance: {} instances rose above their own \
+                 baseline after connecting to {mh_url}, so a rise cannot be attributed to this \
+                 test's connection. The likely cause is another actor connecting to MH within \
+                 the scrape window — test ISOLATION, not budget: this test's #[serial] key \
+                 covers only this binary. Do NOT widen the budget and do NOT pick one of the \
+                 risen set. Risen: {:?}, baseline: {}, last observed: {}",
+                risen.len(),
+                risen,
+                format_instance_map(&connect_baseline),
                 format_instance_map(current),
             )
         },
     )
     .await;
 
-    let conn = connect_wt(&mh_url).await;
-    let (_send, _recv) = send_jwt_on_bi_stream(&conn, &gc_join.token).await;
+    // STEP 3 — the policy-apply delta, on THAT instance.
+    //
+    // What this proves: SOME policy application succeeded on the instance this
+    // client is connected to, after baseline. What it does NOT prove: that it
+    // was THIS meeting's policy — `mh_media_policy_applies_total` carries no
+    // meeting identifier, and correctly so (ADR-0036 §11 forbids one on any
+    // metric, flatly). That gap is a deliberate consequence of the telemetry
+    // rule, not an oversight to be "fixed" with a label. Instance-keying removes
+    // one confound (the wrong pod), not both.
+    poll_until_instance_above(
+        &prom,
+        &policy_apply_promql("applied"),
+        &applied_baseline,
+        &steered_instance,
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        |current| {
+            format!(
+                "the STEERED instance {steered_instance} (serving {mh_url}) did not increase \
+                 mh_media_policy_applies_total{{outcome=\"applied\"}} past its OWN baseline \
+                 within 60s. MC never applied a policy on the handler it directed this client to, \
+                 so any datagram sent now would be correctly dropped as `no_policy`. This is a \
+                 steering / policy-push question, DISTINCT from the two \
+                 instance-identification failures above. Baseline: {}, last observed: {}",
+                format_instance_map(&applied_baseline),
+                format_instance_map(current),
+            )
+        },
+    )
+    .await;
 
     // QUIC datagrams are unreliable, so delivery is a rig precondition driven
     // by repetition, not an assertion about the transport. The ASSERTION is

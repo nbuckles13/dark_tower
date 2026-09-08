@@ -1881,14 +1881,15 @@ exists so the counters shipped in task 14 are reachable from this runbook in the
 meantime, rather than only from the metric catalog and the Grafana panel — both
 of which are found by someone who *already* suspects the media path.
 
-**Read this first: how much of it is live today.** MC composes and sends the
-`SendDirective` now, but the browser SDK does **not yet honour it** (story task
-19). Until task 19 lands, every failure below is **invisible to users** and none
-of it is pageable — treat this as diagnosis for a reported media problem, not as
-a signal to act on proactively. **When task 19 lands, that inverts**: a client
-never told to send simply produces nothing — no error, no join failure, no
-absent-frame signal — and these counters become the only evidence. See the alert
-obligation filed in `docs/TODO.md` §Media Path Obligations.
+**Read this first: this path is live and user-visible.** MC composes and sends
+the `SendDirective`, and the browser SDK honours it — `AudioPipeline` publishes
+to `directive.targets[0]` (story task 19, landed). A client never told to send
+simply produces nothing: no error, no join failure, no WebTransport rejection,
+no absent-frame signal. **These counters are the only evidence**, and **no alert
+rule keys on them yet** (owed at story task 21; obligation filed in
+`docs/TODO.md` §Media Path Obligations). So the absence of a page is not the
+absence of the failure — reach for this section on a *reported* symptom rather
+than waiting for one to fire.
 
 **The symptom that leads here**: "I can't hear anyone" / one-way audio / a
 participant who joined successfully and is silent, with `mc_session_joins_total`

@@ -824,4 +824,135 @@ mod tests {
             .unwrap();
         assert_eq!(plan.slot_id, MAIN_AUDIO_SLOT_ID);
     }
+
+    /// The directive's target handler IS the handler carrying this publisher's
+    /// edges, at N=2 handlers.
+    ///
+    /// # What this rejects, by name
+    ///
+    /// `edge_handler` places every edge on the lexicographically smallest shared
+    /// handler, so with `{mh-0, mh-1}` every edge sits on **mh-0** and mh-1 holds
+    /// a correct-by-design EMPTY edge set. The nameable wrong answer is therefore
+    /// `https://mh-1.example:4434` — which is exactly what list-order selection
+    /// produced on the live cluster, where three of four media connections landed
+    /// on mh-1 while every edge sat on mh-0 (story task 24 escalation,
+    /// `docs/devloop-outputs/2026-09-05-sender-id-binding-contract/main.md`
+    /// §Resume). The `assert_ne!` below is that injected adverse condition, not
+    /// a redundant assertion.
+    ///
+    /// The expected url is a WRITTEN LITERAL, deliberately not sourced from any
+    /// helper the production path also calls: a test that computes its
+    /// expectation the same way the code does passes through the divergence it
+    /// exists to catch. Same discipline as
+    /// `crates/proto-gen/tests/internal_roundtrip.rs`'s `65_535`/`65_536` —
+    /// production code references the bound, boundary tests restate it. Do not
+    /// hoist these to a constant.
+    #[test]
+    fn the_directive_targets_the_handler_carrying_this_publishers_edges_at_n_2() {
+        let (assignment, urls) = loopback(&["mh-0", "mh-1"]);
+
+        // Premise check: the assignment really does place this publisher's edges
+        // on exactly one handler, and that handler is mh-0. Without this the
+        // assertions below could pass over an assignment that placed nothing.
+        let carrying: Vec<&HandlerId> = assignment
+            .per_handler
+            .iter()
+            .filter(|(_, h)| {
+                h.egress_streams
+                    .iter()
+                    .any(|p| p.candidate_sources.contains(&sender(1)))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            carrying,
+            vec![&HandlerId::new("mh-0")],
+            "premise: exactly one handler carries the publisher's edges, and it is mh-0"
+        );
+        // And the OTHER handler is present with an empty edge set — the
+        // correct-by-design state a client used to be steered into.
+        assert!(assignment
+            .per_handler
+            .get(&HandlerId::new("mh-1"))
+            .expect("every input handler gets an entry")
+            .egress_streams
+            .is_empty());
+
+        let (directive, outcome) = build_send_directive(
+            sender(1),
+            &assignment,
+            &urls,
+            &MediaStreamPolicy::new(encoding()),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, DirectiveOutcome::Emitted);
+        assert_eq!(
+            directive.streams.len(),
+            1,
+            "one publisher stream this story"
+        );
+        let targets = &directive.streams[0].targets;
+        assert_eq!(
+            targets.len(),
+            1,
+            "one client, one directed handler; >1 target means §9 multi-handler send landed and \
+             this test must be revisited rather than relaxed"
+        );
+        assert_eq!(
+            targets[0].media_handler_url, "https://mh-0.example:4434",
+            "MC must steer the client to the handler its edges were placed on"
+        );
+        assert_ne!(
+            targets[0].media_handler_url, "https://mh-1.example:4434",
+            "mh-1 holds a correct-by-design EMPTY edge set; steering a client there is the defect \
+             story task 25 fixes — three of four live-cluster media connections landed on mh-1 \
+             while every edge sat on mh-0"
+        );
+    }
+
+    /// Redis enumeration order cannot change where the client is steered.
+    ///
+    /// # This is the unit-tier SHADOW of the real proof, and says so on purpose
+    ///
+    /// At THIS tier the inversion is largely normalised away before the code
+    /// under test runs: `MeetingAssignment::per_handler` is a `BTreeMap`,
+    /// `edge_handler` does `shared.sort()`, and `build_send_directive`
+    /// accumulates into a `BTreeMap<HandlerId, _>`. So a permutation test built
+    /// on a hand-made [`MeetingRoutingInput`] asserts a property the TYPES
+    /// guarantee and could not fail — review-protocol §Assertion Vacuity
+    /// mechanism 4.
+    ///
+    /// The seam whose order genuinely varies is the Redis `MhAssignmentData.handlers`
+    /// `Vec`, which reaches the outcome through two private paths in
+    /// `webtransport/connection.rs` (`routing_input_for` into the assignment,
+    /// `HandlerUrls::from_pairs` into the urls) and is only drivable through a
+    /// real join. **The load-bearing proof is therefore
+    /// `crates/mc-service/tests/media_client_signaling_integration.rs`'s
+    /// `redis_enumeration_order_cannot_change_where_the_client_is_steered`.**
+    /// This test is kept as the cheap local regression pin; do not read its green
+    /// as covering the seam, and do not "add symmetry" by writing more of the
+    /// inversion at this tier.
+    #[test]
+    fn handler_list_order_does_not_move_the_directive_at_this_tier() {
+        use prost::Message;
+        let policy = MediaStreamPolicy::new(encoding());
+        let (ascending, urls_a) = loopback(&["mh-0", "mh-1"]);
+        let (inverted, urls_b) = loopback(&["mh-1", "mh-0"]);
+
+        let (a, _) = build_send_directive(sender(1), &ascending, &urls_a, &policy).unwrap();
+        let (b, _) = build_send_directive(sender(1), &inverted, &urls_b, &policy).unwrap();
+
+        // Byte-identical AND non-empty naming mh-0: equality alone is green when
+        // both sides are empty, so the literal is what gives this teeth.
+        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
+        for directive in [&a, &b] {
+            assert_eq!(directive.streams.len(), 1);
+            assert_eq!(directive.streams[0].targets.len(), 1);
+            assert_eq!(
+                directive.streams[0].targets[0].media_handler_url,
+                "https://mh-0.example:4434"
+            );
+        }
+    }
 }
