@@ -17,8 +17,11 @@ pub fn forward_one(forwarder: &ConnectionForwarder, payload_length: usize) {
 
 // Invariant: FOUR hits, all `media-telemetry-deny-macro-in-media-path`. Three
 // bare forms — one per label-bearing `MacroKind` variant — plus one
-// `metrics::`-qualified form, which must NOT evade: the invocation anchor is
-// `\b<name>!\s*\(`, and `\b` matches between `:` and `c`.
+// `metrics::`-qualified form, which must NOT evade: `DENIED_MACRO_RE` opens
+// with a bare `\b` and no anchored qualifier group, and `\b` matches between
+// `:` and `c`. (Named rather than re-spelled — the anchor's delimiter and
+// whitespace classes were widened on 2026-09-08 and a quoted copy here would
+// now be stale. The `\b` is the part this fixture depends on.)
 //
 // Three bare forms is complete, not short: `counter!`, `gauge!` and
 // `histogram!` are the entire Cat B set. A fourth would duplicate a variant

@@ -96,12 +96,33 @@ impl MacroKind {
 /// by both opener regexes below so adding a new variant updates the regex
 /// automatically. Variants are emitted in `ALL` order (describe-* first)
 /// so the regex engine prefers the longer alternative at each position.
-/// Made `pub` 2026-09-07 so `media_telemetry_deny` can `format!` it into its
-/// own deny-shape pattern (which accepts `(`, `[` and `{` delimiters, where
-/// the two regexes below accept only `(`). Exposing the alternation rather
-/// than having that guard rebuild its own `.iter().map(as_str).join("|")` is
-/// what keeps `MacroKind::ALL` the single source of truth: a seventh variant
-/// widens the media-path deny with zero edits in that module.
+///
+/// # Blast radius — read this before widening or narrowing `MacroKind`
+///
+/// FOUR consumers derive from this alternation, two in this module and two
+/// outside it. Exposing the alternation rather than having each consumer
+/// rebuild its own `.iter().map(as_str).join("|")` is what keeps
+/// `MacroKind::ALL` the single source of truth: a seventh variant widens all
+/// four with zero edits in their modules — and, by the same mechanism, a
+/// DELETED variant narrows all four silently, which is what the hand-written
+/// pin in this module (and its sibling in `telemetry_macros`) exists to red.
+/// Consumers carry the complementary oracle — a DERIVATION test proving the
+/// name still arrives through their own path; see
+/// `metric_labels::tests::every_macro_kind_is_discovered_through_the_opener`
+/// and `media_telemetry_deny::tests::metrics_family_is_derived_from_macro_kind_all`.
+///
+/// * `MACRO_INVOCATION_RE` and `MACRO_INVOCATION_WITH_FIRST_ARG_RE`, below —
+///   **still `(`-only**, and still narrower than Rust's grammar in both the
+///   whitespace and delimiter classes. Tracked in `docs/TODO.md`
+///   §Observability Debt; they are the last two anchors in that entry.
+/// * `media_telemetry_deny::DENIED_MACRO_RE` (`pub` since 2026-09-07).
+/// * `metric_labels::MACRO_OPENER_RE` (since 2026-09-08) — previously a
+///   re-inlined literal copy of these six names, which is why the SSoT claim
+///   in this doc was true of the docs and false of the code for a while.
+///
+/// Both external consumers accept whitespace before the `!` and all three
+/// delimiters (`(`, `[`, `{`); the two statics below accept neither. That
+/// asymmetry is the tracked gap, not a design choice.
 pub static MACRO_NAME_ALTERNATION: Lazy<String> = Lazy::new(|| {
     MacroKind::ALL
         .iter()
@@ -208,6 +229,60 @@ pub struct MacroInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ANTI-NARROWING PIN for the `MacroKind::ALL` derivation (2026-09-08).
+    ///
+    /// Lives HERE, at the source of truth, and not in a consumer. It was
+    /// briefly written in `metric_labels`' test module, which is the consumer
+    /// that motivated it — but the person who deletes a `MacroKind` variant is
+    /// editing THIS file and would never have seen it there, and their natural
+    /// next move would be to add a second pin beside the enum. Its own cited
+    /// precedent, `telemetry_macros::level_group_membership_is_frozen`, lives
+    /// in the module that owns the vocabulary for exactly this reason.
+    ///
+    /// # DELIBERATE DUPLICATION — not a DRY defect, and not a second
+    /// # production encoding
+    ///
+    /// The literal below is HAND-WRITTEN and must never be built from
+    /// `MACRO_NAME_ALTERNATION`, `MacroKind::ALL`, or anything derived from
+    /// them. **A pin that compares a derived value against itself passes
+    /// unchanged when a variant is DELETED** — i.e. it certifies nothing at
+    /// the exact moment it matters. This is a test oracle: no code path
+    /// consumes it, so it cannot drift into use; it can only fail. Do not
+    /// "fix" it into the derived form — that would be a DRY cleanup deleting
+    /// a security control. @dry-reviewer has ruled they will not flag it.
+    ///
+    /// Precedent: `telemetry_macros::tests::level_group_membership_is_frozen`,
+    /// which does the same over a security-owned frozen vocabulary and was
+    /// co-signed by @security + @observability.
+    ///
+    /// # ORDER IS LOAD-BEARING HERE, unlike the `Level` precedent
+    ///
+    /// `level_group_membership_is_frozen` SORTS before comparing, which is
+    /// safe only because its doc rests on the premise that no `Level` member
+    /// is a prefix of another. **`MacroKind::ALL` claims the opposite about
+    /// itself** (`metric_macros.rs`: describe-\* first "so the regex engine
+    /// prefers the longer match at each position"). Sorting this pin would
+    /// silently drop an ordering guarantee the enum's own doc calls
+    /// load-bearing, so it is asserted in `ALL` order and covers membership
+    /// AND order in one assertion. Do not carry the "no member is a prefix of
+    /// another" sentence across from `Level` — it is true there and unverified
+    /// here.
+    #[test]
+    fn macro_name_alternation_is_frozen_against_narrowing() {
+        assert_eq!(
+            *MACRO_NAME_ALTERNATION,
+            "describe_counter|describe_gauge|describe_histogram|counter|gauge|histogram",
+            "`MacroKind::ALL` changed. If a variant was DELETED this NARROWS \
+             `metric_labels` — a PII-relevant detection surface (ADR-0029 \
+             bounded labels), whose opener is the discovery loop feeding the \
+             label PII checks — plus `application_metrics`, `dashboard_panels`, \
+             `metric_coverage` and `histogram_buckets`. If the ORDER changed, `describe_counter!` \
+             may now be matched as `counter!` with a `describe_` prefix. \
+             Updating this literal to green CI requires @security + \
+             @observability sign-off (ADR-0024 §6.2); it is NOT a mechanical fix."
+        );
+    }
 
     #[test]
     fn macro_re_matches_bare_and_qualified() {

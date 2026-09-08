@@ -216,9 +216,14 @@ pub fn names_in_groups(groups: &[TelemetryGroup]) -> Vec<&'static str> {
 /// [`TelemetryMacro::ALL`] order.
 ///
 /// Callers `format!` this into their own pattern shape rather than receiving
-/// a finished regex, because the consumers genuinely differ: the PII guard
-/// anchors `\b…!\s*\(`, its sibling anchors `tracing::…!\s*\(` with no `\b`,
-/// and the media deny accepts `(`, `[` and `{` delimiters.
+/// a finished regex, because the consumers genuinely differ. As of
+/// 2026-09-08 all three accept whitespace before the `!` and all three
+/// delimiters (`(`, `[`, `{`); what still differs is the QUALIFIER handling —
+/// [`LOG_MACRO_RE`] anchors on `\b` with no qualifier, [`TRACING_NAMED_RE`]
+/// requires a `tracing\s*::\s*` prefix and deliberately carries no `\b`, and
+/// `media_telemetry_deny` takes a bare `\b` so it covers every spelling at
+/// once. Do not re-describe the delimiter class here: it is uniform now, and
+/// an enumeration that has to be kept in step is what went stale last time.
 pub fn alternation_for(groups: &[TelemetryGroup]) -> String {
     names_in_groups(groups).join("|")
 }
@@ -226,37 +231,102 @@ pub fn alternation_for(groups: &[TelemetryGroup]) -> String {
 /// The level-family alternation: `trace|debug|info|warn|error` in `ALL` order.
 static LEVEL_ALTERNATION: Lazy<String> = Lazy::new(|| alternation_for(&[TelemetryGroup::Level]));
 
-/// `\b(trace|debug|info|warn|error)!\s*\(` — the historical `LOG_MACRO_RE`
-/// shape, now derived from [`TelemetryGroup::Level`].
+/// `\b(trace|debug|info|warn|error)\s*!\s*[\(\[\{]` — the level-macro
+/// invocation shape, derived from [`TelemetryGroup::Level`].
 ///
 /// **Canonical home for a pattern that was declared twice.** Consumed by
 /// `rust_pii` and `rust_log_secrets`, which each carried a byte-identical
-/// private copy before 2026-09-07. Behaviour is unchanged: see
-/// [`tests::log_macro_re_matches_historical_literal`], which pins the full
-/// compiled pattern string — not merely the member set, because a change to
-/// the `\b` anchor or the `!\s*\(` suffix alters both guards' behaviour just
-/// as much as a membership change would.
+/// private copy before 2026-09-07. See
+/// [`tests::log_macro_re_is_equivalent_to_historical_literal`], which pins the
+/// full compiled pattern string — not merely the member set, because a change
+/// to the `\b` anchor or the invocation suffix alters both guards' behaviour
+/// just as much as a membership change would.
 ///
 /// Note the member ORDER differs from the pre-2026-09-07 literal
 /// (`ALL` order is `trace|debug|info|warn|error`; the old literal read
 /// `info|debug|warn|error|trace`). That is semantically inert for this
 /// alternation — no member is a prefix of another, so no input can match
-/// two alternatives — and the equality test asserts against the ALL-derived
-/// form deliberately, so the SSoT is the array rather than a frozen string.
+/// two alternatives.
+///
+/// # 2026-09-08 — the anchor was NARROWER THAN THE GRAMMAR, in a line gate
+///
+/// Until this date the suffix was `!\s*\(`, which encodes two assumptions
+/// Rust does not make. Both were evasions, and both mattered more here than
+/// at an ordinary matcher because of how this pattern is *consumed*:
+/// `rust_pii.rs` and `rust_log_secrets.rs` use it as a **line gate** —
+/// `if LOG_MACRO_RE.is_match(line) { …vocabulary scan… }` — so a miss does
+/// not narrow one finding, it **skips the entire PII and secrets scan for
+/// that line**.
+///
+/// 1. **`!` need not immediately follow the name.** Rust tokenises
+///    `path ! delim`, so `info !("user = {}", email)` compiles, logs, and
+///    was matched by nothing. Interposed comments are worse: consumers run
+///    over `blank_non_code` output, which turns `info /*x*/ !(…)` into
+///    spaces.
+/// 2. **The delimiter is not always `(`.** `info!{…}` and `info![…]` are
+///    legal macro invocations. A `(`-only anchor is a one-CHARACTER evasion,
+///    where (1) is a one-space evasion.
+///
+/// Neither hole was introduced by the 2026-09-07 promotion — both are
+/// inherited verbatim from the pre-promotion literals, and @security's
+/// `Approved-Cross-Boundary` trailer on that commit certified that the
+/// promotion **preserved** these detection sets, which it did faithfully. It
+/// never certified they were adequate.
+///
+/// **Why nothing caught it, which is the part worth remembering**: the pinned
+/// equality tests below exist to make a *narrowing* red. This pattern was
+/// never wide enough, so no pin redded and nothing noticed — it took a
+/// widening in an unrelated guard (`media_telemetry_deny`, ADR-0036 §11) to
+/// surface it. Read the pins as coverage of **preservation**, never of
+/// adequacy.
+///
+/// # What the structural argument does and does NOT cover — read both halves
+///
+/// **Structural half, which holds for any tree.** `rust_pii.rs` gates its
+/// entire per-line block on `pii_hit(line)` **before** any check runs, and
+/// every other post-gate check requires its own independent hit — a PII
+/// token, a secret-shape match, or `expose_secret`. So widening the gate
+/// alone cannot produce a finding **on a line carrying no vocabulary at
+/// all**. That is the whole of what the structural argument establishes, and
+/// the scope limit is the point rather than a caveat.
+///
+/// **What it does NOT establish, stated plainly because the strong reading is
+/// the tempting one (@security S1).** On a line that DOES carry a vocabulary
+/// hit *and* a newly-admitted invocation spelling, the widening manufactures
+/// a finding — **by design; that is the fix working**. A broadening therefore
+/// still requires a full-tree empirical sweep before it lands. Structural
+/// reasoning narrows what the sweep has to look at; it never replaces it.
+///
+/// **How this diff's own 23 newly-gated lines came to be inert**, since the
+/// answer is not the structural argument and a future re-verifier should not
+/// have to rediscover it: every one of them lives under `crates/dt-guard/**`,
+/// which `common::test_code_filter::is_guard_internal_path` exempts wholesale
+/// via `is_scan_exempt`, so `scan_file` is never called on them. Several
+/// carry vocabulary — `telemetry_macros.rs`'s own
+/// `r#"info !("user = {}", email)"#` test inputs both trip `pii_hit` and
+/// match the widened anchor. Absent the path exemption they would be
+/// findings. (Corroborating sweep, 2026-09-08: zero spaced-invocation
+/// occurrences outside this diff.)
+///
+/// The distinction is load-bearing beyond this file: the same class in
+/// `metric_labels::MACRO_OPENER_RE` lands in **production-scanned** paths
+/// where no such exemption applies. Anyone citing this paragraph as authority
+/// for skipping a sweep there has misread it.
 #[expect(
     clippy::disallowed_methods,
     clippy::expect_used,
     reason = "canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
 pub static LOG_MACRO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(&format!(r"\b({})!\s*\(", *LEVEL_ALTERNATION)).expect("static pattern compiles")
+    Regex::new(&format!(r"\b({})\s*!\s*[\(\[\{{]", *LEVEL_ALTERNATION))
+        .expect("static pattern compiles")
 });
 
-/// `tracing::(trace|debug|info|warn|error)!\s*\(|#\[instrument` — the
-/// historical `rust_pii::TRACING_NAMED_RE` shape.
+/// `tracing\s*::\s*(trace|debug|info|warn|error)\s*!\s*[\(\[\{]|#\[instrument`
+/// — the qualified-spelling shape consumed by `rust_pii` Check 2.
 ///
 /// Three differences from [`LOG_MACRO_RE`], all deliberate and all preserved
-/// verbatim from the pre-promotion literal:
+/// from the pre-promotion literal:
 ///   1. a literal `tracing::` prefix,
 ///   2. **no** `\b` anchor,
 ///   3. a second alternative, `|#\[instrument`.
@@ -264,9 +334,31 @@ pub static LOG_MACRO_RE: Lazy<Regex> = Lazy::new(|| {
 /// Point 3 is the one to be careful with. Dropping it would silently remove
 /// `rust_pii` Check 2's instrument-attribute coverage — a **false negative in
 /// a PII guard**, which nothing else in the pipeline would notice because the
-/// guard would keep reporting clean. [`tests::tracing_named_re_matches_historical_literal`]
+/// guard would keep reporting clean. [`tests::tracing_named_re_is_equivalent_to_historical_literal`]
 /// pins the full compiled string with the alternative explicitly present, so
 /// its removal reds the test rather than passing.
+///
+/// # 2026-09-08 — THREE sub-gaps here, not the two in [`LOG_MACRO_RE`]
+///
+/// This anchor was narrower than the grammar in three independent places, and
+/// they are enumerated rather than summarised because a partial fix would
+/// leave the module reading as coverage it does not have:
+///
+/// 1. **No whitespace tolerance around `::`.** `tracing :: info!(…)` compiles
+///    and was matched by nothing.
+/// 2. **No whitespace tolerance before `!`.** `tracing::info !(…)` likewise.
+/// 3. **Paren-only delimiter.** `tracing::info!{…}` and `tracing::info![…]`
+///    are legal invocations.
+///
+/// Each spelling is pinned separately in
+/// [`tests::tracing_named_re_closes_all_three_sub_gaps`], so a fix that
+/// closes two of three cannot pass.
+///
+/// The `|#\[instrument` alternative is **unchanged**, deliberately: it is an
+/// attribute matcher, not an invocation matcher, and has no `!` or delimiter
+/// to widen. See [`LOG_MACRO_RE`]'s 2026-09-08 section for why the widening
+/// cannot manufacture a false positive and for the line-gate consumption that
+/// made these gaps severe rather than cosmetic.
 #[expect(
     clippy::disallowed_methods,
     clippy::expect_used,
@@ -274,7 +366,7 @@ pub static LOG_MACRO_RE: Lazy<Regex> = Lazy::new(|| {
 )]
 pub static TRACING_NAMED_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!(
-        r"tracing::({})!\s*\(|#\[instrument",
+        r"tracing\s*::\s*({})\s*!\s*[\(\[\{{]|#\[instrument",
         *LEVEL_ALTERNATION
     ))
     .expect("static pattern compiles")
@@ -394,10 +486,13 @@ mod tests {
     }
 
     /// Full COMPILED PATTERN STRING equality, not a member-set assertion.
-    /// A change to the `\b` anchor or the `!\s*\(` suffix alters both
+    /// A change to the `\b` anchor or to the invocation suffix alters both
     /// consumer guards' behaviour just as much as a membership change, and a
     /// member-set assertion would sail past it. (@security condition,
-    /// 2026-09-07.)
+    /// 2026-09-07.) The suffix is named by role rather than re-spelled here,
+    /// because the literal below IS its spelling — a second copy in this doc
+    /// is a hand-maintained duplicate that goes stale on the next widening,
+    /// as it did on 2026-09-08.
     ///
     /// **`_is_equivalent_to_` and not `_matches_`, deliberately.** The
     /// alternation here is REORDERED relative to the pre-promotion literal —
@@ -412,11 +507,39 @@ mod tests {
     /// `Approved-Cross-Boundary` trailers certify against — a name promising
     /// byte-identity over a reordered string over-claims. (@paired-observability
     /// F3, Gate 2.)
+    ///
+    /// # The literal below is HAND-WRITTEN and must stay that way
+    ///
+    /// It is deliberately **not** built from `LEVEL_ALTERNATION` or anything
+    /// else derived from `TelemetryMacro::ALL`. A pin that compares a derived
+    /// value against itself passes unchanged when a member is **deleted** —
+    /// i.e. certifies nothing at the exact moment it matters. This is a test
+    /// oracle, not a second production encoding: no code path consumes it, so
+    /// it cannot drift into use; it can only fail. Do not "fix" it into the
+    /// derived form — that would be a DRY cleanup deleting a security control.
+    ///
+    /// # Byte-equality, so ORDER is not optional
+    ///
+    /// Prefix-freedom within `Level` is a statement about **regex semantics**
+    /// — reordering the alternation cannot change which inputs match — and it
+    /// is NOT a licence to write this literal in a different order from the
+    /// emitted one. A byte-equality assertion must reproduce emitted bytes.
+    /// What prefix-freedom actually buys is narrower: a future maintainer may
+    /// reorder `Level` without redoing the security analysis, and then update
+    /// this literal to match. (Contrast `metric_macros::MacroKind::ALL`,
+    /// whose own doc declares alternation order load-bearing.)
     #[test]
     fn log_macro_re_is_equivalent_to_historical_literal() {
         assert_eq!(
             LOG_MACRO_RE.as_str(),
-            r"\b(trace|debug|info|warn|error)!\s*\("
+            r"\b(trace|debug|info|warn|error)\s*!\s*[\(\[\{]",
+            "`TelemetryGroup::Level` or the LOG_MACRO_RE anchor changed. This \
+             pattern is a LINE GATE in rust_pii.rs and rust_log_secrets.rs — a \
+             narrowing here does not lose one finding, it skips the entire PII \
+             and secrets scan for every line it stops matching. If a member was \
+             DELETED, or the anchor narrowed, updating this literal to green CI \
+             requires @security + @observability sign-off (ADR-0024 §6.2); it \
+             is not a mechanical fix. See the anti-narrowing note on this test."
         );
     }
 
@@ -425,12 +548,72 @@ mod tests {
     /// dropping it REDS this test rather than passing silently — its removal
     /// would be a false negative in a PII guard introduced by an edit that
     /// looks value-neutral.
+    /// Hand-written for the same anti-narrowing reason as the pin above; read
+    /// that test's notes before touching this literal.
     #[test]
     fn tracing_named_re_is_equivalent_to_historical_literal() {
         assert_eq!(
             TRACING_NAMED_RE.as_str(),
-            r"tracing::(trace|debug|info|warn|error)!\s*\(|#\[instrument"
+            r"tracing\s*::\s*(trace|debug|info|warn|error)\s*!\s*[\(\[\{]|#\[instrument",
+            "`TRACING_NAMED_RE` changed. If the `|#[instrument` alternative was \
+             dropped, that silently removes rust_pii Check 2's attribute \
+             coverage — a false negative in a PII guard, introduced by an edit \
+             that looks value-neutral. Updating this literal requires @security \
+             + @observability sign-off (ADR-0024 §6.2)."
         );
+    }
+
+    /// Each of the three sub-gaps closed on 2026-09-08, pinned SEPARATELY so
+    /// that a fix closing two of three cannot pass.
+    ///
+    /// Listed as three assertions rather than one loop because the failure
+    /// message should name which spelling regressed — "the anchor narrowed"
+    /// is not actionable, "the `::`-whitespace spelling stopped matching" is.
+    #[test]
+    fn tracing_named_re_closes_all_three_sub_gaps() {
+        assert!(
+            TRACING_NAMED_RE.is_match(r#"tracing :: info!("user = {}", email)"#),
+            "sub-gap 1: whitespace around `::` must not evade"
+        );
+        assert!(
+            TRACING_NAMED_RE.is_match(r#"tracing::info !("user = {}", email)"#),
+            "sub-gap 2: whitespace before `!` must not evade"
+        );
+        assert!(
+            TRACING_NAMED_RE.is_match(r#"tracing::info!{"user = {}", email}"#),
+            "sub-gap 3: brace delimiter must not evade"
+        );
+        assert!(
+            TRACING_NAMED_RE.is_match(r#"tracing::info!["user = {}", email]"#),
+            "sub-gap 3: bracket delimiter must not evade"
+        );
+        // The attribute alternative is untouched by the widening and must
+        // survive it — dropping it is the false-negative-in-a-PII-guard case.
+        assert!(TRACING_NAMED_RE.is_match("#[instrument]"));
+    }
+
+    /// The same two classes at [`LOG_MACRO_RE`], which is the anchor both PII
+    /// and secrets guards use as their line gate.
+    ///
+    /// `info !("user = {}", email)` is the case that motivated the fix: legal
+    /// Rust that compiles and logs, matched by nothing before 2026-09-08.
+    #[test]
+    fn log_macro_re_closes_whitespace_and_delimiter_classes() {
+        for s in [
+            r#"info !("user = {}", email)"#,
+            r#"info  !("user = {}", email)"#,
+            r#"info!{"user = {}", email}"#,
+            r#"info!["user = {}", email]"#,
+            // What `blank_non_code` hands a consumer for `info /*x*/ !(…)`.
+            r#"info        !("user = {}", email)"#,
+        ] {
+            assert!(LOG_MACRO_RE.is_match(s), "must match after widening: {s}");
+        }
+        // The widening must not reach past the name boundary.
+        assert!(!LOG_MACRO_RE.is_match("my_info !(x)"));
+        assert!(!LOG_MACRO_RE.is_match("println !(x)"));
+        // `!=` is not an invocation: the char after `!` must be a delimiter.
+        assert!(!LOG_MACRO_RE.is_match("if error != (x) {"));
     }
 
     /// The historical behaviour these two statics replaced, asserted as

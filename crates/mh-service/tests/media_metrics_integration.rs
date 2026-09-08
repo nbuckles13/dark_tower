@@ -488,13 +488,21 @@ fn direction_is_pipeline_relative() {
 ///
 /// # Two things about this list that are not obvious from reading it
 ///
-/// **The level macros are covered TRANSITIVELY, not directly.** There is no
-/// `info!(` / `warn!(` / `error!(` / `debug!(` / `trace!(` entry, because a file
-/// calling one must first import it, and the import line contains `tracing::` or
-/// `log::`, which are matched. That is load-bearing and fragile in one specific
-/// way: a future `use crate::telemetry::warn;` re-export would carry neither
-/// prefix and would slip straight through, with nobody aware the coverage was
-/// ever indirect. If such a re-export appears, add the level macros directly.
+/// **The level macros are covered DIRECTLY as of 2026-09-08.** They used to be
+/// covered only transitively — there was no `info!` / `warn!` / `error!` entry,
+/// on the reasoning that a file calling one must first import it and the import
+/// line carries `tracing::` or `log::`. That indirection was load-bearing and
+/// fragile in two specific ways, and the trigger this comment used to name
+/// ("if such a re-export appears, add the level macros directly") had in fact
+/// already fired twice without anyone noticing: a `use crate::telemetry::warn;`
+/// re-export carries neither prefix, and a `#[macro_use] extern crate tracing;`
+/// at the crate root puts the only qualifying line in `lib.rs`, which this
+/// walker does not scan.
+///
+/// What made the indirection necessary was the old substring matcher, which
+/// could not tell `error` the identifier from `error!` the macro.
+/// [`contains_macro_invocation`] can, so the names are listed directly and the
+/// import entries are now belt-and-braces rather than the only coverage.
 ///
 /// **`describe_*` is denied even though it does not emit.** It is the form that
 /// documents a metric without resolving a handle — the shape that leaves
@@ -510,29 +518,91 @@ fn direction_is_pipeline_relative() {
 /// pattern the deny exists to enforce, which is the same mistake as denying
 /// `.increment`. Nothing is lost: the fully-qualified `metrics::counter!(…)`
 /// still contains `counter!(` at a token boundary and is caught by that entry.
-const DENIED_MACROS: [&str; 13] = [
-    "tracing::",
-    "log::",
-    "counter!(",
-    "histogram!(",
-    "gauge!(",
-    "describe_counter!(",
-    "describe_histogram!(",
-    "describe_gauge!(",
-    "println!(",
-    "eprintln!(",
-    "dbg!(",
-    "event!(",
-    "#[instrument",
-];
-
-/// Span macros, denied only at a token boundary.
+/// Non-invocation needles: import prefixes and the attribute form.
 ///
-/// `span!(` as a bare substring also matches `info_span!(`, `debug_span!(` and
-/// any future `*_span!` helper, so the boundary check is what keeps the deny
-/// from firing on a legitimate identifier. All three spellings are listed
-/// explicitly rather than relying on the substring.
-const DENIED_MACRO_CALLS: [&str; 3] = ["span!(", "info_span!(", "debug_span!("];
+/// These are matched as plain token-boundary substrings because they are not
+/// macro *invocations* and so have no `!` or delimiter to shape-match.
+const DENIED_PREFIXES: [&str; 3] = ["tracing::", "log::", "#[instrument"];
+
+/// Macro NAMES, matched by shape rather than as `name!(` literals.
+///
+/// # Why names and not `name!(` substrings (corrected 2026-09-08)
+///
+/// Every entry here used to be spelled `name!(`, which hardcoded two
+/// assumptions Rust does not make — the same two this repo's `dt-guard`
+/// `media-telemetry-deny` guard was widened to stop making in the same commit:
+/// whitespace may sit between the name and the `!` (`counter !("m")`), and the
+/// delimiter may be `[` or `{` (`counter!{…}`). Both compile and both ran
+/// straight through this walker.
+///
+/// That mattered more here than it would in an ordinary test, because this
+/// walker is the **only** coverage for `webtransport/media_transport.rs` (see
+/// the DO-NOT-RETIRE banner below). A complement that is materially narrower
+/// than the control it complements reads as coverage while covering less —
+/// which is the precise failure ADR-0036 §11's coverage section is about, and
+/// which the dt-guard side of this commit spends itself closing. Matching on
+/// shape via [`contains_macro_invocation`] means the list cannot re-acquire
+/// that class one entry at a time.
+///
+/// # Ordering and prefixes
+///
+/// Names that are prefixes of other names (`print`/`println`,
+/// `counter`/`describe_counter`, `span`/`info_span`) are safe in any order:
+/// the shape matcher requires the character after the name to be whitespace or
+/// `!`, so `print` cannot match inside `println!(`, and the token-boundary
+/// check rejects `counter` inside `describe_counter!(` because `_` is an
+/// identifier character.
+const DENIED_MACRO_NAMES: [&str; 24] = [
+    // tracing/log level macros, denied DIRECTLY as of 2026-09-08.
+    //
+    // These were previously covered only TRANSITIVELY, via the `tracing::` /
+    // `log::` import-prefix entries, because a substring list could not tell
+    // `error` the identifier from `error!` the macro. `contains_macro_invocation`
+    // can, so the indirection is no longer necessary — and it never covered
+    // two live spellings: a `#[macro_use] extern crate tracing;` at the crate
+    // root (that line lives in `lib.rs`, which this walker does not scan) and
+    // a `use crate::telemetry::warn;` re-export.
+    //
+    // `compile_error!` is safe under this: the leading `_` makes `error` fail
+    // the token-boundary check, which is the same argument `dt-guard` relies on.
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    // The `log` crate's GENERIC macro, `log!(Level::Info, ...)`. Denied by
+    // dt-guard as `TelemetryGroup::LogMacro` and missed here until 2026-09-08,
+    // where it was covered only by the `"log::"` import prefix -- i.e. exactly
+    // the transitive coverage the paragraph above retires, with the same two
+    // uncovered spellings. `catalog!(` and `dialog !(` cannot match it: the
+    // token-boundary check rejects both on the preceding `a`.
+    "log",
+    // metrics
+    "counter",
+    "histogram",
+    "gauge",
+    "describe_counter",
+    "describe_histogram",
+    "describe_gauge",
+    // std print family — `print!`/`eprint!` were MISSING before 2026-09-08.
+    // Unlike the level macros there is no import line to catch them: they are
+    // std-prelude, so nothing else in this list would ever have fired.
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "dbg",
+    // tracing event + span family. `warn_span`/`error_span`/`trace_span` were
+    // MISSING before 2026-09-08; only `span`/`info_span`/`debug_span` were
+    // listed, so three of the six span spellings walked through.
+    "event",
+    "span",
+    "trace_span",
+    "debug_span",
+    "info_span",
+    "warn_span",
+    "error_span",
+];
 
 /// Whether `line` contains `needle` at a token boundary — not preceded by an
 /// identifier character.
@@ -548,6 +618,46 @@ fn contains_at_token_boundary(line: &str, needle: &str) -> bool {
             || !bytes
                 .get(index.wrapping_sub(1))
                 .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    })
+}
+
+/// Whether `line` invokes the macro `name`, in ANY legal Rust spelling.
+///
+/// Shape: `name` at a token boundary, then optional whitespace, then `!`, then
+/// optional whitespace, then one of `(`, `[`, `{`. This is deliberately the
+/// same shape as `dt_guard::media_telemetry_deny`'s `DENIED_MACRO_RE`, so the
+/// two encodings of ADR-0036 §11 cannot drift into denying different things.
+///
+/// Replaces a set of `name!(` literal substrings, which missed `counter !("m")`
+/// and `counter!{…}` — both legal, both compiling, both logging. See
+/// [`DENIED_MACRO_NAMES`] for why a narrower complement was the dangerous kind
+/// of narrow.
+///
+/// The trailing-character check after `name` is what makes prefix names safe:
+/// in `println!(`, the character after `print` is `l`, which is neither
+/// whitespace nor `!`, so `print` does not match there.
+fn contains_macro_invocation(line: &str, name: &str) -> bool {
+    let bytes = line.as_bytes();
+    line.match_indices(name).any(|(index, _)| {
+        let preceded_by_ident = index != 0
+            && bytes
+                .get(index.wrapping_sub(1))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        if preceded_by_ident {
+            return false;
+        }
+        let mut cursor = index + name.len();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'!') {
+            return false;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        matches!(bytes.get(cursor), Some(b'(' | b'[' | b'{'))
     })
 }
 
@@ -587,13 +697,28 @@ fn rust_files_recursive(dir: &Path) -> Vec<PathBuf> {
 /// No log or metric macro form appears anywhere under the hot-path directory,
 /// nor in the transport-seam adapter.
 ///
-/// # In-crate now; the `dt-guard` directory-scoped version is still owed
+/// # DO NOT RETIRE THIS TEST — it is the dt-guard scope's COMPLEMENT
+///
+/// `dt-guard media-telemetry-deny` now exists and enforces ADR-0036 §11 over
+/// `crates/mh-service/src/media/`. That makes this walker look redundant. **It
+/// is not.** The guard's scope is a directory list, and
+/// `src/webtransport/media_transport.rs` — the per-frame transport-seam
+/// adapter — structurally cannot enter it: naming one file is the file-list
+/// shape §11 rules out, and its directory cannot be denied wholesale because
+/// `connection.rs` sits beside it and legitimately needs telemetry.
+///
+/// So the seam-adapter arm below is that file's **only** coverage. Deleting
+/// this test on redundancy grounds drops it silently, with every guard still
+/// reporting clean. Reasoning lives once, in
+/// `scripts/guards/simple/media-telemetry-deny.yaml` §INCOMPLETE BY DESIGN.
+///
+/// # In-crate stand-in for the directory half, which dt-guard now covers
 ///
 /// ADR-0036 §11 requires enforcement as "a deny of log and metric macros scoped
-/// to a directory". No such guard exists anywhere in the repo today, and
-/// building a `dt-guard` subcommand is infrastructure's, not media-handler's
-/// (CLAUDE.md §Guard-crate ownership). This walker is the in-crate stand-in and
-/// does **not** discharge the guard-pipeline obligation — see `docs/TODO.md`.
+/// to a directory". Building the `dt-guard` subcommand was infrastructure's,
+/// not media-handler's (CLAUDE.md §Guard-crate ownership); it landed in
+/// `c0538b56`. The directory half of this walker is therefore now belt-and-
+/// braces, and the seam-adapter half is load-bearing — see `docs/TODO.md`.
 ///
 /// It is a walker rather than `macro_rules!` shadowing because shadowing cannot
 /// intercept the `#[instrument]` **attribute** at all: it would cover less
@@ -643,13 +768,26 @@ fn no_log_or_metric_macro_is_reachable_from_the_hot_path() {
             if trimmed.starts_with("//") || trimmed.starts_with("*") {
                 continue;
             }
-            for denied in DENIED_MACROS.iter().chain(DENIED_MACRO_CALLS.iter()) {
+            for denied in DENIED_PREFIXES {
                 assert!(
                     !contains_at_token_boundary(line, denied),
-                    "{}:{} invokes '{denied}'. ADR-0036 §11: the media directory holds ONLY the \
-                     hot path, and no log or metric macro may be reachable from it — observe \
+                    "{}:{} references '{denied}'. ADR-0036 §11: the media directory holds ONLY \
+                     the hot path, and no log or metric macro may be reachable from it — observe \
                      through a handle resolved at setup instead. If this is setup or teardown \
                      code, move it to a SIBLING module rather than adding an exemption.",
+                    path.display(),
+                    number + 1
+                );
+            }
+            for denied in DENIED_MACRO_NAMES {
+                assert!(
+                    !contains_macro_invocation(line, denied),
+                    "{}:{} invokes '{denied}!'. ADR-0036 §11: the media directory holds ONLY the \
+                     hot path, and no log or metric macro may be reachable from it — observe \
+                     through a handle resolved at setup instead. If this is setup or teardown \
+                     code, move it to a SIBLING module rather than adding an exemption. \
+                     (Matched by SHAPE, so `{denied} !(`, `{denied}!{{…}}` and `{denied}![…]` \
+                     are caught too — all three are legal Rust.)",
                     path.display(),
                     number + 1
                 );
@@ -657,6 +795,77 @@ fn no_log_or_metric_macro_is_reachable_from_the_hot_path() {
         }
     }
     assert!(scanned >= 8, "scanned only {scanned} files");
+}
+
+/// The walker's matcher covers every legal invocation spelling — pinned,
+/// because an unpinned matcher is how this walker drifted narrow in the first
+/// place.
+///
+/// Until 2026-09-08 the deny list held `name!(` literal substrings, so all of
+/// the `MUST MATCH` cases below walked through. This test is what stops the
+/// list being "simplified" back to substrings, and it is deliberately colocated
+/// with the walker rather than living in `dt-guard`: the two are independent
+/// encodings of ADR-0036 §11 and each has to stand up on its own.
+#[test]
+fn the_walker_matcher_catches_every_legal_invocation_spelling() {
+    for line in [
+        "counter!(\"m\", 1);",
+        "counter !(\"m\", 1);",          // whitespace before `!`
+        "counter  !(\"m\", 1);",         // more of it
+        "counter!{\"m\", 1}",            // brace delimiter
+        "counter![\"m\", 1]",            // bracket delimiter
+        "log!(Level::Info, \"x\");",     // the log crate's generic macro
+        "print!(\"x\");",                // was absent from the list entirely
+        "eprint!(\"x\");",               // ditto
+        "warn_span!(\"s\");",            // was absent from the span list
+        "error_span!(\"s\");",           // ditto
+        "trace_span!(\"s\");",           // ditto
+        "    metrics::counter!(\"m\");", // qualified still contains the name
+    ] {
+        assert!(
+            DENIED_MACRO_NAMES
+                .iter()
+                .any(|name| contains_macro_invocation(line, name)),
+            "MUST MATCH but did not: {line}"
+        );
+    }
+
+    for line in [
+        // Handle calls — the allow side. `.increment(` cannot match `name!`.
+        "self.handles.frames_forwarded.increment(1);",
+        "self.handles.bytes.record(len as f64);",
+        // A denied NAME in a non-invocation position.
+        "let counter = 0;",
+        "struct Gauge { span: u32 }",
+        // Compound names must not fire: the token boundary still holds.
+        "my_counter!(\"m\");",
+        // `log` must not fire inside these — token boundary on the `a`.
+        "catalog!(\"x\");",
+        "dialog !(\"x\");",
+        "frame_counter !(\"m\");",
+        // `!=` is not an invocation — the char after `!` must be a delimiter.
+        "if counter != (0) { }",
+        // `print` must not match inside `println` twice over, nor `span`
+        // inside `info_span` — asserted as "exactly one name matches".
+        "let x = 1;",
+    ] {
+        assert!(
+            !DENIED_MACRO_NAMES
+                .iter()
+                .any(|name| contains_macro_invocation(line, name)),
+            "MUST NOT MATCH but did: {line}"
+        );
+    }
+
+    // Prefix names must not double-count: `println!(` is `println`, never also
+    // `print`; `describe_counter!(` is never also `counter`.
+    for (line, want) in [("println!(\"x\");", 1), ("describe_counter!(\"m\");", 1)] {
+        let hits = DENIED_MACRO_NAMES
+            .iter()
+            .filter(|name| contains_macro_invocation(line, name))
+            .count();
+        assert_eq!(hits, want, "wrong match count for {line}");
+    }
 }
 
 /// The queue bounds the forward path is built against are the declared

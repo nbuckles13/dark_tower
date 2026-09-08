@@ -28,9 +28,26 @@ impl ConnectionForwarder {
 // (`Counter::{increment, absolute}`, `Gauge::{set, increment, decrement}`,
 // `Histogram::{record}`). There is no sixth method to miss.
 //
-// The allow-list is satisfied BY CONSTRUCTION, not by a runtime filter: under
-// the mandatory `!\s*\(` anchor, `.record(x)` structurally cannot match
-// `record!(`. A line-level filter that dropped lines containing `.record(`
-// would suppress a real `counter!(...)` co-located with a handle call — a
-// masked failure, and the ADR's "touching handle methods" in one move. This
-// fixture is the proof; there is no allow-list in the code to inspect.
+// What THIS fixture shows, exactly: the five allowed handle-method spellings
+// appear in realistic media-path shapes and none of them is flagged.
+//
+// What it does NOT show, stated so the gap cannot be read as coverage: that
+// the allow is satisfied BY CONSTRUCTION rather than by a runtime line filter.
+// This body contains zero macro invocations, so a hypothetical filter that
+// dropped every line containing `.increment(` would pass it identically. The
+// claim needs a line carrying BOTH a handle call and a real denied macro, and
+// that lives at `pos_handle_call_colocated_with_macro.rs` — one physical line,
+// exactly one finding, spelling `counter`.
+//
+// The distinction is worth keeping rather than collapsing: a line filter would
+// suppress a real `counter!(...)` that happened to share a line with a handle
+// call, which is a masked failure (CLAUDE.md §Fail loudly) and is §11's
+// "touching handle methods" in one move. There is no allow-list in the code to
+// inspect — `ALLOWED_HANDLE_METHODS` is documentation and a test, never a
+// runtime subtraction — so the co-location fixture is the only way to observe
+// the difference from outside.
+//
+// CORRECTED 2026-09-08 (@observability): this block previously ended "This
+// fixture is the proof." It was not. The most load-bearing property on the
+// allow side had prose in three places — here, the module doc, and
+// `cached_handle_methods_are_never_flagged` — and coverage in none.

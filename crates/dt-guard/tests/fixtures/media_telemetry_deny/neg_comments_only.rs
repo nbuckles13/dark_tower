@@ -23,8 +23,9 @@ pub fn on_frame(payload_length: usize) -> usize {
 //
 //   * `crates/mh-service/src/media/forward.rs:97` — `debug!(?frame)` carries a
 //     real `!(`, so it matches a CORRECTLY-shaped invocation anchor exactly.
-//     This is the proof that the `!\s*\(` anchor alone is insufficient and
-//     comment stripping is mandatory, not a nicety.
+//     This is the proof that the invocation anchor ALONE is insufficient and
+//     comment stripping is mandatory, not a nicety. (The argument is about the
+//     anchor's existence, not its exact spelling, which has since widened.)
 //   * `crates/mh-service/src/media/mod.rs:16` — `#[instrument]` in prose. The
 //     attribute matcher has no paren to anchor on at all, so it breaks even for
 //     someone who reasoned "the backticks and the missing paren will save us."
