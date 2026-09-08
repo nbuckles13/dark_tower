@@ -13,7 +13,69 @@
 //! > calls — the guard denies macro forms and must not touch handle methods,
 //! > or it bans the pattern it exists to enforce."*
 //!
-//! Everything below follows from those four sentences.
+//! Everything below follows from those four sentences — **except the SPAN and
+//! `#[instrument]` families, which derive from a different clause of §11 and
+//! are argued separately in the next section.** That caveat is load-bearing:
+//! those four sentences name log macros, metric macros and `event!` and do
+//! not mention spans, so an unqualified "everything below follows" is a
+//! standing invitation to a future reader to trim two denied families as
+//! scope creep. Read the next section before removing them.
+//!
+//! # SPAN and `#[instrument]`: §11's own invariant, NOT an extension
+//!
+//! This section exists because its absence was the defect. Do not delete it
+//! as commentary; it is the argument a reader has to answer before narrowing
+//! this guard.
+//!
+//! **On the leak axis it is not an extension at all.** §11's retention bullet
+//! names the surface directly: *"No per-frame, per-participant, or
+//! per-stream-identity dimension in media-path logs, metric labels, **or span
+//! attributes**."* Span attributes are enumerated alongside logs and metric
+//! labels in the ADR's own text.
+//!
+//! **On the cost axis the argument has to be made rather than cited, because
+//! the objection is specific.** §11 states the per-frame invariant as *"zero
+//! allocation and zero registry lookup"*, and *"no metric macro is reachable
+//! from the forward function"*. A reader will object: the level is off in
+//! production, the subscriber discards it, so a `debug_span!` costs nothing.
+//! That is wrong on the facts and, more importantly, wrong in kind.
+//!
+//! * **Disabled is not free, and what you still pay is the thing §11 names.**
+//!   `tracing` does short-circuit: `span!`/`event!` put the `valueset!`
+//!   holding your field expressions INSIDE the enabled arm, so a disabled
+//!   callsite really does skip evaluating them and construct a `Span::none()`.
+//!   What it does not skip is the guard: a `level_enabled!` check, then
+//!   `CALLSITE.interest()`, then — when interest is `sometimes` — a
+//!   `Dispatch::current()` lookup. **That interest/dispatch check IS the
+//!   "registry lookup" §11 forbids per frame**, in the ADR's own words.
+//!   (An earlier draft of this paragraph claimed the field expressions are
+//!   evaluated regardless of interest. That is FALSE, and it is recorded here
+//!   rather than quietly deleted because the trimmer this section must answer
+//!   is precisely the reader who knows it — a refutable premise here would
+//!   discredit the whole cost axis and license the trim again.)
+//! * **Enabled, you pay the allocation and the field recording, per frame** —
+//!   anything non-`Copy` in the field list (a formatted stream id, a `String`,
+//!   a `%`- or `?`-rendered value). **And enablement is not yours to assume:**
+//!   it is a runtime configuration this guard cannot see, which is the whole
+//!   of the next bullet.
+//! * **`#[instrument]` is worse per frame precisely because it is invisible
+//!   at the call site**: it wraps every call in span construction plus
+//!   enter/exit and, absent `skip`/`skip_all`, records **every function
+//!   argument** as a field. On a forward function those arguments are the
+//!   connection identity, the stream and the frame — the exact per-frame,
+//!   per-participant value set §11 exists to contain, entering span
+//!   attributes by default rather than by mistake.
+//! * **"The level is off" is a runtime-configuration defence for a per-frame
+//!   invariant**, and it is the defence §11 has already rejected in terms:
+//!   *"A log level is not an acceptable gate. The incident motivating a level
+//!   change is the same incident producing the sensitive trace."*
+//!
+//! **The closing move, which is the one a trimmer must answer.** Denying the
+//! level macros while allowing span forms would make this guard's coverage
+//! depend on a subscriber configuration the guard cannot see. That is not a
+//! narrower policy — it is a policy with a runtime escape hatch, in a control
+//! whose whole design principle (§11, and the ADR's coverage section) is
+//! structural impossibility over a control that has to notice.
 //!
 //! # The allow-list is satisfied BY CONSTRUCTION, not by subtraction
 //!
@@ -120,6 +182,21 @@
 //! the list (`use tracing::info as note;`) is caught by the import deny
 //! wherever the `use` appears inside the scope — **including mid-line, after a
 //! `{` or `;`**.
+//!
+//! **What is NOT caught, and NOT a matcher gap at all — a per-frame surface
+//! OUTSIDE the configured directory.** Deliberately unnumbered: the two
+//! residuals below are matchers that miss something INSIDE the scope, and
+//! folding this into the same series invites closing all three with the
+//! allowlist inversion, which would not touch this one. `crates/mh-service/src/webtransport/media_transport.rs`
+//! is the transport-seam adapter and is called per frame, but it cannot enter
+//! `denied_directories`: a lone file is the file-list shape §11 rules out,
+//! and its directory cannot be denied wholesale because `connection.rs` sits
+//! beside it and legitimately needs telemetry. It is covered instead by the
+//! in-crate walker `crates/mh-service/tests/media_metrics_integration.rs::
+//! no_log_or_metric_macro_is_reachable_from_the_hot_path`, which is this
+//! guard's **complement, not its predecessor** — retiring it as redundant
+//! silently drops the adapter's only coverage. Full reasoning lives once, in
+//! `scripts/guards/simple/media-telemetry-deny.yaml` §INCOMPLETE BY DESIGN.
 //!
 //! **What is NOT caught**: a re-export living in a **sibling**, reached from
 //! the scope as `crate::obs::note!(...)`. The import deny excludes
@@ -392,6 +469,41 @@ static DENIED_MACRO_ALTERNATION: Lazy<String> = Lazy::new(|| {
 /// no false-positive cost — `name!` is a macro invocation under any
 /// delimiter.
 ///
+/// This guard **was, until 2026-09-08, the only consumer in the crate with
+/// the delimiter class right.** It is no longer alone and the list of
+/// stragglers is deliberately not repeated here — `telemetry_macros`' two
+/// anchors and `metric_labels::MACRO_OPENER_RE` were widened alongside it in
+/// the same commit. The current residual is `metric_macros.rs`'s two
+/// invocation regexes, tracked in `docs/TODO.md` §Observability Debt, which
+/// is the single place that list is maintained. (An earlier draft of this
+/// parenthetical named siblings the same commit had already fixed — prose
+/// outliving its support, in the hunk that argues against exactly that.)
+///
+/// # `\s*` before the `!` — closed 2026-09-08, and it was a live evasion
+///
+/// The anchor was `!\s*[\(\[\{]`, requiring the `!` to follow the name
+/// IMMEDIATELY. Rust tokenises `path ! delim`, so **`info !("x")` compiles,
+/// logs, and walked straight through this deny**. Reproduced during the
+/// ADR-0036 §11 policy audit:
+///
+/// ```text
+/// $ printf 'fn f() { info !("x"); }\nfn h() { info!("z"); }\n' \
+///     | grep -nP '\b(info|warn)!\s*[\(\[\{]'
+/// 2:fn h() { info!("z"); }
+/// ```
+///
+/// Interposed comments make it worse rather than better: every matcher here
+/// runs over `blank_non_code` output, which turns `tracing::info /*x*/ !(…)`
+/// into whitespace.
+///
+/// The widening has no realistic false-positive surface, because the
+/// character after `!` must still be an open delimiter: `!=` is excluded, and
+/// every near-miss in valid Rust (`&&`, `||`, `|x|`, `;`, `=>`, `)`)
+/// interposes a non-whitespace token. Verified against the real scope before
+/// landing — `crates/mh-service/src/media/` contains zero `name !(` forms,
+/// and its only macro invocations are `assert*!`, `format_args!` and
+/// `select!`, none of them denied names.
+///
 /// `compile_error!` is deliberately absent: it is §11's own release-build
 /// control and appears in `media/mod.rs`. That is why the alternation is
 /// enumerated rather than a `\w+!\s*[\(\[\{]` shape.
@@ -401,8 +513,11 @@ static DENIED_MACRO_ALTERNATION: Lazy<String> = Lazy::new(|| {
     reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
 static DENIED_MACRO_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(&format!(r"\b({})!\s*[\(\[\{{]", *DENIED_MACRO_ALTERNATION))
-        .expect("static pattern compiles")
+    Regex::new(&format!(
+        r"\b({})\s*!\s*[\(\[\{{]",
+        *DENIED_MACRO_ALTERNATION
+    ))
+    .expect("static pattern compiles")
 });
 
 /// Open `*_span!` shape, media-scope only and deliberately NOT promoted.
@@ -416,13 +531,21 @@ static DENIED_MACRO_RE: Lazy<Regex> = Lazy::new(|| {
 ///
 /// `\w+_span` requires a literal `_`, so bare `span!` still needs its
 /// enumerated entry in the SPAN group.
+///
+/// **This anchor carries the same `\s*` before the `!` as
+/// [`DENIED_MACRO_RE`], and the two must be widened together.** Fixing one
+/// and not the other would leave `custom_span !(…)` passing while
+/// `custom_span!(…)` is denied — an asymmetry WORSE than the uniform gap was,
+/// because this doc comment would then claim the open-span shape is covered
+/// when it is covered for one spelling of two. A partial fix here reads as
+/// coverage, which is the failure ADR-0036's coverage section is about.
 #[expect(
     clippy::disallowed_methods,
     clippy::expect_used,
     reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
 static OPEN_SPAN_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b(\w+_span)!\s*[\(\[\{]").expect("static pattern compiles"));
+    Lazy::new(|| Regex::new(r"\b(\w+_span)\s*!\s*[\(\[\{]").expect("static pattern compiles"));
 
 /// A `use` declaration, captured up to its first path segment.
 ///
@@ -1048,6 +1171,98 @@ mod tests {
                 m.as_str()
             );
         }
+    }
+
+    /// Whitespace between the macro name and its `!` — closed 2026-09-08.
+    ///
+    /// `info !("x")` is legal Rust that compiles and logs, and every one of
+    /// these walked through the deny before the anchor was widened. Asserted
+    /// across BOTH anchors, because `OPEN_SPAN_RE` is a second matcher with
+    /// the identical shape and a one-anchor fix would leave `custom_span !(`
+    /// passing while `custom_span!(` is denied.
+    #[test]
+    fn space_between_name_and_bang_does_not_evade() {
+        for src in [
+            r#"fn f() { info !("x"); }"#,
+            r#"fn f() { tracing::warn  !("x"); }"#,
+            r#"fn f() { counter !("m"); }"#,
+            r#"fn f() { println !("x"); }"#,
+            // OPEN_SPAN_RE's half of the same class.
+            r#"fn f() { custom_span !("x"); }"#,
+            // What `blank_non_code` hands the matcher for an interposed
+            // comment: `tracing::info /*x*/ !(...)`.
+            r#"fn f() { tracing::info        !("x"); }"#,
+        ] {
+            assert!(
+                !check_file("x.rs", src).is_empty(),
+                "spaced invocation must not evade: {src}"
+            );
+        }
+    }
+
+    /// The widening is bounded. These must stay silent.
+    ///
+    /// `\s*` never crosses a token, and the character after `!` must still be
+    /// an open delimiter — so `!=` cannot match however the operands are
+    /// spaced. Without these the widening would be a plausible source of
+    /// false positives on real code, which is the objection it has to answer.
+    #[test]
+    fn space_widening_does_not_over_match() {
+        for src in [
+            // `\b` still holds: a compound name is not a denied name.
+            "fn f() { my_info !(x); }",
+            "fn f(v: &[u8]) { my_counter !(v); }",
+            // `!=` — the char after `!` is `=`, not a delimiter.
+            "fn f(a: u32, b: u32) -> bool { a != (b) }",
+            "fn f(error: u32) -> bool { error != (0) }",
+            // A denied NAME as a plain binding, with no invocation anywhere.
+            "fn f() { let counter = 0; let _ = counter; }",
+        ] {
+            assert!(check_file("x.rs", src).is_empty(), "must not fire: {src}");
+        }
+    }
+
+    /// `\s*` reaches ACROSS LINES here, and that is intended (@security S2).
+    ///
+    /// `\s` includes `\n`, and [`check_file`] runs the matchers over the whole
+    /// `blank_file` output rather than line by line, so a macro call split
+    /// across lines is denied. Correct for a fail-loud deny — it compiles and
+    /// logs like any other — but it was ASSERTED NOWHERE, and the fixture
+    /// footer previously claimed the opposite. Pinned so that a later reader
+    /// who believes the widening is line-local cannot quietly re-narrow it.
+    ///
+    /// Note the asymmetry with the sibling anchors this loop also widened:
+    /// `telemetry_macros`' consumers iterate `content.lines()`, so there the
+    /// same `\s*` genuinely cannot cross a line. The reach is a property of
+    /// the CONSUMER, not of the character class.
+    #[test]
+    fn space_widening_spans_lines_deliberately() {
+        let findings = check_file("x.rs", "fn f() {\n    info\n        !(\"x\");\n}\n");
+        assert_eq!(
+            findings.len(),
+            1,
+            "a line-spanning invocation is still an invocation; got {findings:?}"
+        );
+        assert_eq!(findings[0].spelling, "info!");
+    }
+
+    /// The by-construction allow, demonstrated rather than asserted.
+    ///
+    /// One physical line carrying a handle call AND a real denied macro. This
+    /// is the only shape that distinguishes "structurally cannot match" from
+    /// "filtered out at line level": the allow-fixture, which holds handle
+    /// calls alone, passes identically under either implementation.
+    #[test]
+    fn handle_call_colocated_with_macro_still_fires_exactly_once() {
+        let src = r#"fn f(h: &H) { h.frames.increment(1); counter!("mh_x", 1); }"#;
+        let findings = check_file("x.rs", src);
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly one finding; zero means a line filter masked the \
+             macro, two means the handle method was flagged — got {findings:?}"
+        );
+        assert_eq!(findings[0].spelling, "counter!");
     }
 
     #[test]

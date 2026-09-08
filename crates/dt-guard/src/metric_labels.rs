@@ -21,7 +21,7 @@ use crate::common::scan::warn_skip;
 use crate::common::status::emit_ok;
 use crate::common::test_code_filter::is_scan_exempt;
 use crate::ignore::is_lazy_reason;
-use crate::metric_macros::MacroKind;
+use crate::metric_macros::{MacroKind, MACRO_NAME_ALTERNATION};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -51,15 +51,67 @@ pub const METRIC_NAME_LENGTH_RULE_ID: &str = "metric_name_length";
 pub const METRIC_NAME_NAMING_RULE_ID: &str = "metric_name_naming";
 pub const PARSE_ERROR_RULE_ID: &str = "parse_error";
 
+/// Opener for a `metrics`-crate macro invocation.
+///
+/// # The name list is DERIVED, not re-inlined (2026-09-08)
+///
+/// Until this date the six names were spelled out here as a literal — the
+/// sole holdout among four consumers of `metric_macros`, in a file that
+/// already imports [`MacroKind`], and while `metric_macros`' own module doc
+/// listed `metric_labels` among the subcommands that consume the canonical
+/// home "instead of each re-inlining its own `Lazy<Regex>`". **The doc said
+/// it was converted and the code said it was not**, which is worse than an
+/// honest duplicate: it was a false claim of SSoT coverage. A seventh
+/// `MacroKind` variant widened every sibling and silently not this one.
+///
+/// The complementary guard against that regression returning is
+/// [`tests::every_macro_kind_is_discovered_through_the_opener`]. The frozen
+/// pin at the source of truth cannot catch a consumer un-deriving; only a
+/// derivation test here can.
+///
+/// # Both anchor halves are closed (2026-09-08) — and the second half was
+/// # deferred first, on a cost claim that did not survive being checked
+///
+/// The anchor here was `!\s*\(`, narrower than Rust's grammar in two
+/// independent ways (see `telemetry_macros::LOG_MACRO_RE`):
+///
+/// * **Whitespace** (`!` → `\s*!`). `find_macro_invocations` locates the
+///   delimiter as `whole.end() - 1`, which lands on it however much
+///   whitespace precedes the `!`. Free.
+/// * **Delimiter** (`\(` → `[\(\[\{]`). This one needed the body scanner to
+///   learn the matching closer, and was **initially deferred as task-sized.
+///   That was a misprice, corrected in review**: the scanner reads one opener
+///   byte and derives its closer, and the depth loop compares against those
+///   two variables instead of two literals. Six lines, in a file already open
+///   in the same changeset.
+///
+/// The general seam is still real and still worth knowing — **line gates
+/// versus body scanners**: an `is_match` gate widens for free, a scanner that
+/// parses from the delimiter needs the closer. But "needs the closer" is not
+/// the same as "is expensive", and the entry that priced it never opened the
+/// loop to check. Note this static is used BOTH ways: as a body-scanner
+/// opener at `find_macro_invocations`, and as a pure file-discovery gate in
+/// `run()`.
+///
+/// # Why this matters beyond cataloguing
+///
+/// This opener is the discovery loop feeding the label PII checks, so an
+/// invocation that evades it is **never label-checked at all** — and the
+/// file-discovery use means a file whose metric macros are all brace-form
+/// never entered the scan set. `counter!{"m", "email" => user_email}` would
+/// ship an unbounded, PII-bearing label with nothing firing (ADR-0029). That
+/// was a live leak path, not a tidy-up, which is why it was fixed here rather
+/// than carried as debt.
 #[expect(
     clippy::disallowed_methods,
     clippy::expect_used,
     reason = "canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
 static MACRO_OPENER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"(?:\bmetrics\s*::\s*)?\b(describe_counter|describe_gauge|describe_histogram|counter|gauge|histogram)!\s*\(",
-    )
+    Regex::new(&format!(
+        r"(?:\bmetrics\s*::\s*)?\b({})\s*!\s*[\(\[\{{]",
+        *MACRO_NAME_ALTERNATION
+    ))
     .expect("static pattern compiles")
 });
 
@@ -280,7 +332,8 @@ fn find_char_lit_close(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 // -----------------------------------------------------------------------------
-// Macro invocation finder (balanced-paren walker, string-literal aware).
+// Macro invocation finder (delimiter-generic balanced walker, string-literal
+// aware). Handles `(`, `[` and `{` openers; see `find_macro_invocations`.
 // -----------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -288,6 +341,12 @@ struct MacroInvocation {
     kind: MacroKind,
     start_lineno: usize,
     body: Option<String>, // None on unterminated parse error
+    /// The closer this invocation's opener called for, carried so the
+    /// parse-error message can NAME it. Hardcoding `')'` was wrong for two
+    /// thirds of the delimiters once brace and bracket forms became
+    /// discoverable, and this is operator-facing output on a FAIL path.
+    /// `None` when the opener itself was unrecognised.
+    expected_close: Option<char>,
 }
 
 fn count_newlines_until(src: &str, idx: usize) -> usize {
@@ -296,7 +355,7 @@ fn count_newlines_until(src: &str, idx: usize) -> usize {
 
 #[expect(
     clippy::indexing_slicing,
-    reason = "balanced-paren walker — `paren_open_idx = whole.end() - 1` is a regex-match end, always within `src` bounds; subsequent indexing tracks `i < bytes.len()`"
+    reason = "delimiter-generic balanced walker — `open_idx = whole.end() - 1` is a regex-match end and the final class member is a single ASCII byte, so `bytes[open_idx]` is always within `src` bounds; subsequent indexing tracks `i < bytes.len()`"
 )]
 fn find_macro_invocations(src: &str) -> Vec<MacroInvocation> {
     let mut out = Vec::new();
@@ -304,11 +363,55 @@ fn find_macro_invocations(src: &str) -> Vec<MacroInvocation> {
     for caps in MACRO_OPENER_RE.captures_iter(src) {
         let Some(macro_m) = caps.get(1) else { continue };
         let Some(whole) = caps.get(0) else { continue };
-        let paren_open_idx = whole.end() - 1;
+        let open_idx = whole.end() - 1;
         let start_lineno = count_newlines_until(src, whole.start()) + 1;
+        // Regex group 1 in MACRO_OPENER_RE is the macro name; if it's not a
+        // known variant the parser drops the invocation (defensive — regex
+        // alternation only emits known names but the boundary stays explicit).
+        let Some(kind) = MacroKind::parse(macro_m.as_str()) else {
+            continue;
+        };
+
+        // The opener is whichever of `(`, `[`, `{` the regex matched, so the
+        // depth counter must track THAT pair rather than parens specifically.
+        // A macro body is delimiter-balanced in its own kind, and the other
+        // two kinds are then correctly ignored as ordinary body text:
+        // `counter!("m", if x { 1 } else { 2 })` counts only parens, and
+        // `counter!{"m", "k" => f(a, b)}` counts only braces.
+        let open = bytes[open_idx];
+        let close = match open {
+            b'(' => Some(b')'),
+            b'[' => Some(b']'),
+            b'{' => Some(b'}'),
+            _ => None,
+        };
+        // UNREACHABLE via MACRO_OPENER_RE's character class today — and it
+        // FAILS LOUD rather than being trusted to stay that way.
+        //
+        // An earlier draft wrote `_ => continue` under a comment claiming it
+        // would "red instead of mis-parse". `continue` does neither: it drops
+        // the invocation from the scan set entirely, so widening the regex's
+        // delimiter class without widening this match would remove every
+        // invocation using the new delimiter from the label PII checks with
+        // the guard still reporting STATUS=OK. That is precisely the
+        // clean-verdict-over-an-unchecked-scope failure this crate exists to
+        // prevent, and the comment asserted the opposite of the behaviour.
+        //
+        // Routing it into the existing `body: None` path instead makes the
+        // claim true: it surfaces as PARSE_ERROR_RULE_ID, which is a real
+        // FAIL, and needs no new mechanism (CLAUDE.md §Fail loudly).
+        let Some(close) = close else {
+            out.push(MacroInvocation {
+                kind,
+                start_lineno,
+                body: None,
+                expected_close: None,
+            });
+            continue;
+        };
 
         let mut depth: i32 = 1;
-        let mut i = paren_open_idx + 1;
+        let mut i = open_idx + 1;
         let mut in_str = false;
         let mut found_close: Option<usize> = None;
         while i < bytes.len() && depth > 0 {
@@ -336,9 +439,9 @@ fn find_macro_invocations(src: &str) -> Vec<MacroInvocation> {
                 }
                 continue;
             }
-            if c == b'(' {
+            if c == open {
                 depth += 1;
-            } else if c == b')' {
+            } else if c == close {
                 depth -= 1;
                 if depth == 0 {
                     found_close = Some(i);
@@ -347,25 +450,21 @@ fn find_macro_invocations(src: &str) -> Vec<MacroInvocation> {
             }
             i += 1;
         }
-        // Regex group 1 in MACRO_OPENER_RE is the macro name; if it's not a
-        // known variant the parser drops the invocation (defensive — regex
-        // alternation only emits known names but the boundary stays explicit).
-        let Some(kind) = MacroKind::parse(macro_m.as_str()) else {
-            continue;
-        };
         match found_close {
             Some(end) => {
-                let body = src[paren_open_idx + 1..end].to_string();
+                let body = src[open_idx + 1..end].to_string();
                 out.push(MacroInvocation {
                     kind,
                     start_lineno,
                     body: Some(body),
+                    expected_close: Some(close as char),
                 });
             }
             None => out.push(MacroInvocation {
                 kind,
                 start_lineno,
                 body: None,
+                expected_close: Some(close as char),
             }),
         }
     }
@@ -839,10 +938,22 @@ fn check_source(
                 file: rel_path.to_string(),
                 line: inv.start_lineno,
                 rule_id: PARSE_ERROR_RULE_ID,
-                message: format!(
-                    "could not find matching ')' for {}! invocation",
-                    inv.kind.as_str()
-                ),
+                message: match inv.expected_close {
+                    Some(close) => format!(
+                        "could not find matching '{}' for {}! invocation",
+                        close,
+                        inv.kind.as_str()
+                    ),
+                    // Unrecognised opener: MACRO_OPENER_RE's delimiter class
+                    // was widened without teaching the walker its closer.
+                    None => format!(
+                        "unrecognised opening delimiter for {}! invocation — \
+                         MACRO_OPENER_RE accepts a delimiter `find_macro_invocations` \
+                         cannot match a closer for; widen the `close` match in the \
+                         same commit as the regex",
+                        inv.kind.as_str()
+                    ),
+                },
             });
             continue;
         };
@@ -987,6 +1098,173 @@ fn check_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DERIVATION, not equality — every `MacroKind` name must still arrive
+    /// through THIS consumer's real discovery path with zero edits here.
+    ///
+    /// # Why this exists, and why it is not redundant with the SoT pin
+    ///
+    /// `metric_macros::macro_name_alternation_is_frozen_against_narrowing`
+    /// pins the SoT STRING's membership and order. It cannot catch a
+    /// **consumer un-deriving**: if someone re-inlines the six names as a
+    /// literal in `MACRO_OPENER_RE` — the exact state G6 found and fixed on
+    /// 2026-09-08, when this file was the sole holdout among four consumers —
+    /// the SoT pin still passes (the SoT string is untouched) and the spelling
+    /// tests still pass (an identical literal matches all the same inputs).
+    /// Nothing would red. This is the test that would.
+    ///
+    /// The two oracle types are deliberately different and are meant to sit
+    /// side by side, exactly as `telemetry_macros` holds
+    /// `level_group_membership_is_frozen` (frozen literal) next to
+    /// `every_all_member_is_reachable_through_its_group` (derivation). The
+    /// anti-narrowing warning against self-comparison applies to the FROZEN
+    /// oracle only; self-comparison is correct here, because the property
+    /// under test is reachability, not membership.
+    ///
+    /// Asserted through `find_macro_invocations` rather than against
+    /// `MACRO_OPENER_RE.as_str()`, so it exercises the opener AND the walker —
+    /// a delimiter or whitespace regression reds this too. Modelled on
+    /// `media_telemetry_deny::tests::metrics_family_is_derived_from_macro_kind_all`,
+    /// the sibling consumer that already had this test. (@infrastructure F13.)
+    #[test]
+    fn every_macro_kind_is_discovered_through_the_opener() {
+        for kind in MacroKind::ALL {
+            let src = format!(r#"{}!("m", "k" => v);"#, kind.as_str());
+            let invs = find_macro_invocations(&src);
+            assert_eq!(
+                invs.len(),
+                1,
+                "`{}!` is in MacroKind::ALL but metric_labels does not discover it — \
+                 the derivation is cosmetic. Either MACRO_OPENER_RE stopped deriving \
+                 from MACRO_NAME_ALTERNATION (the G6 regression: a re-inlined literal \
+                 passes every other test in this file), or the anchor narrowed.",
+                kind.as_str()
+            );
+            assert_eq!(invs[0].kind, *kind, "discovered as the wrong kind");
+        }
+    }
+
+    /// BOTH halves of the 2026-09-08 anchor widening: whitespace before the
+    /// `!`, and the non-paren delimiters.
+    ///
+    /// `counter !("m")` and `counter!{"m", …}` are both legal Rust that the
+    /// pre-2026-09-08 anchor missed. Matching is only half the property — see
+    /// [`brace_and_bracket_invocation_bodies_are_actually_parsed`], which
+    /// covers the body scanner. A widened opener whose scanner still hunted
+    /// for `)` would match here and then silently yield no body, which is the
+    /// same missed label check wearing a different hat.
+    #[test]
+    fn macro_opener_accepts_space_before_bang_and_all_three_delimiters() {
+        for s in [
+            r#"counter !("m", "k" => v);"#,
+            r#"counter  !("m");"#,
+            r#"metrics :: describe_counter !("m", "d");"#,
+            r#"counter!{"m", "k" => v}"#,
+            r#"counter!["m"]"#,
+            r#"gauge !{"m"}"#,
+        ] {
+            assert!(
+                MACRO_OPENER_RE.is_match(s),
+                "must match after widening: {s}"
+            );
+        }
+        // Must not reach past the name boundary.
+        assert!(!MACRO_OPENER_RE.is_match("my_counter !(x)"));
+        // `!=` is not an invocation: the char after `!` must be a delimiter.
+        assert!(!MACRO_OPENER_RE.is_match("if counter != (0) {"));
+    }
+
+    /// The body scanner half of the delimiter widening.
+    ///
+    /// This is the assertion that would have caught a half-done fix: the
+    /// opener regex and the depth loop are two encodings of "what delimits a
+    /// macro body", and widening only the first yields an invocation with
+    /// `body: None` — no labels, no PII check, and no finding either way, so
+    /// nothing reds. Each case asserts the body was RECOVERED, not merely that
+    /// the invocation was discovered.
+    ///
+    /// The nesting cases matter for the same reason: the loop counts only its
+    /// OWN delimiter kind, so a paren inside a brace body (and vice versa)
+    /// must be ignored rather than throwing the depth off.
+    #[test]
+    fn brace_and_bracket_invocation_bodies_are_actually_parsed() {
+        for (src, want_kind) in [
+            (r#"counter!{"m", "k" => v};"#, MacroKind::Counter),
+            (r#"gauge!["m", "k" => v];"#, MacroKind::Gauge),
+            // Foreign delimiters inside the body are ordinary text.
+            (r#"counter!{"m", "k" => f(a, b)};"#, MacroKind::Counter),
+            (
+                r#"counter!("m", "k" => if x { 1 } else { 2 });"#,
+                MacroKind::Counter,
+            ),
+            // Same-kind nesting must still balance.
+            (
+                r#"counter!{"m", "k" => g(|| { h() })};"#,
+                MacroKind::Counter,
+            ),
+        ] {
+            let invs = find_macro_invocations(src);
+            assert_eq!(invs.len(), 1, "expected one invocation in: {src}");
+            assert_eq!(invs[0].kind, want_kind, "wrong kind for: {src}");
+            // `assert!` + a plain read, NOT `unwrap_or_else(|| panic!(...))`:
+            // `clippy::panic` is denied workspace-wide (`Cargo.toml`) and
+            // `clippy.toml` grants `allow-expect-in-tests` / `-unwrap-in-tests`
+            // but deliberately NOT `allow-panic-in-tests`. The assertion form
+            // keeps `{src}` in the message, which `.expect()` could not.
+            assert!(
+                invs[0].body.is_some(),
+                "body must be recovered, not None, for: {src}"
+            );
+            let body = invs[0].body.as_deref().unwrap_or_default();
+            assert!(
+                body.starts_with('"'),
+                "body should start at the first label arg, got {body:?} for: {src}"
+            );
+        }
+    }
+
+    /// The unterminated-invocation message NAMES the delimiter it wanted.
+    ///
+    /// It was hardcoded `')'` until 2026-09-08, which became wrong for two of
+    /// three delimiters the moment brace and bracket forms were discoverable.
+    /// Operator-facing output on a FAIL path: telling someone looking at a `{`
+    /// that a `)` is missing costs a real incident minute.
+    #[test]
+    fn unterminated_invocation_names_the_delimiter_it_expected() {
+        let name: &str = "counter";
+        for (src, want) in [
+            (format!(r#"{name}!("m", "k" => x"#), ')'),
+            (format!(r#"{name}!{{"m", "k" => x"#), '}'),
+            (format!(r#"{name}!["m", "k" => x"#), ']'),
+        ] {
+            let invs = find_macro_invocations(&src);
+            assert_eq!(invs.len(), 1, "expected one invocation in: {src}");
+            assert!(invs[0].body.is_none(), "should be unterminated: {src}");
+            assert_eq!(
+                invs[0].expected_close,
+                Some(want),
+                "wrong expected closer for: {src}"
+            );
+        }
+    }
+
+    /// A brace-delimited invocation carrying an unbounded PII-bearing label is
+    /// FOUND, which is why the delimiter half was not left as debt (ADR-0029).
+    ///
+    /// Before 2026-09-08 this shipped with nothing firing: the opener never
+    /// matched, so the invocation was never discovered and its labels were
+    /// never checked.
+    #[test]
+    fn brace_form_unbounded_label_is_not_invisible() {
+        let src = r#"counter!{"mh_frames_total", "email" => user_email.to_string()};"#;
+        let invs = find_macro_invocations(src);
+        assert_eq!(invs.len(), 1, "brace-form invocation must be discovered");
+        let body = invs[0].body.as_ref().expect("body must be recovered");
+        assert!(
+            body.contains("user_email"),
+            "the label value must reach the PII checks; got {body:?}"
+        );
+    }
 
     #[test]
     fn cat_a_token_fires_without_allowlist() {

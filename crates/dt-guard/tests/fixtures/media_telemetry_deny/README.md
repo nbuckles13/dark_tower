@@ -39,6 +39,20 @@ red some *other* guard?" is a real question. It was swept in full on
 The guard under test reads these files as *data*, via
 `media_telemetry_deny::check_file`, so nothing here is compiled.
 
+## One fixture whose LAYOUT is the test
+
+`pos_handle_call_colocated_with_macro.rs` puts a handle call and a denied
+macro on **one physical line**. That is not a style choice — it is the only
+shape that distinguishes "the allow is satisfied by construction" from "the
+allow is a line-level filter", because a fixture holding handle calls alone
+passes identically under either implementation. Splitting that line to satisfy
+a style preference silently turns the fixture into a duplicate of
+`pos_metrics_label_macros.rs`.
+
+`cargo fmt` cannot do this to you (these files are in no cargo target — see
+below); a human can. The fixture says so at its foot, and the expectation of
+exactly one hit is what reds if it happens.
+
 ## Two things not to do
 
 1. **Do not name the harness `*_tests.rs`.** `test_registration` pairs

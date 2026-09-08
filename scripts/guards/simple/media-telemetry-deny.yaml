@@ -37,6 +37,24 @@
 # ADR-0036 §11's "alive, never applied" failure and the single thing this
 # manifest is designed to make impossible.
 #
+# IF THAT READS AS OVER-ENGINEERING, THE PRECEDENT IS IN THIS REPOSITORY.
+# A guard silently disarmed by a rename reports clean forever and reads as
+# coverage while covering nothing. It has already happened here:
+# `crates/dt-guard/src/env_config.rs:23-27` records the env-config guard
+# warn-skipping `mc-service` and `mh-service` while emitting
+#
+#     STATUS=OK REASON=env-config-clean-4-services
+#
+# — a clean verdict carrying a confident count that INCLUDED the two services
+# it had not checked. The WARNING went to stderr; the STATUS line said clean;
+# nothing failed until someone went looking. Two of four services unchecked,
+# reported as four checked and clean.
+#
+# That is why the two tokens above are FAIL and exit 1 rather than a warning,
+# and why the self-test asserts the SPECIFIC token rather than merely "did not
+# report OK". A test that accepts any failure cannot distinguish a working
+# control from a broken one, which is how the same class recurs.
+#
 # The two tokens are deliberately DISTINCT rather than one overloaded token,
 # because their remediations are opposite: "missing" means restore the
 # directory or update the path below; "empty" means the path is right and the
@@ -54,7 +72,57 @@
 #    children, so the directory boundary and the hot-path boundary are the
 #    same boundary."
 #
-# That premise is stated in `crates/mh-service/src/media/mod.rs`'s module doc,
+# A PER-FRAME SURFACE THIS MANIFEST STRUCTURALLY CANNOT COVER, AND WHAT DOES.
+#
+# `crates/mh-service/src/webtransport/media_transport.rs` is the transport-seam
+# adapter — `send_datagram` / `write_all` / `recv_datagram`, called per frame.
+# It is hot path. It is NOT in the list below, and it cannot be:
+#
+#   - naming the single file would be the file-list shape §11 rules out
+#     ("not a file list, which narrows silently on refactor while the guard
+#     keeps passing"); and
+#   - denying its directory wholesale is wrong, because `connection.rs` sits
+#     beside it and legitimately uses tracing and metrics for connection
+#     lifecycle, handshake and JWT work.
+#
+# It is covered instead by the in-crate walker
+# `crates/mh-service/tests/media_metrics_integration.rs::
+# no_log_or_metric_macro_is_reachable_from_the_hot_path`, which scans
+# `src/media` PLUS that adapter, and carries its own anti-false-green
+# assertions.
+#
+# THE WALKER IS THIS GUARD'S COMPLEMENT, NOT ITS PREDECESSOR. The hazard is
+# specific and it is the reason this paragraph exists: once a guard-pipeline
+# control exists and looks authoritative, the in-crate walker reads as
+# redundant scaffolding and someone retires it — at which point the seam
+# adapter silently loses its ONLY coverage, and every guard involved keeps
+# reporting clean. Neither artifact fails; the coverage just stops.
+#
+# This is the canonical home for that reasoning. The guard module and the
+# walker carry a one-line consequence and a pointer back here rather than
+# restating it, because independently-worded copies drift into disagreeing
+# about why. (@media-handler, 2026-09-08.)
+#
+# HONEST ACCOUNTING OF WHAT "ONCE" MEANS HERE (@dry-reviewer, 2026-09-08).
+# The two satellites are not one-liners: each restates the two
+# cannot-be-added bullets, the complement claim and the retirement hazard in
+# its own words. That is three copies, and this paragraph previously claimed
+# otherwise — the same defect as a doc claiming SSoT coverage the code does
+# not have. It is kept deliberately rather than trimmed, because the three
+# readers make three different decisions and a pointer alone does not stop
+# the walker being retired by someone who never opens this file. What the
+# canonical-home claim means in practice is narrower and is stated as such:
+# **this block is where the reasoning is MAINTAINED, and a change here
+# obliges updating the other two.**
+#
+# Note what this means for completeness generally: the scope tokens below
+# detect a configured directory that stops resolving. They cannot detect a
+# hot-path directory that was never configured. Under-scoping is invisible to
+# every control in this design and is held by reviewers.
+#
+# THE SIBLING-LAYOUT PREMISE quoted above (§11's "the directory boundary and
+# the hot-path boundary are the same boundary") is stated in
+# `crates/mh-service/src/media/mod.rs`'s module doc,
 # which is where it belongs. THIS GUARD CANNOT CHECK IT. Mechanically it
 # asserts only "the configured path resolves to a non-empty .rs tree"; it has
 # no way to know whether that tree is the hot path. If someone moves lifecycle
@@ -69,12 +137,20 @@
 # ---------------------------------------------------------------------------
 # A green run says: "the enumerated macro forms do not appear, in code
 # position, in the configured directories." It does not say the media path is
-# free of telemetry. Two named residuals, both in the guard's module doc:
+# free of telemetry. Two named IN-SCOPE residuals — both are matcher gaps
+# within the configured directories, and both are in the guard's module doc:
 #   - a re-export living in a sibling and reached as `crate::obs::note!(...)`
 #     is caught by neither the import deny nor the invocation deny;
 #   - the invocation matcher is a deny LIST, so an unlisted macro name passes.
 # Only inverting to an allowlist of macro names permitted inside the scope
 # would close both.
+#
+# The seam adapter covered in §INCOMPLETE BY DESIGN above is deliberately NOT
+# counted here and must not be folded into that list. It is a different KIND
+# of gap — a per-frame surface OUTSIDE the configured scope entirely, not a
+# matcher that misses something inside it — and the allowlist inversion above
+# would not touch it. Numbering the three together invites exactly that
+# mistake.
 #
 # ---------------------------------------------------------------------------
 # NO SUPPRESSION
@@ -90,9 +166,27 @@
 # OWNERSHIP
 # ---------------------------------------------------------------------------
 # The list below is POLICY CONTENT owned by `observability` (CLAUDE.md
-# §Specialists, guard-crate ownership). The schema, the header and the parsing
-# are `infrastructure` machinery. Extending the list beyond the seed requires
-# observability sign-off.
+# §Specialists, guard-crate ownership). Extending the list beyond the seed
+# requires observability sign-off.
+#
+# The schema, the parsing contract and the file mechanics — the SCHEMA block
+# above, `deny_unknown_fields`, the discovery-inertness note, and this
+# OWNERSHIP block itself — are `infrastructure` machinery. Header PROSE that
+# states what the list covers, why something is out of scope, or what a token
+# means for remediation is POLICY CONTENT and is `observability`'s: a coverage
+# boundary is what a deny-list entry MEANS (CLAUDE.md §Specialists).
+#
+# NARROWED 2026-09-08 BY INFRASTRUCTURE, and the history matters because the
+# earlier text cost a ruling. This block previously read "the schema, the
+# header and the parsing are `infrastructure` machinery", where "the header"
+# was read as covering ALL header prose. At Gate 1 an observability
+# implementer argued the coverage-boundary paragraphs were content; the
+# reviewer and Lead ruled against them NOT on the merits but because an
+# owner's own written claim may only be upgraded, never argued down
+# (ADR-0024 §6.2) — and infrastructure was absent from that team, so nobody
+# could cede. The merits were explicitly left undecided. Infrastructure has
+# now resolved its own ambiguity in the narrower direction, which is the
+# outcome the substance pointed at all along.
 #
 # This file is NOT a Guarded Shared Area mirror and must not be confused with
 # `cross-boundary-ownership.yaml`, which sits beside it. That file is under

@@ -246,6 +246,21 @@ pub fn planted_j() {}'
 # ---------------------------------------------------------------------------
 # These are the "alive, never applied" guard. A rename must not silently
 # disarm the control.
+#
+# THESE CASES ARE NOT PARANOIA, AND THE PRECEDENT IS IN THIS REPOSITORY.
+# A guard silently disarmed by a directory rename reports clean forever, and
+# reads as coverage while covering nothing. That has already happened here:
+# `crates/dt-guard/src/env_config.rs:23-27` records the env-config guard
+# warn-skipping `mc-service` and `mh-service` while emitting
+#   STATUS=OK REASON=env-config-clean-4-services
+# a clean verdict carrying a confident count that INCLUDED the two services it
+# had not checked. The WARNING went to stderr; the STATUS line said clean;
+# nobody noticed until someone went looking.
+#
+# So the assertions below check the SPECIFIC token and a non-zero exit, never
+# merely "did not report OK" — a test that accepts any failure cannot tell a
+# working control from a broken one. Anyone tempted to thin this section
+# should read that entry first.
 write_manifest() { printf 'denied_directories:\n%s\n' "$1" > "${2}/${MANIFEST_REL}"; }
 
 # (d1) configured directory does not exist.
@@ -272,8 +287,41 @@ write_manifest() { printf 'denied_directories:\n%s\n' "$1" > "${2}/${MANIFEST_RE
   out="$OUT"
   assert_exit "scope:empty:rc" 1 "$RC"
   assert_status "scope:empty:token" "STATUS=FAIL REASON=media-telemetry-deny-scope-directory-empty" "$out"
+  assert_status "scope:empty:diff-defect" "THIS IS A DIFF DEFECT, not a machine fault" "$out"
   EMPTY_TOKEN="$(reason_of "$out")"
 }
+
+# (d2c) configured directory exists and is LITERALLY EMPTY (zero entries).
+# Distinct from (d2), which holds a non-.rs file. Both are one equivalence
+# class -- zero `.rs` files -- and must therefore emit the SAME token; a
+# different token for empty-vs-non-rs would itself be a smell, since the
+# operator's next action is identical. The case exists because "empty
+# directory" and "exists but holds no Rust source" are different filesystem
+# states reaching the same code path, and only one of them was covered at any
+# level before 2026-09-08.
+{
+  root="${WORK}/scope_truly_empty"
+  mk_root "$root" custom
+  write_manifest '  - crates/mh-service/src/media/' "$root"
+  mkdir -p "${root}/crates/mh-service/src/media"
+  run_guard "$root"
+  out="$OUT"
+  assert_exit "scope:truly-empty:rc" 1 "$RC"
+  assert_status "scope:truly-empty:token" "STATUS=FAIL REASON=media-telemetry-deny-scope-directory-empty" "$out"
+  assert_status "scope:truly-empty:diff-defect" "THIS IS A DIFF DEFECT, not a machine fault" "$out"
+  TRULY_EMPTY_TOKEN="$(reason_of "$out")"
+}
+
+# (d2d) The two zero-.rs states are ONE equivalence class and must not have
+# forked into two tokens. Asserted rather than assumed: a future walk that
+# distinguished them would send an operator hunting a difference that has no
+# bearing on the fix.
+if [[ "$EMPTY_TOKEN" == "$TRULY_EMPTY_TOKEN" ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[scope:empty-class-forked] no-.rs-file gave '${EMPTY_TOKEN}' but empty-dir gave '${TRULY_EMPTY_TOKEN}'; they are one equivalence class")
+fi
 
 # (d3) The two tokens must be DISTINGUISHABLE by a reader of the STATUS line.
 # Asserting "both failed" would pass against a single overloaded token, which
@@ -295,6 +343,7 @@ fi
   out="$OUT"
   assert_exit "scope:none:rc" 1 "$RC"
   assert_status "scope:none:token" "REASON=media-telemetry-deny-scope-no-directories-configured" "$out"
+  assert_status "scope:none:diff-defect" "THIS IS A DIFF DEFECT, not a machine fault" "$out"
 }
 
 # (d5) configured directory escapes the repo root via a symlink. Must NOT
@@ -315,6 +364,7 @@ fi
   assert_exit "scope:escape:rc" 1 "$RC"
   assert_status "scope:escape:token" "REASON=media-telemetry-deny-scope-directory-escapes-root" "$out"
   assert_absent "scope:escape:not-missing" "REASON=media-telemetry-deny-scope-directory-missing" "$out"
+  assert_status "scope:escape:diff-defect" "THIS IS A DIFF DEFECT, not a machine fault" "$out"
 }
 
 # (d6) manifest missing entirely, and (d7) manifest that will not deserialize.
@@ -326,6 +376,14 @@ fi
   out="$OUT"
   assert_exit "manifest:missing:rc" 1 "$RC"
   assert_status "manifest:missing:token" "REASON=media-telemetry-deny-manifest-missing" "$out"
+  # The prefix-collision pin: `ERROR: PRECONDITION` means the ENVIRONMENT for
+  # `release-build-profile-*` and `env-config-*`, and a DIFF DEFECT here. That
+  # inversion is held by hand-maintained prose in docs/runbooks/devloop-validation.md.
+  # Pinning the string the prose is ABOUT is cheaper than another copy and
+  # cannot rot silently. (Deliberately no count of the prose sites here: a
+  # hand-copied tally inside a comment that justifies deleting a hand-copied
+  # tally is the same defect one layer up. @operations OPS-3.)
+  assert_status "manifest:missing:diff-defect" "THIS IS A DIFF DEFECT, not a machine fault" "$out"
 }
 {
   root="${WORK}/manifest_bad"
@@ -335,6 +393,14 @@ fi
   out="$OUT"
   assert_exit "manifest:bad:rc" 1 "$RC"
   assert_status "manifest:bad:token" "REASON=media-telemetry-deny-manifest-unparseable" "$out"
+  # Sixth of the SEVEN `Rule::is_content() == false` tokens. `unparseable-use`
+  # is the seventh and is deliberately NOT pinned here: it routes through
+  # `print_finding_line`, not `print_scope_failure_line`, so it carries the
+  # `ERROR: PRECONDITION` prefix on an ordinary finding line and no banner.
+  # The runbook prose was corrected to say so rather than the emitter being
+  # changed -- emitted guard output is infrastructure machinery. (@operations
+  # OPS-3.)
+  assert_status "manifest:bad:diff-defect" "THIS IS A DIFF DEFECT, not a machine fault" "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -572,5 +638,29 @@ assert_survives_filter() {
   leaked="$(printf '%s\n' "${FAILURES[@]:-}" | grep -c '^STATUS=' || true)"
   assert_exit "harness:no-bare-status-in-failures" 0 "$leaked"
 }
+
+# The case count, pinned.
+#
+# Without this the harness has NO FLOOR: `report_results` exits 0 on
+# "87 passed, 0 failed" exactly as happily as on the full set, so silently
+# dropping a case is invisible from both ends. A suite whose entire subject is
+# "a control that reads as coverage while covering nothing" must not itself be
+# able to shrink quietly — and `docs/runbooks/devloop-validation.md` now tells
+# an operator to read this suite's pass count, which is only meaningful if
+# something floors it.
+#
+# `PASS + FAIL` is the right tally rather than `PASS`: the (d2d) equivalence
+# check and (d3) token-distinctness check increment the counters directly
+# without going through an `assert_` helper, and they still count as cases.
+#
+# Shape and rationale follow `scripts/guards/validate-frame-vectors.test.sh`,
+# which is the in-repo SSoT precedent. When you legitimately add or remove a
+# case, change this number in the same commit; this is the ONLY home for it.
+EXPECTED_CASES=92
+if [[ $((PASS + FAIL)) -ne "$EXPECTED_CASES" ]]; then
+  echo "FAIL: ran $((PASS + FAIL)) cases, expected ${EXPECTED_CASES}. A case was added or dropped;" \
+       "update EXPECTED_CASES deliberately rather than letting the tally float."
+  exit 1
+fi
 
 report_results "$0"

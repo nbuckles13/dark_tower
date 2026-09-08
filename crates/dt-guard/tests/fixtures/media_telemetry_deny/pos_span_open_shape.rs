@@ -1,7 +1,9 @@
 //! A locally-defined `*_span!` wrapper inside the media path.
 //!
-//! This is the evasion the media-only open shape `\b\w+_span!\s*\(` exists to
-//! close, and it is the span-side twin of `pos_import_renamed_tracing.rs`: a
+//! This is the evasion the media-only `*_span!` open shape (`OPEN_SPAN_RE`)
+//! exists to close — it matches any name ending in a literal `_span`, which is
+//! the property that matters here and which survives the anchor widenings the
+//! spelling does not. It is the span-side twin of `pos_import_renamed_tracing.rs`: a
 //! sibling module defines a wrapper whose name is outside the enumerated six,
 //! and the enumerated list alone never sees it.
 

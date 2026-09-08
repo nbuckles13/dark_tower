@@ -14,6 +14,22 @@
 //!   That is "confirm the premise against the real artifact", machine-checked
 //!   on every `cargo test` rather than narrated in a comment.
 //!
+//! # The *applies* half is not paranoia — the in-tree precedent
+//!
+//! A guard silently disarmed by a directory rename reports clean forever, and
+//! reads as coverage while covering nothing. That is not hypothetical in this
+//! repository: `crates/dt-guard/src/env_config.rs:23-27` records the
+//! env-config guard **warn-skipping `mc-service` and `mh-service` while
+//! emitting `STATUS=OK REASON=env-config-clean-4-services`** — a clean verdict
+//! carrying a confident count that included the two services it had not
+//! checked. The WARNING went to stderr; the STATUS line said clean; nobody
+//! noticed.
+//!
+//! Anyone weighing whether the scope-missing and scope-empty tests below are
+//! over-engineering should read that entry first. They are the difference
+//! between a control and a control-shaped object, and the failure they prevent
+//! has already happened here once.
+//!
 //! # The expectation is the fixture owner's, not the walker's
 //!
 //! `catalog()`'s rows are transcribed from the `// Invariant:` paragraphs the
@@ -104,6 +120,23 @@ fn catalog() -> Vec<Expectation> {
         Expectation {
             file: "pos_print_family.rs",
             per_rule: &[("macro-in-media-path", 5)],
+        },
+        // ---- Fires: whitespace-before-`!` and non-paren delimiters ----
+        // Added 2026-09-08. The whitespace class was a live evasion; the
+        // delimiter class was already denied in code but pinned only by unit
+        // tests, and the catalog is the artifact a later auditor reads as the
+        // coverage inventory.
+        Expectation {
+            file: "pos_macro_space_before_bang.rs",
+            per_rule: &[("macro-in-media-path", 6)],
+        },
+        // ---- Fires: the allow is BY CONSTRUCTION, demonstrated ----
+        // One physical line, a handle call and a real `counter!`. Exactly one
+        // hit: not zero (a line filter would mask it), not two (flagging
+        // `.increment` would ban the pattern §11 exists to enforce).
+        Expectation {
+            file: "pos_handle_call_colocated_with_macro.rs",
+            per_rule: &[("macro-in-media-path", 1)],
         },
         // ---- Fires: `#[instrument]` attribute ----
         Expectation {
