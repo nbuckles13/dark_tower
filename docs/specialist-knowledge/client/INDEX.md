@@ -10,14 +10,17 @@
 - Debate record → `docs/debates/2026-02-28-client-architecture/debate.md`
 
 ## SDK Core (`packages/sdk-core/src/`)
-- Signaling client (proto ServerMessage → events) → `signaling/SignalingClient.ts`
-- Meeting session (event bridge, single-use per join) → `session/MeetingSession.ts`
-- WebTransport length-prefix stream framing (matches MC wire contract) → `framing/length-prefix.ts`, `framing/sendFramed.ts`
-- WebCodecs encode/decode → `media/`
-- WebTransport connection mgmt → `transport/`
+- Signaling client / meeting session (single-use per join) → `signaling/SignalingClient.ts`, `session/MeetingSession.ts`
+- WebTransport length-prefix framing (MC wire contract) → `framing/{length-prefix,sendFramed}.ts`
+- Client config SSoT (Opus, rotation T, queue bounds, metric cadence) → `config/clientConfig.ts`
+- Frame codec + SFrame crypto → `media/frame/`; audio pipeline → `media/{pipeline,lifecycle,setup,teardown}/`
+- Media layout rule (hot path vs siblings, ADR-0036 §11) → `media/__tests__/hotPathLayout.test.ts`
+- Media metric handles + allow-list labels (only `dt_client_` names under `media/**`) → `media/setup/mediaMetrics.ts`
+- Key material seams (meeting KEK, roster keys, identity, transmit keys) → `media/setup/{kekSource,rosterKeys,identity}.ts`, `media/lifecycle/transmitKeys.ts`
+- TS-side KEK sink control → `signaling/kekIntake.ts`, `__tests__/serverMessageSinkScan.test.ts`
+- WebTransport connection mgmt + datagram I/O → `transport/`, `media/MediaTransport.ts`
 - HTTP/3 meeting API client → `http/`
-- Error taxonomy (`SdkErrorCode`) → `errors/`
-- HTTP status → meeting error mapping (cap vs org-inactive 403s) → `errors/MeetingError.ts:fromResponse()`
+- Error taxonomy (`SdkErrorCode`); HTTP status → meeting error mapping → `errors/`, `errors/MeetingError.ts:fromResponse()`
 - Input validation SSoT (`SUBDOMAIN_REGEX`, length caps, validators) → `validation/limits.ts`
 - Protobuf-es generated types → `proto/dark_tower/`
 
@@ -33,9 +36,7 @@
 - Vite proxy + E2E-hook / cert-fingerprint plumbing → `packages/web-app/vite.config.ts`, `packages/web-app/vite/fingerprints.ts`
 
 ## Client Telemetry (`packages/sdk-core/src/telemetry/`)
-- OTel metrics sink / noop → `OtelMetricsSink.ts`, `NoopMetricsSink.ts`
-- Trace propagation → `tracePropagation.ts`
-- Close-reason classification → `closeReason.ts`
+- OTel metrics sinks / trace propagation / close-reason → `{OtelMetricsSink,NoopMetricsSink,tracePropagation,closeReason}.ts`
 - Structured logger + name redaction guard → `logger.ts`, `nameGuard.ts`
 
 ## Browser E2E Harness (`packages/web-app/e2e/`)
@@ -51,10 +52,10 @@
 - Subdomain-pattern drift guard (e2e mirror ↔ SDK SSoT) → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
 
 ## Client Test Utilities (`packages/test-utils/src/`)
-- Mock transport → `MockWebTransport.ts`
+- Mock transport (datagrams, injected drops, back-pressure, queue knobs) → `MockWebTransport.ts`
+- Audio seam doubles (capture, codecs, playback) — never frame crypto → `media/index.ts`
 - Test token builder → `TestTokenBuilder.ts`, `token-claims.ts`
-- Metrics sink contract + in-memory / OTLP mocks → `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`
-- Deterministic id generator → `deterministic-ids.ts`
+- Metrics sink contract + mocks; deterministic ids → `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
 
 ## Protocol Integration
 - Signaling proto (client-server) → `proto/dark_tower/signaling/v1/signaling.proto`
@@ -63,6 +64,8 @@
 - Meeting-token `display_name` claim (roster names) → `crates/common/src/jwt.rs:MeetingTokenClaims`
 
 ## Observability
+- Metrics catalog + frozen grandfathered label roster → `docs/observability/metrics/client.md`
+- Media-path label rules (R1/R2/R3) → `docs/observability/label-taxonomy.md`
 - Client alert rules & dashboards → `client-alerts.yaml`, `client-overview.json`, `client-slo.json`, `client-synthetic.json`
 
 ## Toolchain & Build

@@ -57,6 +57,11 @@ import {
   MhConnectionStatusSchema,
   ParticipantCapabilitiesSchema,
   ServerMessageSchema,
+  MediaKind,
+  MuteRequestSchema,
+  ReceiveCapabilitySchema,
+  ReceiveSlotSchema,
+  SlotState,
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type {
   ClientMessage,
@@ -66,6 +71,15 @@ import type {
 
 import { isAuthClass, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
 import { mapLeaveReason } from './events.js';
+import { takeMeetingKek, type MeetingKekSink } from './kekIntake.js';
+import type {
+  ReceiveSlotDeclaration,
+  RosterKeySink,
+  SendDirectiveEvent,
+  SendStreamDirective,
+  StreamAssignmentEvent,
+  StreamAssignmentsEvent,
+} from './events.js';
 import { toWireCodec } from './codecMap.js';
 import type { Codec } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type {
@@ -121,6 +135,22 @@ export interface SignalingClientOptions {
    * `<= 0` value disables the timeout (opt-out).
    */
   readonly joinTimeoutMs?: number;
+  /**
+   * Where a decoded meeting KEK is deposited (ADR-0036 §4's KEK-source seam).
+   *
+   * Supplied rather than emitted: the KEK MUST NOT ride any event payload, so
+   * `JoinResponse.meeting_kek` goes straight from the decode boundary into this
+   * sink and the decoded field is scrubbed. See `kekIntake.ts`.
+   */
+  readonly kekSink?: MeetingKekSink;
+  /**
+   * Where roster identity public keys are deposited.
+   *
+   * Also a sink rather than an event: it keeps the public `RosterParticipant`
+   * shape unchanged, and therefore keeps key bytes out of the web app's e2e-bus
+   * projection.
+   */
+  readonly rosterKeys?: RosterKeySink;
 }
 
 /** The typed events SignalingClient emits. */
@@ -133,6 +163,24 @@ export interface SignalingEventMap {
   participantLeft: ParticipantLeftEvent;
   /** Emitted on a signaling error that occurs AFTER join has settled. */
   error: SignalingError;
+  /**
+   * MC directed what to produce and where (ADR-0036 §5).
+   *
+   * MC emits this when the client declares its receive capability, NOT at join —
+   * so a client that joins and never declares is never told to send, and the
+   * connection stays healthy in every other respect. That coupling is
+   * deliberate: composing the directive and the slot assignments from ONE
+   * meeting-state snapshot is what keeps the directive's target set and the
+   * assignments' sources from disagreeing.
+   */
+  sendDirective: SendDirectiveEvent;
+  /**
+   * MC filled (or explained) this client's declared slots (ADR-0036 §6).
+   *
+   * PRESENTATION STATE, NOT IDENTITY: a receiver attributes an arriving frame
+   * from that frame's own `key_id.sender_id`, never from an assignment.
+   */
+  streamAssignments: StreamAssignmentsEvent;
 }
 
 interface Deferred<T> {
@@ -149,6 +197,36 @@ function defer<T>(): Deferred<T> {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+/**
+ * Wire `SlotState` -> the SDK's plain vocabulary.
+ *
+ * Every arm is explicit and the default is `unspecified` rather than a
+ * best-guess: ADR-0036 §6 makes slot state explicit on the wire precisely
+ * because absence of frames is not a signal, and a mapper that silently folded
+ * an unknown state into `active` would reintroduce the ambiguity the field
+ * exists to remove.
+ */
+function mapSlotState(state: SlotState): StreamAssignmentEvent['slotState'] {
+  switch (state) {
+    case SlotState.ACTIVE:
+      return 'active';
+    case SlotState.SOURCE_MUTED:
+      return 'source_muted';
+    case SlotState.WITHHELD_BY_CONGESTION:
+      return 'withheld_congestion';
+    case SlotState.FEWER_SOURCES_THAN_SLOTS:
+      return 'fewer_sources';
+    case SlotState.ZERO_REQUESTED:
+      return 'zero_requested';
+    case SlotState.SOURCE_UNREACHABLE:
+      return 'source_unreachable';
+    case SlotState.SWITCH_PENDING:
+      return 'switch_pending';
+    default:
+      return 'unspecified';
+  }
 }
 
 const defaultLogger: SignalingLogger = {
@@ -189,12 +267,32 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
 
   #correlationId: string | undefined;
   #bindingToken: string | undefined;
+  readonly #kekSink: MeetingKekSink | undefined;
+  readonly #rosterKeys: RosterKeySink | undefined;
+  /** The KEK generation MC issued. Never a metric label, never a span attribute. */
+  #kekGeneration = 0;
 
   constructor(options: SignalingClientOptions = {}) {
     super();
     this.#connectFn = options.connect ?? defaultConnect;
     this.#logger = options.logger ?? defaultLogger;
     this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
+    this.#kekSink = options.kekSink;
+    this.#rosterKeys = options.rosterKeys;
+  }
+
+  /**
+   * The KEK generation MC issued at join.
+   *
+   * Read by the media pipeline to stamp every wrapped-key block. NEVER a metric
+   * label, span attribute, or per-frame log dimension: it is a frame-header
+   * field, it is monotonic over the meeting's life so its cardinality is
+   * unbounded over TIME rather than bounded by its type, and it advances on the
+   * leave debounce — which makes a per-meeting generation series a
+   * membership-change trace, de-anonymising by inspection in the two-person case.
+   */
+  get kekGeneration(): number {
+    return this.#kekGeneration;
   }
 
   /**
@@ -308,6 +406,14 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       // First-time join: correlation/binding are empty (ADR-0023).
       correlationId: '',
       bindingToken: '',
+      // ADR-0036 §4 step 2: the raw 32-byte Ed25519 identity signing public key.
+      // NOT attested and NOT trusted by MC — it publishes what the client sent,
+      // trust on first use. A signature verifying against it proves only that
+      // every frame came from the same keyholder, never WHO. The client-validated
+      // AC attestation that closes this is story 2.
+      ...(params.identityPublicKey !== undefined
+        ? { identityPublicKey: params.identityPublicKey }
+        : {}),
     });
     const clientMessage = create(ClientMessageSchema, {
       message: { case: 'joinRequest', value: joinRequest },
@@ -436,6 +542,13 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         // R-17: store for future reconnection (storage only).
         this.#correlationId = jr.correlationId;
         this.#bindingToken = jr.bindingToken;
+        this.#kekGeneration = jr.kekGeneration;
+        // THE KEK LEAVES THE DECODED MESSAGE HERE, IMMEDIATELY. It goes into the
+        // seam and the field is scrubbed, so no later stringify, structured
+        // clone, or interpolation of this `ServerMessage` can print it. It is
+        // never placed on `JoinedEvent`, which is a public payload.
+        if (this.#kekSink) takeMeetingKek(jr, this.#kekSink);
+        this.#feedRosterKeys(jr.existingParticipants);
         const event: JoinedEvent = {
           participantId: jr.participantId,
           // `optional uint32` → `number | undefined`. Absence is passed
@@ -456,6 +569,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       case 'participantJoined': {
         const participant = message.value.participant;
         if (participant !== undefined) {
+          this.#feedRosterKeys([participant]);
           this.emit('participantJoined', {
             participant: { participantId: participant.participantId, name: participant.name },
           });
@@ -468,6 +582,48 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           participantId: pl.participantId,
           reason: mapLeaveReason(pl.reason),
         });
+        return;
+      }
+      case 'sendDirective': {
+        const directive = message.value;
+        const streams: SendStreamDirective[] = directive.streams.map((s) => ({
+          streamNumber: s.streamNumber,
+          mediaKind:
+            s.mediaKind === MediaKind.AUDIO
+              ? 'audio'
+              : s.mediaKind === MediaKind.VIDEO_CAMERA || s.mediaKind === MediaKind.VIDEO_SCREEN
+                ? 'video'
+                : 'other',
+          // Absent or zero means MC did not direct one; the SDK then applies its
+          // configured default. Deliberately NOT coerced to a number here, so
+          // "MC said nothing" stays distinguishable from "MC said 0".
+          maxBitrateBps:
+            s.encoding && s.encoding.maxBitrateBps > 0 ? s.encoding.maxBitrateBps : undefined,
+          targets: s.targets.map((target) => target.mediaHandlerUrl),
+        }));
+        this.emit('sendDirective', { streams, headerVersion: directive.headerVersion });
+        return;
+      }
+      case 'streamAssignments': {
+        const assignments: StreamAssignmentEvent[] = message.value.assignments.map((a) => ({
+          slotId: a.slotId,
+          // `optional uint32` -> `number | undefined`. Absence is passed through
+          // and NEVER coerced to 0: 0 is a reserved-invalid sender id.
+          senderId: a.senderId,
+          mediaHandlerUrl: a.mediaHandlerUrl,
+          slotState: mapSlotState(a.slotState),
+        }));
+        const event: StreamAssignmentsEvent = { assignments };
+        this.emit('streamAssignments', event);
+        return;
+      }
+      case 'meetingKekUpdate': {
+        // Defined additively and UNUSED THIS STORY (KEK-push rotation is story
+        // 2), but the SCRUB runs regardless: the field is key material on a
+        // decoded message the moment it arrives, and leaving it in the object
+        // graph because nothing consumes it yet is exactly how a latent leak
+        // becomes a live one.
+        if (this.#kekSink) takeMeetingKek(message.value, this.#kekSink);
         return;
       }
       case 'error': {
@@ -483,6 +639,101 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         return;
       }
     }
+  }
+
+  /**
+   * Feed roster identity keys into the media path's resolver.
+   *
+   * Fire-and-forget: `importKey` is async and the dispatch loop is not, and a
+   * roster update must not block the read loop. A key that has not landed yet
+   * simply means the next frame from that sender is dropped and counted as
+   * `no_roster_entry` — which is the correct transient, and is why the roster
+   * update must travel the same signalling path as the KEK and land first.
+   */
+  #feedRosterKeys(
+    participants: readonly {
+      readonly senderId?: number | undefined;
+      readonly identityPublicKey: Uint8Array;
+    }[],
+  ): void {
+    const sink = this.#rosterKeys;
+    if (!sink) return;
+    for (const p of participants) {
+      if (p.senderId === undefined) continue;
+      void sink
+        .upsert({ senderId: p.senderId, identityPublicKey: p.identityPublicKey })
+        .catch(() => {
+          // The resolver already fails closed on an unusable key by recording the
+          // absence; there is nothing further to report and nothing safe to log
+          // about a participant's key material.
+        });
+    }
+  }
+
+  /**
+   * Declare what this client can receive (ADR-0036 §6).
+   *
+   * MUST BE SENT BEFORE A SEND DIRECTIVE IS EXPECTED. MC composes the directive
+   * and the slot assignments from one meeting-state snapshot when the capability
+   * arrives, not at join — so a client that never declares is never told to send,
+   * and the connection looks healthy in every other respect. A send-only client
+   * still declares, with an empty slot list.
+   *
+   * A client declares what it can DECODE, never who appears where: which
+   * participant lands in which slot is MC's decision, from meeting state the
+   * client does not have. That is also a security property —
+   * resource-amplification-by-request becomes structurally impossible rather than
+   * rate-limited.
+   *
+   * @throws {SignalingError} `Transport` if called before join settled or after teardown.
+   */
+  async sendReceiveCapability(slots: readonly ReceiveSlotDeclaration[]): Promise<void> {
+    const stream = this.#requireOpenStream('sendReceiveCapability');
+    const capability = create(ReceiveCapabilitySchema, {
+      slots: slots.map((slot) =>
+        create(ReceiveSlotSchema, {
+          slotId: slot.slotId,
+          mediaKind: MediaKind.AUDIO,
+        }),
+      ),
+    });
+    const clientMessage = create(ClientMessageSchema, {
+      message: { case: 'receiveCapability', value: capability },
+    });
+    await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
+  }
+
+  /**
+   * Report client mute to MC (ADR-0036 §5).
+   *
+   * INFORMATIONAL. Client mute is enforced at capture and must not depend on the
+   * server honouring it; this report is what keeps MC's view accurate and what
+   * lets other participants render the state, and MC KEEPS THE SEND DIRECTIVE
+   * ACTIVE regardless — which is what makes unmute instantaneous and keeps "MC
+   * has not asked you to send" distinguishable from "you have muted yourself".
+   *
+   * @throws {SignalingError} `Transport` if called before join settled or after teardown.
+   */
+  async sendMuteRequest(audioMuted: boolean, videoMuted = false): Promise<void> {
+    const stream = this.#requireOpenStream('sendMuteRequest');
+    const clientMessage = create(ClientMessageSchema, {
+      message: {
+        case: 'muteRequest',
+        value: create(MuteRequestSchema, { audioMuted, videoMuted }),
+      },
+    });
+    await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
+  }
+
+  #requireOpenStream(what: string): WebTransportBidirectionalStream {
+    const stream = this.#stream;
+    if (stream === undefined || this.#terminated || !this.#joinSettled) {
+      throw new SignalingError(
+        SignalingErrorCode.Transport,
+        `${what} requires a settled, open join`,
+      );
+    }
+    return stream;
   }
 
   #handleErrorMessage(errorMessage: ErrorMessage): void {

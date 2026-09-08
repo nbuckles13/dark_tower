@@ -152,6 +152,67 @@ export async function assertEd25519Available(): Promise<void> {
   }
 }
 
+/** A meeting-scoped identity signing keypair. */
+export interface IdentityKeyPair {
+  /**
+   * The signing key. **NON-EXTRACTABLE**: `crypto.subtle.exportKey` on it
+   * rejects, so "the private key cannot be logged or serialized" is a platform
+   * guarantee rather than a review outcome. Signing does not need
+   * extractability.
+   */
+  readonly privateKey: CryptoKey;
+  /** The raw 32-byte public half, for `JoinRequest.identity_public_key`. */
+  readonly publicKey: Bytes;
+}
+
+/**
+ * Generate a fresh identity signing keypair (ADR-0036 §4 step 1).
+ *
+ * ---------------------------------------------------------------------------
+ * CUSTODY, WHICH IS THE POINT OF THIS FUNCTION EXISTING SEPARATELY
+ * ---------------------------------------------------------------------------
+ *
+ *   * **Platform CSPRNG.** `crypto.subtle.generateKey`. Production must NEVER
+ *     route through `importSigningKeyFromSeed` — that exists so the conformance
+ *     harness can reproduce the vectors' pinned signatures, and a seed path in
+ *     production is a deterministic-key hazard.
+ *   * **`extractable: false` on the private half.** See {@link IdentityKeyPair}.
+ *   * **PER MEETING, NEVER PERSISTED.** ADR-0036 §4: *"Identity keys are scoped
+ *     to ONE MEETING, not to a participant across meetings: a key reused across
+ *     meetings makes a participant linkable by public key regardless of display
+ *     name, which matters most for the guests who have the least identity
+ *     assurance to begin with."* So: no `localStorage`, no `sessionStorage`, no
+ *     `IndexedDB`, and no module-level singleton that outlives a
+ *     `MeetingSession`. This function returns the pair; it caches nothing.
+ *   * **Dropped at teardown**, alongside the meeting KEK.
+ *
+ * The public half is extracted through a SEPARATE extractable public key rather
+ * than by exporting the private one, because the private one is not extractable
+ * — which is the property we want, not an inconvenience to work around.
+ */
+export async function generateIdentityKeyPair(): Promise<IdentityKeyPair> {
+  // `extractable: true` applies to the PAIR, and WebCrypto then honours it only
+  // for the public half when we export `raw` from `publicKey`. To get a
+  // non-extractable private half we generate extractable, export the public
+  // bytes, then re-import the private half as non-extractable — which is not
+  // possible without the private bytes. So instead: generate NON-extractable and
+  // export the PUBLIC key object, which is always exportable regardless of the
+  // pair's `extractable` flag (the flag governs private-key export only, per
+  // the WebCrypto spec's `[[extractable]]` on each key object; `generateKey`
+  // for Ed25519 marks the public key extractable unconditionally).
+  const pair = (await crypto.subtle.generateKey(ALGORITHM, false, [
+    'sign',
+    'verify',
+  ])) as CryptoKeyPair;
+  const raw = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+  if (raw.length !== ED25519_PUBLIC_KEY_BYTES) {
+    throw new RangeError(
+      `generated Ed25519 public key is ${raw.length} bytes, expected ${ED25519_PUBLIC_KEY_BYTES}`,
+    );
+  }
+  return { privateKey: pair.privateKey, publicKey: raw as Bytes };
+}
+
 /** Import a 32-byte raw Ed25519 public key for verification. */
 export async function importVerifyKey(publicKey: Uint8Array): Promise<CryptoKey> {
   if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
@@ -219,14 +280,22 @@ export async function signFrame(key: CryptoKey, signedRange: Uint8Array): Promis
  * two outcomes are verified and dropped.
  */
 export async function verifyFrameSignature(
-  publicKey: Uint8Array,
+  publicKey: Uint8Array | CryptoKey,
   signature: Uint8Array,
   signedRange: Uint8Array,
 ): Promise<boolean> {
   if (signature.length !== ED25519_SIGNATURE_BYTES) return false;
-  if (publicKey.length !== ED25519_PUBLIC_KEY_BYTES) return false;
+  if (!(publicKey instanceof Uint8Array) && publicKey.type !== 'public') return false;
+  if (publicKey instanceof Uint8Array && publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
+    return false;
+  }
   try {
-    const key = await importVerifyKey(publicKey);
+    // ACCEPTS AN ALREADY-IMPORTED KEY so a receiver can import once per SENDER
+    // at roster update instead of once per frame at 50 frames a second. The
+    // fail-closed property is unchanged: a `CryptoKey` that is not a public
+    // verification key is rejected above, and any throw below still becomes
+    // `false` rather than a propagated exception.
+    const key = publicKey instanceof Uint8Array ? await importVerifyKey(publicKey) : publicKey;
     return await crypto.subtle.verify(
       ALGORITHM,
       key,

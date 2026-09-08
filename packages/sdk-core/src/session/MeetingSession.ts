@@ -22,6 +22,7 @@
 // metric/log label. `meeting_id_hash` is a SHA-256 digest of the meeting id (R-32:
 // `crypto.subtle.digest`, never `Math.random`).
 
+import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../config/clientConfig.js';
 import { AuthApiClient } from '../http/AuthApiClient.js';
 import { bytesToHex } from '../media/frame/hex.js';
 import { MeetingApiClient } from '../http/MeetingApiClient.js';
@@ -30,22 +31,38 @@ import type { SignalingClientOptions } from '../signaling/SignalingClient.js';
 import type { JoinedEvent } from '../signaling/events.js';
 import { MediaTransport } from '../media/MediaTransport.js';
 import type { MediaTransportOptions } from '../media/events.js';
+import { MeetingIdentity } from '../media/setup/identity.js';
+import { AudioPipeline, type AudioPipelineOptions } from '../media/lifecycle/AudioPipeline.js';
+import { JoinResponseKekSource } from '../media/setup/kekSource.js';
+import { MEDIA_KEK_SOURCES, MediaMetrics } from '../media/setup/mediaMetrics.js';
+import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
+import { createMicrophoneCapture } from '../media/setup/capture.js';
+import { createAudioDecoder, createAudioEncoder } from '../media/setup/opus.js';
+import { createAudioContextPlaybackSink } from '../media/setup/audioPlayback.js';
+import type {
+  AudioDecoderFactory,
+  AudioEncoderFactory,
+  CaptureSourceFactory,
+  PlaybackSinkFactory,
+} from '../media/setup/seams.js';
 import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
 import { validateUserToken } from '../validation/limits.js';
 import { SignalingError, SignalingErrorCode } from '../errors/SignalingError.js';
 import { MeetingUnauthorizedError } from '../errors/MeetingError.js';
 import { CloseReason, normalizeCloseReason } from '../telemetry/closeReason.js';
-import { configureTelemetry, getMetricsSink } from '../telemetry/telemetryConfig.js';
+import { configureTelemetry, flushMetrics, getMetricsSink } from '../telemetry/telemetryConfig.js';
 import type { TelemetryConfig } from '../telemetry/telemetryConfig.js';
 import type { MetricLabels, MetricsSink } from '../telemetry/MetricsSink.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 
 import {
+  DEFAULT_AUDIO_SLOT_ID,
   MeetingSessionState,
   type JoinCredentials,
   type JoinOptions,
   type MeetingSessionEventMap,
   type MeetingSessionOptions,
+  type StartMediaOptions,
 } from './events.js';
 
 /**
@@ -239,6 +256,32 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   #joinStartMs = 0;
   #metricLabels: MetricLabels = {};
   #torn = false;
+  readonly #mediaConfig: MediaConfig;
+  /**
+   * The KEK-source seam. THE ONLY PLACE THE MEETING KEK LIVES. Never on an
+   * event, never on an error, never persisted, zeroed at disconnect.
+   */
+  readonly #kekSource = new JoinResponseKekSource();
+  #rosterKeys: RosterIdentityKeys | undefined;
+  /**
+   * The meeting identity — one non-extractable Ed25519 signing capability plus
+   * its public half, generated per meeting and never persisted (ADR-0036 §4: a
+   * key reused across meetings makes a participant linkable by public key
+   * regardless of display name).
+   *
+   * Held behind {@link MeetingIdentity} rather than as a bare keypair record.
+   * See that module's header for what is retained, why ADR-0036 requires it, and
+   * the `ts-no-retained-credentials` interaction that is disclosed there rather
+   * than routed around.
+   */
+  #identity: MeetingIdentity | undefined;
+  #pipeline: AudioPipeline | undefined;
+  #senderId: number | undefined;
+  #orgId = '';
+  readonly #captureFactory: CaptureSourceFactory;
+  readonly #encoderFactory: AudioEncoderFactory;
+  readonly #decoderFactory: AudioDecoderFactory;
+  readonly #playbackFactory: PlaybackSinkFactory;
 
   constructor(options: MeetingSessionOptions) {
     super();
@@ -255,6 +298,11 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     this.#connectTimeoutMs = options.connectTimeoutMs;
     this.#joinTimeoutMs = options.joinTimeoutMs;
     this.#metricsSink = options.metricsSink ?? getMetricsSink();
+    this.#mediaConfig = options.mediaConfig ?? DEFAULT_CLIENT_CONFIG.media;
+    this.#captureFactory = options.captureFactory ?? createMicrophoneCapture;
+    this.#encoderFactory = options.encoderFactory ?? createAudioEncoder;
+    this.#decoderFactory = options.decoderFactory ?? createAudioDecoder;
+    this.#playbackFactory = options.playbackFactory ?? createAudioContextPlaybackSink;
   }
 
   /**
@@ -281,6 +329,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       org_id: options.orgSubdomain,
       meeting_id_hash: 'none',
     };
+    this.#orgId = options.orgSubdomain;
     let stage: FailureStage = FailureStage.Internal;
     try {
       // --- fetching-token: auth + GC meeting token ---
@@ -310,6 +359,11 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         ...this.#metricLabels,
         meeting_id_hash: await meetingIdHash(joinResp.meetingId),
       };
+
+      // ADR-0036 §4 step 1: generate the identity signing keypair BEFORE the
+      // join request, so its public half can travel on it. Per meeting, never
+      // persisted, private half non-extractable.
+      this.#identity = await MeetingIdentity.create();
 
       // --- connecting-mc: MC signaling join ---
       this.#setState(MeetingSessionState.ConnectingMc);
@@ -352,6 +406,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       }
 
       // --- joined ---
+      this.#senderId = joined.senderId;
       this.#setState(MeetingSessionState.Joined);
       this.#emitJoinAttempt('success', FailureStage.None);
       this.emit('joined', joined);
@@ -361,6 +416,115 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       this.disconnect();
       throw err;
     }
+  }
+
+  /**
+   * Start the audio media pipeline (ADR-0036 §5/§6).
+   *
+   * ---------------------------------------------------------------------------
+   * EXPLICIT, AND A MEDIA FAULT DOES NOT TAKE THE MEETING WITH IT
+   * ---------------------------------------------------------------------------
+   *
+   * Deliberately NOT automatic on `join()`. Media needs a microphone permission
+   * prompt and — because of the browser autoplay policy — a user gesture for
+   * playback, so it belongs to an application action rather than to the join. It
+   * is also the only in-story lever resembling a kill switch: "no way to disable
+   * the media path short of a redeploy" is recorded as a story-2 operations item,
+   * and an explicit start is what keeps that from being true today.
+   *
+   * A failure here rejects THIS call and leaves the signaling session joined and
+   * healthy. Degraded audio beats a dropped meeting.
+   *
+   * ---------------------------------------------------------------------------
+   * THE ORDER IS FIXED: DECLARE CAPABILITY, THEN EXPECT A DIRECTIVE
+   * ---------------------------------------------------------------------------
+   *
+   * MC emits the send directive when the client declares its receive capability,
+   * NOT at join. A client that joins and never declares is never told to send,
+   * and the connection stays healthy in every other respect — which is exactly
+   * what makes the omission hard to notice from the client side.
+   *
+   * @throws {SignalingError} if called before a settled join.
+   */
+  async startMedia(options: StartMediaOptions = {}): Promise<AudioPipeline> {
+    const signaling = this.#signaling;
+    const identity = this.#identity;
+    const senderId = this.#senderId;
+    if (!signaling || this.#state !== MeetingSessionState.Joined) {
+      throw new SignalingError(SignalingErrorCode.Transport, 'startMedia requires a settled join');
+    }
+    const signer = identity?.signer;
+    if (!identity || !signer || senderId === undefined) {
+      // Fail loudly rather than degrading. Without a sender id there is no key
+      // id, and without an identity key there is no signature — and this SDK
+      // does not send or accept unsigned frames under any degradation.
+      throw new SignalingError(
+        SignalingErrorCode.Transport,
+        'the meeting controller did not assign a sender id, so media cannot be published',
+      );
+    }
+    if (this.#pipeline) return this.#pipeline;
+
+    // The media label set is built BY ALLOW-LIST from two named strings. It
+    // shares nothing with `this.#metricLabels`, which carries `meeting_id_hash`
+    // — the dimension ADR-0036 §11 bars from every media emission.
+    const metrics = new MediaMetrics(
+      { clientVersion: __SDK_VERSION__, orgId: this.#orgId },
+      this.#metricsSink,
+    );
+    if (this.#kekSource.isProvisioned) metrics.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse);
+
+    const slotId = options.slotId ?? DEFAULT_AUDIO_SLOT_ID;
+    const media = this.#media;
+    const pipelineOptions: AudioPipelineOptions = {
+      config: this.#mediaConfig,
+      metrics,
+      kekSource: this.#kekSource,
+      roster:
+        this.#rosterKeys ?? new RosterIdentityKeys(this.#mediaConfig.ingress.maxCachedIdentityKeys),
+      senderId,
+      kekGeneration: signaling.kekGeneration,
+      identity,
+      declaredSlotIds: [slotId],
+      senderFor: (url) => media?.getDatagramChannel(url),
+      readableFor: (url) => media?.getDatagramChannel(url)?.readable,
+      reportMute: (audioMuted) => {
+        // Informational and deliberately best-effort: ADR-0036 §5 requires
+        // client mute to hold WITHOUT the server honouring it, so a failed
+        // report must not undo the local suppression.
+        void signaling.sendMuteRequest(audioMuted).catch(() => {
+          // Nothing actionable, and nothing safe to log about a mute report.
+        });
+      },
+      captureFactory: this.#captureFactory,
+      encoderFactory: this.#encoderFactory,
+      decoderFactory: this.#decoderFactory,
+      playbackFactory: this.#playbackFactory,
+      clock: this.#clock,
+    };
+    const pipeline = new AudioPipeline(pipelineOptions);
+    this.#pipeline = pipeline;
+
+    signaling.on('sendDirective', (directive) => {
+      const audio = directive.streams.find((s) => s.mediaKind === 'audio');
+      if (!audio) return;
+      pipeline.setSendDirective({
+        streamNumber: audio.streamNumber,
+        // MC's directed value when present; the configured DEFAULT otherwise.
+        // Never a local ceiling applied on top — see `clientConfig.ts`.
+        bitrateBps: audio.maxBitrateBps ?? this.#mediaConfig.audio.defaultBitrateBps,
+        targets: audio.targets,
+      });
+    });
+
+    await signaling.sendReceiveCapability([{ slotId, mediaKind: 'audio' }]);
+    await pipeline.start(options.deviceId !== undefined ? { deviceId: options.deviceId } : {});
+    return pipeline;
+  }
+
+  /** The running media pipeline, or `undefined` before `startMedia()`. */
+  get media(): AudioPipeline | undefined {
+    return this.#pipeline;
   }
 
   /**
@@ -388,6 +552,45 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       } catch {
         // ignore
       }
+      try {
+        // Stops capture (the microphone indicator), the codecs, the reader and
+        // the rotation timer, and clears the replay window, the transmit-key
+        // cache and the send-side keys — ADR-0028 §5's explicit cleanup, whose
+        // wiring the codec task left to this task. Detached because
+        // `disconnect()` is synchronous by contract; the registry is idempotent
+        // and each disposer is isolated.
+        // `.catch` and not just `void`: `stop()` rejects if an embedder's
+        // `fault` listener throws (`TypedEventEmitter.emit` does not isolate
+        // listeners), and the surrounding try/catch catches synchronous throws
+        // only. An unhandled rejection here would surface in the embedder's
+        // error reporting attributed to the SDK, on disconnect, exactly when
+        // something else has already gone wrong.
+        void this.#pipeline?.stop().catch(() => {
+          // Teardown is already complete by the time a fault can be raised —
+          // `dispose()` has run — so resources are released either way.
+        });
+      } catch {
+        // ignore — best-effort teardown
+      }
+      // The KEK is zeroed and dropped, and the roster keys released. The
+      // identity signing capability is non-extractable, so there are no bytes to
+      // overwrite; dropping the reference is the whole cleanup.
+      this.#kekSource.clear();
+      this.#rosterKeys?.clear();
+      this.#identity?.clear();
+      this.#identity = undefined;
+      // At a 10 s export cadence up to 10 s of media counters would otherwise die
+      // with the tab — and the window that dies is the one containing the
+      // incident. `keepalive` rescues requests already in flight; it does nothing
+      // for deltas not yet exported.
+      void flushMetrics().catch(() => {
+        // `forceFlush()` rejects when the exporter fails, and this flush is an
+        // EXTRA export beyond the periodic ones aimed at a proxy with a per-`sub`
+        // rate limit — so a 429 or an unreachable proxy rejects it routinely.
+        // Losing the last window of counters is the cost; an unhandled rejection
+        // in the embedder's page during an incident is not an acceptable
+        // addition to it.
+      });
     }
     // R-23: no token references to drop — tokens are never stored on the instance
     // (held only as `join()`-scoped locals, GC-eligible once `join()` settles), and
@@ -457,9 +660,14 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   #createSignaling(): SignalingClient {
+    this.#rosterKeys = new RosterIdentityKeys(this.#mediaConfig.ingress.maxCachedIdentityKeys);
     const opts: SignalingClientOptions = {
       ...(this.#connectFn ? { connect: this.#connectFn } : {}),
       ...(this.#joinTimeoutMs !== undefined ? { joinTimeoutMs: this.#joinTimeoutMs } : {}),
+      // The KEK goes from the decode boundary straight into the seam and the
+      // decoded field is scrubbed — it never rides an event payload.
+      kekSink: this.#kekSource,
+      rosterKeys: this.#rosterKeys,
     };
     const signaling = new SignalingClient(opts);
     signaling.on('participantJoined', (e) => this.emit('participantJoined', e));
@@ -480,6 +688,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         meetingId: joinResp.meetingId,
         joinToken: joinResp.token,
         participantName,
+        ...(this.#identity?.publicKey ? { identityPublicKey: this.#identity.publicKey } : {}),
       });
       this.#emitSignalingConnection('success', CloseReason.Normal);
       this.#histogram('dt_client_time_to_signaling_ready_ms');
@@ -491,9 +700,19 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   #createMedia(signaling: SignalingClient): MediaTransport {
+    const egress = this.#mediaConfig.egress;
     const opts: MediaTransportOptions = {
       clock: this.#clock,
       metricLabels: this.#metricLabels,
+      // CHOSEN, not inherited (ADR-0036 §1). The transport queue is kept shallow
+      // so the bounded application queue above it makes — and counts — the drop
+      // decision; a drop inside the user agent's queue is uncountable by us and
+      // structurally invisible to MH.
+      datagramQueue: {
+        outgoingHighWaterMark: egress.transportOutgoingHighWaterMarkFrames,
+        outgoingMaxAgeMs: egress.transportOutgoingMaxAgeMs,
+        incomingHighWaterMark: this.#mediaConfig.ingress.transportIncomingHighWaterMarkFrames,
+      },
       runInContext: (fn) => signaling.runInJoinContext(fn),
       ...(this.#connectFn ? { connect: this.#connectFn } : {}),
       ...(this.#connectTimeoutMs !== undefined ? { connectTimeoutMs: this.#connectTimeoutMs } : {}),

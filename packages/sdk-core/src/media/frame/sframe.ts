@@ -239,6 +239,23 @@ export async function sealSframe(params: {
   };
 }
 
+/**
+ * The wire length of the SFrame object that sealing `plaintextLength` bytes
+ * produces: `key_id(8) || tag(16) || ciphertext`.
+ *
+ * Exists so the ENCODE path can size `payload_length` BEFORE sealing. That is
+ * not a shortcut around sealing first — it is what makes the ordering possible
+ * at all: the AEAD associated data is the publisher region, the publisher region
+ * carries `payload_length`, and AES-GCM is length-preserving, so the length is
+ * knowable in advance and the apparent circularity dissolves.
+ *
+ * Derived from the same constants `sealSframe` and `parseSframe` use, so a
+ * caller cannot compute a different answer than the serializer produces.
+ */
+export function sframeObjectLength(plaintextLength: number): number {
+  return KEY_ID_BYTES + TAG_BYTES + plaintextLength;
+}
+
 /** Serialize an SFrame object to its wire form. */
 export function serializeSframe(obj: SframeObject): Bytes {
   return concatBytes(obj.keyId, obj.tag, obj.ciphertext);

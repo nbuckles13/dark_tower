@@ -20,6 +20,15 @@
 // registered for teardown BEFORE awaiting `ready`, so `disconnect()` always reaches
 // an in-flight connection. Teardown is a single idempotent path.
 //
+// TASK 19 ADDS DATAGRAM I/O. `getDatagramChannel(url)` exposes a send/receive
+// channel over an already-connected MH, and the three
+// `WebTransportDatagramDuplexStream` queue knobs are SET from configuration at
+// connect time (ADR-0036 §1: "the default being adequate is not the same as the
+// default being chosen"). The application egress queue lives one layer up, in
+// `pipeline/egressQueue.ts`, and must trip BEFORE the transport ceiling so the
+// drop decision — and the count — happen in our code rather than silently inside
+// the user agent, where neither this client nor the media handler could see it.
+//
 // R-23: the meeting JWT is threaded only as the `connectAll` parameter into each
 // `#connectOne`; it is never stored on the instance. `failureReason`/`failureCode`
 // are SDK-authored bounded classifications (never a raw transport-error message).
@@ -43,7 +52,9 @@ import type { MhConnectionStatusReport } from '../signaling/events.js';
 
 import {
   DEFAULT_MH_CONNECT_TIMEOUT_MS,
+  type DatagramQueueSettings,
   type MediaConnectionState,
+  type MediaDatagramChannel,
   type MediaTransportEventMap,
   type MediaTransportOptions,
   type RunInContext,
@@ -84,6 +95,12 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   readonly #failures = new Map<string, FailureInfo>();
   readonly #transports: IWebTransport[] = [];
   readonly #timers = new Set<ReturnType<typeof setTimeout>>();
+  /** Per-URL datagram channels, created lazily on first use after connect. */
+  readonly #datagramChannels = new Map<string, MediaDatagramChannel>();
+  readonly #datagramWriters = new Map<string, WritableStreamDefaultWriter<Uint8Array>>();
+  /** Connected transports by URL, so a datagram channel can find its transport. */
+  readonly #connectedTransports = new Map<string, IWebTransport>();
+  readonly #datagramQueue: DatagramQueueSettings | undefined;
 
   #terminated = false;
 
@@ -95,6 +112,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     this.#metricsSink = options.metricsSink ?? getMetricsSink();
     this.#metricLabels = options.metricLabels ?? {};
     this.#runInContext = options.runInContext ?? identityRunInContext;
+    this.#datagramQueue = options.datagramQueue;
   }
 
   /**
@@ -161,9 +179,81 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
       clearTimeout(timer);
     }
     this.#timers.clear();
+    for (const writer of this.#datagramWriters.values()) {
+      try {
+        void writer.close().catch(() => {
+          // A writer on an already-errored stream rejects on close. The
+          // transport close below is what actually releases the connection.
+        });
+      } catch {
+        // Already released — ignore.
+      }
+    }
+    this.#datagramWriters.clear();
+    this.#datagramChannels.clear();
+    this.#connectedTransports.clear();
     for (const transport of this.#transports) {
       this.#safeClose(transport);
     }
+  }
+
+  /**
+   * A datagram send/receive channel over a CONNECTED media handler.
+   *
+   * Returns `undefined` for a URL that is not connected — the caller counts that
+   * as `not_connected` rather than being handed a channel that cannot send.
+   *
+   * The channel holds ONE cached writer: `send` awaits `writer.ready` before
+   * every write, so at most one write is in flight in the transport and queue
+   * depth accumulates in the application queue where it can be bounded and
+   * counted.
+   */
+  getDatagramChannel(url: string): MediaDatagramChannel | undefined {
+    const existing = this.#datagramChannels.get(url);
+    if (existing) return existing;
+    const transport = this.#connectedTransports.get(url);
+    if (!transport || this.#terminated) return undefined;
+
+    const writer = transport.datagrams.writable.getWriter();
+    this.#datagramWriters.set(url, writer);
+    let open = true;
+    // `closed` resolving or rejecting both mean the same thing to a sender:
+    // there is no transport left. Distinguishing them would produce two drop
+    // reasons for one condition.
+    void transport.closed.then(
+      () => {
+        open = false;
+      },
+      () => {
+        open = false;
+      },
+    );
+
+    const channel: MediaDatagramChannel = {
+      readable: transport.datagrams.readable,
+      get isOpen(): boolean {
+        return open;
+      },
+      // The platform reports this on the duplex stream; it is absent under a
+      // test double and under a UA that does not expose it, in which case the
+      // sender skips the oversize check rather than inventing a bound.
+      maxDatagramSize: transport.datagrams.maxDatagramSize,
+      async send(bytes: Uint8Array): Promise<void> {
+        await writer.ready;
+        await writer.write(bytes);
+      },
+    };
+    this.#datagramChannels.set(url, channel);
+    return channel;
+  }
+
+  #applyDatagramQueueSettings(transport: IWebTransport): void {
+    const settings = this.#datagramQueue;
+    if (!settings) return;
+    const datagrams = transport.datagrams;
+    datagrams.outgoingHighWaterMark = settings.outgoingHighWaterMark;
+    datagrams.outgoingMaxAge = settings.outgoingMaxAgeMs;
+    datagrams.incomingHighWaterMark = settings.incomingHighWaterMark;
   }
 
   // ----------------------------------------------------------------------------
@@ -227,6 +317,16 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         this.#safeClose(transport);
         return;
       }
+      // CHOOSE the datagram queue depths rather than inheriting the user
+      // agent's. A drop inside the UA's outgoing queue is uncountable by us AND
+      // structurally invisible to MH — the one drop class ADR-0036 §11 says
+      // matters most — so the transport queue is kept shallow and the bounded
+      // application queue above it makes the decision. `outgoingMaxAge` is a
+      // BACKSTOP set clear of what both queues can legitimately hold; at a value
+      // close to that sum it would become a routine uncountable competitor
+      // instead. `validateMediaConfig` asserts both relationships at setup.
+      this.#applyDatagramQueueSettings(transport);
+
       const stream = await transport.createBidirectionalStream();
       const envelope = create(MhClientMessageSchema, {
         message: {
@@ -242,7 +342,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
       // A disconnect mid-handshake closes the transport, so createBidi/write would
       // throw into the catch (whose #terminated guard handles it); no intermediate
       // checks needed here.
-      this.#succeedOne(url, index);
+      this.#succeedOne(url, index, transport);
     } catch (err) {
       clearDeadline();
       if (this.#terminated) return;
@@ -251,7 +351,8 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     }
   }
 
-  #succeedOne(url: string, index: number): void {
+  #succeedOne(url: string, index: number, transport: IWebTransport): void {
+    this.#connectedTransports.set(url, transport);
     this.#states.set(url, 'connected');
     this.#observedAt.set(url, this.#clock());
     this.#emitMetric('success', index);
@@ -281,6 +382,38 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     );
   }
 
+  /**
+   * ---------------------------------------------------------------------------
+   * THE `...this.#metricLabels` SPREAD BELOW IS LEGAL FOR THIS ONE METRIC ONLY.
+   * DO NOT COPY IT INTO A MEDIA EMISSION.
+   * ---------------------------------------------------------------------------
+   *
+   * `dt_client_mh_connection_total` is an ADR-0028 join-flow metric that carried
+   * the join label set — including `meeting_id_hash` — from birth. ADR-0036 §11
+   * grandfathers that set AS A SET: it is a closed, enumerated exception, it is
+   * not extended, and nothing joins it. The frozen roster is named in
+   * `docs/observability/metrics/client.md`.
+   *
+   * **The test is what a metric OBSERVES, not which directory it lives in.**
+   * Connect-lifecycle — once per connection, at handshake, before any frame
+   * exists — is grandfathered. Media-carrying — per frame, per stream, or on the
+   * media data path — is under the bar. "It is in `MediaTransport.ts`" is the
+   * wrong test in BOTH directions: it would wrongly bar this metric, and it
+   * would wrongly permit a media counter someone places outside the media tree.
+   * The second is the one that will actually happen.
+   *
+   * Substantively neither §11 argument reaches this counter. The trace argument
+   * is about the time-ordered sequence of sizes for a single stream, and a
+   * connect-outcome counter reconstructs nothing. The oracle argument is about
+   * `reason` faithfully mirroring which crypto layer rejected a frame; `status`
+   * and `mh_index_bucket` are not crypto-layer discriminators and reveal no
+   * receiver key state.
+   *
+   * EVERY NEW MEDIA EMISSION goes through `mediaMetricLabels` in
+   * `setup/mediaMetrics.ts`, which builds `{client_version, org_id, key_custody}`
+   * by allow-list from two named strings — so there is no set to inherit and
+   * nothing to prune. Nothing mechanical enforces this in TypeScript.
+   */
   #emitMetric(status: 'success' | 'failure', index: number): void {
     this.#metricsSink?.counter('dt_client_mh_connection_total', {
       ...this.#metricLabels,

@@ -78,7 +78,8 @@ export interface VerifiedFrame {
  * Verify a decoded frame and admit it to the opening path.
  *
  * @param identityPublicKey resolved by the caller from `key_id.sender_id` and
- * nothing else. A frame carrying another sender's key id therefore fails HERE, at
+ * nothing else. Raw bytes, or an already-imported `CryptoKey` so a receiver can
+ * import once per SENDER at roster update rather than once per frame. A frame carrying another sender's key id therefore fails HERE, at
  * verify, rather than later at decrypt — which is what makes the signature layer
  * load-bearing rather than decorative (ADR-0036 Assumption 4).
  *
@@ -88,7 +89,7 @@ export interface VerifiedFrame {
  */
 export async function verifyFrame(
   frame: DecodedFrame,
-  identityPublicKey: Uint8Array,
+  identityPublicKey: Uint8Array | CryptoKey,
 ): Promise<VerifiedFrame> {
   const sframe = parseSframe(frame.payload);
   const ok = await verifyFrameSignature(identityPublicKey, frame.signature, frame.signedRange);
@@ -161,6 +162,36 @@ export interface ReceiverKeys {
 }
 
 /**
+ * Default bound on tracked `(stream, generation)` replay contexts per sender.
+ *
+ * NOT {@link DEFAULT_TRANSMIT_KEYS_PER_SENDER}. The two agree today BY COINCIDENCE
+ * and are independent tuning decisions — how many contexts to track for duplicate
+ * detection versus how many unwrapped keys to hold. Do NOT hoist them to one
+ * shared constant: collapsing them would be a false single source of truth that
+ * silently couples two unrelated decisions, so retuning one would move the other.
+ *
+ * Exported so `config/clientConfig.ts` imports it as its own default rather than
+ * restating the number. The dependency direction is `config -> frame`; this
+ * module must never import from `config/`, which would couple the pure
+ * codec/crypto layer to SDK configuration.
+ */
+export const DEFAULT_REPLAY_CONTEXTS_PER_SENDER = 32;
+
+/**
+ * Default sliding duplicate-bitmap width.
+ *
+ * A third, unrelated number — not a variant of either per-sender bound above.
+ */
+export const DEFAULT_REPLAY_WINDOW_BITS = 64;
+
+/**
+ * Default bound on cached unwrapped transmit keys per sender.
+ *
+ * NOT {@link DEFAULT_REPLAY_CONTEXTS_PER_SENDER} — see that constant.
+ */
+export const DEFAULT_TRANSMIT_KEYS_PER_SENDER = 32;
+
+/**
  * Bounded per-sender replay window plus a per-(sender, stream) generation
  * high-water mark.
  *
@@ -186,6 +217,7 @@ export interface ReceiverKeys {
  *     this is free — and it survives window eviction, which turns the LRU from a
  *     security boundary into a plain MEMORY BOUND, which is what it should be.
  */
+
 export class ReplayWindow {
   readonly #maxContextsPerSender: number;
   readonly #windowBits: number;
@@ -201,7 +233,10 @@ export class ReplayWindow {
    * over hardcoding.
    * @param windowBits width of the sliding duplicate bitmap.
    */
-  constructor(maxContextsPerSender = 32, windowBits = 64) {
+  constructor(
+    maxContextsPerSender = DEFAULT_REPLAY_CONTEXTS_PER_SENDER,
+    windowBits = DEFAULT_REPLAY_WINDOW_BITS,
+  ) {
     this.#maxContextsPerSender = maxContextsPerSender;
     this.#windowBits = windowBits;
   }
@@ -310,7 +345,7 @@ export class TransmitKeyCache {
   readonly #maxPerSender: number;
   readonly #bySender = new Map<string, Map<string, CachedTransmitKey>>();
 
-  constructor(maxPerSender = 32) {
+  constructor(maxPerSender = DEFAULT_TRANSMIT_KEYS_PER_SENDER) {
     this.#maxPerSender = maxPerSender;
   }
 

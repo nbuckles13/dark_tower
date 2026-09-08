@@ -103,6 +103,7 @@ export { OtelMetricsSink } from './telemetry/OtelMetricsSink.js';
 
 export {
   configureTelemetry,
+  flushMetrics,
   getMeter,
   getTracer,
   getMetricsSink,
@@ -239,3 +240,100 @@ export type {
 
 export { FrameRejectedError, ALL_REJECT_REASONS } from './media/frame/rejectReason.js';
 export type { RejectReason, RejectLayer, RejectDetail } from './media/frame/rejectReason.js';
+
+// --- ADR-0036 §1/§4/§5/§6/§11 single-client audio media pipeline (story task 19) ---
+//
+// The public surface is the SEAMS plus the lifecycle object. The hot path
+// (`media/pipeline/**`) is deliberately NOT exported: an embedder that could
+// construct an ingress or egress pipeline directly could bypass the
+// `VerifiedFrame` brand's ordering guarantee, and a door that exists only for
+// convenience is still a door.
+
+export {
+  DEFAULT_CLIENT_CONFIG,
+  DEFAULT_METRIC_EXPORT_INTERVAL_MS,
+  MIN_AUDIO_ROTATION_PERIOD_MS,
+  ClientConfigError,
+  validateMediaConfig,
+} from './config/clientConfig.js';
+export type {
+  AudioConfig,
+  ClientConfig,
+  EgressConfig,
+  IngressConfig,
+  KeyRotationConfig,
+  MediaConfig,
+  OpusApplication,
+  OpusSignal,
+  ReceiverStateConfig,
+  TelemetryCadenceConfig,
+} from './config/clientConfig.js';
+
+export { AudioPipeline, MediaFaultStage } from './media/lifecycle/AudioPipeline.js';
+export type {
+  AudioPipelineEventMap,
+  AudioPipelineOptions,
+  AudioPipelineStartOptions,
+  AudioSendDirective,
+  MediaFault,
+} from './media/lifecycle/AudioPipeline.js';
+export { MuteState } from './media/lifecycle/muteState.js';
+export type { MuteSnapshot } from './media/lifecycle/muteState.js';
+
+export {
+  MEDIA_KEK_SOURCES,
+  MEDIA_MUTE_ACTIONS,
+  MEDIA_SEND_DROP_REASONS,
+  MediaMetrics,
+  mediaMetricLabels,
+} from './media/setup/mediaMetrics.js';
+export type {
+  MediaKekSource,
+  MediaMetricIdentity,
+  MediaMuteAction,
+  MediaSendDropReason,
+  ReportableWrapOutcome,
+} from './media/setup/mediaMetrics.js';
+
+export { JoinResponseKekSource } from './media/setup/kekSource.js';
+export type { MeetingKekSource } from './media/setup/kekSource.js';
+export { RosterIdentityKeys } from './media/setup/rosterKeys.js';
+export type { RosterIdentityEntry } from './media/setup/rosterKeys.js';
+export { CaptureFailure, MediaCaptureError, listMicrophones } from './media/setup/capture.js';
+export { AudioCodecUnsupportedError } from './media/setup/opus.js';
+export { MediaPlaybackError, PlaybackFailure } from './media/setup/audioPlayback.js';
+export type {
+  AudioDecoderFactory,
+  AudioDecoderSeam,
+  AudioEncoderFactory,
+  AudioEncoderSeam,
+  CaptureSource,
+  CaptureSourceFactory,
+  EncodedAudioFrame,
+  PlaybackSink,
+  PlaybackSinkFactory,
+} from './media/setup/seams.js';
+
+// `generateIdentityKeyPair` and `IdentityKeyPair` are deliberately NOT exported.
+// `MeetingIdentity` is the seam; the factory behind it is not public surface.
+// A public factory returning a bare keypair record would let an embedder hold one
+// outside `MeetingIdentity`, outside `clear()`, outside the per-meeting
+// never-persisted property, and outside `__tests__/serverMessageSinkScan.test.ts`
+// — which scans `packages/sdk-core/src` and cannot see consumer code. That
+// re-creates in application code exactly the retained-bare-record shape this SDK
+// removed from itself, in the one place no guard of ours runs. Same argument as
+// the hot path above: a door that exists only for convenience is still a door.
+export { MeetingIdentity } from './media/setup/identity.js';
+export { sframeObjectLength } from './media/frame/sframe.js';
+export { buildPublisherRegion, writeHopSequence } from './media/frame/frameCodec.js';
+export type { PublisherRegionInput } from './media/frame/frameCodec.js';
+
+export { DEFAULT_AUDIO_SLOT_ID } from './session/events.js';
+export type { StartMediaOptions } from './session/events.js';
+export type {
+  ReceiveSlotDeclaration,
+  SendDirectiveEvent,
+  SendStreamDirective,
+  StreamAssignmentEvent,
+  StreamAssignmentsEvent,
+} from './signaling/events.js';

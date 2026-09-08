@@ -4,26 +4,21 @@
 **Implementation**: `packages/sdk-core/src/telemetry/` (sinks, name guard, providers)
 **Job Label**: `darktower-sdk-core` (OTel resource `service.name`)
 
-> ## Story 1 stub — full catalog deferred
+> ## Scope
 >
-> This catalog documents the `dt_client_*` join-flow metrics **defined** by the
-> browser-client-join story (R-25) and the `dt_client_*` naming convention
-> (R-24/R-27). It is a **stub**: task #12 lands the telemetry **scaffolding**
-> only (the `MetricsSink` contract + sinks, the name guard, the single global
-> `MeterProvider`/`WebTracerProvider`, the trace-injection helper, the
-> bounded-event logger). The full catalog — buckets, SLOs, dashboards, alerts —
-> is deferred to a later story.
-
-> ## Declared-vs-emitted honesty
-> (mirrors the `gc-service.md` §Telemetry-Proxy convention)
+> This catalog covers the `dt_client_*` **join-flow** metrics (browser-client-join
+> story, R-25) and the `dt_client_*` **media-path** metrics (ADR-0036 story 1).
+> Buckets, SLOs, dashboards and alerts for the media path land with the
+> observability and operations tasks of that story.
 >
-> **Every metric below is DECLARED here but NOT YET EMITTED.** The emission
-> sites (the `meter.createCounter(...).add(...)` / `.record(...)` calls in the
-> join flow) land in tasks **#13/#14**. Until then, no `dt_client_*` series
-> exists in any backend. **Alert / dashboard authors: do NOT key a PromQL
-> selector on any value below yet — it cannot appear.** The metric NAMES + label
-> spellings here are the contract those later tasks implement; treat this as the
-> wire contract, not a live signal.
+> **Both families are EMITTED.** The join-flow emission sites are in
+> `MeetingSession` and `MediaTransport`; the media-path sites are the cached
+> handles in `packages/sdk-core/src/media/setup/mediaMetrics.ts`. The
+> declared-but-not-yet-emitted caveat this file used to carry applied to the
+> scaffolding-only state before those tasks landed and no longer applies to
+> anything below — a blanket not-yet-emitted banner over a file containing live
+> counters is the kind of stale honesty note that makes an operator distrust the
+> whole catalog.
 
 All client SDK metrics follow ADR-0011 naming conventions with the `dt_client_`
 prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
@@ -46,14 +41,38 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
      other (a regression test in `nameGuard.test.ts` locks this — note the
      `{0,53}` doc-form that appears elsewhere DIFFERS on a trailing underscore;
      the compiled `{0,52}…[a-z0-9]` form is authoritative).
-- **Implicit labels** (R-25): every metric carries `client_version`,
-  `meeting_id_hash`, and `org_id`. **Never** label by `user_id`, `email`, `ip`,
-  `user_agent`, or the **raw meeting id**. `meeting_id_hash` is a
-  SHA-256-truncated digest, never the raw code (R-23). The SDK does NOT
-  auto-attach implicit labels at the sink (`OtelMetricsSink` passes
-  caller-supplied labels straight through) — `MeetingSession.join` computes the
-  label set ONCE and threads it into every emission site (the facade, plus
-  `MediaTransport` for `mh_connection_total`).
+- **Implicit labels — two sets, and the media-path set is not the join set.**
+  - **Join-flow metrics** carry `client_version`, `meeting_id_hash`, `org_id`. This set is the **closed, enumerated ADR-0036 §11 exception**: it is grandfathered *as a set*, it is not extended, and nothing joins it.
+  - **Media-path metrics** (`dt_client_media_*` and `dt_client_time_to_first_media_frame_ms`) carry `client_version`, `org_id`, `key_custody=operator` — **and never a meeting, participant, or stream dimension, hashed or otherwise.** They are built by allow-list in `media/setup/mediaMetrics.ts`, never by spreading and pruning the join set.
+  - **No metric, log field, span attribute, or sentence in this file may carry an end-to-end or zero-trust boolean** (ADR-0036 §11: the default deployment is neither).
+  - **Nothing mechanical enforces this in TypeScript.** `dt-guard`'s media-path deny is Rust-only, its metric-label scanner reads `crates/`, and `ts_pii.rs` scans only `console.*`/`logger.*` call sites. The rules and their enforcement status are in `docs/observability/label-taxonomy.md` R1/R2/R3 — **read them before adding a label here**; they are not restated in this file, because a second home drifts.
+
+  **The grandfathered set is FROZEN, and these are its members.** A category with
+  no roster opens by analogy — the next author decides their metric is
+  "join-flow enough" — so the list is enumerated and **it does not grow**:
+
+  | Grandfathered member | What it observes |
+  |---|---|
+  | `dt_client_join_attempts_total` | one join attempt, at its outcome |
+  | `dt_client_signaling_connection_total` | one signaling connection outcome |
+  | `dt_client_mh_connection_total` | one media-handler connection outcome, at handshake |
+  | `dt_client_time_to_signaling_ready_ms` | join → signaling ready |
+  | `dt_client_time_to_first_mh_connected_ms` | join → first MH connected |
+
+  **The test is what a metric OBSERVES, not which directory it lives in.**
+  Connect-lifecycle — once per connection, at setup, before any frame exists — is
+  grandfathered. Media-carrying — per frame, per stream, or on the media data
+  path — is under the bar. A directory-shaped rule fails in BOTH directions, and
+  the failure that will actually happen is permitting a media counter someone
+  places outside the media tree. `dt_client_mh_connection_total` lives in
+  `packages/sdk-core/src/media/MediaTransport.ts` and is grandfathered anyway,
+  for exactly that reason.
+
+  **`dt_client_time_to_first_media_frame_ms` is the nearest neighbour to a
+  grandfathered member and is deliberately NOT one.** The difference is what it
+  observes, not what it is called — see its entry, and see
+  `dt_client_time_to_first_mh_connected_ms`'s.
+
 - **Client-originated label conventions** (task #14 — the client ORIGINATES
   these; there is no server-side equivalent to mirror):
   - `meeting_id_hash` = **full SHA-256 over the `meetingId` UUID** (from
@@ -145,9 +164,17 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 - **Type**: Histogram
 - **Description**: Wall-clock ms from `MeetingSession.join` to the first MH
   connection being established.
-- **Labels**: implicit only.
+- **Labels**: the **join-flow** implicit set (`client_version`,
+  `meeting_id_hash`, `org_id`). A frozen-roster member.
 - **Buckets**: TBD (deferred).
-- **Usage**: client-perceived time-to-media-path-ready.
+- **Usage**: client-perceived time-to-**connect**-readiness. It measures the
+  HANDSHAKE completing, **before any media frame exists** — it is not a
+  media-path measurement, and the earlier wording "time-to-media-path-ready"
+  invited exactly that reading.
+- **DO NOT COPY THIS LABEL SET TO `dt_client_time_to_first_media_frame_ms`.**
+  That metric is its nearest neighbour by name, is a media-path metric, and
+  carries `client_version`, `org_id`, `key_custody` and **no meeting dimension**.
+  The two are separated by what they observe, not by what they are called.
 
 ### `dt_client_signaling_connection_total`
 - **Type**: Counter
@@ -186,6 +213,276 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
     (the raw index is bucketed so cardinality stays bounded as the MH fan-out
     grows).
 - **Cardinality**: Low (2 statuses × 3 buckets = 6, before implicit labels).
+
+---
+
+## Media-path metrics (ADR-0036 §11)
+
+Emitted from `packages/sdk-core/src/media/setup/mediaMetrics.ts`, which is the
+ONLY file under `packages/sdk-core/src/media/**` permitted to name a metric —
+asserted by `media/__tests__/hotPathLayout.test.ts`, since nothing mechanical
+enforces the media-path telemetry rules in TypeScript.
+
+**Every metric in this section carries `client_version`, `org_id` and
+`key_custody=operator`, and nothing else beyond its own bounded discriminator.**
+No meeting, participant, or stream dimension, hashed or otherwise. See
+§Naming convention for the two label sets and why the join set is not this one.
+
+### The receive-path accounting identity
+
+> **`received = accepted + sum(drops by reason)`**
+
+`dt_client_media_frames_received_total` is counted **at the wire**, before any
+parse or verification, and every datagram then leaves the receive path through
+exactly one of `dt_client_media_frames_accepted_total` or
+`dt_client_media_frames_dropped_total{reason}`.
+
+**It is an ACCOUNTING identity, not a playback guarantee.** Its job is to prove
+that no drop path fails to count itself. It says nothing about audibility: all
+fifteen `drops_frame: true` reasons fire at or before decoder handoff, so the
+identity is exact **by construction** at the crypto/parse boundary, and at the
+playback boundary it would be FALSE — a frame lost between handoff and audible
+decrements nothing on the right-hand side.
+
+**ADR-0036 / R-25 prose spells the middle term `played`. This catalog
+deliberately supersedes that spelling**, because `played` names an identity that
+does not hold: a frame handed to a decoder is not played (the decoder can error,
+the output can be discarded, the context can be suspended). The
+accepted→audible segment is not covered by this identity and is covered only
+partially by `dt_client_media_decoder_errors_total`; extending the identity to
+the playback boundary would require playback-side drop reasons — a vocabulary
+extension needing its own planning, not a word swap.
+
+**Counting-point migration (video story).** When several frames share one
+stream, `dt_client_media_frames_received_total` must move from the TRANSPORT
+boundary to the PARSE boundary, and the identity must be re-established there.
+Recorded here rather than only in a code comment because the constraint outlives
+the comment's reader.
+
+---
+
+### `dt_client_media_frames_sent_total`
+- **Type**: Counter
+- **Description**: Frames that left the device on the media datagram path.
+- **Labels**: base only.
+- **Usage**: the denominator for the send-drop ratio.
+
+### `dt_client_media_send_dropped_total`
+- **Type**: Counter
+- **Labels**: `reason` — a NEW bounded vocabulary, **not** the frame reject
+  taxonomy.
+- **Permitted values**:
+
+  | `reason` | Shared with MH? | Meaning and triage |
+  |---|---|---|
+  | `egress_queue_overflow` | **shared** | The SDK's bounded queue was full and the OLDEST frame was evicted. Back-pressure at the application layer, where we can see it. |
+  | `transport_send_refused` | **shared** | The transport refused a datagram it should have accepted. **Fleet contract: reads zero forever; alertable at `> 0`.** |
+  | `oversize_datagram` | **shared** | The frame exceeded the transport maximum and was never offered. Separate from the row above precisely so a configuration condition cannot poison an invariant counter. |
+  | `connection_closed` | **shared** | The connection closed underneath a send. **Routine** — a participant leaves every meeting, many times. Not alertable. |
+  | `not_connected` | **client-only** | A send attempted before any transport was up. A lifecycle ordering bug; **reads zero forever; alertable at `> 0`.** |
+
+- **Cross-end comparison**: the four shared spellings match
+  `MediaDropReason` in `crates/mh-service/src/observability/metrics.rs`, so
+  `sum by(reason)` compares across the two ends of one hop. **`not_connected`
+  has no counterpart** — MH never initiates — so a cross-end sum is meaningful
+  only for the shared four. Nothing mechanically guards that the two lists agree.
+- **Why this counter exists at all**: ADR-0036 §11 calls the client-side send
+  drop the one that matters most, because it happens in the sender and **MH
+  structurally cannot observe it**. WebTransport exposes no send-side drop event,
+  so the SDK keeps the transport queue shallow, owns a bounded queue above it,
+  makes the decision there, and counts it — making the drop observable BY
+  CONSTRUCTION.
+- **Mute is NOT a send drop.** While client-muted nothing is encoded, so nothing
+  enters the queue and nothing is dropped. Mute is
+  `dt_client_media_mute_transitions_total` and nothing else.
+
+### `dt_client_media_send_queue_depth`
+- **Type**: Gauge
+- **Description**: Current depth of the bounded application egress queue, in
+  frames.
+- **Labels**: base only.
+- **Usage**: read against the configured bound (default 10 frames = 200 ms at
+  20 ms/frame). The application bound trips BEFORE the transport high-water mark
+  — asserted at setup — so a rising depth here is back-pressure we can count
+  rather than loss inside the user agent.
+
+### `dt_client_media_frames_received_total`
+- **Type**: Counter
+- **Description**: Datagrams received on the media path, counted **at the wire**
+  before any parse or verification.
+- **Labels**: base only.
+- **Usage**: the left-hand side of the accounting identity above, and the signal
+  that distinguishes "nothing arriving" from "arriving and failing". See the
+  counting-point migration note.
+
+### `dt_client_media_frames_dropped_total`
+- **Type**: Counter
+- **Labels**: `reason` — the frozen frame-reject vocabulary, whose SSoT is
+  `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Membership of
+  THIS counter is carried by `drops_frame`: fifteen of the sixteen tokens.
+  `wrap_key_id_mismatch` is the only `false` and **must never appear here**: the
+  frame it describes is *accepted*, and is already counted on
+  `dt_client_media_frames_accepted_total`. Counting it here as well would put one
+  frame on **both** sides of `received = accepted + sum(drops by reason)` — the
+  right-hand side then exceeds the left, and the identity fails **silently, only in
+  aggregate, and long after the label set is frozen**. It is kept structurally out
+  of reach: it arrives on the receive path's success channel as a `WrapOutcome`,
+  never as a thrown reject, so "catch it into the drop counter" is not a path that
+  exists.
+- **All eight structural codec tokens are emitted INDIVIDUALLY** — `unknown_version`,
+  `reserved_flag_bit_set`, `payload_length_exceeds_max`,
+  `payload_length_exceeds_available`, `truncated`, `extensions_too_large`,
+  `extensions_malformed`, `trailing_bytes` — never collapsed into a
+  `decode_reject` bucket. Collapsing destroys R-31's only lever
+  (`unknown_version` staying individually visible is how a version-skewed
+  rollback is detected — rollback for this feature is redeploy-only with no
+  finer-grained control) and breaks `sum by(reason)` comparability with MH.
+- **The two key-material reasons** are `no_kek_for_generation` (no meeting KEK
+  for the generation the frame's wrap announces) and `no_roster_entry` (no usable
+  identity key for the frame's `key_id.sender_id`, INCLUDING the case where MC
+  published an empty key). Both are expected transients at join and after a KEK
+  rotation; **the sustained case is the signal**, and it is the only signal for a
+  join or rotation path that has silently stopped delivering keys.
+- **`unwrap_failed` versus `decrypt_failed`** are two AES-GCM failures on one
+  receive path routing to opposite teams: `unwrap_failed` is the KEK unwrap, so
+  it is key DISTRIBUTION; `decrypt_failed` is the SFrame payload, so it is the
+  key schedule or the sender.
+- **`no_transmit_key`** is a frame with neither a cached key nor a usable wrap: a
+  protocol violation, not a third key reason and not a decode reject.
+
+### `dt_client_media_frames_accepted_total`
+- **Type**: Counter
+- **Description**: Frames that completed the receive path — verified, replay-
+  checked, decrypted — and were handed to the audio decoder.
+- **Labels**: base only.
+- **NAMED `accepted`, NOT `played`.** A frame handed to a decoder is not played.
+  Silent audio with this counter climbing means the fault is downstream of the
+  handoff — the decoder, the output device, or a suspended audio context — and
+  **not** that frames are playing. See the identity above.
+
+### `dt_client_media_key_wrap_outcomes_total`
+- **Type**: Counter
+- **Labels**: `outcome` — the two NON-DROPPING wrapped-key outcomes. The frame
+  was ACCEPTED in both cases; neither ever reaches the drop counter.
+- **Permitted values**:
+  - `kek_generation_not_held` — the frame's wrap announces a KEK generation this
+    receiver does not hold, but a usable transmit key for that key id was already
+    cached, so the frame plays off the cache. **This is the KEK-rotation-lag
+    signal**: the sender re-wrapped under a generation whose push has not landed.
+  - `wrap_key_id_mismatch` — the SSoT spelling, carried verbatim from
+    `frame-v2.vectors.json` → `vectors[].expected.outcome`. **A rename toward the
+    observable is pending under `docs/TODO.md`** (proposed target spelling:
+    `unwrap_failed_key_held`); the rename is protocol-owned because the token is
+    pinned in a Guarded Shared Area, and it must move both `reject_reason` and
+    `expected.outcome` on the same row.
+- **TRIAGE ON THE CONDITION, NOT THE TOKEN NAME.** What this value actually
+  observes is: **the KEK unwrap failed — a one-bit GCM tag mismatch, which is all
+  the receiver gets — AND a usable transmit key for that key id was already
+  held, so the frame plays.** The receiver **cannot** detect a mis-bound wrap:
+  the wrap's bound key id is nowhere on the wire (the block is
+  `kek_generation || 32 wrapped || 16 tag`, and the binding exists only as the
+  seal-time AAD), so a mis-bound wrap and a wrong KEK are indistinguishable. The
+  **realistic production cause is a KEK-generation skew** from a sender whose
+  transmit key this receiver already holds — not anyone mis-binding wraps.
+- **Cross-reference — `unwrap_failed` and `wrap_key_id_mismatch` are two halves
+  of one AEAD failure**: *same AEAD failure, forked by receiver state; the drop
+  counter carries the half that lost the frame, the wrap-outcome counter carries
+  the half that kept it.* An operator separates key-distribution breakage from
+  KEK-generation skew by which half is moving.
+  **The two CANNOT be summed or ratio'd in a single expression**, and the reason
+  is the identity above: `received = accepted + sum(drops by reason)` is what
+  forces a non-dropping outcome off the drop counter in the first place.
+
+### `dt_client_media_downlink_gap_frames_total`
+- **Type**: Counter
+- **Description**: Frames MISSING between the media handler's egress and this
+  client's ingress, measured as gaps in the relay hop sequence.
+- **Labels**: base only. `stream_id` is bounded internal state and is **never** a
+  label.
+- **Increments by the SIZE of each gap, not by one per gap event** — a counter of
+  missing numbers is comparable against `dt_client_media_frames_received_total`
+  as a loss rate; a counter of events is not.
+- **OVER-COUNTS TRUE LOSS BY EXACTLY THE REORDER COUNT.** QUIC datagrams are
+  unordered, so a reordered frame first opens a gap and then arrives late. **The
+  honest loss estimate is `gap_frames - reorder`.** This is the single most
+  misreadable value in the media set: without the subtraction, normal reordering
+  reads as loss in the first congestion incident.
+- **Why this lives on the client**, mirroring the blockquote on
+  `mh_media_frames_dropped_total` in `mh-service.md`:
+
+  > This is the far-end compensating control for a blind spot MH structurally
+  > cannot close. Beneath MH's own bounded queue, quinn evicts datagrams from its
+  > send buffer **silently** — it pops the oldest, emits a trace-level log,
+  > increments no `ConnectionStats` field, and (because an evicted datagram was
+  > never transmitted) never enters quinn's lost-packet statistics either. So
+  > under congestion severe enough to saturate quinn's buffer but not MH's,
+  > `mh_media_frames_dropped_total{reason="egress_queue_overflow"}` **reads flat
+  > at exactly the moment loss is worst**. MH writes the downlink hop sequence,
+  > so it can never see a gap in a number it generates itself. Only the receiving
+  > end can.
+
+### `dt_client_media_downlink_reorder_total`
+- **Type**: Counter
+- **Description**: Datagrams arriving at or below the running hop-sequence
+  high-water mark.
+- **Labels**: base only.
+- **Usage**: the subtrahend in `gap_frames - reorder`. Kept separate from the gap
+  counter so the subtraction is possible at all.
+
+### `dt_client_media_undeclared_stream_id_total`
+- **Type**: Counter
+- **Description**: Frames arriving on a relay `stream_id` this client never
+  declared in its `ReceiveCapability`.
+- **Labels**: base only.
+- **Usage**: the relay region is UNAUTHENTICATED — a media handler writes
+  `stream_id` freely and nobody signs it — so an undeclared value creates NO
+  receiver state and is counted here instead. The frame itself is still verified
+  and attributed from its own key id. A sustained rate means a handler is routing
+  to slots this subscriber did not ask for.
+
+### `dt_client_media_decoder_errors_total`
+- **Type**: Counter
+- **Description**: The audio decoder's terminal error callback fired.
+- **Labels**: base only. **No `reason`** — `AudioDecoder` provides no bounded
+  one, and an unbounded label here would be the cardinality hazard §11 exists to
+  prevent.
+- **Usage**: the ONLY counter covering the accepted→audible segment, which the
+  receive-path identity deliberately does not reach. Event-driven, never
+  per-frame.
+
+### `dt_client_media_mute_transitions_total`
+- **Type**: Counter
+- **Labels**: `action` — `mute`, `unmute`.
+- **Usage**: client mute is enforced at CAPTURE and does not depend on the server
+  honouring it; MC keeps the send directive active throughout. This counter, not
+  frame absence, is how mute state is observed — *muted*, *silent* and *the
+  network died* are indistinguishable from absence alone.
+
+### `dt_client_media_kek_updates_total`
+- **Type**: Counter
+- **Labels**: `source` — `join_response` (the only source this story;
+  KEK-push rotation adds one when it lands).
+- **Usage**: the KEK arriving through the KEK-source seam. **Never the key
+  itself, and never its generation** — the generation is monotonic over the
+  meeting's life, so as a label its cardinality is unbounded over TIME rather
+  than bounded by its type, and it advances on the leave debounce, which makes a
+  per-meeting generation series a membership-change trace.
+
+### `dt_client_time_to_first_media_frame_ms`
+- **Type**: Histogram
+- **Description**: Wall-clock ms from media pipeline start to the first media
+  frame arriving at the wire.
+- **Labels**: the **media-path** set (`client_version`, `org_id`,
+  `key_custody`). **NOT a frozen-roster member**, notwithstanding its
+  name's resemblance to `dt_client_time_to_first_mh_connected_ms` — the
+  difference is what it observes, not what it is called.
+- **Buckets**: TBD (deferred with the media dashboards).
+- **OBSERVED, NEVER GATED (ADR-0036 §10).** No test asserts a wall-clock
+  threshold against it, and none may: asserting an end-to-end latency target on a
+  local cluster produces a permanent flake, ADR-0028 forbids quarantining quality
+  gates, so the test would be deleted and the headline objective would end with
+  ZERO coverage. Sampled from the start, so the measurement exists for every
+  session rather than only for sessions that got far enough to be instrumented.
 
 ---
 

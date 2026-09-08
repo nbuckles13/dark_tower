@@ -404,7 +404,30 @@ describe('wrap_for_different_key_id — the wrap is IGNORED, the frame is played
     // CACHE STATE is the assertion, not a reject reason. Asserting a reject reason
     // here would test the wrong control: §4 says the receiver IGNORES the
     // mis-bound wrap and otherwise plays the frame.
-    expect(opened.wrapOutcome).toBe('wrap_key_id_mismatch');
+    //
+    // READ FROM THE ROW, not hardcoded, and that is the point. `expected.outcome`
+    // is declared in the SSoT specifically so — in the generator's own words —
+    // "a codec in a third language cannot get this wrong by omission", and until
+    // this line read it, the binding existed in the file, was declared in the row
+    // type, and was asserted by NOTHING on this side: a control alive but out of
+    // scope, which reads as coverage. With it read here, any rename that does not
+    // also move the vectors fails this suite loudly instead of shipping a
+    // two-name contract.
+    expect(opened.wrapOutcome).toBe(row.expected?.outcome);
+
+    // THE SAME VALUE IS PINNED TWICE IN THE SSoT and, before this line, neither
+    // binding was read: `row.reject_reason` is asserted only under
+    // `kind === 'decode_reject'`, on the signature-failure rows, and on one
+    // hardcoded `decrypt_failed` — none of which matches this row's
+    // `kind: 'wrap_binding'`. A partial rename touching one field and not the
+    // other would otherwise pass green with the file carrying two spellings of
+    // one concept, which is the one failure a cross-language SSoT cannot afford.
+    // This is a FILE-INTERNAL CONSISTENCY check, not a new contract.
+    expect(
+      row.reject_reason,
+      'frame-v2.vectors.json pins this condition twice, as `reject_reason` and as ' +
+        '`expected.outcome`; a rename must move BOTH',
+    ).toBe(row.expected?.outcome);
     expect(bytesToHex(opened.plaintext)).toBe(row.crypto.plaintext_hex);
     expect(row.expected?.frame_dropped).toBe(false);
     expect(row.expected?.wrap_cached).toBe(false);

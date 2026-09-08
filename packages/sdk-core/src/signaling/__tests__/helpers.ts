@@ -15,11 +15,20 @@ import {
   ErrorMessageSchema,
   JoinResponseSchema,
   LeaveReason,
+  EncodingParametersSchema,
+  MediaKind,
   MediaServerInfoSchema,
+  MeetingKekUpdateSchema,
   ParticipantJoinedSchema,
   ParticipantLeftSchema,
   ParticipantSchema,
+  SendDirectiveSchema,
+  SendStreamSchema,
+  SendTargetSchema,
   ServerMessageSchema,
+  SlotState,
+  StreamAssignmentSchema,
+  StreamAssignmentsSchema,
   StreamPublishedSchema,
 } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { ClientMessage } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
@@ -38,7 +47,10 @@ function buildServerMessage(
     | { case: 'participantJoined'; value: ReturnType<typeof buildParticipantJoined> }
     | { case: 'participantLeft'; value: ReturnType<typeof buildParticipantLeft> }
     | { case: 'error'; value: ReturnType<typeof buildErrorMessage> }
-    | { case: 'streamPublished'; value: ReturnType<typeof buildStreamPublished> },
+    | { case: 'streamPublished'; value: ReturnType<typeof buildStreamPublished> }
+    | { case: 'sendDirective'; value: ReturnType<typeof buildSendDirective> }
+    | { case: 'streamAssignments'; value: ReturnType<typeof buildStreamAssignments> }
+    | { case: 'meetingKekUpdate'; value: ReturnType<typeof buildMeetingKekUpdate> },
 ) {
   return create(ServerMessageSchema, { message });
 }
@@ -46,7 +58,13 @@ function buildServerMessage(
 export interface JoinResponseInit {
   participantId?: string;
   senderId?: number;
-  participants?: { participantId: string; name: string }[];
+  kekGeneration?: number;
+  participants?: {
+    participantId: string;
+    name: string;
+    senderId?: number;
+    identityPublicKey?: Uint8Array;
+  }[];
   mediaServers?: string[];
   correlationId?: string;
   bindingToken?: string;
@@ -60,8 +78,14 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
     participantId: init.participantId ?? 'participant-self',
     senderId: init.senderId,
     existingParticipants: (init.participants ?? []).map((p) =>
-      create(ParticipantSchema, { participantId: p.participantId, name: p.name }),
+      create(ParticipantSchema, {
+        participantId: p.participantId,
+        name: p.name,
+        ...(p.senderId !== undefined ? { senderId: p.senderId } : {}),
+        ...(p.identityPublicKey !== undefined ? { identityPublicKey: p.identityPublicKey } : {}),
+      }),
     ),
+    kekGeneration: init.kekGeneration ?? 0,
     mediaServers: (init.mediaServers ?? []).map((url) =>
       create(MediaServerInfoSchema, { mediaHandlerUrl: url }),
     ),
@@ -167,3 +191,74 @@ export async function waitFor(predicate: () => boolean, tries = 100): Promise<vo
   }
   throw new Error('waitFor: predicate did not become true in time');
 }
+
+// --- ADR-0036 §4/§5/§6 media signaling (story task 19) ---
+
+/** Build a `SendDirective` naming one audio stream and its targets. */
+export function buildSendDirective(init: {
+  streamNumber?: number;
+  maxBitrateBps?: number;
+  targets?: string[];
+  headerVersion?: number;
+  mediaKind?: MediaKind;
+}) {
+  return create(SendDirectiveSchema, {
+    headerVersion: init.headerVersion ?? 2,
+    streams: [
+      create(SendStreamSchema, {
+        streamNumber: init.streamNumber ?? 1,
+        mediaKind: init.mediaKind ?? MediaKind.AUDIO,
+        encoding: create(EncodingParametersSchema, {
+          maxBitrateBps: init.maxBitrateBps ?? 0,
+        }),
+        targets: (init.targets ?? []).map((url) =>
+          create(SendTargetSchema, { mediaHandlerUrl: url }),
+        ),
+      }),
+    ],
+  });
+}
+
+/** Build a `StreamAssignments` placing (or explaining) one slot. */
+export function buildStreamAssignments(init: {
+  slotId?: number;
+  senderId?: number;
+  mediaHandlerUrl?: string;
+  slotState?: SlotState;
+}) {
+  return create(StreamAssignmentsSchema, {
+    assignments: [
+      create(StreamAssignmentSchema, {
+        slotId: init.slotId ?? 0,
+        ...(init.senderId !== undefined ? { senderId: init.senderId } : {}),
+        mediaKind: MediaKind.AUDIO,
+        mediaHandlerUrl: init.mediaHandlerUrl ?? '',
+        slotState: init.slotState ?? SlotState.ACTIVE,
+      }),
+    ],
+  });
+}
+
+/** Build a `MeetingKekUpdate`. Unused this story; the SCRUB still runs. */
+export function buildMeetingKekUpdate(kek: Uint8Array, generation: number) {
+  return create(MeetingKekUpdateSchema, { meetingKek: kek, kekGeneration: generation });
+}
+
+export function framedSendDirective(init: Parameters<typeof buildSendDirective>[0]): Uint8Array {
+  return frameServerMessage({ case: 'sendDirective', value: buildSendDirective(init) });
+}
+
+export function framedStreamAssignments(
+  init: Parameters<typeof buildStreamAssignments>[0],
+): Uint8Array {
+  return frameServerMessage({ case: 'streamAssignments', value: buildStreamAssignments(init) });
+}
+
+export function framedMeetingKekUpdate(kek: Uint8Array, generation: number): Uint8Array {
+  return frameServerMessage({
+    case: 'meetingKekUpdate',
+    value: buildMeetingKekUpdate(kek, generation),
+  });
+}
+
+export { MediaKind, SlotState };

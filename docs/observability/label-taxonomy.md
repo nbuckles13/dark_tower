@@ -245,6 +245,24 @@ and not `has_vector`.** Those are all *nearly* the same distinction and none of 
   `crates/media-vector-gen` regenerate plus the g16 `spec_anchor`, which requires the token verbatim
   in the story file — and this paragraph is written to be replaced when that lands.
 
+  **UPDATED 2026-09-08 (story task 19): the closure trigger has FIRED and the rename was ruled OUT of
+  that devloop.** This value is now operator-facing for the first time, as an `outcome` on
+  `dt_client_media_key_wrap_outcomes_total` — previously it was only a vector-row outcome nobody saw.
+  **Proposed target spelling for protocol's rename: `unwrap_failed_key_held`**, recorded here and at
+  `docs/TODO.md`'s entry so the spin-out inherits a name rather than coining a third, and so
+  `unwrap_failed` (drop) and `unwrap_failed_key_held` (kept) read as the two halves of one AEAD
+  failure — which is what this section already says they are, in two names that currently hide it.
+  **Why the rename was ruled out rather than done**: renaming `expected.outcome` while `reject_reason`
+  on the same vectors row keeps the old spelling would put **two names for one condition inside the
+  SSoT**, strictly worse than either endpoint; and renaming both is not a larger version of that, it
+  **is** the spin-out. Note the value is pinned **twice** in the vectors file — as `reject_reason` and
+  again as `vectors[].expected.outcome` — a second site the TODO entry's scope list did not name.
+
+  **Until the rename lands, triage on the condition and not the token.** The client catalog entry
+  leads with the observable — the unwrap failed (a one-bit GCM tag mismatch, which is all the receiver
+  gets) **and** a usable transmit key for that key id was already held, so the frame plays — and names
+  the realistic production cause as a **KEK-generation skew**, not a peer mis-binding wraps.
+
 State the rule in its own terms. Do not derive it from a neighbouring field.
 
 **The trigger this pre-answers, because the rule is currently inert.** R2 already bars identity
@@ -456,16 +474,47 @@ at investigation time, in a system that legitimately holds that mapping.
 
 Media-path metrics emitted by the client SDK **must** carry only `client_version` and `org_id`.
 
-> **This is a required end state, not a description of current behaviour.** Today the SDK's implicit
-> join label set — `client_version`, `meeting_id_hash`, `org_id` — is threaded from
-> `MeetingSession.join` into **every** emission site including the media module
-> (`packages/sdk-core/src/media/events.ts`), and `packages/sdk-core/src/media/__tests__/media-transport.test.ts`
-> **asserts** `meeting_id_hash` in that label set. So media-path client metrics would inherit a
-> meeting identifier **by inertia** unless the exemption is applied deliberately. Tracked in
-> `docs/TODO.md`; owner: client.
+Plus `key_custody=operator` (§Key custody). That is the whole set.
 
-Stated in the present-tense-required form because the inertia is the whole risk: the label set arrives
-by default, and doing nothing is what ships the violation.
+> **LANDED 2026-09-08 (story task 19). This paragraph previously read "a required end state, not a
+> description of current behaviour" and that form is now retired** — leaving it would make this file
+> assert a violation that no longer exists, which is the same defect class R3 exists to prevent, one
+> level up.
+>
+> **How it landed matters more than that it landed**, because the mechanism is the reusable part.
+> Media labels are built by an **allow-list projection**, `mediaMetricLabels` in
+> `packages/sdk-core/src/media/setup/mediaMetrics.ts`, whose constructor takes **two named strings**
+> rather than a `MetricLabels` bag. So `meeting_id_hash` is not merely absent from media metrics — it
+> is **unrepresentable at that boundary**. A deletion-based helper (`{...labels, meeting_id_hash:
+> undefined}`) would have satisfied the rule on the day and been one refactor away from re-inheriting
+> a newly-added join label; an allow-list cannot be.
+>
+> **The inertia argument this paragraph used to make was correct and is preserved as the reason for
+> that shape, not deleted with the condition it described.** The join label set still arrives by
+> default at every non-media emission site; what changed is that the media path no longer has a
+> parameter through which it could arrive.
+>
+> **One metric deliberately still carries it.** `dt_client_mh_connection_total` keeps
+> `meeting_id_hash` as a grandfathered ADR-0028 join-flow metric, and
+> `media/__tests__/media-transport.test.ts` keeps the assertion pinning that — annotated at both
+> sites, because it and the R3 negative test assert opposite things and are both correct. See
+> §The grandfathered set below.
+
+### The grandfathered set, and the line that decides membership
+
+**The test is what a metric OBSERVES, not which directory it lives in.** Connect-lifecycle — once per
+connection, at setup, before any frame exists — is grandfathered. Media-carrying — per frame, per
+stream, or on the media data path — is under the bar.
+
+A directory-shaped rule fails in **both** directions, and only one of those failures is the one people
+picture. It would wrongly bar `dt_client_mh_connection_total`, which lives in `media/MediaTransport.ts`
+and is grandfathered anyway; and it would wrongly **permit** a media counter placed outside the media
+tree. The second is the failure that will actually happen, and a directory rule licenses it.
+
+The roster is frozen with a named member list in `docs/observability/metrics/client.md` — a closed
+exception with no roster opens by analogy, because the next author decides their metric is "join-flow
+enough". The obligation to keep it frozen has **no mechanical enforcement**; it is tracked at
+`docs/TODO.md` D5, held open for that reason rather than closed as completed work.
 
 ### Enforcement reality — read this before citing these rules as coverage
 
@@ -489,6 +538,65 @@ by default, and doing nothing is what ships the violation.
   deny of log and metric macros across the whole media path, which catches the offending *form*
   rather than a spelling. Word-boundary vocabulary matching cannot see inside compounds, so a
   prefixed spelling ships clean while the guard reports green.
+
+#### When vocabulary can be the control at all
+
+The `[guard-enforced]` / `[reviewer-only]` annotations above are decided case by case, with no rule
+behind them. This is the rule. It exists because "add the term to the denylist" is the reflex answer
+and is wrong more often than it is right.
+
+**Ask whether the property is a property of names.**
+
+- If the violation is a **term appearing** — a known credential spelling, a named PII field — then
+  vocabulary can be the control, and matcher quality is the only remaining question.
+- If the violation is a **shape arriving** — a dimension reaching a persisted label, a macro reachable
+  from a hot path, a credential entering any sink — then **no matcher over names can reach it at any
+  quality**, and the control must be arrival-shaped: a constructor or type-level allow-list, or a
+  directory-scoped deny. A vocabulary entry against a shape-harm reports clean while the violation
+  ships.
+
+**The branches are not exclusive, and where they overlap the arrival-shaped control wins.** A
+credential leak is both a term appearing and a shape arriving; the second framing is the one that
+survives a spelling nobody enumerated. Vocabulary is the *primary* control only where the violation is
+term-shaped **and no arrival surface exists to constrain**. Where one exists, constrain it and keep the
+vocabulary for classification and triage — never cited as the protection.
+
+**"No arrival surface exists" is a claim requiring evidence, not a default.** An arrival surface is a
+constructor every value of the kind must pass through, a directory boundary, or a type. Before
+concluding none exists, ask whether one can be **created** — and where the cost is bounded, creating
+one is the answer. ADR-0036 §11 is the precedent: it did not accept the tree's boundaries as given, it
+**imposed a layout constraint** (lifecycle, setup and teardown as *siblings* of the hot path rather
+than children) precisely so a directory boundary and the hot-path boundary would coincide and a
+shape-deny could exist at all. The surface was manufactured because the control required one. Without
+this clause the rule degrades into "use vocabulary whenever the alternative is work", which inverts it.
+
+**Three worked instances, all in this tree, all different arrival surfaces:**
+
+| Harm | Arrival surface | Vocabulary's role |
+|------|-----------------|-------------------|
+| KEK / transmit key reaching a log or sink | The §11 directory-scoped deny (`docs/TODO.md` §Credential-leak guard, item (a)) | **Demoted.** No word list in `checks.md` at all; terms went to `pii_vocabulary.rs` CATEGORY_A as classification |
+| Log or metric macro reachable per frame | Directory boundary, **manufactured** by §11's sibling layout | None — the harm is not name-shaped |
+| Identity dimension reaching a media metric label | The `mediaMetricLabels` constructor (two named strings); `media/__tests__/hotPathLayout.test.ts` asserts it is the only label constructor under `media/**` | None — see below |
+
+**Why the third case admits no vocabulary at all, stated because the obvious argument for it is
+wrong.** The tempting reason is "the word-boundary matcher cannot see inside compounds" — true, but
+**not dispositive**, because `segments()` (`crates/dt-guard/src/ts_retained_credentials.rs:198`) exists
+for exactly that case and a reader who knows the guard tree will say so. The argument that holds is one
+level up: **the harm is the label's dimensionality, not its spelling.** Nothing stops a module emitting
+`(sender_id, stream, generation)` under `ctx`, `sid`, or `k` — names no vocabulary would or should
+contain, carrying all three barred dimensions just as completely as `key_id` would. A name-matcher
+catches only the spellings someone anticipated; the constructor allow-list catches the **arrival**,
+whatever it is called. That is §11's *"vocabulary additions cannot be cited as the protection"* in the
+form that forecloses the family, rather than the form that invites a better matcher.
+
+**And the harm there is retention and aggregation, not confidentiality.** The key id is clear-header
+data MH reads on every frame to route — claiming it is secret would be plainly false to the reader
+whose agreement this entry needs, and the real argument would go down with the overclaim. The actual
+grounds: `key_id` decomposes to `(sender_id, stream, generation)`, so **one label carries all three
+barred dimensions in a field that does not read as an identifier**; its `generation` component advances
+on every rotation, making a key id on a label a per-sender **rekey-timing series**; and per D5 any
+participant or stream dimension joined to the reject vocabulary is what makes those `reason` values a
+decryption oracle — which does not care which directory the label was constructed in.
 
 Recorded plainly so nobody cites a conventions file as a control. See `docs/TODO.md` for the gap
 between these rules' stated scope ("anywhere in this design") and what the directory-scoped deny
