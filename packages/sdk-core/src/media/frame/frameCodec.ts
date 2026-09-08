@@ -95,6 +95,17 @@ const {
 const WRAPPED_KEY_AEAD_BYTES = WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES + WIRE_CONSTANTS.aead_tag_bytes;
 
 /**
+ * Relay-region field widths: `stream_id(2) || hop_sequence(4)`.
+ *
+ * Named rather than left as literals at the two `DataView` calls that use them,
+ * because {@link writeHopSequence} needs the hop-sequence OFFSET and deriving it
+ * from an unnamed `+ 2` is how a field width drifts from its reader.
+ * `__tests__/frameCodec.test.ts` asserts the two sum to `relay_region_bytes`.
+ */
+const STREAM_ID_FIELD_BYTES = 2;
+const HOP_SEQUENCE_FIELD_BYTES = 4;
+
+/**
  * Protocol version, from the SSoT (`header_version`, guard g3 pins it against
  * `frame.rs::PROTOCOL_VERSION`). There is deliberately no v1 decode path — see
  * `decodeFrame`.
@@ -465,6 +476,167 @@ export interface UnsignedFrame {
   readonly aeadAad: Bytes;
   /** The Ed25519 signed range — publisher region ‖ payload. */
   readonly signedRange: Bytes;
+  /**
+   * Byte offset of the relay region within `bytes` (and within the finished
+   * frame, since {@link finishFrame} only appends).
+   *
+   * Exposed so a sender can write the hop sequence AFTER signing — see
+   * {@link writeHopSequence}. Returned rather than recomputed by the caller,
+   * because recomputing it means re-deriving the publisher-region length from
+   * the flags and extension sizes, which is a second implementation of the
+   * layout this module owns.
+   */
+  readonly relayRegionOffset: number;
+}
+
+/** Fields of the publisher region. A subset of {@link EncodeFrameInput}. */
+export interface PublisherRegionInput {
+  readonly flags: FrameFlags;
+  readonly streamSequence: number;
+  readonly wrappedTransmitKey: WrappedTransmitKey | null;
+  readonly extensions: readonly FrameExtension[];
+}
+
+/**
+ * Build the publisher region for a frame whose payload will be `payloadLength`
+ * bytes.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS EXPORTED, AND WHY IT IS NOT A SECOND SERIALIZER
+ * ---------------------------------------------------------------------------
+ *
+ * The SFrame seal needs the AEAD associated data; the associated data IS the
+ * publisher region; the region carries `payload_length`, which is a property of
+ * the sealed output. That reads circular and is not: AES-GCM is
+ * length-preserving, so the sealed SFrame object's length is known before
+ * sealing — `key_id(8) + tag(16) + plaintext.length` — and the region can
+ * therefore be built first.
+ *
+ * The alternative was for the egress path to lay out the region itself and hand
+ * the bytes to `buildUnsignedFrame`. That would be a SECOND WRITER of header
+ * bytes, i.e. a second wire format that agrees with this one only by review.
+ * Instead {@link buildUnsignedFrame} calls this function, so there is exactly
+ * one place that knows the layout and the AAD a sender seals under is
+ * byte-identical to the region the frame ships with by construction rather than
+ * by comparison.
+ *
+ * THE ENTIRE REGION IS POPULATED BEFORE IT IS RETURNED. That is the encode-side
+ * mirror of the decode rule: a range taken over a half-filled buffer
+ * authenticates zeros, and the resulting frame verifies against nothing.
+ *
+ * @throws {FrameRejectedError} `payload_length_exceeds_max` / `extensions_too_large`.
+ * @throws {RangeError} if the key-bearing flag and the wrapped key disagree.
+ */
+export function buildPublisherRegion(input: PublisherRegionInput, payloadLength: number): Bytes {
+  const { flags, wrappedTransmitKey, extensions } = input;
+
+  if (flags.keyBearing !== (wrappedTransmitKey !== null)) {
+    throw new RangeError(
+      'buildPublisherRegion: the key-bearing flag and the wrapped transmit key must agree',
+    );
+  }
+  if (payloadLength > MAX_PAYLOAD_BYTES) {
+    throw codecReject(
+      'payload_length_exceeds_max',
+      `payload of ${payloadLength} bytes exceeds the wire-format maximum ${MAX_PAYLOAD_BYTES}`,
+      { declared: payloadLength, limit: MAX_PAYLOAD_BYTES },
+    );
+  }
+
+  const extBytes = concatBytes(
+    ...extensions.map((e) => concatBytes(Uint8Array.of(e.extType, e.value.length), e.value)),
+  );
+  if (extBytes.length > MAX_EXT_BYTES) {
+    throw codecReject(
+      'extensions_too_large',
+      `extension region of ${extBytes.length} bytes exceeds the maximum ${MAX_EXT_BYTES}`,
+      { declared: extBytes.length, limit: MAX_EXT_BYTES },
+    );
+  }
+
+  const regionLen =
+    PUBLISHER_FIXED_PREFIX_BYTES +
+    (wrappedTransmitKey ? WRAPPED_TRANSMIT_KEY_BYTES : 0) +
+    EXT_LENGTH_FIELD_BYTES +
+    extBytes.length;
+
+  const region = new Uint8Array(regionLen);
+  const view = new DataView(region.buffer);
+  region[0] = PROTOCOL_VERSION;
+  region[1] =
+    (flags.independentlyDecodable ? FLAG_INDEPENDENTLY_DECODABLE : 0) |
+    (flags.discardable ? FLAG_DISCARDABLE : 0) |
+    (flags.keyBearing ? FLAG_KEY_BEARING : 0);
+  view.setUint32(2, payloadLength, false);
+  view.setUint32(6, input.streamSequence, false);
+
+  let cursor = PUBLISHER_FIXED_PREFIX_BYTES;
+  if (wrappedTransmitKey) {
+    view.setUint16(cursor, wrappedTransmitKey.kekGeneration, false);
+    region.set(wrappedTransmitKey.wrappedKeyWithTag, cursor + KEK_GENERATION_FIELD_BYTES);
+    cursor += WRAPPED_TRANSMIT_KEY_BYTES;
+  }
+  view.setUint16(cursor, extBytes.length, false);
+  cursor += EXT_LENGTH_FIELD_BYTES;
+  region.set(extBytes, cursor);
+
+  return region as Bytes;
+}
+
+/**
+ * Overwrite the relay region's hop sequence in a built frame.
+ *
+ * ---------------------------------------------------------------------------
+ * SAFE AFTER SIGNING, AND ASSIGNED AT DEQUEUE FOR A REASON THAT SPANS SERVICES
+ * ---------------------------------------------------------------------------
+ *
+ * The relay region is excluded from BOTH the AEAD associated data (which is the
+ * publisher region only) and the Ed25519 signed range (publisher ‖ payload), so
+ * rewriting it invalidates nothing. That exclusion is exactly what ADR-0036 §2's
+ * publisher/relay split exists to permit, and it is what a media handler does to
+ * this same region on every forward.
+ *
+ * ADR-0036 requires the hop sequence to count ONLY FRAMES ACTUALLY SENT. A
+ * sender with a bounded drop-oldest egress queue must therefore assign it at
+ * DEQUEUE, not at enqueue, and the difference has a two-service consequence:
+ *
+ *   * At dequeue, a client-side queue drop leaves the hop sequence CONTIGUOUS on
+ *     the wire and the gap lands on the stream sequence instead. The receiving
+ *     media handler's uplink hop-gap detector therefore sees no gap — which is
+ *     CORRECT, because the client already counted that drop on
+ *     `dt_client_media_send_dropped_total`, and ADR-0036 §11's whole point is
+ *     that the client-side drop is the one the handler structurally cannot see.
+ *   * At enqueue, the same drop would punch a hop gap too, and the handler would
+ *     report it as network loss on the client-to-handler path — the same drop
+ *     counted twice, in two services, under two different causes, one of which
+ *     is wrong.
+ *
+ * Nothing in the tree would catch an inversion, so this comment is the control,
+ * named as the weaker form it is. It is the reciprocal of the far-end obligation
+ * recorded in `docs/TODO.md` (the media handler's missing INGRESS hop-gap
+ * counter): that counter's meaning depends on this choice, so the choice is
+ * written down where the number is generated.
+ *
+ * @param frame the built frame, mutated in place.
+ * @param relayRegionOffset from {@link UnsignedFrame.relayRegionOffset}.
+ */
+export function writeHopSequence(
+  frame: Uint8Array,
+  relayRegionOffset: number,
+  hopSequence: number,
+): void {
+  const hopOffset = relayRegionOffset + STREAM_ID_FIELD_BYTES;
+  if (hopOffset + HOP_SEQUENCE_FIELD_BYTES > frame.length) {
+    throw new RangeError(
+      `writeHopSequence: relay region at ${relayRegionOffset} does not fit in a ` +
+        `${frame.length}-byte frame`,
+    );
+  }
+  new DataView(frame.buffer, frame.byteOffset, frame.byteLength).setUint32(
+    hopOffset,
+    hopSequence,
+    false,
+  );
 }
 
 /**
@@ -482,65 +654,26 @@ export interface UnsignedFrame {
  * why the AAD covers the publisher region only.
  */
 export function buildUnsignedFrame(input: EncodeFrameInput): UnsignedFrame {
-  const { flags, wrappedTransmitKey, extensions, payload } = input;
+  const { payload } = input;
 
-  if (flags.keyBearing !== (wrappedTransmitKey !== null)) {
-    throw new RangeError(
-      'buildUnsignedFrame: the key-bearing flag and the wrapped transmit key must agree',
-    );
-  }
-  if (payload.length > MAX_PAYLOAD_BYTES) {
-    throw codecReject(
-      'payload_length_exceeds_max',
-      `payload of ${payload.length} bytes exceeds the wire-format maximum ${MAX_PAYLOAD_BYTES}`,
-      { declared: payload.length, limit: MAX_PAYLOAD_BYTES },
-    );
-  }
-
-  const extBytes = concatBytes(
-    ...extensions.map((e) => concatBytes(Uint8Array.of(e.extType, e.value.length), e.value)),
-  );
-  if (extBytes.length > MAX_EXT_BYTES) {
-    throw codecReject(
-      'extensions_too_large',
-      `extension region of ${extBytes.length} bytes exceeds the maximum ${MAX_EXT_BYTES}`,
-      { declared: extBytes.length, limit: MAX_EXT_BYTES },
-    );
-  }
-
-  const publisherRegionLen =
-    PUBLISHER_FIXED_PREFIX_BYTES +
-    (wrappedTransmitKey ? WRAPPED_TRANSMIT_KEY_BYTES : 0) +
-    EXT_LENGTH_FIELD_BYTES +
-    extBytes.length;
+  // ONE writer of header bytes. The region is built by `buildPublisherRegion`
+  // and copied in whole; this function never lays out publisher fields itself,
+  // so a sender that pre-computed the AAD gets a byte-identical region here by
+  // construction rather than by comparison.
+  const publisherRegionBytes = buildPublisherRegion(input, payload.length);
+  const publisherRegionLen = publisherRegionBytes.length;
   const total = publisherRegionLen + RELAY_REGION_BYTES + payload.length;
 
   const bytes = new Uint8Array(total);
+  bytes.set(publisherRegionBytes, 0);
   const view = new DataView(bytes.buffer);
-  bytes[0] = PROTOCOL_VERSION;
-  bytes[1] =
-    (flags.independentlyDecodable ? FLAG_INDEPENDENTLY_DECODABLE : 0) |
-    (flags.discardable ? FLAG_DISCARDABLE : 0) |
-    (flags.keyBearing ? FLAG_KEY_BEARING : 0);
-  view.setUint32(2, payload.length, false);
-  view.setUint32(6, input.streamSequence, false);
-
-  let cursor = PUBLISHER_FIXED_PREFIX_BYTES;
-  if (wrappedTransmitKey) {
-    view.setUint16(cursor, wrappedTransmitKey.kekGeneration, false);
-    bytes.set(wrappedTransmitKey.wrappedKeyWithTag, cursor + KEK_GENERATION_FIELD_BYTES);
-    cursor += WRAPPED_TRANSMIT_KEY_BYTES;
-  }
-  view.setUint16(cursor, extBytes.length, false);
-  cursor += EXT_LENGTH_FIELD_BYTES;
-  bytes.set(extBytes, cursor);
-  cursor += extBytes.length;
 
   // The publisher region is now COMPLETE. Only here may it be sliced.
   const publisherRegion = bytes.subarray(0, publisherRegionLen) as Bytes;
 
+  let cursor = publisherRegionLen;
   view.setUint16(cursor, input.streamId, false);
-  view.setUint32(cursor + 2, input.hopSequence, false);
+  view.setUint32(cursor + STREAM_ID_FIELD_BYTES, input.hopSequence, false);
   cursor += RELAY_REGION_BYTES;
   bytes.set(payload, cursor);
 
@@ -548,6 +681,7 @@ export function buildUnsignedFrame(input: EncodeFrameInput): UnsignedFrame {
     bytes: bytes as Bytes,
     aeadAad: publisherRegion,
     signedRange: concatBytes(publisherRegion, bytes.subarray(cursor, cursor + payload.length)),
+    relayRegionOffset: publisherRegionLen,
   };
 }
 

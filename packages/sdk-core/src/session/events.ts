@@ -7,6 +7,13 @@
 import type { SdkError } from '../errors/SdkError.js';
 import type { FetchLike } from '../http/types.js';
 import type { MetricsSink } from '../telemetry/MetricsSink.js';
+import type { MediaConfig } from '../config/clientConfig.js';
+import type {
+  AudioDecoderFactory,
+  AudioEncoderFactory,
+  CaptureSourceFactory,
+  PlaybackSinkFactory,
+} from '../media/setup/seams.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type {
   JoinedEvent,
@@ -112,6 +119,24 @@ export interface MeetingSessionEventMap {
 }
 
 /** Construction options for {@link MeetingSession}. */
+
+/**
+ * The receive slot this client declares by default.
+ *
+ * ADR-0036 §6: a slot id is SUBSCRIBER-SCOPED, not globally unique, so choosing
+ * a constant is safe — two subscribers both choosing 0 do not collide, because a
+ * media handler's routing table is keyed on (subscriber, slot_id).
+ */
+export const DEFAULT_AUDIO_SLOT_ID = 0;
+
+/** Options for `MeetingSession.startMedia`. */
+export interface StartMediaOptions {
+  /** `MediaDeviceInfo.deviceId` of the chosen microphone; the default when absent. */
+  readonly deviceId?: string;
+  /** The slot id to declare. Defaults to {@link DEFAULT_AUDIO_SLOT_ID}. */
+  readonly slotId?: number;
+}
+
 export interface MeetingSessionOptions {
   /** AC origin template containing `{subdomain}` (e.g. `https://{subdomain}.localhost:8443`). */
   readonly acOriginTemplate: string;
@@ -129,4 +154,21 @@ export interface MeetingSessionOptions {
   readonly joinTimeoutMs?: number;
   /** Metrics sink (default `getMetricsSink()`; no-op when telemetry unconfigured). */
   readonly metricsSink?: MetricsSink;
+  /**
+   * Media-path configuration. Defaults to `DEFAULT_CLIENT_CONFIG.media`.
+   *
+   * Validated at pipeline construction — including the two RELATIONSHIPS that
+   * matter (the application egress bound must exceed the transport high-water
+   * mark, and the user agent's age bound must sit clear of what both queues can
+   * hold), which throw rather than clamp.
+   */
+  readonly mediaConfig?: MediaConfig;
+  /** Microphone capture factory. Defaults to `getUserMedia`; injected for tests. */
+  readonly captureFactory?: CaptureSourceFactory;
+  /** Opus encoder factory. Defaults to WebCodecs; injected for tests. */
+  readonly encoderFactory?: AudioEncoderFactory;
+  /** Opus decoder factory. Defaults to WebCodecs; injected for tests. */
+  readonly decoderFactory?: AudioDecoderFactory;
+  /** Playback sink factory. Defaults to `AudioContext`; injected for tests. */
+  readonly playbackFactory?: PlaybackSinkFactory;
 }

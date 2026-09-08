@@ -267,6 +267,28 @@ describe('MediaTransport — teardown + deadline (@operations)', () => {
 describe('MediaTransport — metrics (R-25 M1)', () => {
   it('emits dt_client_mh_connection_total per MH with status + mh_index_bucket + label set', async () => {
     const sink = new InMemoryMetricsSink();
+    // ---------------------------------------------------------------------
+    // `meeting_id_hash` HERE IS CORRECT. DO NOT "FIX" IT WHILE APPLYING R3.
+    // ---------------------------------------------------------------------
+    //
+    // `dt_client_mh_connection_total` is an ADR-0028 join-flow metric that
+    // carried the join label set from birth, and ADR-0036 §11 grandfathers that
+    // set AS A SET: a closed, enumerated exception that is not extended and that
+    // nothing joins. The frozen roster is named in
+    // `docs/observability/metrics/client.md`.
+    //
+    // THE TEST IS WHAT A METRIC OBSERVES, NOT WHICH DIRECTORY IT LIVES IN.
+    // Connect-lifecycle — once per MH, at handshake, before any frame exists —
+    // is grandfathered. Media-carrying is under the bar. Neither §11 argument
+    // reaches this counter: the trace argument concerns the time-ordered
+    // sequence of sizes for ONE stream, and the oracle argument concerns
+    // `reason` mirroring which crypto layer rejected a frame.
+    //
+    // This assertion and the negative one in
+    // `media/pipeline/__tests__/ingress.attribution.test.ts` — that NO
+    // `dt_client_media_*` series carries `meeting_id_hash` — assert opposite
+    // things and BOTH ARE RIGHT. Unannotated they read as a contradiction that
+    // someone resolves in whichever direction they meet first.
     const labels = { client_version: '0.0.0-test', meeting_id_hash: 'abc123', org_id: 'demo' };
     const mocks = new Map<string, MockWebTransport>();
     const mt = new MediaTransport({
@@ -293,5 +315,117 @@ describe('MediaTransport — metrics (R-25 M1)', () => {
     const keys = new Set(sink.getRecordedMetrics().flatMap((m) => Object.keys(m.labels)));
     expect(keys.has('email')).toBe(false);
     expect(keys.has('user_id')).toBe(false);
+  });
+});
+
+describe('MediaTransport — datagram I/O (ADR-0036 §1, §11)', () => {
+  it("CHOOSES the datagram queue depths rather than inheriting the user agent's", async () => {
+    // "The default being adequate is not the same as the default being chosen"
+    // (ADR-0036 §1). Asserted on the VALUES, not on the fact that a write
+    // happened: an unset knob is the hazard, and it looks identical to a set one
+    // unless the number is read back.
+    const mocks = new Map<string, MockWebTransport>();
+    const mt = new MediaTransport({
+      connect: makeConnect(mocks),
+      datagramQueue: {
+        outgoingHighWaterMark: 2,
+        outgoingMaxAgeMs: 500,
+        incomingHighWaterMark: 32,
+      },
+    });
+    const p = mt.connectAll([URL_A], JWT);
+    mocks.get(URL_A)!.simulateReady();
+    await p;
+
+    expect(mocks.get(URL_A)!.getDatagramQueueSettings()).toEqual({
+      outgoingHighWaterMark: 2,
+      outgoingMaxAge: 500,
+      incomingHighWaterMark: 32,
+    });
+    mt.disconnect();
+  });
+
+  it('sends a datagram over a connected handler and reports the transport maximum', async () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const mt = new MediaTransport({ connect: makeConnect(mocks) });
+    const p = mt.connectAll([URL_A], JWT);
+    mocks.get(URL_A)!.simulateReady();
+    await p;
+
+    mocks.get(URL_A)!.setMaxDatagramSize(1200);
+    const channel = mt.getDatagramChannel(URL_A);
+    expect(channel).toBeDefined();
+    expect(channel!.maxDatagramSize).toBe(1200);
+    expect(channel!.isOpen).toBe(true);
+
+    await channel!.send(Uint8Array.of(1, 2, 3));
+    expect([...(mocks.get(URL_A)!.getOutboundDatagrams()[0] ?? [])]).toEqual([1, 2, 3]);
+    mt.disconnect();
+  });
+
+  it('receives datagrams on the channel readable', async () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const mt = new MediaTransport({ connect: makeConnect(mocks) });
+    const p = mt.connectAll([URL_A], JWT);
+    mocks.get(URL_A)!.simulateReady();
+    await p;
+
+    const channel = mt.getDatagramChannel(URL_A)!;
+    const reader = channel.readable.getReader();
+    mocks.get(URL_A)!.simulateIncomingDatagram(Uint8Array.of(9, 9));
+    const { value } = await reader.read();
+    expect([...(value ?? [])]).toEqual([9, 9]);
+    reader.releaseLock();
+    mt.disconnect();
+  });
+
+  it('reports a closed transport as not open, so a sender counts connection_closed', async () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const mt = new MediaTransport({ connect: makeConnect(mocks) });
+    const p = mt.connectAll([URL_A], JWT);
+    mocks.get(URL_A)!.simulateReady();
+    await p;
+
+    const channel = mt.getDatagramChannel(URL_A)!;
+    mocks.get(URL_A)!.simulateClose();
+    await waitFor(() => channel.isOpen === false);
+    expect(channel.isOpen).toBe(false);
+    mt.disconnect();
+  });
+
+  it('returns no channel for a handler that never connected', async () => {
+    // The caller counts that as `not_connected` — a lifecycle ordering bug whose
+    // counter should read zero forever — rather than being handed a channel that
+    // cannot send.
+    const mocks = new Map<string, MockWebTransport>();
+    const mt = new MediaTransport({ connect: makeConnect(mocks) });
+    const p = mt.connectAll([URL_A], JWT);
+    mocks.get(URL_A)!.simulateError(new Error('nope'));
+    await p.catch(() => {});
+    expect(mt.getDatagramChannel(URL_A)).toBeUndefined();
+  });
+
+  it('emits no dt_client_media_* series — media metrics belong to the pipeline', async () => {
+    // The boundary this file's grandfathering comment describes, made
+    // checkable: `MediaTransport` is connect-lifecycle, so its one metric keeps
+    // the join label set, and it must not grow a media counter that would then
+    // inherit it.
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const mt = new MediaTransport({
+      connect: makeConnect(mocks),
+      metricsSink: sink,
+      metricLabels: { client_version: 'v', meeting_id_hash: 'h', org_id: 'o' },
+    });
+    const p = mt.connectAll([URL_A], JWT);
+    mocks.get(URL_A)!.simulateReady();
+    await p;
+    const channel = mt.getDatagramChannel(URL_A)!;
+    await channel.send(Uint8Array.of(1));
+
+    expect(sink.getRecordedMetrics().filter((m) => m.name.startsWith('dt_client_media_'))).toEqual(
+      [],
+    );
+    mt.disconnect();
   });
 });

@@ -22,6 +22,7 @@
 // never couple to a wider type.
 
 import type {
+  WebTransportDatagrams,
   IWebTransport,
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
@@ -63,10 +64,13 @@ export class BrowserWebTransport implements IWebTransport {
     return this.#wt.closed;
   }
 
-  get datagrams(): {
-    readonly readable: ReadableStream<Uint8Array>;
-    readonly writable: WritableStream<Uint8Array>;
-  } {
+  get datagrams(): WebTransportDatagrams {
+    // The platform object IS the shape: `WebTransportDatagramDuplexStream`
+    // declares `outgoingHighWaterMark`, `outgoingMaxAge`,
+    // `incomingHighWaterMark` and `maxDatagramSize`. Passed through rather than
+    // wrapped, so a setter on the returned object reaches the real transport —
+    // which is the point: ADR-0036 §1 requires these depths be CHOSEN rather
+    // than inherited.
     return this.#wt.datagrams;
   }
 

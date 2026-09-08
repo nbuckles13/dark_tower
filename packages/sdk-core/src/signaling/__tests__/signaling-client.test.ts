@@ -672,6 +672,13 @@ describe('SignalingClient — lifecycle & teardown', () => {
       datagrams: {
         readable: new ReadableStream<Uint8Array>(),
         writable: new WritableStream<Uint8Array>(),
+        // The three queue knobs and the reported maximum are part of the
+        // interface as of the media-pipeline task. `undefined` here is the
+        // honest value for a fixture that never sets them.
+        outgoingHighWaterMark: undefined,
+        outgoingMaxAge: undefined,
+        incomingHighWaterMark: undefined,
+        maxDatagramSize: undefined,
       },
       createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
         return Promise.resolve({

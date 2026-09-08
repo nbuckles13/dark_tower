@@ -41,10 +41,73 @@ export interface MediaTransportOptions {
   readonly connectTimeoutMs?: number;
   /** Metrics sink (default `getMetricsSink()`; no-op when telemetry unconfigured). */
   readonly metricsSink?: MetricsSink;
-  /** Join label set threaded from MeetingSession (`client_version`/`meeting_id_hash`/`org_id`). */
+  /**
+   * Join label set threaded from `MeetingSession` (`client_version` /
+   * `meeting_id_hash` / `org_id`). Consumed by ONE grandfathered metric,
+   * `dt_client_mh_connection_total` — see `MediaTransport.#emitMetric`.
+   *
+   * **NOT the media-path label set.** Media metrics are built by allow-list in
+   * `setup/mediaMetrics.ts` from two named strings and carry no meeting
+   * dimension (ADR-0036 §11; `docs/observability/label-taxonomy.md` R3, which
+   * cites THIS FILE by path as the inertia source — an unqualified comment here
+   * is what makes the violation arrive by default).
+   */
   readonly metricLabels?: MetricLabels;
   /** Context runner for R-58 trace injection (default identity). */
   readonly runInContext?: RunInContext;
+  /**
+   * Datagram queue depths to set on each connected transport.
+   *
+   * Omitted for a connect-only transport (the join flow before task 19's media
+   * pipeline starts); supplied by the media pipeline from `clientConfig.ts`.
+   */
+  readonly datagramQueue?: DatagramQueueSettings;
+}
+
+/**
+ * The `WebTransportDatagramDuplexStream` queue depths this SDK CHOOSES.
+ *
+ * ADR-0036 §1 requires these be declared rather than inherited ("the default
+ * being adequate is not the same as the default being chosen"), and §11 requires
+ * the transport queue be kept shallow so the bounded application queue above it
+ * makes — and counts — the drop decision. A drop inside the user agent's queue
+ * is uncountable by this client AND structurally invisible to the media handler.
+ *
+ * Values come from `config/clientConfig.ts`; `validateMediaConfig` asserts that
+ * the application bound exceeds `outgoingHighWaterMark` and that
+ * `outgoingMaxAgeMs` sits clear of what both queues can legitimately hold.
+ */
+export interface DatagramQueueSettings {
+  /** Outgoing depth, in datagrams (for audio: frames). */
+  readonly outgoingHighWaterMark: number;
+  /** Age after which the user agent silently discards a queued datagram, in ms. */
+  readonly outgoingMaxAgeMs: number;
+  /** Incoming depth, in datagrams. */
+  readonly incomingHighWaterMark: number;
+}
+
+/**
+ * A datagram send/receive channel over one connected media handler.
+ *
+ * `send` awaits the writer's `ready` before every write, so at most one write is
+ * in flight in the transport and queue depth accumulates in the application
+ * queue, where it is bounded and counted.
+ */
+export interface MediaDatagramChannel {
+  /** Inbound datagrams. The ingress read loop owns this. */
+  readonly readable: ReadableStream<Uint8Array>;
+  /** False once the transport has closed, however it closed. */
+  readonly isOpen: boolean;
+  /**
+   * The platform's maximum datagram size, when it reports one.
+   *
+   * `undefined` under a test double or a user agent that does not expose it, in
+   * which case the sender skips the oversize check rather than inventing a bound
+   * — a fabricated limit would produce drops with no basis.
+   */
+  readonly maxDatagramSize: number | undefined;
+  /** Send one datagram. Rejects if the transport refuses it. */
+  send(bytes: Uint8Array): Promise<void>;
 }
 
 /** Default per-MH connect deadline (ms). Connect-only, so shorter than the 15s MC join. */

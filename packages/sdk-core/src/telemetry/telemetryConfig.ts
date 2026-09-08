@@ -51,6 +51,7 @@ import {
 } from '@opentelemetry/semantic-conventions';
 import { ATTR_DEPLOYMENT_ENVIRONMENT } from '@opentelemetry/semantic-conventions/incubating';
 
+import { DEFAULT_METRIC_EXPORT_INTERVAL_MS } from '../config/clientConfig.js';
 import { OtelMetricsSink } from './OtelMetricsSink.js';
 import type { GuardMode } from './nameGuard.js';
 import type { MetricsSink } from './MetricsSink.js';
@@ -71,6 +72,24 @@ export interface TelemetryConfig {
   readonly telemetryEndpoint: string;
   /** Deployment environment; drives the name-guard mode + resource attribute. */
   readonly env: TelemetryEnv;
+  /**
+   * OTel metric export interval, in milliseconds. Defaults to
+   * {@link DEFAULT_METRIC_EXPORT_INTERVAL_MS} (the client cadence observability
+   * documents).
+   *
+   * THIS IS GLOBAL, NOT MEDIA-ONLY. The SDK has ONE `MeterProvider` (R-19/R-24),
+   * so this cadence applies to EVERY `dt_client_*` metric — including the
+   * ADR-0028 join-flow metrics grandfathered by ADR-0036 §11. Moving from the
+   * OTel JS default of 60 s to 10 s is a ~6x export-volume change with a blast
+   * radius wider than the media path; it was checked against GC's telemetry
+   * proxy limits (`TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE = 60`, per-`sub`,
+   * per-pod) before landing, taking a client from ~1 to ~6 exports/min.
+   *
+   * Do NOT "scope" the cadence by standing up a second `MeterProvider` — that
+   * breaks R-19's single-provider requirement. If a media-only cadence is ever
+   * genuinely needed, it is a design change, not a constructor argument.
+   */
+  readonly metricExportIntervalMs?: number;
 }
 
 interface ConfiguredProviders {
@@ -108,7 +127,12 @@ export function configureTelemetry(config: TelemetryConfig): MetricsSink {
     // The browser exporter appends `v1/metrics`; pass the proxy base URL.
     url: `${config.telemetryEndpoint}/v1/metrics`,
   });
-  const reader = new PeriodicExportingMetricReader({ exporter });
+  // Read from ONE named configuration point, never a literal here. See
+  // `TelemetryConfig.metricExportIntervalMs` for the global blast radius.
+  const reader = new PeriodicExportingMetricReader({
+    exporter,
+    exportIntervalMillis: config.metricExportIntervalMs ?? DEFAULT_METRIC_EXPORT_INTERVAL_MS,
+  });
   const meterProvider = new MeterProvider({ resource, readers: [reader] });
   metrics.setGlobalMeterProvider(meterProvider);
 
@@ -136,6 +160,23 @@ export function getTracer(): Tracer | undefined {
 /** The configured production `MetricsSink`, or `undefined` if unconfigured. */
 export function getMetricsSink(): MetricsSink | undefined {
   return configured?.metricsSink;
+}
+
+/**
+ * Flush pending metric deltas immediately.
+ *
+ * Called on media/session teardown. At a 10 s export cadence, up to 10 s of
+ * counters otherwise die with the tab — and the failures where that bites are
+ * exactly the ones at end of session, where the lost window is the one containing
+ * the incident. The OTLP fetch transport's `keepalive` flag rescues requests
+ * already in flight; it does nothing for deltas not yet exported, which is what
+ * this covers.
+ *
+ * Resolves (never rejects) when telemetry is unconfigured, so teardown paths can
+ * call it unconditionally.
+ */
+export async function flushMetrics(): Promise<void> {
+  await configured?.meterProvider.forceFlush();
 }
 
 /**

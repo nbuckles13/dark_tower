@@ -16,6 +16,7 @@ export type {
   IWebTransport,
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
+  WebTransportDatagrams,
 } from './contracts/IWebTransport.js';
 
 export type { MetricLabels, MetricsSink } from './contracts/MetricsSink.js';
@@ -45,3 +46,21 @@ export {
 } from './TestTokenBuilder.js';
 
 export { createIdFactory, createSeededRng, createSeededUuid } from './deterministic-ids.js';
+
+// --- Audio media seam doubles (ADR-0036 story task 19) ---
+//
+// These replace the OPUS MEDIA CODEC, capture and playback only. Nothing here
+// fakes frame crypto: Ed25519 verification, the KEK unwrap and the SFrame
+// decrypt are the real primitives in every test that uses them, because a
+// loopback is self-consistent under a swapped AAD, an inverted nonce, a
+// truncated key id, or a signature over the wrong range — so a faked verifier
+// would make a green suite evidence of nothing.
+
+export {
+  FakeAudioCodecs,
+  FakeCaptureSource,
+  RecordingPlaybackSink,
+  makeAudioData,
+  type FakeAudioData,
+  type FakeEncodedFrame,
+} from './media/index.js';

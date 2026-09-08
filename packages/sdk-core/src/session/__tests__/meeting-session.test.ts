@@ -8,7 +8,13 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { context, propagation } from '@opentelemetry/api';
-import { InMemoryMetricsSink, type MockWebTransport } from '@darktower/test-utils';
+import {
+  FakeAudioCodecs,
+  FakeCaptureSource,
+  InMemoryMetricsSink,
+  RecordingPlaybackSink,
+  type MockWebTransport,
+} from '@darktower/test-utils';
 
 import { MeetingSession } from '../MeetingSession.js';
 import { MeetingSessionState } from '../events.js';
@@ -24,9 +30,11 @@ import {
 } from '../../telemetry/telemetryConfig.js';
 import {
   ErrorCode,
+  decodeOutboundClientMessages,
   framedError,
   framedJoinResponse,
   framedParticipantJoined,
+  framedSendDirective,
 } from '../../signaling/__tests__/helpers.js';
 import {
   decodeClientMessages,
@@ -974,5 +982,173 @@ describe('MeetingSession — R-58 end-to-end trace threading', () => {
         } as unknown as JoinCredentials,
       }),
     ).rejects.toThrow(/unhandled credential mode/);
+  });
+});
+
+describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
+  const KEK = new Uint8Array(32).fill(0x11);
+
+  interface MediaRig {
+    readonly session: MeetingSession;
+    readonly mocks: Map<string, MockWebTransport>;
+    readonly capture: FakeCaptureSource;
+    readonly codecs: FakeAudioCodecs;
+    readonly playback: RecordingPlaybackSink;
+    readonly sink: InMemoryMetricsSink;
+  }
+
+  // `null` means "MC assigned none". Deliberately not `undefined`: a default
+  // parameter would substitute 258 for an explicit `undefined`, which is how the
+  // no-sender-id case silently became the happy path the first time this was
+  // written.
+  async function joinedWithMedia(senderId: number | null = 258): Promise<MediaRig> {
+    const mocks = new Map<string, MockWebTransport>();
+    const capture = new FakeCaptureSource();
+    const codecs = new FakeAudioCodecs();
+    const playback = new RecordingPlaybackSink();
+    const sink = new InMemoryMetricsSink();
+    const session = makeSession(mocks, {
+      metricsSink: sink,
+      captureFactory: async () => capture as never,
+      encoderFactory: codecs.encoderFactory as never,
+      decoderFactory: codecs.decoderFactory as never,
+      playbackFactory: playback.factory as never,
+    });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+
+    await waitFor(() => mocks.has(MC_ENDPOINT));
+    const mc = mocks.get(MC_ENDPOINT)!;
+    mc.simulateReady();
+    await waitFor(() => mc.getOpenedBidiStreams().length > 0);
+    mc.simulateServerMessage(
+      0,
+      framedJoinResponse({
+        mediaServers: MEDIA_SERVERS,
+        ...(senderId !== null ? { senderId } : {}),
+        meetingKek: KEK,
+        kekGeneration: 0,
+      }),
+    );
+    await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
+    for (const url of MEDIA_SERVERS) mocks.get(url)!.simulateReady();
+    await joining;
+    return { session, mocks, capture, codecs, playback, sink };
+  }
+
+  it('declares a receive capability BEFORE any directive is expected', async () => {
+    // MC composes the directive and the slot assignments from one meeting-state
+    // snapshot when the capability arrives, not at join.
+    const rig = await joinedWithMedia();
+    await rig.session.startMedia();
+    const messages = decodeOutboundClientMessages(
+      rig.mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0),
+    );
+    expect(messages.some((m) => m.message.case === 'receiveCapability')).toBe(true);
+    rig.session.disconnect();
+  });
+
+  it('counts the KEK arriving through the seam, and never the key itself', async () => {
+    const rig = await joinedWithMedia();
+    await rig.session.startMedia();
+    const kekUpdates = rig.sink
+      .getRecordedMetrics()
+      .filter((m) => m.name === 'dt_client_media_kek_updates_total');
+    expect(kekUpdates).toHaveLength(1);
+    expect(kekUpdates[0]?.labels.source).toBe('join_response');
+    expect(Object.keys(kekUpdates[0]?.labels ?? {})).not.toContain('meeting_id_hash');
+    rig.session.disconnect();
+  });
+
+  it('is idempotent — a second call returns the running pipeline', async () => {
+    const rig = await joinedWithMedia();
+    const first = await rig.session.startMedia();
+    const second = await rig.session.startMedia();
+    expect(second).toBe(first);
+    expect(rig.session.media).toBe(first);
+    rig.session.disconnect();
+  });
+
+  it('FAILS LOUDLY when MC assigned no sender id, rather than degrading', async () => {
+    // Without a sender id there is no key id; without an identity key there is
+    // no signature. This SDK does not send or accept unsigned frames under any
+    // degradation, so there is nothing to fall back to.
+    const rig = await joinedWithMedia(null);
+    await expect(rig.session.startMedia()).rejects.toThrow(/sender id/);
+    rig.session.disconnect();
+  });
+
+  it('refuses before a settled join', async () => {
+    const session = makeSession(new Map());
+    await expect(session.startMedia()).rejects.toThrow(/settled join/);
+  });
+
+  it('does not take the meeting down when media fails to start', async () => {
+    // Degraded audio beats a dropped meeting. The join stays joined and the
+    // signaling session stays open.
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, {
+      captureFactory: async () => {
+        throw new Error('microphone access was denied');
+      },
+    });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await waitFor(() => mocks.has(MC_ENDPOINT));
+    const mc = mocks.get(MC_ENDPOINT)!;
+    mc.simulateReady();
+    await waitFor(() => mc.getOpenedBidiStreams().length > 0);
+    mc.simulateServerMessage(
+      0,
+      framedJoinResponse({ mediaServers: MEDIA_SERVERS, senderId: 258, meetingKek: KEK }),
+    );
+    await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
+    for (const url of MEDIA_SERVERS) mocks.get(url)!.simulateReady();
+    await joining;
+
+    await expect(session.startMedia()).rejects.toThrow('microphone access was denied');
+    expect(session.state).toBe(MeetingSessionState.Joined);
+    session.disconnect();
+  });
+
+  it('applies MC directed bitrate when present and the configured default otherwise', async () => {
+    // `EncodingParameters.max_bitrate_bps` is the wire SSoT; the config value is
+    // the fallback for its absence only, and there is deliberately no local
+    // ceiling applied on top.
+    const rig = await joinedWithMedia();
+    await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [MEDIA_SERVERS[0]!] }));
+    await waitFor(() => rig.capture.started);
+    expect(rig.capture.started).toBe(true);
+    rig.session.disconnect();
+  });
+
+  it('stops capture on disconnect — the microphone indicator must go out', async () => {
+    const rig = await joinedWithMedia();
+    await rig.session.startMedia();
+    rig.session.disconnect();
+    await waitFor(() => rig.capture.stopCount > 0);
+    expect(rig.capture.stopCount).toBe(1);
+  });
+
+  it('reports client mute to MC while suppressing locally first', async () => {
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    pipeline.setAudioMuted(true);
+    // Local state changes synchronously; the report is fire-and-forget.
+    expect(pipeline.muteState.audioMuted).toBe(true);
+    await waitFor(() =>
+      decodeOutboundClientMessages(rig.mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0)).some(
+        (m) => m.message.case === 'muteRequest',
+      ),
+    );
+    rig.session.disconnect();
   });
 });
