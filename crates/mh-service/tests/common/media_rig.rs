@@ -94,8 +94,16 @@ impl LoopbackRig {
     #[must_use]
     pub fn subscriber(&self, subscriber_sender: u32) -> Arc<EgressQueue> {
         let queue: Arc<EgressQueue> = Arc::new(SharedQueue::new(EGRESS_QUEUE_FRAMES));
-        self.subscribers
-            .register(self.meeting.clone(), sender(subscriber_sender), &queue);
+        // A distinct connection id per subscriber ordinal: the slot is now
+        // connection-scoped (SEC-2 compare-and-remove), so a shared or empty id
+        // would make the rig's entries indistinguishable under `unregister`.
+        let connection_id = format!("conn-{subscriber_sender}");
+        self.subscribers.register(
+            self.meeting.clone(),
+            sender(subscriber_sender),
+            &connection_id,
+            &queue,
+        );
         queue
     }
 }

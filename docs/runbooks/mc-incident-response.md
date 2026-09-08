@@ -2122,6 +2122,50 @@ counter is the complete record of repeat occurrences.
 
 ---
 
+### MH media sessions declining — MC-side disambiguation (cross-pointer)
+
+**The procedure lives in MH's runbook**, not here:
+[`mh-incident-response.md` §Scenario 15: Media Sessions Declining — No Sender Binding](mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding).
+Thresholds and queries are owned in one place to avoid silent divergence — the same
+discipline as the MC↔MH post-deploy checklist. **Do not duplicate them here.**
+
+What lives on this side is the **disambiguator**. When MH reports
+`mh_media_session_starts_total{outcome="declined_no_sender_binding"}`, MC answered `0`
+("I cannot resolve this participant") and only MC's counter says why:
+
+```promql
+mc_media_sender_binding_responses_total
+```
+
+| `outcome` | Meaning | Remedy |
+|---|---|---|
+| *(series absent or flat)* | **Version skew** — this MC image predates the `sender_id` field | Redeploy MC. See the rollback **Carve-out #2** in `mc-deployment.md`: do NOT roll MC back on a decline spike. |
+| `participant_unknown` | Transient join race **if a small, decaying fraction**; a **systematic identity mismatch** if sustained near 100% | Check the ratio, not the presence — see below |
+| `meeting_unknown` | Routing/lifecycle fault; MC has no such meeting | Not self-clearing; investigate meeting placement |
+| `registry_full` | Per-meeting connection cap refused the registration, so MC correctly answered `0` rather than handing back an ordinal for a connection it is not tracking | **Capacity.** Never self-clearing — do not triage as a join race |
+| `user_ambiguous` | **One user, two participants** — the user joined from two devices, so one token `sub` maps to two roster entries and MC will not guess which | **No operator remedy.** Never self-clearing; the fix is a contract change (`docs/TODO.md`). Field action: have the user leave on one device. **Not an MC defect** — MC is correctly refusing to guess |
+| `resolved` | MC answered an ordinal | Should not co-occur with an MH decline; if it does, suspect skew between the pods you are querying |
+
+> **`participant_unknown` is not automatically a join race.** Sustained at ~100% of
+> attempts it means MC and MH do not agree on participant identity at all — MH names the
+> participant by its token `sub`, and if MC keys its roster by a different value it can
+> never resolve *any* participant. A race is a small fraction and decays; a mismatch is
+> flat and total. **The ratio is the discriminator, not the label.**
+
+**`declined_no_sender_binding` on MH is the UNION of all four unresolved MC outcomes**, and
+MH structurally cannot split them — it observes only `sender_id == 0`. That is why this
+series is not redundant with MH's: all four have different remedies, from "clears itself"
+(`participant_unknown` race) through "add capacity" (`registry_full`) to "no operator
+remedy exists" (`user_ambiguous`).
+
+**Do not page MC on every MH decline.** Three of MH's **six** decline outcomes
+(`declined_sender_binding_conflict`, `declined_mc_endpoint_unknown`,
+`declined_mc_auth_rejected`) have their first move inside MH, and one of those names MC
+in the label without implying MC is unwell. Scenario 15 Step 1 partitions on which
+service to open before the label is read.
+
+---
+
 ## Diagnostic Commands
 
 ### Quick Health Check

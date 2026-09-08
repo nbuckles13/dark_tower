@@ -117,7 +117,13 @@ impl GcClient {
                 .parse()
                 .map_err(|e| {
                     error!(target: "mh.grpc.gc_client", error = %e, "Authorization header parse failed");
-                    MhError::Config(format!("Authorization header parse failed: {e}"))
+                    // Same fault and same reasoning as `mc_client`'s: `Config`
+                    // means MH's STARTUP configuration, and a per-call
+                    // credential failure behind a name that says
+                    // "misconfigured at boot" is a false triage pointer.
+                    MhError::OutboundAuthUnavailable(format!(
+                        "Authorization header parse failed: {e}"
+                    ))
                 })?,
         );
         Ok(grpc_request)

@@ -10,6 +10,7 @@
 //!   (if any) seen on each call, in call order, for R-56 outbound-injection
 //!   assertions (`otel_grpc_integration.rs`).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -40,9 +41,49 @@ pub enum MockBehavior {
     PermissionDenied,
 }
 
+/// How the mock answers `NotifyParticipantConnected`'s `sender_id`.
+///
+/// # The default is NOT a valid ordinal, deliberately
+///
+/// [`SenderReplies::default`] answers `0` for every participant, i.e. "MC has no
+/// answer" — so a test that wants a media session must SAY which ordinal each
+/// participant gets. The tempting alternative, defaulting to some valid id, is
+/// the lazy repair when this file next fails to compile, and it would silently
+/// disarm every reject arm in the suite at once: each accept-path test would
+/// start a media session whether or not the binding logic worked.
+#[derive(Debug, Clone, Default)]
+pub struct SenderReplies {
+    per_participant: HashMap<String, u32>,
+}
+
+impl SenderReplies {
+    /// Answer `sender_id` for `participant_id`, and `0` for everyone else.
+    ///
+    /// Values are the mock's *record* of what it allocated: assertions must read
+    /// them back from here rather than hard-coding the same literal twice. An
+    /// expectation written from memory passes on exactly the input it was
+    /// written to match (review protocol §Assertion Vacuity, mechanism 4).
+    #[must_use]
+    pub fn with(mut self, participant_id: &str, sender_id: u32) -> Self {
+        self.per_participant
+            .insert(participant_id.to_string(), sender_id);
+        self
+    }
+
+    /// What this table says `participant_id` was allocated. `0` when unset.
+    #[must_use]
+    pub fn allocated_for(&self, participant_id: &str) -> u32 {
+        self.per_participant
+            .get(participant_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// Mock MC `MediaCoordinationService` for integration testing.
 pub struct MockMcServer {
     behavior: MockBehavior,
+    sender_replies: SenderReplies,
     connected_count: AtomicU32,
     disconnected_count: AtomicU32,
     connected_tx: Option<mpsc::Sender<NotifyParticipantConnectedRequest>>,
@@ -54,12 +95,21 @@ impl MockMcServer {
     pub fn new(behavior: MockBehavior) -> Self {
         Self {
             behavior,
+            sender_replies: SenderReplies::default(),
             connected_count: AtomicU32::new(0),
             disconnected_count: AtomicU32::new(0),
             connected_tx: None,
             disconnected_tx: None,
             traceparent_tx: None,
         }
+    }
+
+    /// Answer `NotifyParticipantConnected` from `replies` instead of the
+    /// answer-nobody default.
+    #[must_use]
+    pub fn with_sender_replies(mut self, replies: SenderReplies) -> Self {
+        self.sender_replies = replies;
+        self
     }
 
     pub fn with_connected_tx(
@@ -137,8 +187,13 @@ impl MediaCoordinationService for MockMcServer {
             return Err(status);
         }
 
+        // `acknowledged: true` alongside `sender_id: 0` is the LEGAL, EXPECTED
+        // shape when MC has no answer (`internal.proto`), so the mock emits it
+        // rather than coupling the two. A consumer that gates on `acknowledged`
+        // must fail against this mock.
         Ok(Response::new(NotifyParticipantConnectedResponse {
             acknowledged: true,
+            sender_id: self.sender_replies.allocated_for(&inner.participant_id),
         }))
     }
 

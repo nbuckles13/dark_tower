@@ -51,8 +51,8 @@
 )]
 
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, RegisterMeetingRequest, RegisterMeetingResponse, SelectionRules,
-    SubscriberSlot,
+    CandidateSource, EgressStream, NotifyParticipantConnectedResponse, RegisterMeetingRequest,
+    RegisterMeetingResponse, SelectionRules, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use proto_gen::Message;
@@ -248,4 +248,117 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
         transport_mode: TransportMode::Datagram as i32,
     });
     assert_ne!(zeroed, populated);
+}
+
+// ---------------------------------------------------------------------------
+// `NotifyParticipantConnectedResponse.sender_id` (participant->sender_id binding)
+// ---------------------------------------------------------------------------
+//
+// These tests deliberately NAME the boundary values `65_535` and `65_536`.
+// That is the opposite of the rule the proto comment follows, and both are
+// right: `crates/mh-service/src/routing/mod.rs:55-61` requires boundary tests
+// to name the literals outright, because a test written against the same
+// constant as the code passes no matter what the constant becomes. Production
+// code and proto comments reference the bound; boundary tests restate it on
+// purpose. Do not "fix" these into a constant.
+//
+// What these do NOT assert: that MH rejects, closes, or counts anything. Those
+// are runtime behaviours in another crate. What is locked here is that each
+// reading the contract distinguishes is REPRESENTABLE and DISTINGUISHABLE on
+// the wire -- without which the contract's three-way semantics are prose.
+
+/// `acknowledged: true` with `sender_id: 0` must survive the wire as itself.
+///
+/// This is the combination the contract calls legal-and-expected: MC
+/// acknowledging a notification it cannot answer. It is also the combination a
+/// reader is most likely to believe impossible, because this message was a bare
+/// ack until this field landed -- so if `acknowledged` is ever gated on instead
+/// of `sender_id`, THIS is the value that makes it a bug rather than a nit.
+#[test]
+fn acknowledged_true_with_sender_id_zero_is_representable_and_distinct() {
+    let declined = roundtrip(&NotifyParticipantConnectedResponse {
+        acknowledged: true,
+        sender_id: 0,
+    });
+
+    assert!(
+        declined.acknowledged,
+        "`acknowledged` means received-and-parsed only, NOT bound"
+    );
+    assert_eq!(declined.sender_id, 0, "0 = MC has no answer; reject signal");
+
+    let bound = roundtrip(&NotifyParticipantConnectedResponse {
+        acknowledged: true,
+        sender_id: 5,
+    });
+
+    assert_ne!(
+        declined, bound,
+        "a declined binding must not be wire-identical to a granted one"
+    );
+}
+
+/// Each class of reading the field comment distinguishes survives encode/decode
+/// as a distinct value.
+///
+/// The `>65535` case is the load-bearing one: `sender_id` is a proto `uint32`
+/// carrying 16-bit semantics, so an over-range value IS representable on the
+/// wire and reaches the consumer intact rather than being truncated in transit.
+/// That is precisely why the contract requires the consumer to reject it, and
+/// why `SenderId::from_wire` rejects rather than narrows -- if the wire silently
+/// truncated, `65_536` would arrive as `0` and two distinct faults would
+/// collapse into one.
+#[test]
+fn each_sender_id_class_survives_the_wire_distinctly() {
+    let no_answer = roundtrip(&NotifyParticipantConnectedResponse {
+        acknowledged: true,
+        sender_id: 0,
+    });
+    let lowest_valid = roundtrip(&NotifyParticipantConnectedResponse {
+        acknowledged: true,
+        sender_id: 1,
+    });
+    let highest_valid = roundtrip(&NotifyParticipantConnectedResponse {
+        acknowledged: true,
+        sender_id: 65_535,
+    });
+    let over_range = roundtrip(&NotifyParticipantConnectedResponse {
+        acknowledged: true,
+        sender_id: 65_536,
+    });
+
+    assert_eq!(no_answer.sender_id, 0);
+    assert_eq!(lowest_valid.sender_id, 1);
+    assert_eq!(highest_valid.sender_id, 65_535);
+    assert_eq!(
+        over_range.sender_id, 65_536,
+        "an over-range id must arrive INTACT, not truncated: the consumer's \
+         reject depends on seeing the real value, and a wire truncation would \
+         alias 65_536 onto the reject signal 0"
+    );
+
+    assert_ne!(no_answer, lowest_valid);
+    assert_ne!(highest_valid, over_range);
+}
+
+/// The default (all-zero) response decodes to the reject reading, not to a
+/// plausible binding.
+///
+/// Under the user override this field is a BARE `uint32`, so absent and `0` are
+/// one observable. That is safe only because the zero value is the FAIL-CLOSED
+/// one. This test is what makes that reasoning checkable rather than asserted:
+/// if `sender_id`'s zero value ever stopped meaning "reject", a bare scalar
+/// would become the wrong shape and this test is where it would show.
+#[test]
+fn default_response_decodes_to_the_fail_closed_reading() {
+    let defaulted = roundtrip(&NotifyParticipantConnectedResponse::default());
+
+    assert_eq!(
+        defaulted.sender_id, 0,
+        "absent == 0 == reject: the whole basis for `uint32` over `optional`"
+    );
+    assert!(
+        !defaulted.acknowledged,
+        "a defaulted response is not an acknowledgement either"
+    );
 }

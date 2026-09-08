@@ -160,6 +160,49 @@ pub enum MeetingMessage {
         respond_to: oneshot::Sender<MeetingState>,
     },
 
+    /// Resolve a media-connecting user's allocated `sender_id` (ADR-0036 §2, §4).
+    ///
+    /// # Why this is keyed on `user_id` and not `participant_id`
+    ///
+    /// **This is an identity-translation seam and the reason is not obvious, so
+    /// it is stated here rather than left to be re-derived.** MH names the
+    /// connecting party by the validated meeting token's `sub`
+    /// (`mh-service/src/webtransport/connection.rs`), which is a **contract
+    /// MUST** — that provenance is the entire defence against a client
+    /// asserting someone else's identity (@security S1). MC, however, mints a
+    /// **fresh `Uuid` per join** as its `participant_id`
+    /// (`webtransport/connection.rs`) and stores the token `sub` as the
+    /// participant's `user_id`. The two namespaces are disjoint, and MH has
+    /// never seen MC's UUID: it is not on the token and not on any wire MH
+    /// reads.
+    ///
+    /// So the value arriving in `NotifyParticipantConnectedRequest.participant_id`
+    /// is a token `sub`, and the only field it can be resolved against is
+    /// `user_id`. **Keying this lookup on MC's `participant_id` resolves
+    /// nothing, ever** — it is the defect Gate 2 attempt 1 found, where every
+    /// media connection returned `participant_unknown` and MH forwarded no
+    /// frames.
+    ///
+    /// Deliberately **not** served by [`Self::GetState`]. `GetState` clones the
+    /// entire roster — every `ParticipantInfo`, including display names and
+    /// identity public keys — to answer a one-field question, on a path that
+    /// runs once per media connection. This keeps the read surface to the single
+    /// field the caller is entitled to: the §11 read-surface discipline applied
+    /// to an internal path, not just the wire.
+    GetSenderIdForUser {
+        /// The token `sub` MH asked about, scoped to THIS meeting and nothing
+        /// else.
+        ///
+        /// Sender ids are per-meeting ordinals: id 5 exists concurrently in
+        /// every meeting on a handler. Resolution happens inside one meeting
+        /// actor precisely so a cross-meeting answer is unrepresentable rather
+        /// than merely unlikely.
+        user_id: String,
+        /// Response channel. See [`SenderLookup`] — the ambiguous arm is a real
+        /// outcome, not an error.
+        respond_to: oneshot::Sender<SenderLookup>,
+    },
+
     /// Update participant mute status (self-mute, informational).
     UpdateSelfMute {
         participant_id: String,
@@ -284,6 +327,42 @@ pub struct ControllerStatus {
     pub is_draining: bool,
     /// Current mailbox depth.
     pub mailbox_depth: usize,
+}
+
+/// Outcome of resolving a token `sub` to a per-meeting `sender_id`.
+///
+/// Three arms, not an `Option`, because **"I do not know this user" and "I know
+/// more than one" are different facts with different remedies** and only one of
+/// them is a race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderLookup {
+    /// Exactly one participant on this meeting's roster carries that `user_id`.
+    Found(crate::media_admission::SenderId),
+    /// No participant on this meeting's roster carries that `user_id`.
+    ///
+    /// Usually the benign race: MH's connect notification overtaking MC's join.
+    NotFound,
+    /// **More than one** participant on this meeting's roster carries that
+    /// `user_id`, so the token `sub` does not identify a single sender.
+    ///
+    /// MC mints a fresh `participant_id` per join and does **not** bar the same
+    /// user joining a meeting twice (two devices, or a reconnect that produced a
+    /// second roster entry), so this is reachable rather than theoretical.
+    ///
+    /// **Fail closed: the caller answers `0`.** Picking either candidate would
+    /// bind MH's connection to an ordinal that may belong to the user's *other*
+    /// participant, and MH would then stamp that participant's `sender_id` onto
+    /// this connection's frames — a cross-participant misattribution inside one
+    /// user's own identity, which is exactly the class the binding contract
+    /// exists to prevent. An arbitrary pick would be right half the time and
+    /// undetectable when wrong.
+    ///
+    /// The ambiguity is **inherent in the contract as ruled**, not a bug in this
+    /// lookup: the token `sub` is the only identifier MH holds, so MH's question
+    /// is genuinely ambiguous when a user has two participants. Resolving it
+    /// needs a per-connection identifier on the wire, which is a contract change
+    /// outside this task.
+    Ambiguous,
 }
 
 /// Result of a successful join.

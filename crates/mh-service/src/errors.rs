@@ -44,6 +44,36 @@ pub enum MhError {
     /// Client connected to a meeting not registered on this MH.
     #[error("Meeting not registered: {0}")]
     MeetingNotRegistered(String),
+
+    /// MH could not build its own outbound credential for a service call.
+    ///
+    /// **MH's auth, not the peer's.** Sibling of the peer *rejecting* that
+    /// credential, which arrives as [`MhError::JwtValidation`]: same first move
+    /// (`mh_token_refresh_total{status="error"}`), same "do not page the peer".
+    /// Kept distinct from [`MhError::Config`], which is MH's startup
+    /// configuration — folding the two would put a per-call auth failure behind
+    /// a name that says the process was misconfigured at boot, and would leave a
+    /// media-session decline reporting as peer unavailability.
+    ///
+    /// Deliberately **retryable**: the token comes from a watch channel the
+    /// refresh task writes, so an attempt after a successful refresh can
+    /// genuinely succeed where the previous one could not.
+    #[error("Outbound credential unavailable: {0}")]
+    OutboundAuthUnavailable(String),
+
+    /// The MC endpoint recorded for a meeting is not a usable endpoint.
+    ///
+    /// Distinct from [`MhError::Grpc`], which means MH had a usable endpoint and
+    /// could not complete against it, and from [`MhError::Config`], which is
+    /// MH's own startup configuration. **The remedy is different**: this one
+    /// says the `RegisterMeeting` that programmed this handler carried an
+    /// endpoint MH cannot dial, so the fault is in the registration rather than
+    /// in the network or in MC's availability. The media path counts the two
+    /// separately for exactly that reason
+    /// (`mh_media_session_starts_total{outcome}`), and a caller cannot tell them
+    /// apart from a `Config` that also covers an auth-header parse failure.
+    #[error("MC endpoint unusable: {0}")]
+    McEndpointInvalid(String),
 }
 
 impl MhError {
@@ -63,6 +93,8 @@ impl MhError {
             MhError::JwtValidation(_) => "jwt_validation",
             MhError::WebTransportError(_) => "webtransport",
             MhError::MeetingNotRegistered(_) => "meeting_not_registered",
+            MhError::McEndpointInvalid(_) => "mc_endpoint_invalid",
+            MhError::OutboundAuthUnavailable(_) => "outbound_auth_unavailable",
         }
     }
 
@@ -75,8 +107,10 @@ impl MhError {
         match self {
             MhError::Grpc(_) | MhError::Internal(_) | MhError::WebTransportError(_) => 13, // INTERNAL
             MhError::NotRegistered | MhError::MeetingNotRegistered(_) => 5, // NOT_FOUND
-            MhError::Config(_) => 3,                                        // INVALID_ARGUMENT
-            MhError::TokenAcquisition(_) | MhError::TokenAcquisitionTimeout => 14, // UNAVAILABLE
+            MhError::Config(_) | MhError::McEndpointInvalid(_) => 3,        // INVALID_ARGUMENT
+            MhError::TokenAcquisition(_)
+            | MhError::TokenAcquisitionTimeout
+            | MhError::OutboundAuthUnavailable(_) => 14, // UNAVAILABLE
             MhError::JwtValidation(_) => 16,                                // UNAUTHENTICATED
         }
     }
@@ -89,6 +123,8 @@ impl MhError {
             | MhError::Config(_)
             | MhError::Internal(_)
             | MhError::NotRegistered
+            | MhError::McEndpointInvalid(_)
+            | MhError::OutboundAuthUnavailable(_)
             | MhError::TokenAcquisition(_)
             | MhError::TokenAcquisitionTimeout
             | MhError::WebTransportError(_) => "An internal error occurred",

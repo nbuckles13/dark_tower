@@ -18,7 +18,7 @@ use crate::media_admission::{IdentityPublicKey, MeetingKeyState, SenderId, Sende
 
 use super::messages::{
     DisconnectCause, JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo,
-    ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SignalingPayload,
+    ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SenderLookup, SignalingPayload,
 };
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
@@ -181,6 +181,41 @@ impl MeetingActorHandle {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(MeetingMessage::GetState { respond_to: tx })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
+    }
+
+    /// Resolve one participant's allocated `sender_id`.
+    ///
+    /// Returns a [`SenderLookup`]: `Found(sender_id)` for the single roster
+    /// match; `NotFound` when no participant on this meeting's roster carries
+    /// the `user_id` — an honest "I do not know this participant"; or
+    /// `Ambiguous` when more than one does, so the token `sub` does not identify
+    /// a single sender. The caller turns **both** `NotFound` and `Ambiguous`
+    /// into the wire value `0` so MH rejects. **Never a licence to invent,
+    /// default to, or reuse an id** — and `Ambiguous` in particular must never
+    /// be resolved by picking a candidate (see [`SenderLookup::Ambiguous`]).
+    ///
+    /// Narrow by design: see [`MeetingMessage::GetSenderIdForUser`] for why
+    /// this is not served by `get_state()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McError::Internal`] if the meeting actor's mailbox is closed or
+    /// it drops the response channel — i.e. the meeting is gone. A transport
+    /// failure here is **not** a `NotFound`: the caller must keep the two
+    /// distinguishable, because "the meeting actor died" and "this participant
+    /// is not on the roster" have different remedies.
+    pub async fn get_sender_id_for_user(&self, user_id: String) -> Result<SenderLookup, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::GetSenderIdForUser {
+                user_id,
+                respond_to: tx,
+            })
             .await
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
@@ -644,6 +679,47 @@ impl MeetingActor {
             MeetingMessage::GetState { respond_to } => {
                 let state = self.get_state();
                 let _ = respond_to.send(state);
+            }
+
+            MeetingMessage::GetSenderIdForUser {
+                user_id,
+                respond_to,
+            } => {
+                // Looked up inside THIS meeting's roster and nowhere else, so a
+                // cross-meeting answer is unrepresentable rather than merely
+                // unlikely: `sender_id` 5 exists concurrently in every meeting.
+                //
+                // Matched on `user_id` because that is where MC stores the token
+                // `sub`, which is the only identifier MH holds -- see
+                // `MeetingMessage::GetSenderIdForUser` for the full seam.
+                //
+                // The roster is keyed by MC's per-join UUID, so this is a scan
+                // rather than a map hit. It runs once per media connection, and
+                // the roster is bounded by the per-meeting participant cap.
+                // Deliberately NOT short-circuited on the first match: finding a
+                // second is the whole point, and stopping early would silently
+                // convert an ambiguous answer into a confident wrong one.
+                let mut found = None;
+                let mut ambiguous = false;
+                for participant in self.participants.values() {
+                    if participant.user_id == user_id {
+                        if found.is_some() {
+                            ambiguous = true;
+                            break;
+                        }
+                        found = Some(participant.sender_id);
+                    }
+                }
+
+                let lookup = if ambiguous {
+                    // Fail closed. Never a coin-flip between two of one user's
+                    // participants -- right half the time and undetectable when
+                    // wrong.
+                    SenderLookup::Ambiguous
+                } else {
+                    found.map_or(SenderLookup::NotFound, SenderLookup::Found)
+                };
+                let _ = respond_to.send(lookup);
             }
 
             MeetingMessage::UpdateSelfMute {

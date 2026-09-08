@@ -125,10 +125,18 @@
 //
 // Do not describe this gate as "release builds cannot enable the seam" —
 // describe it as the `debug_assertions` predicate it is.
+// The line break sits after "bypass and" DELIBERATELY, not for width. The
+// release-build self-test at `scripts/release-feature-gate.test.sh` greps ONE
+// FIXED PHRASE that must lie wholly within a single source line -- Rust's
+// `\`-newline escape strips the newline AND the next line's leading whitespace,
+// so a phrase straddling the continuation can never be matched by a
+// line-oriented grep and the gate's own row would fail its precondition rather
+// than pass. Keep `must never be enabled in a release build` unbroken on one
+// line. See that script's NEEDLE_PHRASE and its `\`-continuation-hazard note.
 #[cfg(all(feature = "test-seams", not(debug_assertions)))]
 compile_error!(
-    "the `test-seams` feature exposes the sender-id exhaustion bypass and must never be enabled \
-     in a release build"
+    "the `test-seams` feature exposes the sender-id exhaustion bypass and \
+     must never be enabled in a release build"
 );
 
 pub mod actors;

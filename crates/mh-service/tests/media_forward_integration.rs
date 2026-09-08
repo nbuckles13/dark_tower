@@ -579,7 +579,12 @@ async fn a_sender_valid_in_one_meeting_forwards_nothing_in_another() {
     }
     let registry = LocalSubscribers::new();
     let queue: Arc<EgressQueue> = Arc::new(SharedQueue::new(EGRESS_QUEUE_FRAMES));
-    registry.register(MeetingKey::new("meeting-a"), sender(5), &queue);
+    registry.register(
+        MeetingKey::new("meeting-a"),
+        sender(5),
+        "conn-fwd-a",
+        &queue,
+    );
 
     // Positive arm: publisher 5 forwards inside meeting A.
     let mut in_a = ConnectionForwarder::new(

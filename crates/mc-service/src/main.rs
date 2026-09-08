@@ -375,7 +375,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create MediaCoordinationService for MH→MC notifications (R-15)
-    let media_coord_service = McMediaCoordinationService::new(Arc::clone(&mh_connection_registry));
+    let media_coord_service = McMediaCoordinationService::new(
+        Arc::clone(&mh_connection_registry),
+        Arc::clone(&controller_handle),
+    );
 
     // Create JWKS-based auth layer for gRPC service token validation (R-22)
     // Applied at the server level: validates JWT signature + expiry for ALL

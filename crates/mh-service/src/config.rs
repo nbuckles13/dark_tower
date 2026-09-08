@@ -410,6 +410,31 @@ pub const INGRESS_QUEUE_FRAMES: usize = 16;
 /// observation is the expensive part.
 pub const DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO: f64 = 0.01;
 
+/// Upper bound on the random delay inserted before closing a connection whose
+/// media session was declined because **MC was unreachable**, in milliseconds.
+///
+/// # A herd control, not a timeout — deleting it looks free and is not
+///
+/// `NotifyParticipantConnected` is a blocking precondition for a media session,
+/// so an MC outage closes every connecting client. Every one of them reconnects,
+/// and they arrive in a wave: a synchronized reconnect herd against the service
+/// that is already the bottleneck. This spreads the arrival edge of that wave.
+///
+/// **It applies to the MC-unreachable arm ONLY.** The other decline arms are
+/// MC's *answer* — MC is reachable and said no — where retrying is pointless
+/// and an immediate, terminal close is correct. Jitter there would be latency
+/// with no benefit.
+///
+/// **Jitter is not the fix, and must not be read as one.** It acts on the wave's
+/// *phase*; what bounds its *rate* is (a) the MC client's existing ~48 s retry
+/// budget, which functions as an accidental rate limiter and is deliberately NOT
+/// shortened (`docs/runbooks/mh-deployment.md`), and (b) a client that can tell
+/// a retryable close from a terminal one and back off — which does not exist yet
+/// and is tracked in `docs/TODO.md`. Shortening the retry budget before that
+/// client half lands converts a contained outage into a herd; the two are one
+/// decision.
+pub const MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS: u64 = 2_000;
+
 /// Maximum queued-audio latency the datagram send buffer may be configured to
 /// hold, in milliseconds. Sole input to
 /// [`MAX_DATAGRAM_BUFFER_AUDIO_FRAMES_CEILING`].

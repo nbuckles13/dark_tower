@@ -25,7 +25,8 @@ use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_client::MediaCoordinationServiceClient;
 use proto_gen::dark_tower::internal::v1::{
-    NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
+    NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
+    NotifyParticipantDisconnectedRequest,
 };
 use std::time::Duration;
 use tonic::service::interceptor::InterceptedService;
@@ -78,9 +79,21 @@ impl McClient {
     /// * `participant_id` - Participant who connected (from JWT `sub` claim)
     /// * `handler_id` - This MH instance's identifier
     ///
+    /// # Returns
+    ///
+    /// **MC's response, which is load-bearing rather than an ack.** It carries
+    /// the `sender_id` MC allocated to `participant_id`, and MH cannot start a
+    /// media session without it — see
+    /// `crate::webtransport::connection` for the ordering and
+    /// `internal.proto`'s `NotifyParticipantConnectedResponse` for the value
+    /// semantics. The response's `acknowledged` field answers a *different*
+    /// question (received-and-parsed) and must not gate the media session.
+    ///
     /// # Errors
     ///
-    /// Returns `MhError::Config` if the endpoint is invalid.
+    /// Returns `MhError::McEndpointInvalid` if the endpoint MC was registered
+    /// with cannot be dialled — a registration fault, which the media path
+    /// counts separately from a reachability fault.
     /// Returns `MhError::Grpc` if the connection or RPC fails.
     #[instrument(skip_all, fields(meeting_id = %meeting_id), target = "mh.grpc.mc_client")]
     pub async fn notify_participant_connected(
@@ -89,7 +102,7 @@ impl McClient {
         meeting_id: &str,
         participant_id: &str,
         handler_id: &str,
-    ) -> Result<(), MhError> {
+    ) -> Result<NotifyParticipantConnectedResponse, MhError> {
         let request = NotifyParticipantConnectedRequest {
             meeting_id: meeting_id.to_string(),
             participant_id: participant_id.to_string(),
@@ -125,7 +138,9 @@ impl McClient {
     ///
     /// # Errors
     ///
-    /// Returns `MhError::Config` if the endpoint is invalid.
+    /// Returns `MhError::McEndpointInvalid` if the endpoint MC was registered
+    /// with cannot be dialled — a registration fault, which the media path
+    /// counts separately from a reachability fault.
     /// Returns `MhError::Grpc` if the connection or RPC fails.
     #[instrument(skip_all, fields(meeting_id = %meeting_id), target = "mh.grpc.mc_client")]
     pub async fn notify_participant_disconnected(
@@ -154,6 +169,7 @@ impl McClient {
             client_interceptor(),
         )
         .await
+        .map(|_response| ())
     }
 
     /// Send an RPC with retry and exponential backoff.
@@ -175,7 +191,7 @@ impl McClient {
         rpc_fn: F,
         request: T,
         interceptor: I,
-    ) -> Result<(), MhError>
+    ) -> Result<R, MhError>
     where
         T: Clone + prost::Message,
         R: std::fmt::Debug,
@@ -194,19 +210,19 @@ impl McClient {
                 .try_send(mc_grpc_endpoint, &request, &rpc_fn, interceptor.clone())
                 .await
             {
-                Ok(()) => {
+                Ok(response) => {
                     metrics::record_mc_notification(event, "success");
-                    return Ok(());
+                    return Ok(response);
                 }
                 Err(e) => {
-                    // Do not retry on auth errors — retrying won't fix them
-                    if is_auth_error(&e) {
+                    // Do not retry an error whose outcome cannot change.
+                    if is_terminal_error(&e) {
                         warn!(
                             target: "mh.grpc.mc_client",
                             error = %e,
                             meeting_id = %meeting_id,
                             event = %event,
-                            "MC notification auth failure, not retrying"
+                            "MC notification failed terminally, not retrying"
                         );
                         metrics::record_mc_notification(event, "error");
                         return Err(e);
@@ -241,8 +257,13 @@ impl McClient {
             }
         }
 
-        // Unreachable: loop always returns
-        Ok(())
+        // Unreachable: `1..=MAX_RETRY_ATTEMPTS` is non-empty and every arm of
+        // the loop body returns. Stated as an error rather than `Ok(())`
+        // because there is no response to return here and inventing one would
+        // be a silent success on a path that cannot be reached.
+        Err(MhError::Internal(
+            "MC notification retry loop exited without a terminal outcome".to_string(),
+        ))
     }
 
     /// Attempt a single RPC call to MC.
@@ -252,7 +273,7 @@ impl McClient {
         request: &T,
         rpc_fn: &F,
         interceptor: I,
-    ) -> Result<(), MhError>
+    ) -> Result<R, MhError>
     where
         T: Clone + prost::Message,
         R: std::fmt::Debug,
@@ -272,7 +293,7 @@ impl McClient {
                     error = %e,
                     "Invalid MC endpoint"
                 );
-                MhError::Config(format!("Invalid MC endpoint: {e}"))
+                MhError::McEndpointInvalid(format!("Invalid MC endpoint: {e}"))
             })?
             .connect_timeout(MC_CONNECT_TIMEOUT)
             .timeout(MC_RPC_TIMEOUT)
@@ -292,7 +313,7 @@ impl McClient {
 
         let grpc_request = self.add_auth(request.clone())?;
 
-        rpc_fn(client, grpc_request).await.map_err(|status| {
+        let response = rpc_fn(client, grpc_request).await.map_err(|status| {
             debug!(
                 target: "mh.grpc.mc_client",
                 error = %status,
@@ -309,7 +330,7 @@ impl McClient {
             MhError::Grpc(format!("MC notification RPC failed: {status}"))
         })?;
 
-        Ok(())
+        Ok(response.into_inner())
     }
 
     /// Add authorization header to a request.
@@ -326,20 +347,35 @@ impl McClient {
                         error = %e,
                         "Authorization header parse failed"
                     );
-                    MhError::Config(format!("Authorization header parse failed: {e}"))
+                    MhError::OutboundAuthUnavailable(format!(
+                        "Authorization header parse failed: {e}"
+                    ))
                 })?,
         );
         Ok(grpc_request)
     }
 }
 
-/// Check if an error is an authentication/authorization failure.
+/// Whether retrying this error could ever produce a different result.
 ///
-/// Returns `true` for `JwtValidation` errors (mapped from tonic
-/// `UNAUTHENTICATED`/`PERMISSION_DENIED` status codes in `try_send`).
-/// These should not be retried — retrying won't fix auth issues.
-fn is_auth_error(err: &MhError) -> bool {
-    matches!(err, MhError::JwtValidation(_))
+/// Two classes, both deterministic on the input rather than on the network:
+///
+/// - `JwtValidation` — mapped from tonic `UNAUTHENTICATED` / `PERMISSION_DENIED`
+///   in `try_send`. Retrying will not fix an auth failure, and repeated attempts
+///   can trip rate limiting.
+/// - `McEndpointInvalid` — the endpoint string the meeting was registered with
+///   does not parse. **The retry never even reaches the network**: every attempt
+///   re-parses the same string and fails identically, so the only effect of
+///   retrying is to burn the backoff. That matters more than it used to: since
+///   `NotifyParticipantConnected` became a blocking precondition for a media
+///   session, this delay is a connection held open for a fault that cannot
+///   resolve, and the decline it is owed is already certain at the first
+///   attempt.
+fn is_terminal_error(err: &MhError) -> bool {
+    matches!(
+        err,
+        MhError::JwtValidation(_) | MhError::McEndpointInvalid(_)
+    )
 }
 
 #[cfg(test)]
@@ -390,9 +426,14 @@ mod tests {
             .notify_participant_connected("", "meeting-1", "user-1", "mh-1")
             .await;
 
+        // Pinned to the exact variant, not `Config | Grpc`: the media path now
+        // routes this to `declined_mc_endpoint_unknown` (a registration fault)
+        // and everything else to `declined_mc_unavailable` (a reachability
+        // fault), so a widened match here would let that split silently invert.
         assert!(
-            matches!(&result, Err(MhError::Config(_) | MhError::Grpc(_))),
-            "Expected Config or Grpc error, got: {result:?}"
+            matches!(&result, Err(MhError::McEndpointInvalid(_))),
+            "an empty endpoint is a REGISTRATION fault and must be distinguishable from a \
+             reachability failure, got: {result:?}"
         );
     }
 
@@ -406,7 +447,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(&result, Err(MhError::Config(_) | MhError::Grpc(_))),
+            matches!(&result, Err(MhError::McEndpointInvalid(_))),
             "Expected Config or Grpc error, got: {result:?}"
         );
     }
@@ -448,20 +489,32 @@ mod tests {
     }
 
     #[test]
-    fn test_is_auth_error_jwt_validation() {
+    fn test_is_terminal_error_jwt_validation() {
         let err = MhError::JwtValidation("MC rejected service token".to_string());
-        assert!(is_auth_error(&err));
+        assert!(is_terminal_error(&err));
     }
 
+    /// An unparsable endpoint is terminal: every retry re-parses the same string
+    /// and fails identically without reaching the network, so retrying only
+    /// burns the backoff while holding a connection open for a fault that
+    /// cannot resolve.
     #[test]
-    fn test_is_auth_error_other_grpc() {
+    fn test_is_terminal_error_unusable_endpoint() {
+        let err = MhError::McEndpointInvalid("Invalid MC endpoint: invalid URI".to_string());
+        assert!(is_terminal_error(&err));
+    }
+
+    /// A refused connection is NOT terminal — MC may be mid-restart, which is
+    /// the case the retry budget exists for.
+    #[test]
+    fn test_is_terminal_error_other_grpc() {
         let err = MhError::Grpc("RPC failed: connection refused".to_string());
-        assert!(!is_auth_error(&err));
+        assert!(!is_terminal_error(&err));
     }
 
     #[test]
-    fn test_is_auth_error_non_grpc() {
+    fn test_is_terminal_error_non_grpc() {
         let err = MhError::Config("bad config".to_string());
-        assert!(!is_auth_error(&err));
+        assert!(!is_terminal_error(&err));
     }
 }

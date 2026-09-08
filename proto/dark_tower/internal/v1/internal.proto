@@ -765,6 +765,18 @@ enum DisconnectReason {
 
 // MH→MC coordination service for participant media connection lifecycle
 service MediaCoordinationService {
+  // NOT A FIRE-AND-FORGET ACK. MH AWAITS this response and the connection
+  // depends on it: a response that does not arrive, or that carries no
+  // bindable ordinal, CLOSES the connection. Ordering is `JWT gate ->
+  // NotifyParticipantConnected -> bind(sender_id) -> start_media_session`;
+  // nothing forwards before the bind.
+  //
+  // THIS CALL IS A ROUTING AUTHORITY. MH binds a media path on the strength of
+  // a value in the response body. Its trustworthiness is bounded by whatever
+  // authenticates the MC peer to MH, and NOTHING IN THIS EXCHANGE ESTABLISHES
+  // THAT. Do not assume "internal gRPC" means "authenticated peer" -- check
+  // what the channel actually does before relying on it. Known gaps, if any
+  // are open, are under `docs/TODO.md` §Media Path Obligations.
   rpc NotifyParticipantConnected(NotifyParticipantConnectedRequest) returns (NotifyParticipantConnectedResponse);
   rpc NotifyParticipantDisconnected(NotifyParticipantDisconnectedRequest) returns (NotifyParticipantDisconnectedResponse);
 }
@@ -772,13 +784,144 @@ service MediaCoordinationService {
 // Notification that a participant has connected to a media handler
 message NotifyParticipantConnectedRequest {
   string meeting_id = 1;
+
+  // MUST be derived from the validated meeting token's `sub` -- NEVER from a
+  // client-supplied field, and never from anything a client can influence.
+  //
+  // This is the precondition that makes the response trustworthy, and it is
+  // enforced in a DIFFERENT SERVICE'S FILE, which is why it is stated here.
+  // MC answers about whatever participant this names. If a future change
+  // sources this id from client-influenceable input, MC will faithfully
+  // return ANOTHER PARTICIPANT'S ordinal over the authenticated channel, MH
+  // will bind it, and NOTHING GOES RED -- the entire design is bypassed with
+  // every check passing.
+  //
+  // Today: `crates/mh-service/src/webtransport/connection.rs`, `claims.sub`
+  // after `validate_meeting_token`.
+  //
+  // THE TOKEN IS READ ONCE, AT CONNECTION ESTABLISHMENT. If a consumer adopts
+  // ADR-0007 Phase 8 out-of-band refresh, a re-minted token MUST NOT change an
+  // established connection's participant identity: a differing `sub` is a
+  // REJECT AND CLOSE, never a re-key, and an existing binding is never
+  // re-derived from it. Refresh extends a connection's lifetime; it does not
+  // re-authorize who the connection is. This rule is stated here because its
+  // proper home does not exist yet -- there is no refresh variant on
+  // `dark_tower.signaling.v1.MhClientMessage` today. WHOEVER ADDS ONE MUST
+  // RESTATE IT THERE, at the variant, and may then reduce this to a pointer.
   string participant_id = 2;
+
   string handler_id = 3;
 }
 
-// Response to participant connected notification
+// Response to participant connected notification.
+//
+// NOT A BARE ACK ANY MORE -- see the note at `rpc NotifyParticipantConnected`.
 message NotifyParticipantConnectedResponse {
+  // Does NOT mean the participant was bound. It means this notification was
+  // received and parsed. Binding is reported by `sender_id`, and
+  // `acknowledged: true` with `sender_id: 0` is a LEGAL, EXPECTED response --
+  // MC acknowledging a notification it cannot answer.
+  //
+  // A CONSUMER MUST NOT GATE A MEDIA SESSION ON THIS FIELD. `sender_id` is the
+  // SOLE input to the binding decision. Where a consumer destructures this
+  // response, `acknowledged` should be explicitly discarded at the binding
+  // site rather than bound to a live variable a later edit can reach for.
+  //
+  // (Same narrowing as `RegisterMeetingResponse.accepted`, and for the same
+  // reason.)
   bool acknowledged = 1;
+
+  // The ordinal MC has allocated to this request's `participant_id` within its
+  // `meeting_id`, so MH can bind the connection to a media path.
+  //
+  // SSoT: this is a REFERENCE to an identifier defined canonically at
+  // `dark_tower.signaling.v1.JoinResponse.sender_id` -- zero never valid,
+  // fail-closed, meeting-scoped, MC-allocated and per-meeting. Those rules,
+  // AND THE VALID RANGE, are deliberately NOT restated here. What IS local to
+  // this response is what MC sends when it has no answer, and what each class
+  // of reading obliges MH to do:
+  //
+  //   `0`                 MC HAS NO ANSWER for this participant. A REQUIRED
+  //                       answer, not a default: MC MUST send `0` rather than
+  //                       invent an ordinal. MH rejects and CLOSES. Several
+  //                       distinct causes, not all benign, distinguished by
+  //                       MC's own counter and not by this field.
+  //   any value the SSoT  Bind.
+  //   defines as valid
+  //   any value outside   MC IS VIOLATING ITS OWN CONTRACT: a broken
+  //   that range          allocator, or a peer that is not MC. MH rejects and
+  //                       closes. Distinct from `0` -- a security signal
+  //                       rather than a capacity or timing condition -- and
+  //                       the two MUST NOT be conflated by a consumer.
+  //
+  // THE PROPERTY HERE IS NON-ACCEPTANCE, NOT SECRECY. The client already
+  // learns its own ordinal from `JoinResponse.sender_id`, so echoing this
+  // value is harmless -- which is why no `skip_debug` is owed and why the
+  // existing redacting `Debug` impls print `sender_id` in the clear.
+  // ACCEPTING one from a client is the catastrophe: it is a cross-participant
+  // injection primitive. Guard the input path, not the output path.
+  //
+  // NEVER A TOKEN CLAIM, AND NEVER THE `cnf` VALUE. Someone will eventually
+  // notice the media route is bound to a BEARER meeting token and propose the
+  // textbook remedy: bind the route with a confirmation claim, and since
+  // `sender_id` IS the route, make it the `cnf`. THAT IS THE PROPOSAL THIS
+  // RULE BLOCKS. The correct remedy for bearer-token theft is to
+  // SENDER-CONSTRAIN THE MEETING TOKEN -- a `cnf` binding it to the client's
+  // key. That `cnf` proves possession of the TOKEN; it is never the place to
+  // carry `sender_id`. Route identity in the token is the error, WHATEVER THE
+  // TOKEN'S PoP STATUS.
+  //
+  // The initial meeting token is minted by AC at join, BEFORE MC allocates
+  // this ordinal, so the join token cannot carry it. A future out-of-band
+  // refresh (ADR-0007 Phase 8) re-mints mid-session, AFTER allocation, and
+  // COULD technically carry it -- which is exactly where this prohibition
+  // earns its keep. THE RULE IS NORMATIVE (MUST NOT), NOT A BYPRODUCT OF
+  // CURRENT MINT ORDERING: carrying `sender_id` in any meeting token, initial
+  // or refreshed, forces the CLIENT to present route identity (on
+  // `UPDATE_TOKEN`), recreating the injection primitive above.
+  //
+  // No `cnf` check exists today -- MC's media admission performs none
+  // (trust-on-first-use) -- so this is NOT a description of an existing
+  // control. It is a STANDING CONSTRAINT ON THE DESIGN OF A `cnf` MECHANISM
+  // THAT DOES NOT YET EXIST.
+  //
+  // This paragraph governs what a token may CARRY. It does NOT govern whether
+  // a refreshed token may change an established connection's identity -- that
+  // is a separate rule, at `NotifyParticipantConnectedRequest.participant_id`.
+  //
+  // BARE `uint32`, DELIBERATELY NOT `optional` -- a user override of the
+  // Gate-3 ruling that specified `optional`. `optional` was specified for an
+  // N-1 world that does not exist; revisit only if a mixed-version rollout
+  // ever becomes real. Consequence to keep in view: absent and `0` are ONE
+  // observable, and both mean reject.
+  //
+  // DO NOT ROUTE THIS THROUGH A SHARED `validate_16bit_id()` HELPER, though
+  // the story text and an archived ruling both instruct it. That instruction
+  // rested on a misreading: the `SubscriberSlot` block above was read as a
+  // POSITIVE REFERENCE to such a helper when it is in fact a PROHIBITION, and
+  // no such helper has ever existed. Two reasons, the first decisive:
+  //
+  //   1. `slot_id` zero is VALID; `sender_id` zero is THIS CONTRACT'S REJECT
+  //      SIGNAL. A shared validator must pick one zero-policy, and picking
+  //      `slot_id`'s FAILS OPEN on exactly the value reserved for reject.
+  //   2. `common` does not and must not depend on `media-protocol`, so the
+  //      helper would hardcode the bound locally -- a second, UNANCHORED home
+  //      for a value that today has exactly one. A SHARED HELPER THAT CANNOT
+  //      IMPORT THE VALUE IT VALIDATES AGAINST IS NOT A SHARED HOME FOR THAT
+  //      VALUE; IT IS A COPY OF IT. Creating the "single-source" helper would
+  //      DESTROY the single-sourcing it was invoked to achieve. General form
+  //      of this test: `docs/specialist-knowledge/dry-reviewer/INDEX.md`.
+  //
+  // MH validates through its existing `routing::SenderId::from_wire()`, which
+  // already rejects zero and out-of-range as SEPARATE error variants -- so the
+  // two-event distinction above is enforced by the type, not by a caller
+  // remembering to branch. MC deliberately has NO such constructor: its
+  // allocator is the sole production constructor, which is what makes the
+  // never-recycled invariant a property of the type system. THAT ASYMMETRY IS
+  // LOAD-BEARING, NOT AN OMISSION -- "harmonizing" the two types by adding the
+  // missing constructor is the single edit that would let MC invent an
+  // ordinal.
+  uint32 sender_id = 2;
 }
 
 // Notification that a participant has disconnected from a media handler

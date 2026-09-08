@@ -36,10 +36,12 @@
 //! an end-to-end or zero-trust boolean. Telemetry carries
 //! `key_custody=operator` instead.
 
+pub mod binding_response;
 pub mod identity_key;
 pub mod kek;
 pub mod sender_id;
 
+pub use binding_response::SenderBindingOutcome;
 pub use identity_key::{IdentityPublicKey, IdentityPublicKeyRejected, IDENTITY_PUBLIC_KEY_BYTES};
 pub use kek::{KekGenerationFailed, MeetingKek, MeetingKeyState, MEETING_KEK_BYTES};
 pub use sender_id::{Allocation, SenderId, SenderIdAllocator, SenderIdSpaceExhausted};

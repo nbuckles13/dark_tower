@@ -14,6 +14,7 @@
 //!
 //! Maximum 1,000 unique label combinations per metric.
 
+use crate::media_admission::SenderBindingOutcome;
 use crate::media_routing::{divergence_magnitude, PolicyPushOutcome};
 use crate::media_signaling::{slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome};
 use metrics::{counter, gauge, histogram};
@@ -431,6 +432,71 @@ pub fn record_media_policy_push(outcome: PolicyPushOutcome, sent: NonZeroU64, ap
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(magnitude);
+}
+
+/// # `mc_media_sender_binding_responses_total`
+///
+/// Counter, labels `outcome` x `key_custody` (single value `operator`).
+///
+/// Cardinality is bounded at the type level by [`SenderBindingOutcome::ALL`].
+/// **No restated integer here** — the compile-checked length in `ALL: [Self; N]`
+/// is the guard; a count repeated in prose is an unchecked copy that goes stale
+/// on the next addition (it drifted four times in the devloop that added this).
+///
+/// Whether MC could resolve a participant's `sender_id` for the Media Handler
+/// that asked, and if not, why. Increments **once per
+/// `NotifyParticipantConnected` response MC emits**, on every path that produces
+/// a response. If the RPC fails before a response is formed, nothing increments
+/// here — that population is MH's `declined_mc_unavailable` plus MC's
+/// transport-level metrics.
+///
+/// `outcome` is bounded by [`SenderBindingOutcome`]; its wildcard-free
+/// `label()` match rejects any unhandled variant at compile time, so a newly
+/// added value is a compile error rather than a time series discovered in
+/// production. (No restated ordinal here — see the guard note above; the count
+/// drifted repeatedly in the devloop that added this.) The label
+/// **key** is `outcome`, not `status`, matching the sibling
+/// `mc_media_policy_pushes_total` and MH's counterpart so both ends of one
+/// handshake sit side by side in a query.
+///
+/// # Why this is not redundant with MH's counter
+///
+/// MH observes only `sender_id == 0` and **structurally cannot** tell which
+/// unresolved outcome produced it — its
+/// `mh_media_session_starts_total{outcome="declined_no_sender_binding"}` is the
+/// *union* of MC's `0`-answering outcomes: `meeting_unknown` (routing fault),
+/// `participant_unknown` (join race, self-clearing), `registry_full` (capacity,
+/// never self-clears), `user_ambiguous` (one user, two roster entries — never
+/// self-clears, and **reconnecting causes it**). Only MC can split them, and
+/// each wants a different action. This series therefore carries strictly more
+/// information than any function of the MH series. **Do not "discover" the
+/// redundancy and delete either one.**
+///
+/// Named rather than counted on purpose: a restated count is an unchecked copy.
+///
+/// # Shared denominator, recorded so it is not alerted on twice
+///
+/// This increments on the same path as `record_mh_notification("connected")`,
+/// after the same validation gate, so
+/// `sum(mc_media_sender_binding_responses_total)` equals
+/// `mc_mh_notifications_received_total{event_type="connected"}` **by
+/// construction**. Not duplication — this one carries the resolution dimension
+/// the other lacks — but two series encoding one count invite either a double
+/// alert or a deletion of the wrong one.
+///
+/// # Observability floor
+///
+/// The `sender_id` **value** is never a label, span attribute or structured log
+/// field (ADR-0036 §11). Only the outcome is. `key_custody=operator` is
+/// mandatory on every `mc_media_*` series and comes from the shared constants,
+/// never a re-spelled literal.
+pub fn record_sender_binding_response(outcome: SenderBindingOutcome) {
+    counter!(
+        "mc_media_sender_binding_responses_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
 }
 
 // ============================================================================
