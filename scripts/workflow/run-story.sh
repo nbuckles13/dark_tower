@@ -1239,6 +1239,7 @@ while :; do
   # failure protection). This block sits BEFORE the fresh-start clean-tree check
   # deliberately: next's reopen dirtied the manifest, which that check would
   # otherwise reject.
+  RESTART_FROM_TREE=0
   if { [ "$REVALIDATE" -eq 1 ] || [ "$RESTART" -eq 1 ]; } && [ "$RETRY_APPLIED" -eq 0 ]; then
     esc_rec="$(latest_escalation_record "$id")"
     if [ -z "$esc_rec" ]; then
@@ -1268,8 +1269,29 @@ while :; do
       exit 2
     fi
     if [ "$esc_reason" = "devloop-no-commit" ] || [ "$reval_baseline" = "$cur_head" ]; then
-      slogerr "STORY_RUN: NO-COMMIT-REFUSED — task ${id}'s prior attempt (reason=${esc_reason}) committed nothing (head_after == head_before), so there is no committed work to validate or restart from. This is masked-failure protection: fix the task and rerun the runner WITHOUT a retry flag. record: ${esc_rec}"
-      exit 2
+      # --restart's real requirement is SOMETHING TO RESTART FROM, and an
+      # uncommitted-but-dirty tree is something: a devloop that escalated with
+      # its full implementation in the working tree (ADR-0036 story-1 tasks 3,
+      # 4, 24 all did). --revalidate genuinely needs a commit (it gates and
+      # then records one), so its refusal stands. For --restart, refuse only
+      # when there is NEITHER a commit NOR uncommitted work — that is the
+      # masked-failure case with nothing behind it.
+      if [ "$RESTART" -eq 1 ]; then
+        if ! restart_dirty="$(git status --porcelain -- . ":(exclude)$STORY_FILE" 2>"$giterr")"; then
+          git_error_lane "$id" "checking for uncommitted work before restart" "$giterr"
+        fi
+        __drop_if_empty "$giterr"
+        if [ -n "$restart_dirty" ]; then
+          RESTART_FROM_TREE=1
+          slog "STORY_RUN: RESTART-FROM-TREE task=${id} — prior attempt committed nothing but left uncommitted work in the tree ($(printf '%s' "$restart_dirty" | grep -c .) entries); the operator diagnosis will be delivered to the RESUMED devloop over that tree."
+        else
+          slogerr "STORY_RUN: NO-COMMIT-REFUSED — task ${id}'s prior attempt (reason=${esc_reason}) committed nothing AND the tree is clean, so there is nothing to restart from. This is masked-failure protection: fix the task and rerun the runner WITHOUT a retry flag. record: ${esc_rec}"
+          exit 2
+        fi
+      else
+        slogerr "STORY_RUN: NO-COMMIT-REFUSED — task ${id}'s prior attempt (reason=${esc_reason}) committed nothing (head_after == head_before), so there is no committed work to validate. This is masked-failure protection: fix the task and rerun the runner WITHOUT a retry flag. record: ${esc_rec}"
+        exit 2
+      fi
     fi
     # A committed prior attempt is now positively established: a readable reason
     # that is not devloop-no-commit, and a persisted baseline that differs from
@@ -1319,14 +1341,23 @@ while :; do
     else
       # --restart: seed a FRESH devloop with the operator diagnosis and the prior
       # attempt's evidence, then fall through to the normal fresh-start path.
-      slog "STORY_RUN: RESTART task=${id} — spawning a fresh devloop seeded with the operator diagnosis and the prior attempt's commit; discarding any resume pointer."
-      prior_commit="$cur_head"
+      if [ "$RESTART_FROM_TREE" -eq 1 ]; then
+        slog "STORY_RUN: RESTART task=${id} — delivering the operator diagnosis to the resumed devloop; uncommitted work stays in the tree."
+        prior_commit="<none — the prior attempt committed nothing; its full implementation is uncommitted in the working tree>"
+      else
+        slog "STORY_RUN: RESTART task=${id} — spawning a fresh devloop seeded with the operator diagnosis and the prior attempt's commit; discarding any resume pointer."
+        prior_commit="$cur_head"
+      fi
       # Prior attempt's output-doc slug (best-effort), via the same commit-range
       # derivation the completion path uses. Apply the SAME canonical slug floor
       # every other slug site applies (S-6): it is `cut`-derived and interpolated
       # into the prompt, so an out-of-class value must not pass unfiltered.
-      prior_slug="$(git diff --name-only --diff-filter=A "$reval_baseline" HEAD \
+      if [ "$RESTART_FROM_TREE" -eq 1 ] && [ -s "$slug_file" ]; then
+        prior_slug="$(cat "$slug_file" 2>/dev/null || true)"
+      else
+        prior_slug="$(git diff --name-only --diff-filter=A "$reval_baseline" HEAD \
           -- ':(glob)docs/devloop-outputs/*/main.md' 2>/dev/null | grep . | head -n1 | cut -d/ -f3 || true)"
+      fi
       [[ -n "$prior_slug" && "$prior_slug" =~ $SLUG_CLASS_CANONICAL ]] || prior_slug=""
       [ -n "$prior_slug" ] || prior_slug="<unknown>"
       # The escalation's gate-failure tail (STATUS=FAIL / REASON= lines). This is
@@ -1345,24 +1376,38 @@ while :; do
       # The text was validated (empty + code-fence) at argv-parse time.
       {
         printf '\n\n---\nOPERATOR RESTART DIRECTIVE (run-story --restart)\n'
-        printf 'A prior devloop attempt for this task was COMMITTED, but the operator has diagnosed its work as needing to be fixed rather than re-implemented. Start from that existing commit, not a blank slate.\n\n'
+        if [ "$RESTART_FROM_TREE" -eq 1 ]; then
+          printf 'A prior devloop attempt for this task escalated WITHOUT committing; its full implementation is in the working tree. The operator has diagnosed what must change. Build on the tree as it stands, not a blank slate.\n\n'
+        else
+          printf 'A prior devloop attempt for this task was COMMITTED, but the operator has diagnosed its work as needing to be fixed rather than re-implemented. Start from that existing commit, not a blank slate.\n\n'
+        fi
         printf 'Prior attempt commit: %s\n' "$prior_commit"
         printf 'Prior attempt output-doc slug: %s\n' "$prior_slug"
         printf 'Prior attempt gate-failure tail (machine-generated evidence, quoted):\n%s\n\n' "${gate_tail:-> <none captured>}"
         printf 'Operator diagnosis (authoritative — act on THIS):\n%s\n' "$RESTART_TEXT"
       } >>"$prompt_file"
-      # Discard the resume pointer so the fresh devloop does NOT --continue the
-      # prior work.
-      rm -f "$slug_file"
-      # Commit the manifest reopen so the fresh-start clean-tree check below
-      # passes (mirrors the audit-remediation append-commit); then re-read HEAD as
-      # the fresh devloop's baseline.
-      git add "$STORY_FILE"
-      git commit --quiet -m "chore(story): reopen task #${id} for operator --restart" || true
-      if ! head_before="$(git_head "$giterr")"; then
-        git_error_lane "$id" "reading HEAD after committing the restart reopen" "$giterr"
+      if [ "$RESTART_FROM_TREE" -eq 1 ]; then
+        # KEEP the resume pointer: the fresh-start path requires a clean tree,
+        # and the uncommitted implementation must survive. The resume path
+        # tolerates (expects) a dirty tree, and the resumed session receives
+        # the prompt file with the operator paragraph appended — the session
+        # that escalated gets the answer to the question it asked. No reopen
+        # commit needed: resumes do not run the clean-tree check.
+        slog "STORY_RUN: RESTART task=${id} — operator paragraph appended to ${prompt_file}; resume pointer KEPT (uncommitted work in tree)."
+      else
+        # Discard the resume pointer so the fresh devloop does NOT --continue the
+        # prior work.
+        rm -f "$slug_file"
+        # Commit the manifest reopen so the fresh-start clean-tree check below
+        # passes (mirrors the audit-remediation append-commit); then re-read HEAD as
+        # the fresh devloop's baseline.
+        git add "$STORY_FILE"
+        git commit --quiet -m "chore(story): reopen task #${id} for operator --restart" || true
+        if ! head_before="$(git_head "$giterr")"; then
+          git_error_lane "$id" "reading HEAD after committing the restart reopen" "$giterr"
+        fi
+        slog "STORY_RUN: RESTART task=${id} — operator paragraph appended to ${prompt_file}; resume pointer discarded; reopen committed at $(git rev-parse --short HEAD 2>/dev/null || echo '<unreadable>')."
       fi
-      slog "STORY_RUN: RESTART task=${id} — operator paragraph appended to ${prompt_file}; resume pointer discarded; reopen committed at $(git rev-parse --short HEAD 2>/dev/null || echo '<unreadable>')."
       # Fall through (no `continue`) to the normal fresh-start devloop path.
     fi
   fi
