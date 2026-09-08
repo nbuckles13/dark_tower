@@ -1268,7 +1268,23 @@ while :; do
       slogerr "STORY_RUN: NO-COMMIT-EVIDENCE — cannot establish that task ${id}'s prior attempt committed: reason='${esc_reason:-<unreadable>}', baseline sidecar '${bfile}' is $( [ -s "$bfile" ] && echo present-but-empty || echo absent ). Refusing rather than assuming a commit (masked-failure protection). This can happen for an escalation recorded before this feature existed; fix the task and rerun the runner WITHOUT a retry flag. record: ${esc_rec}"
       exit 2
     fi
-    if [ "$esc_reason" = "devloop-no-commit" ] || [ "$reval_baseline" = "$cur_head" ]; then
+    # Probe for uncommitted work up front. For --restart a dirty tree ALWAYS
+    # selects tree mode: baseline != HEAD does NOT prove the attempt committed —
+    # operator commits (a runner fix, a suppression renewal) land between
+    # attempts, and treating them as attempt evidence took the fresh path and
+    # deleted a live resume pointer (task 24, 2026-09-08). Dirty tree = work
+    # that must not be destroyed, whatever the commit history says.
+    restart_dirty=""
+    if [ "$RESTART" -eq 1 ]; then
+      if ! restart_dirty="$(git status --porcelain -- . ":(exclude)$STORY_FILE" 2>"$giterr")"; then
+        git_error_lane "$id" "checking for uncommitted work before restart" "$giterr"
+      fi
+      __drop_if_empty "$giterr"
+      if [ -n "$restart_dirty" ]; then
+        RESTART_FROM_TREE=1
+      fi
+    fi
+    if [ "$RESTART_FROM_TREE" -eq 0 ] && { [ "$esc_reason" = "devloop-no-commit" ] || [ "$reval_baseline" = "$cur_head" ]; }; then
       # --restart's real requirement is SOMETHING TO RESTART FROM, and an
       # uncommitted-but-dirty tree is something: a devloop that escalated with
       # its full implementation in the working tree (ADR-0036 story-1 tasks 3,
@@ -1277,10 +1293,6 @@ while :; do
       # when there is NEITHER a commit NOR uncommitted work — that is the
       # masked-failure case with nothing behind it.
       if [ "$RESTART" -eq 1 ]; then
-        if ! restart_dirty="$(git status --porcelain -- . ":(exclude)$STORY_FILE" 2>"$giterr")"; then
-          git_error_lane "$id" "checking for uncommitted work before restart" "$giterr"
-        fi
-        __drop_if_empty "$giterr"
         if [ -n "$restart_dirty" ]; then
           RESTART_FROM_TREE=1
           slog "STORY_RUN: RESTART-FROM-TREE task=${id} — prior attempt committed nothing but left uncommitted work in the tree ($(printf '%s' "$restart_dirty" | grep -c .) entries); the operator diagnosis will be delivered to the RESUMED devloop over that tree."
