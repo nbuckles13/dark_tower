@@ -41,8 +41,8 @@ use proto_gen::dark_tower::signaling::v1::{
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::{
-    build_test_stack, client_media_config, connect, encode_framed, read_server_message,
-    sample_identity_public_key, seed_meeting_with_mh, TestStackHandles,
+    build_test_stack, client_media_config, connect, encode_framed, mh_handler, read_server_message,
+    sample_identity_public_key, seed_meeting_with_handlers, seed_meeting_with_mh, TestStackHandles,
 };
 
 /// The handler url `seed_meeting_with_mh` seeds, which is what MC must put on
@@ -218,6 +218,34 @@ impl Session {
 
 async fn join(rig: &AcceptLoopRig, stack: &TestStackHandles, meeting_id: &str) -> Session {
     seed_meeting_with_mh(stack, meeting_id).await;
+    join_seeded(rig, stack, meeting_id).await.0
+}
+
+/// Seed `handlers` **in the given Vec order** — which is the order
+/// `MhAssignmentData.handlers` arrives from Redis in — then join.
+///
+/// Returns the session and the `JoinResponse.media_servers` urls, so a test can
+/// assert on what MC offered as bootstrap data separately from what MC directed.
+async fn join_with_handlers(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    handlers: &[&str],
+) -> (Session, Vec<String>) {
+    seed_meeting_with_handlers(
+        stack,
+        meeting_id,
+        handlers.iter().map(|h| mh_handler(h)).collect(),
+    )
+    .await;
+    join_seeded(rig, stack, meeting_id).await
+}
+
+async fn join_seeded(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+) -> (Session, Vec<String>) {
     let token = stack.keypair.sign_token(&make_meeting_claims(meeting_id));
 
     let conn = connect(&rig.url).await;
@@ -230,19 +258,26 @@ async fn join(rig: &AcceptLoopRig, stack: &TestStackHandles, meeting_id: &str) -
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let sender_id = match resp.message {
-        Some(server_message::Message::JoinResponse(r)) => {
-            r.sender_id.expect("MC allocates a sender id at join")
-        }
+    let (sender_id, media_servers) = match resp.message {
+        Some(server_message::Message::JoinResponse(r)) => (
+            r.sender_id.expect("MC allocates a sender id at join"),
+            r.media_servers
+                .into_iter()
+                .map(|m| m.media_handler_url)
+                .collect::<Vec<String>>(),
+        ),
         other => panic!("expected JoinResponse, got {other:?}"),
     };
 
-    Session {
-        _conn: conn,
-        send,
-        recv,
-        sender_id,
-    }
+    (
+        Session {
+            _conn: conn,
+            send,
+            recv,
+            sender_id,
+        },
+        media_servers,
+    )
 }
 
 // ============================================================================
@@ -1175,4 +1210,187 @@ async fn a_client_that_never_declares_is_never_directed_and_stays_healthy() {
     snap.counter("mc_participant_mh_status_total")
         .with_labels(&[("state", "connected")])
         .assert_delta(1);
+}
+
+// ============================================================================
+// The forwarding assignment is the SINGLE source of truth for steering
+// (ADR-0036 §5, story task 25)
+// ============================================================================
+
+// The two tests below seed handlers `mh-0` and `mh-1` and assert against their
+// urls as INLINE WRITTEN LITERALS — `"wt://mh-0:4433"` (where the assignment
+// places the edges) and `"wt://mh-1:4433"` (the correct-by-design empty edge
+// set, and the answer list-order selection produced on the live cluster).
+//
+// Deliberately not derived from `mh_handler()`, and deliberately NOT hoisted to
+// a shared constant even though they repeat: a test written against the same
+// symbol as the code — or as its sibling test — passes whatever that symbol
+// becomes, and one edit would move both tests together silently. Same
+// discipline as `crates/proto-gen/tests/internal_roundtrip.rs`'s
+// `65_535`/`65_536`: production code references the bound, boundary tests
+// restate it. Restating a short literal twice is the cost, and it is the point.
+//
+// # The expectation does NOT flow from the seeding path
+//
+// Worth stating, because "MC echoed the url we gave it" would be a vacuous pass
+// that mutation testing cannot detect. The seed supplies BOTH urls — `mh_handler`
+// builds one per handler id — so MC is handed a two-element choice set whose
+// members differ, and the assertion pins WHICH element MC selected. Echoing the
+// input is not a way to satisfy it: there is no single "the url" to echo. The
+// `assert_ne!` against the other element makes that explicit rather than
+// implicit.
+//
+// The residual coupling is the right way round: if `mh_handler`'s url format
+// ever changes, these literals go RED rather than silently tracking it.
+
+/// MC steers the client to the handler its edges were PLACED on, not to the head
+/// of `media_servers`.
+///
+/// # This is the live-cluster defect, reproduced
+///
+/// The handlers are seeded `[mh-1, mh-0]` — an inverted Redis enumeration order,
+/// so `JoinResponse.media_servers.first()` is **mh-1**, which holds a
+/// correct-by-design EMPTY edge set (`edge_handler` places every edge on the
+/// lexicographically smallest shared `mh_id`). That is exactly the state that
+/// put three of four live-cluster media connections on mh-1 while every edge sat
+/// on mh-0 (story task 24 escalation,
+/// `docs/devloop-outputs/2026-09-05-sender-id-binding-contract/main.md` §Resume).
+///
+/// # Why this tier, and not a unit test
+///
+/// The order that can actually vary is the `MhAssignmentData.handlers` `Vec` at
+/// the Redis boundary. It reaches the outcome through two paths that are private
+/// to `webtransport/connection.rs` — `routing_input_for` into the assignment and
+/// `HandlerUrls::from_pairs` into the urls — so a real join is the only way to
+/// drive the seam. At unit tier `per_handler`, `HandlerUrls` and the directive's
+/// accumulator are all `BTreeMap` and `edge_handler` sorts, so a permutation test
+/// there asserts what the TYPES guarantee and could not fail (review-protocol
+/// §Assertion Vacuity mechanism 4).
+///
+/// # PRECONDITION: `media_servers` must stay UNSORTED
+///
+/// This test's discriminating power depends on the head of `media_servers`
+/// differing from the placed handler. Sorting that list at its construction site
+/// (`crates/mc-service/src/webtransport/connection.rs`, the `media_servers`
+/// builder) by `mh_id` would collapse the two answers into one and **silently
+/// disarm this test** — it would keep passing while no longer able to fail for
+/// the reason it exists. The builder's comment records the refusal to sort and
+/// names this test; the two are one control and neither is complete alone.
+#[tokio::test]
+async fn steering_follows_edge_placement_not_redis_order() {
+    let (stack, rig) = start_stack("mcs-steer").await;
+    let (mut s, media_servers) =
+        join_with_handlers(&rig, &stack, "mcs-meeting-steer", &["mh-1", "mh-0"]).await;
+
+    // Premise: the bootstrap list really is in inverted order, so its head is
+    // NOT the placed handler. Without this the assertions below could pass with
+    // the two answers coinciding, proving nothing.
+    assert_eq!(
+        media_servers,
+        vec!["wt://mh-1:4433".to_string(), "wt://mh-0:4433".to_string()],
+        "premise: media_servers is bootstrap data in Redis enumeration order and is NOT sorted; \
+         if this fails because the list was sorted, see the refusal-to-sort comment at the \
+         media_servers builder in webtransport/connection.rs — sorting disarms this test"
+    );
+
+    s.write(capability_frame(vec![slot(0, MediaKind::Audio)]))
+        .await;
+    let directive = s.expect_directive().await;
+    let assignments = s.expect_assignments().await;
+
+    assert_eq!(directive.streams.len(), 1);
+    let targets = &directive.streams[0].targets;
+    assert_eq!(
+        targets.len(),
+        1,
+        "one client, one directed handler is story-1 scope; >1 target means ADR-0036 §9 \
+         multi-handler send landed and this test must be revisited rather than relaxed"
+    );
+
+    // (1) The send side names the placed handler.
+    assert_eq!(
+        targets[0].media_handler_url, "wt://mh-0:4433",
+        "MC must direct the client to the handler the assignment placed its edges on"
+    );
+    // The injected adverse condition — a FIRE demonstration, not a spare
+    // assertion. `assert_ne!` against the concrete wrong answer, because
+    // "not empty" and "not the sentinel" both pass under the defect.
+    assert_ne!(
+        targets[0].media_handler_url, "wt://mh-1:4433",
+        "steering the client to mh-1 is the story-task-25 defect: mh-1 holds a \
+         correct-by-design EMPTY edge set, so the client sends into a handler with nothing to \
+         forward and the failure is silent"
+    );
+    // And it is not merely 'not the head of the list' by luck.
+    assert_ne!(
+        targets[0].media_handler_url, media_servers[0],
+        "the directive must not track media_servers.first(); that is the mechanism being removed"
+    );
+
+    // (2) The receive side agrees. Both are read out of ONE MeetingAssignment,
+    // so a divergence here means the two client-facing sides grew separate
+    // answers to 'which handler'.
+    let active: Vec<&str> = assignments
+        .assignments
+        .iter()
+        .filter(|a| a.slot_state == SlotState::Active as i32)
+        .map(|a| a.media_handler_url.as_str())
+        .collect();
+    assert_eq!(
+        active,
+        vec!["wt://mh-0:4433"],
+        "the active slot's handler address must be the same placement the directive names"
+    );
+    assert_eq!(
+        targets[0].media_handler_url, active[0],
+        "send directive and stream assignment must name ONE handler; they are read out of the \
+         same assignment and cannot legitimately disagree"
+    );
+}
+
+/// Redis enumeration order cannot change where the client is steered.
+///
+/// Drives the same real join twice over the two permutations of the seeded
+/// `MhAssignmentData.handlers` `Vec` — the artifact whose order genuinely varies
+/// — and requires byte-identical directives naming the placed handler.
+///
+/// Byte-identity alone would be vacuously green on two empty directives, so the
+/// concrete url and the non-empty target assertion are what give this teeth.
+#[tokio::test]
+async fn redis_enumeration_order_cannot_change_where_the_client_is_steered() {
+    let (stack, rig) = start_stack("mcs-steer-order").await;
+
+    let mut encoded: Vec<Vec<u8>> = Vec::new();
+    for (index, order) in [["mh-0", "mh-1"], ["mh-1", "mh-0"]].into_iter().enumerate() {
+        let meeting = format!("mcs-meeting-order-{index}");
+        let (mut s, _) = join_with_handlers(&rig, &stack, &meeting, &order).await;
+        s.write(capability_frame(vec![slot(0, MediaKind::Audio)]))
+            .await;
+        let directive = s.expect_directive().await;
+        let assignments = s.expect_assignments().await;
+
+        assert_eq!(directive.streams.len(), 1);
+        assert_eq!(
+            directive.streams[0].targets.len(),
+            1,
+            "one client, one directed handler"
+        );
+        assert_eq!(
+            directive.streams[0].targets[0].media_handler_url, "wt://mh-0:4433",
+            "enumeration order {order:?} must not move the directed handler"
+        );
+        assert!(
+            assignments
+                .assignments
+                .iter()
+                .any(|a| a.media_handler_url == "wt://mh-0:4433"),
+            "enumeration order {order:?} must not move the slot's handler address"
+        );
+        encoded.push(directive.encode_to_vec());
+    }
+
+    assert_eq!(
+        encoded[0], encoded[1],
+        "the send directive must be byte-identical across the two Redis enumeration orders"
+    );
 }

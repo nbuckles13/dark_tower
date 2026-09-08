@@ -125,10 +125,28 @@ pub struct RoutingParticipant {
     pub sender_id: SenderId,
     /// The handlers this participant is connected to.
     ///
-    /// **An input, never an assumption.** Today every participant is on every
-    /// handler assigned to the meeting (clients `connectAll()`), so the caller
-    /// fills it that way. When real per-participant placement lands it changes
-    /// what the caller puts here — it does not change the algorithm below.
+    /// **An input, never an assumption.** Today the caller fills this with every
+    /// handler assigned to the meeting — **because MC has no per-participant
+    /// placement input**, not because a client chose to connect to all of them.
+    /// `MhAssignmentData` is a property of the MEETING; nothing on the roster
+    /// says which handler a given participant reached. When real per-participant
+    /// placement lands it changes what the caller puts here — it does not change
+    /// the algorithm below.
+    ///
+    /// # The directed-handler contract (ADR-0036 §5)
+    ///
+    /// Do not read the full-list fill as "the client picks a handler". It does
+    /// not, and since story task 25 it cannot: MC DIRECTS where a client sends.
+    /// [`compute_assignment`] places each edge on exactly one handler
+    /// ([`edge_handler`]), and that placement is what the client is steered to —
+    /// `SendTarget.media_handler_url` on the send directive and the active slot's
+    /// `StreamAssignment.media_handler_url` are both read out of this output.
+    /// `JoinResponse.media_servers` is connection bootstrap data and is
+    /// explicitly not the selection mechanism.
+    ///
+    /// One client, one directed handler, in this story. Multi-handler send is
+    /// ADR-0036 §9 and a later story; the shape here already supports it because
+    /// the walk is general, but nothing today emits more than one target.
     pub handlers: Vec<HandlerId>,
 }
 

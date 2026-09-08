@@ -230,7 +230,13 @@ mod tests {
     }
 
     fn loopback() -> (MeetingAssignment, HandlerUrls) {
-        let ids = vec![HandlerId::new("mh-0")];
+        assignment_over(&["mh-0"])
+    }
+
+    /// Build an assignment + url table over the handler list **in the given Vec
+    /// order**, which is the order `MhAssignmentData.handlers` arrives in.
+    fn assignment_over(handlers: &[&str]) -> (MeetingAssignment, HandlerUrls) {
+        let ids: Vec<HandlerId> = handlers.iter().map(|h| HandlerId::new(*h)).collect();
         let input = MeetingRoutingInput {
             participants: vec![RoutingParticipant {
                 sender_id: sender(1),
@@ -238,10 +244,10 @@ mod tests {
             }],
             handlers: ids.clone(),
         };
-        let urls = HandlerUrls::from_pairs(vec![(
-            ids[0].clone(),
-            "https://mh-0.example:4434".to_string(),
-        )]);
+        let urls = HandlerUrls::from_pairs(
+            ids.iter()
+                .map(|h| (h.clone(), format!("https://{h}.example:4434"))),
+        );
         (compute_assignment(&input).unwrap(), urls)
     }
 
@@ -419,5 +425,91 @@ mod tests {
         let labels: std::collections::HashSet<&str> =
             all.iter().map(|s| slot_state_label(*s)).collect();
         assert_eq!(labels.len(), all.len());
+    }
+
+    /// The slot's handler address IS the handler carrying this subscriber's
+    /// egress plan, at N=2 handlers — the receive-side half of the same SSoT
+    /// property [`super::directive`] asserts for the send side.
+    ///
+    /// # What this rejects, by name
+    ///
+    /// `edge_handler` places every edge on the lexicographically smallest shared
+    /// handler, so with `{mh-0, mh-1}` the plan sits on **mh-0** and mh-1 holds a
+    /// correct-by-design EMPTY set. The nameable wrong answer is
+    /// `https://mh-1.example:4434` — what list-order selection produced on the
+    /// live cluster. The `assert_ne!` is that injected adverse condition.
+    ///
+    /// The url is a WRITTEN LITERAL, not sourced from any helper the production
+    /// path also calls; see `internal_roundtrip.rs`'s `65_535`/`65_536` for the
+    /// in-tree register. Do not hoist it to a constant.
+    #[test]
+    fn the_slot_names_the_handler_carrying_this_subscribers_plan_at_n_2() {
+        let (assignment, urls) = assignment_over(&["mh-0", "mh-1"]);
+
+        // Premise: exactly one handler carries the plan, and mh-1 is present but
+        // empty. Without this the assertion could pass over an empty assignment.
+        let carrying: Vec<&HandlerId> = assignment
+            .per_handler
+            .iter()
+            .filter(|(_, h)| h.egress_streams.iter().any(|p| p.subscriber == sender(1)))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(carrying, vec![&HandlerId::new("mh-0")]);
+        assert!(assignment
+            .per_handler
+            .get(&HandlerId::new("mh-1"))
+            .expect("every input handler gets an entry")
+            .egress_streams
+            .is_empty());
+
+        let composition = build_stream_assignments(
+            sender(1),
+            &declare(&[(0, MediaKind::Audio)]),
+            &assignment,
+            &urls,
+            &SourceMuteView::default(),
+        );
+        let a = &composition.assignments.assignments[0];
+        assert_eq!(a.slot_state, SlotState::Active as i32);
+        assert_eq!(
+            a.media_handler_url, "https://mh-0.example:4434",
+            "the slot must name the handler the assignment placed the plan on"
+        );
+        assert_ne!(
+            a.media_handler_url, "https://mh-1.example:4434",
+            "mh-1 holds a correct-by-design EMPTY set; naming it is the story-task-25 defect"
+        );
+    }
+
+    /// Handler list order does not move the slot's handler address.
+    ///
+    /// **Unit-tier shadow, not the load-bearing proof.** `per_handler` is a
+    /// `BTreeMap`, `HandlerUrls` is a `BTreeMap`, and `edge_handler` sorts, so
+    /// most of the permutation is normalised away before this code runs —
+    /// review-protocol §Assertion Vacuity mechanism 4. The seam whose order
+    /// genuinely varies is `MhAssignmentData.handlers` at the Redis boundary,
+    /// reachable only through a real join; the proof lives in
+    /// `crates/mc-service/tests/media_client_signaling_integration.rs`
+    /// (`redis_enumeration_order_cannot_change_where_the_client_is_steered`).
+    /// Kept as a cheap local regression pin. Do not add more inversion here.
+    #[test]
+    fn handler_list_order_does_not_move_the_slot_handler_at_this_tier() {
+        let mut seen = Vec::new();
+        for order in [["mh-0", "mh-1"], ["mh-1", "mh-0"]] {
+            let (assignment, urls) = assignment_over(&order);
+            let composition = build_stream_assignments(
+                sender(1),
+                &declare(&[(0, MediaKind::Audio)]),
+                &assignment,
+                &urls,
+                &SourceMuteView::default(),
+            );
+            let a = &composition.assignments.assignments[0];
+            assert_eq!(a.slot_state, SlotState::Active as i32);
+            seen.push(a.media_handler_url.clone());
+        }
+        // Equal AND equal to mh-0: equality alone is green on two empty strings.
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(seen[0], "https://mh-0.example:4434");
     }
 }

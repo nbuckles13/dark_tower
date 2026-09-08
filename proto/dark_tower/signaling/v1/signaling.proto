@@ -329,7 +329,16 @@ message JoinResponse {
   reserved "user_id", "encryption_keys";
 
   repeated Participant existing_participants = 3;
-  repeated MediaServerInfo media_servers = 4; // Multiple handlers
+  // Connection bootstrap only: the media handlers this meeting is registered on,
+  // for the client to open transports to. NON-AUTHORITATIVE for send placement —
+  // this list does not decide where a client sends. Selection is the send
+  // directive: `SendTarget.media_handler_url` (matching the active slot's
+  // `StreamAssignment.media_handler_url`), both read out of the forwarding
+  // assignment. This list is deliberately left unordered and is not the
+  // selection mechanism: relying on its order — selecting off its first
+  // element — silently diverges from the directive. Its first element is not a
+  // selection and carries no relationship to placement.
+  repeated MediaServerInfo media_servers = 4;
   // Session recovery fields (ADR-0023)
   string correlation_id = 6; // UUIDv7, client stores for reconnection
   string binding_token = 7; // Client stores for reconnection (30s TTL)
