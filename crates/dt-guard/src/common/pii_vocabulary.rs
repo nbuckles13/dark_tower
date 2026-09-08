@@ -154,11 +154,24 @@ pub(crate) const PII_TOKENS_CATEGORY_A: &[&str] = &[
     // identifying WHICH key, never key material. Do not add it.
     //
     // KNOWN LIMIT, stated rather than assumed away: under word-boundary matching
-    // `\btransmit_key\b` does NOT match `wrapped_transmit_key` (a leading `_` is a word
-    // character, so there is no boundary). `metric_labels` covers it via its substring
-    // path; `rust_log_secrets` and `instrument_skip_all` do not. MC never holds a
-    // wrapped transmit key, so no entry is added for it here — but do not read this
-    // cohort as covering that spelling.
+    // `\btransmit_key\b` does NOT match a compound on EITHER side, because `_` is a word
+    // character and so there is no boundary at the join. That covers both
+    // `wrapped_transmit_key` (leading) and `transmit_key_bytes` (TRAILING) — the trailing
+    // form is the one a KEK-adjacent field is most likely to be spelled, and it was
+    // verified against the shipped guard on 2026-09-08 (story task 23) rather than
+    // inferred: `rust-no-secrets-in-logs` fires on `meeting_kek` at an MC log site and is
+    // silent on `transmit_key_bytes` at the same site. `metric_labels` covers both via its
+    // substring path; `rust_log_secrets` and `instrument_skip_all` cover neither.
+    //
+    // MC never holds a wrapped transmit key, so no entry is added here — and adding one
+    // would not help anyway, which is the point worth carrying: a new entry spelled
+    // `transmit_key_bytes` would be inert against `transmit_key_material` and every other
+    // unenumerated compound. Do not read this cohort as covering compound spellings, and
+    // do not "fix" a fixture by widening this list — ADR-0036 §11 forecloses that in terms
+    // ("Vocabulary additions cannot be cited as the protection"). The control for these
+    // spellings is the credential-leak semantic check (items 11-13), which judges the
+    // value; the structural fix for the matcher is tracked separately (promote
+    // `segments()` to `crate::common::` and repoint the word-boundary consumers).
 ];
 
 /// Credential-shaped subset of [`PII_TOKENS_CATEGORY_A`] — "is this field name a

@@ -191,6 +191,68 @@ If implementer defers (or spins out) one or more findings with justification you
 2. Update your verdict to RESOLVED-DEFERRED (even if other findings were fixed)
 3. Use SendMessage to tell @team-lead: "Verdict: RESOLVED-DEFERRED — {N} findings fixed, {M} acceptably deferred"
 
+## Assertion Vacuity — Ask Where the Expected Value Came From
+
+An assertion can be green because the thing it checks is correct, or because it
+never really ran. Five mechanisms, all found live in one devloop:
+
+1. **Input absent.** The assertion runs over an empty set. `contains("")` is
+   vacuously true; "every X has a Y" over zero X passes.
+2. **Input present but malformed.** The extraction produced something non-empty
+   that cannot match — e.g. concatenating a `\`-continued Rust string literal
+   yields a long needle carrying a backslash and source indentation. A
+   minimum-length check does not catch this, because the bad value is long.
+3. **A reading step that cannot produce malformed input.** This *supersedes* 2:
+   a well-formedness check is itself a control that has to notice, and inherits
+   every weakness of that class. Prefer an extraction that structurally cannot
+   go wrong over a detector for it going wrong.
+4. **The expectation written from memory rather than read from the artifact** —
+   it passes on the exact input it was written to catch, and is invisible to
+   review because it looks correct on the page. Remedy: derive it from the
+   artifact and run it against a real adverse input before believing it.
+
+   Where the expectation has no in-repo source — a toolchain's or a peer's own
+   wording — derivation is impossible at any price, and the question becomes
+   **which way it fails when the foreign side changes.** A foreign expectation
+   that **fails closed** is safe at any tier: `assert_rc 101` on rustc's
+   compile-error code is toolchain-defined and carries primary coverage, and a
+   changed exit code turns the assertion red. One that **fails open** is
+   dangerous: a matched-on error string silently goes green when the wording
+   changes. Keep fail-open expectations as secondary coverage behind an
+   in-repo-derived primary, and record the residual.
+
+   (Not "wrap the foreign diagnostic in our own message" **when the wrapper
+   decides to emit by matching the foreign wording** — that relocates the coupling
+   one layer further from view rather than defending it. The wrap is a real
+   defence only when the wrapper's trigger is itself fail-closed — an exit status,
+   or the presence/absence of output rather than its content. `scripts/dev-web.sh`
+   is the in-tree form: it keys on `ss`'s exit status, discards its stderr, and
+   emits a message of our own, so `dev-web.test.sh`'s expectation has an in-repo
+   source.)
+
+5. **The subject ran where it could observe nothing, and reported clean.** A
+   guard invoked from the wrong working directory finds no files and returns "no
+   findings" — indistinguishable from a real clean result, and the assertion
+   reading it is correct. Distinct from 1: the assertion's own input was
+   well-formed; the emptiness is upstream. Distinct from 1-4 in kind, too — those
+   fail identically every time, this one passes on ambient state and passes in
+   the author's hands. Remedy: every run carries a **positive control** — at
+   least one case that MUST hit — so a wholesale empty result is structurally
+   distinguishable from a genuine pass. Corollary: verification that depends on
+   ambient state (working directory, environment, an already-running service) is
+   not verification; it must be reproducible from a defined starting state. Pair
+   the positive control with an environment-sanity assertion — that the subject
+   reached a verdict at all, and that its input collection succeeded.
+
+**Remedy for 1-3.** Where the extraction can fail, "did this have input" is a
+*separate* assertion carrying a reason token deliberately distinct from a
+content failure — if they look alike, the vacuity case gets triaged as a content
+bug and then "fixed" by relaxing the extractor.
+
+For a placed example, `scripts/release-feature-gate.test.sh`'s `assert_absent` on
+cargo's feature error is fail-open and sits as secondary coverage behind a needle
+assertion derived from in-repo source, with the residual recorded at the site.
+
 ## Time Budget
 
 - Initial review: aim for completion within 30 minutes of receiving code
