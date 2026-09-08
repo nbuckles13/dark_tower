@@ -23,6 +23,9 @@ use opentelemetry::trace::SpanId;
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::jwks_rig::JwksRig;
+use test_common::mock_mc::{
+    start_mock_mc_server, MockBehavior, MockMcHandle, MockMcServer, SenderReplies,
+};
 use test_common::otel_capture::{install_test_propagator, trace_id_hex, SpanCapture};
 use test_common::test_token_receiver;
 use test_common::tokens::mint_meeting_token;
@@ -35,10 +38,31 @@ fn known_traceparent_header() -> String {
     format!("00-{KNOWN_TRACE_ID_U128:032x}-{KNOWN_SPAN_ID_U64:016x}-01")
 }
 
+/// The participant these tests connect as — the `sub` of the minted token, and
+/// therefore the key MC answers a `sender_id` for.
+const OTEL_WT_PARTICIPANT: &str = "otel-wt-user";
+
+/// The participant the second test connects as. Distinct from
+/// [`OTEL_WT_PARTICIPANT`] because the two tests use different meetings, and
+/// the mock's reply table is keyed on the participant alone.
+const OTEL_WT_PARTICIPANT_2: &str = "otel-wt-user-2";
+
+/// The ordinal the mock MC allocates to [`OTEL_WT_PARTICIPANT`].
+///
+/// Any valid value works; what matters is that MC ANSWERS. Before task 24 these
+/// tests pointed at an unroutable MC endpoint and passed, because
+/// `NotifyParticipantConnected` was fire-and-forget. It is now a blocking
+/// precondition, so an unanswerable MC holds `handle_connection` for the MC
+/// client's full retry budget and the span these tests read never closes in
+/// time. The span assertions are unchanged; only the fixture's MC is real now.
+const OTEL_WT_SENDER_ID: u32 = 4_242;
+
 struct WtSuite {
     jwks: JwksRig,
     session_manager: SessionManagerHandle,
     wt: AcceptLoopRig,
+    /// Held for the test's lifetime: dropping it stops the mock MC.
+    mc: MockMcHandle,
 }
 
 impl WtSuite {
@@ -58,11 +82,26 @@ impl WtSuite {
         )
         .await;
 
+        let mc = start_mock_mc_server(
+            MockMcServer::new(MockBehavior::Accept).with_sender_replies(
+                SenderReplies::default()
+                    .with(OTEL_WT_PARTICIPANT, OTEL_WT_SENDER_ID)
+                    .with(OTEL_WT_PARTICIPANT_2, OTEL_WT_SENDER_ID),
+            ),
+        )
+        .await;
+
         Self {
             jwks,
             session_manager,
             wt,
+            mc,
         }
+    }
+
+    /// The mock MC's gRPC endpoint, for the meeting registration.
+    fn mc_endpoint(&self) -> String {
+        format!("http://{}", self.mc.addr)
     }
 }
 
@@ -95,13 +134,13 @@ async fn test_wt_valid_traceparent_reparents_connection_span() {
             "otel-wt-meeting".to_string(),
             mh_service::session::MeetingRegistration {
                 mc_id: "otel-wt-mc".to_string(),
-                mc_grpc_endpoint: "http://localhost:1".to_string(),
+                mc_grpc_endpoint: suite.mc_endpoint(),
                 registered_at: Instant::now(),
             },
         )
         .await;
 
-    let token = mint_meeting_token(&suite.jwks.keypair, "otel-wt-meeting", "otel-wt-user");
+    let token = mint_meeting_token(&suite.jwks.keypair, "otel-wt-meeting", OTEL_WT_PARTICIPANT);
     let (conn, mut send, recv) = connect_and_open_bi(&suite.wt.url).await;
     write_mh_connect_with_trace(&mut send, &token, &known_traceparent_header(), "")
         .await
@@ -156,7 +195,7 @@ async fn test_wt_empty_trace_fields_stays_parentless_root_span() {
             "otel-wt-meeting-noop".to_string(),
             mh_service::session::MeetingRegistration {
                 mc_id: "otel-wt-mc-noop".to_string(),
-                mc_grpc_endpoint: "http://localhost:1".to_string(),
+                mc_grpc_endpoint: suite.mc_endpoint(),
                 registered_at: Instant::now(),
             },
         )
@@ -165,7 +204,7 @@ async fn test_wt_empty_trace_fields_stays_parentless_root_span() {
     let token = mint_meeting_token(
         &suite.jwks.keypair,
         "otel-wt-meeting-noop",
-        "otel-wt-user-2",
+        OTEL_WT_PARTICIPANT_2,
     );
     let (conn, mut send, recv) = connect_and_open_bi(&suite.wt.url).await;
     // Empty trace_parent/trace_state (proto3 default) — same helper every

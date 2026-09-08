@@ -26,6 +26,7 @@
    - [Scenario 12: GC Heartbeat Latency](#scenario-12-gc-heartbeat-latency)
    - [Scenario 13: RegisterMeeting Timeout — Clients Kicked](#scenario-13-registermeeting-timeout--clients-kicked)
    - [Scenario 14: WebTransport Server Startup Failure](#scenario-14-webtransport-server-startup-failure)
+   - [Scenario 15: Media Sessions Declining — No Sender Binding](#scenario-15-media-sessions-declining--no-sender-binding)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -980,6 +981,258 @@ UDP-port-collision reschedule is 30-60s. Bind-address ConfigMap fix +
 rolling restart is 2-3 minutes.
 
 **Related Alerts**: `MHDown`, `MHPodRestartingFrequently`, `MHHighRegistrationLatency` (downstream — registration cannot complete until WebTransport server is up and pod is Ready).
+
+---
+
+### Scenario 15: Media Sessions Declining — No Sender Binding
+
+**Symptom.** Clients connect to MH and get no audio. MH looks **healthy**: readiness
+green, `mh_webtransport_connections_total{status="accepted"}` climbing, handshake
+latency normal. `mh_media_session_starts_total{outcome!="started"}` is climbing.
+
+Since the participant → `sender_id` binding contract landed, MC's response to
+`NotifyParticipantConnected` is a **blocking precondition** for a media session: it
+carries the ordinal MH binds the connection's media route to. No valid binding ⇒ no
+media session ⇒ connection closed with a counted reason. This is fail-closed by
+design — the alternative is forwarding with a guessed sender, which in a
+one-participant meeting is indistinguishable from correct behaviour.
+
+#### Step 1 — partition on WHICH SERVICE to open, before reading the label
+
+**Do not start by reading the outcome value.** Four of the seven values name MC, and
+**two of those four do not mean MC is unwell**. Three rows below say *do not page MC*.
+
+| Outcome | Start in | Why |
+|---|---|---|
+| `declined_sender_binding_conflict` | **MH** | The `(meeting, sender)` ordinal is held by a *different* participant. Check MH's unbind path **first** — see Step 4. |
+| `declined_mc_endpoint_unknown` | **MH** | No usable `mc_grpc_endpoint` for the meeting. **MH never dialled — do NOT page MC.** See Step 5. |
+| `declined_mc_auth_rejected` | **MH** | MH's *outbound credential* failed: MC refused it, or MH could not build one. **MH's outbound auth, not MC's health.** See Step 6. |
+| `declined_mc_unavailable` | **MC reachability** | MH dialled and got no usable answer within the ~48s budget. |
+| `declined_no_sender_binding` | **MC's answer** | MC answered `0` — "I do not know this participant." Go to Step 2. |
+| `declined_sender_binding_out_of_range` | **MC's allocator** | Contract violation. Should read **zero forever** — see Step 3. |
+
+**Timing tiebreaker, and its limits.** `declined_mc_endpoint_unknown` fires **fast**
+(terminal on the first attempt — re-parsing the same string can never succeed).
+`declined_mc_unavailable` fires only after the **full ~48s** retry budget. If you are
+watching the counter live, latency-to-first-increment separates *those two* before the
+label does.
+
+> **This tiebreaker does NOT extend to `declined_mc_auth_rejected`.** That value has two
+> routes with different timings — a refusal declines immediately, a credential-build
+> failure only after the full budget. It is *usually* fast but not reliably so. Stated
+> explicitly because a partial timing rule is more dangerous than no timing rule: a
+> responder who learned "timing separates these" will apply it to the next value unless
+> told not to.
+
+#### Step 2 — `declined_no_sender_binding`: read the MC-side counter
+
+MC answered `0`. That is an honest answer meaning "I cannot resolve this participant" —
+MC never invents an ordinal. The cause is on MC's side; query it there:
+
+```promql
+mc_media_sender_binding_responses_total
+```
+
+| MC-side reading | Cause | First move |
+|---|---|---|
+| **Series absent or flat** | **Version skew** — the mc-service image predates the `sender_id` field | Rebuild and redeploy MC. See §Rollout ordering in `mh-deployment.md`. |
+| `outcome="participant_unknown"` | **Either** a transient join race **or** a systematic identity mismatch — see below | Check whether it is sustained |
+| `outcome="meeting_unknown"` | Routing/lifecycle fault — MC has no such meeting | Not self-clearing; investigate meeting placement |
+| `outcome="registry_full"` | **Capacity** — MC's per-meeting connection cap refused the registration, so it correctly answered `0` rather than handing back an ordinal for a connection it is not tracking | **Never self-clearing.** Raise the cap or add MC capacity. **Do not triage as a join race.** |
+| `outcome="user_ambiguous"` | **One user, two participants.** The user joined twice (two devices), so one token `sub` maps to two roster entries and the question has no single answer | **Never self-clearing, and no operator remedy exists** — see below. Have the user leave on one device. |
+
+> **`user_ambiguous` is user-triggerable, so expect it in normal traffic.** MH names the
+> connecting party by the validated meeting token's `sub` — a contract MUST, and the
+> defence against a client asserting another identity — while MC mints a fresh
+> `participant_id` per join and does not bar the same user joining twice. A user on a
+> phone *and* a laptop therefore produces two roster entries for one `sub`, and MC answers
+> `0` rather than guessing: either candidate would bind this connection to an ordinal
+> possibly belonging to that user's **other** participant, so MH would stamp the wrong
+> `sender_id` on these frames — right half the time and undetectable when wrong. **MC
+> refusing is the correct behaviour.**
+>
+> **There is no operator remedy.** Restarting nothing helps, capacity does not help, and
+> waiting does not help — the remedy is a contract change (tracked in `docs/TODO.md`).
+> The only field action is to have the user leave on one device. Do not escalate this as
+> an MC defect; MC is behaving correctly and refusing to guess.
+
+> **`participant_unknown` is NOT only a join race, and reading it that way will cost you
+> the incident.** A low, transient rate *is* the expected race between MH's connect and
+> MC's join completing. **Sustained** `participant_unknown` at or near 100% of attempts
+> means the two services do not agree on participant identity at all — MH names the
+> participant by its token `sub`, and if MC keys its roster by a different value, MC can
+> never resolve *any* participant. This is not a race that will clear; it is a systematic
+> mismatch. **Discriminator: the ratio.** A race is a small fraction of attempts and
+> decays; a mismatch is ~100% and flat.
+>
+> This is not hypothetical. It is the exact failure this contract's own first live
+> cluster run produced: `mc_media_sender_binding_responses_total{outcome="participant_unknown"} 5`
+> against `mh_media_session_starts_total{outcome="declined_no_sender_binding"} 5` —
+> every attempt, no successes.
+
+**Why "series absent" is a legitimate signal here, when this runbook warns against
+absence-as-signal everywhere else.** An MC binary predating this contract does not merely
+fail to set the field — **it does not have `mc_media_sender_binding_responses_total`
+at all.** So its absence distinguishes "old MC" from "new MC answering `0` honestly",
+which is the discriminator the wire format itself does not carry (the field is a bare
+`uint32`, so absent and zero are the same byte on the wire).
+
+Two cautions, because absence-as-signal is fragile:
+
+1. **An absent series and a scrape failure look identical.** Before reading absence as
+   version skew, confirm MC exports *any* series at all
+   (`up{job="mc-service"}`, or any `mc_*` metric). Otherwise an unreachable `/metrics`
+   or a relabeling drop sends you to rebuild an image that was fine.
+2. **DELETE THIS ROW once no pre-contract MC image can be deployed.** After that point
+   absence means something else entirely and this row misleads. Nothing else will prompt
+   the deletion; it is tracked in `docs/TODO.md`.
+
+#### Step 3 — `declined_sender_binding_out_of_range`
+
+MC returned a `sender_id` above 65535. **This should read zero forever.** It means MC
+violated its own contract — a broken allocator, **or the control plane answering MH is
+not MC.**
+
+The MC→MH gRPC channel has no cryptographic peer authentication (tracked in
+`docs/TODO.md`; compensating controls are network policy plus an MC-attested endpoint).
+**This counter is the only signal separating "MC has an allocator bug" from "something
+that is not MC is answering MH."** Treat **any** non-zero as a **security
+escalation**, not merely a bug. Escalate to the security owner alongside
+meeting-controller.
+
+`MHMediaSenderBindingOutOfRange` fires on a **single occurrence** — there is no
+`for:` debounce, because a counter whose steady state is zero forever has no
+noise floor to debounce and any non-zero is the incident. Do not read a
+low absolute count as "not yet worth acting on": one is the threshold.
+
+> **This counter is the ceiling of the detection story, not its extent.** It
+> catches an *out-of-range* answer. A forged binding **inside** `1..=65535` is
+> indistinguishable from a real one at MH, so **a flat series here is not
+> evidence that no impersonation occurred.** The escalation this counter
+> triggers is worth running; its silence proves nothing.
+
+#### Step 4 — `declined_sender_binding_conflict`: is the incumbent binding live or stale?
+
+The ordinal is held by a *different* participant. The question is whether that incumbent
+binding is **live** or **stale**. Check MH's log for the `meeting_id` on the decline:
+
+- **Stale — MH's fault.** The conflict correlates with a *prior* connection for that
+  meeting having gone away: look for an earlier "Connection closed and cleaned up" for
+  that `meeting_id` with no live connection behind it. MH failed to release the ordinal,
+  so the conflict **recurs on every reconnect for the same meeting and clears on an MH
+  restart.**
+- **Live — MC's fault.** Two connections for that meeting are concurrently up and MC
+  handed both the same ordinal. No preceding teardown.
+
+**Check MH first** — not because it is more likely, but because it is **the cheaper
+hypothesis to falsify.**
+
+> **Do NOT restart MH as a remedy.** "Clears on an MH restart" is a *diagnostic*, not a
+> fix: restarting clears the symptom and destroys the evidence you need to find the
+> unbind-path defect.
+
+`MHMediaSenderBindingConflict` also fires on a **single occurrence**, for the same
+reason as Step 3. An ordinary reconnect cannot produce this outcome —
+`SenderBindings::bind` compares the incumbent's `participant_id`, so a
+same-participant re-bind takes over the entry rather than conflicting — so there is
+no benign population here to debounce against.
+
+#### Step 5 — `declined_mc_endpoint_unknown`
+
+MH has no usable `mc_grpc_endpoint` for the meeting — none recorded, or one that will
+not parse. **MH never reached the network, so MC can be perfectly healthy while this
+climbs. Do not page MC.**
+
+The endpoint MH holds is on the decline log line. Read it.
+
+> **One route here has no remedy, and it is benign: MH shutting down.** The
+> endpoint lookup goes through the session actor, so a connection that reaches
+> this point while MH is draining finds no endpoint and declines. That is
+> **correct behaviour during a shutdown or a rolling deploy**, it is not a
+> registration fault, and there is nothing to fix. Discriminate on coincidence
+> with a pod terminating: if the increments stop when the rollout completes and
+> the log line names a meeting whose registration was fine, you are looking at
+> the shutdown route. Only the *registration* route below has a remedy. (Stated
+> because the common route's remedy — "fix what `RegisterMeeting` carried" — is
+> actively misleading applied to this one: there is nothing wrong with the
+> registration, and a responder who hunts one during a deploy is hunting
+> nothing. `declined_mc_unavailable` carries the equivalent line under §Expected
+> non-incidents; this value needs its own because it is a *different* mechanism
+> reaching the same benign conclusion.)
+
+**Expect this to be near-zero.** MH's `RegisterMeeting` already validates
+`mc_grpc_endpoint` at push time — non-empty, length-bounded, scheme in
+`{http://, https://, grpc://}` — so the obvious defects are rejected loudly and
+attributably at registration and never reach a connection. What squeezes through is
+narrow: a string that passes those checks and still will not parse (`"http://"`
+*exactly*, or an embedded space), plus a `None` race. **If this fires, the endpoint in
+the log is almost certainly malformed in a way MH's own registration validation was too
+weak to catch** — do not spend the night hunting a plausible misconfiguration the
+control plane would have rejected.
+
+#### Step 6 — `declined_mc_auth_rejected`: MH's outbound credential
+
+MH's outbound credential failed. Two routes, **same first move, different second move.**
+
+**First move:** look for this line in MH's log:
+
+```
+target: mh.grpc.mc_client   level: ERROR
+"Authorization header parse failed"
+```
+
+- **Line PRESENT ⇒ credential-build failure.** MH could not construct a `Bearer` header
+  from the token it holds — the **token itself is malformed**. Stay in MH; check AC and
+  what it last issued.
+  > **This is an AC-side defect, not an MH bug.** It means AC issued a token containing
+  > bytes illegal in an HTTP header value. Escalate to the auth-controller owner —
+  > otherwise someone finds the malformed token, restarts something, and the defect stays
+  > in AC.
+- **Line ABSENT while this value climbs ⇒ refusal.** MH built a valid credential and MC
+  rejected it. Read `mc_caller_type_rejected_total` on MC. This is a deployment or
+  credential misconfiguration, **not** an MC health problem.
+
+> **`mh_token_refresh_total{status="error"}` is worth reading as context in BOTH cases,
+> but it does NOT separate them.** A refresh can *succeed* and return a token MH cannot
+> put on the wire (increments `status="success"`, then fails to build on every call), and
+> a refresh can *fail* while the previously cached token still builds fine and gets
+> refused. The counter is wrong in both directions as a discriminator; the log line is
+> not.
+
+#### Expected non-incidents
+
+- **A brief `declined_mc_unavailable` bump during an MC rolling deploy is expected.** MC
+  gates readiness on `httpGet /ready` port 8081 while this call is gRPC on 50052, so a
+  Ready-but-not-yet-serving window is normal. **Sustained past the rollout is not.**
+- **Low-rate, decaying `participant_unknown`** join races are normal. See the Step 2
+  caution for when they are not.
+
+#### Known blind spots
+
+- **The ~48s binding wait lands AFTER `mh_webtransport_handshake_duration_seconds` is
+  recorded.** During an MC outage the **handshake latency panel reads healthy** and
+  `MHWebTransportHandshakeSlow` cannot fire. **Do not clear MH on that panel.** A
+  dedicated instrument on the binding step is tracked in `docs/TODO.md`.
+- **Connections in the binding wait count against `MH_MAX_CONNECTIONS`.** This is *not
+  worse* than before the contract landed — the previous behaviour held a useless
+  connection until idle timeout, where this releases at ~48s — but the pressure is real
+  under a sustained MC outage.
+
+#### Do not "fix" this by shortening the retry budget
+
+The ~48s worst case (`MC_CONNECT_TIMEOUT` 5s + `MC_RPC_TIMEOUT` 10s per attempt,
+`MAX_RETRY_ATTEMPTS` 3, 1s/2s backoff — `crates/mh-service/src/grpc/mc_client.rs`) is
+**functioning as a rate limiter on the reconnect herd.** Clients cannot yet distinguish a
+retryable close from a terminal one, so they retry on their own cadence; cutting the
+budget to ~10s would multiply the retry rate roughly 5× against the service that is
+already the bottleneck. **The deadline and the client-side close code are one decision,
+not two** — see `docs/TODO.md`.
+
+**Related Alerts**: `MHMediaSessionDeclineRate`, `MHMediaSenderBindingOutOfRange`,
+`MHMediaSenderBindingConflict`, `MHHighWebTransportRejections` (a sustained MC outage
+drives connections toward `MH_MAX_CONNECTIONS`), `MHTokenRefreshFailures` (context for
+Step 6), `MHMCNotificationFailures` (same MC-unavailability cause at attempt
+granularity — 3 retries there for 1 decline here).
 
 ---
 

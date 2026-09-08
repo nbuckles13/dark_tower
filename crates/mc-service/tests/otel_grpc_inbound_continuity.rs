@@ -35,7 +35,9 @@ mod test_common;
 
 use std::sync::Arc;
 
+use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::grpc::McMediaCoordinationService;
+use mc_service::media_routing::PolicyGenerations;
 use mc_service::mh_connection_registry::MhConnectionRegistry;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_client::MediaCoordinationServiceClient;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationServiceServer;
@@ -80,7 +82,19 @@ async fn start_test_grpc_server() -> TestGrpcServer {
     let cancel_clone = cancel.clone();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
-    let svc = McMediaCoordinationService::new(Arc::new(MhConnectionRegistry::new()));
+    // Empty controller: this test isolates TRACE CONTINUITY, not sender
+    // resolution. The handler resolves `0`/`meeting_unknown` throughout, which
+    // is the correct answer for a controller holding no meetings and does not
+    // affect the span assertions.
+    let controller = Arc::new(MeetingControllerActorHandle::new(
+        "mc-otel-test".to_string(),
+        ActorMetrics::new(),
+        ControllerMetrics::new(),
+        common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
+        Arc::new(MhConnectionRegistry::new()),
+        Arc::new(PolicyGenerations::new()),
+    ));
+    let svc = McMediaCoordinationService::new(Arc::new(MhConnectionRegistry::new()), controller);
 
     let server = TonicServer::builder()
         .layer(tower_http::trace::TraceLayer::new_for_grpc())

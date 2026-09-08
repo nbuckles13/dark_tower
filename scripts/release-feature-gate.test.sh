@@ -54,16 +54,44 @@ REPO_ROOT="$(cd "${__here}/.." && pwd)"
 # The (crate, feature) table.
 #
 # Table-driven rather than hardcoded to MH so the MC sibling is one row rather
-# than a copy-paste. `crates/mc-service`'s `test-seams` gate is the SAME
-# mechanism and has no automated real-build self-test either, but MC is
-# meeting-controller's crate and adding it was ruled a residual for this
-# devloop (tracked by @dry-reviewer under docs/TODO.md §Cross-Service
-# Duplication). The shape admits it; the row is deliberately absent.
+# than a copy-paste. The MC row was deliberately absent when this file was
+# written and was RE-PRICED and added on 2026-09-08 by the sender-id binding
+# contract devloop (@security S7): the residual was filed when `test-seams`
+# merely exposed a sender-id EXHAUSTION BYPASS, but that devloop made the same
+# seam the sole thing standing between the allocator and an arbitrary
+# `sender_id` on MC's send path -- i.e. the cross-participant injection
+# primitive the whole contract exists to prevent. A typo'd feature name or a
+# dependency edge unifying `test-seams` onto a release build silently un-gates
+# it, and no other layer notices. The `docs/TODO.md` §Cross-Service Duplication
+# residual is struck by that same change.
+#
+# ADDING A ROW: the crate's `compile_error!` literal MUST carry NEEDLE_PHRASE
+# below wholly within ONE source line. Rust's `\`-newline escape strips the
+# newline AND the next line's leading indentation, so a phrase straddling a
+# continuation is unmatchable by this file's line-oriented grep and the row
+# fails its PRECONDITION rather than passing. MC's literal was reflowed for
+# exactly this reason; see the comment at crates/mc-service/src/lib.rs.
+#
+# COST, RECORDED SO THE MC ROW IS NOT PULLED ON A MISREAD NUMBER. Warm run of
+# this whole file is ~7s for both rows. A cold `cargo build --release -p
+# mc-service` IN ISOLATION is ~1m06s -- but that is NOT this row's marginal
+# cost, and quoting it as such is the mistake to avoid. Rows run in sequence
+# with `mh-service` FIRST, and the two dependency sets share 23 crates with only
+# 8 unique to MC (base64, hex, prost-types, redis, ring, serde_json, sysinfo,
+# tower-http). So on a cold cache the MH row already builds the shared graph in
+# the release profile and the MC row inherits it warm; the marginal cost is
+# mc-service itself plus those 8.
+#
+# No ADR-0033 §4 budget applies: ADR-0033:205 scopes the 90s p95 fast-tier
+# budget to Layers 3+6 and EXPLICITLY EXCLUDES the language layers 1/2/4/5 for
+# carrying "inherently large/variable cost". This harness sits in Layer 1
+# deliberately, and that placement IS the cost decision.
 #
 # Fields: <crate-name>|<feature>|<lib.rs path relative to repo root>
 # ---------------------------------------------------------------------------
 GATES=(
   "mh-service|per-frame-trace|crates/mh-service/src/lib.rs"
+  "mc-service|test-seams|crates/mc-service/src/lib.rs"
 )
 
 # The pinned phrase. Chosen because it lies wholly within ONE source line of the

@@ -148,8 +148,8 @@ groups:
           component: webtransport
         annotations:
           summary: "MH WebTransport rejection rate high ({{ $value | humanizePercentage }})"
-          description: "WebTransport connection rejection rate is {{ $value | humanizePercentage }} for 5 minutes. May indicate capacity exhaustion, TLS issues, or a QUIC listener stall."
-          impact: "Subset of users unable to establish media sessions. Check capacity, TLS cert, and pod health."
+          description: "WebTransport connection rejection rate is {{ $value | humanizePercentage }} for 5 minutes. May indicate capacity exhaustion, TLS issues, a QUIC listener stall, OR sustained MC gRPC unavailability holding accept-path slots. Since the sender_id binding contract landed, each connecting client holds an admission slot for up to ~48s awaiting MC's binding response, so an MC outage drives MH toward MH_MAX_CONNECTIONS and surfaces HERE rather than as an MC alert. Check mh_media_session_starts_total{outcome=\"declined_mc_unavailable\"} before concluding this is a capacity fault."
+          impact: "Subset of users unable to establish media sessions. Check capacity, TLS cert, and pod health - AND MC availability, which is a cause this alert cannot distinguish on its own."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-5-webtransport-rejections"
 
       - alert: MHWebTransportHandshakeSlow
@@ -181,6 +181,84 @@ groups:
           description: "One or more gRPC callers rejected by Layer-2 service-type routing over a 5-minute window, sustained for 2 minutes. MH expects meeting-controller as the only caller. Non-zero indicates a deployment misconfig OR credential misuse. Inspect actual_type label to identify the caller."
           impact: "Rejected calls are denied cleanly (no request-serving impact), but the signal means a service is misconfigured OR an unauthorized client is probing endpoints. Investigate deployment manifests and recent cert/token changes; escalate to Security Team if actual_type is unexpected."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-7-caller-type-rejected"
+
+      - alert: MHMediaSessionDeclineRate
+        expr: |
+          (
+            (
+              sum(rate(mh_media_session_starts_total[5m]))
+              - sum(rate(mh_media_session_starts_total{outcome="started"}[5m]))
+            )
+            /
+            sum(rate(mh_media_session_starts_total[5m]))
+          ) > 0.20
+          and
+          sum(rate(mh_media_session_starts_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-binding
+        annotations:
+          summary: "MH media sessions declining to start ({{ $value | humanizePercentage }})"
+          description: "More than 20% of media-session start attempts are declining for 10 minutes. This is the positive signal for 'MH healthy but forwarding nothing' — before this counter existed, the entire mh_media_* family read present-and-flat-at-zero, byte-identical to a healthy idle handler. Break down by outcome and follow mh-incident-response.md Scenario 15, which partitions on WHICH SERVICE to open: three of the seven outcome values mean DO NOT page MC."
+          impact: "Users connect to MH and get no audio. MH readiness, handshake latency and connection-accept rate all read healthy throughout - do not clear MH on those panels."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding"
+
+      # Occurrence-is-the-signal counter: steady state is zero forever, so there
+      # is no noise floor to debounce and any non-zero is the incident. `for:`
+      # suppresses flapping AROUND A THRESHOLD; this rule has no threshold to
+      # flap around.
+      #
+      # `for:` MUST STAY BELOW THE `increase()` WINDOW OR THIS RULE CANNOT FIRE.
+      # A single event — or a burst of any size confined to one window — makes
+      # the expression truthy for at most 15m, so `for: 15m` or longer is
+      # unsatisfiable BY CONSTRUCTION: it passes the alert guard and never
+      # fires. An earlier draft of this rule shipped `increase[5m]` with
+      # `for: 10m` and was blind to exactly the short-lived injection/probe shape
+      # the description below calls its whole purpose. Same defect, same
+      # reasoning as the window-derivation comment on
+      # `GCMeetingCreationOrgStateInvalid` in gc-alerts.yaml.
+      #
+      # `for: 0m` matches MCSenderIdSpaceExhausted and MCActorPanic (mc-alerts.yaml),
+      # the two other any-occurrence rules in this tree: the 15m increase window
+      # supplies the >=30s smoothing the guard requires, and a `for:` delay would
+      # only postpone reporting an already-irreversible fact.
+      - alert: MHMediaSenderBindingOutOfRange
+        expr: |
+          sum(increase(mh_media_session_starts_total{outcome="declined_sender_binding_out_of_range"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-binding
+        annotations:
+          summary: "MH received an out-of-range sender_id from the control plane"
+          description: "MC returned a sender_id above 65535. ANY OCCURRENCE FIRES THIS RULE - a single event is the incident, not a trend, which is why there is no `for:` debounce. THIS SHOULD READ ZERO FOREVER: it means MC violated its own contract (broken allocator) OR the control plane answering MH is not MC. The MC->MH gRPC channel has no cryptographic peer authentication, so this counter is the only signal separating those two causes. Separate from MHMediaSenderBindingConflict because they share no first move: this one starts at MC's allocator RANGE."
+          impact: "Affected media sessions are refused fail-closed, so no wrong-sender forwarding occurs. Treat ANY non-zero as a SECURITY escalation, not merely a bug - escalate to the security owner alongside meeting-controller. WHY warning AND NOT page: the arm is fail-closed, so there is no user-impacting event to page on at 3am and the response is a forensic investigation, not a rollback. That severity is accepted ON THE ASSUMPTION that routing reaches a security owner rather than capacity on-call; if that assumption is found false, revisit the SEVERITY, not this annotation. See docs/TODO.md - no Alertmanager routing config exists in-tree today. CEILING: this catches only an OUT-OF-RANGE answer; a forged binding inside 1..=65535 is indistinguishable from a real one at MH, so a flat series is not evidence of no impersonation."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding"
+
+      # Same any-occurrence shape and the same `for:`-below-the-window rule as
+      # MHMediaSenderBindingOutOfRange above; see that comment for the full
+      # derivation rather than a second copy of it.
+      #
+      # No reconnect-noise cost to `for: 0m`, verified rather than assumed:
+      # SenderBindings::bind compares incumbent.participant_id, so a
+      # same-participant re-bind takes over the entry instead of conflicting.
+      # An ordinary reconnect cannot produce this outcome.
+      - alert: MHMediaSenderBindingConflict
+        expr: |
+          sum(increase(mh_media_session_starts_total{outcome="declined_sender_binding_conflict"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-binding
+        annotations:
+          summary: "MH sender_id binding conflict — ordinal held by a different participant"
+          description: "A (meeting, sender_id) ordinal is already held by a DIFFERENT participant. ANY OCCURRENCE FIRES THIS RULE; an ordinary reconnect cannot produce it, because a same-participant re-bind takes over the entry rather than conflicting. Two candidate causes MH cannot separate: a STALE binding (MH failed to release the ordinal on teardown - MH's own fault) or a LIVE duplicate (MC allocated the same ordinal twice). Separate rule from MHMediaSenderBindingOutOfRange because the first move differs: check MH's UNBIND path first, then MC allocator UNIQUENESS. Do not restart MH as a remedy - it clears the symptom and destroys the evidence."
+          impact: "Affected participants get no media. This is the cross-participant collision the ordinal exists to prevent, refused fail-closed rather than mis-forwarded."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding"
 
       - alert: MHHighMemory
         expr: |

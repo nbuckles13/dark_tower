@@ -16,6 +16,9 @@
 //! This handler only needs to validate request field constraints.
 //! Generic error messages prevent information leakage (ADR-0003).
 
+use crate::actors::messages::SenderLookup;
+use crate::actors::MeetingControllerActorHandle;
+use crate::media_admission::SenderBindingOutcome;
 use crate::mh_connection_registry::{MhConnectionRegistry, MAX_ID_LENGTH};
 use crate::observability::metrics;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
@@ -31,13 +34,97 @@ use tracing::{debug, info, instrument, warn};
 pub struct McMediaCoordinationService {
     /// Registry tracking participant-to-MH connection state.
     registry: Arc<MhConnectionRegistry>,
+    /// Route to the meeting actors, which hold the allocated `sender_id`s.
+    ///
+    /// The controller is the only way to reach a meeting actor, and a meeting
+    /// actor is the only holder of its participants' ordinals. That chain is
+    /// what makes a cross-meeting answer unrepresentable: resolution never
+    /// consults anything but the one meeting named in the request.
+    controller: Arc<MeetingControllerActorHandle>,
 }
 
 impl McMediaCoordinationService {
     /// Create a new media coordination service.
     #[must_use]
-    pub fn new(registry: Arc<MhConnectionRegistry>) -> Self {
-        Self { registry }
+    pub fn new(
+        registry: Arc<MhConnectionRegistry>,
+        controller: Arc<MeetingControllerActorHandle>,
+    ) -> Self {
+        Self {
+            registry,
+            controller,
+        }
+    }
+
+    /// Resolve the wire `sender_id` for a connecting participant.
+    ///
+    /// `token_sub` is `NotifyParticipantConnectedRequest.participant_id`, which
+    /// by contract carries **the validated meeting token's `sub`** — never a
+    /// client-supplied hint (@security S1). MC stores that value as a
+    /// participant's `user_id`, so that is what it is resolved against; MC's own
+    /// per-join `participant_id` is a UUID MH has never seen. See
+    /// `MeetingMessage::GetSenderIdForUser` for the full seam.
+    ///
+    /// Returns the value to put on the wire and the outcome to count. **The
+    /// only path that yields a non-zero value is a live, UNAMBIGUOUS roster
+    /// hit**; every other path yields `0`, which MH treats as a reject.
+    ///
+    /// # MC never invents an id
+    ///
+    /// There is deliberately no fallback, no default and no "nearest" id. The
+    /// type system carries most of this: [`SenderId`](crate::media_admission::SenderId)
+    /// wraps `NonZeroU16` and its only production constructor is the per-meeting
+    /// allocator, so a fabricated ordinal is *unconstructible* here rather than
+    /// merely discouraged. This function's job is to make the *unresolvable*
+    /// case expressible, and `0` is how it is expressed.
+    ///
+    /// # Why a registry refusal declines the binding
+    ///
+    /// `registered == false` means the per-meeting connection cap was hit and MC
+    /// is **not tracking this connection**. Handing back a real ordinal anyway
+    /// would let MH forward media for a connection MC has no record of — and
+    /// will never send `NotifyParticipantDisconnected` for, because there is no
+    /// registry entry to tear down. The two sides would disagree about whether
+    /// the connection exists, and nothing would surface the disagreement. So the
+    /// honest answer is the same `0` MC gives for any participant it is not
+    /// tracking, under its own [`SenderBindingOutcome::RegistryFull`] so
+    /// cap exhaustion is never triaged as a join race.
+    async fn resolve_sender_binding(
+        &self,
+        meeting_id: &str,
+        token_sub: &str,
+        registered: bool,
+    ) -> (u32, SenderBindingOutcome) {
+        if !registered {
+            return (0, SenderBindingOutcome::RegistryFull);
+        }
+
+        // A missing meeting and a dead/closed meeting actor both land here.
+        // Both mean "MC cannot answer for this meeting", and both are counted
+        // as `meeting_unknown` rather than silently degrading to the
+        // participant-level arm -- the remedies differ from a join race.
+        let Ok(meeting) = self
+            .controller
+            .get_meeting_handle(meeting_id.to_string())
+            .await
+        else {
+            return (0, SenderBindingOutcome::MeetingUnknown);
+        };
+
+        match meeting.get_sender_id_for_user(token_sub.to_string()).await {
+            Ok(SenderLookup::Found(sender_id)) => (
+                u32::from(sender_id.get().get()),
+                SenderBindingOutcome::Resolved,
+            ),
+            // Not on the roster: the honest "I do not know this participant".
+            Ok(SenderLookup::NotFound) => (0, SenderBindingOutcome::ParticipantUnknown),
+            // Two participants share this `sub`; the question has no single
+            // answer and MC will not guess one.
+            Ok(SenderLookup::Ambiguous) => (0, SenderBindingOutcome::UserAmbiguous),
+            // The actor went away between the handle lookup and the query. The
+            // meeting, not the participant, is what MC cannot answer for.
+            Err(_) => (0, SenderBindingOutcome::MeetingUnknown),
+        }
     }
 }
 
@@ -105,16 +192,30 @@ impl MediaCoordinationService for McMediaCoordinationService {
 
         metrics::record_mh_notification("connected");
 
+        let (sender_id, outcome) = self
+            .resolve_sender_binding(&inner.meeting_id, &inner.participant_id, added)
+            .await;
+        metrics::record_sender_binding_response(outcome);
+
         info!(
             target: "mc.grpc.media_coordination",
             meeting_id = %inner.meeting_id,
             participant_id = %inner.participant_id,
             handler_id = %inner.handler_id,
+            // The OUTCOME, never the id. ADR-0036 §11 bars the `sender_id`
+            // value as a per-participant log dimension; the bounded outcome
+            // token carries every bit of triage signal the value would.
+            sender_binding = outcome.label(),
             "Participant connected to MH"
         );
 
         Ok(Response::new(NotifyParticipantConnectedResponse {
+            // Unchanged meaning: the notification was received and the registry
+            // consulted. Deliberately NOT repurposed to mean "and I resolved a
+            // sender" -- the two are independent, and MH must read `sender_id`,
+            // never infer a binding from `acknowledged`.
             acknowledged: true,
+            sender_id,
         }))
     }
 
@@ -176,8 +277,27 @@ impl MediaCoordinationService for McMediaCoordinationService {
 mod tests {
     use super::*;
 
+    /// A controller with no meetings.
+    ///
+    /// Every unit test in this module exercises request VALIDATION or the
+    /// registry, not sender resolution — so an empty controller is the honest
+    /// fixture: resolution correctly answers `0`/`meeting_unknown` throughout.
+    /// The resolution arms live in
+    /// `tests/media_coordination_integration.rs`, where a real meeting actor
+    /// can be seeded and the wire value asserted.
+    fn test_controller() -> Arc<MeetingControllerActorHandle> {
+        Arc::new(MeetingControllerActorHandle::new(
+            "mc-media-coord-unit".to_string(),
+            crate::actors::ActorMetrics::new(),
+            crate::actors::ControllerMetrics::new(),
+            ::common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
+            Arc::new(MhConnectionRegistry::new()),
+            Arc::new(crate::media_routing::PolicyGenerations::new()),
+        ))
+    }
+
     fn create_service() -> McMediaCoordinationService {
-        McMediaCoordinationService::new(Arc::new(MhConnectionRegistry::new()))
+        McMediaCoordinationService::new(Arc::new(MhConnectionRegistry::new()), test_controller())
     }
 
     #[tokio::test]
@@ -198,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_notify_connected_updates_registry() {
         let registry = Arc::new(MhConnectionRegistry::new());
-        let svc = McMediaCoordinationService::new(Arc::clone(&registry));
+        let svc = McMediaCoordinationService::new(Arc::clone(&registry), test_controller());
 
         let request = Request::new(NotifyParticipantConnectedRequest {
             meeting_id: "meeting-1".to_string(),
@@ -276,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn test_notify_disconnected_success() {
         let registry = Arc::new(MhConnectionRegistry::new());
-        let svc = McMediaCoordinationService::new(Arc::clone(&registry));
+        let svc = McMediaCoordinationService::new(Arc::clone(&registry), test_controller());
 
         // First connect
         let connect_req = Request::new(NotifyParticipantConnectedRequest {
@@ -315,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn test_coordination_flow_connect_disconnect_round_trip() {
         let registry = Arc::new(MhConnectionRegistry::new());
-        let svc = McMediaCoordinationService::new(Arc::clone(&registry));
+        let svc = McMediaCoordinationService::new(Arc::clone(&registry), test_controller());
 
         // Participant connects to two MHs (active/active topology).
         let connect_mh1 = Request::new(NotifyParticipantConnectedRequest {

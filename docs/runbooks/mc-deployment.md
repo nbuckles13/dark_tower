@@ -1430,6 +1430,25 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 
 **Rollback (MC half)**: same as the join-flow rollback above — `kubectl rollout undo deployment/mc-0 -n dark-tower` and `kubectl rollout undo deployment/mc-1 -n dark-tower` (MC ships as two per-ordinal Deployments; there is no Deployment named `mc-service` — that string is a Service, a PDB and a container name. Form per `docs/runbooks/mh-deployment.md`). **Carve-out — do NOT roll MC back for sustained `no_applied_generation`.** If `mc_media_policy_pushes_total{outcome="no_applied_generation"}` is climbing with retries exhausted after a deploy, MH is below the ADR-0036 §8 contract and **the remedy is to roll MH forward, not MC back**: rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole, not a fix. If the issue is on the MH side (handshake, JWT, RegisterMeeting timeouts), follow the rollback criteria + `mh-service` rollback documented in `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "Rollback criteria".
 
+**Carve-out #2 — do NOT roll MC back on a media-session decline spike.** Since
+`NotifyParticipantConnectedResponse` gained `sender_id`, MC and MH are a two-sided
+contract. An MC binary predating that field never sets it, and because the field is a
+bare `uint32` (not `optional`) a still-new MH decodes the absence as `0` — the reject
+value — and **declines every media session**. So `kubectl rollout undo deployment/mc-0`
+after this contract has landed is a **total media blackout**, not a mitigation.
+
+If `mh_media_session_starts_total{outcome="declined_no_sender_binding"}` is climbing,
+**the remedy is to roll MH back (or MC forward), never MC back.** Deploy order is forced:
+**MC forward first, MH back first.** Full triage at
+`docs/runbooks/mh-incident-response.md` §"Scenario 15: Media Sessions Declining — No
+Sender Binding"; ordering at `docs/runbooks/mh-deployment.md` §"Cross-service ordering:
+MC and MH are coupled by the sender_id binding contract".
+
+**This is the same mechanism as the `no_applied_generation` carve-out above**, one
+contract later: in both cases rolling MC back returns it to a state MH cannot consume,
+and in both cases the intuitive action is the destructive one. Recorded separately rather
+than left to be inferred from the first.
+
 ---
 
 ## Emergency Contacts

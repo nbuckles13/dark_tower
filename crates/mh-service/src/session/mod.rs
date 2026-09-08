@@ -650,7 +650,26 @@ impl SubscriberKey {
 /// stall every other connection's audio.
 #[derive(Debug, Default)]
 pub struct LocalSubscriberSnapshot {
-    connections: HashMap<SubscriberKey, Arc<EgressQueue>>,
+    connections: HashMap<SubscriberKey, SubscriberEntry>,
+}
+
+/// One connected subscriber's egress queue, tagged with the connection that owns
+/// it.
+///
+/// The `connection_id` is what makes teardown a **compare-and-remove**
+/// ([`LocalSubscribers::unregister`]), symmetric to [`SenderBindings`]. A
+/// connection superseded by a same-participant reconnect holds the same
+/// `(meeting, sender)` ordinal as its successor; without the tag, the superseded
+/// connection's teardown would clear the LIVE successor's egress queue. The
+/// successor then stays connected but vanishes from the snapshot, so every frame
+/// addressed to it counts `no_local_subscriber` — a permanent silent-audio
+/// failure under a label the catalog documents as ordinary. This is the same
+/// failure `SenderBindings`' compare-and-remove prevents one registry over
+/// (@security SEC-2 / the media-handler reviewer's independent finding).
+#[derive(Debug, Clone)]
+struct SubscriberEntry {
+    connection_id: String,
+    queue: Arc<EgressQueue>,
 }
 
 impl LocalSubscriberSnapshot {
@@ -672,6 +691,7 @@ impl LocalSubscriberSnapshot {
         // `SubscriberKey` is a composite and `Borrow` cannot decompose it.
         self.connections
             .get(&SubscriberKey::new(meeting.clone(), sender))
+            .map(|entry| &entry.queue)
     }
 
     /// How many subscriber connections this handler holds.
@@ -737,63 +757,133 @@ impl LocalSubscribers {
     ///
     /// `ArcSwap::rcu` is the compare-exchange retry loop for exactly this; the
     /// closure body is the same work.
-    pub fn register(&self, meeting: MeetingKey, sender: SenderId, queue: &Arc<EgressQueue>) {
+    ///
+    /// `connection_id` tags the entry so [`Self::unregister`] can tell a live
+    /// holder from a superseded one; see [`SubscriberEntry`].
+    pub fn register(
+        &self,
+        meeting: MeetingKey,
+        sender: SenderId,
+        connection_id: &str,
+        queue: &Arc<EgressQueue>,
+    ) {
         let key = SubscriberKey::new(meeting, sender);
+        let entry = SubscriberEntry {
+            connection_id: connection_id.to_string(),
+            queue: Arc::clone(queue),
+        };
         self.snapshot.rcu(|current| {
             let mut connections = current.connections.clone();
-            connections.insert(key.clone(), Arc::clone(queue));
+            connections.insert(key.clone(), entry.clone());
             LocalSubscriberSnapshot { connections }
         });
     }
 
-    /// Remove one connection's egress queue. Teardown, not hot path.
+    /// Remove one connection's egress queue, but only if `connection_id` still
+    /// holds the `(meeting, sender)` slot. Teardown, not hot path.
     ///
-    /// `rcu` for the same reason as [`Self::register`].
-    pub fn unregister(&self, meeting: &MeetingKey, sender: SenderId) {
+    /// **Compare-and-remove**, for the same reason [`SenderBindings::unbind`] is:
+    /// a connection superseded by a same-participant reconnect no longer owns the
+    /// slot, and its teardown must not clear the live successor's queue. See
+    /// [`SubscriberEntry`] for the silent-audio failure this prevents.
+    ///
+    /// `rcu` for the same concurrency reason as [`Self::register`].
+    pub fn unregister(&self, meeting: &MeetingKey, sender: SenderId, connection_id: &str) {
         let key = SubscriberKey::new(meeting.clone(), sender);
         self.snapshot.rcu(|current| {
+            let holder_is_caller = current
+                .connections
+                .get(&key)
+                .is_some_and(|entry| entry.connection_id == connection_id);
             let mut connections = current.connections.clone();
-            connections.remove(&key);
+            if holder_is_caller {
+                connections.remove(&key);
+            }
             LocalSubscriberSnapshot { connections }
         });
     }
 }
 
-/// Meeting-scoped `participant_id` -> `sender_id` bindings.
+/// Meeting-scoped sender-ordinal bindings: **which connection holds which
+/// `sender_id` in which meeting**.
 ///
-/// # THE WRITER DOES NOT EXIST YET, AND THAT IS THE OPEN GAP
+/// # What this type is FOR: uniqueness enforcement at the last hop
 ///
-/// The forward path needs to know which `sender_id` a connection publishes as,
-/// because `EgressStream` references `sender_id` and the accept path knows only
-/// the JWT's `meeting_id` and `sub` (the participant UUID). **No contract in
-/// the tree carries that association to MH today**, verified at story task 16:
+/// The binding itself arrives over the control plane — MC answers
+/// [`NotifyParticipantConnected`] with the `sender_id` it allocated, and
+/// `crate::webtransport::connection` validates it through
+/// [`crate::routing::SenderId::from_wire`] and hands the resulting value
+/// *directly* to the media tasks. **Nothing in the forward path reads this
+/// registry**, and that is deliberate: `start_media_session` takes a validated
+/// [`SenderId`] by value, so "a media session started without a binding" is
+/// unrepresentable rather than being a property of the call graph that a reader
+/// has to re-derive.
 ///
-/// - `common::jwt::MeetingTokenClaims` has no sender field, and the token is
-///   minted by GC before MC allocates the ordinal;
-/// - `internal.proto`'s `RegisterMeetingRequest` carries `sender_id` on
-///   `SubscriberSlot` and `CandidateSource` and no `participant_id` anywhere;
-/// - `NotifyConnectedResponse` is `{ bool acknowledged }`;
-/// - `MhConnectRequest` carries only `join_token`, and the `connection_token`
-///   that once crossed client→MH was deleted by the task-4 reshape.
+/// What this registry does is enforce the one invariant that no single
+/// connection can check for itself: **within one meeting, one `sender_id` has
+/// one holder**. Two different participants bound to the same ordinal is the
+/// precise cross-participant collision the ordinal exists to prevent — MH would
+/// forward one participant's frames onto the other's edges — and MH is the
+/// component that would *act* on such a collision, so the last hop is where it
+/// has to be detected. [`Self::bind`] refuses rather than overwrites, and the
+/// refusal is counted (`mh_media_session_starts_total{outcome="declined_sender_binding_conflict"}`).
 ///
-/// **The remaining routes are all client-asserted, and every one of them is a
-/// cross-participant injection primitive**: a patched client claims another
-/// participant's ordinal and MH forwards its frames onto that participant's
-/// edges. That includes reading the `sender_id` out of the `SFrame` key id in the
-/// payload, which is additionally barred because MH never inspects the payload.
-/// So the binding must arrive over the **control plane**, and the contract
-/// field for it is owed — see `docs/TODO.md` §Media Path Obligations.
+/// # Why the key is `(meeting, sender)` and not `(meeting, participant)`
 ///
-/// This type is the complete mechanism minus that one input, and its own
-/// behaviour — including the meeting-scoping arm — is unit-tested below.
-/// [`Self::bind`] has no production caller; when the control-plane field lands,
-/// one call site is added and the forward path starts resolving. Until then
-/// [`Self::resolve`] returns `None` for every connection and
-/// `crate::webtransport::connection` declines to start media tasks, loudly,
-/// rather than guessing an ordinal.
+/// The invariant is about the ORDINAL's uniqueness, so the ordinal is the key.
+/// Keyed the other way, two different participants holding one ordinal are two
+/// different map keys and a plain insert accepts both silently — the collision
+/// would be undetectable by construction, and a counter named for it would name
+/// a condition the code cannot see.
+///
+/// **Sender ids are meeting-scoped** (`internal.proto`: ordinal 5 exists
+/// concurrently in every meeting), so the meeting is part of the key and a
+/// collision in meeting A says nothing about meeting B. A global index would be
+/// a cross-meeting media-crossing primitive.
+///
+/// # The value carries the connection, not just the participant
+///
+/// Teardown is a **compare-and-remove**: a connection only clears the binding it
+/// actually holds. Without that, a superseded connection for the same
+/// participant tearing down would clear a live connection's entry — which does
+/// not break the running session (the session holds its own [`SenderId`]) but
+/// *silently frees the ordinal for the uniqueness check*, i.e. a control about a
+/// control failing open, which is the worse of the two failures.
+///
+/// Residual, bounded rather than chased: a participant reconnecting with a
+/// **different** MC-allocated ordinal leaves its old entry held until the old
+/// connection tears down. Reaching a stale entry that outlives its connection
+/// requires MC to reallocate an ordinal for a live participant, which
+/// contradicts the non-recycling allocation bound `internal.proto` states on
+/// `sender_id`.
 #[derive(Debug)]
 pub struct SenderBindings {
-    bindings: ArcSwap<HashMap<(MeetingKey, String), SenderId>>,
+    bindings: ArcSwap<HashMap<(MeetingKey, SenderId), BoundConnection>>,
+}
+
+/// Who holds one `(meeting, sender_id)` ordinal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundConnection {
+    /// The participant the ordinal was allocated to, from the validated meeting
+    /// token's `sub`. Compared against on [`SenderBindings::bind`] to tell a
+    /// cross-participant collision from a same-participant re-bind.
+    participant_id: String,
+    /// The connection that currently holds it. Compared against on
+    /// [`SenderBindings::unbind`] so a superseded connection cannot clear a live
+    /// one's binding.
+    connection_id: String,
+}
+
+/// Why a [`SenderBindings::bind`] was refused.
+///
+/// One variant, because there is one refusable condition. It is an enum rather
+/// than a `bool` so a second condition arrives as a compile error at every match
+/// site instead of as a silently widened meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindConflict {
+    /// The ordinal is already held by a **different** participant in this
+    /// meeting. The incumbent is untouched; the newcomer is refused.
+    HeldByAnotherParticipant,
 }
 
 impl Default for SenderBindings {
@@ -811,44 +901,101 @@ impl SenderBindings {
         }
     }
 
-    /// Bind `participant_id` to `sender` within `meeting`.
+    /// Claim `sender` for `participant_id` on `connection_id`, within `meeting`.
     ///
-    /// **No production caller today** — see the type docs. The value must come
-    /// from the control plane; it must never be read off the wire from the
-    /// client, and it must never be inferred from the installed policy (in a
-    /// one-participant meeting every wrong inference is indistinguishable from
-    /// the right one, which is exactly the shape that ships a cross-tenant
-    /// defect no test in this story can catch).
-    pub fn bind(&self, meeting: MeetingKey, participant_id: &str, sender: SenderId) {
-        // `rcu` for the same reason as `LocalSubscribers::register`, and fixed
-        // now rather than when the first caller arrives: that caller comes with
-        // the control-plane contract field and will not re-derive the
-        // concurrency question from scratch.
-        let key = (meeting, participant_id.to_string());
+    /// **Incumbent wins.** If the ordinal is already held by a different
+    /// participant, this refuses and mutates nothing; the incumbent connection
+    /// keeps its binding and its edges. Overwriting instead would blackhole the
+    /// incumbent and hand its edges to the newcomer, which is exactly the
+    /// primitive this check exists to prevent.
+    ///
+    /// A re-bind by the **same** participant (a reconnect) takes over the entry
+    /// rather than conflicting: it crosses no media between participants, so it
+    /// is not an anomaly and has no operator remedy.
+    ///
+    /// # Errors
+    ///
+    /// [`BindConflict::HeldByAnotherParticipant`] — the caller must decline the
+    /// media session and count it; see
+    /// `crate::observability::metrics::MediaSessionStartOutcome::DeclinedSenderBindingConflict`.
+    pub fn bind(
+        &self,
+        meeting: MeetingKey,
+        participant_id: &str,
+        connection_id: &str,
+        sender: SenderId,
+    ) -> Result<(), BindConflict> {
+        let key = (meeting, sender);
+        let claimant = BoundConnection {
+            participant_id: participant_id.to_string(),
+            connection_id: connection_id.to_string(),
+        };
+
+        // `rcu` for the same reason as `LocalSubscribers::register` — the
+        // writers are per-connection tasks racing on one runtime, and a plain
+        // read-modify-write loses an update when two participants connect
+        // concurrently.
+        //
+        // The conflict check lives INSIDE the closure, not before it. A check
+        // outside the compare-and-swap loop is a TOCTOU on precisely the
+        // concurrent-connect race the `rcu` exists for: two connections could
+        // both observe the ordinal free and both claim it. `rcu` may run the
+        // closure more than once, so `conflict` is reset at the top of every
+        // attempt rather than accumulated across them.
+        let mut conflict = false;
         self.bindings.rcu(|current| {
+            conflict = false;
+            if let Some(incumbent) = current.get(&key) {
+                if incumbent.participant_id != claimant.participant_id {
+                    conflict = true;
+                    // Store the map unchanged: refusing must not mutate.
+                    return current.as_ref().clone();
+                }
+            }
             let mut bindings = current.as_ref().clone();
-            bindings.insert(key.clone(), sender);
+            bindings.insert(key.clone(), claimant.clone());
             bindings
         });
+
+        if conflict {
+            return Err(BindConflict::HeldByAnotherParticipant);
+        }
+        Ok(())
     }
 
-    /// Forget every binding for one participant in one meeting.
-    pub fn unbind(&self, meeting: &MeetingKey, participant_id: &str) {
-        let key = (meeting.clone(), participant_id.to_string());
+    /// Release `sender` in `meeting`, but only if `connection_id` still holds it.
+    ///
+    /// Compare-and-remove: a connection that was superseded by a reconnect for
+    /// the same participant no longer holds the entry, and its teardown must not
+    /// clear the live connection's binding. See the type docs for why a
+    /// clear-anyway `unbind` fails the uniqueness check open rather than
+    /// breaking the running session.
+    pub fn unbind(&self, meeting: &MeetingKey, sender: SenderId, connection_id: &str) {
+        let key = (meeting.clone(), sender);
         self.bindings.rcu(|current| {
+            let holder_is_caller = current
+                .get(&key)
+                .is_some_and(|held| held.connection_id == connection_id);
+            if !holder_is_caller {
+                return current.as_ref().clone();
+            }
             let mut bindings = current.as_ref().clone();
             bindings.remove(&key);
             bindings
         });
     }
 
-    /// The `sender_id` bound to `participant_id` in `meeting`, if any.
+    /// The participant currently holding `sender` in `meeting`, if any.
+    ///
+    /// The registry's read API. Its production consumer is [`Self::bind`]'s own
+    /// conflict check; this exposes the same question to tests and to future
+    /// diagnostics without handing out the map.
     #[must_use]
-    pub fn resolve(&self, meeting: &MeetingKey, participant_id: &str) -> Option<SenderId> {
+    pub fn holder_of(&self, meeting: &MeetingKey, sender: SenderId) -> Option<String> {
         self.bindings
             .load()
-            .get(&(meeting.clone(), participant_id.to_string()))
-            .copied()
+            .get(&(meeting.clone(), sender))
+            .map(|held| held.participant_id.clone())
     }
 }
 
@@ -875,8 +1022,9 @@ pub struct SessionManagerHandle {
     /// Not behind the mailbox for the same reason `routing` is not: a per-frame
     /// read must not take a mailbox round trip.
     subscribers: Arc<LocalSubscribers>,
-    /// Meeting-scoped `participant_id` -> `sender_id`. See [`SenderBindings`]
-    /// for why nothing writes to it yet.
+    /// Which connection holds which `sender_id` in which meeting. Written at
+    /// connect and cleared at teardown; see [`SenderBindings`] for why the
+    /// forward path does not read it.
     sender_bindings: Arc<SenderBindings>,
 }
 
@@ -938,7 +1086,7 @@ impl SessionManagerHandle {
         &self.subscribers
     }
 
-    /// The meeting-scoped `participant_id` -> `sender_id` bindings.
+    /// The meeting-scoped sender-ordinal bindings.
     #[must_use]
     pub fn sender_bindings(&self) -> &Arc<SenderBindings> {
         &self.sender_bindings
@@ -1462,7 +1610,7 @@ mod tests {
         // resolves nothing at all.
         let subscribers = LocalSubscribers::new();
         let meeting = MeetingKey::new("m-1");
-        subscribers.register(meeting.clone(), key(5), &queue());
+        subscribers.register(meeting.clone(), key(5), "conn-a", &queue());
 
         assert!(subscribers.load().egress_queue(&meeting, key(5)).is_some());
         assert!(
@@ -1476,15 +1624,51 @@ mod tests {
     fn unregistering_removes_only_that_subscriber() {
         let subscribers = LocalSubscribers::new();
         let meeting = MeetingKey::new("m-1");
-        subscribers.register(meeting.clone(), key(5), &queue());
-        subscribers.register(meeting.clone(), key(6), &queue());
+        subscribers.register(meeting.clone(), key(5), "conn-5", &queue());
+        subscribers.register(meeting.clone(), key(6), "conn-6", &queue());
 
-        subscribers.unregister(&meeting, key(5));
+        subscribers.unregister(&meeting, key(5), "conn-5");
 
         assert!(subscribers.load().egress_queue(&meeting, key(5)).is_none());
         assert!(
             subscribers.load().egress_queue(&meeting, key(6)).is_some(),
             "unregistering one subscriber must not disturb another"
+        );
+    }
+
+    #[test]
+    fn a_superseded_connection_teardown_does_not_clear_the_live_subscriber() {
+        // SEC-2, the subscriber-registry twin of
+        // `a_superseded_connection_teardown_does_not_clear_the_live_binding`.
+        // `conn-1` and `conn-2` are the SAME participant reconnecting, so both
+        // hold ordinal 5. `conn-2` registers second and wins the slot. When the
+        // superseded `conn-1` tears down it must NOT clear `conn-2`'s egress
+        // queue — an unconditional remove here leaves `conn-2` connected but
+        // absent from the snapshot, so every frame addressed to it counts
+        // `no_local_subscriber` and the participant goes permanently silent.
+        let subscribers = LocalSubscribers::new();
+        let meeting = MeetingKey::new("m-1");
+        let live = queue();
+        subscribers.register(meeting.clone(), key(5), "conn-1", &queue());
+        subscribers.register(meeting.clone(), key(5), "conn-2", &live);
+
+        subscribers.unregister(&meeting, key(5), "conn-1");
+
+        let held = subscribers
+            .load()
+            .egress_queue(&meeting, key(5))
+            .cloned()
+            .expect("the live successor's queue must survive the superseded teardown");
+        assert!(
+            Arc::ptr_eq(&held, &live),
+            "the slot must still hold conn-2's queue, not be cleared by conn-1's teardown"
+        );
+
+        // And a real teardown by the current holder still releases it.
+        subscribers.unregister(&meeting, key(5), "conn-2");
+        assert!(
+            subscribers.load().egress_queue(&meeting, key(5)).is_none(),
+            "the holder's own unregister must release the slot"
         );
     }
 
@@ -1498,7 +1682,7 @@ mod tests {
         let subscribers = LocalSubscribers::new();
         let meeting_a = MeetingKey::new("meeting-a");
         let meeting_b = MeetingKey::new("meeting-b");
-        subscribers.register(meeting_a.clone(), key(5), &queue());
+        subscribers.register(meeting_a.clone(), key(5), "conn-a", &queue());
 
         assert!(
             subscribers
@@ -1517,55 +1701,148 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_participant_resolves_and_an_unbound_one_does_not() {
+    fn an_ordinal_is_held_by_the_participant_that_bound_it() {
         let bindings = SenderBindings::new();
         let meeting = MeetingKey::new("m-1");
-        bindings.bind(meeting.clone(), "participant-a", key(5));
 
-        assert_eq!(bindings.resolve(&meeting, "participant-a"), Some(key(5)));
+        bindings
+            .bind(meeting.clone(), "participant-a", "conn-a", key(5))
+            .expect("a free ordinal must bind");
+
         assert_eq!(
-            bindings.resolve(&meeting, "participant-b"),
+            bindings.holder_of(&meeting, key(5)),
+            Some("participant-a".to_string())
+        );
+        assert_eq!(
+            bindings.holder_of(&meeting, key(6)),
             None,
-            "an unbound participant must resolve to nothing — the forward path reads this as \
-             'decline to start media', which is the fail-closed behaviour"
+            "an unclaimed ordinal has no holder"
         );
     }
 
     #[test]
-    fn unbinding_forgets_one_participant_and_leaves_the_rest() {
+    fn a_second_participant_cannot_take_an_ordinal_the_first_holds() {
+        // THE reason this type exists. Overwriting here would blackhole the
+        // incumbent and hand its edges to the newcomer — one participant's
+        // frames delivered to another participant's subscribers.
         let bindings = SenderBindings::new();
         let meeting = MeetingKey::new("m-1");
-        bindings.bind(meeting.clone(), "participant-a", key(5));
-        bindings.bind(meeting.clone(), "participant-b", key(6));
+        bindings
+            .bind(meeting.clone(), "participant-a", "conn-a", key(5))
+            .expect("a free ordinal must bind");
 
-        bindings.unbind(&meeting, "participant-a");
+        let refused = bindings.bind(meeting.clone(), "participant-b", "conn-b", key(5));
 
-        assert_eq!(bindings.resolve(&meeting, "participant-a"), None);
-        assert_eq!(bindings.resolve(&meeting, "participant-b"), Some(key(6)));
+        assert_eq!(
+            refused,
+            Err(BindConflict::HeldByAnotherParticipant),
+            "a second participant claiming a held ordinal must be refused, not accepted"
+        );
+        assert_eq!(
+            bindings.holder_of(&meeting, key(5)),
+            Some("participant-a".to_string()),
+            "INCUMBENT WINS: the refusal must leave the incumbent's binding exactly as it was. \
+             A refusal that also clears or overwrites the entry would deny both participants"
+        );
     }
 
     #[test]
-    fn a_participant_bound_in_one_meeting_does_not_resolve_in_another() {
-        // Same cross-tenant property as the subscriber registry, and the reason
-        // the key is the composite `(MeetingKey, participant_id)` rather than
-        // the participant id alone: a participant id is globally unique today,
-        // but the SENDER ORDINAL it maps to is per-meeting, so a global map
-        // would hand meeting B's forward path an ordinal minted in meeting A.
-        //
-        // This mechanism has no production writer yet — the control-plane field
-        // that supplies it is owed — so this test is what makes it trustworthy
-        // at the moment it IS wired, rather than one more thing to verify then.
+    fn the_same_participant_reconnecting_takes_over_its_own_ordinal() {
+        // Self-collision crosses no media between participants, so it is not an
+        // anomaly and must not be refused — a reconnect would otherwise be
+        // permanently unable to start media until the old connection tore down.
+        let bindings = SenderBindings::new();
+        let meeting = MeetingKey::new("m-1");
+        bindings
+            .bind(meeting.clone(), "participant-a", "conn-1", key(5))
+            .expect("a free ordinal must bind");
+
+        bindings
+            .bind(meeting.clone(), "participant-a", "conn-2", key(5))
+            .expect("the same participant reconnecting must not be treated as a collision");
+
+        assert_eq!(
+            bindings.holder_of(&meeting, key(5)),
+            Some("participant-a".to_string())
+        );
+    }
+
+    #[test]
+    fn unbinding_releases_the_ordinal_for_another_participant() {
+        let bindings = SenderBindings::new();
+        let meeting = MeetingKey::new("m-1");
+        bindings
+            .bind(meeting.clone(), "participant-a", "conn-a", key(5))
+            .expect("a free ordinal must bind");
+
+        bindings.unbind(&meeting, key(5), "conn-a");
+
+        assert_eq!(bindings.holder_of(&meeting, key(5)), None);
+        bindings
+            .bind(meeting.clone(), "participant-b", "conn-b", key(5))
+            .expect("a released ordinal must be claimable again");
+    }
+
+    #[test]
+    fn a_superseded_connection_teardown_does_not_clear_the_live_binding() {
+        // The control-about-a-control case. `conn-1` is superseded by `conn-2`
+        // for the same participant; when `conn-1` finally tears down it must NOT
+        // release the ordinal, because `conn-2` is still using it. A
+        // clear-anyway unbind does not break `conn-2`'s running session — the
+        // session holds its own `SenderId` — it silently frees the ordinal for
+        // the uniqueness check, so the collision guard goes quiet rather than
+        // anything visibly failing. That is why this is a test and not a comment.
+        let bindings = SenderBindings::new();
+        let meeting = MeetingKey::new("m-1");
+        bindings
+            .bind(meeting.clone(), "participant-a", "conn-1", key(5))
+            .expect("a free ordinal must bind");
+        bindings
+            .bind(meeting.clone(), "participant-a", "conn-2", key(5))
+            .expect("the same participant reconnecting must not be treated as a collision");
+
+        bindings.unbind(&meeting, key(5), "conn-1");
+
+        assert_eq!(
+            bindings.holder_of(&meeting, key(5)),
+            Some("participant-a".to_string()),
+            "a superseded connection must not release an ordinal it no longer holds"
+        );
+        assert_eq!(
+            bindings.bind(meeting.clone(), "participant-b", "conn-b", key(5)),
+            Err(BindConflict::HeldByAnotherParticipant),
+            "the uniqueness guard must still be armed after the superseded teardown — this is \
+             the assertion that fails if `unbind` clears unconditionally"
+        );
+    }
+
+    #[test]
+    fn one_ordinal_is_held_independently_in_two_meetings() {
+        // Sender ids are per-meeting ordinals (`internal.proto`): ordinal 5
+        // exists concurrently in every meeting on this handler. A collision in
+        // meeting A must say nothing about meeting B — a registry keyed on the
+        // ordinal alone would refuse legitimate bindings AND, keyed the other
+        // way, would let meeting B's forward path resolve an ordinal minted in
+        // meeting A.
         let bindings = SenderBindings::new();
         let meeting_a = MeetingKey::new("meeting-a");
         let meeting_b = MeetingKey::new("meeting-b");
-        bindings.bind(meeting_a.clone(), "participant-a", key(5));
 
-        assert_eq!(bindings.resolve(&meeting_a, "participant-a"), Some(key(5)));
+        bindings
+            .bind(meeting_a.clone(), "participant-a", "conn-a", key(5))
+            .expect("a free ordinal must bind");
+        bindings
+            .bind(meeting_b.clone(), "participant-b", "conn-b", key(5))
+            .expect("the same ordinal in a DIFFERENT meeting is not a collision");
+
         assert_eq!(
-            bindings.resolve(&meeting_b, "participant-a"),
-            None,
-            "a binding is meeting-scoped; resolving it in another meeting would hand that \
-             meeting's forward path an ordinal minted somewhere else"
+            bindings.holder_of(&meeting_a, key(5)),
+            Some("participant-a".to_string())
+        );
+        assert_eq!(
+            bindings.holder_of(&meeting_b, key(5)),
+            Some("participant-b".to_string()),
+            "each meeting holds its own ordinal 5; conflating them is cross-tenant leakage"
         );
     }
 }

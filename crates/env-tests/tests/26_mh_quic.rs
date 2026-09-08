@@ -24,9 +24,21 @@
 //!    unregistered for a real meeting; (c) shortening the timeout requires
 //!    infra changes that would create a dev-vs-prod behavioral gap.
 //! 7. `test_mh_forwards_an_audio_datagram_back_to_its_sender` — R-15/R-18
-//!    loopback forward path. `#[ignore]`d: blocked on MH's `sender_id` ->
-//!    connection binding, which no contract carries yet. Authoritative
-//!    coverage at component tier:
+//!    loopback forward path, `#[ignore]`d pending story tasks 25 and 26 (the
+//!    reason is on the attribute). It proves COMPOSITION: real MC join programs
+//!    real MH, MC's `NotifyParticipantConnectedResponse` carries an ordinal MH
+//!    accepts, and a real v2 frame returns over real QUIC rewritten only in its
+//!    relay region. **The binding contract it depends on has LANDED and is not
+//!    what blocks it**: task 24 shipped
+//!    `NotifyParticipantConnectedResponse.sender_id`, MC's send side and MH's
+//!    receive side, verified live (`resolved` x4, `started` x4). What blocks it
+//!    is (25) client steering being decoupled from edge placement and (26) an
+//!    MH datagram receive-path gap; un-ignoring it is task 26's definition of
+//!    done, and `docs/TODO.md`'s R-15 entry is the durable record. Being a
+//!    single-participant loopback it CANNOT prove the binding is the right one
+//!    — see its own doc comment. That is
+//!    `crates/mh-service/tests/media_session_binding_integration.rs`
+//!    (two participants, two meetings); forward-path mechanics stay in
 //!    `crates/mh-service/tests/media_forward_integration.rs`.
 //! 9. `test_mc_programs_live_handler_with_confirmed_forwarding_policy` —
 //!    `mc_media_policy_pushes_total{outcome="match"}` delta >= 1 after a real
@@ -1272,36 +1284,70 @@ async fn policy_apply_counter(prom: &PrometheusClient, outcome: &str) -> Instanc
 /// R-15: a client's uplink audio datagram comes back to it, rewritten only in
 /// the relay region, purely from MC-pushed policy.
 ///
-/// # `#[ignore]`d, and exactly why — this is NOT a flake quarantine
+/// # This is R-15's composition proof, and it is NOT the injection proof
 ///
-/// Same shape as the R-33 #6 stub above: the scenario cannot run here yet, the
-/// reason is structural, and the authoritative coverage at another tier is
-/// named. **MH has no `sender_id` -> live-connection binding**, and no contract
-/// in the tree carries one: the meeting JWT has no sender field,
-/// `internal.proto`'s `RegisterMeetingRequest` carries `sender_id` with no
-/// `participant_id` anywhere, `NotifyConnectedResponse` is `{acknowledged}`,
-/// and `MhConnectRequest` carries only `join_token`. Every remaining route is
-/// client-asserted and therefore a cross-participant injection primitive, so MH
-/// declines to start its forward path rather than guessing an ordinal — see
-/// `mh_service::session::SenderBindings` and `docs/TODO.md` §Media Path
-/// Obligations for the owed contract field.
+/// Read what this test can and cannot fail on before treating its green as
+/// coverage. It is a **single-participant loopback**, which is the one
+/// configuration in which a wrong binding is invisible: with exactly one sender
+/// in the meeting, "bind the ordinal MC actually named", "bind the only ordinal
+/// in the pushed policy" and "bind a hardcoded 1" all produce byte-identical
+/// output. The `stream_id` assertion below is degenerate for the same reason —
+/// the subscriber's own receive slot coincides with MC's `MAIN_AUDIO_SLOT_ID`,
+/// so `0` is what a correct relay AND several incorrect ones write.
 ///
-/// **Authoritative coverage today, at component tier**, over the same code with
-/// the binding supplied directly:
-/// `crates/mh-service/tests/media_forward_integration.rs` —
-/// `only_the_relay_region_changes_and_every_other_byte_survives` (frames in
-/// equals frames out, publisher region / payload / signature byte-identical),
-/// `the_hop_sequence_advances_per_media_stream_not_per_connection`, and the
-/// fail-closed trio. What this env-test adds that those cannot is composition:
-/// that the real MC join programs the real MH, and that the real QUIC datagram
-/// path carries a real v2 frame.
+/// What this test uniquely proves is **composition**: that the real MC join
+/// programs the real MH, that MC's `NotifyParticipantConnectedResponse` carries
+/// an ordinal MH accepts, and that the real QUIC datagram path carries a real v2
+/// frame back rewritten only in its relay region. That is R-15, and no
+/// component-tier test can supply it.
 ///
-/// **Un-ignore by deleting the attribute** once the binding lands — that
-/// deletion is part of the definition-of-done of the spun-out sender-binding
-/// devloop, not an optional follow-up, so the `#[ignore]` cannot outlive the gap
-/// it waits on. The ordering gate and the fixture need no change; whoever
-/// un-ignores it should re-read the assertions against MC's assignment as it
-/// stands then, rather than assume they are final.
+/// **What proves the binding is the RIGHT one** is at component tier, where two
+/// participants and two meetings can be driven:
+/// `crates/mh-service/tests/media_session_binding_integration.rs` —
+/// `two_participants_in_one_meeting_each_bind_their_own_ordinal` (per-participant
+/// correspondence, which mere distinctness would not catch) and
+/// `one_participant_id_in_two_meetings_binds_per_meeting_ordinals` (the
+/// cross-tenant arm). Both were run against deliberately wrong bindings and
+/// observed to fail before being believed. Forward-path mechanics —
+/// relay-region-only rewrite, hop sequencing, the fail-closed trio — remain in
+/// `crates/mh-service/tests/media_forward_integration.rs`.
+///
+/// # Why it is still `#[ignore]`d, and what that does NOT mean
+///
+/// The `#[ignore]` this test carried is **no longer waiting on the contract
+/// field**: task 24 landed `internal.proto`
+/// `NotifyParticipantConnectedResponse.sender_id`, MC's send side and MH's
+/// receive side, and the live cluster shows the binding working end to end
+/// (`resolved` x4 → `started` x4, with the fail-closed arm counted
+/// `participant_unknown` x1 → `declined_no_sender_binding` x1). Two later,
+/// separately-owned defects keep it red, both diagnosed at task 24's escalation
+/// (`docs/devloop-outputs/2026-09-05-sender-id-binding-contract/main.md`
+/// §Resume third session, §Gate 2 Attempt 3):
+///
+/// - **Story task 25 (meeting-controller)** — steering and placement use
+///   different orderings. `edge_handler` puts every edge on the
+///   lexicographically smallest shared handler (`shared.sort();
+///   shared.first()`, `crates/mc-service/src/media_routing/assignment.rs:269-280`),
+///   while `media_servers` is built in unsorted Redis order
+///   (`crates/mc-service/src/webtransport/connection.rs:2251-2258`) and this
+///   test takes `.first()`. On the cluster three of four media connections
+///   landed on mh-1 while every edge sat on mh-0. The ordering gate below is
+///   instance-agnostic (`poll_until_any_instance_above`), so mh-0
+///   applying a policy satisfies it for a client connected to mh-1 — which is
+///   why the mismatch presents as a silent 15s timeout rather than a race.
+/// - **Story task 26 (media-handler)** — the datagram receive path. With the
+///   session started and a policy installed, `mh_media_frames_forwarded_total`
+///   is 0 **and every** `mh_media_frames_dropped_total{reason}` series is 0 on
+///   both instances, so datagrams are not reaching the routing lookup at all.
+///
+/// **Deleting this `#[ignore]` and this test passing is task 26's stated
+/// definition of done**; task 25's prompt says in terms to leave it `#[ignore]`d.
+/// The durable record is `docs/TODO.md`'s R-15 entry, which stays open until all
+/// four parts of its closure condition hold. Note also that the withdrawn
+/// root cause — "MC computes the assignment before the participant's media
+/// connection exists, so `edge_count: 0`" — is FALSE: `build_routing_input`
+/// chains the joiner on (`connection.rs:2321-2325`), N=1 yields a reflexive
+/// self-edge, and `edge_count: 0` on mh-1 is correct by design.
 ///
 /// # Ordering is gated on a metric delta, never a sleep
 ///
@@ -1310,9 +1356,18 @@ async fn policy_apply_counter(prom: &PrometheusClient, outcome: &str) -> Instanc
 /// delta: MH increments it only from the live snapshot after the apply, so the
 /// delta means the forward path reflects the generation MC sent.
 #[tokio::test]
-#[ignore = "blocked on MH's sender_id -> connection binding; no contract carries it (docs/TODO.md \
-            Media Path Obligations). Component-tier coverage: mh-service \
-            tests/media_forward_integration.rs"]
+#[ignore = "blocked on story tasks 25 + 26, NOT on the binding contract. Task 24 landed \
+            NotifyParticipantConnectedResponse.sender_id and the live cluster binds on it and \
+            starts the media session (resolved x4, started x4). Task 25 (meeting-controller): the \
+            client is steered to media_servers.first() in unsorted Redis order while edge_handler \
+            places every edge on the lexicographically smallest handler (mc-service \
+            media_routing/assignment.rs vs webtransport/connection.rs), and the ordering gate \
+            below is instance-agnostic, so the mismatch presents as a silent 15s timeout. Task 26 \
+            (media-handler): the MH datagram receive-path gap - mh_media_frames_forwarded_total is \
+            0 AND every mh_media_frames_dropped_total{reason} series is 0 on both instances, so \
+            datagrams never reach the routing lookup. Deleting this attribute and this test \
+            passing is task 26's definition of done; the durable record is docs/TODO.md's R-15 \
+            entry, which stays open. See this test's own doc comment for the file:line anchors"]
 #[serial_test::serial(mh_notifications)]
 async fn test_mh_forwards_an_audio_datagram_back_to_its_sender() {
     let cluster = cluster().await;

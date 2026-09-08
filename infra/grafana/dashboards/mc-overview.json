@@ -4395,12 +4395,105 @@
       "type": "stat"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Whether MC could resolve a participant's sender_id for the Media Handler that asked, and if not why (ADR-0036 §2, §4; R-15). Increments once per NotifyParticipantConnected RESPONSE MC emits. READ THIS BEFORE COMPARING WITH MH: MH sees only sender_id==0 and structurally cannot tell the four unresolved outcomes apart - its declined_no_sender_binding is the UNION of all four. This panel is the only place the split exists, and the outcomes triage differently: meeting_unknown is a routing/registration fault whose remedy is in the MC-MH registration path; participant_unknown is an expected low-rate race between MH's connect notification and MC's join completing; registry_full is the per-meeting connection cap declining to hand out a binding for a connection MC is not tracking - its remedy is capacity, not a lifecycle investigation; user_ambiguous is one user with two roster entries for one sub, which NEVER self-clears and which RECONNECTING CAUSES - so the participant_unknown remedy (reconnect) is actively HARMFUL here and there is no operator remedy (full triage in mh-incident-response.md Scenario 15 Step 2). THE sender_id VALUE IS NEVER A LABEL (ADR-0036 §11): outcome carries the triage signal as a bounded token instead of 65535 values. No meeting id, participant id or sender id appears as a label. DENOMINATOR NOTE: sum() over this metric equals mc_mh_notifications_received_total{event_type=\"connected\"} by construction - same path, same gate - so do not alert on both as if they were independent.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 179
+      },
+      "id": 63,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(mc_media_sender_binding_responses_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sender Binding Responses by Outcome",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 179
+        "y": 187
       },
       "id": 157,
       "panels": [],
@@ -4557,7 +4650,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 180
+        "y": 188
       },
       "id": 58,
       "options": {
@@ -4696,7 +4789,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 180
+        "y": 188
       },
       "id": 59,
       "options": {
@@ -4880,7 +4973,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 188
+        "y": 196
       },
       "id": 60,
       "options": {
@@ -4989,7 +5082,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 188
+        "y": 196
       },
       "id": 61,
       "options": {
@@ -5169,7 +5262,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 196
+        "y": 204
       },
       "id": 62,
       "options": {

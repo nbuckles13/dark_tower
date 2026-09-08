@@ -39,6 +39,27 @@ kubectl apply -k infra/kubernetes/overlays/kind/services/mh-service/
 
 Pre-deployment checks: GC reachable, MC reachable, JWKS endpoint reachable, MH WebTransport TLS secret provisioned. Post-rollout, run the post-deploy monitoring checklist below.
 
+> **STOP — DEPLOY ORDER IS FORCED. MC FIRST, THEN MH.** Since
+> `NotifyParticipantConnectedResponse` gained `sender_id`, a new MH against an
+> old MC **declines every media session**: a total media outage for the skew
+> window, not a degradation. **"MC reachable" above does not cover this** — an
+> mc-service running a pre-contract image is perfectly reachable and answers
+> every RPC successfully. Confirm MC is running a build that sets the field
+> before applying MH:
+>
+> ```promql
+> # Must return a series. Absent ⇒ MC predates the contract ⇒ DO NOT DEPLOY MH.
+> mc_media_sender_binding_responses_total
+> ```
+>
+> Absence is only meaningful once you have confirmed MC exports *anything*
+> (`up{job="mc-service"}`), or an unreachable `/metrics` reads as version skew.
+> Full statement, and the reverse constraint for rollback (**MH first, then
+> MC**), in [§Cross-service ordering](#cross-service-ordering-mc-and-mh-are-coupled-by-the-sender_id-binding-contract)
+> below. It is stated there under Rollback because that is where the sibling
+> `no_applied_generation` carve-out lives; it is repeated here because a forward
+> deploy never reaches that section.
+
 ---
 
 ## Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination
@@ -105,6 +126,32 @@ sum(rate(mh_mc_notifications_total{status="success"}[5m]))
 /
 sum(rate(mh_mc_notifications_total[5m]))
 
+# Media sessions that actually STARTED in the bake window (target: >0 once
+# test traffic flows). THIS IS THE POSITIVE CONTROL FOR THE BINDING CONTRACT
+# AND IT IS THE ONLY GATE IN THIS FILE A VERSION SKEW CAN FAIL.
+#
+# Every other gate here is green during a total media blackout: handshakes
+# succeed, JWTs validate, RegisterMeeting does not time out, policy applies,
+# connections are accepted and held. The failure is AFTER all of them.
+sum(increase(mh_media_session_starts_total{outcome="started"}[30m]))
+
+# Media-session decline share (gate: < 0.20). Reuses the ratified R-60 figure
+# rather than inventing one, and is the same number MHMediaSessionDeclineRate
+# fires on, so the gate and the alert cannot drift apart.
+#
+# clamp_min guards the no-traffic case exactly as the R-60 query below does:
+# 0/1 = 0 passes, because no traffic is not a failure.
+#
+# mh_mc_notifications_total CANNOT SUBSTITUTE FOR THIS GATE, and the reason is
+# the whole point of the two queries above. An mc-service image predating the
+# sender_id field answers `acknowledged: true, sender_id: 0` — the RPC
+# SUCCEEDS. The delivery gate reads 100% while every media session declines.
+# Same "receipt is not application" shape as the policy-applies gate above,
+# one contract layer further on: DELIVERY IS NOT BINDING.
+sum(increase(mh_media_session_starts_total{outcome!="started"}[30m]))
+/
+clamp_min(sum(increase(mh_media_session_starts_total[30m])), 1)
+
 # Active connections across all MH pods (target: >0 once traffic flows)
 sum(mh_active_connections)
 
@@ -132,9 +179,11 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 - [ ] `mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}` increase over 30m = 0 (forwarding policy actually took effect — **receipt is not application**; the `mc_register_meeting_total` gate below cannot see this). `no_generation` is excluded and is the expected value until story task 13.
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
+- [ ] `mh_media_session_starts_total{outcome="started"}` increase over 30m **> 0** once test traffic is flowing (**the binding contract works end to end on this build**). This is the only gate in this checklist a MC/MH version skew can fail — every other one is green throughout a total media blackout. If it is zero while connections are being accepted, **stop and read the decline-share gate below before proceeding**; do not sign the deploy off on the other nine.
+- [ ] `mh_media_session_starts_total` **decline share < 0.20** over 30m (run the query above). Breach ⇒ break down by `outcome` and follow `mh-incident-response.md` §Scenario 15, which partitions on *which service to open* before the label is read. **`mh_mc_notifications_total{status="success"}` above cannot cover this**: an MC image predating the `sender_id` field answers `acknowledged: true, sender_id: 0`, so delivery succeeds at 100% while every session declines.
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
 - [ ] `mc_participant_mh_status_total` **failed-share < 0.20** over 30m (R-60 client→MH media-plane health; run the canonical ratio query above). A breach means clients are reaching MC signaling but failing the MH media connection — triage per `mc-incident-response.md` §"Scenario 11: Media Connection Failures".
-- [ ] No new MH alerts firing: `MHHighJwtValidationFailures`, `MHHighWebTransportRejections`, `MHWebTransportHandshakeSlow`
+- [ ] No new MH alerts firing: `MHHighJwtValidationFailures`, `MHHighWebTransportRejections`, `MHWebTransportHandshakeSlow`, `MHMediaSessionDeclineRate`, `MHMediaSenderBindingOutOfRange`, `MHMediaSenderBindingConflict`. The last two fire on a **single occurrence** (no `for:` debounce — steady state is zero forever), so a tick against them means something; the first three are ratio alerts and need a sustained breach.
 - [ ] No new MC alerts firing: `MCMediaConnectionAllFailed` (pages at >0.80 failed-share for 5m — the media-plane paging line above the 0.20 gate)
 
 ### 2-hour check
@@ -245,6 +294,16 @@ Trigger an immediate rollback if any of the following hold (verbatim from user s
 
 - `mh_webtransport_connections_total` non-accepted ratio > 10% sustained for 10 minutes. The `and sum(rate(...)) > 0` guard prevents phantom rollbacks when there is no traffic (without it, a single rejected connection during low-traffic periods would compute `A / 0 = +Inf > 0.10` and fire). Mirrors the pattern at `infra/docker/prometheus/rules/mh-alerts.yaml § "MHHighWebTransportRejections"`.
 
+  > **READ THIS BEFORE ACTING ON THIS CRITERION. It has a cause for which rolling MH back is the WRONG action, and the rollback will look like it worked.**
+  >
+  > This matcher is `{status!="accepted"}`, which is **wider than the alert it mirrors** — `MHHighWebTransportRejections` matches `{status="rejected"}` only. The extra bucket is `error`, and since the `sender_id` binding contract landed, a **declined media session is a deliberate, fail-closed, counted refusal** that MH is *supposed* to perform. Check `mh_media_session_starts_total{outcome="declined_mc_unavailable"}` **before** rolling back:
+  >
+  > - **Climbing ⇒ the fault is MC, and this criterion is reporting MH doing its job.** Rolling MH back removes the component that reports the problem: declines stop, the ratio recovers, this criterion goes green, and **media is still dead with every panel healthy.** The rollback *self-certifies*. Fix MC; leave MH forward.
+  > - **Flat, with `declined_no_sender_binding` climbing instead ⇒ version skew**, MH new against an old MC. Rolling MH back *is* correct here — but so is rolling MC forward, and §Cross-service ordering is the authority on which.
+  > - **Both flat ⇒ a genuine capacity, TLS or listener fault.** This criterion means what it always meant; roll back.
+  >
+  > **The general hazard, stated because the next signal routed into a rollback gate will have it too**: a gate whose remedy removes the reporter cannot distinguish "fixed" from "silenced". Whenever a fail-closed, deliberately-counted outcome feeds an automatic rollback rule, the rule inverts under exactly the fault it exists to catch. Ask what the *absence* of the signal would mean after the remedy, not just what its presence means now.
+
   ```promql
   (
     sum(rate(mh_webtransport_connections_total{status!="accepted"}[10m]))
@@ -265,6 +324,18 @@ Trigger an immediate rollback if any of the following hold (verbatim from user s
   ) > 0.20
   and
   sum(rate(mh_jwt_validations_total[5m])) > 0
+  ```
+
+- `mh_media_session_starts_total` decline share > 20% sustained for 10 minutes. **This is the only rollback criterion a MC/MH version skew trips**; the three above are green throughout a total media blackout. Same 0.20 as the 30-minute gate and as `MHMediaSessionDeclineRate`, so all three move together. Triage per the note on the first criterion above **before** acting — a decline share can mean "roll MH back" (skew) or "do NOT roll MH back, fix MC" (MC outage), and the `outcome` breakdown is the only thing that separates them.
+
+  ```promql
+  (
+    sum(rate(mh_media_session_starts_total{outcome!="started"}[10m]))
+    /
+    sum(rate(mh_media_session_starts_total[10m]))
+  ) > 0.20
+  and
+  sum(rate(mh_media_session_starts_total[10m])) > 0
   ```
 
 - Any `mh_register_meeting_timeouts_total` increment, sustained for 10 minutes (i.e. timeouts are continuing to fire — not a single transient blip). `sum(increase(...))` aggregates across pods so a per-pod label split in the future doesn't change behavior:
@@ -293,6 +364,83 @@ kubectl rollout undo deployment/mh-1 -n dark-tower
 # No data migration or auth-state cleanup is required to roll back; this is a
 # pure binary replacement.
 ```
+
+#### Cross-service ordering: MC and MH are coupled by the sender_id binding contract
+
+Since `NotifyParticipantConnectedResponse` gained `sender_id`, **MC and MH are a
+two-sided contract and the deploy order is forced.** The field is a bare `uint32`,
+not `optional`, so an MC that does not set it is indistinguishable on the wire from
+an MC that answered `0` — and `0` is the reject value. That makes every skew
+fail-closed, which is correct, but it also makes it **total** rather than partial.
+
+- **Forward: MC FIRST, then MH.** A new MH against an old MC decodes the absent
+  field as `0` and **declines every media session**. That is a total media outage
+  for the skew window, not a degradation.
+- **Backward: MH FIRST, then MC.** The reverse order, for the same reason.
+
+> **DO NOT roll MC back alone after this contract has landed.** `kubectl rollout
+> undo deployment/mc-0` returns MC to a binary that never sets `sender_id`, so a
+> still-new MH declines **everything**. Rolling MC back is a **total media
+> blackout**, not a mitigation.
+>
+> This is the **second instance of one mechanism** in this runbook pair. The first
+> is the `no_applied_generation` carve-out in
+> [`mc-deployment.md`](mc-deployment.md) §"Post-Deploy Monitoring Checklist: MC↔MH
+> Coordination" — rolling MC back there returns it to `policy_generation: 0`
+> registrations, which MH installs nothing for. Same shape, same wrong instinct,
+> same remedy: **roll MH, not MC.** Both are recorded because a reader who has to
+> infer the second from the first at 3am will do the intuitive thing.
+
+**Symptom if you get the order wrong**: `mh_media_session_starts_total{outcome="declined_no_sender_binding"}`
+at ~100% of attempts, with `mc_media_sender_binding_responses_total` **absent** on
+MC (an MC image predating the contract does not export that series at all). See
+[`mh-incident-response.md` Scenario 15](mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding)
+Step 2.
+
+**In a devloop Kind cluster, a stale image on either side is the single most likely
+cause** of a `declined_no_sender_binding` spike — `dev-cluster rebuild-all` rebuilds
+and redeploys both, which is why the Layer-7 precondition uses it rather than
+patching one service.
+
+#### MH's media path now depends on MC's gRPC availability, and the wait is ~48s
+
+Since the participant → `sender_id` binding contract landed,
+`NotifyParticipantConnected` is a **blocking precondition** for a media session
+rather than a fire-and-forget ack: MC's response carries the ordinal MH binds the
+connection's media route to. When MC is unreachable, MH exhausts the MC client's
+retry budget before declining and closing the connection.
+
+The budget is `MC_CONNECT_TIMEOUT` 5s + `MC_RPC_TIMEOUT` 10s per attempt,
+`MAX_RETRY_ATTEMPTS` 3, with 1s and 2s backoff between them
+(`crates/mh-service/src/grpc/mc_client.rs`) — **~48s worst case**, plus bounded
+jitter before the close.
+
+**Do not shorten this to make connects fail faster.** It is functioning as an
+accidental **rate limiter on the reconnect herd**. Clients cannot yet tell a
+retryable close from a terminal one, so they retry on their own cadence against a
+down MC; cutting the budget to ~10s would multiply the retry rate roughly 5×
+against the service that is already the bottleneck. A fast fail is only correct
+once the client can back off, and **the deadline and the client-side close code are
+one decision, not two** — see `docs/TODO.md`. The jitter is the complementary
+control and acts on a different variable: it spreads the *phase* of each wave, it
+does not bound the *rate*.
+
+**What an operator sees during an MC outage.** Connections are accepted, held
+~48s, then closed. `mh_media_session_starts_total{outcome="declined_mc_unavailable"}`
+climbs — that is the positive signal, and it is the one to read;
+`mh_mc_notifications_total{event_type="connected",status="error"}` shows the same
+cause at *attempt* granularity (3 retries there = 1 decline here). Note the two
+known blind spots: connections sitting in the wait count against
+`MH_MAX_CONNECTIONS`, and the wait lands **after**
+`mh_webtransport_handshake_duration_seconds` is recorded, so **a 48s media-connect
+stall reads as a healthy sub-second handshake**. The second is filed rather than
+fixed — see `docs/TODO.md`.
+
+**A brief `declined_mc_unavailable` bump during an MC rolling deploy is expected**:
+MC gates readiness on `httpGet /ready` port 8081 while this call is gRPC on 50052,
+so a Ready-but-not-yet-serving window is normal. Sustained past the rollout is not.
+
+Full triage: [`mh-incident-response.md` Scenario 15](mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding).
 
 #### Rollback ordering: the image may roll back alone, the manifests may not
 

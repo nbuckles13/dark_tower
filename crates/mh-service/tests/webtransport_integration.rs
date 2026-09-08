@@ -72,7 +72,7 @@ use tokio::sync::mpsc;
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::jwks_rig::JwksRig;
-use test_common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer};
+use test_common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer, SenderReplies};
 use test_common::test_token_receiver;
 use test_common::tokens::{
     mint_expired_meeting_token, mint_meeting_token, mint_wrong_token_type_token,
@@ -545,7 +545,14 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
     // Stand up a mock MC that captures both notification payloads on channels.
     let (connect_tx, mut connect_rx) = mpsc::channel(4);
     let (disconnect_tx, mut disconnect_rx) = mpsc::channel(4);
+    // The mock must ANSWER with an ordinal: this test's subject is the
+    // client-initiated disconnect (`DISCONNECT_REASON_CLIENT_CLOSED`), which is
+    // only reachable once a media session actually started. `SenderReplies`
+    // answers 0 by default — MC has no answer — and that path closes the
+    // connection with `DISCONNECT_REASON_ERROR` instead, so leaving the default
+    // here would silently retarget the test at the decline path.
     let mock_mc = MockMcServer::new(MockBehavior::Accept)
+        .with_sender_replies(SenderReplies::default().with("user-notify", 9))
         .with_connected_tx(connect_tx)
         .with_disconnected_tx(disconnect_tx);
     let mc = start_mock_mc_server(mock_mc).await;

@@ -183,8 +183,8 @@ pub fn record_grpc_request(status: &str) {
 /// Record the outcome of an ADR-0036 §8 forwarding-policy apply.
 ///
 /// Metric: `mh_media_policy_applies_total`
-/// Labels: `outcome` (5 values, see [`PolicyApplyOutcome`]), `key_custody` (single value `operator`)
-/// Cardinality: 5
+/// Labels: `outcome` (the [`PolicyApplyOutcome`] variants — the compile-checked
+///   [`PolicyApplyOutcome::ALL`] is the count), `key_custody` (single value `operator`)
 ///
 /// Counts **registrations whose policy MH considered** — every terminal path
 /// from the first read of a policy-bearing field (`egress_streams`,
@@ -286,6 +286,213 @@ impl PolicyApplyOutcome {
             Self::NoGeneration => "no_generation",
             Self::RejectedInvalid => "rejected_invalid",
             Self::ApplyFailed => "apply_failed",
+        }
+    }
+}
+
+/// Record one connection's terminal media-session-start decision.
+///
+/// Metric: `mh_media_session_starts_total`
+/// Labels: `outcome` (the [`MediaSessionStartOutcome`] variants — the
+///   compile-checked [`MediaSessionStartOutcome::ALL`] is the count), `key_custody`
+///   (single value `operator`)
+///
+/// **Counts connections that ATTEMPTED to start a media session**, exactly once
+/// each, on every terminal path from the boundary onward. The boundary is: the
+/// connection passed the JWT gate and **entered the media-session start
+/// sequence**, whose first action is the MC-endpoint lookup. Pre-boundary
+/// rejects — JWT validation failure, WebTransport handshake failure, framing
+/// errors — land on `mh_jwt_validations_total` / `mh_webtransport_connections_total`
+/// alone and never touch this counter: "this caller's token is bad" and "MC could
+/// not name this participant's sender" have different owners.
+///
+/// **The boundary sits where it does deliberately, and one step later is the
+/// tempting simplification.** With the boundary at "MH issued the RPC", a meeting
+/// that was never registered on this handler would close every connection while
+/// incrementing only an undifferentiated `mh_webtransport_connections_total{status="error"}`
+/// and emitting a `warn!` — MH healthy, forwarding nothing, detectable only in
+/// logs. That is the exact failure shape this metric exists to close, reproduced
+/// one condition earlier.
+///
+/// **This is NOT a frame drop and must never be folded into
+/// `mh_media_frames_dropped_total`.** No frame was dropped. The catalog defines
+/// `forwarded + dropped = attempts`; a decline counted as a drop puts a non-frame
+/// event in the drop-rate numerator and corrupts the denominator identity. The
+/// two counters have disjoint units — sessions here, frames there.
+///
+/// The label key is `outcome`, not `status`, for the same reason as
+/// [`record_media_policy_apply`]: `status` is `label-taxonomy.md`'s coarse,
+/// fleet-wide classification, and this is a metric-local taxonomy in which each
+/// value names a distinct remedy.
+///
+/// Emits no `sender_id`, no `participant_id`, no `meeting_id` and no connection
+/// identity (ADR-0036 §11). `outcome` is the only variable label.
+pub fn record_media_session_start(outcome: MediaSessionStartOutcome) {
+    counter!(
+        "mh_media_session_starts_total",
+        "outcome" => outcome.as_label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Bounded `outcome` label values for `mh_media_session_starts_total`.
+///
+/// An enum rather than a free `&str` so the label set is closed at the type
+/// level, exactly as [`PolicyApplyOutcome`] is: a typo or a seventh value is a
+/// compile error, not a new time series discovered in production.
+///
+/// Each value exists because its **remedy differs**, which is the test for
+/// whether a bounded outcome label is doing any work. Ordered health-first, then
+/// the three MC-allocator faults grouped, then the two MC-reachability faults;
+/// the catalog table and the dashboard legend use the same order so the three
+/// artefacts read alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSessionStartOutcome {
+    /// The binding was installed and the three media loops were spawned.
+    ///
+    /// **Means the loops were spawned, not that media flowed.** It is measured
+    /// strictly upstream of `mh_media_frames_forwarded_total`, and that gap is
+    /// the point: `started` climbing while ingress frames stay flat at zero is
+    /// the discriminator for "sessions start but no uplink arrives", which is a
+    /// client-side condition rather than an MH one.
+    Started,
+    /// MC answered with no usable `sender_id`.
+    ///
+    /// Under the bare-`uint32` field, absent and `0` are one observable, so this
+    /// value deliberately does **not** claim which cause — the same two-eras,
+    /// one-value shape as [`PolicyApplyOutcome::NoGeneration`], and no rename is
+    /// needed if explicit presence is ever reintroduced.
+    ///
+    /// It is the **union of MC's four unresolved outcomes**
+    /// (`mc_media_sender_binding_responses_total{outcome}` in
+    /// `meeting_unknown`, `participant_unknown`, `registry_full`,
+    /// `user_ambiguous`); all four answer the wire value `0`, and MH sees only
+    /// that `0` and structurally cannot reconstruct which produced it. The split
+    /// lives on MC's counter, not here — read it there when this rate moves.
+    /// Note in particular that `registry_full` (MC's per-meeting connection
+    /// registry at capacity) presents as an elevated-but-flat rate, so an
+    /// increase in this MH-side value must not be characterised as a race.
+    DeclinedNoSenderBinding,
+    /// MC answered above the 16-bit key-id field.
+    ///
+    /// **Should read zero forever.** MC's allocator is bounded and `SenderId`
+    /// wraps a `NonZeroU16`, so MC structurally cannot produce this: if it moves,
+    /// the candidates are field corruption in transit or a mis-versioned or
+    /// foreign peer answering. MC's allocator **range**.
+    DeclinedSenderBindingOutOfRange,
+    /// The `sender_id` MC returned is already bound to a **different**
+    /// participant in that meeting, so MH refused rather than overwrote.
+    ///
+    /// **Should read zero forever.** Distinct from
+    /// [`Self::DeclinedSenderBindingOutOfRange`] in cause — that is MC's
+    /// allocator *range*, this is its *uniqueness / non-recycling* — and in
+    /// consequence: this is the only decline where the binding MH refused could
+    /// have crossed media between participants had it been accepted. The refusal
+    /// is the control.
+    ///
+    /// **Two candidate causes and MH cannot tell them apart**: MC allocated one
+    /// live ordinal to two participants, or MH did not unbind the previous holder
+    /// on teardown. It is therefore the only value in this set with an MH-side
+    /// first move; every other decline points upstream.
+    ///
+    /// Counts the **refused newcomer**, exactly once. The incumbent connection is
+    /// untouched and increments nothing.
+    DeclinedSenderBindingConflict,
+    /// The RPC reached MC (or the network) and yielded no usable response —
+    /// timeout, transport failure, or a non-auth error status — after the MC
+    /// client's retries.
+    ///
+    /// MC availability or the network between them. **Not** a credential
+    /// rejection, which is [`Self::DeclinedMcAuthRejected`]: MC refusing MH's
+    /// token means MC is reachable and healthy, and reporting that as
+    /// unavailability sends a responder to the wrong service. Read with
+    /// `mh_mc_notifications_total{event_type="connected",status="error"}`, which
+    /// is the **attempt**-level view of the same cause: one connection with three
+    /// retries is three there and one here.
+    ///
+    /// Declines only after the whole retry budget, which is what distinguishes it
+    /// live from the two fast-declining reachability outcomes.
+    DeclinedMcUnavailable,
+    /// MH's outbound credential failed — MC **refused** it
+    /// (`UNAUTHENTICATED` / `PERMISSION_DENIED`), or MH could not **build** one.
+    ///
+    /// **MH's outbound auth, not MC's health** — in both routes MC may be
+    /// entirely well; in the build route MH never even sent a request.
+    ///
+    /// The two are separated by a **log line**, not a counter: the build route
+    /// is the only emitter of `"Authorization header parse failed"` **on target
+    /// `mh.grpc.mc_client`**. The target qualifier is load-bearing, not
+    /// decoration — `grpc::gc_client` emits the identical message on
+    /// `mh.grpc.gc_client`, in the same process, off the same
+    /// `TokenReceiver`, so an unqualified match fails OPEN: it hits under this
+    /// very fault (both clients fail to build at once, so it is right for the
+    /// wrong reason) and it also hits when a GC-path parse failure coincides
+    /// with a genuine refusal, producing a confident wrong verdict.
+    /// `mh_token_refresh_failures_total` is context for
+    /// both and separates neither — a refresh can succeed and return a token MH
+    /// cannot put on the wire, and a refresh can fail while the previously
+    /// cached token still builds fine.
+    ///
+    /// More reachable than either allocator-fault value: an expired MH service
+    /// token or a JWKS rotation fires this for **every connection on the handler
+    /// at once** — precisely when someone is reading this label under pressure,
+    /// and precisely when being told "MC is down" costs the most time.
+    ///
+    /// **The two routes differ in timing and the value does not claim
+    /// otherwise**: a refusal is terminal and declines immediately, while a
+    /// build failure is retried, because the token comes from a watch channel
+    /// and a refresh landing mid-budget can genuinely fix it. So this value is
+    /// *usually* fast but not always, and it must not be used as a timing
+    /// discriminator on its own.
+    DeclinedMcAuthRejected,
+    /// MH holds no MC endpoint for this meeting, so it never asked.
+    ///
+    /// **Should read at or near zero** — the meeting should have been registered
+    /// on this handler before any connection for it was accepted. A registration
+    /// fault, not a reachability one: distinct from [`Self::DeclinedMcUnavailable`]
+    /// because there MH knew where MC was and got no usable answer, and here it
+    /// never knew.
+    DeclinedMcEndpointUnknown,
+}
+
+impl MediaSessionStartOutcome {
+    /// Every value of this enum, in catalog order.
+    ///
+    /// The one hand-maintained list, for the reason spelled out on
+    /// [`PolicyApplyOutcome::ALL`]: `as_label`'s wildcard-free `match` is the
+    /// only thing a new variant forces an update to, and every *enumeration* of
+    /// the variants elsewhere would compile clean while staying silently short.
+    /// Every consumer — the recorder tests, the cardinality test and the
+    /// integration label assertions — iterates this slice.
+    ///
+    /// The length is written out rather than inferred: it is the catalogued
+    /// cardinality of the `outcome` label, so a variant added here without the
+    /// catalog and the dashboard being revisited fails to compile first.
+    pub const ALL: [Self; 7] = [
+        Self::Started,
+        Self::DeclinedNoSenderBinding,
+        Self::DeclinedSenderBindingOutOfRange,
+        Self::DeclinedSenderBindingConflict,
+        Self::DeclinedMcUnavailable,
+        Self::DeclinedMcAuthRejected,
+        Self::DeclinedMcEndpointUnknown,
+    ];
+
+    /// The wire label value.
+    ///
+    /// The decline tokens spell `sender_binding` rather than `sender_id` so an
+    /// auditor grepping metric code for `sender_id` gets no false hit to triage.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::DeclinedNoSenderBinding => "declined_no_sender_binding",
+            Self::DeclinedSenderBindingOutOfRange => "declined_sender_binding_out_of_range",
+            Self::DeclinedSenderBindingConflict => "declined_sender_binding_conflict",
+            Self::DeclinedMcUnavailable => "declined_mc_unavailable",
+            Self::DeclinedMcAuthRejected => "declined_mc_auth_rejected",
+            Self::DeclinedMcEndpointUnknown => "declined_mc_endpoint_unknown",
         }
     }
 }
@@ -880,6 +1087,7 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::MhError;
 
     // Note: These tests execute the metric recording functions to ensure code coverage.
     // The metrics crate will record to a global no-op recorder if none is installed,
@@ -942,6 +1150,64 @@ mod tests {
     fn test_record_media_policy_apply_covers_every_outcome() {
         for outcome in PolicyApplyOutcome::ALL {
             record_media_policy_apply(outcome);
+        }
+    }
+
+    #[test]
+    fn test_record_media_session_start_covers_every_outcome() {
+        for outcome in MediaSessionStartOutcome::ALL {
+            record_media_session_start(outcome);
+        }
+    }
+
+    #[test]
+    fn media_session_start_outcome_labels_are_distinct_and_stable() {
+        let labels: Vec<&str> = MediaSessionStartOutcome::ALL
+            .iter()
+            .map(|o| o.as_label())
+            .collect();
+        // Same split as the policy-apply test above: the expected side is the
+        // wire contract and is spelled out, the variant set is iterated. A test
+        // that derived both sides from `as_label` would assert nothing.
+        assert_eq!(
+            labels,
+            [
+                "started",
+                "declined_no_sender_binding",
+                "declined_sender_binding_out_of_range",
+                "declined_sender_binding_conflict",
+                "declined_mc_unavailable",
+                "declined_mc_auth_rejected",
+                "declined_mc_endpoint_unknown"
+            ],
+            "outcome label values are wire-visible; a rename silently breaks every dashboard and alert selecting on them"
+        );
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "outcome labels must be distinct"
+        );
+    }
+
+    /// ADR-0036 §11: no per-participant identity may reach a metric label.
+    ///
+    /// The token spellings deliberately say `sender_binding` rather than
+    /// `sender_id` so an auditor grepping metric code for the identifier gets no
+    /// false hit. That is a convention, and a convention nothing checks is a
+    /// comment — so it is checked here, over `ALL` rather than a hand-listed set.
+    #[test]
+    fn media_session_start_outcome_labels_name_no_identity() {
+        for outcome in MediaSessionStartOutcome::ALL {
+            let label = outcome.as_label();
+            for barred in ["sender_id", "participant", "meeting", "connection"] {
+                assert!(
+                    !label.contains(barred),
+                    "outcome label {label:?} names {barred:?}; ADR-0036 §11 keeps participant and \
+                     stream identity out of labels, and the decline tokens spell `sender_binding` \
+                     precisely so a `sender_id` audit grep stays clean"
+                );
+            }
         }
     }
 
@@ -1055,17 +1321,44 @@ mod tests {
             record_media_policy_apply(outcome);
         }
 
-        // Verify error_type labels are bounded by MhError variants
-        let valid_error_types = [
-            "grpc",
-            "not_registered",
-            "config",
-            "internal",
-            "token_acquisition",
-            "token_timeout",
+        // Likewise for the media-session-start `outcome` label, bounded by
+        // `MediaSessionStartOutcome::ALL`; `key_custody` is a compile-time const
+        // with a single permitted value, so it multiplies nothing.
+        for outcome in MediaSessionStartOutcome::ALL {
+            record_media_session_start(outcome);
+        }
+
+        // Verify `error_type` labels are bounded — DERIVED from the enum, not a
+        // hand-typed list. The previous hand-list was doubly wrong: it carried
+        // `token_timeout`, which `error_type_label` never returns (the real value
+        // is `token_acquisition_timeout`), and it omitted six variants — a
+        // vacuous assertion under a comment claiming it verified boundedness (F5).
+        // One representative of every variant, so the assertion exercises
+        // `error_type_label()` itself; the method's own wildcard-free `match` is
+        // the forcing function that makes a new variant show up here.
+        let all_errors = [
+            MhError::Grpc(String::new()),
+            MhError::NotRegistered,
+            MhError::Config(String::new()),
+            MhError::Internal(String::new()),
+            MhError::TokenAcquisition(String::new()),
+            MhError::TokenAcquisitionTimeout,
+            MhError::JwtValidation(String::new()),
+            MhError::WebTransportError(String::new()),
+            MhError::MeetingNotRegistered(String::new()),
+            MhError::McEndpointInvalid(String::new()),
+            MhError::OutboundAuthUnavailable(String::new()),
         ];
-        for error_type in &valid_error_types {
-            record_error("test_op", error_type, 500);
+        let labels: std::collections::HashSet<&str> =
+            all_errors.iter().map(MhError::error_type_label).collect();
+        assert_eq!(
+            labels.len(),
+            all_errors.len(),
+            "each MhError variant must map to a DISTINCT bounded error_type label; a collision \
+             would silently merge two error populations onto one series"
+        );
+        for err in &all_errors {
+            record_error("test_op", err.error_type_label(), err.status_code());
         }
     }
 

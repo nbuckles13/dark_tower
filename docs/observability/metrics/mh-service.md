@@ -103,8 +103,10 @@ rate(mh_token_refresh_total{status="error"}[5m])
 - **Type**: Counter
 - **Description**: Total WebTransport connection attempts by outcome
 - **Labels**:
-  - `status`: Connection outcome (`accepted`, `rejected`, `error`)
-- **Cardinality**: Low (3 values)
+  - `status`: Connection outcome — `accepted`, `rejected`, or `error`.
+    - `accepted` is incremented at accept time (`webtransport/server.rs`), **before** the media-session decision, so it counts connections that were later declined too. This is why `sum(accepted)` is **not** a denominator for started media sessions — see the "Do not build a ratio against accepted connections" note under `mh_media_session_starts_total`, whose mechanism this is.
+    - `error` means the connection **handler failed**. A deliberate, fail-closed **media-session decline is NOT an error** — it is counted at full resolution on `mh_media_session_starts_total{outcome}` and must never also land here. A decline returning `Err` from `close_declined_connection` would double-count it as `error` and, worse, feed the `{status!="accepted"}` immediate-rollback gate (`docs/runbooks/mh-deployment.md`) with expected fail-closed behaviour — a control that inverts under the fault it exists to catch (F9). The regression guard is `media_session_binding_integration.rs`'s decline arms asserting `status="error"` delta 0.
+- **Cardinality**: Low — the three `status` values above.
 - **Usage**: Monitor connection acceptance rate, capacity rejections, and connection errors
 - **Dashboard**: MH Overview - WebTransport Connections by Status
 
@@ -254,9 +256,9 @@ because story task 21's media metrics need a section to extend.
 - **Type**: Counter
 - **Description**: Outcome of every ADR-0036 §8 forwarding-policy application MH considered. Incremented exactly once per `RegisterMeeting` call that reaches the **policy boundary** — the first read of a policy-bearing field (`egress_streams`, `selection_rules`, `policy_generation`) — on every terminal path from there onward.
 - **Labels**:
-  - `outcome`: what MH did with the policy (5 values, table below)
+  - `outcome`: what MH did with the policy (the `PolicyApplyOutcome` variants, table below)
   - `key_custody`: `operator` (single value)
-- **Cardinality**: Low (5 = 5 outcomes x 1 custody)
+- **Cardinality**: Low — bounded at the type level by the compile-checked `PolicyApplyOutcome::ALL` × one `key_custody` value; the table below is the operator-facing list, and a second encoding of its length only rots.
 - **Usage**: The primary health signal for the MC→MH control plane. `rejected_stale`, `rejected_invalid` and `apply_failed` each indicate a different broken thing with a different owner.
 
 **Why `outcome` and not `status`.** `status` is this repo's *coarse, fleet-wide shared* classification (`success`/`error`/…) that a responder compares across services. This label is a *fine-grained, metric-local* taxonomy in which **each value names a distinct remedy**. `internal.proto` already names the MC-side counterpart of this same RPC `outcome`, so after MC's half lands both ends of one handshake carry the same label key and the two series can be read side by side. See `docs/observability/label-taxonomy.md` §Shared Label Names.
@@ -315,6 +317,28 @@ participant, stream-identity or meeting dimension. See §"Not label material"
 under Media Policy Metrics — that block is **extended** by this section, not
 restated.
 
+**The rule covers logs and span attributes, not only labels.** ADR-0036 §11 bars
+participant and stream identity — `sender_id`, `slot_id`, stream number — from
+metric labels, span attributes **and** media-path log fields alike; MC's catalog
+states the same rule at the same width (`mc-service.md` §"Identity rules"). This
+file used to state only the label half, which left an auditor comparing the two
+free to conclude MH held the rule more narrowly.
+
+Naming the colliding ordinal in the `declined_sender_binding_conflict` log was
+proposed and declined. Two reasons, and the first disproved the premise the
+proposal rested on: (1) the "bounded by an MC bug, not by traffic" rate argument
+fails under the broken-or-racing-unbind cause, where **every reconnect collides**
+and the line becomes a connect/reconnect trace for one identifiable stream —
+safe only in the case nobody would read it; (2) without the two `participant_id`s,
+which are barred under every reading of §11, a bare ordinal cannot be resolved to
+who held it, so it does not answer the question it would be added for. The
+range-vs-uniqueness distinction lives in the `outcome` label instead.
+
+One counter here is a **lifecycle** counter rather than a control-plane or a
+per-frame one: `mh_media_session_starts_total` records whether a connection ever
+got as far as being able to forward. It is read first, which is why it is
+catalogued first.
+
 **A blind spot that applies to this whole section, stated first because a
 reader who takes any single counter at face value will be misled.** MH is
 keyless and never opens a frame, so it cannot observe any crypto- or key-layer
@@ -322,54 +346,100 @@ condition; and quinn's datagram send buffer evicts silently one layer beneath
 MH's own egress queue. Both are elaborated at the entries below.
 **Absence of a drop signal is not evidence that forwarding is healthy.**
 
-> **READ THIS BEFORE READING ANY PANEL IN THIS SECTION: every metric here reads
-> ZERO on a production pod today, and that is not "no load".**
+> **READ THIS BEFORE READING ANY PANEL IN THIS SECTION: a flat zero across this
+> whole family is not "no load", and the counter that tells you which it is
+> comes first.**
 >
-> MH declines to start its media tasks for a connection whose participant it
-> cannot resolve to a `sender_id`, and **no contract in the tree carries that
-> association yet** — so today it declines for *every* connection. The forward
-> path is complete, tested and unreached in production.
+> MH declines to start its media tasks for a connection it cannot bind to a
+> `sender_id`, and it closes that connection rather than holding it open. Every
+> handle in this family is resolved at process start, so the series all exist and
+> render **present and flat at zero** whether MH is idle or failing —
+> `frames_forwarded` 0, every `frames_dropped{reason}` 0, the latency histogram
+> empty. That is **byte-identical between a healthy idle handler and one that has
+> never started a single session**. This section's own rule — *absence of a drop
+> signal is not evidence that forwarding is healthy* — is what condemns reading
+> it as health.
 >
-> Every handle in this family is resolved at process start, so the series all
-> exist and render **present and flat at zero**: `frames_forwarded` 0, every
-> `frames_dropped{reason}` 0, the latency histogram empty. That is
-> **byte-identical to a healthy idle handler**. This section's own rule —
-> *absence of a drop signal is not evidence that forwarding is healthy* — is
-> what condemns reading it as health.
+> **`mh_media_session_starts_total` is the discriminator, and its `outcome` value
+> names the cause without a hunt:**
 >
-> **The sharpest read, and it is a scroll rather than a hunt.** On the MH
-> overview dashboard, `mh_media_policy_applies_total{outcome="applied"}` sits
-> **one row above this section, under `MC Coordination & Outbound Auth`**, and
-> reads **genuinely healthy** in this state — MC did program this handler, and
-> MH did apply the policy. So **control-plane healthy while every forward-path
-> panel reads zero** is the signature: MH was told what to forward and is not
-> forwarding it. That is this section's opening framing used as a diagnostic.
-> The two rows are adjacent and neither is collapsed by default. (The row is
-> named rather than described as "the same section" because row collapse is a
-> one-click change nothing guards, and a responder who looks inside
-> `Media Forward Path` for a panel that is not there concludes the doc describes
-> a different dashboard.)
+> | Reading | Meaning, and where to look next |
+> |---|---|
+> | `outcome="started"` climbing, `mh_media_frames_forwarded_total{direction="ingress"}` flat at 0 | Sessions start; no uplink arrives. **Client-side, not MH.** |
+> | `declined_no_sender_binding` climbing | MC answered with no usable ordinal. Several causes — including MC's per-meeting connection registry at capacity, which presents as an elevated-but-flat rate rather than a spike. `mc_media_sender_binding_responses_total` splits them; MH cannot. |
+> | `declined_sender_binding_out_of_range` > 0 | MC's allocator **range**. Should read zero forever. Field corruption in transit, or a peer that is not MC. |
+> | `declined_sender_binding_conflict` > 0 | Should read zero forever, and it is the only decline where the refused binding could have crossed media between participants. **Check MH's unbind path for that meeting before paging MC** — a broken or racing unbind produces this with MC entirely correct. |
+> | `declined_mc_unavailable` climbing | MH→MC **reachability**. Cross-check `mh_mc_notifications_total{event_type="connected",status="error"}` for the attempt-level view. Declines after the full retry budget. |
+> | `declined_mc_auth_rejected` climbing | MH's outbound credential failed: MC **refused** it, or MH could not **build** one. **MH's outbound auth — do not open MC's health.** Discriminate on the log: `"Authorization header parse failed"` present **on target `mh.grpc.mc_client`** ⇒ build failure, stay in MH; absent on that target ⇒ refusal, read MC's `mc_caller_type_rejected_total`. **The target qualifier is load-bearing** — the same message is emitted on `mh.grpc.gc_client` from the same pod, off the same service token, so an unqualified grep fails open. `mh_token_refresh_total{status="error"}` (what `MHTokenRefreshFailures` fires on), then `mh_token_refresh_failures_total` by `error_type`, are context for both and separate neither. **No timing tell** — see the entry below. |
+> | `declined_mc_endpoint_unknown` climbing | MH has no usable MC endpoint for the meeting and never reached the network. A **registration** fault, not a reachability one — check `mc_grpc_endpoint` on the `RegisterMeeting` that programmed this handler, then `mh_grpc_requests_total{method="register_meeting"}` and MC's `mc_media_policy_pushes_total`. |
+> | **Every outcome flat** while `mh_webtransport_connections_total{status="accepted"}` climbs | Connections never reach the binding boundary at all. The only remaining pre-boundary terminus is the **JWT gate** — read `mh_jwt_validations_total{result="failure"}`. |
 >
-> **The confirming discriminator, if the panels above are not to hand:**
->
-> ```promql
-> sum(rate(mh_webtransport_connections_total{status="accepted"}[5m])) > 0
-> ```
-> while `mh_media_frames_forwarded_total{direction="ingress"}` is flat at 0 **and**
-> every `mh_media_frames_dropped_total` reason is 0
-> ⇒ the media path never started for any connection, rather than an idle handler.
-> Confirm in the pod log: `Media forward path not started: no sender_id is bound`.
->
-> **Obligation (open)** — the honest positive signal is a counter of media
-> sessions that declined to start, e.g.
-> `mh_media_sessions_total{outcome="started"|"declined_no_sender_binding"}`. It
-> must **not** be folded into `mh_media_frames_dropped_total`: no frame was
-> dropped, and this section defines forwarded + dropped = attempts, so a decline
-> would corrupt the drop-rate denominator. Owner: observability for the name and
-> label space, media-handler for emission; lands with whichever task makes the
-> binding real, and **lands first if MH is to be deployed anywhere real before
-> that contract does**. Tracked in `docs/TODO.md` §Media Path Obligations under
-> "R-15 IS NOT SATISFIED IN PRODUCTION".
+> **A corroborating read, one row up rather than a hunt.** On the MH overview
+> dashboard, `mh_media_policy_applies_total{outcome="applied"}` sits **one row
+> above this section, under `MC Coordination & Outbound Auth`**. Control-plane
+> healthy while every forward-path panel reads zero means MH was told what to
+> forward and is not forwarding it — which the table above then attributes. The
+> two rows are adjacent and neither is collapsed by default. (The row is named
+> rather than described as "the same section" because row collapse is a one-click
+> change nothing guards, and a responder who looks inside `Media Forward Path`
+> for a panel that is not there concludes the doc describes a different
+> dashboard.)
+
+### `mh_media_session_starts_total`
+- **Type**: Counter
+- **Description**: Connections that attempted to start a media session, by terminal outcome — one increment per connection.
+- **Labels**:
+  - `outcome`: the values in the table below
+  - `key_custody`: `operator` (single value)
+- **Cardinality**: bounded at the type level by `MediaSessionStartOutcome::ALL` x one `key_custody` value. Deliberately no restated integer — the outcome table below is the operator-facing artifact, and a second encoding of its length only rots. (The written-out length in `ALL` stays: that one is compile-checked.)
+- **Usage**: **Read this first when triaging "no audio".** It is the precondition for every other metric in this section: a handler with no started sessions cannot produce a single frame, forwarded or dropped.
+
+| `outcome` | Condition | Responder's first move |
+|---|---|---|
+| `started` | Bound; the three media loops were spawned. | Nothing. Health. |
+| `declined_no_sender_binding` | MC answered with no usable `sender_id`. | **Upstream in MC.** The union of MC's `0`-answering outcomes, which MH structurally cannot split: `meeting_unknown` (routing/registration fault), `participant_unknown` (join race — transient and self-clearing), `registry_full` (MC's per-meeting connection cap — capacity, **never** self-clears), `user_ambiguous` (one user, two roster entries — **never** self-clears, and reconnecting *causes* it, so the `participant_unknown` remedy is actively harmful here). `mc_media_sender_binding_responses_total` splits them, which is why neither series is redundant. **Discriminate on the ratio, not the label**: a decaying fraction is a race; flat-and-total is a systematic identity mismatch between what MH names and what MC keys on — the shape of the defect this contract's own first cluster run found. |
+| `declined_sender_binding_out_of_range` | MC answered above the 16-bit ordinal range. | **Should read zero forever.** MC's allocator **range**. Field corruption in transit, or a mis-versioned or foreign peer answering. |
+| `declined_sender_binding_conflict` | The ordinal is already held by a **different** participant in that meeting; MH refused rather than overwrote. | **Should read zero forever.** Two candidate causes MH cannot separate: MC's allocator **uniqueness / non-recycling**, or MH failing to unbind a previous holder. **Check MH's unbind path for that meeting first.** |
+| `declined_mc_unavailable` | The RPC reached MC (or the network) and yielded no usable response — timeout, transport failure, or a non-auth error status. | **MC availability / network.** Declines only after the whole retry budget, unlike the two fast reachability outcomes below. |
+| `declined_mc_auth_rejected` | MH's outbound credential failed, by **either** of two routes: MC was reachable and **refused** it (`UNAUTHENTICATED` / `PERMISSION_DENIED`), **or** MH could not **build** one from the token it holds — in which case MC's reachability is unknown, MH never sent a request, and MC refused nothing. | **MH's outbound auth, not MC's health**, on both routes. Discriminate on the log line `"Authorization header parse failed"` **emitted on target `mh.grpc.mc_client`** — the qualifier is load-bearing, because MH emits the same message on `mh.grpc.gc_client` from the same pod off the same service token, so an unqualified grep is right for the wrong reason under this very fault and simply wrong when a GC-path parse failure coincides with a genuine refusal. Present on that target ⇒ build failure, stay in MH and escalate to auth-controller, because AC issued a token containing bytes illegal in an HTTP header value; absent ⇒ refusal, read MC's `mc_caller_type_rejected_total`. `mh_token_refresh_total{status="error"}` — the expression `MHTokenRefreshFailures` fires on, so a responder arriving from that alert sees the same query — then `mh_token_refresh_failures_total` broken down by `error_type` for *why*. Both are context on both routes and **separate neither** — a refresh can succeed and return a token MH cannot put on the wire, and a refresh can fail while the previously cached token still builds. An expired service token or a JWKS rotation fires the refusal route for every connection on the handler at once. |
+| `declined_mc_endpoint_unknown` | MH has no *usable* MC endpoint for the meeting — none recorded, or one that will not parse as an endpoint — so it never reached the network. | **Registration**, not reachability. Read what the `RegisterMeeting` that programmed this handler carried in `mc_grpc_endpoint`; MH never dialled, so MC's health is not the question. Not retried: every attempt re-parses the same string. |
+
+**`started` means the loops were spawned, not that media flowed.** It is measured
+strictly upstream of the frame counters, and that gap is the point: `started`
+climbing while `frames_forwarded{direction="ingress"}` stays flat is the
+discriminator for a client-side uplink problem. A counter that waited for the
+first forwarded frame would be a lagging duplicate of the frame counter and would
+lose the exactly-once-per-connection property the sum depends on.
+
+**This is NOT a frame drop and must never be folded into
+`mh_media_frames_dropped_total`.** No frame was dropped. This section defines
+`forwarded + dropped = attempts`; a decline counted as a drop puts a non-frame
+event in the drop-rate numerator and corrupts the denominator identity. The two
+counters have disjoint units — sessions here, frames there.
+
+**Increment boundary, and why it is not one step later.** A connection counts here
+once it has passed the JWT gate and **entered the media-session start sequence**,
+whose first action is the MC-endpoint lookup — the same "first read of the thing
+this metric is about" boundary `mh_media_policy_applies_total` uses. Pre-boundary
+rejects (JWT failure, handshake failure, framing errors) stay on
+`mh_jwt_validations_total` / `mh_webtransport_connections_total` alone: "this
+caller's token is bad" and "MC could not name this participant's sender" have
+different owners. Putting the boundary one step later, at "MH issued the RPC",
+was considered and rejected: a meeting never registered on this handler would then
+close every connection while incrementing only an undifferentiated
+`mh_webtransport_connections_total{status="error"}` plus a log line — MH healthy,
+forwarding nothing, detectable only in logs, which is the exact failure this
+counter exists to close, reproduced one condition earlier.
+
+**Do not build a ratio against accepted connections.**
+`sum(mh_media_session_starts_total)` is **not** equal to
+`mh_webtransport_connections_total{status="accepted"}`. Connections that hang up
+during the binding await, and connections kicked by the provisional-accept
+timeout (`mh_register_meeting_timeouts_total`), pass the JWT gate and never reach
+the decision. Those two counters are that gap's home.
+
+Cancellation during shutdown does **not** increment: this counter records
+decisions reached, and a cancelled await is not a decision.
 
 ### `mh_media_frames_forwarded_total`
 - **Type**: Counter
@@ -645,9 +715,9 @@ a latency burn-rate alert until the objective is ratified.
 - **Description**: Total errors by operation and type
 - **Labels**:
   - `operation`: Code path (`registration`, `heartbeat`, `grpc_service`)
-  - `error_type`: Error variant (bounded by MhError: `grpc`, `not_registered`, `config`, `internal`, `token_acquisition`, `token_acquisition_timeout`)
+  - `error_type`: Error variant, bounded by the `MhError` variants — `grpc`, `not_registered`, `config`, `internal`, `token_acquisition`, `token_acquisition_timeout`, `jwt_validation`, `webtransport`, `meeting_not_registered`, `mc_endpoint_invalid`, `outbound_auth_unavailable`. The SSoT is `MhError::error_type_label` (a wildcard-free match, so a new variant forces a new label); `metrics.rs`'s `test_cardinality_bounds` derives the set from the enum rather than a hand-list.
   - `status_code`: gRPC-compatible status code
-- **Cardinality**: Low (~30 combinations max)
+- **Cardinality**: Low — bounded by the `error_type` set above × the finite `operation` code paths.
 - **Usage**: Global error tracking, alerting on error spikes
 
 **PromQL example** - total error rate:
