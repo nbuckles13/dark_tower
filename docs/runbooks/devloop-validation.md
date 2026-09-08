@@ -156,7 +156,7 @@ The enum values are exactly:
 
 | STATUS | Meaning | Typical REASON examples |
 |--------|---------|-------------------------|
-| `OK` | Work ran cleanly | `cargo-check-passed`, `buf-build-passed`, `guards-passed` |
+| `OK` | Work ran cleanly | `cargo-build-passed`, `buf-build-passed`, `guards-passed` |
 | `FAIL` | Work ran and detected a problem | `cargo-clippy-failed`, `buf-breaking-failed`, `env-tests-failed`, `browser-e2e-failed` |
 | `SKIPPED-NO-DIFF` | the Layer-6 audit dep-gate when no dependency manifest changed (the COMMON case — every source-only PR emits this; see §6.6). **This is now the ONLY producer**: the language-level `<lang>-no-diff` short-circuit and Layer-7's `browser-e2e-no-diff` lane were both retired 2026-08-20 (every language, and the browser suite, now always-run). The dispatcher's aggregate `all-langs-skipped` fires only if every audit child reports no-dep-changes. | `no-dep-changes`, `all-langs-skipped` |
 | `SKIPPED-NO-VERB` (→ **exit 0**) | `all-langs-filtered` — an INCLUDE/EXCLUDE filter cleared the lang set (operator intent). The ONLY producer of this enum since task #52. | `all-langs-filtered` |
@@ -184,8 +184,8 @@ The intuition (locked in ADR-0033 §1 by the comment block above `_common.sh::ag
 **Worked example — Layer 1 stage-2 (multi-lang)**:
 
 ```
-STATUS=OK REASON=cargo-check-passed         (rust)
-STATUS=OK REASON=tsc-passed                 (ts)
+STATUS=OK REASON=cargo-build-passed         (rust)
+STATUS=OK REASON=nx-typecheck-passed        (ts)
 STATUS=FAIL REASON=buf-build-failed         (proto, stage 1)
 → aggregate_worst_status OK OK FAIL = FAIL
 → Layer 1 final STATUS=FAIL REASON=layer1-summary
@@ -392,7 +392,8 @@ Each subsection covers one layer: what it runs (every language, always-run since
 
 Two-stage compile (ADR-0033 §5):
 - **Stage 1**: proto-only via `scripts/build.sh` with `DEVLOOP_DISPATCH_INCLUDE_LANGS=proto` → `lang/proto/compile.sh` (`buf build proto`). Runs first so contract failures surface ahead of Rust/TS type-error cascades.
-- **Stage 2**: rust + ts via `DEVLOOP_DISPATCH_EXCLUDE_LANGS=proto` → `lang/rust/compile.sh` (`cargo check --workspace`) + `lang/ts/compile.sh` (`nx affected -t typecheck`).
+- **Stage 2**: rust + ts via `DEVLOOP_DISPATCH_EXCLUDE_LANGS=proto` → `lang/rust/compile.sh` (`cargo build --workspace --quiet`, plus release builds of `dt-guard` and `dt-story` and the release-feature gate) + `lang/ts/compile.sh` (`nx run-many -t typecheck --all`).
+  `cargo build`, not `cargo check`, is deliberate — the wrapper's own header says it "catches link-time errors `cargo check` misses".
 
 Both stages route through the dispatcher (`scripts/build.sh` → `_dispatch.sh::for_each_lang_with_verb "compile"`) so always-run dispatch, STATUS aggregation, and missing-verb signalling apply uniformly.
 
@@ -404,16 +405,42 @@ Both stages route through the dispatcher (`scripts/build.sh` → `_dispatch.sh::
 |--------------|---------|-------------|
 | `buf-build-failed` | `lang/proto/compile.sh` | Malformed `.proto`. Run `buf build proto` locally; the error names the file + line. |
 | `buf-binary-missing` | `lang/proto/compile.sh` (also `fmt.sh`, `lint.sh`, `breaking.sh`) | `buf` CLI not installed locally. Install via the project's documented setup; CI has it baked into the runner image. |
-| `cargo-check-failed` | `lang/rust/compile.sh` | Type / borrow / use error. Run `cargo check --workspace` locally for the full error chain. |
-| `nx-typecheck-failed` | `lang/ts/compile.sh` | `tsc --noEmit` error reported via `nx affected -t typecheck`. Run `pnpm exec nx affected -t typecheck --base=$(./scripts/lang/_get_base_ref.sh)` locally. |
+| `cargo-build-failed` | `lang/rust/compile.sh` | Type / borrow / use / link error. Run `cargo build --workspace` locally for the full error chain. |
+| `cargo-build-dt-guard-failed` | `lang/rust/compile.sh` | The `target/release/dt-guard` binary did not build. **Layer 3's guard wrappers consume it**, so this is the upstream cause of §8's "a missing guard binary reaches the implementer lane" caveat — fix here, not there. |
+| `cargo-build-dt-story-failed` | `lang/rust/compile.sh` | The `target/release/dt-story` binary did not build. Same consumer relationship as `dt-guard` above. |
+| `release-feature-gate-failed` | `scripts/release-feature-gate.test.sh` | The ADR-0036 §11 release-build gate self-test failed. **Five distinguishable causes and they do NOT share a fix — read the assertion label before triaging**, see the sub-table below. |
+| `nx-typecheck-failed` | `lang/ts/compile.sh` | `tsc --noEmit` error reported via `nx run-many -t typecheck --all`. Run `pnpm exec nx run-many -t typecheck --all` locally. **The `nx affected` form is retired** (2026-08-20 always-run change) — an `--base=…` repro reproduces something the pipeline no longer runs. |
 | `nx: command not found` | `lang/ts/compile.sh` (also Layer 2 / 4 / 5 TS wrappers) | Local-only failure mode — CI has `corepack` / `pnpm install` in setup. Fix: `pnpm install` from repo root (nx is a project-local dev dep, not a global tool). |
+
+**Triaging `release-feature-gate-failed`** (ADR-0036 §11 self-test;
+`scripts/release-feature-gate.test.sh`, wired here rather than in Layer 3 because
+compiler cost belongs outside the fast tier per ADR-0033 §4):
+
+| Failing assertion / token | What it means | Fix |
+|---|---|---|
+| `…/fire-arm-exits-non-zero` | **The control did not fire.** A release-profile build with `--features per-frame-trace` COMPILED. | Check `[profile.release]` in the root `Cargo.toml` for a `debug-assertions = true` that makes the `not(debug_assertions)` predicate inert, and check the `#[cfg]` at `crates/mh-service/src/lib.rs`. |
+| `…/fire-arm-cites-the-compile_error-message` | The build failed but **without the expected diagnostic**. Either the control did not fire and something else broke, or the `compile_error!` message was reworded. | Read the captured build output first — it names the real error. If the message was merely reworded, update `NEEDLE_PHRASE` in the self-test to a phrase lying wholly within one source line. |
+| `…/fire-arm-originates-in-the-gate-source` | The diagnostic came from **a dependency, not from mh-service's `lib.rs`**. **The control may be perfectly healthy** — something else in the build broke. | Do NOT go auditing `[profile.release]` or the `#[cfg]`. Read the build output and fix the unrelated breakage; re-run. |
+| `…/fire-arm-is-not-a-feature-name-typo` | **A defect in the TEST, not in the gate or the profile.** Cargo rejected the feature name at resolution, so `compile_error!` never expanded. | Fix the feature name in the `GATES` table in `scripts/release-feature-gate.test.sh`. Nothing about mh-service or the release profile is implicated. |
+| `…/clean-arm-succeeds-without-feature` | **The tree is broken for an unrelated reason** — mh-service does not compile under `--release` even without the feature. The fire arm proves nothing until this is fixed. | Usually already announced by `cargo-build-failed` from the `cargo-build` invocation earlier in this same wrapper; fix that first. |
+| `STATUS=PRECONDITION_FAILURE REASON=release-feature-gate-*` | **Operator lane, not the diff.** `cargo` missing, registry/network/disk failure, or the pinned `compile_error!` phrase no longer found in the gate's source. | Read the accompanying message — it names which. For `…-needle-not-found`, do **not** relax the pin; if the message was merely reflowed, move the pinned phrase to one lying wholly within a single source line. |
+
+**Note the log carries two lines on a precondition exit.** `run_and_emit` maps any
+non-zero rc to `STATUS=FAIL REASON=release-feature-gate-failed`, so a
+`PRECONDITION_FAILURE` appears alongside a `STATUS=FAIL`. Worst-status aggregation still
+lands the layer on `PRECONDITION_FAILURE` and exit 2, so the operator lane is correct —
+but an operator who greps `STATUS=FAIL` first has been sent to the implementer lane by an
+artifact of the wrapper rather than by a verdict. Read the `PRECONDITION_FAILURE` line.
+
+**Budget note**: Layer 1 exceeds the 20s per-layer warn on any cold cache; this is
+expected and dominated by the workspace build, not by the release-feature gate.
 
 **Worked example — proto stage-1 fail; rust + ts still compile (stage 2 always-runs)**:
 
 ```
 STATUS=FAIL REASON=buf-build-failed             (proto, stage 1; per-child stdout)
-STATUS=OK REASON=cargo-check-passed             (stage 2, rust — always-runs)
-STATUS=OK REASON=tsc-passed                     (stage 2, ts — always-runs)
+STATUS=OK REASON=cargo-build-passed             (stage 2, rust — always-runs)
+STATUS=OK REASON=nx-typecheck-passed            (stage 2, ts — always-runs)
 STATUS=FAIL REASON=layer1-summary               (aggregated stdout summary line)
 LAYER=1 ... RESULT=FAIL REASON=buf-build-failed (stderr anchor; worst-child cause)
 ```
@@ -445,7 +472,9 @@ observability O2 (one run reveals the full picture; don't force a second invocat
 Key `run_and_emit` invocations:
 - `scripts/guards/run-guards.sh` — iterates every `scripts/guards/simple/**/*.sh` (excluding `fixtures/`). Each guard self-classifies per-file via path globs. Includes the Layer A scope-drift parser and Layer B classification-sanity guards (ADR-0024 cross-boundary), AND the always-run **audit-suppressions** guard (`scripts/guards/simple/audit-suppressions.sh` → `scripts/audit-suppressions-check.sh`, read-only) per task #47.
 - `scripts/audit-suppressions-check.test.sh` — self-test for the suppressions-check (drives its FAIL branches with fixtures; wired here because there is no `*.test.sh` auto-runner). Task #47.
-- plus the other wired self-tests (`_changed_helpers.test.sh`, `_audit_gate.test.sh`, `layer7.test.sh`, the subdomain/slug-class/disk guard self-tests, `layer-all.test.sh`, `run-story.test.sh`). (The former `_test_changed_predicates.sh` meta-test was removed 2026-08-20 with the `changed.sh` classifier — §2/§3 amendments.)
+- plus the other wired self-tests (`_changed_helpers.test.sh`, `_audit_gate.test.sh`, `layer7.test.sh`, the subdomain/slug-class/disk guard self-tests, `layer-all.test.sh`, `run-story.test.sh`, `dev-web.test.sh`, `guards/run-guards.test.sh`, `guards/validate-frame-vectors.test.sh`, `guards/media-telemetry-deny.test.sh`). (The former `_test_changed_predicates.sh` meta-test was removed 2026-08-20 with the `changed.sh` classifier — §2/§3 amendments.)
+  - **This list had drifted and was corrected 2026-09-08** — the last four were wired in `layer3.sh` and missing here. It is hand-maintained with nothing deriving it, so treat it as indicative and read `scripts/layer3.sh` for the authoritative set.
+  - **`scripts/release-feature-gate.test.sh` is deliberately NOT here.** It is wired into Layer 1 (`scripts/lang/rust/compile.sh`), not Layer 3, because it invokes `cargo` and ADR-0033 §4 keeps inherently variable compiler cost out of the fast tier. Layer 3 invokes cargo zero times by design. See §6.1.
 
 Layer 3 also carries a **CI-sentinel-leak runtime assertion** (mirrored in `layer-all.sh`): if `GITHUB_ACTIONS` and `DEVLOOP_TEST` are both set, the layer hard-fails early — see `test-sentinel-set-in-ci` below.
 
@@ -741,6 +770,9 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `STATUS=FAIL REASON=browser-e2e-failed` | Browser E2E spec regression (implementer lane; consumes the shared Layer-7 attempt). Log: `layer-7-browser-e2e.log`; Playwright traces in `packages/web-app/test-results/` (outside `DEVLOOP_TMP` cleanup, can contain live tokens — local-only). **Not always a spec regression:** if the log carries `Triage Prometheus/port-forward`, Prometheus died mid-suite — see that row. | §6.7 |
 | `browser-e2e-not-run:` (stderr) | Env-tests failed first — the browser suite was deliberately skipped this attempt (shared single-attempt budget), NOT a browser problem. Fix the env-test failures; browser suite runs on the retry. | §6.7 |
 | `Triage Prometheus/port-forward` (in `layer-7-env-test.log` **or** `layer-7-browser-e2e.log`) | Layer 7 reports `STATUS=FAIL REASON=env-tests-failed` **or** `browser-e2e-failed` (implementer lane, attempt consumed), but this is substantively an OPERATOR-lane fault: the counter-delta helpers in BOTH suites fail LOUD (Rust panic / TS throw) when a Prometheus query errors mid-suite — Phase 1f only proves Prometheus was ready *before* the suites, so a prometheus pod or port-forward that dies mid-run surfaces here. **Do NOT chase the diff.** Check the `prometheus` pod (`kubectl -n dark-tower get pods -l app=prometheus`) and the port-forward behind `ENV_TEST_PROMETHEUS_URL` / `E2E_PROMETHEUS_URL` (both default `localhost:9090`), then re-run. Deliberately not auto-classified — §6.7 Phase 2 does not grep suite output (grepping it would reopen reverse-masking). | §6.7 |
+| `Triage MH scrape/metric-registration` (in `layer-7-env-test.log`) | Layer 7 reports `STATUS=FAIL REASON=env-tests-failed` (implementer lane, attempt consumed), but this is substantively an OPERATOR-lane fault, keyed on the literal emitted by `crates/env-tests/tests/32_media_metric_hygiene.rs` (constant `TRIAGE_SCRAPE`). `mh_media_frames_forwarded_total` is absent from Prometheus. **MH resolves the full media metric label cross-product unconditionally at startup**, so those series exist at zero on any running MH pod with no media flowing — absence means MH is not up, not scraped, or its metric registration path broke. Check the `mh-service` pods and the Prometheus scrape target. **Do NOT satisfy the check by deleting it**: the anchor is what stops every absence assertion in that suite from passing vacuously. **MC is deliberately NOT under this presence check** — MC's media metrics are lazily created on first emission, so their absence on an idle cluster is the expected state; an MC-shaped presence gate would red on every idle run and be muted within weeks. Do not "fix" that asymmetry into symmetry. | §6.7 |
+| `Triage metric-label policy violation` (in `layer-7-env-test.log`) | **IMPLEMENTER lane and a genuine policy violation** — keyed on `TRIAGE_VIOLATION` in `32_media_metric_hygiene.rs`. A series scraped from `ac-service`, `gc-service`, `mc-service` or `mh-service` carries a `meeting_id*` label (raw or hashed), or an `e2ee` / `end_to_end` / `zero_trust` label key or value. Barred by ADR-0036 §11 and `docs/observability/label-taxonomy.md` §Media-path identity R1 and §Key custody. **The assertion has no carve-outs by design, so there is no legitimate series it can red on. Fix the METRIC, never the assertion**: remove the label from the emitting `metrics.rs`, or change its value. **Two named non-fixes.** (1) Do NOT add a grandfather allowlist — §11's grandfathered set is the client SDK's ADR-0028 join-flow metrics, which cannot reach a Prometheus scrape at all (the OTel collector declares only a `debug` exporter and there is no otel-collector scrape job), so over these four jobs the exception has **zero members**; an allowlist would be dead on the day it was written and would swallow the first real violation after it. (2) Do NOT narrow the job selector — if a carve-out seems necessary, the real diagnosis is that the selector was widened past the Rust services. | §6.7 |
+| `Triage Prometheus relabel configuration` (in `layer-7-env-test.log`) | Keyed on `TRIAGE_RELABEL` in `32_media_metric_hygiene.rs`. Prometheus now applies `metric_relabel_configs`. That suite evaluates **stored** series, so a drop/replace applied before storage makes it blind to a label the pod still emits — it would keep passing while covering less, which is the silent-narrowing failure ADR-0036 §11 is about. Read the labels **at the pod** for the affected jobs. Do NOT widen the suite's selector and do NOT delete the assertion. (Scoped to `metric_relabel_configs` only, deliberately: the service jobs' `relabel_configs` are `keep`-only target *discovery*, and a `relabel_configs` addition would surface as a new label the suite catches.) | §6.7 |
 | `STATUS=PRECONDITION_FAILURE REASON=dev-certs-missing` / `playwright-browser-missing` | Layer 7 Phase-1g browser-suite precondition — **OPERATOR lane (exit 2)**. Missing WebTransport cert fingerprints (`scripts/generate-dev-certs.sh`) or missing Playwright Chromium (`pnpm exec playwright install chromium`). | §6.7 |
 | Layer 1 runs `cargo check`/`tsc` on a docs-only PR | Expected since 2026-08-20 — every language layer always-runs (ADR-0033 §3); `cargo check` is cheap. (Formerly framed as `changed.sh` over-classification; there is no longer any per-lang classification.) | §6.1 |
 | Layer 1 fails locally with `nx: command not found` | Local-only failure — CI has corepack/pnpm install in setup. | §6.1 (run `pnpm install`) |

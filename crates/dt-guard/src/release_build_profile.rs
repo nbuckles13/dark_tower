@@ -8,10 +8,23 @@
 //! control that has to notice fails silently for anyone building outside the
 //! pipeline; a compile error has nothing to notice."*
 //!
-//! That control is `#[cfg(debug_assertions)] compile_error!(...)`. It is
-//! **inert** the moment `debug_assertions` is off in a shipped artifact —
-//! and nothing in this repository asserted that condition. This subcommand
-//! asserts it.
+//! That control is `#[cfg(all(feature = "...", not(debug_assertions)))]
+//! compile_error!(...)`. It is **inert the moment `debug_assertions` is ON**,
+//! because the `not(...)` no longer holds — so the control is LIVE in a release
+//! build and silent in a dev build, which is the whole point. Nothing in this
+//! repository asserted that `debug_assertions` is actually off in a shipped
+//! artifact. This subcommand asserts it.
+//!
+//! **Corrected 2026-09-08 (story task 23), visibly rather than silently.** This
+//! paragraph previously read *"That control is `#[cfg(debug_assertions)]
+//! compile_error!(...)`. It is inert the moment `debug_assertions` is off"* —
+//! the polarity backwards in both halves. Both in-tree controls
+//! (`crates/mc-service/src/lib.rs`, `crates/mh-service/src/lib.rs`) are
+//! `not(debug_assertions)`, and this guard's own finding table below detects
+//! debug-assertions being **enabled**, which is consistent with reality and was
+//! contradicting the sentence above it. Left visible because a reader who took
+//! the old text at face value would conclude the control is inert in exactly the
+//! builds where it is live — and would then "fix" the guard to match.
 //!
 //! # What this guard does NOT claim (read before citing a green)
 //!
@@ -20,12 +33,19 @@
 //!   something must, and only a check can. But it inherits the weakness §11
 //!   named. **This guard does nothing for anyone building outside the
 //!   pipeline** — a local `cargo build`, a dev container, a fork's CI.
-//! * **The control being protected now exists — one instance, since
-//!   2026-09-02.** `crates/mc-service/src/lib.rs`'s
+//! * **The control being protected now exists — named sites, not a tally.** `crates/mc-service/src/lib.rs`'s
 //!   `#[cfg(all(feature = "test-seams", not(debug_assertions)))]` over a
 //!   `compile_error!` is the first in-tree consumer of this premise: it makes the `test-seams`
 //!   sender-id exhaustion bypass fail to compile when `debug_assertions` is
-//!   off. **Superseded statement, kept so the correction is legible**: this
+//!   off. **The second arrived with commit `c0228455`**:
+//!   `crates/mh-service/src/lib.rs`'s
+//!   `#[cfg(all(feature = "per-frame-trace", not(debug_assertions)))]`, guarding
+//!   the dev-only per-frame media tracing facility. This bullet said "one
+//!   instance, since 2026-09-02" until 2026-09-08 (story task 23), by which
+//!   point `c0228455` had already falsified the count — the same class of
+//!   staleness the superseded statement below records, which is why the count is
+//!   now stated as a number of NAMED sites rather than a bare tally.
+//!   **Superseded statement, kept so the correction is legible**: this
 //!   bullet previously read *"As of 2026-09-01 there is no `compile_error!` and
 //!   no `debug_assertions` usage anywhere under `crates/`"*, which that change
 //!   falsified. §11 specifies the control; story task 23 lands the assertion
@@ -114,9 +134,14 @@
 //! Deliberate, and measured rather than reasoned. Cargo's built-in release
 //! profile already sets `debug-assertions = false`, so a manifest with no
 //! `[profile.release]` table builds `--release` with the premise **holding**.
-//! Confirmed twice independently: a throwaway crate carrying §11's exact
-//! control (`#[cfg(debug_assertions)] compile_error!`) compiles clean under
-//! `--release` with no profile table, and trips under the dev profile.
+//! Confirmed twice independently: a throwaway crate carrying a
+//! `#[cfg(debug_assertions)] compile_error!` compiles clean under `--release`
+//! with no profile table, and trips under the dev profile. **The experiment's
+//! RESULT stands; only its description was wrong** — that probe is the polarity
+//! INVERSE of §11's control, chosen because it makes `debug_assertions` being
+//! off observable as a successful build. Calling it "§11's exact control" was
+//! part of the same 2026-09-08 polarity correction recorded at the head of this
+//! module; §11's actual control is `not(debug_assertions)`.
 //! An earlier version failed closed there; that was a false positive, and a
 //! guard that false-fails gets bypassed.
 //!

@@ -3,6 +3,7 @@
 pub mod auth_client;
 pub mod gc_client;
 pub mod media;
+pub mod metric_hygiene;
 pub mod metrics;
 
 pub use auth_client::AuthClient;

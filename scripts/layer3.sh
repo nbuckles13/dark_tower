@@ -23,6 +23,15 @@ layer_lifecycle_begin 3
 # SELF-TEST is wired explicitly here (task #47) — there is no *.test.sh auto-runner, so an
 # unrun test is untested. This drives the check's FAIL branches (past-due/drift/malformed/
 # sentinel) every devloop + CI.
+#
+# NOT EVERY *.test.sh IS WIRED HERE, and the exception is deliberate.
+# `scripts/release-feature-gate.test.sh` (ADR-0036 §11's release-build compile gate) is
+# wired in `scripts/lang/rust/compile.sh` — Layer 1 — because it INVOKES CARGO, and
+# ADR-0033 §3/§4 put variable compiler cost outside the layers-3+6 fast-tier budget. Every
+# self-test below is hermetic: no cluster, no network, no cargo. Layer 3 invoking cargo
+# zero times is structural — Layer 1 produces target/release/{dt-guard,dt-story}, Layer 3
+# consumes them — so do not "consolidate" that one here to match the pattern. The reasoning
+# lives once, at its invocation in compile.sh.
 {
   run_and_emit "guards" "${__here}/guards/run-guards.sh" || true
   run_and_emit "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh" || true
