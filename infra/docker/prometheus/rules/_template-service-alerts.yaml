@@ -1,9 +1,20 @@
 # Starter alert-rules template for a service. Copy to `<svc>-alerts.yaml` and
 # customize. See docs/observability/alert-conventions.md for full guidance.
 #
-# NOT LOADED BY PROMETHEUS — the `_` filename prefix excludes this file from
-# Prometheus's alert-rule load glob. Safe to keep in this directory as a
-# reference-only starter.
+# NOT LOADED BY PROMETHEUS — the `rule_files` glob in BOTH Prometheus configs is
+# `rules/[a-z]*-alerts.yaml`, and this filename does not begin with a lowercase
+# letter. THE OPERATIVE PROPERTY IS THE LEADING CHARACTER CLASS, NOT THE `_`
+# ITSELF: rename this file to anything starting [a-z] and Prometheus will load
+# it, fail to parse the <placeholder> exprs, and refuse to start.
+#   infra/docker/prometheus/prometheus.yml
+#   infra/kubernetes/observability/prometheus.yml
+# Safe to keep in this directory as a reference-only starter.
+#
+# CORRECTED 2026-09-09. This block previously credited the `_` prefix. That was
+# accidentally true and instructively wrong — the two properties coincide for
+# this one filename and diverge for the next file added — and until this commit
+# it was vacuous as well, because no glob existed and nothing loaded any rule
+# file at all. Enabling rule evaluation is what made the claim load-bearing.
 #
 # Placeholders: <svc>, <Svc>, <operation>, <component>, <dependency>,
 # <scenario-anchor>. Angle-bracket form to keep them grep-able.

@@ -1,5 +1,6 @@
 //! Test fixtures for interacting with cluster services.
 
+pub mod alert_rules_loaded;
 pub mod auth_client;
 pub mod gc_client;
 pub mod media;

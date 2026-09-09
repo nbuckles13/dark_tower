@@ -191,21 +191,38 @@ fn check_orphan_manifests(repo_root: &Path) -> Result<Vec<Hit>> {
 /// parsers, one mechanism, two different exposures; fixing only the reported
 /// one would have left the fail-open half in place.
 fn extract_declared_dashboards(kustomization_content: &str) -> Vec<String> {
+    extract_declared_generator_files(kustomization_content, ".json")
+}
+
+/// The mechanism behind [`extract_declared_dashboards`], parameterised on the
+/// suffix so the alert-rules loading check can share it instead of growing a
+/// third parser over the same file shape.
+///
+/// **Generalised on the extension only.** Both repairs above are properties of
+/// the *line shape*, not of the extension, so they carry over unchanged — which
+/// is the whole reason to share rather than copy. The alert-rules ConfigMap
+/// entries are `- rules/gc-alerts.yaml`, the dashboards' are
+/// `- foo.json=../../../grafana/dashboards/foo.json`; both are `- ` bullets
+/// whose tail after the last `/` is the basename, and both sit in files that
+/// carry explanatory comments.
+///
+/// The `/` requirement is inherited deliberately: it is what keeps a bare
+/// `- some.yaml` under `resources:` from being read as a generator entry.
+pub(crate) fn extract_declared_generator_files(
+    kustomization_content: &str,
+    suffix: &str,
+) -> Vec<String> {
     let mut declared: Vec<String> = Vec::new();
     for line in kustomization_content.lines() {
-        // Lines look like: `      - foo.json=../../../grafana/dashboards/foo.json`.
         let Some(rest) = line.trim().strip_prefix("- ") else {
             continue;
         };
         let rest = strip_inline_comment(rest);
-        // The `/` requirement is the original's, kept deliberately: every real
-        // entry is `name=<dir>/<name>`, and widening it here would be a third
-        // change riding on a two-change fix.
         let Some(idx) = rest.rfind('/') else {
             continue;
         };
         let candidate = &rest[idx + 1..];
-        if candidate.ends_with(".json") {
+        if candidate.ends_with(suffix) {
             declared.push(candidate.to_string());
         }
     }
@@ -560,6 +577,44 @@ resources:
             vec!["mc-logs.json".to_string(), "mc-overview.json".to_string()],
             "inline comment must not un-declare a listed dashboard, and a \
              standalone comment must not declare an unlisted one"
+        );
+    }
+
+    /// The generalisation must not change R-20's behaviour — it changes a
+    /// function whose two repairs were earned from live failures, and "a shared
+    /// helper that quietly changes its original caller" is the classic cost of a
+    /// good extraction. Pinned mechanically rather than by reading the diff.
+    ///
+    /// Asserts the two properties that make the parameterisation a no-op for
+    /// the dashboards path: the wrapper is exactly the helper at `".json"`, and
+    /// the suffix is genuinely discriminating rather than incidentally
+    /// satisfied by every entry.
+    #[test]
+    fn generalisation_is_behaviour_preserving_for_the_dashboards_path() {
+        let kust = r#"configMapGenerator:
+  - name: grafana-dashboards-mc
+    files:
+      - mc-logs.json=dashboards/mc-logs.json
+      - mc-overview.json=dashboards/mc-overview.json  # new media row, task 14
+      # mc-legacy.json is deliberately unlisted: see dashboards/mc-legacy.json
+resources:
+  - rules/mc-alerts.yaml
+"#;
+        assert_eq!(
+            extract_declared_dashboards(kust),
+            extract_declared_generator_files(kust, ".json"),
+            "the wrapper must be exactly the helper at \".json\""
+        );
+        // The suffix discriminates: the `.yaml` bullet above is invisible to the
+        // dashboards call and visible to a `.yaml` one. Without this, the
+        // parameterisation could be vacuous and the equality above trivial.
+        assert_eq!(
+            extract_declared_dashboards(kust),
+            vec!["mc-logs.json".to_string(), "mc-overview.json".to_string()]
+        );
+        assert_eq!(
+            extract_declared_generator_files(kust, "-alerts.yaml"),
+            vec!["mc-alerts.yaml".to_string()]
         );
     }
 

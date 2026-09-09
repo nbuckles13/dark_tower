@@ -9,7 +9,19 @@ Alerts are organized by:
 - **Service**: Per-service alert groups (AC, GC, MC, MH)
 - **Component**: Infrastructure, application logic, database, etc.
 
-All alert rules are stored in `infra/docker/prometheus/rules/` and loaded by Prometheus server.
+All alert rules are stored in `infra/docker/prometheus/rules/` and loaded by both Prometheus
+deployments — the docker-compose one (`infra/docker/prometheus/prometheus.yml`) and the in-cluster
+one (`infra/kubernetes/observability/prometheus.yml`, mounted via `configMapGenerator`;
+`prometheus-config.yaml` alongside it holds only the RBAC, Deployment and Service) — via a
+`rule_files` glob of `rules/[a-z]*-alerts.yaml`, byte-identical in both. The character class excludes `_template-service-alerts.yaml`, whose
+placeholder PromQL would fail rule-file parsing at startup; the operative property is **"does not
+begin with a lowercase letter"**, not "begins with `_`".
+
+> **This sentence asserted loading for months before any Prometheus loaded anything** — `rule_files`
+> was commented out in the docker config and absent entirely from the cluster config, so every alert
+> in this catalog was an artifact nothing evaluated. It is true as of the rule-loading fix. Recorded
+> because the false version is a plausible reason nobody checked: a doc that states a property
+> confidently is one of the ways the property stops being verified.
 
 ---
 
@@ -69,8 +81,8 @@ All alert rules are stored in `infra/docker/prometheus/rules/` and loaded by Pro
 **PromQL**:
 ```promql
 up{job="gc-service"} == 0
-for: 1m
 ```
+`for: 1m`
 
 **Response**:
 1. Check GC pod status (`kubectl get pods`)
@@ -94,8 +106,8 @@ for: 1m
   /
   sum(rate(gc_http_requests_total[5m]))
 ) > 0.01
-for: 5m
 ```
+`for: 5m`
 
 **Response**:
 1. Identify failing endpoints (dashboard or Prometheus)
@@ -117,8 +129,8 @@ for: 5m
 histogram_quantile(0.95,
   sum by(le) (rate(gc_http_request_duration_seconds_bucket[5m]))
 ) > 0.200
-for: 5m
 ```
+`for: 5m`
 
 **Response**:
 1. Check latency source (database, MC assignment, token refresh)
@@ -140,8 +152,8 @@ for: 5m
 histogram_quantile(0.95,
   sum by(le) (rate(gc_mc_assignment_duration_seconds_bucket[5m]))
 ) > 0.020
-for: 5m
 ```
+`for: 5m`
 
 **Response**:
 1. Check MC pod availability
@@ -165,8 +177,8 @@ for: 5m
   /
   sum(rate(gc_db_queries_total[1m]))
 ) > 0.5
-for: 1m
 ```
+`for: 1m`
 
 **Response**:
 1. Check PostgreSQL pod status
@@ -190,8 +202,8 @@ for: 1m
   /
   sum(rate(gc_http_requests_total[1h]))
 ) / 0.001 > 10
-for: 1h
 ```
+`for: 1h`
 
 **Response**:
 1. Identify root cause of elevated error rate
@@ -271,12 +283,12 @@ or
 **PromQL**:
 ```promql
 (
-  container_memory_usage_bytes{pod=~"gc-service-.*"}
+  container_memory_usage_bytes{container="gc-service"}
   /
-  container_spec_memory_limit_bytes{pod=~"gc-service-.*"}
+  container_spec_memory_limit_bytes{container="gc-service"}
 ) > 0.85
-for: 10m
 ```
+`for: 10m`
 
 **Response**:
 1. Check for memory leak (heap profiling)
@@ -295,9 +307,9 @@ for: 10m
 
 **PromQL**:
 ```promql
-rate(container_cpu_usage_seconds_total{pod=~"gc-service-.*"}[5m]) > 0.80
-for: 5m
+rate(container_cpu_usage_seconds_total{container="gc-service"}[5m]) > 0.80
 ```
+`for: 5m`
 
 **Response**:
 1. Check request rate (traffic spike?)
@@ -321,8 +333,8 @@ for: 5m
   /
   sum(rate(gc_mc_assignments_total[5m]))
 ) > 0.05
-for: 5m
 ```
+`for: 5m`
 
 <!-- ANCHOR (DRY): the rejection_reason values in step 2 mirror the terminal match in
      crates/gc-service/src/services/mc_assignment.rs (source of truth). Sibling mirrors:
@@ -347,8 +359,8 @@ for: 5m
 histogram_quantile(0.99,
   sum by(le) (rate(gc_db_query_duration_seconds_bucket[5m]))
 ) > 0.050
-for: 5m
 ```
+`for: 5m`
 
 **Response**:
 1. Identify slow queries (pg_stat_activity)
@@ -372,8 +384,8 @@ for: 5m
   /
   sum(rate(gc_token_refresh_total[5m]))
 ) > 0.10
-for: 5m
 ```
+`for: 5m`
 
 **Response**:
 1. Check AC service health
@@ -397,8 +409,8 @@ for: 5m
   /
   sum(rate(gc_http_requests_total[6h]))
 ) / 0.001 > 5
-for: 6h
 ```
+`for: 6h`
 
 **Response**:
 1. Investigate error rate trend
@@ -416,9 +428,9 @@ for: 6h
 
 **PromQL**:
 ```promql
-rate(kube_pod_container_status_restarts_total{pod=~"gc-service-.*"}[1h]) > 0.016
-for: 5m
+rate(kube_pod_container_status_restarts_total{container="gc-service"}[1h]) > 0.016
 ```
+`for: 5m`
 
 **Response**:
 1. Check logs from crashed pods
@@ -617,9 +629,65 @@ histogram_quantile(0.95,
 
 ### Critical Alerts
 
-Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
+Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`, `MCMediaGenerationDivergence`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
+
+**That list is complete; the entries below it are not.** Only `MCMediaGenerationDivergence` has a full inventory entry — it landed with its alert, so byte-identical PromQL was applied at authoring time. The other four are **named here and uninventoried**, exactly as in §Media Handler Alerts. The `inventory_expr_drift` guard checks byte-identity for what is inventoried; it does not require that every rule have an entry, so nothing mechanical will report this section incomplete.
+
+#### MCMediaGenerationDivergence
+
+**Severity**: Page
+**Condition**: MH echoes an applied media-policy generation that differs from the one MC sent, or echoes none at all — any occurrence in 15 minutes
+**Impact**: MH is forwarding under stale or absent policy while every liveness signal reads green. ADR-0036 §8 calls this a partial blackhole reporting healthy. Blast radius is per (meeting, handler).
+**Runbook**: [Scenario 15: Media Generation Divergence](../runbooks/mc-incident-response.md#scenario-15-media-generation-divergence)
+
+**PromQL**:
+```promql
+sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[15m])) > 0
+```
+`for: 0m`
+
+**Response**:
+1. **Do not wait for convergence — it will not converge.** Of ADR-0036 §8's four re-fire triggers only *structural change* is implemented in this build, so a diverged meeting stays media-dark until a rejoin.
+2. Split on the `outcome` label first — the values have different first moves. `generation_mismatch` means MH's apply ran and did not take effect (open MH, read `mh_media_policy_applies_total{outcome}`); `no_applied_generation` means MH echoed nothing (confirm the MH image first — a rollout skew is the cheap explanation and it clears itself); `transport_mode_mismatch` is ADR-0036 §8's separate two-ends-must-agree echo failing, a different remedy reached from the same runbook.
+3. Read `mc_media_generation_divergence` for the magnitude **second, never first**: it is last-write-wins at pod level, so a healthy push for an unrelated meeting erases a diverged reading, and a value of 0 is not evidence that nothing diverged.
+4. Force a structural change on the affected meeting — with one participant that is a rejoin. This is the resolution, not a workaround.
+5. **Do not restart MH.** It sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence.
+
+> **The selector is NEGATED, and that is the design, not a shorthand.** It reads "everything that is not a confirmed match and not the known-noisy diagnostic". `PolicyPushOutcome::ALL` is compile-checked in Rust, but **that compile error does not reach PromQL** — so under the negated form a sixth outcome added later pages and gets classified deliberately, while under a positive `outcome=~"a|b"` it would fall silently outside the alert. For a page alert whose subject is *a partial blackhole reporting healthy*, silence is the failure mode to defend against.
+>
+> `handler_id_mismatch` is the one exclusion beyond `match`: `MH_HANDLER_ID` is per-incarnation, so an ordinary MH restart produces it by construction and a bare `outcome != "match"` would page on every rollout. That exclusion is held at three sites — this rule, `docs/observability/metrics/mc-service.md`'s catalog entry, and `mc-deployment.md`'s post-deploy checklist — as **one decision with one revert trigger**, `2026-09-02-mh-stable-handler-id`; remove it in all three places together.
 
 ### Warning Alerts (Join Flow)
+
+#### MCMediaMissingKeyMaterial
+
+**Severity**: Warning
+**Condition**: >5% of received media frames dropped for missing key material, sustained 15 minutes
+**Impact**: Affected participants hear nothing while every server-side signal reads healthy — MH never opens a frame and structurally cannot observe either condition.
+**Runbook**: [Scenario 16: Missing Key Material](../runbooks/mc-incident-response.md#scenario-16-missing-key-material)
+
+> **THIS ALERT CANNOT FIRE TODAY, AND THAT IS NOT A THRESHOLD PROBLEM.** `dt_client_*` metrics reach no Prometheus in this deployment: the OTLP collector's metrics pipeline exports to `debug` (its own container log) and no Prometheus job scrapes the collector, so the series does not exist. **The absence of this alert firing is not evidence that key delivery is healthy.** The rule lands so that wiring the exporter is the single remaining step rather than a rule nobody wrote; the wiring is tracked in `docs/TODO.md` §Observability Debt. Stated here, adjacent to the PromQL, because every other entry in this file is written in the present tense and an unmarked entry would read as coverage.
+
+**PromQL**:
+```promql
+(
+  sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|no_roster_entry"}[5m]))
+  /
+  sum(rate(dt_client_media_frames_received_total[5m]))
+) > 0.05
+and
+sum(rate(dt_client_media_frames_received_total[5m])) > 0
+```
+`for: 15m`
+
+**Response**:
+1. **Split on the `reason` label first** — the two arms have different remedies and are not equally instrumented.
+2. `no_roster_entry`: no usable identity key for the sender, including the case where MC published an empty key. Signature verification cannot run, so attribution is failing and not merely decryption. Corroborate server-side with `mc_join_identity_key_presence_total{presence}` — a rising `absent` ratio answers "are clients publishing keys?" directly. A *malformed* key is a different condition and lands on `mc_session_join_failures_total{error_type="identity_key_invalid"}`.
+3. `no_kek_for_generation`: no meeting KEK for the generation the frame's wrap announces. **This arm has no server-side counter and cannot have one** — `mc_meeting_kek_generated_total` increments unconditionally and its catalog entry states the inference is not computable even in principle. Absence of a signal here is not evidence the KEK is present.
+4. Check the non-dump path first and completely: the per-join response-side condition (`meeting_kek` not exactly 32 bytes) and `dt_client_media_kek_updates_total{source="join_response"}`. Then read the runbook's dump gate before going further.
+5. Both reasons are **expected transiently** at join and after a KEK rotation. The `for: 15m` window, not the threshold, is what separates the transient from the signal.
+
+**Threshold provenance**: 5% is not SLO-derived and there is no observed baseline. At 20 ms/frame (50 frames/s) a 1–2 second join transient is well under 1% of a 5-minute window while a sustained delivery failure sits near 100%.
 
 #### MCHighJoinFailureRate
 
@@ -734,19 +802,66 @@ histogram_quantile(0.95,
 
 ## Media Handler Alerts
 
-**Status**: ✅ Exists — **not inventoried here**
+**Status**: ✅ Exists — **partially inventoried here**
 **File**: `infra/docker/prometheus/rules/mh-alerts.yaml`
 
-That file ships a full alert set and this inventory documents **none** of it. Read the rules file
-directly; do not treat the absence of entries below as an absence of alerts. Backfilling the MH (and
-MC) inventory is tracked in `docs/TODO.md`, together with the missing rules↔inventory drift guard
-that let the gap persist. (No count is given here deliberately — a literal would be a second
-encoding of `mh-alerts.yaml` with no guard behind it, stale on the next rule added.)
+**This section inventories exactly one of that file's alerts — `MHMediaEgressQueueOverflowRate`,
+below. Every other alert in `mh-alerts.yaml` ships uninventoried.** Read the rules file directly, and
+**do not treat the absence of an entry below as the absence of an alert** — that is the inference a
+reader naturally makes here, and it is wrong.
+
+Inventoried alerts are **named, never counted.** A count would be a second encoding of
+`mh-alerts.yaml` with nothing behind it, stale on the next rule added; this section already carries
+two struck entries from that failure. A name degrades differently: an alert name that stops existing
+is greppable, a count that stops being right is invisible.
+
+The one entry is inventoried because it **landed with its alert** (ADR-0036 story 1), so the
+byte-identical-PromQL discipline was applied at authoring time rather than reconstructed. The rest
+are deliberately **not retro-filled** — backfilling is tracked in `docs/TODO.md`. Note what the
+`inventory_expr_drift` guard does and does not cover: it holds byte-identity for whatever *is*
+inventoried, so a backfilled entry is checked from the moment it lands, but it does **not** require
+that every rule have an entry. Nothing mechanical will tell you this section is incomplete. This
+paragraph is that signal.
 
 The rules file also records two **deliberate omissions** in its header comments — no burn-rate
 page/warning pair, and no RegisterMeeting-apply alert — both gated on the MH SLO **target**, which is
 unratified and lands in story 8. See `docs/observability/slos.md`, which is authoritative for that
 rule; the rules-file comment is the copy.
+
+#### MHMediaEgressQueueOverflowRate
+
+**Severity**: Warning
+**Condition**: >1% of egress datagram attempts dropped on MH's bounded application egress queue, for 5 minutes
+**Impact**: Audible loss for affected subscribers. Audio is one frame per QUIC datagram with no retransmission, so a dropped datagram is a dropped frame. MH readiness, handshake latency and connection-accept rate all read healthy throughout.
+**Runbook**: [Scenario 17: Media Datagram Drop](../runbooks/mh-incident-response.md#scenario-17-media-datagram-drop)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mh_media_frames_dropped_total{direction="egress",reason="egress_queue_overflow"}[5m]))
+  /
+  (
+    sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
+  + sum(rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+  )
+) > 0.01
+and
+(
+  sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
++ sum(rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+) > 0
+```
+`for: 5m`
+
+**Response**:
+1. Break the drop counter down by `reason` **before** concluding back-pressure. Only `egress_queue_overflow` is what this rule measures.
+2. `connection_closed` is routine — every participant leaves every meeting. `no_subscriber` is counted **once per frame**, not once per (frame × subscriber), so in a meeting with nobody subscribed it reads as 100% of egress off a single frame. **Do not widen the selector to include either**; that is the false fire the restriction exists to prevent, and it is why this alert is named for its selector rather than for the runbook scenario.
+3. Sustained overflow means a subscriber the queue cannot drain into fast enough. There is no per-stream lever in this build — the bound is a startup-validated transport parameter. Escalate to `media-handler` with the reason breakdown and the affected pod.
+4. **Nothing may rest on `mh_media_egress_queue_depth` alone** — one process-wide, last-writer-wins gauge fed by N per-subscriber queues, with a scrape interval orders of magnitude longer than the queue's fill-and-drain time. Trend input only.
+
+> **This is an application queue bound, not a bandwidth budget.** It is ADR-0036 §1's transport-parameter bound, sized to trip before quinn's transport ceiling so the drop is countable in our code rather than discarded silently inside the library. There is no egress bandwidth budget, capacity gauge, stream ceiling or admission threshold in this build. The ordering is enforced at startup as `ConfigError::EgressQueueDoesNotBindFirst`, which is what stops this alert becoming dead by construction.
+>
+> **The client-side send drop is not covered by this rule and cannot be** — it happens in the sender, and MH structurally cannot observe it (ADR-0036 §11). A flat counter here is not evidence that frames are arriving. See the runbook's client-side ladder.
 
 **Remaining unbuilt candidates** (aspirational — thresholds are unratified):
 - `MHHighPacketLoss` - Packet loss >1%
@@ -755,7 +870,9 @@ rule; the rules-file comment is the copy.
 > `MHDown` and `MHHighCPU` were also removed from this list on 2026-09-02: **both already exist** in
 > `mh-alerts.yaml`. Listing a shipped alert as unbuilt is the same dangling-entry failure as the
 > struck `MHHighJitter` above — a candidate list reads as a work queue — and it contradicted the
-> "documents none of it" note directly above.
+> then-current "documents none of it" note directly above (since reframed as a partial inventory,
+> when `MHMediaEgressQueueOverflowRate` landed; the contradiction it names was real against the
+> wording of the day).
 
 > **Two entries removed here on 2026-09-02**, because this commit made them dangling:
 > - **`MHHighJitter` — "Jitter p99 >20ms"**: the MH audio-jitter objective is **struck as

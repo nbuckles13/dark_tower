@@ -25,6 +25,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+# YAML, for parsing the on-disk alert-rule files STRUCTURALLY. A line-grep for
+# `alert:` sweeps in comment lines and produces expectations that can never be
+# satisfied; same family as the escaped-JSON trap `32_media_metric_hygiene.rs`
+# documents. Same crate `dt-guard` uses for the same files.
+serde_norway = "0.9.42"
 
 # Error handling
 thiserror = { workspace = true }

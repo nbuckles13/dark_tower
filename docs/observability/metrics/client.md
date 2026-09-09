@@ -25,6 +25,29 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 `OtelMetricsSink`) and exported OTLP-HTTP/proto to the GC telemetry proxy
 (`POST /api/v1/telemetry/v1/metrics`).
 
+> ## NOT ONE METRIC IN THIS CATALOG IS QUERYABLE FROM PROMETHEUS TODAY
+>
+> **Emitted and exported is not the same as queryable, and the chain stops one
+> hop short.** The GC proxy forwards to the OTLP collector, whose metrics
+> pipeline is `receivers: [otlp]` / `exporters: [debug]`
+> (`infra/services/otel-collector/configmap.yaml`). `debug` writes names and
+> counts to the collector's own container log. There is no `prometheus` or
+> `prometheusremotewrite` exporter, and no Prometheus job scrapes the collector.
+>
+> **So every metric below is real, correctly emitted, carries the labels this
+> file documents — and cannot be graphed, alerted on, or queried.** One alert
+> already rests on this (`MCMediaMissingKeyMaterial`); it is loaded, evaluating,
+> and structurally incapable of matching. Tracked in `docs/TODO.md`
+> §Observability Debt, owner infrastructure for the wiring.
+>
+> This block exists because the sentence above it — accurate about emission and
+> export — invites the inference that the chain continues, and a catalog is
+> exactly where someone goes to decide whether a signal is available before
+> building on it. Stating the export path and stopping is how a reader concludes
+> the metric is usable. Delete this block when the exporter lands, **not before,
+> and not because the catalog looks pessimistic**: the state it describes is the
+> state of the tree.
+
 ---
 
 ## Naming convention (R-24, R-27)

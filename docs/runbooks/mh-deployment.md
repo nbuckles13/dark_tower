@@ -22,8 +22,9 @@ For active-incident triage (e.g. "an alert is firing right now"), see the compan
 2. [Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination](#post-deploy-monitoring-checklist-mh-webtransport--mcmh-coordination)
 3. [Required environment keys](#required-environment-keys)
 4. [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply)
-5. [Rollback](#rollback)
-6. [References](#references)
+5. [Rollout With Media Flowing](#rollout-with-media-flowing)
+6. [Rollback](#rollback)
+7. [References](#references)
 
 ---
 
@@ -610,6 +611,131 @@ would blind that guard on **all thirteen** while it kept reporting clean.
 
 ---
 
+## Rollout With Media Flowing
+
+**Read this before rolling MH while meetings are in progress.** The behaviour below is a **recorded
+decision** (ADR-0036 §11), not a defect and not an accident of the current implementation. An
+operator who diagnoses it as a bug will reach for a drain that the design deliberately does not
+have.
+
+### MH sheds media sessions on restart. That is the decision.
+
+Shutdown marks the pod not-ready, cancels in-flight work, and sleeps two seconds inside a
+thirty-five second termination grace period. **There is no drain phase, and v1 keeps it that way.**
+
+The reason is stated in the ADR and is worth carrying here, because "add a drain" is the obvious
+suggestion: draining media sessions means either **holding a pod open for the length of a meeting**
+— unbounded, since a meeting has no deadline — or **migrating live sessions to another handler**,
+which is a different system. Neither is in scope. Shedding is tolerable because §8's periodic
+re-assert bounds the recovery window; the shedding decision and the recovery mechanism are one
+decision made in two halves.
+
+### The client-visible consequence, stated plainly
+
+When an MH pod goes not-ready during a rollout:
+
+- **Every participant whose media session is on that pod loses audio at that moment.** Signalling is
+  unaffected — the client stays joined, the roster is intact, the UI shows a healthy meeting. Only
+  the media stops.
+- **In this build they do not get it back on their own.** The §8 recovery this decision leans on —
+  the ≤10 s periodic re-assert — **has not shipped yet.** Of §8's four re-fire triggers only
+  *structural change* is implemented; there is no cadence, no connectivity-loss trigger, and no
+  newly-assigned trigger. So a shed session is recovered by a **rejoin**, and by nothing else.
+- **Expect user reports of "the call went silent but it still says I'm connected" during every MH
+  rollout**, for as long as that gap stands. That is the expected shape, not an incident.
+
+**Do not open an incident for this, and do not add a drain in response to it.** The recovery half
+lands with the handler-restart story. When it does, this section is one of the places to revise —
+the shedding stays, the "does not come back on its own" clause goes.
+
+> **Diagnostic tell**, so you can distinguish this from a real fault: after a shed, the client's
+> QUIC connection to the old pod fails or closes, and
+> `dt_client_media_frames_received_total` goes flat while
+> `dt_client_media_frames_sent_total` may keep rising briefly. That is the same reading as
+> [`mh-incident-response.md` Scenario 17](mh-incident-response.md#scenario-17-media-datagram-drop),
+> which is why Scenario 17's rung 1 asks about the connection first — a shed shows as connection
+> failure, a stale-policy fault leaves a healthy connection.
+
+### Scaling MH to zero is NOT a media kill switch
+
+If you need to stop media, **scaling `mh-0` / `mh-1` to zero replicas is the wrong lever, and it is
+worse than the problem it is reaching for.**
+
+**MH assignment is part of the join flow.** With no MH available, joins do not degrade to
+audio-less meetings — **they fail**. So scaling to zero converts a media-path problem into a **join
+outage**, whose blast radius is strictly wider: it stops every *new* participant in every meeting,
+including meetings that were not affected by whatever prompted the action.
+
+| Action | Intended blast radius | Actual blast radius |
+|---|---|---|
+| Scale MH to 0 | media on affected meetings | **all joins, fleet-wide**, plus the media it was aimed at |
+
+**There is no finer-grained lever in this build.** There is no per-meeting media disable, no feature
+flag, and no runtime toggle. If media must be stopped, the only correct action is a **redeploy** of
+the previous image — which is the rollback path below, and which keeps joins working.
+
+### Rollback for the media path
+
+| Property | Value |
+|---|---|
+| **Mechanism** | Redeploy only — `kubectl rollout undo` |
+| **Schema change** | None |
+| **Data change** | None |
+| **Feature flag** | None |
+| **MTTR** | **One rollout** |
+| **Partial rollback** | Not available; there is no finer-grained control |
+
+```bash
+# --- WSL2 ---
+kubectl rollout undo deployment/mh-0 -n dark-tower
+kubectl rollout undo deployment/mh-1 -n dark-tower
+kubectl rollout status deployment/mh-0 -n dark-tower --timeout=180s
+kubectl rollout status deployment/mh-1 -n dark-tower --timeout=180s
+```
+
+**The rollback itself sheds media sessions**, by the same mechanism as the rollout that prompted it.
+That is the cost of the redeploy-only lever and it is unavoidable here: participants on the affected
+pods rejoin. Say so when you announce the rollback, rather than discovering it in the user reports.
+
+**One version-skew detector survives a rollback**, and it is the only one: if the rolled-back image
+speaks an older frame version than clients are sending, receivers count
+`dt_client_media_frames_dropped_total{reason="unknown_version"}`. That token is emitted individually
+rather than collapsed into a generic decode-reject bucket **specifically** so a version-skewed
+rollback is detectable. If you see it rising after a rollback, the rollback went back too far.
+
+### Post-rollout verification, media path
+
+Run these after the rollout completes. All are pod- or service-level; none carries a meeting,
+participant or stream dimension.
+
+```promql
+# 1. MH is forwarding at all (should be non-zero once any media session is up).
+sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
+
+# 2. Egress attempts are not dominated by queue overflow.
+#    Compare against the MHMediaEgressQueueOverflowRate threshold; see Scenario 17
+#    for why `no_subscriber` and `connection_closed` in this breakdown are not faults.
+sum by(reason) (rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+
+# 3. Policy is applying, not merely arriving.
+sum by(outcome) (increase(mh_media_policy_applies_total[15m]))
+
+# 4. MC agrees about what MH applied. Anything but `match` (and the
+#    `handler_id_mismatch` diagnostic, which fires on every ordinary MH restart
+#    because MH_HANDLER_ID is per-incarnation) means read MC Scenario 15.
+sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
+```
+
+**Expect `handler_id_mismatch` on every MH rollout.** It is a diagnostic, not a fault, for exactly
+the reason above. `MCMediaGenerationDivergence` excludes it deliberately; do not read it as a
+regression.
+
+**Related**:
+- [`mh-incident-response.md` Scenario 17: Media Datagram Drop](mh-incident-response.md#scenario-17-media-datagram-drop)
+- [`mc-incident-response.md` Scenario 15: Media Generation Divergence](mc-incident-response.md#scenario-15-media-generation-divergence)
+
+---
+
 ## Rollback
 
 For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For other rollback scenarios (general service restore, configuration regression), follow the same `kubectl rollout undo` pattern; deeper operational steps will be filled in alongside the deployment-procedure stub.
@@ -623,6 +749,7 @@ For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criter
 - **MC-side post-deploy checklist (companion)**: `docs/runbooks/mc-deployment.md` §"Post-Deploy Monitoring Checklist: MC↔MH Coordination (RegisterMeeting + Notifications)"
 - **Metrics catalog**: `docs/observability/metrics/mh-service.md`, `docs/observability/metrics/mc-service.md`
 - **Alert rules**: `infra/docker/prometheus/rules/mh-alerts.yaml`, `infra/docker/prometheus/rules/mc-alerts.yaml`
+- **ADR-0036**: Media Flow Between Participants — §1 (transport, the application egress queue bound), §8 (MC→MH control plane, the applied-generation echo and its four re-fire triggers), §11 (shed-on-restart recorded as the decision; media telemetry constraints)
 - **ADR-0011**: Observability Framework
 - **ADR-0029**: Dashboard / counter conventions (counters vs rates; Category A vs B PromQL)
 

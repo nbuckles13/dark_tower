@@ -48,7 +48,8 @@
 - [Secure Context and Media Setup](#secure-context-and-media-setup)
 - [§3 Bring-up](#3-bring-up)
 - [§4 Is the join real?](#4-is-the-join-real)
-- [§5 Failure modes](#5-failure-modes)
+  - [§4.5 "I joined and I hear nothing" — media triage ladder](#45-i-joined-and-i-hear-nothing--media-triage-ladder)
+- [§5 Failure modes](#5-failure-modes) (F1–F15)
 - [§6 Teardown](#6-teardown)
 - [§6.5 Automated checks that exist today](#65-automated-checks-that-exist-today)
 - [§7 Not on this branch](#7-not-on-this-branch)
@@ -720,6 +721,124 @@ notification path, which none of the signals above cover.
 
 ---
 
+### 4.5 "I joined and I hear nothing" — media triage ladder
+
+**This is the section the loopback story exists for.** Localising a silent call is the whole point:
+audio passes through **capture → encrypt → sign → uplink → MH forward → downlink → decrypt →
+verify → playback**, and the hazard is that *every signal reads green while no audio arrives*. §4.2's
+question is the right one here — for each signal, finish *"this proves ___"* without using
+*working*, *fine*, or *healthy*.
+
+**Turn the counters on first.** `dt_client_*` metrics are off unless `VITE_TELEMETRY_ENDPOINT` is
+set. With it set they export to the GC telemetry proxy, **never to the console** — see the note at
+the end of this section about where they can and cannot be read.
+
+#### The ladder, cheapest signal first
+
+| Rung | Read | Localises to |
+|---|---|---|
+| 1 | Is `dt_client_media_frames_sent_total` moving? | **capture / mute** vs everything downstream |
+| 2 | Is `dt_client_media_frames_received_total` moving? | **round trip** vs receive-side processing |
+| 3 | Is `dt_client_media_frames_accepted_total` moving? | **crypto/parse** vs **playback** |
+| 4 | `dt_client_media_frames_dropped_total{reason}` | the exact receive step that rejected, **by name** |
+| 5 | `dt_client_media_send_dropped_total{reason}`, `dt_client_media_send_queue_depth` | **uplink back-pressure** |
+| 6 | Server-side counters (`mh_media_*`, `mc_media_*`) | whose service to open |
+| 7 | Packet capture | last rung; **credential-bearing**, see below |
+
+Most silent calls resolve at rung 1, 3 or 4. Reaching for a packet capture first is the mistake §4.0
+already warns about, and it is worse here because the artifact carries a JWT.
+
+#### What each green signal actually proves
+
+| Signal | This proves… | It does **NOT** prove |
+|---|---|---|
+| `dt_client_media_mute_transitions_total{action}` moved to `unmute` | the app **believes** it is unmuted | that the capture device produced a sample. Client mute is enforced at capture, so a stuck mute produces silence with no error anywhere. |
+| `dt_client_media_frames_sent_total` rising | frames were **encrypted, signed, and left the device** — capture, encrypt, sign and uplink all ran | that MH accepted or forwarded any of them |
+| `dt_client_media_send_dropped_total{reason}` flat | the SDK's bounded egress queue is not shedding | that the frames reached the network. `transport_send_refused` and `not_connected` are **fleet contracts that read zero forever** — any non-zero is a bug, not a load condition. |
+| `dt_client_media_send_queue_depth` low | no application-layer back-pressure right now | anything about the transport queue beneath it |
+| `dt_client_media_frames_received_total` rising | **datagrams arrived at the wire.** Counted before any parse, verification or decryption — deliberately, so *"nothing is arriving"* is distinguishable from *"arriving and failing to open"* | that a single one was openable, let alone audible |
+| `dt_client_media_frames_dropped_total{reason}` flat **and** `received` flat | nothing to reject, because nothing arrived | that the uplink worked |
+| `dt_client_media_frames_accepted_total` rising | frames were verified, replay-checked, decrypted and **handed to the audio decoder** | **that anything was played.** A frame handed to a decoder is not a frame that was heard. |
+| `dt_client_media_decoder_errors_total` flat | the decoder did not report an error | that the output device is live, or that the `AudioContext` is running |
+
+**The accounting identity that makes rungs 2–4 trustworthy:**
+
+> **`received = accepted + sum(drops by reason)`**
+
+It holds at the crypto/parse boundary **by construction** — every datagram leaves the receive path
+through exactly one of those two channels. **It does not hold at playback.** A frame lost between
+decoder handoff and audible decrements nothing on the right-hand side, which is precisely why
+`accepted` is named `accepted` and not `played`.
+
+#### Reading the fork at rung 2
+
+| Rung 1 | Rung 2 | Meaning |
+|---|---|---|
+| `sent` **flat** | — | Capture or mute-release never resumed. **Not a transport problem.** Go to F12. |
+| `sent` rising | `received` **flat** | Transmitting into something that is not returning. **Two causes, no unique client-side discriminator.** Go to F13. |
+| `sent` rising | `received` rising, `accepted` **flat** | Arriving and failing to open. Read rung 4's `reason` label — it names the step. Go to F15 if the reason is key material. |
+| `sent` rising | `accepted` rising, still silent | The fault is **downstream of decoder handoff**. Go to F14. |
+
+#### Rung 4 — the `reason` label is the diagnosis
+
+`dt_client_media_frames_dropped_total{reason}` carries the frozen frame-reject vocabulary, and the
+tokens are emitted **individually** rather than collapsed. Grouped by what they tell you:
+
+| Reason group | Tokens | Means |
+|---|---|---|
+| **Key material** | `no_kek_for_generation`, `no_roster_entry` | Expected transiently at join and after a KEK rotation. **Sustained is the signal.** → F15 |
+| **Crypto** | `unwrap_failed`, `decrypt_failed`, `signature_invalid` | `unwrap_failed` is the KEK unwrap (key **distribution**); `decrypt_failed` is the SFrame payload (key schedule or sender). Two AES-GCM failures on one path routing to opposite owners. |
+| **Structural / codec** | `unknown_version`, `reserved_flag_bit_set`, `payload_length_exceeds_max`, `payload_length_exceeds_available`, `truncated`, `extensions_too_large`, `extensions_malformed`, `trailing_bytes` | A wire-format disagreement. `unknown_version` specifically is the version-skew tell — see `mh-deployment.md` §Rollout With Media Flowing. |
+| **Protocol violation** | `no_transmit_key` | Neither a cached key nor a usable wrap. Not a third key reason. |
+| **Replay** | `replay_detected` | The replay window rejected it. |
+
+#### Rung 6 — server-side, and which service to open
+
+```promql
+# Is MH forwarding at all?
+sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
+
+# Is MH shedding on its egress queue bound?  (`no_subscriber` and `connection_closed`
+# in this breakdown are routine, not faults -- see MH Scenario 17.)
+sum by(reason) (rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+
+# Does MC agree about the policy MH applied?
+sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
+```
+
+**Aggregation floor is pod or service.** There is no `by(meeting_id)`, no `by(participant)` and no
+`by(sender)` on any media-path metric, anywhere — by design, not by omission. A per-stream,
+time-ordered series of frame sizes is a voice-activity trace, so the dimension does not exist to be
+grouped by.
+
+**And for the same reason: do not raise a log level to diagnose this.** The incident that motivates
+the level change is the incident that produces the sensitive trace. There is no debug-logging rung
+in this ladder and there will not be one.
+
+#### Where these counters can actually be read
+
+**Honest limitation, so you do not spend an afternoon on it:** `dt_client_*` metrics **do not reach
+Prometheus in this deployment.** The OTLP collector's metrics pipeline exports to `debug` — the
+collector's own container log — and no Prometheus job scrapes the collector. So:
+
+- **Prometheus and Grafana will not show you any `dt_client_*` series.** An empty query result is
+  the expected outcome, not a sign that the client is broken.
+- The counters *are* emitted and *are* reaching the collector. `kubectl logs -n dark-tower
+  -l app=otel-collector` shows the debug exporter's received-metric names and counts, which is
+  enough to tell "emitted" from "not emitted" — and nothing more.
+- **No `dt_client_*` alert can fire**, including `MCMediaMissingKeyMaterial`. Wiring the export path
+  is tracked in `docs/TODO.md` §Observability Debt.
+
+Server-side counters (`mh_media_*`, `mc_media_*`) reach Prometheus normally; rung 6 works.
+
+**Related**: MC's key-delivery remedies live in
+[`mc-incident-response.md` Scenario 16: Missing Key Material](mc-incident-response.md#scenario-16-missing-key-material);
+the datagram-drop and keepalive story lives in
+[`mh-incident-response.md` Scenario 17: Media Datagram Drop](mh-incident-response.md#scenario-17-media-datagram-drop).
+**Both are pointed at, not restated here** — thresholds and remedies are owned in one place.
+
+---
+
 ## 5. Failure modes
 
 Each scenario gives a **discriminator** — something you can run to tell it apart from the
@@ -1134,6 +1253,129 @@ single-sourced (`.nvmrc`, root `package.json` engines) precisely so the fix is "
 not "guess a version"; a tracked drift-guard (`docs/TODO.md`, §Developer Experience) will fail
 validation if `.nvmrc`, the devloop-image Node pin, the lockfile floor, and root `engines.node`
 ever disagree.
+
+
+### F12 — Joined, unmuted, and `dt_client_media_frames_sent_total` is flat
+
+**Symptom.** The meeting is joined, the UI shows unmuted, and no frames are leaving the device.
+
+**Discriminator.** `dt_client_media_frames_sent_total` flat **while**
+`dt_client_media_mute_transitions_total{action="unmute"}` has incremented. That pair separates this
+from every downstream fault: nothing left, so nothing downstream can be at fault.
+
+**Why.** Client mute is enforced **at capture** — while muted, nothing is encoded, so nothing enters
+the egress queue and nothing is dropped. Mute is therefore invisible on the drop counters by design.
+A stuck mute, a capture device that never started, or a `getUserMedia` track that ended produces
+exactly this: silence, with no error on any path.
+
+**Fix.**
+1. Confirm the microphone permission and the secure-context requirements in
+   [§Secure Context and Media Setup](#secure-context-and-media-setup) — the whole media pipeline is
+   gated all-or-nothing, so a non-trustworthy origin produces a silent capture failure, not an error.
+2. In devtools, check the `MediaStreamTrack`'s `readyState` and `muted` — a track that has `ended`
+   never resumes and needs re-acquiring.
+3. If no microphone exists on the machine, relaunch Chrome with synthesized capture — see
+   [§No microphone on this machine?](#no-microphone-on-this-machine-launch-chrome-with-synthesized-capture).
+
+---
+
+### F13 — `sent` rising, `received` flat: transmitting into something that is not returning
+
+**Symptom.** Frames are leaving the device; nothing is coming back. In loopback that is
+unambiguous — you should be hearing yourself.
+
+**Discriminator — and the honest part: THERE IS NO UNIQUE CLIENT-SIDE DISCRIMINATOR.** This reading
+has at least two causes with different remedies, and no client counter separates them:
+
+1. a **NAT binding reaped** during a mute longer than the QUIC keepalive interval; or
+2. **MH holding stale or absent policy**.
+
+**Fix — work the fork in this order, cheapest first. Rung 1 is the one that separates them:**
+
+1. **Is the QUIC connection still up?** A reaped binding shows as **connection failure or keepalive
+   distress** — the transport reports a closed or timing-out connection. **MH-not-forwarding leaves
+   a perfectly healthy connection.** This single observation does the discrimination the counters
+   cannot.
+2. **If the connection is healthy**, check for generation divergence:
+   `sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))`. Anything other than `match` (and
+   the `handler_id_mismatch` diagnostic, which fires on every ordinary MH restart) sends you to
+   [`mc-incident-response.md` Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).
+   **Note it does not self-correct in this build** — the remedy there is to force a rejoin, not to
+   wait.
+3. **Only then** compare the configured keepalive interval against the mute duration that preceded
+   the symptom.
+4. **Only then** take a packet capture.
+
+> **A packet capture or a devtools HAR of a join is CREDENTIAL-BEARING** — the join carries the
+> meeting JWT. Do not attach one to a ticket, an issue, or a chat message. Named access, encrypted
+> at rest, deleted on a deadline with an owner.
+
+**Also possible and cheaper to rule out**: MH was rolled underneath you. MH sheds media sessions on
+restart by design and, in this build, they do not recover on their own — see
+[`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing). A
+rejoin fixes it; that is the expected behaviour, not a bug.
+
+Full triage: [`mh-incident-response.md` Scenario 17](mh-incident-response.md#scenario-17-media-datagram-drop).
+
+---
+
+### F14 — `dt_client_media_frames_accepted_total` is rising and you still hear nothing
+
+**Symptom.** Every counter reads healthy across the whole path. Frames sent, received, accepted. Silence.
+
+**Discriminator.** `accepted` rising with `dt_client_media_frames_dropped_total` flat. That combination
+proves the entire crypto and parse path succeeded, so the fault is **downstream of the decoder
+handoff** — and no counter in the media path reaches past that boundary.
+
+**Why the counters stop here.** `accepted` is named `accepted` and **not `played`** precisely because
+a frame handed to a decoder is not a frame that was heard: the decoder can error, the output can be
+discarded, and the audio context can be suspended. The `received = accepted + sum(drops)` identity
+holds at the crypto/parse boundary, not at playback, so a healthy identity is fully compatible with
+total silence.
+
+**Fix**, in order — all of these are browser-side and none needs the cluster:
+1. **Is the `AudioContext` running?** Chrome suspends it until a user gesture. In devtools, check its
+   `state`; `suspended` is the single most common cause of this exact symptom and it produces no
+   error.
+2. **Is the output device the one you are listening to?** Check the OS/browser output selection —
+   Chrome can route to a device that is not your headphones.
+3. **`dt_client_media_decoder_errors_total`** — non-zero narrows it to the decoder. Flat rules the
+   decoder out but rules nothing else out; it covers only part of this segment.
+4. Tab muted, page volume, or OS mixer. Unglamorous and genuinely common.
+
+---
+
+### F15 — Sustained key-material drops: `no_kek_for_generation` or `no_roster_entry`
+
+**Symptom.** `dt_client_media_frames_received_total` rising, `accepted` flat, and
+`dt_client_media_frames_dropped_total{reason}` climbing on one of the two key-material tokens.
+
+**Discriminator.** The `reason` label, and **the two arms have different remedies — split on it
+first**:
+
+- `no_kek_for_generation` — no meeting KEK for the generation the frame's wrap announces. Check
+  `dt_client_media_kek_updates_total{source="join_response"}`: flat across a join means the KEK was
+  never delivered.
+- `no_roster_entry` — no usable identity key for the sender, **including the case where MC published
+  an empty key**. This one also means signature verification cannot run at all, not merely decryption.
+
+**Both are EXPECTED as brief transients** at join and immediately after a KEK rotation. **A burst of
+a few frames at join is normal and is not this failure mode.** Sustained is the signal.
+
+**Fix.** The remedy is server-side, in MC's KEK-and-roster delivery path, and it is documented in one
+place:
+[`mc-incident-response.md` Scenario 16: Missing Key Material](mc-incident-response.md#scenario-16-missing-key-material).
+**Do not duplicate the remedies here** — that scenario carries the per-arm split, the server-side
+counters that corroborate the roster arm, and the reason the KEK arm has no server-side counter at
+all.
+
+**Two things to know before you go there**, because they change how you read a quiet system:
+- **No alert will have fired.** `dt_client_*` metrics do not reach Prometheus in this deployment
+  (§4.5, *Where these counters can actually be read*), so `MCMediaMissingKeyMaterial` cannot fire.
+  Silence from alerting is not evidence of health.
+- **Do not add a log line to check whether the KEK is present.** ADR-0036 §11 puts KEK and
+  transmit-key material inside the credential-leak guard's scope for exactly this moment. A KEK in a
+  log is a KEK in the log pipeline.
 
 ---
 

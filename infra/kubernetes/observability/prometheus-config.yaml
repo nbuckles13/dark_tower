@@ -1,145 +1,20 @@
-# Prometheus Configuration for Dark Tower
+# Prometheus for Dark Tower — RBAC, Deployment and Service.
 #
-# Prometheus scrapes metrics from Dark Tower services.
-# Each service exposes a /metrics endpoint on its health port.
+# The server config itself lives in `prometheus.yml` in this directory and the
+# alert rules in `infra/docker/prometheus/rules/`; both are turned into
+# ConfigMaps by `configMapGenerator` in `kustomization.yaml`.
 #
-# Scrape jobs:
-# - prometheus: Self-monitoring
-# - ac-service: Auth Controller (port 8082)
-# - gc-service: Global Controller (port 8080)
-# - mc-service: Meeting Controller (port 8081)
-# - kube-state-metrics: Cluster-level metrics (pod states, deployments, etc.)
-# - node-exporter: Node-level metrics (CPU, memory, disk, network)
-# - kubelet: Container-level metrics (container_cpu_usage_seconds_total, etc.)
+# Scrape jobs (see `prometheus.yml`): prometheus, ac-service, gc-service,
+# mc-service, mh-service, kube-state-metrics, node-exporter, kubelet.
 #
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: prometheus-config
-  namespace: dark-tower-observability
-  labels:
-    app: prometheus
-    component: monitoring
-data:
-  prometheus.yml: |
-    global:
-      scrape_interval: 15s
-      evaluation_interval: 15s
-
-    scrape_configs:
-      - job_name: 'prometheus'
-        static_configs:
-          - targets: ['localhost:9090']
-
-      # Scrape AC service pods running in-cluster
-      - job_name: 'ac-service'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: ac-service
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8082"
-
-      # Scrape Global Controller pods
-      - job_name: 'gc-service'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: gc-service
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8080"
-
-      # Scrape Meeting Controller pods (metrics on health port)
-      - job_name: 'mc-service'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: mc-service
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8081"
-
-      # Scrape Media Handler pods (metrics on health port)
-      - job_name: 'mh-service'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: mh-service
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8083"
-
-      # Scrape kube-state-metrics for cluster-level metrics
-      - job_name: 'kube-state-metrics'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower-observability
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: kube-state-metrics
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "8080"
-
-      # Scrape node-exporter for node-level metrics
-      - job_name: 'node-exporter'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - dark-tower-observability
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: keep
-            regex: node-exporter
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            action: keep
-            regex: "9100"
-
-      # Scrape kubelet for container metrics
-      - job_name: 'kubelet'
-        scheme: https
-        tls_config:
-          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          insecure_skip_verify: true
-        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
-        kubernetes_sd_configs:
-          - role: node
-        relabel_configs:
-          - action: labelmap
-            regex: __meta_kubernetes_node_label_(.+)
-          - target_label: __address__
-            replacement: kubernetes.default.svc:443
-          - source_labels: [__meta_kubernetes_node_name]
-            regex: (.+)
-            target_label: __metrics_path__
-            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+# NOTE: the `prometheus-config` and `prometheus-rules` ConfigMaps are GENERATED
+# by `configMapGenerator` in `kustomization.yaml` -- from
+# `infra/kubernetes/observability/prometheus.yml` and from
+# `infra/docker/prometheus/rules/` respectively. They are deliberately not
+# inline here: a generated ConfigMap carries a content hash, so a change to
+# either rolls the Deployment, which is what makes "the rules on disk are the
+# rules Prometheus loaded" structural rather than a reload call someone must
+# remember to make.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -216,18 +91,40 @@ spec:
           args:
             - "--config.file=/etc/prometheus/prometheus.yml"
             - "--storage.tsdb.path=/prometheus"
-            - "--web.enable-lifecycle"
+            # NO `--web.enable-lifecycle`. It was removed on 2026-09-09 with the
+            # alert-rule loading change, and the reason is that change: the flag
+            # enables unauthenticated `POST /-/reload` AND `POST /-/quit`, this
+            # Service is a NodePort on 30090, and `infra/kind/kind-config.yaml`
+            # maps that to hostPort 9090 -- so `/-/quit` was reachable off-host.
+            # While nothing evaluated rules, stopping Prometheus was a metrics
+            # gap somebody would notice. NOW IT IS A DETECTION OUTAGE, and a
+            # stopped evaluator looks exactly like a quiet one. The flag was
+            # also dead: nothing in scripts/, infra/ or crates/env-tests/ calls
+            # either endpoint. Rule changes do not need it -- the ConfigMaps are
+            # generated with content hashes, so a rules edit changes the
+            # Deployment spec and rolls the pod.
           ports:
             - containerPort: 9090
           volumeMounts:
             - name: config
               mountPath: /etc/prometheus
+            # Mounted at the path `rule_files: "rules/[a-z]*-alerts.yaml"`
+            # resolves to. Prometheus resolves a relative `rule_files` glob
+            # against the CONFIG FILE's directory, so `/etc/prometheus/rules`
+            # here and `/etc/prometheus/rules` in docker-compose keep ONE glob
+            # string valid in both deployments -- nothing to drift.
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
             - name: data
               mountPath: /prometheus
       volumes:
         - name: config
           configMap:
             name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
         - name: data
           emptyDir: {}
 ---

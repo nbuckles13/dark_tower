@@ -117,6 +117,31 @@ impl PrometheusClient {
         self.query(QueryRequest::instant(promql)).await
     }
 
+    /// Fetch the RAW body of `/api/v1/rules`.
+    ///
+    /// Raw, not deserialised, on purpose: parsing lives in
+    /// [`crate::fixtures::alert_rules_loaded::loaded_alert_names`], which is a
+    /// pure kernel with FIRE fixtures in the always-on Rust lane. An extractor
+    /// written inside a cluster-gated test gets zero unit coverage — that is how
+    /// the escaped-JSON `/api/v1/status/config` defect this repo already shipped
+    /// (see `tests/32_media_metric_hygiene.rs`) passed on every possible input.
+    ///
+    /// Added here rather than hand-rolled at the call site because
+    /// `cluster.rs::check_prometheus` and `32_media_metric_hygiene.rs` already
+    /// hand-roll `format!("{}/api/v1/...")` twice; this is the shared home, not
+    /// a third copy.
+    pub async fn rules(&self) -> Result<String, PrometheusError> {
+        let url = format!("{}/api/v1/rules", self.base_url);
+        let response = self.http_client.get(&url).send().await?;
+        if !response.status().is_success() {
+            return Err(PrometheusError::QueryFailed(format!(
+                "/api/v1/rules returned status: {}",
+                response.status()
+            )));
+        }
+        Ok(response.text().await?)
+    }
+
     /// Get the raw metrics from a specific endpoint.
     ///
     /// This bypasses Prometheus storage and queries the service's /metrics endpoint directly.

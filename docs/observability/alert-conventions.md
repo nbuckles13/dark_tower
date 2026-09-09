@@ -253,11 +253,32 @@ Two inline conjuncts are also neither: `MCLowConnectionCount` (a sanity conjunct
 
 `_template-service-alerts.yaml` **now carries the guard** in its ratio example. It did not
 previously, which is why the convention failed to propagate: the template is the copy-paste source
-for every new service, so a new service inherited the unguarded shape by default. Note the template
-is **excluded from `dt-guard` entirely** (the `_template-*.yaml` glob) and is not loaded by
-Prometheus — so no guard would ever have caught the omission, and none will catch a future
-regression there. Its guard is an example in a non-loaded file, not a live rule, and is not counted
-among the 11.
+for every new service, so a new service inherited the unguarded shape by default. Its guard is an
+example in a non-loaded file, not a live rule, and is not counted among the 11.
+
+**The template is excluded twice over, by two different predicates answering two different
+questions.** Read this before assuming either one implies the other:
+
+- **`dt-guard` skips it** via the `_template-*.yaml` glob — answering *"which files must satisfy
+  authoring conventions"*. The template is exempt because its placeholders (`<svc>`, `<operation>`)
+  cannot satisfy them.
+- **Prometheus does not load it**, because the `rule_files` glob is `rules/[a-z]*-alerts.yaml` —
+  answering *"which files are evaluated"*. **The operative property is "does not begin with a
+  lowercase letter", NOT "begins with `_`".** Those coincide for this one file and diverge for the
+  next one added; a `Foo-alerts.yaml` would be lint-validated and never loaded.
+
+Before the rule-loading fix, the second clause was **vacuously** true — no Prometheus in this tree
+loaded any rule file, so nothing was excluded from anything. It is now true for a real reason, and a
+reader cannot tell those two states apart from the sentence alone, which is why the predicate is
+named here rather than asserted. The two exclusion sets coincide today and that coincidence is
+**machine-checked bidirectionally**, failing on a difference in *either* direction — lint-but-never-load
+(a rule file evaluating nowhere) and load-but-never-lint (a rule file evaluating with no
+`runbook_url` resolution, no severity check, and **no annotation-hygiene secret scan**) are opposite
+failures with opposite severities, so the guard names which one it found. The pattern is a guarded
+mirror rather than a trusted one, after `crates/dt-guard/src/common/services.rs`.
+
+What has **not** changed: no guard checks the template's own contents, so none will catch a future
+regression there. That is why its header warns that edits to it must be reviewed as production rules.
 
 **These ratio alerts do not carry the guard** and are not yet reconciled with this convention —
 `GCHighErrorRate`, `GCErrorBudgetBurnRateCritical`, `GCErrorBudgetBurnRateWarning`,
