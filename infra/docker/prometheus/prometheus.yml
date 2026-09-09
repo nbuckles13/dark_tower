@@ -12,9 +12,34 @@ global:
 #         - targets:
 #           - alertmanager:9093
 
-# Load rules once and periodically evaluate them
-# rule_files:
-#   - "alerts/*.yml"
+# Alert rule files.
+#
+# THIS STANZA USED TO BE COMMENTED OUT, AND WHAT IT SAID WAS WRONG TWICE:
+# `alerts/*.yml` names the wrong directory (`rules/`) AND the wrong extension
+# (`.yaml`). Uncommenting it verbatim would have loaded nothing while looking
+# fixed -- the same "alive, never applied" shape one layer down from the one
+# this change closes.
+#
+# KEEP THIS GLOB BYTE-IDENTICAL to the one in
+# `infra/kubernetes/observability/prometheus.yml`. Relative `rule_files` resolve
+# against the config file's directory, and both deployments mount the rules at
+# `/etc/prometheus/rules`, so ONE string is valid in both and there is nothing
+# to drift. `dt-guard alert-rules-policy` parses both and fails on a difference.
+#
+# THE LEADING-UNDERSCORE EXCLUSION IS DELIBERATE. `rules/*-alerts.yaml` would
+# match `_template-service-alerts.yaml`, whose exprs are `<svc>` placeholders
+# and are not parseable PromQL; Prometheus validates rule files at config load
+# and exits non-zero. That file is also guard-exempt by design, so loading it
+# would evaluate -- and serve on `/api/v1/rules` -- annotation text that no
+# hygiene scan has ever read. The predicate has one home:
+# `loadable_rules_files()` in `crates/dt-guard/src/alert_rules.rs`. Do not widen
+# this glob.
+#
+# NOTE: this file is the LOCAL-COMPOSE config and is not deployed.
+# `infra/kubernetes/observability/prometheus.yml` is what runs
+# (docs/observability/dashboard-conventions.md §Two Prometheus configs).
+rule_files:
+  - "rules/[a-z]*-alerts.yaml"
 
 scrape_configs:
   # Prometheus itself

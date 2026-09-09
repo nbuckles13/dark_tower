@@ -78,6 +78,99 @@ groups:
           impact: "Participants are joining meetings but cannot establish media to their assigned Media Handlers — calls are silently broken (no audio/video) even though signaling and join succeed. User-visible."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-11-media-connection-failures"
 
+      # ====================================================================
+      # MCMediaGenerationDivergence - ADR-0036 §8's partial blackhole
+      # ====================================================================
+      #
+      # WHY THIS FIRES ON THE COUNTER AND NOT ON THE GAUGE. There is a gauge,
+      # `mc_media_generation_divergence`, and it is the obvious thing to page
+      # on. Its own catalog entry (docs/observability/metrics/mc-service.md)
+      # says NEVER PAGE ON IT, for two independent reasons: it is
+      # last-write-wins at POD level, so a healthy push for an unrelated
+      # meeting erases a diverged reading; and it is written once per
+      # registration push, which is coarse relative to the scrape interval, so
+      # a real divergence can be overwritten before it is ever scraped. The
+      # gauge is the MAGNITUDE a responder reads next -- it belongs in the
+      # runbook ladder, not in an expr. A reading of 0 there is not evidence
+      # that nothing diverged.
+      #
+      # THE SELECTOR IS NEGATED (`outcome!~`), NOT POSITIVE, AND THAT IS THE
+      # WHOLE DESIGN. It reads "everything that is not a confirmed match and
+      # not the known-noisy diagnostic", never "these two named failures".
+      #
+      # WHY NEGATED -- THE DECISIVE REASON IS VOCABULARY GROWTH.
+      # `PolicyPushOutcome::ALL` is compile-checked in Rust, so a sixth outcome
+      # is a compile error there -- but THAT COMPILE ERROR DOES NOT REACH
+      # PROMQL. Under the negated form a new outcome is covered automatically:
+      # it pages, someone investigates, and the classification gets made
+      # deliberately. Under a positive `outcome=~"a|b"` it would fall silently
+      # outside the alert with nothing anywhere reporting it. For a PAGE alert
+      # whose entire subject is A PARTIAL BLACKHOLE REPORTING HEALTHY, silence
+      # is precisely the failure mode to defend against.
+      #
+      # An earlier draft of this rule shipped the positive form and was caught
+      # at review. Do not "simplify" it back: the two forms differ only when a
+      # sixth value exists, which is exactly when it matters.
+      #
+      # THE ONE EXCLUSION BEYOND `match` IS LOAD-BEARING, NOT TIDYING.
+      # `handler_id_mismatch` is excluded because MH_HANDLER_ID is
+      # per-incarnation today (MH derives it from HOSTNAME plus a fresh UUID at
+      # process start, and MH_HANDLER_ID is unset in all three manifests), so an
+      # ordinary MH pod restart produces that outcome BY CONSTRUCTION. A bare
+      # `outcome != "match"` rule would page on every MH rollout, and a page
+      # that cries wolf stops being read -- including for the real
+      # `no_applied_generation` it exists to catch.
+      #   REVERT TRIGGER: `2026-09-02-mh-stable-handler-id`. When the handler id
+      #   becomes stable per deployment, REMOVE THE EXCLUSION IN ALL THREE
+      #   PLACES TOGETHER. THIS EXPRESSION IS HELD AT THREE SITES -- here,
+      #   `docs/observability/metrics/mc-service.md`'s catalog entry, and
+      #   `docs/runbooks/mc-deployment.md`'s post-deploy checklist. One decision,
+      #   one trigger; whoever stabilises the handler id must find all three, and
+      #   the other two assert that this site holds the same string.
+      #
+      # `transport_mode_mismatch` IS COVERED, and this is a change from an
+      # earlier draft. It is a different FAILURE from generation divergence --
+      # ADR-0036 §8's separate "any two-ends-must-agree configuration is echoed
+      # back with a loud mismatch" -- and the runbook says so. But being a
+      # different failure justifies excluding it from THE SCENARIO's diagnosis,
+      # not from THE ALERTING SURFACE: nothing else pages on it. Scenario 15
+      # carries a triage row that routes it rather than disowning it, so a
+      # responder who arrives on this page is not told their alert is not this
+      # alert's problem.
+      #
+      # `no_applied_generation` is covered for the same reason it matters: MH
+      # echoing nothing means MC cannot verify what MH is running, which is the
+      # "absent policy" half of the scenario. It also fires on a rollout skew (an
+      # MH build predating the echo) -- named in the description so oncall is not
+      # surprised at 3am.
+      #
+      # NO ZERO-DENOMINATOR GUARD, DELIBERATELY. This is not a ratio. The
+      # guard convention (alert-conventions.md §Non-Zero-Denominator Guard)
+      # is load-bearing only when the denominator is an ATTEMPTS SUM; bolted
+      # onto a bare counter it changes nothing about whether this fires and
+      # teaches the next reader that the guard is decorative.
+      #
+      # `for: 0m` WITH A 15m increase() WINDOW: the occurrence IS the signal.
+      # In this build divergence does NOT self-correct -- of ADR-0036 §8's
+      # four re-fire triggers only structural change is implemented, so a
+      # diverged meeting stays blackholed until a rejoin. Delaying the page
+      # buys nothing and costs media-dark time. Same idiom and same reasoning
+      # as MCActorPanic and MCSenderIdSpaceExhausted. `for:` MUST STAY BELOW
+      # THE increase() WINDOW or the rule is unsatisfiable by construction.
+      - alert: MCMediaGenerationDivergence
+        expr: |
+          sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: page
+          service: mc-service
+          component: media-control-plane
+        annotations:
+          summary: "MC and MH disagree about the applied media policy generation ({{ $value }} in 15m)"
+          description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook. THIS DOES NOT SELF-CORRECT IN THIS BUILD: there is no periodic re-assert, so the resolution is to force a structural change (a rejoin), never to wait for convergence. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
+          impact: "Participants in the affected meeting get no audio while the client stays connected and the UI reads healthy. Blast radius is per (meeting, handler), not fleet-wide. DO NOT RESTART MH as a remedy: it sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-15-media-generation-divergence"
+
   - name: mc-service-warning
     interval: 60s
     rules:
@@ -273,6 +366,83 @@ groups:
           description: "JWT validation failure rate is {{ $value | humanizePercentage }} for 5 minutes. May indicate expired tokens, JWKS rotation issues, or token tampering."
           impact: "Users unable to authenticate for meeting join. Check AC service health and JWKS endpoint availability."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-10-jwt-validation-failures"
+
+      # ====================================================================
+      # MCMediaMissingKeyMaterial - client-side counter, MC-side remedy
+      # ====================================================================
+      #
+      # !! THIS ALERT CANNOT FIRE TODAY. THAT IS STATED, NOT HEDGED. !!
+      # `dt_client_*` metrics do not reach Prometheus in this deployment: the
+      # OTLP collector's metrics pipeline exports to `debug` (its own
+      # container log) and no Prometheus job scrapes the collector. So the
+      # series does not exist and this rule cannot fire at any threshold for
+      # any reason. It lands anyway, so that wiring the exporter is the single
+      # remaining step rather than a rule nobody wrote -- and the premise
+      # failure is recorded at five sites (this comment, the fire/apply table
+      # in the devloop record, the docs/observability/alerts.md inventory
+      # entry, mc-incident-response.md Scenario 16, and the docs/TODO.md
+      # entry) so that nothing reads it as coverage.
+      # Tracked: docs/TODO.md §Observability Debt (collector metrics export).
+      #
+      # NOTHING ELSE COVERS A TYPO IN THIS EXPRESSION. `dt-guard
+      # application-metrics` extracts alert metric references with a regex
+      # built from the four service prefixes in
+      # crates/dt-guard/src/common/services.rs -- \b((?:ac|gc|mc|mh)_[a-z][a-z0-9_]*).
+      # Underscore is a word character, so `dt_client_media_frames_dropped_total`
+      # matches nothing and a misspelling here passes CI green while the alert
+      # never fires. The "does it apply" step (the counter arriving in
+      # Prometheus from a real browser client through the SDK OTLP sink and
+      # the GC telemetry proxy) is this rule's SOLE coverage, not
+      # belt-and-braces. When the export lands, that step must read the metric
+      # name back OUT of Prometheus -- OTLP->Prometheus normalisation is not
+      # guaranteed to preserve the `_total` suffix written in TypeScript.
+      #
+      # DENOMINATOR IS `received`, AND THAT IS THE ATTEMPTS SUM.
+      # `received = accepted + sum(drops by reason)` is an accounting identity
+      # held at the crypto/parse boundary, so `received` IS the total and the
+      # guard on it matches the ratio's own denominator. Denominating or
+      # guarding on `accepted` would be the attempts-denominator inversion in
+      # its exact form: in a TOTAL key-delivery outage `accepted` goes to
+      # zero, the guard evaluates false, and the alert goes silent at the
+      # moment the failure is complete.
+      #
+      # `for: 15m` AGAINST A rate(...[5m]) WINDOW IS DELIBERATE AND IS A
+      # DOCUMENTED ANTI-SHAPE. alert-conventions.md says to match `for:` to
+      # the rate() window. DO NOT "FIX" THIS TO 5m. Both reasons are EXPECTED
+      # transients at join and after a KEK rotation (ADR-0036 §11); the
+      # sustained case is the signal, so the `for:` window must outlast the
+      # transients and is doing the discriminating work that the threshold is
+      # not.
+      #
+      # THRESHOLD PROVENANCE, STATED HONESTLY: 5% is not SLO-derived and there
+      # is no observed baseline. At 20 ms/frame (50 frames/s) a 1-2 second
+      # join transient is well under 1% of a 5-minute window, while a
+      # sustained delivery failure sits near 100%. Do not cite it as ratified.
+      #
+      # AGGREGATED NUMERATOR, NOT `sum by(reason)`: both reasons share one
+      # runbook scenario, and a per-reason instance would need
+      # `/ on() group_left()` broadcasting for the denominator - machinery for
+      # no triage gain. The reason fork lives in Scenario 16, which is where
+      # the two remedies diverge.
+      - alert: MCMediaMissingKeyMaterial
+        expr: |
+          (
+            sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|no_roster_entry"}[5m]))
+            /
+            sum(rate(dt_client_media_frames_received_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(dt_client_media_frames_received_total[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-keys
+        annotations:
+          summary: "Clients sustained-dropping media frames for missing key material ({{ $value | humanizePercentage }})"
+          description: "Receiving clients cannot open frames because they lack the meeting KEK for the carried generation (no_kek_for_generation) or a usable identity key for the sender (no_roster_entry). Both are EXPECTED transiently at join and after a KEK rotation; 15 minutes sustained is the signal, and ADR-0036 §11 makes it the only signal for a join or rotation path that has silently stopped delivering keys. Split on the reason label FIRST - the two arms have different remedies and are not equally instrumented. Fires on a client counter but lives here because the remedy is in MC's KEK-and-roster delivery path."
+          impact: "Affected participants hear nothing while every server-side signal reads healthy - MH never opens a frame and structurally cannot observe either condition. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-16-missing-key-material"
 
   - name: mc-service-info
     interval: 60s

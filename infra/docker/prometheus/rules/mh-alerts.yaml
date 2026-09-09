@@ -381,6 +381,84 @@ groups:
           impact: "Audible media loss for affected publishers during the window that has already passed. Three causes with different owners and the runbook separates them: clients publishing outside their media sessions' lifetimes (client/steering timing, NOT MH), quinn's datagram receive buffer evicting under scheduling pressure because it is sized below MH's own ingress ring (an MH sizing defect - runbook Scenario 16 Step 3 has you read the current constants rather than trusting a restated number, and the ingress buffer-inversion entry in docs/TODO.md carries the arithmetic), or a client inflating the counter with unmatched session-id datagrams (neither of the above). DO NOT conclude MH is losing media before separating them - the predecessor of this signal misattributed exactly this shape to the client for three sessions."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-16-ingress-datagrams-received-but-never-read"
 
+      # ====================================================================
+      # MHMediaEgressQueueOverflowRate - the application egress queue bound
+      # ====================================================================
+      #
+      # NAMED FOR ITS SELECTOR, NOT FOR THE SCENARIO. The runbook section is
+      # "Media Datagram Drop", which is broader than this rule. An earlier
+      # draft was called MHMediaEgressDatagramDropRate and that name
+      # overclaims: a responder seeing `connection_closed` and `no_subscriber`
+      # move without this firing would reasonably "fix" the mismatch by
+      # widening the selector, which reintroduces the false fire below. The
+      # name is the guard against that edit.
+      #
+      # THE NUMERATOR IS RESTRICTED TO `egress_queue_overflow` FOR A CONCRETE
+      # REASON. `no_subscriber` is counted ONCE PER FRAME, not once per
+      # (frame x subscriber) -- see docs/observability/metrics/mh-service.md
+      # under mh_media_frames_forwarded_total. So in a meeting with nobody
+      # subscribed, an unrestricted `direction="egress"` numerator reads 100%
+      # off a single frame. `connection_closed` is likewise routine: every
+      # participant leaves every meeting. Neither is back-pressure.
+      #
+      # THIS IS AN APPLICATION QUEUE BOUND, NOT A BANDWIDTH BUDGET. It is
+      # ADR-0036 §1's transport-parameter bound: MH owns a bounded egress
+      # datagram queue above quinn's send buffer, drop-oldest, sized to trip
+      # BEFORE the transport ceiling so the drop is countable in our code
+      # rather than discarded silently inside quinn. There is no egress
+      # bandwidth budget, no capacity gauge, no stream ceiling and no
+      # admission threshold in this build -- that whole chain is a later
+      # story. Do not describe this counter in those terms.
+      #
+      # THE "DOES IT APPLY" HALF IS STRUCTURAL, NOT CONFIRMATORY. If quinn
+      # absorbed the drop instead, this counter would never increment and the
+      # alert would be DEAD BY CONSTRUCTION. That cannot happen silently:
+      # the ordering is enforced at startup as
+      # ConfigError::EgressQueueDoesNotBindFirst
+      # (crates/mh-service/src/config.rs:1211, raised at :1474), so a config
+      # violating it fails startup rather than producing a quiet dead alert.
+      #
+      # ZERO-DENOMINATOR GUARD IS ON THE FULL ATTEMPTS SUM, matching the
+      # ratio's own denominator. Guarding `forwarded > 0` alone is wrong in
+      # exactly the case that matters: when EVERYTHING is dropped, forwarded
+      # is zero, the guard evaluates false, and the alert goes silent at the
+      # moment the failure is total. Same rule as MHGCHeartbeatFailureRate
+      # above and alert-conventions.md §attempts-denominator inversion.
+      #
+      # NOTHING RESTS ON mh_media_egress_queue_depth. Its catalog entry says
+      # NO ALERT MAY REST ON THIS GAUGE ALONE: one process-wide,
+      # last-writer-wins gauge fed by N per-subscriber queues, with a scrape
+      # interval orders of magnitude longer than the queue's fill-and-drain
+      # time. Trend input for the dashboard and the runbook only.
+      #
+      # key_custody is single-valued (`operator`) on every one of these
+      # metrics, so it appears in no selector - it partitions nothing.
+      - alert: MHMediaEgressQueueOverflowRate
+        expr: |
+          (
+            sum(rate(mh_media_frames_dropped_total{direction="egress",reason="egress_queue_overflow"}[5m]))
+            /
+            (
+              sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
+            + sum(rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+            )
+          ) > 0.01
+          and
+          (
+            sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
+          + sum(rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-egress
+        annotations:
+          summary: "MH shedding media datagrams on its egress queue bound ({{ $value | humanizePercentage }} of egress attempts)"
+          description: "More than 1% of egress datagram attempts are being dropped because MH's bounded application egress queue is full - a subscriber the queue cannot drain into fast enough. This is the ADR-0036 §1 transport-parameter bound tripping, NOT a bandwidth budget; no such budget exists in this build. Read the full reason breakdown before concluding back-pressure: connection_closed is routine (participants leave), and no_subscriber is counted once per FRAME rather than per subscriber, so it reads as 100% of egress in an unsubscribed meeting. Neither is included here, deliberately."
+          impact: "Audible loss for affected subscribers. Audio is carried one frame per QUIC datagram with no retransmission, so a dropped datagram is a dropped frame. MH readiness, handshake latency and connection-accept rate all read healthy throughout. The client-side send drop is NOT covered by this rule and cannot be - it happens in the sender and MH structurally cannot observe it; see the runbook's client-side ladder."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-17-media-datagram-drop"
+
       - alert: MHHighMemory
         expr: |
           (

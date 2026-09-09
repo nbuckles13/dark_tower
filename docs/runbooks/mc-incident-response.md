@@ -75,7 +75,10 @@ container name, so `kubectl ... deployment/mc-service` fails with
    - [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures)
    - [Scenario 13: Unexpected MH Notifications](#scenario-13-unexpected-mh-notifications)
    - [Scenario 14: Elevated Involuntary Departures / Slow Roster Removal](#scenario-14-elevated-involuntary-departures--slow-roster-removal)
-   - [Client media signalling — where to look](#client-media-signalling--where-to-look-no-scenario-number-yet) (unnumbered; story task 21 takes Scenarios 15/16)
+   - [Client media signalling — where to look](#client-media-signalling--where-to-look-no-scenario-number-yet) (unnumbered)
+   - [Scenario 15: Media Generation Divergence](#scenario-15-media-generation-divergence)
+   - [Scenario 16: Missing Key Material](#scenario-16-missing-key-material)
+   - [Heap and Core Dumps Contain Live Meeting KEKs](#heap-and-core-dumps-contain-live-meeting-keks) (unnumbered; read **before** taking any memory capture)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -298,6 +301,18 @@ kill %1
 sum by(actor_type) (increase(mc_actor_panics_total[5m]))
 
 # 3. Find panic in logs (look for stack trace)
+```
+
+> **STOP before you collect a core dump or a memory capture for this panic.** A panicking MC can
+> write a core automatically — `RLIMIT_CORE` is unlimited in the container and `core_pattern` is a
+> host-global setting our manifests do not control — and that file contains **the live meeting KEKs
+> of every meeting on the pod**, plus JWTs in flight and participant display names. Read
+> [§Heap and Core Dumps Contain Live Meeting KEKs](#heap-and-core-dumps-contain-live-meeting-keks)
+> first: it states what the artifact is, how it must be handled, and the KEK-rotation step that is
+> required afterwards and is the one people omit. A stack trace from the logs is sufficient for most
+> panics and handles no key material.
+
+```bash
 kubectl logs -n dark-tower -l app=mc-service --tail=500 | grep -A 50 "panic\|PANIC"
 
 # 4. Find correlation with meetings
@@ -916,6 +931,15 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 kubectl top pods -n dark-tower -l app=mc-service
 # CPU should be <70%, memory should be <70%
 ```
+
+> **STOP before you take a heap dump to chase a suspected memory leak.** An MC heap dump contains
+> **the live meeting KEKs of every meeting on that pod**, and taking one converts key material that
+> ADR-0036 §4 guarantees is never persisted into a durable artifact that decrypts those meetings
+> indefinitely. Read
+> [§Heap and Core Dumps Contain Live Meeting KEKs](#heap-and-core-dumps-contain-live-meeting-keks)
+> before proceeding — including the remediation step (KEK rotation, or ending the affected meetings)
+> that is required once a dump exists. `kubectl top`, the container memory series above, and
+> `mc_*` gauge trends answer most capacity questions and handle no key material.
 
 **Escalation**:
 - If memory leak suspected, escalate to MC Team for profiling
@@ -2164,6 +2188,377 @@ remedy exists" (`user_ambiguous`).
 `declined_mc_auth_rejected`) have their first move inside MH, and one of those names MC
 in the label without implying MC is unwell. Scenario 15 Step 1 partitions on which
 service to open before the label is read.
+
+---
+
+### Scenario 15: Media Generation Divergence
+
+**Alert**: `MCMediaGenerationDivergence`
+**Severity**: Page
+**Runbook Section**: `#scenario-15-media-generation-divergence`
+
+**What this is.** MC sends MH a meeting registration carrying a **generation** number. MH's
+response echoes the generation it has **applied** — never the highest it has received (ADR-0036
+§8). When the two differ, **MH is forwarding under stale or absent policy while every liveness
+signal reads green**: `up` is 1, readiness passes, the gRPC call returned success, the channel is
+healthy, handshake latency is normal. ADR-0036 §8 calls this shape a **partial blackhole reporting
+healthy**, and notes it is harder to diagnose than a total one precisely because nothing looks
+wrong.
+
+The mechanism it catches: MC sends generation 7 → MH enqueues it on the session actor's bounded
+mailbox and returns success → the mailbox is full, or the apply errors → **MC believes MH runs
+generation 7; MH runs generation 4.** The call succeeded. Echoing on *receipt* rather than on
+*apply* would reproduce exactly the bug the field exists to catch.
+
+> **THIS DOES NOT SELF-CORRECT IN THE CURRENT BUILD. DO NOT WAIT FOR CONVERGENCE.**
+>
+> ADR-0036 §8 says divergence "is self-correcting — a lost response is re-asserted on the next
+> tick." **That sentence describes a cadence that does not exist yet.** Of §8's four re-fire
+> triggers — structural change, handler-newly-assigned, connectivity loss, and configured cadence —
+> **only structural change is implemented today.** There is no periodic re-assert, no
+> connectivity-loss trigger, and no newly-assigned trigger. With a single participant the only
+> structural change available is a **rejoin**.
+>
+> So the resolution step is **force a structural change**. Nothing will converge on its own, and a
+> responder who waits is waiting on a mechanism that has not shipped. The cadence lands with the
+> handler-restart story; when it does, this paragraph is the one to revise.
+
+**Symptoms**:
+- Alert `MCMediaGenerationDivergence` firing.
+- Participants report no audio, or audio that stopped, while the client stays connected.
+- MH pod is Ready, MC pod is Ready, no error rate anywhere.
+- `mh_media_frames_forwarded_total{direction="egress"}` flat or missing for the affected handler
+  while ingress is non-zero.
+
+**Blast radius**: per **(meeting, handler)**. Other meetings on the same MC and the same MH are
+unaffected. That is why this is a diagnosis job, not a restart job.
+
+**Diagnosis**:
+
+Step 1 — **split on the outcome label first. The two values have different first moves.**
+
+```promql
+sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
+```
+
+| `outcome` | Means | First move |
+|---|---|---|
+| `generation_mismatch` | MH echoed an **older** generation than MC sent. The apply path ran and did not take effect — a full session-actor mailbox, or an apply error. | Open **MH**. Read `mh_media_policy_applies_total{outcome}`; `apply_failed` and `rejected_invalid` are the two that produce this. |
+| `no_applied_generation` | MH echoed **nothing**. Either an MH build that predates the applied-generation echo (a rollout skew), or the apply never ran at all. | Confirm the MH image first — `kubectl get deploy -n dark-tower mh-0 mh-1 -o jsonpath='{.items[*].spec.template.spec.containers[*].image}'`. A skew is the cheap explanation and it clears itself on rollout completion. |
+| `transport_mode_mismatch` | **A DIFFERENT FAILURE, BUT IT PAGES HERE AND THIS IS YOUR RUNBOOK.** §8's separate "any two-ends-must-agree configuration is echoed back with a loud mismatch" check: MC declared a transport mode, MH echoed a different one. Not generation divergence, and the remedy below is not the rejoin. It is routed here because nothing else pages on it and a page with no runbook is worse than a page in an imperfect one. | Compare MC's declared transport mode against MH's applied one — a configuration disagreement, not a policy-apply failure, so **the resolution steps below do not apply**: a rejoin re-sends the same disagreeing declaration. **A REMEDY ALREADY EXISTS — go to [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures) FIRST**, which carries it along with the trap: **roll MH FORWARD; do NOT roll MC back.** Rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole rather than a fix, and it is the intuitive move when two ends disagree about a version-skewed value. Escalate to `meeting-controller` and `media-handler` together only if that does not resolve it; the value is asserted on one side and enforced on the other. |
+| *anything else* | **A NEW OUTCOME VALUE.** The selector is negated (`outcome!~"match\|handler_id_mismatch"`), so an outcome added after this runbook was written pages here rather than falling silently outside the alert — deliberately. | You are the first responder to see it. Read `PolicyPushOutcome` in `crates/mc-service/src/media_routing/confirm.rs` for what the emitting site means by it, then **add a row to this table**. Do not narrow the selector to make the page stop. |
+| `handler_id_mismatch` | **Diagnostic, not an incident.** `MH_HANDLER_ID` is per-incarnation today, so an ordinary MH pod restart produces this outcome by construction. | Ignore unless it persists with no MH restart. The alert deliberately excludes it for this reason. |
+
+> **Do not "fix" `no_applied_generation` by making MH stricter.** MH deliberately does **not** reject
+> `policy_generation: 0`, because MC and MH roll independently: MH-first rejection would register no
+> meeting and kick every client at the registration timeout. That is ADR-0036 §8's opening
+> paragraph almost verbatim — the permanent-media-blackhole-reached-through-an-ordinary-rolling-deploy
+> failure the applied-generation echo exists to prevent. A responder who reads "rollout skew" and
+> reaches for stricter MH validation is reaching for the exact change the design forbids.
+
+Step 2 — **read the magnitude, second, not first.**
+
+```promql
+max(mc_media_generation_divergence)
+```
+
+This gauge is `|sent − applied|`. **It is a triage aid and must never be the primary evidence**, for
+two reasons its catalog entry records: it is **last-write-wins at pod level**, so a healthy push for
+an unrelated meeting overwrites a diverged reading; and it is written once per registration push,
+which is coarse relative to the scrape interval, so a real divergence can be overwritten before it is
+ever scraped. A reading of `0` here is **not** evidence that nothing diverged. The counter in Step 1
+is the durable record.
+
+Step 3 — **confirm MH's side of the story.**
+
+```promql
+sum by(outcome) (increase(mh_media_policy_applies_total[15m]))
+```
+
+`applied` is the healthy outcome. `apply_failed` and `rejected_invalid` are the two that produce
+`generation_mismatch` on MC's side; `rejected_stale` is MH correctly refusing an out-of-order
+generation and is not a fault. If MH shows `applied` for the generation MC sent, the divergence is
+in the response path, not the apply path.
+
+**Resolution**:
+
+> **These steps are for `generation_mismatch` and `no_applied_generation`.** For
+> `transport_mode_mismatch` see its row above — a rejoin re-sends the same disagreeing declaration
+> and will not clear it.
+
+1. **Force a structural change on the affected meeting.** With one participant that means a
+   **rejoin** — have the participant leave and rejoin, which fires the structural-change trigger and
+   causes MC to re-assert the full registration. This is the resolution step. It is not a workaround.
+2. If the rejoin does not clear it, the apply is failing repeatedly rather than transiently: open MH
+   and read `mh_media_policy_applies_total{outcome}` and MH's logs for the session actor's mailbox
+   state.
+3. If `no_applied_generation` and the images are skewed, let the rollout complete; the condition
+   clears when every MH pod runs a build that echoes the applied generation.
+
+> **DO NOT RESTART MH AS A REMEDY.** It clears the symptom and destroys the evidence, and — because
+> MH sheds media sessions on restart with no drain (ADR-0036 §11, and `mh-deployment.md`
+> §Rollout With Media Flowing) — it takes down every *working* media session on that pod while
+> recovering none of the ones that were already dark. There is no periodic re-assert in this build to
+> rescue them. A restart makes the blast radius strictly larger and the diagnosis impossible.
+
+**Escalation**:
+- `meeting-controller` owns the push side; `media-handler` owns the apply side. The label in Step 1
+  tells you which to open first — that is the whole point of splitting on it.
+- Both are required reviewers on any change here: the metric is emitted by MC but its **value** is a
+  statement about MH's apply path.
+
+**Related**:
+- [`mh-incident-response.md` Scenario 17: Media Datagram Drop](mh-incident-response.md#scenario-17-media-datagram-drop)
+  — stale or absent MH policy is one of the two causes of "client sending, nothing coming back", and
+  this scenario is the other half of that fork.
+- `docs/observability/metrics/mc-service.md` — canonical definitions for
+  `mc_media_policy_pushes_total` and `mc_media_generation_divergence`.
+
+---
+
+### Scenario 16: Missing Key Material
+
+**Alert**: `MCMediaMissingKeyMaterial`
+**Severity**: Warning
+**Runbook Section**: `#scenario-16-missing-key-material`
+
+**What this is.** A receiving client is dropping frames because it does not have the key material
+needed to open them. The counter is **client-side**, by design: MH never opens a frame and
+**structurally cannot observe either condition** (ADR-0036 §4, §11).
+
+```promql
+sum by(reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|no_roster_entry"}[5m]))
+```
+
+**Both reasons are expected as transients** at join and immediately after a KEK rotation. **The
+sustained case is the signal**, and ADR-0036 §11 states it is the *only* signal for a join or
+rotation path that has silently stopped delivering keys. That is why the alert's `for:` window is
+long rather than its threshold being high — see the comment on the rule.
+
+> **THIS ALERT CANNOT FIRE TODAY, AND YOU DID NOT GET HERE BY BEING PAGED.**
+>
+> `dt_client_*` metrics do not reach Prometheus in this deployment: the OTLP collector's metrics
+> pipeline exports to `debug` — the collector's own container log — and no Prometheus job scrapes
+> the collector. So the series does not exist, and `MCMediaMissingKeyMaterial` cannot fire at any
+> threshold for any reason. **The absence of a page is not evidence that key delivery is healthy.**
+> You reached this scenario some other way: a user report, or a client-side counter read in a browser
+> devtools session (`client-dev-local.md` §4.5). Wiring the client metric export path is tracked in
+> `docs/TODO.md` §Observability Debt.
+
+**Triage splits on the `reason` label first, because the two arms have different remedies — and
+because they are not equally instrumented.**
+
+#### Arm 1 — `no_roster_entry`
+
+No usable identity key for the frame's `sender_id`, **including the case where MC published an
+empty key**. Per ADR-0036 §3, this means the receiver cannot resolve the sender's AC-attested
+identity public key, so **signature verification — the whole sender-attribution story — is
+failing**, not merely decryption.
+
+**This arm has server-side corroboration.** Use it:
+
+```promql
+sum by(presence) (rate(mc_join_identity_key_presence_total[15m]))
+```
+
+A rising `absent` ratio answers *"are clients publishing keys at all?"* directly. That counter
+exists precisely so that "every client omits the key and nobody notices" cannot be a silent steady
+state.
+
+**Its neighbour, which is a different condition**: a malformed key — present but not 0 and not 32
+bytes — is refused at the trust boundary and lands on
+`mc_session_join_failures_total{error_type="identity_key_invalid"}`. *No key* and *bad key* have
+different remedies; do not conflate them.
+
+Remedy is in MC's **roster publication** path, not key generation.
+
+#### Arm 2 — `no_kek_for_generation`
+
+The client has no meeting KEK for the generation the frame's wrap announces. Remedy is in MC's
+**KEK delivery** path: the join response is the only KEK source in this build
+(`dt_client_media_kek_updates_total{source="join_response"}`).
+
+> **THIS ARM HAS NO SERVER-SIDE COUNTER, AND CANNOT HAVE ONE AS THINGS STAND. Read that as a gap,
+> not as reassurance.**
+>
+> `mc_meeting_kek_generated_total` increments unconditionally and is identically the
+> meeting-creation count; MC has no meeting-creation counter to divide it by, so — in its catalog
+> entry's own words — **the inference is not computable even in principle**, and **no alert may be
+> built on the absence of that counter moving**.
+>
+> So on this arm you have: a client-side counter that does not reach Prometheus, no MC-side counter,
+> and no alert that can fire. **The absence of a signal here is not evidence that the KEK is
+> present.**
+
+**Check the non-dump path first, and completely, before anything else.** Both of these are
+observable without touching MC's memory:
+
+1. **The per-join response-side condition.** The KEK is not provisioned for a join when the join
+   response's `meeting_kek` is not exactly 32 bytes. This is checkable from the client side.
+2. **`dt_client_media_kek_updates_total{source="join_response"}`** — the client-side observation
+   that a KEK was delivered and cached. Flat at zero across a join means delivery, not usage.
+
+If and only if both are exhausted and you still need to know whether the KEK is live in the meeting
+actor, **stop here and read
+[§Heap and Core Dumps Contain Live Meeting KEKs](#heap-and-core-dumps-contain-live-meeting-keks)
+before doing anything else.** That question has no instrument in a running process, and the thing
+you are about to reach for is a heap dump — which is why the gate exists.
+
+> **NO STEP IN THIS SCENARIO MAY PRINT, LOG, OR OTHERWISE MATERIALISE A KEK TO CONFIRM IT IS
+> PRESENT.** Not a temporary log line, not a debug endpoint, not a `dbg!`. ADR-0036 §11 places KEK
+> and transmit-key material inside the credential-leak guard's scope for MC logs for exactly this
+> situation, and *"I'll just add a log line to check the key is there"* is the shape that gets typed
+> under incident pressure. A KEK in a log is a KEK in the log pipeline, on every node that ships it,
+> for the retention period.
+
+#### Neighbouring reasons that are NOT this scenario
+
+| `reason` | What it actually is | Route to |
+|---|---|---|
+| `unwrap_failed` | The **KEK unwrap** failed — key **distribution** | `meeting-controller` |
+| `decrypt_failed` | The **SFrame payload** decrypt failed — the key schedule or the sender | `client` |
+| `no_transmit_key` | A frame with neither a cached key nor a usable wrap — a **protocol violation**, not a third key reason | `protocol` / `client` |
+
+`unwrap_failed` and `decrypt_failed` are both AES-GCM failures on one receive path that route to
+opposite teams. Read the label, not the symptom.
+
+**Escalation**: `meeting-controller` owns both remedies (roster publication, KEK delivery).
+`security` is a required reviewer on any change to KEK handling.
+
+**Related**:
+- [`client-dev-local.md` §4.5](client-dev-local.md#45-i-joined-and-i-hear-nothing--media-triage-ladder)
+  — the client-side ladder that gets a developer here. **Do not duplicate the remedies there**; that
+  file points at this scenario.
+- `docs/observability/metrics/client.md` §`dt_client_media_frames_dropped_total` — the frozen
+  reject-reason vocabulary and the `received = accepted + sum(drops by reason)` identity.
+
+---
+
+### Heap and Core Dumps Contain Live Meeting KEKs
+
+**Read this before taking a heap dump, a core dump, or any memory capture of an MC pod.** It is not
+a numbered scenario because it is not a failure mode — it is a hazard attached to a diagnostic
+action that several scenarios lead to.
+
+#### What is actually in the file
+
+An MC heap or core dump contains, for that pod:
+
+- **The meeting KEK of every meeting live on that pod** (ADR-0036 §4) — the symmetric key that
+  unwraps every participant's transmit key.
+- **Meeting and user JWTs in flight**, and the join-token material accompanying them.
+- **Participant display names**, and the roster's identity public keys.
+
+**Enumerated deliberately.** If this section said only "contains the KEK", the handling procedure
+gets applied to the KEK and everything else in the list walks out in the same file.
+
+#### Why this is different from every other artifact you might collect
+
+ADR-0036 §4's security argument rests on one property, stated there in these terms: the KEK is
+**never derived and never persisted** — it is random, lives in the meeting actor, and dies with the
+meeting. *"Compromise must be live: a database, a backup, or a log yields nothing, and no master
+secret exists whose loss reaches backward across meetings."*
+
+**A dump is precisely the act that converts live-only key material into a durable artifact.** A dump
+taken while a meeting is running decrypts any ciphertext of that meeting captured anywhere else —
+indefinitely, and including after the meeting has ended. It is the one operation that defeats the
+property the design's key management is built on.
+
+Note also what the custody model already is: every service reports `key_custody=operator`. MC holds
+the KEK and can read media; MH, the network, and storage cannot. That is the accepted position. What
+is **not** accepted is turning MC's in-memory custody into a file.
+
+#### Default posture: do not take one
+
+Work the cheaper signals first. They answer most questions and none of them handle key material:
+
+1. Metrics — the counters named in the scenario that sent you here.
+2. `kubectl top pods -n dark-tower -l app=mc-service`, and the pod's own `/metrics`.
+3. [Scenario 1: High Mailbox Depth](#scenario-1-high-mailbox-depth) and
+   [Scenario 7: Resource Pressure](#scenario-7-resource-pressure) ladders, in full.
+4. Logs, at the deployed level. **Not at a raised level** — see the prohibition below.
+
+> **GATE — YOU ARE NOW HANDLING KEY MATERIAL.**
+>
+> If you proceed past this point, the artifact you produce is **private-key-equivalent**. Everything
+> in §Handling applies from the moment it exists, and the meetings live at that moment are to be
+> treated as **key-compromised** (§Remediation). Decide deliberately, and record who decided.
+
+#### Handling, if one is taken
+
+- **Classify it private-key-equivalent.** Not "sensitive", not "internal" — the same class as a TLS
+  private key.
+- **Never attach it to a ticket, a Slack message, or an incident document.** Reference it by
+  identifier; never by content.
+- **Never `kubectl cp` it to a shared bastion, a shared volume, or anything backed up.** A backup
+  turns a bounded exposure into an unbounded one, which is the specific property §4 relies on not
+  existing.
+- **Encrypt at rest immediately**, before it is written anywhere that outlives the session.
+- **Named-responder access only.** One or more named people, recorded — not a group, not a role.
+- **A deletion deadline with a named owner.** A deadline with no owner is not a deadline. Record
+  both.
+- **A record of who held it**, for the duration and afterwards.
+
+#### Remediation — the step that gets forgotten
+
+**The meetings that were live at dump time are key-compromised.** Protecting the file is not the
+remedy; it is half of it.
+
+- The lever is **MC's KEK rotation** (ADR-0036 §4): MC generates a new KEK and pushes it to every
+  member over signalling, and senders wrap under the new KEK from then on.
+- **If rotation cannot be driven for a live meeting, end the meeting.** An unrotated meeting whose
+  KEK is in a file on someone's laptop is not a meeting that should continue.
+- A procedure that protects the file and not the meetings is not a procedure.
+
+#### Can MC produce a dump today without anyone asking?
+
+**Yes, on this dev cluster, and nothing in our manifests constrains it.** Verified rather than
+assumed, from inside a running MC pod:
+
+```bash
+# --- WSL2 --- read the posture; this prints no key material
+MC_POD=$(kubectl get pods -n dark-tower -l app=mc-service -o name | head -1)
+kubectl exec -n dark-tower "${MC_POD#pod/}" -- sh -c 'ulimit -c; cat /proc/sys/kernel/core_pattern'
+```
+
+At the time of writing this returns `unlimited` and `|/wsl-capture-crash %t %E %p %s`.
+
+Two facts follow, and both matter:
+
+- **`RLIMIT_CORE` is unlimited in the MC container.** Nothing in
+  `infra/services/mc-service/mc-{0,1}-deployment.yaml` sets it; the pod spec has resource limits and
+  a `securityContext`, neither of which touches core dumps.
+- **`kernel.core_pattern` is not namespaced.** It is a host-global kernel setting, so what happens
+  when an MC process aborts is determined by the **node**, not by anything in our manifests or our
+  chart. On this dev cluster the host pipes cores to a WSL2 helper.
+
+So an MC abort can write a core containing live meeting KEKs **with nobody asking and nobody
+notified**. That is a standing exposure this procedure does not cover — a procedure governs
+deliberate dumps, and this one is automatic. Stated plainly rather than left to be discovered,
+because ADR-0036's own rule is to prefer structural impossibility over a control that has to notice,
+and here there is currently neither.
+
+**This is a statement about the dev cluster as measured above.** Re-run the command on any other
+environment before assuming it holds there; a different node has a different `core_pattern`.
+
+**Tracked, not merely written down.** This procedure governs **deliberate** dumps; the exposure
+above is **automatic**, and a runbook sentence is read by someone already in an incident — which is
+after the core has been written. The structural fix is `setrlimit(RLIMIT_CORE, 0)` at MC process
+start (Kubernetes has no pod-spec ulimit field and `core_pattern` is host-global, so the process is
+the only place in our control), and it is a real tradeoff against crash forensics rather than pure
+hardening, which is why it is a task. See `docs/TODO.md` §Observability Debt, "An MC abort can write
+a core dump containing live meeting KEKs".
+
+#### What this section must never contain
+
+No copy-pasteable command that writes a dump to a shared path, and no command that prints key
+material to a terminal. The one command above reads two kernel/limit values and nothing else.
+
+> **Related prohibition, which applies everywhere in this runbook**: raising a log level is not an
+> acceptable diagnostic gate on the media path. ADR-0036 §11: the incident that motivates the level
+> change is the same incident that produces the sensitive trace, and enabling debug logging on a pod
+> is one routine action away from a fleet-wide voice-activity trace entering the shipping pipeline.
+
 
 ---
 

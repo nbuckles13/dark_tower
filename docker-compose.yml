@@ -96,6 +96,12 @@ services:
       - "9090:9090"
     volumes:
       - ./infra/docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      # Alert rules. The container path must stay `/etc/prometheus/rules`: a
+      # relative `rule_files` glob resolves against the config file's directory,
+      # and the K8s deployment mounts them at the same path, so ONE glob string
+      # is valid in both and there is nothing to drift. Read-only -- Prometheus
+      # only ever reads them.
+      - ./infra/docker/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     networks:
       - dark_tower_network

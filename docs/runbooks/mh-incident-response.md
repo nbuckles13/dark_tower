@@ -28,6 +28,7 @@
    - [Scenario 14: WebTransport Server Startup Failure](#scenario-14-webtransport-server-startup-failure)
    - [Scenario 15: Media Sessions Declining — No Sender Binding](#scenario-15-media-sessions-declining--no-sender-binding)
    - [Scenario 16: Ingress Datagrams Received But Never Read](#scenario-16-ingress-datagrams-received-but-never-read)
+   - [Scenario 17: Media Datagram Drop](#scenario-17-media-datagram-drop)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1427,6 +1428,177 @@ signal and notify the Security owner — the same routing as
 **Related Alerts**: `MHHighCPU` / `MHHighMemory` (Scenario 8 — the pressure that
 drives Step 3), `MHMediaSessionDeclineRate` (Scenario 15 — work it first if both
 fire), `MHCallerTypeRejected` (Scenario 7 — the Step 4 escalation route).
+
+---
+
+### Scenario 17: Media Datagram Drop
+
+**Alert**: `MHMediaEgressQueueOverflowRate`
+**Severity**: Warning
+**Runbook Section**: `#scenario-17-media-datagram-drop`
+
+> **Numbering note.** This is Scenario **17**, not 15. Scenarios 15 and 16 in this file were taken
+> by earlier tasks in the same story and four shipped alert rules in
+> `infra/docker/prometheus/rules/mh-alerts.yaml` cite their anchors. Renumbering would have broken
+> four guard-resolved links.
+
+**What this is.** Audio is carried one frame per **QUIC datagram** (ADR-0036 §1). Datagrams are
+lossy by design and by transport: there is no retransmission and no ordering guarantee. Drops occur
+at **both ends of the hop**, the two ends have different owners, and only one of them is visible to
+MH.
+
+| End | Counter | Who can see it |
+|---|---|---|
+| **MH egress** — the application egress queue bound tripping | `mh_media_frames_dropped_total{direction="egress",reason="egress_queue_overflow"}` | MH, and this alert |
+| **SDK send** — the client's bounded queue above the transport | `dt_client_media_send_dropped_total{reason="egress_queue_overflow"}` | the client only |
+
+> **THE MH-SIDE DROP IS AN APPLICATION QUEUE BOUND, NOT A BANDWIDTH BUDGET.** It is the §1
+> transport-parameter bound: MH owns a bounded egress datagram queue above quinn's datagram send
+> buffer, with drop-oldest, deliberately sized to trip **before** the transport ceiling so the drop
+> is countable in our code rather than silently discarded inside quinn. **There is no egress
+> bandwidth budget, no capacity gauge, no stream ceiling and no admission threshold in this build.**
+> If you are looking for one, you are looking for something that does not exist; do not infer a
+> number from this counter.
+
+**Why the SDK-side drop matters most.** ADR-0036 §11 is explicit: the client-side send drop is the
+one that matters most, **because it occurs in the sender and MH structurally cannot observe it**.
+WebTransport exposes no send-side drop event, so the SDK keeps the transport queue shallow, owns a
+bounded queue above it, makes the drop decision there and counts it — making the drop observable by
+construction. A flat MH counter is **not** evidence that frames are arriving.
+
+#### The loopback reading, and why it does not identify a cause
+
+In loopback (one client, hearing its own audio back through MH), the diagnostic pair is:
+
+```promql
+rate(dt_client_media_frames_sent_total[5m])
+rate(dt_client_media_frames_received_total[5m])
+```
+
+**`sent` rising while `received` stays flat means audio is not completing its round trip.** That
+reading is real and it is where triage starts — but it has **at least two causes with different
+remedies, and no unique client-side discriminator**:
+
+1. **A NAT binding reaped during a mute longer than the keepalive interval.** QUIC's
+   connection-level keepalive is what refreshes NAT bindings while no media flows, and no media
+   flows whenever a participant is muted (§1, §5). Without an adequate keepalive an intermediary can
+   reap the path and unmute is not instantaneous.
+2. **MH holding stale or absent policy** — see
+   [`mc-incident-response.md` Scenario 15: Media Generation Divergence](mc-incident-response.md#scenario-15-media-generation-divergence).
+
+Both produce the identical client-side counter reading. **Do not guess between them; the ladder
+below separates them at rung 1, cheaply.**
+
+#### Triage ladder
+
+**Fork first, on `sent`:**
+
+| `sent` | Meaning | Go to |
+|---|---|---|
+| **Flat** | Nothing is leaving the device. This is not a transport problem. | Capture or mute-release never resumed. Check `dt_client_media_mute_transitions_total{action}` and the capture pipeline — [`client-dev-local.md` §4.5](client-dev-local.md#45-i-joined-and-i-hear-nothing--media-triage-ladder). Stop here. |
+| **Rising, `received` flat** | Transmitting into something that is not returning. | Rungs 1–4 below, in order. |
+
+**Rung 1 — is the QUIC connection still up?** This is the cheapest rung and it is the one that
+separates the two causes:
+
+- **A reaped binding shows as connection failure or keepalive distress** — the client's transport
+  reports a closed or timing-out connection, and the session ends or re-establishes.
+- **MH-not-forwarding leaves a healthy connection.** The connection is fine; nothing is coming back
+  over it.
+
+That single observation does the discrimination the counters cannot. Take it first.
+
+**Rung 2 — generation divergence.** If the connection is healthy, MH may be forwarding under stale
+or absent policy:
+
+```promql
+sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
+```
+
+Any `generation_mismatch` or `no_applied_generation` sends you to
+[`mc-incident-response.md` Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).
+**Note that in this build divergence does not self-correct** — the resolution there is to force a
+structural change (a rejoin), not to wait.
+
+**Rung 3 — keepalive configuration.** Only after rungs 1 and 2. Compare the configured QUIC
+keepalive interval against the mute duration that preceded the symptom. A keepalive longer than a
+routine mute is the reaped-binding cause; a keepalive comfortably shorter than it is not, and rung 3
+is then a dead end rather than a finding.
+
+**Rung 4 — packet capture.** Last rung, and only when 1–3 have not resolved it.
+
+> **A packet capture of a join or a media session is CREDENTIAL-BEARING.** The join carries the
+> meeting JWT. **Do not attach a capture to a ticket, a Slack message, or an incident document.**
+> Handle it as you would any credential-bearing artifact: named access, encrypted at rest, a
+> deletion deadline with an owner. The same applies to a browser HAR or devtools trace of a join.
+
+#### What each counter actually proves
+
+| Counter | Proves | Does **not** prove |
+|---|---|---|
+| `dt_client_media_frames_sent_total` | frames left the device | that MH accepted or forwarded them |
+| `dt_client_media_frames_received_total` | **datagrams arrived at the wire** — counted before any parse, verification or decryption | that they were openable, or that anything was heard |
+| `dt_client_media_frames_dropped_total{reason}` | which post-arrival step rejected, **by name** | anything about frames that never arrived |
+| `dt_client_media_frames_accepted_total` | frames completed the receive path and were handed to the decoder | that anything was **played** — see below |
+| `mh_media_frames_forwarded_total{direction="egress"}` | MH sent something toward a subscriber | that it reached them |
+
+**`received` is counted at the wire, before verification and decryption, and that is the whole
+point.** It makes *"nothing is arriving"* distinguishable from *"things are arriving and failing to
+open"* — two conditions that would otherwise look identical from the outside. The
+post-verification story is carried by the drop-by-reason counters, under the accounting identity
+`received = accepted + sum(drops by reason)`. That identity holds at the crypto/parse boundary; it
+does **not** hold at playback.
+
+**`accepted`, never `played`.** A frame handed to a decoder is not a frame that was heard. Silent
+audio with `accepted` climbing means the fault is **downstream of the decoder handoff** — the
+decoder, the output device, or a suspended audio context — and no counter in this scenario will
+find it. `dt_client_media_decoder_errors_total` covers part of that segment and only part.
+
+#### MH-side diagnosis, when the alert is what brought you here
+
+```promql
+# Egress drop ratio over ATTEMPTS (forwarded + all egress drops), by reason.
+sum by(reason) (rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+/
+(
+  sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
++ sum(rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
+)
+```
+
+**Read the `reason` breakdown before concluding back-pressure.** Only `egress_queue_overflow` is
+what this alert measures. Two neighbours are routinely non-zero and mean something else entirely:
+
+- `connection_closed` — a participant left underneath a send. **Routine.** Every meeting ends this
+  way, many times.
+- `no_subscriber` — nothing was subscribed to that source. Counted **once per frame**, not once per
+  (frame × subscriber), so in a meeting with nobody subscribed it reads as 100% of egress off a
+  single frame. **Do not widen the alert's selector to include it**; that is precisely the false
+  fire the restriction to `egress_queue_overflow` exists to prevent.
+
+`mh_media_egress_queue_depth` is a trend input only. **No conclusion may rest on it alone**: it is
+one process-wide, last-writer-wins gauge fed by N per-subscriber queues, and the scrape interval is
+orders of magnitude longer than the queue's fill-and-drain time. A reading of zero means nothing.
+
+**Resolution**:
+
+- **Sustained `egress_queue_overflow`** means a subscriber the queue cannot drain into fast enough.
+  In this build there is no per-stream lever: the bound is a startup-validated transport parameter,
+  and there is no bandwidth budget to adjust. Escalate to `media-handler` with the reason breakdown
+  and the affected pod.
+- **A reaped NAT binding** resolves on reconnect; the durable fix is the keepalive interval, which is
+  a configuration change and a redeploy.
+- **Stale or absent policy** resolves by forcing a structural change — see MC Scenario 15. **Not by
+  restarting MH**, which sheds every media session on the pod (see
+  [`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing)).
+
+**Escalation**: `media-handler` for the MH egress queue and the reason breakdown; `client` for the
+SDK send queue and the capture path; `meeting-controller` if rung 2 finds divergence.
+
+**Related Alerts**: `MHMediaSessionDeclineRate` (Scenario 15 — a session that never started is a
+different fault from one that started and stopped forwarding);
+`MCMediaGenerationDivergence` (MC Scenario 15 — rung 2).
+
 
 ---
 

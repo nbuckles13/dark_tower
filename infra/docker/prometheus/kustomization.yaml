@@ -1,0 +1,45 @@
+# Generates the `prometheus-rules` ConfigMap from THE one on-disk copy of the
+# alert rules, so the cluster never gets a hand-mirrored second set.
+#
+# WHY THIS KUSTOMIZATION LIVES HERE AND NOT IN
+# `infra/kubernetes/observability/`, WHERE THE REST OF THE STACK IS.
+# kustomize refuses file sources outside its own directory:
+#
+#   security; file '/work/infra/docker/prometheus/rules/gc-alerts.yaml' is not
+#   in or below '/work/infra/kubernetes/observability'
+#
+# so the generator has to sit at or above the rules directory. It is deliberately
+# at `prometheus/` rather than inside `rules/`: `dt-guard alert-rules-policy`
+# walks `rules/*.yaml`, and a `kustomization.yaml` dropped in there would be a
+# file the linter reads and Prometheus never loads -- which is precisely the
+# asymmetry the set-equality check below exists to make loud. Keeping this file
+# one level up keeps the rules directory containing only rules.
+#
+# THE `files:` LIST IS A MEMBERSHIP SET AND KUSTOMIZE CANNOT GLOB. Verified
+# empirically: `files: [rules/*-alerts.yaml]` fails with an evalsymlink error on
+# the literal path. So a new `<svc>-alerts.yaml` can be inside Prometheus's
+# `rule_files` glob, pass every existing guard, and still never be mounted and
+# never load. `dt-guard alert-rules-policy` parses THIS list and asserts it
+# equals the loadable-rules-file set defined in
+# `crates/dt-guard/src/alert_rules.rs`, failing on a difference in EITHER
+# direction. Add the file here when you add it to `rules/`.
+#
+# `_template-service-alerts.yaml` is absent on purpose -- it is a starter
+# template of `<svc>` placeholders, not parseable PromQL, and it is guard-exempt
+# so its annotations get no hygiene scan.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: dark-tower-observability
+
+configMapGenerator:
+  - name: prometheus-rules
+    options:
+      labels:
+        app: prometheus
+        component: monitoring
+    files:
+      - rules/gc-alerts.yaml
+      - rules/mc-alerts.yaml
+      - rules/mh-alerts.yaml
+      - rules/otel-alerts.yaml
