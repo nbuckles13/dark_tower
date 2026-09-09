@@ -260,6 +260,127 @@ groups:
           impact: "Affected participants get no media. This is the cross-participant collision the ordinal exists to prevent, refused fail-closed rather than mis-forwarded."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding"
 
+      # THE SHAPE HERE IS A RATIO OVER A LONG WINDOW, AND THE TWO RULES ABOVE
+      # ARE THE CONTRAST. They are `increase(...) > 0` with `for: 0m` because a
+      # single occurrence is an invariant violation. This one is neither, and
+      # `> 0` was the first draft. Two independent reasons killed it, either of
+      # which alone is sufficient:
+      #
+      #   1. THE VALUE IS CLIENT-INFLATABLE. Datagrams carrying an unmatched
+      #      HTTP/3 session-id varint still increment quinn's `frame_rx.datagram`
+      #      while wtransport discards them, so any client past the JWT gate can
+      #      move this number at will. An occurrence rule at page severity would
+      #      have been a CLIENT-FORCEABLE PAGE — an availability attack on
+      #      on-call wearing a media-quality costume. This is also why the
+      #      severity below is `warning` and must stay there.
+      #      VERSION-DEPENDENT: verified against wtransport 0.7.1, `Cargo.lock`
+      #      pins 0.7.2. If a future version discards such datagrams before
+      #      quinn's counter, this reason lapses — but reason 2 below does not,
+      #      and the rule shape does not change. Recorded so an upgrade that
+      #      falsifies this bullet does not read as licence to switch to `> 0`.
+      #   2. A SUSTAINED MC OUTAGE DOMINATES THE NUMERATOR RATHER THAN
+      #      PERTURBING IT. Each connecting client holds an admission slot for
+      #      up to ~48 s awaiting MC's binding answer (`config.rs` on
+      #      MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS), and a publishing client emits
+      #      ~50 audio frames/s into that window. The DECLINED half of that
+      #      traffic is deliberately counted on a different reason token
+      #      (`no_media_session`, diagnostic-only, no rule) so it cannot reach
+      #      this expression — but the split is what makes the ratio readable,
+      #      not an accident, and merging the tokens would silently re-break it.
+      #
+      # FORENSIC, NOT DETECTIVE — THE MOST IMPORTANT PROPERTY OF THIS RULE AND
+      # THE EASIEST TO FORGET. `transport_receive_dropped` is computed by
+      # differencing quinn's received-frame count against what the ingress loop
+      # actually read, and that delta is only final AT CONNECTION CLOSE. Nothing
+      # increments while a session is live, and meetings run for an hour. So
+      # this rule reports an incident that has already finished; it cannot
+      # shorten one. Do not add `for:` time hoping to "confirm" the signal, and
+      # do not read a flat series during an active no-audio incident as
+      # evidence that ingress is healthy — the sessions are still open.
+      #
+      # MH HAS NO DETECTIVE SIGNAL FOR SILENT INGRESS LOSS. That gap is real,
+      # is tracked in docs/TODO.md as the live-variant follow-on, and is NOT
+      # closed by this rule. The nearest in-tree substitute is
+      # `mh_media_frames_forwarded_total{direction="ingress"}` failing to track
+      # the expected publisher frame rate on the steered instance, which needs a
+      # responder who already knows that rate.
+      #
+      # THE NUMERATOR IS A SUBSET OF THE DENOMINATOR. THAT IS DELIBERATE.
+      # Both new tokens carry `direction="ingress"`, so the unfiltered
+      # `dropped{direction="ingress"}` term below INCLUDES
+      # `transport_receive_dropped`. The denominator is therefore every datagram
+      # frame the connection RECEIVED, and the ratio is "fraction of received
+      # datagrams never read" — which is the quantity worth alerting on.
+      # DO NOT "fix" the apparent inconsistency by subtracting the numerator out
+      # of the denominator: that silently changes the rule from a fraction of
+      # received to a ratio against the read set, which is a different and much
+      # less useful question. Recovering the READ set, if you ever need it, means
+      # subtracting BOTH new tokens back out.
+      #
+      # WINDOW: 2h, and the length is derived rather than picked. THE NUMERATOR
+      # AND DENOMINATOR ACCRUE ON DIFFERENT CLOCKS — the numerator lands in one
+      # instant at connection close for the whole session, while the denominator
+      # accrues continuously. For any session LONGER than the window they are not
+      # commensurable and the ratio inflates by roughly session_length/window:
+      # over 30m, an hour-long session losing a true 5% reads 9.5%, and the 0.05
+      # threshold actually trips at ~2.6% true loss; at two hours it trips at
+      # ~1.3%. The effective threshold would move with MEETING DURATION, which is
+      # a property of user behaviour, not of MH — an alert nobody could calibrate.
+      # A window past typical session length removes the skew (at 2h, sessions up
+      # to 2h read their true rate). The cost is detection latency, which on a
+      # signal that is already forensic is close to free.
+      #
+      # RESIDUAL, both directions, neither normalisable: sessions LONGER than 2h
+      # still over-read by the same ratio, and a connection that opened inside
+      # the window but has not yet closed under-reads (numerator 0, denominator
+      # already accruing). Do not try to correct per-session — any correction
+      # needs session-length data MH is permanently barred from exposing, since
+      # talk duration for a named participant is joinable via connection_id /
+      # participant_id. The surviving bias for very long meetings is UPWARD, so
+      # this rule fails toward firing early rather than toward silence, which is
+      # the safe direction for a warning.
+      #
+      # THE DENOMINATOR INCLUDES `no_media_session` AND THE NUMERATOR DOES NOT.
+      # That asymmetry is load-bearing and was not free. Declined-connection
+      # datagrams land on `no_media_session`, which is inside the unfiltered
+      # `dropped{direction="ingress"}` denominator term but is not the numerator.
+      # So during a sustained MC outage the denominator GROWS while the numerator
+      # does not, and this rule gets QUIETER — exactly when
+      # MHMediaSessionDeclineRate is already firing and a second page would be
+      # noise. The token split was made to stop this rule firing spuriously on an
+      # MC outage; the direction it fails in was the bonus. Merging the two
+      # tokens back together, or filtering `no_media_session` out of the
+      # denominator, would silently delete this property and turn an MC outage
+      # into a double page.
+      #
+      # `for: 10m` sits below the window per the rule stated on
+      # MHMediaSenderBindingOutOfRange above.
+      - alert: MHIngressDatagramsNeverRead
+        expr: |
+          (
+            sum(rate(mh_media_frames_dropped_total{reason="transport_receive_dropped", direction="ingress"}[2h]))
+            /
+            (
+              sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[2h]))
+              + sum(rate(mh_media_frames_dropped_total{direction="ingress"}[2h]))
+            )
+          ) > 0.05
+          and
+          (
+            sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[2h]))
+            + sum(rate(mh_media_frames_dropped_total{direction="ingress"}[2h]))
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-ingress
+        annotations:
+          summary: "MH is receiving ingress datagrams it never reads ({{ $value | humanizePercentage }})"
+          description: "More than 5% of the ingress datagrams MH's QUIC layer received over 2 hours were never read by a media ingress loop - they arrived outside a live media session's lifetime, or were evicted from quinn's receive buffer before the loop got to them. THIS IS AN UPPER BOUND ON REAL LOSS, NOT A MEASUREMENT OF IT: the underlying value is client-inflatable (datagrams with an unmatched HTTP/3 session-id varint increment quinn's receive counter while wtransport discards them), so do not build a capacity, quality or SLI calculation on it. THRESHOLD IS PROVISIONAL - MH has no ratified SLO target (see docs/observability/slos.md, target OPEN, story 8), so 5% is chosen as a clearly-abnormal line well above the connection-setup race floor, not derived from one. Revisit once a steady-state baseline exists. THE 2h WINDOW IS LOAD-BEARING, NOT A SMOOTHING CHOICE - the numerator lands in one instant at connection close while the denominator accrues continuously, so a window shorter than typical meeting length inflates the ratio by roughly session_length/window and makes the effective threshold move with meeting duration. Meetings longer than 2h still over-read, which fails toward firing early rather than toward silence. THIS ALERT IS FORENSIC: the counter only moves at connection close, so it describes an incident that has already ended."
+          impact: "Audible media loss for affected publishers during the window that has already passed. Three causes with different owners and the runbook separates them: clients publishing outside their media sessions' lifetimes (client/steering timing, NOT MH), quinn's datagram receive buffer evicting under scheduling pressure because it is sized below MH's own ingress ring (an MH sizing defect - runbook Scenario 16 Step 3 has you read the current constants rather than trusting a restated number, and the ingress buffer-inversion entry in docs/TODO.md carries the arithmetic), or a client inflating the counter with unmatched session-id datagrams (neither of the above). DO NOT conclude MH is losing media before separating them - the predecessor of this signal misattributed exactly this shape to the client for three sessions."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-16-ingress-datagrams-received-but-never-read"
+
       - alert: MHHighMemory
         expr: |
           (

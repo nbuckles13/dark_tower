@@ -678,6 +678,27 @@ pub struct CounterQuery<'a> {
 impl CounterQuery<'_> {
     /// Filter the counter lookup to entries whose labels are a superset
     /// of `pairs`.
+    ///
+    /// # This selects ONE series; it does NOT aggregate
+    ///
+    /// A partial filter over a metric with several series returns the **first**
+    /// entry whose labels are a superset of `pairs` (see `find_of_kind`) —
+    /// snapshot-iteration order, not a total. On a family like
+    /// `mh_media_frames_dropped_total`, where a dozen `reason` values share
+    /// `direction="ingress"`, `with_labels(&[("direction", "ingress")])` reads
+    /// back one arbitrary member **while looking exactly like a sum**. Found
+    /// live at story task 26, where it made a non-vacuity check trivially true.
+    ///
+    /// **Note the asymmetry with histograms**: `HistogramQuery` runs the same
+    /// filter through `histogram_count`, which *does* aggregate across every
+    /// matching series. The identical `with_labels` call therefore means "first
+    /// match" here and "sum over matches" there.
+    ///
+    /// To total a family, iterate the label vocabulary and sum — deriving the
+    /// list from the emitting enum's `ALL` so it cannot go stale as the
+    /// vocabulary grows — or pass a filter identifying exactly one series.
+    /// Unifying the two behaviours is tracked in `docs/TODO.md`
+    /// §Observability Debt.
     pub fn with_labels(mut self, pairs: &[(&str, &str)]) -> Self {
         self.labels = pairs.iter().map(LabelFilter::from_pair).collect();
         self

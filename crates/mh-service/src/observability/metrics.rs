@@ -290,6 +290,37 @@ impl PolicyApplyOutcome {
     }
 }
 
+/// Record `count` frames dropped for one MH-local reason, from a SIBLING of the
+/// media forward path.
+///
+/// # Why this exists beside `MediaMetricHandles`, rather than instead of it
+///
+/// The hot path must not touch a macro or a registry (ADR-0036 §11), so
+/// `crates/mh-service/src/media/**` counts exclusively through handles resolved
+/// once at setup. This function is for the **connection lifecycle**, which is a
+/// sibling of that directory and is entitled to the macro: it fires at most
+/// twice per connection — never per frame — and the connection handler holds no
+/// `MediaMetricHandles` of its own.
+///
+/// `count` rather than a bare increment because both callers have a whole
+/// connection's tally to record in one step, and a loop calling `increment(1)`
+/// n times would be the same series with more work and a wider window for a
+/// partial write.
+///
+/// A zero `count` is recorded as zero rather than skipped: the series is
+/// pre-registered by `resolve_media_handles` at process start, so it reads
+/// present-and-zero either way, and a conditional here would be a branch whose
+/// only effect is to make the code look like it does something.
+pub fn record_media_frames_dropped(reason: MediaDropReason, count: u64) {
+    counter!(
+        "mh_media_frames_dropped_total",
+        "reason" => reason.as_str(),
+        "direction" => reason.direction().as_str(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(count);
+}
+
 /// Record one connection's terminal media-session-start decision.
 ///
 /// Metric: `mh_media_session_starts_total`
@@ -352,10 +383,32 @@ pub enum MediaSessionStartOutcome {
     /// The binding was installed and the three media loops were spawned.
     ///
     /// **Means the loops were spawned, not that media flowed.** It is measured
-    /// strictly upstream of `mh_media_frames_forwarded_total`, and that gap is
-    /// the point: `started` climbing while ingress frames stay flat at zero is
-    /// the discriminator for "sessions start but no uplink arrives", which is a
-    /// client-side condition rather than an MH one.
+    /// strictly upstream of `mh_media_frames_forwarded_total`.
+    ///
+    /// # It LOCALISES; it does NOT attribute — corrected, and the old reading
+    /// misdirected three sessions
+    ///
+    /// This docstring used to say that `started` climbing while ingress frames
+    /// stay flat at zero "is a client-side condition rather than an MH one".
+    /// **That is false**, and it is the reading a responder acted on at story
+    /// task 24: they concluded MH was receiving nothing because the client was
+    /// sending nothing, when in fact *nothing in the suite had sent a frame at
+    /// all* — the only test in the tree that sends a media datagram was
+    /// `#[ignore]`d. Every other scenario opens a connection, starts a session
+    /// and sends nothing, so that shape is what a HEALTHY suite looks like.
+    ///
+    /// The honest claim is narrower. `started` proves the loops were
+    /// **spawned**, which is upstream of the loop **receiving** anything — so
+    /// the pair localises a fault to "at or after the spawn" and says nothing
+    /// about which side owns it. The question that has to be asked *first* is
+    /// whether any datagram arrived, and the discriminators for that are
+    /// `mh_media_frames_dropped_total{reason="transport_receive_dropped"}` and
+    /// `{reason="no_media_session"}`, which are non-zero only if datagrams
+    /// actually reached the handler.
+    ///
+    /// This is one of three homes of the retired claim; the other two are the
+    /// triage row and the panel description named in
+    /// `docs/observability/metrics/mh-service.md`. They move together.
     Started,
     /// MC answered with no usable `sender_id`.
     ///
@@ -728,7 +781,7 @@ impl MediaLatencyPhase {
 /// source of truth for how they are spelled.
 ///
 /// Modelled on [`PolicyApplyOutcome`]: an `ALL` array plus a wildcard-free
-/// `as_str`, so a typo or a twelfth value is a compile error rather than a new
+/// `as_str`, so a typo or a new value is a compile error rather than a new
 /// time series discovered in production.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaDropReason {
@@ -796,13 +849,104 @@ pub enum MediaDropReason {
     /// it; leaving the token out would make the video path's first author
     /// invent a spelling.
     PartialFrameDiscard,
+    /// The QUIC connection received a DATAGRAM frame that MH's ingress loop
+    /// never read.
+    ///
+    /// # Not a respelling of [`Self::IngressQueueOverflow`] — a different layer
+    ///
+    /// That one is **MH's own bounded ring** shedding a frame it had already
+    /// accepted. This one is **quinn's receive buffer** discarding a frame MH
+    /// never accepted, or a frame that arrived outside the ingress loop's
+    /// lifetime. Different layer, different owner, different remedy. The three
+    /// `no_*` tokens are likewise distinct: every one of them presupposes a
+    /// live loop that *read* the frame.
+    ///
+    /// # How it is counted, and why it is not sampled at session start
+    ///
+    /// Computed **once per connection at teardown**, as
+    /// `quinn::Connection::stats().frame_rx.datagram` minus the datagrams
+    /// `run_ingress` actually took off the transport. quinn exposes no evicted
+    /// count — its only native signal is a bare `debug!` in
+    /// `quinn-proto`'s `connection/datagrams.rs` — so this is a difference of
+    /// two counts of real events, never an inference from buffer arithmetic.
+    ///
+    /// Sampling `frame_rx.datagram` at session start instead **would
+    /// double-count**, and that shape was written and withdrawn at review:
+    /// quinn evicts drop-OLDEST, so the datagrams still buffered when a
+    /// session starts are exactly the ones the loop reads moments later and
+    /// counts as `forwarded{direction="ingress"}`. On the measurement that
+    /// motivated this token — 60 datagrams, 47 accounted, 13 genuinely lost —
+    /// the session-start sample would have recorded 20.
+    ///
+    /// # A UNION of three windows, not just the pre-session one
+    ///
+    /// Pre-session arrivals, mid-session eviction while the loop was behind,
+    /// and post-teardown arrivals. MH cannot split them without more sampling.
+    /// The pre-session window is expected to dominate, and the day it does not
+    /// is the day mid-session matters most — so do not read a rise as
+    /// necessarily pre-session.
+    ///
+    /// # The lexical pairing with [`Self::TransportSendRefused`] is NOT semantic
+    ///
+    /// The names pair deliberately — same `transport_*` prefix for "the layer
+    /// below us", opposite direction — but that one is an invariant violation
+    /// that should read zero forever, and **this one has a legitimately
+    /// non-zero tail**. A reader who imports the zero-forever alerting
+    /// discipline across the name pair will either alert on noise or dismiss a
+    /// real rise as "the usual tail". Saturation-or-input group; see the
+    /// catalog.
+    ///
+    /// **Value is client-influenced and is an upper bound, not a measurement.**
+    /// `frame_rx.datagram` counts raw QUIC DATAGRAM frames one layer below
+    /// WebTransport session demultiplexing, so datagrams carrying an unmatched
+    /// HTTP/3 session-id varint increment it while `wtransport` discards them
+    /// (`wtransport-0.7.2/src/driver/mod.rs:172-188`). **Therefore not usable
+    /// as an SLI**: a client-inflatable SLI converts an availability attack
+    /// into an error-budget attack.
+    TransportReceiveDropped,
+    /// Datagrams that arrived on a connection whose media session was
+    /// **declined**, so no ingress loop was ever spawned.
+    ///
+    /// Exact rather than an upper bound, unlike [`Self::TransportReceiveDropped`]:
+    /// with no loop, every one of these is discarded.
+    ///
+    /// # Why this is its own token and not the declined arm of that one
+    ///
+    /// **Neither series is a function of the other, and neither may be deleted
+    /// as redundant.** They share a mechanism and differ only by connection
+    /// outcome, which is exactly the shape a later reviewer merges as "one
+    /// condition, redundant split" — so the reason is recorded here as well as
+    /// in the catalog. The vocabulary's discriminator is REMEDY: a decline
+    /// sends the responder to MC availability and the binding contract, a
+    /// started session sends them to ingest or to a client publishing ahead of
+    /// readiness.
+    ///
+    /// The operational argument is decisive on its own. The MC client's retry
+    /// budget means a declined client can hold its admission slot for tens of
+    /// seconds while publishing ~50 frames/s, so during an MC outage a shared
+    /// token would be dominated by declines across a reconnect herd — burying
+    /// the other signal exactly when it is needed, and firing a second page
+    /// that merely restates the decline rate.
+    ///
+    /// Diagnostic only: no alert. It is fully explained one row up by
+    /// `mh_media_session_starts_total{outcome=declined_*}`.
+    NoMediaSession,
 }
 
 impl MediaDropReason {
-    /// Every value, in catalog order. The length is written out so a twelfth
-    /// token cannot be added without the catalog and the dashboards being
-    /// revisited — this array fails to compile first.
-    pub const ALL: [Self; 11] = [
+    /// Every value, in catalog order. The length is written out so a new token
+    /// cannot be added without the catalog and the dashboards being revisited —
+    /// this array fails to compile first.
+    ///
+    /// **The ordinal is deliberately not named.** This sentence said "a twelfth
+    /// token" while the array held eleven, and story task 26 added two — making
+    /// it describe a tripwire two tokens behind where it actually sits. Naming
+    /// the next ordinal re-arms that trap at every addition, which is the same
+    /// reason `docs/observability/metrics/mh-service.md`'s restated cardinality
+    /// integer was DELETED rather than updated in that same change. The written
+    /// out length below is compile-checked and is the guard; prose restating it
+    /// is an unchecked copy.
+    pub const ALL: [Self; 13] = [
         Self::IngressQueueOverflow,
         Self::EgressQueueOverflow,
         Self::TransportSendRefused,
@@ -814,6 +958,8 @@ impl MediaDropReason {
         Self::NoLocalSubscriber,
         Self::RelayRewriteFailed,
         Self::PartialFrameDiscard,
+        Self::TransportReceiveDropped,
+        Self::NoMediaSession,
     ];
 
     /// The wire label value.
@@ -831,6 +977,8 @@ impl MediaDropReason {
             Self::NoLocalSubscriber => "no_local_subscriber",
             Self::RelayRewriteFailed => "relay_rewrite_failed",
             Self::PartialFrameDiscard => "partial_frame_discard",
+            Self::TransportReceiveDropped => "transport_receive_dropped",
+            Self::NoMediaSession => "no_media_session",
         }
     }
 
@@ -847,7 +995,9 @@ impl MediaDropReason {
             Self::IngressQueueOverflow
             | Self::OversizeDatagram
             | Self::StreamRateLimited
-            | Self::NoPolicy => MediaDirection::Ingress,
+            | Self::NoPolicy
+            | Self::TransportReceiveDropped
+            | Self::NoMediaSession => MediaDirection::Ingress,
             Self::EgressQueueOverflow
             | Self::TransportSendRefused
             | Self::ConnectionClosed
@@ -915,7 +1065,7 @@ pub struct MediaMetricHandles {
     /// Indexed by [`MediaDirection::ALL`] order.
     forwarded: [Counter; 2],
     /// Indexed by [`MediaDropReason::ALL`] order.
-    dropped: [Counter; 11],
+    dropped: [Counter; 13],
     /// `(reason, handle)` pairs for the codec family, built by iterating
     /// `ALL_REJECT_REASONS` rather than a hand-written token list — that const
     /// is generated by the same macro as the enum, so a ninth codec token added
@@ -949,7 +1099,7 @@ impl MediaMetricHandles {
 
     /// The drop counter for one MH-local reason.
     pub fn dropped(&self, reason: MediaDropReason) -> &Counter {
-        let [ingress_overflow, egress_overflow, send_refused, closed, oversize, rate_limited, no_policy, no_subscriber, no_local, rewrite_failed, partial] =
+        let [ingress_overflow, egress_overflow, send_refused, closed, oversize, rate_limited, no_policy, no_subscriber, no_local, rewrite_failed, partial, receive_dropped, no_session] =
             &self.dropped;
         match reason {
             MediaDropReason::IngressQueueOverflow => ingress_overflow,
@@ -963,6 +1113,8 @@ impl MediaMetricHandles {
             MediaDropReason::NoLocalSubscriber => no_local,
             MediaDropReason::RelayRewriteFailed => rewrite_failed,
             MediaDropReason::PartialFrameDiscard => partial,
+            MediaDropReason::TransportReceiveDropped => receive_dropped,
+            MediaDropReason::NoMediaSession => no_session,
         }
     }
 

@@ -138,12 +138,37 @@ data:
   #     this a chosen 1:3 ratio rather than an inherited one. A 1:2 ratio would
   #     put a single lost keepalive at the edge of the timeout.
   # Enforced by: quinn, in MH's process.
-  # Where an operator sees it: as connection loss after a long mute — see
-  # docs/runbooks/mh-incident-response.md Scenario 15 (media datagram drop),
-  # whose keepalive fork has no unique client-side discriminator. NOT YET IN THE
-  # TREE: that runbook ends at Scenario 14 today; Scenario 15 is reserved for
-  # this story's operations runbook task. The anchor name is fixed by the story,
-  # so it is written here as-specified rather than invented.
+  # Where an operator sees it: as connection loss after a long mute. There is
+  # NO keepalive scenario in docs/runbooks/mh-incident-response.md today, and
+  # this comment deliberately names no scenario number.
+  #
+  # CORRECTED 2026-09-08. This block previously read "see
+  # mh-incident-response.md Scenario 15 (media datagram drop)" and justified it
+  # with "that runbook ends at Scenario 14 today; Scenario 15 is reserved for
+  # this story's operations runbook task." BOTH CLAIMS ARE NOW FALSE. The
+  # runbook does not end at 14, and the reserved slot was taken by an unrelated
+  # scenario — Scenario 15 is "Media Sessions Declining — No Sender Binding",
+  # which is a control-plane binding fault with no keepalive content at all. An
+  # operator diagnosing a post-mute connection loss who followed the old pointer
+  # landed in an MC-binding triage tree and would have paged the wrong service.
+  #
+  # The correction is recorded rather than quietly applied because the failure
+  # here was not the pointer being stale — it was RESERVING A NUMBER IN A
+  # SEQUENCE THIS FILE DOES NOT OWN. `dt-guard alert-rules-policy` validates
+  # that a `runbook_url` FILE exists but never resolves the `#anchor`, and
+  # nothing at all reads a manifest comment, so neither half of that pointer had
+  # a guard behind it. Do not re-introduce a number here when the keepalive
+  # scenario is eventually written; refer to it by TITLE, which survives
+  # renumbering, or link it from the runbook side where the guard can see it.
+  #
+  # Until that scenario exists, the diagnostic in one line: a connection lost
+  # after a long silent period, with no decline counted on
+  # `mh_media_session_starts_total` and no drop counted on
+  # `mh_media_frames_dropped_total`, is the idle-timeout/NAT-reap shape this
+  # value exists to prevent. It has no unique client-side discriminator — the
+  # client observes an ordinary connection close either way — so confirm from
+  # the MH side that the session was idle for the whole window before treating
+  # it as a keepalive fault.
   MH_KEEPALIVE_INTERVAL_MS: "10000"
 
   # Accept-time resource-exhaustion guard: the maximum number of concurrent

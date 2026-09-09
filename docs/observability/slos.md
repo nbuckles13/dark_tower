@@ -198,20 +198,45 @@ histogram and the sample-ratio gauge. This section is now a **citation, not a fo
   the latter also asserting the slice is non-degenerate and strictly ascending — a `contains` over an
   empty slice passes vacuously.
 
-> **This SLI reads no data on a production pod today, and an empty histogram is
-> not a fast one.** MH declines to start its media tasks pending the participant
-> → `sender_id` binding, so `mh_media_forward_latency_seconds` records nothing
-> and any quantile over it is empty rather than comfortably inside the
-> objective — a distinction that matters most on the SLO dashboard, which is the
-> one that gets screenshotted into a status update. Stated once in full at
-> `docs/observability/metrics/mh-service.md` §Media Forward Path, with the
-> discriminator a responder can run; tracked in `docs/TODO.md` §Media Path
-> Obligations under "R-15 IS NOT SATISFIED IN PRODUCTION".
+> **An empty histogram is not a fast one, and on this SLI the two look
+> identical.** `mh_media_forward_latency_seconds` records only when frames are
+> actually forwarded, so a quantile over an idle or a broken handler is *empty*
+> rather than comfortably inside the objective — a distinction that matters most
+> on the SLO dashboard, which is the one that gets screenshotted into a status
+> update. **Check occupancy before reading the quantile**: `_count` moving at all
+> is the precondition, and `mh_media_session_starts_total` then
+> `mh_media_frames_dropped_total{reason="transport_receive_dropped"}` name the
+> cause when it is not. Stated once in full at
+> `docs/observability/metrics/mh-service.md` §Media Forward Path.
+>
+> (This blockquote previously asserted that MH "declines to start its media tasks
+> pending the participant → `sender_id` binding" and therefore reads no data on
+> any production pod. That ceased to be true when the binding contract landed at
+> story task 24, and nothing detected the staleness — the clause is not derived
+> from anything and no guard covers prose. The permanent, mechanism-independent
+> half is kept above; the era-specific half is deleted rather than re-dated.)
 
 **The presence of the constant does not ratify the target.** 0.030 is the ADR-0011 figure carried
 forward as a placeholder so the mechanism has something to hold; the table above is unchanged and
 story 8 still ratifies the number. **No burn-rate alert may rest on it**, per the rule above, and
 none ships.
+
+> **`mh_media_frames_dropped_total{reason="transport_receive_dropped"}` is NOT SLI-eligible, and
+> this is a hard constraint rather than a current-data caveat.** It is an **upper bound** on
+> datagrams MH never read, not a measurement of them: it counts every DATAGRAM frame quinn decoded
+> and MH did not consume, which includes frames `wtransport` discarded for a WebTransport
+> session-id mismatch. **The value is therefore client-influenceable** — an authenticated client
+> can raise the series at will.
+>
+> That property is survivable for a `warning` alert with a rate and a sustained window, which is
+> where it is used. It is **not** survivable in an SLI. A client-inflatable SLI converts an
+> availability attack into an **error-budget attack**, and if that budget ever gates a release, into
+> a **client-controllable deploy block** — an outside party acquiring a veto over shipping.
+>
+> Recorded here, and not only in the alert rule that respects it, because story 8's author ratifies
+> the forward-latency objective while standing in this file and would otherwise be one hop from a
+> constraint they had no reason to go looking for. The full derivation is at
+> `docs/observability/metrics/mh-service.md` §Media Forward Path, limitations 2 and 3.
 
 Likewise the **sample ratio**, also landed:
 `MH_MEDIA_LATENCY_SAMPLE_RATIO` (optional; default `mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`, cited rather than restated) is read once into

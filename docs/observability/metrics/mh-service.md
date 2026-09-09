@@ -342,8 +342,17 @@ catalogued first.
 **A blind spot that applies to this whole section, stated first because a
 reader who takes any single counter at face value will be misled.** MH is
 keyless and never opens a frame, so it cannot observe any crypto- or key-layer
-condition; and quinn's datagram send buffer evicts silently one layer beneath
+condition; and quinn's datagram **send** buffer evicts silently one layer beneath
 MH's own egress queue. Both are elaborated at the entries below.
+**The two directions are no longer symmetric, and the asymmetry is load-bearing:**
+on the **receive** side quinn's eviction is observable **after the fact, per
+connection, at teardown only** — `frame_rx.datagram`
+counts every DATAGRAM frame it decoded, evicted ones included, which is what
+`transport_receive_dropped` differences against — while on the **send** side
+there is still no accessor and no counter, only a trace-level log. So an absent ingress-side signal means something **once the
+connection has closed**, and nothing at all before then; an absent egress-side
+signal still means nothing, ever. Neither direction gives MH a live detector,
+and this change did not create one.
 **Absence of a drop signal is not evidence that forwarding is healthy.**
 
 > **READ THIS BEFORE READING ANY PANEL IN THIS SECTION: a flat zero across this
@@ -365,7 +374,9 @@ MH's own egress queue. Both are elaborated at the entries below.
 >
 > | Reading | Meaning, and where to look next |
 > |---|---|
-> | `outcome="started"` climbing, `mh_media_frames_forwarded_total{direction="ingress"}` flat at 0 | Sessions start; no uplink arrives. **Client-side, not MH.** |
+> | `outcome="started"` climbing, `mh_media_frames_forwarded_total{direction="ingress"}` flat at 0, **and `transport_receive_dropped` + `no_media_session` also flat** | **Ask this BEFORE client-vs-MH — but only after checking whether connections have closed.** The two drop tokens are emitted at connection teardown, so during an incident whose connections are still open they read flat **whatever is happening**, and this row cannot be used at all. With connections that have since closed, all three flat means no datagram reached this handler; confirm the publisher is transmitting before opening either service. **If sessions are still open, you have no ingress-loss signal — say so and escalate rather than concluding from the flat.** **This row previously read "Sessions start; no uplink arrives. Client-side, not MH." and that instruction misdirected three consecutive triage sessions in 2026-09** — the observed cause was that the only test in the tree which sends a media datagram was `#[ignore]`d, so every session in that fleet legitimately contributed zero frames. |
+> | `outcome="started"` climbing, `forwarded{direction="ingress"}` flat at 0, **`transport_receive_dropped` moving** | Datagrams arrived and **MH never read them**. At or after the ingress-loop spawn: the loop is not draining, or quinn evicts faster than it drains. **Forensic, not live** — this token only increments at connection close, so during an ongoing incident it lags by the session length. Read its entry below before attributing: it is an upper bound and is client-influenceable. |
+> | `outcome="started"` climbing, `forwarded{direction="ingress"}` flat at 0, **`transport_receive_dropped` flat but `no_media_session` moving** | Frames are arriving on connections MH **declined**. Not this row’s fault path at all — read the decline outcomes below; the remedy is upstream. |
 > | `declined_no_sender_binding` climbing | MC answered with no usable ordinal. Several causes — including MC's per-meeting connection registry at capacity, which presents as an elevated-but-flat rate rather than a spike. `mc_media_sender_binding_responses_total` splits them; MH cannot. |
 > | `declined_sender_binding_out_of_range` > 0 | MC's allocator **range**. Should read zero forever. Field corruption in transit, or a peer that is not MC. |
 > | `declined_sender_binding_conflict` > 0 | Should read zero forever, and it is the only decline where the refused binding could have crossed media between participants. **Check MH's unbind path for that meeting before paging MC** — a broken or racing unbind produces this with MC entirely correct. |
@@ -405,11 +416,63 @@ MH's own egress queue. Both are elaborated at the entries below.
 | `declined_mc_endpoint_unknown` | MH has no *usable* MC endpoint for the meeting — none recorded, or one that will not parse as an endpoint — so it never reached the network. | **Registration**, not reachability. Read what the `RegisterMeeting` that programmed this handler carried in `mc_grpc_endpoint`; MH never dialled, so MC's health is not the question. Not retried: every attempt re-parses the same string. |
 
 **`started` means the loops were spawned, not that media flowed.** It is measured
-strictly upstream of the frame counters, and that gap is the point: `started`
-climbing while `frames_forwarded{direction="ingress"}` stays flat is the
-discriminator for a client-side uplink problem. A counter that waited for the
+strictly upstream of the frame counters, and that gap is the point — but it
+**localises** a fault rather than attributing one. `started` climbing while
+`frames_forwarded{direction="ingress"}` stays flat says only that the fault is at
+or after the spawn; it does **not** say which side. It is specifically NOT a
+client-side discriminator, and reading it as one is a documented incident: see
+the first row of the table above. The discriminator is
+`mh_media_frames_dropped_total{reason="transport_receive_dropped"}` — **but it
+is a teardown-emitted counter and is therefore usable only over connections that
+have already closed.** Moving, it means MH received datagrams and never read
+them. Flat, it means *either* nothing was sent *or* the connections carrying the
+loss are still open — those two are indistinguishable here, and treating flat as
+"nothing was sent" during a live incident is the same fail-open mistake as the
+retired row above, with a different mechanism. When sessions are still open, MH
+has **no** ingress-loss signal at all; that is the documented gap in limitation
+1 below, not a reading. A counter that waited for the
 first forwarded frame would be a lagging duplicate of the frame counter and would
 lose the exactly-once-per-connection property the sum depends on.
+
+> **The ingress identity: what the sum now means, and the bounded residue.**
+> With `transport_receive_dropped` and `no_media_session` added — both
+> `direction="ingress"` — the sum
+> `forwarded{direction="ingress"} + dropped{direction="ingress"}` **changed
+> meaning**. It used to be *every datagram the ingress loop read*; it is now
+> *every DATAGRAM frame the connection received*, which is what
+> `forward.rs`'s comment always claimed and what was not previously true. Any
+> panel or rule written against the old reading is now measuring something
+> wider — in particular, **the read set requires subtracting the two new
+> tokens back out.** The sum accounts for every frame received **except** frames
+> still sitting in the ingress ring when the connection is cancelled: the
+> forward loop returns on cancellation without draining, so those were counted
+> as read (and are therefore excluded from `transport_receive_dropped`) but were
+> never forwarded and never dropped. The residue is bounded by the ring itself —
+> **at most `INGRESS_QUEUE_FRAMES` frames per connection, once, at
+> teardown** — so it cannot accumulate or scale with traffic.
+> **Counting the residue as its own drop reason was considered and REJECTED — do
+> not re-derive it.** Two grounds. Draining on cancellation to eliminate the
+> residue would delay shutdown in order to forward frames no subscriber is
+> waiting for, against ADR-0036 §11's "MH sheds media sessions on restart, and
+> that is the decision, not merely the current behaviour". And a token for it
+> would fire exactly once per connection close with a value bounded by
+> `INGRESS_QUEUE_FRAMES`,
+> making it a fixed per-teardown tick whose rate tracks connection churn and
+> nothing else — noise beside the real reasons.
+> **This identity is documented but NOT machine-checked**, and will stay that way
+> until the live detector above exists: no test can assert it as an equality,
+> because the received term (`frame_rx.datagram`) is MH-side quinn state with no
+> metric export, and asserting against a *sent* count is non-deterministic —
+> QUIC datagrams are unreliable, so ordinary network loss would red a correct
+> implementation. The integration coverage is therefore a one-sided sandwich
+> (accounted + unread <= sent, plus a deterministic lower bound on the unread
+> counter, plus a non-vacuity floor), which catches over-counting but cannot
+> confirm the equality. Treat the identity as a design intent with partial
+> coverage, not as a verified invariant. It is documented
+> rather than eliminated because draining on cancellation would delay shutdown
+> to forward frames nobody is waiting for. Expect the sum to fall short of the
+> received count by a small multiple of connection count; that is this residue
+> and not a defect.
 
 **This is NOT a frame drop and must never be folded into
 `mh_media_frames_dropped_total`.** No frame was dropped. This section defines
@@ -493,7 +556,7 @@ stated here.
   - `reason`: one layered label space with two families, below
   - `direction`: `ingress` or `egress`; each reason has exactly one
   - `key_custody`: `operator` (single value)
-- **Cardinality**: Low (19 = 11 MH-local + 8 codec)
+- **Cardinality**: Low — bounded at the type level by the compile-checked `MediaDropReason::ALL` plus `media_protocol`’s `ALL_REJECT_REASONS`, × one `key_custody` value. **Deliberately no restated integer**: the two vocabularies below are the operator-facing artifact, and a second encoding of their combined length only rots — `mc-service.md` §`mc_media_sender_binding_responses_total` records one drifting four times inside a single devloop. The codec half is not merely tedious to restate but **unrestatable in principle**: `resolve_media_handles` builds it by iterating `ALL_REJECT_REASONS`, so a ninth codec token added upstream gets an MH series with no MH edit. (The written-out lengths in `MediaDropReason::ALL` and in the handle array stay: those are compile-checked, and they are the guard.)
 - **Usage**: The primary "why is there no audio" signal. Read it with the forwarded counter, never alone.
 
 **`reason` is ONE layered label space, not two vocabularies.**
@@ -544,6 +607,94 @@ sender; none is a bug on its own.
 | `no_policy` | ingress | No forwarding policy is installed for this meeting. | **The remedy is the control plane, not this handler.** Read `mh_media_policy_applies_total` and MC's `mc_media_policy_pushes_total`. |
 | `no_subscriber` | egress | A policy is installed but no egress edge names this sender. | MC's assignment. The publisher is connected and nobody is subscribed to it. |
 | `no_local_subscriber` | egress | An edge names a subscriber with no connection on this handler. | Ordinary under multi-handler assignment (§9), where a meeting's participants are spread across handlers. Sustained and unexpected means a stale assignment. |
+| `transport_receive_dropped` | ingress | Datagrams the QUIC connection received that **no MH reader ever saw**. Computed exactly at connection teardown as quinn's `frame_rx.datagram` minus the count the ingress loop actually read. | **The client fleet or MH session-start latency — not MH's forward path.** Read the three limitations in the blockquote below this table BEFORE acting on it: it is forensic rather than live, it is an upper bound, and it is client-influenceable. Its ordinary contributor is a client publishing before its `SendDirective` arrives, or reconnecting into a handler it already holds a directive for and racing the new connection's setup. |
+| `no_media_session` | ingress | **Not redundant with the row above — see the note beneath this table.** Datagrams received on a connection whose media session MH **declined**, so no ingress loop was ever spawned and every one was discarded. Exact in the sense that matters — there is no reader to overlap with, so the whole received count IS the loss and no differencing is needed. **"Exact" qualifies the no-reader property, not a race with the wire**: the sample is taken *after* the connection closes (deliberately — the MC-unavailable arm sleeps a jittered interval before closing, and a publishing client sends throughout, so sampling earlier would under-count by exactly the window the slowest decline arm holds open), which leaves one residue — a datagram already in flight when the close frame goes out is discarded uncounted. Bounded by one RTT, per connection, once. | **Diagnostic only; do not alert on it.** It is fully explained one entry up by `mh_media_session_starts_total{outcome="declined_*"}`, which names the cause; this token only says how much media the declined connections were carrying. A large value during an MC outage is expected, not additional signal: MH's MC-client retry budget keeps each declined publisher transmitting for tens of seconds before its close lands. |
+
+> **The `transport_send_refused` / `transport_receive_dropped` pairing is
+> LEXICAL, NOT SEMANTIC — do not import one's discipline onto the other.** The
+> shared `transport_*` prefix says only "the layer below us", in opposite
+> directions. Their *groups* are opposite too: `transport_send_refused` is a
+> should-read-zero invariant violation, alertable at any non-zero value;
+> `transport_receive_dropped` sits in this saturation-or-input table and has a
+> legitimately non-zero tail. A reader who infers symmetry from the surface will
+> either alert on ordinary noise, or — worse — dismiss a genuine rise as "the
+> usual tail" because they half-remember the counter as the routine one. The
+> names pair; the readings do not.
+>
+> **Three limitations on `transport_receive_dropped`, stated here because a
+> panel or alert built on it without them will over-claim.**
+>
+> **1. Forensic, not detective.** The delta is only computable once the ingress
+> loop's read count is final, so **nothing increments until a connection
+> closes**. Meetings run for an hour; during an ongoing incident this token is
+> silent. It does **not** close the "detect silent media loss while it is
+> happening" gap, and no dashboard panel, alert annotation or runbook sentence
+> may imply that it does. The live form needs one more series —
+> `mh_media_datagrams_received_total`, a periodic sum of `frame_rx.datagram`
+> over live connections — because the **accounted** side is already live today:
+> the **read** set is live today as
+> `forwarded{direction="ingress"} + dropped{direction="ingress"} −
+> dropped{reason="transport_receive_dropped"} −
+> dropped{reason="no_media_session"}`, less the bounded residue described below.
+> The two subtractions are load-bearing and easy to omit: both new tokens are
+> themselves `direction="ingress"`, so the unsubtracted sum is the **received**
+> set, not the read set. (`crates/mh-service/src/media/forward.rs` increments
+> `forwarded{ingress}` on the `no_subscriber` path precisely to keep the sum
+> whole.) **Why this is worth
+> building and not merely nice to have**: without it MH has no detective signal
+> for silent ingress loss at all — only a forensic one — and the nearest
+> substitute requires a responder to already know the publisher's expected frame
+> rate, which is not recorded anywhere. Tracked in `docs/TODO.md`
+> §Media Path Obligations, under the R-15 entry.
+>
+> **1b. It is a union of three windows and cannot be split.** The delta covers
+> datagrams that arrived *before* the ingress loop was live, datagrams evicted
+> *mid-session* while the loop was behind, and datagrams that arrived *after*
+> teardown began. MH cannot separate them without further sampling. The
+> pre-session window is expected to dominate, but **do not assume it**: the day
+> it does not is the day the mid-session case matters most, and a responder who
+> read this token as purely pre-session will look at the client fleet while MH's
+> forward loop is the one falling behind.
+>
+> **1c. There is deliberately no per-connection or per-participant breakdown of
+> this counter, and there never can be.** A per-connection count of media frames
+> at ~50/s is talk duration for a named participant, and `connection_id` is
+> logged beside `participant_id`, so such a breakdown would be joinable back to
+> a person. The count is carried in a newtype implementing neither `Display` nor
+> `Debug`, which makes exposing it a compile error rather than a review comment.
+> There is no getter: the newtype's only method consumes the value and returns
+> the difference against the received count, so the per-connection number never
+> leaves the module in a form anything could label, log or export. The bar is
+> structural, not a comment asking reviewers to be vigilant. Do not propose a
+> `sender_id`, `connection_id` or `meeting_id` dimension here.
+>
+> **2. An upper bound on genuine loss, not a measurement of it.** The delta
+> counts every DATAGRAM frame quinn decoded and MH did not read — which includes
+> frames `wtransport` itself discarded for a WebTransport session-id mismatch,
+> because quinn records `stats.frame_rx` when it decodes the frame and
+> `wtransport` drops the mismatch afterwards. Those never had an MH reader and
+> never could have.
+>
+> **3. Therefore client-influenceable, which is why it sits in the
+> saturation-or-input group and not the should-read-zero one.** An authenticated
+> client can raise this series at will. A should-read-zero classification would
+> have handed any such client a lever to force an on-call page, so **no alert on
+> this token may use a bare `> 0` trigger** — it needs a rate over a sustained
+> window, like every other member of its group.
+
+**Why `transport_receive_dropped` and `no_media_session` are two tokens and
+neither may be deleted as redundant.** They share a mechanism — datagrams quinn
+received that no MH reader consumed — and differ only by the connection's
+outcome: a session that *started* versus one MH *declined*. That is enough,
+because the remedies diverge completely (the client fleet and MH's own
+session-start latency, versus the control plane and MC), and because **neither
+series is a function of the other**: a fleet can produce either with the other
+flat, so no arithmetic recovers one from the other. They are also not
+interchangeable in volume — MH's MC-client retry budget keeps each declined
+publisher transmitting for tens of seconds, so during an MC outage
+`no_media_session` can exceed `transport_receive_dropped` by orders of
+magnitude, and a single merged series would bury the client-behaviour signal
+under a control-plane one exactly when both matter.
 
 **MH must never emit a crypto- or key-layer token** — `signature_invalid`,
 `decrypt_failed`, `unwrap_failed`, `replay_detected`, `wrap_key_id_mismatch`,
