@@ -305,6 +305,79 @@ No alert rule ships with this metric. A useful threshold depends on MC's re-asse
 
 ---
 
+## Media-path label conventions (ADR-0036 §11)
+
+**This catalog is the only home for which labels a media-path metric carries.** Any
+change routes through here — never peer-to-peer between an emitter and a dashboard,
+and never by editing a panel description to match a label somebody added. Nothing in
+the tree compares a label key or a label value to anything: `dt-guard`'s
+`application-metrics` and `dashboard-panels` validate metric **names** against code,
+catalogs, dashboards and alerts, and `alert_rules.rs` pins an alert `expr`
+byte-for-byte against its `alerts.md` entry, but **no guard reads a label roster**. A
+roster written anywhere else decays silently and CI stays green.
+
+Note the division of labour with `docs/observability/label-taxonomy.md`, because the
+two are easy to conflate: a **shared label's** name, bounded value set, and the reason
+it is bounded live in the taxonomy — it is the *first* home for a label that more than
+one service emits. **Which labels a given metric carries** lives here. Neither is a
+copy of the other.
+
+### Declared, not yet carried: `media_kind` and `content_kind`
+
+Media-path counters gain two dimensions when video and content share land (**story 3**,
+not this story):
+
+| Label | State |
+|---|---|
+| `media_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
+| `content_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
+
+Both are registered in `docs/observability/label-taxonomy.md` as shared labels, which
+is where their value sets are authoritative. They are recorded here as *declared* so
+that story 3 adds a dimension to an existing scheme rather than inventing one, and so
+that a reader who greps for them today finds "not carried yet" instead of silence.
+**Do not write a dashboard query or an alert that selects on either** — the selector
+would match nothing and yield an empty series rather than an error.
+
+### The transmit/receive convention
+
+`direction` (`ingress` | `egress`) is carried **only where both directions exist on one
+counter**. The convention itself — that it is pipeline-relative and never
+participant-relative, why the `uplink`/`downlink` reading is barred, why it is admitted
+on relay metrics at all, and the explicit statement that the acceptance **does not
+generalise to the client's drop counter** — is stated once in
+`docs/observability/label-taxonomy.md` §Permitted partner: `direction`. It is not
+restated here, because a partial copy that dropped either of those last two clauses
+would read as complete.
+
+**Receive-only counters carry no `direction` label at all.** A direction label with one
+possible value is a label that can only ever be wrong: it invites a selector that will
+one day match nothing, and it implies a second direction that does not exist.
+
+### What that means for MH
+
+MH is the only service where both directions exist on a single counter, so it is the
+only one carrying `direction`.
+
+- `mh_media_frames_forwarded_total` and `mh_media_frames_dropped_total` carry
+  `direction`.
+- Each `reason` token maps to **exactly one** direction, paired with the token at its
+  definition site so the two labels cannot disagree — so the drop counter carries **one
+  MH-local series per token rather than two**. Deliberately no restated integer here:
+  `MediaDropReason::ALL`'s written-out length is compile-checked and is the guard, and
+  a prose count beside it is an unchecked copy. (`crates/mh-service/src/observability/metrics.rs`
+  carried exactly such a copy — "11 MH-local series rather than 22" — which went stale
+  at the 11→13 token growth and survived the very commit that wrote the policy against
+  restating ordinals.)
+- The per-token `reason`↔`direction` mapping is enumerated **once**, in the triage table
+  in §Media Forward Path below. It is not repeated in this section.
+- Every media-path metric carries `key_custody=operator` (ADR-0036 §4). It is a fixed
+  non-identity label with exactly one value by construction, not a cardinality
+  dimension.
+
+
+---
+
 ## Media Forward Path
 
 The ADR-0036 §2/§7 audio datagram forward path and its §11 telemetry. Placed

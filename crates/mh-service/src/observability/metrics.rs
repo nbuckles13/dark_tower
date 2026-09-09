@@ -986,9 +986,9 @@ impl MediaDropReason {
     ///
     /// Paired with the token at its definition site, so `reason` and
     /// `direction` cannot disagree: each token has exactly ONE direction, which
-    /// is why the counter carries 11 MH-local series rather than 22. A token
-    /// that could legitimately occur in both directions would be two conditions
-    /// wearing one name.
+    /// is why the counter carries one MH-local series per token rather than two.
+    /// A token that could legitimately occur in both directions would be two
+    /// conditions wearing one name.
     #[must_use]
     pub const fn direction(self) -> MediaDirection {
         match self {

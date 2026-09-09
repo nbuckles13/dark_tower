@@ -241,6 +241,49 @@ authoritative — do not restate a threshold here.
 
 ---
 
+### MH Media Path
+
+**File**: `infra/grafana/dashboards/mh-media.json` | **UID**: `mh-media`
+
+The media-path **triage** board: where an operator goes to answer *why*, after
+`mh-overview.json` has told them *whether*.
+
+| Panel | Question it answers |
+|---|---|
+| Media Forward Latency by Phase (p95 / p99) | Which of three phases is slow — receive-buffer, processing, or transmit-buffer |
+| Ingress / Egress Drops by Reason | Which condition dropped frames, on which side |
+| Zero-Forever Invariant Drops | Whether an invariant that should never fire has fired |
+| Egress Delivery Ratio | What fraction of egress attempts the transport accepted |
+
+Two conventions this board depends on, both easy to break by well-meaning edit:
+
+- **The latency phases are never aggregated here**, and `total` is excluded by selector.
+  The three phases have different remedies; a total does not say which to pursue. `total`
+  additionally spans a client-influenced phase — see `docs/observability/slos.md`
+  §Open: which series the objective attaches to.
+- **The drop panels use `increase()`, not `rate()`**, and carry **no `or vector(0)`**. At
+  the deployed 15 s cadence a single drop under `rate()` renders ~0.003/s, which reads
+  identical to healthy on the one panel whose purpose is that a single drop is visible;
+  and `or vector(0)` would fabricate a series and flatten the by-reason breakdown.
+
+### Client SDK Media Path
+
+**File**: `infra/grafana/dashboards/client-media.json` | **UID**: `client-media`
+
+Receive- and send-path counters from the browser SDK, organised around the receive-path
+accounting identity `received = accepted + sum(drops by reason)`.
+
+> **This board is non-functional in its entirety today** and carries a banner saying so.
+> The SDK emits and exports correctly, but the OTLP collector's metrics pipeline exports
+> to `debug` and no Prometheus job scrapes it, so every panel renders "No data" for that
+> reason alone. It is built now because ADR-0036 §11 makes the client drop counters the
+> only signal for a join or rotation path that has silently stopped delivering keys, and
+> so that wiring the exporter is the single remaining step.
+>
+> **The empty-panel wording on this board is the OPPOSITE of `mh-media.json`'s and must
+> not be copy-pasted between them.** There, empty means no drops occurred — the healthy
+> state. Here, empty means the pipeline is unwired and says nothing about drops at all.
+
 ## Platform Dashboards
 
 ### Service Health Overview
@@ -329,22 +372,54 @@ services:
 
 ### Kubernetes (Staging/Production)
 
-Dashboards are loaded via **dynamic ConfigMap discovery** using `kiwigrid/k8s-sidecar`:
+Dashboards are loaded via **label-selected ConfigMap discovery** using `kiwigrid/k8s-sidecar`:
 
-**How it works**:
-1. The setup script dynamically discovers dashboard JSON files from `infra/grafana/dashboards/`
-2. Files are grouped by service prefix (e.g., `ac-*.json` -> `grafana-dashboards-ac`)
-3. Files without a `{prefix}-*` pattern go into `grafana-dashboards-common`
-4. Each ConfigMap is labeled with `grafana_dashboard=1` and applied with `--server-side` (avoids the 262KB annotation limit)
-5. A `kiwigrid/k8s-sidecar` init container discovers labeled ConfigMaps and writes them to a shared `emptyDir` volume at `/var/lib/grafana/dashboards`
+**How it works** (corrected — the previous version of this block described
+auto-discovery that does not exist, and following it turned Layer 3 red):
+1. `infra/grafana/kustomization.yaml` holds a **static** `configMapGenerator` list, one
+   group per prefix (`grafana-dashboards-ac`, `-gc`, `-mc`, `-mh`, `-client`, `-errors`).
+   Nothing is auto-discovered.
+2. Each group carries `options.labels.grafana_dashboard: "1"`.
+3. `generatorOptions.disableNameSuffixHash: true` keeps the generated ConfigMap names
+   stable, so **changing a group's contents does not roll the Grafana pod.**
+4. A `kiwigrid/k8s-sidecar` **initContainer** with `METHOD: LIST` lists labeled ConfigMaps
+   **once at pod start**, writes them into a shared `emptyDir` at
+   `/var/lib/grafana/dashboards`, and exits. **It does not watch.**
 
-**Adding a new dashboard**: Simply place the JSON file in `infra/grafana/dashboards/` following the `{service}-{name}.json` naming convention. Re-run `setup.sh` and the file will be automatically picked up -- no script edits required.
+**Adding a new dashboard** — four steps, and steps 3 and 4 are the ones with no guard
+behind them:
 
-```bash
-# Example: adding a new mc-latency.json dashboard
-cp my-dashboard.json infra/grafana/dashboards/mc-latency.json
-# Re-run setup.sh -- it auto-discovers the new file and adds it to grafana-dashboards-mc
-```
+1. Add the JSON to `infra/grafana/dashboards/`, named `{prefix}-{name}.json`.
+2. Register the basename in `infra/grafana/kustomization.yaml` under the matching
+   `grafana-dashboards-{prefix}` group, **creating the group if it does not exist**.
+   `dt-guard kustomize` R-20 enforces this bidirectionally: an unregistered dashboard and
+   a registered-but-absent file both turn Layer 3 red.
+3. **If you created a group, it MUST carry:**
+   ```yaml
+       options:
+         labels:
+           grafana_dashboard: "1"
+   ```
+   **R-20 checks basenames only and never inspects `options.labels`.** A group that lists
+   its files and omits this block passes CI green, lands in the repo, and is invisible to
+   the sidecar forever. No guard will tell you.
+4. **Deploying to a running cluster takes two actions, not one.** Because the ConfigMap
+   names are stable and the sidecar only lists at pod start, `apply` alone leaves you with
+   a correct ConfigMap that Grafana never reads:
+   ```bash
+   kubectl apply -k infra/kubernetes/overlays/kind/observability/
+   kubectl rollout restart deployment/grafana -n dark-tower-observability
+   kubectl rollout status  deployment/grafana -n dark-tower-observability --timeout=300s
+   ```
+   The `rollout status` is a readiness wait on the restart, not a third action — it is
+   there so the step fails loudly instead of returning before Grafana is back. See
+   `docs/LOCAL_DEVELOPMENT.md` §"Grafana Not Showing Dashboards". `deploy_observability()`
+   in `infra/kind/scripts/setup.sh` escapes the restart only because a full setup builds
+   the pod fresh.
+
+**The missing labels block and the missing restart are the same failure with two causes**:
+a dashboard that is registered, guarded, committed — and invisible in Grafana. R-20 covers
+neither, which is why they are spelled out here rather than left to the guard.
 
 ---
 
@@ -399,6 +474,8 @@ To request a new dashboard:
 | AC Overview | Observability | AC Team | TBD |
 | MC Overview | Observability | MC Team | 2026-03-27 |
 | MH Overview | Observability | MH Team | TBD |
+| MH Media Path | MH Team (ADR-0031) | Observability | 2026-09-09 |
+| Client SDK Media Path | Client Team (ADR-0031) | Observability | 2026-09-09 |
 
 **Update Frequency**: Review quarterly or after major service changes.
 

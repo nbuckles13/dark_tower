@@ -40,6 +40,15 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 > and structurally incapable of matching. Tracked in `docs/TODO.md`
 > §Observability Debt, owner infrastructure for the wiring.
 >
+> **"Not queryable" does not mean "not implemented", and the distinction matters
+> more now than it did.** The media-path metrics are emitted, exported,
+> catalogued **and dashboarded**: `infra/grafana/dashboards/client-media.json`
+> exists, is registered in the Grafana kustomization, and renders "No data" on
+> every panel *for this reason and no other*. The exporter is the **sole
+> remaining hop** — everything on either side of it is built. A reader deciding
+> whether to invest in this signal should read that as "one infrastructure
+> change away", not as "nobody has done the work".
+>
 > This block exists because the sentence above it — accurate about emission and
 > export — invites the inference that the chain continues, and a catalog is
 > exactly where someone goes to decide whether a signal is available before
@@ -236,6 +245,100 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
     (the raw index is bucketed so cardinality stays bounded as the MH fan-out
     grows).
 - **Cardinality**: Low (2 statuses × 3 buckets = 6, before implicit labels).
+
+---
+
+## Media-path label conventions (ADR-0036 §11)
+
+**This catalog is the only home for which labels a media-path metric carries.** Any
+change routes through here — never peer-to-peer between an emitter and a dashboard,
+and never by editing a panel description to match a label somebody added. Nothing in
+the tree compares a label key or a label value to anything: `dt-guard`'s
+`application-metrics` and `dashboard-panels` validate metric **names** against code,
+catalogs, dashboards and alerts, and `alert_rules.rs` pins an alert `expr`
+byte-for-byte against its `alerts.md` entry, but **no guard reads a label roster**. A
+roster written anywhere else decays silently and CI stays green.
+
+Note the division of labour with `docs/observability/label-taxonomy.md`, because the
+two are easy to conflate: a **shared label's** name, bounded value set, and the reason
+it is bounded live in the taxonomy — it is the *first* home for a label that more than
+one service emits. **Which labels a given metric carries** lives here. Neither is a
+copy of the other.
+
+### Declared, not yet carried: `media_kind` and `content_kind`
+
+Media-path counters gain two dimensions when video and content share land (**story 3**,
+not this story):
+
+| Label | State |
+|---|---|
+| `media_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
+| `content_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
+
+Both are registered in `docs/observability/label-taxonomy.md` as shared labels, which
+is where their value sets are authoritative. They are recorded here as *declared* so
+that story 3 adds a dimension to an existing scheme rather than inventing one, and so
+that a reader who greps for them today finds "not carried yet" instead of silence.
+**Do not write a dashboard query or an alert that selects on either** — the selector
+would match nothing and yield an empty series rather than an error.
+
+### The transmit/receive convention
+
+`direction` (`ingress` | `egress`) is carried **only where both directions exist on one
+counter**. The convention itself — that it is pipeline-relative and never
+participant-relative, why the `uplink`/`downlink` reading is barred, why it is admitted
+on relay metrics at all, and the explicit statement that the acceptance **does not
+generalise to the client's drop counter** — is stated once in
+`docs/observability/label-taxonomy.md` §Permitted partner: `direction`. It is not
+restated here, because a partial copy that dropped either of those last two clauses
+would read as complete.
+
+**Receive-only counters carry no `direction` label at all.** A direction label with one
+possible value is a label that can only ever be wrong: it invites a selector that will
+one day match nothing, and it implies a second direction that does not exist.
+
+### What that means for the client SDK
+
+**Identity dimensions: exactly two.** `client_version` and `org_id`. Nothing else — and
+specifically **no meeting, participant or stream dimension, hashed or otherwise**
+(ADR-0036 §11 R1).
+
+Plus one **fixed non-identity** label: `key_custody=operator` (ADR-0036 §4). It is not a
+dimension in the cardinality sense, having exactly one value by construction, and R-26
+requires it. The media-path label set is therefore *three* labels; describing it as
+"only `client_version` and `org_id`" would be false against the wire.
+
+**Why a hash does not help, stated because it is the obvious-looking escape hatch.** A
+hashed meeting id has **identical cardinality and identical per-meeting aggregation** to
+a raw one. Both properties are exactly what R1 is about, so hashing buys nothing the
+rule cares about and merely makes the violation harder to see in a label value.
+
+**The concrete inertia risk.** `packages/sdk-core/src/media/events.ts` already threads
+the join-flow implicit label set into the media module, so `meeting_id_hash` would
+attach to every media metric **by default** if the media set were built by spreading the
+join set and pruning it. It is not: the media set is built by **allow-list** in
+`packages/sdk-core/src/media/setup/mediaMetrics.ts`. Stronger than a policy, the code
+makes the leak **unrepresentable**: `mediaMetricLabels(identity: MediaMetricIdentity)`
+takes two named strings (`clientVersion`, `orgId`) — there is no `MetricLabels` bag at
+that boundary, so `meeting_id_hash` is not *excluded* from the set, it is a value a
+caller cannot pass even by mistake, because no parameter could carry it. That is a type,
+not a filter: a filter (`pick(labels, [...])` over an ambient bag) is a control that has
+to *notice*, and it fails open the moment a caller reaches the sink by a path that skips
+it — the type signature has nothing to notice. Keep it that way: an allow-list fails
+closed when a new label appears upstream, and a prune-list fails open. This matters
+specifically here because `MediaTransport`'s `#emitMetric` legitimately *does* spread the
+join label set for the one grandfathered metric, so a deletion-based helper would read as
+the local idiom to a future refactor — and the catalog is what that refactor consults.
+
+`meeting_id_hash` remains grandfathered for the ADR-0028 **join-flow** metrics as a
+**closed set**: it is grandfathered *as a set*, it is not extended, and nothing joins it.
+
+**No `direction` label on any client media metric.** `dt_client_media_frames_dropped_total`
+is receive-only and `dt_client_media_send_dropped_total` is send-only — two single-direction
+counters, not one bidirectional counter. `label-taxonomy.md`'s §Permitted partner:
+`direction` names the client drop counter explicitly as outside its acceptance, so that
+block must not be cited as precedent for adding one here.
+
 
 ---
 

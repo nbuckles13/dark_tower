@@ -47,10 +47,9 @@
 use env_tests::cluster::ClusterConnection;
 use env_tests::eventual::{assert_eventually, ConsistencyCategory};
 use env_tests::fixtures::metric_hygiene::{
-    check_series, scrape_reachable_client_series, service_jobs_with_metric_relabeling, Series,
+    self, check_series, scrape_reachable_client_series, service_jobs_with_metric_relabeling, Series,
 };
 use env_tests::fixtures::PrometheusClient;
-use std::collections::BTreeMap;
 
 /// Rust service jobs. Deliberately ALL four, not just the media pair: R1 is
 /// "no meeting identifier on any metric anywhere in this design", and narrowing
@@ -85,37 +84,22 @@ async fn cluster() -> ClusterConnection {
 /// reported clean: a green suite with a satisfied precondition and no input.
 /// Fetching once and asserting both over the same `Vec` makes the anchor
 /// *guarantee* the predicate had input, because there is only one input.
+///
+/// **That argument lives HERE, at the call site, and not on the kernel
+/// function.** `metric_hygiene::fetch_all_series` returns a `Vec` and cannot make
+/// any caller use one fetch for two assertions; stating the guarantee there would
+/// read as though it held for everyone, while a caller fetching twice made it hold
+/// nowhere. `30_observability.rs` makes the same argument separately, for its own
+/// assertion pair — two call sites, two facts, not one duplicated fact.
+///
+/// The mechanics (response → `Vec<Series>`, and the loud refusal of a series with
+/// no `__name__`) were hoisted to `crates/env-tests/src/fixtures/metric_hygiene.rs`
+/// so they run in the always-on Rust lane. They previously sat in this file, which
+/// `cargo test` cannot reach — the same root cause as the escaped-JSON relabel bug
+/// documented below, and the reason a `"<unnamed>"` fallback survived here
+/// undetected while silently defeating the anchor assertion.
 async fn fetch_all_series(client: &PrometheusClient) -> Vec<Series> {
-    let response = client
-        .query_promql(&format!(r#"{{job=~"{JOBS}"}}"#))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "{TRIAGE_SCRAPE}: Prometheus instant query failed: {e}. \
-                    The cluster or the port-forward is the fault here, not the diff."
-            )
-        });
-
-    response
-        .data
-        .result
-        .iter()
-        .map(|r| {
-            let mut labels: BTreeMap<String, String> = r
-                .metric
-                .iter()
-                .filter(|(k, _)| k.as_str() != "__name__")
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let name = r
-                .metric
-                .get("__name__")
-                .cloned()
-                .unwrap_or_else(|| "<unnamed>".to_string());
-            labels.remove("__name__");
-            Series { name, labels }
-        })
-        .collect()
+    metric_hygiene::fetch_all_series(client, &format!(r#"{{job=~"{JOBS}"}}"#), TRIAGE_SCRAPE).await
 }
 
 #[tokio::test]
