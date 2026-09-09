@@ -407,6 +407,27 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
 
       // --- joined ---
       this.#senderId = joined.senderId;
+      // OUR OWN key goes into the roster resolver, and this is NOT a self-trust
+      // branch.
+      //
+      // MC's roster carries `existing_participants` — everyone EXCEPT us — so
+      // `#feedRosterKeys` never learns our own key. In a one-participant meeting
+      // that is fatal to the whole objective: every frame MH forwards back to us
+      // carries `key_id.sender_id == our own id`, `identityKeyFor` returns
+      // `undefined`, and the receive path fails closed on `no_roster_entry`. Not
+      // some frames — ALL of them, silently, with audio visibly arriving at the
+      // wire. (Found by the Layer 7 loopback env-test, which is the only thing
+      // in the suite that could have found it: every unit-tier loopback seeds
+      // its own roster by hand.)
+      //
+      // What this does NOT do is skip verification. The frame still has to carry
+      // a signature that verifies against this key, and only the holder of the
+      // matching private key can produce one — so a forged frame claiming our
+      // sender id is rejected exactly as before. The ingress path keeps its
+      // single, uniform "resolve the key for `key_id.sender_id`, then verify"
+      // rule with no `if (senderId === mine)` anywhere; we are simply supplying
+      // the key for a sender the roster structurally cannot tell us about.
+      await this.#seedOwnRosterKey();
       this.#setState(MeetingSessionState.Joined);
       this.#emitJoinAttempt('success', FailureStage.None);
       this.emit('joined', joined);
@@ -505,6 +526,19 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     const pipeline = new AudioPipeline(pipelineOptions);
     this.#pipeline = pipeline;
 
+    // The remaining three absence-signals (§5/§10), forwarded verbatim — see
+    // `session/events.ts`. Subscribed immediately after construction and before
+    // `start()`, so nothing the pipeline can emit is missed: `firstMediaFrame`
+    // in particular is armed inside `start()` and could otherwise fire into no
+    // listener on a fast loopback.
+    //
+    // Nothing is recomputed here. `muteChanged` is the ONLY mute source a UI may
+    // render from, and re-deriving it (from frame counts, a timer, or the click
+    // that requested it) is what §5's out-of-band rule exists to prevent.
+    pipeline.on('muteChanged', (snapshot) => this.emit('muteChanged', snapshot));
+    pipeline.on('firstMediaFrame', (elapsedMs) => this.emit('firstMediaFrame', elapsedMs));
+    pipeline.on('fault', (fault) => this.emit('mediaFault', fault));
+
     signaling.on('sendDirective', (directive) => {
       const audio = directive.streams.find((s) => s.mediaKind === 'audio');
       if (!audio) return;
@@ -520,6 +554,40 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     await signaling.sendReceiveCapability([{ slotId, mediaKind: 'audio' }]);
     await pipeline.start(options.deviceId !== undefined ? { deviceId: options.deviceId } : {});
     return pipeline;
+  }
+
+  /**
+   * Publish this client's own identity public key into the roster resolver.
+   *
+   * Best-effort by the same reasoning `#feedRosterKeys` uses: a key that has not
+   * landed means the next frame from that sender is dropped and counted as
+   * `no_roster_entry`, which is the correct transient. It is awaited at join
+   * rather than fired-and-forgotten because, unlike a peer's key, this one is
+   * needed by the FIRST frame that returns — and the join has already settled by
+   * the time we get here, so the wait costs nothing on the media path.
+   *
+   * THE ENTRY IS NOT PINNED, and that is deliberate. `#feedRosterKeys` routes
+   * every later `ParticipantJoined` through the same `upsert`, and
+   * `RosterIdentityKeys` replaces on write — so a roster message naming our own
+   * sender id would overwrite this key, after which frames forged against our
+   * sender id would verify.
+   *
+   * That is bounded by something larger rather than by anything special here:
+   * MC distributes every participant's identity key with no out-of-band
+   * verification, so MC can already impersonate any peer to us. Hardening only
+   * the self entry would buy little and would imply a protection that does not
+   * exist for peers. What IS worth recording is the asymmetry — this is the one
+   * key we know independently, because we generated it. Pinning it is a change
+   * to the crypto resolver in `media/setup/rosterKeys.ts` with its own tests,
+   * not a change here.
+   */
+  async #seedOwnRosterKey(): Promise<void> {
+    const senderId = this.#senderId;
+    const publicKey = this.#identity?.publicKey;
+    // No sender id means MC assigned none; `startMedia()` already fails closed on
+    // that, so there is nothing to seed and nothing to report here.
+    if (senderId === undefined || !publicKey) return;
+    await this.#rosterKeys?.upsert({ senderId, identityPublicKey: publicKey });
   }
 
   /** The running media pipeline, or `undefined` before `startMedia()`. */
@@ -673,6 +741,11 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     signaling.on('participantJoined', (e) => this.emit('participantJoined', e));
     signaling.on('participantLeft', (e) => this.emit('participantLeft', e));
     signaling.on('error', (e) => this.emit('error', e));
+    // ADR-0036 §6 slot state, forwarded verbatim. Bridged HERE rather than in
+    // `startMedia()` because it is signalling state, not pipeline state: MC can
+    // reassign slots for a client that has not started media, and a UI that
+    // renders "waiting for the controller" must see that happen.
+    signaling.on('streamAssignments', (e) => this.emit('streamAssignments', e));
     return signaling;
   }
 

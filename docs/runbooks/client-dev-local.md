@@ -2,7 +2,7 @@
 
 **Service(s)**: web-app demo + AC / GC / MC / MH (local Kind)
 **Owner**: operations
-**Last Updated**: 2026-08-06
+**Last Updated**: 2026-09-09
 **Executable companion**: `scripts/dev-web.sh`
 
 > ## ⚠ NON-GOAL BANNER — THIS IS NOT A PRODUCTION PATTERN
@@ -45,9 +45,10 @@
 - [§0 Which machine am I on?](#0-which-machine-am-i-on)
 - [§1 Which cluster am I running?](#1-which-cluster-am-i-running)
 - [§2 Prerequisites](#2-prerequisites)
+- [Secure Context and Media Setup](#secure-context-and-media-setup)
 - [§3 Bring-up](#3-bring-up)
 - [§4 Is the join real?](#4-is-the-join-real)
-- [§5 Failure modes (F1–F11)](#5-failure-modes-f1f11)
+- [§5 Failure modes](#5-failure-modes)
 - [§6 Teardown](#6-teardown)
 - [§6.5 Automated checks that exist today](#65-automated-checks-that-exist-today)
 - [§7 Not on this branch](#7-not-on-this-branch)
@@ -261,6 +262,113 @@ Both are pinned in the repo, and the pins are **not restated here** — a second
 `scripts/dev-web.sh` reads both at runtime and prints the exact `nvm install` / `corepack prepare`
 command with the value already substituted. Run it rather than transcribing a version by hand.
 See F2, F3, F4 for the three ways this goes wrong.
+
+---
+
+## Secure Context and Media Setup
+
+**Unnumbered deliberately, and the spelling is frozen.** `scripts/dev-web.sh`'s header points at
+`#secure-context-and-media-setup`, `scripts/dev-web.test.sh` pins both the slug and several claims
+in the prose below, and §4's triage ladder links here for the facts. Renaming this heading, or
+adding punctuation to it, breaks all three; numbering it would break it twice over, since the number
+would then move whenever a section is inserted. No subheading under it contains the words "secure"
+and "context" together, because the guard finds this section by the FIRST such heading in the file
+and would otherwise slugify the wrong one.
+
+### The whole media pipeline is gated, all or nothing
+
+`getUserMedia`, **WebCodecs**, **WebCrypto** and **WebTransport** are all gated on a
+[secure context](https://w3c.github.io/webappsec-secure-contexts/). The demo needs every one of
+them — microphone in, Opus out, SFrame encryption and Ed25519 signing, and the QUIC datagrams that
+carry the result — so on a non-secure origin the media path is not degraded, it is **absent**.
+
+**Absent, not erroring**, and that distinction is the whole reason this section exists:
+
+- `navigator.mediaDevices` is `undefined` — so there is no permission prompt to deny, and no
+  "microphone blocked" indicator. Nothing appears to happen.
+- `crypto.subtle` is `undefined`.
+- The `AudioEncoder` / `AudioDecoder` and `WebTransport` constructors are not defined.
+
+Sign-up and create-meeting keep working, because those are HTTP through the Vite proxy and need
+none of the four.
+
+**The join does NOT.** MC signalling runs over WebTransport and has no fallback
+(`SignalingClient` holds a single `WebTransportConnectFn`), so the client dies at
+**`connecting-mc`** and never reaches `joined`. No roster ever appears.
+
+**And the screen tells you nothing about the origin.** `BrowserWebTransport` throws
+`WebTransport is not available in this environment` — but that string is attached as
+`Error.cause`, which the demo deliberately never renders (R-23 redaction: `SdkError.toJSON()` is a
+fixed allowlist and `cause` is not on it). What `data-testid="last-error"` actually shows is the
+generic:
+
+```
+SIGNALING: Signaling transport closed
+```
+
+which is **byte-identical to what F1, F8 and F9 produce**. There is no distinguishing text anywhere
+on screen, and no console message naming the origin. So this failure does not merely *resemble* an
+MC-reachability problem — at rung 1 it is indistinguishable from one, and a developer who works §4's
+ladder will find nothing wrong at every rung. That dead end is the moment someone starts looking for
+a browser switch, which is exactly what this section exists to prevent.
+
+**The discriminator is the origin in your address bar, and it costs nothing.** Check it before rung
+1: if the host is not a `.localhost` name or a loopback literal, stop — the ladder has nothing to
+find. Note *why* that is the discriminator: not because the error is helpful, but because it is
+useless.
+
+To confirm rather than infer, expand the error's `cause` chain in devtools — the underlying
+`WebTransport is not available in this environment` is there. It is **only** there; nothing in the
+UI shows it.
+
+### `http://<org-subdomain>.localhost:5173` IS potentially trustworthy
+
+Plain HTTP, and correct. Chrome treats an origin as *potentially trustworthy* when its host is a
+loopback literal (`127.0.0.1`, `[::1]`) **or a `.localhost` name** — `.localhost` is reserved for
+loopback by RFC 6761, and Chrome implements the subdomain case, so `demo.localhost` qualifies just
+as `localhost` does. This is a Chrome statement, not a cross-browser one; the demo is Chrome-only
+(ADR-0028) and other engines are not promised here.
+
+That is why the whole demo runs over `http://` with no TLS anywhere in front of Vite, and it is why
+the `demo.` prefix costs you nothing: the subdomain is needed for the `Host` header (§3 Step 4) and
+it stays potentially trustworthy.
+
+### What breaks it: a non-loopback HTTP origin
+
+Reaching the same dev server at `http://<lan-ip>:5173`, or by machine name from another host, is
+**not** potentially trustworthy. All four APIs vanish at once, so the join fails at `connecting-mc`
+exactly as a cert or reachability problem would — and nothing on screen names the origin as the
+cause.
+
+The fix is the origin, and there are exactly two approved forms:
+
+- use a `.localhost` name or a loopback literal — on Windows/WSL2 this is what §2.1's hosts entry is
+  for; or
+- terminate real TLS in front of the dev server.
+
+**Do not reach for a browser flag.** Chrome has settings that force an insecure origin to be treated
+as trustworthy, and they are prohibited here — in scripts, config, tests and runbooks alike, checked
+by `dt-guard no-insecure-browser-flags`. They do not just relax the origin check: MC and MH trust in
+dev flows exclusively through `serverCertificateHashes` pinning, and the flags people pair with this
+one disable exactly that. The result is a demo that appears to work while the property the pinning
+exists to prove is gone. If the origin is not a secure context, change the origin.
+
+### No microphone on this machine? Launch Chrome with synthesized capture
+
+A laptop with no input device, a VM, or a shared demo box can still hear the loopback tone. Chrome
+can synthesize a capture stream and auto-accept the permission prompt:
+
+```
+--use-fake-device-for-media-stream --use-fake-ui-for-media-stream
+```
+
+You will hear a steady tone rather than your voice — which is enough to prove the round trip, since
+the point is that *something you sent came back through MH*.
+
+These are the same two flags `packages/web-app/playwright.config.ts` launches with, which is where
+the browser E2E suite gets its deterministic audio; keep the two in step. They are **not** security
+bypasses — they inject a device and answer a prompt, and change no trust decision — which is why
+they are permitted where the flags in the previous subsection are not.
 
 ---
 
@@ -612,7 +720,7 @@ notification path, which none of the signals above cover.
 
 ---
 
-## 5. Failure modes (F1–F11)
+## 5. Failure modes
 
 Each scenario gives a **discriminator** — something you can run to tell it apart from the
 scenarios that share its symptom. F1/F8 and F1/F9 are symptom-identical pairs; without a
@@ -803,9 +911,19 @@ That last point is §0's mechanism again, in a form that catches people: a **`Ho
 
 ### F7 — Browser refuses the MC/MH WebTransport handshake
 
-**Symptom.** Sign-up and create work; join fails at the media or signaling step. `dev-web.sh` may
-warn that `infra/docker/certs/fingerprints.json` is missing — it does not exist in a fresh clone,
-since the whole directory is generated and gitignored.
+**Symptom.** Sign-up and create work; join fails at the media or signaling step, or the join looks
+clean and no audio comes back.
+
+**`dev-web.sh` HARD FAILS on a missing `infra/docker/certs/fingerprints.json`** and does not start
+the dev server — it does not exist in a fresh clone, since the whole directory is generated and
+gitignored. (It used to warn. It cannot any more: the demonstrated path is now audio through MH, so
+a warning there produced a demo that started, appeared to join, and returned nothing.)
+
+**But the preflight being green does not mean the fingerprints are RIGHT.** The check is
+`[[ -s "$FINGERPRINTS_JSON" ]]` — presence only. A **stale-but-present** file passes it, and the
+browser still refuses the handshake. That asymmetry is the whole reason F7 exists as an entry
+separate from F1/F8: the cheap check cannot see this failure, so the discriminator below is the
+only thing that can.
 
 **Discriminator.** Unlike F1, the MC-side counter **moves**:
 
@@ -839,6 +957,13 @@ kubectl rollout restart deployment/mc-0 deployment/mc-1 deployment/mh-0 deployme
 scripts/dev-web.sh
 #   the browser-side fingerprints are read at Vite CONFIG time — a running server never re-reads them
 ```
+
+**Not a browser setting.** The remedy is the four-step sequence above. A browser setting that turns
+off certificate validation is never the fix here: MC/MH trust in dev flows entirely through
+`serverCertificateHashes` pinning, so disabling validation does not restore the media path — it
+leaves a demo that appears to work while the property the pinning exists to prove is gone. This is
+the branch where that temptation actually bites, because the preflight is GREEN (it checks presence,
+not freshness) and `dev-web.sh`'s own warning never printed.
 
 To confirm which leaf is deployed, compare fingerprints — never dump the PEM:
 
@@ -1147,3 +1272,4 @@ yourself updating the same fact in two of these files, one of them is wrong.
 |------|--------|---------|
 | 2026-07-29 | operations (task #20) | Initial creation (R-49). Two-machine topology, two-topology cluster split, bring-up, join-verification ladder, F1–F10, teardown, env-tests section. Deliberately diverges from `TEMPLATE.md` — see the banner. |
 | 2026-08-06 | infrastructure (task #61) | Added **F11** (Vite "cannot find native binding" — engines-skipped optional binding under a below-floor Node) with (a)/(b) sub-case split; updated §5 header + ToC. Reconciled §6.5/§7 with reality: the Playwright browser-E2E lane (tasks #18/#19) now exists and runs diff-triggered in Layer 7 — corrected the stale "no Playwright" §7 note and the §6.5 cross-reference. Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
+| 2026-09-09 | client (story task #20) | Added the frozen `## Secure Context and Media Setup` section between §2 and §3 — the four gated APIs as one all-or-nothing gate, `http://<sub>.localhost:5173` being potentially trustworthy in Chrome, the non-loopback-HTTP failure (**fails at `connecting-mc`, symptom-identical to F1/F8/F9** — WebTransport is one of the four gated APIs and MC signalling has no fallback, so the join never completes; the discriminator is the origin in the address bar), and the fake-device/fake-ui launch for a machine with no microphone. It is the anchor `scripts/dev-web.sh`'s header and §4's ladder both cite; `scripts/dev-web.test.sh` now pins its slug AND its prose. Corrected **F7**'s stale "may warn" (the fingerprints check has been a hard fail since task #61's escalation), added the presence-only/stale-but-present asymmetry that is F7's actual reason for existing, and added F7's anti-flag counter-message — the stale-but-present case is the one branch where `dev-web.sh`'s own warning never prints. Dropped the count from the §5 heading and its ToC entry (`#5-failure-modes-f1f11` -> `#5-failure-modes`, one live referrer, both fixed here) so the anchor stops rotting as F-entries are added — the rule stated under `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`: name a set's members, never restate its count. Per-entry `### F7 — ...` slug untouched (`mh-incident-response.md` links into it three times). Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |

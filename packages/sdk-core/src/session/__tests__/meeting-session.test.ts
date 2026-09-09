@@ -17,11 +17,12 @@ import {
 } from '@darktower/test-utils';
 
 import { MeetingSession } from '../MeetingSession.js';
+import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
 import { MeetingSessionState } from '../events.js';
 import type { JoinCredentials, MeetingSessionOptions } from '../events.js';
 import { MediaConnectionError } from '../../errors/MediaConnectionError.js';
 import { MeetingUnauthorizedError } from '../../errors/MeetingError.js';
-import { ConnectionState } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
+import { ConnectionState, SlotState } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { FetchLike } from '../../http/types.js';
 import {
   configureTelemetry,
@@ -35,6 +36,7 @@ import {
   framedJoinResponse,
   framedParticipantJoined,
   framedSendDirective,
+  framedStreamAssignments,
 } from '../../signaling/__tests__/helpers.js';
 import {
   decodeClientMessages,
@@ -150,17 +152,24 @@ function makeSession(
   });
 }
 
-/** Drive the MC mock to a joined state, then settle the MH mocks per `mhOutcome`. */
+/**
+ * Drive the MC mock to a joined state, then settle the MH mocks per `mhOutcome`.
+ *
+ * `joinInit` widens the JoinResponse for callers that need more than the default
+ * — notably a `senderId`, without which `startMedia()` fails closed (no sender id
+ * means no key id, and this SDK sends no unsigned frames under any degradation).
+ */
 async function driveJoin(
   mocks: Map<string, MockWebTransport>,
   mhOutcome: 'all' | 'partial' | 'none',
+  joinInit: Parameters<typeof framedJoinResponse>[0] = {},
 ): Promise<void> {
   // 1) MC: ready → JoinRequest stream opens → feed JoinResponse with media servers.
   await waitFor(() => mocks.has(MC_ENDPOINT));
   const mc = mocks.get(MC_ENDPOINT)!;
   mc.simulateReady();
   await waitFor(() => mc.getOpenedBidiStreams().length > 0);
-  mc.simulateServerMessage(0, framedJoinResponse({ mediaServers: MEDIA_SERVERS }));
+  mc.simulateServerMessage(0, framedJoinResponse({ mediaServers: MEDIA_SERVERS, ...joinInit }));
 
   // 2) MH: drive each per the requested outcome.
   await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
@@ -1150,5 +1159,193 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
       ),
     );
     rig.session.disconnect();
+  });
+});
+
+// ===========================================================================
+// The four media absence-signals reaching the facade (ADR-0036 §5/§6/§10)
+// ===========================================================================
+//
+// WHY THESE LIVE HERE rather than in the adapter or view suites: those drive a
+// MOCK session that fires these events directly. That is right for what they
+// assert — a store projects what it is given, a view renders what the store
+// holds — but it means neither can fail if the REAL `MeetingSession` never
+// forwards anything. The whole design rests on one bridge, and without these it
+// is the single link nothing covers: every test above it stays green while a
+// joined participant watches a mute indicator that never moves.
+//
+// The rig (`fakeFetch`, `makeSession`, `driveJoin`) is reused rather than
+// restated — a second copy of the GC/AC stub in a sibling file is how two
+// versions of the join response start to disagree.
+
+describe('MeetingSession — media absence-signals (ADR-0036 §5/§6/§10)', () => {
+  it('forwards streamAssignments from the wire, preserving each slot state verbatim', async () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+    const seen: Array<{ slotId: number; slotState: string }> = [];
+    session.on('streamAssignments', (event) => {
+      for (const a of event.assignments) seen.push({ slotId: a.slotId, slotState: a.slotState });
+    });
+
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: TOKEN_CREDS,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+
+    const mc = mocks.get(MC_ENDPOINT)!;
+    // §6: these three are indistinguishable to a client — all present as no
+    // media — and render completely differently. Each must survive the trip to
+    // the embedder as a DISTINCT value; collapsing any pair produces exactly the
+    // one-spinner-for-three-causes client §6 complains about.
+    mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, slotState: SlotState.SOURCE_MUTED }),
+    );
+    mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 1, slotState: SlotState.WITHHELD_BY_CONGESTION }),
+    );
+    mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 2, slotState: SlotState.SOURCE_UNREACHABLE }),
+    );
+
+    await waitFor(() => seen.length === 3);
+    expect(seen).toEqual([
+      { slotId: 0, slotState: 'source_muted' },
+      { slotId: 1, slotState: 'withheld_congestion' },
+      { slotId: 2, slotState: 'source_unreachable' },
+    ]);
+
+    session.disconnect();
+  });
+
+  it('bridges assignments that arrive BEFORE media is started', async () => {
+    // The assignments bridge is wired in `#wireSignaling`, not in `startMedia()`,
+    // and this is why: MC can assign slots to a client that has not opened its
+    // microphone, and a UI showing "waiting for the controller" must see that
+    // resolve. Wiring it alongside the pipeline events would make this silently
+    // impossible — and the failure would look like a controller problem.
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+    let assignments = 0;
+    session.on('streamAssignments', () => {
+      assignments += 1;
+    });
+
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: TOKEN_CREDS,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+
+    expect(session.media, 'no pipeline yet — startMedia() was never called').toBeUndefined();
+    mocks
+      .get(MC_ENDPOINT)!
+      .simulateServerMessage(
+        0,
+        framedStreamAssignments({ slotId: 0, slotState: SlotState.ACTIVE }),
+      );
+
+    await waitFor(() => assignments === 1);
+    session.disconnect();
+  });
+
+  it('seeds OUR OWN identity key into the roster, or the loopback can never decode', async () => {
+    // THE REGRESSION THIS PINS, found by the Layer 7 env-test and by nothing
+    // else: MC's roster carries `existing_participants` — everyone except us —
+    // so nothing in the signalling path ever teaches the receive path our own
+    // key. In a one-participant meeting every frame MH returns carries our own
+    // sender id, `identityKeyFor` returns `undefined`, and EVERY frame is
+    // dropped `no_roster_entry` while audio is visibly arriving at the wire.
+    //
+    // Unit-tier loopbacks cannot catch this: they seed their own roster by hand
+    // (see `media/lifecycle/__tests__`), which is precisely the step this
+    // asserts the session performs for itself.
+    //
+    // Asserted at the roster's own `upsert` seam — the same one `#feedRosterKeys`
+    // uses for peers — rather than by reaching into a private field, so this
+    // fails if the key stops reaching the resolver the ingress path consults.
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+
+    const upserts: Array<{ senderId: number; keyBytes: number }> = [];
+    const realUpsert = RosterIdentityKeys.prototype.upsert;
+    vi.spyOn(RosterIdentityKeys.prototype, 'upsert').mockImplementation(async function (
+      this: RosterIdentityKeys,
+      entry: Parameters<typeof realUpsert>[0],
+    ) {
+      upserts.push({ senderId: entry.senderId, keyBytes: entry.identityPublicKey.length });
+      return realUpsert.call(this, entry);
+    });
+
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: TOKEN_CREDS,
+    });
+    await driveJoin(mocks, 'all', { senderId: 258 });
+    await joinP;
+
+    const own = upserts.filter((u) => u.senderId === 258);
+    expect(
+      own,
+      'the session must publish its OWN (senderId, identity public key) into the roster — ' +
+        'without it every returned frame is dropped no_roster_entry',
+    ).toHaveLength(1);
+    // A real Ed25519 public key, not a placeholder: `upsert` records an ABSENCE
+    // for a wrong-length key rather than throwing, so a zero-length "key" would
+    // satisfy a call-count-only assertion while leaving the resolver empty.
+    expect(own[0]!.keyBytes).toBe(32);
+
+    session.disconnect();
+  });
+
+  it('startMedia subscribes the pipeline emitter BEFORE awaiting start()', async () => {
+    // `startMedia()` cannot complete under `environment: 'node'` — real
+    // WebCodecs and getUserMedia are absent — so this asserts the SUBSCRIPTION
+    // and its ORDERING rather than a running pipeline. The ordering is the part
+    // that matters: `firstMediaFrame` is armed inside `start()`, so a bridge
+    // registered after the await could miss it entirely on a fast loopback, and
+    // the symptom would be an in-meeting view stuck on "waiting for audio" while
+    // audio played.
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks);
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: TOKEN_CREDS,
+    });
+    // A sender id is REQUIRED: without one `startMedia()` fails closed before
+    // constructing a pipeline (no sender id -> no key id -> no signable frame),
+    // and this test would then assert on an empty list for the wrong reason.
+    await driveJoin(mocks, 'all', { senderId: 258 });
+    await joinP;
+
+    const subscribed: string[] = [];
+    const { AudioPipeline } = await import('../../media/lifecycle/AudioPipeline.js');
+    const realOn = AudioPipeline.prototype.on;
+    vi.spyOn(AudioPipeline.prototype, 'on').mockImplementation(function (
+      this: InstanceType<typeof AudioPipeline>,
+      type: never,
+      listener: never,
+    ) {
+      subscribed.push(type as unknown as string);
+      return realOn.call(this, type, listener);
+    } as typeof AudioPipeline.prototype.on);
+
+    await session.startMedia().catch(() => undefined);
+
+    expect(
+      subscribed,
+      'all three pipeline events must be bridged, and before start() is awaited',
+    ).toEqual(expect.arrayContaining(['muteChanged', 'firstMediaFrame', 'fault']));
+
+    session.disconnect();
   });
 });

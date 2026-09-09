@@ -154,6 +154,17 @@ out="$(plain "$RUN_OUT")"
 assert_hard_fail_branch "fingerprints-missing" "fingerprints missing" "$out"
 assert_status "fingerprints-states-the-stop"   "Not starting the dev server" "$out"
 assert_status "fingerprints-has-remedy"        "scripts/generate-dev-certs.sh" "$out"
+# The COUNTER-MESSAGE, at the one output that actually prints when a developer
+# meets "the browser refuses the handshake" — which is the moment a
+# certificate-validation bypass gets pasted into a launch line. The script header
+# carries the same warning, but the header is only ever reached through `--help`.
+#
+# Pinned on a phrase from our own prose, deliberately NOT on a flag name: this
+# file is scanned by `dt-guard no-insecure-browser-flags` (`.sh` is a candidate
+# suffix and this script is named in that guard's own test), so an assertion
+# spelling the literal would reintroduce the very thing the clause warns against.
+assert_status "fingerprints-warns-off-browser-flag" \
+  "disables certificate validation" "$out"
 
 # ...and the positive control: present fingerprints do NOT emit that branch.
 root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
@@ -313,54 +324,191 @@ assert_status "header-tags-listener-hard-fail"     "right-family listener   [HAR
 assert_status "header-keeps-demo-localhost-warn" "demo.localhost resolves (/etc/hosts)                    [WARN" "$header_block"
 
 # ===========================================================================
-# (7) The secure-context pointer carries substance AND cites the frozen anchor.
-#     Substance inline because the anchor's target lands in a later story task:
-#     the reader who follows a dead pointer is, by construction, someone who
-#     just hit a hard fail — which is exactly when a prohibited insecure-origin
-#     flag gets pasted in.
+# (7) The secure-context contract, now enforced on BOTH sides.
+#
+#     Story task 20 landed `## Secure Context and Media Setup` in the runbook and
+#     trimmed this script's header to one claim plus the pointer (the decision
+#     recorded at docs/TODO.md:759 / F-DRY-E). That reconciliation moved prose
+#     out of a file this suite guards and into one it did not — so the
+#     assertions below were RETARGETED rather than retired. The rule the trim had
+#     to satisfy: the runbook side must not end up carrying FEWER guarantees than
+#     the header side it replaced.
+#
+#     OWNERSHIP, because a failure here spans two owners: `scripts/dev-web.*` is
+#     infrastructure's; `docs/runbooks/client-dev-local.md` is OPERATIONS'. Every
+#     `runbook-*` failure below says so in its own message — do not "fix" one by
+#     editing runbook prose you do not own.
 # ===========================================================================
 assert_status "pointer-cites-frozen-anchor" \
   "docs/runbooks/client-dev-local.md#secure-context-and-media-setup" "$header_block"
-assert_status "pointer-names-the-apis"      "getUserMedia, WebCodecs, WebCrypto and WebTransport" "$header_block"
+# NOTE: `pointer-names-the-apis` used to live here, asserting the four gated API
+# names in THIS header. It was not deleted — it MOVED to `runbook-names-the-apis`
+# below, because the enumeration itself moved to the runbook, which is now
+# canonical for it. Retiring it outright would have left that claim guarded
+# nowhere: not here (assertion gone) and not there (never covered).
 assert_status "pointer-says-non-loopback"   "NON-LOOPBACK" "$header_block"
+# NOT just the word NON-LOOPBACK: that token survives any rewrite, so the header
+# could lose the symptom sentence entirely without reddening. Pin the corrected
+# OBSERVABLE too — the join dying at connecting-mc, which is the claim that
+# replaced the false "joined, no audio" this diff removed.
+assert_status "pointer-states-the-symptom"  "connecting-mc" "$header_block"
+# THE ANTI-FLAG CLAUSE. §9 retains a duplicate of this header block on the
+# argument that this one sentence is the one whose absence causes harm — and
+# until now four assertions pinned which API names appear and ZERO pinned the
+# sentence the argument was actually about. `dt-guard no-insecure-browser-flags`
+# does not cover this: it denies a prohibited literal being ADDED; nothing
+# detects the counter-message being REMOVED. Different failure modes.
+# The needle names no prohibited literal, so this assertion does not trip it.
+assert_status "pointer-warns-against-browser-flag" "Never a browser flag" "$header_block"
 assert_status "pointer-gives-approved-fix"  "Use a .localhost name or a loopback literal" "$header_block"
 # Must NOT say "an HTTP origin" flatly: http://<org>.localhost:5173 IS a secure
-# context, and a reader told otherwise chases the wrong problem. Story task 20
-# asserts the same fact from the runbook side; the two must not contradict.
+# context, and a reader told otherwise chases the wrong problem. The runbook
+# asserts the same fact from its side — see `runbook-does-not-contradict-header`.
 assert_status "pointer-does-not-contradict-task-20" \
   "ARE potentially trustworthy, which is why the demo works over plain http://" "$header_block"
 
-# ─── The frozen anchor is a CONTRACT — enforce it the moment it exists ───────
+# ─── The frozen anchor is a CONTRACT, and it is now FAIL-CLOSED ──────────────
 #
-# @observability Finding 2: asserting the pointer STRING is present says nothing
-# about whether it RESOLVES. Story task 20 authors
-# `## Secure Context and Media Setup` (anchor `#secure-context-and-media-setup`)
-# in client-dev-local.md; until then the target legitimately does not exist, and
-# the substance is carried inline in the header for exactly that window.
+# This block used to end in `else PASS=$((PASS+1))`, which was right while the
+# target legitimately did not exist. It no longer is: the heading exists by
+# construction, so that branch became a check that observes nothing and reports
+# clean — it would stay green forever if someone renamed the heading away, which
+# is the one failure it was written to catch.
 #
-# The gap this closes: if task 20 lands with a differently-spelled heading, the
-# pointer would stay broken permanently with nothing red — a frozen anchor
-# contract with neither side machine-checked. So: CONDITIONAL enforcement. While
-# no secure-context heading exists this is a documented no-op; the moment one
-# appears, its GitHub-style slug must equal the cited anchor.
-#
-# Deliberately keyed on "a secure-context heading exists" rather than on the
-# exact heading text, so a task-20 landing with the WRONG spelling reds here
-# instead of being skipped as "not landed yet" — which is the whole failure
-# mode. Cheapest thing that notices at the right moment.
+# Two DISTINCT reason tokens, deliberately: "the pointer's target vanished" and
+# "the pointer is misspelled" have different fixes, and a single token would send
+# whoever hits it to the wrong file.
 RUNBOOK="docs/runbooks/client-dev-local.md"
 CITED_ANCHOR="secure-context-and-media-setup"
+
+# A prose claim the runbook is canonical for, with a failure that ROUTES ITSELF.
+#
+# `assert_status` emits a fixed shape — `[label] expected substring ... not
+# found in output` — with no file and no owner. Fine for a claim about THIS
+# script, wrong for these: the two structural failures in this block already
+# name the file and its owner, and it is the inconsistency INSIDE one block
+# whose whole purpose is cross-owner coordination that makes the plain form a
+# defect here. Prose reds are also the likelier ones, since runbook wording is
+# reworded far more often than headings are deleted.
+#
+# THE LAST CLAUSE IS LOAD-BEARING. Without it the cheapest-looking fix for a red
+# here is to put the sentence back into this script header — which silently
+# undoes the reconciliation the trim exists to land.
+assert_runbook_claim() { # $1=label $2=needle $3=body
+    local label="$1" needle="$2" body="$3"
+    if [[ "$body" == *"$needle"* ]]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILURES+=("[${label}] ${RUNBOOK} (OPERATIONS-owned) no longer states: '"'"'${needle}'"'"'. dev-web.sh header prose was trimmed on the promise this claim lives there — restore it in the runbook; do NOT re-add prose to the script.")
+    fi
+}
 sc_heading="$(grep -inE '^#{2,3} .*secure.context' "$REPO_ROOT/$RUNBOOK" | head -1 || true)"
-if [[ -n "$sc_heading" ]]; then
+if [[ -z "$sc_heading" ]]; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[secure-context-heading-missing] no secure-context heading in ${RUNBOOK}, but scripts/dev-web.sh points at #${CITED_ANCHOR}. The pointer's TARGET is gone (not misspelled). ${RUNBOOK} is OPERATIONS-owned — restore the '## Secure Context and Media Setup' section there rather than editing the pointer.")
+else
     # GitHub slug: lowercase, drop non-alphanumeric/space/hyphen, spaces -> hyphens.
     sc_text="${sc_heading#*:}"; sc_text="${sc_text#\#* }"
     sc_slug="$(printf '%s' "$sc_text" \
         | tr '[:upper:]' '[:lower:]' \
         | sed -e 's/[^a-z0-9 -]//g' -e 's/^ *//' -e 's/ *$//' -e 's/ /-/g')"
     assert_status "secure-context-anchor-resolves" "$CITED_ANCHOR" "$sc_slug"
-else
-    # No-op today by design; recorded so a reader knows this is pending, not missing.
-    PASS=$((PASS + 1))
+
+    # ─── PROSE PARITY: the runbook must carry what the trim removed ──────────
+    #
+    # docs/TODO.md:759 noted that the anchor check pins the SLUG but not prose
+    # DIVERGENCE. With the header down to one claim, closing that gap is cheap.
+    #
+    # BOUNDED extraction, structurally: heading line to the line before the next
+    # `^## `, or EOF. Same reasoning as the awk-vs-`sed -n '2,/^$/p'` note in
+    # dev-web.sh's --help arm — a range whose worst case is truncation, never an
+    # unbounded run to EOF that would make every `contains` below pass by
+    # swallowing the whole document. Note this stops at the next `##`, so a
+    # `###` subsection IS included and a new `##` section is NOT.
+    sc_line="${sc_heading%%:*}"
+    sc_body="$(awk -v start="$sc_line" 'NR < start { next } NR == start { print; next } /^## / { exit } { print }' "$REPO_ROOT/$RUNBOOK")"
+
+    # Vacuity guard, with its OWN token: an empty extraction makes every
+    # `contains` below fail, and without this they would all read as "the runbook
+    # lost the claim" when the truth is "the extraction produced nothing".
+    if [[ -z "${sc_body//[[:space:]]/}" ]]; then
+        FAIL=$((FAIL + 1))
+        FAILURES+=("[secure-context-section-extraction-empty] extracted an EMPTY body for '${CITED_ANCHOR}' in ${RUNBOOK} — the extraction is broken, NOT the prose. Check the awk range above before touching the runbook.")
+    else
+        # The four claims the runbook is now canonical for. Each has its own
+        # reason token so a failure names WHICH claim went missing.
+        assert_runbook_claim "runbook-names-the-apis" "WebTransport" "$sc_body"
+        assert_runbook_claim "runbook-names-getusermedia" "getUserMedia" "$sc_body"
+        assert_runbook_claim "runbook-names-webcodecs" "WebCodecs" "$sc_body"
+        assert_runbook_claim "runbook-names-webcrypto" "WebCrypto" "$sc_body"
+        # THE SYMPTOM, and it is NOT "joined with no audio" — that spelling was
+        # WRONG and this assertion used to pin it. WebTransport is one of the
+        # four gated APIs and MC signalling has no fallback, so a non-loopback
+        # origin fails at `connecting-mc` and never reaches a roster at all.
+        # Telling a reader to expect silence sends them down §4'"'"'s
+        # MC-reachability ladder for a fault that is not there — which is the
+        # moment a certificate-validation flag gets pasted in, i.e. the exact
+        # outcome this section exists to prevent. A parity assertion pinning a
+        # FALSE claim is worse than none: it makes the correction look like a
+        # regression.
+        assert_runbook_claim "runbook-says-non-loopback" "connecting-mc" "$sc_body"
+        # The instruction, matching dev-web.sh'"'"'s approved remedy set exactly.
+        assert_runbook_claim "runbook-gives-approved-fix" "loopback literal" "$sc_body"
+        assert_runbook_claim "runbook-gives-tls-fix" "terminate real TLS" "$sc_body"
+        # The runbook half of the anti-flag clause — see
+        # `pointer-warns-against-browser-flag` above for why removal, not
+        # addition, is the uncovered failure mode. Inherits the non-empty-body
+        # vacuity guard, so it adds no new vacuity surface.
+        assert_runbook_claim "runbook-warns-against-browser-flag" \
+            "Do not reach for a browser flag" "$sc_body"
+        # The non-contradiction pin, mirroring `pointer-does-not-contradict-task-20`
+        # on the runbook side. The header comment above that assertion has said
+        # since task #61 that "story task 20 asserts the same fact from the
+        # runbook side; the two must not contradict" — this is that half. Without
+        # it the runbook could be reworded to "HTTP origins are insecure" (false
+        # for http://<org>.localhost:5173) with nothing red.
+        assert_runbook_claim "runbook-does-not-contradict-header" "potentially trustworthy" "$sc_body"
+
+        # ─── FLAG PARITY: the runbook's fake-media launch line vs the suite's ──
+        #
+        # The runbook documents the two sanctioned fake-media flags for a demo
+        # machine with no microphone. They are a fourth in-tree encoding of a
+        # pair that `packages/web-app/playwright.config.ts` also launches with,
+        # and prose cannot import a constant — so they are tied together here.
+        #
+        # These two flags are NOT security bypasses: they inject a device and
+        # answer a prompt. They pass `dt-guard no-insecure-browser-flags` on
+        # vocabulary non-membership, never via an allowlist entry.
+        # DERIVED FROM THE ARTIFACT, never spelled here. An earlier version put
+        # the pair in a local array — which made this check, whose job is to stop
+        # the flag names drifting, itself a FIFTH in-tree copy of them. It was
+        # also weaker: asking "do the flags from OUR list that appear in the
+        # runbook also appear in playwright.config?" cannot see a third flag the
+        # runbook documents and the config does not, because a list written from
+        # memory only finds what it already knew to look for.
+        #
+        # Reading playwright.config FIRST also makes the check direction match
+        # what the runbook itself claims — "the same two flags
+        # packages/web-app/playwright.config.ts launches with".
+        PW_CONFIG="packages/web-app/playwright.config.ts"
+        mapfile -t FAKE_MEDIA_FLAGS < <(grep -oE -- '--use-fake-[a-z-]+' "$REPO_ROOT/$PW_CONFIG" | sort -u)
+        sc_flag_hits=0
+        for flag in "${FAKE_MEDIA_FLAGS[@]}"; do
+            [[ "$sc_body" == *"$flag"* ]] && sc_flag_hits=$((sc_flag_hits + 1))
+        done
+        # POSITIVE CONTROL. Without it the loop above is an "every X has a Y"
+        # over an extracted set, which passes VACUOUSLY when the extraction finds
+        # zero flags — e.g. after a reflow pushes the launch line into the next
+        # `##` section. That is the same shape as the `else PASS++` removed above;
+        # do not reintroduce it here.
+        # TWO positive controls, because the derivation has two ends and either
+        # yielding zero makes the loop pass vacuously.
+        assert_status "flag-parity-config-declares-both" \
+            "config declares 2" "config declares ${#FAKE_MEDIA_FLAGS[@]}"
+        assert_status "flag-parity-extracted-both" \
+            "found 2 fake-media flags" "found ${sc_flag_hits} fake-media flags"
+    fi
 fi
 
 # ===========================================================================

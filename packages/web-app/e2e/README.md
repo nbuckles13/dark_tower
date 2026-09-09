@@ -112,6 +112,40 @@ mc-token-rejection reuse their retained session (the latter clears the meetingId
 rewrite first); auth-rejection Test A re-authenticates as V after the session
 drop. This proves a failed join is not a dead end.
 
+## What the media-loopback spec asserts (task #20, ADR-0036 story 1)
+
+`media-loopback.spec.ts` is the browser half of the story's headline objective:
+**a participant hears their own audio returned through the media handler.** It is the
+first place the TypeScript codec, MC's slot assignment and MH's forwarding are proven
+to agree with each other — `sdk-core`'s own loopback test feeds a pipeline's egress
+into its own ingress, which proves wiring and nothing about composition.
+
+Capture is synthesized and the microphone permission auto-granted by the
+`--use-fake-device-for-media-stream` / `--use-fake-ui-for-media-stream` launch flags
+already in `playwright.config.ts`. **No setting that weakens certificate validation,
+web security or origin trust appears anywhere in this suite** — MC/MH trust flows
+exclusively through `serverCertificateHashes` pinning, and such a setting would turn
+that pinning into decoration while every assertion below stayed green.
+
+| # | Assertion | Why it is shaped this way |
+|---|---|---|
+| m1 | A `firstMediaFrame` bus event arrives after `start-audio` | **The functional pass/fail.** It means a frame this client captured, Opus-encoded, SFrame-encrypted, Ed25519-signed and sent came back from MH and completed verify → replay → unwrap → decrypt → decode. |
+| m2 | The observed round trip is **annotated and printed, never compared** | ADR-0036 §10: latency is OBSERVED, NEVER GATED. A wall-clock target on a local cluster is a permanent flake; ADR-0028 forbids quarantining gates, so the test would be deleted and the objective would end with zero coverage. The only assertions on the number are that it is finite and non-negative. **A threshold appearing here later is the §10 defect, not a tightening.** |
+| m3 | `framesSent` strictly advances **before** mute | The positive control the rest of the spec rests on. Without it, "flat while muted" passes just as well on a client that never sent a frame. |
+| m4 | The DOM mute indicator and the SDK's client-mute state on the bus **agree** | An indicator that can disagree with what gates capture is a hot mic wearing a "muted" label (§5). The indicator is driven by the SDK's `muteChanged` echo, never by the click. |
+| m5 | `framesSent` is **flat** across the muted window | **Structural, not acoustic.** Sampling audio energy would show only that playback went quiet, which is equally what a dead decoder looks like. A flat send counter proves no encoded audio *left the device* — what §5 actually requires. |
+| m6 | The muted window contains **≥ 4 samples**, asserted separately | Flatness over zero samples is vacuously true, so a stalled sampler would be reported as a working mute. This assertion has its own message saying it is a harness failure, not a mute failure. |
+| m7 | `framesSent` **and** `framesAccepted` both advance after unmute | Send-side only would call it a pass if MH had stopped forwarding during the mute — the resumption failure that matters most to a user and the one a send-only assertion cannot see. |
+| m8 | The declared slot leaves `awaiting-assignment` for an MC-assigned wire state | §6: slot state is explicit on the wire; absence of frames is not a signal. Asserted on `data-slot-state`, the raw wire token, so the assertion is on the protocol's vocabulary rather than display copy. |
+
+**Timing constants** live at the top of `fixtures.ts`'s media section: a 750 ms
+post-mute settle (frames already queued at the instant of mute may still drain —
+§5 stops *capture* within one frame, which is not the same as un-queueing), a
+2 500 ms observation window, and a 4-sample floor.
+
+**Registration cost: 0.** Both tests sign in as the shared user V and create their
+meeting Node-side.
+
 ## Prerequisites (host-side)
 
 1. **Kind cluster with AC+GC+MC+MH _and_ the observability stack**:
@@ -244,6 +278,16 @@ counterpart). MC/MH endpoints come exclusively from the join response's
   false-pass a negative spec (their 401/404-exact assertions reject it). This
   suite assumes a **single workstation against its own cluster**; it is not
   designed for concurrent runs sharing one cluster's rate-limit budget.
+- **Wall-clock budget**: `media-loopback.spec.ts` costs roughly **25 s** — join +
+  MH handshake ≈ 5 s, start-audio ≈ 2 s, first media ≈ 2 s, a 1.5 s pre-mute
+  observation, a 2.5 s muted window, 1.5 s post-unmute, plus auth and bootstrap.
+  It shares the suite-wide 600 s `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`) and
+  does not move it. **Why the number is written down**: on budget exhaustion
+  `layer7.sh` prints "exited 124" and emits `FAIL browser-e2e-failed` — the *same*
+  terminal status as a genuine assertion failure, in the implementer lane — so a
+  timeout presents as a diff bug and sends triage hunting a defect that does not
+  exist. If headroom ever gets tight the fix is a deliberate
+  `DEVLOOP_BROWSER_E2E_TIMEOUT` change, not a discovery at 3am.
 - **`retries: 0`** (ADR-0028): a failure is real. Fix it or delete the test —
   never mask with retries.
 - **Timeouts**: 120s/test ceiling; assertion-meaningful waits are tighter (5s

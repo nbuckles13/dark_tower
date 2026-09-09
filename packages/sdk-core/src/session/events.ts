@@ -15,10 +15,13 @@ import type {
   PlaybackSinkFactory,
 } from '../media/setup/seams.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
+import type { MediaFault } from '../media/lifecycle/AudioPipeline.js';
+import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import type {
   JoinedEvent,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
+  StreamAssignmentsEvent,
 } from '../signaling/events.js';
 
 /**
@@ -116,6 +119,58 @@ export interface MeetingSessionEventMap {
   error: SdkError;
   /** Emitted on every state-machine transition (the new state). */
   stateChange: MeetingSessionState;
+
+  // --------------------------------------------------------------------------
+  // THE FOUR ABSENCE-SIGNALS (ADR-0036 §5/§6/§10)
+  // --------------------------------------------------------------------------
+  //
+  // In the media path, "nothing is arriving" is ambiguous. §6 is explicit that
+  // absence of frames is not a signal, and §5 requires the mute signal to travel
+  // out of band rather than be inferred from absence — *muted*, *silent* and
+  // *the network died* are indistinguishable to a relay.
+  //
+  // So every condition an embedder might be tempted to infer from silence is
+  // published here as an explicit event with ONE authoritative holder inside the
+  // SDK. A UI that derives any of these from frame absence inverts the dangerous
+  // way: it shows "muted" during a transport stall.
+  //
+  // These are BRIDGES, not new state. `muteChanged` / `firstMediaFrame` /
+  // `mediaFault` are forwarded verbatim from the running `AudioPipeline` (also
+  // reachable as `MeetingSession.media`), and `streamAssignments` verbatim from
+  // `SignalingClient`. Nothing is recomputed on the way through, so an embedder
+  // and the SDK cannot disagree about any of them.
+
+  /**
+   * Client-mute state changed (§5). **The only source a UI may render a mute
+   * indicator from.** Fires on real transitions only, so a UI that sets the same
+   * value twice does not see two events.
+   */
+  muteChanged: MuteSnapshot;
+  /**
+   * The first media frame arrived, in ms since media start (§10).
+   *
+   * The same value as `dt_client_time_to_first_media_frame_ms` — one measurement,
+   * two consumers. **Observed, never gated**: §10 forbids asserting a wall-clock
+   * target on it, and this event carries no threshold, target or comparison.
+   */
+  firstMediaFrame: number;
+  /**
+   * MC's current slot assignments (§6), with each slot's state explicit on the
+   * wire. This is where "the far end is muted", "withheld by congestion",
+   * "fewer sources than slots" and "source unreachable" come from — all four
+   * present as no media and render completely differently.
+   */
+  streamAssignments: StreamAssignmentsEvent;
+  /**
+   * The media pipeline hit a bounded, SDK-authored fault. At most once per
+   * stage, never per frame.
+   *
+   * Separate from `error`, which is terminal for the SESSION: a media fault
+   * leaves signaling joined and healthy, because degraded audio beats a dropped
+   * meeting. Surfaced rather than absorbed so a broken pipeline is visible
+   * instead of presenting as silence.
+   */
+  mediaFault: MediaFault;
 }
 
 /** Construction options for {@link MeetingSession}. */

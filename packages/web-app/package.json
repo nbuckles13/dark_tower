@@ -12,7 +12,7 @@
     "test:component": "vitest run --config vitest.config.ts",
     "test:e2e": "playwright test",
     "test:watch": "vitest --config vitest.config.ts",
-    "lint": "svelte-check --tsconfig ./tsconfig.json && eslint src/ && prettier --check \"src/**/*.{ts,svelte}\"",
+    "lint": "svelte-check --tsconfig ./tsconfig.json && eslint src/ e2e/ && prettier --check \"{src,e2e}/**/*.{ts,svelte}\"",
     "typecheck": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {

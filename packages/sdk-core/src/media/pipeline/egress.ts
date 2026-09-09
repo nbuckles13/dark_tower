@@ -160,6 +160,27 @@ export class EgressPipeline {
     this.#streamId = options.streamId;
   }
 
+  /**
+   * Frames actually sent since construction (monotone).
+   *
+   * The same value as `#hopSequence`, which ADR-0036 §2 defines as "what the
+   * transmitter actually sent" — so this is a read of bookkeeping the send path
+   * already maintains, not a second counter. It advances at DEQUEUE, never at
+   * enqueue, and never for a frame the transport refused.
+   *
+   * Exposed so an embedder can SAMPLE it. It must never become a per-frame
+   * emission: this file is the hot path under ADR-0036 §11's layout constraint,
+   * whose per-frame invariant is zero allocation and zero registry lookup.
+   *
+   * A frame COUNT is exposable where a per-frame SIZE would not be (§11's
+   * voice-activity trace) only because the encoder runs with DTX off — see
+   * `lifecycle/muteState.ts`. With DTX the frame rate becomes speech-dependent
+   * and this, along with the production counter, becomes that trace.
+   */
+  get framesSent(): number {
+    return this.#hopSequence;
+  }
+
   /** Attach (or detach, with `undefined`) the transport this pipeline sends on. */
   setSender(sender: DatagramSender | undefined): void {
     this.#sender = sender;
@@ -318,6 +339,14 @@ export class EgressPipeline {
           this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.TransportSendRefused);
           continue;
         }
+        // ONE INCREMENT, TWO READERS. `#hopSequence` is the wire hop counter AND
+        // the source of `framesSent` below; it sits adjacent to the counter
+        // deliberately. Separating them would give two encodings of "how many
+        // frames went out" that agree today and drift the first time a drop path
+        // lands between the two sites — with the bus field and
+        // `dt_client_media_frames_sent_total` disagreeing and nothing failing.
+        // Both are AFTER a successful `send()`: every branch above `continue`s,
+        // so neither counts an attempted-but-refused send.
         this.#hopSequence += 1;
         this.#metrics.frameSent();
       }

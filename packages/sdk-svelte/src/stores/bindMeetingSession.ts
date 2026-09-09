@@ -41,6 +41,15 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
     session.on('participantLeft', (event) => store.applyParticipantLeft(event)),
     session.on('mediaConnected', (url) => store.applyMediaConnected(url)),
     session.on('error', (error) => store.applyError(error)),
+    // The four media absence-signals (ADR-0036 §5/§6/§10), into the SAME
+    // subscription and the SAME aggregate unsubscribe as the roster events.
+    // Deliberately not a second `bindMediaSession` helper: one binding call, one
+    // teardown, one place where an event can be forgotten. They land in
+    // `store.media` so their reactive cells stay independent of the roster's.
+    session.on('muteChanged', (snapshot) => store.media.applyMuteChanged(snapshot)),
+    session.on('firstMediaFrame', (elapsedMs) => store.media.applyFirstMediaFrame(elapsedMs)),
+    session.on('streamAssignments', (event) => store.media.applyStreamAssignments(event)),
+    session.on('mediaFault', (fault) => store.media.applyMediaFault(fault)),
   ];
   return () => {
     for (const unsubscribe of unsubscribes) unsubscribe();
@@ -55,7 +64,9 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
  * behavior-based unmount-leak test).
  *
  * @returns the reactive store; read `.meetingState` / `.participants` /
- *   `.mediaConnections` / `.lastError` in your template.
+ *   `.mediaConnections` / `.lastError`, and `.media.audioMuted` /
+ *   `.media.firstMediaFrameMs` / `.media.slots` / `.media.lastMediaFault`, in
+ *   your template.
  */
 export function bindMeetingSession(session: BoundMeetingSession): MeetingStore {
   const store = new MeetingStore();

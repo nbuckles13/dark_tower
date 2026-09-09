@@ -79,7 +79,8 @@ import {
   type PromResultRow,
 } from './instanceCounters.js';
 
-const CONNECTED_SUM_PROMQL = 'sum by (instance) (mc_participant_mh_status_total{state="connected"})';
+const CONNECTED_SUM_PROMQL =
+  'sum by (instance) (mc_participant_mh_status_total{state="connected"})';
 
 // Task-64 departure counter (browser-E2E gap (2), leave/teardown/rejoin).
 //
@@ -161,7 +162,9 @@ async function promInstantByInstance(promql: string): Promise<InstanceCounters> 
     'Global-setup proved Prometheus healthy, so a query error here is a real problem — ' +
     'NOT a zero reading. Triage Prometheus/port-forward, not the service under test.';
   if (!response.ok) {
-    throw new Error(`Prometheus query failed: ${url} responded ${response.status}. ${failLoudTail}`);
+    throw new Error(
+      `Prometheus query failed: ${url} responded ${response.status}. ${failLoudTail}`,
+    );
   }
   const body = (await response.json()) as PromQueryResponse;
   if (body.status !== 'success') {

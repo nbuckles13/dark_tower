@@ -11,9 +11,11 @@
   import type { AuthSession } from '../lib/types.js';
   import type { JoinCredentials } from '@darktower/sdk-core';
   import { bindMeetingSession } from '@darktower/sdk-svelte';
+  import { MeetingSessionState } from '@darktower/sdk-core';
   import { buildMeetingSession } from '../lib/session.js';
   import { installE2EHooks } from '../lib/e2eBus.js';
   import { errorText, isSessionRejection } from '../lib/errorText.js';
+  import InMeeting from './InMeeting.svelte';
 
   let {
     config,
@@ -33,9 +35,14 @@
 
   // svelte-ignore state_referenced_locally
   const session = buildMeetingSession(config);
-  installE2EHooks(session);
+  // Returns a disposer because the bus now runs a sampling timer in test builds
+  // (a no-op function in production, where the whole bus is eliminated).
+  const disposeE2EHooks = installE2EHooks(session);
   const store = bindMeetingSession(session);
-  onDestroy(() => session.disconnect());
+  onDestroy(() => {
+    disposeE2EHooks();
+    session.disconnect();
+  });
 
   let meetingCode = $state('');
   let joinError = $state('');
@@ -83,6 +90,17 @@
     <li data-testid={`participant-${participant.participantId}`}>{participant.name}</li>
   {/each}
 </ul>
+
+<!--
+  The in-meeting experience appears AFTER a settled join, alongside the join
+  form and roster rather than replacing them: the existing DOM contract
+  (`meeting-state`, `participant-list`, `last-error`) is what the browser suite
+  and the dev runbook's triage both read, and moving it would break both for no
+  benefit.
+-->
+{#if store.meetingState === MeetingSessionState.Joined}
+  <InMeeting {session} {store} />
+{/if}
 
 {#if store.lastError}
   <p data-testid="last-error">{store.lastError.code}: {store.lastError.message}</p>

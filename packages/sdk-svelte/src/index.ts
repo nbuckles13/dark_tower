@@ -9,6 +9,7 @@
 // none are re-declared here.
 
 export { MeetingStore } from './stores/MeetingStore.svelte.js';
+export { MediaStore } from './stores/MediaStore.svelte.js';
 
 export { bindMeetingSession, subscribeSession } from './stores/bindMeetingSession.js';
 export type { BoundMeetingSession } from './stores/bindMeetingSession.js';
