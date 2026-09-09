@@ -483,6 +483,21 @@ the comment's reader.
   gates, so the test would be deleted and the headline objective would end with
   ZERO coverage. Sampled from the start, so the measurement exists for every
   session rather than only for sessions that got far enough to be instrumented.
+- **A HEALTHY VALUE HERE IS NOT EVIDENCE THAT AUDIO WAS HEARD — pair it with
+  `dt_client_media_frames_accepted_total` before reading it as one.** This is a
+  **wire-boundary** measurement, taken at the same point as
+  `dt_client_media_frames_received_total`: `IngressPipeline.accept()` calls the
+  observer as its FIRST statement, before decode, before signature verification,
+  before decrypt. So a session in which every single frame is subsequently
+  dropped still records a perfectly normal first-media time.
+  That is not hypothetical. During ADR-0036 story 1's first end-to-end run this
+  metric read **31 ms** while `frames_accepted` sat at **0** across 55 samples —
+  every frame was arriving and being rejected `no_roster_entry` — and the pair
+  was initially read as a broken counter rather than a broken receive path,
+  by a reader with the source open. It is the entry most likely to be put on a
+  dashboard on its own, and on its own it means only *datagrams are reaching
+  us*. See §The receive-path accounting identity above for the three terms that
+  together say whether media is actually working.
 
 ---
 

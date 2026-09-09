@@ -48,20 +48,25 @@
 # it and never closed again.
 #
 # SECURE CONTEXT — the failure this script cannot see, and the one most likely
-# to waste your afternoon. getUserMedia, WebCodecs, WebCrypto and WebTransport
-# are ALL secure-context gated, so the whole media pipeline is either present or
-# entirely absent. `.localhost` names and loopback literals (127.0.0.1, [::1])
+# to waste your afternoon. A NON-LOOPBACK http:// origin — reaching Vite at
+# http://<lan-ip>:5173, or by hostname from another machine — disables
+# getUserMedia, WebCodecs, WebCrypto AND WebTransport at once. The join then
+# dies at connecting-mc showing 'SIGNALING: Signaling transport closed', which
+# is the SAME string F1/F8/F9 produce — nothing on screen names the origin, so
+# the MC-reachability ladder will find nothing. Check the address bar first.
+# `.localhost` names and loopback literals (127.0.0.1, [::1])
 # ARE potentially trustworthy, which is why the demo works over plain http://.
-# A NON-LOOPBACK http:// origin — reaching Vite at http://<lan-ip>:5173 or by
-# hostname from another machine — silently disables all four and presents as
-# "joined, no audio". Use a .localhost name or a loopback literal, or terminate
-# real TLS. Details: docs/runbooks/client-dev-local.md#secure-context-and-media-setup
+# Use a .localhost name or a loopback literal, or terminate real TLS.
+# Never a browser flag: there is no setting that makes a non-loopback origin
+# trustworthy without also defeating the cert pinning MC/MH trust depends on.
+# Full explanation: docs/runbooks/client-dev-local.md#secure-context-and-media-setup
 #
-# That runbook section is the CANONICAL prose and is authored by story task 20;
-# the paragraph above is a deliberate offline copy, kept inline because a reader
-# who follows a not-yet-existing anchor is by construction someone who just hit
-# a hard fail — the moment a bad "fix" gets pasted in. Reconcile the two when
-# task 20 lands (tracked in docs/TODO.md §Documentation Hygiene).
+# That runbook section is CANONICAL: which APIs are gated, and why the failure is
+# silent, live there and are not restated here. What stays inline is the one
+# sentence whose absence causes harm — the approved fix — because this block
+# reaches a reader through `--help`, at a terminal, which is where a prohibited
+# browser flag gets typed. Keeping a smaller duplicate is deliberate and is
+# guarded on both sides by scripts/dev-web.test.sh.
 #
 # Usage:
 #   scripts/dev-web.sh              # preflight + install (if needed) + dev server
@@ -297,6 +302,14 @@ else
     echo "      dev server that is already running will never pick up regenerated certs."
     echo "      (Sign-up and create-meeting would still work: they are TCP through the Vite"
     echo "       proxy. That is exactly why this used to warn, and exactly why it no longer can.)"
+    # THE COUNTER-MESSAGE, at the moment it is needed. This branch is where a
+    # developer first meets "the browser refuses the handshake", and it is the
+    # moment a certificate-validation flag gets pasted into a launch line. The
+    # remedy is regenerating the certs above; browser trust here flows only
+    # through serverCertificateHashes pinning, and disabling validation would
+    # turn that pinning into decoration while every test stayed green.
+    echo "      Do NOT reach for a browser flag that disables certificate validation — it"
+    echo "      defeats the pinning this handshake depends on. Regenerate the certs instead."
 fi
 
 # ─── MC / MH WebTransport reachability (HARD FAIL — this IS the demo) ──

@@ -58,6 +58,7 @@ import {
   type TransmitKeyCache,
 } from '../frame/receivePath.js';
 import { FrameRejectedError } from '../frame/rejectReason.js';
+import type { RejectReason } from '../frame/rejectReason.js';
 import type { MediaMetrics } from '../setup/mediaMetrics.js';
 import type { AudioDecoderSeam } from '../setup/seams.js';
 import type { FirstMediaObserver } from '../setup/measurement.js';
@@ -109,6 +110,42 @@ export class IngressPipeline {
   readonly #onAccepted: ((frame: AcceptedFrame) => void) | undefined;
 
   #decoder: AudioDecoderSeam | undefined;
+  /**
+   * Frames that completed the receive path, since construction. Monotone.
+   *
+   * A plain field read, sampled by an embedder — never a per-frame emission.
+   * Bumped at the single site beside `MediaMetrics.frameAccepted()`.
+   */
+  #framesAccepted = 0;
+  /**
+   * Datagrams that arrived, since construction. Monotone.
+   *
+   * The LEFT-HAND side of `received = accepted + sum(drops by reason)`. Without
+   * it a reader cannot tell "nothing is arriving" from "arriving and being
+   * rejected" — two states with opposite remediations (a server forwarding
+   * failure vs a client key-attribution bug) that look identical when only
+   * `accepted` is visible. That ambiguity cost a live misdiagnosis at this
+   * task's Gate 2.
+   */
+  #framesReceived = 0;
+  /** Frames rejected for any wire reason. The `sum(drops)` term. Monotone. */
+  #framesDropped = 0;
+  /**
+   * The most recent reject token, or `undefined` if nothing has been dropped.
+   *
+   * Safe to expose and to project, and **the TYPE is what makes that true** —
+   * not this comment. `RejectReason` is the frozen sixteen-token union whose
+   * SSoT is `proto/test-vectors/frame-v2.vectors.json`, so the field is bounded
+   * by construction and carries no participant, key or payload information.
+   *
+   * Typed as the union rather than `string` deliberately: a bounded telemetry
+   * token is always one refactor away from becoming a metric label or a log
+   * field, and `string` is the annotation that lets a `DOMException.message` or
+   * an interpolated identifier land here and compile. That is the journey
+   * ADR-0036 §11 and `label-taxonomy.md` R2 exist to block. Same discipline as
+   * `MediaMetrics.frameDropped(reason: RejectReason)` beside the call sites.
+   */
+  #lastDropReason: RejectReason | undefined;
 
   constructor(options: IngressPipelineOptions) {
     this.#metrics = options.metrics;
@@ -119,6 +156,34 @@ export class IngressPipeline {
     this.#hopMonitor = options.hopMonitor;
     this.#firstMedia = options.firstMedia;
     this.#onAccepted = options.onAccepted;
+  }
+
+  /**
+   * Frames accepted since construction (monotone).
+   *
+   * Named `Accepted`, not `Received`, and the distinction is the one
+   * `MediaMetrics.frameAccepted` already draws: a received frame may be dropped
+   * for a wire reason, so `received = accepted + sum(drops by reason)`. This
+   * counts the left-hand side's *accepted* term, so it moves only for a frame
+   * that verified, decrypted and reached the decoder.
+   */
+  get framesAccepted(): number {
+    return this.#framesAccepted;
+  }
+
+  /** Datagrams that arrived at the wire (monotone). The identity's left side. */
+  get framesReceived(): number {
+    return this.#framesReceived;
+  }
+
+  /** Frames rejected for a wire reason (monotone). The `sum(drops)` term. */
+  get framesDropped(): number {
+    return this.#framesDropped;
+  }
+
+  /** The most recent reject token; `undefined` before the first drop. Bounded by type. */
+  get lastDropReason(): RejectReason | undefined {
+    return this.#lastDropReason;
   }
 
   /** Attach (or detach, with `undefined`) the audio decoder. */
@@ -141,7 +206,11 @@ export class IngressPipeline {
    */
   async accept(datagram: Uint8Array): Promise<void> {
     // AT THE WIRE. First statement, before any parse.
+    // ONE INCREMENT, TWO READERS — same rule as the accepted and dropped pairs
+    // below. Kept adjacent so the getter and
+    // `dt_client_media_frames_received_total` cannot drift apart.
     this.#metrics.frameReceived();
+    this.#framesReceived += 1;
     this.#firstMedia.onFrameReceived();
 
     try {
@@ -173,7 +242,13 @@ export class IngressPipeline {
         // verification": that reading fails open and is the natural one, which
         // is exactly why it is refused here in one place rather than guarded at
         // each call site.
+        // ONE INCREMENT, TWO READERS. Both drop sites must record, or the
+        // identity `received = accepted + sum(drops)` silently stops holding for
+        // a reader of these getters — and a half-instrumented reason field is
+        // worse than none, because it reads as "no drops of that kind".
         this.#metrics.frameDropped('no_roster_entry');
+        this.#framesDropped += 1;
+        this.#lastDropReason = 'no_roster_entry';
         return;
       }
 
@@ -213,7 +288,20 @@ export class IngressPipeline {
         this.#metrics.wrapOutcome(outcome);
       }
 
+      // ONE INCREMENT, TWO READERS. `#framesAccepted` and the counter are two
+      // statements encoding one fact, and they are kept adjacent deliberately: a
+      // `++` placed anywhere else in this function would agree today and drift
+      // the first time a drop path lands between the two sites, at which point
+      // the getter and `dt_client_media_frames_accepted_total` disagree and
+      // nothing fails. Do not separate them.
+      //
+      // The count is safe to expose where a per-frame SIZE would not be
+      // (ADR-0036 §11's voice-activity trace) ONLY because the encoder runs with
+      // DTX off — see `lifecycle/muteState.ts`, "with DTX, absence of frames
+      // becomes a signal". Enabling DTX makes the frame RATE speech-dependent
+      // and turns both this getter and the production counter into that trace.
       this.#metrics.frameAccepted();
+      this.#framesAccepted += 1;
       this.#onAccepted?.({ senderId: Number(opened.senderId), plaintext: opened.plaintext });
       this.#decoder?.decode({ data: opened.plaintext, timestampUs: 0 });
     } catch (err) {
@@ -223,6 +311,10 @@ export class IngressPipeline {
         // keeps `unknown_version` able to reveal a version-skewed rollback and
         // keeps `sum by(reason)` comparable with the media handler.
         this.#metrics.frameDropped(err.rejectReason);
+        this.#framesDropped += 1;
+        // The verbatim token, from the frozen sixteen. No mapping table here
+        // either — see the comment above this catch.
+        this.#lastDropReason = err.rejectReason;
         return;
       }
       // Anything else is a defect rather than a wire condition, and it must not

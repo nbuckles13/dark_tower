@@ -24,6 +24,7 @@ import type {
   SdkError,
 } from '@darktower/sdk-core';
 import { MeetingSessionState } from '@darktower/sdk-core';
+import { MediaStore } from './MediaStore.svelte.js';
 
 /**
  * Reactive store mirroring the high-level `MeetingSession` state. Constructed
@@ -39,6 +40,21 @@ export class MeetingStore {
   #mediaConnections = $state<readonly string[]>([]);
   /** `$lastError` — the most recent terminal/post-join error (typed, redactable). */
   #lastError = $state<SdkError | undefined>(undefined);
+
+  /**
+   * The media-path stores (mute, first-media, slot state, media fault).
+   *
+   * A PLAIN field, deliberately not `$state`. Reading `store.media` therefore
+   * tracks nothing, so a template reading `store.participants` is not
+   * invalidated when a mute toggles, and a template reading `store.media.audioMuted`
+   * is not invalidated when the roster changes. That isolation is the whole
+   * reason the media state lives in its own class with its own cells rather than
+   * as four more fields here — see `MediaStore`.
+   *
+   * `readonly` because the identity never changes for the life of the store; the
+   * cells inside it are what move.
+   */
+  readonly media = new MediaStore();
 
   /** Reactive getter for `$meetingState`. */
   get meetingState(): MeetingSessionState {

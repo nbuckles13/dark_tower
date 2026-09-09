@@ -34,6 +34,29 @@
 // This is also why the encoder is configured with DTX off — with DTX, absence of
 // frames becomes a signal, which is precisely what out-of-band signalling exists
 // to avoid.
+//
+// DTX-off has a second consequence, load-bearing elsewhere: because the frame
+// rate is constant and independent of speech, a frame COUNT is not a
+// voice-activity trace, which is what makes `EgressPipeline.framesSent` and
+// `IngressPipeline.framesAccepted` safe to expose where ADR-0036 §11 bars
+// per-frame sizes. Turning DTX on would silently turn both of those — and the
+// production `dt_client_media_frames_sent_total` — into that trace.
+//
+// ---------------------------------------------------------------------------
+// CLIENT MUTE DOES NOT RELEASE THE CAPTURE DEVICE, AND MUST NOT
+// ---------------------------------------------------------------------------
+//
+// The track stays open while muted, so the browser and OS microphone indicators
+// STAY LIT. That looks wrong next to a UI that says "muted", and it is not: the
+// invariant §5 states is that **no media leaves the device**, not that the
+// device is closed. Suppression happens at the capture callback, before the
+// encoder — see `AudioPipeline.#onCapturedFrame`.
+//
+// Written here because the obvious "fix" is destructive. Stopping the track on
+// mute means unmute has to re-acquire it — a `getUserMedia` round trip, possibly
+// a permission prompt — which replaces the local, instantaneous resume this
+// whole design exists to provide with a resumption path that can fail. Nothing
+// in the mute path may call `stop()` on the capture.
 
 /** Immutable snapshot of the local mute state. */
 export interface MuteSnapshot {

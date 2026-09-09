@@ -54,9 +54,11 @@ import type {
   AudioDecoderFactory,
   AudioEncoderFactory,
   AudioEncoderSeam,
+  CaptureSource,
   CaptureSourceFactory,
   PlaybackSinkFactory,
 } from '../setup/seams.js';
+import type { RejectReason } from '../frame/rejectReason.js';
 import { TeardownRegistry } from '../teardown/teardown.js';
 import { MuteState, type MuteSnapshot } from './muteState.js';
 import { TransmitKeyManager } from './transmitKeys.js';
@@ -82,6 +84,32 @@ export interface MediaFault {
   readonly message: string;
   /** True when the pipeline stopped as a result. */
   readonly fatal: boolean;
+}
+
+/**
+ * A sampled snapshot of the pipeline's monotone frame counters.
+ *
+ * Deliberately a SNAPSHOT rather than a live view: it is read by an embedder on
+ * a timer (the browser demo samples it a few times a second for its E2E bus),
+ * never on the forward path. See `AudioPipeline.frameCounts`.
+ */
+export interface MediaFrameCounts {
+  /** Frames this client actually put on the wire. */
+  readonly framesSent: number;
+  /** Datagrams that arrived, counted at the wire before any parse. */
+  readonly framesReceived: number;
+  /** Frames that verified, decrypted and reached the decoder. */
+  readonly framesAccepted: number;
+  /** Frames rejected for a wire reason. */
+  readonly framesDropped: number;
+  /**
+   * The most recent reject token, or `undefined` before the first drop.
+   *
+   * Bounded by TYPE, not by convention: `RejectReason` is the frozen
+   * sixteen-token union whose SSoT is `proto/test-vectors/frame-v2.vectors.json`,
+   * so no participant, key or payload string can reach this field and compile.
+   */
+  readonly lastDropReason: RejectReason | undefined;
 }
 
 /** Events the pipeline emits. */
@@ -191,6 +219,18 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   /** Event-once flags: a repeating fault must not become per-frame telemetry. */
   readonly #reportedFaults = new Set<MediaFaultStage>();
 
+  /**
+   * The live capture, held as a FIELD rather than captured by the teardown
+   * closure, so `setCaptureDevice` can swap it while keeping exactly ONE
+   * registration. `TeardownRegistry` has no unregister, so a closure over the
+   * local would pin the first capture forever and a device swap would leak the
+   * old microphone — the lit-indicator privacy failure `setup/capture.ts` calls
+   * out, one layer up.
+   */
+  #capture: CaptureSource | undefined;
+  /** The requested microphone. Applied at `start()`, or immediately if running. */
+  #deviceId: string | undefined;
+
   constructor(options: AudioPipelineOptions) {
     super();
     validateMediaConfig(options.config);
@@ -223,6 +263,43 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   }
 
   /**
+   * Monotone frame counters, for an embedder to SAMPLE.
+   *
+   * Allocates one object PER READ, which is why reads must stay sampled and
+   * must never happen per frame. Nothing on the forward path calls this.
+   *
+   * Every number is a read of bookkeeping the pipelines already maintain beside
+   * their metric counters (`dt_client_media_frames_{sent,received,accepted,dropped}_total`),
+   * so a projection of these cannot disagree with the metrics. Zero before
+   * `start()`, because neither pipeline exists yet — which is a real state a
+   * caller can observe, not a missing value.
+   *
+   * THE RECEIVE SIDE IS REPORTED AS A COMPLETE IDENTITY —
+   * `received = accepted + sum(drops by reason)` — and not as `accepted` alone,
+   * because `accepted` on its own cannot distinguish **nothing is arriving**
+   * from **arriving and being rejected**. Those have opposite remediations (a
+   * relay that stopped forwarding vs a client that cannot attribute the sender),
+   * and collapsing them cost a live misdiagnosis during this pipeline's first
+   * end-to-end run. `lastDropReason` turns the second case from "something
+   * rejected them" into the actual token.
+   */
+  get frameCounts(): MediaFrameCounts {
+    const ingress = this.#ingress;
+    return {
+      framesSent: this.#egress?.framesSent ?? 0,
+      framesReceived: ingress?.framesReceived ?? 0,
+      framesAccepted: ingress?.framesAccepted ?? 0,
+      framesDropped: ingress?.framesDropped ?? 0,
+      lastDropReason: ingress?.lastDropReason,
+    };
+  }
+
+  /** The microphone currently requested, or `undefined` for the platform default. */
+  get captureDeviceId(): string | undefined {
+    return this.#deviceId;
+  }
+
+  /**
    * Start capture, encode, transport I/O and playback.
    *
    * EVERY resource is registered for teardown at acquisition, before the next
@@ -239,14 +316,19 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     await assertEd25519Available();
 
     const audio = this.#config.audio;
+    if (options.deviceId !== undefined) this.#deviceId = options.deviceId;
     const capture = await this.#options.captureFactory({
       sampleRateHz: audio.sampleRateHz,
       channels: audio.channels,
-      deviceId: options.deviceId,
+      deviceId: this.#deviceId,
     });
+    this.#capture = capture;
     // REGISTERED BEFORE THE NEXT AWAIT: a leaked capture keeps the microphone
     // hot and the browser's recording indicator lit.
-    this.#teardown.register('capture', () => capture.stop());
+    //
+    // The disposer reads the FIELD, not this local, so `setCaptureDevice` can
+    // replace the capture without a second registration — see `#capture`.
+    this.#teardown.register('capture', () => this.#capture?.stop());
 
     const playback = await this.#options.playbackFactory({
       sampleRateHz: audio.sampleRateHz,
@@ -326,13 +408,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
 
     await capture.start(
       (data) => this.#onCapturedFrame(data),
-      () => {
-        this.#fault(
-          MediaFaultStage.Capture,
-          'the microphone stopped; the device may have been unplugged or access revoked',
-          true,
-        );
-      },
+      () => this.#onCaptureEnded(),
     );
 
     this.#rotationTimer = this.#setInterval(() => {
@@ -380,6 +456,67 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#options.reportMute(muted);
   }
 
+  /**
+   * Choose the microphone, before or during a session.
+   *
+   * Before `start()` this records the choice, which `start()` then applies.
+   * While running it performs a REAL swap — stop the old capture, acquire the
+   * new one, resume feeding the same encoder. A device picker whose selection
+   * silently did nothing after start would be a masked failure wearing a UI
+   * disguise, which is the thing this story's whole failure mode is made of.
+   *
+   * What deliberately does NOT change across a swap: the encoder, decoder and
+   * playback sink (same sample rate and channel count, so rebuilding them would
+   * only add a gap), the mute state (checked per frame, so it survives), the
+   * transmit keys, and the first-media measurement epoch — a device change is
+   * not a new session and must not restart a measurement that means "time to
+   * first media after media start".
+   *
+   * @throws {MediaCaptureError} if the new device cannot be acquired. The old
+   * capture is already stopped by then, so the caller is told loudly rather than
+   * left believing a dead pipeline is live; a fault is also raised so a UI that
+   * ignores the rejection still sees it.
+   */
+  async setCaptureDevice(deviceId: string | undefined): Promise<void> {
+    if (this.#deviceId === deviceId) return;
+    this.#deviceId = deviceId;
+    if (!this.#started || this.#stopped) return;
+
+    const audio = this.#config.audio;
+    // Stop FIRST. Two live captures means two lit microphone indicators and two
+    // frame sources feeding one encoder, which reorders the encoder's input.
+    this.#capture?.stop();
+    this.#capture = undefined;
+    let capture: CaptureSource;
+    try {
+      capture = await this.#options.captureFactory({
+        sampleRateHz: audio.sampleRateHz,
+        channels: audio.channels,
+        deviceId,
+      });
+    } catch (err) {
+      this.#fault(
+        MediaFaultStage.Capture,
+        'the selected microphone could not be opened; capture has stopped',
+        true,
+      );
+      throw err;
+    }
+    // Assigned BEFORE the next await, same rule as `start()`: the single
+    // registered disposer reads this field, so an acquisition that completes
+    // after teardown is still released.
+    this.#capture = capture;
+    if (this.#stopped) {
+      capture.stop();
+      this.#capture = undefined;
+      return;
+    }
+    await capture.start(
+      (data) => this.#onCapturedFrame(data),
+      () => this.#onCaptureEnded(),
+    );
+  }
+
   /** Stop everything. Idempotent, and safe to call during `start()`. */
   async stop(): Promise<void> {
     if (this.#stopped) return;
@@ -410,6 +547,20 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * check happens before the encoder sees the sample. Unmute resumes on the very
    * next captured frame with no round trip.
    */
+  /**
+   * The capture track ended on its own. Shared by `start()` and
+   * `setCaptureDevice()` so a device acquired by the swap reports an unplug
+   * exactly as the original does — a second, subtly different handler is how a
+   * swapped device ends up failing silently.
+   */
+  #onCaptureEnded(): void {
+    this.#fault(
+      MediaFaultStage.Capture,
+      'the microphone stopped; the device may have been unplugged or access revoked',
+      true,
+    );
+  }
+
   #onCapturedFrame(data: AudioData): void {
     if (this.#mute.audioMuted || this.#stopped) {
       // `AudioData` holds a platform-side buffer; a suppressed frame must still

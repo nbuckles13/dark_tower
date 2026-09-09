@@ -274,6 +274,7 @@ export type {
   AudioPipelineEventMap,
   AudioPipelineOptions,
   AudioPipelineStartOptions,
+  MediaFrameCounts,
   AudioSendDirective,
   MediaFault,
 } from './media/lifecycle/AudioPipeline.js';

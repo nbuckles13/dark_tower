@@ -16,46 +16,44 @@
 - Frame codec + SFrame crypto → `media/frame/`; audio pipeline → `media/{pipeline,lifecycle,setup,teardown}/`
 - Media layout rule (hot path vs siblings, ADR-0036 §11) → `media/__tests__/hotPathLayout.test.ts`
 - Media metric handles + allow-list labels (only `dt_client_` names under `media/**`) → `media/setup/mediaMetrics.ts`
-- Key material seams (meeting KEK, roster keys, identity, transmit keys) → `media/setup/{kekSource,rosterKeys,identity}.ts`, `media/lifecycle/transmitKeys.ts`
+- Sampled frame counters (one increment beside each metric call) + live mic swap (`setCaptureDevice`) → `media/pipeline/{egress,ingress}.ts`, `media/lifecycle/AudioPipeline.ts`
+- The four media absence-signals on the session facade (mute / first-media / slot state / fault) → `session/events.ts:MeetingSessionEventMap`
+- Key material seams (KEK, roster keys, identity, transmit keys); **own key self-seeded at join — MC's roster excludes self, so loopback drops every frame without it** → `media/setup/{kekSource,rosterKeys,identity}.ts`, `session/MeetingSession.ts`
 - TS-side KEK sink control → `signaling/kekIntake.ts`, `__tests__/serverMessageSinkScan.test.ts`
 - WebTransport connection mgmt + datagram I/O → `transport/`, `media/MediaTransport.ts`
-- HTTP/3 meeting API client → `http/`
-- Error taxonomy (`SdkErrorCode`); HTTP status → meeting error mapping → `errors/`, `errors/MeetingError.ts:fromResponse()`
-- Input validation SSoT (`SUBDOMAIN_REGEX`, length caps, validators) → `validation/limits.ts`
-- Protobuf-es generated types → `proto/dark_tower/`
+- HTTP/3 meeting API client; protobuf-es generated types → `http/`, `proto/dark_tower/`
+- Error taxonomy (`SdkErrorCode`, HTTP→meeting mapping); input validation SSoT (`SUBDOMAIN_REGEX`, caps) → `errors/`, `validation/limits.ts`
 
 ## Svelte Adapter (`packages/sdk-svelte/src/`)
 - Roster/participant store (seeded from `existingParticipants`, excludes self) → `stores/MeetingStore.svelte.ts`
-- Session-to-store binding → `stores/bindMeetingSession.ts`
+- Media/mute/slot/fault store (one `$state` cell per field; hung off `MeetingStore.media` as a NON-reactive field so mute does not invalidate the roster) → `stores/MediaStore.svelte.ts`
+- Session-to-store binding (one subscription, one aggregate unsubscribe, roster + media alike) → `stores/bindMeetingSession.ts`
+- Re-render granularity proof (counts `$derived` recomputations, with positive control) → `__tests__/MediaStore.test.ts`
 
 ## Web Application (`packages/web-app/src/`)
 - Roster DOM (`participant-list` / `participant-${id}` testids) → `views/JoinMeeting.svelte`
+- In-meeting view: mute control + indicator, mic picker, slot rows (`in-meeting` / `mute-toggle` / `mute-state` / `mic-select` / `slot-${id}` testids) → `views/InMeeting.svelte`
+- §6 slot-state → user-facing text SSoT (exhaustive by type; `awaiting-assignment` is NOT a wire token) → `lib/slotState.ts`
 - Auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
 - E2E event bus (whitelist projection of SDK events) → `lib/e2eBus.ts`
 - Session wiring, config, error text → `lib/{session,config,errorText}.ts`
 - Vite proxy + E2E-hook / cert-fingerprint plumbing → `packages/web-app/vite.config.ts`, `packages/web-app/vite/fingerprints.ts`
 
 ## Client Telemetry (`packages/sdk-core/src/telemetry/`)
-- OTel metrics sinks / trace propagation / close-reason → `{OtelMetricsSink,NoopMetricsSink,tracePropagation,closeReason}.ts`
-- Structured logger + name redaction guard → `logger.ts`, `nameGuard.ts`
+- OTel sinks / trace propagation / close-reason; structured logger + name redaction guard → `{OtelMetricsSink,NoopMetricsSink,tracePropagation,closeReason,logger,nameGuard}.ts`
 
 ## Browser E2E Harness (`packages/web-app/e2e/`)
-- Shared fixtures/helpers (auth, roster asserts, recovery, shared-user memo) → `fixtures.ts`
-- MC metric assertions (baseline-delta, `pollUntilSumAbove`) → `mcMetrics.ts`
-- Specs (happy-path, negative, recovery tails) → `*.spec.ts`
-- Env contract (required `E2E_ORG_SUBDOMAIN`, derived `E2E_BASE_URL`) → `env.ts`, `global-setup.ts`
-- Budgets & assertion catalog → `packages/web-app/e2e/README.md`
+- Fixtures (auth, roster asserts, recovery, shared-user memo, media loopback helpers) + MC metric assertions → `fixtures.ts`, `mcMetrics.ts`
+- Specs: happy-path, negative, recovery tails; media loopback (first-media pass/fail, latency OBSERVED-never-gated, structural mute) → `*.spec.ts`
+- Env contract (required `E2E_ORG_SUBDOMAIN`, derived `E2E_BASE_URL`); budgets & assertion catalog → `env.ts`, `global-setup.ts`, `README.md`
 - Playwright config (retries=0, workers=1) → `packages/web-app/playwright.config.ts`
-- Browser E2E pipeline lane (Layer 7) → `scripts/layer7.sh`
-- Per-run org provisioning (source of `E2E_ORG_SUBDOMAIN`) → `scripts/layer7.sh` Phase 1h, `infra/kind/scripts/setup.sh:provision_run_org()`
+- Layer 7 lane + per-run org provisioning (source of `E2E_ORG_SUBDOMAIN`) → `scripts/layer7.sh` (Phase 1h), `infra/kind/scripts/setup.sh:provision_run_org()`
 - Node-tier vitest specs (env contract, bundle content) → `packages/web-app/tests/`
 - Subdomain-pattern drift guard (e2e mirror ↔ SDK SSoT) → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
 
 ## Client Test Utilities (`packages/test-utils/src/`)
-- Mock transport (datagrams, injected drops, back-pressure, queue knobs) → `MockWebTransport.ts`
-- Audio seam doubles (capture, codecs, playback) — never frame crypto → `media/index.ts`
-- Test token builder → `TestTokenBuilder.ts`, `token-claims.ts`
-- Metrics sink contract + mocks; deterministic ids → `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
+- Mock transport (datagrams, injected drops, back-pressure, queue knobs); audio seam doubles (capture, codecs, playback) — never frame crypto → `MockWebTransport.ts`, `media/index.ts`
+- Test tokens; metrics sink contract + mocks; deterministic ids → `TestTokenBuilder.ts`, `token-claims.ts`, `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
 
 ## Protocol Integration
 - Signaling proto (client-server) → `proto/dark_tower/signaling/v1/signaling.proto`
@@ -72,4 +70,5 @@
 - Node version SSoT (`.nvmrc`; enforced via `.npmrc` engine-strict, `package.json` engines.node, `infra/devloop/Dockerfile`) → `.nvmrc`
 - pnpm transitive-security overrides → `package.json:pnpm.overrides`
 - Dev-web preflight (rolldown-binding probe) → `scripts/dev-web.sh`
+- Secure-context facts (frozen anchor `#secure-context-and-media-setup`; prose pinned from `scripts/dev-web.test.sh`) → `docs/runbooks/client-dev-local.md`
 - Client CI workflow → `.github/workflows/ci-client.yml`

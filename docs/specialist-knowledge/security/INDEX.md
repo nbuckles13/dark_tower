@@ -47,7 +47,7 @@
 
 ## Code Locations — Client / E2E (Credential-Leak Controls)
 - Token-only join traffic assertion + failure-message `redact` helper → `packages/web-app/e2e/fixtures.ts:assertTokenOnlyJoinTraffic`
-- Test-bus secret/PII whitelist projection (drops `bindingToken`/`correlationId`) → `packages/web-app/src/lib/e2eBus.ts`
+- Test-bus secret/PII whitelist projection (drops `bindingToken`/`correlationId`; media events are scalars only — no key ids/salts/frame bytes/per-frame SIZES, which are ADR-0036 §11's voice-activity trace, and frame COUNTS are safe only while the encoder runs DTX-off) → `packages/web-app/src/lib/e2eBus.ts`; prod-absence proof + its marker-token rule → `packages/web-app/tests/bundle-content.test.ts`
 - Token/meeting-code format validation → `packages/sdk-core/src/validation/limits.ts:validateUserToken`/`validateMeetingCode`
 - Trace artifacts contain live tokens — gitignored, do-not-promote → `packages/web-app/e2e/README.md`, runbook `docs/runbooks/devloop-validation.md` §6.7/§8
 
@@ -57,7 +57,7 @@
 - ADR-0032 GC audit patterns (authz-shift, bounded `error_type`, caller-type pinning) → `crates/gc-service/src/handlers/meetings.rs`, `docs/observability/metrics/gc-service.md` | metric-catalog debt → `docs/TODO.md` §Observability Debt
 
 ## TLS & Certificates
-- Dev cert generation + fingerprint SSoT (single writer) → `scripts/generate-dev-certs.sh`; consumers → `packages/web-app/vite/fingerprints.ts`, `scripts/layer7.sh` (14-day `serverCertificateHashes` expiry cap); Playwright hash-pin (no cert-bypass flags) → `packages/web-app/playwright.config.ts`
+- Dev cert generation + fingerprint SSoT (single writer) → `scripts/generate-dev-certs.sh`; consumers → `packages/web-app/vite/fingerprints.ts`, `scripts/layer7.sh` (14-day `serverCertificateHashes` expiry cap); Playwright hash-pin (no cert-bypass flags) → `packages/web-app/playwright.config.ts`; browser-trust prohibition is TWO failure modes — a prohibited literal being ADDED (deny-list: `dt-guard no-insecure-browser-flags`, tracked-files-only, docs in scope, allowlist must stay at 2) vs the anti-flag counter-message being REMOVED (required-content pins `pointer-/runbook-warns-against-browser-flag`, `fingerprints-warns-off-browser-flag` → `scripts/dev-web.test.sh`)
 - MC/MH TLS volume mounts (defaultMode 0400) → `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`; WebTransport UDP ingress → `infra/services/{mc,mh}-service/network-policy.yaml`, `infra/kind/kind-config.yaml`; test-time self-signed PEM rigs (rcgen, SAN `localhost`/`127.0.0.1`) → `crates/mh-service/tests/common/accept_loop_rig.rs`
 
 ## Devloop Container, Story Runner & Cluster Helper

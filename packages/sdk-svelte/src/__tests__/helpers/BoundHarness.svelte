@@ -29,3 +29,9 @@
 </ul>
 <div data-testid="media-connections">{store.mediaConnections.length}</div>
 <div data-testid="last-error">{store.lastError ? store.lastError.code : ''}</div>
+<div data-testid="audio-muted">{store.media.audioMuted ? 'muted' : 'unmuted'}</div>
+<div data-testid="first-media-ms">{store.media.firstMediaFrameMs ?? ''}</div>
+<div data-testid="slot-count">{store.media.slots.length}</div>
+<div data-testid="media-fault">
+  {store.media.lastMediaFault ? store.media.lastMediaFault.stage : ''}
+</div>

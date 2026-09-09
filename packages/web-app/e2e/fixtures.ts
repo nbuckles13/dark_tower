@@ -851,3 +851,318 @@ export async function recoverByJoining(page: Page, meetingCode: string): Promise
   await joinAsUser(page, meetingCode);
   return waitForJoined(page);
 }
+
+// ============================================================================
+// Media loopback (task #20, ADR-0036 §5/§6/§10)
+// ============================================================================
+
+/**
+ * One sample of the SDK's monotone frame counters, as the bus projects it.
+ *
+ * The bus SAMPLES a counter rather than emitting per frame — `pipeline/egress.ts`
+ * is the hot path under ADR-0036 §11, whose per-frame invariant is zero
+ * allocation and zero registry lookup. So a "flat while muted" assertion is made
+ * over a handful of readings, and the number of readings is itself asserted (see
+ * {@link expectEgressFlatWhileMuted}) because flatness over zero samples is
+ * vacuously true.
+ */
+export interface FrameCountSample {
+  readonly framesSent: number;
+  /** Datagrams that arrived, counted at the wire BEFORE any parse. */
+  readonly framesReceived: number;
+  /** Frames that verified, decrypted and reached the decoder. */
+  readonly framesAccepted: number;
+  /** Frames rejected for a wire reason. */
+  readonly framesDropped: number;
+  /** The most recent reject token; absent before the first drop. Bounded. */
+  readonly lastDropReason: string | undefined;
+  readonly atMs: number;
+}
+
+/** How long to wait for the first media frame to come back through MH. */
+const FIRST_MEDIA_TIMEOUT_MS = 20_000;
+
+/**
+ * How long a muted window is observed before it is judged flat, and the minimum
+ * number of samples that window must contain.
+ *
+ * The sample floor is the anti-vacuity control: without it, a stalled sampler
+ * produces zero readings and "every reading is equal" passes, reporting a broken
+ * harness as a working mute.
+ */
+const MUTE_OBSERVATION_MS = 2_500;
+const MIN_MUTE_SAMPLES = 4;
+
+/**
+ * Frames already queued at the instant of mute may still drain — ADR-0036 §5
+ * stops CAPTURE within one frame, which is a different claim from un-queueing
+ * what the egress queue already holds. The flatness baseline is therefore taken
+ * after this settle rather than at the mute itself; taking it at the mute would
+ * make the assertion fail on correct behaviour.
+ */
+const MUTE_SETTLE_MS = 750;
+
+/**
+ * Render the receive-path accounting identity from the newest sample.
+ *
+ * `received = accepted + sum(drops by reason)`. Printing only `accepted` leaves
+ * "nothing is arriving" and "arriving and being rejected" indistinguishable —
+ * two states with OPPOSITE remediations (a relay that stopped forwarding vs a
+ * client that cannot attribute the sender). An earlier version of these messages
+ * stated that ambiguity rather than resolving it, and a reader with the source
+ * open still misdiagnosed it. So the message now names the conclusion.
+ */
+function diagnoseCounters(samples: readonly FrameCountSample[]): string {
+  const last = samples[samples.length - 1];
+  if (last === undefined) {
+    return (
+      `NO frame-count samples on the bus at all (${samples.length}). That is a HARNESS ` +
+      `condition, not a media one: either media was never started or the __E2E_HOOKS__ ` +
+      `sampler is not running.`
+    );
+  }
+  const counts =
+    `sent=${last.framesSent} received=${last.framesReceived} ` +
+    `accepted=${last.framesAccepted} dropped=${last.framesDropped}` +
+    (last.lastDropReason !== undefined ? ` lastDropReason=${last.lastDropReason}` : '') +
+    ` over ${samples.length} samples`;
+
+  let reading: string;
+  if (last.framesSent === 0) {
+    reading =
+      'READING: nothing left this client. The fault is upstream of the wire — capture, ' +
+      'encode, or the send path. MH and the receive path are not implicated.';
+  } else if (last.framesReceived === 0) {
+    reading =
+      'READING: frames left but NOTHING came back. The fault is between this client and ' +
+      'MH — forwarding, the assignment, or the return path. The receive path is not ' +
+      'implicated: it never saw a datagram.';
+  } else if (last.framesAccepted === 0) {
+    reading =
+      'READING: datagrams ARE arriving and every one is being REJECTED. The fault is in ' +
+      "this client's receive path, NOT in MH forwarding — see lastDropReason above for " +
+      "which check failed. (A `no_roster_entry` here means the sender's identity key is " +
+      'missing from the roster resolver; in a loopback the sender is this client itself.)';
+  } else {
+    reading = 'READING: media is flowing in both directions.';
+  }
+  return `${counts}. ${reading}`;
+}
+
+/** Read every frame-count sample the bus has recorded so far. */
+export async function frameCountSamples(page: Page): Promise<readonly FrameCountSample[]> {
+  const raw = await busEvents(page);
+  return raw
+    .filter((e) => e['type'] === 'mediaFrameCounts')
+    .map((e) => ({
+      framesSent: e['framesSent'] as number,
+      framesReceived: e['framesReceived'] as number,
+      framesAccepted: e['framesAccepted'] as number,
+      framesDropped: e['framesDropped'] as number,
+      lastDropReason: e['lastDropReason'] as string | undefined,
+      atMs: e['atMs'] as number,
+    }));
+}
+
+/**
+ * Start the media pipeline from the in-meeting view.
+ *
+ * The microphone permission and the capture itself come from Chromium's
+ * fake-device / fake-ui launch flags, already set in `playwright.config.ts`. No
+ * flag is added here, and none that weakens certificate validation, web security
+ * or origin trust appears anywhere in this suite — MC/MH trust flows exclusively
+ * through `serverCertificateHashes` pinning, which such a flag would turn into
+ * decoration while every assertion stayed green.
+ */
+export async function startAudio(page: Page): Promise<void> {
+  await expect(
+    page.getByTestId('in-meeting'),
+    'the in-meeting view must render after a settled join',
+  ).toBeVisible();
+  await page.getByTestId('start-audio').click();
+  await expect(
+    page.getByTestId('mute-toggle'),
+    'the mute control must appear once the media pipeline is running',
+  ).toBeVisible();
+}
+
+/**
+ * Wait for audio to come back through the media handler, and RETURN the observed
+ * end-to-end latency.
+ *
+ * **This is the functional pass/fail of the loopback**: a `firstMediaFrame` event
+ * means a frame this client captured, encoded, encrypted, signed and sent came
+ * back from MH and completed verify -> replay -> unwrap -> decrypt -> decode.
+ *
+ * **The returned number is OBSERVED, NEVER GATED** (ADR-0036 §10). Nothing in
+ * this suite compares it against a threshold; a wall-clock target on a local
+ * cluster is a permanent flake, and ADR-0028 forbids quarantining gates, so the
+ * test would end up deleted and the headline objective would have zero coverage.
+ * The timeout below is a LIVENESS bound on the event existing at all — not a
+ * latency budget, and it must not be tightened into one.
+ */
+export async function waitForFirstMediaFrame(
+  page: Page,
+  timeoutMs = FIRST_MEDIA_TIMEOUT_MS,
+): Promise<number> {
+  try {
+    await page.waitForFunction(
+      () => window.__darktower_test__?.events.some((e) => e['type'] === 'firstMediaFrame') ?? false,
+      undefined,
+      { timeout: timeoutMs },
+    );
+  } catch {
+    const samples = await frameCountSamples(page);
+    throw new Error(
+      `no audio returned from the media handler: no 'firstMediaFrame' bus event within ` +
+        `${timeoutMs}ms after start-audio. This is a LIVENESS failure (no media at all), not a ` +
+        `latency failure — the bound is not a budget. ` +
+        `${diagnoseCounters(samples)} ${await busFailureContext(page)}`,
+    );
+  }
+  const events = await busEvents(page);
+  const first = events.find((e) => e['type'] === 'firstMediaFrame');
+  const elapsedMs = first?.['elapsedMs'];
+  if (typeof elapsedMs !== 'number' || !Number.isFinite(elapsedMs) || elapsedMs < 0) {
+    throw new Error(`malformed 'firstMediaFrame' bus event: ${JSON.stringify(first)}`);
+  }
+  return elapsedMs;
+}
+
+/** Click the mute control and wait for the SDK's echo to reach the DOM. */
+export async function setMuteViaUi(page: Page, muted: boolean): Promise<number> {
+  await page.getByTestId('mute-toggle').click();
+  // The DOM assertion is on the SDK's ECHO, not on the click: the indicator is
+  // driven by `muteChanged`, so waiting here proves the SDK actually applied it.
+  await expect(
+    page.getByTestId('mute-state'),
+    `the mute indicator must follow the SDK's client-mute state (requested ${String(muted)})`,
+  ).toHaveText(muted ? 'muted' : 'unmuted');
+  const busState = await page.evaluate(() => {
+    const events = window.__darktower_test__?.events ?? [];
+    const mutes = events.filter((e) => e['type'] === 'muteState');
+    return mutes[mutes.length - 1]?.['audioMuted'];
+  });
+  expect(
+    busState,
+    'the DOM indicator and the SDK client-mute state must agree — a UI that can disagree with ' +
+      'what gates capture is the hot-mic defect ADR-0036 §5 exists to prevent',
+  ).toBe(muted);
+  return Date.now();
+}
+
+/**
+ * Wait until one frame counter strictly exceeds its current value.
+ *
+ * ONE algorithm, parameterised by field — the two exported wrappers below differ
+ * only in which counter they watch, their timeout, and their diagnosis. The
+ * duplicated part worth collapsing is the PREDICATE: both encode "how to find
+ * the newest frame-count sample on the bus", and a fix to that (skipping a
+ * malformed sample, tolerating a sampler gap) applied to one copy and not the
+ * other leaves two assertions silently testing different things.
+ *
+ * The callback is serialized into the page, so the field name travels in the
+ * argument object rather than through a closure.
+ */
+async function waitForCounterAbove(
+  page: Page,
+  field: 'framesSent' | 'framesAccepted',
+  timeoutMs: number,
+  describeFailure: (baseline: number, after: readonly FrameCountSample[]) => string,
+): Promise<void> {
+  const before = await frameCountSamples(page);
+  const baseline = before[before.length - 1]?.[field] ?? 0;
+  try {
+    await page.waitForFunction(
+      (arg: { floor: number; field: string }) => {
+        const events = window.__darktower_test__?.events ?? [];
+        const samples = events.filter((e) => e['type'] === 'mediaFrameCounts');
+        const last = samples[samples.length - 1];
+        return last !== undefined && (last[arg.field] as number) > arg.floor;
+      },
+      { floor: baseline, field },
+      { timeout: timeoutMs },
+    );
+  } catch {
+    throw new Error(describeFailure(baseline, await frameCountSamples(page)));
+  }
+}
+
+/**
+ * Assert the egress counter STRICTLY ADVANCES over a short window.
+ *
+ * The positive control for everything else here. Without it, "flat while muted"
+ * passes just as well on a pipeline that never sent a frame in its life, and the
+ * whole spec becomes decorative.
+ */
+export async function expectEgressAdvances(
+  page: Page,
+  label: string,
+  windowMs = 1_500,
+): Promise<void> {
+  await waitForCounterAbove(
+    page,
+    'framesSent',
+    windowMs + 5_000,
+    (baseline, after) =>
+      `egress did not advance (${label}): framesSent stayed at ${baseline}. The client is not ` +
+      `putting audio on the wire, so every mute assertion in this spec would have passed ` +
+      `vacuously. ${diagnoseCounters(after)}`,
+  );
+}
+
+/** Assert decoded audio is still arriving — the "unmute resumes audio" half. */
+export async function expectIngressAdvances(page: Page, label: string): Promise<void> {
+  await waitForCounterAbove(
+    page,
+    'framesAccepted',
+    10_000,
+    (baseline, after) =>
+      `decoded audio did not resume (${label}): framesAccepted stayed at ${baseline}. ` +
+      diagnoseCounters(after),
+  );
+}
+
+/**
+ * Assert the egress counter is FLAT for the whole muted window — the STRUCTURAL
+ * proof that mute produces silence.
+ *
+ * Structural, not acoustic, and deliberately: sampling audio energy would prove
+ * only that this client's playback went quiet, which is also what a broken
+ * decoder looks like. A flat send counter proves no encoded audio LEFT THE
+ * DEVICE, which is the property ADR-0036 §5 actually states ("under client mute,
+ * no media leaves the device... enforced client-side at capture").
+ *
+ * @param mutedAtMs when mute was applied, from {@link setMuteViaUi}.
+ */
+export async function expectEgressFlatWhileMuted(page: Page, mutedAtMs: number): Promise<void> {
+  await page.waitForTimeout(MUTE_SETTLE_MS + MUTE_OBSERVATION_MS);
+
+  const settledAtMs = mutedAtMs + MUTE_SETTLE_MS;
+  const samples = (await frameCountSamples(page)).filter((s) => s.atMs >= settledAtMs);
+
+  // VACUITY CONTROL, asserted SEPARATELY and with its own message. "Every
+  // sample is equal" is trivially true of zero samples, so a stalled sampler
+  // would otherwise be reported as a working mute — the exact false green this
+  // spec exists to make impossible.
+  expect(
+    samples.length,
+    `the frame-count sampler produced only ${samples.length} sample(s) in the ` +
+      `${MUTE_OBSERVATION_MS}ms muted window (needed >= ${MIN_MUTE_SAMPLES}). This is a HARNESS ` +
+      `failure, not a mute failure: with no samples, flatness is vacuously true. Check that the ` +
+      `__E2E_HOOKS__ bus sampler is running and that media was started.`,
+  ).toBeGreaterThanOrEqual(MIN_MUTE_SAMPLES);
+
+  const baseline = samples[0]!.framesSent;
+  const moved = samples.filter((s) => s.framesSent !== baseline);
+  expect(
+    moved,
+    `MUTE REGRESSION: framesSent moved ${baseline} -> ${samples[samples.length - 1]!.framesSent} ` +
+      `across ${samples.length} samples spanning ` +
+      `${samples[samples.length - 1]!.atMs - samples[0]!.atMs}ms while muted ` +
+      `(mute applied at t=${mutedAtMs}, baseline taken after a ${MUTE_SETTLE_MS}ms queue-drain ` +
+      `settle). Egress must be FLAT while muted: ADR-0036 §5 enforces client mute at capture, so ` +
+      `no encoded audio should exist to leave the device. A counter that keeps advancing means ` +
+      `the indicator is telling the user something the send path is not doing.`,
+  ).toEqual([]);
+}
