@@ -3,7 +3,7 @@
 **Service**: Media Handler (mh-service)
 **Owner**: SRE Team / Media Handler Service Owner
 **On-Call Rotation**: PagerDuty - Dark Tower MH Team
-**Last Updated**: 2026-05-01
+**Last Updated**: 2026-09-08
 
 ---
 
@@ -27,6 +27,7 @@
    - [Scenario 13: RegisterMeeting Timeout — Clients Kicked](#scenario-13-registermeeting-timeout--clients-kicked)
    - [Scenario 14: WebTransport Server Startup Failure](#scenario-14-webtransport-server-startup-failure)
    - [Scenario 15: Media Sessions Declining — No Sender Binding](#scenario-15-media-sessions-declining--no-sender-binding)
+   - [Scenario 16: Ingress Datagrams Received But Never Read](#scenario-16-ingress-datagrams-received-but-never-read)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1233,6 +1234,199 @@ not two** — see `docs/TODO.md`.
 drives connections toward `MH_MAX_CONNECTIONS`), `MHTokenRefreshFailures` (context for
 Step 6), `MHMCNotificationFailures` (same MC-unavailability cause at attempt
 granularity — 3 retries there for 1 decline here).
+
+---
+
+### Scenario 16: Ingress Datagrams Received But Never Read
+
+**Alert**: `MHIngressDatagramsNeverRead` (`warning`)
+
+**Symptom.** `mh_media_frames_dropped_total{reason="transport_receive_dropped",
+direction="ingress"}` is rising: MH's QUIC layer received datagrams that no media
+ingress loop ever read. Publishers on the affected instance lost audio.
+
+> **READ THIS BEFORE ANYTHING ELSE — THIS ALERT IS FORENSIC, NOT DETECTIVE.**
+>
+> The counter is a difference between quinn's received-frame count and what the
+> ingress loop actually read, and that difference is only final **at connection
+> close**. Nothing increments while a session is live, and meetings run for an
+> hour.
+>
+> Two consequences, and both invert the habits that work for every other
+> scenario in this runbook:
+>
+> - **The incident is over when you are paged.** You are reading a record, not a
+>   live fault. Nothing you do to the fleet in the next ten minutes changes this
+>   number. Do not restart pods to "clear" it.
+> - **A FLAT SERIES DURING AN ACTIVE NO-AUDIO INCIDENT IS NOT EVIDENCE THAT
+>   INGRESS IS HEALTHY.** The sessions are still open, so the counter has not
+>   been computed yet. This is the single most likely way to be misled here.
+>
+> **MH has no detective signal for silent ingress loss.** That is a known,
+> recorded gap, not an oversight of this runbook. If you need to know whether loss
+> is happening *right now*, the only in-tree substitute is
+> `mh_media_frames_forwarded_total{direction="ingress"}` failing to track the
+> expected publisher frame rate on the steered instance, and that requires you to
+> already know the expected rate.
+>
+> **The gap has a defined, small closure — do not re-derive it.** The *accounted*
+> half is already live: `forwarded{direction="ingress"} + dropped{direction="ingress"}`
+> is exactly the set of datagrams the ingress loop read (the code increments
+> `forwarded{ingress}` on the `no_subscriber` path specifically to keep that sum
+> whole). The missing half is one series — a periodic sum of quinn's
+> `frame_rx.datagram` over live connections — after which the live loss rate is a
+> PromQL subtraction with no teardown required. Spec and sampling-cadence
+> trade-off are filed in `docs/TODO.md`.
+
+#### Step 1 — establish that this is loss at all, before attributing it
+
+The value is an **upper bound on real loss, not a measurement of it.** Any client
+past the JWT gate can inflate it: datagrams carrying an unmatched HTTP/3
+session-id varint still increment quinn's `frame_rx.datagram` while `wtransport`
+discards them. So a rising series has three candidate causes with three different
+owners, and the ratio below is what separates the first two.
+
+```promql
+# The comparison that attributes. Run both. The 2h window matches the alert and
+# is load-bearing — see the note below before shortening it.
+sum by(instance) (rate(mh_media_frames_dropped_total{reason="transport_receive_dropped", direction="ingress"}[2h]))
+sum by(instance) (rate(mh_media_frames_forwarded_total{direction="ingress"}[2h]))
+```
+
+> **Do not shorten these windows to "see it more clearly."** The first series is
+> emitted in one instant at connection close for a whole session; the second
+> accrues continuously. Over a window shorter than a typical meeting the ratio
+> between them inflates by roughly `session_length / window` — at 30 minutes, an
+> hour-long session losing a true 5% reads about 9.5%. Shortening the window is
+> the most natural thing to try here and it will make you over-state the loss.
+
+| Reading | Meaning, and who owns it |
+|---|---|
+| `transport_receive_dropped` rising, `forwarded{ingress}` **flat** | Clients are publishing outside their media sessions' lifetimes. **Client / steering timing — NOT MH's forward path.** Go to Step 2. |
+| **Both** rising together | Media is flowing normally and a fraction is being lost. The ratio is the whole story. Go to Step 3. |
+| `transport_receive_dropped` rising, confined to one client or org | Suspect counter inflation rather than loss. Go to Step 4. |
+
+> **Do not skip to "MH is losing media."** The predecessor of this signal — the
+> triage row that read `started` climbing with flat ingress frames as
+> "client-side, not MH" — misdirected three sessions by attributing a shape it
+> could not actually resolve. This table is the corrected form and it earns its
+> attribution from the *comparison*, not from either series alone. If neither row
+> matches cleanly, say so in the incident channel rather than picking the closest.
+
+#### Step 2 — clients publishing outside a session's lifetime
+
+Expected in small numbers: a client reconnecting to a handler it already holds a
+`SendDirective` for can race the new connection's setup. That floor is why the
+alert is a ratio over 30 minutes rather than an occurrence trigger.
+
+Escalate beyond the floor when the rate is sustained and **not** correlated with
+reconnect churn:
+
+```promql
+# Is this reconnect churn, or steady-state client misbehaviour?
+sum(rate(mh_webtransport_connections_total{status="accepted"}[30m]))
+sum by(outcome) (rate(mh_media_session_starts_total[30m]))
+```
+
+- Rate tracks connection churn ⇒ setup races. Expected; watch, do not page anyone.
+- Rate is flat-and-high while churn is low ⇒ a client build is publishing before
+  its `SendDirective` or after teardown. **Owner: client.** Identify the client
+  version from the join path; MH cannot attribute this from its own metrics.
+- `mh_media_session_starts_total{outcome=~"declined_.*"}` also climbing ⇒ you are
+  probably looking at an MC-availability incident, not this one. The declined-path
+  datagrams are counted separately on `reason="no_media_session"` **precisely so
+  they cannot land in this alert** — if you see both, work Scenario 15 first and
+  come back.
+
+#### Step 3 — quinn's receive buffer evicting under scheduling pressure
+
+This is the MH-owned cause and, if the inequality below holds, it is a **sizing
+defect, not a transient.**
+
+**Confirm the relationship before concluding it — do not take this step's word
+for it.** The conclusion here is an inequality between two constants that live in
+`crates/mh-service/src/config.rs`, and either can be retuned without anyone
+editing this runbook. Read the current values:
+
+| Constant | What it bounds |
+|---|---|
+| `DATAGRAM_RECEIVE_BUFFER_BYTES` | quinn's ingress datagram buffer, in **bytes** |
+| `NOMINAL_AUDIO_FRAME_BYTES` | one 20 ms audio frame, for converting the above into frames |
+| `INGRESS_QUEUE_FRAMES` | MH's own per-connection ingress ring, in **frames** |
+
+**The defect is present when `DATAGRAM_RECEIVE_BUFFER_BYTES / NOMINAL_AUDIO_FRAME_BYTES`
+is LESS THAN `INGRESS_QUEUE_FRAMES`** — quinn's buffer holds fewer frames than
+MH's own ring, so quinn evicts before MH's ring ever reaches its bound. MH sheds
+silently, and `reason="ingress_queue_overflow"` may never fire at all. Each frame
+is 20 ms, so the frame counts convert directly to absorption windows.
+
+**If the inequality does NOT hold on the values you just read, this step is not
+your cause** — MH's ring binds first, `ingress_queue_overflow` is the counter
+that should be moving, and you should return to Step 2. It also means the
+`docs/TODO.md` entry below was closed without this runbook being updated; say so
+in the incident channel.
+
+At the values current when this step was written the inequality held with roughly
+a factor of two, which is what the `docs/TODO.md` entry (§Devloop… — search
+`ingress_queue_overflow`) records and argues for fixing. **That entry carries the
+arithmetic; this step deliberately does not restate it**, because a stale
+inequality here is a wrong diagnosis under time pressure rather than a confusing
+one.
+
+```promql
+# If Step 3 is the cause, these correlate. If they don't, reconsider Step 2.
+rate(container_cpu_usage_seconds_total{container="mh-service"}[5m])
+sum by(reason) (rate(mh_media_frames_dropped_total{direction="ingress"}[30m]))
+```
+
+- Correlates with CPU pressure or pod restarts ⇒ scheduling starvation outlasted
+  quinn's absorption window (the frame count you computed above, times 20 ms).
+  Relieve the pressure (Scenario 8); the loss stops.
+- `ingress_queue_overflow` reading **zero while `transport_receive_dropped`
+  rises** is the expected shape, not a contradiction — it is the inversion above.
+  Do not treat the zero as evidence MH's ring is healthy.
+- **There is no config knob to turn.** `DATAGRAM_RECEIVE_BUFFER_BYTES` is a
+  compile-time constant, and raising it is a wire-visible change because quinn
+  derives the advertised `max_datagram_frame_size` from the same field. The
+  ordering defect and the missing startup validation (the ingress-side counterpart
+  to `ConfigError::EgressQueueDoesNotBindFirst`) are tracked in `docs/TODO.md`.
+  **Do not hand-patch the constant during an incident.**
+
+#### Step 4 — counter inflation rather than loss
+
+If the rise is confined to a narrow set of connections and `forwarded{ingress}`
+for those meetings looks normal, the likely reading is a client sending datagrams
+with an unmatched HTTP/3 session-id varint — counted by quinn, discarded by
+`wtransport`, never loss at all.
+
+MH cannot distinguish inflation from loss on its own metrics; that is a ceiling of
+this signal, not a gap in this procedure. Corroborate from the client side, and if
+the pattern looks deliberate rather than a build defect, treat it as a probing
+signal and notify the Security owner — the same routing as
+`MHCallerTypeRejected` (Scenario 7).
+
+> **This step, and only this step, rests on a `wtransport` implementation
+> detail** — that an unmatched session-id varint is counted at frame-decode and
+> discarded above it. Verified against 0.7.1; `Cargo.lock` pins 0.7.2. If a
+> future version drops such datagrams before quinn's counter, **this cause
+> disappears and Step 4 becomes dead procedure** — the reading would then be
+> genuine loss and belongs in Step 2 or 3. Re-check on any `wtransport` upgrade.
+> Steps 1-3 and the alert's `warning` severity do **not** depend on this: the
+> alert is a ratio for an independent reason (a sustained MC outage dominates the
+> numerator), so the rule shape survives even if this paragraph does not.
+
+#### What NOT to do
+
+- **Do not restart MH pods.** The incident already ended; a restart destroys the
+  connection-close accounting that would have told you the scale.
+- **Do not use this counter as an SLI or in a capacity calculation.** It is
+  client-inflatable and an upper bound. This is why no burn-rate rule rests on it.
+- **Do not read a flat series as ingress health** during an open incident. See
+  the forensic note at the top.
+
+**Related Alerts**: `MHHighCPU` / `MHHighMemory` (Scenario 8 — the pressure that
+drives Step 3), `MHMediaSessionDeclineRate` (Scenario 15 — work it first if both
+fire), `MHCallerTypeRejected` (Scenario 7 — the Step 4 escalation route).
 
 ---
 

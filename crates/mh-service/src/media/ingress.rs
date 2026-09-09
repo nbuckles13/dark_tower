@@ -57,6 +57,71 @@ pub enum LoopExit {
     Cancelled,
 }
 
+/// How many datagrams [`run_ingress`] took off the transport, for one
+/// connection.
+///
+/// # This type exists to make a privacy hazard a COMPILE ERROR
+///
+/// At one 20 ms Opus frame per datagram, a per-connection count of received
+/// media frames **is talk duration for that participant**. It is the same class
+/// of value this module's docs bar `DecodeError`'s `Display` from carrying out
+/// of `media/`, and for the same reason: the sibling that formats it into a log
+/// line rebuilds the voice-activity trace by a route the directory-scoped macro
+/// deny structurally cannot see — the walker looks for macros *under* `media/`,
+/// not for a sibling logging a value that came *out* of it.
+///
+/// The hazard is concrete rather than theoretical. Widening this loop's return
+/// type breaks the homogeneous `[("ingress", …), ("forward", …), ("egress", …)]`
+/// teardown array in `crate::webtransport::connection`, forcing a hand-written
+/// ingress arm — and that module logs `connection_id` beside `participant_id`
+/// eighty lines later, so the two are joinable.
+///
+/// So: **no `Display`, no `Debug`, no derive of either, a private field, and no
+/// accessor that returns the count.** The only method is
+/// [`Self::unread_since`], which consumes the value and yields the *difference*
+/// against a received total. A sibling therefore cannot obtain the count at
+/// all — only the residual, which is near-zero in health and is not a
+/// talk-duration proxy. Same remedy as [`crate::media::forward::IngressFrame`]'s
+/// hand-rolled `Debug`, taken one step further because here nothing legitimate
+/// needs to read the number.
+///
+/// # Deliberately NOT a metric, and no counter formula reconstructs it
+///
+/// This is task-local and is never published as a series, and the reason is
+/// **not** that it duplicates existing counters — an earlier draft of this
+/// paragraph claimed it equalled
+/// `forwarded{ingress} + dropped{ingress_queue_overflow} + dropped{oversize_datagram}`,
+/// then equalled that plus `dropped{no_policy}`, and **both were wrong**.
+/// `frames_read` is not reconstructible from the drop vocabulary at all: a
+/// frame counted here can terminate in a codec reject (which returns before the
+/// `forwarded{ingress}` increment), in `no_policy` (whose branch deliberately
+/// does not increment it), or in the ring residue left when the forward loop's
+/// `select!` cancels without draining — counted here, forwarded never, dropped
+/// never. **No formula is stated in its place**, deliberately: enumerating an
+/// accounting identity that interacts with `forward_one`'s disposition set
+/// would rot the first time that set changes, which is the same trap the
+/// deleted ordinals in `crate::observability::metrics` were.
+///
+/// The real justification stands on its own and always did: what makes this
+/// value worth having is that it is **per-connection and exact at teardown**,
+/// which no aggregate counter can give across a scrape boundary. That is why it
+/// exists, and equally why it must not be published — a per-connection media
+/// frame count is the talk-duration hazard the type above exists to contain.
+pub struct FramesRead(u64);
+
+impl FramesRead {
+    /// Datagrams the QUIC connection received that this loop never read.
+    ///
+    /// Consumes `self`: the count is spent here and cannot be observed
+    /// elsewhere. `saturating_sub` because the two counts are sampled from
+    /// different sources and a transient skew must not wrap into a vast
+    /// bogus reading.
+    #[must_use]
+    pub const fn unread_since(self, received: u64) -> u64 {
+        received.saturating_sub(self.0)
+    }
+}
+
 /// A queue of datagrams accepted off the transport, awaiting forwarding.
 pub type IngressQueue = SharedQueue<IngressFrame>;
 
@@ -70,17 +135,28 @@ pub async fn run_ingress<T: MediaTransport>(
     queue: Arc<IngressQueue>,
     context: Arc<MediaTaskContext>,
     cancel: CancellationToken,
-) -> LoopExit {
+) -> (LoopExit, FramesRead) {
+    // Loop-local, non-atomic, returned rather than shared — see `FramesRead`
+    // for why it is neither a metric nor loggable. One `u64 += 1` per datagram
+    // is not a §11 concern: no macro form, no allocation, no registry lookup,
+    // no clock read.
+    let mut frames_read = 0_u64;
     loop {
         let payload = tokio::select! {
-            () = cancel.cancelled() => return LoopExit::Cancelled,
+            () = cancel.cancelled() => return (LoopExit::Cancelled, FramesRead(frames_read)),
             received = transport.recv_datagram() => match received {
                 Ok(payload) => payload,
                 Err(TransportError::ConnectionClosed | TransportError::StreamClosed) => {
-                    return LoopExit::ConnectionClosed
+                    return (LoopExit::ConnectionClosed, FramesRead(frames_read))
                 }
             },
         };
+
+        // Counted the instant it leaves the transport, BEFORE the size cap, so
+        // the tally is "what this loop took off the wire" and not "what it
+        // liked". A cap rejection is still a datagram quinn delivered and MH
+        // read, and must not reappear as unread.
+        frames_read = frames_read.saturating_add(1);
 
         // MEASUREMENT clock: real elapsed time, never paused.
         let received_at = Instant::now();

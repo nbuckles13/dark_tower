@@ -24,20 +24,14 @@
 //!    unregistered for a real meeting; (c) shortening the timeout requires
 //!    infra changes that would create a dev-vs-prod behavioral gap.
 //! 7. `test_mh_forwards_an_audio_datagram_back_to_its_sender` — R-15/R-18
-//!    loopback forward path, `#[ignore]`d pending story task 26 alone — task 25
-//!    landed, so MC steering now follows the forwarding assignment and this
-//!    fixture follows the send directive (the reason is on the attribute). It proves COMPOSITION: real MC join programs
-//!    real MH, MC's `NotifyParticipantConnectedResponse` carries an ordinal MH
-//!    accepts, and a real v2 frame returns over real QUIC rewritten only in its
-//!    relay region. **The binding contract it depends on has LANDED and is not
-//!    what blocks it**: task 24 shipped
-//!    `NotifyParticipantConnectedResponse.sender_id`, MC's send side and MH's
-//!    receive side, verified live (`resolved` x4, `started` x4). What blocks it
-//!    is (25) client steering being decoupled from edge placement and (26) an
-//!    MH datagram receive-path gap; un-ignoring it is task 26's definition of
-//!    done, and `docs/TODO.md`'s R-15 entry is the durable record. Being a
-//!    single-participant loopback it CANNOT prove the binding is the right one
-//!    — see its own doc comment. That is
+//!    loopback forward path, and it RUNS: the `#[ignore]` came off at story
+//!    task 26, whose diagnosis found no MH receive-path defect to fix (MH was
+//!    byte-identical since task 24 and this test passed unmodified). It proves
+//!    COMPOSITION: real MC join programs real MH, MC's
+//!    `NotifyParticipantConnectedResponse` carries an ordinal MH accepts, and a
+//!    real v2 frame returns over real QUIC rewritten only in its relay region.
+//!    Being a single-participant loopback it CANNOT prove the binding is the
+//!    right one — see its own doc comment. That is
 //!    `crates/mh-service/tests/media_session_binding_integration.rs`
 //!    (two participants, two meetings); forward-path mechanics stay in
 //!    `crates/mh-service/tests/media_forward_integration.rs`.
@@ -1571,43 +1565,42 @@ fn mh_connection_promql() -> String {
 /// relay-region-only rewrite, hop sequencing, the fail-closed trio — remain in
 /// `crates/mh-service/tests/media_forward_integration.rs`.
 ///
-/// # Why it is still `#[ignore]`d, and what that does NOT mean
+/// # Why this was `#[ignore]`d for three sessions, and what was actually wrong
 ///
-/// The `#[ignore]` this test carried is **no longer waiting on the contract
-/// field, and no longer waiting on MC steering either**:
+/// **Nothing in MH.** The attribute came off at story task 26 after a
+/// live-cluster diagnosis found that **there was no MH datagram receive-path
+/// defect at all**: `crates/mh-service/` is byte-identical between task 24's
+/// commit and task 25's (`git diff cc56d7fc..d090c753 -- crates/mh-service/` is
+/// empty), and this test passed against the cluster **unmodified**, three runs
+/// of three. Task 25's client steering is what unblocked it.
 ///
-/// - **Task 24 landed** `internal.proto`
-///   `NotifyParticipantConnectedResponse.sender_id`, MC's send side and MH's
-///   receive side, and the live cluster shows the binding working end to end
-///   (`resolved` x4 -> `started` x4, with the fail-closed arm counted
-///   `participant_unknown` x1 -> `declined_no_sender_binding` x1).
-/// - **Story task 25 (meeting-controller) LANDED.** MC's forwarding assignment
-///   is now the single source of truth for BOTH client-facing sides, and this
-///   fixture follows the directive instead of `media_servers.first()`:
-///   [`follow_mc_steering`] declares a receive capability, reads the
-///   `SendDirective`, and cross-checks that the active `StreamAssignment` names
-///   the same handler. `JoinResponse.media_servers` remains connection bootstrap
-///   data and is explicitly non-authoritative — it is deliberately NOT sorted, so
-///   that selecting off its head fails loudly rather than passing for the wrong
-///   reason (see the refusal comment at MC's `media_servers` builder,
-///   `crates/mc-service/src/webtransport/connection.rs`). The instance-agnostic
-///   ordering gate is gone too: the gate below now keys on the SAME MH instance
-///   this client was steered to, discovered empirically from its own connection.
+/// The reading that funded task 26 — `mh_media_frames_forwarded_total` at 0 and
+/// every `mh_media_frames_dropped_total{reason}` series at 0, therefore
+/// "datagrams are not reaching the routing lookup at all" — was taken over a
+/// pod lifetime in which this test was `#[ignore]`d, and **this test is the
+/// only thing in the tree that sends a media datagram.** Every other scenario in
+/// this file opens a WebTransport connection, starts a media session and sends
+/// nothing, so `mh_media_session_starts_total{outcome="started"}` climbing
+/// beside flat frame series is what a HEALTHY suite looks like. The inference
+/// required that a datagram had been sent; none had.
 ///
-/// **One defect keeps this red**, and it is not this file's:
+/// Measured directly rather than argued: 40 datagrams sent to a handler holding
+/// no edge for the sender produce `forwarded{direction="ingress"}` +40 **and**
+/// `dropped{reason="no_subscriber"}` +40. The no-route drop the escalation
+/// reported missing was never missing.
 ///
-/// - **Story task 26 (media-handler)** — the datagram receive path. With the
-///   session started and a policy installed, `mh_media_frames_forwarded_total`
-///   is 0 **and every** `mh_media_frames_dropped_total{reason}` series is 0 on
-///   both instances, so datagrams are not reaching the routing lookup at all.
+/// # What the diagnosis DID find, and why task 26 was not a no-op
 ///
-/// **Deleting this `#[ignore]` and this test passing is task 26's stated
-/// definition of done.** The durable record is `docs/TODO.md`'s R-15 entry, which
-/// stays open until all four parts of its closure condition hold. Note also that
-/// the withdrawn root cause — "MC computes the assignment before the
-/// participant's media connection exists, so `edge_count: 0`" — is FALSE:
-/// `build_routing_input` chains the joiner on, N=1 yields a reflexive self-edge,
-/// and `edge_count: 0` on the non-placed handler is correct by design.
+/// A real hole, one layer above where anyone was looking. Datagrams arriving on
+/// a connection before its ingress loop exists are evicted inside quinn's
+/// datagram receive buffer with only a `debug!` and no counter anywhere in MH —
+/// 60 datagrams sent on one connection yielded 47 counted and 13 that vanished.
+/// An operator could not distinguish "the client sent nothing" from "MH threw it
+/// away", which is precisely the distinction three consecutive sessions failed
+/// to make. `mh_media_frames_dropped_total{reason="transport_receive_dropped"}`
+/// and `{reason="no_media_session"}` are what close it; their component-tier
+/// firing paths are in
+/// `crates/mh-service/tests/media_session_binding_integration.rs`.
 ///
 /// # Ordering is gated on a metric delta, never a sleep — and on the RIGHT pod
 ///
@@ -1629,19 +1622,6 @@ fn mh_connection_promql() -> String {
 /// connects, then asks which instance's connection counter rose. See the three
 /// gate steps in the body for what each one proves and how it fails.
 #[tokio::test]
-#[ignore = "blocked on story task 26 ONLY, and neither on the binding contract nor on MC steering. \
-            Task 24 landed NotifyParticipantConnectedResponse.sender_id and the live cluster binds \
-            on it and starts the media session (resolved x4, started x4). Task 25 LANDED: MC's \
-            forwarding assignment is now the single source of truth for both the send directive's \
-            target and the stream assignment's handler address, this fixture follows the directive \
-            instead of media_servers.first(), and the ordering gate below keys on the SAME MH \
-            instance the client was steered to (discovered from its own connection, not from any \
-            topology table). Task 26 (media-handler) is the remaining defect: the MH datagram \
-            receive-path gap - mh_media_frames_forwarded_total is 0 AND every \
-            mh_media_frames_dropped_total{reason} series is 0 on both instances, so datagrams \
-            never reach the routing lookup. Deleting this attribute and this test passing is task \
-            26's definition of done; the durable record is docs/TODO.md's R-15 entry, which stays \
-            open. See this test's own doc comment for the anchors"]
 #[serial_test::serial(mh_notifications)]
 async fn test_mh_forwards_an_audio_datagram_back_to_its_sender() {
     let cluster = cluster().await;
@@ -1804,12 +1784,13 @@ async fn test_mh_forwards_an_audio_datagram_back_to_its_sender() {
     // They are not belt-and-braces; do not remove any of them as redundant, and
     // do not read this list as closed.
     //
-    // NOTE: this orchestration is UNEXERCISED while the test is `#[ignore]`d.
-    // Nothing runs it until task 26 un-ignores R-15, so its correctness rests on
-    // review plus the unit coverage of the pure predicates it leans on
-    // (`instances_exceeding_baseline` and friends, in
-    // `env_tests::fixtures::metrics`). That is why as much decision logic as
-    // possible lives there rather than here.
+    // This orchestration RUNS as of story task 26 — the `#[ignore]` is gone and
+    // Layer 7 invokes it in the default set. It was written unexercised, so its
+    // first real exercise was that task's DoD run; the reason as much decision
+    // logic as possible still lives in `env_tests::fixtures::metrics`
+    // (`instances_exceeding_baseline` and friends) is that those predicates are
+    // unit-tested, while this body can only be exercised against a live
+    // cluster.
     // ------------------------------------------------------------------
 
     // STEP 1 was performed ABOVE, before the MC join — see the `tokio::join!`

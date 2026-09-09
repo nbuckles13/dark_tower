@@ -75,14 +75,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::observability::testing::MetricAssertion;
+use media_protocol::codec::ALL_REJECT_REASONS;
 use mh_service::auth::MhJwtValidator;
+use mh_service::config::DATAGRAM_RECEIVE_BUFFER_BYTES;
 use mh_service::grpc::McClient;
-use mh_service::observability::metrics::MediaSessionStartOutcome;
+use mh_service::observability::metrics::{
+    MediaDirection, MediaDropReason, MediaSessionStartOutcome,
+};
 use mh_service::routing::{MeetingKey, SenderId};
 use mh_service::session::{MeetingRegistration, SessionManagerHandle};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::jwks_rig::JwksRig;
+use test_common::media_frame::audio_datagram;
 use test_common::mock_mc::{
     start_mock_mc_server, MockBehavior, MockMcHandle, MockMcServer, SenderReplies,
 };
@@ -232,6 +237,45 @@ impl BindingSuite {
             .await
             .expect("failed to write MhClientMessage frame");
         (conn, send, recv)
+    }
+
+    /// Connect, flood `count` datagrams BEFORE writing the connect envelope,
+    /// then complete the handshake as `participant_id`.
+    ///
+    /// The pre-envelope window is the whole point: MH has not validated a token,
+    /// has not asked MC for a binding and has spawned no ingress loop, so
+    /// nothing on the server reads a datagram. They land in quinn's receive
+    /// buffer, which is bounded by `DATAGRAM_RECEIVE_BUFFER_BYTES`, and the
+    /// oldest are evicted with only a `debug!` inside `quinn-proto`.
+    ///
+    /// Returns the datagrams the client successfully handed to its transport —
+    /// the `Ok` count, not `count` — because that is the only number the
+    /// assertions may treat as "sent".
+    async fn connect_flooding_first(
+        &self,
+        meeting_id: &str,
+        participant_id: &str,
+        count: u32,
+    ) -> (
+        wtransport::Connection,
+        wtransport::stream::SendStream,
+        wtransport::stream::RecvStream,
+        u64,
+    ) {
+        let token = mint_meeting_token(&self.jwks.keypair, meeting_id, participant_id);
+        let (conn, mut send, recv) = connect_and_open_bi(&self.wt.url).await;
+
+        let mut sent = 0_u64;
+        for sequence in 0..count {
+            if conn.send_datagram(audio_datagram(sequence, 0x5A)).is_ok() {
+                sent = sent.saturating_add(1);
+            }
+        }
+
+        write_mh_connect(&mut send, &token)
+            .await
+            .expect("failed to write MhClientMessage frame");
+        (conn, send, recv, sent)
     }
 
     /// The ordinal the mock says it allocated to `participant_id`, as a
@@ -857,4 +901,361 @@ fn any_binding_exists(session_manager: &SessionManagerHandle, meeting: &MeetingK
                 .is_some()
         })
     })
+}
+
+/// Poll a counter until its delta reaches `minimum`, or fail at `budget`.
+///
+/// # Why this exists rather than a fixed settle
+///
+/// Every emission these two tests assert on is written by a task the test does
+/// not join: the media loops for the teardown delta, and
+/// `close_declined_connection`'s caller for the decline count. A fixed
+/// `sleep(N)` gates a deterministic assertion on scheduler timing — a too-short
+/// margin reds a correct implementation under CI load, which is a flaky red,
+/// and ADR-0028's zero-retry policy means a flaky red is a broken test rather
+/// than a retryable one. Polling removes the guess: it returns as soon as the
+/// observable lands and only spends the budget when nothing ever will.
+///
+/// `MetricAssertion`'s counter reads are non-destructive (`take_entries` drains
+/// histograms, not counters — see its module docs), so the same snapshot can be
+/// read repeatedly here and asserted on afterwards.
+///
+/// The budget is generous on purpose. It is not a latency expectation and must
+/// never be read as one: nothing here asserts that the emission is *fast*, only
+/// that it happens. A test that failed because the budget was tight would be
+/// reporting the wrong thing.
+async fn poll_counter_until(
+    snap: &common::observability::testing::MetricSnapshot,
+    labels: &[(&str, &str)],
+    minimum: u64,
+    budget: Duration,
+    what: &str,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let observed = snap
+            .counter("mh_media_frames_dropped_total")
+            .with_labels(labels)
+            .delta();
+        if observed >= minimum {
+            return observed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: waited {budget:?} for mh_media_frames_dropped_total{labels:?} to reach \
+             {minimum} and it reached {observed}. This is the emission never landing, NOT a \
+             latency budget — the counter is written by a task this test does not join, and the \
+             budget exists only so a hang fails instead of hanging"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// As [`poll_counter_until`], but over the DERIVED ingress-drop sum rather than
+/// a single series — the same reason [`ingress_drop_total`] exists.
+async fn poll_ingress_drops_until(
+    snap: &common::observability::testing::MetricSnapshot,
+    minimum: u64,
+    budget: Duration,
+    what: &str,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let observed = ingress_drop_total(snap);
+        if observed >= minimum {
+            return observed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: waited {budget:?} for the ingress-direction drop total to reach {minimum} \
+             and it reached {observed}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Sum of every `mh_media_frames_dropped_total` series carrying
+/// `direction="ingress"`, across BOTH families that share the `reason` label
+/// space.
+///
+/// # Why this is a hand-rolled sum and not `with_labels(&[("direction", "ingress")])`
+///
+/// `MetricAssertion`'s label filter selects the FIRST entry whose labels are a
+/// superset of the filter — it does not aggregate. A one-label filter over a
+/// multi-series family therefore returns one arbitrary member and looks exactly
+/// like a total. That is a vacuity hazard, and it bit this very test during
+/// development: the "sum" read back the eviction term alone, which made a
+/// non-vacuity check trivially true.
+///
+/// The reason list is DERIVED — `MediaDropReason::ALL` filtered by its own
+/// `direction()`, plus the codec family from `ALL_REJECT_REASONS`, which
+/// `resolve_media_handles` registers as `ingress` wholesale. A hand-written
+/// token list here would go stale the next time either vocabulary grows, and
+/// would go stale silently, in the direction of under-counting.
+fn ingress_drop_total(snap: &common::observability::testing::MetricSnapshot) -> u64 {
+    let mh_local: u64 = MediaDropReason::ALL
+        .iter()
+        .filter(|reason| reason.direction() == MediaDirection::Ingress)
+        .map(|reason| {
+            snap.counter("mh_media_frames_dropped_total")
+                .with_labels(&[
+                    ("reason", reason.as_str()),
+                    ("direction", MediaDirection::Ingress.as_str()),
+                ])
+                .delta()
+        })
+        .sum();
+
+    let codec: u64 = ALL_REJECT_REASONS
+        .iter()
+        .map(|reason| {
+            snap.counter("mh_media_frames_dropped_total")
+                .with_labels(&[
+                    ("reason", reason.as_str()),
+                    ("direction", MediaDirection::Ingress.as_str()),
+                ])
+                .delta()
+        })
+        .sum();
+
+    mh_local.saturating_add(codec)
+}
+
+// ---------------------------------------------------------------------------
+// Datagrams that arrive when no reader exists (story task 26)
+//
+// These are the firing paths for the two ingress tokens the task-26 diagnosis
+// added. Both are written against a REAL wtransport/quinn connection rather
+// than the transport double, because the defect they pin lives in quinn's
+// receive buffer: a double has no buffer to evict from and would be green
+// against any implementation.
+// ---------------------------------------------------------------------------
+
+/// Datagrams arriving before the ingress loop exists are COUNTED, not silently
+/// evicted.
+///
+/// # What was actually broken, since the token's name does not say it
+///
+/// Nothing in MH's forwarding. Story task 26's premise — an MH datagram
+/// receive-path defect — was falsified on the live cluster: `crates/mh-service/`
+/// was byte-identical across the two commits either side of the failure, and
+/// the R-15 env-test passed unmodified. What the diagnosis found instead is
+/// this: 60 datagrams sent on one connection produced 47 counted, and the other
+/// 13 were evicted inside quinn's receive buffer with only a `debug!` and no
+/// counter anywhere in MH. An operator could not distinguish "the client sent
+/// nothing" from "MH threw it away", which is exactly the distinction three
+/// consecutive sessions failed to make.
+///
+/// # Eviction here is ARITHMETIC, not timing — the property that keeps this pin
+/// deterministic
+///
+/// (a) `DATAGRAM_RECEIVE_BUFFER_BYTES` is a compile-time constant and this rig
+/// goes through the same `build_transport_config` production does; (b) the
+/// burst's TOTAL BYTES exceed that window several times over, and quinn's
+/// admission check is on cumulative `incoming.memory_used()`, so once the sum
+/// passes the window it MUST evict; (c) nothing drains the window — no ingress
+/// loop exists yet, and `recv_datagram` has exactly one caller in the whole
+/// service. A scheduling hiccup can change WHICH datagrams survive; it cannot
+/// make the buffer hold more bytes than it has.
+///
+/// The lower bound below assumes the burst reaches quinn with negligible
+/// transit loss. True on this loopback rig; **NOT true if this assertion is
+/// ever ported to a lossy harness**, where it would have to become a bound on
+/// what the client observed rather than on what it sent.
+#[tokio::test(flavor = "current_thread")]
+async fn datagrams_arriving_before_the_ingress_loop_are_counted_not_silently_evicted() {
+    // SNAPSHOT FIRST, before the rig starts — this ordering is load-bearing and
+    // it is NOT the pattern the other tests in this file use.
+    //
+    // The forward path counts through handles `resolve_media_handles()` returns,
+    // and a `metrics` handle binds to whichever recorder is installed when it is
+    // RESOLVED, not when it is incremented. `AcceptLoopRig::start_with` resolves
+    // them, so a snapshot taken afterwards installs a recorder those handles
+    // will never write to — every handle-based counter then reads zero while the
+    // macro-emitted ones (session outcomes, and the two tokens this file's other
+    // arms assert) read correctly. That mixture is exactly the kind of green
+    // this test exists to disprove, and it caught this test during development:
+    // the ingress total read back the eviction term alone. The arms above are
+    // unaffected because they assert only macro-emitted series.
+    // `media_metrics_integration.rs` uses the same snapshot-then-resolve order.
+    let snap = MetricAssertion::snapshot();
+
+    let replies = SenderReplies::default().with("participant-early", SENDER_FIRST_TO_CONNECT);
+    let suite = BindingSuite::start(MockBehavior::Accept, replies).await;
+    suite.register("meeting-early-datagrams").await;
+
+    // Several times the receive window, so eviction is forced by arithmetic.
+    let burst = 40_u32;
+    let (conn, _send, _recv, sent) = suite
+        .connect_flooding_first("meeting-early-datagrams", "participant-early", burst)
+        .await;
+    // Wait on the OBSERVABLE, not on a stopwatch: at least one datagram has
+    // reached `forward_one`. That is the precondition the non-vacuity floor
+    // below depends on, and it is what proves the media session actually
+    // started and its ingress loop drained the buffer survivors. This rig
+    // installs no forwarding policy, so those frames land on `no_policy` —
+    // an ingress-direction drop, hence visible in the sum.
+    poll_ingress_drops_until(
+        &snap,
+        1,
+        Duration::from_secs(10),
+        "media session never read a datagram",
+    )
+    .await;
+
+    // The delta is emitted at TEARDOWN, so the connection has to end first.
+    drop(conn);
+    let unread = poll_counter_until(
+        &snap,
+        &[
+            ("reason", "transport_receive_dropped"),
+            ("direction", "ingress"),
+        ],
+        1,
+        Duration::from_secs(10),
+        "teardown delta never emitted after the connection was dropped",
+    )
+    .await;
+
+    // POSITIVE CONTROL — the counter FIRED, and by at least the amount the
+    // window arithmetic forces. Without this the test would pass against an
+    // implementation that never increments.
+    let survivable = DATAGRAM_RECEIVE_BUFFER_BYTES
+        .div_ceil(audio_datagram(0, 0x5A).len())
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let floor = sent.saturating_sub(survivable);
+    assert!(
+        unread >= floor,
+        "transport_receive_dropped must count the datagrams quinn evicted before the ingress \
+         loop existed: {sent} sent into a {DATAGRAM_RECEIVE_BUFFER_BYTES} B window, so at least \
+         {floor} could not have survived, but only {unread} were counted"
+    );
+
+    let forwarded = snap
+        .counter("mh_media_frames_forwarded_total")
+        .with_labels(&[("direction", "ingress")])
+        .delta();
+    let ingress_drops = ingress_drop_total(&snap);
+
+    // NON-VACUITY — at least one datagram was actually READ by the ingress
+    // loop. Without it every assertion here is satisfiable by a run in which
+    // nothing was sent at all, which is precisely the state that funded story
+    // task 26.
+    //
+    // Stated over the WHOLE accounted set, not over either half of it, and both
+    // halves were tried and are wrong on their own:
+    //
+    // - `forwarded{ingress} >= 1` fails HERE. This rig installs no forwarding
+    //   policy, so a read frame lands on `no_policy`, which deliberately does
+    //   not increment `forwarded{ingress}` — there is no ingress attempt to
+    //   keep whole when the control plane never programmed the handler.
+    // - `ingress_drops > unread` fails in the OPPOSITE world. `ingress_drops`
+    //   already contains the eviction term, so that form asserts "some read
+    //   frame produced an ingress DROP" — true here, but false the moment a
+    //   policy is installed and frames forward cleanly, at which point it
+    //   would red a correct implementation while claiming nothing reached the
+    //   forward path.
+    //
+    // Either addend alone is a partial view of "was anything read", because a
+    // read frame may terminate in either one. The sum is what the ingress
+    // identity actually defines, and it holds in both worlds.
+    assert!(
+        forwarded + ingress_drops > unread,
+        "fixture precondition: at least one datagram must have been READ by the ingress loop, \
+         but the whole accounted ingress set ({forwarded} forwarded + {ingress_drops} dropped) \
+         is explained by the eviction term ({unread}) alone — so nothing reached the forward \
+         path and the assertions above are vacuously true over an empty set"
+    );
+
+    // ANTI-DOUBLE-COUNT — the invariant in the direction that can actually
+    // fail. The eviction term carries `direction=ingress`, so it is ALREADY
+    // inside `ingress_drops` and must not be added a second time. An
+    // implementation that sampled quinn's received count at session start
+    // instead of differencing it at teardown would count the surviving buffered
+    // frames twice — once as forwarded or as a read-frame drop, once as
+    // evicted — and exceed what was ever sent. Loss only LOWERS the left side,
+    // so this can never flake.
+    assert!(
+        forwarded + ingress_drops <= sent,
+        "ingress accounting exceeded what was sent ({} forwarded + {} dropped > {} sent): a \
+         datagram has been counted twice, which is what sampling quinn's received total at \
+         session start rather than differencing it at teardown produces",
+        forwarded,
+        ingress_drops,
+        sent
+    );
+}
+
+/// Datagrams arriving on a connection whose media session is DECLINED are
+/// counted too — on their own token.
+///
+/// # Why this is a separate token rather than an arm of the other one
+///
+/// The MC client's retry budget lets a declined connection stay open for tens
+/// of seconds while a client publishes ~50 frames/s, so during an MC outage a
+/// shared token would be dominated by declines across a reconnect herd — the
+/// client-behaviour signal buried under a control-plane one exactly when both
+/// matter. `no_media_session` is also EXACT where the other is an upper bound:
+/// no ingress loop is ever spawned here, so every datagram this connection
+/// received is discarded.
+#[tokio::test(flavor = "current_thread")]
+async fn datagrams_arriving_on_a_declined_connection_are_counted_not_silently_discarded() {
+    // No reply for this participant: the mock answers 0, the contract's "MC has
+    // no answer", and the session is declined.
+    let (suite, mut disconnect_rx) =
+        BindingSuite::start_capturing_disconnects(MockBehavior::Accept, SenderReplies::default())
+            .await;
+    suite.register("meeting-declined-datagrams").await;
+
+    let burst = 40_u32;
+    let snap = MetricAssertion::snapshot();
+    let (_conn, _send, _recv, sent) = suite
+        .connect_flooding_first("meeting-declined-datagrams", "participant-unknown", burst)
+        .await;
+
+    // The decline's teardown is the sync point, exactly as the other decline
+    // arms use it — the notification is sent as the connection is torn down.
+    expect_reject_and_close(&mut disconnect_rx, "participant-unknown").await;
+
+    // ...but this arm needs a settle the others do not, and the reason is an
+    // ordering the sync point cannot see. `close_declined_connection` SENDS the
+    // disconnect notification and then returns, and the datagram count is
+    // sampled AFTER it returns — deliberately, so the MC-unavailable arm's
+    // jittered close window is inside the measurement rather than outside it.
+    // So the notification now arrives strictly BEFORE the emission it used to
+    // follow. Every other assertion below is on a counter written before the
+    // notify and needs no wait.
+    let counted = poll_counter_until(
+        &snap,
+        &[("reason", "no_media_session"), ("direction", "ingress")],
+        1,
+        Duration::from_secs(10),
+        "declined connection's datagram count never emitted",
+    )
+    .await;
+    // No `counted >= 1` assertion here: the poll above returns only once the
+    // count reaches 1, so such an assert could never fire. A control that reads
+    // as present and cannot fire is worse than an absent one — the
+    // `StreamRateLimited` lesson, and it was CREATED by the fix for @test's
+    // wall-clock finding rather than surviving it.
+    assert!(
+        counted <= sent,
+        "no_media_session counted {counted} datagrams but only {sent} were sent"
+    );
+
+    // PAIRING CONTROL — the connection really was declined. Without it a green
+    // could mean the decline never happened and the count came from somewhere
+    // else entirely.
+    assert_started_only(&snap, MediaSessionStartOutcome::DeclinedNoSenderBinding);
+
+    // The other token belongs to connections that HAD a loop. This one had
+    // none, so it must stay flat — which is what makes the two a partition
+    // rather than two names for one condition.
+    snap.counter("mh_media_frames_dropped_total")
+        .with_labels(&[
+            ("reason", "transport_receive_dropped"),
+            ("direction", "ingress"),
+        ])
+        .assert_delta(0);
 }

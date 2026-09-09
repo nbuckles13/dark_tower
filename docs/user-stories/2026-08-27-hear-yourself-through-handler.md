@@ -511,12 +511,13 @@ tasks:
   slug: 2026-09-08-mc-steer-client-to-edge-handler
   tag: story-2026-08-27-hear-yourself-through-handler-task-25
 - id: 26
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 24
   - 25
   prompt: 'Diagnose and fix the MH datagram receive-path gap found at the task-24 escalation (third session, docs/devloop-outputs/2026-09-05-sender-id-binding-contract/main.md): with the participant bound, the media session started (mh_media_session_starts_total{outcome=started} incremented), and a forwarding policy installed, a client-sent audio datagram produces NO effect — mh_media_frames_forwarded_total is 0 AND every mh_media_frames_dropped_total{reason} series is 0 on both handler instances, so datagrams are not reaching the routing lookup at all; a frame arriving at a handler with no matching edge should at minimum count a no-route drop. The gap is upstream of edge matching, somewhere between the QUIC connection''s datagram receive and the media ingress loop wired in story task 16 (crates/mh-service/src/media/ingress.rs, the transport trait''s receive path from tasks 5 and 12, and the session-start handoff in webtransport/connection.rs / session/). Candidate causes to check rather than assume: the ingress loop not being spawned for a bound connection, the datagram receive side of the WtMediaTransport impl never being polled, max_datagram_frame_size negotiation, or the receive loop reading from a different connection handle than the one the client sends on. Diagnose first on the live Kind cluster with the counters and logs; fix in MH; add the missing observable if one exists (a frame that arrives on a connection with no started media session, or before the ingress loop is live, must be counted, not silently dropped — the story''s drop-by-reason discipline). DEFINITION OF DONE: delete the #[ignore] on crates/env-tests/tests/26_mh_quic.rs::test_mh_forwards_an_audio_datagram_back_to_its_sender and the test passes against the live cluster — this closes story requirement R-15 and the docs/TODO.md §Media Path Obligations R-15 entry per its four-part closure condition. Depends on task 25 (client steering to the edge-bearing handler) so the test exercises the full corrected path. Zero-copy/no-macro/§11 constraints of the media directory unchanged; pair with test for the env-test fixture.'
+  slug: 2026-09-08-mh-datagram-receive-path-gap
   tag: story-2026-08-27-hear-yourself-through-handler-task-26
 ```
 

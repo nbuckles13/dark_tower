@@ -20,7 +20,9 @@ use crate::errors::MhError;
 use crate::grpc::McClient;
 use crate::media::forward::EgressQueue;
 use crate::media::forwarder::ConnectionForwarder;
-use crate::media::ingress::{run_egress, run_forward, run_ingress, IngressQueue, LoopExit};
+use crate::media::ingress::{
+    run_egress, run_forward, run_ingress, FramesRead, IngressQueue, LoopExit,
+};
 use crate::media::queue::SharedQueue;
 use crate::media::{MediaSetup, MediaTaskContext};
 use crate::observability::metrics;
@@ -418,6 +420,29 @@ pub async fn handle_connection(
                 outcome,
             )
             .await;
+            // Every datagram this connection received is discarded: no ingress
+            // loop is ever spawned on a declined session, so there is no reader
+            // to have taken any of them off the transport. No difference is
+            // needed here, and none is available — the whole received count IS
+            // the loss.
+            //
+            // Sampled AFTER the close, not before, and the ordering is the
+            // honest half of the claim. `close_declined_connection` awaits a
+            // gRPC notification, and on the MC-unavailable arm it also sleeps a
+            // jittered interval before closing — a client that is publishing
+            // sends throughout that window. Sampling first would have silently
+            // under-counted by exactly the traffic the decline arms take
+            // longest to shed, which is the case this token exists for.
+            //
+            // The residue that remains is the flight time of the QUIC close
+            // itself: a datagram already in the air when the close frame goes
+            // out is discarded and not counted here. Bounded by one RTT and
+            // stated rather than papered over — the catalog says "exact" about
+            // the no-reader property, not about a race with the wire.
+            metrics::record_media_frames_dropped(
+                metrics::MediaDropReason::NoMediaSession,
+                quic_datagram_frames_received(&connection),
+            );
             // Counted, closed, and NOT an error: returning `Ok` keeps the
             // decline off `mh_webtransport_connections_total{status="error"}`
             // (F9). The connection drops with this frame.
@@ -492,8 +517,72 @@ pub async fn handle_connection(
     session_manager
         .sender_bindings()
         .unbind(&meeting_key, media_session.sender, &connection_id);
+    // The ingress arm is awaited SEPARATELY from the other two, and only
+    // because it carries the frame tally the delta below needs.
+    //
+    // PRIVACY, and it is why this arm is hand-written rather than folded back
+    // into the array: the log statement here is BYTE-IDENTICAL to what the
+    // array emits for the other two loops, and `FramesRead` deliberately
+    // appears in no `tracing` field. A per-connection count of media frames is
+    // talk duration for this participant, `connection_id` is logged beside
+    // `participant_id` further down, and `crate::media::ingress`'s module docs
+    // bar exactly this — a sibling formatting a per-frame-derived value into a
+    // log line, by the second route a directory-scoped macro deny structurally
+    // cannot see. `FramesRead` has no `Display`, no `Debug` and no accessor
+    // returning the count, so adding a field here is a compile error rather
+    // than a review miss; do not "improve" this arm by logging the new value.
+    let frames_read = match media_session.ingress.await {
+        Ok((exit, frames_read)) => {
+            match exit {
+                LoopExit::ConnectionClosed => debug!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    loop_name = "ingress",
+                    "Media loop exited: connection closed"
+                ),
+                LoopExit::Cancelled => debug!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    loop_name = "ingress",
+                    "Media loop exited: cancelled"
+                ),
+            }
+            Some(frames_read)
+        }
+        Err(e) => {
+            warn!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                loop_name = "ingress",
+                error = %e,
+                "Media loop task failed"
+            );
+            None
+        }
+    };
+
+    // Datagrams quinn received on this connection that the ingress loop never
+    // read: evicted from quinn's receive buffer before the loop existed, shed
+    // mid-session while the loop was behind, or arrived after teardown.
+    //
+    // Read AFTER awaiting the ingress task, never before: a datagram arriving
+    // between the read and the loop's last `recv_datagram` would otherwise be
+    // counted as unread while the loop was about to read it.
+    //
+    // FAIL CLOSED TO SILENCE on a join error. Without `frames_read` the
+    // difference is unknowable, and publishing `frame_rx.datagram` alone would
+    // report every datagram this connection ever received as lost. A missing
+    // observation is recoverable; a confidently wrong one sends the next
+    // responder where this task's own escalation went. The join error itself is
+    // NOT silent — the `warn!` above carries it.
+    if let Some(frames_read) = frames_read {
+        metrics::record_media_frames_dropped(
+            metrics::MediaDropReason::TransportReceiveDropped,
+            frames_read.unread_since(quic_datagram_frames_received(&connection)),
+        );
+    }
+
     for (name, task) in [
-        ("ingress", media_session.ingress),
         ("forward", media_session.forward),
         ("egress", media_session.egress),
     ] {
@@ -564,11 +653,44 @@ pub async fn handle_connection(
     Ok(())
 }
 
+/// DATAGRAM frames this QUIC connection has received, from quinn's own frame
+/// accounting.
+///
+/// # `frame_rx.datagram`, NOT `udp_rx.datagrams` — one letter apart on the same struct
+///
+/// `frame_rx.datagram` (singular) counts QUIC **DATAGRAM frames**, which is what
+/// carries media. `udp_rx.datagrams` (plural, `quinn-proto`'s `UdpStats`) counts
+/// **UDP packets** on the connection, handshake and ACK-only packets included —
+/// reading it here would produce a counter that is badly wrong and entirely
+/// plausible-looking, and no test asserting merely "it went up" would catch it.
+///
+/// # Why this number sees frames MH never can
+///
+/// `quinn-proto`'s `connection/mod.rs` records `stats.frame_rx` on **every**
+/// decoded frame, before the datagram reaches the accept-or-evict decision in
+/// `connection/datagrams.rs`. That eviction loop discards the oldest queued
+/// datagram with a bare `debug!` and nothing else — no counter MH can read, no
+/// error surfaced to the application. So this is the only figure that includes
+/// datagrams evicted before any MH code ran, which is precisely the population
+/// [`MediaDropReason::TransportReceiveDropped`] exists to count.
+///
+/// # A STATS READ ONLY — this is not an I/O path
+///
+/// `quic_connection()` compiles here because `Cargo.toml` enables `wtransport`'s
+/// `quinn` feature for `with_custom_transport`. That does **not** license using
+/// the raw QUIC connection for datagram I/O: datagrams sent through it skip the
+/// HTTP/3 session-id varint and are unattributable to a WebTransport session.
+/// See the seam's clause on this in `crate::transport`. Nothing below reads or
+/// writes a datagram; it reads a counter quinn already maintains.
+fn quic_datagram_frames_received(connection: &wtransport::Connection) -> u64 {
+    connection.quic_connection().stats().frame_rx.datagram
+}
+
 /// The three media tasks one connection owns, plus the sender they are bound
 /// to.
 struct MediaSession {
     sender: SenderId,
-    ingress: tokio::task::JoinHandle<LoopExit>,
+    ingress: tokio::task::JoinHandle<(LoopExit, FramesRead)>,
     forward: tokio::task::JoinHandle<LoopExit>,
     egress: tokio::task::JoinHandle<LoopExit>,
 }
