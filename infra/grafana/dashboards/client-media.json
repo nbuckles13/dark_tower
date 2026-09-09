@@ -1,0 +1,1072 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Client SDK media-path counters. NON-FUNCTIONAL TODAY - the OTLP collector exports metrics to debug only and no Prometheus job scrapes it, so every panel reads 'No data'. See the READ FIRST banner before reading any panel. key_custody=operator: the client encrypts; MC holds the meeting KEK and can read; this is not end-to-end and not zero-trust (ADR-0036 \u00a74).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Dashboard-level premise notice. Read before any panel below.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        },
+        "content": "# THIS DASHBOARD IS NON-FUNCTIONAL IN ITS ENTIRETY TODAY\n\n**Every panel on this board renders 'No data', and none of it is a health signal.** The client SDK emits and exports these metrics correctly over OTLP-HTTP to the GC telemetry proxy, but the chain stops one hop short: the OTLP collector's metrics pipeline is `receivers: [otlp]` / `exporters: [debug]` (`infra/services/otel-collector/configmap.yaml`), which writes names and counts to the collector's own container log, and no Prometheus job scrapes the collector. So every series below is real, correctly labelled, and **not queryable**.\n\n**Do not read an empty panel on this board as 'nothing bad happened'.** That reading is correct on the Media Handler - Media Path drop panels and is WRONG here. Until the exporter lands, series-absent and series-present-at-zero are indistinguishable. Once both states are possible, discriminate with `count(dt_client_media_frames_received_total)`: no data means the pipeline is unwired; a number means the pipeline works and the counters are genuinely zero.\n\n**Why this board exists anyway.** Per ADR-0036 \u00a711 the client drop counters are the ONLY signal for a join or rotation path that has silently stopped delivering keys - MH never opens a frame and is structurally incapable of observing the condition. The board is built now so that wiring the exporter is the single remaining step rather than a dashboard nobody wrote. One alert already rests on the same premise (`MCMediaMissingKeyMaterial`): it is loaded, evaluating, and structurally incapable of matching.\n\n**Remedy and tracking**: `docs/TODO.md` \u00a7Observability Debt (collector metrics export), owner infrastructure for the wiring.\n\n**Key custody**: `key_custody=operator`. The client encrypts media; MC holds the per-meeting KEK and can read it; MH, transport and storage cannot. That is accepted operator custody, **not end-to-end and not zero-trust** (ADR-0036 \u00a74).\n\n**DELETE THIS BANNER when, and only when, the collector exports metrics and a Prometheus job scrapes it.** Not before, and not because the board looks pessimistic. A 'this board does not work' notice that outlives the fix trains responders to skip the board, and would be the last thing anyone thinks to delete.\n\nTriage for the key-material path: `docs/runbooks/mc-incident-response.md` Scenario 16: Missing Key Material.",
+        "mode": "markdown"
+      },
+      "pluginVersion": "9.5.3",
+      "targets": [],
+      "title": "READ FIRST - this board is not wired up yet",
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The two ends of the receive-path accounting identity received = accepted + sum(drops by reason), ratified in docs/observability/metrics/client.md. received is counted AT THE WIRE before any parse or verification; accepted is counted after the frame opened. A gap between them that the drop panel does not explain means the identity is broken and one of the three counters has a missing emission site. THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_frames_received_total[$__rate_interval]))",
+          "legendFormat": "received",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_frames_accepted_total[$__rate_interval]))",
+          "legendFormat": "accepted",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Receive Path - Frames Received / Accepted",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Frames the receive path could not open, by frozen reject reason. THE SIGNAL THIS BOARD EXISTS FOR: no_kek_for_generation and no_roster_entry are, per ADR-0036 \u00a711, the only signal for a join or rotation path that has silently stopped delivering keys - both are expected transiently at join and after a KEK rotation, and sustained is the fault. Split on reason FIRST; the two arms have different remedies and are not equally instrumented. EMPTY HERE IS NOT A STATEMENT ABOUT DROPS AT ALL. Today it means the export hop is unwired (see the banner), and it would look exactly the same whether or not frames were being dropped. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where an empty drop panel IS the healthy reading - a Prometheus counter materialises no series until first incremented. Do not carry that reading across to this board; once the exporter lands, an empty panel here will mean what it means there, and not before. The discriminator, once both states are possible: count(dt_client_media_frames_received_total) returning no data (series absent, pipeline unwired) versus returning a number (series present, counters genuinely at zero). No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(reason) (increase(dt_client_media_frames_dropped_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Path - Frame Drops by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Wrapped-key outcomes on frames that were ACCEPTED - neither value ever reaches the drop counter, and counting one as a drop would silently break the receive-path accounting identity. kek_generation_not_held is the KEK-ROTATION-LAG signal: the sender re-wrapped under a generation whose push has not landed, and the frame played off a cached transmit key. THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(dt_client_media_key_wrap_outcomes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Path - Non-Dropping Wrapped-Key Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Gap frames and reorder events on the downlink, plus terminal decoder errors. Gaps and reorders are network-shaped; decoder errors are terminal AudioDecoder failures and carry no reason label by design (AudioDecoder provides no bounded vocabulary, and an unbounded one here is the cardinality hazard ADR-0036 \u00a711 exists to prevent). THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Events",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_downlink_gap_frames_total[$__rate_interval]))",
+          "legendFormat": "gap frames",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_downlink_reorder_total[$__rate_interval]))",
+          "legendFormat": "reorder events",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_decoder_errors_total[$__rate_interval]))",
+          "legendFormat": "decoder errors",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Receive Path - Downlink Continuity and Decode",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Frames arriving on a relay stream_id this client never declared in its ReceiveCapability. The relay region is UNAUTHENTICATED - a handler writes stream_id freely and nobody signs it - so an undeclared value creates no receiver state and is counted here instead; the frame is still verified and attributed from its own key id. A sustained rate means a handler is routing to slots this subscriber did not ask for. THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_undeclared_stream_id_total[$__rate_interval]))",
+          "legendFormat": "undeclared stream ids",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Path - Undeclared Stream IDs",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Frames that left the device on the media datagram path; the denominator for the send-drop ratio. MUTE IS NOT VISIBLE HERE AND MUST NOT BE INFERRED FROM IT: while client-muted nothing is encoded, so nothing is sent and nothing is dropped. Muted, silent and the-network-died are indistinguishable from absence alone - read the mute-transitions panel. THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_frames_sent_total[$__rate_interval]))",
+          "legendFormat": "frames sent",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Send Path - Frames Sent",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Frames the send path discarded, by a bounded send-drop vocabulary that is DISTINCT from the receive reject taxonomy. Every spelling EXCEPT `not_connected` deliberately matches MH's MediaDropReason, so `sum by(reason)` compares across the two ends of one hop; `not_connected` is client-only, because MH never initiates. The roster's one home is `MEDIA_SEND_DROP_REASONS` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`, which a `toEqual` test pins - the correspondence is stated here by naming the exception, never by a count, so it cannot go stale on a sixth token. transport_send_refused and not_connected should both READ ZERO FOREVER. EMPTY HERE IS NOT A STATEMENT ABOUT DROPS AT ALL. Today it means the export hop is unwired (see the banner), and it would look exactly the same whether or not frames were being dropped. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where an empty drop panel IS the healthy reading - a Prometheus counter materialises no series until first incremented. Do not carry that reading across to this board; once the exporter lands, an empty panel here will mean what it means there, and not before. The discriminator, once both states are possible: count(dt_client_media_frames_received_total) returning no data (series absent, pipeline unwired) versus returning a number (series present, counters genuinely at zero). No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(reason) (increase(dt_client_media_send_dropped_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Send Path - Send Drops by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Current depth of the bounded application egress queue, in frames. Read against the configured bound - `media.egress.maxQueueFrames` and `media.audio.frameDurationMs` in `packages/sdk-core/src/config/clientConfig.ts` (10 frames x 20 ms = 200 ms at the defaults in force at time of writing; cited rather than restated so the figure cannot silently drift from the config). The application bound trips BEFORE the transport high-water mark - asserted at setup - so a rising depth here is back-pressure we can count rather than loss inside the user agent. NOT an egress budget, capacity or ceiling: no such gauge exists in this story. THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(dt_client_media_send_queue_depth)",
+          "legendFormat": "queue depth",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Send Path - Egress Queue Depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "KEK arrivals through the KEK-source seam by source, and client mute transitions by action. Neither carries key material or a KEK generation - the generation is monotonic over a meeting's life, so as a label its cardinality is unbounded over TIME and a per-meeting generation series would be a membership-change trace. Client mute is enforced at CAPTURE and does not depend on the server honouring it. THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Events",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(source) (increase(dt_client_media_kek_updates_total[$__rate_interval]))",
+          "legendFormat": "kek {{source}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(action) (increase(dt_client_media_mute_transitions_total[$__rate_interval]))",
+          "legendFormat": "mute {{action}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Key and Mute Lifecycle",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Wall-clock milliseconds from media pipeline start to the first media frame arriving at the wire. Despite the name's resemblance to dt_client_time_to_first_mh_connected_ms this is NOT a frozen-roster member and carries the media-path label set, not the join-flow one - it has no meeting dimension of any kind. No objective attaches to it in this story. THIS PANEL IS EMPTY BECAUSE THE EXPORT PIPELINE IS NOT WIRED - see the banner at the top of this dashboard. It is NOT empty because nothing has happened. Do not read an empty panel here as a clean result of any kind. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Milliseconds",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(dt_client_time_to_first_media_frame_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(dt_client_time_to_first_media_frame_ms_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Time to First Media Frame (p95 / p50)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "client",
+    "media"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Client SDK - Media Path",
+  "uid": "client-media",
+  "version": 1,
+  "weekStart": ""
+}

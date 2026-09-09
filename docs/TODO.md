@@ -311,6 +311,20 @@
 
   **Instrument, if picked up**: either a reachable shared const (workspace-root module, imported by all three configs) or a guard asserting the three config sites agree — following `scripts/dev-web.test.sh`'s flag-parity assertion, which already solves the prose-vs-config half of the same problem and is the natural place to extend. **Do NOT** solve it by adding an allowlist entry to `crates/dt-guard/src/no_insecure_browser_flags.rs`: these flags pass that guard on **vocabulary non-membership**, deliberately, and its own module docs record that an allowlist entry here would go on to mask a real cert-bypass setting added to the same file later. Low urgency — the three copies agree today and a divergence fails loudly in the affected tier rather than silently.
 
+### From DRY Reviewer — story task #22 (2026-09-09)
+
+Filed by @dry-reviewer at Gate 3 of `docs/devloop-outputs/2026-09-09-media-dashboards-and-catalogs/` as ADR-0019 extraction opportunities. Both are **pre-existing and were not introduced by task #22**; neither entered fix-or-defer.
+
+- [ ] **The four Rust service jobs are encoded three times inside `crates/env-tests/`, in three different shapes** (owner `test` + `observability`). `crates/env-tests/src/fixtures/metric_hygiene.rs:SERVICE_JOBS` (a `&[&str]` slice), `crates/env-tests/tests/32_media_metric_hygiene.rs:JOBS` (a `|`-alternation string built for a PromQL `job=~` selector), and `crates/env-tests/tests/30_observability.rs:EXPECTED_SERVICES` (`&[(&str, &str)]` job→metric-prefix tuples). All three name the same four jobs and must agree: a service added to the fleet and missed in any one copy silently narrows whichever control reads it, and narrowing is invisible — the affected assertion keeps passing over a smaller set. Task #22 correctly derived its media-pair selector from `EXPECTED_SERVICES` rather than adding a fourth home.
+
+  **The three are not one value in three encodings — they carry different payloads**, which is why this is a scoped collapse rather than a delete-two-of-three. `EXPECTED_SERVICES` pairs each job with its metric prefix (`ac_`, `gc_`, …), which the other two neither have nor need; `JOBS` is a regex alternation consumed inside a PromQL string, not a Rust collection. **Only the MEMBERSHIP question must agree.** A single `&[&str]` home with `SERVICE_JOBS.join("|")` at the selector site, prefixes kept beside their one consumer, collapses membership while leaving the payloads where they are used.
+
+  **Reachability is satisfied, which is what makes this a genuine candidate** rather than a deliberate boundary: all three sites are inside `crates/env-tests/`, so the proposed home can be imported by every consumer (contrast the entries above where the collapse fails the INDEX reachability test). Filed rather than fixed because it edits a shared fixture with consumers in two test binaries, and task #22 touched only one of them.
+
+  **SCOPE BOUND — the `key_custody` and `MediaDropReason` literals in `30_observability.rs` are NOT members of this set and must not be swept into any fix here.** They are deliberate restatements: an env-test's subject is the deployed artifact, and a test importing the emitter's constant agrees with the emitter no matter what the emitter becomes. Their rationale is recorded at the constants themselves and includes an explicit warning against "simplifying" them into imports. Anyone collapsing the job set who also collapses those has misread this entry.
+
+- [ ] **`mh_grpc_requests_total`'s retired `method` values are restated in prose on `mh-overview.json` panel 28** (owner `media-handler`). The description states that `register_meeting` is the only RPC on `MediaHandlerService` and that `register`, `route_media` and `stream_telemetry` "were retired … and can never appear". **Accurate today, and deliberately written** — it tells an operator why those series will never appear. It is filed only because it is a second home for a fact whose first home is `docs/observability/metrics/mh-service.md`, and no guard compares them: `dt-guard application-metrics` and `dashboard-panels` match metric **names**, never label keys or values. If `MediaHandlerService` ever gains a second RPC, this sentence becomes false with nothing to catch it. **Low severity, listed as a locatable instance** of the class filed under §Observability Debt → *"Restated label rosters and restated counts have no guard, and no sweep enforcement"*; close it with that class, not on its own.
+
 ## Port Constant Scattering (Kind / K8s / Env-Tests)
 
 - [ ] **MC/MH port constants duplicated across 6+ files with no single source of truth**: Host ports (4433, 4434, 4435, 4436), NodePorts (30433, 30434, 30435, 30436), and observability ports (9090/30090, 3000/30030, 3100/30080) are hardcoded independently in `infra/kind/kind-config.yaml`, `infra/services/{mc,mh}-service/service.yaml` (NodePort values), `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml` (advertise addresses), `infra/services/{mc,mh}-service/configmap.yaml` (bind addresses), `infra/docker/{mc,mh}-service/Dockerfile` (EXPOSE + bind defaults), `infra/kind/scripts/setup.sh` (print output), and `crates/env-tests/src/cluster.rs` (ClusterPorts::default). Changing a port in one file without updating all others causes silent breakage. Consider extracting port assignments to a shared config (e.g., `ports.env` sourced by setup.sh, referenced by Kustomize configMapGenerator). The new `kind-config.yaml.tmpl` (ADR-0030) correctly uses envsubst placeholders for its hostPorts, avoiding this issue for devloop clusters. **Update (2026-09-02, story task #9 / devloop `2026-09-02-mh-transport-parameter-manifests`, @dry-reviewer's condition on an accepted deferral)**: the closing "low priority — manual workflow only" in the original text is now FALSE and has been struck. Three of the scattered MH values are bind addresses a running service reads, and `crates/mh-service/src/config.rs:22,25,28` holds byte-identical duplicate strings (`DEFAULT_GRPC_BIND_ADDRESS`, `DEFAULT_HEALTH_BIND_ADDRESS`, `DEFAULT_WEBTRANSPORT_BIND_ADDRESS`) of all three ConfigMap values. **Fresh MH inventory**: `4434` at 9 sites, `8083` at 10, `50053` at 9 — ~28 across `configmap.yaml`, `mh-0-configmap.yaml`, both deployments (containerPort, both probes, and `MH_GRPC_ADVERTISE_ADDRESS`'s embedded `"grpc://$(POD_IP):50053"`), `service.yaml` and `network-policy.yaml`; `service.yaml:32,56` and `network-policy.yaml:30` also restate ports in **prose comments**, which a derivation would leave stale. **No port guard exists** (`dt-guard` has no `containerPort` logic). **Why kustomize `replacements:` alone cannot close this** (established while landing the `MH_TERMINATION_GRACE_SECONDS` derivation): (a) `infra/kind/scripts/setup.sh:1211-1217` **rewrites** `mh-{0,1}-config`'s `MH_WEBTRANSPORT_ADVERTISE_ADDRESS` with `kubectl patch` *after* `apply -k`, so no build-time replacement can ever guard it; (b) deriving `containerPort` from a ConfigMap needs `options.delimiter`, which yields a **string**, and `containerPort` is int32 — so the chain must run source=containerPort → target=ConfigMap, the opposite of the intuitive direction; (c) the shared `mh-service-config` has no single instance to source from, unlike the grace-period case whose source and target sit inside one object. A partial derivation covering only the kustomize-reachable subset would manufacture false assurance. **Named follow-up, owner infrastructure**: *Port SSoT for per-instance services* — **step 1 is a compare-only `dt-guard` drift check** across the five MH manifest files plus `config.rs` (cheap, zero deploy blast radius, and the only half that can reach the `setup.sh` patch); step 2 designates each deployment's `containerPort` as canonical and derives ConfigMap bind addresses, Service `port`/`targetPort`, NetworkPolicy ports and both probe ports, chaining mh-0→mh-1 for the shared-ConfigMap source question; then MC, then GC/AC. Revisit the single-file `replacements:` idiom at ~6 entries. **Update (R-37, task #4)**: the AC/GC host-side E2E ports are now also scattered — static host ports 8443 (AC) / 8444 (GC) and NodePort containerPorts 30082 (AC) / 30180 (GC) are hardcoded in `infra/kind/kind-config.yaml` (new AC/GC `extraPortMappings`), `infra/kind/kind-config.yaml.tmpl` (30082/30180 under `${HOST_PORT_*}`), `infra/kubernetes/overlays/kind/services/{ac,gc}-service/nodeport.yaml`, `infra/kind/scripts/setup.sh` (`print_access_info`), and the committed client config (`packages/web-app/vite.config.ts` proxy targets `127.0.0.1:8443/8444`). Same single-source-of-truth opportunity as MC/MH above.
@@ -424,6 +438,80 @@
 - [ ] **Timeseries panel titles say "Rate" for increase() panels**: Many panels across AC/GC/MC overviews still titled "...Rate" (e.g., "Request Rate by Endpoint") while using `increase()`. Units are correct (`short`), but titles are misleading. Large cosmetic rename. Locations: `infra/grafana/dashboards/{ac,gc,mc}-overview.json`
 
 ## Observability Debt
+
+### `dt_client_*` metrics have ZERO static guard coverage in alerts and dashboards (2026-09-09, story task #22)
+
+**Owner**: policy content `observability`; **guard machinery `infrastructure`** (per
+CLAUDE.md's guard ownership split — matcher implementations and the shape of the
+constructs policy is expressed in are machinery).
+
+`dt-guard application-metrics` extracts metric references from alert rules and dashboards
+with `SERVICE_METRIC_PREFIX_RE`, which is built at `Lazy::new` time from
+`CANONICAL_SERVICES` (`crates/dt-guard/src/common/services.rs`: the const at `:45`, the
+regex at `:65`), giving `\b((?:ac|gc|mc|mh)_[a-z][a-z0-9_]*)`. **Underscore is a word
+character**, so `dt_client_media_frames_dropped_total` matches nothing, is never
+extracted, and is never checked — in either direction.
+
+**Demonstrated, not asserted** (task #22): corrupting `mh_media_forward_latency_seconds_bucket`
+in `infra/grafana/dashboards/mh-media.json` fires
+`VIOLATION: mh-media.json (dashboard_metric_missing)`; corrupting
+`dt_client_media_frames_dropped_total` in `infra/grafana/dashboards/client-media.json`
+leaves the guard reporting `STATUS=OK REASON=application-metrics-clean`.
+
+**Consequence**: a typo in `MCMediaMissingKeyMaterial`'s expression
+(`infra/docker/prometheus/rules/mc-alerts.yaml`) passes CI silently while the alert never
+fires. That rule's sole coverage is operations' "does it apply" step — the counter
+arriving in Prometheus from a real browser through the SDK sink and the GC telemetry
+proxy. That is why the step is load-bearing rather than belt-and-braces.
+
+**THE WRONG FIX, NAMED**: adding `dt_client` to the alternation. This is the same
+word-boundary property ADR-0036 §11 describes for the deny-guard vocabulary, but §11's
+segment-splitting remedy **does not transfer**. Two failures, in the order they occur:
+
+1. The alternation is derived from `CANONICAL_SERVICES`, which is a **guarded
+   release-premise mirror, not a free-to-edit metrics list** — its own doc comment says
+   so, and `release_build_profile`'s `canonical_services_roster_drift` rule derives from
+   it. `dt_client` is not a `crates/*-service` workspace member, so **roster-drift fires
+   first**.
+2. Even past that, extracting the name would immediately fail `alert_metric_missing`,
+   because no Rust `metrics.rs` defines it and none ever will.
+
+**The real fix** is a TypeScript-aware metric source for the guard (parsing
+`packages/sdk-core/src/**` emission sites the way the Rust side parses `metrics.rs`).
+Task-sized; explicitly out of scope for task #22.
+
+### Restated label rosters and restated counts have no guard, and no sweep enforcement (2026-09-09, story task #22)
+
+**Owner**: policy content `observability` (with `security` for label-value policy);
+**guard machinery `infrastructure`**.
+
+Two surfaces, one mechanism: **nothing in the tree compares prose to the thing it
+describes.**
+
+- **Label rosters.** `application-metrics` and `dashboard-panels` validate metric
+  **names** against code, catalogs, dashboards and alerts, and `alert_rules.rs` pins an
+  alert `expr` byte-for-byte against its `alerts.md` entry. **No guard reads a label key
+  or a label value.** So a label roster restated in a panel description, a runbook table
+  or a doc comment decays invisibly to CI. The remedy adopted in task #22 is procedural —
+  the per-service catalogs are the single home and new panel descriptions *cite* rather
+  than restate — which is a convention, not a control.
+- **Counts.** `MediaDropReason::ALL: [Self; 13]` is compile-checked; every prose copy of
+  that number is unchecked.
+
+**The sweep is the thing that needs the guard, not the individual sentence.** Story task
+26 added two `MediaDropReason` tokens, and *that same commit* wrote `ALL`'s warning against
+naming ordinals **and** deleted `mh-service.md`'s restated cardinality integer — then left
+`crates/mh-service/src/observability/metrics.rs`'s "11 MH-local series rather than 22"
+behind, stale, in the very file defining the compile-checked length. This is not "nobody
+knew the rule": it is a **correctly-diagnosed class with an incomplete sweep**, which is
+why better prose is not the instrument. (Fixed in task #22 by deletion, not by updating
+the integer — updating it re-arms the trap at token 14.)
+
+**Candidate remedy** (machinery, `infrastructure`): a guard flagging prose integers
+adjacent to a compile-checked `ALL: [Self; N]`, and/or label-value extraction so a roster
+in a description can be compared to the emitting site. Task-sized; explicitly out of scope
+for task #22.
+
 
 - [ ] **The media path has its first honest availability SLI and no SLO defined for it (owner: observability for the objective + error-budget policy, operations for the alert threshold and routing; raised 2026-09-08 by @observability at Gate 3 of `docs/devloop-outputs/2026-09-05-sender-id-binding-contract/`)**: that devloop landed `mh_media_session_starts_total{outcome,key_custody}`, whose `outcome="started"` over the total is the first ratio in the tree that answers "did media sessions actually start" — the question every `mh_media_*` panel was previously unable to distinguish from an idle handler (`docs/observability/metrics/mh-service.md` §Media Forward Path opens with exactly that blind spot). `infra/grafana/dashboards/mh-slos.json` carries media **latency** SLOs only (`Media Forward Latency by Phase (p95) - OBJECTIVE PROVISIONAL`, sample-ratio and queue-depth panels) and has no availability panel for the new counter.
   **Deliberately NOT filed as a Gate-3 finding against that diff.** Landing a counter does not oblige the same diff to define an SLO over it: choosing an objective and an error-budget policy is a decision with its own planning, and one made from a number nobody has watched yet would be invented rather than derived. `MHMediaSessionDeclineRate`'s `> 0.20` in `infra/docker/prometheus/rules/mh-alerts.yaml` is an **alert threshold, not an SLO**, and must not be promoted into one by restating it here — @operations set it, and the devloop record notes at §Lessons Learned 1b-i that the one live failure this loop produced validated the counter and **not** the threshold.
@@ -1573,6 +1661,22 @@ the operations brief. Related: see "Skip unchanged service image builds" under
 
 ## Process / Review-Protocol
 
+### A review verdict has no as-of commit, so post-verdict edits fall silently inside its scope (2026-09-09, story task #22)
+
+**Owner**: process. Surfaced by @dry-reviewer at Gate 2 of task #22 and confirmed live: a
+reviewer issued a clean verdict on `client-media.json`, three edits then landed on that
+file, and the verdict silently covered a state it never saw — one of the new edits
+introduced a fresh finding (F-3, a restated count) that the ACK now appeared to bless. The
+finding was caught only because the implementer *disclosed* the post-verdict edits, which
+prompted a re-read; nothing structural pins a verdict to the artifact state it was issued
+against. **Candidate remedy**: a verdict names the commit SHA it was issued against, so a
+later edit to a reviewed file is visibly outside the ACK's scope rather than inside it by
+default. Task-sized (touches the review-protocol contract and the devloop record schema);
+out of scope for task #22. This is the reviewer-side form of the same read-the-artifact
+class the task's `dt_client_*` inspection obligation addresses on the author side.
+
+
+
 - [ ] **Amend `.claude/skills/devloop/review-protocol.md` §Assertion Vacuity mechanism 4 (owner: test, operations co-sign; filed 2026-09-08 from `docs/devloop-outputs/2026-09-05-sender-id-binding-contract/`)**. **Form agreed by both co-owners: amend mechanism 4, do NOT carve a sixth mechanism.** The finding: an expectation **correctly derived from the artifact** (satisfying 4's provenance clause) can still be vacuous when the derived value coincides with the value a degenerate implementation would return — an allocator that issues `1` to the first joiner makes the honestly-derived expectation identical to a hardcoded `1`. This is not a new mechanism; it is the **proof that mechanism 4's second clause is non-optional**. 4's remedy already reads "derive it from the artifact AND run it against a real adverse input before believing it"; the protocol worked when followed literally, and what failed was @security's S2 paraphrase, which kept the derivation clause and dropped the adverse-input one. A sixth mechanism would only add a sixth thing to paraphrase-and-drop. **The amendment** lands in 4 as: *derivation establishes provenance, not discrimination; a correctly-derived expectation can coincide with the degenerate value a defect would produce — re-sourcing does not fix this (it is about position, not provenance), only running the mutation the assertion exists to catch and watching it go RED does.* State the run in **falsification form** (mutation shown red, not "exercise an adverse case"), plus an optional head-of-section framing sentence for the broader class — *a control that cannot report on the thing it would be consulted about, and reports clean instead* — which also reaches @operations' OPS-3b (a production instrument recorded before the interval it would measure) and OPS-4 (an alert routed off the signal it exists to catch), neither of which a §Assertion-Vacuity *test* item could carry. **Instance, mutation-verified**: an arm in `crates/mc-service/tests/media_coordination_integration.rs` satisfied @security's derive-from-the-allocator rule and **still passed a hardcoded-`1` mutation**; fixed by joining a decoy first so the id under test is `> 1`. Full provenance in that devloop's `main.md` §Lessons Learned 1. **Lands as its own test-owned change with an operations co-sign trailer, NOT in this devloop's diff** (`review-protocol.md` is co-owned and unrelated to the sender_id wire contract; folding it in would smuggle a co-owned protocol edit past its co-owner).
 
 - [ ] **Add a RELAY-failure mechanism to `.claude/skills/devloop/review-protocol.md` §Assertion Vacuity: a composite claim whose cheap limb is verified launders its expensive limb** (filed 2026-09-09 by @operations from `docs/devloop-outputs/2026-09-09-web-app-in-meeting-loopback/`; owner **operations** for the review-protocol edit, co-signed by @infrastructure who supplied half the mechanism). **This is genuinely a sixth mechanism, not a paraphrase of the five** — and the entry above is the reason to be careful about that claim, since its own conclusion was "amend mechanism 4, do NOT carve a sixth". The five listed mechanisms are all about **an assertion that runs and observes nothing**. This one is about **a claim that travels between reviewers**: nothing is asserted, no test is involved, and the artifact is a message rather than a control. It cannot be folded into 1-5 without stretching "assertion" past the point where the remedies still apply.
@@ -1642,6 +1746,31 @@ the operations brief. Related: see "Skip unchanged service image builds" under
 - [x] **`shopt -s extglob` non-restoration in `path_matches_glob` (cross-script visibility)**: `scripts/guards/common.sh::path_matches_glob` enables extglob without restoring (pre-existing posture, carried verbatim from `validate-cross-boundary-classification.sh` during the 2026-05-08 Pattern C promotion). Now that the function lives in `common.sh` and is consumed by both Layer A (`validate-cross-boundary-scope.sh`) and Layer B (`validate-cross-boundary-classification.sh`), any guard that sources `common.sh` AND calls `path_matches_glob` leaves extglob enabled for the rest of that script. Operations surveyed all 20 guards sourcing `common.sh` and found none rely on extglob being off, so status-quo carry is operationally safe today. Future hardening: save prior state via `local prev_extglob; shopt -q extglob && prev_extglob=on || prev_extglob=off`, then restore conditionally before return. Single-line change, low risk. Owner: operations + dry-reviewer. Source: `docs/devloop-outputs/2026-05-08-layer-a-scope-drift-parser-fix/main.md` Tech Debt References. (resolved 2026-05-08 via devloop-outputs/2026-05-08-extglob-restore-and-deadcode-cleanup)
 
 ## Test Debt
+
+### `bcrypt_metrics_integration.rs` advertises a bucket-fidelity assertion it does not contain (2026-09-09, story task #22)
+
+**Owner**: `test` + `auth-controller`. **Task-sized, not a one-liner.**
+
+`crates/ac-service/tests/bcrypt_metrics_integration.rs`'s doc comment advertises a
+histogram-bucket-fidelity assertion and describes `DEFAULT_BCRYPT_COST` as load-bearing
+for the 50 ms–1000 ms bucket design. **The test bodies do not contain that assertion** —
+they assert observation counts and unobserved/adjacency only, and nothing reads a bucket.
+So `DEFAULT_BCRYPT_COST` is a production constant whose lowering would move timings
+outside the designed bucket range **with no failing test**, while the file reads as
+though that case were covered.
+
+**Why it is task-sized rather than a one-line fix**:
+`crates/common/src/observability/testing.rs` has **no bucket introspection at all** — only
+observation-count assertions. Proving that observations land in the designed range needs a
+new method on `MetricAssertion`, a helper shared by every service, so the change is a
+shared-test-infrastructure change with four consumers, not an edit to one test.
+
+**Contrast, so the two are not conflated**: story task #22's bucket-objective binding in
+`mh-service` (`MEDIA_FORWARD_OBJECTIVE_SECONDS` ∈ `MEDIA_FORWARD_LATENCY_BUCKETS`) is a
+pure **constant-membership** assertion — it checks that a named constant equals one of the
+declared bucket edges, needs no introspection of recorded observations, and is not
+evidence that this gap is closed.
+
 
 - [ ] **`an_unreachable_mc_declines_on_the_reachability_outcome` sleeps 55s of real wall-clock (owner: media-handler, with test; trigger: the next media-handler devloop touching `crates/mh-service/src/grpc/mc_client.rs` or its retry constants; raised by @test as F2 at Gate 3 of `docs/devloop-outputs/2026-09-05-sender-id-binding-contract/`, deferral offered by @test and accepted).** `crates/mh-service/tests/media_session_binding_integration.rs::an_unreachable_mc_declines_on_the_reachability_outcome` waits out the MC client's full connect+retry budget with a literal `tokio::time::sleep(Duration::from_secs(55))`, because `MC_CONNECT_TIMEOUT` / `MC_RPC_TIMEOUT` / `MAX_RETRY_ATTEMPTS` / the backoff schedule in `mc_client.rs` are compile-time `const`s with no injection seam. The budget is deliberately long in production (it rate-limits the reconnect herd — see `mc_client.rs`'s `is_terminal_error` docs and @operations' ruling), so the test cannot simply shorten it. **Fix when acted on**: give `McClient` an injectable timeout/retry policy (a `RetryPolicy` struct threaded through `McClient::new`, production-default via `Default`, test-overridden to milliseconds) OR drive the test under a paused tokio clock (`#[tokio::test(start_paused = true)]`) if the real TCP-refused connect and tonic's own timers cooperate with auto-advance. **Deferred rather than fixed in this task because** it is a `McClient`-construction refactor touching every MC-client call site and its own test surface, out of proportion to the binding-contract changeset, and it is test-runtime hygiene rather than a correctness defect (the assertion itself is sound). Note for whoever picks it up: this task's SEC-1 fix made the `DeclinedMcUnavailable` path also attempt a `NotifyParticipantDisconnected` (a second retry cycle) after the outcome is recorded — the 55s still covers the metric assertion, but an injectable policy would also bound that tail.
 - [ ] **No in-tree way to assert that a `tracing::warn!` FIRED, so every "log loud on X" requirement in the tree is unpinned (owner: test, with observability; trigger: the next devloop whose acceptance criteria include a log line — story task 16's forward-path drop logging is the nearest; raised by @test at Gate 3 of `docs/devloop-outputs/2026-09-02-mh-register-meeting-policy-apply/`, deferral accepted by @test)**: `common::observability::otel_capture::SpanCapture` captures **spans**, not `tracing` *events*, so a `tracing::warn!` has no observable at all in a Rust test. **Concretely unpinned as of story task 11**, both in `crates/mh-service`: the equal-generation contract-violation detector in `session/mod.rs::handle_config_apply` (an unchanged `policy_generation` carrying changed policy — MH honours the generation, does not swap, and WARNs, and the WARN is the whole of the detection), and the ADR-0036 §8 two-ends-must-agree transport-mode mismatch WARN in `grpc/mh_service.rs::register_meeting`. **The behavioural half of both IS pinned** — `reassert_at_an_equal_generation_with_different_content_does_not_swap` and `reassert_at_an_equal_generation_echoes_the_installed_transport_mode` assert the no-swap and the installed-not-requested echo through the real handler — so what is missing is only the assertion that the operator gets told. **Deferred rather than fixed at task 11 because it is infrastructure, not a test**: it needs an event-capturing `tracing_subscriber::Layer` with a bounded, thread-safe buffer and a story about test isolation under `cargo test`'s parallel harness, which is a `crates/common` addition affecting every service's test suite — cross-service by construction and out of proportion to a Gate-3 fix. **Fix when acted on**: an `EventCapture` sibling to `SpanCapture` in `crates/common/src/observability/`, asserting on `target` + `level` + a named field's presence, never on message text (message wording is not a contract and pinning it would make every reword a test failure). **The class is wider than these two sites** — grep `tracing::warn!` across `crates/*/src/` for the population; this entry is filed against the mechanism, not against MH.
@@ -2636,3 +2765,68 @@ Gate 1/2 of `docs/devloop-outputs/2026-09-07-media-telemetry-deny-guard/`; measu
   `docs/devloop-outputs/2026-09-01-release-premise-and-preflight-guards/main.md`, @operations +
   @observability, @team-lead ruling 2026-09-01 that all three items stay out of the surfacing diff.
   **To be scheduled — no slug.**
+
+## Guard Coverage Gap — R-20 checks that a dashboard is REGISTERED, never that its group is LABELLED, so an unlabelled group is green and invisible (owner: `infrastructure` for the machinery; surfaced 2026-09-09 by @infrastructure as the owner-ACK condition on `infra/grafana/kustomization.yaml` in `docs/devloop-outputs/2026-09-09-media-dashboards-and-catalogs/`)
+
+**Not the same defect as the R-20 entry under §Infrastructure Validation in Devloops** — that
+one is a *parser* bug (line-oriented matching with no comment-stripping and no `- ` bullet
+anchor, fixed 2026-09-05). This is a **scope** gap: the parser is now correct about the
+question it asks, and the question is the wrong size. Filing separately so a future sweep of
+the parser class does not read this as already closed.
+
+`check_dashboard_coverage` (`crates/dt-guard/src/kustomize.rs`) compares the set of
+`*.json` basenames in `infra/grafana/dashboards/` against the set declared in
+`infra/grafana/kustomization.yaml`, bidirectionally. It never inspects `options.labels`.
+The Grafana `kiwigrid/k8s-sidecar` (`infra/grafana/deployment.yaml`, `LABEL=grafana_dashboard`,
+`LABEL_VALUE="1"`) mounts **only** ConfigMaps carrying that label. So a `configMapGenerator`
+group that lists its files and omits
+
+```yaml
+    options:
+      labels:
+        grafana_dashboard: "1"
+```
+
+is registered, guarded, committed — and invisible in Grafana forever, with nothing red.
+
+**Demonstrated, not asserted** (2026-09-09, against a copy of `infra/grafana/` at this commit):
+
+- *Positive control*, so the negative is not vacuous — delete the `client-media.json` line
+  from the generator and R-20 fires:
+  `VIOLATION: infra/grafana/dashboards/client-media.json [dashboard_orphan] ... not in configMapGenerator`,
+  `STATUS=FAIL`. The rule is live and reaching the file.
+- *Negative control* — restore the line, delete only the `options.labels` block:
+  **0 `dashboard_orphan` hits**, and `kubectl kustomize` renders
+  `metadata: {name: grafana-dashboards-client, namespace: dark-tower-observability}` with
+  **no labels at all**.
+
+**The sibling failure is the same shape one hop downstream and has no guard either.** Because
+`generatorOptions.disableNameSuffixHash: true` keeps generated names stable, changing a group's
+contents does not alter the Grafana Deployment spec and does not roll the pod; and the sidecar
+is a `METHOD: LIST` **initContainer** that lists once at pod start and exits. So `kubectl apply -k`
+alone also yields a correct, correctly-labelled ConfigMap that Grafana never reads.
+**The missing labels block and the missing `rollout restart` are one failure with two causes.**
+Today both are covered only by prose (`docs/observability/dashboards.md` §Kubernetes, rewritten
+in this devloop — it previously described auto-discovery that does not exist and told the reader
+"no script edits required"). A doc is the weakest control available for a failure whose whole
+character is that CI is green.
+
+**Why this is not a predicate tweak.** `extract_declared_generator_files` is deliberately
+**block-agnostic**: it flattens every `- ` bullet in the file with no notion of which generator
+entry owns it. Asserting a label requires associating a `- name:` block with its `options.labels`
+*and* its `files:` — a structure-aware matcher, not a new condition on the existing one. That
+function is **shared** with the alert-rules loading check (`crates/dt-guard/src/alert_rules.rs`),
+so changing its shape has a second consumer, and this rule class carries mandatory self-tests
+(see the R-20 regression tests in `kustomize.rs`).
+
+**Scope it wider than dashboards when acted on.** The general shape is *a generated ConfigMap is
+invisible to its consumer without a selector label*, and there is at least one more instance:
+the `prometheus-config` generator in `infra/kubernetes/observability/kustomization.yaml` carries
+`options.labels` `app: prometheus` / `component: monitoring`. Fixing only the dashboards case is
+the mechanism this file keeps recording — see the R-20 parser entry, where the prescribed sweep
+found a fourth instance 90 lines from a fix already applied once.
+
+**Ownership**: `infrastructure`. Per CLAUDE.md's guard-crate split, matcher implementations and
+the shape of the constructs policy is expressed in are **machinery**; which label value is
+required is content (`observability`). **Task-sized — to be scheduled, no slug.** Explicitly out
+of scope for story task #22, whose changeset is dashboards and catalogs.

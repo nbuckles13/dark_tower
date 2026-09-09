@@ -306,6 +306,105 @@ pub fn service_jobs_with_metric_relabeling(
     Ok(offending)
 }
 
+/// Turn a Prometheus instant-query response into the projection the rules read.
+///
+/// **Pure and total-or-loud, so it is FIRE-fixturable in the always-on Rust lane.**
+/// This is the half of the old test-file-local `fetch_all_series` that had never
+/// been exercised: it lived in a `tests/` file behind the `observability` feature
+/// and the cluster gate, which `cargo test` cannot reach. That is the same root
+/// cause this module's relabel scanner already documents — the escaped-JSON bug
+/// that passed on every possible input, including a real violation, precisely
+/// because nothing could run it.
+///
+/// # A series with no `__name__` PANICS rather than becoming a sentinel
+///
+/// The earlier version substituted `"<unnamed>"`. That is a **false negative in
+/// two of the three consumers**: `32_media_metric_hygiene.rs`'s anchor compares
+/// `s.name == MH_ANCHOR_METRIC`, and [`scrape_reachable_client_series`] compares a
+/// prefix — a sentinel silently satisfies neither, so the anchor reports "absent"
+/// and every assertion it guards passes vacuously. ([`check_series`] is unaffected;
+/// it iterates labels regardless of name, so there a sentinel degrades triage
+/// rather than opening a hole. Stating the real blast radius, not the alarming one.)
+///
+/// Refusing a key that cannot be formed is the same rule `results_to_instance_map`
+/// applies to a result row with no `instance` label, and it is the right one here
+/// for the sharper reason: a sentinel key is **indistinguishable from a real miss**
+/// at exactly the assertion that depends on the key.
+///
+/// A Prometheus instant query cannot return a series without `__name__`, so this
+/// panic is unreachable against a healthy Prometheus — which is the point. If it
+/// ever fires, the response is not what this function was written against, and
+/// continuing would mean evaluating rules over a projection nobody designed.
+///
+/// # What this function does NOT guarantee
+///
+/// It returns a `Vec`. It **cannot** make a caller use one fetch for two
+/// assertions, so the "one fetch feeds both the anchor and the predicate" argument
+/// is deliberately **not** stated here — it is a property of a *call site*, and it
+/// lives at each one. See `32_media_metric_hygiene.rs` and
+/// `30_observability.rs`, which each make that argument for their own assertion
+/// pair. Writing it once here would be a false single-source-of-truth of
+/// *reasoning*: it would read as a guarantee while a third caller fetching twice
+/// silently made it hold nowhere.
+#[must_use]
+pub fn response_to_series(response: &crate::fixtures::metrics::QueryResponse) -> Vec<Series> {
+    response
+        .data
+        .result
+        .iter()
+        .map(|r| {
+            let name = r.metric.get("__name__").cloned().unwrap_or_else(|| {
+                panic!(
+                    "Prometheus returned a series with no `__name__` label: {:?}. \
+                     This is refused rather than bucketed under a sentinel, because a \
+                     sentinel name is indistinguishable from a real miss at the anchor \
+                     assertions that key on the name. Do NOT 'fix' this by restoring a \
+                     placeholder.",
+                    r.metric
+                )
+            });
+            let labels: BTreeMap<String, String> = r
+                .metric
+                .iter()
+                .filter(|(k, _)| k.as_str() != "__name__")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Series { name, labels }
+        })
+        .collect()
+}
+
+/// Fetch every stored series matching `selector`, as [`Series`].
+///
+/// **A deliberately trivial wrapper over [`response_to_series`], and the module's
+/// only I/O.** It lives here rather than in a `tests/` file because it has *two*
+/// callers (`30_observability.rs` and `32_media_metric_hygiene.rs`) and a copy in
+/// each is the duplication this hoist exists to remove. Contrast
+/// [`service_jobs_with_metric_relabeling`], whose I/O legitimately stays in its one
+/// test file: one caller, nothing duplicated.
+///
+/// The **parse** is what needed the always-on lane; the I/O is the thin part that
+/// could not be fixtured either way. That split is why a module whose header
+/// advertises purity now contains a network call — it is the seam
+/// `fixtures/metrics.rs` already models with `instance_counter_map` over
+/// `results_to_instance_map`, not an erosion of it.
+///
+/// Panics on a failed query, naming the PromQL: an unreachable cluster must not be
+/// reported as an empty result set, which reads exactly like a clean one.
+pub async fn fetch_all_series(
+    client: &crate::fixtures::metrics::PrometheusClient,
+    selector: &str,
+    triage: &str,
+) -> Vec<Series> {
+    let response = client.query_promql(selector).await.unwrap_or_else(|e| {
+        panic!(
+            "{triage}: Prometheus instant query `{selector}` failed: {e}. \
+             The cluster or the port-forward is the fault here, not the diff."
+        )
+    });
+    response_to_series(&response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +593,67 @@ mod tests {
     fn client_namespace_pin_fires_when_client_series_are_scraped() {
         let series = vec![s("dt_client_media_frames_sent_total", &[])];
         assert_eq!(scrape_reachable_client_series(&series).len(), 1);
+    }
+
+    fn response_with(
+        metrics: Vec<std::collections::HashMap<String, String>>,
+    ) -> crate::fixtures::metrics::QueryResponse {
+        crate::fixtures::metrics::QueryResponse {
+            status: "success".to_string(),
+            data: crate::fixtures::metrics::QueryData {
+                result_type: "vector".to_string(),
+                result: metrics
+                    .into_iter()
+                    .map(|metric| crate::fixtures::metrics::QueryResult {
+                        metric,
+                        value: None,
+                        values: None,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn metric_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn response_to_series_lifts_name_and_keeps_remaining_labels() {
+        let out = response_to_series(&response_with(vec![metric_map(&[
+            ("__name__", "mh_media_frames_forwarded_total"),
+            ("direction", "ingress"),
+            ("key_custody", "operator"),
+        ])]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "mh_media_frames_forwarded_total");
+        assert_eq!(
+            out[0].labels.get("direction").map(String::as_str),
+            Some("ingress")
+        );
+        assert!(
+            !out[0].labels.contains_key("__name__"),
+            "`__name__` must be lifted out of the label map exactly once, not left in it"
+        );
+    }
+
+    /// FIRE fixture for the decision recorded on [`response_to_series`]: a series
+    /// with no `__name__` is refused, never bucketed under a sentinel. Without this
+    /// the choice is a comment; with it, restoring a placeholder reds here.
+    #[test]
+    #[should_panic(expected = "no `__name__` label")]
+    fn response_to_series_panics_rather_than_inventing_a_sentinel_name() {
+        let _ = response_to_series(&response_with(vec![metric_map(&[(
+            "direction",
+            "ingress",
+        )])]));
+    }
+
+    #[test]
+    fn response_to_series_is_empty_for_an_empty_result() {
+        assert!(response_to_series(&response_with(vec![])).is_empty());
     }
 }

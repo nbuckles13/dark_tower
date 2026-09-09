@@ -49,8 +49,24 @@ configMapGenerator:
         grafana_dashboard: "1"
     files:
       - mh-logs.json=dashboards/mh-logs.json
+      - mh-media.json=dashboards/mh-media.json
       - mh-overview.json=dashboards/mh-overview.json
       - mh-slos.json=dashboards/mh-slos.json
+  # `client` is not a Rust service, but it follows the same `<prefix>-*.json`
+  # grouping convention so future `client-*.json` dashboards land here too.
+  #
+  # The `options.labels` block below is LOAD-BEARING AND UNGUARDED. The Grafana
+  # k8s-sidecar mounts only ConfigMaps carrying `grafana_dashboard: "1"`, and
+  # `dt-guard kustomize` R-20 checks dashboard BASENAMES in both directions
+  # while never inspecting `options.labels`. A group that lists its files and
+  # omits this block passes Layer 3 green, lands in the repo, and never appears
+  # in Grafana. Every other group here carries it; so must any new one.
+  - name: grafana-dashboards-client
+    options:
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - client-media.json=dashboards/client-media.json
   - name: grafana-dashboards-errors
     options:
       labels:

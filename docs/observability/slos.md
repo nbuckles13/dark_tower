@@ -135,6 +135,11 @@ See `alert-conventions.md` §Burn-Rate Alert Shapes for the rule shapes, and its
 
 ### Decided: the measurement point
 
+> **CONTESTED — see §Open: which series the objective attaches to, below.** The end boundary
+> stated in this paragraph is the 2-to-1 outlier against `ingress.rs` and `metrics.rs`, and whether
+> the objective attaches to `total` is open, not decided. Read the open item before ratifying anything
+> against this measurement point.
+
 The SLI is the latency from **ingress-read-complete to egress-enqueued** — from the moment MH has
 finished reading a datagram off the network, to the moment the rewritten datagram is enqueued for
 transmit.
@@ -151,9 +156,10 @@ now carries it as a dated amendment.
 
 The SLI is observed **decomposed into three phases** — receive buffer, processing/routing, transmit
 buffer — because they have different remedies and an undifferentiated total does not tell an operator
-which to pursue (ADR-0036 §11). A `total` phase exists **solely** to serve this objective: quantiles
+which to pursue (ADR-0036 §11). A `total` phase exists to serve this objective: quantiles
 do not sum, so the SLO number needs its own observation and cannot be reconstructed from the three
-phases.
+phases. **(That `total` is the *right* series for it is CONTESTED — `total` is client-influenced via
+`transmit_buffer`; see §Open: which series the objective attaches to.)**
 
 ### Open: the target
 
@@ -163,7 +169,7 @@ point are a pair, and inheriting one without the other is how an unfalsifiable o
 
 | Field | State |
 |---|---|
-| SLI | **Decided** (above) |
+| SLI | Measurement point **decided**; **which series carries the objective is OPEN** — see below |
 | Target | **OPEN** — ratified in **story 8** (performance: targets, benchmarks, tuning) |
 | Error budget | **OPEN** — derived from the target; blocked on it |
 | Measurement window | 30 days |
@@ -171,7 +177,76 @@ point are a pair, and inheriting one without the other is how an unfalsifiable o
 
 Only the target and its derived error budget are unknown. Everything else is decided and written
 above, so story 8 ratifies **one number** rather than re-litigating the alerting posture from a blank
-table.
+table — **with the second open item below settled first, because it decides which series that number
+attaches to.**
+
+### Open: which series the objective attaches to — and the SLI-eligible span has no series today
+
+**Read this before ratifying the target.** It supersedes the "A `total` phase exists **solely** to
+serve this objective" sentence in the §Decided block above, which is now contested rather than
+settled.
+
+**The measurement point stated above is the outlier, two-to-one, against the artifacts.** The end
+boundary is written as "the moment the rewritten datagram is **enqueued for transmit**". Two other
+artifacts say otherwise, and they agree with each other and with the code:
+
+| Artifact | End of the span |
+|---|---|
+| `crates/mh-service/src/media/ingress.rs` (`MediaLatencyPhase::Total` recording) | `sent_at`, taken **after** `transport.send_datagram()` returns — sent to network |
+| `crates/mh-service/src/observability/metrics.rs` (`MEDIA_FORWARD_OBJECTIVE_SECONDS` doc) | "ingress-from-network to **egress-to-network**" |
+| **This file, above** | "**is enqueued for transmit**" |
+
+So this is **not a slip in the code that drifted from a ratified SLI** — the framing that first
+suggested itself, and the wrong one. The *intended* span was always ingress-read-complete →
+sent-to-network, MH implemented exactly the span its own doc describes, and this document's narrower
+sentence is the odd one out. Stating it the other way round would both understate the problem and be
+unfair to the authors of a coherent design.
+
+**The problem is what that intended span contains.** `total` spans all three phases, so it includes
+`transmit_buffer` — egress-push → send-returned — which MH's own artifacts describe as *"a slow
+subscriber"*. A subscriber's behaviour therefore lengthens it. That makes `total`
+**client-influenced by construction**.
+
+**This is an EXTENSION of the doctrine below, not a citation of a rule already on the books.** The
+`transport_receive_dropped` blockquote in the next section bars *that metric, by name*, and states
+the generalizable reasoning: a client-inflatable SLI converts an availability attack into an
+**error-budget attack**, and if that budget ever gates a release, into a **client-controllable deploy
+block**. Nothing currently written bars `total`. Applying the doctrine to it is a judgement this
+document is making here, explicitly, so that a reader is not left believing the rule was already
+written down. The §Decided exclusion list — "what it deliberately excludes, because MH does not
+control any of it" — points the same way.
+
+**And the SLI-eligible subset cannot be observed today, which is the part most likely to be
+missed.** The eligible span is `receive_buffer` + `processing`: MH-internal, not client-influenceable.
+Those two phases are *visible* as separate series on the "Media Handler - Media Path" dashboard —
+but they are **not available** as the quantity an objective needs. `p95(receive_buffer + processing)`
+cannot be constructed from `p95(receive_buffer)` and `p95(processing)`, by the very
+quantiles-do-not-sum property that justifies a `total` phase existing at all. So:
+
+> **No series measures the SLI-eligible span. Not `total` (too wide, client-influenced), and not any
+> combination of the three phases (quantiles do not sum). Do not ratify a number off the two
+> plotted phases — the quantity is not computable from them.**
+
+**Two candidate resolutions, both for story 8:**
+
+1. **Narrow `MediaLatencyPhase::Total`'s recording to end at the egress-queue push** (`queued_at`),
+   making it the eligible span and creating the series that does not exist today. This is an MH
+   hot-path change, owner `media-handler`, and is **not** in the loopback story.
+2. **Re-ratify the measurement point to include `transmit_buffer`** and accept the client influence.
+   This is what the tree already reflects, and it is what the `transport_receive_dropped` precedent
+   argues against.
+
+**Blast radius of resolution 1** — listed so a narrowing does not silently falsify prose that is
+accurate today. Both go false *together*, which is why they are named in one place:
+
+- `crates/mh-service/src/media/ingress.rs` — the `MediaLatencyPhase::Total` recording itself.
+- `crates/mh-service/src/observability/metrics.rs` — `MEDIA_FORWARD_OBJECTIVE_SECONDS`'s
+  "ingress-from-network to egress-to-network". **Correct today**, which is exactly why it would rot
+  unobserved; naming it here is the protection, and it is deliberately *not* edited now.
+
+`transmit_buffer` is **not** made useless by any of this. It keeps the same carve-out this file
+grants `transport_receive_dropped`: survivable for a `warning` alert with a rate and a sustained
+window, not survivable in an SLI. Do not over-correct by deleting the phase.
 
 > **No MH burn-rate alert may be authored until the target is ratified.** Cargo-culting a 10×/5×
 > pair without an authoritative target produces a threshold with no principled justification. This

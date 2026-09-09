@@ -100,6 +100,30 @@ counterpart of the last of those `outcome` too. The row was missing, which is
 the gap this section's own "add before the second service" rule is meant to
 close.
 
+### Declared, not yet carried: `media_kind` and `content_kind` `[reviewer-only]`
+
+Registered here **at declaration** rather than at first emission, because §Adding a new
+shared label fires on intent: both are multi-service by construction — MH, MC and the
+client SDK will all carry them — so the "add here before the second service" rule
+applies now, not in story 3.
+
+| Label | Bounded values | Emitted today? | Lands with |
+|---|---|---|---|
+| `media_kind` | `audio`, `video` | **No** | Story 3 (video) |
+| `content_kind` | `main`, `slides` | **No** | Story 3 (content share) |
+
+Both value sets are **closed and enumerable**, which is the property that makes them
+admissible: each is a small fixed set fixed by the media pipeline's own type system, not
+a free-form string, so neither can grow unboundedly at runtime. Adding a value is a
+protocol change, not a call-site decision.
+
+**They are declared, not carried.** No metric emits either label today. Do not write a
+dashboard query or an alert selecting on them — an unmatched selector yields an empty
+series rather than an error, so it fails silently. Which metrics will carry them is
+recorded in the per-service catalogs (`docs/observability/metrics/*.md` §Media-path
+label conventions), which is the home for *which labels a metric carries*; this section
+is the home for *what the label is and what values it may take*.
+
 ### Non-canonical aliases (flagged by reviewers, not the guard) `[reviewer-only]`
 
 These aliases SHOULD be renamed toward the canonical form during a
