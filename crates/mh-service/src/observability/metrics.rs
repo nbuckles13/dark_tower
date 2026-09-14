@@ -34,6 +34,20 @@ use std::time::Duration;
 ///
 /// Returns error if Prometheus recorder fails to install (e.g., already installed).
 pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    configured_prometheus_builder()?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
+}
+
+/// Build the `PrometheusBuilder` with MH's production bucket configuration,
+/// WITHOUT installing it globally. Single source of the exporter config so the
+/// present-at-zero render test exercises the SAME builder production installs.
+/// NOTE: that test proves present-at-0 under this exact config; it does NOT prove
+/// `idle_timeout` is absent — `render()` runs synchronously at t≈0, before a
+/// realistic minutes-scale `idle_timeout` would reap idle 0-series — so
+/// idle_timeout-absence is a CONFIG-REVIEW checkpoint here, not a test-enforced
+/// invariant (neither this test nor the Layer-7 env-test reliably backstops it).
+fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
     PrometheusBuilder::new()
         // GC heartbeat latency buckets - internal service call (p95 < 100ms)
         .set_buckets_for_metric(
@@ -76,9 +90,7 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             Matcher::Prefix("mh_media_forward_latency".to_string()),
             &MEDIA_FORWARD_LATENCY_BUCKETS,
         )
-        .map_err(|e| format!("Failed to set media forward latency buckets: {e}"))?
-        .install_recorder()
-        .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
+        .map_err(|e| format!("Failed to set media forward latency buckets: {e}"))
 }
 
 /// Record a GC registration attempt.
@@ -1166,6 +1178,14 @@ impl MediaMetricHandles {
 /// This is a **sibling** of `crates/mh-service/src/media/**` (ADR-0036 §11's
 /// layout constraint): setup lives here so the media directory holds only the
 /// hot path and the directory boundary is the hot-path boundary.
+///
+/// This function IS a zero-init entrypoint: resolving each `counter!` handle at
+/// startup registers a present-at-0 series (proven — bare registration renders
+/// `…_total 0`), so the media-frame counters get counter-visibility from here,
+/// NOT from a duplicate enumeration in `zero_initialize_counters()`. If this
+/// call is ever removed from `main.rs` startup, those counters go lazy again.
+/// `dt-guard:zero-init-entrypoint`
+// dt-guard:zero-init-entrypoint
 #[must_use]
 pub fn resolve_media_handles() -> MediaMetricHandles {
     // Names are literals; labels are loop variables. See `MediaMetricHandles`.
@@ -1236,10 +1256,212 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
     }
 }
 
+// ============================================================================
+// Zero-initialization of discrete-event counters (counter-visibility fix)
+//
+// A `metrics`-crate counter is created lazily — its series first appears in
+// `/metrics` at its first increment, already at that value, so `increase()`
+// reads 0 forever for a single low-volume event. Proven empirically: resolving
+// a `counter!` handle (even `.increment(0)`) renders a scrapeable `…_total 0`
+// line, so touching every enumerable label combination here at startup gives
+// each series a present-at-zero point and makes the first real event a visible
+// 0→1 edge.
+//
+// The mh media-frame counters (`mh_media_frames_dropped_total`,
+// `mh_media_frames_forwarded_total`) are covered by `resolve_media_handles()`
+// (marked `dt-guard:zero-init-entrypoint`), NOT re-enumerated here. `mh_errors_total`
+// is catalog-exempt (unbounded `operation`/`status_code`). The two media outcome
+// counters below have `ALL` and are iterated from it; the rest are enum-less
+// `&str` vocabularies, each closed at its emit site (all call sites pass literals
+// or the single `GRPC_METHOD_REGISTER_MEETING` const — never an external string).
+// ============================================================================
+
+/// `status` on the `success`/`error`-shaped counters. Emit sites pass literals.
+const STATUS_SUCCESS_ERROR: &[&str] = &["success", "error"];
+/// `mh_token_refresh_failures_total{error_type}` — `common::token_manager`
+/// `error_category()` wildcard-free range (bounded by `TokenError`).
+const TOKEN_ERROR_CATEGORIES: &[&str] = &[
+    "http",
+    "auth_rejected",
+    "invalid_response",
+    "acquisition_failed",
+    "configuration",
+    "channel_closed",
+];
+/// `mh_webtransport_connections_total{status}`. Emit sites pass literals.
+const WEBTRANSPORT_STATUSES: &[&str] = &["accepted", "rejected", "error"];
+/// `mh_mc_notifications_total{event_type}`. Emit sites pass literals.
+const MC_EVENT_TYPES: &[&str] = &["connected", "disconnected"];
+/// `mh_jwt_validations_total{token_type}`. Emit sites pass literals.
+const JWT_TOKEN_TYPES: &[&str] = &["meeting", "service"];
+/// JWT failure reasons (result="failure"). `classify_jwt_error` + call-site literals.
+const JWT_FAILURE_REASONS: &[&str] = &[
+    "signature_invalid",
+    "expired",
+    "scope_mismatch",
+    "malformed",
+    "validation_failed",
+];
+/// `mh_caller_type_rejected_total{actual_type}` — the peer JWT's `service_type`
+/// claim CLAMPED at the single emit site (`grpc/auth_interceptor.rs`) by
+/// `common::service_type::service_type_metric_label`. MH's only path expects
+/// `meeting-controller` (which therefore never rejects), so the reachable
+/// recognized identities are `global-controller` and `media-handler`, plus
+/// `unknown` (claim absent) and `other` (present-but-unrecognized — where a value
+/// like `auth-controller`, not a recognized identity, now lands). Bounded
+/// regardless of the peer-controlled value.
+const CALLER_ACTUAL_TYPES: &[&str] = &["global-controller", "media-handler", "unknown", "other"];
+
+/// Zero-initialize every enumerable discrete-event `mh_*_total` counter NOT
+/// already covered by `resolve_media_handles()`, so each series is present at 0
+/// from process start (see module section header).
+///
+/// INFALLIBLE: no `Result`, no panic path — called at boot, must never fail a
+/// service start. Uses `.increment(0)` at statement position (registers via side
+/// effect; a scrapeable 0-series, proven empirically).
+///
+/// `dt-guard:zero-init-entrypoint`
+// dt-guard:zero-init-entrypoint
+pub fn zero_initialize_counters() {
+    // --- media outcome enums (iterate `ALL`, key_custody=operator) ---
+    for o in PolicyApplyOutcome::ALL {
+        counter!("mh_media_policy_applies_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in MediaSessionStartOutcome::ALL {
+        counter!("mh_media_session_starts_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+
+    // --- single-status counters ---
+    for s in STATUS_SUCCESS_ERROR {
+        counter!("mh_gc_registration_total", "status" => *s).increment(0);
+        counter!("mh_gc_heartbeats_total", "status" => *s).increment(0);
+        counter!("mh_token_refresh_total", "status" => *s).increment(0);
+        counter!("mh_grpc_requests_total", "method" => GRPC_METHOD_REGISTER_MEETING, "status" => *s).increment(0);
+    }
+    for e in TOKEN_ERROR_CATEGORIES {
+        counter!("mh_token_refresh_failures_total", "error_type" => *e).increment(0);
+    }
+    for s in WEBTRANSPORT_STATUSES {
+        counter!("mh_webtransport_connections_total", "status" => *s).increment(0);
+    }
+    // No-label counter (cardinality 1).
+    counter!("mh_register_meeting_timeouts_total").increment(0);
+    // mc notifications: event_type × status.
+    for ev in MC_EVENT_TYPES {
+        for st in STATUS_SUCCESS_ERROR {
+            counter!("mh_mc_notifications_total", "event_type" => *ev, "status" => *st)
+                .increment(0);
+        }
+    }
+    // JWT: success→none per token_type; failure→each reason per token_type.
+    for tt in JWT_TOKEN_TYPES {
+        counter!("mh_jwt_validations_total", "result" => "success", "token_type" => *tt, "failure_reason" => "none").increment(0);
+        for fr in JWT_FAILURE_REASONS {
+            counter!("mh_jwt_validations_total", "result" => "failure", "token_type" => *tt, "failure_reason" => *fr).increment(0);
+        }
+    }
+    // caller type rejections: fixed grpc_service/expected_type × actual_types.
+    for at in CALLER_ACTUAL_TYPES {
+        counter!("mh_caller_type_rejected_total", "grpc_service" => "MediaHandlerService", "expected_type" => "meeting-controller", "actual_type" => *at).increment(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::errors::MhError;
+
+    /// Leg-1 completeness / touch-idiom proof — the ONLY place proving the real
+    /// `metrics-exporter-prometheus` exposition emits a registered-but-never-
+    /// incremented counter at 0. Runs through the SAME builder config production
+    /// installs (`configured_prometheus_builder`), so a future `idle_timeout`
+    /// that would reap idle 0-series is reflected here.
+    #[test]
+    fn zero_init_renders_counters_present_at_zero() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            zero_initialize_counters();
+        }
+        let rendered = handle.render();
+
+        // Positive control (anchor): a known-present series must exist, else a
+        // wholesale-empty render lets every present-at-0 check pass vacuously.
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("mh_gc_heartbeats_total{")),
+            "ANCHOR ABSENT — render produced no mh_gc_heartbeats_total series: a \
+             scrape/recorder failure (env-sanity), NOT a present-at-0 violation. \
+             DO NOT satisfy this by deleting the check."
+        );
+
+        // Present-at-0, two-part per series: line exists AND value is exactly 0.
+        let present_at_zero = |prefix: &str| {
+            let found = rendered.lines().find(|l| l.starts_with(prefix));
+            // Loud on absence WITHOUT `panic!` (the crate denies clippy::panic
+            // even in tests): a missing series is a scrape/recorder failure, not
+            // a present-at-0 violation — the assert carries the same message.
+            assert!(found.is_some(), "series absent from /metrics: {prefix}");
+            let value = found.and_then(|l| l.rsplit(' ').next()).unwrap_or("");
+            assert_eq!(value, "0", "present-at-0 violation (value != 0): {found:?}");
+        };
+
+        present_at_zero(r#"mh_gc_heartbeats_total{status="success"}"#);
+        present_at_zero(r#"mh_webtransport_connections_total{status="rejected"}"#);
+        present_at_zero("mh_register_meeting_timeouts_total");
+        present_at_zero(
+            r#"mh_caller_type_rejected_total{grpc_service="MediaHandlerService",expected_type="meeting-controller",actual_type="unknown"}"#,
+        );
+        // Media enum-ALL counter (exposition preserves emission label order:
+        // outcome then key_custody).
+        present_at_zero(
+            r#"mh_media_session_starts_total{outcome="started",key_custody="operator"}"#,
+        );
+
+        // Series-count ceiling (security): a future enum variant can't silently
+        // multiply the cross-product unnoticed.
+        let total_series = rendered
+            .lines()
+            .filter(|l| l.contains("_total{") || l.contains("_total "))
+            .count();
+        assert!(
+            (30..=200).contains(&total_series),
+            "zero-init series count {total_series} outside expected band 30..=200 — a \
+             vocabulary grew/shrank; update the band deliberately"
+        );
+    }
+
+    /// Assert a registered-at-0 counter survives to `render()` through the SHARED
+    /// prod builder — present-at-0 under the exact prod config.
+    ///
+    /// HONEST SCOPE (OBS-F3): this does NOT pin `idle_timeout`-absence — `render()`
+    /// is synchronous at t≈0, so a minutes-scale `idle_timeout` would not reap
+    /// first; it duplicates the present-at-0 render assertion under a stronger
+    /// name. idle_timeout-absence is a config-review checkpoint, not test-enforced.
+    #[test]
+    fn production_builder_has_no_idle_timeout() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            counter!("mh_register_meeting_timeouts_total").increment(0);
+        }
+        assert!(
+            handle
+                .render()
+                .contains("mh_register_meeting_timeouts_total"),
+            "a registered-at-0 counter did NOT render through configured_prometheus_builder() \
+             — present-at-0 broke under the prod exporter config (a recorder/scrape/config \
+             regression). This does not by itself prove an idle_timeout was added; that stays \
+             a config-review checkpoint."
+        );
+    }
 
     // Note: These tests execute the metric recording functions to ensure code coverage.
     // The metrics crate will record to a global no-op recorder if none is installed,

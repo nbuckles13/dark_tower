@@ -187,7 +187,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Total session join failures in the selected time range.",
+      "description": "Total session join failures in the selected time range. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -548,7 +548,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Total actor panics since service start. Any panic is a critical issue requiring investigation.",
+      "description": "Total actor panics since service start. Any panic is a critical issue requiring investigation. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -784,7 +784,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Message drop rate by actor type (messages per second). Any dropped messages indicate capacity issues or backpressure.",
+      "description": "Message drop rate by actor type (messages per second). Any dropped messages indicate capacity issues or backpressure. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -877,7 +877,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Actor panic rate by actor type. Any panic is a critical issue. Usually indicates a bug in message handling.",
+      "description": "Actor panic rate by actor type. Any panic is a critical issue. Usually indicates a bug in message handling. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2073,7 +2073,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Fenced-out events by reason. Non-zero values indicate split-brain scenarios. Investigate if rate > 0.1/min.",
+      "description": "Fenced-out events by reason. Non-zero values indicate split-brain scenarios. Investigate if rate > 0.1/min. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2330,7 +2330,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Token refresh failure rate by reason (error_type). High rate indicates AC connectivity issues.",
+      "description": "Token refresh failure rate by reason (error_type). High rate indicates AC connectivity issues. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2660,7 +2660,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Session join failures by error type. High rate may indicate JWT issues, capacity problems, or internal errors.",
+      "description": "Session join failures by error type. High rate may indicate JWT issues, capacity problems, or internal errors. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3618,7 +3618,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint.",
+      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3808,7 +3808,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of per-MH status entries dropped because the participant already tracks the per-participant cap of distinct MH URLs (R-60). Nonzero means a client flooded distinct MH URLs.",
+      "description": "Rate of per-MH status entries dropped because the participant already tracks the per-participant cap of distinct MH URLs (R-60). Nonzero means a client flooded distinct MH URLs. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5012,7 +5012,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES ABOVE IT IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - that counter's emitted fires before the send, so it means COMPOSED, not delivered, and this panel is the mailbox-FULL half of what happened next. The mailbox-CLOSED half (participant actor gone) is a WARN at mc.webtransport.connection and is deliberately uncounted, since the FULL case is covered here. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. TWO SIGNALS, both about media MC decided on that never reached the client. mc_media_unmatched_plan_slots_total: MH is forwarding egress the subscriber will never accept - wasted uplink and handler work. A non-zero value is CLIENT-CONFORMANCE-DRIVEN, not necessarily an MC defect: it is reachable through the zero-audio exemption, where a subscriber legitimately declares no audio slot (\"send but do not receive\") and MC's planned audio slot matches nothing. It is the MIRROR of slot_id_not_planned on the declarations panel - the plan's slot was not declared HERE, the client's slot has no plan THERE. The two are easy to transpose; read the direction off the name. Under whole-declaration rejection they are mutually exclusive per declaration. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard.",
+      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES ABOVE IT IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - that counter's emitted fires before the send, so it means COMPOSED, not delivered, and this panel is the mailbox-FULL half of what happened next. The mailbox-CLOSED half (participant actor gone) is a WARN at mc.webtransport.connection and is deliberately uncounted, since the FULL case is covered here. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. TWO SIGNALS, both about media MC decided on that never reached the client. mc_media_unmatched_plan_slots_total: MH is forwarding egress the subscriber will never accept - wasted uplink and handler work. A non-zero value is CLIENT-CONFORMANCE-DRIVEN, not necessarily an MC defect: it is reachable through the zero-audio exemption, where a subscriber legitimately declares no audio slot (\"send but do not receive\") and MC's planned audio slot matches nothing. It is the MIRROR of slot_id_not_planned on the declarations panel - the plan's slot was not declared HERE, the client's slot has no plan THERE. The two are easy to transpose; read the direction off the name. Under whole-declaration rejection they are mutually exclusive per declaration. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {

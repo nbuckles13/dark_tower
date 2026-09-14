@@ -251,7 +251,12 @@ where
                 metrics::record_caller_type_rejected(
                     grpc_service_label,
                     expected_type,
-                    actual_type,
+                    // Clamp the peer-controlled `service_type` claim to the
+                    // recognized vocabulary BEFORE it becomes a metric label —
+                    // a raw claim admits unbounded label cardinality (exporter
+                    // DoS). The RAW value is still logged above for diagnostics;
+                    // only the metric label is clamped, auth behavior unchanged.
+                    common::service_type::service_type_metric_label(claims.service_type.as_deref()),
                 );
                 let response = tonic::Status::permission_denied("Access denied").into_http();
                 return Ok(response);

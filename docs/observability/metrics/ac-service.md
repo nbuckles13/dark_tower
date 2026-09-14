@@ -121,9 +121,15 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Description**: Total number of database queries executed
 - **Labels**:
   - `operation`: SQL operation type (`select`, `insert`, `update`, `delete`)
-  - `table`: Database table name (`service_credentials`, `signing_keys`, etc.)
-  - `status`: Query outcome (`success`, `error`)
-- **Cardinality**: Low (4 operations × ~7 tables × 2 statuses = ~56 series)
+  - `table`: Database table name (`service_credentials`, `signing_keys`, `auth_events`, `organizations`,
+    `users`, `user_roles`)
+  - `status`: Query outcome (`success`, `error`) — the binary `if is_ok()` result.
+- **Cardinality**: a CLOSED OBSERVED `(operation, table)` **PAIR-SET** of 12 real combinations, each ×
+  `{success, error}` = 24 series — NOT the `operation × table × status` cross-product. Most `(operation, table)`
+  cells never occur (e.g. `delete/organizations`), so a domain check must compare the observed pair-set and
+  must NOT expand the per-label `operation`/`table` lists into a product (that would fabricate ~10 impossible
+  always-zero series). The 12 pairs are `AC_DB_QUERY_PAIRS` in `observability/metrics.rs` (source of truth,
+  closed at the emit sites). Zero-initialized (present-at-zero) — the rare error series were previously masked.
 - **Usage**: Track database query rates and failures by table and operation
 - **Call Sites**: All repository functions in `users.rs`, `organizations.rs`, `service_credentials.rs`, `signing_keys.rs`, `auth_events.rs`
 
@@ -156,12 +162,20 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 ## Audit Metrics
 
 ### `ac_audit_log_failures_total`
+- **Expected-empty**: yes — any audit-log write failure is compliance-critical, zero when healthy
 - **Type**: Counter
 - **Description**: Total number of audit log write failures (compliance-critical)
 - **Labels**:
-  - `event_type`: Type of audit event that failed to log (`token_issued`, `key_rotation`, etc.)
-  - `reason`: Reason for failure (`db_write_failed`, `encryption_failed`, etc.)
-- **Cardinality**: Medium (bounded by event types and failure reasons)
+  - `event_type`: Type of audit event that failed to log (`key_generated`, `key_rotated`, `key_expired`,
+    `user_registered`, `service_registered`, `service_deactivated`, `service_token_issued`,
+    `service_token_failed`, `scopes_updated`, `user_login`, `user_login_failed`)
+  - `reason`: Reason for failure (`db_write_failed`, `encryption_failed`)
+- **Cardinality**: a CLOSED **pair set** of 11 real `(event_type, reason)` combinations, NOT the
+  `event_type × reason` cross-product — most cells never occur (e.g. `key_generated/encryption_failed` does
+  not). Zero-init touches only the 11 real pairs (`AUDIT_LOG_FAILURE_PAIRS` in `observability/metrics.rs`,
+  closed at the emit sites); a check comparing this metric's domain must compare PAIRS, not expand the two
+  per-label lists into a cross-product (which would fabricate ~10 impossible always-zero series around a
+  page-on-any-value alert).
 - **Alert Threshold**: ANY non-zero value should trigger oncall page
 - **Usage**: Detect audit log failures that could impact compliance
 - **Call Sites**: `token_service`, `user_service`, `key_management_service`, `registration_service`
@@ -171,6 +185,7 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 ## Error Metrics
 
 ### `ac_errors_total`
+- **Zero-init**: exempt — unbounded domain: operation is free-form and status_code is a raw u16
 - **Type**: Counter
 - **Description**: Total number of errors by category
 - **Labels**:
@@ -199,6 +214,7 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 ## HTTP Request Metrics
 
 ### `ac_http_requests_total`
+- **Zero-init**: exempt — unbounded domain: status_code is a raw u16 (endpoint is bounded via normalize_path but status_code is not)
 - **Type**: Counter
 - **Description**: Total HTTP requests received across all endpoints
 - **Labels**:

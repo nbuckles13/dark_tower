@@ -75,6 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to initialize metrics recorder: {}", e);
         e
     })?;
+    // Zero-initialize discrete-event counters so each series is present at 0 from
+    // process start (counter-visibility fix). Infallible; runs right after the
+    // recorder installs and before any event can fire.
+    observability::metrics::zero_initialize_counters();
     info!("Prometheus metrics recorder initialized");
 
     // Log whether clock skew was explicitly configured or using default

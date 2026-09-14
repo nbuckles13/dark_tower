@@ -1800,7 +1800,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Token refresh failures by error type. High rate indicates AC connectivity issues.",
+      "description": "Token refresh failures by error type. High rate indicates AC connectivity issues. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2793,7 +2793,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Meeting creation failures by error type. Values are not interchangeable: org_limit is capacity exhaustion; org_inactive and org_not_provisioned are organization-state faults (expected permanently absent \u2014 see runbook Scenario 8); forbidden is role denial only; bad_request and unauthorized are client-side; db_error, code_collision and internal are server-side faults.",
+      "description": "Meeting creation failures by error type. Values are not interchangeable: org_limit is capacity exhaustion; org_inactive and org_not_provisioned are organization-state faults (expected permanently absent — see runbook Scenario 8); forbidden is role denial only; bad_request and unauthorized are client-side; db_error, code_collision and internal are server-side faults. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3123,7 +3123,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Meeting join failures by error type. High rate may indicate MC capacity issues or AC connectivity problems.",
+      "description": "Meeting join failures by error type. High rate may indicate MC capacity issues or AC connectivity problems. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3638,7 +3638,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration \u2014 a service is presenting a valid token but calling the wrong gRPC endpoint.",
+      "description": "Rate of Layer 2 caller service_type rejections. Any non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4120,7 +4120,8 @@
           "range": true,
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook."
     },
     {
       "id": 58,
@@ -4212,7 +4213,8 @@
           "range": true,
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook."
     },
     {
       "collapsed": false,
@@ -4324,7 +4326,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "MC assignment failures broken down by rejection_reason. The GcMcAssignmentFailures alert directs oncall here first: most reasons (at_capacity, draining, unhealthy) point at MC fleet health, but invalid_request is a GC contract violation \u2014 GC sent a malformed AssignMeetingWithMh \u2014 and scaling MCs will not help it.",
+      "description": "MC assignment failures broken down by rejection_reason. The GcMcAssignmentFailures alert directs oncall here first: most reasons (at_capacity, draining, unhealthy) point at MC fleet health, but invalid_request is a GC contract violation — GC sent a malformed AssignMeetingWithMh — and scaling MCs will not help it.",
       "fieldConfig": {
         "defaults": {
           "color": {

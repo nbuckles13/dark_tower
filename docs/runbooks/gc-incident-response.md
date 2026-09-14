@@ -1040,11 +1040,14 @@ curl http://localhost:8080/metrics | grep 'gc_token_refresh_total{status="succes
 > exhaustion is now `org_limit`.
 
 The "Meeting Creation Failures by Type" panel in `gc-overview.json` groups by
-`error_type` rather than enumerating values, so it shows all four with no edit.
+`error_type` rather than enumerating values, so it shows all four with no edit
+(since present-at-zero, all four series are always drawn; a non-zero value is the
+signal, not the presence of a series).
 
-> **`org_inactive` and `org_not_provisioned` are expected to be permanently
-> absent.** No data on those series is healthy — not a broken exporter, not a bad
-> scrape config. Neither state is reachable through any application flow (AC's
+> **`org_inactive` and `org_not_provisioned` are expected to read a permanent
+> zero.** A `0` on those series is healthy; *absence* is not — they are
+> present-at-zero from process start, so a missing series means a scrape or export
+> fault, not calm. Neither state is reachable through any application flow (AC's
 > `org_extraction` resolves the org by subdomain filtered on `is_active = true`
 > and fails closed, so no token is minted for a missing or inactive org). They are
 > reachable only inside the ~1h token TTL after the row changes underneath a

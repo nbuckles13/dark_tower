@@ -38,6 +38,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Dashboard**: MC Overview - Actor Mailbox Depth by Type
 
 ### `mc_actor_panics_total`
+- **Expected-empty**: yes — every actor panic is a bug, so a healthy service reads zero here
 - **Type**: Counter
 - **Description**: Total actor panic events
 - **Labels**:
@@ -52,6 +53,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 ## Message Processing Metrics
 
 ### `mc_messages_dropped_total`
+- **Expected-empty**: yes — a healthy actor system drops no messages, so this reads zero when healthy
 - **Type**: Counter
 - **Description**: Messages dropped due to backpressure
 - **Labels**:
@@ -102,6 +104,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 ## Fencing Metrics
 
 ### `mc_fenced_out_total`
+- **Expected-empty**: yes — fencing is split-brain recovery; a healthy single-writer reads zero
 - **Type**: Counter
 - **Description**: Fenced-out events (split-brain recovery)
 - **Labels**:
@@ -168,6 +171,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Dashboard**: MC Overview - Session Join Latency P50/P95/P99 (Join Flow row)
 
 ### `mc_session_join_failures_total`
+- **Expected-empty**: yes — every series is a join failure, so a healthy join path reads zero
 - **Type**: Counter
 - **Description**: Total session join failures by error type
 - **Labels**:
@@ -574,6 +578,7 @@ span would record as attributes, on a surface no guard covers.
 ## Participant Outbound Delivery Metrics
 
 ### `mc_participant_outbound_messages_dropped_total`
+- **Expected-empty**: yes — a healthy outbound path drops nothing, so this reads zero when healthy
 - **Type**: Counter
 - **Description**: Server messages dropped because a participant's outbound channel was full or closed
 - **Labels**:
@@ -628,6 +633,7 @@ which MC records on the participant actor.
 - **Dashboard**: MC Overview - Client-Reported MH Status by State
 
 ### `mc_participant_mh_status_dropped_total`
+- **Expected-empty**: yes — drops are cap/over-limit refusals of client-reported status, zero on a well-behaved client
 - **Type**: Counter
 - **Description**: Total per-MH status drops on the client→MC reporting path,
   by reason. Two independent security bounds:
@@ -750,6 +756,7 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
 - **Usage**: Monitor token refresh latency
 
 ### `mc_token_refresh_failures_total`
+- **Expected-empty**: yes — every series is a token-refresh failure, so a healthy token manager reads zero
 - **Type**: Counter
 - **Description**: Token refresh failures by error type
 - **Labels**:
@@ -763,13 +770,14 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
 ## gRPC Auth Layer 2 Metrics (ADR-0003)
 
 ### `mc_caller_type_rejected_total`
+- **Expected-empty**: yes — any caller-type rejection is a misconfiguration/bug, so this reads zero when healthy
 - **Type**: Counter
 - **Description**: Total Layer 2 service_type routing rejections (valid token, wrong caller for gRPC service)
 - **Labels**:
   - `grpc_service`: Target gRPC service name (`MeetingControllerService`, `MediaCoordinationService`)
   - `expected_type`: Expected service_type for the gRPC service (`global-controller`, `media-handler`)
-  - `actual_type`: Actual service_type from the token (`global-controller`, `media-handler`, `meeting-controller`, `unknown`)
-- **Cardinality**: Low (2 x 3 x 4 = 24 max, bounded by service types)
+  - `actual_type`: Caller's `service_type` claim, **clamped** at the emit site (`common::service_type::service_type_metric_label`) to the recognized identities (`global-controller`, `media-handler`, `meeting-controller`), plus `unknown` (claim absent) and `other` (present-but-unrecognized — a forged/off-spec claim). A recognized-but-wrong identity keeps its real value; only genuinely-unrecognized strings collapse to `other`.
+- **Cardinality**: Low — `actual_type` is bounded to 5 values by the emit-site clamp (3 identities + `unknown` + `other`), independent of the peer-controlled claim; `grpc_service` (2) and `expected_type` (2) are path-fixed literals.
 - **Alert**: ANY non-zero value indicates a bug or misconfiguration
 - **Usage**: Detect service-to-service routing errors, misconfigured tokens
 - **Recorded in**: `grpc/auth_interceptor.rs` on Layer 2 rejection
@@ -826,7 +834,9 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
 - **Description**: Total errors by operation and type
 - **Labels**:
   - `operation`: Operation that failed (token_refresh, gc_heartbeat, redis_session, meeting_join, session_binding)
-  - `error_type`: Error classification from `McError::error_type_label()` (redis, grpc, not_registered, config, session_binding, meeting_not_found, participant_not_found, meeting_capacity_exceeded, mc_capacity_exceeded, draining, migrating, fenced_out, conflict, jwt_validation, permission_denied, internal, token_acquisition, token_acquisition_timeout)
+  - `error_type`: Error classification — the authoritative value set is `McError::error_type_label()`
+    (`crates/mc-service/src/errors.rs`), a wildcard-free match; do NOT re-list it here (an inline copy drifted
+    from 18 to the method's full range and is the exact restated-roster rot `mh-service.md` §header warns of).
   - `status_code`: Signaling error code as string (2, 3, 4, 5, 6, 7)
 - **Cardinality**: Medium (~90 combinations, bounded by operations and error types)
 - **Usage**: Track error rates by type, identify patterns in failures
@@ -973,9 +983,9 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `event_type` | 2 | `connected`, `disconnected` (MH notifications) |
 | `grpc_service` | 2 | `MeetingControllerService`, `MediaCoordinationService` (Layer 2 auth) |
 | `expected_type` | 3 | `global-controller`, `media-handler`, `meeting-controller` (Layer 2 auth) |
-| `actual_type` | 4 | `global-controller`, `media-handler`, `meeting-controller`, `unknown` (Layer 2 auth) |
+| `actual_type` | 5 | `global-controller`, `media-handler`, `meeting-controller`, `unknown`, `other` — emit-site clamp (`common::service_type::service_type_metric_label`); `other` = present-but-unrecognized claim |
 
-**Total Estimated Cardinality**: ~111 time series (well within Prometheus limits) — +4 `state` (participant MH status) and +2 `reason` (mh-status drop: `cap`, `over_limit`) over the prior ~105.
+**Total Estimated Cardinality**: ~115 time series (well within Prometheus limits) — +4 `state` (participant MH status) and +2 `reason` (mh-status drop: `cap`, `over_limit`) over the prior ~105, plus a bounded `actual_type` clamp domain (`other` bucket + `meeting-controller` now zero-init'd) on `mc_caller_type_rejected_total`.
 
 ---
 

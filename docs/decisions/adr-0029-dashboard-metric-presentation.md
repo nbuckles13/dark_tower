@@ -115,6 +115,113 @@ When adding new dashboard panels, apply this rule:
 - **Operations** (94%): Confirmed alert-dashboard parity preserved — ratio-based alerts match rate()-based ratio panels, counter panels without ratio alerts switch safely. SLO dashboard carve-out preserves incident response workflow.
 - **Security** (95%): Confirmed security event integer visibility in both stat and timeseries panels. No PII exposure changes. Attack indicators more visible in low-traffic environments.
 
+## Amendment (2026-09-10) — zero-init precondition, window enforcement, empty-is-healthy descriptions
+
+This amendment records three things the original decision left implicit or unenforced. It changes **no**
+PromQL function: Category A stays `increase()`, Category B `rate()`, Category C explicit windows.
+
+### A. The zero-init precondition (why `increase()` on a counter is honest)
+
+Category A prescribes `increase(metric[$__range])` on a discrete-event counter. That reading is honest **only
+if the counter series exists at 0 from process start.** A `metrics`-crate counter is created lazily — it first
+appears in `/metrics` at its first increment, already at that value, with no prior `0` sample — so for a single
+low-volume event `increase()` reads 0 *forever* (the ADR-0036 story-1 Join Flow defect). The fix is
+**present-at-zero**: services zero-initialize every enumerable discrete-event `*_total` counter at startup
+(`zero_initialize_counters()` / eager handle registration), giving each series a `0` point so the first real
+event is a visible `0→1` edge. This is **enforced by the `dt-guard counter-zero-init` guard** — a future
+service that follows the Category A classification rule but skips zero-init is caught, rather than silently
+reproducing this defect. Counters whose label domain is genuinely unbounded/runtime-discovered (raw
+`status_code`, free-form `operation`/`table`/`reason`), or whose absence is load-bearing for a liveness alert
+(`absent_over_time`), are `Zero-init: exempt` in the catalog with a stated reason.
+
+### B. Window split is now enforced (stat `$__range`, timeseries `$__rate_interval`)
+
+Category A's existing stat-vs-timeseries split (a stat counts over the dashboard range; a timeseries rates over
+the scrape-adaptive interval) was documented but unenforced — `dt-guard dashboard-panels` accepted either
+window on either panel type. It is now enforced: for a `*_total` **counter** ref, a `stat`/`gauge`/`bargauge`
+panel's `increase()` window must be `$__range`, and a `timeseries` panel's must be `$__rate_interval`.
+Category B (ratio/quantile) and SLO dashboards are unaffected.
+
+### C. Zero-is-healthy DESCRIPTION convention (NO `noValue`)
+
+A panel over a **catalog-declared expected-empty** counter (one whose every series is a bad event — annotated
+`- **Expected-empty**: yes — <why>`) must carry a description marker, in **one of TWO variants selected by the
+counter's `Zero-init: exempt` status** (OPS-21), matched case-insensitively and enforced by `dt-guard
+dashboard-panels`:
+- a **zero-init'd** (non-exempt) expected-empty counter reads a flat `0` when healthy and an **absent series is
+  a FAULT**, so its panels must carry **`zero is healthy`**;
+- an **exempt** (unbounded / lazily-created) expected-empty counter is **legitimately absent** when healthy, so
+  its panels must carry **`empty is healthy`**.
+
+A single mandated phrase across both would be false on the zero-init'd majority — a guard checking presence of a
+sentence that is wrong on ~25 of 27 panels, which is the very misreading (absent-as-healthy) this devloop
+removes. The variant is not a judgment: it is the `Zero-init: exempt` field the shared parser
+(`dt-guard`'s `common::metric_catalog::parse_annotations_dir`) already returns to the guard alongside
+`Expected-empty`, so `counter-zero-init` and `dashboard-panels` cannot disagree about which counters are exempt
+or expected-empty. Both variants also carry the two mandated statements below.
+
+**Why `noValue: 0` was REJECTED (record this, or it gets re-proposed as an obvious improvement).** A dashboard
+sweep initially proposed `noValue: 0` on failure panels; **the user ruled it out** (2026-09-10) on
+observability's argument. `noValue` and zero-init fix the SAME defect. After zero-init a healthy failure
+counter reads `0`, not "No data", so `noValue` is **dead code** there; and an absent series can now only be a
+**fault** (recorder not installed, scrape failing, pod down, wrong job label), so painting it a green `0` would
+**MASK** that fault — a "fail loudly, never mask" violation. The walk across all three exemption classes finds
+no set where `noValue` both fires and is correct (unbounded = never absent; absence-is-load-bearing = hides the
+very absence an `absent_over_time` alert fires on; deliberate-absence-is-signal = contradicts it). The one
+in-tree instance (mh-media panel 6) was dead code that never fired and nobody had noticed.
+
+**The description must make TWO statements, and the second is the valuable one:** (a) a flat line at zero is the
+healthy reading; (b) **an absent series is a metrics-pipeline fault, not a zero** (name where liveness is read,
+and the runbook to open on non-zero). Statement (b) is exactly what `noValue` used to destroy; now that we
+stopped painting absence as zero, the description is the only thing teaching an operator to read absence as a
+fault. **Two variants, selected by the catalog annotation:** for a **zero-init'd** counter, absence IS a fault
+(state it). For a `Zero-init: exempt` counter, absence can be **legitimate** — and for the absence-is-load-
+bearing class it is exactly what an `absent_over_time` alert keys on — so a copy-pasted "absence is a fault"
+sentence there would be actively wrong; the exempt variant gets its own wording. (After the exempt-list
+re-audit the only expected-empty ∩ genuinely-unbounded-exempt counter is `mh_errors_total`; its stat tiles
+read "No data" when healthy, mitigated by the exempt-variant description — the `noValue` carve-up for that
+intersection was NOT taken, per the user ruling.)
+
+### D. Mixed-class panels (both tokens + per-metric attribution)
+
+A single panel can plot BOTH a zero-init'd expected-empty counter (absent ⇒ broken pipeline) AND an exempt
+counter (absent ⇒ healthy). `errors-overview` id 5 "Top Error Types" is the one such panel today
+(`mc_messages_dropped_total` zero-init'd; `gc_http_requests_total{status_code=~"[45].."}` and `ac_errors_total`
+exempt). An empty such panel is **ambiguous** — the 3am failure is *misattribution*, an operator seeing an empty
+panel and concluding "pipeline broken" when only the legitimately-absent exempt series are missing. Three
+requirements, enforced by `dt-guard dashboard-panels` (`mixed_panel_attribution`):
+1. **Both tokens.** The `needs_empty` test is computed over **all exempt refs on the panel, not only those that
+   are also expected-empty** — an exempt ref need not itself be expected-empty to need the `empty is healthy`
+   statement. So a mixed panel must carry `zero is healthy` **and** `empty is healthy`. A correct-sounding
+   exception clause that names the exempt series but contains neither literal token still reds — the trap that
+   caught both reviewers drafting this.
+2. **Per-metric attribution, by set-equality (not subset).** The description must name **exactly** the panel's
+   exempt refs — every one named verbatim, and none stray. The stray half is load-bearing: a subset test would
+   pass a description lifted from a *future second* mixed panel that names that panel's exempt metrics instead.
+3. **A `count()` discriminator.** The description must name a `count()` on the zero-init'd metric
+   (`count(mc_messages_dropped_total)` — a number ⇒ present-and-genuinely-zero, no data ⇒ broken pipeline). This
+   adopts an existing in-tree convention (`client-media.json` ids 3, 8), not a new one.
+
+**`mh-overview` id 27 (`mh_errors_total`) is NOT a mixed panel and needs no change.** Its only counter is exempt,
+so `needs_zero` is false and only `empty is healthy` is required — which it carries. (An earlier draft asked for
+both markers there; withdrawn — the strict token's "an absent series is a fault" is FALSE for an exempt counter,
+which is never zero-init'd, so requiring it would inject the very misattribution this fixes. The exempt variant's
+prose already states the flat-zero-is-healthy half under one token.) The widening changes the required-marker set
+of exactly **one** panel (id 5); the governed set is identical before and after.
+
+**Residual blind spot (measured, not assumed).** The class test and `metric_not_in_catalog` iterate the *same*
+service-prefixed ref extractor (`ac|gc|mc|mh`); a governed panel carrying a non-service-prefixed `_total` ref is
+classified on an incomplete set and `metric_not_in_catalog` does **not** backstop it — they share the extractor,
+they do not cover each other. Vacuous today by measurement (0 governed panels carry such a ref). It stops being
+vacuous when the `dt_client_*` panels (already catalogued in `client.md`) gain a marker after the client exporter
+lands — the first instance.
+
+**Known limitation (state it honestly):** the description-marker guard checks that a token is PRESENT, not that
+the prose is TRUE — it is a checkbox, so a copy-pasted description that contradicts its own panel passes. The
+mixed-class set-equality check narrows this for mixed panels (a description naming another panel's metrics reds),
+but for single-class panels a cheap future mitigation is flagging byte-identical descriptions across two
+marker-carrying panels; not built.
+
 ## Debate Reference
 
 See: `docs/debates/2026-04-01-dashboard-rates-vs-counts/debate.md`

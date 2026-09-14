@@ -482,3 +482,149 @@ async fn media_path_metrics_carry_key_custody_and_every_drop_reason_is_registere
         observed.len()
     );
 }
+
+// -----------------------------------------------------------------------------
+// Counter-visibility (present-at-zero) — DEPLOYED-ARTIFACT proof for the
+// ADR-0036 story-1 fix. The hermetic per-service `zero_init_renders_counters_
+// present_at_zero` unit tests prove the exporter emits registered-but-never-
+// incremented counters at 0 in-process; THIS test proves it through the real
+// running MC pod + scrape path, and is the permanent regression guard against
+// the defect returning in a deployed build. Co-owned: observability + test.
+// -----------------------------------------------------------------------------
+
+/// Structurally-quiescent present-at-zero target. `mc_actor_panics_total
+/// {actor_type="controller"}` is UNREACHABLE by any production code path: the
+/// MeetingControllerActor is the supervision-tree ROOT (nothing supervises it,
+/// so nothing records it panicking; if it dies the process dies). The two prod
+/// `record_panic` callers pass `Meeting`/`Participant`, never `Controller`. So a
+/// rendered `…{controller} 0` line can ONLY be the product of zero-init — the
+/// cleanest possible present-at-0 proof; nothing else could have created it. A
+/// non-zero value would be a genuine bug (a real controller panic), never noise.
+const ZERO_INIT_TARGET: &str = r#"mc_actor_panics_total{actor_type="controller"}"#;
+const TRIAGE_ZI_SCRAPE: &str = "Triage MC scrape/pod liveness (up)";
+const TRIAGE_ZI_ABSENT: &str = "Triage zero-init combo NOT registered";
+const TRIAGE_ZI_NONZERO: &str = "Triage a REAL controller actor panic";
+const TRIAGE_ZI_BADVALUE: &str = "Triage unexpected metric value shape";
+
+#[tokio::test]
+async fn zero_initialized_counter_is_present_at_zero_on_a_running_pod() {
+    let cluster = cluster().await;
+
+    // Tier 1 (test F3): poll `up` — Prometheus's own liveness metric, decoupled
+    // from MC's registration path, so it separates "scrape/pod down" from
+    // "zero-init failed for this combo".
+    assert_eventually(ConsistencyCategory::MetricsScrape, || {
+        let prometheus = PrometheusClient::new(&cluster.prometheus_base_url);
+        async move {
+            prometheus
+                .query_promql(r#"up{job="mc-service"} == 1"#)
+                .await
+                .ok()
+                .filter(|r| !r.data.result.is_empty())
+                .is_some()
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{TRIAGE_ZI_SCRAPE}: `up{{job=\"mc-service\"}}` is not 1 — MC is not up or not \
+             scraped. Decoupled from MC's registration path, so this is a scrape/pod \
+             fault, NOT a zero-init failure."
+        )
+    });
+
+    // Tier 2 (test F3): poll the target's PRESENCE via assert_eventually. `up==1`
+    // can lead the app-metric sample being queryable by a scrape cycle, so a
+    // single-shot query right after pod-ready could transiently miss the series
+    // and red ZI_ABSENT falsely. The value assertion (tier 3) is a point check and
+    // is NOT retried — panics only ever climb, so a settled 0 cannot un-settle.
+    assert_eventually(ConsistencyCategory::MetricsScrape, || {
+        let prometheus = PrometheusClient::new(&cluster.prometheus_base_url);
+        async move {
+            prometheus
+                .query_promql(ZERO_INIT_TARGET)
+                .await
+                .ok()
+                .filter(|r| !r.data.result.is_empty())
+                .is_some()
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{TRIAGE_ZI_ABSENT}: `{ZERO_INIT_TARGET}` is ABSENT while `up{{mc}}==1` — the \
+             pod is scraped but this combo was never registered. That is exactly the \
+             counter-visibility defect: `zero_initialize_counters()` did not touch it (or \
+             `Controller` was dropped from `ACTOR_TYPES`). DO NOT fix this red by weakening \
+             the test — the controller combo MUST stay zero-init'd; it pins zero-init \
+             completeness for a combo no runtime path can otherwise create."
+        )
+    });
+
+    let prometheus = PrometheusClient::new(&cluster.prometheus_base_url);
+    let resp = prometheus
+        .query_promql(ZERO_INIT_TARGET)
+        .await
+        .expect("Prometheus query for the zero-init target failed");
+
+    // Tier 3 (test F1): FOR-ALL pods, not `.first()`. The target returns one series
+    // PER mc pod; during a rolling deploy a new-build pod registers the combo at 0
+    // while an old-build (broken) pod may not — `.first()` could land on the good
+    // one and pass while the defect ships on the other. A per-pod present-at-0
+    // guard must see every pod.
+    assert!(
+        !resp.data.result.is_empty(),
+        "{TRIAGE_ZI_ABSENT}: settled fetch of `{ZERO_INIT_TARGET}` returned zero series \
+         despite tier 2 — the scrape flapped; re-investigate registration."
+    );
+
+    // test F1b: an ABSENT pod contributes NO series to the for-all below, so the
+    // loop alone cannot catch a live-but-not-registering pod (a rolling-deploy
+    // old build serving traffic while missing the combo). Cross-check the two
+    // populations: the target's series count must equal the live-pod count.
+    async fn scalar_count(prom: &PrometheusClient, q: &str) -> Option<f64> {
+        prom.query_promql(q)
+            .await
+            .ok()?
+            .data
+            .result
+            .first()?
+            .value
+            .as_ref()
+            .and_then(|(_, v)| v.parse::<f64>().ok())
+    }
+    let live_pods = scalar_count(&prometheus, r#"count(up{job="mc-service"} == 1)"#).await;
+    let target_series = scalar_count(&prometheus, &format!("count({ZERO_INIT_TARGET})")).await;
+    assert!(
+        live_pods.is_some() && target_series == live_pods,
+        "{TRIAGE_ZI_ABSENT}: live mc pods = {live_pods:?} but `{ZERO_INIT_TARGET}` exposes \
+         {target_series:?} series — a live pod is NOT exposing the combo (its build did not \
+         zero-init it). The for-all below cannot see an absent pod; this count cross-check can."
+    );
+    for r in &resp.data.result {
+        let pod = r.metric.get("instance").map_or("?", String::as_str);
+        // test F2: a missing/unparseable value is a BAD-VALUE fault, NOT a panic —
+        // give it its OWN token so it can never be mis-triaged as a controller panic.
+        let raw = match r.value.as_ref() {
+            Some((_, v)) => v.as_str(),
+            None => panic!(
+                "{TRIAGE_ZI_BADVALUE}: `{ZERO_INIT_TARGET}` on pod {pod} has no scalar value \
+                 in the query result — a response-shape fault, not a panic."
+            ),
+        };
+        let value: f64 = raw.parse().unwrap_or_else(|_| {
+            panic!(
+                "{TRIAGE_ZI_BADVALUE}: `{ZERO_INIT_TARGET}` on pod {pod} rendered {raw:?}, \
+                 which does not parse as a number — a response-shape fault, not a panic."
+            )
+        });
+        // Present-at-zero renders exactly "0"; NaN cannot reach here (a non-number
+        // was already caught as ZI_BADVALUE above), so the epsilon check is a clean
+        // exact-zero test without the float-cmp lint.
+        assert!(
+            value.abs() < f64::EPSILON,
+            "{TRIAGE_ZI_NONZERO}: `{ZERO_INIT_TARGET}` on pod {pod} reads {raw} (!= 0) — a \
+             controller actor genuinely panicked on that pod. Investigate; not a flake."
+        );
+    }
+}

@@ -30,6 +30,20 @@ use std::time::Duration;
 ///
 /// Returns error if Prometheus recorder fails to install (e.g., already installed).
 pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    configured_prometheus_builder()?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus recorder: {}", e))
+}
+
+/// Build the `PrometheusBuilder` with AC's production bucket configuration,
+/// WITHOUT installing it globally. Single source of the exporter config so the
+/// present-at-zero render test exercises the SAME builder production installs.
+/// NOTE: that test proves present-at-0 under this exact config; it does NOT prove
+/// `idle_timeout` is absent — `render()` runs synchronously at t≈0, before a
+/// realistic minutes-scale `idle_timeout` would reap idle 0-series — so
+/// idle_timeout-absence is a CONFIG-REVIEW checkpoint here, not a test-enforced
+/// invariant (neither this test nor the Layer-7 env-test reliably backstops it).
+fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
     PrometheusBuilder::new()
         // Token issuance buckets aligned with 350ms SLO target
         .set_buckets_for_metric(
@@ -62,9 +76,7 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
                 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
             ],
         )
-        .map_err(|e| format!("Failed to set HTTP request buckets: {}", e))?
-        .install_recorder()
-        .map_err(|e| format!("Failed to install Prometheus recorder: {}", e))
+        .map_err(|e| format!("Failed to set HTTP request buckets: {}", e))
 }
 
 // ============================================================================
@@ -380,10 +392,256 @@ fn is_uuid(s: &str) -> bool {
     true
 }
 
+// ============================================================================
+// Zero-initialization of discrete-event counters (counter-visibility fix)
+//
+// A `metrics`-crate counter is created lazily on first increment, so no `0`
+// sample precedes it and `increase()` reads 0 forever for a single low-volume
+// event. Empirically proven against metrics-exporter-prometheus 0.16.2 that
+// resolving a `counter!` handle (incl. `.increment(0)`) renders a scrapeable
+// `…_total 0` line, so touching every enumerable label combination at startup
+// gives each series a present-at-zero point and makes the first event a visible
+// 0→1 edge.
+//
+// AC has no ALL-backed label enums — every vocabulary is a bounded set of
+// `&'static str` literals passed at the emit site. Each `const [&str]` below is
+// the single in-file home for one vocabulary and is proven closed at its emit
+// site (all call sites pass a fixed literal, never an external/request string).
+// Counters whose domain is unbounded/runtime-discovered (raw `status_code`,
+// free-form `operation`/`table`/`reason`), or that have no production emit site,
+// are catalog-marked `Zero-init: exempt` and NOT touched here.
+// ============================================================================
+
+/// `status` on the success/error-shaped counters. Emit sites: fixed literals.
+const STATUS_SUCCESS_ERROR: &[&str] = &["success", "error"];
+/// `ac_token_issuance_total{grant_type}` — closed at emit site: all call sites
+/// pass a literal (auth_handler.rs:131,194,241,256,299; internal_tokens.rs:
+/// 54,70,107,123). The client's OAuth `grant_type` form field is VALIDATED
+/// against `"client_credentials"` (auth_handler.rs:237) and never recorded raw.
+const GRANT_TYPES: &[&str] = &[
+    "client_credentials",
+    "password",
+    "registration",
+    "internal_meeting",
+    "internal_guest",
+];
+/// `ac_meeting_token_display_name_total{outcome}` — literals at
+/// internal_tokens.rs:176,182,191. Never the user's display name (PII).
+const DISPLAY_NAME_OUTCOMES: &[&str] = &["resolved", "user_not_found", "lookup_error"];
+/// `ac_rate_limit_decisions_total{action}` — literals at token_service.rs:67,70,
+/// 240,246 and user_service.rs:85,91.
+const RATE_LIMIT_ACTIONS: &[&str] = &["allowed", "rejected"];
+/// `ac_jwks_requests_total{cache_status}` — literals at jwks_handler.rs:33 etc.
+const JWKS_CACHE_STATUSES: &[&str] = &["hit", "miss", "bypass"];
+/// `ac_credential_operations_total{operation}` — literals across admin_handler.rs.
+const CREDENTIAL_OPERATIONS: &[&str] =
+    &["list", "get", "create", "update", "delete", "rotate_secret"];
+/// `ac_audit_log_failures_total{event_type, reason}` — the CLOSED prod pair set
+/// (the two labels are correlated, so only real pairs are touched, never the
+/// cross-product). Un-exempted 2026-09-10 (was wrongly "unbounded"): every emit
+/// site passes literals except `token_service.rs:366`, whose `event_type` is
+/// `AuthEventType::{UserLogin,UserLoginFailed}.as_str()` = `"user_login"`/
+/// `"user_login_failed"` — still a closed typed-enum set. `reason` is
+/// `"db_write_failed"` at EVERY prod site; `encryption_failed`/`log_overflow`
+/// appear only in unit-test fixtures and are NOT prod-emittable, so they are not
+/// fabricated here. Emit sites: `key_management_service.rs:96,166,384`,
+/// `user_service.rs:144`, `token_service.rs:105,172,366`,
+/// `registration_service.rs:78,124,158`.
+const AUDIT_LOG_FAILURE_PAIRS: &[(&str, &str)] = &[
+    ("key_generated", "db_write_failed"),
+    ("key_rotated", "db_write_failed"),
+    ("key_expired", "db_write_failed"),
+    ("user_registered", "db_write_failed"),
+    ("service_token_failed", "db_write_failed"),
+    ("service_token_issued", "db_write_failed"),
+    ("service_registered", "db_write_failed"),
+    ("scopes_updated", "db_write_failed"),
+    ("service_deactivated", "db_write_failed"),
+    ("user_login", "db_write_failed"),
+    ("user_login_failed", "db_write_failed"),
+];
+/// `ac_token_validations_total{status, error_category}` — un-exempted 2026-09-10
+/// (was wrongly "no emit site": `crypto/mod.rs:284,439` DO call it in prod). The
+/// only PROD-emittable combo today is `error`/`clock_skew` (the JWT clock-skew
+/// rejection path); the other `error_category` values documented in ADR-0011
+/// (authentication/authorization/cryptographic/internal) and the `success` path
+/// have no prod emit site yet (Phase-4), so they are not fabricated here.
+const TOKEN_VALIDATION_PAIRS: &[(&str, &str)] = &[("error", "clock_skew")];
+
+/// `ac_db_queries_total{operation, table, status}` — the CLOSED observed
+/// `(operation, table)` PAIR-SET from every `record_db_query` prod call site
+/// (`repositories/{service_credentials,signing_keys,users,auth_events,
+/// organizations}.rs`), each × `status ∈ {success, error}` (the binary
+/// `if is_ok()` outcome). NOT the `operation × table × status` cross-product —
+/// most `(operation, table)` cells never occur (e.g. `delete/organizations`), so
+/// zero-initing them would fabricate impossible always-zero series (OPS-6 trap).
+/// Un-exempted 2026-09-10: the earlier "unbounded/high-traffic" exemption was
+/// reversed — the labels are finitely enumerable literals, and the rare error
+/// series are exactly the low-volume series the lazy-init defect hides. The
+/// 12 observed `(operation, table)` pairs:
+const AC_DB_QUERY_PAIRS: &[(&str, &str)] = &[
+    ("select", "service_credentials"),
+    ("insert", "signing_keys"),
+    ("select", "signing_keys"),
+    ("select", "auth_events"),
+    ("insert", "auth_events"),
+    ("select", "organizations"),
+    ("select", "users"),
+    ("insert", "users"),
+    ("update", "users"),
+    ("select", "user_roles"),
+    ("insert", "user_roles"),
+    ("delete", "user_roles"),
+];
+
+/// Zero-initialize every enumerable discrete-event `ac_*_total` counter so each
+/// series is present at 0 from process start (see module section header).
+///
+/// INFALLIBLE: no `Result`, no panic path — called at boot, must never fail a
+/// service start. Uses `.increment(0)` at statement position (registers via side
+/// effect; a scrapeable 0-series, proven empirically).
+///
+/// `dt-guard:zero-init-entrypoint`.
+// dt-guard:zero-init-entrypoint
+pub fn zero_initialize_counters() {
+    for gt in GRANT_TYPES {
+        for st in STATUS_SUCCESS_ERROR {
+            counter!("ac_token_issuance_total", "grant_type" => *gt, "status" => *st).increment(0);
+        }
+    }
+    for o in DISPLAY_NAME_OUTCOMES {
+        counter!("ac_meeting_token_display_name_total", "outcome" => *o).increment(0);
+    }
+    for st in STATUS_SUCCESS_ERROR {
+        counter!("ac_key_rotation_total", "status" => *st).increment(0);
+    }
+    for a in RATE_LIMIT_ACTIONS {
+        counter!("ac_rate_limit_decisions_total", "action" => *a).increment(0);
+    }
+    for c in JWKS_CACHE_STATUSES {
+        counter!("ac_jwks_requests_total", "cache_status" => *c).increment(0);
+    }
+    for op in CREDENTIAL_OPERATIONS {
+        for st in STATUS_SUCCESS_ERROR {
+            counter!("ac_credential_operations_total", "operation" => *op, "status" => *st)
+                .increment(0);
+        }
+    }
+    // ac_audit_log_failures_total{event_type, reason} — closed prod pair set.
+    for (event_type, reason) in AUDIT_LOG_FAILURE_PAIRS {
+        counter!("ac_audit_log_failures_total", "event_type" => *event_type, "reason" => *reason)
+            .increment(0);
+    }
+    // ac_db_queries_total{operation, table, status} — observed (op,table) pairs × status
+    for (operation, table) in AC_DB_QUERY_PAIRS {
+        for status in STATUS_SUCCESS_ERROR {
+            counter!("ac_db_queries_total", "operation" => *operation, "table" => *table, "status" => *status)
+                .increment(0);
+        }
+    }
+    // ac_token_validations_total{status, error_category} — prod-emittable combos.
+    for (status, category) in TOKEN_VALIDATION_PAIRS {
+        counter!("ac_token_validations_total", "status" => *status, "error_category" => *category)
+            .increment(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::observability::testing::MetricAssertion;
+
+    /// Leg-1 completeness / touch-idiom proof: runs `zero_initialize_counters()`
+    /// through the SAME builder config production installs and asserts every
+    /// enumerable counter combo is present at 0 in the real exposition. A red on
+    /// the anchor is a recorder/scrape failure, NOT a present-at-0 violation.
+    #[test]
+    fn zero_init_renders_counters_present_at_zero() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            zero_initialize_counters();
+        }
+        let rendered = handle.render();
+
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("ac_token_issuance_total{")),
+            "ANCHOR ABSENT — no ac_token_issuance_total series: a scrape/recorder \
+             failure (env-sanity), NOT a present-at-0 violation. DO NOT satisfy \
+             this by deleting the check."
+        );
+
+        let present_at_zero = |prefix: &str| {
+            let found = rendered.lines().find(|l| l.starts_with(prefix));
+            // Loud on absence WITHOUT `panic!` (the crate denies clippy::panic
+            // even in tests): a missing series is a scrape/recorder failure, not
+            // a present-at-0 violation — the assert carries the same message.
+            assert!(found.is_some(), "series absent from /metrics: {prefix}");
+            let value = found.and_then(|l| l.rsplit(' ').next()).unwrap_or("");
+            assert_eq!(value, "0", "present-at-0 violation (value != 0): {found:?}");
+        };
+
+        // Exposition preserves EMISSION label order (grant_type then status).
+        present_at_zero(
+            r#"ac_token_issuance_total{grant_type="client_credentials",status="success"}"#,
+        );
+        present_at_zero(r#"ac_key_rotation_total{status="error"}"#);
+        present_at_zero(r#"ac_rate_limit_decisions_total{action="rejected"}"#);
+        present_at_zero(r#"ac_jwks_requests_total{cache_status="miss"}"#);
+        present_at_zero(
+            r#"ac_credential_operations_total{operation="rotate_secret",status="success"}"#,
+        );
+        present_at_zero(r#"ac_meeting_token_display_name_total{outcome="lookup_error"}"#);
+        // db_queries: an observed (operation,table) pair × error — previously masked.
+        present_at_zero(r#"ac_db_queries_total{operation="select",table="users",status="error"}"#);
+        // Un-exempted 2026-09-10 (audit-log page-on-any-value + clock-skew rejections).
+        present_at_zero(
+            r#"ac_audit_log_failures_total{event_type="user_login_failed",reason="db_write_failed"}"#,
+        );
+        present_at_zero(
+            r#"ac_token_validations_total{status="error",error_category="clock_skew"}"#,
+        );
+
+        let total_series = rendered
+            .lines()
+            .filter(|l| l.contains("_total{") || l.contains("_total "))
+            .count();
+        assert!(
+            (15..=200).contains(&total_series),
+            "zero-init series count {total_series} outside expected band 15..=200"
+        );
+    }
+
+    /// Assert a registered-at-0 counter survives to `render()` through the SHARED
+    /// prod builder — present-at-0 under the exact prod config.
+    ///
+    /// HONEST SCOPE (OBS-F3): this does NOT pin `idle_timeout`-absence — `render()`
+    /// is synchronous at t≈0, so a minutes-scale `idle_timeout` would not reap
+    /// first; it duplicates the present-at-0 render assertion under a stronger
+    /// name. idle_timeout-absence is a config-review checkpoint, not test-enforced.
+    #[test]
+    fn production_builder_has_no_idle_timeout() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            counter!("ac_key_rotation_total", "status" => "success").increment(0);
+        }
+        assert!(
+            handle.render().contains("ac_key_rotation_total{"),
+            "a registered-at-0 counter did NOT render through configured_prometheus_builder() \
+             — present-at-0 broke under the prod exporter config (a recorder/scrape/config \
+             regression). This does not by itself prove an idle_timeout was added; that stays \
+             a config-review checkpoint."
+        );
+    }
 
     // ========================================================================
     // Per-cluster MetricAssertion tests — replace the pre-ADR-0032 hand-rolled

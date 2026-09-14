@@ -234,7 +234,7 @@ impl McAssignmentService {
 /// GC's side it is a fault in GC's own request rather than a refusal of a
 /// healthy one. The `rejection_reason` values still match, which is what makes
 /// the join across the two series work.
-fn rejection_reason_label(reason: RejectionReason) -> &'static str {
+pub(crate) fn rejection_reason_label(reason: RejectionReason) -> &'static str {
     match reason {
         RejectionReason::AtCapacity => "at_capacity",
         RejectionReason::Draining => "draining",

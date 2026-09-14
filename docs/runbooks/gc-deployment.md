@@ -1239,9 +1239,11 @@ histogram_quantile(0.95,
 > capacity will report clean *during a real cap exhaustion*. If you are carrying the old
 > association, re-read the four selectors above.
 >
-> **`org_inactive` and `org_not_provisioned` are expected to be permanently absent** — they are
-> organization-state faults with no legitimate cause in this system. Their appearance is most
-> likely right after a deploy, which makes this checklist the highest-signal place to catch them.
+> **`org_inactive` and `org_not_provisioned` are expected to read a permanent zero** — a `0` is
+> healthy (they are present-at-zero from process start); *absence* of the series is a scrape/export
+> fault, not calm. They are organization-state faults with no legitimate cause in this system, so any
+> non-zero value is the signal. It is most likely right after a deploy, which makes this checklist the
+> highest-signal place to catch them.
 > If either is non-zero, do **not** treat it as a code regression and do **not** roll back on that
 > basis: check first whether GC and AC are pointed at the same database (`gc-service-secrets` and
 > `ac-service-secrets` each carry an independent `DATABASE_URL`, and nothing enforces that they

@@ -13,6 +13,7 @@ use dt_guard::api_version;
 use dt_guard::application_metrics;
 use dt_guard::cite_extract;
 use dt_guard::common::status::{emit_fail, reason_token};
+use dt_guard::counter_zero_init;
 use dt_guard::cross_boundary_classification;
 use dt_guard::cross_boundary_scope;
 use dt_guard::dashboard_panels;
@@ -291,6 +292,16 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
+    /// Counter zero-init coverage: every catalogued enumerable `*_total` counter
+    /// is present-at-zero from startup (ADR-0036 story-1 counter-visibility fix).
+    CounterZeroInit {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
     /// Metric test-coverage check (ADR-0032).
     MetricCoverage {
         /// Repository root for path resolution.
@@ -457,6 +468,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::ApiVersionCheck { root, explain } => api_version::run(&root, explain),
         Command::KnowledgeIndex { root, explain } => knowledge_index::run(&root, explain),
         Command::HistogramBuckets { root, explain } => histogram_buckets::run(&root, explain),
+        Command::CounterZeroInit { root, explain } => counter_zero_init::run(&root, explain),
         Command::MetricCoverage { root, explain } => metric_coverage::run(&root, explain),
         Command::TodoTracking { root, explain } => todo_tracking::run(&root, explain),
         Command::EnvConfig { root, explain } => env_config::run(&root, explain),

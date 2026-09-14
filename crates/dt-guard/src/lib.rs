@@ -21,6 +21,7 @@ pub mod api_version;
 pub mod application_metrics;
 pub mod cite_extract;
 pub mod common;
+pub mod counter_zero_init;
 pub mod cross_boundary_classification;
 pub mod cross_boundary_scope;
 pub mod dashboard_panels;
