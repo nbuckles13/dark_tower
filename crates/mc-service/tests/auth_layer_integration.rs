@@ -405,3 +405,41 @@ async fn auth_layer_records_caller_type_rejected_unknown_actual_type() {
         ])
         .assert_delta(1);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn auth_layer_clamps_unrecognized_actual_type_to_other() {
+    // A signature-valid token carrying an arbitrary, unrecognized `service_type`
+    // must NOT reach the metric label RAW (unbounded-cardinality DoS). The emit
+    // site clamps it to `other`; auth still rejects. (`unknown` = absent claim,
+    // `other` = present-but-unrecognized — a distinct triage signal.)
+    let (_mock, keypair, layer) = setup().await;
+    let mut svc = layer.layer(NoopService);
+
+    let claims = make_service_claims(0, 3600, REQUIRED_SCOPE, Some("forged-🦀-value"));
+    let token = keypair.sign_token(&claims);
+
+    let snap = MetricAssertion::snapshot();
+    let _ = svc
+        .ready()
+        .await
+        .unwrap()
+        .call(bearer_request(MH_GRPC_PATH, &token))
+        .await
+        .unwrap();
+
+    // The forged string is NOT a label value; only the `other` bucket fires.
+    snap.counter("mc_caller_type_rejected_total")
+        .with_labels(&[
+            ("grpc_service", "MediaCoordinationService"),
+            ("expected_type", "media-handler"),
+            ("actual_type", "other"),
+        ])
+        .assert_delta(1);
+    snap.counter("mc_caller_type_rejected_total")
+        .with_labels(&[
+            ("grpc_service", "MediaCoordinationService"),
+            ("expected_type", "media-handler"),
+            ("actual_type", "forged-🦀-value"),
+        ])
+        .assert_delta(0);
+}

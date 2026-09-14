@@ -182,6 +182,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!(error = %e, "Failed to install Prometheus metrics recorder");
             e
         })?;
+    // Zero-initialize discrete-event counters so each series is present at 0 from
+    // process start (counter-visibility fix — a lazily-created counter has no
+    // 0→1 edge and `increase()` reads 0 forever). Infallible; must run right
+    // after the recorder installs and before any event can fire.
+    mc_service::observability::metrics::zero_initialize_counters();
     info!("Prometheus metrics recorder initialized");
 
     // Initialize health state

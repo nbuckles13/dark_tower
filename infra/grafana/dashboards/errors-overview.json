@@ -351,7 +351,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Top error types by frequency across all services. Identifies most common error patterns.",
+      "description": "Top error types by frequency across all services. Identifies most common error patterns. Zero is healthy: a flat line at zero means no such events occurred. For `mc_messages_dropped_total`, an ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label). But empty is healthy for the other two: `gc_http_requests_total` and `ac_errors_total` are lazily created (zero-init exempt), so an absent series there is the healthy outcome — no 4xx/5xx responses and no AC errors have occurred. To tell the two apart, read count(mc_messages_dropped_total): a number means the series is present and genuinely zero; no data means the MC pipeline is broken.",
       "fieldConfig": {
         "defaults": {
           "color": {

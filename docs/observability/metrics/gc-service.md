@@ -11,6 +11,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 ## HTTP Metrics
 
 ### `gc_http_requests_total`
+- **Zero-init**: exempt — status_code is a raw HTTP status u16 and method a raw HTTP verb, an unbounded runtime-discovered label domain
 - **Type**: Counter
 - **Description**: Total HTTP requests received
 - **Labels**:
@@ -121,9 +122,13 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Type**: Counter
 - **Description**: Total database queries executed
 - **Labels**:
-  - `operation`: Query operation (select_mc, get_healthy_assignment, get_candidate_mcs, atomic_assign, end_assignment, update_heartbeat, etc.)
-  - `status`: Query outcome (success, error)
-- **Cardinality**: Low (~30 combinations)
+  - `operation`: Query operation — a CLOSED set of literals passed at the `record_db_query` call sites (the
+    23 in `GC_DB_QUERY_OPERATIONS`, `observability/metrics.rs`); never a runtime string.
+  - `status`: Query outcome (`success`, `error`) — the binary `if is_ok()` result.
+- **Cardinality**: `operation × {success, error}` = 46 series. Every pair is real (each operation can succeed
+  or fail), so this is a full enumeration, not a sparse pair-set; a domain check may treat it as the product
+  of the two closed lists. Zero-initialized (present-at-zero) — the rare error series (e.g. a failing
+  `atomic_assign`) are low-volume and were previously masked. `GC_DB_QUERY_OPERATIONS` is the source of truth.
 - **Usage**: Track database query rates and failures by operation
 - **Example**:
   ```promql
@@ -177,6 +182,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   ```
 
 ### `gc_token_refresh_failures_total`
+- **Expected-empty**: yes — every series is a token-refresh failure, zero when the token manager is healthy
 - **Type**: Counter
 - **Description**: Token refresh failures by error type
 - **Labels**:
@@ -221,6 +227,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   ```
 
 ### `gc_meeting_creation_failures_total`
+- **Expected-empty**: yes — every series is a creation failure, so a healthy path reads zero
 - **Type**: Counter
 - **Description**: Meeting creation failures by error type
 - **Labels**:
@@ -231,9 +238,9 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
     - `org_limit` — the organization is at `max_concurrent_meetings`. A routine
       policy refusal (`403 ORGANIZATION_MEETING_LIMIT_EXCEEDED`).
     - `org_inactive` — the organization row exists with `is_active = false`
-      (`403 ORGANIZATION_INACTIVE`). Expected permanently absent; see below.
+      (`403 ORGANIZATION_INACTIVE`). Expected to read a permanent zero (present-at-zero); see below.
     - `org_not_provisioned` — a valid token names an organization with no row
-      (`500 ORGANIZATION_NOT_PROVISIONED`). Expected permanently absent; see below.
+      (`500 ORGANIZATION_NOT_PROVISIONED`). Expected to read a permanent zero (present-at-zero); see below.
 - **Cardinality**: Low (9 error types — note ADR-0011 bounds `error_type` at ~10,
   so this metric is near its budget; adding a tenth value warrants a look at
   whether the axis is still bounded by error *variants* rather than by causes.)
@@ -245,8 +252,11 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   a `403` on `POST /api/v1/meetings` can be attributed to a specific cause without
   log-diving — which is the point of story R-6.
 - **Absence semantics**: `org_inactive` and `org_not_provisioned` are expected to
-  be **permanently absent** in normal operation. No data on those series means
-  healthy, not a broken exporter or a bad scrape config. Neither is reachable
+  read a **permanent zero** in normal operation — they are present-at-zero from
+  process start (`gc_meeting_creation_failures_total` is zero-init'd), so a healthy
+  reading is `0`, not absent. *Absence* now means the series stopped being exported
+  (pod down, scrape broken, metric/label renamed) and is itself worth investigating,
+  not read as calm. Neither value is reachable
   through any application flow: AC's `org_extraction` resolves the organization by
   subdomain filtered on `is_active = true` and fails closed, so no token is minted
   for a missing or inactive org. They are reachable only inside the token TTL after
@@ -308,6 +318,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   ```
 
 ### `gc_meeting_join_failures_total`
+- **Expected-empty**: yes — every series is a join failure, so a healthy path reads zero
 - **Type**: Counter
 - **Description**: Meeting join failures by error type and participant type
 - **Labels**:
@@ -412,14 +423,15 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Dashboard**: GC Overview - JWT Validations by Result
 
 ### `gc_caller_type_rejected_total`
+- **Expected-empty**: yes — any caller-type rejection is a misconfiguration/bug, zero when healthy
 - **Type**: Counter
 - **Description**: Total Layer 2 `service_type` routing rejections (valid token, wrong caller for the target gRPC service). ADR-0003.
 - **Labels**:
   - `grpc_service`: Target gRPC service name (`GlobalControllerService`, `MediaHandlerRegistryService`)
   - `expected_type`: Expected `service_type` for the gRPC service (`meeting-controller`, `media-handler`)
-  - `actual_type`: Actual `service_type` from the token (`meeting-controller`, `media-handler`, `global-controller`, `unknown`)
-- **Cardinality**: Low (2 x 2 x 4 = 16 max, bounded by gRPC services and service types + "unknown")
-- **Cardinality note**: The label values listed are the expected/legitimate set. The emission site at `grpc/auth_layer.rs:241` does not currently allowlist-clamp the `claims.service_type` value before recording, so a forged or off-spec JWT presenting an arbitrary string would inject that value as a label. Tracked in `docs/TODO.md` for clamping fix (ADR-0032 Step 5 finding F1); bound in production is enforced by JWKS auth (only legitimately-issued tokens reach this site, and AC issues only the 4 enumerated values).
+  - `actual_type`: Caller's `service_type` claim, **clamped** at the emit site (`common::service_type::service_type_metric_label`) to the recognized identities (`global-controller`, `meeting-controller`, `media-handler`), plus `unknown` (claim absent) and `other` (present-but-unrecognized). A recognized-but-wrong identity keeps its real value; only genuinely-unrecognized strings collapse to `other`.
+- **Cardinality**: Low — `actual_type` is bounded to 5 values by the emit-site clamp (3 identities + `unknown` + `other`), independent of the peer-controlled claim; `grpc_service` (2) and `expected_type` (2) are path-fixed literals.
+- **Cardinality note**: `claims.service_type` is a peer-supplied JWT claim (only the signature is validated); recording it RAW would let a signature-valid peer inject an arbitrary label value (unbounded-cardinality / exporter-memory DoS). The emit site at `grpc/auth_layer.rs` now clamps it to the bounded set above via `common::service_type::service_type_metric_label` — the ADR-0032 Step 5 finding F1 fix. JWKS auth is defense-in-depth, not the bound; the clamp is the bound.
 - **Alert**: ANY non-zero value indicates a bug or misconfiguration — a service is presenting a valid token but calling the wrong gRPC endpoint.
 - **Usage**: Detect service-to-service routing errors, misconfigured tokens.
 - **Recorded in**: `grpc/auth_layer.rs` on Layer 2 rejection.
@@ -481,6 +493,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 ## Error Metrics
 
 ### `gc_errors_total`
+- **Zero-init**: exempt — operation is a free-form subsystem string and status_code a raw u16, an unbounded label domain
 - **Type**: Counter
 - **Description**: Total errors by operation and type
 - **Labels**:
@@ -552,6 +565,7 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
 > `docs/TODO.md` §Observability Debt).
 
 ### `gc_telemetry_ingest_total`
+- **Zero-init**: exempt — absence is load-bearing: absent_over_time(gc_telemetry_ingest_total[15m]) at gc-alerts.yaml:144 detects restart-silence, which present-at-zero would defeat
 - **Type**: Counter
 - **Description**: Telemetry proxy ingest attempts, one per request that REACHES
   the handler, recorded on every handler-internal exit via a record-on-drop
@@ -620,12 +634,14 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
 - **Cardinality**: Low.
 
 ### `gc_telemetry_rate_limited_total`
+- **Expected-empty**: yes — rate-limiting client telemetry is exceptional, zero under normal load
 - **Type**: Counter
 - **Description**: Telemetry proxy rate-limit rejections.
 - **Labels**: `reason` — `per_user` (wired); `per_org`, `global` (reserved/unwired).
 - **Cardinality**: Low (3 max).
 
 ### `gc_telemetry_pii_attributes_dropped_total`
+- **Expected-empty**: yes — dropped PII attributes are a client-hygiene signal, zero when clients send clean telemetry
 - **Type**: Counter
 - **Description**: Attributes stripped by the allowlist filter, by structural
   nesting level. Labeled by LEVEL, never by the dropped key/value (which would be

@@ -34,6 +34,21 @@ use std::time::Duration;
 ///
 /// Returns error if Prometheus recorder fails to install (e.g., already installed).
 pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    configured_prometheus_builder()?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
+}
+
+/// Build the `PrometheusBuilder` with MC's production bucket configuration,
+/// WITHOUT installing it globally. Single source of the exporter config so the
+/// present-at-zero render test (`zero_init_renders_counters_present_at_zero`)
+/// exercises the SAME builder production installs. NOTE: that test proves
+/// present-at-0 under this exact config; it does NOT prove `idle_timeout` is
+/// absent — `render()` runs synchronously at t≈0, before a realistic
+/// minutes-scale `idle_timeout` would reap idle 0-series — so idle_timeout-
+/// absence is a CONFIG-REVIEW checkpoint here, not a test-enforced invariant
+/// (neither this test nor the Layer-7 env-test reliably backstops it).
+fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
     PrometheusBuilder::new()
         // GC heartbeat latency buckets - internal service call (p95 < 100ms)
         .set_buckets_for_metric(
@@ -72,9 +87,7 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
                 0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000,
             ],
         )
-        .map_err(|e| format!("Failed to set register meeting buckets: {e}"))?
-        .install_recorder()
-        .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
+        .map_err(|e| format!("Failed to set register meeting buckets: {e}"))
 }
 
 // ============================================================================
@@ -1044,7 +1057,12 @@ pub fn record_join_identity_key_presence(presence: &str) {
 /// Metric: `mc_caller_type_rejected_total`
 /// Labels: `grpc_service`, `expected_type`, `actual_type`
 ///
-/// Cardinality: 2 x 3 x 4 = 24 max (bounded by gRPC services and service types + "unknown")
+/// Cardinality: bounded — `actual_type` is clamped at the emit site
+/// (`common::service_type::service_type_metric_label`) to the 3 recognized
+/// service-type identities plus `unknown` (claim absent) and `other`
+/// (present-but-unrecognized), so the label domain is 5, independent of the
+/// peer-controlled claim. Callers MUST pass an already-clamped `actual_type`
+/// (the interceptor does); this wrapper does not re-clamp.
 ///
 /// ALERT: Any non-zero value indicates a bug or misconfiguration — a service
 /// is presenting a valid token but calling the wrong gRPC endpoint.
@@ -1057,11 +1075,688 @@ pub fn record_caller_type_rejected(grpc_service: &str, expected_type: &str, actu
     .increment(1);
 }
 
+// ============================================================================
+// Zero-initialization of discrete-event counters (counter-visibility fix)
+//
+// A `metrics`-crate counter series is created lazily — it first appears in
+// `/metrics` at the instant of its first increment, already at that value, so
+// no `0` sample precedes it and `increase()` reads 0 forever for a single
+// low-volume event (the ADR-0036 story-1 Join Flow defect). Empirically proven
+// against metrics-exporter-prometheus 0.16.2: resolving a `counter!` handle —
+// even `.increment(0)` — DOES render a scrapeable `…_total 0` line, so touching
+// every enumerable label combination here at startup gives each series a
+// present-at-zero point and makes the first real event a visible 0→1 edge.
+//
+// Enumeration derives from a wildcard-free source so a new label value cannot
+// silently escape zero-init (which would reintroduce this very defect):
+//   - media outcome enums carry `ALL`; iterate it.
+//   - the fieldless domain enums (`ActorType`/`LeaveReason`/`DisconnectCause`)
+//     and the proto `SlotState` are enumerated IN-DOMAIN by a `const VARIANTS`
+//     array here, with a co-located wildcard-free index-map `slot_*` witness so
+//     a new variant fails to compile IN THIS FILE. Labels always defer to the
+//     enum's own `label()`/`as_str()`/`slot_state_label` — never restated here.
+//   - genuinely enum-less string vocabularies are `const [&str]` lists here,
+//     each proven closed at its emit site (see per-list notes).
+// Counters whose label domain is unbounded/runtime-discovered, or that have no
+// emit site, are catalog-marked `Zero-init: exempt` and are NOT touched here.
+// ============================================================================
+
+use crate::actors::messages::{DisconnectCause, LeaveReason};
+use crate::actors::metrics::ActorType as McActorType;
+
+/// `mc_actor_panics_total{actor_type}` / `mc_messages_dropped_total{actor_type}`
+/// domain. VARIANTS holds the enum values; the label defers to `as_str()`.
+const ACTOR_TYPES: &[McActorType] = &[
+    McActorType::Controller,
+    McActorType::Meeting,
+    McActorType::Participant,
+];
+
+/// Wildcard-free witness: this exhaustive match is the SOLE drift control for
+/// `ACTOR_TYPES`. Do NOT add a `_ =>` arm and do NOT move it behind
+/// `#[cfg(test)]`. Discharging this compile error on a new variant ALSO requires
+/// adding the variant to `ACTOR_TYPES` above. (Deliberate in-domain divergence
+/// from the `PolicyApplyOutcome::ALL` house doctrine, for ownership-containment;
+/// hoist-to-`ALL` tracked in docs/TODO.md.)
+const fn slot_actor_type(v: McActorType) -> usize {
+    match v {
+        McActorType::Controller => 0,
+        McActorType::Meeting => 1,
+        McActorType::Participant => 2,
+    }
+}
+
+/// `mc_participant_leaves_total{reason}` domain; label via `LeaveReason::label`.
+const LEAVE_REASONS: &[LeaveReason] = &[
+    LeaveReason::Voluntary,
+    LeaveReason::Timeout,
+    LeaveReason::Removed,
+    LeaveReason::MeetingEnded,
+];
+
+/// Sole drift control for `LEAVE_REASONS` — see `slot_actor_type` for the rule.
+const fn slot_leave_reason(v: LeaveReason) -> usize {
+    match v {
+        LeaveReason::Voluntary => 0,
+        LeaveReason::Timeout => 1,
+        LeaveReason::Removed => 2,
+        LeaveReason::MeetingEnded => 3,
+    }
+}
+
+/// `mc_participant_disconnects_total{cause}` domain; label via `.label()`.
+const DISCONNECT_CAUSES: &[DisconnectCause] = &[
+    DisconnectCause::ClientClosed,
+    DisconnectCause::ConnectionLost,
+    DisconnectCause::ServerInitiated,
+];
+
+/// Sole drift control for `DISCONNECT_CAUSES` — see `slot_actor_type`.
+const fn slot_disconnect_cause(v: DisconnectCause) -> usize {
+    match v {
+        DisconnectCause::ClientClosed => 0,
+        DisconnectCause::ConnectionLost => 1,
+        DisconnectCause::ServerInitiated => 2,
+    }
+}
+
+/// `mc_media_slot_states_total{slot_state}` domain — all eight wire `SlotState`
+/// variants (label via the pub `slot_state_label`). Proto enum, enumerated
+/// in-domain with a witness so a regen adding a variant fails to compile here.
+const SLOT_STATES: &[proto_gen::dark_tower::signaling::v1::SlotState] = {
+    use proto_gen::dark_tower::signaling::v1::SlotState;
+    &[
+        SlotState::Unspecified,
+        SlotState::Active,
+        SlotState::SourceMuted,
+        SlotState::WithheldByCongestion,
+        SlotState::FewerSourcesThanSlots,
+        SlotState::ZeroRequested,
+        SlotState::SourceUnreachable,
+        SlotState::SwitchPending,
+    ]
+};
+
+/// Sole drift control for `SLOT_STATES` — see `slot_actor_type`.
+const fn slot_slot_state(v: proto_gen::dark_tower::signaling::v1::SlotState) -> usize {
+    use proto_gen::dark_tower::signaling::v1::SlotState;
+    match v {
+        SlotState::Unspecified => 0,
+        SlotState::Active => 1,
+        SlotState::SourceMuted => 2,
+        SlotState::WithheldByCongestion => 3,
+        SlotState::FewerSourcesThanSlots => 4,
+        SlotState::ZeroRequested => 5,
+        SlotState::SourceUnreachable => 6,
+        SlotState::SwitchPending => 7,
+    }
+}
+
+/// `mc_meeting_assignments_total{rejection_reason}` domain on the `rejected`
+/// arm — all five wire `RejectionReason` variants (label via the pub(crate)
+/// `rejection_reason_label`). Proto enum, enumerated in-domain with a witness so
+/// a regen adding a variant fails to compile here. Closes the main.md §Planning
+/// (proto enums) gap: `SlotState` shipped this witness, `RejectionReason` did not,
+/// so `ASSIGNMENT_REJECTION_REASONS` had a silent proto-regen drift path.
+const REJECTION_REASONS: &[proto_gen::dark_tower::internal::v1::RejectionReason] = {
+    use proto_gen::dark_tower::internal::v1::RejectionReason;
+    &[
+        RejectionReason::AtCapacity,
+        RejectionReason::Draining,
+        RejectionReason::Unhealthy,
+        RejectionReason::InvalidRequest,
+        RejectionReason::Unspecified,
+    ]
+};
+
+/// Sole drift control for `REJECTION_REASONS` — see `slot_actor_type`.
+const fn slot_rejection_reason(v: proto_gen::dark_tower::internal::v1::RejectionReason) -> usize {
+    use proto_gen::dark_tower::internal::v1::RejectionReason;
+    match v {
+        RejectionReason::AtCapacity => 0,
+        RejectionReason::Draining => 1,
+        RejectionReason::Unhealthy => 2,
+        RejectionReason::InvalidRequest => 3,
+        RejectionReason::Unspecified => 4,
+    }
+}
+
+// Keep the drift-witnesses live (referenced in non-test const context). Each
+// `slot_*` still type-checks its exhaustive match regardless, so a new variant
+// is a compile error in this file; this reference only prevents a dead-code
+// lint. No restated variant COUNT here (defers to the exhaustive match).
+const _: () = {
+    let _ = slot_actor_type(McActorType::Controller);
+    let _ = slot_leave_reason(LeaveReason::Voluntary);
+    let _ = slot_disconnect_cause(DisconnectCause::ClientClosed);
+    let _ = slot_slot_state(proto_gen::dark_tower::signaling::v1::SlotState::Unspecified);
+    let _ =
+        slot_rejection_reason(proto_gen::dark_tower::internal::v1::RejectionReason::Unspecified);
+    let _ = REJECTION_REASONS.len();
+};
+
+// ---- Enum-less string vocabularies (each proven closed at its emit site) ----
+//
+// These labels arrive at the recorder as `&str` classified by the caller; the
+// arrays below are the SINGLE in-file home for each vocabulary (the in-module
+// tests reference them, not their own literals). None of these values is ever
+// forwarded from an external/request/DB/peer string — all emit sites pass a
+// fixed literal or a wildcard-free enum mapping — so the domain is closed.
+
+/// `status` on the `success`/`error`-shaped counters. Emit sites: fixed literals.
+const STATUS_SUCCESS_ERROR: &[&str] = &["success", "error"];
+/// `status` on `mc_session_joins_total`. Emit sites: `connection.rs` literals.
+const JOIN_STATUSES: &[&str] = &["success", "failure"];
+/// `mc_webtransport_connections_total{status}`. Emit sites: `server.rs` literals.
+const WEBTRANSPORT_STATUSES: &[&str] = &["accepted", "rejected", "error"];
+/// `mc_gc_heartbeats_total{heartbeat_type}`. Emit sites: `gc_client.rs` literals.
+const HEARTBEAT_TYPES: &[&str] = &["fast", "comprehensive"];
+/// `mc_fenced_out_total{reason}`. Emit sites: `redis/client.rs` literals.
+const FENCE_REASONS: &[&str] = &["stale_generation", "concurrent_write"];
+/// `mc_token_refresh_failures_total{error_type}` — `common::token_manager`
+/// `error_category()` wildcard-free range (bounded by `TokenError`).
+const TOKEN_ERROR_CATEGORIES: &[&str] = &[
+    "http",
+    "auth_rejected",
+    "invalid_response",
+    "acquisition_failed",
+    "configuration",
+    "channel_closed",
+];
+/// `mc_session_join_failures_total{error_type}` — the join-path-reachable subset
+/// of `McError::error_type_label()`. NOTE: this counter's presence at 0 for a
+/// value is NOT evidence that failure mode is reachable on the join path; it is
+/// the visibility ("0 jwt_validation failures") this fix exists to create. Emit
+/// site: `connection.rs` via `e.error_type_label()`, a wildcard-free mapping.
+const JOIN_FAILURE_ERROR_TYPES: &[&str] = &[
+    "jwt_validation",
+    "internal",
+    "meeting_not_found",
+    "mc_capacity_exceeded",
+    "meeting_capacity_exceeded",
+    "identity_key_invalid",
+    "sender_id_space_exhausted",
+    "session_binding",
+    "conflict",
+    "draining",
+];
+/// `mc_jwt_validations_total{result, token_type, failure_reason}` — token types.
+const JWT_TOKEN_TYPES: &[&str] = &["meeting", "guest", "service"];
+/// JWT failure reasons (result="failure"). `classify_jwt_error` + call-site literals.
+const JWT_FAILURE_REASONS: &[&str] = &[
+    "signature_invalid",
+    "expired",
+    "missing_token",
+    "scope_mismatch",
+    "malformed",
+];
+/// `mc_mh_notifications_received_total{event_type}`. Emit: media_coordination.rs.
+const MH_EVENT_TYPES: &[&str] = &["connected", "disconnected"];
+/// `mc_participant_mh_status_total{state}` — proto `ConnectionState` via a total
+/// match with an `unspecified` catch-all in the caller.
+const MH_STATUS_STATES: &[&str] = &["connected", "disconnected", "failed", "unspecified"];
+/// `mc_participant_mh_status_dropped_total{reason}`. Emit sites: literals.
+const MH_STATUS_DROP_REASONS: &[&str] = &["cap", "over_limit"];
+/// `mc_join_display_name_resolved_total{outcome}`. Emit sites: two literals.
+const DISPLAY_NAME_OUTCOMES: &[&str] = &["present", "fallback"];
+/// `mc_join_identity_key_presence_total{presence}`. Emit sites: two literals.
+const IDENTITY_KEY_PRESENCES: &[&str] = &["present", "absent"];
+/// `mc_meeting_assignments_total` rejection reasons on the `rejected` arm —
+/// the proto `RejectionReason` label range (mirrors GC). `success` pairs with
+/// `none`. Emit site: `grpc/mc_service.rs` via a wildcard-free mapping.
+const ASSIGNMENT_REJECTION_REASONS: &[&str] = &[
+    "at_capacity",
+    "draining",
+    "unhealthy",
+    "invalid_request",
+    "unspecified",
+];
+/// `mc_participant_outbound_messages_dropped_total{payload_kind}` — bounded by
+/// the two `try_send` sites in `actors/participant.rs`, each naming its own
+/// const. Emit sites pass those two `&'static str` constants, never a runtime
+/// value.
+const OUTBOUND_PAYLOAD_KINDS: &[&str] = &["signaling_raw", "participant_update"];
+/// `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` —
+/// the Layer-2 (ADR-0003) rejection combinations. `grpc_service`/`expected_type`
+/// are fixed literals chosen by the gRPC path at the `grpc/auth_interceptor.rs`
+/// emit site. `actual_type` is the peer JWT's `service_type` claim CLAMPED to the
+/// recognized vocabulary by `common::service_type::service_type_metric_label`
+/// before it becomes a label: a recognized-but-wrong identity is preserved (real
+/// service-confusion), a present-but-unrecognized claim collapses to `other`, an
+/// absent claim to `unknown` — so the domain is bounded regardless of the
+/// peer-controlled value. Per path we stand up every recognized identity except
+/// the expected one, plus the two clamp buckets, so the const, the catalog
+/// `actual_type` list, and the emitted set agree.
+const CALLER_TYPE_REJECTIONS: &[(&str, &str, &str)] = &[
+    // MeetingControllerService path — expects `global-controller`.
+    (
+        "MeetingControllerService",
+        "global-controller",
+        "media-handler",
+    ),
+    (
+        "MeetingControllerService",
+        "global-controller",
+        "meeting-controller",
+    ),
+    ("MeetingControllerService", "global-controller", "unknown"),
+    ("MeetingControllerService", "global-controller", "other"),
+    // MediaCoordinationService path — expects `media-handler`.
+    (
+        "MediaCoordinationService",
+        "media-handler",
+        "global-controller",
+    ),
+    (
+        "MediaCoordinationService",
+        "media-handler",
+        "meeting-controller",
+    ),
+    ("MediaCoordinationService", "media-handler", "unknown"),
+    ("MediaCoordinationService", "media-handler", "other"),
+];
+
+/// Zero-initialize every enumerable discrete-event `*_total` counter so each
+/// series is present at 0 from process start (see module section header).
+///
+/// INFALLIBLE: no `Result`, no panic path — it is called at boot and must never
+/// be able to fail a service start. Uses `.increment(0)` at statement position
+/// (registers via side effect; a scrapeable 0-series, proven empirically).
+///
+/// `dt-guard:zero-init-entrypoint` (counter-zero-init guard scans marked fns).
+// dt-guard:zero-init-entrypoint
+pub fn zero_initialize_counters() {
+    // --- media outcome enums (iterate `ALL`, key_custody=operator) ---
+    for o in PolicyPushOutcome::ALL {
+        counter!("mc_media_policy_pushes_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in SenderBindingOutcome::ALL {
+        counter!("mc_media_sender_binding_responses_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in CapabilityOutcome::ALL {
+        counter!("mc_media_receive_capability_declarations_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in DirectiveOutcome::ALL {
+        counter!("mc_media_send_directives_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in MuteOutcome::ALL {
+        counter!("mc_media_mute_requests_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for s in SLOT_STATES {
+        counter!("mc_media_slot_states_total", "slot_state" => slot_state_label(*s), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    // key_custody-only media counters (cardinality 1)
+    counter!("mc_media_unmatched_plan_slots_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+        .increment(0);
+    counter!("mc_meeting_kek_generated_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+        .increment(0);
+
+    // --- fieldless domain enums (VARIANTS + witness, label via method) ---
+    for a in ACTOR_TYPES {
+        counter!("mc_actor_panics_total", "actor_type" => a.as_str()).increment(0);
+        counter!("mc_messages_dropped_total", "actor_type" => a.as_str()).increment(0);
+    }
+    for r in LEAVE_REASONS {
+        counter!("mc_participant_leaves_total", "reason" => r.label()).increment(0);
+    }
+    for c in DISCONNECT_CAUSES {
+        counter!("mc_participant_disconnects_total", "cause" => c.label()).increment(0);
+    }
+
+    // --- enum-less string vocabularies ---
+    for s in STATUS_SUCCESS_ERROR {
+        counter!("mc_token_refresh_total", "status" => *s).increment(0);
+        counter!("mc_register_meeting_total", "status" => *s).increment(0);
+    }
+    for s in JOIN_STATUSES {
+        counter!("mc_session_joins_total", "status" => *s).increment(0);
+    }
+    for s in WEBTRANSPORT_STATUSES {
+        counter!("mc_webtransport_connections_total", "status" => *s).increment(0);
+    }
+    for st in STATUS_SUCCESS_ERROR {
+        for ht in HEARTBEAT_TYPES {
+            counter!("mc_gc_heartbeats_total", "status" => *st, "heartbeat_type" => *ht)
+                .increment(0);
+        }
+    }
+    for r in FENCE_REASONS {
+        counter!("mc_fenced_out_total", "reason" => *r).increment(0);
+    }
+    for e in TOKEN_ERROR_CATEGORIES {
+        counter!("mc_token_refresh_failures_total", "error_type" => *e).increment(0);
+    }
+    for e in JOIN_FAILURE_ERROR_TYPES {
+        counter!("mc_session_join_failures_total", "error_type" => *e).increment(0);
+    }
+    // JWT: success × token_type × failure_reason="none"; failure × token_type × reasons
+    for tt in JWT_TOKEN_TYPES {
+        counter!("mc_jwt_validations_total", "result" => "success", "token_type" => *tt, "failure_reason" => "none").increment(0);
+        for fr in JWT_FAILURE_REASONS {
+            counter!("mc_jwt_validations_total", "result" => "failure", "token_type" => *tt, "failure_reason" => *fr).increment(0);
+        }
+    }
+    for e in MH_EVENT_TYPES {
+        counter!("mc_mh_notifications_received_total", "event_type" => *e).increment(0);
+    }
+    for s in MH_STATUS_STATES {
+        counter!("mc_participant_mh_status_total", "state" => *s).increment(0);
+    }
+    for r in MH_STATUS_DROP_REASONS {
+        counter!("mc_participant_mh_status_dropped_total", "reason" => *r).increment(0);
+    }
+    for o in DISPLAY_NAME_OUTCOMES {
+        counter!("mc_join_display_name_resolved_total", "outcome" => *o).increment(0);
+    }
+    for p in IDENTITY_KEY_PRESENCES {
+        counter!("mc_join_identity_key_presence_total", "presence" => *p).increment(0);
+    }
+    // meeting assignments: success→none, rejected→each rejection reason
+    counter!("mc_meeting_assignments_total", "status" => "success", "rejection_reason" => "none")
+        .increment(0);
+    for r in ASSIGNMENT_REJECTION_REASONS {
+        counter!("mc_meeting_assignments_total", "status" => "rejected", "rejection_reason" => *r)
+            .increment(0);
+    }
+    for k in OUTBOUND_PAYLOAD_KINDS {
+        counter!("mc_participant_outbound_messages_dropped_total", "payload_kind" => *k)
+            .increment(0);
+    }
+    for (svc, expected, actual) in CALLER_TYPE_REJECTIONS {
+        counter!("mc_caller_type_rejected_total", "grpc_service" => *svc, "expected_type" => *expected, "actual_type" => *actual).increment(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::observability::testing::MetricAssertion;
     use common::token_manager::TokenRefreshEvent;
+
+    /// Leg-1 completeness / touch-idiom proof.
+    ///
+    /// This is the ONLY place the story's core premise is proven rather than
+    /// assumed: that the real `metrics-exporter-prometheus` exposition emits a
+    /// registered-but-never-incremented counter at 0. It runs
+    /// `zero_initialize_counters()` through the SAME builder config production
+    /// installs (`configured_prometheus_builder`), so a future `idle_timeout`
+    /// that would reap idle 0-series is reflected here. A red on the anchor is a
+    /// recorder/scrape failure, NOT a present-at-0 violation.
+    #[test]
+    fn zero_init_renders_counters_present_at_zero() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            zero_initialize_counters();
+        }
+        let rendered = handle.render();
+
+        // Positive control (anchor): a known-present series must exist, else a
+        // wholesale-empty render lets every present-at-0 check pass vacuously.
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("mc_session_joins_total{")),
+            "ANCHOR ABSENT — render produced no mc_session_joins_total series: a \
+             scrape/recorder failure (env-sanity), NOT a present-at-0 violation. \
+             DO NOT satisfy this by deleting the check."
+        );
+
+        // Present-at-0, two-part per series: the line exists AND value is exactly 0.
+        let present_at_zero = |prefix: &str| {
+            let found = rendered.lines().find(|l| l.starts_with(prefix));
+            // Loud on absence WITHOUT `panic!` (the crate denies clippy::panic
+            // even in tests): a missing series is a scrape/recorder failure, not
+            // a present-at-0 violation — the assert carries the same message.
+            assert!(found.is_some(), "series absent from /metrics: {prefix}");
+            let value = found.and_then(|l| l.rsplit(' ').next()).unwrap_or("");
+            assert_eq!(value, "0", "present-at-0 violation (value != 0): {found:?}");
+        };
+
+        // Demo-symptom Join Flow counters that read 0/No-Data on the story-1 demo.
+        present_at_zero(r#"mc_session_joins_total{status="success"}"#);
+        present_at_zero(r#"mc_session_joins_total{status="failure"}"#);
+        present_at_zero(r#"mc_webtransport_connections_total{status="rejected"}"#);
+        present_at_zero(r#"mc_actor_panics_total{actor_type="controller"}"#);
+        present_at_zero(r#"mc_session_join_failures_total{error_type="jwt_validation"}"#);
+        // Media enum-ALL counter (exposition preserves emission label order:
+        // outcome then key_custody).
+        present_at_zero(
+            r#"mc_media_send_directives_total{outcome="emitted",key_custody="operator"}"#,
+        );
+
+        // Series-count ceiling (security): a future enum variant can't silently
+        // multiply the cross-product unnoticed. Count zero-init'd `_total` lines.
+        let total_series = rendered
+            .lines()
+            .filter(|l| l.contains("_total{") || l.contains("_total "))
+            .count();
+        assert!(
+            (60..=400).contains(&total_series),
+            "zero-init series count {total_series} outside expected band 60..=400 — a \
+             vocabulary grew/shrank; update the band deliberately"
+        );
+    }
+
+    /// Assert a registered-at-0 counter survives to `render()` through the SHARED
+    /// prod builder (`configured_prometheus_builder`) — i.e. present-at-0 holds
+    /// under the exact prod config.
+    ///
+    /// HONEST SCOPE (OBS-F3): this does NOT pin `idle_timeout`-absence. `render()`
+    /// runs synchronously at t≈0, so a realistically-configured `idle_timeout`
+    /// (minutes) would not reap before the render — the test would still pass. It
+    /// is effectively the present-at-0 render assertion under a second name, kept
+    /// as a focused single-counter check. idle_timeout-absence is a CONFIG-REVIEW
+    /// checkpoint, not a test-enforced invariant, and neither this test nor the
+    /// Layer-7 env-test reliably backstops it (the builder exposes no readback).
+    #[test]
+    fn production_builder_has_no_idle_timeout() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            counter!("mc_meeting_kek_generated_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+                .increment(0);
+        }
+        assert!(
+            handle.render().contains("mc_meeting_kek_generated_total{"),
+            "a registered-at-0 counter did NOT render through configured_prometheus_builder() \
+             — present-at-0 broke under the prod exporter config (a recorder/scrape/config \
+             regression). NOTE: this does not by itself prove an idle_timeout was added (a \
+             minutes-scale one would not reap before this synchronous render); idle_timeout \
+             remains a config-review checkpoint."
+        );
+    }
+
+    /// TEST-F1 drift control for `JOIN_FAILURE_ERROR_TYPES`.
+    ///
+    /// The zero-init set for `mc_session_join_failures_total{error_type}` is the
+    /// join-path-reachable SUBSET of `McError::error_type_label()` (a full-enum
+    /// zero-init would manufacture permanently-0 series for failure modes the join
+    /// path cannot reach — see the const's doc). A hand-listed subset with no
+    /// compiler tie to the enum is exactly how this devloop's defect returns for
+    /// one combo: a NEW join-reachable variant, or a RENAMED label, silently never
+    /// gets zero-init'd. This test ties the subset back to the enum:
+    ///
+    ///  * `join_reachable` is a **wildcard-free exhaustive** match — a new
+    ///    `McError` variant fails to COMPILE here, forcing the author to classify
+    ///    it in/out of the join set. Discharging that compile error also requires
+    ///    updating `JOIN_FAILURE_ERROR_TYPES` (the assertion below reds otherwise).
+    ///  * labels are read from `error_type_label()` (the single source), so a
+    ///    renamed label flows through and a stale const is caught.
+    ///
+    /// (The `all` array is the one hand-maintained surface; a variant added to the
+    /// enum but forgotten here is caught by `join_reachable`'s exhaustiveness the
+    /// moment this fn is compiled.)
+    #[test]
+    fn join_failure_error_types_tracks_mcerror_enum() {
+        use crate::errors::{McError, SessionBindingError};
+        use std::collections::BTreeSet;
+
+        let all: &[McError] = &[
+            McError::Redis(String::new()),
+            McError::Grpc(String::new()),
+            McError::NotRegistered,
+            McError::Config(String::new()),
+            McError::InvalidArgument(String::new()),
+            McError::SessionBinding(SessionBindingError::InvalidToken),
+            McError::MeetingNotFound(String::new()),
+            McError::ParticipantNotFound(String::new()),
+            McError::MeetingCapacityExceeded(String::new()),
+            McError::McCapacityExceeded,
+            McError::Draining,
+            McError::Migrating {
+                new_mc_endpoint: String::new(),
+            },
+            McError::FencedOut(String::new()),
+            McError::Conflict(String::new()),
+            McError::JwtValidation(String::new()),
+            McError::PermissionDenied(String::new()),
+            McError::MhAssignmentMissing(String::new()),
+            McError::Internal(String::new()),
+            McError::TokenAcquisition(String::new()),
+            McError::TokenAcquisitionTimeout,
+            McError::IdentityKeyInvalid,
+            McError::SenderIdSpaceExhausted,
+            McError::MediaPolicyDivergence {
+                outcome: PolicyPushOutcome::ALL[0],
+            },
+        ];
+
+        // WILDCARD-FREE: adding an `McError` variant breaks compilation here until
+        // it is classified. Do NOT add a `_ =>` arm — that reopens the drift gap.
+        fn join_reachable(e: &McError) -> bool {
+            match e {
+                McError::JwtValidation(_)
+                | McError::Internal(_)
+                | McError::MeetingNotFound(_)
+                | McError::McCapacityExceeded
+                | McError::MeetingCapacityExceeded(_)
+                | McError::IdentityKeyInvalid
+                | McError::SenderIdSpaceExhausted
+                | McError::SessionBinding(_)
+                | McError::Conflict(_)
+                | McError::Draining => true,
+                McError::Redis(_)
+                | McError::Grpc(_)
+                | McError::NotRegistered
+                | McError::Config(_)
+                | McError::InvalidArgument(_)
+                | McError::ParticipantNotFound(_)
+                | McError::Migrating { .. }
+                | McError::FencedOut(_)
+                | McError::PermissionDenied(_)
+                | McError::MhAssignmentMissing(_)
+                | McError::TokenAcquisition(_)
+                | McError::TokenAcquisitionTimeout
+                | McError::MediaPolicyDivergence { .. } => false,
+            }
+        }
+
+        let reachable: BTreeSet<&str> = all
+            .iter()
+            .filter(|e| join_reachable(e))
+            .map(McError::error_type_label)
+            .collect();
+        let declared: BTreeSet<&str> = JOIN_FAILURE_ERROR_TYPES.iter().copied().collect();
+        assert_eq!(
+            reachable,
+            declared,
+            "JOIN_FAILURE_ERROR_TYPES drifted from the McError join-reachable set — \
+             missing (in enum, not const): {:?}; extra (in const, not enum): {:?}. \
+             A drifted value is never zero-init'd → the counter-visibility defect returns \
+             for that error_type.",
+            reachable.difference(&declared).collect::<Vec<_>>(),
+            declared.difference(&reachable).collect::<Vec<_>>(),
+        );
+    }
+
+    /// TEST-F1 (RejectionReason) drift control for `ASSIGNMENT_REJECTION_REASONS`.
+    ///
+    /// The zero-init set for `mc_meeting_assignments_total{rejection_reason}` mirrors
+    /// the proto `RejectionReason` enum, but the hand-listed string const has no
+    /// compiler tie to it. `rejection_reason_label` (grpc/mc_service.rs) is
+    /// WILDCARD-FREE, so a proto regen adding a variant reds that mapping → a dev
+    /// adds an arm → a new `rejection_reason` series is emitted → but the string
+    /// const stays stale → that combo is never zero-init'd (`increase()` reads 0
+    /// forever for it), this devloop's exact defect. `slot_rejection_reason` (above,
+    /// non-test) makes a new proto variant a COMPILE error in this file; this test
+    /// asserts the enum-derived label set equals the const, catching a stale const
+    /// or a renamed label. Closes the main.md §Planning proto-enum witness gap
+    /// (`SlotState` shipped this, `RejectionReason` had not).
+    #[test]
+    fn assignment_rejection_reasons_track_the_rejectionreason_enum() {
+        use crate::grpc::mc_service::rejection_reason_label;
+        use std::collections::BTreeSet;
+
+        let from_enum: BTreeSet<&str> = REJECTION_REASONS
+            .iter()
+            .map(|r| rejection_reason_label(*r))
+            .collect();
+        let declared: BTreeSet<&str> = ASSIGNMENT_REJECTION_REASONS.iter().copied().collect();
+        assert_eq!(
+            from_enum, declared,
+            "ASSIGNMENT_REJECTION_REASONS drifted from RejectionReason::rejection_reason_label — \
+             missing (in enum, not const): {:?}; extra (in const, not enum): {:?}. A drifted value \
+             is never zero-init'd → the counter-visibility defect returns for that rejection_reason.",
+            from_enum.difference(&declared).collect::<Vec<_>>(),
+            declared.difference(&from_enum).collect::<Vec<_>>(),
+        );
+    }
+
+    /// TEST-F1 leg-1 comparison primitive + its does-it-fire proof.
+    ///
+    /// GUARD 1's designed leg-1 (symmetric catalog-label-VALUES ↔ emitted-VALUES)
+    /// is NOT wired end-to-end in this pass: several catalog entries document label
+    /// values non-exhaustively (`mc_session_join_failures_total` uses "e.g."), so a
+    /// value-parsing comparison would false-positive until the catalog value lists
+    /// are normalized (tracked in `docs/TODO.md`). This is the reusable symmetric
+    /// checker that full leg-1 will call once the catalog is machine-readable; it
+    /// ships tested-for-firing (the plan's does-it-fire requirement) so the
+    /// primitive is trustworthy when wired. Reds in BOTH directions.
+    fn diff_label_sets(
+        expected: &std::collections::BTreeSet<String>,
+        emitted: &std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        let missing: Vec<&String> = expected.difference(emitted).collect();
+        let extra: Vec<&String> = emitted.difference(expected).collect();
+        if missing.is_empty() && extra.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "label-set drift: missing-from-emitted {missing:?}, extra-in-emitted {extra:?}"
+            ))
+        }
+    }
+
+    #[test]
+    fn diff_label_sets_fires_on_missing_and_extra() {
+        use std::collections::BTreeSet;
+        let expected: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+
+        // Equal → Ok.
+        assert!(diff_label_sets(&expected, &expected).is_ok());
+
+        // Emitted MISSING a combo the catalog has → Err (the defect direction:
+        // a value never zero-init'd).
+        let missing: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert!(
+            diff_label_sets(&expected, &missing).is_err(),
+            "checker must red when a catalog value is not emitted"
+        );
+
+        // Emitted has an EXTRA combo the catalog lacks → Err (catalog drift).
+        let extra: BTreeSet<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        assert!(
+            diff_label_sets(&expected, &extra).is_err(),
+            "checker must red when an emitted value is undocumented"
+        );
+    }
 
     // Note: The legacy `test_*` functions below execute the metric recording
     // functions without a recorder — the metrics crate records to a global

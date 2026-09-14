@@ -45,6 +45,21 @@ use std::time::Duration;
 ///
 /// Returns error if Prometheus recorder fails to install (e.g., already installed).
 pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
+    configured_prometheus_builder()?
+        .install_recorder()
+        .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
+}
+
+/// Build the `PrometheusBuilder` with GC's production bucket configuration,
+/// WITHOUT installing it globally. Single source of the exporter config so the
+/// present-at-zero render test (`zero_init_renders_counters_present_at_zero`)
+/// exercises the SAME builder production installs. NOTE: that test proves
+/// present-at-0 under this exact config; it does NOT prove `idle_timeout` is
+/// absent — `render()` runs synchronously at t≈0, before a realistic
+/// minutes-scale `idle_timeout` would reap idle 0-series — so idle_timeout-
+/// absence is a CONFIG-REVIEW checkpoint here, not a test-enforced invariant
+/// (neither this test nor the Layer-7 env-test reliably backstops it).
+fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
     PrometheusBuilder::new()
         // HTTP request buckets aligned with 200ms p95 SLO target
         .set_buckets_for_metric(
@@ -131,9 +146,7 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
             Matcher::Prefix("gc_telemetry_payload".to_string()),
             &[1024.0, 4096.0, 16384.0, 65536.0, 131072.0, 262144.0],
         )
-        .map_err(|e| format!("Failed to set telemetry payload buckets: {e}"))?
-        .install_recorder()
-        .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
+        .map_err(|e| format!("Failed to set telemetry payload buckets: {e}"))
 }
 
 // ============================================================================
@@ -403,8 +416,12 @@ pub fn record_jwt_validation(result: &str, token_type: &str, failure_reason: &st
 /// Metric: `gc_caller_type_rejected_total`
 /// Labels: `grpc_service`, `expected_type`, `actual_type`
 ///
-/// Cardinality: 2 x 2 x 4 = 16 max (bounded by gRPC services and service
-/// types + "unknown").
+/// Cardinality: bounded — `actual_type` is clamped at the emit site
+/// (`common::service_type::service_type_metric_label`) to the 3 recognized
+/// service-type identities plus `unknown` (claim absent) and `other`
+/// (present-but-unrecognized), a domain of 5 independent of the peer-controlled
+/// claim. Callers MUST pass an already-clamped `actual_type` (the auth layer
+/// does); this wrapper does not re-clamp.
 ///
 /// ALERT: Any non-zero value indicates a bug or misconfiguration — a service
 /// is presenting a valid token but calling the wrong gRPC endpoint.
@@ -763,6 +780,299 @@ pub fn update_registered_controller_gauges(controller_type: &str, counts: &[(Str
 }
 
 // ============================================================================
+// Zero-initialization of discrete-event counters (counter-visibility fix)
+//
+// A `metrics`-crate counter is created lazily on first increment, already at
+// that value, so no 0 sample precedes it and `increase()` reads 0 forever for a
+// single low-volume event. Proven against metrics-exporter-prometheus 0.16.2:
+// touching a counter (`.increment(0)`) renders a scrapeable `…_total 0` line, so
+// touching every enumerable label combination at startup gives each series a
+// present-at-zero point and makes the first real event a visible 0→1 edge.
+//
+// Enumeration derives from a wildcard-free source: `MeetingRefusal` is
+// enumerated IN-DOMAIN by a `const VARIANTS` + `const fn slot_*` witness here
+// (labels defer to `metric_label()`); the enum-less vocabularies are `const
+// [&str]` lists proven closed at their emit sites. Counters whose label domain
+// is unbounded/runtime-discovered, or whose alerting depends on the series being
+// ABSENT, are catalog-marked `Zero-init: exempt` and are NOT touched here.
+// ============================================================================
+
+use crate::repositories::meetings::MeetingRefusal;
+
+/// `gc_meeting_creation_failures_total{error_type}` organization-refusal causes;
+/// label defers to `MeetingRefusal::metric_label()`.
+const MEETING_REFUSALS: &[MeetingRefusal] = &[
+    MeetingRefusal::OrganizationNotProvisioned,
+    MeetingRefusal::OrganizationInactive,
+    MeetingRefusal::CapacityExhausted,
+];
+
+/// Wildcard-free witness: this exhaustive match is the SOLE drift control for
+/// `MEETING_REFUSALS`. Do NOT add a `_ =>` arm and do NOT move it behind
+/// `#[cfg(test)]`. Discharging this compile error on a new variant ALSO requires
+/// adding the variant to `MEETING_REFUSALS` above. (In-domain divergence from
+/// the `PolicyApplyOutcome::ALL` house doctrine for ownership-containment;
+/// hoist-to-`ALL` on the enum tracked in docs/TODO.md.)
+const fn slot_meeting_refusal(v: MeetingRefusal) -> usize {
+    match v {
+        MeetingRefusal::OrganizationNotProvisioned => 0,
+        MeetingRefusal::OrganizationInactive => 1,
+        MeetingRefusal::CapacityExhausted => 2,
+    }
+}
+
+// Keep the drift-witness live (referenced in non-test const context). The match
+// still type-checks its exhaustiveness regardless; this only prevents a
+// dead-code lint. No restated variant count (defers to the exhaustive match).
+const _: () = {
+    let _ = slot_meeting_refusal(MeetingRefusal::OrganizationNotProvisioned);
+};
+
+// ---- Enum-less string vocabularies (each closed at its emit site) ----
+// None of these values is forwarded from an external/request/DB/peer string —
+// every emit site passes a fixed literal (or a wildcard-free enum mapping) — so
+// the domain is closed. These arrays are the single in-file home; the in-module
+// tests reference them rather than their own literals.
+
+/// `success`/`error` status shared by several counters. Emit sites: literals.
+const STATUS_SUCCESS_ERROR: &[&str] = &["success", "error"];
+/// `gc_mc_assignments_total{status}` non-success arms. Emit: `mc_assignment.rs`.
+const ASSIGNMENT_FAIL_STATUSES: &[&str] = &["rejected", "error"];
+/// `gc_mc_assignments_total{rejection_reason}` — `McRejectionReason` label range
+/// + `no_mcs_available`. Emit: `services/mc_assignment.rs` (wildcard-free match).
+const ASSIGNMENT_REJECTION_REASONS: &[&str] = &[
+    "at_capacity",
+    "draining",
+    "unhealthy",
+    "unspecified",
+    "invalid_request",
+    "no_mcs_available",
+];
+/// `gc_token_refresh_failures_total{error_type}` — `common::token_manager`
+/// `error_category()` wildcard-free range.
+const TOKEN_ERROR_CATEGORIES: &[&str] = &[
+    "http",
+    "auth_rejected",
+    "invalid_response",
+    "acquisition_failed",
+    "configuration",
+    "channel_closed",
+];
+/// `gc_ac_requests_total{operation}`. Emit sites: two literals.
+const AC_REQUEST_OPERATIONS: &[&str] = &["meeting_token", "guest_token"];
+/// `gc_jwt_validations_total{token_type}` — gRPC auth only sees service tokens.
+const JWT_TOKEN_TYPES: &[&str] = &["service"];
+/// JWT failure reasons (result="failure"). Emit: `grpc/auth_layer.rs` literals +
+/// `classify_jwt_error` (wildcard-free).
+const JWT_FAILURE_REASONS: &[&str] = &[
+    "signature_invalid",
+    "expired",
+    "scope_mismatch",
+    "malformed",
+    "missing_token",
+];
+/// `gc_caller_type_rejected_total{grpc_service}`. Emit: `grpc/auth_layer.rs`.
+const CALLER_GRPC_SERVICES: &[&str] = &["GlobalControllerService", "MediaHandlerRegistryService"];
+/// `gc_caller_type_rejected_total{expected_type}`. Emit: literals.
+const CALLER_EXPECTED_TYPES: &[&str] = &["meeting-controller", "media-handler"];
+/// `gc_caller_type_rejected_total{actual_type}` — the peer JWT's `service_type`
+/// claim CLAMPED at the `grpc/auth_layer.rs` emit site by
+/// `common::service_type::service_type_metric_label`: the 3 recognized identities
+/// (a recognized-but-wrong caller keeps its real value) plus `unknown` (claim
+/// absent) and `other` (present-but-unrecognized). Bounded regardless of the
+/// peer-controlled value.
+const CALLER_ACTUAL_TYPES: &[&str] = &[
+    "global-controller",
+    "meeting-controller",
+    "media-handler",
+    "unknown",
+    "other",
+];
+/// `gc_mh_selections_total{has_multiple}` — `bool.to_string()`.
+const BOOL_STRINGS: &[&str] = &["true", "false"];
+/// `gc_meeting_creation_failures_total{error_type}` non-organization literals.
+const CREATION_FAILURE_LITERALS: &[&str] = &[
+    "bad_request",
+    "unauthorized",
+    "internal",
+    "db_error",
+    "code_collision",
+    "forbidden",
+];
+/// `gc_meeting_join_total{participant}` / `_failures_total{participant}`.
+const JOIN_PARTICIPANTS: &[&str] = &["user", "guest"];
+/// `gc_meeting_join_failures_total{error_type}`. Emit: `handlers` literals.
+const JOIN_FAILURE_ERROR_TYPES: &[&str] = &[
+    "not_found",
+    "bad_status",
+    "unauthorized",
+    "forbidden",
+    "guests_disabled",
+    "bad_request",
+    "mc_assignment",
+    "ac_request",
+    "internal",
+];
+/// `gc_telemetry_rate_limited_total{reason}`. Emit: literals.
+const TELEMETRY_RATE_LIMIT_REASONS: &[&str] = &["per_user", "per_org", "global"];
+/// `gc_telemetry_pii_attributes_dropped_total{kind}` — OTLP structural levels.
+const TELEMETRY_PII_KINDS: &[&str] = &[
+    "resource",
+    "scope",
+    "datapoint",
+    "span",
+    "span_event",
+    "span_link",
+];
+/// `gc_cors_preflight_total{origin_class}` / `{status}`. Emit: literals.
+const CORS_ORIGIN_CLASSES: &[&str] = &["allowed", "denied"];
+const CORS_STATUSES: &[&str] = &["200", "403"];
+/// `gc_grpc_mc_calls_total{method, status}` — closed at the emit sites: `method`
+/// is the fixed literal `"assign_meeting_with_mh"` at every prod call
+/// (`services/mc_client.rs:168,213,222,232`), never a runtime gRPC method name;
+/// `status` is one of these three literals. (Un-exempted 2026-09-10: the earlier
+/// "method is a runtime string" exemption was wrong — every call site is a literal.)
+const GRPC_MC_METHODS: &[&str] = &["assign_meeting_with_mh"];
+const GRPC_MC_STATUSES: &[&str] = &["success", "error", "rejected"];
+
+/// `gc_db_queries_total{operation, status}` — the CLOSED set of `operation`
+/// literals passed at every `record_db_query` call site across
+/// `repositories/{participants,meeting_controllers,meetings,media_handlers,
+/// meeting_assignments}.rs` (never a runtime/request string). `status` is the
+/// binary `if is_ok() {"success"} else {"error"}` outcome, so every
+/// (operation, status) pair is real — the domain is `operation × {success,error}`
+/// with no impossible cells (NOT a wider cross-product). Un-exempted 2026-09-10:
+/// the earlier "unbounded/high-traffic" exemption was reversed — the label set is
+/// finitely enumerable and its rare error series (e.g. a once-a-week failing
+/// `atomic_assign`) are exactly the low-volume series the lazy-init defect hides.
+/// NOTE: this metric has NO `table` label (only operation + status).
+const GC_DB_QUERY_OPERATIONS: &[&str] = &[
+    "count_active_participants",
+    "add_participant",
+    "remove_participant",
+    "register_mc",
+    "update_heartbeat",
+    "mark_stale_controllers_unhealthy",
+    "get_controller",
+    "get_controller_counts_by_status",
+    "create_meeting",
+    "log_audit_event",
+    "activate_meeting",
+    "register_mh",
+    "update_load_report",
+    "mark_stale_mh_unhealthy",
+    "get_candidate_mhs",
+    "get_handler",
+    "get_healthy_assignment",
+    "get_candidate_mcs",
+    "atomic_assign",
+    "get_current_assignment",
+    "end_assignment",
+    "end_stale_assignments",
+    "cleanup_old_assignments",
+];
+
+/// Zero-initialize every enumerable discrete-event `gc_*_total` counter so each
+/// series is present at 0 from process start (see module section header).
+///
+/// INFALLIBLE: no `Result`, no panic path — called at boot, must never fail a
+/// service start. Uses `.increment(0)` at statement position.
+///
+/// `dt-guard:zero-init-entrypoint`.
+// dt-guard:zero-init-entrypoint
+pub fn zero_initialize_counters() {
+    // gc_mc_assignments_total{status, rejection_reason}
+    counter!("gc_mc_assignments_total", "status" => "success", "rejection_reason" => "none")
+        .increment(0);
+    for st in ASSIGNMENT_FAIL_STATUSES {
+        for r in ASSIGNMENT_REJECTION_REASONS {
+            counter!("gc_mc_assignments_total", "status" => *st, "rejection_reason" => *r)
+                .increment(0);
+        }
+    }
+    // gc_db_queries_total{operation, status} — operation × {success, error}
+    for op in GC_DB_QUERY_OPERATIONS {
+        for s in STATUS_SUCCESS_ERROR {
+            counter!("gc_db_queries_total", "operation" => *op, "status" => *s).increment(0);
+        }
+    }
+    // gc_token_refresh_total{status} + failures{error_type}
+    for s in STATUS_SUCCESS_ERROR {
+        counter!("gc_token_refresh_total", "status" => *s).increment(0);
+    }
+    for e in TOKEN_ERROR_CATEGORIES {
+        counter!("gc_token_refresh_failures_total", "error_type" => *e).increment(0);
+    }
+    // gc_ac_requests_total{operation, status}
+    for op in AC_REQUEST_OPERATIONS {
+        for s in STATUS_SUCCESS_ERROR {
+            counter!("gc_ac_requests_total", "operation" => *op, "status" => *s).increment(0);
+        }
+    }
+    // gc_jwt_validations_total{result, token_type, failure_reason}
+    for tt in JWT_TOKEN_TYPES {
+        counter!("gc_jwt_validations_total", "result" => "success", "token_type" => *tt, "failure_reason" => "none").increment(0);
+        for fr in JWT_FAILURE_REASONS {
+            counter!("gc_jwt_validations_total", "result" => "failure", "token_type" => *tt, "failure_reason" => *fr).increment(0);
+        }
+    }
+    // gc_caller_type_rejected_total{grpc_service, expected_type, actual_type}
+    for gs in CALLER_GRPC_SERVICES {
+        for et in CALLER_EXPECTED_TYPES {
+            for at in CALLER_ACTUAL_TYPES {
+                counter!("gc_caller_type_rejected_total", "grpc_service" => *gs, "expected_type" => *et, "actual_type" => *at).increment(0);
+            }
+        }
+    }
+    // gc_mh_selections_total{status, has_multiple}
+    for s in STATUS_SUCCESS_ERROR {
+        for hm in BOOL_STRINGS {
+            counter!("gc_mh_selections_total", "status" => *s, "has_multiple" => *hm).increment(0);
+        }
+    }
+    // gc_meeting_creation_total{status} + failures{error_type}
+    for s in STATUS_SUCCESS_ERROR {
+        counter!("gc_meeting_creation_total", "status" => *s).increment(0);
+    }
+    for r in MEETING_REFUSALS {
+        counter!("gc_meeting_creation_failures_total", "error_type" => r.metric_label())
+            .increment(0);
+    }
+    for e in CREATION_FAILURE_LITERALS {
+        counter!("gc_meeting_creation_failures_total", "error_type" => *e).increment(0);
+    }
+    // gc_meeting_join_total{participant, status} + failures{participant, error_type}
+    for p in JOIN_PARTICIPANTS {
+        for s in STATUS_SUCCESS_ERROR {
+            counter!("gc_meeting_join_total", "participant" => *p, "status" => *s).increment(0);
+        }
+        for e in JOIN_FAILURE_ERROR_TYPES {
+            counter!("gc_meeting_join_failures_total", "participant" => *p, "error_type" => *e)
+                .increment(0);
+        }
+    }
+    // gc_telemetry_rate_limited_total{reason} + pii_attributes_dropped{kind}
+    for r in TELEMETRY_RATE_LIMIT_REASONS {
+        counter!("gc_telemetry_rate_limited_total", "reason" => *r).increment(0);
+    }
+    for k in TELEMETRY_PII_KINDS {
+        counter!("gc_telemetry_pii_attributes_dropped_total", "kind" => *k).increment(0);
+    }
+    // gc_cors_preflight_total{origin_class, status}
+    for oc in CORS_ORIGIN_CLASSES {
+        for s in CORS_STATUSES {
+            counter!("gc_cors_preflight_total", "origin_class" => *oc, "status" => *s).increment(0);
+        }
+    }
+    // gc_grpc_mc_calls_total{method, status} (un-exempted — closed at emit sites)
+    for m in GRPC_MC_METHODS {
+        for s in GRPC_MC_STATUSES {
+            counter!("gc_grpc_mc_calls_total", "method" => *m, "status" => *s).increment(0);
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -770,6 +1080,90 @@ pub fn update_registered_controller_gauges(controller_type: &str, counts: &[(Str
 mod tests {
     use super::*;
     use common::observability::testing::MetricAssertion;
+
+    /// Leg-1 completeness / touch-idiom proof — the only place the story's core
+    /// premise is proven (the real exporter emits a registered-but-never-
+    /// incremented counter at 0), through the SAME builder config production
+    /// installs (`configured_prometheus_builder`), so a future `idle_timeout`
+    /// that would reap idle 0-series is reflected. Anchor red = recorder/scrape
+    /// failure, NOT a present-at-0 violation.
+    #[test]
+    fn zero_init_renders_counters_present_at_zero() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            zero_initialize_counters();
+        }
+        let rendered = handle.render();
+
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("gc_meeting_creation_total{")),
+            "ANCHOR ABSENT — render produced no gc_meeting_creation_total series: a \
+             scrape/recorder failure (env-sanity), NOT a present-at-0 violation. \
+             DO NOT satisfy this by deleting the check."
+        );
+
+        let present_at_zero = |prefix: &str| {
+            let found = rendered.lines().find(|l| l.starts_with(prefix));
+            // Loud on absence WITHOUT `panic!` (the crate denies clippy::panic
+            // even in tests): a missing series is a scrape/recorder failure, not
+            // a present-at-0 violation — the assert carries the same message.
+            assert!(found.is_some(), "series absent from /metrics: {prefix}");
+            let value = found.and_then(|l| l.rsplit(' ').next()).unwrap_or("");
+            assert_eq!(value, "0", "present-at-0 violation (value != 0): {found:?}");
+        };
+
+        present_at_zero(r#"gc_meeting_creation_total{status="success"}"#);
+        present_at_zero(r#"gc_meeting_creation_failures_total{error_type="org_limit"}"#);
+        present_at_zero(r#"gc_mc_assignments_total{status="success",rejection_reason="none"}"#);
+        present_at_zero(
+            r#"gc_meeting_join_failures_total{participant="user",error_type="not_found"}"#,
+        );
+        present_at_zero(r#"gc_cors_preflight_total{origin_class="allowed",status="200"}"#);
+        // db_queries: the rare error series that were previously masked.
+        present_at_zero(r#"gc_db_queries_total{operation="atomic_assign",status="error"}"#);
+
+        let total_series = rendered
+            .lines()
+            .filter(|l| l.contains("_total{") || l.contains("_total "))
+            .count();
+        assert!(
+            (60..=300).contains(&total_series),
+            "zero-init series count {total_series} outside expected band 60..=300 — a \
+             vocabulary grew/shrank; update the band deliberately"
+        );
+    }
+
+    /// Assert a registered-at-0 counter survives to `render()` through the SHARED
+    /// prod builder — present-at-0 under the exact prod config.
+    ///
+    /// HONEST SCOPE (OBS-F3): this does NOT pin `idle_timeout`-absence — `render()`
+    /// is synchronous at t≈0, so a minutes-scale `idle_timeout` would not reap
+    /// first; it duplicates the present-at-0 render assertion under a stronger
+    /// name. idle_timeout-absence is a config-review checkpoint, not test-enforced.
+    #[test]
+    fn production_builder_has_no_idle_timeout() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            counter!("gc_meeting_creation_total", "status" => "success").increment(0);
+        }
+        assert!(
+            handle.render().contains("gc_meeting_creation_total{"),
+            "a registered-at-0 counter did NOT render through configured_prometheus_builder() \
+             — present-at-0 broke under the prod exporter config (a recorder/scrape/config \
+             regression). This does not by itself prove an idle_timeout was added; that stays \
+             a config-review checkpoint."
+        );
+    }
 
     // ========================================================================
     // Per-cluster MetricAssertion tests — replace the pre-ADR-0032 hand-rolled

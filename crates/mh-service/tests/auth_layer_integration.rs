@@ -265,6 +265,45 @@ async fn no_service_type_claim_returns_permission_denied() {
 }
 
 #[tokio::test]
+async fn unrecognized_service_type_clamps_metric_label_to_other() {
+    // A signature-valid token carrying an arbitrary, unrecognized `service_type`
+    // must reject AND its claim must NOT reach the metric label RAW (an
+    // unbounded-cardinality / exporter-memory DoS). The emit site clamps it to
+    // `other` (distinct from `unknown`, which means the claim was absent).
+    let rig = AuthRig::start().await;
+    let mut client = connect_client(&rig.grpc).await;
+
+    let token = mint_wrong_service_type_token(&rig.jwks.keypair, "totally-forged-type");
+
+    let snap = MetricAssertion::snapshot();
+    let err = client
+        .register_meeting(req_with_bearer(Some(&token)))
+        .await
+        .expect_err("unrecognized service_type must not reach MediaHandlerService");
+    assert_eq!(
+        err.code(),
+        Code::PermissionDenied,
+        "unrecognized service_type must map to PERMISSION_DENIED (ADR-0003 Layer 2)"
+    );
+
+    // Only the `other` bucket fires; the forged string is never a label value.
+    snap.counter("mh_caller_type_rejected_total")
+        .with_labels(&[
+            ("grpc_service", "MediaHandlerService"),
+            ("expected_type", "meeting-controller"),
+            ("actual_type", "other"),
+        ])
+        .assert_delta(1);
+    snap.counter("mh_caller_type_rejected_total")
+        .with_labels(&[
+            ("grpc_service", "MediaHandlerService"),
+            ("expected_type", "meeting-controller"),
+            ("actual_type", "totally-forged-type"),
+        ])
+        .assert_delta(0);
+}
+
+#[tokio::test]
 async fn alg_none_bypass_attempt_returns_unauthenticated() {
     // CVE-2015-9235-class attack: unsigned JWT with `alg: "none"` (Auth0 2015
     // advisory, "Critical vulnerabilities in JSON Web Token libraries").

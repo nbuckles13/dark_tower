@@ -76,6 +76,7 @@ histogram_quantile(0.95, rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
 - **Usage**: Monitor AC response times
 
 ### `mh_token_refresh_failures_total`
+- **Expected-empty**: yes — every series is a token-refresh failure, zero when the token manager is healthy
 - **Type**: Counter
 - **Description**: Token refresh failures by error type
 - **Labels**:
@@ -155,13 +156,14 @@ sum by(failure_reason) (rate(mh_jwt_validations_total{result="failure"}[5m]))
 ## gRPC Auth Layer 2 Metrics (ADR-0003)
 
 ### `mh_caller_type_rejected_total`
+- **Expected-empty**: yes — any caller-type rejection is a misconfiguration/bug, zero when healthy
 - **Type**: Counter
 - **Description**: Total caller service_type rejections by Layer 2 routing
 - **Labels**:
   - `grpc_service`: Target gRPC service name (`MediaHandlerService`)
   - `expected_type`: Expected caller service_type (`meeting-controller`)
-  - `actual_type`: Actual caller service_type (e.g., `global-controller`, `unknown`)
-- **Cardinality**: Low (1 x 1 x 3 = 3 max)
+  - `actual_type`: Caller's `service_type` claim, **clamped** at the emit site (`common::service_type::service_type_metric_label`). MH's only path expects `meeting-controller` (never rejected), so the reachable recognized identities are `global-controller` and `media-handler`, plus `unknown` (claim absent) and `other` (present-but-unrecognized — e.g. an `auth-controller` value now lands here). A recognized-but-wrong identity keeps its real value.
+- **Cardinality**: Low — `actual_type` is bounded to 4 values (`global-controller`, `media-handler`, `unknown`, `other`) by the emit-site clamp, independent of the peer-controlled claim; `grpc_service` (1) and `expected_type` (1) are fixed.
 - **Usage**: Detect misconfigured services calling wrong gRPC endpoints
 - **ALERT**: Any non-zero value indicates a bug or misconfiguration
 
@@ -195,6 +197,7 @@ sum(rate(mh_mc_notifications_total[5m]))
 ## RegisterMeeting Metrics
 
 ### `mh_register_meeting_timeouts_total`
+- **Expected-empty**: yes — a RegisterMeeting timeout is exceptional, zero when MC↔MH is healthy
 - **Type**: Counter
 - **Description**: Count of provisional WebTransport connections disconnected because `RegisterMeeting` did not arrive within the configured timeout (R-26). Fires only from the provisional-accept timeout arm in `webtransport::connection::handle_connection`; shutdown-driven cancellation does not increment this counter.
 - **Labels**: None
@@ -623,6 +626,7 @@ defensible and neither is inferable from the series names, which is why they are
 stated here.
 
 ### `mh_media_frames_dropped_total`
+- **Expected-empty**: yes — frame drops are the media-path fault signal, zero on a healthy idle/loopback path
 - **Type**: Counter
 - **Description**: Frames MH did not forward, by reason.
 - **Labels**:
@@ -935,6 +939,8 @@ a latency burn-rate alert until the objective is ratified.
 ## Error Metrics
 
 ### `mh_errors_total`
+- **Expected-empty**: yes — every series is an error, so a healthy handler reads zero
+- **Zero-init**: exempt — operation is a free-form call-site string and status_code is a raw HTTP u16, an unbounded runtime-discovered domain
 - **Type**: Counter
 - **Description**: Total errors by operation and type
 - **Labels**:

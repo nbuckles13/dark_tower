@@ -489,7 +489,7 @@ sum(increase(gc_meeting_creation_failures_total{error_type=~"org_inactive|org_no
 
 **Absence semantics — read this before treating a firing as a misconfiguration**:
 - **Steady state is provably zero.** No code path deactivates or deletes an organization, and AC will not mint a token for an inactive org. A valid token naming a missing or inactive org means GC and AC disagree about database state.
-- **No data is healthy**, not a broken exporter or a bad scrape config. This series is expected to be permanently absent in normal operation.
+- **Zero is healthy; no data is a fault.** The series is present-at-zero from process start, so normal operation reads `0`, not absent. Absence means the series stopped being exported — pod down, scrape broken, metric or label renamed — and should be investigated rather than read as calm. (Before the present-at-zero fix this rule could not have fired at all: the series was born at 1 on its first event with no `0→1` edge for `increase()` to measure.)
 - **One occurrence is the signal.** `for: 15m` debounces scrape flapping; it does **not** require repeated events. Expected detection delay ~15m.
 - **This rule has no automated exerciser** — the repo has no `promtool test rules` harness — so the fact that it has never fired before is *not* evidence that it works, nor that this firing is spurious.
 

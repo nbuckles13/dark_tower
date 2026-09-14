@@ -2548,7 +2548,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Audit log write failures. ANY non-zero value is compliance-critical and should trigger investigation.",
+      "description": "Audit log write failures. ANY non-zero value is compliance-critical and should trigger investigation. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3021,7 +3021,7 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (increase(ac_meeting_token_display_name_total{job=\"ac-service\"}[$__range]))",
+          "expr": "sum by (outcome) (increase(ac_meeting_token_display_name_total{job=\"ac-service\"}[$__rate_interval]))",
           "legendFormat": "{{outcome}}",
           "range": true,
           "refId": "A"

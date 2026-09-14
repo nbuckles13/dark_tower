@@ -132,6 +132,15 @@ groups:
           impact: "Users cannot create meetings. Investigate GC health, routing, and upstream dependencies."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-4-complete-service-outage"
 
+      # OPS-14 dual-end coupling (counter-zero-init devloop). The
+      # `absent_over_time(gc_telemetry_ingest_total[15m])` clause below detects a
+      # restarted pod that received NO telemetry since restart by the series being
+      # ABSENT. Because of this, `gc_telemetry_ingest_total` is deliberately
+      # `Zero-init: exempt` in docs/observability/metrics/gc-service.md and must
+      # NOT be added to any `zero_initialize_counters()` entrypoint: present-at-0
+      # would make the series always present and silently defeat this clause (a
+      # freshly-restarted pod also has no `[1h] offset 15m` baseline for the
+      # fallback). Change one end and you must change the other.
       - alert: GCTelemetryProxySilent
         expr: |
           (
@@ -320,6 +329,12 @@ groups:
       #
       # This rule has no automated exerciser — the repo has no `promtool test
       # rules` harness — so its silence is NOT evidence that it works.
+      #
+      # NOTE (counter-visibility fix, 2026-09-10): before `gc_meeting_creation_failures_total`
+      # was present-at-zero from process start, this rule could not have fired AT
+      # ALL — the series was born at 1 on its first event with no `0→1` edge for
+      # `increase()` to measure. That is what this PR repaired; a first firing
+      # after deploy is the fix working, not a spurious page.
       - alert: GCMeetingCreationOrgStateInvalid
         expr: |
           sum(increase(gc_meeting_creation_failures_total{error_type=~"org_inactive|org_not_provisioned"}[1h])) > 0
@@ -330,7 +345,7 @@ groups:
           component: meeting-creation
         annotations:
           summary: "GC refused meeting creation for organization-state reasons ({{ $value }} in the last hour)"
-          description: "Meeting creation was refused because the caller's organization is inactive (`org_inactive`) or absent (`org_not_provisioned`), rather than because its meeting cap is full. Steady state for this series is zero — no code path deactivates or deletes an organization — so any occurrence means a valid token references organization state GC cannot see. Check in this order: a database volume reset (the seeded org is re-created with a fresh org_id while pre-reset tokens carry the old one), GC and AC configured against different databases, a restore, then out-of-band SQL. This rule fires on a SINGLE occurrence; the 15m `for` clause debounces scrape flapping and does not require repeated events. Expected detection delay ~15m. An empty series is the normal, healthy state — absence of data here is not a broken exporter."
+          description: "Meeting creation was refused because the caller's organization is inactive (`org_inactive`) or absent (`org_not_provisioned`), rather than because its meeting cap is full. Steady state for this series is zero — no code path deactivates or deletes an organization — so any occurrence means a valid token references organization state GC cannot see. Check in this order: a database volume reset (the seeded org is re-created with a fresh org_id while pre-reset tokens carry the old one), GC and AC configured against different databases, a restore, then out-of-band SQL. This rule fires on a SINGLE occurrence; the 15m `for` clause debounces scrape flapping and does not require repeated events. Expected detection delay ~15m. The healthy reading is 0, not absent: this series is present-at-zero from process start, so a 0→1 edge exists for increase() to see. Absence now means the series stopped being exported — pod down, scrape broken, or the metric or label renamed — and is itself worth investigating."
           impact: "Affected callers cannot create meetings. `org_not_provisioned` returns 500 and so also counts toward the aggregate HTTP error-rate SLO alerts; `org_inactive` returns 403. A rate that does not decay within roughly an hour indicates an ongoing divergence rather than the tail of expiring tokens."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-8-meeting-creation-limit-exhaustion"
 

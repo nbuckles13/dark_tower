@@ -277,7 +277,7 @@ mod tests {
              `metric_labels` — a PII-relevant detection surface (ADR-0029 \
              bounded labels), whose opener is the discovery loop feeding the \
              label PII checks — plus `application_metrics`, `dashboard_panels`, \
-             `metric_coverage` and `histogram_buckets`. If the ORDER changed, `describe_counter!` \
+             `metric_coverage`, `counter_zero_init` and `histogram_buckets`. If the ORDER changed, `describe_counter!` \
              may now be matched as `counter!` with a `describe_` prefix. \
              Updating this literal to green CI requires @security + \
              @observability sign-off (ADR-0024 §6.2); it is NOT a mechanical fix."

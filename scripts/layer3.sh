@@ -57,6 +57,13 @@ layer_lifecycle_begin 3
   # nothing and report success. Deliberately NOT under guards/simple/ for the same
   # find -name '*.sh' reason. No cluster.
   run_and_emit "slug-class-sync-guard-selftest" "${__here}/guards/validate-slug-class-sync.test.sh" || true
+  # Counter-zero-init self-test (ADR-0036 story-1 counter-visibility fix): the guard PASSES on
+  # every real run (all four services are zero-init'd), so its failure branches — the positive
+  # control (a planted lazy counter MUST fire), the exempt/malformed/mutual-exclusion paths, the
+  # slot()-witness predicate, the entrypoint-not-called check, and the scope-liveness tokens —
+  # are exercised here against synthetic roots. Deliberately NOT under guards/simple/ (the
+  # find -name '*.sh' reason). No cluster.
+  run_and_emit "counter-zero-init-selftest" "${__here}/guards/counter-zero-init.test.sh" || true
   # Disk-guard self-test (envtest-infra-reliability devloop): forces
   # check_build_disk_space's trip branch so the `REASON=insufficient-disk` operator contract
   # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed
