@@ -48,7 +48,7 @@ Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers). `name` 
 | Code Quality Reviewer | `code-reviewer` | `code-reviewer` | Rust idioms, ADR compliance |
 | DRY Reviewer | `dry-reviewer` | `dry-reviewer` | Cross-service duplication (see DRY exception in review protocol) |
 | Operations Reviewer | `operations` | `operations` | Deployment safety, rollback, runbooks |
-| Semantic Guard Reviewer | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (e.g. credential leak, client credential lifetime — authoritative list: `scripts/guards/semantic/checks.md`). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. |
+| Semantic Guard Reviewer **(conditional — see below)** | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (e.g. credential leak, client credential lifetime — authoritative list: `scripts/guards/semantic/checks.md`). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. **Spawned only when the diff touches a check surface (ADR-0037 D4) — not an always-present reviewer.** |
 | Paired Specialist (if `--paired-with=<specialist>`) | `paired-<specialist>` | `{specialist}` | Active collaborator during implementation + Gate 2 reviewer. When `<specialist>` is already a mandatory reviewer (security/test/observability/operations), the paired teammate replaces that slot with the same identity and an expanded role. |
 
 The Lead (orchestrator) is automatically named `team-lead` in the team config.
@@ -56,6 +56,8 @@ The Lead (orchestrator) is automatically named `team-lead` in the team config.
 **Review model**: All findings default to "fix it." Deferral requires demonstrating that fix-now-cost > fix-later-cost + tracking-overhead — *for this specific finding*. Verdicts split RESOLVED into RESOLVED-FIXED (everything cleared from the diff) vs RESOLVED-DEFERRED (any finding still in tree); even one accepted deferral forces RESOLVED-DEFERRED for that reviewer. See review protocol for the burden-of-proof, the suspicious-deferral check, and the full taxonomy.
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer. Same for Protocol when API contracts are affected by a non-Protocol implementer.
+
+**Conditional semantic guard (ADR-0037 D4)**: Semantic Guard is no longer an always-present full-mode reviewer. Spawn it only when the diff plausibly touches a surface named in `scripts/guards/semantic/checks.md` — e.g. a type carrying credential/secret material, a `Debug`/`Display` derive or impl over a payload or key, client credential-lifetime handling, or comment-vs-code meaning drift. Its historical yield is ~1 real catch per 6 tasks at the cost of a full reviewer seat, so the default is **skip**; err toward including it when a check surface is plausibly in the diff (a false include costs one seat; a false skip misses a catch), and when in genuine doubt on a production-code diff, include it. When not spawned, its Gate-3 verdict row is omitted, not left blank.
 
 ### Lightweight Mode (`--light`)
 
