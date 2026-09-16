@@ -5,7 +5,7 @@ description: Close a completed user story — verify completeness, run story-sco
 
 # Close-Story Skill
 
-Close a user story: verify every devloop is done, run story-scope reflection (specialists update INDEX across the story's devloops), run a DRY ownership-lens retrospective, commit + push, create or update the story's PR.
+Close a user story: verify every devloop is done, run story-scope reflection (specialists update INDEX across the story's devloops), commit + push, create or update the story's PR.
 
 Moves reflection from per-devloop (cheap, repetitive) to per-story (once, with cross-devloop context). Per-devloop reflection no longer exists — see `.claude/skills/devloop/SKILL.md` Workflow Overview.
 
@@ -34,7 +34,7 @@ Do NOT use mid-story (Phase 1 refuses), for standalone devloops (Gate 2 INDEX gu
 ## Workflow
 
 ```
-VERIFY → TEAM CREATE → REFLECTION → DRY RETRO → TEAM DELETE → FINALIZE (commit/push) → PR → COMPLETE
+VERIFY → TEAM CREATE → REFLECTION → TEAM DELETE → FINALIZE (commit/push) → PR → COMPLETE
 ```
 
 ## Phase 1: Verify
@@ -118,7 +118,7 @@ That literal is pinned to `manifest::SLUG_PATTERN` (the canonical class, enforce
 
 ## Phase 2: Story-scope Reflection
 
-**Identify participating specialists**: from each `docs/devloop-outputs/{devloop-slug}/main.md`, collect the implementing specialist (`**Specialist**:` header) plus any reviewer whose Code Review Results verdict was `RESOLVED` or `ESCALATED`. CLEAR reviewers skip reflection. Deduplicate. Always include `dry-reviewer` (Phase 2.5 retrospective runs in the same team).
+**Identify participating specialists**: from each `docs/devloop-outputs/{devloop-slug}/main.md`, collect the implementing specialist (`**Specialist**:` header) plus any reviewer whose Code Review Results verdict was `RESOLVED` or `ESCALATED`. CLEAR reviewers skip reflection. Deduplicate. (`dry-reviewer` is included only when it was a RESOLVED/ESCALATED reviewer on some devloop — the former always-include was for the removed Phase 2.5 retrospective.)
 
 **Spawn the reflection teammates.** The session has a single implicit team — there is no team to create (the `team_name` argument is deprecated and ignored). Custom subagent types from `.claude/agents/{name}.md` are spawnable directly (mirrors `/devloop` Step 3).
 
@@ -164,46 +164,11 @@ When done, reply "Reflection complete" via SendMessage.
 
 If it fails, forward to the offending specialist, ask for a fix, re-run. Phase 2 fails closed if the guard cannot be cleared — do not proceed to commit. Per ADR-0024 §6.3, cross-boundary INDEX edits follow owner-involvement rules (rare — INDEX files are in each specialist's own domain).
 
-## Phase 2.5: DRY Ownership Lens Retrospective
+## Phase 2.5: Teammate Teardown
 
-Send this prompt to `dry-reviewer` (already in the team from Phase 2) via SendMessage:
+> **Removed (ADR-0037 D1)**: the former "DRY Ownership Lens Retrospective" (Phase 2.5) is deleted. It was a meta-audit *of* the cross-boundary classifications — and D1 stops classifying Mechanical/Minor edits, so there is nothing left to audit. Cross-devloop DRY findings still reach `docs/TODO.md` from Gate 3 as before.
 
-```
-You are running the Ownership Lens retrospective for user story {story-slug}.
-
-Scope: story-level, across the N completed devloops. NOT per-devloop code-duplication review — that's done at Gate 3.
-
-Inputs:
-- docs/user-stories/{story-slug}.md
-- docs/devloop-outputs/{each-devloop-slug}/main.md
-
-Read the "Code Review Results" section of each devloop main.md, focusing on the Ownership Lens verdict field (ADR-0024 §6.6 step 7). Assess cross-devloop patterns: templated vs specific entries; classification drift; same edit shape with different classifications across devloops; Pattern B without named convention author; GSA accidentally routed as Mechanical; ESCALATE routes; Paired flag use.
-
-Output: Write docs/devloop-outputs/{story-slug}-story-close/ownership-lens-retrospective.md. Create the directory if needed — the `-story-close` suffix keeps it distinct from devloop output dirs. ≤30 lines with this EXACT structure (stable headers for future machine parsing per ADR-0024 §6.8 item #3):
-
-## Summary
-{1-2 sentences}
-
-## Ownership Lens Verdict Audit
-- Devloop: <slug>   Classification: <Mine|Mechanical|Minor-judgment|Domain-judgment>   Outcome: <clean|upgraded|escalated>
-{one bullet per devloop}
-
-## Pattern Observations
-{bulleted}
-
-## Follow-Ups
-{bulleted or "None"; add TODO.md entries if warranted}
-
-Non-blocking: advisory only, does NOT gate the close. Do NOT perform DRY code-duplication analysis.
-
-When done, reply "Retrospective complete".
-```
-
-**Timeout**: 15 min; proceed, note "retrospective skipped (timeout)" if missed.
-
-## Phase 2.6: Teammate Teardown
-
-After all reflections + the retrospective have completed (or timed out):
+After all reflections have completed (or timed out):
 
 1. Send `{type: "shutdown_request"}` to every teammate you spawned via SendMessage; `TaskStop` by name any that do not wind down.
 2. Clear the session-global task list: call `TaskList`, then `TaskUpdate(status: "completed" | "deleted")` on remaining items.
@@ -282,7 +247,7 @@ Exclude everything else: `.env` dumps, log tails, teammate transcripts, freeform
 {Non-story commits; or "None".}
 
 ## Remaining follow-ups
-{Aggregated devloop Tech Debt + Phase 2.5 TODO.md additions; or "None".}
+{Aggregated devloop Tech Debt; or "None".}
 
 ## Test evidence
 Rolled-up verdicts:
@@ -327,14 +292,12 @@ Harness permission prompts fire on `gh pr create/edit`; deny is terminal per Pha
 Devloops: {count} ({comma-separated slugs})
 Slug coverage: {N}/{M} completed tasks
 PR: {URL}
-TODO additions: {count from Phase 2.5}
 Reflection: {count of specialists who updated INDEX}
-Ownership-lens retrospective: docs/devloop-outputs/{story-slug}-story-close/ownership-lens-retrospective.md
 ```
 
 **`Slug coverage` is ALWAYS printed, never conditional.** The normal case reads `4/4`; a degraded close (the pre-slug-era tolerate path) reads e.g. `0/65` and is visible in the fixed record **by value**. A degraded close must not depend on a model remembering to mention it in prose under budget pressure — same reason the runner emits a `cause=` token rather than a sentence.
 
-Conditional output: print the retrospective line only if the file exists (substitute `skipped (timeout)` or omit). If Phase 3 was a no-op commit, add `Commit: none (no working-tree changes)`. Flag any other skipped phases inline.
+Conditional output: if Phase 3 was a no-op commit, add `Commit: none (no working-tree changes)`. Flag any other skipped phases inline.
 
 ## Limits
 
@@ -343,15 +306,13 @@ Conditional output: print the retrospective line only if the file exists (substi
 | Phase 1 | — | Block immediately on incomplete tasks |
 | Phase 2 | 20 min per specialist | Proceed without; note in report |
 | Phase 2 INDEX guard | 3 retries | Fail close — do not commit |
-| Phase 2.5 | 15 min | Proceed without; note in report |
-| Phase 2.6 (team teardown) | — | Always runs after Phase 2 + 2.5, even if either timed out |
+| Phase 2.5 (team teardown) | — | Always runs after Phase 2, even if it timed out |
 | Phase 3 (commit/push), Phase 4 (PR) | — | Harness permission prompts; deny is terminal |
 
 ## Files
 
 - Story file: `docs/user-stories/{story-slug}.md` (exact filename resolved via glob at Phase 1)
 - Devloop outputs: `docs/devloop-outputs/{devloop-slug}/main.md`
-- Story-close output: `docs/devloop-outputs/{story-slug}-story-close/ownership-lens-retrospective.md`
 - Specialist INDEX: `docs/specialist-knowledge/{name}/INDEX.md`
 - Upstream: `.claude/skills/devloop/SKILL.md` (reflection removed), `.claude/skills/user-story/SKILL.md` (emits the `dt-story` manifest this skill reads)
 - Slug class pinned to `crates/dt-story/src/manifest.rs::SLUG_PATTERN` by `scripts/guards/simple/validate-slug-class-sync.sh`

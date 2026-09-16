@@ -95,12 +95,16 @@ For small, contained changes (typically 10-30 lines):
 
 ## Cross-Boundary Edits
 
-When authoring the plan for a devloop, the implementer lists **every** planned file change in `main.md` (plan template) with a per-file classification — **Mine** (in-domain, the trivial label for most rows), or for cross-boundary rows one of **Not mine, Mechanical** / **Not mine, Minor-judgment** / **Not mine, Domain-judgment**. Reviewers may **upgrade** a classification at Gate 1 or during Gate 3 review (downgrade disallowed); challenges auto-route to ESCALATE. Route per the Owner Involvement table (§6.3). See ADR-0024 §6 for rationale; this section covers operational triggers.
+When authoring the plan for a devloop, the implementer lists **every** planned file change in `main.md` (plan template) so the scope-drift guard can compare plan against diff.
+
+**Classification and owner routing apply only to the edits that actually need an owner (ADR-0037 D1): Domain-judgment cross-boundary edits and Guarded Shared Areas.** Everything else — in-domain edits, and Mechanical or Minor-judgment cross-boundary edits — is reviewed by the standard panel with **no** separate classification row, owner-confirmation, or Gate-3 Ownership Lens verdict. Rationale: story-1 evidence showed Mechanical/Minor cross-boundary edits (~82% of classified rows) almost never produced an owner catch, while the classification/co-sign/verdict ceremony around them was a top token sink. Only Domain-judgment (~12%) and the GSA safety boundary earn owner involvement.
+
+For an edit that *does* need an owner, classify the row (**Not mine, Domain-judgment**, or a GSA path) and route per the Owner Involvement table (§6.3). Reviewers may still **upgrade** any cross-boundary edit they believe needs the owner (Mechanical/Minor → Domain-judgment); the challenge auto-routes to ESCALATE — that upgrade path is the backstop against an implementer under-calling a Domain-judgment edit. See ADR-0024 §6 for the original rationale; ADR-0037 D1 narrows its application during the story-2 trial.
 
 ### Three-Category Classification (§6.2)
 
 - **Mechanical** — Value-neutral *and* structure-preserving (the `sed`-test applies: deterministic find-and-replace that does not change the encoded concept). Requires full guard pipeline coverage for the change-pattern: **Mechanical iff guards catch every partial version** (see `./scripts/guards/run-guards.sh`). Concept substitution (renaming a metric label while changing its semantic meaning) is NOT Mechanical.
-- **Minor-judgment** — Small defensive adjustments where a reasonable reader could argue either way but impact is bounded. Examples: widening a numeric threshold, adding a missing structured-log field. **Alert rule changes** (severity, routing labels, `for:` duration) are Minor-judgment when the edit couples to runbook prose (`docs/runbooks/*.md`) or the alert conventions doc (`docs/observability/alert-conventions.md`) — hunk-ACK by operations is required because the runbook narrative must stay coherent with the fired-state semantics.
+- **Minor-judgment** — Small defensive adjustments where a reasonable reader could argue either way but impact is bounded. Examples: widening a numeric threshold, adding a missing structured-log field. **Alert rule changes** (severity, routing labels, `for:` duration) that couple to runbook prose (`docs/runbooks/*.md`) or the alert conventions doc (`docs/observability/alert-conventions.md`) are Minor-judgment. Under ADR-0037 D1 these are **review-only** — no separate operations hunk-ACK; operations is on the standing panel and reviews the runbook-coherence concern there (upgrade to Domain-judgment if the fired-state semantics genuinely change).
 - **Domain-judgment** — Changes requiring the owner's domain knowledge (threshold tuning, behavior changes, API semantics, new instrumentation affecting SLO shape).
 
 Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B coordinated renames require a **named convention author** (e.g., observability for metric taxonomy) — absent one, Pattern B collapses to owner-implements.
@@ -109,11 +113,11 @@ Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B
 
 | Category | Owner involvement | Mechanism |
 |----------|-------------------|-----------|
-| Mechanical | Review-only | Owner sees the change at the standard reviewer gate. No separate approval — **proceed with review**. |
-| Minor-judgment | Owner confirmation required | Owner-specialist must be a reviewer on the devloop and must confirm the cross-boundary hunk at Gate 1 and at Gate 3 (via Ownership Lens verdict). Not satisfied by generic PR approval. Optional `Approved-Cross-Boundary:` trailer (below) available as an audit breadcrumb. |
-| Domain-judgment | Owner-implements | Route to a separate devloop with owner as implementer, or use `--paired-with=<owner>` to keep the owner in the loop during the current devloop. |
+| Mechanical | Review-only | No classification row, no separate approval, no Ownership Lens verdict. Reviewed by the standard panel like any other diff (ADR-0037 D1). |
+| Minor-judgment | Review-only | Same as Mechanical (ADR-0037 D1): no owner-confirmation dance, no Ownership Lens verdict. If the owner-specialist is on the panel they see it at the standard gate; the always-on quartet (security/obs/ops/dry) backstops. A reviewer who thinks it needs the owner **upgrades to Domain-judgment** (auto-ESCALATE). |
+| Domain-judgment | Owner-implements | Route to a separate devloop with owner as implementer, or use `--paired-with=<owner>` to keep the owner in the loop during the current devloop. Classify the row and record the owner. |
 
-**Default-posture flip**: For Mechanical cross-boundary edits the default is "proceed with review," NOT "defer to owner." The older implicit "owner-implements" rule holds only for Domain-judgment and Guarded Shared Areas. **This flip does NOT apply inside Guarded Shared Areas — Mechanical classification is disallowed there.**
+**Default posture**: Mechanical and Minor-judgment cross-boundary edits **proceed with review** — no deferral to owner. Owner-implements holds only for Domain-judgment and Guarded Shared Areas. **Inside Guarded Shared Areas this posture does NOT apply — Mechanical classification is disallowed there and the GSA rules below govern (unchanged by ADR-0037).**
 
 ### Guarded Shared Areas (§6.4)
 
@@ -144,7 +148,7 @@ Extending the enumerated list requires a **micro-debate** (~3 specialists: affec
 
 ### Optional `Approved-Cross-Boundary:` Commit Trailer (§6.7)
 
-Owner confirmation is satisfied by Gate 1 review + Gate 3 Ownership Lens verdict (§6.3). For cases where a durable audit breadcrumb matters (e.g., auth-critical edits that will be referenced during post-incident review), an owner may optionally record confirmation as a commit trailer:
+For **Domain-judgment cross-boundary edits and GSA edits** — the only categories that involve the owner under ADR-0037 D1 — an owner may optionally record confirmation as a commit trailer where a durable audit breadcrumb matters (e.g. auth-critical edits referenced during post-incident review). (Mechanical/Minor edits are review-only and take no trailer.)
 
 ```
 Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>

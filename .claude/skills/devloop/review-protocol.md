@@ -48,7 +48,7 @@ When the implementer shares their plan, verify before confirming:
 3. No domain-specific concerns that would require redesign
 4. For Security reviewer: threat model implications considered
 5. All technical questions you raised with the implementer are resolved — no pending concerns
-6. **Cross-Boundary Classification review**: verify the plan's `## Cross-Boundary Classification` table. For every row with classification other than `Mine`, check the classification against the change-pattern and impact, and confirm the Owner field is correct. Ensure there is a row for every file the plan touches — not only cross-boundary rows. If uncertain, challenge via **upgrade** (Mechanical → Minor-judgment → Domain-judgment) — downgrade is disallowed per ADR-0024 §6.2 and auto-routes to ESCALATE. See ADR-0024 §6.3 (owner-involvement) and §6.4 (Guarded Shared Areas).
+6. **Cross-Boundary review (ADR-0037 D1)**: the plan lists every file it touches for scope-drift, but classification and owner routing apply **only to Domain-judgment cross-boundary edits and Guarded Shared Areas**. For those rows, check the classification against the change-pattern and impact and confirm the Owner field. Mechanical and Minor-judgment cross-boundary edits are reviewed like any other diff — no classification row, no owner-confirmation, no Ownership Lens verdict. If you believe a Mechanical/Minor edit actually needs the owner, challenge via **upgrade** to Domain-judgment — downgrade is disallowed per ADR-0024 §6.2 and auto-routes to ESCALATE; that upgrade path is the backstop against an under-called Domain-judgment edit. See ADR-0024 §6.3/§6.4, as narrowed by ADR-0037 D1.
    - The Layer B classification-sanity guard (`scripts/guards/simple/validate-cross-boundary-classification.sh`) enforces two narrow mechanical rules ahead of Lead's "Plan approved": (a) GSA paths cannot be `Mechanical`; (b) GSA paths with a non-`Mine` classification must have an Owner in the ownership manifest. **Human judgment on is-this-really-Mechanical, is-the-sed-test-clean, and is-the-intersection-rule-honored stays with you at Gate 1** — the guard does not substitute for review.
 
 Only use SendMessage to tell @team-lead "Plan confirmed" after checking all applicable items. **Do NOT confirm if you have unresolved questions or outstanding discussions with the implementer.**
@@ -128,13 +128,11 @@ The DRY reviewer operates on a hybrid model:
 ### ADR Compliance
 [List relevant ADRs checked and compliance status — mandatory for Code Quality reviewer]
 
-### Ownership Lens
-[For each cross-boundary edit in the diff, record the classification and answer the reviewer-question for that tier. Mandatory for Code Quality reviewer per ADR-0024 §6.6; optional for other reviewers unless a cross-boundary concern surfaces.]
+### Ownership Lens (ADR-0037 D1: Domain-judgment / GSA only)
+[Record a verdict here ONLY for a **Domain-judgment** cross-boundary edit or a **Guarded Shared Area** edit in the diff. Mechanical and Minor-judgment cross-boundary edits get no Ownership Lens entry — **omit this whole section** if the diff has no Domain-judgment/GSA edit. Mandatory for the Code Quality reviewer when such an edit is present.]
 
-- **Mechanical** — Is the edit value-neutral and structure-preserving per the sed-test, and does the guard pipeline cover this change-pattern?
-- **Minor-judgment** — Has the owner-specialist recorded an `Approved-Cross-Boundary:` trailer for each hunk they own?
-- **Domain-judgment** — Was this routed to an owner-implemented devloop, or used `--paired-with=<owner>`?
-- **Guarded Shared Area** — Does the edit fall inside §6.4 paths/criterion, and if so, do all affected owners have trailers (intersection rule)?
+- **Domain-judgment** — Was this routed to an owner-implemented devloop, or used `--paired-with=<owner>`? If it landed in a non-owner devloop without the owner present, ESCALATE.
+- **Guarded Shared Area** — Does the edit fall inside §6.4 paths/criterion, and if so, is the required owner present and confirming (intersection rule for multi-GSA edits)?
 
 ### Findings
 
@@ -283,7 +281,7 @@ Three anchors for the Ownership Lens. Apply in order: sed-test first, then check
 - **Guard coverage**: metric-labels + metric-name guards enforce every partial state.
 - **Cross-boundary hunks**: `crates/mh-service/src/observability/metrics.rs::set_active_connections` and the corresponding MH label panel in `infra/grafana/dashboards/mh-overview.json` — MC implementer touching MH surfaces.
 - **Required trailer** on the commit: `Approved-Cross-Boundary: media-handler label-taxonomy rename matches ADR-0011 canonical`. The reason clause (≥10 chars per ADR-0024 §6.7) names the authority (ADR-0011), not just the what.
-- **Classification**: **Minor-judgment** — cross-service ownership crosses into MH dashboards and alert semantics; MH reviewer hunk-ACK via trailer. The combination of **named convention author** + **full guard coverage** is what legitimizes Pattern B here; absent either, this would collapse to owner-implements per ADR-0019 + ADR-0024 §6.6.
+- **Classification**: **Minor-judgment** — cross-service ownership crosses into MH dashboards and alert semantics. The combination of **named convention author** + **full guard coverage** is what legitimizes Pattern B here; absent either, this would collapse to owner-implements per ADR-0019 + ADR-0024 §6.6. **(ADR-0037 D1: a Minor-judgment edit like this is now review-only — no MH hunk-ACK trailer is required; the example is kept to illustrate the Pattern B vocabulary and the upgrade test. Only an upgrade to Domain-judgment re-involves the owner.)**
 
 ### 3. Negative case — Guarded Shared Area override
 
