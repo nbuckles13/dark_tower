@@ -1,71 +1,75 @@
 # Semantic Guard Navigation
 
 ## Architecture & Design
-- Guard methodology → ADR-0015 | Agent Teams pipeline → ADR-0024 | Polyglot layers → ADR-0033
-- Story runner → ADR-0035 | Cluster helper (+ cannot-self-validate corollary) → ADR-0030
+- Media path / key custody / frame-v2 → ADR-0036 | Guard methodology → ADR-0015 | Agent Teams pipeline → ADR-0024
+- Polyglot layers → ADR-0033 | Story runner → ADR-0035 | Cluster helper (+ cannot-self-validate) → ADR-0030
 - Semantic check definitions → `scripts/guards/semantic/checks.md` | Shell utils → `scripts/guards/common.sh`
 - Reviewer-panel slot (Gate 2 unicast loop, Step 7 dedup) → `.claude/skills/devloop/SKILL.md`
 
-## Story Runner (`scripts/workflow/`)
-- Test seams (`STORY_REPO_ROOT`, `DT_STORY`) + containment predicate → `run-story.sh` seam block (after `set -euo pipefail`)
-- Failure lanes → `run-story.sh:canary_probe()`, `canary_classify()`, `git_error_lane()`, `newest_devloop_output()`
-- Hermetic suite → `scripts/workflow/run-story.test.sh` (wired in `scripts/layer3.sh`)
-- Preflight → `preflight-story.sh` | Stop hook (fail-closed) → `devloop-stop-hook.sh`
-- Planning / closing skills → `.claude/skills/user-story/SKILL.md`, `.claude/skills/close-story/SKILL.md`
+## Media Path — Key Custody (ADR-0036, credential-leak items 11-13)
+- MC key custody (KEK, identity key, sender-id, binding outcome; §4 floor in `mod.rs`) → `crates/mc-service/src/media_admission/`
+- Frame-v2 + wrapped-key redacting Debug → `crates/media-protocol/src/frame.rs`
+- Redaction control (`skip_debug` set + `RedactedLen` hand-Debug) → `crates/proto-gen/build.rs`, `crates/proto-gen/src/lib.rs`
+- Signaling contract (MediaKind/Codec/SlotState, `JoinResponse.meeting_kek`) → `proto/dark_tower/signaling/v1/signaling.proto`
+- MC→MH internal contract (RegisterMeeting, sole RPC) → `proto/dark_tower/internal/v1/internal.proto`
 
-## dt-story Manifest (`crates/dt-story/src/`)
-- Schema, `Slug` newtype, `SLUG_PATTERN`, fence-safe emit → `manifest.rs:Slug`, `Manifest::to_block_body()`
-- Block extraction (unterminated fence + orphan `- id:` scan) → `markdown.rs:find_manifest_block()`
-- Task selection / completion (status + slug write) → `engine.rs` | CLI verbs → `main.rs`
-- Manifest guard → `scripts/guards/simple/validate-story-manifest.sh`
+## MC Media Routing & MH Coordination
+- Routing control plane (assignment / generation / confirm) → `crates/mc-service/src/media_routing/`
+- MH programming call → `crates/mc-service/src/grpc/mh_client.rs` | sender-binding resolve → `grpc/media_coordination.rs`
 
-## Drift Guards & Shell Test Helpers
-- Slug class sync → `scripts/guards/simple/validate-slug-class-sync.sh` | Org-subdomain regex sync → `validate-subdomain-regex-sync.sh`
-- Shared assertions (`assert_absent`/`assert_marker`/`assert_no_marker`) → `scripts/lang/_test_helpers.sh`
+## MH Media Hot Path (telemetry-free by construction)
+- Forward path (no tracing/metrics macros) → `crates/mh-service/src/media/`
+- Transport seam → `crates/mh-service/src/transport/mod.rs`, `webtransport/media_transport.rs`
+- Sender binding (`SenderBindings`, `bind()`, `start_media_session`) → `crates/mh-service/src/session/mod.rs`
 
-## Layer-7 Per-Run Org Provisioning
-- Phase 1h generation + precondition lanes → `scripts/layer7.sh:__generate_org_subdomain()`
-- SQL provisioning (stopgap for an AC org API) → `infra/kind/scripts/setup.sh:provision_run_org()`, `dt_psql()`
-- Rust suite org resolution → `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`
-- Browser env contract → `packages/web-app/e2e/env.ts` | Hermetic coverage → `scripts/layer7.test.sh`, `scripts/setup.test.sh`
+## Client SDK Media (credential-leak items 5-10 + credential lifetime)
+- Hot path (no console/logger/metric names) → `packages/sdk-core/src/media/pipeline/`
+- Custody siblings (KEK, roster keys, allow-list metric projection) → `packages/sdk-core/src/media/setup/`
+- Layout-deny test → `packages/sdk-core/src/media/__tests__/hotPathLayout.test.ts` | whitelist-projection SAFE example → `packages/web-app/src/lib/e2eBus.ts`
+- Media store → `packages/sdk-svelte/src/stores/MediaStore.svelte.ts`
 
-## Authentication Seams
-- Common JWT (types, JWKS, validator, HasIat) → `crates/common/src/jwt.rs` | Token refresh → `common/src/token_manager.rs`
-- GC JWT validation → `crates/gc-service/src/auth/jwt.rs` | JWKS → `auth/jwks.rs` | Middleware → `middleware/auth.rs`
-- MC JWT validation (McJwtValidator) → `crates/mc-service/src/auth/mod.rs` | JWKS config → `mc-service/src/config.rs:ac_jwks_url`
-- MC WebTransport JWT check (pre-actor) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
-- MH gRPC auth interceptor → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor` | JWKS → `infra/services/mh-service/configmap.yaml:AC_JWKS_URL`
-- JwtError → service error mapping → `crates/gc-service/src/errors.rs`, `crates/mc-service/src/errors.rs`
+## Media Telemetry Deny & Key-Custody Fixtures
+- Deny guard → `crates/dt-guard/src/media_telemetry_deny.rs` | config → `scripts/guards/simple/media-telemetry-deny.yaml`
+- Macro-vocab SSoT → `crates/dt-guard/src/telemetry_macros.rs`, `metric_macros.rs` | scope liveness → `crates/dt-guard/src/common/scope.rs`
+- Key-custody fixtures + harness (fixture-verification runs) → `crates/dt-guard/tests/credential_leak_key_custody_fixtures.rs`
 
 ## MC Actors & WebTransport (`crates/mc-service/src/`)
 - Actors (controller, meeting, participant, messages, metrics) → `actors/*.rs`
 - Server (accept loop, TLS, capacity gate) → `webtransport/server.rs:WebTransportServer`
-- Connection handler (join flow, bridge loop) → `webtransport/connection.rs:handle_connection()`
+- Connection handler (join flow, post-join media dispatch, bridge loop) → `webtransport/connection.rs:handle_connection()`
 - RegisterMeeting trigger (first-participant, async spawn) → `connection.rs:register_meeting_with_handlers()`
 - MhRegistrationClient trait (testable RPC abstraction) → `grpc/mh_client.rs:MhRegistrationClient`
-- Protobuf framing utilities → `webtransport/handler.rs:encode_participant_update()`
+
+## Authentication Seams
+- Common JWT (types, JWKS, validator, HasIat) → `crates/common/src/jwt.rs` | Token refresh → `common/src/token_manager.rs`
+- GC JWT → `crates/gc-service/src/auth/jwt.rs` | MC JWT (McJwtValidator) → `crates/mc-service/src/auth/mod.rs`
+- MC WebTransport JWT check (pre-actor) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
+- MH gRPC auth interceptor → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
+- JwtError → service error mapping → `crates/gc-service/src/errors.rs`, `crates/mc-service/src/errors.rs`
 
 ## GC Handlers, Repositories & MH Selection
-- Create/Join/Guest/Settings handlers → `crates/gc-service/src/handlers/meetings.rs`
-- Meeting-refusal outcomes → `repositories/meetings.rs:CreateMeetingOutcome`, `MeetingRefusal::metric_label()`
+- Create/Join/Guest/Settings handlers → `crates/gc-service/src/handlers/meetings.rs` | routes → `routes/mod.rs:build_routes()`
 - Insert-error classification (SQLSTATE, not prose) → `repositories/meetings.rs:classify_insert_error()`
-- Refusal → HTTP + `error.code` + `error_type` → `errors.rs:GcError` (`OrgMeetingLimitExceeded`, `OrgInactive`, `OrgNotProvisioned`)
-- Routes → `routes/mod.rs:build_routes()` | Participants → `repositories/participants.rs` | Models → `models/mod.rs`
-- MH selection (weighted random) → `services/mh_selection.rs:MhSelectionService` | Assignment → `services/mc_assignment.rs:AssignmentWithMh`
+- Refusal → HTTP + `error.code` → `errors.rs:GcError` | MH selection (weighted random) → `services/mh_selection.rs:MhSelectionService`
 
-## Service Test Harnesses
-- GC meeting tests → `crates/gc-service/tests/meeting_tests.rs`, `meeting_create_tests.rs`, `mc_assignment_rpc_tests.rs`
-- MC TestKeypair + JWKS mock → `crates/mc-test-utils/src/jwt_test.rs` | Join tests → `crates/mc-service/tests/join_tests.rs`
+## Devloop Tooling (`scripts/workflow/`, `crates/dt-story/`)
+- Story runner seams + failure lanes → `run-story.sh` | Stop hook (fail-closed) → `devloop-stop-hook.sh`
+- Manifest schema, `Slug`, fence-safe emit → `crates/dt-story/src/manifest.rs`; block extraction → `markdown.rs:find_manifest_block()`
+- Manifest guard → `scripts/guards/simple/validate-story-manifest.sh` | Slug-class sync → `validate-slug-class-sync.sh`
+- Planning / closing skills → `.claude/skills/user-story/SKILL.md`, `.claude/skills/close-story/SKILL.md` | shell assertions → `scripts/lang/_test_helpers.sh`
+
+## Layer-7 Per-Run Org Provisioning
+- Phase 1h generation + precondition lanes → `scripts/layer7.sh:__generate_org_subdomain()`
+- SQL provisioning → `infra/kind/scripts/setup.sh:provision_run_org()` | Rust org resolution → `crates/env-tests/src/fixtures/auth_client.rs` | browser env → `packages/web-app/e2e/env.ts`
 
 ## Observability
 - GC metrics → `crates/gc-service/src/observability/metrics.rs` | MC → `crates/mc-service/src/observability/metrics.rs`
-- Metric catalogs (one per service) → `docs/observability/metrics/` | Dashboards → `infra/grafana/dashboards/gc-overview.json`, `mc-overview.json`
-- Alerts → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml` | Docs → `docs/observability/alerts.md`, `dashboards.md`
+- MH media metrics → `crates/mh-service/src/observability/metrics.rs` | catalogs → `docs/observability/metrics/`
+- Alerts → `infra/docker/prometheus/rules/{gc,mc}-alerts.yaml` | docs → `docs/observability/alerts.md`, `dashboards.md`
 
 ## E2E Env-Tests (`crates/env-tests/`)
-- Cluster infra → `src/cluster.rs:ClusterConnection`, `ClusterPorts::from_env()`, `parse_host_port()`
-- Auth/GC fixtures → `src/fixtures/auth_client.rs`, `gc_client.rs` | Join flow → `tests/24_join_flow.rs`
+- Cluster infra → `src/cluster.rs:ClusterConnection` | Auth/GC fixtures → `src/fixtures/auth_client.rs`, `gc_client.rs`
+- Join → `tests/24_join_flow.rs` | MH QUIC media loopback → `tests/26_mh_quic.rs` | web-app media loopback → `packages/web-app/e2e/media-loopback.spec.ts`
 
 ## Network Policies & Kind
-- Per-service policies → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`
-- Kind overlay → `infra/kubernetes/overlays/kind/` | Setup → `infra/kind/scripts/setup.sh` | Helper → `crates/devloop-helper/src/commands.rs`
+- Per-service policies → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml` | Kind setup → `infra/kind/scripts/setup.sh`

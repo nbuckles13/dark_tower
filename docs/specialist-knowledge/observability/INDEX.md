@@ -2,74 +2,71 @@
 
 ## Architecture & Design
 - Observability framework (metrics, tracing, dashboards, alerts, SLOs) -> ADR-0011
-- Validation pipeline + cross-boundary ownership model -> ADR-0024, ADR-0024 §6
-- Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028
-- Dashboard metric presentation (counters vs rates) -> ADR-0029
-- Host-side cluster helper (observability access, port discovery, health gating) -> ADR-0030
-- Service-owned dashboards and alerts; observability as cross-cutting reviewer -> ADR-0031
+- Media flow — forward path, key custody §4, media-path telemetry prohibition §11 -> ADR-0036
+- Validation pipeline + cross-boundary ownership model -> ADR-0024, ADR-0024 §6; polyglot layers -> ADR-0033
+- Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028; dashboard counter-vs-rate presentation -> ADR-0029
+- Host-side cluster helper -> ADR-0030; service-owned dashboards/alerts + observability as cross-cutting reviewer -> ADR-0031
 - Metric testability (component tests + `MetricAssertion` + presence guard) -> ADR-0032
-- Polyglot validation pipeline -> ADR-0033
-- Guard pipeline as Rust binary; `dt-guard <subcommand> --explain` -> ADR-0034, ADR-0034 §7; fixtures `crates/dt-guard/tests/fixtures/`; vendor-coverage matrix `docs/debates/2026-05-14-python-guard-pipeline-strategy/guard-vendor-coverage-matrix.md`
-- Deterministic story runner (run-story) -> ADR-0035
-- Open observability debt -> `docs/TODO.md` §Observability Debt
+- Guard pipeline as Rust binary; `dt-guard <subcommand> --explain` -> ADR-0034 §7; fixtures `crates/dt-guard/tests/fixtures/`
+- Deterministic story runner; governance boundary ADR-0035 §11 -> ADR-0035
+- Open debt -> `docs/TODO.md` §Observability Debt, §Media Path Obligations, §Guard Coverage Gaps
 
-## Story Runner Telemetry (ADR-0035; governance boundary ADR-0035 §11)
-- Cost ledger, canary probe/classify, escalation + infra-incident lanes, run-record dir -> `scripts/workflow/run-story.sh:report_task_cost()`, `canary_probe()`, `canary_classify()`, `escalate()`, `record_infra_incident()`, `RUN_DIR`
-- Gate rc lane split (implementer vs operator), git-fault lane, devloop-output enumeration -> `scripts/workflow/run-story.sh:git_error_lane()`, `git_head()`, `tree_dirty()`, `newest_devloop_output()`, `persist_resume_pointer()`
-- Test seams + containment predicate; hermetic suite; shared bash assert helpers -> `scripts/workflow/run-story.sh:__test_sentinel_active()`, `__any_seam_override_present()`, `__seam_assert_run_dir_isolated()`, `scripts/workflow/run-story.test.sh`, `scripts/lang/_test_helpers.sh`
-- Substrate probe + settings registration; devloop completion enforcement -> `scripts/workflow/preflight-story.sh`, `scripts/workflow/devloop-stop-hook.sh`
-- Gate-2 verdict emitter (per-layer `LAYER n STATUS DURATION`; ephemeral-only guard) -> `scripts/lang/_gate2_binding.sh:emit_gate2_verdict()`
-- Manifest as sole home for task status + devloop slug (`Slug`, `SLUG_PATTERN`, fence-safe emit) -> `crates/dt-story/src/manifest.rs`, `engine.rs`, `markdown.rs:find_manifest_block()`, `main.rs`; producer/consumer `.claude/skills/user-story/SKILL.md`, `.claude/skills/close-story/SKILL.md`
-- Per-task devloop records (one dir per devloop) -> `docs/devloop-outputs/`, template `docs/devloop-outputs/_template/main.md`
+## Policy Documents (authoritative; prose elsewhere points here)
+- SLO targets, error budgets, open objectives — precedence over ADR-0011's table -> `docs/observability/slos.md`
+- Label vocabulary, `key_custody`, media-path identity, shared labels -> `docs/observability/label-taxonomy.md`
+- Units, throughput, periodicity, panel shape -> `docs/observability/dashboard-conventions.md`
+- Alert shape + non-zero-denominator guard -> `docs/observability/alert-conventions.md`; inventory `docs/observability/alerts.md`
+- Dashboard inventory, ownership rows, K8s registration -> `docs/observability/dashboards.md`
+- Metric catalogs -> `docs/observability/metrics/ac-service.md`, `gc-service.md`, `mc-service.md`, `mh-service.md`, `client.md`
 
 ## Metrics
-- Metric catalogs -> `docs/observability/metrics/ac-service.md`, `docs/observability/metrics/gc-service.md`, `docs/observability/metrics/mc-service.md`, `docs/observability/metrics/mh-service.md`
-- AC -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, `record_meeting_display_name_outcome()`; gauge init `services/key_management_service.rs:init_key_metrics()`; HTTP middleware `middleware/http_metrics.rs`; rate-limit config `config.rs`; emission site `handlers/internal_tokens.rs:resolve_meeting_display_name()`
-- GC -> `crates/gc-service/src/observability/metrics.rs`; middleware `middleware/http_metrics.rs:normalize_endpoint()`; join wiring `handlers/meetings.rs:join_meeting()`, `get_guest_token()`; DB `repositories/`; telemetry-proxy + CORS `handlers/telemetry.rs`, `services/telemetry_filter.rs`, `middleware/cors_observer.rs`; meeting-refusal cause taxonomy (`error_type` labels, per-cause logs) `repositories/meetings.rs:MeetingRefusal::metric_label()`, `classify_insert_error()`, `errors.rs`, `handlers/meetings.rs:create_meeting()`
-- MC -> `crates/mc-service/src/observability/metrics.rs:record_display_name_resolution()`, `record_participant_leave()`, `record_participant_disconnect()`; media-path key custody (ADR-0036 §4/§11) `record_meeting_kek_generated()`, `record_join_identity_key_presence()`, `key_custody` consts DEFINED in `crates/common/src/observability/labels.rs` (hoisted at their 2nd consumer; MC re-exports); bounded labels `errors.rs:error_type_label()`; emission sites `actors/meeting.rs:handle_join()`, `handle_disconnect()`, `grpc/media_coordination.rs`; admission facts, deliberately emitting no telemetry of their own, `crates/mc-service/src/media_admission/`; client-facing media signalling (ADR-0036 §5/§6) `record_receive_capability()`, `record_send_directive()`, `record_slot_state()`, `record_unmatched_plan_slots()`, `record_mute_request()`, `record_participant_outbound_dropped()`; bounded vocabularies (`CapabilityOutcome`/`DirectiveOutcome`/`MuteOutcome`, each `ALL` + `label()`) `crates/mc-service/src/media_signaling/outcome.rs`, wire-mirroring `slot_state_label()` in `assignments.rs`; emission sites `webtransport/connection.rs:handle_receive_capability()`, `reject_capability()`, `handle_mute_request()`, `compose_and_emit()`, `handle_connection()` (join-time), `actors/participant.rs:record_outbound_drop()`
-- MH -> `crates/mh-service/src/observability/metrics.rs`; `mh_media_policy_applies_total{outcome,key_custody}` bounded by `PolicyApplyOutcome::ALL`; emission sites `grpc/auth_interceptor.rs:MhAuthService`, `grpc/mc_client.rs`, `grpc/mh_service.rs:register_meeting()`
+- AC -> `crates/ac-service/src/observability/metrics.rs:init_metrics_recorder()`, `record_meeting_display_name_outcome()`; gauges `services/key_management_service.rs:init_key_metrics()`; middleware `middleware/http_metrics.rs`; emission `handlers/internal_tokens.rs:resolve_meeting_display_name()`
+- GC -> `crates/gc-service/src/observability/metrics.rs`; middleware `middleware/http_metrics.rs:normalize_endpoint()`; join wiring `handlers/meetings.rs:join_meeting()`, `get_guest_token()`; telemetry proxy + CORS `handlers/telemetry.rs`, `services/telemetry_filter.rs`, `middleware/cors_observer.rs`; refusal taxonomy `repositories/meetings.rs:MeetingRefusal::metric_label()`
+- MC -> `crates/mc-service/src/observability/metrics.rs:record_display_name_resolution()`, `record_participant_disconnect()`, `record_meeting_kek_generated()`, `record_join_identity_key_presence()`, `record_media_policy_push()`, `record_sender_binding_response()`, `record_receive_capability()`, `record_send_directive()`, `record_slot_state()`, `record_unmatched_plan_slots()`, `record_mute_request()`, `record_participant_outbound_dropped()`; bounded labels `errors.rs:error_type_label()`
+- MC bounded telemetry vocabularies (`ALL` + `label()`) -> `crates/mc-service/src/media_signaling/outcome.rs`, `assignments.rs:slot_state_label()`, `crates/mc-service/src/media_admission/binding_response.rs:SenderBindingOutcome`
+- MC emission sites -> `crates/mc-service/src/webtransport/connection.rs:handle_receive_capability()`, `reject_capability()`, `handle_mute_request()`, `compose_and_emit()`, `handle_connection()`; `actors/meeting.rs:handle_join()`; `actors/participant.rs:record_outbound_drop()`; `grpc/media_coordination.rs`
+- MH -> `crates/mh-service/src/observability/metrics.rs:MediaDirection`, `MediaLatencyPhase`, `MediaDropReason`, `MediaMetricHandles`, `resolve_media_handles()`, `record_media_frames_dropped()`, `MEDIA_FORWARD_OBJECTIVE_SECONDS`, `PolicyApplyOutcome`; dev-only per-frame facility `observability/per_frame_trace.rs`
+- MH emission sites -> `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`, `grpc/auth_interceptor.rs`, `grpc/mc_client.rs`, `session/mod.rs`, `process.rs`; rejection reasons `routing/mod.rs:PolicyRejection`
+- Shared `key_custody` / media label consts (hoisted at 2nd consumer) -> `crates/common/src/observability/labels.rs`
+- Telemetry-free hot paths, by construction -> `crates/media-protocol/`, `crates/mh-service/src/media/`, `packages/sdk-core/src/media/pipeline/`
+- Client SDK media metrics + allow-list label projection -> `packages/sdk-core/src/media/setup/mediaMetrics.ts`; config `packages/sdk-core/src/config/clientConfig.ts`; export cadence `packages/sdk-core/src/telemetry/telemetryConfig.ts`; wire-token mapping `packages/web-app/src/lib/slotState.ts`
 
-## Auth & JWT Tracing
-- Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`
-- Service wrappers -> `crates/gc-service/src/auth/jwt.rs:JwtValidator`, `crates/mc-service/src/auth/mod.rs:McJwtValidator`, `crates/mh-service/src/auth/mod.rs:MhJwtValidator`
-- MH gRPC auth (JWKS ServiceClaims validation, tower Layer) -> `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
-
-## Service Tracing & Health
-- MC WebTransport -> `crates/mc-service/src/webtransport/server.rs`, `connection.rs`, `handler.rs`; ParticipantActor `crates/mc-service/src/actors/participant.rs:run()`
-- MH WebTransport -> `crates/mh-service/src/webtransport/server.rs`, `crates/mh-service/src/webtransport/connection.rs`
-- MC gRPC clients -> `crates/mc-service/src/grpc/gc_client.rs`, `crates/mc-service/src/grpc/mh_client.rs`; RegisterMeeting trigger `crates/mc-service/src/webtransport/connection.rs:register_meeting_with_handlers()`
+## Tracing & Health
+- Common JWT (JwksClient, JwtValidator, verify_token, PII-redacted Debug) -> `crates/common/src/jwt.rs`; wrappers `crates/gc-service/src/auth/jwt.rs`, `crates/mc-service/src/auth/mod.rs`, `crates/mh-service/src/auth/mod.rs`; MH gRPC layer `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthLayer`
+- MC WebTransport -> `crates/mc-service/src/webtransport/server.rs`, `connection.rs`, `handler.rs`; ParticipantActor `crates/mc-service/src/actors/participant.rs:run()`; gRPC clients `grpc/gc_client.rs`, `grpc/mh_client.rs`
+- MH WebTransport + transport seam -> `crates/mh-service/src/webtransport/server.rs`, `connection.rs`, `media_transport.rs`, `crates/mh-service/src/transport/mod.rs`
 - Health routers -> `crates/mc-service/src/observability/health.rs:health_router()`, `crates/mh-service/src/observability/health.rs:health_router()`
 
 ## Dashboards & Alerts
-- Dashboards + provisioning + K8s wiring -> `infra/grafana/dashboards/`, `infra/grafana/provisioning/`, `infra/grafana/kustomization.yaml`
-- Per-service overviews -> `infra/grafana/dashboards/ac-overview.json`, `gc-overview.json`, `mc-overview.json` (Client Media Signalling panels 58-62, under row id 157), `mh-overview.json`; template `_template-service-overview.json`; MH logs + SLOs `mh-logs.json`, `mh-slos.json`
-- Grafana K8s (configMapGenerator, sidecar, RBAC) -> `infra/kubernetes/observability/grafana/`
-- Alert rules -> `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`, `mh-alerts.yaml`, template `_template-service-alerts.yaml` — **rule FILES are `operations`-owned** (ADR-0011 §Documentation Ownership), while `docs/observability/alerts.md` + `alert-conventions.md` + dashboard JSON are mine; three reviewers got this row's owner wrong two ways in one devloop, so read the ADR table before classifying it
-- Conventions + docs -> `docs/observability/alert-conventions.md`, `alerts.md`, `dashboards.md`
+- Dashboards + provisioning + K8s wiring -> `infra/grafana/dashboards/`, `infra/grafana/provisioning/`, `infra/grafana/kustomization.yaml`, `infra/kubernetes/observability/grafana/`
+- Per-service overviews -> `infra/grafana/dashboards/ac-overview.json`, `gc-overview.json`, `mc-overview.json`, `mh-overview.json`; template `_template-service-overview.json`
+- Media + SLO boards -> `infra/grafana/dashboards/mh-media.json`, `client-media.json`, `mh-slos.json`, `mh-logs.json`, `ac-slos.json`, `mc-slos.json`
+- Alert rules -> `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`, `mh-alerts.yaml`, template `_template-service-alerts.yaml` — rule FILES are `operations`-owned (ADR-0011 §Documentation Ownership); the conventions and catalog docs above are mine
 
 ## Observability Infrastructure
-- Prometheus + Loki -> `infra/docker/prometheus/prometheus.yml`, `infra/kubernetes/observability/prometheus-config.yaml`, `infra/kubernetes/observability/loki-config.yaml`, `infra/kubernetes/observability/kustomization.yaml`
-- Kind NodePorts -> `infra/kind/kind-config.yaml`; template `infra/kind/kind-config.yaml.tmpl`
+- Prometheus server config, extracted to one file both Docker and K8s load -> `infra/kubernetes/observability/prometheus.yml`, `infra/docker/prometheus/prometheus.yml`, `infra/docker/prometheus/kustomization.yaml`, `infra/kubernetes/observability/prometheus-config.yaml`, `loki-config.yaml`, `kustomization.yaml`
 - MC/MH probes + scrape config (per-instance workloads) -> `infra/services/mc-service/mc-0-deployment.yaml`, `mc-1-deployment.yaml`, `infra/services/mh-service/mh-0-deployment.yaml`, `mh-1-deployment.yaml`
-- Cluster setup / teardown -> `infra/kind/scripts/setup.sh`, `infra/kind/scripts/teardown.sh`
-- Devloop helper (port map, status, audit log) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `cmd_status()`, `parse_pod_health()`, `crates/devloop-helper/src/logging.rs:AuditLog`, `/tmp/devloop-{slug}/ports.json`, `infra/devloop/dev-cluster`, `infra/devloop/devloop.sh`
-- Env-tests observability -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`, `crates/env-tests/tests/30_observability.rs`; Layer 7 -> `.claude/skills/devloop/SKILL.md`
-- Layer-7 operator lane + per-run org provisioning (`PRECONDITION_FAILURE` reason tokens, AC org probe) -> `scripts/layer7.sh:precondition_fail()`, `__generate_org_subdomain()`, `infra/kind/scripts/setup.sh:provision_run_org()`, `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`, `packages/web-app/e2e/env.ts`, tokens documented in `docs/runbooks/devloop-validation.md`, hermetic pins `scripts/layer7.test.sh`, `scripts/setup.test.sh`, `packages/web-app/tests/e2e-env.test.ts`
+- Kind NodePorts + cluster lifecycle -> `infra/kind/kind-config.yaml`, `infra/kind/kind-config.yaml.tmpl`, `infra/kind/scripts/setup.sh`, `teardown.sh`
+- Devloop helper (port map, status, audit log) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `cmd_status()`, `parse_pod_health()`, `crates/devloop-helper/src/logging.rs:AuditLog`, `infra/devloop/dev-cluster`, `infra/devloop/devloop.sh`
+- Layer-7 operator lane + per-run org provisioning -> `scripts/layer7.sh:precondition_fail()`, `__generate_org_subdomain()`, `infra/kind/scripts/setup.sh:provision_run_org()`, `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`; tokens `docs/runbooks/devloop-validation.md`
 
 ## Guards
-- Metric-to-dashboard coverage -> `scripts/guards/simple/validate-application-metrics.sh`
-- Metric-test coverage (src emission vs test reference) -> `scripts/guards/simple/validate-metric-coverage.sh`
-- Dashboard-to-kustomize coverage (bidirectional) -> `scripts/guards/simple/validate-kustomize.sh`
-- Instrument skip_all enforcement -> `scripts/guards/simple/instrument-skip-all.sh`; alert-rules lint -> `scripts/guards/simple/validate-alert-rules.sh`
-- PII / secret identifier vocabulary -> `crates/dt-guard/src/common/pii_vocabulary.rs`, `scripts/guards/simple/no-pii-in-logs.sh`, `scripts/guards/simple/ts/no-pii-in-logs-ts.sh`
-- **Matcher families — read before adding any vocabulary entry.** Two shapes, and an entry that is load-bearing under one is inert under the other. *Word-boundary* `\b(alternation)\b` (`metric_labels.rs`, `rust_pii.rs`, `rust_log_secrets`, `instrument_skip_all`) cannot see inside compounds: `_` is a word character, so `\btoken\b` matches neither `userToken` nor `user_token`, and `\bkid\b` does not match `sender_kid`. *Segment equality* -> `crates/dt-guard/src/ts_retained_credentials.rs:198` `pub fn segments()` splits on `_`, non-word chars and camelCase, so one entry covers every spelling; tests `segments_splits_camel_and_snake`, `token_limb_matches_camel_and_snake_spellings`. A vocabulary entry on the word-boundary matcher reports clean while the compound spelling ships. Promote `segments()` to `crate::common::` at the third consumer (Pattern B, as `pii_vocabulary` itself was).
-- Metric label + naming policies -> `crates/dt-guard/src/metric_labels.rs`, `crates/dt-guard/src/ts_metric_naming.rs`; `MetricAssertion` test helper `crates/common/src/observability/testing.rs`
-- Cross-encoding pattern drift (org subdomain, story slug class) -> `scripts/guards/simple/validate-subdomain-regex-sync.sh`, `scripts/guards/simple/validate-slug-class-sync.sh`
-
-## Runbooks
-- Per-service deployment + incident response -> `docs/runbooks/` (two per service); GC join-failure triage, telemetry-proxy + CORS scenarios -> `docs/runbooks/gc-incident-response.md`, `docs/runbooks/gc-deployment.md`; OTLP smoke fixture `infra/smoke/empty-otlp-metrics.bin`
+- Metric-to-dashboard, metric-test and dashboard-to-kustomize coverage -> `scripts/guards/simple/validate-application-metrics.sh`, `validate-metric-coverage.sh`, `validate-kustomize.sh`
+- Metric label + naming policies -> `crates/dt-guard/src/metric_labels.rs`, `ts_metric_naming.rs`; `MetricAssertion` helper `crates/common/src/observability/testing.rs`
+- Alert-rules policy incl. on-disk ⊆ `rule_files` loading -> `crates/dt-guard/src/alert_rules.rs`, `scripts/guards/simple/validate-alert-rules.sh`; Prometheus-derived valid-label set `crates/dt-guard/src/infrastructure_metrics.rs`
+- Media-path telemetry deny (ADR-0036 §11) -> `crates/dt-guard/src/media_telemetry_deny.rs`; scope config `scripts/guards/simple/media-telemetry-deny.yaml`; wrapper `media-telemetry-deny.sh`; self-test `scripts/guards/media-telemetry-deny.test.sh`
+- Macro vocabulary canonical homes; scope liveness; comment/string lexer -> `crates/dt-guard/src/telemetry_macros.rs`, `metric_macros.rs`, `common/scope.rs`, `common/test_code_filter.rs`
+- PII vocabulary + matcher-family split (word-boundary vs `segments()`) -> `crates/dt-guard/src/common/pii_vocabulary.rs`, `crates/dt-guard/src/ts_retained_credentials.rs:segments()`, `scripts/guards/simple/no-pii-in-logs.sh`, `scripts/guards/simple/ts/no-pii-in-logs-ts.sh`
+- `instrument(skip_all)`, frame reject-reason vocabulary, cross-encoding drift -> `scripts/guards/simple/instrument-skip-all.sh`, `validate-frame-vectors.sh`, `validate-subdomain-regex-sync.sh`, `validate-slug-class-sync.sh`
 
 ## Test Coverage & Integration Seams
-- MH/MC accept-loop rigs (ADR-0032 Steps 2-3) -> `crates/mh-service/tests/common/accept_loop_rig.rs`, `crates/mh-service/tests/webtransport_accept_loop_integration.rs`, `crates/mc-service/tests/common/accept_loop_rig.rs`, `crates/mc-service/tests/webtransport_accept_loop_integration.rs`
-- AC cluster component tests (ADR-0032 Step 4) -> `crates/ac-service/tests/*_integration.rs`
-- GC cluster component tests (ADR-0032 Step 5) -> `crates/gc-service/tests/*_integration.rs`, `crates/gc-service/src/handlers/meetings.rs`; refusal-cause + metric-label pins `crates/gc-service/tests/meeting_create_tests.rs`, `meeting_creation_metrics_integration.rs`
+- Live metric-hygiene kernel (pure predicate + FIRE fixtures, fed by live scrape) -> `crates/env-tests/src/fixtures/metric_hygiene.rs`, `crates/env-tests/tests/32_media_metric_hygiene.rs`
+- Cluster observability + alert-rule loading -> `crates/env-tests/tests/30_observability.rs`, `33_alert_rules_loaded.rs`, `crates/env-tests/src/fixtures/alert_rules_loaded.rs`
+- Metric polling + baseline helpers; cluster ports -> `crates/env-tests/src/fixtures/metrics.rs:instances_exceeding_baseline()`, `poll_until_instance_above()`, `poll_until_stable()`, `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
+- MH/MC accept-loop rigs (ADR-0032); MH media telemetry gates -> `crates/mh-service/tests/common/accept_loop_rig.rs`, `crates/mc-service/tests/common/accept_loop_rig.rs`, `crates/mh-service/tests/media_metrics_integration.rs`, `policy_apply_integration.rs`
+- AC/GC cluster component tests -> `crates/ac-service/tests/`, `crates/gc-service/tests/`
+
+## Runbooks & Story Runner
+- Per-service deployment + incident response, media-path scenarios -> `docs/runbooks/`; OTLP smoke fixture `infra/smoke/empty-otlp-metrics.bin`
+- Cost ledger, canary, escalation, gate-rc lanes -> `scripts/workflow/run-story.sh`; seams `scripts/workflow/run-story.test.sh`, `scripts/lang/_test_helpers.sh`, `scripts/workflow/preflight-story.sh`, `devloop-stop-hook.sh`, `scripts/lang/_gate2_binding.sh:emit_gate2_verdict()`
+- Task status + devloop slug SSoT -> `crates/dt-story/src/manifest.rs`, `engine.rs`, `markdown.rs:find_manifest_block()`; records `docs/devloop-outputs/`, template `docs/devloop-outputs/_template/main.md`
