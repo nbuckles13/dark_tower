@@ -290,11 +290,11 @@ The lead collects all proposed tasks from specialists and assembles the ordered 
 5. Deploy/operational changes after code is written
 6. E2E tests last (depend on deployed, operational services)
 
-**Task granularity** — each task should stay within one specialist's domain:
-- If a task description spans domains (endpoint code + dashboard panels + runbook), split it
-- Trivially small cross-cutting work is fine within a service task (e.g., adding `#[instrument]` to a new handler)
-- Substantial cross-cutting work gets its own task (e.g., new dashboard with alert rules, new runbook section)
-- The natural range is 1-3 tasks per specialist who has work to do. A specialist proposing a single task that covers code + tests + instrumentation + dashboards is too broad. A specialist splitting every function into its own task is too narrow.
+**Task granularity** — size each task as the largest *independently-verifiable behavioral increment* that completes in one devloop session, **not the smallest seam** (ADR-0037 D3). Each task still has one implementing specialist.
+- **Bundle adjacent seams within a specialist's contribution** rather than splitting each into its own task. Every task pays the full fixed overhead of a devloop — team spawn plus a Gate-3 review panel that re-reads the task's context — so seam-cutting multiplies that overhead for no review benefit. (Story-1 measured this: ~26 seam-cut tasks where ~14–16 demonstrable-increment tasks would have covered the same work.)
+- **The ceiling is one session's working context, including the task's own Gate-3 resolution.** A task whose diff + review would not fit one session is too large — split it. Do not bundle past that ceiling merely to reduce the task count; larger tasks also raise failure blast-radius and recovery cost.
+- Keep the two boundaries that are about *verifiability*, not seams: (a) one implementing specialist per task; (b) substantial cross-cutting work with its own demonstrable output — a new dashboard + alert rules, a new runbook section — gets its own task rather than riding inside a feature task. Trivially small cross-cutting work (e.g. `#[instrument]` on a new handler) stays inside the task.
+- Smell test: splitting every function or file into its own task is seam-cutting (too narrow); a single task spanning a feature *and* its dashboards *and* its runbook is too broad (three demonstrable outputs, three owners). Aim between: one coherent increment a human could verify on its own.
 
 **Aspect coverage** — each of these must appear in the plan or be marked N/A with justification:
 - Code changes
