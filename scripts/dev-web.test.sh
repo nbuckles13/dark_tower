@@ -42,6 +42,27 @@ DEV_WEB="$REPO_ROOT/scripts/dev-web.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# A hermetic PATH for the script under test: every executable reachable on the
+# outer PATH, symlinked into one directory, EXCEPT `ss`. The stub dir is then
+# prefixed to shadow curl/getent and to supply `ss` for the present/broken
+# modes. This is what makes the ss-absent case testable at all — prefixing a
+# stub dir onto the real PATH can hide nothing, so on any machine with
+# iproute2 installed (every CI runner, most workstations) the absent branch
+# was unreachable and its three assertions were guaranteed red.
+TOOLBOX="$WORK/toolbox"
+mkdir -p "$TOOLBOX"
+IFS=: read -r -a __path_dirs <<<"$PATH"
+for __d in "${__path_dirs[@]}"; do
+  [[ -d "$__d" ]] || continue
+  for __f in "$__d"/*; do
+    [[ -f "$__f" && -x "$__f" ]] || continue
+    __n="${__f##*/}"
+    [[ "$__n" == "ss" ]] && continue
+    [[ -e "$TOOLBOX/$__n" ]] || ln -s "$__f" "$TOOLBOX/$__n"
+  done
+done
+unset __path_dirs __d __f __n
+
 # ---------------------------------------------------------------------------
 # Fixture: a temp "repo" carrying only what dev-web.sh's preflight reads.
 # ---------------------------------------------------------------------------
@@ -119,9 +140,11 @@ SH
 }
 
 # Run `dev-web.sh --check` hermetically. Sets RUN_OUT.
+# PATH is stubs + TOOLBOX only — never the outer PATH — so `ss` exists exactly
+# when the stub dir provides it.
 run_check() {
   local root="$1" stubs="$2"
-  RUN_OUT="$(cd "$root" && env PATH="${stubs}:$PATH" AC_PORT=1 GC_PORT=2 \
+  RUN_OUT="$(cd "$root" && env PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
     bash "$root/scripts/dev-web.sh" --check 2>&1 || true)"
 }
 
