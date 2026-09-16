@@ -419,10 +419,22 @@ fn mechanical_floor_extent_is_pinned_per_spelling() {
         // because it happened to be run from inside the throwaway root. The
         // scaffolding assertions below are what turned that latent difference
         // into a loud failure instead of a silent no-hit for every row.
+        //
+        // The GitHub Actions variables are stripped for the same reason. Under
+        // `GITHUB_ACTIONS` + `GITHUB_EVENT_NAME=pull_request` the resolver
+        // switches to CI-PR mode: it merge-bases against `origin/$GITHUB_BASE_REF`
+        // (which the throwaway root does not have, so the guard dies) and, even
+        // with a base it could resolve, CI mode never unions in untracked files
+        // — so the untracked probe would be invisible and every row would read
+        // as a no-hit. This scaffold is built for local mode (base = HEAD, plus
+        // untracked union); the host's CI environment must not leak into it.
         let devloop_tmp = root.join(".devloop-tmp");
         let out = Command::new(&bin)
             .current_dir(root)
             .env("DEVLOOP_TMP", &devloop_tmp)
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_EVENT_NAME")
+            .env_remove("GITHUB_BASE_REF")
             .args(["rust-no-secrets-in-logs", "--root"])
             .arg(root)
             .output()
