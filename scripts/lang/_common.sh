@@ -52,6 +52,27 @@ init_devloop_tmp() {
 }
 
 # -----------------------------------------------------------------------------
+# Build parallelism cap (memory, not cores)
+# -----------------------------------------------------------------------------
+# Cap concurrent cargo jobs for the WHOLE validation pipeline. Every rust wrapper
+# (compile/test/lint/audit) sources this file, so this is the single locus.
+#
+# WHY: layer-all.sh compiles ~140 targets (workspace + 117 integration-test
+# binaries), and the RAM peak is the LINK phase — several concurrent links at
+# ~1.5-2GB each. cargo's only self-scaling is to CPU count (nproc=32 here), which
+# is the wrong axis: more cores → more concurrent links → OOM. There is no
+# memory-aware self-throttle in stable cargo, so we cap jobs by hand. On the 16GB
+# WSL dev box the Kind cluster + observability stack take ~3GB, leaving ~11GB;
+# 6 links * ~1.5-2GB fits with margin, 8 does not.
+#
+# Precedence (cargo): `--jobs` flag > CARGO_BUILD_JOBS env > build.jobs config.
+# The `:-` respects an operator override — export CARGO_BUILD_JOBS=N (or pass
+# `--jobs`) to raise it on a bigger box or lower it on a weaker one. A bare
+# `cargo build` outside the pipeline is intentionally NOT capped; see the pointer
+# comment in .cargo/config.toml.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
+
+# -----------------------------------------------------------------------------
 # Color helpers
 # -----------------------------------------------------------------------------
 

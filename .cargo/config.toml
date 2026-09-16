@@ -1,0 +1,17 @@
+# Cargo configuration.
+#
+# Build parallelism is intentionally NOT capped here — a bare `cargo build` runs
+# at full parallelism (cargo defaults to your CPU count).
+#
+# The validation pipeline caps it instead: scripts/lang/_common.sh (sourced by
+# every rust wrapper) exports `CARGO_BUILD_JOBS=6`. layer-all.sh compiles ~140
+# targets (workspace + 117 integration-test binaries) and the RAM peak is the
+# LINK phase — several concurrent links at ~1.5-2GB each — which on the 16GB WSL
+# dev box (with the Kind cluster + observability stack taking ~3GB) OOMs at full
+# 32-way parallelism. cargo has no memory-aware self-throttle (it only scales to
+# core count, the wrong axis), so the pipeline caps jobs by hand.
+#
+# To change it: export `CARGO_BUILD_JOBS=N` (raise on a bigger box, lower on a
+# weaker one) or pass `--jobs N`. Precedence: `--jobs` > CARGO_BUILD_JOBS env >
+# any `build.jobs` set here. This file deliberately leaves `build.jobs` unset so
+# the cap applies only to the pipeline, not to every cargo invocation.

@@ -34,6 +34,12 @@ source "${__here}/lang/_common.sh"
 source "${__here}/lang/_gate2_binding.sh"
 init_devloop_tmp
 
+# Runtime discoverability for the memory cap set in lang/_common.sh: announce the
+# effective cargo job budget and its escape hatch once at pipeline start, so anyone
+# watching a run sees why parallelism is limited and how to change it.
+printf 'CARGO_BUILD_JOBS=%s (capped for memory; export CARGO_BUILD_JOBS=N or pass --jobs to override)\n' \
+  "${CARGO_BUILD_JOBS:-<unset>}" >&2
+
 # Per-layer result/duration accumulators — declared BEFORE the EXIT trap installs
 # so emit_gate2_verdict's namerefs always bind to existing (possibly-empty) arrays,
 # even on an early exit that fires before the layer loop populates them.
