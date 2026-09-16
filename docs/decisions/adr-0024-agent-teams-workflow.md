@@ -352,6 +352,18 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 
 *Added by the 2026-04-18 amendment debate (see Debate Reference).*
 
+> **Narrowed by ADR-0037 D1 (Proposed — trial on ADR-0036 story 2).** Story-1
+> evidence showed Mechanical/Minor cross-boundary edits (~82% of classified
+> rows) almost never produced an owner catch, while the classification/co-sign/
+> Ownership-Lens ceremony around them was a top token sink. Under ADR-0037 D1,
+> classification and owner routing apply **only to Domain-judgment cross-boundary
+> edits and Guarded Shared Areas** (§6.4, unchanged); Mechanical and
+> Minor-judgment edits are review-only with no classification row, owner
+> confirmation, or Gate-3 Ownership Lens verdict, and the story-close Ownership
+> Lens retrospective (§6.8 item #3) is removed. The upgrade path (§6.2) is the
+> backstop. If ADR-0037 is not ratified, this narrowing reverts and §6 applies as
+> written below.
+
 #### 6.1 Motivation
 
 The implicit "file owner implements" rule produces correct outcomes when changes require domain judgment but disproportionate ceremony when changes are mechanical, minor defensive adjustments, or naturally span services via convention. The 2026-04 ADR-0031 rollout surfaced multiple instances where cross-boundary friction generated elaborate workarounds (~80 LOC of allowlist infrastructure, Lead-level adjudication thrash, multiple devloops where one would do) that were disproportionate to the underlying work.
