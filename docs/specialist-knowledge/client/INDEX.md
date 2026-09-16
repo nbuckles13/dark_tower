@@ -21,7 +21,7 @@
 - Key material seams (KEK, roster keys, identity, transmit keys); **own key self-seeded at join — MC's roster excludes self, so loopback drops every frame without it** → `media/setup/{kekSource,rosterKeys,identity}.ts`, `session/MeetingSession.ts`
 - TS-side KEK sink control → `signaling/kekIntake.ts`, `__tests__/serverMessageSinkScan.test.ts`
 - WebTransport connection mgmt + datagram I/O → `transport/`, `media/MediaTransport.ts`
-- HTTP/3 meeting API client; protobuf-es generated types → `http/`, `proto/dark_tower/`
+- HTTP/3 meeting API client; protobuf-es generated types; wire-`Codec`→public `SignalingCodec` oracle (one table, both directions; generated enums never reach `.d.ts`) → `http/`, `proto/dark_tower/`, `signaling/codecMap.ts`
 - Error taxonomy (`SdkErrorCode`, HTTP→meeting mapping); input validation SSoT (`SUBDOMAIN_REGEX`, caps) → `errors/`, `validation/limits.ts`
 
 ## Svelte Adapter (`packages/sdk-svelte/src/`)

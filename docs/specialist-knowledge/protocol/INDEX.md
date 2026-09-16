@@ -16,10 +16,11 @@
 - Wire layout, size constants, flags, zero-copy view, publisher/relay split, key-id layout → `frame.rs`; TLV grammar + registry → `extensions.rs`
 - Single parser, four entry points, encode, reject reasons; relay rewrite (`rewrite_relay_region()`), reader bound (`peek_frame_len()`) → `crates/media-protocol/src/codec.rs`
 - Tests (no-skipped-byte proof, reject-reason precedence, zero-copy/roundtrip/redaction, fuzz corpus) → `crates/media-protocol/tests/`; fuzzers → `fuzz/fuzz_targets/`
+- Cross-language v2 frame SSoT (Rust+TS codecs conform) → `proto/test-vectors/frame-v2.vectors.json`; external sframe-wg vectors → `proto/test-vectors/external/sframe-wg/`; non-prod reference generator → `crates/media-vector-gen/`; SDK conforming codec → `packages/sdk-core/src/media/frame/`; drift guard wired via ADR-0033
 
 ## gRPC Services (all in `proto/dark_tower/internal/v1/internal.proto`)
 - MediaHandlerService (MC→MH): **RegisterMeeting only** — one RPC by design (ADR-0036 §8: registration IS the control plane and gains fields, not sibling RPCs). `Register`, `RouteMedia`, `StreamTelemetry` retired 2026-09-01; tombstone block in the proto
-- MediaCoordinationService (MH→MC): NotifyParticipantConnected/Disconnected
+- MediaCoordinationService (MH→MC): NotifyParticipantConnected/Disconnected — `NotifyParticipantConnectedResponse` carries the participant→`sender_id` binding (load-bearing gate on MH media accept, R-15); MC builder → `crates/mc-service/src/media_admission/binding_response.rs`; MH validates via `crates/mh-service/src/routing/mod.rs`→`SenderId::from_wire()`, bound single-sourced at `media_protocol::frame::KEY_ID_SENDER_ID_BITS` (no `common` helper)
 - MeetingControllerService (GC→MC): AssignMeetingWithMh
 - GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat
 - MediaHandlerRegistryService (MH→GC): RegisterMH, SendLoadReport
