@@ -332,11 +332,14 @@ const FLOOR_EXTENT: &[(&str, bool)] = &[
     ("meetingKek", false),
 ];
 
-/// Locate the shipped guard binary. Layer 1 (`scripts/lang/rust/compile.sh`)
-/// builds it before Layer 4 runs, and `DT_GUARD` is the documented override.
+/// Locate the guard binary. Cargo builds this crate's own `dt-guard` bin for
+/// integration tests and pins its path at compile time via `CARGO_BIN_EXE_*`,
+/// so this resolves under any target dir (plain `cargo test`, the Layer-4
+/// release build, `cargo llvm-cov`'s separate target dir in CI). `DT_GUARD`
+/// remains the documented override for pointing at a specific shipped binary.
 fn dt_guard_bin() -> PathBuf {
     std::env::var_os("DT_GUARD").map_or_else(
-        || repo_root().join("target/release/dt-guard"),
+        || PathBuf::from(env!("CARGO_BIN_EXE_dt-guard")),
         PathBuf::from,
     )
 }
@@ -359,10 +362,10 @@ fn mechanical_floor_extent_is_pinned_per_spelling() {
     let bin = dt_guard_bin();
     assert!(
         bin.is_file(),
-        "dt-guard binary not found at {}. Layer 1 builds it \
-         (scripts/lang/rust/compile.sh); set DT_GUARD to override. This is a \
-         LOUD failure on purpose — skipping here would silently drop the only \
-         assertion proving the vocabulary floor is not the protection.",
+        "dt-guard binary not found at {}. Cargo builds it alongside this \
+         test; set DT_GUARD to override. This is a LOUD failure on purpose — \
+         skipping here would silently drop the only assertion proving the \
+         vocabulary floor is not the protection.",
         bin.display()
     );
 
