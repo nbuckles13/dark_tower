@@ -193,7 +193,7 @@ jobs:
         run: pnpm test:unit
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           # flags: client-unit separates this report from the Rust lcov
           # report uploaded by ci.yml's coverage job.
