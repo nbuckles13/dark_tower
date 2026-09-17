@@ -17,7 +17,7 @@
 //! `validate` catching each violation class.
 
 use assert_cmd::Command;
-use dt_story::manifest::{Manifest, Status, MARKER};
+use dt_story::manifest::{Manifest, Status, Tier, MARKER};
 use dt_story::markdown;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,33 @@ fn next_runnable_prints_json_and_exits_zero() {
     assert_eq!(
         prompt, "Implement the join endpoint.\nReturn a meeting token on success.\n",
         "multiline prompt must round-trip with real newlines"
+    );
+    // Wire-contract pin (constraint 10 B): a tier-less task emits the exact
+    // lowercase token `"full"` — this is what run-story's `jq -r .tier` reads,
+    // and what makes a `null` tier a stale-binary-ONLY signal.
+    assert_eq!(
+        json["tier"], "full",
+        "a tier-less task must emit tier=\"full\" on next"
+    );
+}
+
+/// Wire-contract pin for the `light` token (constraint 10 B / constraint 5).
+/// A serialization change emitting e.g. `"Light"` would regress run-story's
+/// `jq -r .tier` gate and only surface as a runtime floor rejection.
+#[test]
+fn next_emits_light_tier_token() {
+    let (_dir, story) = story_in_tempdir(
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n  \
+         tier: light\n  tier_reason: single specialist\n",
+    );
+    let assert = dt_story().arg("next").arg(&story).assert();
+    let output = assert.success().get_output().clone();
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout JSON");
+    assert_eq!(json["id"], 1);
+    assert_eq!(
+        json["tier"], "light",
+        "a light task must emit the exact lowercase token tier=\"light\""
     );
 }
 
@@ -604,14 +631,17 @@ fn story_in_tempdir(yaml_body: &str) -> (tempfile::TempDir, PathBuf) {
 /// `commit`, `escalation`. Any of those appearing in the output is
 /// a widening of the projection. Task 1 carries a `slug`, which IS projected
 /// (rule 1: its named consumer is `/close-story` Phase 1/4), and tasks 2/3 do
-/// not, so the `null`-not-absent property below is exercised too.
+/// not, so the `null`-not-absent property is exercised. Task 3 carries
+/// `tier: light` + a reason (so the `tier`/`tier_reason` projection is
+/// exercised with a non-default value); tasks 1/2 are tier-less, so the
+/// `tier == full` default and `tier_reason == null` cases are exercised too.
 const MIXED_MANIFEST: &str = "story: s\ntasks:\n\
-- id: 3\n  status: pending\n  specialist: protocol\n  deps:\n  - 1\n  prompt: |\n    third\n\
+- id: 3\n  status: pending\n  specialist: protocol\n  deps:\n  - 1\n  prompt: |\n    third\n  tier: light\n  tier_reason: single specialist, no wire contract\n\
 - id: 1\n  status: completed\n  commit: abc1234\n  slug: 2026-08-13-some-devloop\n\
 - id: 2\n  status: escalated\n  specialist: test\n  deps:\n  - 1\n  prompt: |\n    second\n  escalation: /tmp/devloop/story-runner/s/task-2.log\n";
 
 #[test]
-fn list_tasks_projects_exactly_four_keys_in_manifest_order() {
+fn list_tasks_projects_exactly_six_keys_in_manifest_order() {
     let (_dir, story) = story_in_tempdir(MIXED_MANIFEST);
 
     let assert = dt_story().arg("list-tasks").arg(&story).assert();
@@ -639,8 +669,9 @@ fn list_tasks_projects_exactly_four_keys_in_manifest_order() {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["deps", "id", "slug", "status"],
-            "projection key set must be exactly {{id, status, deps, slug}}, got: {element}"
+            ["deps", "id", "slug", "status", "tier", "tier_reason"],
+            "projection key set must be exactly {{id, status, deps, slug, tier, tier_reason}}, \
+             got: {element}"
         );
     }
 
@@ -682,6 +713,30 @@ fn list_tasks_projects_exactly_four_keys_in_manifest_order() {
         array[0]["slug"],
         serde_json::Value::Null,
         "a task with no slug must emit null, not omit the key"
+    );
+
+    // `tier` is TOTAL and always the lowercase token: task 3 (manifest order
+    // index 0) is `light`, the tier-less tasks 1/2 default to `full` — never
+    // absent, so a consumer never needs `// "full"`.
+    assert_eq!(array[0]["tier"], serde_json::json!("light"));
+    assert_eq!(
+        array[1]["tier"],
+        serde_json::json!("full"),
+        "a tier-less task must project the default `full`, not omit the key"
+    );
+    assert_eq!(array[2]["tier"], serde_json::json!("full"));
+
+    // `tier_reason` is likewise TOTAL: the light task carries its reason,
+    // tier-less tasks emit `null` (not absent), so a consumer never
+    // distinguishes absent from empty.
+    assert_eq!(
+        array[0]["tier_reason"],
+        serde_json::json!("single specialist, no wire contract")
+    );
+    assert_eq!(
+        array[1]["tier_reason"],
+        serde_json::Value::Null,
+        "a task with no tier_reason must emit null, not omit the key"
     );
 
     // The projection must NOT be a serialization of `manifest::Task`: the
@@ -1295,4 +1350,260 @@ fn add_task_refuses_a_prompt_containing_a_fence() {
     // The refusal must leave the file untouched, not half-written.
     let manifest = parse_manifest(&fs::read_to_string(&story).expect("read back"));
     assert_eq!(manifest.tasks.len(), 1);
+}
+
+// ===========================================================================
+// Tier (ADR-0037 §D2): schema round-trip (full omits, light round-trips with
+// reason), the status-independent light-requires-reason invariant, the
+// default-full backward-compat, the enum-closes-the-input-class pin, and the
+// tier_reason fence-refusal. Serialized-byte assertions where the property IS
+// the serialization; non-vacuous rejections over otherwise-valid manifests.
+// ===========================================================================
+
+/// Read the manifest block's YAML body out of a story file's text.
+fn manifest_yaml_of(text: &str) -> String {
+    let span = markdown::find_manifest_block(text).expect("manifest block");
+    markdown::manifest_yaml(text, &span)
+        .expect("manifest yaml")
+        .to_string()
+}
+
+/// A Full / tier-less task does NOT serialize a `tier:` line — byte-identical
+/// backward-compat. Asserted on SERIALIZED bytes (via a real round-trip write),
+/// not parse-back-only: `skip_serializing_if` is exactly the thing under test.
+#[test]
+fn full_task_omits_tier_on_serialize() {
+    let (_dir, story) = story_in_tempdir(
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n",
+    );
+    // `complete` forces a round-trip rewrite through `to_block_body`.
+    dt_story()
+        .args(["complete"])
+        .arg(&story)
+        .arg("1")
+        .assert()
+        .success();
+    let text = fs::read_to_string(&story).expect("read back");
+    let yaml = manifest_yaml_of(&text);
+    assert!(
+        !yaml.contains("tier:"),
+        "a full/tier-less task must emit no tier: line, got:\n{yaml}"
+    );
+    assert_eq!(
+        parse_manifest(&text).tasks[0].tier,
+        Tier::Full,
+        "and it must parse back as Full"
+    );
+}
+
+/// A Light task round-trips WITH its reason: `tier: light` and `tier_reason`
+/// both appear in the serialized bytes and parse back, while the adjacent Full
+/// task still emits no tier line (only ONE `  tier: ` in the block).
+#[test]
+fn light_task_round_trips_with_reason() {
+    let (_dir, story) = story_in_tempdir(
+        "story: s\ntasks:\n\
+         - id: 1\n  status: pending\n  specialist: test\n  prompt: p\n\
+         - id: 2\n  status: pending\n  specialist: test\n  prompt: q\n  tier: light\n  \
+         tier_reason: single specialist, no wire contract\n",
+    );
+    // Round-trip the whole file by completing the (full) task 1.
+    dt_story()
+        .args(["complete"])
+        .arg(&story)
+        .arg("1")
+        .assert()
+        .success();
+    let text = fs::read_to_string(&story).expect("read back");
+    let yaml = manifest_yaml_of(&text);
+    assert!(
+        yaml.contains("tier: light"),
+        "the light tier must serialize, got:\n{yaml}"
+    );
+    assert!(
+        yaml.contains("tier_reason: single specialist, no wire contract"),
+        "the reason must serialize, got:\n{yaml}"
+    );
+    assert_eq!(
+        yaml.matches("  tier: ").count(),
+        1,
+        "only the light task may emit a tier line — the full task stays tier-less, got:\n{yaml}"
+    );
+    let manifest = parse_manifest(&text);
+    let task2 = manifest.task(2).expect("task 2");
+    assert_eq!(task2.tier, Tier::Light);
+    assert_eq!(
+        task2.tier_reason.as_deref(),
+        Some("single specialist, no wire contract")
+    );
+    assert_eq!(
+        manifest.task(1).expect("task 1").tier,
+        Tier::Full,
+        "the untouched full task must remain Full"
+    );
+}
+
+/// A tier-less task parses as `Full` (the backward-compat default).
+#[test]
+fn no_tier_defaults_to_full() {
+    let (_dir, story) = story_in_tempdir("story: s\ntasks:\n- id: 1\n  status: completed\n");
+    let manifest = parse_manifest(&fs::read_to_string(&story).expect("read back"));
+    assert_eq!(manifest.tasks[0].tier, Tier::Full);
+    assert_eq!(manifest.tasks[0].tier_reason, None);
+}
+
+/// light-requires-reason: an OTHERWISE-VALID pending task (specialist + prompt)
+/// tiered `light` with NO reason — the ONLY violation is the missing reason.
+/// Non-vacuous by construction, and the SPECIFIC message is asserted.
+#[test]
+fn validate_rejects_light_tier_without_reason() {
+    let (code, stderr) = run_validate(
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n  tier: light\n",
+    );
+    assert_eq!(code, 1, "light with no reason must fail; stderr: {stderr}");
+    assert!(
+        stderr.contains("tier `light` but has no tier_reason"),
+        "the violation must name the tier rule specifically, got: {stderr}"
+    );
+}
+
+/// A whitespace-only reason is treated as absent (the rule trims).
+#[test]
+fn validate_rejects_light_tier_with_whitespace_only_reason() {
+    let (code, stderr) = run_validate(
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n  tier: light\n  tier_reason: \"   \"\n",
+    );
+    assert_eq!(code, 1, "a blank reason must fail; stderr: {stderr}");
+    assert!(
+        stderr.contains("tier `light` but has no tier_reason"),
+        "got: {stderr}"
+    );
+}
+
+/// The tier rule is STATUS-INDEPENDENT (unlike specialist/prompt): a completed
+/// task tiered `light` with no reason still fails, so a story file cannot
+/// record a reasonless planning skip after the fact.
+#[test]
+fn validate_rejects_light_tier_on_completed_task_too() {
+    let (code, stderr) =
+        run_validate("story: s\ntasks:\n- id: 1\n  status: completed\n  tier: light\n");
+    assert_eq!(code, 1, "the tier rule applies regardless of status");
+    assert!(
+        stderr.contains("tier `light` but has no tier_reason"),
+        "got: {stderr}"
+    );
+}
+
+/// `add-task --tier light` with no `--tier-reason` is refused by the before/
+/// after delta-validate, and the refused task is NOT appended (mirrors
+/// `add_task_refuses_a_dangling_dep`).
+#[test]
+fn add_task_refuses_light_tier_without_reason() {
+    let (dir, story) = story_in_tempdir("story: s\ntasks:\n- id: 1\n  status: completed\n");
+    let prompt = dir.path().join("p.txt");
+    fs::write(&prompt, "second").expect("write prompt");
+    let assert = dt_story()
+        .args(["add-task"])
+        .arg(&story)
+        .args(["--specialist", "test"])
+        .arg("--prompt-file")
+        .arg(&prompt)
+        .args(["--tag", "t", "--tier", "light"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8");
+    assert!(
+        stderr.contains("tier_reason"),
+        "the refusal must name the missing reason, got: {stderr}"
+    );
+    let manifest = parse_manifest(&fs::read_to_string(&story).expect("read back"));
+    assert_eq!(
+        manifest.tasks.len(),
+        1,
+        "the refused light-without-reason task must not be appended"
+    );
+}
+
+/// `add-task --tier light --tier-reason <text>` appends and serializes both
+/// fields — pins the CLI threading through `NewTask` end to end.
+#[test]
+fn add_task_light_with_reason_appends_and_serializes() {
+    let (dir, story) = story_in_tempdir("story: s\ntasks:\n- id: 1\n  status: completed\n");
+    let prompt = dir.path().join("p.txt");
+    fs::write(&prompt, "second").expect("write prompt");
+    dt_story()
+        .args(["add-task"])
+        .arg(&story)
+        .args(["--specialist", "test"])
+        .arg("--prompt-file")
+        .arg(&prompt)
+        .args([
+            "--tag",
+            "t",
+            "--tier",
+            "light",
+            "--tier-reason",
+            "single specialist",
+        ])
+        .assert()
+        .success();
+    let text = fs::read_to_string(&story).expect("read back");
+    assert!(manifest_yaml_of(&text).contains("tier: light"));
+    let manifest = parse_manifest(&text);
+    assert_eq!(manifest.tasks.len(), 2);
+    let added = manifest.task(2).expect("added task");
+    assert_eq!(added.tier, Tier::Light);
+    assert_eq!(added.tier_reason.as_deref(), Some("single specialist"));
+}
+
+/// A bogus tier is serde-closed: it fails the WHOLE file to parse (`next` exits
+/// 2), mirroring `invalid_slug_fails_the_whole_manifest_to_parse`. This proves
+/// the enum closes the input class the run-story `^(full|light)$` floor guards —
+/// so a `null` tier reaching that floor can ONLY be a stale binary, never a
+/// real manifest.
+#[test]
+fn bogus_tier_fails_the_whole_manifest_to_parse() {
+    let (_dir, story) = story_in_tempdir(
+        "story: s\ntasks:\n- id: 1\n  status: pending\n  specialist: test\n  prompt: p\n  tier: bogus\n",
+    );
+    let assert = dt_story().arg("next").arg(&story).assert();
+    assert.code(2);
+}
+
+/// `tier_reason` is a new input to `to_block_body`'s fence check (the
+/// anti-silent-truncation control). A reason containing a markdown fence line
+/// must be refused on write, same as a prompt — the exact analog of
+/// `add_task_refuses_a_prompt_containing_a_fence`.
+#[test]
+fn add_task_refuses_a_tier_reason_containing_a_fence() {
+    let (dir, story) = story_in_tempdir("story: s\ntasks:\n- id: 1\n  status: completed\n");
+    let prompt = dir.path().join("p.txt");
+    fs::write(&prompt, "ordinary prompt").expect("write prompt");
+    let assert = dt_story()
+        .args(["add-task"])
+        .arg(&story)
+        .args(["--specialist", "test"])
+        .arg("--prompt-file")
+        .arg(&prompt)
+        .args([
+            "--tag",
+            "t",
+            "--tier",
+            "light",
+            "--tier-reason",
+            "see:\n```\ncode\n```",
+        ])
+        .assert()
+        .code(2);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8");
+    assert!(
+        stderr.contains("fence"),
+        "the refusal must name the mechanism, got: {stderr}"
+    );
+    let manifest = parse_manifest(&fs::read_to_string(&story).expect("read back"));
+    assert_eq!(
+        manifest.tasks.len(),
+        1,
+        "the fence refusal must leave the file untouched"
+    );
 }

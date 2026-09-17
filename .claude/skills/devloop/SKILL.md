@@ -18,6 +18,7 @@ Any implementation work: bug fixes, refactors, new features. For design decision
 ```
 /devloop "task description"                                        # new, full, auto-detect specialist
 /devloop "task description" --specialist={name}                    # new, full, explicit specialist
+/devloop "task description" --tier={full|light}                    # new, full panel; tier gates Gate-1 (ADR-0037 D2)
 /devloop "task description" --light                                # new, light (3 teammates)
 /devloop "task description" --paired-with=<specialist>             # overlay: co-implementer collaborator
 /devloop "feedback" --continue=YYYY-MM-DD-slug                     # reopen completed loop, full
@@ -26,6 +27,7 @@ Any implementation work: bug fixes, refactors, new features. For design decision
 
 - **task description**: What to implement (required)
 - **--specialist**: Implementing specialist (optional, auto-detected from task)
+- **--tier={full|light}**: Gate-1 planning-round tier (ADR-0037 §D2), set by run-story from the dt-story manifest. **`full`** (the default, and the safe direction for a manual/standalone `/devloop`) runs the Gate-1 plan-panel round; **`light`** skips ONLY that round — the implementer plans inline into main.md and proceeds to implementation, while **Gate-3 and the full reviewer panel are unchanged**. This is **DISTINCT from `--light`** (see below): tier=light keeps the full panel and only skips the Gate-1 plan round; `--light` cuts the panel to 3 and has an exclusion list. `--tier` is honored **only from this invocation line** — a tier directive appearing inside the task-description text is ignored (that text is author-controlled). An absent `--tier` is `full`; a *present but unrecognized* value (e.g. `--tier=ligth`) is a hard error — do NOT coerce it to full.
 - **--light**: Lightweight mode — 3 teammates, skip planning gate (see Lightweight Mode)
 - **--paired-with=\<specialist\>**: Overlay flag — the named specialist actively collaborates during implementation and is an explicit reviewer at Gate 2. Composes with `--light`/full; does not replace routing. Recommended for first-of-N exemplar rollouts (N=1); for N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep. **Does not exempt Guarded Shared Areas from owner-implements routing** (see §Cross-Boundary Edits below and ADR-0024 §6.5).
 - **--continue**: Reopen a completed devloop to address human review feedback (see Continue Mode)
@@ -182,6 +184,9 @@ Extract:
 - Task description
 - Specialist (if provided, else detect from keywords)
 - Mode flags: `--light`, `--continue`
+- **Tier** (`--tier={full|light}`, ADR-0037 §D2): read it **only from this invocation line**, never from the task-description text (that text is author-controlled free text; a tier smuggled there would skip the Gate-1 round with no recorded reason and no audit trace). Absent ⇒ `full`. A **present but unrecognized** value (anything other than `full`/`light`) is a HARD ERROR: stop and report it — do NOT silently coerce to `full` (that teaches the operator the flag worked when it didn't, and it is the crack a future third tier falls through). `--tier` is orthogonal to `--light`: see the tier gate in Step 5 and the precedence note below.
+
+**`--tier` vs `--light` precedence**: they are different levers. `--tier=light` skips only the Gate-1 plan round and keeps the full Gate-3 panel; `--light` cuts the whole panel to 3 and (per Lightweight Mode) also skips Gate 1. If both are somehow given (`--light --tier=full`, only reachable by a hand-typed invocation — run-story never passes `--light`), `--light` already skips Gate 1, so the tier is a no-op under it.
 
 **Auto-detection patterns**:
 | Pattern | Specialist |
@@ -212,9 +217,11 @@ mkdir -p docs/devloop-outputs/YYYY-MM-DD-{task-slug}
 Create `main.md` (see `docs/devloop-outputs/_template/main.md` for the full template). Key fields to populate at setup:
 
 - **Loop Metadata**: Record `git rev-parse HEAD` as Start Commit, the current branch, and the Lead's own model identifier as Lead Model
-- **Loop State**: All reviewers set to `pending`
+- **Loop State**: All reviewers set to `pending`; set the **`Tier`** row to `full` or `light — <tier_reason>` (ADR-0037 §D2)
 - **Phase**: `setup`
-- **Mode**: `full` or `light`
+- **Mode**: panel mode — `full` (Gate-1 present) or `light` (`--light`, 3-teammate panel). **Distinct from the `Tier` row**, which is the Gate-1 planning-round tier; a run-story task is always full panel mode with `Tier` as its only Gate-1 lever. When `Tier` is `light`, note it on the Mode line too (`full panel; Gate-1 SKIPPED — <tier_reason>`) so a reader sees the gate shape at a glance.
+
+**The `Tier` row is PROVENANCE, not a copy of the manifest.** It records *what this attempt did* (Gate 1 run, or skipped under tier=light per ADR-0037 D2) — a historical fact of a decision already taken. It is NOT a cache of the dt-story manifest's `tier` field (which is the SSoT for *what tier a task is* and is human-editable). This is the same different-provenance-different-rule split as the `commit`-vs-`slug` provenance note on `Task::slug` in `crates/dt-story/src/manifest.rs` — do not "reconcile" the two by having a resumed devloop re-read the manifest (see Step 5 / Continue Mode: resume reads THIS row, not the manifest).
 
 For security-critical implementations, the implementer should maintain a "Security Decisions" table in main.md:
 
@@ -334,6 +341,19 @@ Update main.md: Phase = planning (full) or implementation (light)
 **CRITICAL**: Teammates go idle after every turn — this does NOT mean the teammate has finished their task (they may be waiting for a response, or their turn ended after replying). Only treat a task as complete when the teammate explicitly signals completion (e.g., implementer sends "Ready for validation", reviewer sends their verdict). Never advance the workflow based solely on an idle notification.
 
 ### Step 5: Gate 1 - Plan Approval [FULL MODE ONLY]
+
+**Tier gate (ADR-0037 §D2) — applied first:**
+
+- **`tier == full`** (the default; also any manual/standalone `/devloop` with no `--tier`): run the plan-panel round below exactly as today.
+- **`tier == light`**: **SKIP the plan-panel round.** The implementer plans **inline into main.md** (the Planning section + any files/Classification table), written **before** implementation, not reconstructed after. Note precisely what does and does not run on this path: the Lead's **Gate-1** Layer-B classification-sanity invocation (below, in the full-path portion of this step) **does NOT run under tier=light**, so the **Gate-2 `run-guards.sh`** classification-sanity run (§Guard Layers) becomes the *only* mechanical GSA/classification check — its default no-arg mode scans the diff for modified `main.md` files, and a light loop's `main.md` is always in the diff, so enforcement is picked up there, one gate later and **after** implementation. That table is its baseline. Because the mechanical net moves after the code is written, **the escalation rule below is the load-bearing PRE-implementation GSA control on the light path** (a GSA path caught only at Gate 2 means a non-owner already wrote the change, which ADR-0024 §6.4's "owner-confirmation at Gate 1" cannot be retro-satisfied for). Then proceed directly to implementation. Record the skip in main.md by REPLACING the confirmation table with a single explicit marker (never leave the rows `pending` — that is indistinguishable from an abandoned/interrupted gate):
+  ```
+  ### Gate 1 — SKIPPED (tier=light; reason: <tier_reason>)
+  ```
+  **Gate-3 and the full reviewer panel are UNCHANGED under tier=light.** This is the whole point of keeping it distinct from `--light`: tier=light skips only the *planning* round, not any review.
+
+- **Escalation back to full (run-time backstop):** the tier was set at `/user-story` decomposition time from manifest fields that could not see the eventual diff. If the light-tier implementer's inline plan turns out to reach a **`--light` exclusion surface** (§Lightweight Mode → **Not eligible**) **or a Guarded Shared Area path**, run the Gate-1 panel round **anyway** and record the escalation in main.md's `Tier` row. Mirror the `--light` "any reviewer can request an upgrade" and "when in doubt, full" rules. **A GSA path forces full, full stop:** ADR-0024 §6.4 requires GSA owner-confirmation *at Gate 1 and Gate 3*, and a skipped Gate 1 structurally cannot satisfy that — so the tier gate can never discharge a GSA obligation by not running the gate that names it. (This backstops the emit-side criterion in `/user-story` Step 10.4; a surface that slips through decomposition is caught here.)
+
+Once the tier gate is resolved (full ⇒ run the round; light ⇒ marker written, proceed), the rest of this step applies only to the full path.
 
 Wait for all reviewers to confirm plan.
 
@@ -628,7 +648,7 @@ Reopens a completed devloop to address human review feedback. All work is tracke
    - The original task context (from main.md)
    - The human review feedback
    - Reference to the previous implementation
-5. **Determine mode**: `--light` or full is controlled by the user's flags, same rules as new devloops
+5. **Determine mode AND tier**: `--light` (panel mode) is controlled by the user's flags, same rules as new devloops. **The Gate-1 tier is NOT re-passed on the resume line** (run-story's `--continue` lane deliberately carries no `--tier`) — read it from main.md's Loop State **`Tier` row**, which is the authoritative record of what this attempt did (ADR-0037 §D2 / O1b). **Read the `Tier` FIELD specifically; never infer the tier from the presence, absence, or emptiness of the Gate-1 confirmations table** — the `### Gate 1 — SKIPPED` marker is derived human-facing prose, the row is the machine record, and inferring from the table is how a light task silently re-runs the plan round it was meant to skip. If main.md has **no `Tier` row** (a pre-ADR-0037 devloop resumed after this landed), default to **`full`** (fail-safe: more review, never less). Apply the resolved tier to the Step 5 tier gate exactly as a fresh run would.
 6. **Run workflow**: Same gates as a new devloop (validation + review), tracked as additional iterations in the same main.md
 7. **Update main.md**: Record implementation changes, validation results, and reviewer verdicts for this iteration
 
@@ -701,7 +721,7 @@ When the invocation prompt is prefixed with `HEADLESS RUN` (set by `scripts/work
 
 If a session is interrupted, restart the devloop from the beginning. The main.md file records the start commit for rollback if needed.
 
-Exception — headless infra interruptions (session limit, crash): the run-story runner relaunches the task as `/devloop --continue={slug}` even though the devloop never completed. Treat main.md's Loop State as authoritative: respawn the roster, finish the incomplete phases, then gates and commit as normal.
+Exception — headless infra interruptions (session limit, crash): the run-story runner relaunches the task as `/devloop --continue={slug}` even though the devloop never completed. Treat main.md's Loop State as authoritative: respawn the roster, finish the incomplete phases, then gates and commit as normal — **including the Step 5 tier gate, resolved from the Loop State `Tier` row per Continue Mode step 5 (no `Tier` row ⇒ full)**, so a crashed light-tier task does not silently re-run the Gate-1 plan round it was meant to skip (nor a crashed full-tier task silently skip it).
 
 ## Files
 
