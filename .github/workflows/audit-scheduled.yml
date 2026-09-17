@@ -96,7 +96,7 @@ jobs:
       # one-per-week). Uses actions/github-script (first-party — no new marketplace dep).
       - name: Surface drift via deduplicated issue
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const TITLE = 'Scheduled audit drift — unsuppressed advisory detected';
