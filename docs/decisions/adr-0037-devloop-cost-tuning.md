@@ -64,7 +64,7 @@ A structured read of all 26 devloop `main.md` Gate tables established:
 
 ## Decision
 
-Six changes, each with what it keeps, what it drops, and the fallout it accepts.
+Eight changes, each with what it keeps, what it drops, and the fallout it accepts.
 All are trial changes under the Status above.
 
 ### D1 — Trim the cross-boundary ownership ceremony to the load-bearing slice
@@ -173,6 +173,41 @@ today re-hydrates a ~100-turn transcript):
 
 These are mechanical and low-risk; they are included so the trial exercises them,
 but they do not change review shape.
+
+### D7 — fmt auto-fixes locally, checks in CI
+
+The rust fmt layer runs `cargo fmt --all -- --check` (`scripts/lang/rust/fmt.sh`),
+so a purely-mechanical formatting miss fails the gate and costs the implementer a
+manual fix or a re-run — for a deterministic transform that carries no signal.
+
+- **Decision**: the fmt layer **applies** the fix and reports what it changed when
+  run locally (devloop / run-story), and stays **`--check`** in CI (gated on the
+  `CI` env var). Same split for the TypeScript fmt layer.
+- **Why safe (not a masking violation)**: formatting is deterministic and
+  semantically empty, so auto-applying it hides no real failure — unlike
+  auto-fixing lint, which could. CI stays read-only and fails loud, so a
+  formatting miss is still caught where auto-fix runs (locally).
+- **Note**: this reverses an earlier deliberate "check-only per code-reviewer #2"
+  choice; the reversal is scoped to local runs and carries this rationale.
+
+### D8 — Point-of-failure log directive in the pipeline aggregator
+
+On a layer failure the failing sub-check's detail is **already captured**
+(`run-guards.sh` names the failed guard and prints its first error lines;
+`layer-all.sh` writes it to `${DEVLOOP_TMP}/layer-N.log`), yet a model seeing only
+the aggregate "Layer N FAILED" re-runs the whole layer to get detail it already
+has — pure token/time waste.
+
+- **Decision**: on a layer FAIL, `layer-all.sh` prints an explicit, self-locating
+  directive in its own output — naming the `layer-N.log` file **and** the
+  anti-pattern ("read the log to triage; do NOT re-run the layer to capture
+  detail, it is already there"), optionally with a 2–3 line grepped teaser of the
+  `FAILED`/`VIOLATION` lines. The instruction lands at the point of failure, in the
+  output the model is already reading — harder to miss than a SKILL line, which is
+  kept only as a demoted backup.
+- **Optional enhancement**: `run-guards.sh` emits a structured `FAILED_GUARDS=<names>`
+  line `layer-all.sh` can surface, so the summary names the exact guard, not just
+  the log — not required for the core fix.
 
 ## Deferred (not in this ADR)
 
