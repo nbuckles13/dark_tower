@@ -495,7 +495,32 @@ A reviewer's verdict is **RESOLVED-DEFERRED** if even one of their findings was 
 After review, stage and commit:
 
 1. `git add -A`
-2. Commit with message:
+2. **Commit-intent checkpoint (headless only — ADR-0037 D6/f).** This is written at
+   Gate-3 close, i.e. AFTER the reviewer verdicts (and any `Approved-Cross-Boundary:`
+   owner co-sign) and AFTER staging, but BEFORE the commit in step 3 — so that if the
+   session dies during the terminal phase (CLI crash at teardown, PID exhaustion,
+   quota) with the work staged-but-uncommitted, `run-story.sh --finish` can replay
+   this decision with **no model turn**. Only when `DEVLOOP_COMMIT_INTENT_FILE` is set
+   (the runner sets it under `HEADLESS RUN`); skip it entirely in interactive
+   `/devloop`. Write the machine-readable intent to that path:
+   ```json
+   {
+     "story": "<the story file this task belongs to>",
+     "task_id": <this task's id>,
+     "head": "<the DEVLOOP_START_HEAD env value — the HEAD this task started from>",
+     "slug": "YYYY-MM-DD-{slug}",
+     "message": "<the COMPLETE step-3 commit message below, rendered — subject + body + trailers, exactly what you will pass to git commit; do NOT re-specify the trailer grammar and do NOT hand-write Co-Authored-By>",
+     "files": [ "<each staged path>", "...", "docs/devloop-outputs/YYYY-MM-DD-{slug}/main.md" ],
+     "raw": "<the exact stdout of `git diff --cached --raw --no-abbrev` after `git add -A`>"
+   }
+   ```
+   `files` MUST include this devloop's `docs/devloop-outputs/<slug>/main.md` (the
+   runner derives the task slug from it). `--finish` re-runs the authoritative gate,
+   then refuses unless the staged path-set AND the `raw` content/mode match this
+   record exactly and `head` still matches — a stale or tampered intent fails closed
+   and falls back to a normal resume, so this checkpoint can only ever replay the
+   exact reviewed tree.
+3. Commit with message:
    ```
    {task description}
 
@@ -505,7 +530,7 @@ After review, stage and commit:
    Verdicts: Security {verdict}, Test {verdict}, Observability {verdict}, Code Quality {verdict}, DRY {verdict}, Operations {verdict}, Semantic Guard {verdict}
    ```
    (The standard `Co-Authored-By` trailer is added per the harness commit convention — do not hard-code it here; a hard-coded version has gone stale before.)
-3. If nothing to commit, skip silently
+4. If nothing to commit, skip silently
 
 ### Step 8.5: Cleanup Teammates
 

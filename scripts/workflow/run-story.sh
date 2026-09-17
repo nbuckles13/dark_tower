@@ -48,6 +48,44 @@ set -euo pipefail
 slog() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 slogerr() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
+# resolve_run_base <kind> — the base dir for a run-artifact class (ADR-0037 D5).
+# TWO kinds with DELIBERATELY DIFFERENT bases that must NOT be collapsed (the
+# two-key decomposition): a single-value accessor would re-unify them behind a
+# name that reads like correctness, which is why this takes an argument.
+#   marker   — per-CONTAINER, EPHEMERAL: the in-flight marker + substrate-probe
+#              cache. Stays on ${DEVLOOP_TMP:-/tmp/devloop} — this is what
+#              devloop.sh:~715 reads to skip the mid-run CLI update; do NOT move it.
+#   run-dir  — per-STORY, HOST-PERSISTENT: cost ledger + durable per-task evidence.
+#              Default base moves off container /tmp so it survives teardown.
+# Returns the base WITH the /story-runner segment (callers append [/<story>]); the
+# .ledger-mount positive-control marker lives one level up, at
+# "$(dirname "$(resolve_run_base run-dir)")/.ledger-mount" == the mount root.
+#
+# PRECEDENCE IS A SECURITY INVARIANT — DEVLOOP_TMP MUST dominate DEVLOOP_STORY_RUN_BASE.
+# Two properties rest on it: (1) under DEVLOOP_TEST the harness sets DEVLOOP_TMP to a
+# mktemp dir to isolate, and __seam_assert_run_dir_isolated validates DEVLOOP_TMP —
+# if the carrier outranked it, the seam would validate one var while another placed
+# evidence (the S-1 hazard, back door); (2) the carrier gets NO CI-presence clause
+# precisely because DEVLOOP_TMP dominates and the harness's env -i scrubs it, so an
+# ambient carrier leaking into a CI job is overridden and inert. Flip the order and
+# both break. The carrier is a DEFAULT the launcher supplies, never an override; the
+# isolation knob is DEVLOOP_TMP and it wins.
+#
+# DEVLOOP_STORY_RUN_BASE is NOT a seam (see the seam header): a seam refuses when
+# present WITHOUT the sentinel, but devloop.sh sets this on every production
+# container (DEVLOOP_TEST unset), so enrolling it would refuse every production run.
+# A var the production launcher sets can never carry "present without sentinel =
+# tamper". It composes RUN_DIR in production only and cannot reach the destructive
+# git paths (those key on REPO_ROOT). The unguarded ${HOME} is deliberate: with both
+# vars unset, `set -u` makes an unset HOME a HARD ERROR, not a silent empty expansion.
+resolve_run_base() {
+  case "${1:-}" in
+    marker)  printf '%s' "${DEVLOOP_TMP:-/tmp/devloop}/story-runner" ;;
+    run-dir) printf '%s' "${DEVLOOP_TMP:-${DEVLOOP_STORY_RUN_BASE:-${HOME}/.cache/devloop/story-runs}}/story-runner" ;;
+    *) slogerr "STORY_RUN: RESOLVE-RUN-BASE-BAD-KIND '${1:-}' — internal error, expected 'marker' or 'run-dir'."; exit 2 ;;
+  esac
+}
+
 # =============================================================================
 # TEST SEAMS (security trust boundary; ADR-0035 §12)
 # =============================================================================
@@ -70,6 +108,19 @@ slogerr() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 # DEVLOOP_TMP is NOT a seam. It is a PRE-EXISTING redirect (see RUN_DIR /
 # RUN_BASE below) that predates this block; the sentinel adds a CONSTRAINT on
 # it, not a redirect through it. That is why the count above stays two.
+#
+# DEVLOOP_STORY_RUN_BASE (ADR-0037 D5) is ALSO not a seam — same class as
+# DEVLOOP_TMP, so the count stays two. It is a production CARRIER: devloop.sh sets
+# it via -e to the container ledger mount target on EVERY production container
+# (where DEVLOOP_TEST is unset). A seam's defining behaviour is "present without
+# the exact sentinel => exit 2"; a var the production launcher sets on every run
+# can never carry that "present without sentinel = tamper" signal, so enrolling it
+# in __any_seam_override_present would refuse every production run. It composes the
+# run-dir base ONLY in production (DEVLOOP_TMP dominates it under the sentinel — see
+# resolve_run_base) and cannot reach the destructive git reset/clean paths (those
+# key on REPO_ROOT). The evidence-interleaving hazard it could otherwise open under
+# the sentinel is closed by the H2 sibling clause in __seam_assert_run_dir_isolated,
+# NOT by a seam refusal.
 #
 # Overrides are read ONLY when DEVLOOP_TEST is set EXACTLY to "1".
 # DO NOT change the gating to a truthy `-n` test — DEVLOOP_TEST=0 must NOT
@@ -186,7 +237,7 @@ __seam_assert_run_dir_isolated() {
   local dt resolved default_base
   dt="${DEVLOOP_TMP:-}"
   if [ -z "$dt" ]; then
-    slogerr "STORY_RUN: SEAM-RUN-DIR-NOT-REDIRECTED — DEVLOOP_TEST=1 but DEVLOOP_TMP is unset, so the run dir would default to /tmp/devloop and share evidence + the in-flight marker with any live run. Redirect it (mktemp -d)."
+    slogerr "STORY_RUN: SEAM-RUN-DIR-NOT-REDIRECTED — DEVLOOP_TEST=1 but DEVLOOP_TMP is unset, so BOTH per-container defaults would be live: the in-flight marker + probe cache default to /tmp/devloop, and the evidence/ledger defaults to the production ledger base — either would collide with a live run. Redirect it (mktemp -d)."
     exit 2
   fi
   if ! resolved="$(cd "$dt" 2>/dev/null && pwd -P)"; then
@@ -207,10 +258,59 @@ __seam_assert_run_dir_isolated() {
   # so neither the fail-loud-without-sentinel guard nor the CI presence
   # rejection would cover it. If this ever needs to be configurable it enters
   # through that enumeration and gets the CI clause, like the other two.
+  # H1 — MARKER-deletion hazard. This literal is the MARKER base default
+  # (resolve_run_base marker), and it STAYS a literal: :200-209 argues making it
+  # configurable would relax the check. Post-decomposition /tmp/devloop holds the
+  # in-flight marker + substrate-probe cache (the ledger moved to the run-dir base);
+  # so this message now names the marker hazard specifically, and H2 below names the
+  # evidence hazard that moved with the ledger.
   default_base="/tmp/devloop"
   if [ -d "$default_base" ] && [ "$resolved" -ef "$default_base" ]; then
-    slogerr "STORY_RUN: SEAM-RUN-DIR-NOT-REDIRECTED — DEVLOOP_TMP resolves to the default '${default_base}', which is where a live run keeps its in-flight marker and its evidence. Redirect it (mktemp -d)."
+    slogerr "STORY_RUN: SEAM-RUN-DIR-NOT-REDIRECTED — DEVLOOP_TMP resolves to the default '${default_base}', where a live run keeps its in-flight marker and substrate-probe cache; this process's EXIT trap would delete that marker. Redirect it (mktemp -d)."
     exit 2
+  fi
+  # H2 — EVIDENCE-interleaving hazard, which moved to the run-dir (ledger) base
+  # under the two-key decomposition and is NO LONGER guarded by the /tmp/devloop
+  # literal above. A DEVLOOP_TEST run whose DEVLOOP_TMP resolves to the production
+  # ledger base lands RUN_DIR identical to a live run's — and that dir now SURVIVES
+  # teardown, so fixture canary/incident/cost records durably interleave into it.
+  # (The :272 in-use check only covered the run dir incidentally, while marker and
+  # run dir shared a base; the decomposition ended that co-location silently.)
+  #
+  # LEFT operand is `$resolved` (this test's own DEVLOOP_TMP, env-following — same as
+  # H1). RIGHT operands are two LITERALS, OR'd, and MUST NOT derive via
+  # resolve_run_base: that reads DEVLOOP_STORY_RUN_BASE/$HOME, so a nonexistent
+  # target would make `-ef` compare a missing operand (FALSE => pass) and a
+  # DEVLOOP_TMP aimed at the real ledger would sail through — the :200-209
+  # relaxation, one base over. The comparison FLOOR must be a value this test
+  # process's env cannot influence.
+  #   (a) container base — env-IMMUNE floor;
+  #   (b) ${HOME} form   — adds the STORY_RUNNER_ALLOW_HOST host-lane, where the real
+  #       base is the operator's $HOME. OR-ing (b) atop (a) can only ADD a refusal,
+  #       never subtract one (a phantom (b) simply never fires) — a future edit that
+  #       makes (b) REPLACE rather than AUGMENT (a) reopens the original hole; keep
+  #       (a) as the standalone floor.
+  # SYMMETRY vs H1 (:210), stated precisely so the host-lane gap stays visible: this
+  # clause and H1 are symmetric in FORM (both a test-resolved LEFT `-ef` a non-relaxable
+  # literal RIGHT, same reason) but NOT in COVERAGE — /tmp/devloop is the marker base on
+  # EVERY lane incl. the host hatch, whereas /home/dev/.cache/... is the ledger base
+  # ONLY in-container. That coverage gap is exactly WHY clause (b) exists (it closes the
+  # host lane the container literal misses). Do not "simplify" to a bare symmetric claim.
+  # `-ef` is device+inode EXACT identity, NOT prefix — a DEVLOOP_TMP at a broad
+  # parent does not sweep fixtures beneath it. Own fresh-host argument: an absent
+  # literal ⇒ no live run there, so a missing-operand pass is correct; a live run
+  # necessarily creates the dir, so the check is present exactly when it can matter.
+  __ledger_base_container="/home/dev/.cache/devloop/story-runs"
+  if [ -d "$__ledger_base_container" ] && [ "$resolved" -ef "$__ledger_base_container" ]; then
+    slogerr "STORY_RUN: SEAM-RUN-DIR-IS-LEDGER-BASE — DEVLOOP_TMP='${resolved}' resolves to the container production ledger base ('${__ledger_base_container}'), so this test's RUN_DIR would land in a live run's host-persistent evidence dir (which survives teardown) and interleave fixture records into it. Redirect DEVLOOP_TMP (mktemp -d)."
+    exit 2
+  fi
+  if [ -n "${HOME:-}" ]; then
+    __ledger_base_host="${HOME}/.cache/devloop/story-runs"
+    if [ -d "$__ledger_base_host" ] && [ "$resolved" -ef "$__ledger_base_host" ]; then
+      slogerr "STORY_RUN: SEAM-RUN-DIR-IS-LEDGER-BASE-HOST — DEVLOOP_TMP='${resolved}' resolves to the host-lane production ledger base ('${__ledger_base_host}', the STORY_RUNNER_ALLOW_HOST base) — same evidence-interleaving hazard as the container case. Redirect DEVLOOP_TMP (mktemp -d)."
+      exit 2
+    fi
   fi
   case "${resolved}/" in
     "${REAL_REPO_ROOT}"/*)
@@ -274,7 +374,7 @@ if __test_sentinel_active && __any_seam_override_present; then
   slog "STORY_RUN: TEST SEAMS ACTIVE — repo_root=${REPO_ROOT} dt_story=${DT_STORY} run_dir_base=${DEVLOOP_TMP:-<unset>} (NOT a production run)"
 fi
 
-ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text>]}"
+ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text> | --finish | --interactive]}"
 shift
 # Flag grammar (order-independent after the story arg). Extra/unknown argv is
 # REFUSED, not silently dropped — a flag that silently does nothing is the same
@@ -289,6 +389,8 @@ SAW_STOP_AFTER=0   # PRESENCE, tracked separately from the value: `--stop-after=
 REVALIDATE=0
 RESTART=0
 RESTART_TEXT=""
+FINISH=0        # D6/f: model-free commit-intent finisher (reviewed-but-uncommitted)
+INTERACTIVE=0   # D6/g: attach claude to the operator TTY for the escalated task
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stop-after=*)
@@ -320,7 +422,17 @@ while [ "$#" -gt 0 ]; do
     --restart=*)
       [ "$RESTART" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --restart given more than once."; exit 2; }
       RESTART=1; RESTART_TEXT="${1#--restart=}" ;;
-    *) slogerr "STORY_RUN: UNKNOWN-ARGUMENT '$1' — usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text>]"; exit 2 ;;
+    # --finish / --interactive: booleans, no text (unlike --restart), so no
+    # next-token handling. Duplicate-flag guard per R-5. Both are operator-
+    # intervention retry flags in the same family and join the mutual-exclusion +
+    # RETRY_APPLIED machinery below.
+    --finish)
+      [ "$FINISH" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --finish given more than once."; exit 2; }
+      FINISH=1 ;;
+    --interactive)
+      [ "$INTERACTIVE" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --interactive given more than once."; exit 2; }
+      INTERACTIVE=1 ;;
+    *) slogerr "STORY_RUN: UNKNOWN-ARGUMENT '$1' — usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text> | --finish | --interactive]"; exit 2 ;;
   esac
   shift
 done
@@ -333,8 +445,21 @@ fi
 # Retry-flag misuse, each a distinct STORY_RUN token + exit 2. These are the
 # up-front (argv-only) refusals; NO-ESCALATED-TASK and NO-COMMIT-REFUSED need the
 # manifest and fire inside the loop.
+# The specific --revalidate+--restart pairing keeps its own tailored message (its
+# guidance names what each does), checked FIRST so that combo hits it rather than the
+# generic one. Every other multi-flag combo (any involving --finish/--interactive)
+# hits the general count>1 check below — one check, not six pairwise ifs (DRY C4).
 if [ "$REVALIDATE" -eq 1 ] && [ "$RESTART" -eq 1 ]; then
   slogerr "STORY_RUN: REVALIDATE-WITH-RESTART — --revalidate and --restart are mutually exclusive: the first re-runs only the gate, the second spawns a fresh devloop. Pick one."
+  exit 2
+fi
+if [ "$((REVALIDATE + RESTART + FINISH + INTERACTIVE))" -gt 1 ]; then
+  __retry_set=""
+  [ "$REVALIDATE" -eq 1 ] && __retry_set="${__retry_set} --revalidate"
+  [ "$RESTART" -eq 1 ] && __retry_set="${__retry_set} --restart"
+  [ "$FINISH" -eq 1 ] && __retry_set="${__retry_set} --finish"
+  [ "$INTERACTIVE" -eq 1 ] && __retry_set="${__retry_set} --interactive"
+  slogerr "STORY_RUN: MULTIPLE-RETRY-FLAGS — the operator-intervention retry flags are mutually exclusive; given:${__retry_set}. Each is a distinct retry on the first-reached escalated task — pick one."
   exit 2
 fi
 if [ "$RESTART" -eq 1 ]; then
@@ -368,11 +493,20 @@ else
 fi
 # (DT_STORY is resolved in the seam block at the top of this file — a built
 # artifact that must not move with the tree. Do not re-assign it here.)
-RUN_DIR="${DEVLOOP_TMP:-/tmp/devloop}/story-runner/$(basename "${STORY_FILE%.md}")"
+# RUN_DIR — per-STORY, host-persistent ledger/evidence base (ADR-0037 D5), via
+# resolve_run_base. NOT the same base as RUN_BASE/INFLIGHT below: those are the
+# per-CONTAINER marker on ${DEVLOOP_TMP:-/tmp/devloop} and MUST stay there (the
+# two-key decomposition — do not "unify" the two). The shared knob is DEVLOOP_TMP:
+# when set (always, under DEVLOOP_TEST) both bases collapse onto it and the seam
+# guards cover RUN_DIR; when unset (production) RUN_DIR defaults to the persistent
+# mount while the marker stays ephemeral. resolve_run_base carries the precedence
+# rule and why DEVLOOP_TMP must dominate.
+RUN_DIR="$(resolve_run_base run-dir)/$(basename "${STORY_FILE%.md}")"
 
 # RUN_DIR character floor. UNCONDITIONAL, not sentinel-gated: the hazard exists
-# in production. RUN_DIR is composed from DEVLOOP_TMP (an env var with no
-# character constraint) and `basename "${STORY_FILE%.md}"`, which on the `-f
+# in production. RUN_DIR is composed from DEVLOOP_TMP / DEVLOOP_STORY_RUN_BASE /
+# $HOME (env vars with no character constraint) and `basename "${STORY_FILE%.md}"`,
+# which on the `-f
 # "$ARG"` branch above is OPERATOR-SUPPLIED ARGV — so
 # `run-story.sh '/path/my"story.md'` puts a double quote into it. That path is
 # the one piece of variable content inside the quoted `/devloop "..."` argument
@@ -390,10 +524,63 @@ RUN_DIR="${DEVLOOP_TMP:-/tmp/devloop}/story-runner/$(basename "${STORY_FILE%.md}
 # reopens the defect for every character added. Redirect DEVLOOP_TMP or rename
 # the story file instead.
 if ! [[ "$RUN_DIR" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-  slogerr "STORY_RUN: UNSAFE-RUN-DIR — the resolved run dir '${RUN_DIR}' contains characters outside [A-Za-z0-9._/-] (a space is the common case). This path is referenced inside the devloop instruction, so an unconstrained byte here changes what the task is told to do. NOTE this refuses some paths that worked before this check existed — that is deliberate; redirect DEVLOOP_TMP to a space-free path, or rename the story file. Do NOT widen the character class."
+  slogerr "STORY_RUN: UNSAFE-RUN-DIR — the resolved run dir '${RUN_DIR}' contains characters outside [A-Za-z0-9._/-] (a space is the common case). This path is referenced inside the devloop instruction, so an unconstrained byte here changes what the task is told to do. NOTE this refuses some paths that worked before this check existed — that is deliberate; the offending byte may come from DEVLOOP_TMP, DEVLOOP_STORY_RUN_BASE, or \$HOME (on the STORY_RUNNER_ALLOW_HOST host lane) — redirect to a space-free path, or rename the story file. Do NOT widen the character class."
   exit 2
 fi
-mkdir -p "$RUN_DIR"
+
+# Persistence positive control (ADR-0037 D5 / O-3). A plain writability check is
+# VACUOUS for D5's goal: it passes on a dir that is writable but NOT the
+# host-persistent mount (a failed helper launch, or a container created before this
+# change via devloop.sh's already-running short-circuit — no mount was added), in
+# which case the ledger silently evaporates on destroy, the exact story-1 failure D5
+# exists to fix. devloop.sh writes .ledger-mount host-side into the mount root before
+# `podman run`, so its presence PROVES the bind happened.
+#
+# GATED on the IN-CONTAINER production lane: DEVLOOP_TMP unset (so not a test / not a
+# DEVLOOP_TMP redirect) AND STORY_RUNNER_ALLOW_HOST != 1 (code-reviewer F1). The
+# host-hatch lane (STORY_RUNNER_ALLOW_HOST=1, no container) legitimately resolves the
+# run dir to ${HOME}/.cache/devloop/story-runs, which is the operator's REAL home —
+# inherently durable, no container to mount a .ledger-mount into — so asserting the
+# marker there is wrong (the writable-but-not-mount property and the will-it-survive
+# property diverge exactly on that lane) and would refuse a supported lane with a
+# nonsensical "devloop.sh --recreate" (pre-D5 that lane ran, resolving to /tmp/devloop).
+# ALLOW_HOST is the right discriminator: set only on the host lane, never in-container,
+# so it separates "host lane, skip" from "container mount failed, still catch" — where
+# gating on the carrier would wrongly skip a pre-D5 image that leaves the carrier unset.
+# The marker lives at the mount ROOT, one level above the /story-runner segment.
+if [ -z "${DEVLOOP_TMP:-}" ] && [ "${STORY_RUNNER_ALLOW_HOST:-}" != "1" ]; then
+  __ledger_mount_root="$(dirname "$(resolve_run_base run-dir)")"
+  if [ ! -f "${__ledger_mount_root}/.ledger-mount" ]; then
+    slogerr "STORY_RUN: LEDGER-NOT-PERSISTENT — the run-dir base '${__ledger_mount_root}' has no .ledger-mount marker, so it is NOT the host-persistent bind mount (writable, but the ledger would die with the container — the failure D5 exists to fix). This container predates the D5 mount or the mount failed. Recover on the host: infra/devloop/devloop.sh --recreate ${DEVLOOP_SLUG:-<devloop-slug>}. NOT falling back to /tmp."
+    exit 2
+  fi
+fi
+
+# Create-and-writable, loud on failure — NEVER a silent /tmp fallback (D5). A bare
+# `mkdir -p` under `set -e` would abort with no STORY_RUN token; this names the path
+# and the host-side recovery.
+if ! mkdir -p "$RUN_DIR" 2>/dev/null || [ ! -w "$RUN_DIR" ]; then
+  slogerr "STORY_RUN: RUN-DIR-UNWRITABLE — could not create or write the run dir '${RUN_DIR}' (host-persistent ledger, ADR-0037 D5). A podman-created mount root can be root-owned under --userns=keep-id. Fix perms on ${__ledger_mount_root:-the mount}, or recover on the host: infra/devloop/devloop.sh --recreate ${DEVLOOP_SLUG:-<devloop-slug>}. NOT falling back to /tmp — that lost story-1's ledgers."
+  exit 2
+fi
+
+# Announce the resolved run dir — ONE unconditional line, three consumers: the test
+# harness greps it and ASSERTS it equals its own RUN_DIR_OF (an agreement check, so a
+# drift between the runner's resolution and the harness's restatement goes red — see
+# O2; the harness restates rather than derives, and the single agreement assertion
+# suffices because every case shares $DT + the fixed slug); an operator sees where the
+# ledger landed (a redirected/wrong base is then visible in the log, not silent); and
+# `source=` is the precedence-branch discriminator. Emitted AFTER the writability
+# check succeeds (a usable dir exists to
+# point at) — genuinely ABSENT on the UNSAFE-RUN-DIR / RUN-DIR-UNWRITABLE / LEDGER-
+# NOT-PERSISTENT refusal lanes. VOCABULARY IS `STORY_RUN:`, NOT `STATUS=`/`REASON=`:
+# a STATUS= line would cast a spurious vote in Layer-3's verdict via
+# tee_collect_statuses (docs/runbooks/devloop-validation.md §6.3) AND break the
+# harness read-back. Do not change the token or the leading path field.
+if [ -n "${DEVLOOP_TMP:-}" ]; then __run_dir_source="DEVLOOP_TMP"
+elif [ -n "${DEVLOOP_STORY_RUN_BASE:-}" ]; then __run_dir_source="DEVLOOP_STORY_RUN_BASE"
+else __run_dir_source="default"; fi
+slog "STORY_RUN: RUN-DIR ${RUN_DIR} source=${__run_dir_source}"
 
 # --- --stop-after validated against the MANIFEST, not as a bare integer (R-5) --
 # A number that names no task, or names one the story never reaches, was
@@ -513,35 +700,146 @@ slog "STORY_RUN: substrate bound to claude ${STORY_CLI_VERSION:-unknown}"
 
 # In-flight marker: lets a host-side attach see that a run owns this container and
 # skip its CLI update. Removed on every exit path, including escalation.
-RUN_BASE="${DEVLOOP_TMP:-/tmp/devloop}/story-runner"
+#
+# PER-CONTAINER, ephemeral — the MARKER base (resolve_run_base marker), NOT the
+# ledger base. It stays on ${DEVLOOP_TMP:-/tmp/devloop}: this is the exact path
+# devloop.sh:~715 reads (INFLIGHT_MARKER) to skip the mid-run CLI update, so moving
+# it silently breaks that detection (the CLI updates under a live run and the story
+# later dies on SUBSTRATE-CHANGED, wrong cause). Deliberately a DIFFERENT base than
+# RUN_DIR in production (two-key decomposition); do not unify them. validate-run-dir-
+# path-sync.sh statically binds this composition to devloop.sh's INFLIGHT_MARKER.
+RUN_BASE="$(resolve_run_base marker)"
 INFLIGHT="$RUN_BASE/.run-in-flight"
 mkdir -p "$RUN_BASE"
 printf 'story=%s pid=%s started=%s\n' \
   "$(basename "${STORY_FILE%.md}")" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$INFLIGHT"
 trap 'rm -f "$INFLIGHT"' EXIT
 
+# Concurrent-same-story guard (ADR-0037 D5 / ops). The ledger mount is FLAT/shared,
+# so two containers running the SAME story share one RUN_DIR — which the per-container
+# in-flight marker above CANNOT see (it lives on the per-slug /tmp/devloop). Without
+# this, their cost-ledger.jsonl interleaves (a wrong story total) and
+# latest_escalation_record could select a foreign attempt's baseline (breaking the
+# S-10 HEAD binding --finish/--revalidate rest on). Write a per-story owner stamp and
+# refuse if a DIFFERENT live owner holds it. The stamp records the container slug so
+# the ledger's single-owner invariant (see report_task_cost) is checkable after the
+# fact. A stale stamp from a KILLED run (its EXIT trap could not fire) is removable
+# deliberately — same discipline as SEAM-RUN-DIR-IN-USE at the seam block; never
+# block recovery forever on a stamp nobody owns.
+OWNER_FILE="$RUN_DIR/.owner"
+__owner_self="slug=${DEVLOOP_SLUG:-<none>} pid=$$ started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ -f "$OWNER_FILE" ]; then
+  __owner_prev_slug="$(sed -n 's/^slug=\([^ ]*\).*/\1/p' "$OWNER_FILE" 2>/dev/null || true)"
+  if [ "${__owner_prev_slug:-}" != "${DEVLOOP_SLUG:-<none>}" ]; then
+    slogerr "STORY_RUN: STORY-DIR-IN-USE — the run dir '${RUN_DIR}' is owned by a different devloop ('$(cat "$OWNER_FILE" 2>/dev/null || echo unknown)'); another container is running this SAME story on the shared ledger mount. Their evidence + cost ledger would interleave. Run this story in ONE container at a time. If that owner is a KILLED run (no live process), remove ${OWNER_FILE} deliberately and rerun."
+    exit 2
+  fi
+fi
+printf '%s\n' "$__owner_self" >"$OWNER_FILE"
+
 # Best-effort cost telemetry: sum every result event in the task's log (all
 # attempts, including cross-invocation resumes, append to the same file).
 # Telemetry only — never routes control flow; classification uses the canary.
+# LEDGER INVARIANT (ADR-0037 D5, stated ONCE — honored here, in append_lane_cost,
+# and in the story-close rollup). An entry with no `kind` or kind="devloop" is a
+# cumulative SUPERSET of this task's attempts within this story FOR A SINGLE LIVE
+# OWNER — report_task_cost greps the whole accumulated tasklog, so later entries
+# subsume earlier ones (that is why the rollup takes the last devloop entry). Two
+# concurrent runs over one story would produce accumulations that are supersets of
+# each other in NEITHER direction — which is exactly what the .owner guard prevents.
+# An entry with any other `kind` is a per-lane SINGLETON that never supersedes a
+# devloop entry. Unmeasured lanes carry cost fields null+measured:false (never 0).
+# `kind` is present on EVERY entry so the rollup can partition without null-handling.
+# append_unavailable_cost <id> <reason> — persist a per-lane singleton marking a task
+# whose devloop cost was LOST but recoverably known-lost (obs F1). Without it the loud
+# COST-UNAVAILABLE line vanishes with the console and the persistent rollup reads the
+# task as free with unmeasured_tasks=0 — affirmatively asserting nothing was lost. As
+# a measured:false entry the rollup's unmeasured branch counts it, so the headline
+# STORY-COST carries unmeasured_tasks>=1. NOT for the append-failed path (it can't
+# self-record by definition — that stays loud-line-only).
+append_unavailable_cost() {
+  local id="$1" reason="$2" entry
+  entry="$(jq -n -c --argjson task "$id" --arg reason "$reason" \
+    '{task:$task, kind:"unavailable", measured:false, reason:$reason,
+      usd:null, output_tokens:null, cache_read_tokens:null, turns:null, api_minutes:null}' 2>/dev/null || true)"
+  [ -n "$entry" ] && echo "$entry" >>"$RUN_DIR/cost-ledger.jsonl" || true
+}
+
 report_task_cost() {
   local id="$1" summary
+  if [ ! -s "$RUN_DIR/task-${id}.devloop.log" ]; then
+    # No session log to derive from. On the devloop path this means no result event
+    # was captured — loud, not silent (O6): a persistent ledger makes "task N was
+    # free" and "we lost task N's cost" indistinguishable otherwise. Also persist an
+    # `unavailable` entry so the loss survives into the rollup (obs F1).
+    slogerr "STORY_RUN: COST-UNAVAILABLE task=${id} reason=no-session-log — no ${RUN_DIR}/task-${id}.devloop.log to derive cost from; the ledger gains no devloop entry for this task."
+    append_unavailable_cost "$id" "no-session-log"
+    return 0
+  fi
   summary="$( (grep -h '"type":"result"' "$RUN_DIR/task-${id}.devloop.log" 2>/dev/null || true) \
     | jq -s -c --argjson task "$id" 'select(length > 0) | {
-        task: $task, attempts: length,
+        task: $task, kind: "devloop", measured: true, attempts: length,
         usd: (map(.total_cost_usd // 0) | add * 100 | round / 100),
         output_tokens: (map(.usage.output_tokens // 0) | add),
         cache_read_tokens: (map(.usage.cache_read_input_tokens // 0) | add),
         turns: (map(.num_turns // 0) | add),
         api_minutes: ((map(.duration_api_ms // 0) | add) / 60000 | round)
       }' 2>/dev/null)" || true
-  [ -n "$summary" ] || return 0
-  echo "$summary" >>"$RUN_DIR/cost-ledger.jsonl"
-  slog "STORY_RUN: COST $(jq -r '"task=\(.task) attempts=\(.attempts) usd=\(.usd) output_tokens=\(.output_tokens) cache_read_tokens=\(.cache_read_tokens) turns=\(.turns) api_minutes=\(.api_minutes)"' <<<"$summary")"
+  if [ -z "$summary" ]; then
+    slogerr "STORY_RUN: COST-UNAVAILABLE task=${id} reason=no-result-events — the session log has no parseable \"type\":\"result\" event (truncated log, jq failure, or a session that emitted none); no devloop cost entry written."
+    append_unavailable_cost "$id" "no-result-events"
+    return 0
+  fi
+  if ! echo "$summary" >>"$RUN_DIR/cost-ledger.jsonl"; then
+    slogerr "STORY_RUN: COST-UNAVAILABLE task=${id} reason=append-failed — could not append the devloop cost entry to ${RUN_DIR}/cost-ledger.jsonl (disk/permissions)."
+    return 0
+  fi
+  slog "STORY_RUN: COST $(jq -r '"task=\(.task) kind=\(.kind) attempts=\(.attempts) usd=\(.usd) output_tokens=\(.output_tokens) cache_read_tokens=\(.cache_read_tokens) turns=\(.turns) api_minutes=\(.api_minutes)"' <<<"$summary")"
+}
+
+# append_lane_cost <id> <kind> [wall_secs] — explicit ledger entry for a lane that
+# ran NO model session (revalidate-gate-only, finish, interactive), so
+# report_task_cost has nothing to derive and would WRONGLY re-grep a prior attempt's
+# stale tasklog (the O2a hazard). Per the invariant above, these are per-lane
+# singletons that never supersede a devloop entry.
+#   revalidate-gate-only / finish — model-free, TRUE zero cost (measured:true).
+#   interactive — real but UNMEASURED cost (usd:null + measured:false, NEVER 0;
+#     wall_clock_seconds is the one magnitude that survives without a session log).
+append_lane_cost() {
+  local id="$1" kind="$2" wall="${3:-0}" entry
+  # -c: one compact object per line — the ledger is JSONL, and the story-close
+  # rollup + tests read it line-oriented.
+  if [ "$kind" = "interactive" ]; then
+    entry="$(jq -n -c --argjson task "$id" --argjson wall "${wall:-0}" \
+      '{task:$task, kind:"interactive", measured:false, cost_source:"attached-session-no-stream-json",
+        usd:null, output_tokens:null, cache_read_tokens:null, turns:null, api_minutes:null,
+        wall_clock_seconds:$wall}' 2>/dev/null || true)"
+  else
+    entry="$(jq -n -c --argjson task "$id" --arg kind "$kind" \
+      '{task:$task, kind:$kind, measured:true, attempts:1,
+        usd:0, output_tokens:0, cache_read_tokens:0, turns:0, api_minutes:0}' 2>/dev/null || true)"
+  fi
+  if [ -z "$entry" ] || ! echo "$entry" >>"$RUN_DIR/cost-ledger.jsonl"; then
+    slogerr "STORY_RUN: COST-UNAVAILABLE task=${id} kind=${kind} reason=append-failed — could not write the lane cost entry."
+    return 0
+  fi
+  if [ "$kind" = "interactive" ]; then
+    slog "STORY_RUN: COST task=${id} kind=interactive measured=false wall_clock_seconds=${wall:-0} (attached session; cost unmeasured, NOT zero)"
+  else
+    slog "STORY_RUN: COST task=${id} kind=${kind} usd=0 measured=true (no devloop session)"
+  fi
 }
 
 escalate() {
   local id="$1" reason="$2" log="$3" rec
-  report_task_cost "$id"
+  # Cost (O2a): the interactive lane has no stream-json tasklog, so report_task_cost
+  # would either find nothing or re-grep a PRIOR attempt's stale log and attribute it
+  # here — a false number, worse than a gap. Record it explicitly as unmeasured.
+  if [ "${INTERACTIVE_SPAWN:-0}" -eq 1 ]; then
+    append_lane_cost "$id" interactive "${INTERACTIVE_WALL_SECS:-0}"
+  else
+    report_task_cost "$id"
+  fi
   # Per-task, per-attempt record. A single shared escalation.json was overwritten
   # by each later escalation: Run #1 escalated tasks 61/64/66 (ledger attempts=2)
   # but only ONE runner record survived, so the escalation history — the evidence
@@ -570,6 +868,15 @@ escalate() {
     slogerr "STORY_RUN: recover: this attempt committed nothing to retry from — fix the task and rerun the runner (the diagnosed-retry flags --revalidate/--restart require a committed attempt)."
   else
     slogerr "STORY_RUN: recover after diagnosing: rerun with --revalidate (re-run the gate ONLY, for an environmental failure) OR --restart 'what to fix' (fresh devloop from THIS commit). A plain rerun re-implements from scratch."
+  fi
+  # Auto-suggest the interactive lane after the 2nd+ escalation of THIS task (count
+  # the per-attempt records this escalate() writes). A SUGGESTION only — never an
+  # auto-switch into a lane that needs a human who may not be present (that is the
+  # operator's call, and --interactive refuses without a TTY).
+  local __esc_count
+  __esc_count="$(ls -1 "$RUN_DIR"/task-"${id}".runner-escalation.*.json 2>/dev/null | grep -c . || true)"
+  if [ "${__esc_count:-0}" -ge 2 ]; then
+    slogerr "STORY_RUN: SUGGEST task=${id} has now escalated ${__esc_count} times — consider re-running with --interactive to drive it attached to your TTY (the Lead asks you in-session instead of escalating), rather than another headless attempt."
   fi
   exit 1
 }
@@ -1031,17 +1338,42 @@ run_gate() {
   slog "STORY_RUN: GATE task=${id} layers=${gate_layers} rc=${gate_rc} elapsed=$(( $(date +%s) - gate_start ))s"
 }
 
+# run_full_gate <logfile> — the AUTHORITATIVE FULL-pipeline run in ONE pass via
+# layer-all.sh, appended to <logfile>; returns its rc. The ONE home of this
+# invocation (DRY F2): the pass/fail authority (ADR-0035 §3) had two callers — the
+# --finish lane and the story-close gate — exactly the shape run_gate exists to
+# collapse. layer-all.sh (NOT the per-layer run_gate) is REQUIRED where a commit
+# follows, because its EXIT trap is the ONLY producer of the Gate-2 verdict the
+# pre-commit hook reads at ${DEVLOOP_TMP}/gate2-verdict. DEVLOOP_FAIL_FAST=0 forces
+# run-all: this runs from the runner's own shell where DEVLOOP_HEADLESS is unset, so
+# without it layer-all.sh would classify the run interactive and fail-fast. Callers
+# capture the rc under set -e via `rc=0; run_full_gate "$log" || rc=$?`, and
+# pre-truncate the log themselves if they want fresh output (finish appends to the
+# task gate log; story-close truncates its own).
+run_full_gate() {
+  local log="$1" rc
+  set +e
+  DEVLOOP_FAIL_FAST=0 ./scripts/layer-all.sh >>"$log" 2>&1
+  rc=$?
+  set -e
+  return "$rc"
+}
+
 # complete_task <id> <baseline-head> [cost_mode] — slug resolution + dt-story
 # complete + manifest bump + cleanup + suppression-visibility note. Factored so
-# the normal completion path and --revalidate share ONE implementation of the
-# closed-set slug derivation and the amend-or-chore commit; the ONLY difference
-# is the commit-range baseline (the devloop's head_before on the normal path, the
-# prior attempt's persisted baseline on --revalidate). cost_mode selects the
-# ledger entry: `devloop` (default) derives cost from the session log via
-# report_task_cost; `gate-only` appends an explicit zero-cost entry (a
-# --revalidate attempt spawned no devloop, so it has no session log to derive
-# from). Reuses continue_slug / slug_file / start_marker / stop_count_file /
-# gatelog as the per-task globals the caller set.
+# every completion path shares ONE implementation of the closed-set slug derivation
+# and the amend-or-chore commit; the differences are the commit-range baseline (the
+# devloop's head_before on the normal, --interactive AND --finish paths; only
+# --revalidate reads the prior attempt's persisted `task-N.head-before` sidecar) and
+# the cost_mode. cost_mode selects
+# the ledger entry (see the invariant at report_task_cost):
+#   devloop (default)     — derive cost from the session log via report_task_cost;
+#   gate-only             — --revalidate: model-free true-zero entry;
+#   finish                — --finish: model-free true-zero entry;
+#   interactive           — --interactive: UNMEASURED entry (usd:null + wall_clock).
+# Callers: the normal completion path, --revalidate, --finish, and --interactive.
+# Reuses continue_slug / slug_file / start_marker / stop_count_file / gatelog as the
+# per-task globals the caller set.
 complete_task() {
   local id="$1" baseline="$2" cost_mode="${3:-devloop}"
   local slug_git_err slug_derive_ok slug_raw slug_candidates slug_count
@@ -1123,18 +1455,16 @@ complete_task() {
   rm -f "$slug_file" "$start_marker" "$stop_count_file"
   slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD) slug=${task_slug:-none} src=${slug_src:-none} cause=${slug_cause:-none}"
 
-  # Cost ledger. A gate-only (--revalidate) attempt spawned no devloop, so
-  # report_task_cost would either find nothing or (wrongly) re-derive the PRIOR
-  # devloop's cost from its leftover session log; instead append an explicit
-  # zero-cost entry. Telemetry only — never routes control flow.
-  if [ "$cost_mode" = "gate-only" ]; then
-    jq -n --argjson task "$id" \
-      '{task:$task, attempts:1, usd:0, output_tokens:0, cache_read_tokens:0, turns:0, api_minutes:0, kind:"revalidate-gate-only"}' \
-      >>"$RUN_DIR/cost-ledger.jsonl" || true
-    slog "STORY_RUN: COST task=${id} kind=revalidate-gate-only usd=0 (no devloop session)"
-  else
-    report_task_cost "$id"
-  fi
+  # Cost ledger. A gate-only (--revalidate), finish, or interactive completion spawned
+  # no devloop session for THIS attempt, so report_task_cost would find nothing or
+  # (wrongly) re-derive a PRIOR attempt's cost from its leftover log; route through
+  # append_lane_cost (per-lane singleton entry) instead. See the ledger invariant.
+  case "$cost_mode" in
+    gate-only)   append_lane_cost "$id" revalidate-gate-only ;;
+    finish)      append_lane_cost "$id" finish ;;
+    interactive) append_lane_cost "$id" interactive "${INTERACTIVE_WALL_SECS:-0}" ;;
+    *)           report_task_cost "$id" ;;
+  esac
 
   # Suppression-visibility monitor: if this task's commit ADDED audit-suppression
   # entries, surface it — a cleared advisory via suppression (vs a real fix) is a
@@ -1147,7 +1477,217 @@ complete_task() {
   fi
 }
 
+# working_tree_status <id> <errfile> <what> — porcelain of the tree EXCLUDING the
+# manifest, routing a git fault to the operator lane (with <what> naming the caller's
+# context in the git-error message, so each site keeps its own diagnostic). Shared by
+# ALL THREE byte-identical sites — --restart's dirty probe, --revalidate's clean-tree
+# attestation, and --finish's post-stage remainder check — collapsed here beside
+# git_head/tree_dirty (C7).
+working_tree_status() {
+  local id="$1" errfile="$2" what="${3:-checking the work tree}" out
+  if ! out="$(git status --porcelain -- . ":(exclude)$STORY_FILE" 2>"$errfile")"; then
+    git_error_lane "$id" "$what" "$errfile"
+  fi
+  __drop_if_empty "$errfile"
+  printf '%s' "$out"
+}
+
+# finish_lane <id> — D6/f model-free finisher. Covers the reviewed-but-UNCOMMITTED
+# case (the terminal-phase crash after Gate-3 close), the INVERSE of
+# --revalidate/--restart (which require a committed prior attempt) — so it does NOT
+# run the NO-COMMIT-EVIDENCE/REFUSED checks; its precondition is the commit-intent
+# the devloop wrote at Gate-3 close. Fail-closed throughout; every refusal a distinct
+# STORY_RUN token that falls back to resume; the index is reset on any post-stage
+# refusal so a failed finish doesn't wedge the next run. Reuses complete_task
+# (slug/complete/amend/ledger) — the gate is layer-all (NEW-1), not run_gate.
+# Uses per-task globals set by the caller (head_before, gatelog, STORY_FILE, RUN_DIR).
+finish_lane() {
+  local id="$1"
+  local intent="$RUN_DIR/task-${id}.commit-intent.json"
+  [ -f "$intent" ] || {
+    slogerr "STORY_RUN: FINISH-NO-INTENT task=${id} — no commit-intent at ${intent}. Gate-3 never closed with an intent (a terminal-phase crash BEFORE the intent was written, or a pre-feature escalation). Rerun WITHOUT --finish to resume."
+    exit 2
+  }
+  if ! jq -e . "$intent" >/dev/null 2>&1; then
+    slogerr "STORY_RUN: FINISH-INTENT-MALFORMED task=${id} — ${intent} is not parseable JSON. Refusing (a malformed intent must not silently commit an empty/partial changeset). Rerun WITHOUT --finish to resume."
+    exit 2
+  fi
+  # Bindings (S-10): story + task + HEAD, else a stale intent could replay onto a
+  # different task or a moved tree. NO expiry check — the bindings ARE the control;
+  # an age check is a strictly weaker second control whose only reachable effect is
+  # a false refusal on a task legitimately picked up weeks later.
+  local i_story i_task i_head i_slug i_msg
+  i_story="$(jq -r '.story // ""' "$intent")"
+  i_task="$(jq -r '.task_id // ""' "$intent")"
+  i_head="$(jq -r '.head // ""' "$intent")"
+  i_slug="$(jq -r '.slug // ""' "$intent")"
+  i_msg="$(jq -r '.message // ""' "$intent")"
+  if [ "$i_story" != "$STORY_FILE" ] || [ "$i_task" != "$id" ] || [ "$i_head" != "$head_before" ]; then
+    slogerr "STORY_RUN: FINISH-STALE-INTENT task=${id} — the intent binds to story='${i_story}' task='${i_task}' head='${i_head}', but this run is story='${STORY_FILE}' task='${id}' head='${head_before}'. A stale intent must not replay onto a moved tree or a different task. Rerun WITHOUT --finish to resume."
+    exit 2
+  fi
+  [ -n "$i_msg" ] || {
+    slogerr "STORY_RUN: FINISH-INTENT-MALFORMED task=${id} — the intent carries no commit message. Refusing. Rerun WITHOUT --finish to resume."
+    exit 2
+  }
+  # Trailer vocabulary (S-9): Approved-Cross-Boundary: is the ADR-0024 §6.7 owner
+  # co-sign record — a well-formed trailer naming an uninvolved specialist is a
+  # governance bypass, not a formatting nit. Refuse any Approved-Cross-Boundary
+  # trailer whose specialist is outside the known set.
+  local bad_trailer
+  bad_trailer="$(printf '%s\n' "$i_msg" | grep -E '^Approved-Cross-Boundary:' \
+    | grep -vE '^Approved-Cross-Boundary: (auth-controller|global-controller|meeting-controller|media-handler|database|protocol|infrastructure|client|security|observability|operations|test|code-reviewer|dry-reviewer|semantic-guard) ' || true)"
+  if [ -n "$bad_trailer" ]; then
+    slogerr "STORY_RUN: FINISH-BAD-TRAILER task=${id} — the commit-intent message carries an Approved-Cross-Boundary: trailer naming an unknown/uninvolved specialist: $(printf '%s' "$bad_trailer" | head -n1). That trailer is the owner co-sign record; refusing to replay it. Rerun WITHOUT --finish to resume."
+    exit 2
+  fi
+  # File list. Read into an array; validate EACH path at parse time (S-7). git's
+  # `--` stops OPTION parsing but NOT pathspec magic, so ':/' / ':(glob)' / '.' each
+  # stage the whole tree and pass a naive check — reject them here, before `git add`.
+  local files=() f had_output_doc=0
+  while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(jq -r '.files[]? // empty' "$intent")
+  [ "${#files[@]}" -gt 0 ] || {
+    slogerr "STORY_RUN: FINISH-INTENT-MALFORMED task=${id} — the intent lists no files. Refusing. Rerun WITHOUT --finish to resume."
+    exit 2
+  }
+  for f in "${files[@]}"; do
+    case "$f" in
+      /*|.|"" ) : "reject" ;;
+      :*) : "reject pathspec magic" ;;
+      *) if [[ "$f" == *".."* ]] || printf '%s' "$f" | grep -qE '[[:cntrl:]]'; then : "reject"; else
+           case "$f" in docs/devloop-outputs/*/main.md) had_output_doc=1 ;; esac
+           continue
+         fi ;;
+    esac
+    slogerr "STORY_RUN: FINISH-UNSAFE-PATH task=${id} — intent file '${f}' is absolute, '.', empty, contains '..', a control char, or a git pathspec-magic prefix (':', ':/', ':(...)') — any of which would stage far more than intended. Refusing. Rerun WITHOUT --finish to resume."
+    exit 2
+  done
+  if [ "$had_output_doc" -ne 1 ]; then
+    slogerr "STORY_RUN: FINISH-NO-SLUG task=${id} — the intent's files include no docs/devloop-outputs/*/main.md, so complete_task cannot derive the output-doc slug. Refusing (an intent that would complete without a slug is malformed). Rerun WITHOUT --finish to resume."
+    exit 2
+  fi
+  RETRY_APPLIED=1
+  # AUTHORITATIVE gate = layer-all.sh (NEW-1), NOT run_gate: the per-layer run_gate
+  # emits no Gate-2 verdict, and the `git commit` below stages a devloop-shaped
+  # changeset (main.md at Phase=complete), which the pre-commit hook requires a
+  # verdict for and blocks fail-closed without. layer-all.sh's EXIT trap produces
+  # the verdict at ${DEVLOOP_TMP}/gate2-verdict, binding it to exactly this tree.
+  # DEVLOOP_FAIL_FAST=0 mirrors the story-close gate (one-pass full report).
+  slog "STORY_RUN: FINISH task=${id} — re-running the authoritative gate (layer-all) with NO model turn (log=${gatelog})"
+  local fin_rc=0 fin_start
+  fin_start="$(date +%s)"
+  run_full_gate "$gatelog" || fin_rc=$?
+  slog "STORY_RUN: FINISH task=${id} gate rc=${fin_rc} elapsed=$(( $(date +%s) - fin_start ))s"
+  if [ "$fin_rc" -ne 0 ]; then
+    tail -n 50 "$gatelog"
+    escalate "$id" "finish-pipeline-red" "$gatelog"
+  fi
+  # RE-DERIVE the index from the intent (security F-1). The SKILL producer stages
+  # (`git add -A`) BEFORE it writes the intent and commits, so a terminal-phase crash
+  # — the exact case --finish exists for — leaves the index STAGED. A pre-stage
+  # "index must be clean" assertion (the old FINISH-INDEX-DIRTY lane) would refuse
+  # that headline scenario. Instead do a MIXED reset (worktree UNTOUCHED — the
+  # reviewed content stays exactly as reviewed) and rebuild the index solely from the
+  # intent's file list below. This satisfies S-8's ACTUAL purpose ("a staged change
+  # the intent doesn't list must not ride into the commit") more strongly: a file the
+  # operator had staged that the intent omits becomes an unstaged working-tree change.
+  #
+  # NO pre-stage index precondition here BY DESIGN (ops): with the reset normalising
+  # the starting index, the POST-STAGE remainder check below is now the SOLE defense
+  # against a pre-staged foreign change (it surfaces as an unstaged remainder → the
+  # FINISH-DIRTY-REMAINDER test is therefore load-bearing). Do NOT re-add an index
+  # precondition, and do NOT read the absence of one as a gap.
+  git reset -q
+  # Stage exactly the intent's files, per-file so a path the intent lists but the
+  # tree no longer has does NOT abort the lane under `set -e` (`git add` errors on an
+  # unmatched pathspec) — a missing file is a MISMATCH, caught by the set-equality
+  # check below, not a crash. `--` mandatory (leading-'-' safety); magic pre-rejected.
+  local __add_f
+  for __add_f in "${files[@]}"; do git add -- "$__add_f" 2>/dev/null || true; done
+  # Set equality on the staged PATH set (S-18): missing OR extra both fail.
+  # Newline-safe WITHOUT -z ONLY because FINISH-UNSAFE-PATH rejects control chars in
+  # files[] (security F-2); if that floor is ever relaxed, switch this AND the --raw
+  # comparison below to -z (and the SKILL's capture) together — do not switch one
+  # side. Note: --name-only quote-escapes non-ASCII (core.quotePath) while files[] are
+  # raw JSON, so a non-ASCII path yields a (fail-closed) FINISH-FILE-MISMATCH, not a
+  # clean refusal — acceptable, and another reason the floor stays strict.
+  local staged_paths expected_paths
+  staged_paths="$(git diff --cached --name-only | sort -u)"
+  expected_paths="$(printf '%s\n' "${files[@]}" | sort -u)"
+  if [ "$staged_paths" != "$expected_paths" ]; then
+    git reset -q
+    slogerr "STORY_RUN: FINISH-FILE-MISMATCH task=${id} — the staged path set does not equal the intent's file list (a file changed/added/removed since Gate-3 close). Refusing rather than committing a set the review didn't approve. Likely cause: an edit after Gate-3. EITHER revert the stray edit and rerun --finish (cheap), OR rerun WITHOUT --finish to resume so the edit is re-reviewed (re-hydrates the transcript). expected=[$(printf '%s' "$expected_paths" | tr '\n' ' ')] staged=[$(printf '%s' "$staged_paths" | tr '\n' ' ')]"
+    exit 2
+  fi
+  # Content/status/mode: the staged raw must equal the intent's captured staged raw.
+  # Distinct token from the path-set mismatch (different repair — ops O-16).
+  local staged_raw intent_raw
+  staged_raw="$(git diff --cached --raw --no-abbrev | sort)"
+  intent_raw="$(jq -r '.raw // ""' "$intent" | sort)"
+  if [ "$staged_raw" != "$intent_raw" ]; then
+    git reset -q
+    slogerr "STORY_RUN: FINISH-CONTENT-MISMATCH task=${id} — the staged content/mode does not match what Gate-3 reviewed (same file set, changed bytes). Refusing. EITHER revert the post-Gate-3 edit and rerun --finish (cheap), OR rerun WITHOUT --finish to resume for re-review (expensive)."
+    exit 2
+  fi
+  # Post-stage remainder (ops, --revalidate parity): layer-all ran over the WORKING
+  # TREE, so a file dirty-but-UNSTAGED outside the intent set was in the green but
+  # won't be in the commit — a green not reproducible from the commit. Refuse before
+  # committing, in the right place with the right message (NEW-1 would otherwise
+  # backstop it with a confusing Gate-2 signature failure).
+  local remainder rem_err="$RUN_DIR/task-${id}.finish-remainder.err"
+  remainder="$(working_tree_status "$id" "$rem_err" "checking for uncommitted work outside the intent before finishing")"
+  # Drop the STAGED-index entries from the remainder; anything left is uncommitted
+  # work outside the intent. The staged class is `XY path` with X in [MADRCT] and a
+  # blank Y (` `) — `T` (typechange: file↔symlink↔gitlink) included (ops F1: omitting
+  # it false-refuses a legitimately-staged typechange). `U` (unmerged) deliberately
+  # EXCLUDED — an unmerged path should refuse. Any `X  path` this drops is NECESSARILY
+  # an intent file, because the path-set equality check above already proved
+  # staged==intent — so this cannot mask a stray staged file (do not "fix" it to match
+  # paths instead of status).
+  local rem_left
+  rem_left="$(printf '%s\n' "$remainder" | grep -vE '^[MADRCT]  ' | grep -v '^$' || true)"
+  if [ -n "$rem_left" ]; then
+    git reset -q
+    slogerr "STORY_RUN: FINISH-DIRTY-REMAINDER task=${id} — the work tree has changes outside the intent's file set (unstaged/untracked), which layer-all validated but this commit would NOT carry — a green not reproducible from the commit (--revalidate's REVALIDATE-DIRTY-TREE reasoning). Commit or clean them, then rerun. Offending: $(printf '%s' "$rem_left" | head -n 5 | tr '\n' ';')"
+    exit 2
+  fi
+  # Commit with the recorded message via -F (S-9: never argv/eval). complete_task
+  # then amends the manifest bump onto it (index-vs-HEAD; only $STORY_FILE staged, so
+  # gate2_is_devloop_mainmd rejects it and the pre-commit hook no-ops — verified).
+  local msg_file="$RUN_DIR/task-${id}.finish-message"
+  printf '%s\n' "$i_msg" >"$msg_file"
+  git commit -q -F "$msg_file"
+  # ACCEPT-PATH receipt (S-20): bounded — counts + verdicts, not per-path enumeration.
+  slog "STORY_RUN: FINISH-VERIFIED task=${id} intent=${intent} head=${head_before} paths=${#files[@]} pathset_ok=true content_ok=true committed=$(git rev-parse --short HEAD 2>/dev/null || echo '<unreadable>')"
+  complete_task "$id" "$head_before" finish
+  slog "STORY_RUN: FINISH task=${id} — committed the reviewed intent with no model turn; task completed."
+}
+
+# build_devloop_prompt <mode> <id> — the ONE home of the /devloop prompt (C5), so
+# the R-2 defect-5 out-of-band discipline (no manifest byte on the command line; the
+# prompt reaches the model only via $prompt_file) lives in one place. The two lanes
+# differ ONLY in the "HEADLESS RUN … Headless Mode" prefix (headless sets it so the
+# Lead escalates instead of asking; interactive omits it so the Lead asks the human)
+# and in the claude flags at the spawn site — NOT in the prompt body. Reads the
+# per-task globals continue_slug / prompt_file / specialist the caller set.
+build_devloop_prompt() {
+  local mode="$1" id="$2" prefix_resume="" prefix_fresh=""
+  if [ "$mode" = headless ]; then
+    prefix_resume="HEADLESS RUN (run-story task #${id}, resumed): follow the devloop skill including its Headless Mode section.\n"
+    prefix_fresh="HEADLESS RUN (run-story task #${id}): follow the devloop skill including its Headless Mode section.\n"
+  fi
+  if [ -n "$continue_slug" ]; then
+    printf '%b/devloop "This devloop was interrupted before completion. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
+      "$prefix_resume" "$continue_slug"
+  else
+    printf '%bThe task description for this devloop is the EXACT, COMPLETE contents of the file %s. Read that file now and treat its full text AS the /devloop prompt argument — do not paraphrase, summarise or truncate it, and do not re-quote it.\n/devloop "See %s — that file'"'"'s exact contents are this devloop'"'"'s task description." --specialist=%s' \
+      "$prefix_fresh" "$prompt_file" "$prompt_file" "$specialist"
+  fi
+}
+
 RETRY_APPLIED=0
+INTERACTIVE_SPAWN=0       # set when --interactive reaches the escalated task; the
+INTERACTIVE_WALL_SECS=0   # spawn site branches on it and records wall-clock for the ledger
 while :; do
   set +e
   task_json="$("$DT_STORY" next "$STORY_FILE")"
@@ -1222,6 +1762,12 @@ while :; do
   # this task has an interrupted devloop to continue instead of a fresh start.
   continue_slug=""
 
+  # Per-iteration reset: --interactive/--finish act on the FIRST-reached escalated
+  # task ONCE (RETRY_APPLIED gate), so INTERACTIVE_SPAWN must NOT leak into the next
+  # task's spawn. Reset here; the retry block re-sets it only for the escalated task.
+  INTERACTIVE_SPAWN=0
+  INTERACTIVE_WALL_SECS=0
+
   # --- OPERATOR-INTERVENTION RETRY (--revalidate / --restart) ------------------
   # A run halts at its FIRST escalation, and `dt-story next` reopens an escalated
   # task on selection (status back to pending, escalation cleared, file
@@ -1240,13 +1786,55 @@ while :; do
   # deliberately: next's reopen dirtied the manifest, which that check would
   # otherwise reject.
   RESTART_FROM_TREE=0
-  if { [ "$REVALIDATE" -eq 1 ] || [ "$RESTART" -eq 1 ]; } && [ "$RETRY_APPLIED" -eq 0 ]; then
+  if { [ "$REVALIDATE" -eq 1 ] || [ "$RESTART" -eq 1 ] || [ "$FINISH" -eq 1 ] || [ "$INTERACTIVE" -eq 1 ]; } && [ "$RETRY_APPLIED" -eq 0 ]; then
     esc_rec="$(latest_escalation_record "$id")"
     if [ -z "$esc_rec" ]; then
-      slogerr "STORY_RUN: NO-ESCALATED-TASK — the task the run reached (task ${id}) has no prior runner-escalation record in ${RUN_DIR}, so there is nothing for --revalidate/--restart to act on. These flags retry a task an EARLIER run escalated; run the runner without them to make forward progress."
+      slogerr "STORY_RUN: NO-ESCALATED-TASK — the task the run reached (task ${id}) has no prior runner-escalation record in ${RUN_DIR}, so there is nothing for --revalidate/--restart/--finish/--interactive to act on. These flags retry a task an EARLIER run escalated; run the runner without them to make forward progress."
       exit 2
     fi
     esc_reason="$(jq -r '.reason // ""' "$esc_rec" 2>/dev/null || true)"
+
+    # --finish: reviewed-but-UNCOMMITTED, its OWN precondition branch (the commit
+    # intent), NOT the committed-attempt evidence checks below. Ends in `continue`
+    # (success) or exits/escalates.
+    if [ "$FINISH" -eq 1 ]; then
+      finish_lane "$id"
+      if [ -n "$STOP_AFTER" ] && [ "$id" = "$STOP_AFTER" ]; then
+        STOP_AFTER_FIRED=1
+        slog "STORY_RUN: STOPPED after task ${id} (--stop-after) — story-close gate NOT run; rerun without the flag to continue"
+        exit 0
+      fi
+      continue
+    fi
+
+    # --interactive: mark the spawn and fall through to the normal fresh/resume path.
+    # The commit-evidence checks below are REVALIDATE/RESTART-only (interactive cares
+    # only about HEAD movement + gate rc, whatever the human did), so they are guarded
+    # to skip for interactive. The spawn site branches on INTERACTIVE_SPAWN.
+    if [ "$INTERACTIVE" -eq 1 ]; then
+      RETRY_APPLIED=1
+      INTERACTIVE_SPAWN=1
+      # `dt-story next` reopened the escalated task, dirtying the manifest. Commit
+      # that reopen so the fresh-start clean-tree check below passes (mirrors
+      # --restart's fresh reopen-commit), then re-read head_before as this attempt's
+      # baseline. Any resume pointer is preserved — if one exists the attached spawn
+      # --continues and the resume path (which tolerates a dirty tree) is taken;
+      # otherwise this leaves only the reopen committed and the tree clean for a fresh
+      # attached start. (Uncommitted prior implementation work with NO resume pointer
+      # still refuses at the clean-tree check — the operator cleans up, as with --restart.)
+      git add "$STORY_FILE"
+      git commit --quiet -m "chore(story): reopen task #${id} for operator --interactive" || true
+      if ! head_before="$(git_head "$giterr")"; then
+        git_error_lane "$id" "reading HEAD after committing the interactive reopen" "$giterr"
+      fi
+      slog "STORY_RUN: INTERACTIVE task=${id} — attaching claude to your TTY (no timeout, Stop hook inert); after you exit, the runner gates/commits/completes or escalates on HEAD movement + gate rc, unchanged."
+    fi
+    # --- REVALIDATE / RESTART body (committed-attempt lanes) --------------------
+    # Guarded so --interactive (which fell through above with INTERACTIVE_SPAWN set)
+    # skips it: interactive needs no committed-prior-attempt evidence — it cares only
+    # about HEAD movement + gate rc after the human exits. --finish already
+    # `continue`d. So only REVALIDATE/RESTART reach this body.
+    if [ "$REVALIDATE" -eq 1 ] || [ "$RESTART" -eq 1 ]; then
     # Establish the prior attempt's baseline (HEAD before its devloop ran) from
     # the sidecar escalate() persists. cur_head is HEAD at loop entry, which — on
     # a committed prior attempt that then escalated (e.g. pipeline-red) — is that
@@ -1276,10 +1864,7 @@ while :; do
     # that must not be destroyed, whatever the commit history says.
     restart_dirty=""
     if [ "$RESTART" -eq 1 ]; then
-      if ! restart_dirty="$(git status --porcelain -- . ":(exclude)$STORY_FILE" 2>"$giterr")"; then
-        git_error_lane "$id" "checking for uncommitted work before restart" "$giterr"
-      fi
-      __drop_if_empty "$giterr"
+      restart_dirty="$(working_tree_status "$id" "$giterr" "checking for uncommitted work before restart")"
       if [ -n "$restart_dirty" ]; then
         RESTART_FROM_TREE=1
       fi
@@ -1319,10 +1904,7 @@ while :; do
       # not reproducible from the commit. Refuse unless the tree is clean apart
       # from the manifest reopen next() just made. Route a git read failure to the
       # operator lane, consistent with tree_dirty's rc>1 handling.
-      if ! reval_status="$(git status --porcelain -- . ":(exclude)$STORY_FILE" 2>"$giterr")"; then
-        git_error_lane "$id" "checking the tree is clean before revalidation" "$giterr"
-      fi
-      __drop_if_empty "$giterr"
+      reval_status="$(working_tree_status "$id" "$giterr" "checking the tree is clean before revalidation")"
       if [ -n "$reval_status" ]; then
         slogerr "STORY_RUN: REVALIDATE-DIRTY-TREE task=${id} — the work tree has uncommitted changes beyond the manifest reopen, so the gate would validate work this completion (which stages only ${STORY_FILE}) will NOT record — a green not reproducible from the commit. Commit or clean the tree, then rerun. Offending: $(printf '%s' "$reval_status" | head -n 5 | tr '\n' ';')"
         exit 2
@@ -1422,6 +2004,7 @@ while :; do
       fi
       # Fall through (no `continue`) to the normal fresh-start devloop path.
     fi
+    fi  # end REVALIDATE/RESTART body (interactive skipped it)
   fi
 
   if [ -s "$slug_file" ]; then
@@ -1461,48 +2044,59 @@ while :; do
   slog "STORY_RUN: START task=${id} specialist=${specialist} resume=${continue_slug:-no} log=${tasklog}"
   touch "$start_marker"
   limit_waits=0
-  while :; do
-    # PROMPT INTERPOLATION (R-2 defect 5). The task prompt used to be spliced
-    # into `/devloop "%s" --specialist=%s`, so a prompt containing a double
-    # quote truncated the instruction and silently changed what the task was
-    # told to do — and an embedded newline split it, and a trailing
-    # `--flag`-shaped suffix read as extra flags. Latent while manifests are
-    # hand-authored; live once /user-story emits them.
-    #
-    # Fixed OUT OF BAND: the prompt is already on disk at $prompt_file, so the
-    # instruction references that PATH and no manifest byte reaches the command
-    # line. (The path itself is constrained by the RUN_DIR character floor
-    # above — otherwise this guarantee would be false for a story filename
-    # containing a quote.)
-    #
-    # NOT escaping: /devloop's arguments are not mechanically parsed (SKILL.md's
-    # frontmatter has no $ARGUMENTS / argument-hint; its `## Arguments` block is
-    # prose a model reads), so "does the reader un-escape \" " has no checkable
-    # answer. NOT lossy normalisation either ("`"`->`'`"): "the task is silently
-    # told something different" is not closed by silently telling the task
-    # something different.
-    #
-    # Residual, stated rather than implied: this trades "does the model
-    # un-escape" for "does the model expand the referenced file verbatim". The
-    # asymmetry is why it is the better trade — truncation is silent and
-    # unrecoverable, the lost text exists nowhere, whereas an expansion-fidelity
-    # failure leaves the complete prompt durably on disk at the path the
-    # instruction names, so the ground truth survives and is auditable.
-    if [ -n "$continue_slug" ]; then
-      task_prompt="$(printf 'HEADLESS RUN (run-story task #%s, resumed): follow the devloop skill including its Headless Mode section.\n/devloop "This devloop was interrupted before completion. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
-          "$id" "$continue_slug")"
-    else
-      task_prompt="$(printf 'HEADLESS RUN (run-story task #%s): follow the devloop skill including its Headless Mode section.\nThe task description for this devloop is the EXACT, COMPLETE contents of the file %s. Read that file now and treat its full text AS the /devloop prompt argument — do not paraphrase, summarise or truncate it, and do not re-quote it.\n/devloop "See %s — that file'"'"'s exact contents are this devloop'"'"'s task description." --specialist=%s' \
-          "$id" "$prompt_file" "$prompt_file" "$specialist")"
+
+  # PROMPT INTERPOLATION (R-2 defect 5) — see build_devloop_prompt: the prompt lives
+  # on disk at $prompt_file and no manifest byte reaches the command line; the path
+  # is constrained by the RUN_DIR character floor above. The two spawn lanes below
+  # share that builder.
+
+  if [ "${INTERACTIVE_SPAWN:-0}" -eq 1 ]; then
+    # --- D6/g attached spawn (branch at ENTRY, code-reviewer: fail-CLOSED). The
+    # canary/session-limit retry machinery below is headless-only recovery — a human
+    # is present here, so this lane STRUCTURALLY never enters it (threading
+    # !INTERACTIVE guards through it would fail OPEN on a future edit).
+    # TTY GATE (S-13/O-9): with the timeout dropped and the Stop hook inert, a spawn
+    # with no controlling terminal would hang forever holding the container, cluster,
+    # and in-flight marker. This premise ("a human is attached") must be CHECKED, not
+    # assumed. Never auto-selected — only this explicit operator flag reaches here.
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+      slogerr "STORY_RUN: INTERACTIVE-NO-TTY task=${id} — --interactive attaches claude to your terminal, but stdin/stdout is not a TTY (nohup, a background job, or 'podman exec' without -t). With the task timeout dropped and the Stop hook inert, that spawn would hang unattended forever. Run it attached (devloop.sh execs with -it), or use --revalidate/--restart."
+      exit 2
     fi
+    interactive_prompt="$(build_devloop_prompt interactive "$id")"
+    slog "STORY_RUN: INTERACTIVE task=${id} — you are driving; /exit or Ctrl-D when done. The runner then gates/commits/completes or escalates on HEAD movement + gate rc."
+    __iw_start="$(date +%s)"
+    set +e
+    # env -u DEVLOOP_HEADLESS (NOT mere omission): an operator who exported it into
+    # the runner's shell must not silently re-arm the Stop hook (which self-gates on
+    # it, devloop-stop-hook.sh:14). No DEVLOOP_START_HEAD → the hook is doubly inert.
+    # No -p (attached, interactive), no timeout, no stream-json redirect. And
+    # --dangerously-skip-permissions is DROPPED (S-15): its ADR-0035 §6 justification
+    # is "no human is present to answer the prompt", false by construction here — a
+    # prompt the operator can answer beats one bypassed. Preflight's container-boundary
+    # gate is unchanged, so this is no bypass.
+    env -u DEVLOOP_HEADLESS claude "$interactive_prompt" --model "$STORY_MODEL"
+    claude_rc=$?
+    set -e
+    INTERACTIVE_WALL_SECS=$(( $(date +%s) - __iw_start ))
+    # Fall straight through to the UNCHANGED post-loop machinery (escalation-file
+    # check, no-commit check, run_gate, complete). claude_rc here is the human's exit,
+    # NOT a substrate fault — the session-error lane below is guarded to skip it.
+  else
+    while :; do
+    task_prompt="$(build_devloop_prompt headless "$id")"
 
     # stream-json + verbose: default text mode prints only the final result at
     # session end, leaving the log empty for the whole run. JSONL events make
     # `tail -f` useful; filter with e.g.
     #   jq -r 'select(.type=="assistant") | .message.content[]? | .text? // empty'
+    # DEVLOOP_COMMIT_INTENT_FILE (D6/f): where the devloop writes its Gate-3-close
+    # commit-intent (env-passed, same precedent as DEVLOOP_START_HEAD); --finish reads
+    # it back. Per-task path under RUN_DIR so it persists with the ledger.
     set +e
     DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
       DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
+      DEVLOOP_COMMIT_INTENT_FILE="$RUN_DIR/task-${id}.commit-intent.json" \
       timeout "$TASK_TIMEOUT" claude -p "$task_prompt" \
       --model "$STORY_MODEL" \
       --output-format stream-json --verbose \
@@ -1577,7 +2171,8 @@ while :; do
       esac
     fi
     break
-  done
+    done
+  fi  # end interactive-vs-headless spawn branch
 
   # Persist the resume pointer on any uncommitted exit, so a later runner
   # invocation (after human intervention) resumes via --continue instead of
@@ -1596,22 +2191,37 @@ while :; do
   # an infra escalation, not a task verdict") — the code contradicted it. A
   # wedged 4h headless session is a substrate condition and TASK_TIMEOUT is
   # operator-configured.
-  if [ "$claude_rc" -eq 124 ]; then
-    record_infra_incident "$id" devloop-timeout \
-      "headless devloop exceeded STORY_TASK_TIMEOUT=${TASK_TIMEOUT}s" "$tasklog"
-    slogerr "STORY_RUN: TIMEOUT task=${id} — the headless devloop exceeded STORY_TASK_TIMEOUT=${TASK_TIMEOUT}s. Manifest untouched; rerun to resume via --continue, or raise STORY_TASK_TIMEOUT. Log: ${tasklog}"
-    exit 2
+  # The three claude_rc-driven lanes (timeout / session-limit-exhausted /
+  # session-error) are HEADLESS recovery — they exist because no human can react to
+  # a wedge, quota, or crash. The interactive lane STRUCTURALLY skipped the canary
+  # loop, has no `timeout` wrapper, and its claude_rc is the HUMAN'S exit (Ctrl-D=0,
+  # Ctrl-C=130), not a substrate fault — so O-10/S-14: for interactive, only HEAD
+  # movement + gate rc are authority. Skip all three; a non-zero human exit is noted
+  # (evidence, not a session-error) and falls through to the no-commit/gate machinery.
+  if [ "${INTERACTIVE_SPAWN:-0}" -ne 1 ]; then
+    if [ "$claude_rc" -eq 124 ]; then
+      record_infra_incident "$id" devloop-timeout \
+        "headless devloop exceeded STORY_TASK_TIMEOUT=${TASK_TIMEOUT}s" "$tasklog"
+      slogerr "STORY_RUN: TIMEOUT task=${id} — the headless devloop exceeded STORY_TASK_TIMEOUT=${TASK_TIMEOUT}s. Manifest untouched; rerun to resume via --continue, or raise STORY_TASK_TIMEOUT. Log: ${tasklog}"
+      exit 2
+    fi
+    # Retry exhaustion on a POSITIVELY-classified quota outage is infra, not a task
+    # verdict. Without this the classify inversion above would convert MORE
+    # outages into recorded implementer bugs, so the two must stay together.
+    if [ "$claude_rc" -ne 0 ] && [ "${canary_class:-}" = "session-limit" ]; then
+      record_infra_incident "$id" session-limit-exhausted \
+        "quota window outlasted STORY_SESSION_LIMIT_RETRIES=${SESSION_LIMIT_RETRIES} retries" "$tasklog"
+      slogerr "STORY_RUN: SESSION-LIMIT-EXHAUSTED task=${id} — the quota window outlasted ${SESSION_LIMIT_RETRIES} retry wait(s). This is an environment condition, NOT a task failure: manifest untouched, resume pointer persisted. Rerun after the window resets. Log: ${tasklog}"
+      exit 2
+    fi
+    [ "$claude_rc" -ne 0 ] && escalate "$id" devloop-session-error "$tasklog"
+  elif [ "$claude_rc" -ne 0 ]; then
+    # Interactive: record the human's non-zero exit as EVIDENCE (a session that never
+    # started — bad flag, expired creds — exits non-zero with HEAD unmoved and lands
+    # in devloop-no-commit below, whose record would otherwise say "made no commit"
+    # when the truth is "never started"). Not itself an escalation.
+    slog "STORY_RUN: INTERACTIVE task=${id} — attached claude exited rc=${claude_rc} (recorded; HEAD movement + gate rc decide the outcome, not this rc)."
   fi
-  # Retry exhaustion on a POSITIVELY-classified quota outage is infra, not a task
-  # verdict. Without this the classify inversion above would convert MORE
-  # outages into recorded implementer bugs, so the two must stay together.
-  if [ "$claude_rc" -ne 0 ] && [ "${canary_class:-}" = "session-limit" ]; then
-    record_infra_incident "$id" session-limit-exhausted \
-      "quota window outlasted STORY_SESSION_LIMIT_RETRIES=${SESSION_LIMIT_RETRIES} retries" "$tasklog"
-    slogerr "STORY_RUN: SESSION-LIMIT-EXHAUSTED task=${id} — the quota window outlasted ${SESSION_LIMIT_RETRIES} retry wait(s). This is an environment condition, NOT a task failure: manifest untouched, resume pointer persisted. Rerun after the window resets. Log: ${tasklog}"
-    exit 2
-  fi
-  [ "$claude_rc" -ne 0 ] && escalate "$id" devloop-session-error "$tasklog"
   if ! head_after="$(git_head "$giterr")"; then
     git_error_lane "$id" "reading HEAD after the devloop finished" "$giterr"
   fi
@@ -1666,8 +2276,14 @@ while :; do
   # Slug resolution + dt-story complete + manifest bump + suppression note,
   # factored into complete_task (shared with --revalidate). The devloop's own
   # head_before is the commit-range baseline on this path; cost is derived from
-  # the session log.
-  complete_task "$id" "$head_before"
+  # the session log. On the interactive lane there is no session log, so pass the
+  # `interactive` cost_mode: complete_task records an UNMEASURED (usd:null) entry via
+  # append_lane_cost instead of report_task_cost re-grepping a stale/absent log (O2a).
+  if [ "${INTERACTIVE_SPAWN:-0}" -eq 1 ]; then
+    complete_task "$id" "$head_before" interactive
+  else
+    complete_task "$id" "$head_before"
+  fi
 
   if [ -n "$STOP_AFTER" ] && [ "$id" = "$STOP_AFTER" ]; then
     STOP_AFTER_FIRED=1
@@ -1693,18 +2309,15 @@ fi
 closelog="$RUN_DIR/story-close.gate.log"
 slog "STORY_RUN: STORY-CLOSE GATE running — full layer-all.sh incl. layer 7 (log=${closelog})"
 close_start="$(date +%s)"
-set +e
-# S3: force RUN-ALL on the story-close authority gate. This runs from the runner's OWN shell
-# where DEVLOOP_HEADLESS is unset (line ~1041 sets it only as a per-command prefix on the
-# `claude` invocation), so without a signal layer-all.sh would classify this unattended gate as
-# interactive and FAIL-FAST it — losing the one-pass full report ADR-0035's authority gate needs.
-# DEVLOOP_FAIL_FAST=0 (not DEVLOOP_HEADLESS=1): Model B already refuses an ambient =1 under
-# headless, but an inline =0 is defense-in-depth (independent of the helper's precedence table)
-# AND overrides an ambient DEVLOOP_FAIL_FAST=1 a developer may have exported into the runner's
-# env (a DEVLOOP_HEADLESS=1 prefix would leave that ambient =1 present). See devloop main.md S3.
-DEVLOOP_FAIL_FAST=0 ./scripts/layer-all.sh >"$closelog" 2>&1
-rc=$?
-set -e
+# The authoritative full-pipeline run + its DEVLOOP_FAIL_FAST=0 rationale live in
+# run_full_gate (DRY F2 — one home for the two callers). Truncate our own log first
+# (run_full_gate appends), preserving this gate's fresh-log-per-close behaviour.
+# (S3 context retained: this runs from the runner's own shell where DEVLOOP_HEADLESS
+# is unset, so run_full_gate's inline DEVLOOP_FAIL_FAST=0 is what forces RUN-ALL and
+# also overrides an ambient =1 a developer may have exported — see devloop main.md S3.)
+: >"$closelog"
+rc=0
+run_full_gate "$closelog" || rc=$?
 slog "STORY_RUN: STORY-CLOSE GATE rc=${rc} elapsed=$(( $(date +%s) - close_start ))s"
 if [ "$rc" -ne 0 ]; then
   tail -n 50 "$closelog"
@@ -1712,12 +2325,57 @@ if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
 
-# Story-level cost rollup (last ledger entry per task — later entries for a
-# resumed task are supersets of earlier partials).
+# Story-level cost rollup, honoring the LEDGER INVARIANT (see report_task_cost):
+# per task, take the LAST devloop-kind entry (cumulative superset of that task's
+# attempts) PLUS any per-lane singleton entries (finish/gate-only add nothing to
+# usd; interactive is UNMEASURED). A lane entry NEVER supersedes a devloop entry —
+# the old `map(last)` let a zero/placeholder lane entry appended at completion erase
+# a task's real devloop cost (measured: an escalated-then-revalidated task reported
+# $0 for the escalated attempt). `usd` is null on unmeasured entries; jq `add` folds
+# null to identity, and unmeasured tasks are counted separately so a headline total
+# never silently excludes them. WINDOW: all attempts for THIS story, all container
+# generations (the tasklog persists under the flat story-keyed dir) — stated on the
+# line so the number and its label agree.
 if [ -f "$RUN_DIR/cost-ledger.jsonl" ]; then
-  jq -s -r 'group_by(.task) | map(last)
-    | "STORY_RUN: STORY-COST tasks=\(length) usd=\(map(.usd) | add * 100 | round / 100) output_tokens=\(map(.output_tokens) | add) api_minutes=\(map(.api_minutes) | add)"' \
-    "$RUN_DIR/cost-ledger.jsonl" 2>/dev/null || true
+  # FAIL LOUD, never silent (obs F2): every path prints exactly one STORY_RUN:
+  # STORY-COST* line, so "no line" stays diagnosable as a bug rather than a legal
+  # outcome. The old `2>/dev/null || true` swallowed two reachable inputs — an EMPTY
+  # ledger (`[] | add` -> null, then `* 100` errors) and ONE truncated JSONL line from
+  # a killed mid-write (parse error) — and under D5's persistent ledger one bad line
+  # would permanently kill the rollup silently. Guard empty in bash AND emit inside jq
+  # for the all-blank case; capture the rc and emit STORY-COST-UNAVAILABLE on failure.
+  if [ ! -s "$RUN_DIR/cost-ledger.jsonl" ]; then
+    slogerr "STORY_RUN: STORY-COST-UNAVAILABLE reason=empty-ledger — the cost ledger exists but is empty; no per-task cost was recorded (every task hit COST-UNAVAILABLE, or the ledger was truncated to zero)."
+  else
+    __story_cost="$(jq -s -r '
+      def num(x): (x // 0);
+      if length == 0 then "STORY_RUN: STORY-COST-UNAVAILABLE reason=empty-ledger" else
+      ( group_by(.task)
+        | map({
+            task: .[0].task,
+            devloop: ( [ .[] | select((.kind // "devloop") == "devloop") ] | last ),
+            unmeasured: ( [ .[] | select(.measured == false) ] | length )
+          })
+        | { usd: ( map(.devloop | num(.usd)) | add * 100 | round / 100 ),
+            output_tokens: ( map(.devloop | num(.output_tokens)) | add ),
+            api_minutes: ( map(.devloop | num(.api_minutes)) | add ),
+            tasks: length,
+            unmeasured_tasks: ( map(select(.unmeasured > 0)) | length ) }
+        | "STORY_RUN: STORY-COST window=this-story-all-generations tasks=\(.tasks) usd=\(.usd) output_tokens=\(.output_tokens) api_minutes=\(.api_minutes) unmeasured_tasks=\(.unmeasured_tasks)" )
+      end' "$RUN_DIR/cost-ledger.jsonl" 2>/dev/null)"
+    if [ -n "$__story_cost" ]; then
+      slog "$__story_cost"
+    else
+      slogerr "STORY_RUN: STORY-COST-UNAVAILABLE reason=rollup-failed — jq could not aggregate ${RUN_DIR}/cost-ledger.jsonl (a malformed/truncated JSONL line from a killed mid-write is the likely cause); the story total is unavailable. The per-task STORY_RUN: COST lines above remain the record."
+    fi
+  fi
+  # Read-only size measurement (Lead item B / D5 measurability): the run dir's size
+  # and the largest per-task session log's bytes. No threshold, no deletion — pure
+  # measurement, so story 2's data can right-size the deferred retention default.
+  __rd_size="$(du -sh "$RUN_DIR" 2>/dev/null | cut -f1 || true)"
+  __biggest_log="$(ls -S "$RUN_DIR"/task-*.devloop.log 2>/dev/null | head -n1 || true)"
+  __biggest_bytes="$( [ -n "$__biggest_log" ] && wc -c <"$__biggest_log" 2>/dev/null || echo 0)"
+  slog "STORY_RUN: RUN-DIR-SIZE dir=${RUN_DIR} total=${__rd_size:-unknown} largest_task_log_bytes=${__biggest_bytes:-0}"
 fi
 
 slog "STORY_RUN: ALL TASKS COMPLETE — story-close gate green. Next step: /close-story"

@@ -388,6 +388,13 @@ for a in "$@"; do
   esac
 done
 case " $* " in *" --version "*) mode=version ;; esac
+# Interactive (--interactive) attaches with NO -p and NO --output-format, so it
+# matches neither version (--version) nor devloop/canary (--output-format). Detect
+# it as the argv that carries neither flag.
+case " $* " in
+  *" --version "*|*" --output-format "*) : ;;
+  *) mode=interactive ;;
+esac
 
 case "$mode" in
   version)
@@ -457,9 +464,40 @@ case "$mode" in
       git add docs/devloop-outputs >/dev/null 2>&1 || true
       git commit --quiet -m "fixture task work ${n}" >/dev/null 2>&1
     fi
+    # FAKE_DEVLOOP_STAGE=1: STAGE the changeset but do NOT commit — reproduces the
+    # SKILL producer's real post-Gate-3-crash state (Step 1 `git add -A`, Step 2 write
+    # intent, crash before Step 3 commit). Used with FAKE_DEVLOOP_COMMIT=0 so HEAD
+    # stays put (→ devloop-no-commit escalation) but the index is STAGED — the state
+    # --finish's reset-and-rederive fix (security F-1) exists to handle, which every
+    # reset-first fixture otherwise hides.
+    [ "${FAKE_DEVLOOP_STAGE:-0}" = "1" ] && git add -A >/dev/null 2>&1 || true
     # Simulate a TRANSIENT git failure at the point the runner reads HEAD back.
     [ "${FAKE_BREAK_GIT_HEAD:-0}" = "1" ] && printf 'ref: refs/heads/nonexistent-branch\n' > .git/HEAD
     exit "$rc" ;;
+  interactive)
+    # D6/g attached spawn. Records its OWN marker (positive control that the
+    # interactive arm ran), and PROVES the attached-spawn contract: NO -p, NO
+    # stream-json, and DEVLOOP_HEADLESS unset (env -u) — a leak of any of these is a
+    # finding, so record the negative facts.
+    : >> "${M}/ran.claude.interactive"
+    case " $* " in *" -p "*) : >> "${M}/interactive.saw.-p" ;; esac
+    case " $* " in *" stream-json "*|*" --output-format "*) : >> "${M}/interactive.saw.output-format" ;; esac
+    [ -n "${DEVLOOP_HEADLESS:-}" ] && : >> "${M}/interactive.saw.headless"
+    case " $* " in *" --dangerously-skip-permissions "*) : >> "${M}/interactive.saw.skip-perms" ;; esac
+    # Optional output-doc + commit, symmetric with FAKE_DEVLOOP_* — models a human who
+    # resolved the task (commit → runner gates+completes) vs exited without (no commit
+    # → runner escalates devloop-no-commit through its UNCHANGED machinery).
+    [ "${FAKE_INTERACTIVE_MKOUT:-0}" = "1" ] && {
+      MKOUT_NAME="${FAKE_INTERACTIVE_MKOUT_NAME:-2026-08-13-interactive-devloop}"
+      mkdir -p "docs/devloop-outputs/${MKOUT_NAME}"
+      printf '# fixture interactive devloop\n' > "docs/devloop-outputs/${MKOUT_NAME}/main.md"
+      touch -d 'now + 1 minute' "docs/devloop-outputs/${MKOUT_NAME}"; }
+    if [ "${FAKE_INTERACTIVE_COMMIT:-0}" = "1" ]; then
+      printf 'interactive work\n' >> work.txt
+      git add work.txt docs/devloop-outputs >/dev/null 2>&1 || true
+      git commit --quiet -m "fixture interactive work" >/dev/null 2>&1
+    fi
+    exit "${FAKE_INTERACTIVE_RC:-0}" ;;
 esac
 STUB
 chmod +x "${STUB_BIN}/claude"
@@ -649,6 +687,39 @@ run_story() {
   # STORY_REPO_ROOT / DT_STORY / DEVLOOP_TMP are defaults here; a case can
   # override any of them by passing the same KEY=VAL later in env_kv (later
   # assignments win in `env`), which is how the containment cases work.
+  #
+  # PTY mode (PTY=1): run the invocation under a real pseudo-terminal via
+  # `script -qec` so run-story's TTY gate ([ -t 0 ] && [ -t 1 ]) PASSES — the ONLY
+  # way to reach the --interactive attached-spawn fall-through hermetically, WITHOUT a
+  # TTY-bypass seam (security's ruling; tests the gate PASSING, which a bypass can't).
+  # REJECTED ALTERNATIVE, named so it isn't reinvented: a DEVLOOP_TEST-gated TTY-bypass
+  # seam (an override that skips the `[ -t 0 ] && [ -t 1 ]` check under the sentinel).
+  # Do NOT "simplify" to that — it relaxes a safety gate in the runner, needs a third
+  # seam + enrollment + CI-rejection, and can only ever test the code AFTER the gate,
+  # never the gate itself. The PTY needs no seam and exercises the gate for real.
+  # `script` (util-linux, Linux-only — container + CI) allocates the pty, merges
+  # stdout/stderr, injects a trailing CR per line (stripped), and propagates the
+  # child rc exactly. Fail LOUD if `script` is unavailable — never a silent skip.
+  if [ -n "${PTY:-}" ]; then
+    command -v script >/dev/null 2>&1 || { printf 'run-story.test.sh: PRECONDITION — `script` (util-linux) not found; PTY-mode interactive tests cannot run and MUST NOT be silently skipped. Install util-linux (Linux-only harness).\n' >&2; exit 2; }
+    # Build the env-i invocation as one string for `sh -c` under the pty, %q-quoted so
+    # paths/values survive intact. env_kv entries are already KEY=VAL literals.
+    local __pcmd __kv
+    __pcmd="env -i PATH=$(printf %q "${STUB_BIN}:${PATH}") HOME=$(printf %q "$FIXHOME")"
+    __pcmd+=" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null"
+    __pcmd+=" DEVLOOP_TEST_MARKERS=$(printf %q "$MARK") DEVLOOP_TEST=1"
+    __pcmd+=" STORY_REPO_ROOT=$(printf %q "$FIX") DT_STORY=$(printf %q "$REAL_DT_STORY")"
+    __pcmd+=" DEVLOOP_TMP=$(printf %q "$DT") STORY_SESSION_LIMIT_RETRIES=0"
+    for __kv in "${env_kv[@]}"; do __pcmd+=" $(printf %q "$__kv")"; done
+    __pcmd+=" bash $(printf %q "$RUN_STORY")"
+    for a in "${args[@]}"; do __pcmd+=" $(printf %q "$a")"; done
+    script -qec "$__pcmd" /dev/null >"$OUT" 2>&1
+    RC=$?
+    tr -d '\r' <"$OUT" >"${OUT}.stripped" && mv "${OUT}.stripped" "$OUT"
+    : >"$ERR"   # merged into $OUT under a pty; keep ERR a valid (empty) path
+    OUTPUT="$(cat "$OUT" 2>/dev/null)"
+    return 0
+  fi
   env -i \
     PATH="${STUB_BIN}:${PATH}" \
     HOME="$FIXHOME" \
@@ -1724,5 +1795,593 @@ if [ "$n16_devloop_count" = "1" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[n16-oneshot-devloop-count-exact] expected exactly 1 devloop (task 2 only), got '${n16_devloop_count}'"); fi
 if [ "$(manifest_status "$FIX" 1)" = "completed" ] && [ "$(manifest_status "$FIX" 2)" = "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[n16-oneshot-both-completed] expected both tasks completed, got '$(manifest_status "$FIX" 1)' + '$(manifest_status "$FIX" 2)'"); fi
+
+# =============================================================================
+# (O) D5 BASE RESOLUTION + D6 --finish / --interactive LANES (ADR-0037)
+# =============================================================================
+# N16 swapped TEMPLATE to a two-task fixture and did not restore it; restore the
+# single-task default so the O cases below start from a clean single-task story.
+mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" "$DEFAULT_TASKS"
+git -C "$TEMPLATE" commit --quiet -am "restore single-task fixture for O section" >/dev/null
+
+# _finish_seed <mkout> <files-json> [msg] [raw-override] — shared --finish setup:
+# after a task has escalated with an uncommitted output doc, capture the staged raw of
+# that doc and write a commit-intent (story/task/head/slug/message/files/raw) to the
+# run dir, leaving FSEED_DOC/FSEED_HEAD/FSEED_RAW set. Defined here so every O case
+# below can use it. Each fail-closed --finish refusal MUST have a test — an untested
+# `exit 2` guard can silently invert to fail-open and the suite stays green.
+_finish_seed() {
+  local mk="$1" files="$2" raw_over="${4:-}" msg
+  msg="${3:-fixture finish
+Devloop: ${mk}}"
+  FSEED_DOC="docs/devloop-outputs/${mk}/main.md"
+  FSEED_HEAD="$(git -C "$FIX" rev-parse HEAD)"
+  git -C "$FIX" add -- "$FSEED_DOC" >/dev/null 2>&1
+  FSEED_RAW="$(git -C "$FIX" diff --cached --raw --no-abbrev)"
+  git -C "$FIX" reset -q >/dev/null 2>&1
+  local raw="${raw_over:-$FSEED_RAW}"
+  jq -n --arg story "docs/user-stories/2026-08-13-fixture.md" --argjson task 1 \
+        --arg head "$FSEED_HEAD" --arg slug "$mk" --arg msg "$msg" \
+        --argjson files "$files" --arg raw "$raw" \
+    '{story:$story, task_id:$task, head:$head, slug:$slug, message:$msg, files:$files, raw:$raw}' \
+    > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+}
+
+# O1: resolve_run_base unit — the SOLE mechanical assertion of D5's production
+# default branch, which a FULL run cannot reach (DEVLOOP_TEST requires DEVLOOP_TMP
+# set, so the else-branch never executes under the seam). Extract the REAL function
+# from run-story.sh (not a copy) and exercise its three precedence branches directly
+# with the env controlled; assert the EXACT composed string (never `-n`), HOME pinned.
+o1_fn="$(sed -n '/^resolve_run_base() {/,/^}/p' "$RUN_STORY")"
+if [ -z "$o1_fn" ]; then
+  FAIL=$((FAIL+1)); FAILURES+=("[o1-extract] could not extract resolve_run_base() from run-story.sh — the definition moved or changed shape")
+else
+  o1_call() { ( slogerr() { printf '%s\n' "$*" >&2; }; eval "$o1_fn"; resolve_run_base "$1" ); }
+  # (1) DEVLOOP_TMP dominates (both other inputs ignored)
+  o1v="$(DEVLOOP_TMP=/seam DEVLOOP_STORY_RUN_BASE=/carrier HOME=/h o1_call run-dir)"
+  assert_status "o1-tmp-dominates" "/seam/story-runner" "$o1v"
+  if [ "$o1v" = "/seam/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-tmp-dominates-exact] got '$o1v'"); fi
+  # (2) carrier wins over HOME when DEVLOOP_TMP unset
+  o1v="$(DEVLOOP_STORY_RUN_BASE=/carrier HOME=/h o1_call run-dir)"
+  if [ "$o1v" = "/carrier/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-carrier-over-home] expected /carrier/story-runner got '$o1v'"); fi
+  # (3) HOME default when both unset — HOME PINNED (mech #5)
+  o1v="$(HOME=/home/dev o1_call run-dir)"
+  if [ "$o1v" = "/home/dev/.cache/devloop/story-runs/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-home-default] expected /home/dev/.cache/devloop/story-runs/story-runner got '$o1v'"); fi
+  # marker base stays DEVLOOP_TMP-based and does NOT collapse into the run-dir base
+  o1m="$(HOME=/home/dev o1_call marker)"
+  if [ "$o1m" = "/tmp/devloop/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-marker-default] expected /tmp/devloop/story-runner got '$o1m'"); fi
+  o1m="$(DEVLOOP_TMP=/seam o1_call marker)"
+  if [ "$o1m" = "/seam/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-marker-tmp] expected /seam/story-runner got '$o1m'"); fi
+fi
+
+# O2: the single unconditional startup RUN-DIR emission — RUN_DIR_OF must AGREE with
+# what the runner actually resolved (the SSoT pin: drift between the runner's
+# resolution and the harness's RUN_DIR_OF goes red here). STORY_RUN: vocabulary, and
+# source=DEVLOOP_TMP under the seam.
+run_story -- fixture --stop-after=1
+assert_exit   "o2-emit-exit0" 0 "$RC"
+assert_status "o2-emit-line" "STORY_RUN: RUN-DIR $(RUN_DIR_OF "$DT") source=DEVLOOP_TMP" "$OUTPUT"
+assert_absent "o2-emit-not-status-vote" "STATUS=" "$OUTPUT"
+
+# O3: RUN-DIR-UNWRITABLE — a read-only base fails loud, names the path, never /tmp.
+# DEVLOOP_TMP points at an EXISTING dir (so the seam's cd/pwd + containment checks
+# pass) that is read-only, so the runner's own `mkdir -p "$RUN_DIR"` (a story-runner
+# subdir under it) is what fails — the RUN-DIR-UNWRITABLE lane, not a seam refusal.
+o3_ro="$(mktemp -d "${WORK}/o3ro.XXXXXX")"; chmod 0500 "$o3_ro"
+run_story DEVLOOP_TMP="$o3_ro" -- fixture
+assert_exit      "o3-unwritable-exit2" 2 "$RC"
+assert_status    "o3-unwritable-token" "RUN-DIR-UNWRITABLE" "$OUTPUT"
+assert_absent    "o3-unwritable-no-tmp-fallback" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_no_marker "o3-unwritable-no-devloop" "$MARK" 'ran.claude.devloop'
+chmod 0700 "$o3_ro" 2>/dev/null || true
+
+# O4: flag discipline — duplicate + mutual exclusion for the new flags.
+run_story -- fixture --finish --finish
+assert_exit   "o4-finish-dup-exit2" 2 "$RC"
+assert_status "o4-finish-dup-token" "DUPLICATE-FLAG" "$OUTPUT"
+run_story -- fixture --interactive --interactive
+assert_exit   "o4-interactive-dup-exit2" 2 "$RC"
+assert_status "o4-interactive-dup-token" "DUPLICATE-FLAG" "$OUTPUT"
+run_story -- fixture --finish --interactive
+assert_exit   "o4-finish-interactive-exit2" 2 "$RC"
+assert_status "o4-finish-interactive-token" "MULTIPLE-RETRY-FLAGS" "$OUTPUT"
+run_story -- fixture --revalidate --finish
+assert_exit   "o4-revalidate-finish-exit2" 2 "$RC"
+assert_status "o4-revalidate-finish-token" "MULTIPLE-RETRY-FLAGS" "$OUTPUT"
+# The specific revalidate+restart message is preserved (checked before the generic).
+run_story -- fixture --revalidate --restart 'x'
+assert_status "o4-revalidate-restart-specific" "REVALIDATE-WITH-RESTART" "$OUTPUT"
+
+# O5: --finish refusals that need no committed prior attempt.
+run_story -- fixture --finish
+assert_exit   "o5-finish-no-escalation-exit2" 2 "$RC"
+assert_status "o5-finish-no-escalation-token" "NO-ESCALATED-TASK" "$OUTPUT"
+assert_no_marker "o5-finish-no-escalation-no-gate" "$MARK" 'ran.layer-all'
+# Escalate a task with no commit, then --finish with NO intent file present.
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "o5-setup-nocommit-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o5-finish-no-intent-exit2" 2 "$RC"
+assert_status "o5-finish-no-intent-token" "FINISH-NO-INTENT" "$OUTPUT"
+assert_no_marker "o5-finish-no-intent-no-gate" "$MARK" 'ran.layer-all'
+# Malformed intent → distinct token, NOT collapsing into no-intent / file-mismatch.
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "o5-setup-malformed-exit1" 1 "$RC"
+printf 'not json {' > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+REUSE_FIXTURE=1 run_story -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o5-finish-malformed-exit2" 2 "$RC"
+assert_status "o5-finish-malformed-token" "FINISH-INTENT-MALFORMED" "$OUTPUT"
+
+# O6: --finish GREEN — replay a reviewed-but-uncommitted task with NO model turn.
+# Setup: a devloop that creates its output doc but commits nothing → devloop-no-commit
+# escalation, leaving the uncommitted output doc in the tree.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-finish-devloop -- fixture
+assert_exit "o6-setup-escalated-exit1" 1 "$RC"
+o6_doc="docs/devloop-outputs/2026-08-17-finish-devloop/main.md"
+o6_head="$(git -C "$FIX" rev-parse HEAD)"
+o6_story="docs/user-stories/2026-08-13-fixture.md"
+# Capture the exact staged raw the runner will compare against (like-for-like).
+git -C "$FIX" add -- "$o6_doc" >/dev/null 2>&1
+o6_raw="$(git -C "$FIX" diff --cached --raw --no-abbrev)"
+git -C "$FIX" reset -q >/dev/null 2>&1
+# Seed the commit-intent the devloop would have written at Gate-3 close.
+jq -n --arg story "$o6_story" --argjson task 1 --arg head "$o6_head" \
+      --arg slug "2026-08-17-finish-devloop" \
+      --arg msg "fixture finish: task #1 complete
+Devloop: 2026-08-17-finish-devloop" \
+      --arg doc "$o6_doc" --arg raw "$o6_raw" \
+  '{story:$story, task_id:$task, head:$head, slug:$slug, message:$msg, files:[$doc], raw:$raw}' \
+  > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit      "o6-finish-green-exit0" 0 "$RC"
+assert_status    "o6-finish-verified" "FINISH-VERIFIED task=1" "$OUTPUT"
+assert_status    "o6-finish-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_marker    "o6-finish-gate-ran" "$MARK" 'ran.layer-all'
+# NO model turn: no devloop session on the --finish invocation (positive control:
+# the gate DID run, above, so this is not vacuous).
+assert_no_marker "o6-finish-no-devloop" "$MARK" 'ran.claude.devloop'
+if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o6-finish-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
+o6_ledger="$(RUN_DIR_OF "$DT")/cost-ledger.jsonl"
+assert_status "o6-finish-ledger-kind" '"kind":"finish"' "$(cat "$o6_ledger" 2>/dev/null || echo MISSING)"
+
+# O7: --finish FILE-MISMATCH set-equality is BIDIRECTIONAL — both directions tested
+# (obs F3 / ops F2 / test F8; a one-directional/containment "simplification" would
+# pass one and silently permit the other). O7a = MISSING side (intent lists a path
+# never staged); O7b = EXTRA side (staging an intent entry brings in files the intent
+# doesn't enumerate — reachable because the path validator rejects magic/absolute/`..`
+# but NOT a directory, so `git add -- src/` stages the subtree).
+#
+# O7a — missing side: intent expects a file that isn't present.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-fmiss-devloop -- fixture
+assert_exit "o7a-setup-escalated-exit1" 1 "$RC"
+_finish_seed 2026-08-17-fmiss-devloop '["docs/devloop-outputs/2026-08-17-fmiss-devloop/main.md", "src/never-created.txt"]'
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit      "o7a-missing-mismatch-exit2" 2 "$RC"
+assert_status    "o7a-missing-mismatch-token" "FINISH-FILE-MISMATCH" "$OUTPUT"
+if [ "$(manifest_status "$FIX" 1)" != "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o7a-missing-not-completed] a missing-side --finish marked task 1 completed"); fi
+#
+# O7b — extra side: intent lists a DIRECTORY; staging it pulls in files the intent's
+# set (which contains the directory literal, not the members) does not equal.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-fextra-devloop -- fixture
+assert_exit "o7b-setup-escalated-exit1" 1 "$RC"
+mkdir -p "${FIX}/src"
+printf 'a\n' > "${FIX}/src/a.txt"; printf 'b\n' > "${FIX}/src/b.txt"
+o7b_head="$(git -C "$FIX" rev-parse HEAD)"
+jq -n --arg story "docs/user-stories/2026-08-13-fixture.md" --argjson task 1 --arg head "$o7b_head" \
+      --arg slug "2026-08-17-fextra-devloop" --arg msg "fixture extra
+Devloop: 2026-08-17-fextra-devloop" \
+  '{story:$story, task_id:$task, head:$head, slug:$slug, message:$msg,
+    files:["docs/devloop-outputs/2026-08-17-fextra-devloop/main.md", "src/"], raw:""}' \
+  > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit      "o7b-extra-mismatch-exit2" 2 "$RC"
+assert_status    "o7b-extra-mismatch-token" "FINISH-FILE-MISMATCH" "$OUTPUT"
+if [ "$(manifest_status "$FIX" 1)" != "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o7b-extra-not-completed] an extra-side --finish marked task 1 completed"); fi
+
+# O8: --finish STALE-INTENT — HEAD recorded in the intent no longer matches.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-stale-devloop -- fixture
+assert_exit "o8-setup-escalated-exit1" 1 "$RC"
+o8_doc="docs/devloop-outputs/2026-08-17-stale-devloop/main.md"
+git -C "$FIX" add -- "$o8_doc" >/dev/null 2>&1
+o8_raw="$(git -C "$FIX" diff --cached --raw --no-abbrev)"
+git -C "$FIX" reset -q >/dev/null 2>&1
+jq -n --arg story "docs/user-stories/2026-08-13-fixture.md" --argjson task 1 \
+      --arg head "0000000000000000000000000000000000000000" \
+      --arg slug "2026-08-17-stale-devloop" --arg msg "fixture stale
+Devloop: 2026-08-17-stale-devloop" \
+      --arg doc "$o8_doc" --arg raw "$o8_raw" \
+  '{story:$story, task_id:$task, head:$head, slug:$slug, message:$msg, files:[$doc], raw:$raw}' \
+  > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o8-stale-exit2" 2 "$RC"
+assert_status "o8-stale-token" "FINISH-STALE-INTENT" "$OUTPUT"
+assert_no_marker "o8-stale-no-gate" "$MARK" 'ran.layer-all'
+
+# O9: --interactive NO-ESCALATED-TASK on a fresh fixture.
+run_story -- fixture --interactive
+assert_exit   "o9-interactive-no-escalation-exit2" 2 "$RC"
+assert_status "o9-interactive-no-escalation-token" "NO-ESCALATED-TASK" "$OUTPUT"
+
+# O10: --interactive INTERACTIVE-NO-TTY — the harness runs under `env -i` with no
+# controlling terminal (stdin/stdout are pipes), so the TTY gate must refuse. First
+# escalate a task so it gets PAST NO-ESCALATED-TASK to the spawn's TTY gate.
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "o10-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story -- fixture --interactive
+unset REUSE_FIXTURE
+assert_exit   "o10-no-tty-exit2" 2 "$RC"
+assert_status "o10-no-tty-token" "INTERACTIVE-NO-TTY" "$OUTPUT"
+assert_no_marker "o10-no-tty-no-interactive-spawn" "$MARK" 'ran.claude.interactive'
+
+# O10b: --interactive FALL-THROUGH under a real PTY (F1). The attached spawn runs
+# (TTY gate passes under `script`), then the runner falls through to the UNCHANGED
+# gate/complete machinery on HEAD movement. Asserts the ARGV CONTRACT — the property
+# headless cases structurally cannot catch: NO -p, NO --output-format, NO
+# --dangerously-skip-permissions, DEVLOOP_HEADLESS unset (S-15/S-12).
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "o10b-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 PTY=1 run_story FAKE_INTERACTIVE_COMMIT=1 FAKE_INTERACTIVE_MKOUT=1 \
+  FAKE_INTERACTIVE_MKOUT_NAME=2026-08-17-int-b -- fixture --interactive
+unset REUSE_FIXTURE PTY
+assert_exit      "o10b-interactive-exit0" 0 "$RC"
+assert_marker    "o10b-interactive-spawn-ran" "$MARK" 'ran.claude.interactive'
+assert_no_marker "o10b-argv-no-dash-p" "$MARK" 'interactive.saw.-p'
+assert_no_marker "o10b-argv-no-output-format" "$MARK" 'interactive.saw.output-format'
+assert_no_marker "o10b-argv-headless-unset" "$MARK" 'interactive.saw.headless'
+assert_no_marker "o10b-argv-no-skip-perms" "$MARK" 'interactive.saw.skip-perms'
+assert_marker    "o10b-fell-through-to-gate" "$MARK" 'ran.layer7'   # unchanged gate machinery ran
+assert_status    "o10b-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+o10b_ledger="$(cat "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo MISSING)"
+assert_status    "o10b-ledger-kind-interactive" '"kind":"interactive"' "$o10b_ledger"
+assert_status    "o10b-ledger-unmeasured" '"measured":false' "$o10b_ledger"
+
+# O10c: --interactive, human commits NOTHING → HEAD unmoved → the UNCHANGED
+# devloop-no-commit escalation (not a special interactive verdict).
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "o10c-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 PTY=1 run_story FAKE_INTERACTIVE_COMMIT=0 -- fixture --interactive
+unset REUSE_FIXTURE PTY
+assert_exit      "o10c-no-commit-exit1" 1 "$RC"
+assert_marker    "o10c-interactive-spawn-ran" "$MARK" 'ran.claude.interactive'
+assert_status    "o10c-no-commit-reason" "devloop-no-commit" "$OUTPUT"
+
+# O10d: claude_rc guard (S-14/O-10) — a NON-ZERO human exit (Ctrl-C=130) with work
+# COMMITTED must NOT be treated as timeout/session-limit/session-error; it's logged as
+# evidence and the outcome is decided by HEAD movement + gate rc (→ complete).
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "o10d-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 PTY=1 run_story FAKE_INTERACTIVE_COMMIT=1 FAKE_INTERACTIVE_MKOUT=1 \
+  FAKE_INTERACTIVE_MKOUT_NAME=2026-08-17-int-d FAKE_INTERACTIVE_RC=130 -- fixture --interactive
+unset REUSE_FIXTURE PTY
+assert_exit      "o10d-nonzero-exit-completes-exit0" 0 "$RC"
+assert_status    "o10d-nonzero-exit-recorded" "exited rc=130" "$OUTPUT"
+assert_absent    "o10d-not-session-error" "devloop-session-error" "$OUTPUT"
+assert_status    "o10d-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+
+# O11: FINISH-NO-SLUG — intent files omit any docs/devloop-outputs/*/main.md.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o11 -- fixture
+assert_exit "o11-setup-exit1" 1 "$RC"
+_finish_seed 2026-08-17-o11 '["work.txt"]'
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o11-no-slug-exit2" 2 "$RC"
+assert_status "o11-no-slug-token" "FINISH-NO-SLUG" "$OUTPUT"
+assert_no_marker "o11-no-slug-no-gate" "$MARK" 'ran.layer-all'
+
+# O12: FINISH-UNSAFE-PATH — a pathspec-magic entry rejected at PARSE time (before add).
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o12 -- fixture
+assert_exit "o12-setup-exit1" 1 "$RC"
+_finish_seed 2026-08-17-o12 '["docs/devloop-outputs/2026-08-17-o12/main.md", ":/"]'
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o12-unsafe-path-exit2" 2 "$RC"
+assert_status "o12-unsafe-path-token" "FINISH-UNSAFE-PATH" "$OUTPUT"
+assert_no_marker "o12-unsafe-path-no-gate" "$MARK" 'ran.layer-all'
+
+# O13: FINISH-BAD-TRAILER — an Approved-Cross-Boundary trailer naming an unknown
+# specialist is a governance-record forgery, refused.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o13 -- fixture
+assert_exit "o13-setup-exit1" 1 "$RC"
+_finish_seed 2026-08-17-o13 '["docs/devloop-outputs/2026-08-17-o13/main.md"]' \
+  "fixture finish
+Devloop: 2026-08-17-o13
+Approved-Cross-Boundary: not-a-real-specialist because reasons"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o13-bad-trailer-exit2" 2 "$RC"
+assert_status "o13-bad-trailer-token" "FINISH-BAD-TRAILER" "$OUTPUT"
+
+# O14: FINISH-CONTENT-MISMATCH — same file set, changed bytes since Gate-3. Capture the
+# raw, then MODIFY the doc so its staged blob differs from the recorded raw.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o14 -- fixture
+assert_exit "o14-setup-exit1" 1 "$RC"
+_finish_seed 2026-08-17-o14 '["docs/devloop-outputs/2026-08-17-o14/main.md"]'
+printf 'tampered after Gate-3\n' >> "${FIX}/${FSEED_DOC}"   # blob now differs from intent.raw
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o14-content-mismatch-exit2" 2 "$RC"
+assert_status "o14-content-mismatch-token" "FINISH-CONTENT-MISMATCH" "$OUTPUT"
+assert_marker "o14-content-mismatch-gate-ran" "$MARK" 'ran.layer-all'  # gate runs, THEN the content check refuses
+if [ "$(manifest_status "$FIX" 1)" != "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o14-content-mismatch-not-completed] a content-mismatched --finish completed the task"); fi
+
+# O15: FINISH-DIRTY-REMAINDER — an unstaged file OUTSIDE the intent set that layer-all
+# validated over the working tree but the commit would not carry.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o15 -- fixture
+assert_exit "o15-setup-exit1" 1 "$RC"
+_finish_seed 2026-08-17-o15 '["docs/devloop-outputs/2026-08-17-o15/main.md"]'
+printf 'stray uncommitted work outside the intent\n' > "${FIX}/stray-remainder.txt"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o15-dirty-remainder-exit2" 2 "$RC"
+assert_status "o15-dirty-remainder-token" "FINISH-DIRTY-REMAINDER" "$OUTPUT"
+
+# O15b: FINISH-CONTENT-MISMATCH via an internally-inconsistent intent — files[] a
+# STRICT SUBSET of what raw records (security/test: the most likely REAL failure — no
+# crash, no tampering, just imperfect enumeration by the model). raw was captured from
+# `git add -A` (doc + a second file); files[] lists only the doc. finish_lane resets,
+# stages only files[] → the path set matches files[], but staged_raw (doc) lacks the
+# second file that intent.raw records → CONTENT-MISMATCH (checked before the remainder
+# lane). Reachable ONLY because the F-1 fix re-derives the index from files[].
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o15b -- fixture
+assert_exit "o15b-setup-exit1" 1 "$RC"
+o15b_doc="docs/devloop-outputs/2026-08-17-o15b/main.md"
+printf 'second staged file the intent under-enumerates\n' > "${FIX}/second.txt"
+o15b_head="$(git -C "$FIX" rev-parse HEAD)"
+git -C "$FIX" add -- "$o15b_doc" second.txt >/dev/null 2>&1
+o15b_raw="$(git -C "$FIX" diff --cached --raw --no-abbrev)"   # records BOTH
+git -C "$FIX" reset -q >/dev/null 2>&1
+_finish_seed 2026-08-17-o15b "[\"$o15b_doc\"]" "fixture subset
+Devloop: 2026-08-17-o15b" "$o15b_raw"   # files[] lists ONLY the doc; raw records both
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o15b-subset-content-mismatch-exit2" 2 "$RC"
+assert_status "o15b-subset-content-mismatch-token" "FINISH-CONTENT-MISMATCH" "$OUTPUT"
+if [ "$(manifest_status "$FIX" 1)" != "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o15b-subset-not-completed] a files[]⊊raw --finish completed the task"); fi
+
+# O16: --finish GREEN commits the RECORDED message + exact file set + zero-cost ledger
+# (test F5/F6). The core of D6/f is "commit with the recorded message/trailers".
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o16 -- fixture
+assert_exit "o16-setup-exit1" 1 "$RC"
+_finish_seed 2026-08-17-o16 '["docs/devloop-outputs/2026-08-17-o16/main.md"]' \
+  "o16 recorded subject
+Devloop: 2026-08-17-o16
+Specialist: infrastructure"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit "o16-green-exit0" 0 "$RC"
+o16_msg="$(git -C "$FIX" log -1 --format=%B 2>/dev/null || true)"
+assert_status "o16-committed-recorded-subject" "o16 recorded subject" "$o16_msg"
+assert_status "o16-committed-recorded-specialist" "Specialist: infrastructure" "$o16_msg"
+# The committed changeset (HEAD's added output doc) is the intent's file.
+o16_files="$(git -C "$FIX" show --name-only --format= HEAD 2>/dev/null || true)"
+assert_status "o16-committed-file" "docs/devloop-outputs/2026-08-17-o16/main.md" "$o16_files"
+o16_zero="$(jq -r 'select(.kind=="finish") | (.usd==0 and .measured==true and .output_tokens==0)' "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo PARSE-FAILED)"
+assert_status "o16-finish-zero-cost" "true" "$o16_zero"
+
+# O17: --finish + --stop-after composition (test F3) — completes the task, prints
+# STOPPED, skips the story-close gate.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o17 -- fixture
+assert_exit "o17-setup-exit1" 1 "$RC"
+_finish_seed 2026-08-17-o17 '["docs/devloop-outputs/2026-08-17-o17/main.md"]'
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish --stop-after=1
+unset REUSE_FIXTURE
+assert_exit      "o17-finish-stop-exit0" 0 "$RC"
+assert_status    "o17-finish-stop-message" "STOPPED after task 1" "$OUTPUT"
+# The story-close gate is skipped — the runner exits 0 at the STOPPED line before it.
+# (Both --finish's gate and the close gate drop the same ran.layer-all marker, so the
+# skip is proven by the STOPPED-then-exit-0 sequence, not a distinct marker.)
+assert_absent    "o17-finish-stop-no-all-complete" "ALL TASKS COMPLETE" "$OUTPUT"
+if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o17-finish-stop-completed] task 1 not completed under --finish --stop-after"); fi
+
+# O18: --finish gate-red → re-escalate finish-pipeline-red, no commit (test F4).
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o18 -- fixture
+assert_exit "o18-setup-exit1" 1 "$RC"
+o18_head="$(git -C "$FIX" rev-parse HEAD)"
+_finish_seed 2026-08-17-o18 '["docs/devloop-outputs/2026-08-17-o18/main.md"]'
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=1 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o18-gate-red-exit1" 1 "$RC"
+assert_status "o18-gate-red-reason" "finish-pipeline-red" "$OUTPUT"
+if [ "$(git -C "$FIX" rev-parse HEAD)" = "$o18_head" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o18-gate-red-no-commit] --finish committed despite a red gate"); fi
+
+# O19: strengthen O3 — RUN-DIR-UNWRITABLE names the refused path + no-/tmp-fallback
+# (test F7, security operator-visibility contract).
+o19_ro="$(mktemp -d "${WORK}/o19ro.XXXXXX")"; chmod 0500 "$o19_ro"
+run_story DEVLOOP_TMP="$o19_ro" -- fixture
+assert_status "o19-unwritable-names-path" "$o19_ro" "$OUTPUT"
+assert_status "o19-unwritable-no-tmp" "NOT falling back to /tmp" "$OUTPUT"
+chmod 0700 "$o19_ro" 2>/dev/null || true
+
+# O20: obs F1 — a devloop that completes but leaves no derivable cost (the stub emits
+# no "type":"result" events) writes an `unavailable` ledger entry, and the story-close
+# rollup counts it (unmeasured_tasks>=1) rather than asserting unmeasured_tasks=0 over
+# a real loss.
+run_story FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o20 -- fixture
+assert_exit "o20-exit0" 0 "$RC"
+o20_ledger="$(cat "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo MISSING)"
+assert_status "o20-unavailable-entry" '"kind":"unavailable"' "$o20_ledger"
+assert_status "o20-rollup-unmeasured" "unmeasured_tasks=1" "$OUTPUT"
+
+# O21: obs F2 — the story-close rollup fails LOUD, never silently vanishes. The
+# behavioural emit path is covered by O20 (a full story whose ledger holds only
+# unavailable/unmeasured cost still prints a STORY-COST line, not nothing). The two
+# defensive fail-loud branches (empty ledger; a truncated JSONL line from a killed
+# mid-write) are NOT hermetically reachable end-to-end — a completing task always
+# writes >=1 ledger entry (so empty-at-rollup can't occur via a normal run), and the
+# harness can't produce a deterministic mid-write truncation — so assert their PRESENCE
+# in the source (both reasons emit rather than swallow), which is the honest coverage
+# for an inspection-only branch. (Manual test plan owns the real truncation case.)
+assert_status "o21-rollup-empty-loud-in-source" "STORY-COST-UNAVAILABLE reason=empty-ledger" "$(cat "$RUN_STORY")"
+assert_status "o21-rollup-failed-loud-in-source" "STORY-COST-UNAVAILABLE reason=rollup-failed" "$(cat "$RUN_STORY")"
+
+# --- validate-run-dir-path-sync.sh self-test (ops F4) -------------------------
+# A sync guard that has only ever run GREEN on the current tree has never been shown
+# to catch drift — the non-staleness leg the whole literal design rests on is
+# unproven. Point it at a mutated copy of one source via its env-overridable path and
+# assert it goes RED; and confirm it's GREEN on the real tree (positive control).
+GUARD_SYNC="${__here}/../guards/simple/validate-run-dir-path-sync.sh"
+if [ -x "$GUARD_SYNC" ] && bash "$GUARD_SYNC" >/dev/null 2>&1; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o22-guard-green-on-tree] validate-run-dir-path-sync.sh red on the real tree"); fi
+o22_tmp="$(mktemp -d "${WORK}/o22.XXXXXX")"
+# Mutate devloop.sh's CONTAINER_LEDGER_BASE so it disagrees with run-story's literal.
+sed 's#^CONTAINER_LEDGER_BASE="/home/dev/.cache/devloop/story-runs"#CONTAINER_LEDGER_BASE="/home/dev/.cache/devloop/DRIFTED"#' \
+  "${__here}/../../infra/devloop/devloop.sh" > "$o22_tmp/devloop.sh"
+# Assert the mutation actually TOOK (ops F6): if the sed pattern ever stops matching
+# (the literal moves/gets indented/re-quoted), the copy is byte-identical, the guard
+# is correctly green, and the red-assertion below would falsely accuse a healthy guard
+# — a control asserting something about an input it never confirmed it had, the exact
+# shape O22 exists to catch.
+grep -q 'DRIFTED' "$o22_tmp/devloop.sh" || {
+  FAIL=$((FAIL+1)); FAILURES+=("[o22-mutation-vacuous] the sed did not match CONTAINER_LEDGER_BASE — O22's red assertion would be testing an unmutated copy; fix the sed pattern, not the guard"); }
+if RUN_DIR_PATH_SYNC_DEVLOOP="$o22_tmp/devloop.sh" bash "$GUARD_SYNC" >/dev/null 2>&1; then
+  FAIL=$((FAIL+1)); FAILURES+=("[o22-guard-red-on-drift] guard stayed GREEN when the ledger-base literals were made to disagree — it may be comparing nothing")
+else PASS=$((PASS+1)); fi
+
+# O24: --finish enters the STAGED post-crash state and completes (security F-3 / test
+# F10 — the case that actually EXERCISES the reset-and-rederive fix). Every other
+# --finish fixture resets the index before the lane, so it enters CLEAN and would go
+# green against the PRE-fix `git diff --cached --quiet` precondition too. Here the stub
+# STAGES without committing (FAKE_DEVLOOP_STAGE=1 + COMMIT=0) — the producer's real
+# state — so the index is dirty going in; only finish_lane's `git reset -q` re-derive
+# makes it complete. Against the removed FINISH-INDEX-DIRTY precondition this case
+# would have exited 2, so its green is the discrimination — VERIFIED by a one-time
+# hand mutation on 2026-09-17 (on a SCRATCH COPY, never /work): reinstating the removed
+# `git diff --cached --quiet → FINISH-INDEX-DIRTY` precondition ahead of the reset reds
+# THIS case (and only this case — O6/O16 reset before the lane, so they enter clean),
+# confirming it genuinely reproduces the staged post-crash state rather than passing
+# because the runner normalises it. (@security independently reproduced: baseline
+# 2-of-2 unrelated fails → mutated adds exactly the 3 o24-* fails.) The next reader
+# should re-run the mutation on a scratch copy, not in /work.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_STAGE=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o24 -- fixture
+assert_exit "o24-setup-escalated-exit1" 1 "$RC"
+o24_doc="docs/devloop-outputs/2026-08-17-o24/main.md"
+# Normalise the doc's mtime: MKOUT sets it to `now + 1 minute` (for the resume path's
+# `find -newer`, irrelevant here), and O24 is the ONLY case that carries that
+# future-mtime file STAGED into the lane across the REUSE — a git racy-timestamp edge
+# where the index stat-cache can occasionally disagree with the worktree. `touch` to
+# now removes it; the staged blob is content-addressed so this changes nothing tested.
+touch "${FIX}/${o24_doc}"
+git -C "$FIX" add -- "$o24_doc" >/dev/null 2>&1   # re-stage after the mtime touch
+# The doc is ALREADY staged (FAKE_DEVLOOP_STAGE) — capture raw from the staged index
+# directly and DO NOT reset, so --finish enters with a dirty (staged) index.
+o24_staged="$(git -C "$FIX" diff --cached --name-only)"
+if printf '%s\n' "$o24_staged" | grep -qx "$o24_doc"; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o24-precondition-staged] the output doc is not staged going into --finish (FAKE_DEVLOOP_STAGE did not take), so this case would not exercise the reset fix"); fi
+o24_head="$(git -C "$FIX" rev-parse HEAD)"
+o24_raw="$(git -C "$FIX" diff --cached --raw --no-abbrev)"
+jq -n --arg story "docs/user-stories/2026-08-13-fixture.md" --argjson task 1 --arg head "$o24_head" \
+      --arg slug "2026-08-17-o24" --arg msg "fixture staged-entry
+Devloop: 2026-08-17-o24" --arg doc "$o24_doc" --arg raw "$o24_raw" \
+  '{story:$story, task_id:$task, head:$head, slug:$slug, message:$msg, files:[$doc], raw:$raw}' \
+  > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish   # index still STAGED (no reset)
+unset REUSE_FIXTURE
+assert_exit   "o24-staged-entry-green-exit0" 0 "$RC"
+assert_status "o24-staged-entry-verified" "FINISH-VERIFIED task=1" "$OUTPUT"
+if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o24-staged-entry-completed] --finish did not complete from a staged post-crash index"); fi
+
+# O25: --finish handles a DELETION in the intent (test) — `raw` records a `D` status;
+# finish_lane's per-file `git add -- <deleted>` must stage the removal WITHOUT a set-e
+# abort (the design note's "native delete, no hash-object exit-128" claim), and commit.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o25 -- fixture
+assert_exit "o25-setup-escalated-exit1" 1 "$RC"
+o25_doc="docs/devloop-outputs/2026-08-17-o25/main.md"
+# A committed file the "reviewed change" deletes.
+printf 'delete me\n' > "${FIX}/to-delete.txt"
+git -C "$FIX" add to-delete.txt >/dev/null 2>&1
+git -C "$FIX" commit --quiet -m "add to-delete.txt" >/dev/null 2>&1
+o25_head="$(git -C "$FIX" rev-parse HEAD)"
+rm -f "${FIX}/to-delete.txt"                     # worktree deletion (unstaged)
+git -C "$FIX" add -A -- "$o25_doc" to-delete.txt >/dev/null 2>&1   # stage add(doc)+delete
+o25_raw="$(git -C "$FIX" diff --cached --raw --no-abbrev)"         # records A doc + D to-delete.txt
+git -C "$FIX" reset -q >/dev/null 2>&1
+jq -n --arg story "docs/user-stories/2026-08-13-fixture.md" --argjson task 1 --arg head "$o25_head" \
+      --arg slug "2026-08-17-o25" --arg msg "fixture delete
+Devloop: 2026-08-17-o25" --arg doc "$o25_doc" --arg raw "$o25_raw" \
+  '{story:$story, task_id:$task, head:$head, slug:$slug, message:$msg, files:[$doc, "to-delete.txt"], raw:$raw}' \
+  > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o25-delete-green-exit0" 0 "$RC"
+assert_status "o25-delete-verified" "FINISH-VERIFIED task=1" "$OUTPUT"
+# to-delete.txt must be GONE from HEAD (the deletion was committed, no set-e abort).
+if git -C "$FIX" cat-file -e HEAD:to-delete.txt 2>/dev/null; then
+  FAIL=$((FAIL+1)); FAILURES+=("[o25-delete-committed] to-delete.txt still in HEAD — the intent's deletion was not committed"); else PASS=$((PASS+1)); fi
+
+# O26: a CRLF file in the intent commits cleanly — no false CONTENT-MISMATCH (test).
+# The --raw comparison uses STAGED blobs (git diff --cached --raw), so both the capture
+# and finish_lane's re-stage pass through the SAME filter → identical blob; the
+# `--no-filters`-CRLF trap the original hash-object approach had does not apply here.
+run_story FAKE_DEVLOOP_COMMIT=0 FAKE_DEVLOOP_MKOUT=1 FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-o26 -- fixture
+assert_exit "o26-setup-escalated-exit1" 1 "$RC"
+o26_doc="docs/devloop-outputs/2026-08-17-o26/main.md"
+printf 'line one\r\nline two\r\n' > "${FIX}/crlf.txt"   # CRLF content
+o26_head="$(git -C "$FIX" rev-parse HEAD)"
+git -C "$FIX" add -- "$o26_doc" crlf.txt >/dev/null 2>&1
+o26_raw="$(git -C "$FIX" diff --cached --raw --no-abbrev)"
+git -C "$FIX" reset -q >/dev/null 2>&1
+jq -n --arg story "docs/user-stories/2026-08-13-fixture.md" --argjson task 1 --arg head "$o26_head" \
+      --arg slug "2026-08-17-o26" --arg msg "fixture crlf
+Devloop: 2026-08-17-o26" --arg doc "$o26_doc" --arg raw "$o26_raw" \
+  '{story:$story, task_id:$task, head:$head, slug:$slug, message:$msg, files:[$doc, "crlf.txt"], raw:$raw}' \
+  > "$(RUN_DIR_OF "$DT")/task-1.commit-intent.json"
+REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
+unset REUSE_FIXTURE
+assert_exit   "o26-crlf-green-exit0" 0 "$RC"
+assert_absent "o26-crlf-no-content-mismatch" "FINISH-CONTENT-MISMATCH" "$OUTPUT"
+if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o26-crlf-completed] a CRLF file in the intent did not commit cleanly via --finish"); fi
+
+# O23: INTERACTIVE_SPAWN per-iteration RESET (S-12) — a leak would spawn a SUBSEQUENT
+# headless task attached, with no timeout + the Stop hook inert (a permanent wedge).
+# Two-task story: task 1 goes --interactive (PTY, commits→completes), task 2 must run
+# HEADLESS in the same invocation. (LAST, like N16 — swaps TEMPLATE to two tasks.)
+mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
+  status: pending
+  specialist: test
+  prompt: interactive reset task one
+- id: 2
+  status: pending
+  specialist: test
+  deps: [1]
+  prompt: interactive reset task two'
+git -C "$TEMPLATE" commit --quiet -am "two-task fixture for interactive-reset O23" >/dev/null
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture   # task 1 escalates (no commit)
+assert_exit "o23-setup-task1-escalated-exit1" 1 "$RC"
+if [ "$(manifest_status "$FIX" 1)" = "escalated" ] && [ "$(manifest_status "$FIX" 2)" = "pending" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o23-setup-state] expected task1 escalated + task2 pending, got '$(manifest_status "$FIX" 1)' + '$(manifest_status "$FIX" 2)'"); fi
+# --interactive acts on task 1 (RETRY_APPLIED one-shot); task 2 then runs the normal
+# headless path. FAKE_INTERACTIVE_COMMIT=1 so task 1 completes; the devloop stub
+# (task 2) commits by default.
+REUSE_FIXTURE=1 PTY=1 run_story FAKE_INTERACTIVE_COMMIT=1 FAKE_INTERACTIVE_MKOUT=1 \
+  FAKE_INTERACTIVE_MKOUT_NAME=2026-08-17-int-e -- fixture --interactive
+unset REUSE_FIXTURE PTY
+assert_exit   "o23-exit0" 0 "$RC"
+assert_marker "o23-task1-interactive-ran" "$MARK" 'ran.claude.interactive'
+assert_marker "o23-task2-headless-ran" "$MARK" 'ran.claude.devloop'
+# The load-bearing assertion: task 2's spawn was HEADLESS (DEVLOOP_HEADLESS=1 marker),
+# proving INTERACTIVE_SPAWN did NOT leak from task 1 into task 2.
+assert_marker "o23-task2-was-headless" "$MARK" 'devloop.session.headless'
+if [ "$(manifest_status "$FIX" 1)" = "completed" ] && [ "$(manifest_status "$FIX" 2)" = "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o23-both-completed] expected both tasks completed, got '$(manifest_status "$FIX" 1)' + '$(manifest_status "$FIX" 2)'"); fi
 
 report_results "scripts/workflow/run-story.test.sh"

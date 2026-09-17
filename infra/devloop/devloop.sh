@@ -134,6 +134,24 @@ HELPER_TARGET_DIR="${REPO_ROOT}/target/devloop-helper"
 HELPER_BINARY="${HELPER_TARGET_DIR}/release/devloop-helper"
 HELPER_RUNTIME_DIR="/tmp/devloop-${TASK_SLUG}"
 
+# Story-runner ledger (ADR-0037 D5). TWO-KEY DECOMPOSITION — read before touching:
+# the story-runner keeps TWO run-artifact bases with different lifetimes.
+#   - The in-flight MARKER + substrate-probe cache are per-CONTAINER and ephemeral;
+#     they stay on HELPER_RUNTIME_DIR (the /tmp/devloop mount) — INFLIGHT_MARKER
+#     below still reads them there, UNCHANGED.
+#   - The cost LEDGER + durable per-task evidence are per-STORY and MUST survive
+#     container teardown, so they live on this host-persistent, git-external, FLAT
+#     dir — NOT under HELPER_RUNTIME_DIR, which cleanup() deletes.
+# STORY_RUNS_HOST is flat (shared across per-slug containers); run-story keys it
+# per-story under story-runner/<story>. Do NOT move the marker onto this mount and
+# do NOT make this per-slug — see run-story.sh's resolve_run_base + the seam block.
+STORY_RUNS_HOST="${HOME}/.cache/devloop/story-runs"
+# SINGLE SOURCE of the in-container ledger path (DRY): used BOTH as the bind-mount
+# target AND passed to run-story via -e DEVLOOP_STORY_RUN_BASE, so the two sides
+# cannot drift (they agreed before only because the image user happens to be `dev`).
+# validate-run-dir-path-sync.sh statically binds this to run-story's default.
+CONTAINER_LEDGER_BASE="/home/dev/.cache/devloop/story-runs"
+
 # ─── Quick actions (early exit) ───────────────────────────────────
 
 refresh_credentials() {
@@ -209,10 +227,17 @@ cleanup() {
         podman builder prune -f 2>/dev/null || true
     fi
 
-    # Remove helper runtime directory
+    # Remove helper runtime directory.
+    # DO NOT add "$STORY_RUNS_HOST" (~/.cache/devloop/story-runs) to any rm here:
+    # it is the host-persistent cost ledger + escalation/incident evidence (ADR-0037
+    # D5), the whole point of which is to survive --destroy, and it is FLAT/shared
+    # across slugs — deleting it on one slug's teardown would nuke other slugs'
+    # stories. The two rm's below are per-slug scoped (HELPER_RUNTIME_DIR and
+    # devloop-${TASK_SLUG}), so they are safe; do NOT widen either to
+    # "$HOME/.cache/devloop", which would take story-runs with it.
     rm -rf "$HELPER_RUNTIME_DIR"
 
-    # Release port reservation
+    # Release port reservation (per-slug — NOT $HOME/.cache/devloop; see above)
     rm -rf "$HOME/.cache/devloop/devloop-${TASK_SLUG}"
     local registry="$HOME/.cache/devloop/port-registry.json"
     if [ -f "$registry" ] && command -v jq &>/dev/null; then
@@ -222,6 +247,7 @@ cleanup() {
 
     echo "Removing clone: ${CLONE_DIR}"
     rm -rf "$CLONE_DIR"
+    echo "Story-runner ledger retained (survives --destroy by design): ${STORY_RUNS_HOST}"
     echo "Cleaned up."
 }
 
@@ -590,6 +616,22 @@ if ! is_container_running "$DEV_CONTAINER"; then
     if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
         EXTRA_PODMAN_ARGS+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
     fi
+
+    # Story-runner ledger mount (ADR-0037 D5) — UNCONDITIONAL (not gated on kind,
+    # unlike the helper mount): the ledger must persist even on the no-cluster path.
+    # Created 0700 BEFORE `podman run` so the runtime never auto-creates it
+    # root-owned under --userns=keep-id (matches HELPER_RUNTIME_DIR at :515). With
+    # `:z` the SELinux relabel is SHARED — required because this flat dir is mounted
+    # into potentially-concurrent per-slug containers; `:Z` (private, as the helper
+    # and /work mounts correctly use) would lock the second container out. 0700 is
+    # therefore the load-bearing isolation control here, not defence-in-depth — do
+    # NOT relax it to 0755. The .ledger-mount marker is run-story's positive control
+    # that the bind actually happened (a writable dir that ISN'T this mount would
+    # otherwise pass silently and lose the ledger on destroy — LEDGER-NOT-PERSISTENT).
+    mkdir -p -m 0700 "$STORY_RUNS_HOST"
+    : > "$STORY_RUNS_HOST/.ledger-mount"
+    EXTRA_PODMAN_ARGS+=(-v "${STORY_RUNS_HOST}:${CONTAINER_LEDGER_BASE}:z")
+    EXTRA_PODMAN_ARGS+=(-e "DEVLOOP_STORY_RUN_BASE=${CONTAINER_LEDGER_BASE}")
 
     # Start dev container on the named network (ADR-0030).
     # Uses container DNS to reach postgres via container name.
