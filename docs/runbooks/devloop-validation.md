@@ -973,6 +973,82 @@ reproduce a hook-logic regression without touching your real index:
 
 ---
 
+## 8.6 Coverage Lane (CI `coverage` job — instrumented dt-guard)
+
+**This is a standalone CI job, NOT a `layer-all.sh` layer — do not hunt for it in a local
+devloop run.** The `Code Coverage` job (`.github/workflows/ci.yml` § "Run tests with coverage")
+runs only in GitHub Actions and does **not** invoke `scripts/layer-all.sh`. It uses
+cargo-llvm-cov's **external-binary** flow so that the bash guard self-tests — which drive the
+`dt-guard` binary as a subprocess — contribute to the same merged `lcov.info` as the Rust
+`*_e2e.rs` fixtures. The chain: `cargo llvm-cov clean` → capture `show-env --export-prefix` to a
+file and `source` it → build the **instrumented** `dt-guard` → `cargo llvm-cov --no-report`
+(runs the cargo tests) → point `$DT_GUARD` at the instrumented binary → run the bash suites the
+SSoT discovery script selects → `cargo llvm-cov report --lcov`. The suite list is **derived**, not
+hand-maintained, by `scripts/guards/list-coverage-suites.sh` — today exactly
+`counter-zero-init.test.sh` + `media-telemetry-deny.test.sh`.
+
+**What the job reds on**: an instrumentation/plumbing fault (empty `show-env`; an instrumentation
+assert failing — `RUSTC_WRAPPER` / `-Cinstrument-coverage` / `cfg(coverage)` absent from `show-env`,
+i.e. cargo-llvm-cov stopped providing them, NOT a user `RUSTFLAGS` drop; `$DT_GUARD` unresolvable), a
+selected bash suite failing, the per-suite profraw-delta assert, the discovery/drift check, or a
+Codecov **upload** error (`fail_ci_if_error: true`). There is **no coverage-percentage threshold in
+the workflow itself** — a `%` regression only reds if a `codecov.yml` / Codecov project status target
+defines one (a separate Codecov-side concern, not enforced by this job).
+
+**Reproduce a CI-only coverage red locally** (no cluster needed — this is why the suites must stay
+hermetic; the job's checkout is deliberately shallow, no `fetch-depth: 0`):
+
+```
+cargo llvm-cov clean --workspace
+cargo llvm-cov show-env --export-prefix > llvm-cov-env.sh && . ./llvm-cov-env.sh
+cargo build -p dt-guard && cargo llvm-cov --no-report --workspace
+export DT_GUARD="${CARGO_LLVM_COV_TARGET_DIR}/debug/dt-guard"
+./scripts/guards/list-coverage-suites.sh > coverage-suites.txt   # fails non-zero on drift/floor
+while read -r s; do DT_GUARD="$DT_GUARD" bash "$s"; done < coverage-suites.txt
+cargo llvm-cov report --lcov --output-path lcov.info
+```
+
+This writes `llvm-cov-env.sh` and `coverage-suites.txt` to the repo root; both are gitignored build
+artifacts (alongside `lcov.info` / `*.profraw`), safe to leave in a dirty tree.
+
+Four failure shapes are specific to this job and appear in NO local layer:
+
+| Symptom (in the `Code Coverage` job log) | Meaning | First action |
+|------------------------------------------|---------|--------------|
+| An **instrumentation precondition** fails: `::error::show-env did not set RUSTC_WRAPPER=cargo-llvm-cov`, or `::error::-Cinstrument-coverage missing …`, or `::error::cfg=coverage missing …`. | cargo-llvm-cov's `show-env` did not carry the expected instrumentation — a version/flow change in cargo-llvm-cov, or `show-env` was captured before the wrapper env was set. **NOT a defect in the code under test.** The three asserts are orthogonal and each fail-closed; each guards a distinct invariant: **RUSTC_WRAPPER** → the binary is actually instrumented (else 0% coverage reads green); **`instrument-coverage`** → lines are counted, not 0%; **`cfg=coverage`** → the three ac-service `#[cfg_attr(coverage, ignore)]` timing tests stay ignored. A lone `cfg=coverage` check would leave the uninstrumented-build mode a silent pass — checks 1-2 close it. | **LANE: infrastructure** (plumbing — see the §9 infra escalation row). Re-run `cargo llvm-cov show-env --export-prefix` and confirm all three tokens are present in the output. **ANTI-MASK: do NOT loosen any pattern to the space-form `--cfg coverage`** — the injected form is `--cfg=coverage`; a `show-env` format shift SHOULD red the job (fail-closed), never be tolerated into a false pass. |
+| A selected bash suite is **RED under instrumentation but GREEN in local Layer 3** — it fails only in this job; the same suite against `target/release/dt-guard` (what Layer 3 runs) passes. | The suite runs against the **instrumented** binary via `$DT_GUARD`, which is a *debug* build in a *different* target dir (`${CARGO_LLVM_COV_TARGET_DIR}/debug/dt-guard`), not the release binary Layer 3 uses. The divergence is real: a debug-vs-release behaviour difference, or a suite assumption (a path, a timing, a `--release`-only optimisation) that holds only for the release binary. Reproduce with the local chain above using a plain `cargo build -p dt-guard` (debug) binary as `$DT_GUARD`. **LANE:** the local repro decides — a genuine instrumented-binary behavioural difference is the **implementer** lane (fix the suite or the guard), while a `$DT_GUARD` misresolution or job-env fault is **infrastructure**. **If it reproduces, fix the suite or the guard**, not the coverage job. **ANTI-MASK: do NOT** "fix" it by re-pointing `$DT_GUARD` at `target/release/dt-guard`: that strips instrumentation (defeating the whole job) and is the uninstrumented fallback the profraw-delta assert (next row) exists to forbid. If it reproduces ONLY under `cargo llvm-cov` and not with a plain debug binary, suspect a path the instrumented run relocated. |
+| **`::error::<suite> produced NO new profraw (<before> -> <after>)`** followed by `::error::a coverage suite failed or produced no coverage`. | The **per-suite profraw-delta** assert fired: the suite ran but deposited zero new `*.profraw`, so the `dt-guard` child it invoked was **not instrumented** and its lines counted as 0% — which would otherwise read as green. Cause is almost always `$DT_GUARD` resolving to the plain `target/release/dt-guard` (restored by `rust-cache`) instead of the instrumented binary, or `LLVM_PROFILE_FILE` not propagating to the child. (The earlier preconditions catch a dropped `%p`/`%m` pattern and a non-executable `$DT_GUARD` up front, so those fail before the loop.) **LANE: infrastructure** — the child was not instrumented; this is plumbing, not a defect in the code under test. Confirm `echo "$DT_GUARD"` points into `${CARGO_LLVM_COV_TARGET_DIR}/debug/`, is `-x`, and is `!= $PWD/target/release/dt-guard`, and that the child inherits `LLVM_PROFILE_FILE` (pattern carries `%p`/`%m`). This assert is a **strict-growth delta snapshotted before each suite**, deliberately NOT a post-run "≥1 profraw exists" — the cargo tests already deposit many, so a bare existence check is vacuously green. It is per-suite so one silently-uninstrumented suite cannot hide behind the other's profraw. **ANTI-MASK: do NOT relax the strict-growth delta to a "≥1 profraw exists" check** — that is the exact vacuity it exists to catch. |
+| A `list-coverage-suites:` error: **`found <N> DT_GUARD-driving suite(s), need >= 2`**, or **`<file> is under scripts/guards/, does not drive $DT_GUARD, and carries no # coverage-exempt: <reason> marker`**, or **`non-$DT_GUARD dt-guard binary invocation`**. | The SSoT discovery / drift check (`scripts/guards/list-coverage-suites.sh` — the SELECTION, FLOOR, DRIFT-MARKER and SECOND-GREP blocks; no enclosing function; flat script) failed. Three sub-cases. **(1) FLOOR** — fewer than 2 driving suites: a coverage suite was renamed/removed or refactored so it stopped matching `DT_GUARD`. **(2) MARKER drift** — a new `scripts/guards/*.test.sh` neither drives `$DT_GUARD` nor carries a `# coverage-exempt: <reason>` line. **(3) SECOND-GREP** — a `*.sh` under `scripts/` invokes `dt-guard <subcommand>` via a hardcoded path or bare command instead of `"$DT_GUARD"` (the message names `file:line`). | **(1) FLOOR** — restore the dropped suite; only lower the pinned `FLOOR=2` deliberately, with a note, if a suite genuinely stops driving the binary. A NEW (3rd) suite does NOT trip the floor — it is a floor, not a count-equality. **LANE:** whoever changed the suite. **(2) MARKER** — add the marker (reason ≥10 chars — **length floor only**, SSoT `ignore.rs::MIN_REASON_LEN`) if the file legitimately is not a coverage suite, or route its invocation through `"$DT_GUARD"` if it should be one. The marker universe is bounded to `scripts/guards/*.test.sh` on purpose — selection is recursive over all of `scripts/**`, so a driver placed elsewhere is still run; the annotation discipline is confined to where guard self-tests belong. **LANE:** whoever added/renamed the self-test. **(3) SECOND-GREP** — route the invocation through `"$DT_GUARD"` so the coverage job can point it at the instrumented binary. **LANE:** infrastructure / whoever added it. **ANTI-MASK:** the ≥10-char floor rejects short lazy tokens like `wip`/`todo`, so write a genuine descriptive reason — the bar is deliberately length-only (weaker than a `guard:ignore` suppression; the bash `is_lazy_reason` vocabulary is NOT mirrored here, since a portable ERE can't match its `\b`-boundaried regex and a copy just forks), so a lazy-but-long reason technically passes but defeats the marker's purpose. **And do NOT lower `FLOOR` just to green the job.** |
+
+### Is `coverage` a required status check?
+
+**A job existing in `ci.yml` does NOT mean its red blocks merge.** Branch protection is a GitHub repo
+setting, **not** encoded in `.github/workflows/ci.yml` — a red check only blocks merge if its *context*
+is in the branch's required-status-checks list. The check context is `Code Coverage`
+(`.github/workflows/ci.yml § "Code Coverage"` — the job's `name:`), **not** the job key `coverage`.
+Read the authoritative state with:
+
+```
+gh api repos/:owner/:repo/branches/main/protection/required_status_checks --jq '.contexts'
+```
+
+If `Code Coverage` is absent from that list, it is advisory.
+
+**Current documented state: ADVISORY (not verified required).** Two reasons: (i) as of 2026-09-17 the
+live config could not be read from the devloop environment (no authenticated `gh`); and (ii) GitHub does
+**not** auto-add a new job's context to required checks — an admin must add it explicitly, so a
+brand-new job defaults to advisory. Operationally, **while advisory a coverage-job red does NOT block
+merge** — it only shows in the PR Checks tab, so someone must watch it, because a silently
+uninstrumented suite (0% reading as green) is exactly the failure the profraw-delta assert exists to
+make loud, and that loudness is wasted if nobody is looking. **Once required**, ALL of its red modes
+(plumbing, suite, profraw-delta, discovery-drift, AND a Codecov upload error) block merge.
+
+To make it enforce, a repo admin adds `Code Coverage` to the `main` branch-protection required checks —
+a policy call for the repo owner, not this devloop. **Tracked in `docs/TODO.md` under "Polyglot Pipeline
+Follow-ups", pending the repo-owner decision**; record the state here once decided.
+
+---
+
 ## 9. Escalation & Related References
 
 ### When to escalate
@@ -987,6 +1063,8 @@ reproduce a hook-logic regression without touching your real index:
 | security | An audit advisory needs an `[advisories.ignore]` entry — policy is security-owned (ADR-0033 §11). |
 | security | An advisory's mean-time-to-resolution exceeds **14 days** — tripwire (ADR-0033 §12). |
 | protocol | `buf breaking` fires on an intentional wire-break and no override mechanism exists yet (ADR-0033 Wave 3 #10, task #41). |
+| infrastructure | The CI `Code Coverage` job reds on **instrumentation / plumbing** (§8.6): empty `show-env`, `--cfg coverage` dropped from the instrumentation flags, `$DT_GUARD` unresolvable to the instrumented binary, the profraw-delta assert firing, or `list-coverage-suites.sh` drift/floor. These are coverage-harness faults, not a defect in the code under test — the external-binary wiring is infrastructure-owned. |
+| implementer (consume an attempt) | The CI `Code Coverage` job reds because a **selected bash guard suite genuinely fails** under instrumentation and reproduces locally against a plain debug `dt-guard` (§8.6, first failure row). This is a real test/guard defect, not a harness fault — route it like any other failing suite, do not escalate to infrastructure. |
 
 ### Related documentation
 
@@ -1023,3 +1101,4 @@ Bare `:<NN>` line cites are forbidden — they drift the moment a file grows by 
 | 2026-08-05 | test, paired with operations (story task #19) | Layer 7 browser-E2E lane (R-48): §6.7 two-Phase-2-suites description (diff trigger via `__BROWSER_E2E_TRIGGER_PATHS`, env-red skip note, per-suite timeouts, Phase-1g preconditions) + lane-table rows (`browser-e2e-passed`/`-failed`/`-no-diff`, `dev-certs-missing`, `playwright-browser-missing`, the `browser-e2e-not-run:` stderr state); §3 REASON examples; §8 symptom rows incl. the Playwright-artifact sensitivity note (traces retained outside `DEVLOOP_TMP`, can contain live tokens). |
 | 2026-08-29 | test, paired with operations (L7 counter-delta per-instance devloop) | Counter-delta helpers in BOTH Phase-2 suites now panic/throw on a Prometheus query error instead of reading it as `0.0` (TODO 188-189). Added a §8 row and §6.7 pointers on `env-tests-failed` + `browser-e2e-failed` for the resulting lane split: the failure surfaces in the IMPLEMENTER lane and consumes a Layer-7 attempt, but is substantively an operator-lane fault (Prometheus lost mid-suite, after Phase 1f proved it ready). Deliberately not auto-classified — Phase 2's "never grep suite output" anti-reverse-masking rule is preserved; the routing correction is documentation only. `Triage Prometheus/port-forward` added as the single cross-language grep key (Rust panic + both TS throws). |
 | 2026-08-21 | operations, paired with test (fast-fail-guards devloop) | **Two changes.** (1) **Guard timeout → operator lane**: `run-guards.sh` 124/137 arms now emit `STATUS=PRECONDITION_FAILURE` (was `FAIL`) with byte-identical REASON tokens (`guard-timeout-<name>`/`-kill-<name>`) → Layer 3 can now emit `PRECONDITION_FAILURE`/exit 2 (§3 ladder row, §4 emitter list, §6.3 rows, §8 catalogue). run-guards.sh gained a `guard-violations` STATUS trace + `MIXED_LANE:` line (so a coexisting violation stays legible) and a violation/timeout counter split; its standalone exit mirrors the ladder (PRECONDITION 2 dominates FAIL 1). Retry-discriminator recorded: a timeout that reproduces on retry/quiet-machine is diff-caused → implementer lane. Fixed the §8 "layer3 flattens a guard PRECONDITION_FAILURE" caveat (it was false — in-guard reclassification survives when the guard emits its own STATUS line). (2) **Interactive fail-fast**: `layer-all.sh` stops at the first failing layer for interactive runs (new §3 "Fail-fast vs run-all" subsection), controlled by `DEVLOOP_FAIL_FAST` (pure `_common.sh::fail_fast_mode()`); unattended callers (`GITHUB_ACTIONS`/`DEVLOOP_HEADLESS`, incl. the story-close gate `run-story.sh`) keep run-all. Un-run layers render `RESULT=NOT-RUN` (display-only, never aggregates, never OK). New greppable tokens: `PIPELINE_MODE=`, `STOPPED_EARLY`, `WARN BUDGET_TOTAL_SKIPPED`, `WARN FAIL_FAST_OVERRIDE_IGNORED`. ADR-0033 §4 amended (run-all now conditional on unattended mode); ADR-0034 §9 amended (timeout enum). |
+| 2026-09-17 | operations (dt-guard proof-of-trap coverage devloop) | Added §8.6 "Coverage Lane (CI `coverage` job — instrumented dt-guard)" — the CI-only external-binary llvm-cov flow that drives an instrumented `dt-guard` through the bash guard self-tests. Local-repro chain + a four-failure-shape table (instrumentation-precondition asserts — RUSTC_WRAPPER/instrument-coverage/cfg=coverage; suite red under instrumentation but green in Layer 3; the per-suite profraw-delta `produced NO new profraw` assert; the `list-coverage-suites.sh` FLOOR/marker-drift/second-grep checks) + the `Code Coverage` required-status-check verification (`gh api …/required_status_checks`), documented ADVISORY pending confirmation. Two §9 escalation rows split the lane: infrastructure owns instrumentation/plumbing/discovery faults, implementer owns a genuinely-failing suite that reproduces on a plain debug binary. Drafted by infrastructure (failure-mode knowledge), owned/reviewed by operations. |

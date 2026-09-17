@@ -71,6 +71,10 @@ coverage/
 lcov.info
 *.profraw
 *.profdata
+# cargo-llvm-cov external-binary flow artifacts written at repo root by the CI
+# `Code Coverage` job (.github/workflows/ci.yml) — runtime only, never committable.
+llvm-cov-env.sh
+coverage-suites.txt
 # Playwright browser-E2E artifacts (task #18) — traces record request bodies
 # incl. synthetic dev-cluster credentials; never committable.
 packages/web-app/test-results/

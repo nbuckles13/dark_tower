@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: exercises run-guards.sh exit-code classification in-process, does not drive the dt-guard binary via $DT_GUARD
 # run-guards.test.sh — self-test for scripts/guards/run-guards.sh's exit-code /
 # STATUS-emission contract (fast-fail-guards devloop). There is no *.test.sh
 # auto-runner, so this is wired into scripts/layer3.sh to run every devloop + CI.

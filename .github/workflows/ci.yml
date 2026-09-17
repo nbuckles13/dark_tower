@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# Least-privilege default token for every job (matches ci-client.yml /
+# audit-scheduled.yml). The coverage job's Codecov upload uses its own
+# CODECOV_TOKEN secret, scoped to that step — see the coverage job.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -120,7 +126,10 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Raised from 30 deliberately: the external-binary flow adds an instrumented
+    # dt-guard build plus the two bash guard suites (~111 cases) under
+    # instrumentation. A timeout is loud, so this is ergonomics not correctness.
+    timeout-minutes: 40
 
     services:
       postgres:
@@ -167,8 +176,96 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dark_tower_test
           AC_MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
           AC_BIND_ADDRESS: 127.0.0.1:8082
+          # REDUNDANT under cargo-llvm-cov's wrapper flow, kept as belt-and-suspenders.
+          # cargo-llvm-cov 0.8.x instruments via RUSTC_WRAPPER and injects `--cfg=coverage`
+          # ITSELF, independent of this line (verified: `show-env` emits an identical
+          # `__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS=-Cinstrument-coverage--cfg=coverage`
+          # with or without RUSTFLAGS set, and never exports CARGO_ENCODED_RUSTFLAGS).
+          # The `coverage` cfg keeps ac-service's three `#[cfg_attr(coverage, ignore)]`
+          # tests ignored; the load-bearing guarantee of that is the assert below, NOT
+          # this env var.
           RUSTFLAGS: --cfg coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # External-binary flow, so the bash guard self-tests' runs of the
+        # INSTRUMENTED dt-guard contribute to the single merged lcov. See
+        # docs/runbooks/devloop-validation.md §8.6 "Coverage Lane" for triage.
+        run: |
+          set -euo pipefail
+
+          cargo llvm-cov clean --workspace
+
+          # `source <(...)` swallows a show-env failure under set -e/pipefail (an
+          # empty stream sources cleanly -> an UNINSTRUMENTED build). Capture to
+          # a file, require it non-empty, then source.
+          cargo llvm-cov show-env --export-prefix > llvm-cov-env.sh
+          [ -s llvm-cov-env.sh ] || { echo "::error::cargo llvm-cov show-env produced no output"; exit 1; }
+          . ./llvm-cov-env.sh
+
+          # Instrumentation asserts against the ACTUAL cargo-llvm-cov 0.8.x mechanism: a
+          # RUSTC_WRAPPER that injects the flags per crate. It does NOT export
+          # CARGO_ENCODED_RUSTFLAGS, and it sets cfg(coverage) ITSELF (independent of the
+          # job-env RUSTFLAGS). Each grep fails CLOSED — sound because the string is present
+          # whenever the tool instruments, so it vanishes (and reds the job) only if a future
+          # llvm-cov stops providing it. Three distinct silent-failure modes:
+          #   1. RUSTC_WRAPPER unset            -> build is NOT instrumented (0% coverage).
+          #   2. -Cinstrument-coverage absent   -> same, via a broken/changed show-env.
+          #   3. cfg(coverage) absent           -> ac-service's three `#[cfg_attr(coverage,
+          #      ignore)]` tests un-ignore and RUN under coverage.
+          # (Review O-A: the original lone `cfg=coverage` grep was SOUND for mode 3, but its
+          # comment wrongly cited CARGO_ENCODED_RUSTFLAGS/user-RUSTFLAGS survival, and it left
+          # modes 1-2 unguarded — an uninstrumented build (RUSTC_WRAPPER unset or
+          # -Cinstrument-coverage dropped) still matches `cfg=coverage`, so 0% would read green.
+          # Comment corrected; modes 1-2 added. Patterns are deliberately TIGHT (the real
+          # injected form is `--cfg=coverage`, the `=` form) — a format shift SHOULD red the
+          # job, not be tolerated, so no space-form loosening.)
+          grep -qE '^export RUSTC_WRAPPER=.*cargo-llvm-cov' llvm-cov-env.sh || { echo "::error::show-env did not set RUSTC_WRAPPER=cargo-llvm-cov — the build would be UNINSTRUMENTED (0% coverage)"; exit 1; }
+          grep -q 'instrument-coverage' llvm-cov-env.sh || { echo "::error::-Cinstrument-coverage missing from the wrapper rustflags — the build would be UNINSTRUMENTED (0% coverage)"; exit 1; }
+          grep -q 'cfg=coverage' llvm-cov-env.sh || { echo "::error::cfg=coverage missing from the wrapper rustflags — ac-service #[cfg_attr(coverage, ignore)] tests would un-ignore and RUN"; exit 1; }
+
+          # The profraw filename must uniquify per process (%p/%m), or the
+          # per-suite delta below cannot move.
+          case "${LLVM_PROFILE_FILE:-}" in
+            *%p*|*%m*) : ;;
+            *) echo "::error::LLVM_PROFILE_FILE lacks %p/%m: '${LLVM_PROFILE_FILE:-<unset>}'"; exit 1 ;;
+          esac
+
+          # Build the instrumented binary (dev profile — identical across build,
+          # test and report, so the report semantics are unchanged) and run the
+          # cargo tests (the *_e2e.rs proof-of-trap fixtures included).
+          cargo build -p dt-guard
+          cargo llvm-cov --no-report --workspace
+
+          # Point DT_GUARD at the INSTRUMENTED binary, derived from the target dir
+          # cargo-llvm-cov exported (not a hardcoded target/llvm-cov-target path).
+          export DT_GUARD="${CARGO_LLVM_COV_TARGET_DIR:?}/debug/dt-guard"
+          # Fail loudly rather than let the bash suites fall back to the
+          # uninstrumented target/release/dt-guard (rust-cache may restore it).
+          [ -n "${DT_GUARD}" ] && [ -x "${DT_GUARD}" ] || { echo "::error::instrumented DT_GUARD missing or not executable: ${DT_GUARD}"; exit 1; }
+          [ "${DT_GUARD}" != "${PWD}/target/release/dt-guard" ] || { echo "::error::DT_GUARD points at the uninstrumented release binary"; exit 1; }
+
+          # SSoT: derive the suite list (the script fails on drift/floor). set -e
+          # catches its non-zero exit BEFORE we read the file.
+          ./scripts/guards/list-coverage-suites.sh > coverage-suites.txt
+          mapfile -t SUITES < coverage-suites.txt
+
+          # Per-suite profraw DELTA: snapshot before each suite, require STRICT
+          # growth after. A post-run ">=1 profraw exists" would be vacuous (the
+          # cargo tests already deposited many); the delta proves the INSTRUMENTED
+          # binary actually ran under each suite.
+          PROFRAW_DIR="${CARGO_LLVM_COV_TARGET_DIR:?}"
+          rc=0
+          for s in "${SUITES[@]}"; do
+            before=$(find "${PROFRAW_DIR}" -maxdepth 1 -name '*.profraw' | wc -l)
+            if DT_GUARD="${DT_GUARD}" bash "${s}"; then :; else rc=1; fi
+            after=$(find "${PROFRAW_DIR}" -maxdepth 1 -name '*.profraw' | wc -l)
+            if [ "${after}" -le "${before}" ]; then
+              echo "::error::${s} produced NO new profraw (${before} -> ${after}) — the binary under DT_GUARD was not instrumented (did DT_GUARD resolve to the plain target/release/dt-guard?)"
+              rc=1
+            fi
+          done
+          [ "${rc}" -eq 0 ] || { echo "::error::a coverage suite failed or produced no coverage"; exit 1; }
+
+          # Single merged lcov from ALL profiles (cargo tests + bash suites).
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

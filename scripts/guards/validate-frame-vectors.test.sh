@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: validates frame-vector fixtures against a Python kernel, does not drive the dt-guard binary via $DT_GUARD
 #
 # SELF-TEST for scripts/guards/simple/validate-frame-vectors.sh.
 #

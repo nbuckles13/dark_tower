@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: checks org-subdomain regex drift across source files, does not drive the dt-guard binary via $DT_GUARD
 # validate-subdomain-regex-sync.test.sh — self-test for the org-subdomain drift guard
 # (scripts/guards/simple/validate-subdomain-regex-sync.sh; story R-7, task #3).
 #
