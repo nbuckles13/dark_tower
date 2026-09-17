@@ -45,7 +45,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use dt_story::engine::{self, NextOutcome};
-use dt_story::manifest::{Manifest, Slug, Status};
+use dt_story::manifest::{Manifest, Slug, Status, Tier};
 use dt_story::markdown::{self, BlockSpan};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -132,6 +132,18 @@ enum Command {
         /// `T`, which conflicts with our single-token comma-separated parser.
         #[arg(long, value_parser = parse_deps)]
         deps: Option<Deps>,
+        /// Gate-1 tier (ADR-0037 §D2): `full` runs the Gate-1 plan round,
+        /// `light` skips it. Default full (the safe direction). A `light` tier
+        /// with no `--tier-reason` is refused by the before/after delta-validate
+        /// (`validate_manifest`'s status-independent tier rule).
+        #[arg(long, value_enum, default_value_t = Tier::Full)]
+        tier: Tier,
+        /// Stated reason for a `light` tier (required when `--tier light`).
+        /// Free text; NEVER reaches a command line (round-trips through the
+        /// manifest only), so — unlike the tier token — it carries no character
+        /// floor beyond the fence refusal in `Manifest::to_block_body`.
+        #[arg(long)]
+        tier_reason: Option<String>,
     },
     /// Check the story's manifest; print violations to stderr.
     Validate {
@@ -209,6 +221,17 @@ struct TaskSummary<'a> {
     status: Status,
     deps: &'a [u32],
     slug: Option<&'a str>,
+    /// Gate-1 tier (ADR-0037 §D2). NAMED CONSUMER (rule 1): `run-story.sh`'s
+    /// tier gating reads it from `next` (not here), but `list-tasks` surfaces it
+    /// for humans staging/auditing a story and for `/user-story` verification.
+    /// Always-present key (rule 4): defaults to `full`, never absent, so a
+    /// consumer never needs `// "full"`. Serializes as the lowercase token.
+    tier: Tier,
+    /// Stated `light`-tier reason. `null` when absent (rule 4: total shape, so a
+    /// consumer never distinguishes absent from empty). Free text but SAFE to
+    /// project here (rule 2): `list-tasks` output is not interpolated onto any
+    /// command line — only the floored `tier` token reaches the `/devloop` line.
+    tier_reason: Option<&'a str>,
 }
 
 /// Parse `--deps 1,2,3` into ids. Our own parser rather than clap's
@@ -335,12 +358,16 @@ fn main() -> ExitCode {
             prompt_file,
             tag,
             deps,
+            tier,
+            tier_reason,
         } => cmd_add_task(
             &story,
             &specialist,
             &prompt_file,
             &tag,
             deps.map(|d| d.0).unwrap_or_default(),
+            tier,
+            tier_reason,
         ),
         Command::Validate { story } => cmd_validate(&story),
         Command::ListTasks { story } => cmd_list_tasks(&story),
@@ -473,6 +500,8 @@ fn cmd_add_task(
     prompt_file: &Path,
     tag: &str,
     deps: Vec<u32>,
+    tier: Tier,
+    tier_reason: Option<String>,
 ) -> ExitCode {
     // Read the prompt first: a bad --prompt-file is a caller error (exit 2),
     // distinct from a manifest/write error, but both map to EXIT_MALFORMED.
@@ -490,6 +519,8 @@ fn cmd_add_task(
                 prompt,
                 tag: tag.to_string(),
                 deps,
+                tier,
+                tier_reason: tier_reason.clone(),
             },
         )?;
         if let engine::AddOutcome::Added(_) = outcome {
@@ -547,6 +578,8 @@ fn cmd_list_tasks(story: &Path) -> ExitCode {
             status: task.status,
             deps: &task.deps,
             slug: task.slug.as_ref().map(dt_story::manifest::Slug::as_str),
+            tier: task.tier,
+            tier_reason: task.tier_reason.as_deref(),
         })
         .collect();
     // Serialize fully BEFORE printing anything, so a SERIALIZATION failure

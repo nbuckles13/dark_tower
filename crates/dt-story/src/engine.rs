@@ -1,7 +1,7 @@
 //! State transitions (`next`, `complete`, `escalate`, `validate`) and the
 //! atomic write used by mutating subcommands.
 
-use crate::manifest::{Manifest, Slug, Status, Task};
+use crate::manifest::{Manifest, Slug, Status, Task, Tier};
 use crate::markdown;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -15,6 +15,12 @@ pub struct RunnableTask {
     pub id: u32,
     pub specialist: String,
     pub prompt: String,
+    /// Gate-1 tier (ADR-0037 §D2), always concrete since `Task::tier` defaults
+    /// to `Full`. `run-story.sh` reads it from this JSON (`jq -r .tier`), floors
+    /// it, and threads `--tier=<tier>` onto the fresh `/devloop` line. Serializes
+    /// as the lowercase token `full`/`light` — the wire contract that bash read
+    /// depends on (pinned by a cli.rs test).
+    pub tier: Tier,
 }
 
 /// Outcome of `next` resolution (exit codes 0 / 3 / 4 respectively).
@@ -111,6 +117,7 @@ fn runnable_payload(task: &Task) -> Result<RunnableTask> {
         id: task.id,
         specialist: specialist.to_string(),
         prompt: prompt.to_string(),
+        tier: task.tier,
     })
 }
 
@@ -197,6 +204,8 @@ pub struct NewTask {
     pub prompt: String,
     pub tag: String,
     pub deps: Vec<u32>,
+    pub tier: Tier,
+    pub tier_reason: Option<String>,
 }
 
 /// Append a pending task, idempotent on `tag`. If a task with the same tag
@@ -244,6 +253,8 @@ pub fn add_task(manifest: &mut Manifest, new: NewTask) -> Result<AddOutcome> {
         slug: None,
         escalation: None,
         tag: Some(new.tag),
+        tier: new.tier,
+        tier_reason: new.tier_reason,
     });
     let after = validate_manifest(manifest);
     let introduced: Vec<String> = after
@@ -373,6 +384,27 @@ pub fn validate_manifest(manifest: &Manifest) -> Vec<String> {
         }
         if task.prompt.as_deref().is_none_or(|s| s.trim().is_empty()) {
             violations.push(format!("pending task {} has no prompt", task.id));
+        }
+    }
+
+    // Tier rule (ADR-0037 §D2), STATUS-INDEPENDENT (unlike the specialist/prompt
+    // checks above): a `light` tier must carry a non-empty (after-trim) reason.
+    // This is the guardable form of "any planning skip carries a stated reason".
+    // It applies to completed/escalated tasks too so a story file cannot record
+    // a reasonless skip after the fact — and it is what makes `add-task
+    // --tier light` with no `--tier-reason` fail the before/after delta-validate.
+    for task in &manifest.tasks {
+        if task.tier == Tier::Light
+            && task
+                .tier_reason
+                .as_deref()
+                .is_none_or(|r| r.trim().is_empty())
+        {
+            violations.push(format!(
+                "task {} is tier `light` but has no tier_reason (a light tier skips the Gate-1 \
+                 planning round, so it must record why)",
+                task.id
+            ));
         }
     }
 

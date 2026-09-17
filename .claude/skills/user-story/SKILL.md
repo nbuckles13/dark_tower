@@ -337,7 +337,9 @@ target/release/dt-story add-task "$STORY" \
   --specialist <name> \
   --prompt-file /tmp/task-<n>.prompt \
   --tag "story-{story-slug}-task-<n>" \
-  --deps 1,2
+  --deps 1,2 \
+  --tier {full|light} \
+  --tier-reason "<one line; required only when --tier light>"
 ```
 
 **Why through `dt-story` and not hand-written YAML.** `Manifest::to_block_body` refuses to write a manifest containing a markdown fence line. A prompt carrying a fenced code example would otherwise close the manifest block early and truncate it **silently** — the surviving prefix still parses, still validates, and `next` then reports the story complete with tasks missing. Emitting through the write verb makes that refusal cover this skill by construction. Hand-writing the YAML bypasses it entirely.
@@ -358,6 +360,10 @@ target/release/dt-story add-task "$STORY" \
 - **`specialist` must match `^[a-z][a-z0-9-]*$`** — a single bare agent name. It is the one manifest value the runner still interpolates onto a command line (`run-story.sh` floors it and refuses otherwise). Record pairing as **prose inside the prompt** ("Pair with protocol for the crate change"), never as `test --paired-with=infrastructure` in the `specialist` field.
 - **Prompts must be self-contained** (the devloop sees only the prompt) and **must not contain fenced code blocks**. Inline `` `backtick spans` `` are fine.
 - **`--deps ''` is an error.** Omit the flag for a task with no dependencies.
+- **`--tier` sets the Gate-1 planning-round tier (ADR-0037 §D2).** The lead sets each task's tier here, at decomposition time (where the author already reasons about contract surfaces), from this **mechanical rule** — **`full`** when the task **delivers `proto` / touches a wire contract or public API**, **introduces or moves an architectural seam**, **spans >1 service/specialist**, **is author-flagged ambiguous**, **OR touches a Guarded Shared Area or an auth / crypto / secrets / tenancy-isolation surface**; **`light`** otherwise, with a one-line `--tier-reason`. The default errs toward `full` wherever a contract signal exists.
+  - **Authority on disagreement**: this rule is carried verbatim from **ADR-0037 §D2**; if this text and the ADR ever disagree, **the ADR wins**. The final criterion — GSA / auth / crypto / secrets / tenancy-isolation — is a **deliberate security-motivated EXTENSION beyond ADR-0037 §D2's literal triggers** (plan-stage review is worth materially more than diff-stage for crypto/secrets, and the criterion is checkable from the task's own file list); it is not in the ADR's enumerated list and is applied here as a flagged extension, not presented as ADR text.
+  - **`--tier`, never `--light`.** Tier is the manifest's Gate-1 lever; run-story always runs the full panel and passes `--tier` (never `--light`). Do not conflate them: `--tier light` skips only the Gate-1 plan round and keeps the full Gate-3 panel; `--light` is a separate `/devloop` panel-cut the story lane never uses.
+  - **`--tier light` with no `--tier-reason` is refused** at `add-task` time (the before/after delta-validate) and by `dt-story validate` (the rule is status-independent), so a reasonless planning skip cannot be recorded. Reason is a presence check (non-empty after trim), not a content check.
 
 ### Step 10.5: Verify the Emission — BLOCKING
 
@@ -373,7 +379,7 @@ target/release/dt-story list-tasks "$STORY" | jq -r '[.[].id] | @csv'   # 2. id-
 
 If either fails, fix the manifest and re-run — do **not** report the story Ready.
 
-**If the plan changes (`--continue`)**: reset the manifest block back to the skeleton and re-emit the whole plan. Do **not** re-run `add-task` over a populated manifest — an existing tag returns rc 4 **without applying** the supplied `--specialist`, `--prompt-file` or `--deps`, so a revised prompt would be silently discarded. **Refuse to reset if any task is not `pending`**: the story has already started, and resetting would destroy completed tasks' `status` and `slug`. Escalate — and name the next move rather than stopping at the refusal: the human either edits the affected task's `prompt` in the manifest block directly (leaving completed tasks untouched), or, if the remaining plan has changed structurally, closes this story and plans a new one for the remaining work.
+**If the plan changes (`--continue`)**: reset the manifest block back to the skeleton and re-emit the whole plan. Do **not** re-run `add-task` over a populated manifest — an existing tag returns rc 4 **without applying** the supplied `--specialist`, `--prompt-file`, `--deps`, `--tier` or `--tier-reason`, so a revised prompt or a re-tiering would be silently discarded. (The only route to change an already-emitted task's tier is a hand-edit of the manifest block — which is exactly why the light-requires-reason rule lives in `validate_manifest`, not only at the `add-task` boundary.) **Refuse to reset if any task is not `pending`**: the story has already started, and resetting would destroy completed tasks' `status` and `slug`. Escalate — and name the next move rather than stopping at the refusal: the human either edits the affected task's `prompt` in the manifest block directly (leaving completed tasks untouched), or, if the remaining plan has changed structurally, closes this story and plans a new one for the remaining work.
 
 ### Step 11: Report and Review
 
