@@ -140,6 +140,61 @@ impl fmt::Display for Status {
     }
 }
 
+/// Gate-1 planning-round risk tier for a task (ADR-0037 §D2). `full` runs the
+/// devloop's Gate-1 plan-panel round; `light` skips it (implementer plans
+/// inline; Gate-3 and the full reviewer panel are unchanged — see the /devloop
+/// SKILL, which is careful to keep this DISTINCT from `--light`'s panel cut).
+///
+/// This enum is the SINGLE SOURCE OF TRUTH for the tier value set. `rename_all
+/// = "lowercase"` under the struct's `deny_unknown_fields` makes an illegal
+/// tier fail YAML deserialization (the `Slug` placement principle: floor in the
+/// deserializer, every consumer inherits it).
+///
+/// ADDING A THIRD TIER requires widening FOUR downstream copies of `{full,
+/// light}` — deliberate copies, not a guarded mirror, because the fail-loud
+/// property holds at every one (a forgotten site rejects the new value rather
+/// than silently accepting it), so a comment is the right instrument, not a
+/// sync guard:
+///   1. `scripts/workflow/run-story.sh` — the `^(full|light)$` interpolation
+///      floor (its own comment carries the full rationale);
+///   2. `.claude/skills/devloop/SKILL.md` — §Arguments, the Step 1 parse (a
+///      present-but-unrecognized value is a hard error), and the Step 5 gate;
+///   3. `.claude/skills/user-story/SKILL.md` — Step 10.4's `--tier {full|light}`
+///      and the full/light decision rule;
+///   4. `docs/devloop-outputs/_template/main.md` — the `Tier` row + `Mode` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    Full,
+    Light,
+}
+
+impl Default for Tier {
+    /// Absent `tier` ⇒ `Full`. This is the backward-compat contract: an
+    /// existing manifest with no `tier` field parses as a full-tier task, and
+    /// `skip_serializing_if = "Tier::is_full"` keeps it byte-identical on
+    /// rewrite (a Full task never writes `tier: full`).
+    fn default() -> Self {
+        Tier::Full
+    }
+}
+
+impl Tier {
+    /// Skip-serialization predicate for [`Task::tier`] — a Full tier is the
+    /// default and is never written, so existing (tier-less) manifests
+    /// round-trip byte-identical.
+    fn is_full(&self) -> bool {
+        matches!(self, Tier::Full)
+    }
+}
+
+// NB: no `Display` for `Tier` — the lowercase wire tokens have exactly ONE
+// producer, serde `rename_all = "lowercase"` (read by run-story via `jq -r
+// .tier`). A hand-written `Display` would be a second, unguarded copy of those
+// tokens with no consumer today, free to drift from the serde token on a
+// variant rename. Add one only WITH a test pinning it to the serde token, and
+// only when a caller actually needs it (YAGNI).
+
 /// One task entry. Field declaration order is the stable serialization
 /// order for rewritten manifest blocks (matches the schema contract).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +246,24 @@ pub struct Task {
     /// re-emit, not to re-run `add-task` over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Gate-1 planning-round tier (ADR-0037 §D2). Appended at the END of the
+    /// field list so existing fields' serialization order is undisturbed, and
+    /// `skip_serializing_if = "Tier::is_full"` so a tier-less manifest
+    /// round-trips byte-identical and a Full task never writes `tier: full`.
+    /// Absent ⇒ Full (see [`Tier::default`]).
+    #[serde(default, skip_serializing_if = "Tier::is_full")]
+    pub tier: Tier,
+    /// Stated reason a task was tiered `light` (ADR-0037 §D2). Required and
+    /// non-empty (after trim) whenever `tier == Light` — enforced in
+    /// [`crate::engine::validate_manifest`], the guardable form of "any
+    /// planning skip carries a stated reason". `skip_serializing_if =
+    /// "Option::is_none"` skips it only when ABSENT — it is keyed on presence,
+    /// NOT on tier, so a task hand-edited from `light` back to `full` without
+    /// clearing this field still serializes a stale `tier_reason:` (harmless:
+    /// no gate or runner reads a Full task's reason; validation only requires a
+    /// reason for Light). This is deliberately NOT normalized on write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_reason: Option<String>,
 }
 
 /// The embedded task manifest (v1).

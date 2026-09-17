@@ -776,9 +776,21 @@ report_task_cost() {
     append_unavailable_cost "$id" "no-session-log"
     return 0
   fi
+  # `tier` (ADR-0037 D2 / obs O3) is the loop global floored ONCE at task
+  # selection (read adjacent to specialist), NOT re-read from the manifest here —
+  # the manifest is mutable after the run, and two reads would drift; the D2
+  # trial's tier-vs-cost conclusion rests on this field. On the FRESH lane it is
+  # the exact tier interpolated onto the /devloop line (what the task ran at). On
+  # the --continue / RESTART_FROM_TREE resume lane no --tier is passed and the
+  # resumed devloop derives its gate shape from main.md's Tier row, so this
+  # records the manifest's CURRENT tier — which the resumed session is expected
+  # to match via that row, and which diverges only if the manifest was hand-edited
+  # between the interrupted attempt and the resume. Provenance, same reading as the
+  # Loop State Tier row. `set -u`-safe: bound before any report_task_cost call
+  # site in this loop iteration.
   summary="$( (grep -h '"type":"result"' "$RUN_DIR/task-${id}.devloop.log" 2>/dev/null || true) \
-    | jq -s -c --argjson task "$id" 'select(length > 0) | {
-        task: $task, kind: "devloop", measured: true, attempts: length,
+    | jq -s -c --argjson task "$id" --arg tier "$tier" 'select(length > 0) | {
+        task: $task, kind: "devloop", tier: $tier, measured: true, attempts: length,
         usd: (map(.total_cost_usd // 0) | add * 100 | round / 100),
         output_tokens: (map(.usage.output_tokens // 0) | add),
         cache_read_tokens: (map(.usage.cache_read_input_tokens // 0) | add),
@@ -1669,7 +1681,7 @@ finish_lane() {
 # differ ONLY in the "HEADLESS RUN … Headless Mode" prefix (headless sets it so the
 # Lead escalates instead of asking; interactive omits it so the Lead asks the human)
 # and in the claude flags at the spawn site — NOT in the prompt body. Reads the
-# per-task globals continue_slug / prompt_file / specialist the caller set.
+# per-task globals continue_slug / prompt_file / specialist / tier the caller set.
 build_devloop_prompt() {
   local mode="$1" id="$2" prefix_resume="" prefix_fresh=""
   if [ "$mode" = headless ]; then
@@ -1677,11 +1689,17 @@ build_devloop_prompt() {
     prefix_fresh="HEADLESS RUN (run-story task #${id}): follow the devloop skill including its Headless Mode section.\n"
   fi
   if [ -n "$continue_slug" ]; then
+    # RESUME lane carries NO --tier BY DESIGN (ADR-0037 D2 / obs O1b): the
+    # resumed devloop re-derives its gate shape from the main.md Loop State
+    # `Tier` row (which the /devloop SKILL names as the authoritative record of
+    # what this attempt did), NOT from a re-passed flag. Threading --tier here
+    # would be a second, drifting source; the omission is deliberate — do not
+    # "fix" it. (RESTART_FROM_TREE takes this lane too.)
     printf '%b/devloop "This devloop was interrupted before completion. Resume from main.md state: finish incomplete phases, then gates and commit as normal." --continue=%s' \
       "$prefix_resume" "$continue_slug"
   else
-    printf '%bThe task description for this devloop is the EXACT, COMPLETE contents of the file %s. Read that file now and treat its full text AS the /devloop prompt argument — do not paraphrase, summarise or truncate it, and do not re-quote it.\n/devloop "See %s — that file'"'"'s exact contents are this devloop'"'"'s task description." --specialist=%s' \
-      "$prefix_fresh" "$prompt_file" "$prompt_file" "$specialist"
+    printf '%bThe task description for this devloop is the EXACT, COMPLETE contents of the file %s. Read that file now and treat its full text AS the /devloop prompt argument — do not paraphrase, summarise or truncate it, and do not re-quote it.\n/devloop "See %s — that file'"'"'s exact contents are this devloop'"'"'s task description." --specialist=%s --tier=%s' \
+      "$prefix_fresh" "$prompt_file" "$prompt_file" "$specialist" "$tier"
   fi
 }
 
@@ -1742,6 +1760,39 @@ while :; do
   # under an active STORY_REPO_ROOT that path resolves inside the fixture.
   if ! [[ "$specialist" =~ ^[a-z][a-z0-9-]*$ ]]; then
     slogerr "STORY_RUN: INVALID-SPECIALIST task=${id} — specialist '${specialist}' is not a plain token ([a-z][a-z0-9-]*). It is interpolated as a flag value, so anything else changes what the devloop is told to do."
+    exit 2
+  fi
+  # Read tier ADJACENT to specialist (ADR-0037 D2) — bind it HERE so every
+  # downstream site sees it under `set -u`, including report_task_cost on the
+  # --finish / --revalidate / escalate lanes that reach it early in this
+  # iteration (a later read would be an unbound-variable abort there).
+  tier="$(jq -r .tier <<<"$task_json")"
+  # TIER FLOOR. This `^(full|light)$` alternation is a DELIBERATE SECOND COPY of
+  # manifest::Tier's value set {full,light} — mirroring the specialist floor
+  # above — and it earns its keep the way `commit` and `slug` earn their opposite
+  # rules in manifest.rs:158-176: different provenance, different job, not an
+  # inconsistency to tidy.
+  #   (a) It is a second copy of the set the Rust `manifest::Tier` enum owns as
+  #       the SSoT.
+  #   (b) It does TWO jobs, and its failure IS reachable: command-line
+  #       interpolation safety (tier is spliced onto the /devloop line, like
+  #       specialist) AND presence/staleness detection. A dt-story predating the
+  #       `tier` field emits a `next` payload with no tier key, so `jq -r .tier`
+  #       yields the literal string `null`; this floor is what stops `--tier=null`
+  #       reaching the /devloop line. A `null` here can ONLY mean a stale binary
+  #       (a current dt-story always serializes a concrete tier on the non-Option
+  #       RunnableTask field), so it is an environment fault → exit 2, NEVER a
+  #       "use default" (that is serde's job upstream and yields "full", never
+  #       null). A plain token class ([a-z]+) cannot substitute — it would ACCEPT
+  #       `null` — precisely because of this second job.
+  #   (c) ADDING A TIER to manifest::Tier requires WIDENING THIS LITERAL too.
+  #   (d) A sync guard was considered and DECLINED as disproportionate: drift
+  #       fails loud in BOTH directions (Rust widens → this floor rejects the new
+  #       value at run time; Rust narrows → the value is unreachable), unlike the
+  #       slug class whose drift was silent. security(exit-2) vs ops(full+warn)
+  #       was resolved to exit-2 (fail-loud beats masking a stale environment).
+  if ! [[ "$tier" =~ ^(full|light)$ ]]; then
+    slogerr "STORY_RUN: INVALID-TIER task=${id} — tier '${tier}' is not 'full' or 'light'. A tier of 'null' means a STALE dt-story that predates the tier field (rebuild: cargo build --release -p dt-guard -p dt-story); any other value is a malformed manifest.tier the serde enum manifest::Tier should have rejected. Not coercing to full — that would mask the fault."
     exit 2
   fi
   prompt_file="$RUN_DIR/task-${id}.prompt"
@@ -2041,7 +2092,7 @@ while :; do
     exit 2
   fi
 
-  slog "STORY_RUN: START task=${id} specialist=${specialist} resume=${continue_slug:-no} log=${tasklog}"
+  slog "STORY_RUN: START task=${id} specialist=${specialist} tier=${tier} resume=${continue_slug:-no} log=${tasklog}"
   touch "$start_marker"
   limit_waits=0
 

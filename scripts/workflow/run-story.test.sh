@@ -1211,6 +1211,9 @@ assert_absent "i2-paired-with-not-spliced"   "--paired-with=evil" "$devloop_argv
 # prompt reference entirely and dispatches a task with no instruction at all.
 assert_status "i3-prompt-file-referenced" "task-1.prompt" "$devloop_argv"
 assert_status "i4-specialist-flag-intact" "--specialist=test" "$devloop_argv"
+# i4b: the tier-less splice fixture defaults to full, threaded onto the line
+# (ADR-0037 D2). The PASS branch of the ^(full|light)$ floor is exercised here.
+assert_status "i4b-tier-full-threaded" "--tier=full" "$devloop_argv"
 # And the full prompt survives verbatim on disk, where the instruction points.
 prompt_on_disk="$(cat "$(RUN_DIR_OF "$DT")/task-1.prompt" 2>/dev/null || true)"
 assert_status "i5-prompt-verbatim-on-disk" "$SPLICE_SENTINEL" "$prompt_on_disk"
@@ -1225,6 +1228,47 @@ git -C "$TEMPLATE" commit --quiet -am "bad specialist fixture" >/dev/null
 run_story -- fixture
 assert_exit   "i7-bad-specialist-exit2" 2 "$RC"
 assert_status "i7-bad-specialist-token" "INVALID-SPECIALIST" "$OUTPUT"
+
+# I8: a light-tiered task threads --tier=light onto the fresh /devloop line
+# (ADR-0037 D2). tier rides the command line like --specialist; the value comes
+# from `next`'s JSON, floored to ^(full|light)$. This is the positive light-tier
+# path (i4b covered full).
+mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" '- id: 1
+  status: pending
+  specialist: test
+  prompt: light task prompt
+  tier: light
+  tier_reason: single specialist, no wire contract'
+git -C "$TEMPLATE" commit --quiet -am "light tier fixture" >/dev/null
+run_story -- fixture
+i8_devloop_argv="$(grep -- '--output-format stream-json' "${MARK}/claude.argv" 2>/dev/null || true)"
+assert_status "i8-tier-light-threaded" "--tier=light" "$i8_devloop_argv"
+
+# I9: the REACHABLE null path (constraint 18, security + test). A dt-story that
+# PREDATES the tier field emits a `next` payload with no tier key, so
+# `jq -r .tier` yields the string "null". The ^(full|light)$ floor's REJECT
+# branch MUST fire (exit 2, distinct INVALID-TIER token) rather than splice
+# --tier=null onto the /devloop line. Faked with a stale-binary $DT_STORY stub
+# emitting tier-less JSON — NOT a bogus-enum fake (serde-closed, can't reach the
+# shell; that case is covered at the serde layer in cli.rs). The reject branch is
+# untested code on a fail-loud path otherwise.
+STALE_DT_STORY="${WORK}/stale-dt-story"
+cat > "$STALE_DT_STORY" <<'FAKE'
+#!/usr/bin/env bash
+# Simulates a dt-story built before the `tier` field: `next` emits NO tier key.
+case "$1" in
+  next) printf '{"id":1,"specialist":"test","prompt":"stale-binary task"}\n'; exit 0 ;;
+  *)    exit 2 ;;
+esac
+FAKE
+chmod +x "$STALE_DT_STORY"
+mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" "$DEFAULT_TASKS"
+git -C "$TEMPLATE" commit --quiet -am "restore fixture for stale-dt-story case" >/dev/null
+run_story DT_STORY="$STALE_DT_STORY" -- fixture
+assert_exit      "i9-stale-tier-null-exit2" 2 "$RC"
+assert_status    "i9-stale-tier-null-token" "INVALID-TIER" "$OUTPUT"
+assert_no_marker "i9-stale-tier-null-no-devloop" "$MARK" 'ran.claude.devloop'
+
 mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" "$DEFAULT_TASKS"
 git -C "$TEMPLATE" commit --quiet -am "restore fixture" >/dev/null
 
@@ -2230,6 +2274,21 @@ assert_status "o20-rollup-unmeasured" "unmeasured_tasks=1" "$OUTPUT"
 # for an inspection-only branch. (Manual test plan owns the real truncation case.)
 assert_status "o21-rollup-empty-loud-in-source" "STORY-COST-UNAVAILABLE reason=empty-ledger" "$(cat "$RUN_STORY")"
 assert_status "o21-rollup-failed-loud-in-source" "STORY-COST-UNAVAILABLE reason=rollup-failed" "$(cat "$RUN_STORY")"
+
+# O21b (obs F2 / constraint 13, ADR-0037 D2) — folded into the O21 source-presence
+# block it mirrors (not a new O22 — that ID is the run-dir-path-sync self-test
+# below). The `tier` field on the devloop cost-ledger entry is the host-persistent
+# record the D2 trial measures on (output-tokens/task, full vs light). It is NOT
+# end-to-end reachable in this harness: the claude stub emits no `"type":"result"`
+# events, so report_task_cost writes NO kind:"devloop" entry anywhere in this suite
+# (only finish/gate-only/unavailable entries are produced). Same shape as O21 —
+# assert the field's PRESENCE in the source (both the `--arg tier` binding and the
+# `tier: $tier` projection), the honest coverage for a path the stub can't reach.
+# `--arg` (not string interpolation into the jq program) is also the injection-safe
+# form. End-to-end coverage awaits a stub that emits a result event (a bigger change
+# to every ledger-adjacent test's expectations — deliberately not grown here).
+assert_status "o21b-ledger-tier-arg-in-source"  '--arg tier "$tier"' "$(cat "$RUN_STORY")"
+assert_status "o21b-ledger-tier-field-in-source" 'tier: $tier' "$(cat "$RUN_STORY")"
 
 # --- validate-run-dir-path-sync.sh self-test (ops F4) -------------------------
 # A sync guard that has only ever run GREEN on the current tree has never been shown

@@ -3,7 +3,7 @@
 **Date**: YYYY-MM-DD
 **Task**: Brief description of what was implemented
 **Specialist**: {specialist-name}
-**Mode**: Agent Teams (v2)
+**Mode**: Agent Teams (v2) — {full, Gate-1 present | full panel; Gate-1 SKIPPED — <tier_reason> | light (--light, 3-teammate panel)} <!-- panel mode + Gate-1 tier (ADR-0037 §D2); see the Tier row in Loop State -->
 **Branch**: `branch-name`
 **Duration**: ~Xm (approximate total time)
 
@@ -29,6 +29,7 @@
 | Phase | `{setup|planning|implementation|review|complete}` |
 | Implementer | `{agent_id or pending}` |
 | Implementing Specialist | `{specialist-name}` |
+| Tier | `{full | light — <tier_reason>}` |
 | Iteration | `{1-5}` |
 | Security | `{agent_id or pending}` |
 | Test | `{agent_id or pending}` |
@@ -45,6 +46,7 @@
      - Only mark complete after Gate 3 approval
      - Use /devloop-status to check state
      - If interrupted, restart the devloop; main.md records start commit for rollback
+     - Tier (ADR-0037 §D2): set the Tier row at setup from the manifest tier; under `light`, Step 5 SKIPS the Gate-1 plan round and writes a `### Gate 1 — SKIPPED (tier=light; reason: …)` marker instead of pending rows. A resumed devloop reads the tier from THIS Tier row (not the manifest, not the confirmations table); no Tier row ⇒ full (fail-safe).
 -->
 
 ---
