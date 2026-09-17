@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: checks slug-class drift between two shell/source files, does not drive the dt-guard binary via $DT_GUARD
 # Self-test for validate-slug-class-sync.sh.
 #
 # A sync guard without a DRIFT CASE cannot fail, and is indistinguishable
