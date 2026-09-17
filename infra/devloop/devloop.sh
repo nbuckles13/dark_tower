@@ -847,9 +847,11 @@ if [ -n "$PR_URL" ]; then
     fi
 
 elif [ -n "$COMMITS" ]; then
-    echo "=== Commits on ${BRANCH_NAME} ==="
+    echo "=== Commits on ${BRANCH_NAME} (no open PR) ==="
     echo "$COMMITS"
     echo ""
+    echo "  [c] Push and create PR into ${BASE_BRANCH}"
+    echo "  [p] Push branch to origin (no PR)"
     echo "  [r] Re-enter container"
     echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
     echo "  [q] Quit (containers stay running)"
@@ -857,6 +859,24 @@ elif [ -n "$COMMITS" ]; then
     echo
 
     case $REPLY in
+        c|C)
+            # Stateless PR creation from commit history (per eee1739: no
+            # .devloop-pr.json state file). --fill populates the PR title/body
+            # from the commit(s). --base must already exist on origin; gh fails
+            # loudly here if it does not, and the branch is still pushed.
+            if git -C "$CLONE_DIR" push -u origin "$BRANCH_NAME"; then
+                (cd "$CLONE_DIR" && gh pr create --base "$BASE_BRANCH" --head "$BRANCH_NAME" --fill) \
+                    || echo "PR creation failed (is ${BASE_BRANCH} on origin?). Branch is pushed — create the PR manually: gh pr create --base ${BASE_BRANCH} --head ${BRANCH_NAME} --fill"
+            fi
+            echo ""
+            menu_reenter_or_cleanup
+            ;;
+        p|P)
+            git -C "$CLONE_DIR" push -u origin "$BRANCH_NAME"
+            echo "Pushed ${BRANCH_NAME}. Open a PR when ready: gh pr create --base ${BASE_BRANCH} --head ${BRANCH_NAME} --fill"
+            echo ""
+            menu_reenter_or_cleanup
+            ;;
         r|R) exec "$0" "$TASK_SLUG" "$BASE_BRANCH" ;;
         d|D) cleanup ;;
         *) echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}" ;;
