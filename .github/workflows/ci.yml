@@ -231,8 +231,20 @@ jobs:
           # Build the instrumented binary (dev profile — identical across build,
           # test and report, so the report semantics are unchanged) and run the
           # cargo tests (the *_e2e.rs proof-of-trap fixtures included).
+          #
+          # PLAIN cargo here, NOT `cargo llvm-cov` — the instrumentation env is
+          # already active (sourced from show-env above), so a nested `cargo
+          # llvm-cov` subcommand re-wraps an already-wrapped build. cargo-llvm-cov
+          # warns against exactly this ("subcommands other than report and clean
+          # may not work correctly in context where environment variables are set
+          # by show-env; consider using normal cargo commands"), and the doubled
+          # RUSTC_WRAPPER nesting inflates the per-compile process fan-out until
+          # the runner's fork/thread limit is hit — rustc children fail to spawn
+          # with EAGAIN ("Resource temporarily unavailable", never executed) and
+          # the step dies. `cargo test` under the sourced env emits the same
+          # instrumented profraws the report step below consumes.
           cargo build -p dt-guard
-          cargo llvm-cov --no-report --workspace
+          cargo test --workspace
 
           # Point DT_GUARD at the INSTRUMENTED binary, derived from the target dir
           # cargo-llvm-cov exported (not a hardcoded target/llvm-cov-target path).
