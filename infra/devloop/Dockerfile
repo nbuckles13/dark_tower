@@ -216,6 +216,12 @@ ENV HOME=/home/dev
 # tools write directly to CARGO_HOME (e.g., advisory-db/).
 RUN mkdir -p /tmp/cargo-home && chmod 777 /tmp/cargo-home
 
+# Pre-create the XDG cache dir with open permissions for the same --userns=keep-id
+# reason: buf/proto codegen and TS tooling write $HOME/.cache. Without this the
+# cache lands root-owned and every proto/TS gate fails in the container (surfaced
+# 2026-09-17 at the ADR-0037 D2 devloop, worked around there via BUF_CACHE_DIR).
+RUN mkdir -p /home/dev/.cache && chmod -R 777 /home/dev/.cache
+
 # Add the in-clone tooling directory to PATH at the image level. `podman exec`
 # does NOT run the entrypoint, so PATH exports inside entrypoint.sh are scoped
 # to that one shell and invisible to exec'd processes (the claude session,
