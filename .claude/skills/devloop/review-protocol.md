@@ -80,7 +80,7 @@ Use SendMessage to tell @team-lead your final verdict:
 The implementer will either:
 1. **Fix it** — the expected default
 2. **Defer with justification** — explain why the fix is too expensive for this PR
-3. **Spin-out** — route the finding to a separate devloop owned by a different specialist when the ADR-0024 §6.3 owner-involvement tier mandates it (Domain-judgment in a non-owner's devloop, or a Guarded Shared Area edit lacking the required owner trailer). Implementer elects; reviewer accepts or escalates using the same triage model as deferrals. When spun out to an owner-implemented devloop, the current devloop's commit does not require the missing owner's trailer — the spun-out devloop is the forcing function. Record the target slug in `docs/TODO.md`.
+3. **Spin-out** — route a genuinely **out-of-scope** finding to a separate devloop (a large refactor, or work in a different area surfaced during review). Implementer elects; reviewer accepts or escalates using the same triage model as deferrals. Record the target slug in `docs/TODO.md`. **Cross-boundary ownership is NO LONGER a spin-out trigger (ADR-0037 D1)** — a Domain-judgment or GSA edit is made in the current devloop with the owner (and security, for GSA) pulled into planning + review, not routed to a separate owner devloop.
 
 ### Burden of proof for any deferral
 
@@ -131,8 +131,8 @@ The DRY reviewer operates on a hybrid model:
 ### Ownership Lens (ADR-0037 D1: Domain-judgment / GSA only)
 [Record a verdict here ONLY for a **Domain-judgment** cross-boundary edit or a **Guarded Shared Area** edit in the diff. Mechanical and Minor-judgment cross-boundary edits get no Ownership Lens entry — **omit this whole section** if the diff has no Domain-judgment/GSA edit. Mandatory for the Code Quality reviewer when such an edit is present.]
 
-- **Domain-judgment** — Was this routed to an owner-implemented devloop, or used `--paired-with=<owner>`? If it landed in a non-owner devloop without the owner present, ESCALATE.
-- **Guarded Shared Area** — Does the edit fall inside §6.4 paths/criterion, and if so, is the required owner present and confirming (intersection rule for multi-GSA edits)?
+- **Domain-judgment** — Was the owning specialist pulled into **planning and review** (e.g. `--paired-with=<owner>`)? The edit is made in this devloop (no owner-implements, no spin-out — ADR-0037 D1); if a Domain-judgment cross-boundary edit landed with **no owner in plan + review**, ESCALATE.
+- **Guarded Shared Area** — Does the edit fall inside §6.4 paths/criterion, and if so, are the required owner **and security** present in planning + review (intersection rule: all affected owners + security)? If not, ESCALATE.
 
 ### Findings
 

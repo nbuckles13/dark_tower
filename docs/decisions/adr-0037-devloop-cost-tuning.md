@@ -74,10 +74,16 @@ implementer's domain, at three loci (Gate-1 classification table, Gate-3
 per-reviewer ownership-lens verdict, close-story ownership-lens retrospective).
 ~82% of that rides on Mechanical/Minor edits that produce ~no owner catches.
 
-- **Keep**: one lightweight rule — *if you changed another domain's **core
-  logic**, add that domain's owner to the review.* This preserves the ~12%
-  Domain-judgment slice, which is the only part the evidence shows buys anything
-  (owner-on-owned-change).
+- **Keep**: one lightweight rule — *the implementer may edit **any file** in a
+  single devloop; a Domain-judgment cross-boundary edit pulls the owning
+  specialist into **planning and review** (e.g. `--paired-with`), and a Guarded
+  Shared Area edit additionally pulls **security**.* This is the deliberate change
+  from ADR-0024's **owner-implements**: there is no spin-out to a separate owner
+  devloop and no re-assigning the implementation — the owner's domain knowledge is
+  applied via plan + review, which keeps a cross-domain increment as one task
+  (serving D3) while preserving the ~12% Domain-judgment slice that buys anything
+  (owner-on-owned-change). The upgrade path (Mechanical/Minor → Domain-judgment)
+  is the backstop.
 - **Drop**: the classification rows, co-sign trailers, and Gate-3 ownership-lens
   verdict-audit for Mine / Mechanical / Minor-judgment edits; and the
   **close-story ownership-lens retrospective** entirely (it is a meta-audit *of*
