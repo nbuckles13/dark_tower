@@ -281,7 +281,7 @@ Three anchors for the Ownership Lens. Apply in order: sed-test first, then check
 - **Guard coverage**: metric-labels + metric-name guards enforce every partial state.
 - **Cross-boundary hunks**: `crates/mh-service/src/observability/metrics.rs::set_active_connections` and the corresponding MH label panel in `infra/grafana/dashboards/mh-overview.json` — MC implementer touching MH surfaces.
 - **Required trailer** on the commit: `Approved-Cross-Boundary: media-handler label-taxonomy rename matches ADR-0011 canonical`. The reason clause (≥10 chars per ADR-0024 §6.7) names the authority (ADR-0011), not just the what.
-- **Classification**: **Minor-judgment** — cross-service ownership crosses into MH dashboards and alert semantics. The combination of **named convention author** + **full guard coverage** is what legitimizes Pattern B here; absent either, this would collapse to owner-implements per ADR-0019 + ADR-0024 §6.6. **(ADR-0037 D1: a Minor-judgment edit like this is now review-only — no MH hunk-ACK trailer is required; the example is kept to illustrate the Pattern B vocabulary and the upgrade test. Only an upgrade to Domain-judgment re-involves the owner.)**
+- **Classification**: **Minor-judgment** — cross-service ownership crosses into MH dashboards and alert semantics. The combination of **named convention author** + **full guard coverage** is what legitimizes Pattern B here; absent either, this would collapse to Domain-judgment (owner pulled into planning + review, per ADR-0037 D1). **(ADR-0037 D1: a Minor-judgment edit like this is now review-only — no MH hunk-ACK trailer is required; the example is kept to illustrate the Pattern B vocabulary and the upgrade test. Only an upgrade to Domain-judgment re-involves the owner.)**
 
 ### 3. Negative case — Guarded Shared Area override
 
@@ -289,5 +289,5 @@ Three anchors for the Ownership Lens. Apply in order: sed-test first, then check
 
 - **Sed-test result**: passes. Value-neutral, structure-preserving, guard coverage exists.
 - **Surface check**: `crates/common/src/jwt.rs` is enumerated in ADR-0024 §6.4 Guarded Shared Areas (auth/crypto primitives).
-- **Classification**: **NOT Mechanical**. **Surface precedence overrides pattern cleanliness** — GSA paths disallow Mechanical classification regardless of how clean the sed-test is. Route: owner-implements (auth-controller) OR owner-trailered hunk-ACK from auth-controller + security (§6.4 intersection rule).
+- **Classification**: **NOT Mechanical**. **Surface precedence overrides pattern cleanliness** — GSA paths disallow Mechanical classification regardless of how clean the sed-test is. Handling (ADR-0037 D1): the implementer makes the edit in this devloop with **auth-controller AND security pulled into planning + review** (§6.4 intersection rule) — not routed to a separate owner devloop.
 - **Reviewer takeaway**: the sed-test alone is insufficient. Always check GSA paths/criterion before defaulting to review-only. The rule is *stricter* inside GSA, not looser (§6.4).
