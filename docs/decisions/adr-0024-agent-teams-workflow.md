@@ -357,12 +357,15 @@ Update CLAUDE.md to explicitly state: **All 4 cross-cutting specialists (Securit
 > rows) almost never produced an owner catch, while the classification/co-sign/
 > Ownership-Lens ceremony around them was a top token sink. Under ADR-0037 D1,
 > classification and owner routing apply **only to Domain-judgment cross-boundary
-> edits and Guarded Shared Areas** (§6.4, unchanged); Mechanical and
-> Minor-judgment edits are review-only with no classification row, owner
-> confirmation, or Gate-3 Ownership Lens verdict, and the story-close Ownership
-> Lens retrospective (§6.8 item #3) is removed. The upgrade path (§6.2) is the
-> backstop. If ADR-0037 is not ratified, this narrowing reverts and §6 applies as
-> written below.
+> edits and Guarded Shared Areas**; Mechanical and Minor-judgment edits are
+> review-only with no classification row, owner confirmation, or Gate-3 Ownership
+> Lens verdict, and the story-close Ownership Lens retrospective (§6.8 item #3) is
+> removed. It also **replaces §6.3 "owner-implements" with "owner in planning +
+> review"**: the current implementer may edit **any file** (including GSA) in one
+> devloop — no spin-out to a separate owner devloop — and a Domain-judgment edit
+> pulls the owner into planning + review (a GSA edit additionally pulls security,
+> per the §6.4 intersection rule). The upgrade path (§6.2) is the backstop. If
+> ADR-0037 is not ratified, this reverts and §6 applies as written below.
 
 #### 6.1 Motivation
 

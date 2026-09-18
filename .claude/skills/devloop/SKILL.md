@@ -101,7 +101,7 @@ When authoring the plan for a devloop, the implementer lists **every** planned f
 
 **Classification and owner routing apply only to the edits that actually need an owner (ADR-0037 D1): Domain-judgment cross-boundary edits and Guarded Shared Areas.** Everything else — in-domain edits, and Mechanical or Minor-judgment cross-boundary edits — is reviewed by the standard panel with **no** separate classification row, owner-confirmation, or Gate-3 Ownership Lens verdict. Rationale: story-1 evidence showed Mechanical/Minor cross-boundary edits (~82% of classified rows) almost never produced an owner catch, while the classification/co-sign/verdict ceremony around them was a top token sink. Only Domain-judgment (~12%) and the GSA safety boundary earn owner involvement.
 
-For an edit that *does* need an owner, classify the row (**Not mine, Domain-judgment**, or a GSA path) and route per the Owner Involvement table (§6.3). Reviewers may still **upgrade** any cross-boundary edit they believe needs the owner (Mechanical/Minor → Domain-judgment); the challenge auto-routes to ESCALATE — that upgrade path is the backstop against an implementer under-calling a Domain-judgment edit. See ADR-0024 §6 for the original rationale; ADR-0037 D1 narrows its application during the story-2 trial.
+**The implementer may edit any file in this devloop** — ADR-0037 D1 removes owner-implements and spin-out entirely. For an edit that *does* need an owner (Domain-judgment cross-boundary, or a GSA path), the owner is **pulled into planning and review** (not re-assigned the implementation): classify the row (**Not mine, Domain-judgment**, or a GSA path), record the owner, and add them via `--paired-with=<owner>`. Reviewers may still **upgrade** any cross-boundary edit they believe needs the owner (Mechanical/Minor → Domain-judgment); the challenge auto-routes to ESCALATE — that upgrade path is the backstop against an implementer under-calling a Domain-judgment edit. See ADR-0024 §6 for the original rationale; ADR-0037 D1 narrows its application during the story-2 trial.
 
 ### Three-Category Classification (§6.2)
 
@@ -109,7 +109,7 @@ For an edit that *does* need an owner, classify the row (**Not mine, Domain-judg
 - **Minor-judgment** — Small defensive adjustments where a reasonable reader could argue either way but impact is bounded. Examples: widening a numeric threshold, adding a missing structured-log field. **Alert rule changes** (severity, routing labels, `for:` duration) that couple to runbook prose (`docs/runbooks/*.md`) or the alert conventions doc (`docs/observability/alert-conventions.md`) are Minor-judgment. Under ADR-0037 D1 these are **review-only** — no separate operations hunk-ACK; operations is on the standing panel and reviews the runbook-coherence concern there (upgrade to Domain-judgment if the fired-state semantics genuinely change).
 - **Domain-judgment** — Changes requiring the owner's domain knowledge (threshold tuning, behavior changes, API semantics, new instrumentation affecting SLO shape).
 
-Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B coordinated renames require a **named convention author** (e.g., observability for metric taxonomy) — absent one, Pattern B collapses to owner-implements.
+Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B coordinated renames require a **named convention author** (e.g., observability for metric taxonomy) — absent one, Pattern B collapses to Domain-judgment (owner in planning + review, per ADR-0037 D1).
 
 ### Owner Involvement (§6.3)
 
@@ -117,13 +117,13 @@ Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B
 |----------|-------------------|-----------|
 | Mechanical | Review-only | No classification row, no separate approval, no Ownership Lens verdict. Reviewed by the standard panel like any other diff (ADR-0037 D1). |
 | Minor-judgment | Review-only | Same as Mechanical (ADR-0037 D1): no owner-confirmation dance, no Ownership Lens verdict. If the owner-specialist is on the panel they see it at the standard gate; the always-on quartet (security/obs/ops/dry) backstops. A reviewer who thinks it needs the owner **upgrades to Domain-judgment** (auto-ESCALATE). |
-| Domain-judgment | Owner-implements | Route to a separate devloop with owner as implementer, or use `--paired-with=<owner>` to keep the owner in the loop during the current devloop. Classify the row and record the owner. |
+| Domain-judgment | Owner in planning + review | The implementer makes the edit **in this devloop** — any file is editable; there is **no spin-out and no owner-implements** (ADR-0037 D1). The owning specialist is pulled into **Gate 1 (planning)** and **Gate 3 (review)**, e.g. via `--paired-with=<owner>`. Classify the row and record the owner so they are pulled in. |
 
-**Default posture**: Mechanical and Minor-judgment cross-boundary edits **proceed with review** — no deferral to owner. Owner-implements holds only for Domain-judgment and Guarded Shared Areas. **Inside Guarded Shared Areas this posture does NOT apply — Mechanical classification is disallowed there and the GSA rules below govern (unchanged by ADR-0037).**
+**Default posture (ADR-0037 D1)**: the implementer may edit **any file** in a single devloop — there is no owner-implements and no spin-out to a separate owner devloop. Mechanical and Minor-judgment cross-boundary edits **proceed with review** by the standard panel. Domain-judgment cross-boundary edits also proceed **in this devloop**, but pull the **owner into planning + review**. **Guarded Shared Areas** additionally pull **security** into planning + review (intersection rule: all affected owners + security); Mechanical classification is disallowed inside a GSA (a GSA edit is always at least Domain-judgment-level owner involvement).
 
 ### Guarded Shared Areas (§6.4)
 
-Certain surfaces override the category classification: even a sed-clean edit routes to the owner-specialist. **Mechanical is disallowed inside GSA; Minor-judgment requires owner confirmation at Gate 1 and Gate 3 (§6.3).**
+Certain surfaces raise the bar regardless of how clean the edit looks. Under ADR-0037 D1 the implementer still makes the edit **in this devloop** (no spin-out, no owner-implements), but a GSA edit **pulls the owning specialist AND security into planning (Gate 1) and review (Gate 3)** — e.g. via `--paired-with`. **Mechanical classification is disallowed inside a GSA** (a GSA edit is always at least Domain-judgment-level owner involvement); the intersection rule below governs multi-GSA edits.
 
 **Criterion** (names the test, not just the list): wire-format runtime coupling, OR auth-routing policy, OR detection/forensics contract, OR schema evolution. Paths matching the criterion are Guarded whether or not enumerated below.
 
