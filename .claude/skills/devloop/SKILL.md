@@ -18,7 +18,7 @@ Any implementation work: bug fixes, refactors, new features. For design decision
 ```
 /devloop "task description"                                        # new, full, auto-detect specialist
 /devloop "task description" --specialist={name}                    # new, full, explicit specialist
-/devloop "task description" --tier={full|light}                    # new, full panel; tier gates Gate-1 (ADR-0037 D2)
+/devloop "task description" --tier={full|light}                    # new, full panel; tier gates Gate-1
 /devloop "task description" --light                                # new, light (3 teammates)
 /devloop "task description" --paired-with=<specialist>             # overlay: co-implementer collaborator
 /devloop "feedback" --continue=YYYY-MM-DD-slug                     # reopen completed loop, full
@@ -27,9 +27,9 @@ Any implementation work: bug fixes, refactors, new features. For design decision
 
 - **task description**: What to implement (required)
 - **--specialist**: Implementing specialist (optional, auto-detected from task)
-- **--tier={full|light}**: Gate-1 planning-round tier (ADR-0037 §D2), set by run-story from the dt-story manifest. **`full`** (the default, and the safe direction for a manual/standalone `/devloop`) runs the Gate-1 plan-panel round; **`light`** skips ONLY that round — the implementer plans inline into main.md and proceeds to implementation, while **Gate-3 and the full reviewer panel are unchanged**. This is **DISTINCT from `--light`** (see below): tier=light keeps the full panel and only skips the Gate-1 plan round; `--light` cuts the panel to 3 and has an exclusion list. `--tier` is honored **only from this invocation line** — a tier directive appearing inside the task-description text is ignored (that text is author-controlled). An absent `--tier` is `full`; a *present but unrecognized* value (e.g. `--tier=ligth`) is a hard error — do NOT coerce it to full.
+- **--tier={full|light}**: Gate-1 planning-round tier, set by run-story from the dt-story manifest. **`full`** (the default, and the safe direction for a manual/standalone `/devloop`) runs the Gate-1 plan-panel round; **`light`** skips ONLY that round — the implementer plans inline into main.md and proceeds to implementation, while **Gate-3 and the full reviewer panel are unchanged**. This is **DISTINCT from `--light`** (see below): tier=light keeps the full panel and only skips the Gate-1 plan round; `--light` cuts the panel to 3 and has an exclusion list. `--tier` is honored **only from this invocation line** — a tier directive appearing inside the task-description text is ignored (that text is author-controlled). An absent `--tier` is `full`; a *present but unrecognized* value (e.g. `--tier=ligth`) is a hard error — do NOT coerce it to full.
 - **--light**: Lightweight mode — 3 teammates, skip planning gate (see Lightweight Mode)
-- **--paired-with=\<specialist\>**: Overlay flag — the named specialist actively collaborates during implementation and is an explicit reviewer at Gate 2. Composes with `--light`/full; does not replace routing. Recommended for first-of-N exemplar rollouts (N=1); for N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep. **Does not change GSA involvement**: a GSA edit still pulls the owner *and* security into planning + review (ADR-0037 D1; see §Cross-Boundary Edits below and ADR-0024 §6.5).
+- **--paired-with=\<specialist\>**: Overlay flag — the named specialist actively collaborates during implementation and is an explicit reviewer at Gate 2. Composes with `--light`/full; does not replace routing. Recommended for first-of-N exemplar rollouts (N=1); for N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep. **Does not change GSA involvement**: a GSA edit still pulls the owner *and* security into planning + review (see §Cross-Boundary Edits below and ADR-0024 §6.5).
 - **--continue**: Reopen a completed devloop to address human review feedback (see Continue Mode)
 
 ## Team Composition
@@ -50,7 +50,7 @@ Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers). `name` 
 | Code Quality Reviewer | `code-reviewer` | `code-reviewer` | Rust idioms, ADR compliance |
 | DRY Reviewer | `dry-reviewer` | `dry-reviewer` | Cross-service duplication (see DRY exception in review protocol) |
 | Operations Reviewer | `operations` | `operations` | Deployment safety, rollback, runbooks |
-| Semantic Guard Reviewer **(conditional — see below)** | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (e.g. credential leak, client credential lifetime — authoritative list: `scripts/guards/semantic/checks.md`). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. **Spawned only when the diff touches a check surface (ADR-0037 D4) — not an always-present reviewer.** |
+| Semantic Guard Reviewer **(conditional — see below)** | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (e.g. credential leak, client credential lifetime — authoritative list: `scripts/guards/semantic/checks.md`). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. **Spawned only when the diff touches a check surface — not an always-present reviewer.** |
 | Paired Specialist (if `--paired-with=<specialist>`) | `paired-<specialist>` | `{specialist}` | Active collaborator during implementation + Gate 2 reviewer. When `<specialist>` is already a mandatory reviewer (security/test/observability/operations), the paired teammate replaces that slot with the same identity and an expanded role. |
 
 The Lead (orchestrator) is automatically named `team-lead` in the team config.
@@ -59,7 +59,7 @@ The Lead (orchestrator) is automatically named `team-lead` in the team config.
 
 **Conditional domain reviewer**: When the task touches database patterns (`migration|schema|sql`) but the implementer is NOT the Database specialist, add Database as a conditional 8th reviewer. Same for Protocol when API contracts are affected by a non-Protocol implementer.
 
-**Conditional semantic guard (ADR-0037 D4)**: Semantic Guard is no longer an always-present full-mode reviewer. Spawn it only when the diff plausibly touches a surface named in `scripts/guards/semantic/checks.md` — e.g. a type carrying credential/secret material, a `Debug`/`Display` derive or impl over a payload or key, client credential-lifetime handling, or comment-vs-code meaning drift. Its historical yield is ~1 real catch per 6 tasks at the cost of a full reviewer seat, so the default is **skip**; err toward including it when a check surface is plausibly in the diff (a false include costs one seat; a false skip misses a catch), and when in genuine doubt on a production-code diff, include it. When not spawned, its Gate-3 verdict row is omitted, not left blank.
+**Conditional semantic guard**: Semantic Guard is no longer an always-present full-mode reviewer. Spawn it only when the diff plausibly touches a surface named in `scripts/guards/semantic/checks.md` — e.g. a type carrying credential/secret material, a `Debug`/`Display` derive or impl over a payload or key, client credential-lifetime handling, or comment-vs-code meaning drift. Its historical yield is ~1 real catch per 6 tasks at the cost of a full reviewer seat, so the default is **skip**; err toward including it when a check surface is plausibly in the diff (a false include costs one seat; a false skip misses a catch), and when in genuine doubt on a production-code diff, include it. When not spawned, its Gate-3 verdict row is omitted, not left blank.
 
 ### Lightweight Mode (`--light`)
 
@@ -99,31 +99,31 @@ For small, contained changes (typically 10-30 lines):
 
 When authoring the plan for a devloop, the implementer lists **every** planned file change in `main.md` (plan template) so the scope-drift guard can compare plan against diff.
 
-**Classification and owner routing apply only to the edits that actually need an owner (ADR-0037 D1): Domain-judgment cross-boundary edits and Guarded Shared Areas.** Everything else — in-domain edits, and Mechanical or Minor-judgment cross-boundary edits — is reviewed by the standard panel with **no** separate classification row, owner-confirmation, or Gate-3 Ownership Lens verdict. Rationale: story-1 evidence showed Mechanical/Minor cross-boundary edits (~82% of classified rows) almost never produced an owner catch, while the classification/co-sign/verdict ceremony around them was a top token sink. Only Domain-judgment (~12%) and the GSA safety boundary earn owner involvement.
+**Classification and owner routing apply only to the edits that actually need an owner: Domain-judgment cross-boundary edits and Guarded Shared Areas.** Everything else — in-domain edits, and Mechanical or Minor-judgment cross-boundary edits — is reviewed by the standard panel with **no** separate classification row, owner-confirmation, or Gate-3 Ownership Lens verdict. Rationale: story-1 evidence showed Mechanical/Minor cross-boundary edits (~82% of classified rows) almost never produced an owner catch, while the classification/co-sign/verdict ceremony around them was a top token sink. Only Domain-judgment (~12%) and the GSA safety boundary earn owner involvement.
 
-**The implementer may edit any file in this devloop** — ADR-0037 D1 removes owner-implements and spin-out entirely. For an edit that *does* need an owner (Domain-judgment cross-boundary, or a GSA path), the owner is **pulled into planning and review** (not re-assigned the implementation): classify the row (**Not mine, Domain-judgment**, or a GSA path), record the owner, and add them via `--paired-with=<owner>`. Reviewers may still **upgrade** any cross-boundary edit they believe needs the owner (Mechanical/Minor → Domain-judgment); the challenge auto-routes to ESCALATE — that upgrade path is the backstop against an implementer under-calling a Domain-judgment edit. See ADR-0024 §6 for the original rationale; ADR-0037 D1 narrows its application during the story-2 trial.
+**The implementer may edit any file in this devloop** — owner-implements and spin-out are removed entirely. For an edit that *does* need an owner (Domain-judgment cross-boundary, or a GSA path), the owner is **pulled into planning and review** (not re-assigned the implementation): classify the row (**Not mine, Domain-judgment**, or a GSA path), record the owner, and add them via `--paired-with=<owner>`. Reviewers may still **upgrade** any cross-boundary edit they believe needs the owner (Mechanical/Minor → Domain-judgment); the challenge auto-routes to ESCALATE — that upgrade path is the backstop against an implementer under-calling a Domain-judgment edit. See ADR-0024 §6 for the original rationale.
 
 ### Three-Category Classification (§6.2)
 
 - **Mechanical** — Value-neutral *and* structure-preserving (the `sed`-test applies: deterministic find-and-replace that does not change the encoded concept). Requires full guard pipeline coverage for the change-pattern: **Mechanical iff guards catch every partial version** (see `./scripts/guards/run-guards.sh`). Concept substitution (renaming a metric label while changing its semantic meaning) is NOT Mechanical.
-- **Minor-judgment** — Small defensive adjustments where a reasonable reader could argue either way but impact is bounded. Examples: widening a numeric threshold, adding a missing structured-log field. **Alert rule changes** (severity, routing labels, `for:` duration) that couple to runbook prose (`docs/runbooks/*.md`) or the alert conventions doc (`docs/observability/alert-conventions.md`) are Minor-judgment. Under ADR-0037 D1 these are **review-only** — no separate operations hunk-ACK; operations is on the standing panel and reviews the runbook-coherence concern there (upgrade to Domain-judgment if the fired-state semantics genuinely change).
+- **Minor-judgment** — Small defensive adjustments where a reasonable reader could argue either way but impact is bounded. Examples: widening a numeric threshold, adding a missing structured-log field. **Alert rule changes** (severity, routing labels, `for:` duration) that couple to runbook prose (`docs/runbooks/*.md`) or the alert conventions doc (`docs/observability/alert-conventions.md`) are Minor-judgment. These are **review-only** — no separate operations hunk-ACK; operations is on the standing panel and reviews the runbook-coherence concern there (upgrade to Domain-judgment if the fired-state semantics genuinely change).
 - **Domain-judgment** — Changes requiring the owner's domain knowledge (threshold tuning, behavior changes, API semantics, new instrumentation affecting SLO shape).
 
-Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B coordinated renames require a **named convention author** (e.g., observability for metric taxonomy) — absent one, Pattern B collapses to Domain-judgment (owner in planning + review, per ADR-0037 D1).
+Use ADR-0019 Pattern A/B/C vocabulary for duplication/rename patterns; Pattern B coordinated renames require a **named convention author** (e.g., observability for metric taxonomy) — absent one, Pattern B collapses to Domain-judgment (owner in planning + review).
 
 ### Owner Involvement (§6.3)
 
 | Category | Owner involvement | Mechanism |
 |----------|-------------------|-----------|
-| Mechanical | Review-only | No classification row, no separate approval, no Ownership Lens verdict. Reviewed by the standard panel like any other diff (ADR-0037 D1). |
-| Minor-judgment | Review-only | Same as Mechanical (ADR-0037 D1): no owner-confirmation dance, no Ownership Lens verdict. If the owner-specialist is on the panel they see it at the standard gate; the always-on quartet (security/obs/ops/dry) backstops. A reviewer who thinks it needs the owner **upgrades to Domain-judgment** (auto-ESCALATE). |
-| Domain-judgment | Owner in planning + review | The implementer makes the edit **in this devloop** — any file is editable; there is **no spin-out and no owner-implements** (ADR-0037 D1). The owning specialist is pulled into **Gate 1 (planning)** and **Gate 3 (review)**, e.g. via `--paired-with=<owner>`. Classify the row and record the owner so they are pulled in. |
+| Mechanical | Review-only | No classification row, no separate approval, no Ownership Lens verdict. Reviewed by the standard panel like any other diff. |
+| Minor-judgment | Review-only | Same as Mechanical: no owner-confirmation dance, no Ownership Lens verdict. If the owner-specialist is on the panel they see it at the standard gate; the always-on quartet (security/obs/ops/dry) backstops. A reviewer who thinks it needs the owner **upgrades to Domain-judgment** (auto-ESCALATE). |
+| Domain-judgment | Owner in planning + review | The implementer makes the edit **in this devloop** — any file is editable; there is **no spin-out and no owner-implements**. The owning specialist is pulled into **Gate 1 (planning)** and **Gate 3 (review)**, e.g. via `--paired-with=<owner>`. Classify the row and record the owner so they are pulled in. |
 
-**Default posture (ADR-0037 D1)**: the implementer may edit **any file** in a single devloop — there is no owner-implements and no spin-out to a separate owner devloop. Mechanical and Minor-judgment cross-boundary edits **proceed with review** by the standard panel. Domain-judgment cross-boundary edits also proceed **in this devloop**, but pull the **owner into planning + review**. **Guarded Shared Areas** additionally pull **security** into planning + review (intersection rule: all affected owners + security); Mechanical classification is disallowed inside a GSA (a GSA edit is always at least Domain-judgment-level owner involvement).
+**Default posture**: the implementer may edit **any file** in a single devloop — there is no owner-implements and no spin-out to a separate owner devloop. Mechanical and Minor-judgment cross-boundary edits **proceed with review** by the standard panel. Domain-judgment cross-boundary edits also proceed **in this devloop**, but pull the **owner into planning + review**. **Guarded Shared Areas** additionally pull **security** into planning + review (intersection rule: all affected owners + security); Mechanical classification is disallowed inside a GSA (a GSA edit is always at least Domain-judgment-level owner involvement).
 
 ### Guarded Shared Areas (§6.4)
 
-Certain surfaces raise the bar regardless of how clean the edit looks. Under ADR-0037 D1 the implementer still makes the edit **in this devloop** (no spin-out, no owner-implements), but a GSA edit **pulls the owning specialist AND security into planning (Gate 1) and review (Gate 3)** — e.g. via `--paired-with`. **Mechanical classification is disallowed inside a GSA** (a GSA edit is always at least Domain-judgment-level owner involvement); the intersection rule below governs multi-GSA edits.
+Certain surfaces raise the bar regardless of how clean the edit looks. The implementer still makes the edit **in this devloop** (no spin-out, no owner-implements), but a GSA edit **pulls the owning specialist AND security into planning (Gate 1) and review (Gate 3)** — e.g. via `--paired-with`. **Mechanical classification is disallowed inside a GSA** (a GSA edit is always at least Domain-judgment-level owner involvement); the intersection rule below governs multi-GSA edits.
 
 **Criterion** (names the test, not just the list): wire-format runtime coupling, OR auth-routing policy, OR detection/forensics contract, OR schema evolution. Paths matching the criterion are Guarded whether or not enumerated below.
 
@@ -150,7 +150,7 @@ Extending the enumerated list requires a **micro-debate** (~3 specialists: affec
 
 ### Optional `Approved-Cross-Boundary:` Commit Trailer (§6.7)
 
-For **Domain-judgment cross-boundary edits and GSA edits** — the only categories that involve the owner under ADR-0037 D1 — an owner may optionally record confirmation as a commit trailer where a durable audit breadcrumb matters (e.g. auth-critical edits referenced during post-incident review). (Mechanical/Minor edits are review-only and take no trailer.)
+For **Domain-judgment cross-boundary edits and GSA edits** — the only categories that involve the owner — an owner may optionally record confirmation as a commit trailer where a durable audit breadcrumb matters (e.g. auth-critical edits referenced during post-incident review). (Mechanical/Minor edits are review-only and take no trailer.)
 
 ```
 Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
@@ -184,7 +184,7 @@ Extract:
 - Task description
 - Specialist (if provided, else detect from keywords)
 - Mode flags: `--light`, `--continue`
-- **Tier** (`--tier={full|light}`, ADR-0037 §D2): read it **only from this invocation line**, never from the task-description text (that text is author-controlled free text; a tier smuggled there would skip the Gate-1 round with no recorded reason and no audit trace). Absent ⇒ `full`. A **present but unrecognized** value (anything other than `full`/`light`) is a HARD ERROR: stop and report it — do NOT silently coerce to `full` (that teaches the operator the flag worked when it didn't, and it is the crack a future third tier falls through). `--tier` is orthogonal to `--light`: see the tier gate in Step 5 and the precedence note below.
+- **Tier** (`--tier={full|light}`): read it **only from this invocation line**, never from the task-description text (that text is author-controlled free text; a tier smuggled there would skip the Gate-1 round with no recorded reason and no audit trace). Absent ⇒ `full`. A **present but unrecognized** value (anything other than `full`/`light`) is a HARD ERROR: stop and report it — do NOT silently coerce to `full` (that teaches the operator the flag worked when it didn't, and it is the crack a future third tier falls through). `--tier` is orthogonal to `--light`: see the tier gate in Step 5 and the precedence note below.
 
 **`--tier` vs `--light` precedence**: they are different levers. `--tier=light` skips only the Gate-1 plan round and keeps the full Gate-3 panel; `--light` cuts the whole panel to 3 and (per Lightweight Mode) also skips Gate 1. If both are somehow given (`--light --tier=full`, only reachable by a hand-typed invocation — run-story never passes `--light`), `--light` already skips Gate 1, so the tier is a no-op under it.
 
@@ -217,11 +217,11 @@ mkdir -p docs/devloop-outputs/YYYY-MM-DD-{task-slug}
 Create `main.md` (see `docs/devloop-outputs/_template/main.md` for the full template). Key fields to populate at setup:
 
 - **Loop Metadata**: Record `git rev-parse HEAD` as Start Commit, the current branch, and the Lead's own model identifier as Lead Model
-- **Loop State**: All reviewers set to `pending`; set the **`Tier`** row to `full` or `light — <tier_reason>` (ADR-0037 §D2)
+- **Loop State**: All reviewers set to `pending`; set the **`Tier`** row to `full` or `light — <tier_reason>`
 - **Phase**: `setup`
 - **Mode**: panel mode — `full` (Gate-1 present) or `light` (`--light`, 3-teammate panel). **Distinct from the `Tier` row**, which is the Gate-1 planning-round tier; a run-story task is always full panel mode with `Tier` as its only Gate-1 lever. When `Tier` is `light`, note it on the Mode line too (`full panel; Gate-1 SKIPPED — <tier_reason>`) so a reader sees the gate shape at a glance.
 
-**The `Tier` row is PROVENANCE, not a copy of the manifest.** It records *what this attempt did* (Gate 1 run, or skipped under tier=light per ADR-0037 D2) — a historical fact of a decision already taken. It is NOT a cache of the dt-story manifest's `tier` field (which is the SSoT for *what tier a task is* and is human-editable). This is the same different-provenance-different-rule split as the `commit`-vs-`slug` provenance note on `Task::slug` in `crates/dt-story/src/manifest.rs` — do not "reconcile" the two by having a resumed devloop re-read the manifest (see Step 5 / Continue Mode: resume reads THIS row, not the manifest).
+**The `Tier` row is PROVENANCE, not a copy of the manifest.** It records *what this attempt did* (Gate 1 run, or skipped under tier=light) — a historical fact of a decision already taken. It is NOT a cache of the dt-story manifest's `tier` field (which is the SSoT for *what tier a task is* and is human-editable). This is the same different-provenance-different-rule split as the `commit`-vs-`slug` provenance note on `Task::slug` in `crates/dt-story/src/manifest.rs` — do not "reconcile" the two by having a resumed devloop re-read the manifest (see Step 5 / Continue Mode: resume reads THIS row, not the manifest).
 
 For security-critical implementations, the implementer should maintain a "Security Decisions" table in main.md:
 
@@ -342,7 +342,7 @@ Update main.md: Phase = planning (full) or implementation (light)
 
 ### Step 5: Gate 1 - Plan Approval [FULL MODE ONLY]
 
-**Tier gate (ADR-0037 §D2) — applied first:**
+**Tier gate — applied first:**
 
 - **`tier == full`** (the default; also any manual/standalone `/devloop` with no `--tier`): run the plan-panel round below exactly as today.
 - **`tier == light`**: **SKIP the plan-panel round.** The implementer plans **inline into main.md** (the Planning section + any files/Classification table), written **before** implementation, not reconstructed after. Note precisely what does and does not run on this path: the Lead's **Gate-1** Layer-B classification-sanity invocation (below, in the full-path portion of this step) **does NOT run under tier=light**, so the **Gate-2 `run-guards.sh`** classification-sanity run (§Guard Layers) becomes the *only* mechanical GSA/classification check — its default no-arg mode scans the diff for modified `main.md` files, and a light loop's `main.md` is always in the diff, so enforcement is picked up there, one gate later and **after** implementation. That table is its baseline. Because the mechanical net moves after the code is written, **the escalation rule below is the load-bearing PRE-implementation GSA control on the light path** (a GSA path caught only at Gate 2 means a non-owner already wrote the change, which ADR-0024 §6.4's "owner-confirmation at Gate 1" cannot be retro-satisfied for). Then proceed directly to implementation. Record the skip in main.md by REPLACING the confirmation table with a single explicit marker (never leave the rows `pending` — that is indistinguishable from an abandoned/interrupted gate):
@@ -515,7 +515,7 @@ A reviewer's verdict is **RESOLVED-DEFERRED** if even one of their findings was 
 After review, stage and commit:
 
 1. `git add -A`
-2. **Commit-intent checkpoint (headless only — ADR-0037 D6/f).** This is written at
+2. **Commit-intent checkpoint (headless only).** This is written at
    Gate-3 close, i.e. AFTER the reviewer verdicts (and any `Approved-Cross-Boundary:`
    owner co-sign) and AFTER staging, but BEFORE the commit in step 3 — so that if the
    session dies during the terminal phase (CLI crash at teardown, PID exhaustion,
@@ -648,7 +648,7 @@ Reopens a completed devloop to address human review feedback. All work is tracke
    - The original task context (from main.md)
    - The human review feedback
    - Reference to the previous implementation
-5. **Determine mode AND tier**: `--light` (panel mode) is controlled by the user's flags, same rules as new devloops. **The Gate-1 tier is NOT re-passed on the resume line** (run-story's `--continue` lane deliberately carries no `--tier`) — read it from main.md's Loop State **`Tier` row**, which is the authoritative record of what this attempt did (ADR-0037 §D2 / O1b). **Read the `Tier` FIELD specifically; never infer the tier from the presence, absence, or emptiness of the Gate-1 confirmations table** — the `### Gate 1 — SKIPPED` marker is derived human-facing prose, the row is the machine record, and inferring from the table is how a light task silently re-runs the plan round it was meant to skip. If main.md has **no `Tier` row** (a pre-ADR-0037 devloop resumed after this landed), default to **`full`** (fail-safe: more review, never less). Apply the resolved tier to the Step 5 tier gate exactly as a fresh run would.
+5. **Determine mode AND tier**: `--light` (panel mode) is controlled by the user's flags, same rules as new devloops. **The Gate-1 tier is NOT re-passed on the resume line** (run-story's `--continue` lane deliberately carries no `--tier`) — read it from main.md's Loop State **`Tier` row**, which is the authoritative record of what this attempt did. **Read the `Tier` FIELD specifically; never infer the tier from the presence, absence, or emptiness of the Gate-1 confirmations table** — the `### Gate 1 — SKIPPED` marker is derived human-facing prose, the row is the machine record, and inferring from the table is how a light task silently re-runs the plan round it was meant to skip. If main.md has **no `Tier` row** (a devloop from before the Tier row existed, resumed after this landed), default to **`full`** (fail-safe: more review, never less). Apply the resolved tier to the Step 5 tier gate exactly as a fresh run would.
 6. **Run workflow**: Same gates as a new devloop (validation + review), tracked as additional iterations in the same main.md
 7. **Update main.md**: Record implementation changes, validation results, and reviewer verdicts for this iteration
 

@@ -166,7 +166,7 @@ If it fails, forward to the offending specialist, ask for a fix, re-run. Phase 2
 
 ## Phase 2.5: Teammate Teardown
 
-> **Removed (ADR-0037 D1)**: the former "DRY Ownership Lens Retrospective" (Phase 2.5) is deleted. It was a meta-audit *of* the cross-boundary classifications — and D1 stops classifying Mechanical/Minor edits, so there is nothing left to audit. Cross-devloop DRY findings still reach `docs/TODO.md` from Gate 3 as before.
+> **Removed**: the former "DRY Ownership Lens Retrospective" (Phase 2.5) is deleted. It was a meta-audit *of* the cross-boundary classifications — and the current model stops classifying Mechanical/Minor edits, so there is nothing left to audit. Cross-devloop DRY findings still reach `docs/TODO.md` from Gate 3 as before.
 
 After all reflections have completed (or timed out):
 
