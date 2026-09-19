@@ -30,16 +30,11 @@ set -euo pipefail
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source common library for helper functions
+# Source common library for helper functions (also provides RED/YELLOW/… — tty-gated there, the
+# ONE home for the guards tree; standalone use still reaches this source unconditionally under
+# `set -e`, so no separate copy is kept here. ADR-0037 D8: the tty-gate keeps raw ANSI out of
+# ${DEVLOOP_TMP}/layer-3.log so the runbook §6.3/§8 `FAILED:` grep and the `^FAILED` teaser anchor match).
 source "$SCRIPT_DIR/common.sh"
-
-# Colors (already defined in common.sh, but keep for standalone use)
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m'
 
 # Default options
 VERBOSE=false
@@ -286,6 +281,16 @@ echo ""
 # operator-lane exit (2, below) from MASKING a real defect when a timeout coexists.
 if [[ $FAILED_GUARDS -gt 0 ]]; then
     echo "STATUS=FAIL REASON=guard-violations"
+    # Machine-parseable, uncolored, comma-joined names (ADR-0037 D8). DISTINCT from the human
+    # "Failed guards" block below AND from the INTEGER counter var FAILED_GUARDS (`:99`, which
+    # drives the >0 test, the :277 summary and the exit ladder at :335) — same spelling, different
+    # thing: this is a log-line TOKEN, that is a shell variable. Emitted from the FAILED_GUARD_NAMES
+    # array (one producer, so the token and the human list cannot disagree). Plain `echo`, no color,
+    # so `^FAILED_GUARD_NAMES=` anchors; a subshell scopes IF=',' without leaking. layer-all.sh
+    # reads it via _common.sh::parse_failed_guard_names() to name the exact guard in the D8
+    # FAILURE_TRIAGE directive. NOT a STATUS= line (does not trip the ANCHOR revisit trigger below).
+    # The token string is the emitter<->parser contract, pinned by run-guards.test.sh's round-trip.
+    ( IFS=','; echo "FAILED_GUARD_NAMES=${FAILED_GUARD_NAMES[*]}" )
     echo -e "${RED}Failed guards (violations — implementer lane):${NC}"
     for failed in "${FAILED_GUARD_NAMES[@]}"; do
         echo "  - $failed"
