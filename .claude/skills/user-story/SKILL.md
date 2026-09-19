@@ -296,6 +296,8 @@ The lead collects all proposed tasks from specialists and assembles the ordered 
 - Keep the two boundaries that are about *verifiability*, not seams: (a) one implementing specialist per task; (b) substantial cross-cutting work with its own demonstrable output — a new dashboard + alert rules, a new runbook section — gets its own task rather than riding inside a feature task. Trivially small cross-cutting work (e.g. `#[instrument]` on a new handler) stays inside the task.
 - Smell test: splitting every function or file into its own task is seam-cutting (too narrow); a single task spanning a feature *and* its dashboards *and* its runbook is too broad (three demonstrable outputs, three owners). Aim between: one coherent increment a human could verify on its own.
 
+**Cut by invariant, never leave a partial one.** When a task establishes a *consistency rule* — a formatter applied one way, a config-not-hardcode pattern, an error taxonomy, a metric-label convention — the task **owns every instance of that rule**, not just the ones in the lane it started in. Cutting an invariant by lane/language/service is the seam that manufactures inconsistencies (a rule established in some places but not others), and a half-applied rule is worse than an unstarted one: it is a landmine filed in a TODO that rots. So a task that sets a rule enumerates and covers all its instances. If the full rule genuinely cannot fit one session, it is **one deliberately-sized task**, not several lane-tasks that each ship a seam — the bound is the invariant's own scope, not a file count. Never plan a task that ships a rule "everywhere except X."
+
 **Aspect coverage** — each of these must appear in the plan or be marked N/A with justification:
 - Code changes
 - Database migrations
