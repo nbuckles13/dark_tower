@@ -223,4 +223,34 @@ assert_status "warn-arm-surfaces-prefixed-line" \
 assert_absent "warn-arm-anchor-is-line-start" \
   "incidental mention of WARN mid-sentence" "$warn_out"
 
+# =============================================================================
+# (RT) FAILED_GUARD_NAMES= round-trip + color-gating (ADR-0037 D8). A violation run emits the
+#      structured, uncolored, comma-joined token; _common.sh::parse_failed_guard_names() reads it
+#      back. The emitter (run-guards.sh, sources guards/common.sh) and the parser (_common.sh)
+#      CANNOT share a helper (ADR-0015 coupling), so the token string IS the contract — pinned here
+#      on BOTH sides (Reachability). Reuses the exit-1 stub: every discovered guard becomes a
+#      violation, so FAILED_GUARD_NAMES is the comma-join of all guard basenames.
+# =============================================================================
+d="$WORK/stubRT"; mk_fixed_timeout "$d" 1
+run_rg "$d"
+out="$(cat "$RG_OUT")"
+# Emitter side: the token is present AND line-anchored at column 0 (leading \n in both needle and
+# haystack, so a mid-line occurrence would NOT match) AND uncolored (no ESC before it).
+assert_status "rt-emits-token-line-start" "$(printf '\nFAILED_GUARD_NAMES=')" "$(printf '\n%s' "$out")"
+# Parser side: reads a non-empty value back from run-guards' actual output.
+rt_parsed="$(parse_failed_guard_names "$RG_OUT")"
+if [[ -n "$rt_parsed" ]]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[rt-parser-nonempty] parse_failed_guard_names read nothing from the emitted line"); fi
+# Round-trip: the parsed value equals the guard names independently derived from the human
+# "  - <name>" block (a DIFFERENT code path in run-guards over the same array), comma-joined — so
+# the machine token and the human list cannot silently disagree.
+rt_from_human="$(printf '%s\n' "$out" | sed -n 's/^  - //p' | paste -sd, -)"
+if [[ -n "$rt_from_human" && "$rt_parsed" == "$rt_from_human" ]]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[rt-roundtrip] parsed='${rt_parsed}' != human-derived='${rt_from_human}'"); fi
+# Color-gating (the live ANSI defect fix): under a redirect (not a tty) the FAILED: line is
+# UNCOLORED, so no raw ESC bytes land in the log and the runbook §6.3/§8 `FAILED:` grep works.
+if ! grep -q "$(printf '\033')" "$RG_OUT"; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[rt-no-ansi] RG_OUT has raw ANSI escapes under redirect — colors not tty-gated"); fi
+assert_status "rt-failed-colon-greppable" "$(printf '\nFAILED: ')" "$(printf '\n%s' "$out")"
+
 report_results "scripts/guards/run-guards.test.sh"

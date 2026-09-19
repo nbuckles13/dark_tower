@@ -11,13 +11,26 @@
 # Configuration
 # =============================================================================
 
-# Colors for output
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+# Colors for output — tty-gated (ADR-0037 D8 fix): mirror scripts/lang/_common.sh:79-91. When
+# stdout is NOT a terminal (e.g. under layer-all's `tee` into ${DEVLOOP_TMP}/layer-3.log), emit
+# EMPTY strings so raw escape sequences never land in the log. Ungated, `echo -e "${RED}FAILED${NC}:
+# ..."` wrote `\033[0;31mFAILED\033[0m:` into layer-3.log, so the reset sat BETWEEN `FAILED` and
+# `:` and the runbook §6.3/§8 "scan for FAILED:" grep (and any teaser anchor) matched nothing.
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    YELLOW='\033[1;33m'
+    GREEN='\033[0;32m'
+    BLUE='\033[0;34m'
+    BOLD='\033[1m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    YELLOW=''
+    GREEN=''
+    BLUE=''
+    BOLD=''
+    NC=''
+fi
 
 # =============================================================================
 # Changed File Detection

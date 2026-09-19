@@ -344,4 +344,93 @@ assert_exit      "vii-invalid-exit2"   2 "$LA_RC"
 assert_status    "vii-invalid-message" "DEVLOOP_FAIL_FAST=ture is not a recognized boolean" "$err"
 assert_no_marker "vii-no-stub-ran"     "$LA_DT" 'ran.layer*'
 
+# =============================================================================
+# D8 (ADR-0037) — FAILURE_TRIAGE point-of-failure directive. Emitted on STDERR ($LA_ERR), one per
+# ACTIONABLE-failed layer, in a single block after the human table. ADD-ONLY: the a–vii exit-code/
+# summary asserts above are UNEDITED (byte-identity proof). Directive keys on
+# status_to_exit_code(status)!=0 UNION rc!=0, with NOT-RUN excluded first.
+# =============================================================================
+
+# (D8-1) FAIL@L4 → directive on stderr naming BOTH logs + the anti-pattern + a prefixed teaser;
+#        NOT on stdout (would collide with the summary-cell substring assertions). Default
+#        fail-fast stops at L4, so L5-7 are NOT-RUN and get no directive.
+d="$(new_stubdir)"; mk_stub "$d" 4 FAIL layer4-test-fail 1
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+out="$(cat "$LA_OUT")"; err="$(cat "$LA_ERR")"
+assert_status "d8-1-triage-l4"        "FAILURE_TRIAGE LAYER=4 " "$err"
+assert_status "d8-1-triage-log"       "layer-4.log"             "$err"
+assert_status "d8-1-triage-stderrlog" "layer-4.stderr.log"      "$err"
+assert_status "d8-1-antipattern"      "do NOT re-run the layer" "$err"
+assert_status "d8-1-teaser-prefixed"  "    | STATUS=FAIL"       "$err"   # prefix (ops OPS-D) + teaser present
+assert_absent "d8-1-not-on-stdout"    "FAILURE_TRIAGE"          "$out"
+assert_absent "d8-1-no-triage-l7"     "FAILURE_TRIAGE LAYER=7"  "$err"   # NOT-RUN layer gets nothing
+
+# (D8-2) all-OK → NO directive at all (the negative half; without it the assertion is vacuous —
+#        it would pass if the directive printed unconditionally).
+d="$(new_stubdir)"
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+err="$(cat "$LA_ERR")"
+assert_absent "d8-2-all-ok-no-triage" "FAILURE_TRIAGE" "$err"
+
+# (D8-3) SKIPPED-NO-CLUSTER@L7 (exit 0, non-OK status) → NO directive (test's required negative:
+#        a `!= OK` predicate would wrongly fire; keying on status_to_exit_code()==0 does not). This
+#        is the realistic CI false-positive (L7 green-skips every cluster-less CI run).
+d="$(new_stubdir)"; mk_stub "$d" 7 SKIPPED-NO-CLUSTER no-cluster-ci 0
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+err="$(cat "$LA_ERR")"
+assert_absent "d8-3-skipped-no-triage" "FAILURE_TRIAGE" "$err"
+
+# (D8-4) RUN-ALL multi-red (FAIL@L4 + PRECONDITION@L7) → a directive for BOTH failing layers.
+d="$(new_stubdir)"; mk_stub "$d" 4 FAIL layer4-test-fail 1; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=0
+err="$(cat "$LA_ERR")"
+assert_status "d8-4-triage-l4" "FAILURE_TRIAGE LAYER=4 " "$err"
+assert_status "d8-4-triage-l7" "FAILURE_TRIAGE LAYER=7 " "$err"
+
+# (D8-5) FAIL-FAST (same tree, default mode) → stops at L4: directive for L4, ABSENT for NOT-RUN L7.
+d="$(new_stubdir)"; mk_stub "$d" 4 FAIL layer4-test-fail 1; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+err="$(cat "$LA_ERR")"
+assert_status "d8-5-ff-triage-l4"    "FAILURE_TRIAGE LAYER=4 " "$err"
+assert_absent "d8-5-ff-no-triage-l7" "FAILURE_TRIAGE LAYER=7"  "$err"
+
+# (D8-6) LYING STATUS=OK; exit 1 (rc-keyed, not status-keyed): status_to_exit_code(OK)=0 but rc=1
+#        → the directive STILL fires. The most operator-hostile case (table reads OK, exit non-zero).
+d="$(new_stubdir)"; mk_stub "$d" 7 OK lying-status-line 1
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+err="$(cat "$LA_ERR")"
+assert_status "d8-6-lying-triage-l7" "FAILURE_TRIAGE LAYER=7 " "$err"
+
+# (D8-7) NO-MATCH TEASER + exit survives (security G3, BLOCKING): two PRECONDITION layers in run-all
+#        whose logs contain NONE of the teaser anchors (STATUS=PRECONDITION_FAILURE matches neither
+#        ^STATUS=FAIL nor ^PRECONDITION_FAILURE:). The `|| true` must keep set -e from aborting on
+#        the grep no-match, so: (a) LAYER_ALL_EXIT stays the TRUE final_exit (2, not demoted to 1),
+#        and (b) the loop COMPLETES — BOTH L3 and L7 get a directive (a mid-loop abort would drop L7).
+d="$(new_stubdir)"; mk_stub "$d" 3 PRECONDITION_FAILURE guard-timeout 2; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=0
+err="$(cat "$LA_ERR")"
+assert_exit   "d8-7-exit2-survives-nomatch" 2 "$LA_RC"
+assert_status "d8-7-triage-l3"              "FAILURE_TRIAGE LAYER=3 "       "$err"
+assert_status "d8-7-triage-l7-loop-done"    "FAILURE_TRIAGE LAYER=7 "       "$err"
+assert_status "d8-7-no-teaser-line"         "no teaser — read the log(s)"   "$err"
+
+# (D8-8) PER-LOG TEASER BUDGET (obs F3): the stderr-only detail must surface even when the stdout
+#        log already has multiple matching lines — a guard-timeout `PRECONDITION_FAILURE:` line is
+#        stderr-only and coexists with stdout violations (runbook §6.3 mixed lane). A single `head`
+#        over the concatenation would let the ≥2 stdout matches starve it; the per-log `head -2`
+#        guarantees each channel is represented. Custom stub: 3 stdout VIOLATION lines + 1 stderr
+#        PRECONDITION line. (Would RED on the old concatenation approach — non-vacuous.)
+d="$(new_stubdir)"
+cat > "$d/layer3.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'VIOLATION: guard-a\nVIOLATION: guard-b\nVIOLATION: guard-c\nSTATUS=FAIL REASON=guard-violations\n'
+printf 'PRECONDITION_FAILURE: guard xyz timed out after 30s\n' >&2
+exit 1
+STUB
+chmod +x "$d/layer3.sh"
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=0
+err="$(cat "$LA_ERR")"
+assert_status "d8-8-stdout-teaser-line"  "    | VIOLATION: guard-a"              "$err"
+assert_status "d8-8-stderr-surfaces"     "    | PRECONDITION_FAILURE: guard xyz" "$err"
+
 report_results "scripts/layer-all.test.sh"

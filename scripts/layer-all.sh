@@ -20,6 +20,10 @@
 # Greppable warn tokens (paired-operations §2):
 #   WARN BUDGET_BREACH LAYER=<n> DURATION=<s> BUDGET=<s>
 #   WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=<s> BUDGET=90
+# Greppable failure-triage token (ADR-0037 D8, on stderr; one per actionable-failed layer):
+#   FAILURE_TRIAGE LAYER=<n> LOG=<path> STDERR_LOG=<path> RESULT=<status>
+# (§8 runbook rows for this + FMT_APPLIED / FMT_LANE / FAILED_GUARD_NAMES are owed to Devloop D —
+#  tracked in docs/TODO.md, not edited here.)
 #
 # Failure triage: docs/runbooks/devloop-validation.md (all layers + §4 two-token convention).
 
@@ -43,7 +47,7 @@ printf 'CARGO_BUILD_JOBS=%s (capped for memory; export CARGO_BUILD_JOBS=N or pas
 # Per-layer result/duration accumulators — declared BEFORE the EXIT trap installs
 # so emit_gate2_verdict's namerefs always bind to existing (possibly-empty) arrays,
 # even on an early exit that fires before the layer loop populates them.
-declare -a layer_status layer_dur
+declare -a layer_status layer_dur layer_rc
 final_exit=0
 stopped_early=0   # >0 = the layer at which interactive fail-fast stopped the run (0 = ran all)
 
@@ -173,6 +177,10 @@ for n in 1 2 3 4 5 6 7; do
   status=$(parse_status_line "${DEVLOOP_TMP}/layer-${n}.log")
   layer_status[$n]="${status:-UNKNOWN}"
   layer_dur[$n]=$dur
+  # Record the layer's real process exit code for the ADR-0037 D8 directive (ADD-ONLY — a value
+  # already computed above; not consumed by aggregation or the Gate-2 trap). Lets the directive
+  # fire on a lying `STATUS=OK; exit 1` layer (the :170 FLOOR case), not just on the parsed enum.
+  layer_rc[$n]=$rc
 
   # Per-layer 20s warn EXCLUDES Layer 7 (task #56 ruling B): env-tests run in a separate
   # ~10–15 min envelope (ADR-0033 §4), so a Layer-7 BUDGET_BREACH would false-fire every
@@ -266,6 +274,87 @@ printf '%-8s %-22s %s\n' "Layer" "Status" "Duration(s)"
 printf '%-8s %-22s %s\n' "-----" "------" "-----------"
 for n in 1 2 3 4 5 6 7; do
   printf '%-8s %-22s %s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}"
+done
+
+# ADR-0037 D8 — point-of-failure log directive (ADD-ONLY, DISPLAY-ONLY). Each failing layer's
+# detail is ALREADY captured (run-guards.sh names the guard + first error lines; each layer's
+# stdout is tee'd to ${DEVLOOP_TMP}/layer-N.log and stderr to layer-N.stderr.log). A reader seeing
+# only the aggregate "Layer N FAILED" re-runs the whole layer to get detail it already has — pure
+# token/time waste. So point at the logs, in the output the reader is already looking at, and name
+# the anti-pattern. This block reads layer_status / layer_rc / DEVLOOP_TMP but NEVER final_exit /
+# TOTAL_RESULT / LAYER_SUMMARY / the NOT-RUN handling / aggregation / STOPPED_EARLY / the
+# __gate2_emit_trap — it changes what is DISPLAYED on a failure, never what a failure MEANS.
+#
+# Channel = stderr, joining the WARN BUDGET_* / PIPELINE_MODE= / STOPPED_EARLY / PRECONDITION_FAILURE:
+# family; stdout stays the machine block + table (a stdout FAILURE_TRIAGE line would also collide
+# with the summary-cell substring assertions in layer-all.test.sh). Placed AFTER the human table so
+# it is the LAST thing on screen — visible when a fail-fast run ends here, and surviving
+# run-story.sh's `tail -n 50 "$gatelog"` on a run-all authority gate.
+#
+# WHICH layers get a directive: those with ACTIONABLE detail — status_to_exit_code(status) != 0
+# (the FAIL / PRECONDITION_FAILURE / FAIL-MISSING-VERB / UNKNOWN set) OR real process rc != 0 (the
+# lying `STATUS=OK; exit 1` masking case the :170 FLOOR names). NOT-RUN is filtered FIRST and
+# EXPLICITLY, before the exit-code map: status_to_exit_code(NOT-RUN) hits its fail-closed `*)`->2
+# backstop and would otherwise hand a directive to a layer that never ran (the mirror of the "do
+# NOT complete the enum" guardrail on the NOT_RUN decl above). OK / N/A / SKIPPED-* map to 0 with
+# rc 0, so they are silently skipped. Works under BOTH modes: fail-fast (un-run layers are NOT-RUN
+# -> skipped; the one red layer gets it) and run-all (every red layer gets one).
+for n in 1 2 3 4 5 6 7; do
+  st="${layer_status[$n]:-UNKNOWN}"
+  [[ "$st" == "$NOT_RUN" ]] && continue
+  # ${layer_rc[$n]:-0} defaulted for `set -u`: fail-fast sets layer_status/layer_dur for un-run
+  # layers (above) but never layer_rc.
+  if [[ "$(status_to_exit_code "$st")" -ne 0 || "${layer_rc[$n]:-0}" -ne 0 ]]; then
+    triage_log="${DEVLOOP_TMP}/layer-${n}.log"
+    triage_errlog="${DEVLOOP_TMP}/layer-${n}.stderr.log"
+    # RESULT= placed NON-adjacent to LAYER= so this line never contains the `LAYER=<n> RESULT=<st>`
+    # substring the summary-cell assertions pin (belt-and-braces; it is on stderr, they read stdout).
+    printf 'FAILURE_TRIAGE LAYER=%d LOG=%s STDERR_LOG=%s RESULT=%s\n' \
+      "$n" "$triage_log" "$triage_errlog" "$st" >&2
+    printf '    read the log(s) to triage; do NOT re-run the layer to capture detail — it is already there.\n' >&2
+    if [[ $n -eq 7 ]]; then
+      printf '    (layer 7: env-test / browser-e2e sublogs + failure map in docs/runbooks/devloop-validation.md §6.7)\n' >&2
+    fi
+    # Layer 3: name the exact failed guard(s) from the structured, closed-vocabulary token (a list
+    # of guard NAMES, which cannot carry a secret), in preference to grepping raw log text.
+    if [[ $n -eq 3 ]]; then
+      triage_guards="$(parse_failed_guard_names "$triage_log")"
+      [[ -n "$triage_guards" ]] && printf '    FAILED_GUARD_NAMES=%s\n' "$triage_guards" >&2
+    fi
+    # Optional teaser: a short preview of the failing lines. Pipeline order is load-bearing:
+    # SANITIZE (strip ANSI CSI + control chars) -> MATCH (anchored) -> TRUNCATE per line -> head.
+    # Sanitize FIRST and UNCONDITIONALLY: the colorized `FAILED:` line begins with the escape byte so
+    # `^FAILED` matches nothing until stripped, and every layer log can carry third-party color
+    # (cargo/nx/prettier/Playwright force color on CI) the run-guards/common.sh tty-gate does not
+    # touch — the sanitizer is a property of the teaser, not a workaround for one emitter. `grep -a`
+    # (@observability F5): treat the log as text so an odd byte can't make grep suppress the line.
+    # BUDGET IS PER-LOG (@observability F3): take up to 2 lines from EACH of layer-N.log AND
+    # layer-N.stderr.log — a single `head` over the concatenation lets a busy stdout log starve the
+    # stderr-only detail (a guard-timeout `PRECONDITION_FAILURE:` line, MIXED_LANE), the exact
+    # mixed-lane case the two-log pointer exists for. Each line is PREFIXED `    | ` so no echoed line
+    # can begin STATUS=/REASON= and be re-collected by run-story.sh's escalation grep. NO
+    # tail/head-of-log fallback on no-match: ${DEVLOOP_TMP} is 700-perm precisely because layer logs
+    # may incidentally capture token-bearing env (_common.sh:40-43); a `|| tail -20` would exfiltrate
+    # arbitrary log text and is a REGRESSION, not a usability fix. The `|| true` on EACH pipeline is
+    # load-bearing under `set -euo pipefail`: a grep no-match (exit 1) or `head` SIGPIPE (141) would
+    # otherwise abort layer-all BEFORE `exit "$final_exit"`, firing __gate2_emit_trap with the WRONG
+    # rc (a true operator-lane exit 2 written as exit 1 in the Gate-2 verdict — misrouted triage) and
+    # truncating this loop so later red layers get no directive. Same mechanism run-guards.sh
+    # documents ("turning a single failure into a CI lie").
+    triage_teaser="$(
+      for __tlog in "$triage_log" "$triage_errlog"; do
+        { LC_ALL=C sed 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/[[:cntrl:]]//g' "$__tlog" 2>/dev/null \
+            | grep -aE '^(FAILED:|VIOLATION|STATUS=FAIL|PRECONDITION_FAILURE:)' \
+            | cut -c1-200 \
+            | head -2; } || true
+      done
+    )"
+    if [[ -n "$triage_teaser" ]]; then
+      printf '%s\n' "$triage_teaser" | sed 's/^/    | /' >&2
+    else
+      printf '    (no teaser — read the log(s) above)\n' >&2
+    fi
+  fi
 done
 
 exit "$final_exit"

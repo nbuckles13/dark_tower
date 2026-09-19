@@ -188,6 +188,25 @@ parse_status_reason() {
   grep '^STATUS=' "$1" 2>/dev/null | tail -n1 | sed -n 's/^STATUS=[^ ]* REASON=\([^ ]*\).*/\1/p'
 }
 
+# Parse the LAST FAILED_GUARD_NAMES= line from a log file; print just the comma-joined value.
+# Sibling of parse_status_line/parse_status_reason (SPOT for this log-line contract) — D8:
+# layer-all.sh surfaces the failed guard names in the FAILURE_TRIAGE directive without
+# re-implementing an inline sed/grep. NOTE (ADR-0015 coupling): the EMITTER is run-guards.sh,
+# which sources scripts/guards/common.sh — NOT this file — so emitter and parser structurally
+# cannot share a helper; the token string `FAILED_GUARD_NAMES=` IS the hand-held contract, pinned
+# on both sides by run-guards.test.sh's round-trip test (emit -> parse_failed_guard_names).
+# Args: $1=log-file
+# Outputs: stdout=comma-joined guard names (empty if no FAILED_GUARD_NAMES= line found)
+# Returns: 0
+parse_failed_guard_names() {
+  # `|| true` is load-bearing (unlike parse_status_line/_reason, which are only ever called on logs
+  # that DO contain their token): the common case is a log with NO FAILED_GUARD_NAMES= line (only a
+  # guard-VIOLATION run emits one), so grep exits 1, pipefail propagates, and an unguarded caller
+  # `x="$(parse_failed_guard_names f)"` would abort under `set -e`. This makes the documented
+  # "Returns: 0" true, so the layer-all.sh D8 caller stays safe without its own guard.
+  grep '^FAILED_GUARD_NAMES=' "$1" 2>/dev/null | tail -n1 | sed -n 's/^FAILED_GUARD_NAMES=//p' || true
+}
+
 # CI-SENTINEL-LEAK runtime assertion (task #47, §J/C — security trust boundary).
 # Single source of truth for the check, called from BOTH entry points that can run the
 # always-run path: layer-all.sh (full pipeline) and layer3.sh (standalone). Two call
