@@ -38,9 +38,18 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(peek_frame_len(data), Ok(Some(view.encoded_len())));
         }
         Ok(None) => {
-            // Incomplete: peek must also be silent, and must never need more
-            // than a full header to decide.
-            assert_eq!(peek_frame_len(data), Ok(None));
+            // Incomplete: peek never rejects what the stream path holds open.
+            // It is silent while the header is short, and once the header is
+            // complete it names a length the buffer does not yet reach — that
+            // is its whole job as the pre-allocation bound.
+            match peek_frame_len(data) {
+                Ok(None) => {}
+                Ok(Some(frame_len)) => {
+                    assert!(frame_len > data.len());
+                    assert!(frame_len <= MAX_FRAME_BYTES);
+                }
+                Err(err) => panic!("incomplete on stream, terminal on peek: {err:?}"),
+            }
             assert!(data.len() < MAX_FRAME_BYTES);
         }
         Err(err) => {
