@@ -1,4 +1,4 @@
-# ADR-0037: Tuning /devloop for Lower Token Cost
+# ADR-0037: Tuning the /devloop Process
 
 ## Status
 
@@ -23,6 +23,11 @@ premise this ADR tests: there is ceremony in the current process that produces
 tokens and almost no shipped-byte changes, and cutting it is free. If that
 premise is false for a given cut, the cut should cost nothing to abandon — hence
 the trial framing.
+
+Cost was the entry point, but the trial grew to carry the **work-sizing and
+consistency discipline** the cost work exposed — how devloop work is cut and
+kept coherent (D3, D9), not only how much ceremony it carries. Hence the rename
+from the original "Lower Token Cost" title.
 
 ### What the story-1 evidence shows (the basis for every decision here)
 
@@ -64,7 +69,7 @@ A structured read of all 26 devloop `main.md` Gate tables established:
 
 ## Decision
 
-Eight changes, each with what it keeps, what it drops, and the fallout it accepts.
+Nine changes, each with what it keeps, what it drops, and the fallout it accepts.
 All are trial changes under the Status above.
 
 ### D1 — Trim the cross-boundary ownership ceremony to the load-bearing slice
@@ -214,6 +219,49 @@ has — pure token/time waste.
 - **Optional enhancement**: `run-guards.sh` emits a structured `FAILED_GUARDS=<names>`
   line `layer-all.sh` can surface, so the summary names the exact guard, not just
   the log — not required for the core fix.
+
+### D9 — Cut work by invariant; never ship a partial invariant
+
+The recurring failure this repo has fought for a long time: devloops "stay in
+their own lane," and the accumulation is a mis-mash of inconsistencies — a rule
+established in some places but not others (the polyglot fmt lane exposed at the
+D7 devloop is the canonical case: rust fmt applied locally, the TS "fmt layer"
+formatted no TypeScript, proto was double-formatted). Each devloop was locally
+correct — bounded, in-scope — but a half-applied rule is **worse than an
+unstarted one**: it is a landmine a later reader steps on, filed in a TODO that
+rots. That debt grows exactly as unbounded as task size does; it is just moved to
+a ledger nobody watches. This is the negative twin of D3 (D3: don't cut too
+small; D9: don't leave gotchas), and D1 is what makes it affordable (the
+cross-owner "extra work" is now done in-loop, not deferred).
+
+- **Decision — cut by invariant, not by lane or file-locality.** The unit of
+  work is "establish this consistency rule *everywhere it applies*," which is
+  naturally bounded (one concept) and complete (no partial). Cutting an invariant
+  by lane/language/service is the seam that manufactures the mis-mash.
+- **Never ship a partial invariant.** If the whole rule genuinely cannot fit one
+  devloop, do **not** dribble it — **hold the behavior change entirely** and keep
+  the *consistent* status quo until every instance can flip at once. A
+  consistent-but-less-convenient state beats an inconsistent-but-more-convenient
+  one, because the inconsistency is the expensive part.
+- **A necessary consistency deferral gets a forcing function**, not a passive
+  TODO — a guard that fails, or a gate that blocks — because passive TODOs are
+  *how* the mis-mash accumulated (CLAUDE.md "add a guard that fails on drift").
+- **Three implementation homes**: (1) `/user-story` decomposition — cut tasks by
+  invariant; a task establishing a rule owns every instance of it, and an
+  invariant too big for one session is *one* deliberately-sized task, never
+  lane-splits. (2) `/devloop` lead — on finding an instance of the invariant
+  outside the stated scope mid-loop, default to completing it in-loop (D1 pulls
+  the owner in), fallback to hold-complete, never ship-partial. (3)
+  `review-protocol` — **DRY** carries the explicit Gate-1 charge ("what invariant
+  does this establish, and does the plan cover every instance?"), and a shipped
+  partial invariant is a Gate-3 finding for **any** reviewer → ESCALATE (the
+  backstop, including for light-tier tasks that skipped Gate-1).
+- **Fallout accepted**: "cover every instance" can push a devloop larger, up
+  against D3's one-session ceiling. The reconciliation is that the bound is the
+  *invariant's own scope*, not a file count — cut by invariant and the task is
+  both bounded and complete; when an invariant is genuinely too big, schedule it
+  as one complete devloop rather than several partial ones. Story 2 tests whether
+  "always complete the invariant" is affordable or needs a carve-out.
 
 ## Deferred (not in this ADR)
 
