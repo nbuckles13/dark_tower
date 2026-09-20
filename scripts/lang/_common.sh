@@ -416,6 +416,96 @@ fail_fast_mode() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# fmt lane decision (ADR-0037 §D7) — check-default, explicit apply opt-in
+# -----------------------------------------------------------------------------
+
+# Classify a boolean fmt-lane env knob. Echoes: on | off | invalid | absent.
+#
+# DELIBERATE DIVERGENCE from fail_fast_mode's ${VAR:-} idiom (which treats set-but-empty as
+# unset): a set-but-EMPTY fmt knob is `invalid`, not `absent`. An empty DEVLOOP_FMT_CHECK_ONLY /
+# DEVLOOP_FMT_APPLY is the signature of a mis-expanded var, and both knobs gate tree-writing on a
+# GSA-adjacent lane — a silent fall-through there is exactly the fail-open we are removing. bash-4
+# `-v` (this file already hard-requires bash 4 at the top) distinguishes set-empty from unset.
+__fmt_knob_state() {
+  local name="$1"
+  [[ -v "$name" ]] || { printf 'absent\n'; return 0; }
+  case "${!name}" in
+    1|true|TRUE|yes|YES) printf 'on\n' ;;
+    0|false|FALSE|no|NO) printf 'off\n' ;;
+    *)                   printf 'invalid\n' ;;   # incl. set-but-empty — loud, not silent
+  esac
+}
+
+# Decide the fmt lane (apply vs check) for scripts/lang/{rust,ts,proto}/fmt.sh, from ENV ONLY.
+# PURE + sourceable + NO self-exit (the CALLER acts) — the single home of the lane decision, mirroring
+# fail_fast_mode. Every fmt wrapper sources this file and consumes this ONE function; none re-derives.
+#
+# Echoes exactly one of:
+#   APPLY apply-opt-in | CHECK check-only-override | CHECK ci-github-actions | CHECK ci-generic
+#   | CHECK check-default | INVALID
+#
+# PRECEDENCE (top wins) — ROLE of each rung is load-bearing, do NOT reorder:
+#   1. either knob has a bad/empty value                         -> INVALID   (loud EVEN in CI)
+#   2. DEVLOOP_FMT_CHECK_ONLY on   (attesting-gate override)     -> CHECK check-only-override
+#   3. GITHUB_ACTIONS set                                        -> CHECK ci-github-actions
+#   4. CI set                                                    -> CHECK ci-generic
+#   5. DEVLOOP_FMT_APPLY on        (explicit apply opt-in)       -> APPLY apply-opt-in
+#   6. otherwise                                                 -> CHECK check-default
+#
+# WHY check-DEFAULT (fail-closed inversion — @team-lead ruling 2026-09-20; SUPERSEDES the earlier
+# "apply is the computed default, no apply-forcing value" design): under apply-default a forgotten
+# attesting-gate override was fail-OPEN, and verify-completion.sh (a layer-all caller) was a proven
+# miss. Default CHECK makes every caller — including ones not yet written — safe by default; APPLY
+# now requires the explicit DEVLOOP_FMT_APPLY opt-in, set ONLY by the interactive /devloop pipeline
+# invocation.
+#
+# WHY BOTH KNOBS (DEVLOOP_FMT_CHECK_ONLY is NOT dead code under check-default): the apply opt-in can
+# be AMBIENT at a gate — a run-story/pre-commit gate invoked from inside a devloop session that
+# exported DEVLOOP_FMT_APPLY. Rungs 2+3+4 are evaluated BEFORE rung 5, so an attesting gate that sets
+# DEVLOOP_FMT_CHECK_ONLY (and CI) forces CHECK even with an ambient apply opt-in present. That
+# ordering — not the absence of an apply value — is what guarantees "no supplied value produces APPLY
+# in CI or at an attesting gate." A precedence reorder that lets rung 5 pass rungs 2/3/4 REOPENS the
+# hole; the truth table pins both cross cells so a reorder reds.
+#
+# CI DETECTOR = GITHUB_ACTIONS || CI (union) — a DELIBERATE, risk-reasoned divergence from the repo's
+# other consumers (which key on GITHUB_ACTIONS alone): fmt_mode is the ONLY lane helper whose wrong
+# answer MUTATES the tree, so it reads a broader unattended signal — a non-GHA CI that sets only CI
+# still gets CHECK (fail-closed) rather than APPLY. The split ci-github-actions/ci-generic source lets
+# a dev with a stray CI export see why apply stopped, and gives the self-test a distinguishable cell.
+# (Do NOT collapse the two source tokens, and do NOT hoist a shared is_ci() consumed by fail_fast_mode
+# — that helper deliberately excludes DEVLOOP_HEADLESS and asks a different question.)
+#
+# Args: none (reads DEVLOOP_FMT_CHECK_ONLY, GITHUB_ACTIONS, CI, DEVLOOP_FMT_APPLY)
+# Outputs: stdout = the verdict above
+# Returns: 0 always
+fmt_mode() {
+  local co ap
+  co="$(__fmt_knob_state DEVLOOP_FMT_CHECK_ONLY)"
+  ap="$(__fmt_knob_state DEVLOOP_FMT_APPLY)"
+  if [[ "$co" == invalid || "$ap" == invalid ]]; then printf 'INVALID\n'; return 0; fi
+  if [[ "$co" == on ]]; then printf 'CHECK check-only-override\n'; return 0; fi
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then printf 'CHECK ci-github-actions\n'; return 0; fi
+  if [[ -n "${CI:-}" ]]; then printf 'CHECK ci-generic\n'; return 0; fi
+  if [[ "$ap" == on ]]; then printf 'APPLY apply-opt-in\n'; return 0; fi
+  printf 'CHECK check-default\n'
+}
+
+# Emit the fmt lane verdict as a greppable stderr anchor (observability), in the house KEY=value style
+# of layer-all.sh's `PIPELINE_MODE= SOURCE=` line. Uses SOURCE=, NOT REASON= — REASON is the STATUS
+# line's key, and lane-vs-outcome are independent dimensions. ONE emitter so rust/ts/proto can't drift.
+# Nothing parses it yet; the token is kept stable.
+# Args: $1 = the fmt_mode verdict
+# Outputs: stderr = "FMT_MODE=<apply|check|invalid> SOURCE=<source>"
+# Returns: 0
+fmt_mode_emit() {
+  local verdict="$1" mode src
+  mode="${verdict%% *}"
+  src="${verdict#* }"
+  [[ "$src" == "$verdict" ]] && src="none"   # single-token verdict (INVALID) carries no source
+  printf 'FMT_MODE=%s SOURCE=%s\n' "$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')" "$src" >&2
+}
+
 # Among children sharing the WINNING enum, pick a representative real reason — so the
 # stderr LAYER= / dispatcher-emit REASON field names an actual lang/verb cause rather
 # than a generic "<status>-aggregate" token (observability's 3am anchor, P2). This is

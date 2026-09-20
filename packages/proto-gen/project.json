@@ -33,17 +33,6 @@
       },
       "cache": true
     },
-    "format": {
-      "executor": "nx:run-commands",
-      "inputs": [
-        "{workspaceRoot}/proto/**/*.proto"
-      ],
-      "options": {
-        "command": "pnpm exec buf format --diff --exit-code",
-        "cwd": "proto"
-      },
-      "cache": true
-    },
     "test": {
       "executor": "nx:run-commands",
       "dependsOn": ["codegen"],

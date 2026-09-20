@@ -23,7 +23,14 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "packages/test-utils",
-        "command": "tsc --noEmit && eslint src/ && prettier --check \"src/**/*.ts\""
+        "command": "tsc --noEmit && eslint src/"
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "prettier \"packages/test-utils/src/**/*.ts\""
       }
     }
   }

@@ -280,12 +280,24 @@ gate2_deletions_staged() {
 # file. Do not "helpfully" recompute the signature from the rendered FILE lines;
 # they exist only for human eyes and use a different (lossy) field order.
 #
+# SYMMETRY CONSTRAINT (durability — @paired-protocol (f)). Every record kind in this stream must be
+# derivable IDENTICALLY by BOTH sides — the producer from the WORKTREE, the hook from the staged INDEX. A
+# fact known only to the producing run (e.g. "this run rewrote these files", or anything from FMT_APPLIED)
+# CANNOT be signed here: it would appear in the producer's stream and never the hook's, diverging the
+# recomputation on every commit and wedging the gate. This is why the deletion record (below) is a
+# first-class, symmetrically-derivable "DELETED <path>" and not, say, a producer-only apply log.
+#
 # gate2_signature — reads NUL-delimited records "<blob> <path>" on stdin, prints
 # the hex sha256 of the LC_ALL=C-sorted record stream.
 # -----------------------------------------------------------------------------
 gate2_signature() {
   local -; set -euo pipefail   # function-local opts (bash 4.4+): auto-restored, never leaks to sourcer
   local out
+  # This sort OWNS the signature's order-canonicalization: it makes the hash invariant to the order records
+  # ARRIVE in. It is NOT redundant with the upstream `LC_ALL=C sort -z -u` in gate2_records_{worktree,staged}
+  # (:182/:190), which sorts to DEDUP the path universe; this sorts to canonicalize RECORD order before
+  # hashing. Keep it (code-reviewer + @test ruling): cheap defense-in-depth for an authority control — do
+  # NOT couple the signature's correctness to intermediate order-preservation surviving on both sides.
   out="$(LC_ALL=C sort -z | sha256sum)"
   # sha256sum prints "<hex>  -"; take the leading hex field via parameter expansion
   # (IFS-independent — robust regardless of the sourcer's IFS, and unaffected by the
@@ -717,7 +729,14 @@ gate2_validate_commit() {
   printf '\n❌ Gate-2: the staged tree does not match the validated tree (signature mismatch).\n' >&2
   printf '   The pipeline verdict was produced for a different set of changes than what is staged.\n' >&2
   gate2_report_drift "$verdict" >&2
-  printf '   Re-stage and re-run the pipeline:  git add -A && ./scripts/layer-all.sh\n' >&2
+  # Order: VALIDATE, then stage what you validated (`./scripts/layer-all.sh && git add -A`), NOT the
+  # reverse. `emit_gate2_verdict` signs the WORKTREE; the hook compares the staged INDEX. Staging first
+  # then validating would sign a tree the index doesn't hold — and under ADR-0037 §D7 (fmt applies during
+  # a local run) the reverse order is actively wrong: layer-all reformats mid-run, so `git add -A &&
+  # layer-all` stages pre-format content and signs post-format, reproducing the very mismatch this
+  # message resolves and pushing the operator toward `--no-verify`. (Correct regardless of D7 — validate,
+  # then stage the validated tree; D7 only makes the wrong order break rather than merely mislead.)
+  printf '   Run the pipeline, then stage what it validated:  ./scripts/layer-all.sh && git add -A\n' >&2
   return 1
 }
 
