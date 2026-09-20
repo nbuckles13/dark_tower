@@ -73,9 +73,9 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
-      - name: Install buf
-        uses: bufbuild/buf-setup-action@v1
-
+      # buf is provided by `pnpm exec buf` (@bufbuild/buf, lockfile-pinned) after `pnpm install`
+      # (ADR-0037 §D7 COLLAPSE) — no separate buf-setup-action install. `pnpm install` runs before
+      # `layer-all.sh` below, so the proto wrappers' `pnpm exec buf` resolves.
       - name: Build guard binaries
         # Layer 3 guards are always-run and consume target/release/dt-guard and
         # dt-story. Those binaries are produced by scripts/lang/rust/compile.sh,

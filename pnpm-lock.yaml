@@ -40,10 +40,10 @@ importers:
         specifier: 23.1.1
         version: 23.1.1
       prettier:
-        specifier: ^3.9.6
+        specifier: 3.9.6
         version: 3.9.6
       prettier-plugin-svelte:
-        specifier: ^4.1.1
+        specifier: 4.1.1
         version: 4.1.1(prettier@3.9.6)(svelte@5.56.8(@typescript-eslint/types@8.65.0))
       svelte-check:
         specifier: ^4.7.4

@@ -51,7 +51,14 @@
       "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/web-app",
-        "command": "svelte-check --tsconfig ./tsconfig.json && eslint src/ && prettier --check \"src/**/*.{ts,svelte}\""
+        "command": "svelte-check --tsconfig ./tsconfig.json && eslint src/"
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "prettier \"packages/web-app/{src,e2e}/**/*.{ts,svelte}\""
       }
     }
   }

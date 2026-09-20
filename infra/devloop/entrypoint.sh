@@ -84,7 +84,8 @@ npm update -g @anthropic-ai/claude-code \
 if command -v pnpm &>/dev/null && [ -f /work/pnpm-lock.yaml ] && [ ! -x /work/node_modules/.bin/nx ]; then
     echo "Running pnpm install (first run on this host populates the pnpm-store cache, ~30-60s; subsequent devloops are 2-5s)..."
     pnpm install --frozen-lockfile --dir /work || {
-        echo "ERROR: pnpm install failed — TS pipeline wrappers will not work in this devloop."
+        echo "ERROR: pnpm install failed — the TS AND proto pipeline wrappers will not work (ADR-0037 §D7:"
+        echo "       proto now runs buf via 'pnpm exec buf', so a failed install reds proto compile/fmt/lint too)."
         echo "       To debug: podman run --rm -it --entrypoint bash darktower-dev:latest"
         exit 1
     }

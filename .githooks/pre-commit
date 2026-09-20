@@ -8,10 +8,20 @@ set -e
 
 echo "🔍 Running pre-commit checks..."
 
-# Check code formatting (does NOT format, only checks)
+# Check code formatting (does NOT format, only checks).
+#
+# ADR-0037 §D7: this is a tree-attesting gate, so it stays CHECK-ONLY — auto-formatting here would
+# mutate the tree being attested. It is NOT routed through fmt_mode() in scripts/lang/rust/fmt.sh
+# because this hook is deliberately `#!/bin/bash` + bash-3.2-tolerant (see _gate2_binding.sh:16-43) and
+# must not source _common.sh (bash-4 tripwire + lastpipe/job-control toggles on EVERY commit). The lane
+# here is a COMPILE-TIME CONSTANT (always check), not a runtime decision, so there is nothing for the
+# helper to decide. Drift is prevented by the fmt-lane policy guard (asserts this invocation stays the
+# check-only form), not by sharing the helper. Keep this in sync with scripts/lang/rust/fmt.sh's CHECK
+# branch (`cargo fmt --all -- --check`).
 echo "  ➜ Checking code formatting with cargo fmt..."
-cargo fmt --all -- --check
-if [ $? -ne 0 ]; then
+# `if !` not `cmd; if [ $? ]` — under `set -e` the bare command would abort the hook before the test
+# (the old form's error message never printed).
+if ! cargo fmt --all -- --check; then
     echo ""
     echo "❌ Code formatting issues detected!"
     echo "   Run 'cargo fmt' to fix formatting, then commit again."

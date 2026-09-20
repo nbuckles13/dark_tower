@@ -34,6 +34,14 @@ updates:
     open-pull-requests-limit: 5
     groups:
       npm-minor-patch:
+        # @bufbuild/buf is EXCLUDED from the grouped bump (ADR-0037 §D7 COLLAPSE, @security): under the
+        # collapse it is the proto wire-FORMATTER that `pnpm exec buf` runs, so a version change is a
+        # GSA-formatter event (proto/** may reformat) needing protocol + security review — never a silent
+        # grouped minor/patch. Excluding it here un-groups it into its own reviewable PR. This is NOT an
+        # `ignore:` block (which the file header forbids for advisory suppression — that lives in
+        # audit-suppressions.toml); exclude-patterns only un-groups, it does not suppress.
+        exclude-patterns:
+          - "@bufbuild/buf"
         update-types:
           - "minor"
           - "patch"

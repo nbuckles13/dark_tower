@@ -26,7 +26,7 @@
     "test:unit": "vitest run --coverage",
     "test:component": "vitest run --config vitest.component.config.ts",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit && eslint src/ && prettier --check \"src/**/*.ts\"",
+    "lint": "tsc --noEmit && eslint src/",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

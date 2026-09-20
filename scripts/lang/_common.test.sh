@@ -306,6 +306,71 @@ assert_ffm "ci-refuses-1"           "RUNALL unattended-override-refused" GITHUB_
 assert_ffm "both-unset-ci-label"    "RUNALL github-actions"              GITHUB_ACTIONS=1 DEVLOOP_HEADLESS=1
 assert_ffm "both-refuses-1"         "RUNALL unattended-override-refused" GITHUB_ACTIONS=1 DEVLOOP_HEADLESS=1 DEVLOOP_FAIL_FAST=1
 
+# =============================================================================
+# fmt_mode() — fmt lane precedence truth table (ADR-0037 §D7, check-default inversion).
+#
+# Precedence: INVALID > check-only-override > CI(GHA|CI) > apply-opt-in > CHECK-default.
+# The TWO load-bearing cross cells (an apply opt-in must NOT win in CI or at an attesting gate)
+# are pinned explicitly with the opt-in ACTUALLY PRESENT (non-vacuous). Includes ≥1 case that FAILS
+# under the OLD (apply-default) precedence — proof the arms are derived from the new order, not merely
+# satisfied by both: "bare local -> CHECK check-default" was APPLY under apply-default.
+# =============================================================================
+assert_fmt() {
+  local label="$1" expected="$2"; shift 2
+  local actual
+  actual=$(
+    unset DEVLOOP_FMT_CHECK_ONLY DEVLOOP_FMT_APPLY GITHUB_ACTIONS CI
+    if (( $# )); then export "$@"; fi
+    fmt_mode
+  )
+  if [[ "$actual" == "$expected" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[fmt:${label}] env(${*:-none}) → expected '${expected}' got '${actual}'")
+  fi
+}
+
+# --- default / apply opt-in (the inversion: bare local is CHECK, not APPLY) ---
+assert_fmt "bare-local-is-check-default" "CHECK check-default"                      # FAILS under old apply-default
+assert_fmt "apply-opt-in"                "APPLY apply-opt-in"        DEVLOOP_FMT_APPLY=1
+assert_fmt "apply-off-is-default"        "CHECK check-default"       DEVLOOP_FMT_APPLY=0
+# --- CI lane (union), split source token ---
+assert_fmt "gha"                         "CHECK ci-github-actions"   GITHUB_ACTIONS=1
+assert_fmt "ci-generic"                  "CHECK ci-generic"          CI=1                       # the new non-GHA cell
+# --- LOAD-BEARING precedence cells: opt-in must NOT produce APPLY in CI / at an attesting gate ---
+assert_fmt "gha-beats-apply-optin"       "CHECK ci-github-actions"   GITHUB_ACTIONS=1 DEVLOOP_FMT_APPLY=1
+assert_fmt "ci-beats-apply-optin"        "CHECK ci-generic"          CI=1 DEVLOOP_FMT_APPLY=1
+assert_fmt "override-beats-apply-optin"  "CHECK check-only-override" DEVLOOP_FMT_CHECK_ONLY=1 DEVLOOP_FMT_APPLY=1
+assert_fmt "override-beats-ci-too"       "CHECK check-only-override" DEVLOOP_FMT_CHECK_ONLY=1 GITHUB_ACTIONS=1
+# --- validity-first, fail-closed: bad/empty knob → INVALID (loud even in CI) ---
+assert_fmt "bad-apply-knob"              "INVALID"                   DEVLOOP_FMT_APPLY=ture
+assert_fmt "empty-apply-knob"            "INVALID"                   DEVLOOP_FMT_APPLY=
+assert_fmt "empty-check-only-knob"       "INVALID"                   DEVLOOP_FMT_CHECK_ONLY=
+assert_fmt "invalid-loud-in-ci"          "INVALID"                   GITHUB_ACTIONS=1 DEVLOOP_FMT_APPLY=xyz
+
+# =============================================================================
+# fmt_mode_emit() — the greppable FMT_MODE=/SOURCE= anchor (obs F3: the emitter had ZERO coverage).
+# Pins the verdict→line translation the wrappers depend on: mode LOWERCASED, source passed through, and the
+# SOURCE=none fallback that ONLY the single-token INVALID verdict reaches (a live branch, previously untested).
+# Emits to STDERR, so capture 2>&1. Driven with crafted verdict strings (fmt_mode's own arms are the table above).
+# =============================================================================
+assert_emit() {
+  local label="$1" verdict="$2" expected="$3" actual
+  actual="$(fmt_mode_emit "$verdict" 2>&1)"
+  if [[ "$actual" == "$expected" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[emit:${label}] verdict '${verdict}' → expected '${expected}' got '${actual}'")
+  fi
+}
+assert_emit "apply-lowercased"  "APPLY apply-opt-in"      "FMT_MODE=apply SOURCE=apply-opt-in"
+assert_emit "check-default"     "CHECK check-default"     "FMT_MODE=check SOURCE=check-default"
+assert_emit "check-ci-gha"      "CHECK ci-github-actions" "FMT_MODE=check SOURCE=ci-github-actions"
+assert_emit "override-source"   "CHECK check-only-override" "FMT_MODE=check SOURCE=check-only-override"
+assert_emit "invalid-source-none" "INVALID"               "FMT_MODE=invalid SOURCE=none"   # the single-token fallback branch
+
 # Summary.
 printf '\n_common.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

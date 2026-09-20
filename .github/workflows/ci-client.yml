@@ -100,9 +100,8 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
-      - name: Install buf
-        uses: bufbuild/buf-setup-action@v1
-
+      # buf-setup-action removed (ADR-0037 §D7 COLLAPSE): every buf step in this workflow already uses
+      # `pnpm exec buf` (@bufbuild/buf, lockfile-pinned), so the standalone install was dead weight.
       - name: Install pnpm dependencies
         # --frozen-lockfile enforces the committed lockfile (R-34).
         run: pnpm install --frozen-lockfile
@@ -128,9 +127,11 @@ jobs:
           BASE_SHA=$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)
           pnpm exec buf breaking proto --against ".git#ref=${BASE_SHA},subdir=proto"
 
-      - name: buf format check
-        run: pnpm exec buf format --diff --exit-code
-        working-directory: proto
+      # buf format check REMOVED here (ADR-0037 §D7 COLLAPSE dedup): proto format is checked exactly
+      # once in CI by ci.yml's from-scratch `layer-all.sh` → scripts/lang/proto/fmt.sh (CHECK mode).
+      # ci.yml's trigger set strictly contains this workflow's, so removing this duplicate opens no
+      # coverage gap and kills the cross-version exposure. (buf lint + buf breaking above are a DIFFERENT
+      # invariant and a separately-tracked duplication — see docs/TODO.md, @dry-reviewer.)
 
       - name: Guard — no-secrets-in-code (R-33)
         # Scans changed .ts/.tsx/.svelte files for hardcoded JWTs, API keys,
