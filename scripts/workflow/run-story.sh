@@ -1333,9 +1333,14 @@ run_gate() {
   gate_start="$(date +%s)"
   gate_rc=0
   gate_layer=0
+  # ADR-0037 §D7: this is the ADR-0035 §3 per-task AUTHORITY gate (also the --revalidate gate). It must
+  # NEVER auto-format the tree it attests, so force the fmt lane CHECK-only via DEVLOOP_FMT_CHECK_ONLY —
+  # which out-ranks any ambient DEVLOOP_FMT_APPLY in fmt_mode's precedence (defense-in-depth: a gate
+  # invoked from a devloop session that opted into apply still checks). Per-invocation prefix, NOT
+  # exported (an export would strip auto-apply from the spawned devloop session, defeating D7 there).
   for n in 1 2 3 4 5 6; do
     set +e
-    "scripts/layer${n}.sh" >>"$gatelog" 2>&1
+    DEVLOOP_FMT_CHECK_ONLY=1 "scripts/layer${n}.sh" >>"$gatelog" 2>&1
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then gate_rc=$rc; gate_layer=$n; break; fi
@@ -1365,7 +1370,11 @@ run_gate() {
 run_full_gate() {
   local log="$1" rc
   set +e
-  DEVLOOP_FAIL_FAST=0 ./scripts/layer-all.sh >>"$log" 2>&1
+  # ADR-0037 §D7: this is the authoritative full-pipeline gate (--finish + story-close) whose EXIT trap
+  # produces the Gate-2 verdict — it must attest a tree it did NOT auto-format, so force the fmt lane
+  # CHECK-only (DEVLOOP_FMT_CHECK_ONLY out-ranks any ambient DEVLOOP_FMT_APPLY). Per-invocation prefix,
+  # never exported.
+  DEVLOOP_FAIL_FAST=0 DEVLOOP_FMT_CHECK_ONLY=1 ./scripts/layer-all.sh >>"$log" 2>&1
   rc=$?
   set -e
   return "$rc"
@@ -1962,6 +1971,21 @@ while :; do
       fi
       run_gate "$id"
       if [ "$gate_rc" -eq 0 ]; then
+        # RE-ATTEST THE TREE (S-8, ADR-0037 §D7). The pre-gate check above proved the
+        # tree clean; the gate is forced CHECK-only (run_gate prefixes
+        # DEVLOOP_FMT_CHECK_ONLY=1) precisely so it does NOT mutate the tree it
+        # attests. This is the defense-in-depth backstop: if that invariant ever
+        # regressed (a gate layer auto-formatted, or check-only stopped out-ranking an
+        # ambient apply), the gate would have rewritten files AFTER the clean-tree
+        # gate, and complete_task — which stages only $STORY_FILE — would record a
+        # green not reproducible from the commit. Re-probe and refuse loudly rather
+        # than complete on a tree the gate itself changed. A git read fault routes to
+        # the operator lane, consistent with working_tree_status/tree_dirty (C7).
+        postgate_status="$(working_tree_status "$id" "$giterr" "re-checking the tree is unchanged after the revalidation gate")"
+        if [ -n "$postgate_status" ]; then
+          slogerr "STORY_RUN: REVALIDATE-TREE-MUTATED-BY-GATE task=${id} — the authoritative gate ran green but LEFT the work tree dirty (it should attest a frozen tree CHECK-only, never write it — see ADR-0037 §D7). Completing now would record a green not reproducible from the commit. This is a gate/invariant regression, NOT a task verdict: investigate why a layer wrote the tree (a fmt lane that applied instead of checked?). Offending: $(printf '%s' "$postgate_status" | head -n 5 | tr '\n' ';')"
+          exit 2
+        fi
         # Green: complete the task, recovering the slug from the PRIOR attempt's
         # commit range (baseline..HEAD) via the shared completion path; record a
         # gate-only, zero-cost ledger entry.

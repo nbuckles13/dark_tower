@@ -162,4 +162,46 @@ layer_lifecycle_begin 3
   # guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run
   # it as a production guard as well as here.
   run_and_emit "media-telemetry-deny-selftest" "${__here}/guards/media-telemetry-deny.test.sh" || true
+  # _common.sh unit tests (ADR-0037 §D7 wires this in — it was orphaned/unrun, docs/TODO.md:2006). Hosts
+  # the STATUS-aggregation precedence, fail_fast_mode, AND the fmt_mode truth table (incl. the two
+  # load-bearing apply-opt-in-loses-to-CI/override cells). Hermetic: pure bash, no cargo/cluster/network.
+  run_and_emit "common-selftest" "${__here}/lang/_common.test.sh" || true
+  # Rust fmt wrapper integration (ADR-0037 §D7): stubbed `cargo` on PATH (hermetic — a PATH stub, NOT the
+  # real toolchain, so the "no cargo" invariant above holds), argv-asserted mode dispatch + the four-arm
+  # apply pre-pass + positive controls. Under scripts/lang/rust/ (NOT guards/simple/ — the find-name reason).
+  run_and_emit "rust-fmt-selftest" "${__here}/lang/rust/fmt.test.sh" || true
+  # Proto fmt wrapper + _buf.sh preflight (ADR-0037 §D7 COLLAPSE branch): stubbed `pnpm` on PATH (hermetic
+  # — a PATH stub, NOT the real toolchain/buf), asserting the four-token preflight taxonomy, the P-6 version-
+  # precedence (version-mismatch beats format), the buf rc map (drift=100/parse=1, INVERSE of rust), the
+  # apply post-condition re-check, and the GSA WARN anchor. The pnpm-unavailable discriminator proves the
+  # lane never falls back to a bare-PATH buf (the COLLAPSE decision).
+  run_and_emit "proto-fmt-selftest" "${__here}/lang/proto/fmt.test.sh" || true
+  # Proto GOLDEN-FORMAT behavioral pin (ADR-0037 §D7; @security control). UNLIKE the stubbed fmt self-tests
+  # above, this runs the REAL `pnpm exec buf` (offline, no network, sub-second over a ~25-line fixture — the
+  # same node-tooling-in-Layer-3 precedent as ts-fmt-selftest). It asserts the pinned buf is idempotent on the
+  # committed golden and normalizes a deformed copy back to it, so a @bufbuild/buf bump that reformats reds
+  # here and its diff is the review evidence — the disjoint control the version assertion (green on a bump)
+  # cannot provide. Fail-loud via the shared preflight; never a skip.
+  run_and_emit "proto-golden-format-selftest" "${__here}/lang/proto/golden-format.test.sh" || true
+  # TS fmt wrapper integration (ADR-0037 §D7). DELIBERATELY NOT STUBBED (unlike rust/proto's PATH stubs):
+  # the TS lane forwards `-- <flag>` through `nx run-many` to prettier, and bare prettier with no mode
+  # flag exits 0 (vacuous pass), so ONLY the REAL nx→prettier chain proves the flag arrives — a stub
+  # can't exercise nx arg-forwarding. Still hermetic + NO NETWORK: a synthetic nx workspace under
+  # DEVLOOP_TMP with node_modules SYMLINKED to the repo's (nx/prettier/plugin already installed —
+  # offline), never the repo tree; NX_DAEMON=false + isolated NX_CACHE_DIRECTORY so no stale graph/cache
+  # is served. Node tooling, NOT cargo — the "no cargo" invariant above is about compiler cost/variance
+  # in the fast tier; nx+prettier over tiny fixtures run ~10s (budget recorded with @operations per §6.3).
+  run_and_emit "ts-fmt-selftest" "${__here}/lang/ts/fmt.test.sh" || true
+  # Fmt-lane SSoT policy guard SELF-TEST (ADR-0037 §D7/§D9). The guard (auto-discovered under
+  # guards/simple/) PASSES on the real tree, so its failure branches — the SSoT-bypass detector, the
+  # attesting-gate prefix checks, the pre-commit check-only form, and the comment-vs-code discriminator
+  # that keeps the bypass detector from forbidding documentation — are exercised here against synthetic
+  # fixtures via the FMT_SSOT_* seams. Deliberately NOT under guards/simple/ (the find -name '*.sh'
+  # reason). No cluster.
+  run_and_emit "fmt-lane-ssot-guard-selftest" "${__here}/guards/validate-fmt-lane-ssot.test.sh" || true
+  # TS-fmt proto-exclusion standing guard SELF-TEST (ADR-0037 §D7; @dry-reviewer). The guard (auto-discovered
+  # under guards/simple/) PASSES on the real tree, so its failure branches — the missing proto-ignore line,
+  # a format-target cwd, and the zero-targets vacuity guard — are exercised here against synthetic config via
+  # the TSFMT_* seams. Deliberately NOT under guards/simple/ (the find -name '*.sh' reason). No cluster.
+  run_and_emit "ts-fmt-proto-excluded-guard-selftest" "${__here}/guards/validate-ts-fmt-proto-excluded.test.sh" || true
 } | tee_collect_statuses

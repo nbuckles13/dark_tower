@@ -484,8 +484,45 @@ case_o() {
   fi
 }
 
-printf 'gate2 isolation self-test (matrix a–f + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/source-safety guards):\n'
-for c in case_a case_b case_c case_d case_e case_f case_g case_h case_i case_j case_k case_l case_m case_n case_o; do
+# ---------------------------------------------------------------------------
+# (p) REMEDIATION ORDERING — the drift message must instruct VALIDATE-then-STAGE
+#     (`./scripts/layer-all.sh && git add -A`), never the reverse. This pins the
+#     _gate2_binding.sh:727 reorder made this devloop (ADR-0037 §D7): emit signs the
+#     WORKTREE, the hook compares the staged INDEX, and under D7 the fmt lane
+#     reformats mid-run — so `git add -A && layer-all` stages pre-format content and
+#     signs post-format, reproducing the mismatch and inducing `--no-verify`
+#     (@operations flagged the reorder as the load-bearing anti-inducement). A revert
+#     to the wrong order flips BOTH assertions. Reuses case_b's mismatch trigger.
+# ---------------------------------------------------------------------------
+case_p() {
+  seed_commit
+  mk_main_md "story-p" "complete"
+  echo "original" > src.rs
+  git add -A
+  declare -A ls=( [4]=OK ) ld=( [4]=2 )
+  emit_gate2_verdict 0 ls ld
+  echo "TAMPERED" > src.rs
+  git add src.rs
+  local out rc
+  out="$(gate2_validate_commit 2>&1)" && rc=0 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    bad "(p) precondition: expected a signature-mismatch BLOCK to reach the remediation message (rc=0)"
+    return
+  fi
+  if grep -qF './scripts/layer-all.sh && git add -A' <<<"$out"; then
+    ok "(p) remediation instructs VALIDATE-then-stage (layer-all && git add)"
+  else
+    bad "(p) remediation missing the validate-then-stage form './scripts/layer-all.sh && git add -A'; output: $out"
+  fi
+  if grep -qF 'git add -A && ./scripts/layer-all.sh' <<<"$out"; then
+    bad "(p) remediation instructs the WRONG stage-then-validate order (:727 reorder reverted) — under D7 this signs a tree the index doesn't hold and induces --no-verify"
+  else
+    ok "(p) remediation does NOT instruct the reverse stage-then-validate order"
+  fi
+}
+
+printf 'gate2 isolation self-test (matrix a–f + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards):\n'
+for c in case_a case_b case_c case_d case_e case_f case_g case_h case_i case_j case_k case_l case_m case_n case_o case_p; do
   with_temp_repo "$c" || true
 done
 

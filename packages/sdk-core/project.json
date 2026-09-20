@@ -35,7 +35,14 @@
       "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/sdk-core",
-        "command": "tsc --noEmit && eslint src/ && prettier --check \"src/**/*.ts\""
+        "command": "tsc --noEmit && eslint src/"
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "prettier \"packages/sdk-core/src/**/*.ts\""
       }
     }
   }

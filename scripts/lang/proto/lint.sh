@@ -5,11 +5,11 @@
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/_buf.sh"
 install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
 
-if ! command -v buf >/dev/null 2>&1; then
-  emit_status FAIL "buf-binary-missing"
-  exit 1
-fi
+# COLLAPSE branch (ADR-0037 §D7): buf via `pnpm exec buf`; the preflight replaces the bare-`buf`
+# `command -v` guard (four-token taxonomy + version assertion; DiD — lint is read-only).
+proto_buf_preflight || exit 1
 
-run_and_emit "buf-lint" buf lint proto
+run_and_emit "buf-lint" pnpm exec buf lint proto

@@ -595,6 +595,13 @@ for n in 1 2 3 4 5 6 7; do
   cat > "$TEMPLATE/scripts/layer${n}.sh" <<STUB
 #!/usr/bin/env bash
 : >> "\${DEVLOOP_TEST_MARKERS}/ran.layer${n}"
+# ADR-0037 §D7: record the fmt-lane knob the per-task AUTHORITY gate (run_gate) prefixed onto this
+# layer, so a pin can prove it PROPAGATED to the child (=="1") and cannot regress to unset. \${VAR-x}
+# (not \${VAR:-x}) keeps set-empty distinct from unset.
+printf '%s' "\${DEVLOOP_FMT_CHECK_ONLY-UNSET}" > "\${DEVLOOP_TEST_MARKERS}/gate.fmt_check_only.layer${n}"
+# S-8 fixture (ADR-0037 §D7): simulate a gate LAYER that writes the tree (the invariant regression the
+# post-gate re-attestation catches) — layer 2 is the fmt lane, so it is the thematically-correct mutator.
+if [ "${n}" -eq 2 ] && [ -n "\${FAKE_GATE_MUTATES:-}" ]; then printf 'x\n' > gate-mutation-probe.txt; fi
 printf 'fixture layer${n} output\n'
 __rc="\${FAKE_LAYER${n}_RC:-0}"
 if [ "\$__rc" -ne 0 ] && [ -n "\${FAKE_LAYER_FAIL_STATUS:-}" ]; then
@@ -613,6 +620,9 @@ cat > "$TEMPLATE/scripts/layer-all.sh" <<'STUB'
 # Record the effective value so a pin can prove the belt is present (=="0") and cannot be
 # truncated by an ambient =1. ${VAR-x} (not ${VAR:-x}) keeps set-empty distinct from unset.
 printf '%s' "${DEVLOOP_FAIL_FAST-UNSET}" > "${DEVLOOP_TEST_MARKERS}/close-gate.fail_fast"
+# ADR-0037 §D7: record the fmt-lane knob run_full_gate prefixed onto the authoritative full-pipeline
+# gate — it must attest a tree it did NOT auto-format, so this MUST be "1" even under an ambient apply.
+printf '%s' "${DEVLOOP_FMT_CHECK_ONLY-UNSET}" > "${DEVLOOP_TEST_MARKERS}/close-gate.fmt_check_only"
 exit "${FAKE_LAYER_ALL_RC:-0}"
 STUB
 chmod +x "$TEMPLATE"/scripts/workflow/preflight-story.sh "$TEMPLATE"/scripts/layer*.sh
@@ -860,6 +870,24 @@ if [ "$(cat "$MARK/close-gate.fail_fast" 2>/dev/null)" = "0" ]; then PASS=$((PAS
 assert_marker "d1-devloop-session-headless" "$MARK" 'devloop.session.headless'
 if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[d1-baseline-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
+# ADR-0037 §D7 (the single most load-bearing fmt-knob assertion, @security/@operations): the
+# CHECK-only knob PROPAGATED from run_gate's per-layer loop to the child layer (run-story.sh:1343's
+# per-invocation prefix). If the prefix is dropped, the authority gate would auto-format the very tree
+# it attests — reds here as UNSET. Layer 1 is the loop's first iteration; the loop covers layers 1-6.
+if [ "$(cat "$MARK/gate.fmt_check_only.layer1" 2>/dev/null)" = "1" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[d1-run-gate-forces-fmt-check] run_gate layer saw DEVLOOP_FMT_CHECK_ONLY='$(cat "$MARK/gate.fmt_check_only.layer1" 2>/dev/null)', expected '1' (the per-layer CHECK-only prefix is missing — the authority gate would auto-format the tree it attests)"); fi
+# ADR-0037 §D7: the SAME control on the OTHER authority-gate home — run_full_gate's layer-all invocation
+# (run-story.sh:1377). Both gate shapes force CHECK-only; a regression in either alone reds independently.
+if [ "$(cat "$MARK/close-gate.fmt_check_only" 2>/dev/null)" = "1" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[d1-close-gate-forces-fmt-check] close gate saw DEVLOOP_FMT_CHECK_ONLY='$(cat "$MARK/close-gate.fmt_check_only" 2>/dev/null)', expected '1'"); fi
+# ADR-0037 §D7 / S-11 PERSIST DIRECTION (@security F2): the knob must NOT persist past the per-invocation
+# prefix. run_gate prefixes DEVLOOP_FMT_CHECK_ONLY=1 onto layers 1-6 but calls layer7.sh WITHOUT it, so the
+# layer7 marker MUST read UNSET. If it read "1", the prefix leaked into the runner's env — which would then
+# strip D7's auto-apply from the spawned devloop session for the rest of the run. Regression guard against a
+# future `set -o posix` / refactor that flips bash's prefix-scoping (fail-closed today, but invisible).
+__l7knob="$(cat "$MARK/gate.fmt_check_only.layer7" 2>/dev/null || true)"
+if [ "$__l7knob" = "UNSET" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[d1-fmt-knob-does-not-persist] layer7 (called by run_gate WITHOUT the prefix) saw DEVLOOP_FMT_CHECK_ONLY='${__l7knob}', expected 'UNSET' — the per-invocation prefix on layers 1-6 leaked into the runner env (persist regression)"); fi
 
 # F1 (companion — the actual threat, @security): an ambient DEVLOOP_FAIL_FAST=1 leaked into the
 # runner (a developer who exports it for fast interactive loops, then runs a story) must NOT
@@ -874,6 +902,20 @@ assert_exit   "f1-ambient-story-completes" 0 "$RC"
 assert_marker "f1-ambient-close-gate-ran"  "$MARK" 'ran.layer-all'
 if [ "$(cat "$MARK/close-gate.fail_fast" 2>/dev/null)" = "0" ]; then PASS=$((PASS + 1)); else
   FAIL=$((FAIL + 1)); FAILURES+=("[f1-ambient-not-truncated] ambient DEVLOOP_FAIL_FAST=1 reached the close gate (saw '$(cat "$MARK/close-gate.fail_fast" 2>/dev/null)', expected '0' — the inline =0 belt is missing)"); fi
+
+# F1b (fmt companion — the actual threat, @security): an ambient DEVLOOP_FMT_APPLY=1 exported into the
+# runner (a developer who opts into fmt auto-apply for interactive loops, then runs a story) must NOT
+# make either authority gate auto-format the tree it attests. run-story.sh's per-invocation
+# DEVLOOP_FMT_CHECK_ONLY=1 prefix out-ranks the ambient apply in fmt_mode's precedence (INVALID >
+# check-only-override > CI > apply-opt-in > CHECK-default), so both child markers still read "1". RED if
+# a gate call site drops its prefix — the child would then inherit the ambient apply. This is the
+# fail-closed direction the whole tri-state design turns on; of the fmt-knob asserts, keep THIS one.
+run_story DEVLOOP_FMT_APPLY=1 -- fixture
+assert_exit   "f1b-ambient-apply-story-completes" 0 "$RC"
+if [ "$(cat "$MARK/gate.fmt_check_only.layer1" 2>/dev/null)" = "1" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[f1b-run-gate-override-beats-apply] ambient DEVLOOP_FMT_APPLY=1 reached run_gate's layer (saw DEVLOOP_FMT_CHECK_ONLY='$(cat "$MARK/gate.fmt_check_only.layer1" 2>/dev/null)', expected '1' — the check-only prefix no longer out-ranks the ambient apply)"); fi
+if [ "$(cat "$MARK/close-gate.fmt_check_only" 2>/dev/null)" = "1" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[f1b-close-gate-override-beats-apply] ambient DEVLOOP_FMT_APPLY=1 reached the close gate (saw '$(cat "$MARK/close-gate.fmt_check_only" 2>/dev/null)', expected '1')"); fi
 
 # =============================================================================
 # (E) --stop-after  (R-5)
@@ -1637,6 +1679,29 @@ assert_status "n7-revalidate-slug-in-manifest" "slug: 2026-08-17-revalidate-devl
 # devloop's cost from its leftover session log). Assert the shape, not just kind.
 n7_zero="$(jq -r 'select(.kind=="revalidate-gate-only") | (.usd==0 and .output_tokens==0 and .turns==0)' "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo PARSE-FAILED)"
 assert_status "n7-revalidate-gate-only-zero-cost" "true" "$n7_zero"
+
+# N7b: (S-8, ADR-0037 §D7) --revalidate re-attests the tree AFTER the gate. Set up the same committed-
+# escalated prior attempt as N7, then --revalidate with the gate GREEN (FAKE_LAYER3_RC=0) but a gate LAYER
+# that WRITES the tree (FAKE_GATE_MUTATES=1 — layer 2, the fmt lane, drops an untracked file). The pre-gate
+# clean check passes; the gate runs green; the post-gate re-check finds the tree dirty and REFUSES rather
+# than completing a green not reproducible from the commit. This is the fail-closed backstop for the whole
+# check-only design: if a fmt lane ever applied inside the authority gate, THIS is what catches it. Task
+# must stay escalated (NOT completed) and exit 2 (invariant regression, operator lane).
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-reval-mutate-devloop -- fixture
+assert_exit "n7b-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 FAKE_GATE_MUTATES=1 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit   "n7b-mutated-gate-exit2" 2 "$RC"
+assert_status "n7b-mutated-gate-token" "REVALIDATE-TREE-MUTATED-BY-GATE" "$OUTPUT"
+assert_status "n7b-mutated-gate-names-offender" "gate-mutation-probe.txt" "$OUTPUT"
+# The load-bearing property is that the task is NOT completed — a tree-mutating gate must never record a
+# green. It is left 'pending' here (the --revalidate flow's `dt-story next` reopened escalated->pending
+# BEFORE the gate, and S-8 exits before the red-path re-escalate), which an operator correctly reads as
+# "reopened, completion refused". Assert the guarantee, not the intermediate reopen state.
+n7b_status="$(manifest_status "$FIX" 1)"
+if [ "$n7b_status" != "completed" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n7b-mutated-gate-not-completed] task 1 status is 'completed' — a tree-mutating gate recorded a green"); fi
 
 # N8: (F1) --revalidate composed with --stop-after. The revalidate-green + stop
 # branch must fire: complete the task, print STOPPED, and SKIP the story-close

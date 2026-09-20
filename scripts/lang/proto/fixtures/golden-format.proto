@@ -1,0 +1,27 @@
+syntax = "proto3";
+package test.v2;
+
+option go_package = "example.com/foo;foopb";
+option java_multiple_files = true;
+// leading comment
+message Wide { // trailing comment
+  /* block
+     comment */
+  reserved 2, 15, 9 to 11;
+  reserved "old_field", "older";
+  string a_very_long_field_name_that_goes_on = 1 [
+    json_name = "aVeryLongFieldNameThatGoesOn",
+    deprecated = true
+  ];
+  message Nested {
+    int32 x = 1;
+  }
+  repeated Nested n = 3;
+  extensions 100 to 199;
+}
+service Big {
+  // rpc comment
+  rpc LongMethodNameHere(Wide) returns (stream Wide) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}

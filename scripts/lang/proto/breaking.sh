@@ -31,12 +31,13 @@
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/_buf.sh"
 install_wrapper_exit_trap  # task #50: BASE_SHA=$(...) can set -e abort before run_and_emit
 
-if ! command -v buf >/dev/null 2>&1; then
-  emit_status FAIL "buf-binary-missing"
-  exit 1
-fi
+# COLLAPSE branch (ADR-0037 §D7): buf via `pnpm exec buf`; the preflight replaces the bare-`buf`
+# `command -v` guard (four-token taxonomy + version assertion; DiD — breaking is read-only, but the
+# uniform check means a stale toolchain reds as version-mismatch, not a spurious wire-compat pass/fail).
+proto_buf_preflight || exit 1
 
 if [[ -n "${DEVLOOP_LAYER:-}" ]]; then
   # Inside a layer — suppress the duplicate BASE_REF= stderr emission.
@@ -102,4 +103,4 @@ if [[ -f "$__buf_yaml" ]]; then
   fi
 fi
 
-run_and_emit "buf-breaking" buf breaking proto --against ".git#ref=${BASE_SHA},subdir=proto"
+run_and_emit "buf-breaking" pnpm exec buf breaking proto --against ".git#ref=${BASE_SHA},subdir=proto"

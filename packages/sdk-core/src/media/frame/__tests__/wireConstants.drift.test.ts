@@ -67,7 +67,13 @@ describe('wireConstants.ts is a faithful render of the SSoT', () => {
           `If you edited ${generator.OUTPUT_PATH} by hand: DO NOT re-render to make this pass — ` +
           `that discards your edit silently. The value's origin is ` +
           `crates/media-protocol/src/frame.rs; change it there, regenerate the vectors, then ` +
-          `regenerate this file.`,
+          `regenerate this file.\n\n` +
+          `Ruling out fmt (this file is deliberately kept IN the prettier gate): check ` +
+          `\${DEVLOOP_TMP}/layer-2.log. If the fmt run shows FMT_MODE=check (any SOURCE), fmt is ` +
+          `EXCLUDED — check mode never writes, so stale content is the cause; regenerate as above. ` +
+          `Only FMT_MODE=apply with this file listed in FMT_APPLIED= implicates fmt (the ` +
+          `renderer↔prettier convergence broke — a prettier/plugin version or config split); ` +
+          `reconcile them, don't just regenerate.`,
       );
     }
     expect(committed).toBe(rendered);

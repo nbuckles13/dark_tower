@@ -71,24 +71,25 @@ scripts/
 
     rust/
       compile.sh                # cargo check
-      fmt.sh                    # cargo fmt
+      fmt.sh                    # cargo fmt (tri-state: APPLY local / CHECK CI+gates — ADR-0037 §D7)
       lint.sh                   # cargo clippy
       test.sh                   # cargo test (called by scripts/test.sh dispatcher)
       audit.sh                  # cargo audit
 
     ts/
       compile.sh                # nx affected -t typecheck
-      fmt.sh                    # nx affected -t format
+      fmt.sh                    # nx format (tri-state — ADR-0037 §D7)
       lint.sh                   # nx affected -t lint
       test.sh                   # nx affected -t test:unit test:component
       audit.sh                  # pnpm audit --audit-level=high
       e2e.sh                    # nx affected -t test:e2e (Playwright)
 
     proto/
-      compile.sh                # buf build
-      fmt.sh                    # buf format --diff --exit-code
-      lint.sh                   # buf lint
-      breaking.sh               # buf breaking (always-run)
+      compile.sh                # pnpm exec buf build
+      fmt.sh                    # pnpm exec buf format (tri-state — ADR-0037 §D7; bare buf retired, COLLAPSE)
+      lint.sh                   # pnpm exec buf lint
+      breaking.sh               # pnpm exec buf breaking (always-run)
+      _buf.sh                   # NEW (ADR-0037 §D7) — shared `pnpm exec buf` preflight: toolchain + version pin
       # Note: no test.sh or audit.sh — proto has no test verb; breaking.sh covers audit
 
   guards/
