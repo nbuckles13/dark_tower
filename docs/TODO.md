@@ -1973,7 +1973,6 @@ via CLI flags, hand-edited derived files, or Dependabot alert dismissals. See
 |----|-----------|--------|
 | RUSTSEC-2023-0071 | rust | this section (Cluster C below) |
 | RUSTSEC-2025-0052 | rust | 'Polyglot Pipeline Follow-ups' → async-std entry |
-| GHSA-h67p-54hq-rp68 | js | this section |
 
 > **`expires` and the exposure rationale are deliberately NOT reproduced here — read them from
 > `audit-suppressions.toml`.** They used to be, and on 2026-09-02 this table was found carrying both
