@@ -141,7 +141,7 @@ main() {
   export DATABASE_URL
 
   # Wrap cargo with the STATUS contract via run_and_emit.
-  run_and_emit "cargo-test" cargo test "$@"
+  run_and_emit "cargo-test" cargo test "${CARGO_LOCKED[@]}" "$@"
 }
 
 main "$@"
