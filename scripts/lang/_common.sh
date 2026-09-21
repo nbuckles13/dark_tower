@@ -73,6 +73,27 @@ init_devloop_tmp() {
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
 
 # -----------------------------------------------------------------------------
+# Cargo lockfile enforcement (CI only)
+# -----------------------------------------------------------------------------
+# Enforce the committed Cargo.lock — build/test/lint against it and FAIL LOUD if
+# the manifest and lock have drifted (someone changed Cargo.toml without committing
+# the regenerated Cargo.lock) — in two contexts:
+#   - CI (GITHUB_ACTIONS), and
+#   - any tree-attesting gate that sets DEVLOOP_FMT_CHECK_ONLY — notably
+#     run-story's post-devloop validation (scripts/workflow/run-story.sh), which
+#     marks its layer-all run that way. An attestation must validate the committed
+#     tree, not silently re-resolve — the same reason such gates force fmt
+#     CHECK-only.
+# A plain local run stays empty: cargo silently rewrites the lock as usual and the
+# dev commits Cargo.lock alongside the Cargo.toml change. Single locus for the
+# decision — the rust wrappers expand "${CARGO_LOCKED[@]}". (cargo audit takes no
+# --locked; it already reads the lock.)
+CARGO_LOCKED=()
+if [[ -n "${GITHUB_ACTIONS:-}" || -n "${DEVLOOP_FMT_CHECK_ONLY:-}" ]]; then
+  CARGO_LOCKED=(--locked)
+fi
+
+# -----------------------------------------------------------------------------
 # Color helpers
 # -----------------------------------------------------------------------------
 

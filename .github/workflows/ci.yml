@@ -94,7 +94,7 @@ jobs:
         # a second build site for the same two binaries (a knowingly-accepted SSoT
         # cost, no longer a correctness requirement — see docs/TODO.md §Polyglot).
         # Mirrors ci-client.yml's equivalent step.
-        run: cargo build --release -p dt-guard -p dt-story
+        run: cargo build --release -p dt-guard -p dt-story --locked
 
       - name: Install Playwright Chromium
         # INTERIM PATCH (see TODO: run CI in the devloop image). Layer 4
@@ -243,8 +243,8 @@ jobs:
           # with EAGAIN ("Resource temporarily unavailable", never executed) and
           # the step dies. `cargo test` under the sourced env emits the same
           # instrumented profraws the report step below consumes.
-          cargo build -p dt-guard
-          cargo test --workspace
+          cargo build -p dt-guard --locked
+          cargo test --workspace --locked
 
           # Point DT_GUARD at the INSTRUMENTED binary, derived from the target dir
           # cargo-llvm-cov exported (not a hardcoded target/llvm-cov-target path).
