@@ -88,7 +88,7 @@ jobs:
         # a second build site for the same two binaries (a knowingly-accepted SSoT
         # cost, no longer a correctness requirement — see docs/TODO.md §Polyglot).
         # Mirrors ci-client.yml's equivalent step.
-        run: cargo build --release -p dt-guard -p dt-story
+        run: cargo build --release -p dt-guard -p dt-story --locked
 
       - name: Install Playwright Chromium
         # INTERIM PATCH (see TODO: run CI in the devloop image). Layer 4
@@ -168,7 +168,7 @@ jobs:
           AC_MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
           AC_BIND_ADDRESS: 127.0.0.1:8082
           RUSTFLAGS: --cfg coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

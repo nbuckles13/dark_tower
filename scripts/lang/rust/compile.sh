@@ -15,9 +15,9 @@ set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_common.sh"
 install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
-run_and_emit "cargo-build" cargo build --workspace --quiet "$@"
-run_and_emit "cargo-build-dt-guard" cargo build --release -p dt-guard --quiet "$@"
-run_and_emit "cargo-build-dt-story" cargo build --release -p dt-story --quiet "$@"
+run_and_emit "cargo-build" cargo build --workspace "${CARGO_LOCKED[@]}" --quiet "$@"
+run_and_emit "cargo-build-dt-guard" cargo build --release -p dt-guard "${CARGO_LOCKED[@]}" --quiet "$@"
+run_and_emit "cargo-build-dt-story" cargo build --release -p dt-story "${CARGO_LOCKED[@]}" --quiet "$@"
 
 # ADR-0036 §11 release-build feature gate — asserts mh-service's `per-frame-trace`
 # `compile_error!` (crates/mh-service/src/lib.rs) BOTH fires under the release profile with
