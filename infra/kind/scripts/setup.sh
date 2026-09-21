@@ -58,11 +58,37 @@ CLUSTER_NAME="${DT_CLUSTER_NAME:-dark-tower}"
 KIND_CONFIG="${PROJECT_ROOT}/infra/kind/kind-config.yaml"
 CALICO_VERSION="v3.27.0"
 
-# --- Cluster name validation ---
-if [[ ! "${CLUSTER_NAME}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || [[ ${#CLUSTER_NAME} -gt 63 ]]; then
-    echo "ERROR: Invalid cluster name '${CLUSTER_NAME}': must be lowercase alphanumeric/hyphens, start and end with alphanumeric, max 63 chars" >&2
-    exit 1
-fi
+# --- Cluster name validation (#1 name-length, DERIVED from 63) ---
+# KIND names the control-plane node `<cluster>-control-plane`, a Kubernetes DNS
+# label capped at 63 chars. KIND_CONFIG above (infra/kind/kind-config.yaml) declares
+# exactly one control-plane node (see the NOTE above its `nodes:` block), so `-control-plane` is the
+# longest node-name suffix and the operative cap is on the CLUSTER NAME:
+# 63 - len("-control-plane") = 49. Derive it (one `63` literal here, the suffix by
+# length) so the bound can't drift; never type 49. No truncation/hash — that would
+# silently collide two clusters onto one name. A pure function (no side effects, no
+# cluster calls) so setup.test.sh can source + call it directly, the disk-guard way.
+# INVERSE PRECONDITION vs teardown.sh (the (b) Finding-5 pattern): setup MUST cap length
+# (it CREATES the cluster and a >49 name can't fit the 63-char DNS-label node), whereas
+# teardown deliberately does NOT cap (it must be able to DELETE a pre-existing orphan with
+# a too-long name). The CHARSET regex below is kept in sync with teardown.sh's by a check
+# in scripts/setup.test.sh; the length-cap divergence is intentional — DO NOT unify them.
+validate_cluster_name() {
+    local name="$1"
+    local node_suffix="-control-plane"   # cross-ref: infra/kind/kind-config.yaml (single control-plane node; see the NOTE above `nodes:`)
+    local dns_label_max=63
+    local cluster_name_max=$(( dns_label_max - ${#node_suffix} ))   # 49
+    if [[ ! "${name}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+        echo "ERROR: Invalid cluster name '${name}': must be lowercase alphanumeric/hyphens, start and end with alphanumeric" >&2
+        exit 1
+    fi
+    if (( ${#name} > cluster_name_max )); then
+        echo "ERROR: CLUSTER_NAME_TOO_LONG SUBJECT=cluster-name NAME=${name} LEN=${#name} MAX=${cluster_name_max}" >&2
+        echo "  Cluster name '${name}' is ${#name} chars; shorten it to <= ${cluster_name_max}." >&2
+        echo "  (Its '${node_suffix}' node name must fit the ${dns_label_max}-char DNS label.)" >&2
+        exit 1
+    fi
+}
+validate_cluster_name "${CLUSTER_NAME}"
 
 # --- DT_PORT_MAP sourcing ---
 if [[ -n "${DT_PORT_MAP:-}" ]]; then
@@ -350,6 +376,39 @@ warn_port_mapping_cliff() {
     log_warn "   the conflicting loopback port and retry.)"
 }
 
+# Export the kind-<cluster> context into the active kubeconfig (#2). SINGLE source
+# of the host-kubeconfig write, called from ALL THREE create_cluster() exits.
+#
+# `kind create cluster` writes this context as a side effect — but the two reuse
+# paths below return BEFORE ever creating, so on reuse a caller whose active
+# kubeconfig lacks the kind-<cluster> context gets kubectl falling back to
+# localhost:8080 -> "connection refused" -> a healthy cluster mis-read as broken (a
+# masked failure). Making the write explicit + idempotent on every path closes that.
+#
+# `kind export kubeconfig` MERGES into the target ($KUBECONFIG, else ~/.kube/config):
+# it adds/updates the kind-<cluster> context and switches current-context toward the
+# kind cluster (deliberate — every subsequent kubectl here is explicit-context anyway,
+# and the switch is the operator convenience), and it does NOT clobber the operator's
+# other contexts. This is the HOST $KUBECONFIG — a deliberately DISTINCT artifact from
+# the devloop-helper's container kubeconfig (crates/devloop-helper's
+# generate_container_kubeconfig writes /tmp/devloop/kubeconfig); do not collapse them.
+#
+# LOUD on failure: a swallowed failure here is byte-identical to the bug being fixed.
+write_kubeconfig() {
+    # Report the actual KUBECONFIG state, not the selection RULE — the person who hits
+    # the reuse bug is the one with KUBECONFIG set to something they've forgotten. Name
+    # the variable's value rather than computing a single path: KUBECONFIG may be a
+    # colon-separated list and `kind export` writes only its FIRST entry, so a computed
+    # "~/.kube/config" fallback would be confidently wrong in that case.
+    log_info "Exporting kubeconfig context 'kind-${CLUSTER_NAME}' (KUBECONFIG=${KUBECONFIG:-<unset, using ~/.kube/config>})..."
+    if ! kind export kubeconfig --name "${CLUSTER_NAME}"; then
+        log_error "Failed to export kubeconfig for cluster '${CLUSTER_NAME}' (KUBECONFIG=${KUBECONFIG:-<unset, using ~/.kube/config>})."
+        log_error "  Without the kind-${CLUSTER_NAME} context, kubectl falls back to localhost:8080"
+        log_error "  and a healthy cluster reads as unreachable. Aborting."
+        exit 1
+    fi
+}
+
 # Create kind cluster
 create_cluster() {
     if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
@@ -357,6 +416,7 @@ create_cluster() {
         if [[ "${AUTO_YES}" == "true" ]]; then
             log_info "Cluster exists, reusing (auto-yes defaults to non-destructive)."
             warn_port_mapping_cliff
+            write_kubeconfig   # reuse path: kind create was skipped, so export explicitly (#2)
             return 0
         fi
         read -p "Delete and recreate? [y/N] " -n 1 -r
@@ -367,12 +427,14 @@ create_cluster() {
         else
             log_info "Using existing cluster."
             warn_port_mapping_cliff
+            write_kubeconfig   # reuse path: kind create was skipped, so export explicitly (#2)
             return 0
         fi
     fi
 
     log_step "Creating kind cluster '${CLUSTER_NAME}' with Calico CNI..."
     kind create cluster --config="${KIND_CONFIG}" --name="${CLUSTER_NAME}"
+    write_kubeconfig   # create path: make kind's implicit side-effect write explicit + checked (#2)
 
     # NOTE: Don't wait for nodes here - they won't be Ready until Calico is installed
     # (because we set disableDefaultCNI: true in kind-config.yaml)

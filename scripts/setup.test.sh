@@ -376,4 +376,187 @@ assert_status "provision-context-mismatch-names-available" "kind-some-other-clus
 # And it must NOT report success.
 assert_absent "provision-context-mismatch-no-success-line" "PROVISIONED_ORG" "$PROV_OUT"
 
+# =============================================================================================
+# === (C) #1 name-length — CLUSTER_NAME cap 49 (setup.sh + teardown.sh), slug cap 41 (devloop.sh)
+# =============================================================================================
+# The cap is DERIVED from the 63-char DNS-label limit (see setup.sh's validate_cluster_name).
+# A literal `49` at a slug site is the specific bug that passes review while leaving the hole
+# open, so these boundary cases pin 49/50 (cluster) and 41/42 (slug). Reject cases assert the
+# create/delete verb did NOT run (marker), not exit-code alone — a broken fixture also exits
+# non-zero.
+TEARDOWN="${REPO_ROOT}/infra/kind/scripts/teardown.sh"
+DEVLOOP="${REPO_ROOT}/infra/devloop/devloop.sh"
+NAME50="$(printf 'a%.0s' {1..50})"
+NAME49="$(printf 'a%.0s' {1..49})"
+SLUG42="$(printf 'a%.0s' {1..42})"
+SLUG41="$(printf 'a%.0s' {1..41})"
+
+# --- setup.sh: source + call validate_cluster_name directly (the disk-guard pattern, :47).
+#     Sourcing with a VALID DT_CLUSTER_NAME lets the top-level call pass; then we drive the
+#     function with the test value. The function has NO cluster calls, so a reject cannot
+#     create anything — "before creation" is structural.
+SETUP_VALIDATE='sp="$1"; nm="$2"; set --; source "$sp" >/dev/null 2>&1; validate_cluster_name "$nm"'
+
+c_rej_out="$(DT_CLUSTER_NAME=dark-tower bash -c "$SETUP_VALIDATE" _ "$SETUP" "$NAME50" 2>&1)"; c_rej_rc=$?
+assert_rc     "namelen-setup-reject-exit1"  1 "$c_rej_rc"
+assert_status "namelen-setup-reject-token"  "CLUSTER_NAME_TOO_LONG SUBJECT=cluster-name NAME=${NAME50} LEN=50 MAX=49" "$c_rej_out"
+
+c_acc_out="$(DT_CLUSTER_NAME=dark-tower bash -c "$SETUP_VALIDATE" _ "$SETUP" "$NAME49" 2>&1)"; c_acc_rc=$?
+assert_rc     "namelen-setup-accept-exit0"    0 "$c_acc_rc"
+assert_absent "namelen-setup-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$c_acc_out"   # not rejecting on some other axis
+
+# --- teardown.sh DELIBERATELY has NO length cap (inverse precondition, @paired-operations):
+#     it must be able to DELETE a pre-existing orphan cluster whose name is >49 chars. So a
+#     50-char name must NOT be rejected — it must REACH `kind delete`. (Charset is still
+#     enforced; the charset-in-sync check below covers that.) Run the REAL script (no
+#     source-guard); the `get clusters` stub reports the orphan so teardown proceeds to delete.
+cat > "${STUB_BIN}/kind" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "get clusters")   echo "\${DT_CLUSTER_NAME}" ;;   # report the orphan cluster exists
+  "delete cluster") touch "${MARK}/ran.kind_delete" ;;
+  *)                : ;;
+esac
+exit 0
+EOF
+chmod +x "${STUB_BIN}/kind"
+reset_marks
+td_out="$(PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME="$NAME50" bash "$TEARDOWN" 2>&1)"; td_rc=$?
+# Positive control (@dry-reviewer): a 50-char name is ACCEPTED (exit 0), emits NO token, and
+# REACHES `kind delete` (the marker — exit-code-only would pass if teardown returned 0 for an
+# unrelated reason). This assertion IS the ruling: teardown must not strand a long-named orphan.
+assert_rc     "namelen-teardown-accepts-long-exit0"          0 "$td_rc"
+assert_absent "namelen-teardown-accepts-long-no-token"       "CLUSTER_NAME_TOO_LONG" "$td_out"
+assert_marker "namelen-teardown-accepts-long-reaches-delete" "$MARK" "ran.kind_delete"
+# teardown STILL enforces charset (the injection control): a malformed name is rejected before
+# any delete, so the length-cap divergence didn't drop the format check.
+reset_marks
+tdbad_out="$(PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME='Bad_Name' bash "$TEARDOWN" 2>&1)"; tdbad_rc=$?
+assert_rc        "namelen-teardown-charset-reject-exit1"        1 "$tdbad_rc"
+assert_status    "namelen-teardown-charset-reject-msg"          "Invalid cluster name" "$tdbad_out"
+assert_no_marker "namelen-teardown-charset-reject-before-delete" "$MARK" "ran.kind_delete"
+
+# --- CHARSET regex in sync (@dry-reviewer): pin the CANONICAL literal absolutely (not just
+#     compare the two files — a change applied to BOTH would pass a mutual compare). The charset
+#     rule is the one thing setup.sh + teardown.sh must still agree on after the length-cap
+#     divergence; a teardown charset STRICTER than setup's would strand a cluster setup could
+#     create. `grep -c -F` the exact `=~`-anchored condition in EACH; require >= 1 in BOTH (zero
+#     is drift — renamed fn / edited literal / deleted file — never a pass). NOTE a THIRD charset
+#     site exists at infra/devloop/devloop.sh (TASK_SLUG) — deliberately NOT pinned here: it
+#     validates the SLUG (different subject), and drift there surfaces loudly at setup.
+# Needle is the `=~`-anchored PATTERN only (not the `[[ ! "${name}" … ]]` wrapper), so a
+# reindent or a local-variable rename can't falsely red this (@dry-reviewer).
+readonly CHARSET_NEEDLE='=~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+setup_n="$(grep -c -F -- "$CHARSET_NEEDLE" "$SETUP" || true)"
+teardown_n="$(grep -c -F -- "$CHARSET_NEEDLE" "$TEARDOWN" || true)"
+if (( setup_n >= 1 && teardown_n >= 1 )); then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[charset-validators-in-sync] setup.sh(${setup_n})/teardown.sh(${teardown_n}) must EACH contain the canonical charset check — they must share the CHARSET rule (their LENGTH caps deliberately differ: teardown has none, by design; see its header)")
+fi
+
+# --- Guard the single-control-plane-node ASSUMPTION the 49/41 caps derive from (@test).
+#     The caps subtract len("-control-plane")=14; a SECOND control-plane node makes KIND emit
+#     `-control-plane2` (suffix 15) → real cap 48/40, but every pinned cap test above stays
+#     green (they pin the caps, not the config). CLAUDE.md SSoT: two places encode one fact →
+#     guard the drift. Match the node-list ENTRY precisely (anchored `-  role: control-plane`),
+#     NOT a bare `grep 'role: control-plane'` — the back-reference NOTE comment contains that
+#     string, so a naive count returns 2 and the guard would be vacuous. Require EXACTLY 1 in
+#     BOTH configs; 0 (extractor drifted / node renamed) is a FAILURE, never "fine".
+CP_NEEDLE='^[[:space:]]*-[[:space:]]+role:[[:space:]]*control-plane'
+KIND_STATIC="${REPO_ROOT}/infra/kind/kind-config.yaml"
+KIND_TMPL="${REPO_ROOT}/infra/kind/kind-config.yaml.tmpl"
+cp_static="$(grep -cE "$CP_NEEDLE" "$KIND_STATIC" || true)"
+cp_tmpl="$(grep -cE "$CP_NEEDLE" "$KIND_TMPL" || true)"
+if [[ "$cp_static" == "1" && "$cp_tmpl" == "1" ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[single-control-plane-node] kind-config.yaml(${cp_static})/kind-config.yaml.tmpl(${cp_tmpl}) must EACH declare EXACTLY ONE control-plane node — the 49/41 name-length caps assume it (a 2nd shifts the real cap to 48/40; the pinned cap tests would stay green). Adjust the caps at all four sites if this changes.")
+fi
+
+# --- devloop.sh launch-time slug cap 41. Reject exits BEFORE any container/cluster creation:
+#     run in a NON-git temp dir ($WORK) so a passing slug can't proceed to real work, and prove
+#     the podman stub never ran on the reject.
+cat > "${STUB_BIN}/podman" <<EOF
+#!/usr/bin/env bash
+touch "${MARK}/ran.podman"
+exit 0
+EOF
+chmod +x "${STUB_BIN}/podman"
+reset_marks
+dl_rej_out="$(cd "$WORK" && PATH="${STUB_BIN}:${PATH}" bash "$DEVLOOP" "$SLUG42" 2>&1)"; dl_rej_rc=$?
+assert_rc        "namelen-devloop-reject-exit1"           1 "$dl_rej_rc"
+assert_status    "namelen-devloop-reject-token"           "CLUSTER_NAME_TOO_LONG SUBJECT=slug NAME=${SLUG42} LEN=42 MAX=41" "$dl_rej_out"
+assert_no_marker "namelen-devloop-reject-before-creation" "$MARK" "ran.podman"
+
+# accept: a 41-char slug passes the length gate (it then fails later at the git step in the
+# non-repo dir — WITHOUT the token, which is the boundary proof).
+reset_marks
+dl_acc_out="$(cd "$WORK" && PATH="${STUB_BIN}:${PATH}" bash "$DEVLOOP" "$SLUG41" 2>&1)"
+assert_absent "namelen-devloop-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$dl_acc_out"
+
+# =============================================================================================
+# === (D) #2 kubeconfig-on-reuse — write_kubeconfig() runs on BOTH reuse return-paths ==========
+# =============================================================================================
+# The bug: create_cluster()'s two reuse `return 0` paths (AUTO_YES + interactive) skipped the
+# host-kubeconfig export, so on reuse kubectl fell back to localhost:8080 and a healthy cluster
+# read as broken. Drive the REUSE branch specifically (stub `kind get clusters` to report the
+# cluster exists) — NOT the create path (which always exported) — and assert the export ran ON
+# that path. MUTATION CHECK: removing write_kubeconfig from a reuse path drops ran.kind_export,
+# reddening the assert_marker below. Both reuse branches are covered (the SSoT helper means one
+# callsite could be present and the other dropped).
+cat > "${STUB_BIN}/kind" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "get clusters")      echo "reusecluster" ;;   # report the cluster already exists -> reuse path
+  "export kubeconfig") touch "${MARK}/ran.kind_export" ;;
+  "delete cluster")    touch "${MARK}/ran.kind_delete" ;;
+  "create cluster")    touch "${MARK}/ran.kind_create" ;;
+  *) echo "FAKE kind: unmodeled '\$*'" >&2; exit 3 ;;
+esac
+exit 0
+EOF
+chmod +x "${STUB_BIN}/kind"
+
+# AUTO_YES reuse branch.
+reset_marks
+PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME=reusecluster \
+  bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; AUTO_YES=true; create_cluster' _ "$SETUP" >/dev/null 2>&1
+assert_marker    "kubeconfig-reuse-autoyes-exported"      "$MARK" "ran.kind_export"
+assert_no_marker "kubeconfig-reuse-autoyes-not-recreated" "$MARK" "ran.kind_delete"
+assert_no_marker "kubeconfig-reuse-autoyes-not-created"   "$MARK" "ran.kind_create"
+
+# Interactive reuse branch ("Delete and recreate? [y/N]" answered n -> "Using existing cluster").
+reset_marks
+echo n | PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME=reusecluster \
+  bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; AUTO_YES=false; create_cluster' _ "$SETUP" >/dev/null 2>&1
+assert_marker    "kubeconfig-reuse-interactive-exported"      "$MARK" "ran.kind_export"
+assert_no_marker "kubeconfig-reuse-interactive-not-recreated" "$MARK" "ran.kind_delete"
+# Symmetric with the AUTO_YES branch (@test): catches an `else`-branch that lost its
+# `return 0` and fell through to `kind create cluster` — which would touch ran.kind_export
+# via the create-path write AND leave ran.kind_delete absent, passing the two assertions
+# above while wrongly RECREATING the cluster. This is the "reuse must not create" control.
+assert_no_marker "kubeconfig-reuse-interactive-not-created"   "$MARK" "ran.kind_create"
+
+# --- #2 LOUD-on-failure (@paired-operations): a FAILING `kind export kubeconfig` on a reuse
+#     path must ABORT create_cluster non-zero with the diagnostic — this is the anti-masking
+#     property #2 exists to guarantee (a future `|| true`/dropped `exit 1` would silently
+#     re-introduce the kubectl→localhost:8080 bug with every success-path test still green).
+cat > "${STUB_BIN}/kind" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "get clusters")      echo "reusecluster" ;;
+  "export kubeconfig") echo "kind: simulated export failure" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "${STUB_BIN}/kind"
+reset_marks
+wk_out="$(PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME=reusecluster \
+  bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; AUTO_YES=true; create_cluster' _ "$SETUP" 2>&1)"; wk_rc=$?
+assert_rc     "kubeconfig-export-failure-aborts" 1 "$wk_rc"
+assert_status "kubeconfig-export-failure-loud"   "localhost:8080" "$wk_out"
+
 report_results "scripts/setup.test.sh"

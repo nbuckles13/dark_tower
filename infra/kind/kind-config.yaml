@@ -10,6 +10,13 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: dark-tower
 
 nodes:
+  # NOTE: exactly ONE `role: control-plane` node is ASSUMED by the KIND name-length caps
+  # derived in infra/devloop/devloop.sh, infra/kind/scripts/{setup,teardown}.sh and
+  # crates/devloop-helper/src/error.rs. Those caps subtract len("-control-plane")=14 from the
+  # 63-char DNS label. Adding a second control-plane node makes KIND emit `<cluster>-control-plane2`
+  # (suffix 15), so the real cluster-name cap becomes 48 and all four sites would be wrong by one
+  # — and their pinned tests would stay green (they pin the caps, not this file). Adjust them
+  # together with this block, or not at all.
   - role: control-plane
     # Expose ports for local access.
     #
