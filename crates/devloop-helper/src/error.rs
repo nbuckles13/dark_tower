@@ -95,21 +95,46 @@ impl HelperError {
     }
 }
 
+/// KIND cluster-name length bounds — single source of truth, DERIVED not typed.
+///
+/// KIND names the control-plane node `<cluster>-control-plane`, a Kubernetes DNS
+/// label capped at 63 chars (RFC 1123). Exactly one control-plane node is declared
+/// in `infra/kind/kind-config.yaml.tmpl` (the config this helper renders from — see the
+/// NOTE above its `nodes:` block),
+/// so `-control-plane` is the longest node-name suffix. That makes the operative
+/// caps: cluster name ≤ `63 − len("-control-plane")` = 49, and — because this helper
+/// forms every cluster name as `devloop-<slug>` (see [`crate`] `run()`) — slug ≤
+/// `49 − len("devloop-")` = 41. Deriving from the two string constants (rather than
+/// typing `49`/`41`) keeps every bound honest if the prefix or suffix ever changes.
+pub const DNS_LABEL_MAX: usize = 63;
+pub const NODE_SUFFIX: &str = "-control-plane";
+pub const CLUSTER_PREFIX: &str = "devloop-";
+pub const CLUSTER_NAME_MAX: usize = DNS_LABEL_MAX - NODE_SUFFIX.len();
+pub const SLUG_MAX: usize = CLUSTER_NAME_MAX - CLUSTER_PREFIX.len();
+
 /// Validated slug for use in paths and cluster names.
 ///
 /// Guarantees: lowercase alphanumeric and hyphens only, starts and ends with
-/// alphanumeric, max 63 characters. Safe for filesystem paths and Kind cluster names.
+/// alphanumeric, and **at most [`SLUG_MAX`] (41) characters**. The length cap is
+/// NOT an arbitrary path limit: the helper forms the KIND cluster name as
+/// `devloop-<slug>`, whose control-plane node `devloop-<slug>-control-plane` must
+/// fit the 63-char DNS label ([`DNS_LABEL_MAX`]) — so `slug ≤ 63 − 14 − 8 = 41`.
+/// A longer slug produces a node name KIND cannot create; capping here (defence in
+/// depth behind `devloop.sh`'s launch check) rejects it loudly instead of letting
+/// the cluster silently fail to come up.
 #[derive(Debug, Clone)]
 pub struct ValidSlug(String);
 
 impl ValidSlug {
     /// Validate a slug string.
     ///
-    /// Pattern: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, max 63 chars.
+    /// Pattern: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, max [`SLUG_MAX`] chars.
     pub fn new(s: &str) -> Result<Self, HelperError> {
-        if s.is_empty() || s.len() > 63 {
+        if s.is_empty() || s.len() > SLUG_MAX {
             return Err(HelperError::InvalidSlug(format!(
-                "slug must be 1-63 characters, got {}",
+                "slug must be 1-{SLUG_MAX} characters, got {} \
+                 (cluster name is 'devloop-<slug>', whose '-control-plane' node name \
+                 must fit the {DNS_LABEL_MAX}-char DNS label)",
                 s.len()
             )));
         }
@@ -243,5 +268,47 @@ mod tests {
         );
         let clean = HelperError::Cancelled { escalated: false }.to_string();
         assert!(!clean.contains("sigkill"), "got: {clean}");
+    }
+
+    // --- #1 name-length: the slug cap is the reachable Rust bypass of devloop.sh's
+    //     launch check (main.rs forms `devloop-<slug>`), so it must enforce slug ≤ 41.
+
+    /// The bounds are DERIVED from 63 (not typed), so pin the computed values — a
+    /// change to the prefix/suffix that shifted them would red this, which is the
+    /// point of the derivation.
+    #[test]
+    fn test_slug_bounds_are_derived_from_63() {
+        assert_eq!(CLUSTER_NAME_MAX, 49, "63 - len(\"-control-plane\")");
+        assert_eq!(SLUG_MAX, 41, "49 - len(\"devloop-\")");
+    }
+
+    /// Boundary: a slug of exactly SLUG_MAX is accepted (produces a 63-char node name).
+    #[test]
+    fn test_valid_slug_accepts_max_length() {
+        let s = "a".repeat(SLUG_MAX); // 41 chars, all valid
+        assert!(ValidSlug::new(&s).is_ok(), "len {} should pass", s.len());
+    }
+
+    /// Boundary: SLUG_MAX + 1 is REJECTED — a 42-char slug yields a 50-char cluster
+    /// name (`devloop-` + 42) and a 64-char node name (+ `-control-plane`), which
+    /// exceeds the 63-char DNS label and KIND cannot create. This is the hole that a
+    /// literal `63` cap here would have left open.
+    #[test]
+    fn test_valid_slug_rejects_over_max_length() {
+        let s = "a".repeat(SLUG_MAX + 1); // 42 chars
+        let err = ValidSlug::new(&s).expect_err("42-char slug must be rejected");
+        assert!(
+            matches!(&err, HelperError::InvalidSlug(_)),
+            "expected InvalidSlug, got {err:?}"
+        );
+        // Message must name the computed cap + the 63 origin (self-documenting,
+        // since there is no §8 catalogue row in task (a)).
+        if let HelperError::InvalidSlug(msg) = &err {
+            assert!(msg.contains(&SLUG_MAX.to_string()), "cap not named: {msg}");
+            assert!(
+                msg.contains(&DNS_LABEL_MAX.to_string()),
+                "63 origin not named: {msg}"
+            );
+        }
     }
 }
