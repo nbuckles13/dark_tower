@@ -2,12 +2,18 @@
 /target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# Cargo.lock IS committed: this is a deployable service workspace (ac/gc/mc/mh are
+# binaries), so the lock is tracked for reproducible builds and controllable,
+# auditable dependency updates. (Only libraries gitignore it; the earlier ignore
+# here was an unexamined `cargo new` template default.)
 
 # Fuzz testing artifacts
 **/fuzz/corpus/
 **/fuzz/target/
 **/fuzz/artifacts/
+# Fuzz sub-projects are dev-only tooling, not deployed binaries — their locks stay
+# untracked (the workspace Cargo.lock above is the one that's committed).
+**/fuzz/Cargo.lock
 
 # Generated protobuf code
 packages/sdk-core/src/proto/**/*_pb.ts
