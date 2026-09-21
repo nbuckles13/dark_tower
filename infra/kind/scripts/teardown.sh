@@ -13,11 +13,25 @@ set -euo pipefail
 
 CLUSTER_NAME="${DT_CLUSTER_NAME:-dark-tower}"
 
-# --- Cluster name validation ---
-if [[ ! "${CLUSTER_NAME}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || [[ ${#CLUSTER_NAME} -gt 63 ]]; then
-    echo "ERROR: Invalid cluster name '${CLUSTER_NAME}': must be lowercase alphanumeric/hyphens, start and end with alphanumeric, max 63 chars" >&2
-    exit 1
-fi
+# --- Cluster name validation (#1 charset only — DELIBERATELY no length cap) ---
+# INVERSE PRECONDITION vs setup.sh (@paired-operations / @security, the (b) Finding-5
+# pattern): setup.sh MUST reject a >49-char name (it can't CREATE the 63-char DNS-label
+# node), but teardown MUST NOT — a partially-created orphan cluster from before the
+# length cap existed (unbounded slugs) can carry a 50-63 char name, and teardown's whole
+# job is to DELETE whatever exists. A length cap here would strand that orphan (exit
+# before `kind delete`) AND misdirect ("shorten it" is useless advice for a name you're
+# deleting). So teardown validates CHARSET/FORMAT only — which is what protects the
+# `kind delete`/`pkill` command sites; length contributes nothing to injection safety.
+# The CHARSET regex below is kept in sync with setup.sh's by a check in
+# scripts/setup.test.sh; the length-cap divergence is intentional — DO NOT unify them.
+validate_cluster_name() {
+    local name="$1"
+    if [[ ! "${name}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+        echo "ERROR: Invalid cluster name '${name}': must be lowercase alphanumeric/hyphens, start and end with alphanumeric" >&2
+        exit 1
+    fi
+}
+validate_cluster_name "${CLUSTER_NAME}"
 
 # Colors for output
 RED='\033[0;31m'

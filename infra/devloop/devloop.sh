@@ -95,6 +95,34 @@ if [[ ! "$TASK_SLUG" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     exit 1
 fi
 
+# --- Cluster name-length bound (#1), DERIVED from 63 — reject LOUDLY at launch,
+#     before any container or cluster is created. ---
+# KIND names the control-plane node `<cluster>-control-plane`, a Kubernetes DNS
+# label capped at 63 chars. Exactly one control-plane node is declared in
+# infra/kind/kind-config.yaml.tmpl (the config the helper renders for a devloop
+# cluster), so `-control-plane` is the longest node-name suffix. The cluster name
+# here is `${CLUSTER_PREFIX}${TASK_SLUG}`, so the operative bound is on the SLUG.
+# Derive the caps from the two string constants (never type 49/41) so the bound
+# stays honest if a prefix/suffix ever changes. CLUSTER_PREFIX is the SAME constant
+# that builds CLUSTER_NAME below (single source of truth). NO truncation/hash — that
+# would silently collide two devloops onto one cluster.
+CLUSTER_PREFIX="devloop-"
+NODE_SUFFIX="-control-plane"       # cross-ref: infra/kind/kind-config.yaml.tmpl (single control-plane node; see the NOTE above `nodes:`)
+DNS_LABEL_MAX=63
+CLUSTER_NAME_MAX=$(( DNS_LABEL_MAX - ${#NODE_SUFFIX} ))   # 49
+SLUG_MAX=$(( CLUSTER_NAME_MAX - ${#CLUSTER_PREFIX} ))     # 41
+if (( ${#TASK_SLUG} > SLUG_MAX )); then
+    # SUBJECT= disambiguates which entity NAME=/LEN=/MAX= describe (this shared token
+    # also fires from setup.sh/teardown.sh with SUBJECT=cluster-name). Here it is the
+    # SLUG the operator typed; MAX is the computed cap, never a literal. A
+    # SUBJECT=cluster-name line reaching an operator who launched via devloop.sh means
+    # this launcher check was bypassed — itself a finding.
+    echo "ERROR: CLUSTER_NAME_TOO_LONG SUBJECT=slug NAME=${TASK_SLUG} LEN=${#TASK_SLUG} MAX=${SLUG_MAX}" >&2
+    echo "  Task slug '${TASK_SLUG}' is ${#TASK_SLUG} chars; shorten it to <= ${SLUG_MAX}." >&2
+    echo "  (Cluster name is '${CLUSTER_PREFIX}<slug>', whose '${NODE_SUFFIX}' node name must fit the ${DNS_LABEL_MAX}-char DNS label.)" >&2
+    exit 1
+fi
+
 # Optional base-branch, then an optional `-- <command...>`: everything after the
 # separator runs in the container instead of the interactive claude attach. Kept
 # deliberately general — devloop.sh sets up an environment, and encoding any
@@ -206,8 +234,8 @@ cleanup() {
 
     # Delete Kind cluster if kind is available
     if command -v kind &>/dev/null; then
-        echo "Deleting Kind cluster: devloop-${TASK_SLUG}..."
-        kind delete cluster --name "devloop-${TASK_SLUG}" 2>/dev/null || true
+        echo "Deleting Kind cluster: ${CLUSTER_PREFIX}${TASK_SLUG}..."
+        kind delete cluster --name "${CLUSTER_PREFIX}${TASK_SLUG}" 2>/dev/null || true
     fi
 
     # Reclaim the host build cruft this devloop produced — the service images and build
@@ -368,14 +396,20 @@ detect_orphan_clusters() {
         return 0
     fi
 
+    # Cluster-name sites: the prefix that FINDS the cluster must be the same
+    # CLUSTER_PREFIX const that BUILDS it (:724) and that the length cap subtracts —
+    # a rename that missed here would make this grep match nothing and report a clean
+    # host, masking the orphaned-cluster leak this function exists to catch (Finding 4,
+    # @dry-reviewer). The `-dev`/`-net`/`/tmp/devloop-` sites below share the string
+    # only incidentally and are deliberately left as literals.
     local clusters
-    clusters=$(kind get clusters 2>/dev/null | grep "^devloop-" || true)
+    clusters=$(kind get clusters 2>/dev/null | grep "^${CLUSTER_PREFIX}" || true)
     if [ -z "$clusters" ]; then
         return 0
     fi
 
     while IFS= read -r cluster; do
-        local slug="${cluster#devloop-}"
+        local slug="${cluster#"${CLUSTER_PREFIX}"}"
         local dev_container="devloop-${slug}-dev"
         local helper_pid_file="/tmp/${cluster}/helper.pid"
 
@@ -695,7 +729,10 @@ if [ -n "$HOST_GATEWAY_IP" ] && command -v kind &>/dev/null; then
     fi
 
     # 2. Check cluster readiness and trigger eager setup if needed
-    CLUSTER_NAME="devloop-${TASK_SLUG}"
+    # CLUSTER_PREFIX is the SAME const the launch-time slug-length cap subtracts
+    # (Finding 4) — the prefix that builds the name and the prefix the bound assumes
+    # cannot drift apart.
+    CLUSTER_NAME="${CLUSTER_PREFIX}${TASK_SLUG}"
     PORTS_FILE_PATH="$HELPER_RUNTIME_DIR/ports.json"
     NEEDS_SETUP=false
     if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
