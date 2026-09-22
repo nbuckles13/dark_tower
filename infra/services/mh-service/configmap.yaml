@@ -178,34 +178,43 @@ data:
   # attributed to it mean a connection flood or a connection leak, not demand
   # that has outgrown the deployment.
   #
-  # `500` is chosen against expected peak (single digits in this deployment) and
-  # as a 20x reduction from the 10,000 default that no one chose. It is NOT
-  # derived from this pod's memory limit, and the arithmetic below is recorded
-  # so task #12 inherits the reasoning rather than re-deriving it:
+  # `500` is MEMORY-DERIVED against this pod's 1 Gi limit. MH declares its
+  # receive-side flow control explicitly in
+  # `crates/mh-service/src/webtransport/server.rs`, so the per-connection
+  # receive ceiling is bounded rather than unbounded:
   #
-  #   quinn-proto 0.11.17 defaults, all currently UNDECLARED by MH:
-  #     receive_window            = VarInt::MAX  (unbounded — the dominant term)
-  #     stream_receive_window     = 1.25 MB
-  #     datagram_receive_buffer_size = 1.25 MB
-  #   Per-connection adversarial receive ceiling is therefore ~206 MB against
-  #   this pod's 1 Gi limit — roughly five hostile connections, not 500. And
-  #   ADR-0036's Context records that MH has NO `accept_uni` loop today, so
-  #   incoming stream data is never read and the windows fill and stay filled:
-  #   the worst case is the ordinary case, not a tail.
+  #     receive_window               = 256 KiB  (the dominant term)
+  #     stream_receive_window        =  64 KiB  (bounded BY receive_window)
+  #     datagram_receive_buffer_size =   2 KiB
+  #   ≈ 264 KB per connection, so 500 is ~132 MB, ~13% of 1 Gi. The derivation
+  #   has one home — `crates/mh-service/src/config.rs`, at the constants
+  #   themselves — and this comment does not restate its reasoning.
   #
-  # Connection-level receive flow control is the missing control. Task #12
-  # declares it as named constants — receive_window, stream_receive_window, and
-  # datagram_receive_buffer_size, the last of which is its OWN constant and is
-  # deliberately NOT derived from MH_DATAGRAM_BUFFER_AUDIO_FRAMES (that quinn
-  # field also feeds the advertised max_datagram_frame_size, so the send and
-  # receive directions have opposing sizing pressures). This drops the
-  # per-connection ceiling to
-  # ~263 KB and makes 500 genuinely memory-derived (~132 MB, ~13% of 1 Gi).
-  # Tracked in docs/TODO.md; until then this bound is chosen, not derived.
+  # `datagram_receive_buffer_size` is its OWN constant and is deliberately NOT
+  # derived from MH_DATAGRAM_BUFFER_AUDIO_FRAMES: that quinn field also feeds
+  # the advertised max_datagram_frame_size, so the send and receive directions
+  # have opposing sizing pressures and must not share a number.
   #
-  # The ~206 MB figure above is measured against this pod's 1 Gi limit — so
-  # changing `resources.limits.memory` in mh-{0,1}-deployment.yaml invalidates
-  # that analysis and requires revisiting this value.
+  # CORRECTED 2026-09-22. This block previously said the three receive-side
+  # parameters were "all currently UNDECLARED by MH", put the per-connection
+  # adversarial ceiling at ~206 MB — "roughly five hostile connections, not
+  # 500" — and closed with "until then this bound is chosen, not derived." All
+  # of that described the tree before the transport-config work landed; every
+  # clause is now false. `server.rs` declares all three and asserts the
+  # rendered values (`receive_window: 262144`, `stream_receive_window: 65536`,
+  # `max_idle_timeout: Some(30000)`), and ADR-0036's Context note that MH has
+  # no `accept_uni` loop no longer holds either.
+  #
+  # The correction is recorded rather than quietly applied because an operator
+  # reading the old text would have concluded this pod tolerates about five
+  # connections — an order of magnitude below the truth — and throttled a
+  # healthy deployment on the strength of it. Nothing mechanical would have
+  # caught it: no guard reads a manifest comment, which is why this file
+  # carries its corrections in the open instead of rewriting them away.
+  #
+  # The memory figure is measured against this pod's 1 Gi limit — so changing
+  # `resources.limits.memory` in mh-{0,1}-deployment.yaml invalidates the
+  # arithmetic and requires revisiting this value.
   # Enforced by: mh-service itself, in crates/mh-service/src/webtransport/server.rs,
   # before allocating handler resources.
   # Where an operator sees it: `mh_webtransport_connections_total{status="rejected"}`,
