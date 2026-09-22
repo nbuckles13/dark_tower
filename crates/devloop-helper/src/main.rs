@@ -8,6 +8,7 @@
 mod auth;
 mod commands;
 mod error;
+mod fs_atomic;
 mod logging;
 mod ports;
 mod protocol;
@@ -96,6 +97,7 @@ fn run() -> Result<(), HelperError> {
         host_gateway_ip: args.host_gateway_ip,
         shutdown: Arc::clone(&shutdown),
         write_state: Arc::new(Mutex::new(commands::WriteState::new())),
+        recreate_bound: AtomicBool::new(false),
     });
 
     // Bind socket
@@ -544,6 +546,11 @@ fn set_file_permissions(path: &Path, mode: u32) -> Result<(), HelperError> {
 }
 
 /// Acquire a startup lock to prevent concurrent helper launches for the same slug.
+///
+/// not secret-bearing (an empty flock file), so this keeps an ordinary write —
+/// the atomic-secret-write helper is for credential files only. It also
+/// deliberately does NOT truncate (`truncate(false)`); the file is only ever
+/// flock'd, never read.
 fn acquire_startup_lock(lock_path: &Path) -> Result<fs::File, HelperError> {
     let file = fs::OpenOptions::new()
         .write(true)
@@ -595,6 +602,10 @@ fn handle_stale_pid(pid_path: &Path, runtime_dir: &Path) -> Result<(), HelperErr
 }
 
 /// Write the current PID to the PID file.
+///
+/// not secret-bearing (a PID is not credential material), so this keeps an
+/// ordinary write — the atomic-secret-write helper (`fs_atomic::atomic_write_secret`)
+/// is for credential files (kubeconfig, auth token) only.
 fn write_pid_file(pid_path: &Path) -> Result<(), HelperError> {
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -629,6 +640,7 @@ fn build_test_context(dir: &Path) -> commands::Context {
         host_gateway_ip: None,
         shutdown: Arc::new(AtomicBool::new(false)),
         write_state: Arc::new(Mutex::new(commands::WriteState::new())),
+        recreate_bound: AtomicBool::new(false),
     }
 }
 

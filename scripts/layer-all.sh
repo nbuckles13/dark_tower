@@ -22,8 +22,6 @@
 #   WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=<s> BUDGET=90
 # Greppable failure-triage token (ADR-0037 D8, on stderr; one per actionable-failed layer):
 #   FAILURE_TRIAGE LAYER=<n> LOG=<path> STDERR_LOG=<path> RESULT=<status>
-# (§8 runbook rows for this + FMT_APPLIED / FMT_LANE / FAILED_GUARD_NAMES are owed to Devloop D —
-#  tracked in docs/TODO.md, not edited here.)
 #
 # Failure triage: docs/runbooks/devloop-validation.md (all layers + §4 two-token convention).
 

@@ -55,21 +55,78 @@ trap 'rm -rf "$WORK"' EXIT
 FAKE_DC="${WORK}/dev-cluster"
 cat > "$FAKE_DC" <<'EOF'
 #!/usr/bin/env bash
+# Marker dir (recreate/restore counters + the post-fix health-flip). Set by
+# run_layer7 to $MARKERS so reset_case's `rm -rf $MARKERS` clears it per case.
+M="${FAKE_DC_MARKERS:-/tmp}"
 case "$1" in
   status)
+    # An optional sleep lets a case drive a REAL timeout(124) at the self-heal's
+    # `timeout`-wrapped status probe (distinct from FAKE_STATUS_RC's plain rc≠0).
+    if [[ "${FAKE_STATUS_SLEEP:-0}" != "0" ]]; then sleep "${FAKE_STATUS_SLEEP}"; fi
     # FAKE_STATUS_RC != 0 simulates a DEAD helper (connection refused on a stale socket):
     # the real client prints an error to stderr and exits non-zero WITHOUT health lines.
     if [[ "${FAKE_STATUS_RC:-0}" != "0" ]]; then
       echo "ERROR: Cannot connect to helper socket (simulated dead helper)" >&2
       exit "${FAKE_STATUS_RC}"
     fi
+    # After a successful fix (recreate/restore touched the flip marker), the
+    # cluster is healthy on re-verify — this is what makes RESULT=recovered
+    # reachable while the INITIAL status (below) is unhealthy enough to trip the
+    # self-heal in the first place.
+    #
+    # FAKE_PODS_FLIP_AFTER models the A7 "initially-not-ready → then-green" race
+    # the kubeconfig-stale arm requires: __cluster_ready (which checks pods
+    # healthy) must FAIL so the self-heal runs, but the self-heal's own probe
+    # must then see pods HEALTHY + apiserver reachable. A per-call counter flips
+    # to healthy once the count EXCEEDS the threshold, so an earlier
+    # __wait_cluster_ready poll sees not-ready while the later self-heal
+    # classification poll sees ready.
+    n=0
+    if [[ "${FAKE_PODS_FLIP_AFTER:-0}" != "0" ]]; then
+      n=$(( $(cat "$M/status.count" 2>/dev/null || echo 0) + 1 ))
+      echo "$n" > "$M/status.count"
+    fi
+    if [[ -f "$M/healthy" || ( "${FAKE_PODS_FLIP_AFTER:-0}" != "0" && "$n" -gt "${FAKE_PODS_FLIP_AFTER}" ) ]]; then
+      echo "  Cluster exists:     true" >&2
+      echo "  Pods healthy:       true" >&2
+      echo "  Setup in progress:  false" >&2
+      echo "  Apiserver reachable: ${FAKE_APISERVER_REACHABLE:-reachable}" >&2
+      exit 0
+    fi
     echo "  Cluster exists:     ${FAKE_CLUSTER_EXISTS:-true}" >&2
     echo "  Pods healthy:       ${FAKE_PODS_HEALTHY:-true}" >&2
     echo "  Setup in progress:  ${FAKE_SETUP_IN_PROGRESS:-false}" >&2
+    # 4th COUPLED line (self-heal input). Tail-anchored value; three-valued.
+    echo "  Apiserver reachable: ${FAKE_APISERVER_REACHABLE:-reachable}" >&2
     exit 0 ;;
   setup)       exit "${FAKE_SETUP_RC:-0}" ;;
   teardown)    exit "${FAKE_TEARDOWN_RC:-0}" ;;
   rebuild-all) exit "${FAKE_REBUILD_RC:-0}" ;;
+  recreate)
+    # Append-counter (one line per invocation) so a case can assert EXACTLY one
+    # recreate — the once-per-helper-lifetime bound proof at the shell level.
+    echo "recreate" >> "$M/recreate.count"
+    outcome="${FAKE_RECREATE_OUTCOME:-recreated}"
+    # Only a `recreated` outcome flips the cluster healthy for the re-verify —
+    # unless FAKE_RECREATE_NO_FLIP=1 (helper claimed recreated but the cluster is
+    # still sick on re-verify ⇒ RESULT=failed DETAIL=recreate-failed).
+    [[ "$outcome" == "recreated" && "${FAKE_RECREATE_NO_FLIP:-0}" != "1" ]] && touch "$M/healthy"
+    # Evidence leaf mirrors the real helper: a bundle is captured only when a
+    # destroy is actually attempted (recreated / recreate-failed); refused and
+    # already-attempted carry `none` (no bundle).
+    case "$outcome" in
+      recreate-refused-cluster-alive|recreate-refused-inconclusive|recreate-already-attempted-this-helper-lifetime) ev="none" ;;
+      *) ev="${FAKE_RECREATE_EVIDENCE:-self-heal-evidence-20260922T00-00-00Z}" ;;
+    esac
+    # The helper's structured transport line (client renders it from data.self_heal).
+    echo "SELF_HEAL HELPER_OUTCOME=${outcome} ATTEMPT=${FAKE_RECREATE_ATTEMPT:-1/1} EVIDENCE_LEAF=${ev}" >&2
+    exit "${FAKE_RECREATE_RC:-0}" ;;
+  restore-kubeconfig)
+    echo "restore" >> "$M/restore.count"
+    outcome="${FAKE_RESTORE_OUTCOME:-restored}"
+    [[ "$outcome" == "restored" ]] && touch "$M/healthy"
+    echo "SELF_HEAL HELPER_OUTCOME=${outcome} ATTEMPT=${FAKE_RESTORE_ATTEMPT:-0/1} EVIDENCE_LEAF=none" >&2
+    exit "${FAKE_RESTORE_RC:-0}" ;;
   # LOUD on any unrecognized verb — NOT `exit 0`. A permissive catch-all here is a
   # vacuous-pass generator, and it was a real one: with `*) exit 0`, a MISSPELLED or
   # SILENTLY DROPPED dev-cluster verb in layer7.sh still produced a green suite, because
@@ -248,9 +305,22 @@ run_layer7() {
       FAKE_PODS_HEALTHY="${FAKE_PODS_HEALTHY:-true}" \
       FAKE_SETUP_IN_PROGRESS="${FAKE_SETUP_IN_PROGRESS:-false}" \
       FAKE_STATUS_RC="${FAKE_STATUS_RC:-0}" \
+      FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-0}" \
       FAKE_SETUP_RC="${FAKE_SETUP_RC:-0}" \
       FAKE_TEARDOWN_RC="${FAKE_TEARDOWN_RC:-0}" \
       FAKE_REBUILD_RC="${FAKE_REBUILD_RC:-0}" \
+      FAKE_APISERVER_REACHABLE="${FAKE_APISERVER_REACHABLE:-reachable}" \
+      FAKE_PODS_FLIP_AFTER="${FAKE_PODS_FLIP_AFTER:-0}" \
+      FAKE_RECREATE_OUTCOME="${FAKE_RECREATE_OUTCOME:-recreated}" \
+      FAKE_RECREATE_NO_FLIP="${FAKE_RECREATE_NO_FLIP:-0}" \
+      FAKE_RECREATE_RC="${FAKE_RECREATE_RC:-0}" \
+      FAKE_RECREATE_EVIDENCE="${FAKE_RECREATE_EVIDENCE:-self-heal-evidence-20260922T00-00-00Z}" \
+      FAKE_RECREATE_ATTEMPT="${FAKE_RECREATE_ATTEMPT:-1/1}" \
+      FAKE_RESTORE_OUTCOME="${FAKE_RESTORE_OUTCOME:-restored}" \
+      FAKE_RESTORE_RC="${FAKE_RESTORE_RC:-0}" \
+      FAKE_RESTORE_ATTEMPT="${FAKE_RESTORE_ATTEMPT:-0/1}" \
+      FAKE_DC_MARKERS="${MARKERS}" \
+      DEVLOOP_SELF_HEAL_STATUS_TIMEOUT="${STATUS_TIMEOUT:-20}" \
       bash "$LAYER7" ) >"$out_f" 2>"$err_f"
   RC=$?
 }
@@ -266,7 +336,10 @@ reset_case() {
         ENVCMD CI_FLAG BROWSER_CMD FP_JSON PW_DIR \
         FAKE_PROVISION_RC FAKE_PROVISION_TOKEN FAKE_PROVISION_SLEEP FAKE_PROBE_CODE \
         FAKE_AC_READY FAKE_SUITE_RC PORTS_JSON_OVERRIDE SETUP_SH_OVERRIDE \
-        ORG_PROBE_OVERRIDE PROVISION_TIMEOUT
+        ORG_PROBE_OVERRIDE PROVISION_TIMEOUT \
+        FAKE_STATUS_SLEEP FAKE_APISERVER_REACHABLE FAKE_PODS_FLIP_AFTER FAKE_RECREATE_OUTCOME \
+        FAKE_RECREATE_NO_FLIP FAKE_RECREATE_RC FAKE_RECREATE_EVIDENCE FAKE_RECREATE_ATTEMPT \
+        FAKE_RESTORE_OUTCOME FAKE_RESTORE_RC FAKE_RESTORE_ATTEMPT STATUS_TIMEOUT
   # Markers are per-case evidence; a stale one from the previous case would make
   # assert_no_marker report a stub that never ran (and assert_marker pass vacuously).
   rm -rf "$MARKERS"; mkdir -p "$MARKERS"
@@ -1000,6 +1073,179 @@ if [[ -n "$provision_insert" ]]; then PASS=$((PASS+1)); else
   FAILURES+=("[org-insert-column-list-extractor] could not find the organizations INSERT column list in setup.sh — this case is VACUOUS until the extractor is repaired (a zero-match grep that then finds no forbidden column would pass trivially)")
 fi
 assert_absent "org-insert-omits-max-participants" "max_participants_per_meeting" "$provision_insert"
+
+# =============================================================================================
+# === Self-heal (Phase-1e cluster-unhealthy → __self_heal_cluster) — Deltas 1 & 2, R3-final ====
+# =============================================================================================
+# Reached whenever __wait_cluster_ready times out at the health-confirm gate (run_layer7 pins
+# DEVLOOP_HEALTH_BUDGET=0). FAKE_PODS_HEALTHY=false makes __cluster_ready fail so the self-heal
+# runs; the classification then keys on FAKE_APISERVER_REACHABLE. The fake `dev-cluster
+# recreate`/`restore-kubeconfig` verbs replay FAKE_RECREATE_OUTCOME/FAKE_RESTORE_OUTCOME and (on
+# a success outcome) flip a `$MARKERS/healthy` file so the shell's re-verify sees health.
+
+# Recreate append-counter (lines = invocations). Absent ⇒ 0.
+__recreate_count() { local c; c=$(wc -l < "${MARKERS}/recreate.count" 2>/dev/null || echo 0); echo "${c//[[:space:]]/}"; }
+
+# (SH1) apiserver-unreachable → recreate fires EXACTLY once → re-verify green → recovered → OK.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unreachable \
+  FAKE_RECREATE_OUTCOME=recreated ENVCMD="true"
+run_layer7 "$OUT" "$ERR"
+assert_status "sh1-case"        "SELF_HEAL CASE=apiserver-unreachable ACTION=recreate" "$(cat "$ERR")"
+assert_status "sh1-helper-line" "SELF_HEAL HELPER_OUTCOME=recreated ATTEMPT=1/1" "$(cat "$ERR")"
+assert_status "sh1-result"      "SELF_HEAL RESULT=recovered ACTION=recreate ATTEMPT=1/1 EVIDENCE=${WORK}/devloop-tmp/self-heal-evidence-" "$(cat "$ERR")"
+assert_marker "sh1-recreate-ran"  "$MARKERS" "recreate.count"
+assert_exit   "sh1-recreate-once" 1 "$(__recreate_count)"
+assert_exit   "sh1-exit0"       0 "$RC"
+assert_status "sh1-ok"          "STATUS=OK" "$(cat "$OUT")"
+reset_case
+
+# (SH2) kubeconfig-stale → restore-kubeconfig → recovered. A7 flip: initially-not-ready so the
+# self-heal runs, then the self-heal's own probe sees pods healthy + apiserver reachable.
+# FLIP_AFTER=5 = top-liveness(1) + Phase-1a not-ready path(3) + Phase-1e poll(1); the self-heal
+# classification poll (6th) then reads healthy ⇒ kubeconfig-stale.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=reachable \
+  FAKE_PODS_FLIP_AFTER=5 FAKE_RESTORE_OUTCOME=restored ENVCMD="true"
+run_layer7 "$OUT" "$ERR"
+assert_status "sh2-case"      "SELF_HEAL CASE=kubeconfig-stale ACTION=restore-kubeconfig" "$(cat "$ERR")"
+assert_status "sh2-recovered" "SELF_HEAL RESULT=recovered ACTION=restore-kubeconfig" "$(cat "$ERR")"
+assert_marker    "sh2-restore-ran"   "$MARKERS" "restore.count"
+assert_no_marker "sh2-no-recreate"   "$MARKERS" "recreate.count"
+assert_exit   "sh2-exit0"     0 "$RC"
+reset_case
+
+# (SH3) recreate re-verify FAILS (helper claimed recreated, cluster still sick) → escalate loud.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unreachable \
+  FAKE_RECREATE_OUTCOME=recreated FAKE_RECREATE_NO_FLIP=1
+run_layer7 "$OUT" "$ERR"
+assert_status "sh3-case"    "SELF_HEAL CASE=apiserver-unreachable ACTION=recreate" "$(cat "$ERR")"
+assert_status "sh3-failed"  "SELF_HEAL RESULT=failed ACTION=recreate" "$(cat "$ERR")"
+assert_status "sh3-detail"  "DETAIL=recreate-failed" "$(cat "$ERR")"
+assert_status "sh3-token"   "REASON=cluster-self-heal-failed" "$(cat "$OUT")"
+assert_status "sh3-banner"  "PRECONDITION_FAILURE:" "$(cat "$ERR")"
+assert_exit   "sh3-once"    1 "$(__recreate_count)"
+assert_exit   "sh3-exit2"   2 "$RC"
+assert_no_marker "sh3-no-suite" "$MARKERS" "ran.env-suite"
+reset_case
+
+# (SH4) rollout-wedged (apiserver LISTENING but pods not ready) → bare cluster-unhealthy, NO recreate.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=reachable
+run_layer7 "$OUT" "$ERR"
+assert_status    "sh4-case"      "SELF_HEAL CASE=rollout-wedged ACTION=none" "$(cat "$ERR")"
+assert_status    "sh4-unhealthy" "REASON=cluster-unhealthy" "$(cat "$OUT")"
+assert_no_marker "sh4-no-recreate" "$MARKERS" "recreate.count"
+assert_no_marker "sh4-no-restore"  "$MARKERS" "restore.count"
+assert_exit      "sh4-exit2"     2 "$RC"
+reset_case
+
+# (SH5) probe-inconclusive (reachable=unknown) → fail closed, NO destroy on either verb.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unknown
+run_layer7 "$OUT" "$ERR"
+assert_status    "sh5-case"   "SELF_HEAL CASE=probe-inconclusive ACTION=none" "$(cat "$ERR")"
+assert_status    "sh5-token"  "REASON=cluster-self-heal-probe-inconclusive" "$(cat "$OUT")"
+assert_no_marker "sh5-no-recreate" "$MARKERS" "recreate.count"
+assert_no_marker "sh5-no-restore"  "$MARKERS" "restore.count"
+assert_exit      "sh5-exit2"  2 "$RC"
+reset_case
+
+# (SH6) recreate REFUSED by the host re-confirm (cluster alive) → probe-inconclusive, ATTEMPT=0/1.
+# The refusal DETAIL routing (recreate-refused-cluster-alive → probe-inconclusive, NOT
+# self-heal-failed) is the shell half; the Rust cmd_recreate gate tests prove no destroy happens.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unreachable \
+  FAKE_RECREATE_OUTCOME=recreate-refused-cluster-alive FAKE_RECREATE_ATTEMPT=0/1
+run_layer7 "$OUT" "$ERR"
+assert_status "sh6-detail"  "DETAIL=recreate-refused-cluster-alive" "$(cat "$ERR")"
+assert_status "sh6-attempt" "ATTEMPT=0/1 EVIDENCE=none DETAIL=recreate-refused-cluster-alive" "$(cat "$ERR")"
+assert_status "sh6-token"   "REASON=cluster-self-heal-probe-inconclusive" "$(cat "$OUT")"
+assert_exit   "sh6-exit2"   2 "$RC"
+reset_case
+
+# (SH6b) recreate REFUSED-INDETERMINATE (host couldn't determine — runtime down) → probe-inconclusive,
+# ATTEMPT=0/1, and the fix text points at the container RUNTIME, not the kubeconfig (Security F2).
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unreachable \
+  FAKE_RECREATE_OUTCOME=recreate-refused-inconclusive FAKE_RECREATE_ATTEMPT=0/1
+run_layer7 "$OUT" "$ERR"
+assert_status "sh6b-attempt" "ATTEMPT=0/1 EVIDENCE=none DETAIL=recreate-refused-inconclusive" "$(cat "$ERR")"
+assert_status "sh6b-token"   "REASON=cluster-self-heal-probe-inconclusive" "$(cat "$OUT")"
+assert_status "sh6b-runtime" "HOST CONTAINER RUNTIME" "$(cat "$ERR")"
+assert_exit   "sh6b-exit2"   2 "$RC"
+reset_case
+
+# (SH6c) DRIFT DETECTOR: the helper reports a HELPER_OUTCOME the shell has no arm for → loud
+# cluster-self-heal-failed with DETAIL=recreate-unrecognized-outcome (dry-F2), NOT a silent
+# misclassification as recreate-failed. Symmetric with capture-failed:unrecognized-reason.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unreachable \
+  FAKE_RECREATE_OUTCOME=some-future-variant-the-shell-does-not-know
+run_layer7 "$OUT" "$ERR"
+assert_status "sh6c-detail" "DETAIL=recreate-unrecognized-outcome" "$(cat "$ERR")"
+assert_status "sh6c-names"  "some-future-variant-the-shell-does-not-know" "$(cat "$ERR")"
+assert_status "sh6c-token"  "REASON=cluster-self-heal-failed" "$(cat "$OUT")"
+assert_exit   "sh6c-exit2"  2 "$RC"
+reset_case
+
+# (SH7) recreate ALREADY-ATTEMPTED this helper lifetime (bound spent) → escalate, ATTEMPT=1/1.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unreachable \
+  FAKE_RECREATE_OUTCOME=recreate-already-attempted-this-helper-lifetime FAKE_RECREATE_ATTEMPT=1/1
+run_layer7 "$OUT" "$ERR"
+assert_status "sh7-detail"  "DETAIL=recreate-already-attempted-this-helper-lifetime" "$(cat "$ERR")"
+# One combined needle (symmetric with SH6) proves ATTEMPT/EVIDENCE/DETAIL are CO-LOCATED on
+# one line — the designated guard for the compare_exchange placement.
+assert_status "sh7-attempt" "ATTEMPT=1/1 EVIDENCE=none DETAIL=recreate-already-attempted-this-helper-lifetime" "$(cat "$ERR")"
+assert_status "sh7-token"   "REASON=cluster-self-heal-failed" "$(cat "$OUT")"
+assert_exit   "sh7-exit2"   2 "$RC"
+reset_case
+
+# (SH8) restore-failed → escalate cluster-self-heal-failed. Reach kubeconfig-stale via the flip,
+# then the restore verb reports restore-failed.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=reachable \
+  FAKE_PODS_FLIP_AFTER=5 FAKE_RESTORE_OUTCOME=restore-failed
+run_layer7 "$OUT" "$ERR"
+assert_status "sh8-case"   "SELF_HEAL CASE=kubeconfig-stale ACTION=restore-kubeconfig" "$(cat "$ERR")"
+assert_status "sh8-detail" "DETAIL=restore-failed" "$(cat "$ERR")"
+assert_status "sh8-token"  "REASON=cluster-self-heal-failed" "$(cat "$OUT")"
+assert_marker "sh8-restore-ran" "$MARKERS" "restore.count"
+assert_exit   "sh8-exit2"  2 "$RC"
+reset_case
+
+# (SH9) ABSENCE-ROUTING: `Cluster exists: false` routes to CASE=apiserver-unreachable → recreate.
+# This proves ROUTING ONLY — that dispatch row 1's `Cluster exists: false` OR-clause reaches the
+# verb — NOT license: the fake recreate replays FAKE_RECREATE_OUTCOME and does not model the
+# host-side two-armed gate. The LICENSE proof (cluster_already_exists()==Ok(false) proceeds,
+# ==Err refuses) lives in the Rust cmd_recreate unit tests; do NOT cut those as "redundant" with
+# this green shell case.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_CLUSTER_EXISTS=false FAKE_PODS_HEALTHY=false \
+  FAKE_APISERVER_REACHABLE=unknown FAKE_RECREATE_OUTCOME=recreated ENVCMD="true"
+run_layer7 "$OUT" "$ERR"
+assert_status "sh9-case"      "SELF_HEAL CASE=apiserver-unreachable ACTION=recreate" "$(cat "$ERR")"
+assert_status "sh9-recovered" "SELF_HEAL RESULT=recovered ACTION=recreate" "$(cat "$ERR")"
+assert_marker "sh9-recreate-ran" "$MARKERS" "recreate.count"
+assert_exit   "sh9-exit0"     0 "$RC"
+reset_case
+
+# (SH10) helper-unreachable AT THE SELF-HEAL via a REAL timeout(124): the self-heal's
+# `timeout`-wrapped `dev-cluster status` times out (proves the wrapper exists). NOTE a plain
+# rc≠0 status is caught EARLIER by the top liveness gate (the dead-socket case above), so the
+# self-heal's helper-unreachable arm is only reachable via a mid-run timeout — which is exactly
+# what this pins. STATUS_TIMEOUT=1 + FAKE_STATUS_SLEEP=2 ⇒ the wrapped probe hits rc 124.
+reset_case
+SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=unreachable \
+  FAKE_STATUS_SLEEP=2 STATUS_TIMEOUT=1
+run_layer7 "$OUT" "$ERR"
+assert_status    "sh10-case"   "SELF_HEAL CASE=helper-unreachable ACTION=none" "$(cat "$ERR")"
+assert_status    "sh10-token"  "REASON=helper-unreachable" "$(cat "$OUT")"
+assert_no_marker "sh10-no-recreate" "$MARKERS" "recreate.count"
+assert_exit      "sh10-exit2"  2 "$RC"
+reset_case
 
 # === SEAM SYMMETRY: both branches of the DEVLOOP_TEST block define the SAME variable set ======
 # STATIC analysis of layer7.sh, not an execution case — which is the whole point. layer7.test.sh

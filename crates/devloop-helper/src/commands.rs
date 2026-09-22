@@ -6,15 +6,18 @@
 //! buffered `.output()` since they need to inspect output programmatically.
 
 use crate::error::HelperError;
+use crate::fs_atomic::atomic_write_secret;
 use crate::logging::now_rfc3339;
 use crate::ports::{self, PortAllocation, PortOffsets};
 use crate::protocol::{
     CommandOutcome, CommandResult, CommandStarted, HelperCommand, Service, StreamKind, StreamLine,
     StreamMsg, MAX_LINE_LEN,
 };
+use serde::Serialize;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -22,6 +25,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Bounded timeouts for the apiserver-reachability probe (per Security pt.3).
+/// The probe runs on EVERY `status` call, and `status` is `timeout`-wrapped by
+/// `scripts/layer7.sh`; the SUM of these two host-subprocess bounds plus a
+/// margin must stay strictly under that shell `timeout`, or a healthy-but-slow
+/// probe trips rc-124 → `helper-unreachable` and the operator restarts a helper
+/// that is fine. Current sum: inspect (5s) + TCP connect (3s) = 8s < the shell's
+/// `DEVLOOP_SELF_HEAL_STATUS_TIMEOUT` (20s) in `layer7.sh`. Keep that inequality
+/// when tuning either side.
+const INSPECT_TIMEOUT_SECS: &str = "5";
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Hostname that dev containers use to reach the host via podman's gateway.
 /// This is a well-known podman/slirp4netns convention — resolves to the
@@ -225,6 +239,19 @@ pub struct Context {
     /// Shared write-mutex state — `None` when idle, `Some(InFlightOp)` when a
     /// write command is running. Reads/cancel observe; only the writer sets it.
     pub write_state: Arc<Mutex<WriteState>>,
+    /// Self-heal recreate bound (Delta 1): set true (via `compare_exchange`) the
+    /// moment before the FIRST automated `recreate` destroys, so at most ONE
+    /// automated recreate happens per helper PROCESS LIFETIME. This is the
+    /// BOUNDED safety control, and it lives in process memory ON PURPOSE — the
+    /// earlier design keyed a file marker in `runtime_dir`, which the dev
+    /// container can `rm` (it is bind-mounted RW at the same uid, devloop.sh:583),
+    /// defeating the bound with one command. An `AtomicBool` in the helper's own
+    /// address space is unforgeable by the container. Per-process == per-lifetime:
+    /// the Gate-2 outer retry re-enters the same live helper (suppressed); a host
+    /// crash restarts the helper (a fresh, legitimate allowance). `Context` is
+    /// held behind `Arc` and never cloned by value, so every connection observes
+    /// this same atom.
+    pub recreate_bound: AtomicBool,
 }
 
 impl Context {
@@ -419,6 +446,8 @@ fn run_with_write_slot(
         HelperCommand::RebuildAll => cmd_rebuild_all(ctx, writer, &signal).map(|()| None),
         HelperCommand::Deploy(svc) => cmd_deploy(ctx, *svc, writer, &signal).map(|()| None),
         HelperCommand::Teardown => cmd_teardown(ctx, writer, &signal).map(|()| None),
+        HelperCommand::Recreate => cmd_recreate(ctx, writer, &signal),
+        HelperCommand::RestoreKubeconfig => cmd_restore_kubeconfig(ctx, writer, &signal),
         #[cfg(test)]
         HelperCommand::TestSleep { seconds } => {
             cmd_test_sleep(ctx, *seconds, writer, &signal).map(|()| None)
@@ -608,6 +637,259 @@ fn validate_gateway_ip(ip: &str) -> Result<(), HelperError> {
     Ok(())
 }
 
+// =============================================================================
+// Self-heal: apiserver-reachability probe (ADR-0030 §self-heal, Deltas 1 & 2)
+// =============================================================================
+
+/// Positive tri-state reachability of the cluster's apiserver.
+///
+/// Only `Unreachable` licenses a destroy, and (Delta 2) it comes from EXACTLY
+/// one place: the control-plane container reported stopped by `<runtime>
+/// inspect` (`rc==0 && "false"`). The TCP step can only confirm life
+/// (`Reachable`) or fail to determine (`Unknown`) — it NEVER yields
+/// `Unreachable`, because its inputs (`ports.json`'s port, the gateway IP) are
+/// influenceable by the container-writable mount / a compile-time default, and
+/// a refusal at a possibly-wrong address is not evidence anything died.
+/// Everything indeterminate ⇒ `Unknown` ⇒ escalate, never destroy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiserverReachability {
+    Reachable,
+    Unreachable,
+    Unknown,
+}
+
+impl ApiserverReachability {
+    /// Serialized additively as a string in `status` JSON (`reachable |
+    /// unreachable | unknown`). The shell's `__self_heal_cluster` classifies off
+    /// this; `cmd_recreate` re-confirms host-side.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Unreachable => "unreachable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify a `<runtime> inspect -f '{{.State.Running}}'` result into a
+/// container-running tri-state, WITHOUT parsing any runtime error string.
+///
+/// - `Some(true)`  — rc 0, stdout `"true"`  (container running).
+/// - `Some(false)` — rc 0, stdout `"false"` (container STOPPED — the sole
+///   `Unreachable`/destroy license per Delta 2 / R3-final).
+/// - `None`        — everything else ⇒ `Unknown`: spawn/exec failure, any
+///   non-zero exit (timeout 124/137, container ABSENT [Docker exit 1 / Podman
+///   125], daemon down — indistinguishable by exit code, and all correctly
+///   `Unknown`), or rc 0 with unexpected stdout. Container-absence is licensed
+///   separately and positively via `cluster_already_exists() == Ok(false)`, NOT
+///   here — so a runtime hiccup can never read as a destroy license.
+///
+/// Pure over `(spawned_ok, exit_code, stdout)` so every cell is unit-testable
+/// without a container runtime.
+fn inspect_signal(spawned_ok: bool, exit_code: Option<i32>, stdout: &str) -> Option<bool> {
+    if !spawned_ok {
+        return None; // spawn/exec failure (incl. `timeout` binary missing) ⇒ Unknown
+    }
+    if exit_code != Some(0) {
+        return None; // any non-zero (timeout / absent / daemon-down) ⇒ Unknown
+    }
+    match stdout.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        // rc 0 but not a clean bool: DO NOT default to `false` — that would
+        // destroy on garbage. Unknown.
+        _ => None,
+    }
+}
+
+/// Pure reachability classifier over the three probe signals. `Some(false)`
+/// container-running is the SOLE `Unreachable`; TCP yields only `Reachable`
+/// (connected) or `Unknown` (anything else). Exhaustive by construction.
+fn reachability_from_signals(
+    container_running: Option<bool>,
+    port: Option<u16>,
+    tcp_connected: Option<bool>,
+) -> ApiserverReachability {
+    match container_running {
+        // Container STOPPED — the only positive destroy license from the probe.
+        Some(false) => ApiserverReachability::Unreachable,
+        // inspect indeterminate (spawn-err / timeout / absent / garbage) ⇒ Unknown.
+        None => ApiserverReachability::Unknown,
+        // Container running: only a successful TCP connect proves the apiserver
+        // is listening. Refused / no-route (Some(false)) and timeout (None) and
+        // an undeterminable port (None) ALL ⇒ Unknown, never Unreachable.
+        Some(true) => match (port, tcp_connected) {
+            (Some(_), Some(true)) => ApiserverReachability::Reachable,
+            _ => ApiserverReachability::Unknown,
+        },
+    }
+}
+
+/// Read the live apiserver port from the persisted port map (`ports.json`
+/// `.ports.k8s_api`) — the SAME value setup wrote (S4-convergent). Returns
+/// `None` if the file is missing/unparseable or the port is absent/zero.
+///
+/// This is also `restore-kubeconfig`'s port source (S4): NEVER a fresh
+/// `allocate_ports`, which on a restarted helper could hand a different slot and
+/// point a cluster-admin kubeconfig at another devloop's apiserver.
+fn read_k8s_api_port(ctx: &Context) -> Option<u16> {
+    let ports_path = ctx.runtime_dir.join("ports.json");
+    let contents = fs::read_to_string(&ports_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let port = value.pointer("/ports/k8s_api").and_then(|v| v.as_u64())?;
+    u16::try_from(port).ok().filter(|&p| p != 0)
+}
+
+/// Read the persisted `observability_deployed` SSoT from the live `ports.json`
+/// (written from `!skip_observability` by setup). A cluster brought up with
+/// `--skip-observability` must be RECREATED without observability too — else the
+/// self-heal silently restores a stack the operator explicitly opted out of
+/// (@code-reviewer, config-over-hardcoding). Defaults to `true` (full stack) when
+/// the file is missing/unparseable — there is then no SSoT to honour, and that
+/// matches the pre-existing behaviour.
+fn read_observability_deployed(ctx: &Context) -> bool {
+    let ports_path = ctx.runtime_dir.join("ports.json");
+    fs::read_to_string(&ports_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("observability_deployed").and_then(|b| b.as_bool()))
+        .unwrap_or(true)
+}
+
+/// `<runtime> inspect -f '{{.State.Running}}' <cluster>-control-plane`, bounded
+/// by coreutils `timeout` (Security pt.3 — a wedged runtime must not hang the
+/// probe/recreate). Reads from the container runtime, NOT the RW mount, so the
+/// container cannot influence this observation (ADR-0030:468 forbids mounting
+/// the runtime socket into the container).
+fn inspect_container_running(ctx: &Context) -> Option<bool> {
+    let node = format!("{}-control-plane", ctx.cluster_name);
+    let runtime = ctx.container_runtime.as_str();
+    match Command::new("timeout")
+        .arg(INSPECT_TIMEOUT_SECS)
+        .arg(runtime)
+        .arg("inspect")
+        .arg("-f")
+        .arg("{{.State.Running}}")
+        .arg(&node)
+        .output()
+    {
+        Ok(out) => inspect_signal(
+            true,
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stdout),
+        ),
+        // spawn failure (incl. `timeout` not on PATH) ⇒ Unknown, never a license.
+        Err(_) => inspect_signal(false, None, ""),
+    }
+}
+
+/// Bounded TCP connect to `host:port`. `Some(true)` connected, `Some(false)`
+/// refused / no-route, `None` timeout / resolve error. Only `Some(true)` feeds
+/// `Reachable`; the other two are `Unknown` (Delta 2), but the distinction is
+/// kept for the unit tests and future use.
+fn tcp_probe(host: &str, port: u16) -> Option<bool> {
+    let mut addrs = match (host, port).to_socket_addrs() {
+        Ok(a) => a,
+        Err(_) => return None,
+    };
+    let addr = addrs.next()?;
+    match TcpStream::connect_timeout(&addr, TCP_CONNECT_TIMEOUT) {
+        Ok(_) => Some(true),
+        // Refused/reset = a definite "not listening" answer. Everything else
+        // (TimedOut / WouldBlock / no-route / other) ⇒ None. Under Delta 2 both
+        // Some(false) and None classify to Unknown, so only `Some(true)` is
+        // load-bearing; the distinction is kept for the unit tests.
+        Err(e) => match e.kind() {
+            ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => Some(false),
+            _ => None,
+        },
+    }
+}
+
+/// Gather the three signals and classify. Kubeconfig-free, HTTP-status-agnostic,
+/// no stderr parsing. Used by BOTH `cmd_status` (the shell's classification
+/// input) and `cmd_recreate` (the host-side re-confirmation at the moment of
+/// action) — one definition, so the two can differ only in timing, never in what
+/// `Unreachable` means.
+pub fn probe_apiserver_reachable(ctx: &Context) -> ApiserverReachability {
+    let container_running = inspect_container_running(ctx);
+    let port = read_k8s_api_port(ctx);
+    let tcp_connected = match (container_running, port) {
+        (Some(true), Some(p)) => {
+            let host = ctx
+                .host_gateway_ip
+                .as_deref()
+                .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
+            tcp_probe(host, p)
+        }
+        // No point probing TCP unless the container is running and we know the port.
+        _ => None,
+    };
+    reachability_from_signals(container_running, port, tcp_connected)
+}
+
+// =============================================================================
+// Self-heal: recreate + restore-kubeconfig outcome vocabulary
+// =============================================================================
+
+/// Structured outcome the helper reports for a self-heal verb, in
+/// `CommandResult.data.self_heal.outcome`. Typed (not a `json!` string literal)
+/// so the exact token strings are compile-checked — the shell greps them, and a
+/// typo would ship a silently-wrong token no compiler catches (@code-reviewer).
+///
+/// The FAILURE values are BYTE-IDENTICAL to the shell's `DETAIL=` set and the
+/// runbook §8 rows, so `grep 'SELF_HEAL '` puts the helper's raw report beside
+/// the shell's rendering with no near-miss to reconcile by eye. See
+/// `test_self_heal_outcome_failure_tokens_match_detail_set` for the pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SelfHealOutcome {
+    Recreated,
+    Restored,
+    /// Refused because the host re-confirmed the control plane `Reachable`
+    /// (`reach == Reachable`) — the two host-side observations DISAGREE (a flap,
+    /// or the cluster came up between the classify and re-confirm probes). NOT a
+    /// container-visibility or kubeconfig problem: `probe_apiserver_reachable` is
+    /// host-side and reads no kubeconfig anywhere in this path (@observability
+    /// F3/F5 — the definition site, kept explicitly negated because this exact
+    /// wrong belief has regenerated in several artifacts).
+    RecreateRefusedClusterAlive,
+    /// Refused because the host could NOT determine the control-plane state
+    /// (`reach == Unknown`, e.g. the container runtime is down / `inspect`
+    /// errored) — nothing was confirmed, alive OR dead (Security F2). Distinct
+    /// from `RecreateRefusedClusterAlive` because the two demand OPPOSITE
+    /// operator actions (kubeconfig vs container-runtime), and this is the most
+    /// likely refusal in practice.
+    RecreateRefusedInconclusive,
+    RecreateAlreadyAttemptedThisHelperLifetime,
+    RecreateFailed,
+    RestoreFailed,
+}
+
+/// Build the `{ "self_heal": { outcome, attempt, max, evidence } }` data payload
+/// the client renders as `SELF_HEAL HELPER_OUTCOME=… ATTEMPT=<n>/<max>
+/// EVIDENCE_LEAF=…`.
+///
+/// `max` is the LITERAL `1`, NOT a `SELF_HEAL_MAX_RECREATE` const: the bound is
+/// the `AtomicBool` on `Context`, which permits exactly one transition, so `1`
+/// is derived from the type's arity — a standalone const would be a decorative
+/// second encoding that could drift (set it to 2 and the token reports `1/2`
+/// while the code still enforces 1). Do NOT reintroduce a tunable const here.
+fn self_heal_data(
+    outcome: SelfHealOutcome,
+    attempt: u8,
+    evidence_leaf: &str,
+) -> Option<serde_json::Value> {
+    Some(serde_json::json!({
+        "self_heal": {
+            "outcome": outcome,
+            "attempt": attempt,
+            "max": 1,
+            "evidence": evidence_leaf,
+        }
+    }))
+}
+
 /// Setup: allocate ports, generate kind-config, create cluster, run setup.sh.
 fn cmd_setup(
     ctx: &Context,
@@ -644,6 +926,8 @@ fn cmd_setup(
     let config_content = ports::substitute_template(&template, &vars);
     let config_path = ctx.runtime_dir.join("kind-config.yaml");
     {
+        // not secret-bearing (port mappings + gateway IP) — ordinary write; the
+        // atomic-secret-write helper (`fs_atomic`) is for credential files only.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -719,9 +1003,9 @@ fn cmd_setup(
     run_command_streaming(&mut setup_cmd, "setup.sh", writer, signal)?;
 
     // Generate kubeconfig for container access (ADR-0030/0031).
-    // Rewrites the API server URL to use host.containers.internal and the
-    // gateway K8s API port (extraPortMappings), not the apiServerPort.
-    generate_container_kubeconfig(ctx, &alloc)?;
+    // Rewrites the API server URL to the single `HOST_GATEWAY_IP:HOST_PORT_K8S_API`
+    // binding (offset K8S_API). Shares the impl with `restore-kubeconfig`.
+    generate_container_kubeconfig(ctx, alloc.port(PortOffsets::K8S_API))?;
 
     // Return port map as data
     let data = serde_json::to_value(&port_map).map_err(|e| HelperError::CommandFailed {
@@ -734,6 +1018,8 @@ fn cmd_setup(
 
 /// Write a shell-sourceable port map file for setup.sh.
 fn write_port_map_shell(path: &Path, alloc: &PortAllocation) -> Result<(), HelperError> {
+    // not secret-bearing (port numbers) — ordinary write; the atomic-secret-write
+    // helper (`fs_atomic`) is for credential files only.
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -784,15 +1070,13 @@ fn write_port_map_shell(path: &Path, alloc: &PortAllocation) -> Result<(), Helpe
 
 /// Rewrite kubeconfig `server:` URL for container access (ADR-0030).
 ///
-/// Kind generates `server: https://127.0.0.1:API_SERVER_PORT` where API_SERVER_PORT
-/// is the Kind apiServerPort (bound to 127.0.0.1, for host-side kubectl).
-///
-/// Inside the dev container, the K8s API is reached through a different path:
-/// `host.containers.internal:GATEWAY_PORT` where GATEWAY_PORT is the
-/// extraPortMappings hostPort for containerPort 6443, bound to the host-gateway IP.
-///
-/// These are two different ports — the apiServerPort and the gateway port are
-/// independently allocated. This function replaces both host and port.
+/// The apiserver binds a SINGLE address, `HOST_GATEWAY_IP:HOST_PORT_K8S_API`
+/// (`infra/kind/kind-config.yaml.tmpl`: `apiServerAddress`/`apiServerPort`).
+/// There is NO 127.0.0.1 binding and NO separate `6443` extraPortMapping — the
+/// old "two-port" design (a 127.0.0.1 apiServerPort plus a gateway extraPortMap)
+/// never existed in the template, so this function targets the one real binding.
+/// Kind emits `server: https://<gateway-ip>:<port>`; this replaces host+port with
+/// the container-reachable `<target_host>:<target_port>`.
 fn rewrite_kubeconfig_server(
     kubeconfig: &str,
     target_host: &str,
@@ -825,15 +1109,22 @@ fn rewrite_kubeconfig_server(
 
 /// Generate a kubeconfig file for use inside the dev container (ADR-0030/0031).
 ///
-/// Runs `kind get kubeconfig`, rewrites the API server URL from
-/// `https://127.0.0.1:$apiServerPort` to
-/// `https://host.containers.internal:$gatewayK8sPort` so the container
-/// can reach the Kind cluster's K8s API through the host-gateway binding.
+/// Runs `kind get kubeconfig`, rewrites the API server URL to
+/// `https://<gateway-ip>:<k8s_api_port>` — the single `HOST_GATEWAY_IP:
+/// HOST_PORT_K8S_API` binding — so the container reaches the Kind cluster's K8s
+/// API through the host-gateway binding.
 ///
-/// The two ports are different: apiServerPort is Kind's host-side port
-/// bound to 127.0.0.1, while gatewayK8sPort is the extraPortMappings
-/// port bound to HOST_GATEWAY_IP (reachable via host.containers.internal).
-fn generate_container_kubeconfig(ctx: &Context, alloc: &PortAllocation) -> Result<(), HelperError> {
+/// Takes the k8s_api port as a `u16` so setup + `restore-kubeconfig` share ONE
+/// impl (@dry-reviewer): setup passes `alloc.port(PortOffsets::K8S_API)`;
+/// `cmd_restore_kubeconfig` passes the port read from the LIVE `ports.json` (S4 —
+/// never a fresh `allocate_ports`).
+///
+/// NOTE: this is the CONTAINER kubeconfig (`runtime_dir/kubeconfig`), distinct
+/// from (a)'s host `$KUBECONFIG` written by `infra/kind/scripts/setup.sh`'s
+/// `write_kubeconfig()` (:393-397). Host kubeconfig vs container kubeconfig — do
+/// NOT collapse the two writers; they target different files for different
+/// consumers.
+fn generate_container_kubeconfig(ctx: &Context, k8s_api_port: u16) -> Result<(), HelperError> {
     eprintln!("[devloop-helper] setup: generating container kubeconfig...");
 
     let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
@@ -858,7 +1149,6 @@ fn generate_container_kubeconfig(ctx: &Context, alloc: &PortAllocation) -> Resul
     }
 
     let kubeconfig = String::from_utf8_lossy(&output.stdout);
-    let gateway_k8s_port = alloc.port(PortOffsets::K8S_API);
     // Use the gateway IP directly (not host.containers.internal) because the K8s API
     // server's TLS cert includes the IP as a SAN but not the DNS name.
     // HTTP services (AC, GC, etc.) can use host.containers.internal since they don't
@@ -867,17 +1157,14 @@ fn generate_container_kubeconfig(ctx: &Context, alloc: &PortAllocation) -> Resul
         .host_gateway_ip
         .as_deref()
         .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
-    let kubeconfig = rewrite_kubeconfig_server(&kubeconfig, gw_ip, gateway_k8s_port)?;
+    let kubeconfig = rewrite_kubeconfig_server(&kubeconfig, gw_ip, k8s_api_port)?;
 
+    // Kubeconfig is cluster-admin credential material in the container-RW mount:
+    // write it atomically (S3) via the ONE secret-write home. temp+rename carries
+    // 0600 (no looser-mode preservation), is symlink-safe, and never leaves a
+    // partial key.
     let kubeconfig_path = ctx.runtime_dir.join("kubeconfig");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&kubeconfig_path)?;
-    file.write_all(kubeconfig.as_bytes())?;
-    file.flush()?;
+    atomic_write_secret(&kubeconfig_path, kubeconfig.as_bytes())?;
 
     eprintln!(
         "[devloop-helper] setup: kubeconfig written to {}",
@@ -885,6 +1172,414 @@ fn generate_container_kubeconfig(ctx: &Context, alloc: &PortAllocation) -> Resul
     );
 
     Ok(())
+}
+
+/// Per-item timeout for evidence-bundle host commands (Security pt.3). Each
+/// item is `timeout`-bounded so a wedged runtime — the very thing we're often
+/// recovering from — cannot hang the capture into a silent, `SELF_HEAL`-less
+/// stall.
+const EVIDENCE_TIMEOUT_SECS: &str = "10";
+
+/// The closed evidence-bundle item allowlist (item file names). The individual
+/// `EV_*` consts are the production SSoT — `capture_evidence_bundle` writes each
+/// bundle file through them, so a new item requires a new `EV_*` const + a writer
+/// (@test B2 / @security). Do NOT add `kubectl config view`, `kind get
+/// kubeconfig`, `-o yaml`, `describe`, or `kubectl logs` (see the
+/// `capture_evidence_bundle` doc for why each is excluded).
+const EV_META: &str = "meta.txt";
+const EV_STATUS: &str = "status.json";
+const EV_KIND_CLUSTERS: &str = "kind-clusters.txt";
+const EV_CP_INSPECT: &str = "control-plane-inspect.txt";
+const EV_PODS: &str = "pods.txt";
+/// The `EV_*` set aggregated for the set-equality test's expected value. Built
+/// from the SAME `EV_*` consts production writes through, so the test's real
+/// capture (which writes via those consts) vs this set catches any drift in
+/// either direction. `#[cfg(test)]` because production writes via the individual
+/// consts, not this slice — so in the bin build the aggregate is genuinely unused
+/// (marking it, not `#[allow(dead_code)]`, keeps that honest).
+#[cfg(test)]
+const EVIDENCE_BUNDLE_ITEMS: &[&str] =
+    &[EV_META, EV_STATUS, EV_KIND_CLUSTERS, EV_CP_INSPECT, EV_PODS];
+
+/// Current charged state of the recreate bound as the `ATTEMPT=n` numerator
+/// (0 or 1). `max` is always 1 (the `AtomicBool`'s arity).
+fn recreate_bound_charged(ctx: &Context) -> u8 {
+    u8::from(ctx.recreate_bound.load(Ordering::SeqCst))
+}
+
+/// Write one evidence-bundle file (0600). Diagnostics, not secret-bearing;
+/// best-effort (ordinary write — the atomic-secret-write helper is for
+/// credential files only).
+fn write_bundle_file(dir: &Path, filename: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let path = dir.join(filename);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Run `timeout <n> <program> <args…>`, writing combined stdout+stderr into
+/// `dir/filename`. Returns `Err(())` ONLY when the `timeout` binary itself
+/// cannot spawn (⇒ the caller aborts the whole bundle with
+/// `capture-failed:timeout-unavailable`); every other failure (the inner program
+/// missing, non-zero, etc.) is written into the file as a diagnostic and is
+/// non-fatal.
+fn capture_cmd(dir: &Path, filename: &str, program: &str, args: &[&str]) -> Result<(), ()> {
+    match Command::new("timeout")
+        .arg(EVIDENCE_TIMEOUT_SECS)
+        .arg(program)
+        .args(args)
+        .output()
+    {
+        Ok(out) => {
+            let mut body = out.stdout;
+            body.extend_from_slice(&out.stderr);
+            let _ = write_bundle_file(dir, filename, &body);
+            Ok(())
+        }
+        Err(_) => Err(()), // `timeout` not on PATH / unspawnable ⇒ abort bundle
+    }
+}
+
+/// Capture the pre-destroy evidence bundle, HOST-SIDE, BEFORE `cmd_recreate`
+/// destroys anything. Returns the bundle's LEAF name (`self-heal-evidence-<ts>`,
+/// no `/`) which the shell composes into a container path, or
+/// `capture-failed:<reason>` from the closed reason enum
+/// (`bundle-dir-unwritable`, `timeout-unavailable`). NEVER aborts recovery —
+/// capture failure only annotates the leaf.
+///
+/// CLOSED ALLOWLIST (P3 / Security R2 — do NOT extend without re-reviewing).
+/// Items: `meta.txt` (timestamp, helper pid, cluster name, fresh reachability
+/// verdict); `status.json` (a FRESH host-side status snapshot — this helper's own
+/// observation at the moment of action, more trustworthy than the container's
+/// triggering classification; embeds `ports.json`, which is not credentials);
+/// `kind-clusters.txt` (`kind get clusters`); `control-plane-inspect.txt`
+/// (`<runtime> inspect <cluster>-control-plane`, the S2 second observation
+/// captured before deciding); and `pods.txt` (`kubectl get pods` DEFAULT TABLE
+/// output only).
+///
+/// DELIBERATELY EXCLUDED: `kind get kubeconfig` and `kubectl config view [--raw]`
+/// (cluster-admin `client-certificate-data`/`client-key-data`), `kubectl describe
+/// pod` and `-o yaml`/`-o json` (container env var names + ConfigMap-inlined
+/// values + secret references), and `kubectl logs` (can hang AND can carry pod
+/// tokens). The realistic risk is a future contributor finding table output
+/// insufficient and reaching for `describe`/`-o yaml` — that is why this list is
+/// closed and named.
+///
+/// The dir is 0700 and files 0600 — that guards the bundle from OTHER host
+/// users, NOT from the dev container (same uid, inside the RW mount). This is a
+/// diagnostic aid, not a tamper-evident forensic record.
+///
+/// ANCHOR (DRY): the `capture-failed:<reason>` values this produces
+/// (`bundle-dir-unwritable`, `timeout-unavailable`) are two of the closed
+/// 5-member set mirrored in `scripts/layer7.sh::__self_heal_compose_evidence`
+/// (which emits the other three and validates ALL of them) and enumerated in
+/// `docs/runbooks/devloop-validation.md` §8. Add a member to all three together.
+fn capture_evidence_bundle(ctx: &Context) -> String {
+    let leaf = format!(
+        "self-heal-evidence-{}",
+        now_rfc3339().replace([':', '.'], "-")
+    );
+    let dir = ctx.runtime_dir.join(&leaf);
+    if fs::DirBuilder::new().mode(0o700).create(&dir).is_err() {
+        return "capture-failed:bundle-dir-unwritable".to_string();
+    }
+
+    // meta.txt — no subprocess, always safe.
+    let meta = format!(
+        "timestamp={}\nhelper_pid={}\ncluster={}\nreachability={}\n",
+        now_rfc3339(),
+        std::process::id(),
+        ctx.cluster_name,
+        probe_apiserver_reachable(ctx).as_str(),
+    );
+    let _ = write_bundle_file(&dir, EV_META, meta.as_bytes());
+
+    // status.json — fresh host-side snapshot (best-effort).
+    if let Ok(Some(status)) = cmd_status(ctx) {
+        if let Ok(s) = serde_json::to_string_pretty(&status) {
+            let _ = write_bundle_file(&dir, EV_STATUS, s.as_bytes());
+        }
+    }
+
+    // Bounded host commands. A missing `timeout` binary is the one capture
+    // failure that aborts the (subprocess-based) items — surface it as the enum
+    // value; meta/status above are already written.
+    let node = format!("{}-control-plane", ctx.cluster_name);
+    let kube_ctx = format!("kind-{}", ctx.cluster_name);
+    let runtime = ctx.container_runtime.as_str();
+    let items: [(&str, &str, Vec<&str>); 3] = [
+        (EV_KIND_CLUSTERS, "kind", vec!["get", "clusters"]),
+        (
+            EV_CP_INSPECT,
+            runtime,
+            // BOUNDED format (Security F1): capture ONLY the lifecycle fields
+            // that answer why/when the control plane died — NOT the raw full
+            // object, whose `Config.Env`/`HostConfig.Binds`/`Mounts` would
+            // auto-capture anything that later lands in the kind node's env or
+            // mounts (a registry cred, a proxy token) with no code change for
+            // review to catch. Keeping this a format string keeps the item
+            // bounded like its allowlist neighbours; do NOT restore the wildcard.
+            vec![
+                "inspect",
+                "-f",
+                "{{.State.Status}} {{.State.Running}} {{.State.ExitCode}} \
+                 {{.State.OOMKilled}} {{.State.StartedAt}} {{.State.FinishedAt}}",
+                node.as_str(),
+            ],
+        ),
+        (
+            EV_PODS,
+            "kubectl",
+            vec![
+                "get",
+                "pods",
+                "-n",
+                "dark-tower",
+                "--context",
+                kube_ctx.as_str(),
+            ],
+        ),
+    ];
+    for (filename, program, args) in &items {
+        if capture_cmd(&dir, filename, program, args).is_err() {
+            return "capture-failed:timeout-unavailable".to_string();
+        }
+    }
+
+    leaf
+}
+
+/// The two-armed destroy license (R3-final). Extracted pure so the license
+/// logic is unit-provable without running teardown/setup. `Err` (daemon down /
+/// wedged `kind`) is NOT `Ok(false)`, so it does NOT license — the pin against a
+/// future `unwrap_or(false)` that would make every daemon outage a destroy
+/// license.
+fn recreate_licensed(reach: ApiserverReachability, exists: &Result<bool, HelperError>) -> bool {
+    reach == ApiserverReachability::Unreachable || matches!(exists, Ok(false))
+}
+
+/// The gate + bound decision, pure and hermetically testable WITHOUT running
+/// teardown/setup (@test B1). Separating this from the IO makes both the LICENSE
+/// (may we destroy at all) and the BOUND (have we already destroyed this
+/// lifetime, and is it charged ONLY after a positive license) unit-provable.
+#[derive(Debug, PartialEq, Eq)]
+enum RecreateDecision {
+    /// Refused: host re-confirmed the control plane Reachable (a raced/flap
+    /// observation). Bound NOT charged.
+    RefusedClusterAlive,
+    /// Refused: host could not determine (Unknown / `exists == Err`). Bound NOT
+    /// charged.
+    RefusedInconclusive,
+    /// Licensed, but the one recreate for this helper lifetime was already spent.
+    /// Bound stays charged; NOT re-charged.
+    AlreadyAttempted,
+    /// Licensed and this call charged the bound — proceed to evidence + destroy.
+    Proceed,
+}
+
+/// Decide whether to recreate, and charge the once-per-lifetime bound EXACTLY
+/// when (and only when) a positive license lets us proceed.
+///
+/// Ordering is load-bearing (Delta 1, @test B1): the license check comes FIRST,
+/// so a refusal NEVER charges the bound (a later legitimate `Unreachable` still
+/// gets its one recreate); the `compare_exchange` runs only on the licensed
+/// path, BEFORE the caller captures evidence or destroys — so a failed capture
+/// or a failed destroy cannot buy a SECOND destroy.
+fn decide_recreate(
+    reach: ApiserverReachability,
+    exists: &Result<bool, HelperError>,
+    bound: &AtomicBool,
+) -> RecreateDecision {
+    if !recreate_licensed(reach, exists) {
+        return if reach == ApiserverReachability::Reachable {
+            RecreateDecision::RefusedClusterAlive
+        } else {
+            RecreateDecision::RefusedInconclusive
+        };
+    }
+    if bound
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return RecreateDecision::AlreadyAttempted;
+    }
+    RecreateDecision::Proceed
+}
+
+/// `dev-cluster recreate` — the guarded, once-per-helper-lifetime cluster
+/// recreate, and the ENFORCEMENT POINT of the whole self-heal safety argument at
+/// the ADR-0030 trust boundary.
+///
+/// This runs on the PRIVILEGED host side and RE-CONFIRMS, at the moment of
+/// action, that a destroy is licensed — the semi-trusted container only
+/// *requested* it. The re-confirmation is TWO-armed (R3-final):
+///   License 1: `probe_apiserver_reachable(ctx) == Unreachable` (control-plane
+///              container reported stopped by `inspect` — an observation the
+///              container cannot influence; the runtime socket is not mounted
+///              into it, ADR-0030:468).
+///   License 2: `cluster_already_exists() == Ok(false)` (cluster positively
+///              ABSENT — nothing to destroy).
+/// Anything else — including `cluster_already_exists() == Err` (a daemon outage,
+/// which `inspect`'s exit code cannot distinguish from absence) — REFUSES.
+///
+/// LOAD-BEARING, do NOT "optimize away": this re-confirmation is not redundant
+/// with the shell's probe. The shell classifies; the host RE-VERIFIES against an
+/// observation the container cannot forge. Removing it collapses the safety
+/// argument. Containment invariant: destroys ONLY `ctx.cluster_name` — there is
+/// no client-supplied target arg (see `protocol::Request::reject_all_args`), so
+/// the worst case is "one devloop destroys its OWN cluster" (the blast radius
+/// devloop.sh:577-582 already accepts). The container's *assertion* is never the
+/// authority; this gate + the containment invariant are.
+///
+/// NON-COLLAPSE (Finding-5 RECIPROCAL with `scripts/layer7.sh`'s infra-change
+/// branch): that branch does an UNCONDITIONAL `teardown`+`setup` and MUST destroy
+/// a HEALTHY cluster (the `infra/kind/` blueprint changed, so the running cluster
+/// is stale by definition). This verb is its INVERSE — it MUST REFUSE to destroy
+/// a healthy cluster. Two semantically-opposite operations; do NOT let a DRY pass
+/// merge them (the forward half of this note lives at that shell branch).
+fn cmd_recreate(
+    ctx: &Context,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<Option<serde_json::Value>, HelperError> {
+    // --- Host-side re-confirmation + bound (the enforcement point) -------------
+    // `exists` consumes the `Result` DIRECTLY — `Err` (rc≠0 / wedged `kind`) MUST
+    // stay distinguishable from `Ok(false)` (an `unwrap_or(false)` would turn
+    // every daemon outage into a destroy license). The gate + bound decision is
+    // pure (`decide_recreate`); it charges the bound ONLY on the licensed path,
+    // after the re-confirm and before any destroy.
+    let reach = probe_apiserver_reachable(ctx);
+    let exists = cluster_already_exists(&ctx.cluster_name);
+    match decide_recreate(reach, &exists, &ctx.recreate_bound) {
+        RecreateDecision::RefusedClusterAlive | RecreateDecision::RefusedInconclusive => {
+            // Split the refusal at the point the distinction EXISTS (Security F2):
+            // `Reachable` is a POSITIVE "alive" observation (a raced re-confirm);
+            // anything else (`Unknown` / `exists == Err`, runtime down) is "could
+            // not determine", which demands the OPPOSITE operator action. The
+            // bound is untouched, so a later legitimate `Unreachable` still heals.
+            let outcome = if reach == ApiserverReachability::Reachable {
+                SelfHealOutcome::RecreateRefusedClusterAlive
+            } else {
+                SelfHealOutcome::RecreateRefusedInconclusive
+            };
+            eprintln!(
+                "[devloop-helper] recreate: REFUSED ({outcome:?}) — control plane not confirmed dead \
+                 (reachability={}, cluster_exists={:?}); escalating, not destroying",
+                reach.as_str(),
+                exists
+            );
+            return Ok(self_heal_data(outcome, recreate_bound_charged(ctx), "none"));
+        }
+        RecreateDecision::AlreadyAttempted => {
+            eprintln!(
+                "[devloop-helper] recreate: bound already spent this helper lifetime; escalating"
+            );
+            return Ok(self_heal_data(
+                SelfHealOutcome::RecreateAlreadyAttemptedThisHelperLifetime,
+                1,
+                "none",
+            ));
+        }
+        RecreateDecision::Proceed => { /* licensed + bound charged — fall through */ }
+    }
+
+    // --- Evidence BEFORE the destroy -------------------------------------------
+    let evidence_leaf = capture_evidence_bundle(ctx);
+    // Honour the persisted observability-deploy SSoT BEFORE teardown wipes
+    // ports.json (@code-reviewer): recreate the cluster with the SAME
+    // observability choice it was originally brought up with, not a hardcoded
+    // full stack.
+    let skip_observability = !read_observability_deployed(ctx);
+    eprintln!(
+        "[devloop-helper] recreate: control plane confirmed down; evidence={evidence_leaf}; \
+         recreating {} (skip_observability={skip_observability})",
+        ctx.cluster_name
+    );
+
+    // --- Destroy + recreate (reuse cmd_teardown/cmd_setup) ---------------------
+    // Called DIRECTLY (not via the dispatcher): they run inside the write slot
+    // this command already holds; routing through `execute`/`run_with_write_slot`
+    // would self-`Busy`. cmd_teardown swallows non-cancel kind errors internally,
+    // so its `?` only propagates a genuine `Cancelled`.
+    cmd_teardown(ctx, writer, signal)?;
+    match cmd_setup(ctx, skip_observability, writer, signal) {
+        Ok(_) => Ok(self_heal_data(
+            SelfHealOutcome::Recreated,
+            1,
+            &evidence_leaf,
+        )),
+        Err(e @ HelperError::Cancelled { .. }) => Err(e),
+        Err(e) => {
+            eprintln!("[devloop-helper] recreate: setup after teardown failed: {e}");
+            Ok(self_heal_data(
+                SelfHealOutcome::RecreateFailed,
+                1,
+                &evidence_leaf,
+            ))
+        }
+    }
+}
+
+/// `dev-cluster restore-kubeconfig` — regenerate ONLY the container kubeconfig
+/// from the LIVE cluster. NON-DESTRUCTIVE: reaches no teardown/delete/create
+/// path (this is the whole point — a stale/missing kubeconfig on a HEALTHY
+/// cluster must never trigger a destroy). NOT bound-gated.
+///
+/// Refuses loudly (S4/P6) — explicit early return, never a fallthrough to
+/// `allocate_ports` — if the cluster is absent or `ports.json` has no k8s_api
+/// port. The port comes from the persisted live port map ONLY: a restarted
+/// helper re-allocating could hand a different slot and point a cluster-admin
+/// kubeconfig at another devloop's apiserver.
+fn cmd_restore_kubeconfig(
+    ctx: &Context,
+    _writer: &mut dyn Write,
+    _signal: &CancelSignal,
+) -> Result<Option<serde_json::Value>, HelperError> {
+    let attempt = recreate_bound_charged(ctx); // report the actual bound state
+    match cluster_already_exists(&ctx.cluster_name) {
+        Ok(true) => {}
+        other => {
+            eprintln!(
+                "[devloop-helper] restore-kubeconfig: refusing — cluster not present ({other:?})"
+            );
+            return Ok(self_heal_data(
+                SelfHealOutcome::RestoreFailed,
+                attempt,
+                "none",
+            ));
+        }
+    }
+    let port = match read_k8s_api_port(ctx) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[devloop-helper] restore-kubeconfig: refusing — ports.json missing/unparseable \
+                 or no k8s_api port (NOT re-allocating)"
+            );
+            return Ok(self_heal_data(
+                SelfHealOutcome::RestoreFailed,
+                attempt,
+                "none",
+            ));
+        }
+    };
+    match generate_container_kubeconfig(ctx, port) {
+        Ok(()) => Ok(self_heal_data(SelfHealOutcome::Restored, attempt, "none")),
+        Err(e) => {
+            eprintln!("[devloop-helper] restore-kubeconfig: kubeconfig regen failed: {e}");
+            Ok(self_heal_data(
+                SelfHealOutcome::RestoreFailed,
+                attempt,
+                "none",
+            ))
+        }
+    }
 }
 
 /// Summary of pod health in the dark-tower namespace.
@@ -1039,7 +1734,16 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
     // invocations that never wrote a setup.pid. The `setup.pid` file still
     // exists and is still maintained by devloop.sh for its own wrapper-lifecycle
     // tracking; cmd_status simply doesn't consult it any more.
-    let setup_in_progress = busy.as_ref().is_some_and(|b| b.op == "setup");
+    // Vocabulary matched by literal op name. `recreate` calls `cmd_setup`
+    // INTERNALLY, so a status served mid-`recreate` (reads bypass the write
+    // mutex) would otherwise report `setup_in_progress=false` while a genuine
+    // setup runs inside it — and `Cluster exists: false` + `Setup in progress:
+    // false` is dispatch row 1 (`apiserver-unreachable`), i.e. it fails toward a
+    // destroy. Both write ops that run setup must be in this set; adding a THIRD
+    // verb that runs setup requires revisiting this matcher.
+    let setup_in_progress = busy
+        .as_ref()
+        .is_some_and(|b| matches!(b.op.as_str(), "setup" | "recreate"));
 
     // Build response data — construct fully to avoid indexing (clippy::indexing_slicing)
     let pod_summary_val = pod_summary.map(|summary| {
@@ -1064,9 +1768,18 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
     });
     let cancel_pending = busy.as_ref().is_some_and(|b| b.cancel_pending);
 
+    // Apiserver reachability (self-heal input). ADDITIVE string field — the three
+    // COUPLED health lines + NDJSON shape are untouched, and a probe failure
+    // degrades to `unknown` (never errors), so `__cluster_ready` (which greps
+    // only the three) is unaffected. The probe is internally `timeout`-bounded;
+    // its total bound stays under the shell `timeout` on `dev-cluster status`
+    // (see INSPECT_TIMEOUT_SECS / TCP_CONNECT_TIMEOUT).
+    let apiserver_reachable = probe_apiserver_reachable(ctx).as_str();
+
     let data = serde_json::json!({
         "cluster_exists": cluster_exists,
         "pods_healthy": pods_healthy,
+        "apiserver_reachable": apiserver_reachable,
         "setup_in_progress": setup_in_progress,
         "checked_at": now_rfc3339(),
         "pod_summary": pod_summary_val,
@@ -1943,6 +2656,7 @@ mod tests {
             host_gateway_ip: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             write_state: Arc::new(Mutex::new(WriteState::new())),
+            recreate_bound: AtomicBool::new(false),
         };
 
         let mut output = Vec::new();
@@ -2267,5 +2981,370 @@ current-context: kind-devloop-test
 
         let result = propagate_teardown_kind_result(Ok(()));
         assert!(result.is_ok());
+    }
+
+    // --- Self-heal: inspect_signal (License 1 classifier, R3-final) -----------
+
+    #[test]
+    fn test_inspect_signal_running_stopped() {
+        // rc0 + "true" ⇒ running; rc0 + "false" ⇒ stopped (the SOLE Unreachable).
+        assert_eq!(inspect_signal(true, Some(0), "true\n"), Some(true));
+        assert_eq!(inspect_signal(true, Some(0), "false\n"), Some(false));
+        assert_eq!(inspect_signal(true, Some(0), " false "), Some(false));
+    }
+
+    #[test]
+    fn test_inspect_signal_garbage_is_unknown_not_destroy() {
+        // rc0 but not a clean bool ⇒ None (Unknown). Guards a future
+        // `!= "true" ⇒ false` simplification that would destroy on garbage.
+        assert_eq!(inspect_signal(true, Some(0), "maybe"), None);
+        assert_eq!(inspect_signal(true, Some(0), ""), None);
+    }
+
+    #[test]
+    fn test_inspect_signal_runtime_errors_are_unknown() {
+        // spawn/exec failure (e.g. `timeout` missing) ⇒ None.
+        assert_eq!(inspect_signal(false, None, ""), None);
+        // timeout / kill ⇒ None.
+        assert_eq!(inspect_signal(true, Some(124), ""), None);
+        assert_eq!(inspect_signal(true, Some(137), ""), None);
+        // container ABSENT (Docker exit 1) and daemon-down (also exit 1) ⇒ None:
+        // an exit code cannot tell them apart, so neither licenses a destroy.
+        // Absence is licensed separately via cluster_already_exists()==Ok(false).
+        assert_eq!(inspect_signal(true, Some(1), ""), None);
+        // Podman "no such object" exit 125 ⇒ None.
+        assert_eq!(inspect_signal(true, Some(125), ""), None);
+    }
+
+    // --- Self-heal: reachability_from_signals (Delta 2) -----------------------
+
+    #[test]
+    fn test_reachability_container_stopped_is_unreachable() {
+        // The ONLY Unreachable source.
+        assert_eq!(
+            reachability_from_signals(Some(false), Some(6443), Some(true)),
+            ApiserverReachability::Unreachable
+        );
+        assert_eq!(
+            reachability_from_signals(Some(false), None, None),
+            ApiserverReachability::Unreachable
+        );
+    }
+
+    #[test]
+    fn test_reachability_inspect_indeterminate_is_unknown() {
+        assert_eq!(
+            reachability_from_signals(None, Some(6443), Some(true)),
+            ApiserverReachability::Unknown
+        );
+    }
+
+    #[test]
+    fn test_reachability_running_tcp_cases() {
+        // running + connected ⇒ Reachable (healthy-cluster probe-target pin:
+        // this must NOT be aimed at a defunct 127.0.0.1).
+        assert_eq!(
+            reachability_from_signals(Some(true), Some(6443), Some(true)),
+            ApiserverReachability::Reachable
+        );
+        // running + refused ⇒ Unknown (Delta 2 — the flipped row; NOT Unreachable).
+        assert_eq!(
+            reachability_from_signals(Some(true), Some(6443), Some(false)),
+            ApiserverReachability::Unknown
+        );
+        // running + timeout ⇒ Unknown.
+        assert_eq!(
+            reachability_from_signals(Some(true), Some(6443), None),
+            ApiserverReachability::Unknown
+        );
+        // running + port undeterminable ⇒ Unknown.
+        assert_eq!(
+            reachability_from_signals(Some(true), None, None),
+            ApiserverReachability::Unknown
+        );
+    }
+
+    // --- Self-heal: two-armed recreate gate (License proof, R3-final) ---------
+    // These prove the LICENSE (distinct from the classifier). The shell's
+    // `Cluster exists: false ⇒ recreate` case proves only ROUTING; the license
+    // that a real cmd_recreate permits the destroy lives here.
+
+    #[test]
+    fn test_recreate_gate_license_1_unreachable_proceeds() {
+        // Container stopped ⇒ licensed regardless of the exists probe.
+        assert!(recreate_licensed(
+            ApiserverReachability::Unreachable,
+            &Ok(true)
+        ));
+    }
+
+    #[test]
+    fn test_recreate_gate_license_2_absent_proceeds() {
+        // Cluster positively absent ⇒ licensed (nothing to destroy).
+        assert!(recreate_licensed(
+            ApiserverReachability::Unknown,
+            &Ok(false)
+        ));
+        assert!(recreate_licensed(
+            ApiserverReachability::Reachable,
+            &Ok(false)
+        ));
+    }
+
+    #[test]
+    fn test_recreate_gate_present_and_alive_refuses() {
+        // Reachable / Unknown with the cluster present ⇒ NOT licensed.
+        assert!(!recreate_licensed(
+            ApiserverReachability::Reachable,
+            &Ok(true)
+        ));
+        assert!(!recreate_licensed(
+            ApiserverReachability::Unknown,
+            &Ok(true)
+        ));
+    }
+
+    #[test]
+    fn test_recreate_gate_daemon_down_err_refuses_not_absence() {
+        // THE PIN: `Err` (daemon down / wedged kind) must NOT license — it is
+        // NOT `Ok(false)`. An `unwrap_or(false)` collapse would flip this to
+        // licensed (every daemon outage a destroy license) and red this test.
+        let err = || HelperError::CommandFailed {
+            cmd: "kind get clusters".to_string(),
+            detail: "daemon unreachable".to_string(),
+        };
+        assert!(!recreate_licensed(
+            ApiserverReachability::Unknown,
+            &Err(err())
+        ));
+        // Even with a Reachable probe (which alone wouldn't license), Err stays refused.
+        assert!(!recreate_licensed(
+            ApiserverReachability::Reachable,
+            &Err(err())
+        ));
+        // And Unreachable still licenses via arm 1 even if exists is Err.
+        assert!(recreate_licensed(
+            ApiserverReachability::Unreachable,
+            &Err(err())
+        ));
+    }
+
+    // --- Self-heal: the AtomicBool once-per-lifetime BOUND (B1) ---------------
+    // Distinct from the license: license = "may we destroy at all"; bound =
+    // "have we already destroyed once this lifetime". `decide_recreate` is the
+    // pure gate+bound decision; these drive it hermetically (no teardown/setup).
+
+    #[test]
+    fn test_decide_recreate_refusal_does_not_charge_bound() {
+        let err = || HelperError::CommandFailed {
+            cmd: "kind get clusters".to_string(),
+            detail: "daemon down".to_string(),
+        };
+        // Reachable + present ⇒ refused-cluster-alive, bound untouched.
+        let b = AtomicBool::new(false);
+        assert_eq!(
+            decide_recreate(ApiserverReachability::Reachable, &Ok(true), &b),
+            RecreateDecision::RefusedClusterAlive
+        );
+        assert!(
+            !b.load(Ordering::SeqCst),
+            "refusal must not charge the bound"
+        );
+        // Unknown + Err (runtime down) ⇒ refused-inconclusive, bound untouched —
+        // so a LATER legitimate Unreachable still gets its one recreate.
+        let b = AtomicBool::new(false);
+        assert_eq!(
+            decide_recreate(ApiserverReachability::Unknown, &Err(err()), &b),
+            RecreateDecision::RefusedInconclusive
+        );
+        assert!(!b.load(Ordering::SeqCst));
+        // Proven: after that inconclusive refusal, Unreachable now proceeds+charges.
+        assert_eq!(
+            decide_recreate(ApiserverReachability::Unreachable, &Err(err()), &b),
+            RecreateDecision::Proceed
+        );
+        assert!(
+            b.load(Ordering::SeqCst),
+            "licensed destroy must charge the bound"
+        );
+    }
+
+    #[test]
+    fn test_decide_recreate_bound_is_once_per_lifetime() {
+        // A shared bound models the daemon's Arc<Context> across accept threads.
+        let b = AtomicBool::new(false);
+        // First licensed recreate proceeds and charges.
+        assert_eq!(
+            decide_recreate(ApiserverReachability::Unreachable, &Ok(true), &b),
+            RecreateDecision::Proceed
+        );
+        // Second in the same lifetime is suppressed — the no-infinite-loop guard.
+        assert_eq!(
+            decide_recreate(ApiserverReachability::Unreachable, &Ok(true), &b),
+            RecreateDecision::AlreadyAttempted
+        );
+        // License 2 (Ok(false)) is likewise bound-suppressed after the spend.
+        assert_eq!(
+            decide_recreate(ApiserverReachability::Unknown, &Ok(false), &b),
+            RecreateDecision::AlreadyAttempted
+        );
+    }
+
+    // --- Self-heal: evidence-bundle closed allowlist (B2) ---------------------
+
+    /// Runs the REAL `capture_evidence_bundle` and set-compares the PRODUCED
+    /// files against the EXPECTED set (`EVIDENCE_BUNDLE_ITEMS`, the test-side
+    /// aggregate of the production `EV_*` filename consts). NOT a static
+    /// list-equals-itself check (@test): production writes each bundle file
+    /// THROUGH those same `EV_*` consts, so a 6th capture with a new filename, or
+    /// a slice-only add, both red — drift caught bidirectionally, fails closed,
+    /// which a content grep can't — plus a credential-marker defence-in-depth
+    /// (no `client-key-data`/`client-certificate-data`/PEM; `certificate-authority-data`
+    /// is public and deliberately NOT asserted). Requires coreutils `timeout`
+    /// (a hard dependency of the capture path); runs the real bounded capture,
+    /// whose subprocesses fail harmlessly if kind/podman/kubectl are absent.
+    #[test]
+    fn test_evidence_bundle_matches_allowlist_and_has_no_credentials() {
+        use std::collections::BTreeSet;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let leaf = capture_evidence_bundle(&ctx);
+        assert!(
+            leaf.starts_with("self-heal-evidence-"),
+            "capture failed ({leaf}) — is coreutils `timeout` on PATH?"
+        );
+        let bundle_dir = dir.path().join(&leaf);
+        let produced: BTreeSet<String> = fs::read_dir(&bundle_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let expected: BTreeSet<String> = EVIDENCE_BUNDLE_ITEMS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            produced, expected,
+            "evidence bundle drifted from EVIDENCE_BUNDLE_ITEMS"
+        );
+        // Positive control (not vacuous) + no credential markers.
+        for item in EVIDENCE_BUNDLE_ITEMS {
+            let body = fs::read_to_string(bundle_dir.join(item)).unwrap_or_default();
+            for marker in ["client-key-data", "client-certificate-data", "-----BEGIN"] {
+                assert!(
+                    !body.contains(marker),
+                    "credential marker {marker:?} found in evidence item {item}"
+                );
+            }
+        }
+    }
+
+    // --- Self-heal: outcome token vocabulary (identity-mapping pin) -----------
+
+    /// The helper's `HELPER_OUTCOME=` wire tokens, pinned EXHAUSTIVELY: the
+    /// `wire` match below is compile-forced to cover every `SelfHealOutcome`
+    /// variant, so a NEW variant fails to compile until its token is pinned —
+    /// not a vacuity-prone per-variant literal list (@team-lead A3, @dry-reviewer
+    /// F4). serde and the hand map must agree (catches a serde-rename drift), and
+    /// the produced set must equal the frozen 7-member `HELPER_OUTCOME=` set that
+    /// @paired-operations catalogues in §8 (the cross-encoding assertion the old
+    /// name overclaimed but never actually made). The shell `DETAIL=` half is
+    /// pinned independently by `layer7.test.sh`'s SH cases + the `ANCHOR (DRY):`.
+    #[test]
+    fn test_self_heal_outcome_wire_tokens_exhaustive() {
+        use std::collections::BTreeSet;
+        fn wire(o: &SelfHealOutcome) -> &'static str {
+            match o {
+                SelfHealOutcome::Recreated => "recreated",
+                SelfHealOutcome::Restored => "restored",
+                SelfHealOutcome::RecreateRefusedClusterAlive => "recreate-refused-cluster-alive",
+                SelfHealOutcome::RecreateRefusedInconclusive => "recreate-refused-inconclusive",
+                SelfHealOutcome::RecreateAlreadyAttemptedThisHelperLifetime => {
+                    "recreate-already-attempted-this-helper-lifetime"
+                }
+                SelfHealOutcome::RecreateFailed => "recreate-failed",
+                SelfHealOutcome::RestoreFailed => "restore-failed",
+            }
+        }
+        let all = [
+            SelfHealOutcome::Recreated,
+            SelfHealOutcome::Restored,
+            SelfHealOutcome::RecreateRefusedClusterAlive,
+            SelfHealOutcome::RecreateRefusedInconclusive,
+            SelfHealOutcome::RecreateAlreadyAttemptedThisHelperLifetime,
+            SelfHealOutcome::RecreateFailed,
+            SelfHealOutcome::RestoreFailed,
+        ];
+        let expected: BTreeSet<&str> = [
+            "recreated",
+            "restored",
+            "recreate-refused-cluster-alive",
+            "recreate-refused-inconclusive",
+            "recreate-already-attempted-this-helper-lifetime",
+            "recreate-failed",
+            "restore-failed",
+        ]
+        .into_iter()
+        .collect();
+        let mut produced: BTreeSet<&str> = BTreeSet::new();
+        for o in &all {
+            assert_eq!(
+                serde_json::to_value(o).unwrap(),
+                wire(o),
+                "serde vs hand map"
+            );
+            produced.insert(wire(o));
+        }
+        assert_eq!(
+            produced, expected,
+            "HELPER_OUTCOME wire set drifted from the frozen §8 set"
+        );
+    }
+
+    /// `self_heal_data` emits `max: 1` (literal, derived from the AtomicBool's
+    /// arity — not a tunable const).
+    #[test]
+    fn test_self_heal_data_max_is_one() {
+        let data = self_heal_data(SelfHealOutcome::Recreated, 1, "self-heal-evidence-x").unwrap();
+        assert_eq!(data["self_heal"]["max"], 1);
+        assert_eq!(data["self_heal"]["attempt"], 1);
+        assert_eq!(data["self_heal"]["outcome"], "recreated");
+        assert_eq!(data["self_heal"]["evidence"], "self-heal-evidence-x");
+    }
+
+    /// S4: cmd_restore_kubeconfig derives the apiserver port from the persisted
+    /// ports.json, and `read_k8s_api_port` returns None (⇒ refuse loudly, never
+    /// allocate) when the file is missing or the port absent/zero.
+    #[test]
+    fn test_read_k8s_api_port_from_ports_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        // Missing ports.json ⇒ None.
+        assert_eq!(read_k8s_api_port(&ctx), None);
+        // Present with a real port ⇒ Some.
+        fs::write(
+            dir.path().join("ports.json"),
+            r#"{"ports":{"k8s_api":24303}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_k8s_api_port(&ctx), Some(24303));
+        // Zero port ⇒ None (treated as absent).
+        fs::write(dir.path().join("ports.json"), r#"{"ports":{"k8s_api":0}}"#).unwrap();
+        assert_eq!(read_k8s_api_port(&ctx), None);
+    }
+
+    /// Minimal Context for the pure-fn tests that need one (`read_k8s_api_port`).
+    fn test_ctx(dir: &std::path::Path) -> Context {
+        Context {
+            slug: "test".to_string(),
+            cluster_name: "devloop-test".to_string(),
+            project_root: PathBuf::from("/tmp/devloop-test-nonexistent"),
+            runtime_dir: dir.to_path_buf(),
+            registry_path: dir.join("port-registry.json"),
+            container_runtime: ContainerRuntime::Podman,
+            host_gateway_ip: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            write_state: Arc::new(Mutex::new(WriteState::new())),
+            recreate_bound: AtomicBool::new(false),
+        }
     }
 }
