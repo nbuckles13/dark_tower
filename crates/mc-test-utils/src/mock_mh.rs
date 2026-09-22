@@ -29,7 +29,9 @@
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::{
     MediaHandlerService, MediaHandlerServiceServer,
 };
-use proto_gen::dark_tower::internal::v1::{RegisterMeetingRequest, RegisterMeetingResponse};
+use proto_gen::dark_tower::internal::v1::{
+    EndMeetingRequest, EndMeetingResponse, RegisterMeetingRequest, RegisterMeetingResponse,
+};
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +84,8 @@ pub struct MediaHandlerStub {
     /// The `egress_streams` of the most recent request, so a test can assert
     /// what MC actually put on the wire.
     last_request: Arc<Mutex<Option<RegisterMeetingRequest>>>,
+    /// Every `EndMeeting` request served, in order.
+    end_meeting_requests: Arc<Mutex<Vec<EndMeetingRequest>>>,
 }
 
 impl MediaHandlerStub {
@@ -100,6 +104,7 @@ pub struct MediaHandlerStubHandle {
     received_generations: Arc<Mutex<Vec<u64>>>,
     call_count: Arc<AtomicU64>,
     last_request: Arc<Mutex<Option<RegisterMeetingRequest>>>,
+    end_meeting_requests: Arc<Mutex<Vec<EndMeetingRequest>>>,
 }
 
 impl MediaHandlerStubHandle {
@@ -128,6 +133,17 @@ impl MediaHandlerStubHandle {
     #[must_use]
     pub fn last_request(&self) -> Option<RegisterMeetingRequest> {
         self.last_request
+            .lock()
+            .expect("MediaHandlerStub mutex poisoned")
+            .clone()
+    }
+
+    /// Every `EndMeeting` request the stub has served, in order — so a test can
+    /// assert MC tore a meeting down once per handler, after its pushes stopped,
+    /// with the `mc_id` it registered under.
+    #[must_use]
+    pub fn end_meeting_requests(&self) -> Vec<EndMeetingRequest> {
+        self.end_meeting_requests
             .lock()
             .expect("MediaHandlerStub mutex poisoned")
             .clone()
@@ -226,6 +242,7 @@ impl MediaHandlerStubBuilder {
             received_generations: Arc::new(Mutex::new(Vec::new())),
             call_count: Arc::new(AtomicU64::new(0)),
             last_request: Arc::new(Mutex::new(None)),
+            end_meeting_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -243,6 +260,7 @@ impl MediaHandlerStubBuilder {
         let received_generations = Arc::new(Mutex::new(Vec::new()));
         let call_count = Arc::new(AtomicU64::new(0));
         let last_request = Arc::new(Mutex::new(None));
+        let end_meeting_requests = Arc::new(Mutex::new(Vec::new()));
 
         let stub = MediaHandlerStub {
             accept: self.accept,
@@ -253,6 +271,7 @@ impl MediaHandlerStubBuilder {
             received_generations: Arc::clone(&received_generations),
             call_count: Arc::clone(&call_count),
             last_request: Arc::clone(&last_request),
+            end_meeting_requests: Arc::clone(&end_meeting_requests),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -276,6 +295,7 @@ impl MediaHandlerStubBuilder {
             received_generations,
             call_count,
             last_request,
+            end_meeting_requests,
         }
     }
 }
@@ -312,6 +332,23 @@ impl MediaHandlerService for MediaHandlerStub {
             process_start_epoch_ms: self.process_start_epoch_ms,
             transport_mode: self.transport_mode as i32,
         }))
+    }
+
+    /// Records the request and acknowledges it.
+    ///
+    /// Always `acknowledged: true`: the stub models the release and the
+    /// unknown-meeting no-op, which the contract answers identically. It does
+    /// NOT model the `mc_id`-mismatch rejection; a test needing that should add
+    /// a builder knob rather than rely on this default.
+    async fn end_meeting(
+        &self,
+        request: Request<EndMeetingRequest>,
+    ) -> Result<Response<EndMeetingResponse>, Status> {
+        self.end_meeting_requests
+            .lock()
+            .expect("MediaHandlerStub mutex poisoned")
+            .push(request.into_inner());
+        Ok(Response::new(EndMeetingResponse { acknowledged: true }))
     }
 }
 

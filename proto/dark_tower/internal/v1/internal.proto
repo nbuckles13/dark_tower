@@ -5,6 +5,33 @@ package dark_tower.internal.v1;
 import "dark_tower/signaling/v1/signaling.proto";
 
 // ============================================================================
+// NO KEY MATERIAL ON THIS CONTRACT -- MECHANICALLY ENFORCED (ADR-0036 §4)
+// ============================================================================
+//
+// "No key material crosses the MC->MH contract" is enforced on this file by
+// `scripts/guards/simple/validate-internal-proto-no-key-material.sh` as a
+// THREE-PART rule, each part a mechanical proxy for the one above:
+//
+//   1. NO `bytes` FIELD, EVER, in any spelling (`bytes`, `repeated`,
+//      `optional`, `map<..., bytes>`, `google.protobuf.BytesValue`). Every
+//      piece of key material in this tree is `bytes`; the client-facing
+//      contract carries exactly the ones that legitimately exist there.
+//   2. NO CROSS-PACKAGE TYPE except an allowlisted ENUM, spelled by its
+//      canonical fully-qualified name (today only
+//      `dark_tower.signaling.v1.TransportMode`). Rule 1 alone would be
+//      defeated by embedding a signaling MESSAGE (e.g. `MeetingKekUpdate`) --
+//      the key arrives without the word `bytes` ever appearing here. An enum
+//      cannot carry a `bytes` field, which is why the boundary is enums-only.
+//      Relative (`signaling.v1.X`) and leading-dot spellings are rejected on
+//      purpose: fix the spelling, never loosen the comparison.
+//   3. NO `import` beyond `dark_tower/signaling/v1/signaling.proto`. A
+//      same-package import would let a message be referenced unqualified,
+//      which rule 2 cannot see.
+//
+// A legitimate need for any of these is a re-derivation of the rule with
+// @security, not an edit to the guard. The guard has no suppression path.
+//
+// ============================================================================
 // Meeting Controller -> Media Handler control plane (ADR-0036 §7, §8)
 // ============================================================================
 //
@@ -86,11 +113,14 @@ import "dark_tower/signaling/v1/signaling.proto";
 //     registration hostile to the mechanism §8 relies on for restart recovery.
 //     The egress stream stays in the applied policy and forwards nothing until
 //     the source connects; the subscriber's slot reports its §6 state.
-//     (Concretely, and not as the reason: loopback's own subscriber is
-//     provisionally accepted and promoted BY THIS VERY RPC, so at the instant
-//     the registration is processed the referenced connection is mid-promotion.
-//     Rejecting on non-resolution would make the CONTROL PLANE HOSTAGE TO
-//     DATA-PLANE CONNECTION TIMING.)
+//     (Concretely, and not as the reason: under static fill a joiner's own
+//     connection is provisionally accepted and promoted BY THE REGISTRATION
+//     THAT FIRST NAMES IT -- as a subscriber of its own slots and as a
+//     candidate in every other subscriber's -- so at the instant that
+//     registration is processed the referenced connection is mid-promotion,
+//     and other sources it references may not have attached yet. Rejecting on
+//     non-resolution would make the CONTROL PLANE HOSTAGE TO DATA-PLANE
+//     CONNECTION TIMING.)
 //
 //     A PENDING SOURCE DOES NOT HOLD BACK `applied_generation`, AND MUST NOT.
 //     The two are different instruments: `applied_generation` is PER-SNAPSHOT
@@ -117,20 +147,21 @@ import "dark_tower/signaling/v1/signaling.proto";
 // alone, need no external state, and stay IMMEDIATE HARD REJECTS: the
 // cross-meeting / structurally-unresolvable half of this very check; duplicate
 // `egress_stream_id`; duplicate `(subscriber.sender_id, subscriber.slot_id)`;
-// the candidate-per-egress and egress-per-meeting count bounds;
+// duplicate `server_muted_sources[].sender_id`; the candidate-per-egress,
+// egress-per-meeting and muted-sources-per-meeting count bounds;
 // `transport_mode == TRANSPORT_MODE_UNSPECIFIED`; and heterogeneous transport
 // modes across egress streams. The security-load-bearing rejects are in that
 // list, and "the sender_id rule says defer" must not be read onto them.
 //
-// NO GATE IN THIS STORY CAN CATCH A GLOBAL INDEX. Loopback is one meeting with
-// one participant, so a correctly meeting-scoped index and a global one are
-// OBSERVATIONALLY IDENTICAL across all seven validation layers -- unit,
-// integration, env-test, every guard. This contract is the only artefact that
-// survives into the MH task carrying the requirement, which is why it is a MUST
-// here and not a review note there. The acceptance pin is an executable
-// MULTI-MEETING negative test (a `sender_id` valid in meeting A must be
-// REJECTED in meeting B's request), recorded in docs/TODO.md §Media Path
-// Obligations.
+// NO SINGLE-MEETING TEST CAN CATCH A GLOBAL INDEX. A multi-party meeting is
+// still ONE meeting: however many participants it has, a correctly
+// meeting-scoped index and a global one are OBSERVATIONALLY IDENTICAL until a
+// SECOND CONCURRENT MEETING reuses the same `sender_id` values. Only a
+// multi-meeting input distinguishes them, which is why this is a MUST in the
+// contract and not a review note in a consumer. The executable pin is the
+// multi-meeting negative test in `crates/mh-service/src/routing/mod.rs`,
+// `sender_id_valid_in_one_meeting_does_not_resolve_in_another` (a `sender_id`
+// valid in meeting A must not resolve in meeting B).
 //
 // This is a NEW obligation created by this reshape, not an existing one:
 // `crates/mh-service/src/session/mod.rs` keys connections
@@ -224,10 +255,11 @@ message EgressStream {
 
   // Sources eligible to fill this egress stream.
   //
-  // REPEATED EVEN THOUGH SIZE IS 1 THIS STORY. The loopback assignment yields
-  // exactly one candidate (the subscriber's own audio), but audio selection
-  // among many speakers (§7, story 5) must be ADDITIVE -- it adds candidates and
-  // a ranking rule, not a new message shape.
+  // REPEATED EVEN THOUGH SIZE IS 1 UNDER STATIC FILL. Static fill pins exactly
+  // one candidate per egress stream -- the join-order source MC placed in that
+  // slot, never the subscriber itself -- but audio selection among many
+  // speakers (§7, story 5) must be ADDITIVE -- it adds candidates and a ranking
+  // rule, not a new message shape.
   //
   // BOUND: MH MUST reject a registration whose candidate count exceeds the
   // configured per-egress bound, and whose `egress_streams` count exceeds the
@@ -254,7 +286,7 @@ message EgressStream {
   // egress (ADR-0036 §7). A BEHAVIOUR, not a media type: MH is told what the
   // stream does, never that it is video.
   //
-  // FALSE for the loopback audio egress stream -- every frame forwards. "Every
+  // FALSE for every audio egress stream -- every frame forwards. "Every
   // audio frame forwards" is a consequence of this flag, not of MH knowing the
   // stream is audio.
   //
@@ -297,6 +329,33 @@ message EgressStream {
 // POOL, not of one egress edge. Folding a ranking field into `EgressStream`
 // would make one meeting-wide rule N per-edge copies that can disagree.
 message SelectionRules {}
+
+// One server-muted source (ADR-0036 §7 "Server mute is enforced at MH ingress";
+// story 2 R-9). MH drops every frame this sender publishes, at ingress, before
+// any forwarding decision -- counted under its own reason.
+//
+// SENDER-ONLY, DELIBERATELY: there is no stream or media-kind field, and adding
+// one would create a rule enforced nowhere. The publisher's stream number lives
+// inside the SFrame key id carried in the opaque payload (layout: see
+// `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`). MH does not parse the
+// payload -- it is type-blind (§7) -- and, being keyless (§4), could not
+// AUTHENTICATE the stream component even if it did: a publisher could label any
+// stream 0. What MH CAN attribute is the sender, bound per connection by MC at
+// attach (`NotifyParticipantConnectedResponse.sender_id`). Sender-scoped is exact
+// while meetings are audio-only. Per-kind mute, when video lands (story 3), will
+// key on TRANSPORT -- datagram versus unidirectional stream -- which MH observes
+// directly, not on a stream number it cannot read.
+//
+// OBSERVABILITY (ADR-0036 §11): as `SubscriberSlot` -- never a label, never a
+// span attribute, never a per-frame log dimension.
+message MutedSource {
+  // The muted publisher. MEETING-SCOPED, with the malformed-rejects /
+  // not-yet-connected-holds rules stated once at `SubscriberSlot.sender_id`;
+  // they apply identically here and are deliberately not restated. A muted
+  // `sender_id` not yet connected is HELD (it stays muted when it attaches),
+  // which is the safe direction.
+  uint32 sender_id = 1;
+}
 
 // ============================================================================
 // Global Controller <-> Meeting Controller
@@ -361,16 +420,32 @@ message ComprehensiveHeartbeatRequest {
 
 // Media handler service (Meeting Controller -> Media Handler).
 //
-// ONE RPC BY DESIGN. Registration IS the control plane (ADR-0036 §8): it gains
-// FIELDS rather than sibling RPCs, which is why this service has exactly one
-// method and is expected to keep exactly one. Three RPCs were retired on
-// 2026-09-01 -- see the tombstone block above `SubscriberSlot`.
+// FORWARDING POLICY GAINS FIELDS, NOT SIBLING RPCs. Registration IS the
+// control plane (ADR-0036 §8): anything that changes WHAT MH FORWARDS -- edges,
+// behaviours, server mute, selection rules -- is a field on the full
+// `RegisterMeetingRequest` snapshot, never a new method. A second
+// forwarding-policy RPC would reintroduce exactly the partial-state and
+// ordering problems the full-snapshot re-assert exists to eliminate.
 //
-// The MH gRPC `method` metric label is therefore single-valued by design
-// (`register_meeting`); its value set is bounded by this service block, which is
-// its single source of truth (docs/observability/label-taxonomy.md).
+// MEETING LIFECYCLE TEARDOWN IS A DISTINCT CONCERN WITH ITS OWN RPC
+// (`EndMeeting`, story 2 R-20). It changes no forwarding policy; it releases a
+// meeting's handler resources. Folding it into registration (e.g. "an empty
+// snapshot means end") is wrong: an empty `egress_streams` set is ALREADY a
+// meaningful, legal policy ("forward nothing"), and overloading it would make
+// "this meeting has no edges right now" and "this meeting is over"
+// indistinguishable. Three forwarding RPCs were retired on 2026-09-01 -- see
+// the tombstone block above `SubscriberSlot`.
+//
+// The MH gRPC `method` metric label values are DERIVED from this service's
+// method names; this block names the method set, and the label vocabulary's
+// own home is `crates/mh-service/src/observability/metrics.rs`'s
+// `GRPC_METHOD_*` consts (docs/observability/label-taxonomy.md). Enforcement
+// owner for `end_meeting` emission: the MH EndMeeting task -- until it lands
+// MH answers `EndMeeting` UNIMPLEMENTED and records no `end_meeting` series, so
+// an empty result for that value is expected, not a scrape fault.
 service MediaHandlerService {
   rpc RegisterMeeting(RegisterMeetingRequest) returns (RegisterMeetingResponse);
+  rpc EndMeeting(EndMeetingRequest) returns (EndMeetingResponse);
 }
 
 // Request to register a meeting with a media handler (MC->MH).
@@ -456,7 +531,8 @@ message RegisterMeetingRequest {
   //       THAT API ARE TRAPS, and the READ path is the likelier collapse:
   //       `get_generation(meeting_id) -> u64` is what an implementer reaches for
   //       when they want "the current generation for this meeting". It
-  //       type-checks, compiles, and PASSES EVERY LOOPBACK TEST -- the fencing
+  //       type-checks, compiles, and PASSES EVERY TEST THAT NEVER MAKES A
+  //       FENCED WRITE WITHOUT CHANGING FORWARDING OUTPUT -- the fencing
   //       counter is monotonic and non-zero, so even the §8 applied-generation
   //       echo check goes green. `increment_generation()` is the same trap from
   //       the write side. Using either BREAKS §8's "unchanged policy carries the
@@ -478,6 +554,53 @@ message RegisterMeetingRequest {
   // `RegisterMeetingResponse.applied_generation`; the numbers themselves belong
   // in the log line and in the metric's VALUE, never in a label.
   uint64 policy_generation = 6;
+
+  // The server-muted sources THIS HANDLER MUST ENFORCE (ADR-0036 §7; story 2
+  // R-9). MEETING-LEVEL, not per-egress: a mute silences a publisher for EVERY
+  // subscriber, so it is a property of the source, not of one edge -- the same
+  // reasoning that makes `SelectionRules` meeting-level.
+  //
+  // SCOPED TO THIS HANDLER, NOT THE WHOLE MEETING. Ingress reaches only the
+  // handler a source is attached to, so MC MAY send each handler only the
+  // muted senders placed on it, and does so in story 2. Read accordingly:
+  //   - A sender ABSENT from this set is UNMUTED ON THIS HANDLER. MH must not
+  //     infer anything about other handlers from it, and must not read a subset
+  //     as a meeting-wide unmute.
+  //   - A muted `sender_id` that is not placed on this handler is harmlessly
+  //     held: it never attaches here, so nothing is dropped for it.
+  //   - A mute change therefore advances `policy_generation` ONLY for the
+  //     handler(s) whose set changed, and the per-meeting bound below sizes a
+  //     per-handler set.
+  //
+  // PART OF THE FULL SNAPSHOT, WITH EVERYTHING THAT IMPLIES:
+  //   - It rides every registration, so a mute SURVIVES a re-assert and an MH
+  //     restart (the restarted handler relearns it from the next snapshot).
+  //   - It is swapped ATOMICALLY with the rest of the snapshot -- the
+  //     all-edges-or-none apply stated at `RegisterMeetingResponse.applied_generation`.
+  //     A stale, generation-0 or failed apply leaves the PRIOR set live.
+  //   - A change to this set IS an assignment-output change, so MC MUST advance
+  //     `policy_generation` when it changes. Otherwise MH sees an unchanged
+  //     generation and no-ops the change -- an unmute (or a mute) that never
+  //     takes effect, with the §8 echo reading `match`.
+  //
+  // AN EMPTY SET MEANS "NOBODY IS SERVER-MUTED" and is byte-identical on the
+  // wire to a pre-R-9 MC that never sends the field -- so the older-MC case is
+  // the correct reading, not a degraded one.
+  //
+  // DUPLICATES: MH MUST REJECT THE WHOLE REGISTRATION if any `sender_id`
+  // appears twice -- same posture as duplicate `egress_stream_id`. Not
+  // dedupe: a duplicate means MC's set-construction is broken, and silently
+  // tidying it hides that.
+  //
+  // BOUND: MH MUST reject a registration whose `server_muted_sources` count
+  // exceeds the configured per-meeting bound `MH_MAX_MUTED_SOURCES_PER_MEETING`
+  // (the key is landed by the MH configuration task) BEFORE building any
+  // routing table or doing any per-element work -- the same posture as
+  // `egress_streams` and `candidate_sources`. An unbounded caller-controlled
+  // repeated field is attacker-sized work performed before the policy check.
+  // Both rejects are in the IMMEDIATE HARD REJECTS list at `SubscriberSlot`.
+  // Enforcement owner: the MH server-mute task.
+  repeated MutedSource server_muted_sources = 7;
 }
 
 // Response to meeting registration (ADR-0036 §8).
@@ -622,8 +745,9 @@ message RegisterMeetingResponse {
   // SCOPE LIMIT, STATED SO IT CANNOT DEGRADE SILENTLY. This is ONE field echoing
   // a policy that is PER-EGRESS-STREAM in the request. It is unambiguous only
   // while a meeting's egress streams are homogeneous in transport mode, which is
-  // true for this story (one audio egress stream, datagram) and stops being true
-  // when video lands (§1: audio on datagrams, video on stream-per-group).
+  // true while meetings are audio-only (every egress stream is audio, on
+  // datagrams, however many there are) and stops being true when video lands
+  // (§1: audio on datagrams, video on stream-per-group).
   //
   // Therefore: MH MUST REJECT a registration whose egress streams do not all
   // carry the same transport mode, rather than pick one and echo it. Echoing one
@@ -636,6 +760,117 @@ message RegisterMeetingResponse {
   // contract change, which the reject forces to happen loudly. Enforcement
   // owner: story task 5. Recorded in docs/TODO.md §Media Path Obligations.
   dark_tower.signaling.v1.TransportMode transport_mode = 5;
+}
+
+// Request to release a meeting's resources on a media handler (MC->MH;
+// story 2 R-20).
+//
+// NOT `NotifyMeetingEnded`. That is MC->GC fleet bookkeeping (GC learns a
+// meeting ended). This is MC->MH HANDLER RESOURCE RELEASE: without it a
+// handler never reclaims an ended meeting's routing entry, and its
+// `MH_MAX_TOTAL_EGRESS_EDGES` budget ratchets down with pod uptime. Different
+// callee, different purpose; neither substitutes for the other.
+//
+// NO GENERATION AND NO REASON FIELD, deliberately. Teardown is unconditional
+// by meeting id, so ordering is MC's obligation. BEFORE CALLING THIS, MC MUST
+// QUIESCE EVERY `RegisterMeeting` PUSH FOR THE MEETING:
+//   (a) no new attempt starts -- including retries and backoff; and
+//   (b) every attempt already issued has RETURNED (with a response or an
+//       error). An in-flight RPC must not be abandoned by dropping its future:
+//       once MH's handler has enqueued the policy and upserted the
+//       registration, an RST_STREAM from a dropped client does not undo it.
+// "Signalled a stop" is not "quiesced": MC's pushes are detached tasks with
+// retry backoff, and one sitting in backoff would otherwise land AFTER this
+// call and re-create the ended meeting, leaking its edge budget until MH
+// restarts. MC evicts its own policy generations after the quiesce, not
+// before. Enforcement owner: the MC teardown task (per-meeting cancellation
+// plus a tracker of issued attempts, awaited before the call).
+//
+// RESIDUAL, ACCEPTED IN STORY 2: an attempt whose client-side deadline expired
+// has returned an error to MC but may still be applied by MH afterwards,
+// re-creating the meeting. The window is bounded by the RPC deadline. Once
+// story 4 adds a periodic re-assert the same race becomes routine; the fence
+// that closes both is recorded in docs/TODO.md §Media Path Obligations.
+//
+// SEMANTICS (enforcement owner: the MH EndMeeting task):
+//   - UNKNOWN OR ALREADY-RELEASED `meeting_id` -> idempotent no-op,
+//     `acknowledged: true`. This includes a handler in MC's assigned set that
+//     never received a registration: MC calls EVERY handler in the set, not
+//     only those it pushed to.
+//   - `mc_id` EQUAL to the one recorded for the meeting -> release: remove the
+//     meeting's routing state, return its edges to the egress budget, FORGET
+//     ITS APPLIED GENERATION, close its promoted connections, acknowledge.
+//     Forgetting the generation is required, not tidy: MC drops its own
+//     per-(meeting, handler) generations at teardown, so a meeting later
+//     re-created under the same id pushes from 1 again, and that must be a
+//     FRESH INSTALL, never "stale". Pending (provisional) connections are left
+//     to the existing registration timeout -- one may be a re-join racing the
+//     teardown, and the next registration rescues it. MH closing a connection
+//     is NOT the client's meeting-ended signal; MC's signalling is. A client
+//     reconnecting afterwards is held pending like any other.
+//   - `mc_id` MISMATCH -> REJECTED with gRPC `FAILED_PRECONDITION`, counted by
+//     MH under a bounded outcome value. NEVER idempotent-accept and NEVER
+//     `acknowledged: false` (ambiguous with the no-op): a different MC must
+//     never tear down another MC's meeting. Legitimate failover RE-REGISTERS
+//     FIRST (overwriting `mc_id`), then may release.
+//
+// `mc_id` IS SELF-ASSERTED AND IS NOT AN AUTHORIZATION CONTROL, in the same
+// register as `RegisterMeetingRequest.policy_generation`'s "NOT A SECURITY
+// TOKEN". It is compared against the `mc_id` of the most recent
+// VALIDATION-PASSING `RegisterMeeting` for this meeting (the value the caller
+// sent as `RegisterMeetingRequest.mc_id`) -- NOT gated on that registration's
+// generation outcome, or a failover MC re-registering at a generation <= the
+// applied one would leave the old `mc_id` in place and be unable to release,
+// stranding the meeting and leaking its budget. A registration rejected as
+// invalid does not rebind it. The check guards against a misrouted or stale MC.
+// Nothing binds the caller's identity to `mc_id`; see the docs/TODO.md entry
+// "MH does not verify meeting ownership".
+//
+// Channel authenticity is MhAuthLayer's existing TWO-LAYER gate, which this
+// method inherits with no auth change: scope `service.write.mh` (every method),
+// AND caller `service_type` = `meeting-controller` (the
+// `/dark_tower.internal.v1.MediaHandlerService/` path prefix). That is why the
+// mismatch is `FAILED_PRECONDITION` and not `PERMISSION_DENIED`: the latter is
+// what MhAuthLayer returns for a real authorization rejection, and a
+// self-asserted field must not produce a status that reads as one.
+//
+// ACCEPTED, AND MUST NOT BE "FIXED": the ack-versus-error asymmetry is a
+// meeting-existence oracle to `service.write.mh` holders (unknown meeting
+// acks, wrong `mc_id` errors). The only uniform alternative is idempotent-accept
+// on mismatch, which is forbidden above.
+//
+// ROLLOUT (R-24). MH gains this RPC before any MC calls it; rollback reverses
+// (MC back first). An MC talking to a one-version-older MH gets UNIMPLEMENTED:
+// that is EXPECTED AND NON-FATAL -- MC counts it, does NOT retry it, and
+// teardown at MC and GC proceeds. The older MH keeps the meeting's state and
+// budget until it restarts (today's behaviour), and a same-id re-registration at
+// generation 1 reads as stale there until then -- surfacing as MC's
+// applied/sent mismatch. A mismatch rejection MUST NOT be retried (it cannot
+// succeed without a re-register). Transport failures are retried bounded, with
+// backoff. MC teardown never blocks on the ack.
+//
+// OPERATOR-VISIBLE SYMPTOM of an erroneous or misrouted release: every
+// participant of exactly one meeting is dropped at once, handler-side, with no
+// client-visible cause.
+//
+// OBSERVABILITY: neither `meeting_id` nor `mc_id` is ever a metric label
+// (unbounded, meeting-identifying); both belong in the log line.
+message EndMeetingRequest {
+  string meeting_id = 1;
+  // MUST equal the `RegisterMeetingRequest.mc_id` this MC registered the
+  // meeting with. Not a secret; see the comment above.
+  string mc_id = 2;
+}
+
+// Response to `EndMeeting`.
+//
+// `true` for BOTH a release and the unknown-meeting no-op -- the caller's
+// correct action is identical (the meeting is gone from this handler). A
+// mismatch is never represented here: it is a gRPC error status, because the
+// default-decoded response is `acknowledged: false`, and a failure must not be
+// indistinguishable from an empty reply.
+message EndMeetingResponse {
+  bool acknowledged = 1;
 }
 
 // Meeting controller service (Global Controller -> Meeting Controller)

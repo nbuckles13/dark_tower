@@ -161,28 +161,39 @@ pub fn record_token_refresh_metrics(event: &common::token_manager::TokenRefreshE
     record_token_refresh(status, event.error_category, event.duration);
 }
 
-/// The only method on `MediaHandlerService`, as a metric label value.
+/// The `RegisterMeeting` method on `MediaHandlerService`, as a metric label
+/// value.
 ///
-/// `internal.proto`'s service block is the single source of truth for this
-/// value set: ADR-0036 §8 makes meeting registration the control plane, so the
-/// service "gains FIELDS rather than sibling RPCs" and is expected to keep
-/// exactly one method. The
-/// `register`, `route_media` and `stream_telemetry` values retired with the
-/// 2026-09-01 reshape can never appear again — the proto's tombstone block
-/// forbids resurrecting the names.
+/// The `method` label's values are derived from `MediaHandlerService`'s method
+/// names (`internal.proto`'s service block names the method set); these
+/// `GRPC_METHOD_*` consts are the label vocabulary's home. ADR-0036 §8:
+/// FORWARDING POLICY gains fields rather than sibling RPCs, but meeting
+/// lifecycle teardown is a distinct concern with its own RPC, `EndMeeting`
+/// (story 2 R-20), so the service is no longer single-method.
+///
+/// **`end_meeting` is not emitted yet** — this handler answers `EndMeeting`
+/// `UNIMPLEMENTED` and records nothing for it — so an empty result for
+/// `method="end_meeting"` today is expected, not a scrape fault. Story-2 task 11
+/// restores the recorder's `method` parameter with a bounded vocabulary, adds
+/// `end_meeting` to [`zero_initialize_counters`] in the same commit, and
+/// re-tightens this comment. The `register`, `route_media` and
+/// `stream_telemetry` values retired with the 2026-09-01 reshape can never
+/// appear again — the proto's tombstone block forbids resurrecting the names.
 const GRPC_METHOD_REGISTER_MEETING: &str = "register_meeting";
 
 /// Record an incoming gRPC request from MC.
 ///
 /// Metric: `mh_grpc_requests_total`
-/// Labels: `method` (single value, bound by `GRPC_METHOD_REGISTER_MEETING`), `status` (success | error)
-/// Cardinality: 2
+/// Labels: `method` (only `GRPC_METHOD_REGISTER_MEETING` is emitted today; see
+/// that const for the value set and why `end_meeting` is not yet), `status`
+/// (success | error)
+/// Cardinality: 2 today (1 emitting method x 2 statuses); 4 = 2 emitting
+/// methods x 2 statuses once `end_meeting` emits
 ///
-/// The `method` label stays on the series — runbook queries and dashboard
-/// panels select on `method="register_meeting"`, and an absent label yields an
-/// empty result rather than an error, so removing it would silently blank them.
-/// The *parameter* is gone, which is what makes the single value structural: a
-/// second one cannot be introduced from a call site.
+/// This recorder deliberately takes no `method` parameter and so can ONLY
+/// count `register_meeting`: calling it from the `EndMeeting` path would forge
+/// the R-26 `RegisterMeeting` receipt signal. Story-2 task 11 restores the
+/// parameter; until then the `EndMeeting` stub records nothing.
 pub fn record_grpc_request(status: &str) {
     counter!(
         "mh_grpc_requests_total",
@@ -1513,9 +1524,10 @@ mod tests {
 
     #[test]
     fn test_record_grpc_request() {
-        // Both combinations: 1 method x 2 statuses. `MediaHandlerService` has
-        // exactly one RPC by design (ADR-0036 §8), and the method label value
-        // is now a const inside the recorder rather than a parameter.
+        // Both combinations this recorder can emit: 1 method x 2 statuses. The
+        // recorder takes no `method` parameter, so it covers `register_meeting`
+        // only; `end_meeting` is not emitted until story-2 task 11 restores the
+        // parameter (see `GRPC_METHOD_REGISTER_MEETING`).
         record_grpc_request("success");
         record_grpc_request("error");
     }

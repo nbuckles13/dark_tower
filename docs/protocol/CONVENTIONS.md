@@ -58,6 +58,29 @@ it escalates and a human decides.
 > **If you are the task-4 (`internal.proto`) implementer**: your break is *not*
 > covered by the entry above and Layer 6 will fire for you. Declare it the same
 > way and expect the same escalation.
+>
+> **Correction (2026-09-22, story 2 protocol contract).** Two sentences above are
+> no longer true, and they are corrected here rather than reworded in place.
+> "`internal.proto` and every other proto stay fully enforced" and "your break is
+> *not* covered by the entry above" were accurate on 2026-08-31. The task-4
+> escalation on 2026-09-01 did exactly what the second sentence anticipated: at
+> the user's decision it **extended the carve-out to `internal.proto`**, with 11
+> predicted and measured findings. `proto/buf.yaml`'s `breaking.ignore` now lists
+> **both** `dark_tower/signaling/v1/signaling.proto` and
+> `dark_tower/internal/v1/internal.proto`, and that file's own comment records the
+> extension. **So a green `buf breaking` is evidence for neither file until the
+> key is deleted after the story merges.** A reviewer who trusted the old text
+> would have read a clean Layer 6 as proof that an `internal.proto` diff is
+> additive. It proves nothing: the file is unenforced. To show a diff to either
+> file is additive while the key exists, derive an ignore-free config from
+> `proto/buf.yaml` and run it against a pinned ref, *paired with a positive
+> control that must produce findings*. A zero-finding run on its own cannot be
+> told apart from a mistyped ref or an ignored `--config`. The story-2 protocol
+> devloop output
+> (`docs/devloop-outputs/2026-09-22-hear-each-other-protocol-contract/main.md`
+> §Validation) records the working invocation and control. Do **not** narrow the
+> ignore list mid-story. `buf.yaml` explains why: precision returns when the whole
+> key is deleted.
 
 ## Rules
 
@@ -84,9 +107,11 @@ wire-compatible changes only. Wire-breaking changes get a new `vN+1` package.
 For each RPC `Foo`, the request type is `FooRequest` and the response type is
 `FooResponse` — **bare**, not service-prefixed.
 
-Concrete: the `RegisterParticipant` RPC on `MediaHandlerService` uses
-`RegisterParticipantRequest` / `RegisterParticipantResponse`, not
-`MediaHandlerServiceRegisterParticipantRequest`.
+Concrete: the `EndMeeting` RPC on `MediaHandlerService` uses
+`EndMeetingRequest` / `EndMeetingResponse`, not
+`MediaHandlerServiceEndMeetingRequest`. (This example previously named
+`RegisterParticipant`, which appeared only in `docs/API_CONTRACTS.md`'s retired
+§4.1 text and was never an RPC in `internal.proto`.)
 
 Each service's RPCs live under their own service block; cross-service name
 collisions don't happen in practice and bare names read cleaner at call sites.

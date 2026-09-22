@@ -138,6 +138,13 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinResponse {
             // Live meeting KEK (ADR-0036 §4).
             .field("meeting_kek", &RedactedLen(self.meeting_kek.len()))
             .field("kek_generation", &self.kek_generation)
+            // W: a duration, not key material -- in the clear, so an operator
+            // triaging the client's floor/ceiling substitution can see what MC
+            // sent.
+            .field(
+                "kek_rotation_debounce_seconds",
+                &self.kek_rotation_debounce_seconds,
+            )
             .finish()
     }
 }
@@ -148,6 +155,11 @@ impl fmt::Debug for dark_tower::signaling::v1::MeetingKekUpdate {
         f.debug_struct("MeetingKekUpdate")
             .field("meeting_kek", &RedactedLen(self.meeting_kek.len()))
             .field("kek_generation", &self.kek_generation)
+            // W: a duration, not key material (see `JoinResponse` above).
+            .field(
+                "kek_rotation_debounce_seconds",
+                &self.kek_rotation_debounce_seconds,
+            )
             .finish()
     }
 }

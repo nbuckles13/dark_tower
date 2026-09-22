@@ -256,6 +256,12 @@ impl MhClient {
             // — so `None` is the accurate statement, not a stub left unfilled.
             selection_rules: None,
             policy_generation: programming.policy_generation.get(),
+            // Empty is the TRUTHFUL value today, not a placeholder: MC does not
+            // yet program server mute into MH. Story-2 task 12 (MC server mute
+            // into MH policy) populates it, and must advance `policy_generation`
+            // whenever the set changes. An empty set is byte-identical to the
+            // pre-R-9 wire.
+            server_muted_sources: Vec::new(),
         };
 
         let grpc_request = self.add_auth(request)?;
@@ -559,6 +565,7 @@ mod tests {
             egress_streams: build_egress_streams(p.assignment),
             selection_rules: None,
             policy_generation: p.policy_generation.get(),
+            server_muted_sources: Vec::new(),
         };
         // `RegisterMeetingRequest` has no bytes-typed field at all, so this is
         // structural rather than a scan: there is nowhere for a key to go.

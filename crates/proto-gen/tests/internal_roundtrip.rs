@@ -30,6 +30,21 @@
 //!   read is indistinguishable from a correct sample until a SECOND PROCESS
 //!   INCARNATION SHARING A POD IDENTITY exists. Split: within-process stability
 //!   at story task 5, changes-on-restart at the handler-restart story.
+//!
+//! Story 2 adds four more, owned by the MH tasks that implement them and
+//! expressible only against a running handler:
+//!
+//! - **`server_muted_sources` duplicate and count-bound rejects**
+//!   (`RegisterMeetingRequest.server_muted_sources`): whether MH rejects BEFORE
+//!   building a routing table is a property of the handler, not of the wire.
+//! - **`EndMeeting` compares against the most recent validation-passing
+//!   registration's `mc_id`, not gated on its generation outcome**: needs a
+//!   handler holding registration state.
+//! - **`EndMeeting` forgets the applied generation**: needs a re-registration
+//!   after release on the same handler.
+//! - **A mismatch is `FAILED_PRECONDITION`, not an `acknowledged: false`
+//!   reply**: a status is not a message field. What this crate CAN pin is why
+//!   the rule exists — see `default_end_meeting_response_is_not_an_acknowledgement`.
 
 // Test code: a failed decode IS the failure signal here, so panicking is the
 // assertion mechanism rather than a defect.
@@ -51,8 +66,9 @@
 )]
 
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, NotifyParticipantConnectedResponse, RegisterMeetingRequest,
-    RegisterMeetingResponse, SelectionRules, SubscriberSlot,
+    CandidateSource, EgressStream, EndMeetingRequest, EndMeetingResponse, MutedSource,
+    NotifyParticipantConnectedResponse, RegisterMeetingRequest, RegisterMeetingResponse,
+    SelectionRules, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use proto_gen::Message;
@@ -98,6 +114,7 @@ fn egress_stream_carries_edge_and_behaviours_in_one_message() {
         }],
         selection_rules: Some(SelectionRules {}),
         policy_generation: 7,
+        server_muted_sources: vec![],
     };
 
     let decoded = roundtrip(&req);
@@ -132,6 +149,7 @@ fn empty_egress_stream_set_is_legal_and_survives() {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 1,
+        server_muted_sources: vec![],
     };
 
     let decoded = roundtrip(&req);
@@ -154,6 +172,7 @@ fn selection_rules_presence_is_distinguishable_from_absence() {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 1,
+        server_muted_sources: vec![],
     };
 
     let absent = roundtrip(&base);
@@ -190,6 +209,7 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 7,
+        server_muted_sources: vec![],
     });
 
     let echoed = roundtrip(&RegisterMeetingResponse {
@@ -360,5 +380,145 @@ fn default_response_decodes_to_the_fail_closed_reading() {
     assert!(
         !defaulted.acknowledged,
         "a defaulted response is not an acknowledgement either"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Story 2: server mute on the snapshot (R-9) and meeting teardown (R-20)
+// ---------------------------------------------------------------------------
+
+/// Top-level field numbers present in an encoded message, in wire order.
+///
+/// Derived from the bytes rather than compared against a golden vector, so the
+/// assertion below cannot be satisfied by a stale expectation. Handles the two
+/// wire types `RegisterMeetingRequest` uses at top level (varint and
+/// length-delimited) and fails loudly on anything else rather than guessing.
+fn top_level_field_numbers(mut bytes: &[u8]) -> Vec<u64> {
+    /// `None` on a truncated or over-long (more than 64-bit) varint.
+    fn varint(buf: &mut &[u8]) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let (byte, rest) = buf.split_first()?;
+            *buf = rest;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+    let mut fields = Vec::new();
+    while !bytes.is_empty() {
+        let key = varint(&mut bytes).expect("valid field key");
+        let wire_type = key & 0x7;
+        assert!(
+            wire_type == 0 || wire_type == 2,
+            "unexpected wire type {wire_type} at top level"
+        );
+        fields.push(key >> 3);
+        if wire_type == 0 {
+            varint(&mut bytes).expect("valid varint field value");
+        } else {
+            let len = usize::try_from(varint(&mut bytes).expect("valid length prefix"))
+                .expect("length fits usize");
+            bytes = bytes
+                .get(len..)
+                .expect("length-delimited field within buffer");
+        }
+    }
+    fields
+}
+
+fn populated_request(muted: Vec<MutedSource>) -> RegisterMeetingRequest {
+    RegisterMeetingRequest {
+        meeting_id: "meeting-1".to_string(),
+        mc_id: "mc-1".to_string(),
+        mc_grpc_endpoint: "http://mc:50052".to_string(),
+        egress_streams: vec![EgressStream {
+            egress_stream_id: 1,
+            subscriber: Some(SubscriberSlot {
+                sender_id: 2,
+                slot_id: 0,
+            }),
+            candidate_sources: vec![CandidateSource {
+                sender_id: 3,
+                stream_number: 0,
+            }],
+            priority_group: 1,
+            supersede_on_independent_frame: false,
+            transport_mode: TransportMode::Datagram as i32,
+        }],
+        selection_rules: None,
+        policy_generation: 4,
+        server_muted_sources: muted,
+    }
+}
+
+/// The muted set survives by VALUE and ORDER, with more than one entry — a
+/// single-element case cannot catch repeated-field handling defects.
+#[test]
+fn server_muted_sources_roundtrip_by_value_and_order() {
+    let decoded = roundtrip(&populated_request(vec![
+        MutedSource { sender_id: 9 },
+        MutedSource { sender_id: 2 },
+        MutedSource { sender_id: 65535 },
+    ]));
+    let muted: Vec<u32> = decoded
+        .server_muted_sources
+        .iter()
+        .map(|m| m.sender_id)
+        .collect();
+    assert_eq!(muted, vec![9, 2, 65535]);
+    // The additive field does not disturb the policy it rides with.
+    assert_eq!(decoded.policy_generation, 4);
+    assert_eq!(decoded.egress_streams.len(), 1);
+}
+
+/// An EMPTY muted set puts NOTHING on the wire for field 7, so it is
+/// byte-identical to a pre-R-9 MC that never heard of the field — which is why
+/// the contract can say the older-MC reading is the correct one ("nobody
+/// muted"), not a degraded one. Checked structurally from the bytes, not
+/// against a golden.
+#[test]
+fn empty_muted_set_emits_no_field_7_and_a_populated_one_does() {
+    let empty = top_level_field_numbers(&populated_request(Vec::new()).encode_to_vec());
+    assert!(
+        !empty.contains(&7),
+        "empty set must emit no field 7: {empty:?}"
+    );
+    // Positive control: the walker genuinely sees the other fields, so an empty
+    // result cannot be mistaken for "saw nothing".
+    assert!(empty.contains(&1) && empty.contains(&4) && empty.contains(&6));
+
+    let populated = top_level_field_numbers(
+        &populated_request(vec![MutedSource { sender_id: 5 }]).encode_to_vec(),
+    );
+    assert!(populated.contains(&7), "a populated set must emit field 7");
+}
+
+#[test]
+fn end_meeting_request_roundtrips() {
+    let out = roundtrip(&EndMeetingRequest {
+        meeting_id: "meeting-1".to_string(),
+        mc_id: "mc-7".to_string(),
+    });
+    assert_eq!(out.meeting_id, "meeting-1");
+    assert_eq!(out.mc_id, "mc-7");
+}
+
+/// Why an `mc_id` mismatch is a gRPC error status and never
+/// `acknowledged: false`: the default-decoded response IS `false`. An empty
+/// reply — including an older peer's — must not be readable as a deliberate
+/// refusal, and a refusal must not be readable as an empty reply.
+#[test]
+fn default_end_meeting_response_is_not_an_acknowledgement() {
+    let empty = EndMeetingResponse::decode(&[][..]).expect("empty decodes");
+    assert!(!empty.acknowledged);
+
+    let acked = roundtrip(&EndMeetingResponse { acknowledged: true });
+    assert!(acked.acknowledged);
+    assert_ne!(
+        EndMeetingResponse { acknowledged: true }.encode_to_vec(),
+        Vec::<u8>::new()
     );
 }

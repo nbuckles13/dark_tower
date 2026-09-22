@@ -210,7 +210,14 @@ pub fn build_stream_assignments(
     }
 
     SlotComposition {
-        assignments: StreamAssignments { assignments },
+        assignments: StreamAssignments {
+            assignments,
+            // Empty is truthful today: every edge is placed on the meeting's
+            // first handler, so no roster participant is on a different handler
+            // from any subscriber. Story-2 task 6 (per-handler placement and the
+            // unreachable set) populates it.
+            unreachable_sender_ids: Vec::new(),
+        },
         slot_states,
         unmatched_plan_slots: planned.len().saturating_sub(matched_plan_slots),
     }

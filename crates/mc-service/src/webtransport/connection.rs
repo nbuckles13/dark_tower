@@ -2335,6 +2335,12 @@ async fn build_join_response(
             // not a sentinel: the not-provisioned signal is `meeting_kek` not
             // being exactly 32 bytes, so never gate on `kek_generation != 0`.
             kek_generation: u32::from(result.kek_generation),
+            // W. Zero until story-2 task 9 (MC KEK lifecycle) reads
+            // `MC_KEK_ROTATION_DEBOUNCE_SECONDS`. Zero is exactly the contract's
+            // older-MC observable: the client substitutes its floor, counts it
+            // and warns, never hard-fails -- and today there is no rotation for
+            // retention to serve.
+            kek_rotation_debounce_seconds: 0,
             correlation_id: result.correlation_id.clone(),
             binding_token: result.binding_token.clone(),
         },

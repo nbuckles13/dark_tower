@@ -133,6 +133,7 @@ fn stream_assignment_roundtrips_full_attribution_shape() {
             slot_state: SlotState::Active as i32,
             switch_command_id: None,
         }],
+        unreachable_sender_ids: Vec::new(),
     };
 
     let out = roundtrip(&assignments);
@@ -308,6 +309,7 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
         sender_id: Some(65535),
         meeting_kek: kek.clone(),
         kek_generation: 65535,
+        kek_rotation_debounce_seconds: 0,
     });
 
     assert_eq!(out.sender_id, Some(65535));
@@ -382,9 +384,90 @@ fn meeting_kek_update_roundtrips() {
     let out = roundtrip(&MeetingKekUpdate {
         meeting_kek: kek.clone(),
         kek_generation: 7,
+        kek_rotation_debounce_seconds: 0,
     });
     assert_eq!(out.meeting_kek, kek);
     assert_eq!(out.kek_generation, 7);
+}
+
+// ---------------------------------------------------------------------------
+// Story 2: W on the wire (R-14) and the per-subscriber unreachable set (R-33)
+// ---------------------------------------------------------------------------
+
+/// W survives by VALUE on both carriers. Distinct values per carrier, so a
+/// codegen slip that wired one message's field to the other's tag reds here.
+#[test]
+fn kek_rotation_debounce_seconds_roundtrips_on_both_carriers() {
+    let join = roundtrip(&JoinResponse {
+        participant_id: "p-1".to_string(),
+        kek_rotation_debounce_seconds: 60,
+        ..Default::default()
+    });
+    assert_eq!(join.kek_rotation_debounce_seconds, 60);
+
+    let push = roundtrip(&MeetingKekUpdate {
+        meeting_kek: vec![0x77u8; 32],
+        kek_generation: 3,
+        kek_rotation_debounce_seconds: 45,
+    });
+    assert_eq!(push.kek_rotation_debounce_seconds, 45);
+    // The additive field does not disturb its neighbours.
+    assert_eq!(push.kek_generation, 3);
+}
+
+/// Zero and absent are ONE observable (a non-optional scalar), which is exactly
+/// why the contract makes the client floor-substitute on either: an older MC
+/// that never sends the field is indistinguishable from one sending 0. If this
+/// field ever becomes `optional`, this test's premise changes and the client's
+/// "zero-or-absent" rule must be re-read.
+#[test]
+fn kek_rotation_debounce_seconds_absent_and_zero_are_one_observable() {
+    let absent = roundtrip(&MeetingKekUpdate {
+        meeting_kek: vec![0x77u8; 32],
+        kek_generation: 3,
+        ..Default::default()
+    });
+    let zero = roundtrip(&MeetingKekUpdate {
+        meeting_kek: vec![0x77u8; 32],
+        kek_generation: 3,
+        kek_rotation_debounce_seconds: 0,
+    });
+    assert_eq!(absent.kek_rotation_debounce_seconds, 0);
+    assert_eq!(absent.encode_to_vec(), zero.encode_to_vec());
+}
+
+/// More than one entry, values AND order checked: a single-element case cannot
+/// catch repeated-field handling defects.
+#[test]
+fn unreachable_sender_ids_roundtrip_by_value_and_order() {
+    let out = roundtrip(&StreamAssignments {
+        assignments: vec![StreamAssignment {
+            slot_id: 1,
+            sender_id: Some(3),
+            media_kind: MediaKind::Audio as i32,
+            media_handler_url: "https://mh-0.example/mh".to_string(),
+            slot_state: SlotState::Active as i32,
+            switch_command_id: None,
+        }],
+        unreachable_sender_ids: vec![9, 2, 65535],
+    });
+    assert_eq!(out.unreachable_sender_ids, vec![9, 2, 65535]);
+    assert_eq!(out.assignments.len(), 1);
+}
+
+/// The contract says a message MAY carry zero assignments and a non-empty
+/// unreachable set ("everyone else is on another handler"). That shape must be
+/// well-formed on the wire, not collapse into an empty message.
+#[test]
+fn unreachable_set_survives_with_zero_assignments() {
+    let msg = StreamAssignments {
+        assignments: Vec::new(),
+        unreachable_sender_ids: vec![4, 5],
+    };
+    assert!(!msg.encode_to_vec().is_empty());
+    let out = roundtrip(&msg);
+    assert!(out.assignments.is_empty());
+    assert_eq!(out.unreachable_sender_ids, vec![4, 5]);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +574,36 @@ fn error_code_zero_keeps_its_number_and_meaning() {
 // ---------------------------------------------------------------------------
 // Redaction (the control stood up in build.rs + lib.rs)
 // ---------------------------------------------------------------------------
+
+/// W is added to both hand-written redacting `Debug` impls: it must render in
+/// the clear (it is a duration, and the operator triaging a floor/ceiling
+/// substitution needs it) while the KEK beside it stays a length placeholder.
+/// Pins both halves, because the impls are hand-maintained field lists with no
+/// compiler-enforced exhaustiveness.
+#[test]
+fn debug_shows_w_in_the_clear_and_still_redacts_the_kek() {
+    let join = JoinResponse {
+        meeting_kek: vec![0xC3u8; 32],
+        kek_rotation_debounce_seconds: 60,
+        ..Default::default()
+    };
+    let push = MeetingKekUpdate {
+        meeting_kek: vec![0xC3u8; 32],
+        kek_generation: 2,
+        kek_rotation_debounce_seconds: 45,
+    };
+    for (rendered, w) in [(format!("{join:?}"), 60), (format!("{push:?}"), 45)] {
+        assert!(
+            rendered.contains(&format!("kek_rotation_debounce_seconds: {w}")),
+            "W must be visible: {rendered}"
+        );
+        assert!(rendered.contains("<redacted 32 B>"));
+        assert!(
+            !rendered.contains("195, 195"),
+            "KEK bytes must not be printed"
+        );
+    }
+}
 
 #[test]
 fn debug_never_prints_the_meeting_kek() {
@@ -651,6 +764,7 @@ fn debug_redaction_survives_the_enclosing_envelope() {
             MeetingKekUpdate {
                 meeting_kek: vec![0xC3u8; 32],
                 kek_generation: 1,
+                kek_rotation_debounce_seconds: 60,
             },
         )),
         trace_parent: String::new(),

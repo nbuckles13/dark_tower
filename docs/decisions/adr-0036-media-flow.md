@@ -471,15 +471,18 @@ requires. Nothing needs to coordinate which stream numbers are live.
 
 | Trigger | Rule |
 |---|---|
-| Participant leaves | **MC rotates the KEK, debounced to at most once per W** measured from the oldest un-rotated leave; departures inside one window coalesce. **A leaver is bounded by W and by nothing else**: holding the KEK, it unwraps every new transmit key as it is carried, so transmit-key rotation does not shorten this window. It receives no media from MH after leaving, so W bounds damage only where ciphertext was captured in transit. **W is configuration**, defaulting to the order of a minute. |
+| Participant leaves | **MC rotates the KEK, debounced to at most once per W** measured from the oldest un-rotated leave; departures inside one window coalesce. **A leaver is bounded by W**, and only because senders rotate transmit keys when the KEK rotates (below). Holding the old KEK, it unwraps every new transmit key carried before the rotation lands, so the ordinary transmit-key cadence does not shorten the window; and because receivers cache the unwrapped key, re-wrapping alone would not end the leaver's access either — the sender has to move to a key the leaver never held. It receives no media from MH after leaving, so W bounds damage only where ciphertext was captured in transit. **W is configuration**, defaulting to the order of a minute. |
 | Participant joins | **No action on any existing member.** The joiner receives the current KEK and unwraps each sender's key from that sender's next key-bearing frame. **Backward secrecy is bounded by the last KEK rotation, not by join**: a joiner who captured ciphertext before joining holds key-bearing frames, and the KEK it is handed unwraps them. Same caveat as the leave case — it requires ciphertext obtained outside the media path — and closing it would mean rotating the KEK on every join, the O(N) coordination this design exists to avoid. Accepted and stated. |
 | Transmit-key cadence | Senders rotate transmit keys **on every video group and every T for audio**, because rotation is free. What this bounds is a **leaked transmit key** — one group or one T of media — and counter hygiene. It bounds nothing for a KEK holder, joiner or leaver, since every new key is carried under the KEK. |
+| Meeting KEK rotated | Every sender rotates its transmit keys on receipt of a new KEK. Rotation is O(1), involves nobody else and needs no signalling, so this costs nothing. Without it the leave bound above is false: a departed member keeps decrypting from the unwrapped transmit keys it cached before the rotation, and re-wrapping under the new KEK cannot revoke a key the leaver already holds in plaintext. This row is what makes the leave row's W bound true. |
 | Sender resumes from empty | Rotate the transmit key. For video this coincides with the resume keyframe (§5); for audio it is the same generation bump without one. |
 | Counter exhaustion | Rotate the transmit key before the stream sequence wraps. |
 | Reconnect (same process, transport dropped) | MC re-issues the current KEK; the sender rotates its transmit keys rather than resuming counters. |
 | Fresh join after lost state | **Identity key, token, and generation counter share one lifetime.** Losing any means a fresh join with a fresh identity, which is a new key-id namespace; no continuity is attempted. |
 | MC migration (ADR-0023) | The new owner generates a fresh KEK; clients receive it on re-attach. MC state is in memory and moves with ownership. |
 | MH failover or reassignment | **Not a trigger.** MH never held keys. |
+
+> **Correction (2026-09-22, story 2 planning).** The leave row previously read 'bounded by W and by nothing else'. That reasoning tracked only the wrapped key and missed the cached plaintext: receivers cache the unwrapped transmit key, so a leaver continued to decrypt after the rotation until each sender's next generation bump — a bound of W plus one transmit-key interval, with that interval unconfigured anywhere in the tree. A reader who trusted the original would have stated an exposure window shorter than the one the system delivered. The fix is the new trigger row rather than a weaker claim, because sender rotation is free and restores the bound as written.
 
 **Rate-limit rotation per participant and evict flappers.** A client in a reconnect loop must not be
 able to force a KEK rotation per cycle; the leave debounce covers that, and the per-sender generation
@@ -560,8 +563,7 @@ configuration, not design.
 - **Frames in flight across a rotation**: receivers retain the previous KEK and the previous
   transmit-key generation for a bounded window, which is part of the leave-exposure figure.
 - **Both membership bounds are KEK bounds.** A leaver decrypts forward until the next KEK rotation
-  (≤ W); a joiner with captured ciphertext decrypts backward to the last one. Transmit-key rotation
-  does not tighten either.
+  (≤ W); a joiner with captured ciphertext decrypts backward to the last one. The ordinary transmit-key cadence tightens neither; the KEK-triggered rotation above is what closes the leaver's forward window, and nothing closes the joiner's backward one short of rotating on every join, which this design exists to avoid.
 - **W, N, and T have no measurement behind them.** Configuration, with stated defaults.
 
 ### Identity keys must be AC-attested, and clients must check
@@ -856,6 +858,16 @@ back.
 request gains the selector, per-egress-stream behaviours, priority groups, transport mode, and server
 mute (§7) — plus a **generation** number, monotonic per (meeting, handler) and derived from the assignment
 computation's *output change*, never free-running.
+
+**Forwarding policy gains fields, not sibling RPCs; meeting teardown is a separate RPC.** Anything
+that changes *what MH forwards* — edges, behaviours, priority groups, transport mode, server mute,
+selection rules — rides the one full-snapshot registration, so a re-assert remains the whole
+recovery story and there is no second policy channel to order against it. Releasing a meeting's
+handler resources when it ends is a different concern, and it gets its own RPC (`EndMeeting`, added
+by story 2 for R-20) rather than an overloaded registration: an empty edge set is already a
+meaningful policy ("forward nothing"), so it cannot also mean "this meeting is over". The internal
+contract and its derived documents previously described registration as the service's only RPC by
+design. That invariant is narrowed here to forwarding policy, not dropped.
 
 MC re-fires on four triggers:
 
@@ -1397,7 +1409,11 @@ signalling changes rather than separately.
 transcoding-mixer relay that cannot exist under end-to-end encryption and is called from nowhere.
 Registration survives and *is* the control plane (§8): it gains the selector, selection rules, and
 per-egress-stream behaviours carrying priority group, supersede-on-independent-frame, transport mode,
-and server mute — plus a generation derived from assignment output change. Its response gains the
+and server mute — plus a generation derived from assignment output change. Server mute rides the
+snapshot as a meeting-level, sender-scoped set: MH cannot read or authenticate a publisher's stream
+number, so a per-stream mute would be enforced nowhere. Forwarding policy gains fields, not sibling
+RPCs. Meeting teardown is the one lifecycle RPC beside registration (`EndMeeting`, §8), which
+releases a handler's routing state and edge budget and carries no policy. Its response gains the
 handler identifier, a process-start epoch, and the **applied** generation. A slot-state notification
 carries §6's states plus §7's switch-completion reports keyed by command identifier, debounced by MH.
 
@@ -1430,6 +1446,8 @@ transmit-key material **in logs**.
 > implementation). Until it exists, the enforcement is that no key-shaped field exists on
 > the MC→MH contract and that reintroducing one is a review failure — reviewer-enforced,
 > not structural, and named as the weaker form it is.
+>
+> **Partly superseded 2026-09-22 (story 2).** The direct case is now structural for `internal.proto`: `scripts/guards/simple/validate-internal-proto-no-key-material.sh` rejects any `bytes` field, any cross-package type other than an allowlisted enum, and any import outside its allowlist. The general `.proto` scanner is still absent and its `docs/TODO.md` entry stays open.
 
 ## Addendum — Planned Story Arc
 

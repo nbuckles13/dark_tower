@@ -19,7 +19,7 @@
 - Cross-language v2 frame SSoT (Rust+TS codecs conform) → `proto/test-vectors/frame-v2.vectors.json`; external sframe-wg vectors → `proto/test-vectors/external/sframe-wg/`; non-prod reference generator → `crates/media-vector-gen/`; SDK conforming codec → `packages/sdk-core/src/media/frame/`; drift guard wired via ADR-0033
 
 ## gRPC Services (all in `proto/dark_tower/internal/v1/internal.proto`)
-- MediaHandlerService (MC→MH): **RegisterMeeting only** — one RPC by design (ADR-0036 §8: registration IS the control plane and gains fields, not sibling RPCs). `Register`, `RouteMedia`, `StreamTelemetry` retired 2026-09-01; tombstone block in the proto
+- MediaHandlerService (MC→MH): RegisterMeeting + EndMeeting — forwarding policy gains fields, not sibling RPCs (ADR-0036 §8); teardown is its own RPC (story 2 R-20; mc_id-mismatch → FAILED_PRECONDITION, not an authz control). `Register`, `RouteMedia`, `StreamTelemetry` retired 2026-09-01; tombstone block in the proto
 - MediaCoordinationService (MH→MC): NotifyParticipantConnected/Disconnected — `NotifyParticipantConnectedResponse` carries the participant→`sender_id` binding (load-bearing gate on MH media accept, R-15); MC builder → `crates/mc-service/src/media_admission/binding_response.rs`; MH validates via `crates/mh-service/src/routing/mod.rs`→`SenderId::from_wire()`, bound single-sourced at `media_protocol::frame::KEY_ID_SENDER_ID_BITS` (no `common` helper)
 - MeetingControllerService (GC→MC): AssignMeetingWithMh
 - GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat
@@ -27,7 +27,7 @@
 - DisconnectReason enum (bounded for metrics)
 
 ## ADR-0036 MC→MH Control Plane (internal.proto, 2026-09-01 reshape)
-One RPC by design; all shapes in `proto/dark_tower/internal/v1/internal.proto`.
+All shapes in `internal.proto`. No-key-material rule → its header + `scripts/guards/simple/validate-internal-proto-no-key-material.sh`; server mute → `MutedSource`; teardown → `EndMeetingRequest`
 - Self-contained forwarding instruction (§6; NOT parallel lists) → `EgressStream`; empty-but-named meeting-level rules → `SelectionRules`
 - `sender_id`-is-meeting-scoped MUST (no global index; malformed rejects, not-yet-connected holds) → `SubscriberSlot`; key-id-pair source ref, not `MediaStream` (§7 type-blind) → `CandidateSource`
 - Output-derived generation, three-"generation" trap list, task-5/6 ordering constraint → `RegisterMeetingRequest.policy_generation`
@@ -53,6 +53,7 @@ All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
 - Send directive (transport mode, NOT §7 priority group) → `SendDirective`/`SendTarget`
 - Slot assignment, attribution chain, switch-pending command id → `StreamAssignment`
 - `sender_id` contract (1..=65535, zero invalid) → `JoinResponse.sender_id`; meeting KEK + generation → `JoinResponse.meeting_kek`, `MeetingKekUpdate`
+- W carried on the wire, retention `min(W/2, ceiling)` derived at client → `JoinResponse.kek_rotation_debounce_seconds`; per-subscriber cross-handler set → `StreamAssignments.unreachable_sender_ids`; ZERO_REQUESTED/SOURCE_UNREACHABLE retained-unemitted → `SlotState`
 - Roster identity key (no attestation yet) → `Participant.identity_public_key`; client- vs server-mute (§5) → `MuteRequest`/`ServerMuteRequest`
 - Redacting `Debug` → `crates/proto-gen/build.rs`, `src/lib.rs`; wire-shape tests → `crates/proto-gen/tests/signaling_roundtrip.rs`
 - Codegen oracle (presence + absence, both protos) → `packages/proto-gen/scripts/verify-codegen.sh`; SDK codec vocabulary → `packages/sdk-core/src/signaling/codecMap.ts`

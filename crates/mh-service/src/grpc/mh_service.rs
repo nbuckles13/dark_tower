@@ -2,8 +2,10 @@
 //!
 //! Implements the MC→MH gRPC service from `internal.proto`.
 //!
-//! **One RPC by design** (ADR-0036 §8): `RegisterMeeting` *is* the MC→MH
-//! control plane and gains fields rather than sibling RPCs. The `Register`,
+//! **Forwarding policy gains fields, not sibling RPCs** (ADR-0036 §8):
+//! `RegisterMeeting` *is* the MC→MH control plane. Meeting lifecycle teardown is
+//! a distinct concern with its own RPC, `EndMeeting` (story 2 R-20), which this
+//! handler answers `UNIMPLEMENTED` until story-2 task 11. The `Register`,
 //! `RouteMedia` and `StreamTelemetry` stubs were retired with the 2026-09-01
 //! `internal.proto` reshape; see the tombstone block in that file.
 //!
@@ -53,7 +55,9 @@ use crate::routing::MeetingPolicy;
 use crate::session::{ApplyOutcome, MeetingRegistration, SessionManagerHandle};
 use common::observability::labels::KEY_CUSTODY_OPERATOR;
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerService;
-use proto_gen::dark_tower::internal::v1::{RegisterMeetingRequest, RegisterMeetingResponse};
+use proto_gen::dark_tower::internal::v1::{
+    EndMeetingRequest, EndMeetingResponse, RegisterMeetingRequest, RegisterMeetingResponse,
+};
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
@@ -344,6 +348,32 @@ impl MediaHandlerService for MhMediaService {
 
         Ok(Response::new(response))
     }
+
+    /// Release a meeting's handler resources (ADR-0036 §8, story 2 R-20).
+    ///
+    /// **Not implemented yet — answers `UNIMPLEMENTED`, deliberately.** The
+    /// contract (`internal.proto`, `EndMeetingRequest`) landed in the protocol
+    /// task; the release, the `mc_id` ownership check and the reclamation land
+    /// in story-2 task 11 (MH `EndMeeting` teardown). `UNIMPLEMENTED` is the
+    /// contract's own rollback observable, which MC counts and does not retry,
+    /// so an MC that calls early degrades to today's never-reclaimed behaviour
+    /// rather than to a false acknowledgement.
+    ///
+    /// **Records no metric, and must not call `metrics::record_grpc_request`
+    /// here.** That recorder hard-codes `method="register_meeting"`, so calling
+    /// it would count every teardown as a `RegisterMeeting` receipt — forging the
+    /// R-26 receipt signal `mh_grpc_requests_total{method="register_meeting"}`
+    /// exists to be. Task 11 gives the recorder its `method` parameter, adds
+    /// `end_meeting` to `zero_initialize_counters()` in the same commit, and
+    /// instruments this path.
+    async fn end_meeting(
+        &self,
+        _request: Request<EndMeetingRequest>,
+    ) -> Result<Response<EndMeetingResponse>, Status> {
+        Err(Status::unimplemented(
+            "EndMeeting is not implemented by this media handler yet (story-2 task 11)",
+        ))
+    }
 }
 
 /// Bridge the actor's outcome to the metric's bounded label set.
@@ -433,6 +463,7 @@ mod tests {
             egress_streams: Vec::new(),
             selection_rules: None,
             policy_generation: 0,
+            server_muted_sources: Vec::new(),
         })
     }
 
@@ -442,6 +473,36 @@ mod tests {
         streams: Vec<EgressStream>,
     ) -> Request<RegisterMeetingRequest> {
         Request::new(register_request(meeting_id, generation, streams))
+    }
+
+    // =======================================================================
+    // Story 2 R-20: the `EndMeeting` stub's two load-bearing properties
+    // =======================================================================
+
+    /// Until story-2 task 11 implements release, `EndMeeting` MUST answer
+    /// `UNIMPLEMENTED`, which is the contract's rollback observable that MC
+    /// counts and does not retry. It must not return a false acknowledgement,
+    /// and it must NOT touch `mh_grpc_requests_total`. That recorder
+    /// hard-codes `method="register_meeting"`, so a call here would forge the
+    /// R-26 `RegisterMeeting` receipt signal. Task 11 replaces this test with
+    /// real release assertions.
+    #[tokio::test]
+    async fn end_meeting_stub_is_unimplemented_and_forges_no_register_meeting_receipt() {
+        use common::observability::testing::MetricAssertion;
+
+        let snap = MetricAssertion::snapshot();
+        let (svc, _sm) = make_service();
+
+        let status = svc
+            .end_meeting(Request::new(EndMeetingRequest {
+                meeting_id: "meeting-1".to_string(),
+                mc_id: "mc-1".to_string(),
+            }))
+            .await
+            .expect_err("the stub must not acknowledge");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+        snap.counter("mh_grpc_requests_total").assert_unobserved();
     }
 
     // =======================================================================

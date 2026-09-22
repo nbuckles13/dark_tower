@@ -410,7 +410,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       // NOT attested and NOT trusted by MC — it publishes what the client sent,
       // trust on first use. A signature verifying against it proves only that
       // every frame came from the same keyholder, never WHO. The client-validated
-      // AC attestation that closes this is story 2.
+      // AC attestation that closes this is the attestation story (ADR-0036 addendum).
       ...(params.identityPublicKey !== undefined
         ? { identityPublicKey: params.identityPublicKey }
         : {}),

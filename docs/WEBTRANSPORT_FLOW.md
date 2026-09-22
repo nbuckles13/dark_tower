@@ -549,7 +549,7 @@ const encodedFrame = encodeMediaFrame({
   flags: { independentlyDecodable: true, discardable: false, keyBearing: true },
   streamSequence: streamSequence++,   // per (sender, stream); NEVER reset — AEAD nonce input
   wrappedTransmitKey: wrapped,        // present iff keyBearing (§4)
-  extensions: [],                     // publisher-set TLV (§7); loopback carries none
+  extensions: [],                     // publisher-set TLV (§7); audio carries none today
   streamId,                           // relay region: subscriber slot
   hopSequence: hopSequence++,         // relay region: per (connection, media stream)
   payload: sframeObject,              // opaque SFrame object
