@@ -731,6 +731,24 @@ If a session is interrupted, restart the devloop from the beginning. The main.md
 
 Exception — headless infra interruptions (session limit, crash): the run-story runner relaunches the task as `/devloop --continue={slug}` even though the devloop never completed. Treat main.md's Loop State as authoritative: respawn the roster, finish the incomplete phases, then gates and commit as normal — **including the Step 5 tier gate, resolved from the Loop State `Tier` row per Continue Mode step 5 (no `Tier` row ⇒ full)**, so a crashed light-tier task does not silently re-run the Gate-1 plan round it was meant to skip (nor a crashed full-tier task silently skip it).
 
+### Host-infra precondition the self-heal cannot resolve
+
+Layer 7's self-heal (`scripts/layer7.sh`, `SELF_HEAL_*`) attempts exactly ONE bounded in-container fix for a `cluster-unhealthy` failure — `dev-cluster recreate` (recreate-once, host-side re-confirmation of control-plane-dead before it destroys) for a dead control plane, `dev-cluster restore-kubeconfig` (restore only, never destroy) for a stale/missing container kubeconfig. When it cannot recover — `STATUS=PRECONDITION_FAILURE REASON=cluster-self-heal-failed` (the fix ran and the cluster is still unhealthy), `cluster-self-heal-probe-inconclusive` (couldn't classify, or the host refused a destroy), or `helper-unreachable` — the remaining action is HOST infrastructure the container cannot perform: recreate the Kind cluster from the host, restart the ADR-0030 helper, or reclaim host disk.
+
+**This escalates to the OPERATOR/HOST, not the `operations` reviewer agent.** The operations specialist runs inside the devloop container and cannot create/destroy Kind clusters, restart the host-side helper, or touch host disk — routing a host-infra precondition to it is a dead end. Do NOT retry the self-heal: the destructive recreate is bounded once per session by design (a second automated attempt is the operator-loop the bound exists to prevent).
+
+- **Interactive**: surface the failure to the user (the operator) with the recover-a-dead-cluster path below.
+- **Headless** (`DEVLOOP_HEADLESS`): write `.devloop-escalation.json` (Step 6 contract) with `"reason": "host-op-needed"` (or `"precondition-failure"`) and end the session. The run-story runner records the escalation and stops the story for operator intervention; it does not route a host-op to the operations agent.
+
+**Recover-a-dead-cluster (operator/host):**
+1. Inspect: `dev-cluster status` (from the container) + the helper logs and the self-heal's pre-destroy `EVIDENCE=` bundle. **Path spelling matters here — the `/tmp/devloop/…` paths the container and the `EVIDENCE=`/log lines print are the CONTAINER view of a per-slug host mount; on the HOST the same files live under `/tmp/devloop-<slug>/`** (`infra/devloop/devloop.sh` bind-mounts host `/tmp/devloop-<slug>` → container `/tmp/devloop`). So the helper log is `/tmp/devloop-<slug>/helper.log` / `helper-stderr.log` on the host (= `/tmp/devloop/helper.log` inside the container), and the evidence bundle printed as `${DEVLOOP_TMP:-/tmp/devloop}/self-heal-evidence-*/` (present when `cluster-self-heal-failed` fired) is `/tmp/devloop-<slug>/self-heal-evidence-*/` on the host. Determine whether the helper is alive.
+2. Helper unreachable → restart it on the host: re-run `infra/devloop/devloop.sh`.
+3. Cluster dead, helper alive → `dev-cluster recreate` (the host verb the self-heal uses; it re-confirms the control plane is actually dead before destroying, and refuses if the cluster is alive — safe to run). Raw manual equivalent WITHOUT that re-confirmation: `dev-cluster teardown && dev-cluster setup` — only run that once you have confirmed by hand the cluster is genuinely dead. If the recreate itself failed, read the setup output first (disk exhaustion, cluster-name length, image build) before re-running.
+4. Kubeconfig missing/stale, cluster healthy → `dev-cluster restore-kubeconfig` (restore only; never teardown a healthy cluster).
+5. Re-run the devloop once `dev-cluster status` shows `Cluster exists: true` + `Pods healthy: true`.
+
+The token → REASON → fix mapping and the full `SELF_HEAL_*` recovery recipe live in `docs/runbooks/devloop-validation.md §6.7`.
+
 ## Files
 
 - **Specialist definitions**: `.claude/agents/{name}.md` (auto-loaded via `subagent_type`)

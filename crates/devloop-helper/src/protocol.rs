@@ -94,6 +94,13 @@ pub enum HelperCommand {
     Deploy(Service),
     /// Delete Kind cluster, clean up all state.
     Teardown,
+    /// Self-heal: destroy + recreate this slug's cluster, guarded by a host-side
+    /// re-confirmation that the control plane is genuinely down (ADR-0030 trust
+    /// boundary). Takes NO target argument — destroys only `ctx.cluster_name`.
+    Recreate,
+    /// Self-heal: regenerate ONLY the container kubeconfig from the live cluster
+    /// (non-destructive — reaches no teardown/delete/create path).
+    RestoreKubeconfig,
     /// Read-only health check: cluster exists, pods healthy, ports.json.
     Status,
     /// Interrupt the in-flight write handler (idempotent: no-op when idle).
@@ -132,6 +139,8 @@ impl HelperCommand {
             Self::RebuildAll => "rebuild-all",
             Self::Deploy(_) => "deploy",
             Self::Teardown => "teardown",
+            Self::Recreate => "recreate",
+            Self::RestoreKubeconfig => "restore-kubeconfig",
             Self::Status => "status",
             Self::Cancel => "cancel",
             #[cfg(test)]
@@ -156,7 +165,12 @@ impl HelperCommand {
                 }
             }
             Self::Rebuild(svc) | Self::Deploy(svc) => vec![svc.to_string()],
-            Self::RebuildAll | Self::Teardown | Self::Status | Self::Cancel => vec![],
+            Self::RebuildAll
+            | Self::Teardown
+            | Self::Recreate
+            | Self::RestoreKubeconfig
+            | Self::Status
+            | Self::Cancel => vec![],
             #[cfg(test)]
             Self::TestSleep { seconds } => vec![seconds.to_string()],
             #[cfg(test)]
@@ -177,7 +191,9 @@ impl HelperCommand {
             | Self::Rebuild(_)
             | Self::RebuildAll
             | Self::Deploy(_)
-            | Self::Teardown => true,
+            | Self::Teardown
+            | Self::Recreate
+            | Self::RestoreKubeconfig => true,
             Self::Status | Self::Cancel => false,
             // TestSleep is a write so the test stub exercises the real
             // write-lock + cancel-token + child-kill paths.
@@ -204,6 +220,8 @@ impl fmt::Display for HelperCommand {
             Self::RebuildAll => write!(f, "rebuild-all"),
             Self::Deploy(svc) => write!(f, "deploy {svc}"),
             Self::Teardown => write!(f, "teardown"),
+            Self::Recreate => write!(f, "recreate"),
+            Self::RestoreKubeconfig => write!(f, "restore-kubeconfig"),
             Self::Status => write!(f, "status"),
             Self::Cancel => write!(f, "cancel"),
             #[cfg(test)]
@@ -239,6 +257,32 @@ pub struct Request {
 }
 
 impl Request {
+    /// Reject ANY argument beyond `token`+`command` for the no-arg self-heal
+    /// verbs (`recreate`, `restore-kubeconfig`).
+    ///
+    /// Written as an EXHAUSTIVE destructure of `Request` on purpose (@security
+    /// R1): this is the allowlist form, so a future field added to `Request`
+    /// fails to COMPILE at this site until it is classified here, rather than
+    /// being silently accepted by a per-field deny-list. This check is what
+    /// holds the containment invariant — these verbs take no client-supplied
+    /// target — at the parse boundary. Do NOT "simplify" it to
+    /// `self.service.is_none() && !self.skip_observability`; that reopens the
+    /// silent-accept-a-new-field hole.
+    fn reject_all_args(&self, verb: &str) -> Result<(), HelperError> {
+        let Request {
+            token: _,
+            command: _,
+            service,
+            skip_observability,
+        } = self;
+        if service.is_some() || *skip_observability {
+            return Err(HelperError::InvalidRequest(format!(
+                "{verb} command does not accept any arguments"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate and parse the request into a typed command.
     pub fn parse_command(&self) -> Result<HelperCommand, HelperError> {
         // Reject null bytes and control characters in all string fields
@@ -292,6 +336,14 @@ impl Request {
                     ));
                 }
                 Ok(HelperCommand::Teardown)
+            }
+            "recreate" => {
+                self.reject_all_args("recreate")?;
+                Ok(HelperCommand::Recreate)
+            }
+            "restore-kubeconfig" => {
+                self.reject_all_args("restore-kubeconfig")?;
+                Ok(HelperCommand::RestoreKubeconfig)
             }
             "status" => {
                 if self.service.is_some() {
@@ -602,6 +654,81 @@ mod tests {
         };
         let cmd = req.parse_command().unwrap();
         assert_eq!(cmd, HelperCommand::Teardown);
+    }
+
+    #[test]
+    fn test_parse_command_recreate() {
+        let req = Request {
+            token: "abc123".to_string(),
+            command: "recreate".to_string(),
+            service: None,
+            skip_observability: false,
+        };
+        assert_eq!(req.parse_command().unwrap(), HelperCommand::Recreate);
+    }
+
+    #[test]
+    fn test_parse_command_restore_kubeconfig() {
+        let req = Request {
+            token: "abc123".to_string(),
+            command: "restore-kubeconfig".to_string(),
+            service: None,
+            skip_observability: false,
+        };
+        assert_eq!(
+            req.parse_command().unwrap(),
+            HelperCommand::RestoreKubeconfig
+        );
+    }
+
+    /// Containment invariant (P5): both self-heal verbs reject ANY argument —
+    /// not just a service arg — so no client-supplied target can reach them.
+    #[test]
+    fn test_recreate_and_restore_reject_any_arg() {
+        for cmd in ["recreate", "restore-kubeconfig"] {
+            // A service arg is rejected.
+            let with_service = Request {
+                token: "abc123".to_string(),
+                command: cmd.to_string(),
+                service: Some("ac".to_string()),
+                skip_observability: false,
+            };
+            assert!(
+                with_service.parse_command().is_err(),
+                "{cmd} must reject a service arg"
+            );
+            // A stray skip_observability is rejected too (not just service).
+            let with_flag = Request {
+                token: "abc123".to_string(),
+                command: cmd.to_string(),
+                service: None,
+                skip_observability: true,
+            };
+            assert!(
+                with_flag.parse_command().is_err(),
+                "{cmd} must reject skip_observability"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recreate_restore_are_writes() {
+        assert!(HelperCommand::Recreate.is_write());
+        assert!(HelperCommand::RestoreKubeconfig.is_write());
+    }
+
+    #[test]
+    fn test_recreate_restore_display_and_name() {
+        assert_eq!(HelperCommand::Recreate.to_string(), "recreate");
+        assert_eq!(HelperCommand::Recreate.name(), "recreate");
+        assert_eq!(
+            HelperCommand::RestoreKubeconfig.to_string(),
+            "restore-kubeconfig"
+        );
+        assert_eq!(
+            HelperCommand::RestoreKubeconfig.name(),
+            "restore-kubeconfig"
+        );
     }
 
     #[test]

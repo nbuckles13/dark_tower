@@ -249,14 +249,19 @@ __poll_setup_idle() {
 # every 10s up to a budget so the rollout has time to settle; only a genuinely stuck
 # cluster trips PRECONDITION_FAILURE.
 # Args: $1=budget-seconds (default 300)  Returns: 0 when ready, 1 on timeout.
+# Uses REAL wall-clock (layer_now) rather than counting sleeps, so the budget is
+# honoured against actual elapsed time — each __cluster_ready poll itself costs
+# wall-clock (kubectl get pods, and now the apiserver-reachability probe), so a
+# sleep-counter would overrun the stated budget and make the emitted "within Ns"
+# cause string a lie.
 __wait_cluster_ready() {
-  local waited=0 budget="${1:-300}"
+  local budget="${1:-300}" start
+  start=$(layer_now)
   until __cluster_ready; do
-    if (( waited >= budget )); then
+    if (( $(layer_now) - start >= budget )); then
       return 1
     fi
     sleep 10
-    waited=$(( waited + 10 ))
   done
   return 0
 }
@@ -286,22 +291,316 @@ __wait_http_ready() {
   return 0
 }
 
-# `dev-cluster setup`, BUSY-TOLERANT (@operations condition 4). The helper serializes
-# writes behind a mutex; if another write holds it (typically devloop.sh's eager-setup still
-# running when Layer 7 starts) `setup` returns non-zero with a `(busy)` error. That is a
-# transient race, NOT a setup failure — short-circuiting it to PRECONDITION_FAILURE would
-# spuriously red the operator lane. So on a busy result, wait the in-flight write out
-# (poll-setup-idle) and retry ONCE; a non-busy non-zero is a genuine setup failure.
-# Args: (none)  Returns: setup's exit code (0 on success).
-__dev_cluster_setup() {
+# One invocation of a dev-cluster WRITE verb, optionally `timeout`-wrapped.
+# DEVLOOP_DC_WRITE_TIMEOUT (a caller `local`) wraps the call in coreutils
+# `timeout` so a wedged helper can't hang the caller; unset ⇒ unbounded (the
+# helper enforces its own setup timeout). Merges stderr so the client's health/
+# summary/self-heal lines (all on stderr) are captured.
+# Args: <verb...>  Outputs: combined stdout+stderr on stdout  Returns: verb rc.
+__dc_write_once() {
+  if [[ -n "${DEVLOOP_DC_WRITE_TIMEOUT:-}" ]]; then
+    timeout "$DEVLOOP_DC_WRITE_TIMEOUT" "$DEV_CLUSTER" "$@" 2>&1
+  else
+    "$DEV_CLUSTER" "$@" 2>&1
+  fi
+}
+
+# The ONE home for busy-tolerant dev-cluster WRITE dispatch (@operations condition
+# 4, @dry-reviewer one-home). The helper serializes writes behind a mutex; if
+# another write holds it (typically devloop.sh's eager-setup still running when
+# Layer 7 starts) the verb returns non-zero with a `(busy)` error. That is a
+# transient race, NOT a failure — short-circuiting it to PRECONDITION_FAILURE
+# would spuriously red the operator lane. So on a busy result, wait the in-flight
+# write out (poll-setup-idle) and retry ONCE; a non-busy non-zero is genuine.
+#
+# CAPTURES AND PRINTS on BOTH attempts (load-bearing): printing relays setup.sh's
+# `REASON=insufficient-disk` banner into layer-7.stderr.log (operators grep it —
+# docs/runbooks/devloop-validation.md §6.7); the capture is REPOPULATED on the
+# retry so a verb that succeeds on the busy-retry is classified from the RETRY's
+# output, not the busy attempt's. Sets globals DC_WRITE_RC + DC_WRITE_OUT for
+# callers (e.g. __self_heal_recreate parses the helper's SELF_HEAL line out of
+# DC_WRITE_OUT).
+# Args: <verb...>  Returns: the verb's exit code (0 on success).
+DC_WRITE_RC=0
+DC_WRITE_OUT=""
+__dev_cluster_write() {
   local out rc
-  out="$("$DEV_CLUSTER" setup 2>&1)"; rc=$?
+  out="$(__dc_write_once "$@")"; rc=$?
   printf '%s\n' "$out" >&2
   if (( rc != 0 )) && grep -qiE '\(busy\)|in.?flight write|another write' <<<"$out"; then
-    __poll_setup_idle || return 1
-    "$DEV_CLUSTER" setup; return $?
+    if ! __poll_setup_idle; then
+      DC_WRITE_RC=1; DC_WRITE_OUT="$out"; return 1
+    fi
+    out="$(__dc_write_once "$@")"; rc=$?   # REPOPULATE — classify from the retry
+    printf '%s\n' "$out" >&2
   fi
+  DC_WRITE_RC=$rc
+  DC_WRITE_OUT="$out"
   return "$rc"
+}
+
+# `dev-cluster setup`, busy-tolerant — a thin caller of the one home above.
+# Args: (none)  Returns: setup's exit code (0 on success).
+__dev_cluster_setup() {
+  __dev_cluster_write setup
+  return "$DC_WRITE_RC"
+}
+
+# -----------------------------------------------------------------------------
+# Self-heal (Guard-C symbol: __self_heal_cluster) — the SOLE cluster-unhealthy
+# emitter. Reached only when __wait_cluster_ready timed out at the :health-confirm
+# gate. A bounded, LOUD, SCOPED, once-per-helper-lifetime recovery:
+#   LOUD    — every reached path emits a greppable `SELF_HEAL CASE=` line BEFORE
+#             its precondition_fail (which exits); absence of a CASE= line on a
+#             cluster-unhealthy log = self-heal did not run = a regression.
+#   SCOPED  — a destroy is requested ONLY on a POSITIVE `apiserver unreachable`
+#             (control-plane container down) or `Cluster exists: false`; `unknown`
+#             fails closed (probe-inconclusive → escalate, never destroy).
+#   BOUNDED — the destructive `dev-cluster recreate` is a distinct helper verb
+#             that RE-CONFIRMS control-plane-dead host-side and is bounded to one
+#             per helper lifetime by an in-helper AtomicBool (survives the Gate-2
+#             outer retry).
+# -----------------------------------------------------------------------------
+
+# Single-source default for the self-heal write-verb (recreate/restore) `timeout`
+# wrapper (@dry-reviewer C4): generous (> the setup envelope) so a wedged helper
+# can't hang recovery, but bounded. The `local DEVLOOP_DC_WRITE_TIMEOUT` pattern
+# must repeat per-verb (a global would apply the timeout to Phase-1a setup too),
+# but the DEFAULT value must not.
+readonly SELF_HEAL_WRITE_TIMEOUT_DEFAULT=900
+
+# Escalation shared by the recreate/restore failure paths (the automated fix ran
+# and the cluster is still unhealthy). Exits via precondition_fail.
+__self_heal_escalate_failed() {
+  precondition_fail cluster-self-heal-failed \
+    "the automated self-heal (recreate/restore) already ran and the cluster still did not become healthy on re-verify" \
+    "the automated recreate/restore already ran and failed — do NOT run teardown+setup (the self-heal just tried exactly that). Inspect \${DEVLOOP_TMP:-/tmp/devloop}/self-heal-evidence-* + /tmp/devloop/helper.log, check host disk/resources for a fresh KIND cluster, then escalate to the host/operator"
+}
+
+# Validate the helper-reported EVIDENCE_LEAF and compose the container-side
+# EVIDENCE= value. Closes the enum at the log surface (@observability): a
+# `capture-failed:<reason>` passes through ONLY if <reason> is in the closed set,
+# else ⇒ `capture-failed:unrecognized-reason` (so §8's enumeration is true by
+# construction, not by helper good behaviour); a leaf must match
+# `^self-heal-evidence-…$` (no `/`, no `..`) or it becomes
+# `capture-failed:malformed-leaf` rather than composing an untrusted path.
+# ANCHOR (DRY): the closed `capture-failed:` set is mirrored in three places —
+# the Rust producers in crates/devloop-helper/src/commands.rs (capture_evidence_bundle),
+# this shell validator, and the §8 row in docs/runbooks/devloop-validation.md.
+# Add a member to all three together.
+# Args: $1=raw EVIDENCE_LEAF value  Outputs: the composed EVIDENCE= value.
+__self_heal_compose_evidence() {
+  local raw="$1"
+  if [[ -z "$raw" ]]; then
+    printf 'capture-failed:no-evidence-line'
+    return
+  fi
+  # `none` is the helper's sentinel for "no bundle captured" (refused /
+  # already-attempted / restore paths) — pass through, it is not a leaf.
+  if [[ "$raw" == "none" ]]; then
+    printf 'none'
+    return
+  fi
+  if [[ "$raw" == capture-failed:* ]]; then
+    case "${raw#capture-failed:}" in
+      bundle-dir-unwritable|timeout-unavailable|no-evidence-line|malformed-leaf|unrecognized-reason)
+        printf '%s' "$raw" ;;
+      *) printf 'capture-failed:unrecognized-reason' ;;
+    esac
+    return
+  fi
+  if [[ "$raw" =~ ^self-heal-evidence-[0-9A-Za-z_-]+$ ]]; then
+    printf '%s/%s' "${DEVLOOP_TMP:-/tmp/devloop}" "$raw"
+  else
+    printf 'capture-failed:malformed-leaf'
+  fi
+}
+
+# Parse the helper's `SELF_HEAL HELPER_OUTCOME=<o> ATTEMPT=<n>/<max>
+# EVIDENCE_LEAF=<leaf>` transport line (client-rendered from the structured
+# CommandResult.data.self_heal) out of DC_WRITE_OUT. Sets SH_OUTCOME / SH_ATTEMPT
+# / SH_LEAF. The outcome is AUTHORITATIVE from HELPER_OUTCOME= (a structured
+# field), NOT scraped prose. No line (transport/helper failure) ⇒ a synthetic
+# failed outcome with the no-evidence-line marker.
+__self_heal_parse_helper_line() {
+  local out="$1" hl
+  hl="$(grep -E 'SELF_HEAL HELPER_OUTCOME=' <<<"$out" | tail -1)"
+  if [[ -n "$hl" ]]; then
+    SH_OUTCOME="$(sed -n 's/.*HELPER_OUTCOME=\([^ ]*\).*/\1/p' <<<"$hl")"
+    SH_ATTEMPT="$(sed -n 's/.*ATTEMPT=\([^ ]*\).*/\1/p' <<<"$hl")"
+    SH_LEAF="$(sed -n 's/.*EVIDENCE_LEAF=\([^ ]*\).*/\1/p' <<<"$hl")"
+  else
+    SH_OUTCOME="recreate-failed"; SH_ATTEMPT="0/1"; SH_LEAF=""
+  fi
+  [[ -n "$SH_OUTCOME" ]] || SH_OUTCOME="recreate-failed"
+  [[ -n "$SH_ATTEMPT" ]] || SH_ATTEMPT="0/1"
+}
+
+# Case A: apiserver-unreachable → the guarded, host-re-confirmed recreate.
+# Args: $1=health budget seconds. Returns 0 on recovery; otherwise exits via
+# precondition_fail.
+__self_heal_recreate() {
+  local budget="$1"
+  # Bound the recreate (teardown+setup) so a wedged helper can't hang recovery;
+  # generous (> the setup envelope). `local` is visible to __dc_write_once.
+  local DEVLOOP_DC_WRITE_TIMEOUT="${DEVLOOP_SELF_HEAL_WRITE_TIMEOUT:-$SELF_HEAL_WRITE_TIMEOUT_DEFAULT}"
+  __dev_cluster_write recreate || true   # rc/output consumed via DC_WRITE_* below
+  local SH_OUTCOME SH_ATTEMPT SH_LEAF evidence
+  __self_heal_parse_helper_line "$DC_WRITE_OUT"
+  evidence="$(__self_heal_compose_evidence "$SH_LEAF")"
+
+  case "$SH_OUTCOME" in
+    recreated)
+      if __wait_cluster_ready "$budget"; then
+        printf 'SELF_HEAL RESULT=recovered ACTION=recreate ATTEMPT=%s EVIDENCE=%s\n' \
+          "$SH_ATTEMPT" "$evidence" >&2
+        return 0
+      fi
+      printf 'SELF_HEAL RESULT=failed ACTION=recreate ATTEMPT=%s EVIDENCE=%s DETAIL=recreate-failed\n' \
+        "$SH_ATTEMPT" "$evidence" >&2
+      __self_heal_escalate_failed
+      ;;
+    recreate-refused-cluster-alive)
+      # NOT a container-visibility/kubeconfig problem (@observability F3 /
+      # @paired-operations): reachability is container-INSPECT-based and
+      # kubeconfig-independent, and the SAME host-side probe runs at classify
+      # (cmd_status) and at the destroy gate (cmd_recreate) — the container never
+      # probes independently. A refusal here means the helper's own probe
+      # DISAGREED WITH ITSELF across the interval (unreachable/absent at T1,
+      # Reachable at T2): a flap/race, or the cluster came up in between. So it is
+      # a raced observation, and `restore-kubeconfig` cannot change an
+      # inspect-based verdict.
+      printf 'SELF_HEAL RESULT=failed ACTION=recreate ATTEMPT=%s EVIDENCE=%s DETAIL=recreate-refused-cluster-alive\n' \
+        "$SH_ATTEMPT" "$evidence" >&2
+      precondition_fail cluster-self-heal-probe-inconclusive \
+        "the helper's own host-side probe reported the control plane unreachable at classification time and Reachable moments later at the destroy gate — the two host-side observations DISAGREE (a flap/race, or the cluster came up between them), so the destroy was correctly declined; the cluster is very likely fine" \
+        "re-run 'dev-cluster status'; if it now shows healthy, re-run the devloop. If it repeats, the control plane is FLAPPING — /tmp/devloop/helper.log has both observations. This is NOT a kubeconfig problem (do NOT run 'dev-cluster restore-kubeconfig' — it cannot change an inspect-based reachability verdict); do NOT force a destroy"
+      ;;
+    recreate-refused-inconclusive)
+      # Refused because the host could NOT determine the control-plane state
+      # (container runtime down, or inspect errored/timed out) — NOTHING was
+      # confirmed, alive or dead. Opposite operator action from
+      # refused-cluster-alive: a HOST container-runtime problem, NOT a kubeconfig
+      # one (Security F2). The helper's refusal eprintln records the observed
+      # reachability=/cluster_exists= in helper.log.
+      printf 'SELF_HEAL RESULT=failed ACTION=recreate ATTEMPT=%s EVIDENCE=%s DETAIL=recreate-refused-inconclusive\n' \
+        "$SH_ATTEMPT" "$evidence" >&2
+      precondition_fail cluster-self-heal-probe-inconclusive \
+        "the host could NOT determine the control-plane state (the container runtime is unreachable, or 'inspect' errored/timed out) and refused to destroy — nothing was confirmed, alive OR dead; failing closed" \
+        "check the HOST CONTAINER RUNTIME (podman/docker daemon up?) + /tmp/devloop/helper.log (the helper's refusal line records the observed reachability=/cluster_exists=) — NOT the kubeconfig. The cluster state is UNKNOWN, not confirmed alive; do NOT force a destroy until the runtime is back and 'dev-cluster status' can answer"
+      ;;
+    recreate-already-attempted-this-helper-lifetime)
+      printf 'SELF_HEAL RESULT=failed ACTION=recreate ATTEMPT=%s EVIDENCE=%s DETAIL=recreate-already-attempted-this-helper-lifetime\n' \
+        "$SH_ATTEMPT" "$evidence" >&2
+      __self_heal_escalate_failed
+      ;;
+    recreate-failed)
+      # Genuine failure (helper reported recreate-failed, or the transport line
+      # was absent so __self_heal_parse_helper_line synthesized it).
+      printf 'SELF_HEAL RESULT=failed ACTION=recreate ATTEMPT=%s EVIDENCE=%s DETAIL=recreate-failed\n' \
+        "$SH_ATTEMPT" "$evidence" >&2
+      __self_heal_escalate_failed
+      ;;
+    *)
+      # DRIFT DETECTOR (dry-F2): the helper reported a HELPER_OUTCOME this shell
+      # version has no arm for — a SelfHealOutcome Rust variant added without the
+      # matching case here. Symmetric with capture-failed:unrecognized-reason:
+      # escalate LOUDLY as a code defect rather than silently misclassifying it
+      # as recreate-failed (a wrong operator lane). ANCHOR (DRY): a new
+      # SelfHealOutcome variant must add BOTH a Rust site and an arm above.
+      printf 'SELF_HEAL RESULT=failed ACTION=recreate ATTEMPT=%s EVIDENCE=%s DETAIL=recreate-unrecognized-outcome\n' \
+        "$SH_ATTEMPT" "$evidence" >&2
+      precondition_fail cluster-self-heal-failed \
+        "the helper reported a self-heal outcome '${SH_OUTCOME}' this Layer-7 shell version does not recognize — a Rust↔shell vocabulary DRIFT (a SelfHealOutcome variant was added without the matching __self_heal_recreate arm)" \
+        "this is a CODE defect, not an environment problem: add a '${SH_OUTCOME}' arm to __self_heal_recreate + a row to docs/runbooks/devloop-validation.md §8; inspect /tmp/devloop/helper.log"
+      ;;
+  esac
+}
+
+# Case B: kubeconfig-stale → the non-destructive restore-kubeconfig.
+# Args: $1=health budget seconds. Returns 0 on recovery; otherwise exits.
+__self_heal_restore_kubeconfig() {
+  local budget="$1"
+  local DEVLOOP_DC_WRITE_TIMEOUT="${DEVLOOP_SELF_HEAL_WRITE_TIMEOUT:-$SELF_HEAL_WRITE_TIMEOUT_DEFAULT}"
+  __dev_cluster_write restore-kubeconfig || true
+  local SH_OUTCOME SH_ATTEMPT SH_LEAF
+  __self_heal_parse_helper_line "$DC_WRITE_OUT"
+  if [[ "$SH_OUTCOME" == "restored" ]] && __wait_cluster_ready "$budget"; then
+    printf 'SELF_HEAL RESULT=recovered ACTION=restore-kubeconfig ATTEMPT=%s EVIDENCE=none\n' \
+      "$SH_ATTEMPT" >&2
+    return 0
+  fi
+  printf 'SELF_HEAL RESULT=failed ACTION=restore-kubeconfig ATTEMPT=%s EVIDENCE=none DETAIL=restore-failed\n' \
+    "$SH_ATTEMPT" >&2
+  __self_heal_escalate_failed
+}
+
+# The self-heal entry. Runs a timeout-wrapped `dev-cluster status` probe (rc +
+# output captured SEPARATELY — NOT via __cluster_ready, which collapses rc into
+# the readiness verdict and would destroy the helper-unreachable vs
+# probe-inconclusive discriminator), classifies, and applies AT MOST one fix.
+# Returns 0 if the cluster was recovered (Phase 1 continues); otherwise exits via
+# precondition_fail.
+__self_heal_cluster() {
+  local budget="${DEVLOOP_HEALTH_BUDGET:-300}"
+  local status_timeout="${DEVLOOP_SELF_HEAL_STATUS_TIMEOUT:-20}"
+  local out rc
+  set +e
+  out="$(timeout "$status_timeout" "$DEV_CLUSTER" status 2>&1)"; rc=$?
+  set -e
+
+  # Split on TERMINATION MODE, not content: rc!=0 / timeout(124) = "couldn't ask
+  # the helper" (helper-unreachable); rc==0-but-unclassifiable = probe-inconclusive.
+  if (( rc != 0 )); then
+    printf 'SELF_HEAL CASE=helper-unreachable ACTION=none\n' >&2
+    precondition_fail helper-unreachable \
+      "the Phase-1e self-heal probe could not reach the helper (dev-cluster status rc=${rc}$( (( rc == 124 )) && printf ' — timed out')) within ${status_timeout}s" \
+      "re-run devloop.sh on the host to restart the helper; check /tmp/devloop/helper.log + helper-stderr.log"
+  fi
+
+  # rc==0 — classify from the status lines. Value greps are TAIL-ANCHORED because
+  # `unreachable` contains `reachable` as a substring; anchoring the tail keeps a
+  # dead apiserver from reading as reachable.
+  local exists=false reachable=absent
+  grep -qE 'Cluster exists:[[:space:]]+true[[:space:]]*$' <<<"$out" && exists=true
+  local pods_healthy=false setup_in_progress=false
+  grep -qE 'Pods healthy:[[:space:]]+true[[:space:]]*$' <<<"$out" && pods_healthy=true
+  grep -qE 'Setup in progress:[[:space:]]+true[[:space:]]*$' <<<"$out" && setup_in_progress=true
+  if   grep -qE 'Apiserver reachable:[[:space:]]+unreachable[[:space:]]*$' <<<"$out"; then reachable=unreachable
+  elif grep -qE 'Apiserver reachable:[[:space:]]+reachable[[:space:]]*$'   <<<"$out"; then reachable=reachable
+  elif grep -qE 'Apiserver reachable:[[:space:]]+unknown[[:space:]]*$'     <<<"$out"; then reachable=unknown
+  fi
+
+  # Dispatch — explicit arms + explicit else. The CASE= line is emitted once the
+  # verdict is known, BEFORE the fix/escalation.
+  if [[ "$reachable" == "unreachable" || "$exists" == "false" ]]; then
+    printf 'SELF_HEAL CASE=apiserver-unreachable ACTION=recreate\n' >&2
+    __self_heal_recreate "$budget"
+  elif [[ "$reachable" == "reachable" && "$pods_healthy" == "true" && "$setup_in_progress" == "false" ]]; then
+    # WHAT THIS ARM ACTUALLY DETECTS (@observability F4): NOT a stale container
+    # kubeconfig — the CASE name names a presumed cause the detection path cannot
+    # observe. Every input above is HOST-side (helper `cluster_already_exists`,
+    # the helper's host-kubeconfig `kubectl`, the kubeconfig-free reachability
+    # probe, the write mutex); nothing here reads the CONTAINER kubeconfig. This
+    # arm fires only after __wait_cluster_ready timed out on the SAME
+    # helper-reported fields and the self-heal's own probe then read them healthy
+    # — i.e. the cluster went READY LATE (a race between the wait expiring and the
+    # probe). `restore-kubeconfig` here is a PROPHYLACTIC refresh of the container
+    # kubeconfig the Phase-2 suites consume via KUBECONFIG=/tmp/devloop/kubeconfig,
+    # NOT a repair of a diagnosed fault.
+    printf 'SELF_HEAL CASE=kubeconfig-stale ACTION=restore-kubeconfig\n' >&2
+    __self_heal_restore_kubeconfig "$budget"
+  elif [[ "$reachable" == "reachable" && "$pods_healthy" == "false" ]]; then
+    printf 'SELF_HEAL CASE=rollout-wedged ACTION=none\n' >&2
+    precondition_fail cluster-unhealthy \
+      "cluster did not become healthy within ${budget}s after rebuild-all — the apiserver is LISTENING but pods are not ready (a wedged rollout on a live control plane, NOT a dead cluster; deliberately NOT self-healed — recreating a cluster whose apiserver answers would mask a code defect)" \
+      "'dev-cluster status' for the not-ready pods; check pod logs (rollout may be wedged, e.g. ImagePullBackOff/CrashLoopBackOff). Do NOT teardown+setup."
+  else
+    printf 'SELF_HEAL CASE=probe-inconclusive ACTION=none\n' >&2
+    precondition_fail cluster-self-heal-probe-inconclusive \
+      "the self-heal probe could not classify the cluster (apiserver reachable=${reachable}, exists=${exists}, pods_healthy=${pods_healthy}, setup_in_progress=${setup_in_progress}) — failing closed, refusing to destroy on an uncertain state" \
+      "determine cluster state by hand ('dev-cluster status' + /tmp/devloop/helper.log). If the control-plane container is up but nothing is listening at the apiserver, inspect its logs before any manual recreate — do not force a destroy"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -474,6 +773,14 @@ __layer7_main() {
   emit_step_duration cluster-ready "$t_step"
 
   # (b) Infra-change detection: a touched infra/kind/ skeleton is stale ⇒ rebuild it.
+  #
+  # NON-COLLAPSE (Finding 5, reciprocal with cmd_recreate): this branch does an
+  # UNCONDITIONAL teardown+setup and MUST destroy a HEALTHY cluster — the blueprint
+  # (infra/kind/) changed, so the running cluster is stale by definition. That is
+  # the INVERSE precondition of the self-heal's `dev-cluster recreate`
+  # (crates/devloop-helper/src/commands.rs::cmd_recreate), which MUST REFUSE to
+  # destroy a healthy cluster (it re-confirms the control plane is dead first).
+  # Two semantically-opposite operations — do NOT let a DRY pass merge them.
   t_step=$(layer_now)
   if diff_touches_path "infra/kind/"; then
     echo "Layer7: infra/kind/ changed — tearing down + re-creating the cluster skeleton. Triggering files:" >&2
@@ -506,9 +813,13 @@ __layer7_main() {
   #     pre-check means a subsequent failure cannot be blamed on cluster bring-up. We POLL
   #     (not one-shot) because rebuild-all returns before the rollout-restarted pods settle.
   t_step=$(layer_now)
-  __wait_cluster_ready "${DEVLOOP_HEALTH_BUDGET:-300}" || precondition_fail cluster-unhealthy \
-    "cluster did not become healthy within ${DEVLOOP_HEALTH_BUDGET:-300}s after rebuild-all (pods not ready) — refusing to run the suite against a sick cluster" \
-    "'dev-cluster status' for the not-ready pods; check pod logs (rollout may be wedged, e.g. ImagePullBackOff/CrashLoopBackOff)"
+  # SOLE cluster-unhealthy site: on timeout, hand off to the self-heal
+  # (Guard-C: scripts/layer7.sh::__self_heal_cluster). It probes the REAL cause
+  # and applies at most one bounded, host-re-confirmed fix — or escalates loudly.
+  # A bare `cluster-unhealthy` now emits ONLY from __self_heal_cluster's
+  # rollout-wedged arm (with a preceding `SELF_HEAL CASE=rollout-wedged`);
+  # __self_heal_cluster returns 0 only if it recovered the cluster.
+  __wait_cluster_ready "${DEVLOOP_HEALTH_BUDGET:-300}" || __self_heal_cluster
   emit_step_duration health-confirm "$t_step"
 
   # (f) Observability-stack HTTP readiness (Phase-1e completion; task #56 user ruling (a)).

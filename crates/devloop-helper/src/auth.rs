@@ -4,10 +4,8 @@
 //! permissions, and validates incoming requests using constant-time comparison.
 
 use crate::error::HelperError;
+use crate::fs_atomic::atomic_write_secret;
 use ring::rand::{SecureRandom, SystemRandom};
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// Generate a random 32-byte authentication token as a 64-character hex string.
@@ -24,17 +22,16 @@ pub fn generate_token() -> Result<String, HelperError> {
     Ok(hex::encode(bytes))
 }
 
-/// Write the auth token to a file with 0600 permissions.
+/// Write the auth token to a file with 0600 permissions, atomically.
+///
+/// Routes through [`atomic_write_secret`] (the ONE secret-write home, P8): the
+/// token is credential material in the container-RW mount, so it needs the same
+/// symlink-safe, mode-enforcing, no-partial-write guarantees as the kubeconfig.
+/// The previous `create(true).truncate(true).mode(0o600)` form preserved a
+/// looser mode on an existing token file and could hand a concurrent reader a
+/// partial token; temp+rename fixes both.
 pub fn write_token(path: &Path, token: &str) -> Result<(), HelperError> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(token.as_bytes())?;
-    file.flush()?;
-    Ok(())
+    atomic_write_secret(path, token.as_bytes())
 }
 
 /// Validate a provided token against the expected token using constant-time comparison.
@@ -77,6 +74,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::fs;
 
     #[test]
     fn test_generate_token_length() {

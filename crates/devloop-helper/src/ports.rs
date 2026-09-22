@@ -43,8 +43,11 @@ impl PortOffsets {
     pub const GRAFANA: u16 = 101;
     pub const LOKI: u16 = 102;
     pub const K8S_API: u16 = 103;
-    /// K8s API on 127.0.0.1 for host-side kubectl (separate from gateway-bound K8S_API)
-    pub const K8S_API_HOST: u16 = 104;
+    // Offset 104 RETIRED (was `K8S_API_HOST`, a 127.0.0.1 host-side kubectl port
+    // for a defunct two-port design the template never used). NOT freed for
+    // reuse — do not re-assign 104. The apiserver binds a single port,
+    // `HOST_GATEWAY_IP:HOST_PORT_K8S_API` (offset 103); see
+    // `infra/kind/kind-config.yaml.tmpl` (`apiServerAddress`/`apiServerPort`).
 }
 
 /// A port allocation for a devloop.
@@ -517,10 +520,6 @@ pub fn template_env_vars(alloc: &PortAllocation, host_gateway_ip: &str) -> HashM
         "HOST_PORT_K8S_API".to_string(),
         alloc.port(PortOffsets::K8S_API).to_string(),
     );
-    vars.insert(
-        "HOST_PORT_K8S_API_HOST".to_string(),
-        alloc.port(PortOffsets::K8S_API_HOST).to_string(),
-    );
     vars
 }
 
@@ -835,7 +834,6 @@ mod tests {
             "HOST_PORT_GRAFANA",
             "HOST_PORT_LOKI",
             "HOST_PORT_K8S_API",
-            "HOST_PORT_K8S_API_HOST",
         ];
 
         for key in &expected_keys {
