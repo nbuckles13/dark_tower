@@ -1430,3 +1430,27 @@ transmit-key material **in logs**.
 > implementation). Until it exists, the enforcement is that no key-shaped field exists on
 > the MC→MH contract and that reintroducing one is a review failure — reviewer-enforced,
 > not structural, and named as the weaker form it is.
+
+## Addendum — Planned Story Arc
+
+*This is delivery planning, not part of the design above. The sections above are the
+settled design; this addendum records the **intended incremental delivery** and is
+**mutable** — each story's scope is re-confirmed at planning time and this list is updated
+to match. It exists so the arc has one maintained home rather than living in a single
+story file. Do not read a story's line here as a committed contract; read the design
+sections for what is settled.*
+
+Each story ends in something a person can demonstrate in a browser:
+
+1. **Hear yourself** — single-client audio loopback through the handler. *(delivered — `docs/user-stories/2026-08-27-hear-yourself-through-handler.md`)*
+2. **Hear each other** — **N+1 participants hear each other**, where **N = a configurable number of client audio receive slots** (N may be 1 or larger); a static fill (join-order), *not* speaker-based selection; plus **server mute** and **KEK rotation on leave**. Enabled by story 1's deliberately general N=1 assignment.
+3. **See each other** — video.
+4. **Survive a handler restart** — §8 periodic re-assert of policy.
+5. **A crowded room picks the right speakers** — **dynamic (active-speaker) selection**, replacing story 2's static fill when there are more senders than a receiver's slots.
+6. **Two handlers, one meeting** — cross-handler forwarding.
+7. **Historical meeting debug** — per-meeting/per-client quality records with a retention posture (a §11 amendment).
+8. **Performance** — targets, benchmarks, tuning (the Tier-2 regression benchmark and the three experiments).
+
+**Re-scopes from the original plan (recorded so the reasoning isn't lost):**
+- **Attestation was pulled out of story 2 into its own story.** Story 1 publishes the client's Ed25519 `identity_public_key` on the roster **unverified** (trust-on-first-use). Binding it to an authenticated identity via a `cnf` thumbprint is only as meaningful as the identity it binds to — under the current **operator key-custody** model (MC holds the KEK; §4 / ADR-0024 §5.7 risk acceptance) and largely pseudonymous participants, its marginal value is mostly semantic. It earns its keep once there is a genuine notion of identity to bind to, and/or a move toward removing operator key custody, for which it is the foundation. Sequenced then, not bundled into the first multi-party story.
+- **Story 2 generalized from "a second participant" to "N configurable receive slots."** The fixed-capacity mesh (everyone hears everyone up to N+1) is distinct from story 5's *dynamic* selection; story 1's general-N assignment made this the natural next step rather than a special case.
