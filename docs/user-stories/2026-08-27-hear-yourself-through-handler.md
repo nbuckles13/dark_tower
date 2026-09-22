@@ -12,7 +12,7 @@ As a **participant**, I want **to join a meeting from Windows Chrome, speak, and
 
 **Acceptance framing, stated so it is not overclaimed.** No production Rust component seals, signs, verifies, or decrypts a media frame (MH is keyless, MC never encrypts), so the same TypeScript encrypts and decrypts in loopback and a self-consistent crypto error is invisible to the demo. "Every layer proven end to end" therefore means *wiring proven by the demo and browser env-test, crypto proven by the cross-language vectors* (R-7) — whose Rust reference generator is deliberately non-production and is the only independent check on the TypeScript crypto.
 
-**Series plan** (each story ends in something a person can demonstrate in a browser): 1 hear yourself · 2 hear each other (attestation, second participant, server mute, KEK rotation on leave) · 3 see each other (video) · 4 survive a handler restart (§8 re-assert) · 5 a crowded room picks the right speakers (selection) · 6 two handlers, one meeting · 7 historical meeting debug (per-meeting/per-client quality records with a retention posture — an ADR-0036 §11 amendment) · 8 performance (targets, benchmarks, tuning).
+**Series plan**: the maintained arc lives in `docs/decisions/adr-0036-media-flow.md` → *Addendum — Planned Story Arc* (one home, updated as scopes are re-confirmed). At a glance: 1 hear yourself · 2 hear each other (N configurable receive slots, static fill, server mute, KEK rotation on leave) · 3 see each other · 4 survive a handler restart · 5 crowded room picks the right speakers (dynamic selection) · 6 two handlers, one meeting · 7 historical meeting debug · 8 performance. Attestation was pulled out of story 2 into its own separately-sequenced story (rationale in the addendum).
 
 ## Requirements
 
