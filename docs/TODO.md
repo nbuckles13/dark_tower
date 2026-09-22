@@ -510,6 +510,22 @@ segment-splitting remedy **does not transfer**. Two failures, in the order they 
 `packages/sdk-core/src/**` emission sites the way the Rust side parses `metrics.rs`).
 Task-sized; explicitly out of scope for task #22.
 
+**COST RAISED 2026-09-22 by the `2026-09-21-hear-each-other` story (R-27), recorded so
+this entry's priority is re-derived rather than inherited from a description that
+predates the change.** When this entry was filed, `dt_client_*` series did not reach
+Prometheus at all — the collector's metrics pipeline exported only to `debug`. So a
+mis-spelled or mis-labelled client metric cost a wrong log line. R-27 wires the
+collector's Prometheus exporter and a scrape job, which changes the cost of the same
+gap to **a persistent time series**, and in the worst case one carrying a meeting
+identifier: `packages/sdk-core/src/media/MediaTransport.ts` spreads the join label set
+(including `meeting_id_hash`) onto `dt_client_mh_connection_total` under a documented
+ADR-0036 §11 grandfathered exception, and that file's own comment ends "Nothing
+mechanical enforces this in TypeScript." Two controls land in that story — a collector
+metric-name allowlist and a `meeting_id_hash` strip on the metrics pipeline — and
+**neither closes this entry**: they protect the store, not the rule, so a violation
+becomes harmless and simultaneously invisible. Raised by `@security` at planning;
+same re-derivation asked of the MH registered-meeting-count entry.
+
 ### Restated label rosters and restated counts have no guard, and no sweep enforcement (2026-09-09, story task #22)
 
 **Owner**: policy content `observability` (with `security` for label-value policy);

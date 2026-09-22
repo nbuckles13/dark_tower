@@ -1443,7 +1443,7 @@ sections for what is settled.*
 Each story ends in something a person can demonstrate in a browser:
 
 1. **Hear yourself** — single-client audio loopback through the handler. *(delivered — `docs/user-stories/2026-08-27-hear-yourself-through-handler.md`)*
-2. **Hear each other** — **N+1 participants hear each other**, where **N = a configurable number of client audio receive slots** (N may be 1 or larger); a static fill (join-order), *not* speaker-based selection; plus **server mute** and **KEK rotation on leave**. Enabled by story 1's deliberately general N=1 assignment.
+2. **Hear each other** — **N+1 participants hear each other**, where **N = a configurable number of client audio receive slots** (N may be 1 or larger); a static fill (join-order), *not* speaker-based selection; plus **server mute** and **KEK rotation on leave**. Enabled by story 1's deliberately general N=1 assignment. *(planned — `docs/user-stories/2026-09-21-hear-each-other.md`; scope re-confirmed 2026-09-22: loopback removed outright; participants may span the meeting's handler set with the N+1 rule applied within a handler and cross-handler peers reported unreachable per §9 — no cascade and no client multi-handler send, which stay in story 6; attestation stays out.)*
 3. **See each other** — video.
 4. **Survive a handler restart** — §8 periodic re-assert of policy.
 5. **A crowded room picks the right speakers** — **dynamic (active-speaker) selection**, replacing story 2's static fill when there are more senders than a receiver's slots.
