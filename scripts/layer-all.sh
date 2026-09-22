@@ -44,6 +44,41 @@ init_devloop_tmp
 printf 'CARGO_BUILD_JOBS=%s (capped for memory; export CARGO_BUILD_JOBS=N or pass --jobs to override)\n' \
   "${CARGO_BUILD_JOBS:-<unset>}" >&2
 
+# --- Layer range (developer fast lane) ---------------------------------------
+# Default: the full authority pipeline, layers 1..7. `--max-layer N` runs layers
+# 1..N only; it is the mechanism behind scripts/layer-fast.sh — the non-destructive
+# inner-loop check an implementer runs before "Ready for validation", which stops
+# BEFORE Layer 7's shared-cluster bring-up (the resource a concurrent run thrashes).
+#
+# Two guardrails keep the fast lane off the authority path:
+#   1. A shortened range is REFUSED in any tree-attesting context (CI, the run-story
+#      authority/close gate, pre-commit — the same GITHUB_ACTIONS/DEVLOOP_FMT_CHECK_ONLY
+#      sentinels CARGO_LOCKED gates on). The authority pipeline can never be shortened.
+#   2. A shortened run emits NO Gate-2 verdict (the EXIT trap below is not installed for
+#      it). A missing verdict is fail-closed — a commit still needs a full layer-all.sh —
+#      so a fast run can never be mistaken for an authority PASS.
+# No caller passes positional args today (ci.yml, run-story, verify-completion, pre-commit
+# all invoke bare), so the default path is byte-identical to before.
+layer_lo=1
+layer_hi=7
+while (( $# )); do
+  case "$1" in
+    --max-layer) shift; [[ $# -gt 0 ]] || { printf 'PRECONDITION_FAILURE: --max-layer needs a value (1..7).\n' >&2; exit 2; }; layer_hi="$1" ;;
+    --max-layer=*) layer_hi="${1#--max-layer=}" ;;
+    *) printf 'PRECONDITION_FAILURE: unknown argument %q — layer-all.sh accepts only --max-layer N.\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ "$layer_hi" =~ ^[1-7]$ ]] || { printf 'PRECONDITION_FAILURE: --max-layer must be an integer 1..7 (got %q).\n' "$layer_hi" >&2; exit 2; }
+fast_lane=0
+if (( layer_hi < 7 )); then
+  if [[ -n "${GITHUB_ACTIONS:-}" || -n "${DEVLOOP_FMT_CHECK_ONLY:-}" ]]; then
+    printf 'PRECONDITION_FAILURE: --max-layer=%s refused in an attesting context (CI / run-story gate / pre-commit) — the authority pipeline runs all 7 layers. REASON=fast-lane-in-attesting-context\n' "$layer_hi" >&2
+    exit 2
+  fi
+  fast_lane=1
+fi
+
 # Per-layer result/duration accumulators — declared BEFORE the EXIT trap installs
 # so emit_gate2_verdict's namerefs always bind to existing (possibly-empty) arrays,
 # even on an early exit that fires before the layer loop populates them.
@@ -79,7 +114,11 @@ __gate2_emit_trap() {
   fi
   exit "$__rc"
 }
-trap '__gate2_emit_trap' EXIT
+# Authority runs only: a fast-lane run (--max-layer < 7) writes no Gate-2 verdict
+# (guardrail 2 above), so its EXIT must not fire the emitter.
+if (( ! fast_lane )); then
+  trap '__gate2_emit_trap' EXIT
+fi
 
 # CI-SENTINEL-LEAK runtime assertion (task #47, §J/C — security trust boundary).
 # Shared single-locus check in _common.sh; called here (full pipeline) and from
@@ -150,8 +189,11 @@ printf 'PIPELINE_MODE=%s SOURCE=%s\n' "$([[ $fail_fast -eq 1 ]] && printf 'fail-
 if [[ "$ff_source" == "unattended-override-refused" ]]; then
   echo "WARN FAIL_FAST_OVERRIDE_IGNORED REQUESTED=1 MODE=run-all" >&2
 fi
+if (( fast_lane )); then
+  printf 'FAST_LANE=1 LAYERS=%d-%d — developer inner-loop check; NOT an authority Gate-2 run; no verdict emitted. Layer 7 (shared cluster) is the Lead Gate 2.\n' "$layer_lo" "$layer_hi" >&2
+fi
 
-for n in 1 2 3 4 5 6 7; do
+for n in $(seq "$layer_lo" "$layer_hi"); do
   start=$(date +%s)
   # observability O3: atomic stderr append redirect (no process-sub race with stdout tee).
   # Capture the LAYER's real exit code (PIPESTATUS[0], NOT tee's). set +e/-e around the
@@ -208,7 +250,7 @@ done
 # line so "layers N+1..7 missing" is never ambiguous with a truncated log.
 if (( stopped_early > 0 )); then
   not_run_list=""
-  for (( n = stopped_early + 1; n <= 7; n++ )); do
+  for (( n = stopped_early + 1; n <= layer_hi; n++ )); do
     layer_status[$n]="$NOT_RUN"
     layer_dur[$n]=0
     not_run_list="${not_run_list:+${not_run_list},}${n}"
@@ -231,11 +273,13 @@ fi
 # silently stops checking (CLAUDE.md "fail loudly; never mask"). Skip it with a loud greppable
 # token (joins the WARN BUDGET_* family) rather than compare against absent data. Keyed off the
 # NOT-RUN status, not layer_dur==0 (a genuinely fast layer 6 can legitimately measure 0s).
-if [[ "${layer_status[3]:-}" != "$NOT_RUN" && "${layer_status[6]:-}" != "$NOT_RUN" ]]; then
+if (( layer_hi >= 6 )) && [[ "${layer_status[3]:-}" != "$NOT_RUN" && "${layer_status[6]:-}" != "$NOT_RUN" ]]; then
   guard_audit_dur=$(( ${layer_dur[3]:-0} + ${layer_dur[6]:-0} ))
   if [[ $guard_audit_dur -gt $total_budget_secs ]]; then
     echo "WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=${guard_audit_dur} BUDGET=${total_budget_secs}" >&2
   fi
+elif (( layer_hi < 6 )); then
+  : # fast lane stopped before layer 6 — the guard+audit fast-tier budget is not measurable; nothing to warn.
 else
   echo "WARN BUDGET_TOTAL_SKIPPED REASON=layers-not-run LAST_RAN=${stopped_early}" >&2
 fi
@@ -246,7 +290,7 @@ fi
 # failing one) = the failing layer's status; final_exit already holds its rc.
 total_dur=0
 total_result="OK"
-for n in 1 2 3 4 5 6 7; do
+for n in $(seq "$layer_lo" "$layer_hi"); do
   total_dur=$(( total_dur + ${layer_dur[$n]:-0} ))
   [[ "${layer_status[$n]:-UNKNOWN}" == "$NOT_RUN" ]] && continue
   total_result=$(aggregate_worst_status "$total_result" "${layer_status[$n]:-UNKNOWN}")
@@ -263,7 +307,7 @@ mapped_exit=$(status_to_exit_code "$total_result")
 if (( mapped_exit > final_exit )); then final_exit=$mapped_exit; fi
 
 printf '\n=== LAYER_SUMMARY_BEGIN ===\n'
-for n in 1 2 3 4 5 6 7; do
+for n in $(seq "$layer_lo" "$layer_hi"); do
   printf 'LAYER=%d RESULT=%s DURATION=%s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}"
 done
 printf '=== LAYER_SUMMARY_END ===\n'
@@ -272,7 +316,7 @@ printf 'TOTAL_DURATION=%s TOTAL_RESULT=%s\n\n' "$total_dur" "$total_result"
 # Human-readable table.
 printf '%-8s %-22s %s\n' "Layer" "Status" "Duration(s)"
 printf '%-8s %-22s %s\n' "-----" "------" "-----------"
-for n in 1 2 3 4 5 6 7; do
+for n in $(seq "$layer_lo" "$layer_hi"); do
   printf '%-8s %-22s %s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}"
 done
 
@@ -299,7 +343,7 @@ done
 # NOT complete the enum" guardrail on the NOT_RUN decl above). OK / N/A / SKIPPED-* map to 0 with
 # rc 0, so they are silently skipped. Works under BOTH modes: fail-fast (un-run layers are NOT-RUN
 # -> skipped; the one red layer gets it) and run-all (every red layer gets one).
-for n in 1 2 3 4 5 6 7; do
+for n in $(seq "$layer_lo" "$layer_hi"); do
   st="${layer_status[$n]:-UNKNOWN}"
   [[ "$st" == "$NOT_RUN" ]] && continue
   # ${layer_rc[$n]:-0} defaulted for `set -u`: fail-fast sets layer_status/layer_dur for un-run
