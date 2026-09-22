@@ -269,7 +269,7 @@ You are implementing a feature for Dark Tower.
    **Escalate vs. resolve — headless (`DEVLOOP_HEADLESS`).** Interactively the Lead may surface a completion-level choice to the operator; it's cheap to ask. **Headless, the Lead does not block on it** — apply the completion default above and proceed. Stop a headless run to escalate **only** when completing the invariant either (i) genuinely will not fit one session **and** is required for the current user story → escalate "split / re-plan" (back to `/user-story`); or (ii) crosses a hard safety line the Lead cannot adjudicate (security veto, destructive/irreversible op). A preference among completion levels is neither — auto-resolve toward completeness and keep moving. A headless run blocking hours on a design preference is the failure this rule prevents; a run that stops for a genuine split-or-safety call is correct.
 2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
 3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
-4. When done, use SendMessage to tell @team-lead: "Ready for validation"
+4. **Self-check with `./scripts/layer-fast.sh`, fix what it finds, and when it's green SendMessage @team-lead "Ready for validation" and stop.** Gate 2 — the full `layer-all.sh` and its shared-cluster bring-up — is the Lead's, not yours.
 5. REVIEW: Respond to reviewer findings — fix each one or defer with justification (see review protocol for valid/invalid justifications)
 
 ## Communication

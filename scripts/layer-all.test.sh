@@ -433,4 +433,66 @@ err="$(cat "$LA_ERR")"
 assert_status "d8-8-stdout-teaser-line"  "    | VIOLATION: guard-a"              "$err"
 assert_status "d8-8-stderr-surfaces"     "    | PRECONDITION_FAILURE: guard xyz" "$err"
 
+# =============================================================================
+# (F) FAST LANE — `--max-layer N` / scripts/layer-fast.sh (developer inner-loop).
+#     Layers 1..N only, NO Gate-2 verdict, REFUSED in an attesting context. This is
+#     the seam that keeps a diligent implementer's self-check off the shared Layer-7
+#     cluster the Lead's Gate 2 owns. run_la doesn't forward positional args, so a
+#     tiny arg-forwarding twin drives these (same env -i + fresh DEVLOOP_TMP).
+# =============================================================================
+run_la_args() {
+  shift  # $1 is the stubdir (call-site symmetry with run_la); the dir reaches layer-all via LAYER_SCRIPT_DIR.
+  local la_args="$1"; shift
+  local t; t="$(mktemp -d "$WORK/run.XXXXXX")"
+  LA_DT="$t/dt"; LA_OUT="$t/out"; LA_ERR="$t/err"
+  # The suite's IFS=$'\n\t' (line 23) has no space, so split la_args on spaces here.
+  local IFS=' '
+  # la_args is a deliberate word-split list of literal flags (e.g. "--max-layer 6").
+  # shellcheck disable=SC2086
+  env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TMP="$LA_DT" "$@" \
+      bash "$LAYER_ALL" $la_args >"$LA_OUT" 2>"$LA_ERR"
+  LA_RC=$?
+}
+
+# (F1) HAPPY PATH: --max-layer 6 runs layers 1-6, STOPS before 7, exits 0, prints the
+#      FAST_LANE banner, and writes NO gate2-verdict (the no-authority guarantee).
+d="$(new_stubdir)"
+run_la_args "$d" "--max-layer 6" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+out="$(cat "$LA_OUT")"; err="$(cat "$LA_ERR")"
+assert_exit      "f1-fast-exit0"          0 "$LA_RC"
+assert_status    "f1-fast-banner"         "FAST_LANE=1 LAYERS=1-6"          "$err"
+assert_marker    "f1-l6-ran"              "$LA_DT" 'ran.layer6'
+assert_no_marker "f1-l7-not-run"          "$LA_DT" 'ran.layer7'
+assert_status    "f1-summary-has-l6"      "LAYER=6 RESULT=OK"               "$out"
+assert_absent    "f1-summary-no-l7"       "LAYER=7"                         "$out"
+assert_no_marker "f1-no-gate2-verdict"    "$LA_DT" 'gate2-verdict'
+
+# (F2) CONTROL: a bare (full) run over the SAME stubs DOES run layer 7 and DOES write the
+#      verdict — proves F1's absences are the fast lane, not a broken fixture.
+d="$(new_stubdir)"
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+assert_marker "f2-full-l7-ran"        "$LA_DT" 'ran.layer7'
+assert_marker "f2-full-gate2-verdict" "$LA_DT" 'gate2-verdict'
+
+# (F3) ATTESTING-CONTEXT REFUSAL (security): --max-layer < 7 under GITHUB_ACTIONS is rejected
+#      exit 2 with the greppable token, and NO stub runs — the authority pipeline can never be
+#      shortened. (DEVLOOP_TEST=1 present so the seam is honored; the refusal precedes the loop.)
+d="$(new_stubdir)"
+run_la_args "$d" "--max-layer 6" DEVLOOP_TEST=1 GITHUB_ACTIONS=1 LAYER_SCRIPT_DIR="$d"
+err="$(cat "$LA_ERR")"
+assert_exit      "f3-refuse-exit2"    2 "$LA_RC"
+assert_status    "f3-refuse-token"    "REASON=fast-lane-in-attesting-context" "$err"
+assert_no_marker "f3-no-stub-ran"     "$LA_DT" 'ran.layer*'
+
+# (F4) ARG VALIDATION: out-of-range and unknown flags fail loud (exit 2), no stub runs.
+d="$(new_stubdir)"
+run_la_args "$d" "--max-layer 9" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+assert_exit      "f4-range-exit2"     2 "$LA_RC"
+assert_status    "f4-range-token"     "--max-layer must be an integer 1..7" "$(cat "$LA_ERR")"
+assert_no_marker "f4-range-no-stub"   "$LA_DT" 'ran.layer*'
+d="$(new_stubdir)"
+run_la_args "$d" "--bogus" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+assert_exit   "f4-unknown-exit2"      2 "$LA_RC"
+assert_status "f4-unknown-token"      "unknown argument" "$(cat "$LA_ERR")"
+
 report_results "scripts/layer-all.test.sh"
