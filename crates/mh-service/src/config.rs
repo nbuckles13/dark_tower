@@ -102,8 +102,10 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 ///
 /// **Nothing releases an ENDED meeting's edges.** `RoutingSnapshot::with_policy`
 /// is the only mutator of the meeting map and it only inserts; `SessionState`
-/// is likewise insert-only; and `MediaHandlerService` has one RPC, so MH is
-/// given no meeting-ended signal it could act on. Headroom is freed only when a
+/// is likewise insert-only. The meeting-ended signal now EXISTS on the contract
+/// — `MediaHandlerService.EndMeeting` (story 2 R-20) — but this handler answers
+/// it `UNIMPLEMENTED` until story-2 task 11 implements the release, so nothing
+/// acts on it yet. Headroom is freed only when a
 /// still-**live** meeting re-asserts a smaller policy — the per-meeting
 /// subtraction makes 5 edges shrinking to 4 install and drop the total by one —
 /// so the total is not monotone, but the portion held by meetings that have

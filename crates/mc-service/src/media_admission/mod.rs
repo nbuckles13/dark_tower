@@ -21,8 +21,9 @@
 //! pseudonym (ADR-0036 §4).
 //!
 //! Say "same-keyholder consistency", never "verified identity". The
-//! client-validated AC attestation that closes this is **story 2**, and when
-//! it lands the attestation wins over the roster on disagreement.
+//! client-validated AC attestation that closes this is **the attestation story**
+//! (ADR-0036 addendum), and when it lands the attestation wins over the roster
+//! on disagreement.
 //!
 //! Naming floor: nothing here may be called `attested`, `verified` or
 //! `trusted` — not a field, not a type, not a local, not a test.

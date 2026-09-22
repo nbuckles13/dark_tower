@@ -1766,7 +1766,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Inbound gRPC request volume from MC by method and status. MC->MH RPC health. The `method` label is single-valued by design: `register_meeting` is the only RPC on MediaHandlerService, because ADR-0036 §8 makes meeting registration the control plane and it gains fields rather than sibling RPCs. The `register`, `route_media` and `stream_telemetry` values this description previously listed were retired with the 2026-09-01 internal.proto reshape and can never appear.",
+      "description": "Inbound gRPC request volume from MC by method and status. MC->MH RPC health. `method` values are derived from MediaHandlerService's method names (docs/observability/metrics/mh-service.md). Only `register_meeting` is emitted today. `end_meeting` (the story-2 EndMeeting teardown RPC) is NOT emitted yet, because MH answers it UNIMPLEMENTED until the MH EndMeeting task, so an absent `end_meeting` series is expected and is not a scrape fault. The `register`, `route_media` and `stream_telemetry` values were retired with the 2026-09-01 internal.proto reshape and can never appear.",
       "fieldConfig": {
         "defaults": {
           "color": {

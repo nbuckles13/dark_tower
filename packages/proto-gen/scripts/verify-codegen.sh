@@ -100,6 +100,21 @@ for symbol in \
   assert_generated "dark_tower/internal/v1/internal_pb.ts" "${symbol}"
 done
 
+# Story 2 (R-9, R-20) — the new internal shapes: the meeting-level muted set on
+# the registration snapshot, and the distinct teardown RPC with its own
+# request/response pair (buf STANDARD: distinct types per RPC). Field and method
+# names are checked in protoc-gen-es's generated casing, read from a regenerated
+# output rather than written from memory. `endMeeting: {` is the service
+# descriptor's method entry, so it cannot be satisfied by the message names.
+for symbol in \
+  MutedSource \
+  EndMeetingRequest \
+  EndMeetingResponse \
+  serverMutedSources \
+  "endMeeting: {"; do
+  assert_generated "dark_tower/internal/v1/internal_pb.ts" "${symbol}"
+done
+
 # ADR-0036 internal contract — the retired shapes must be GONE.
 #
 # All eight, not a sample. A presence-only oracle stays green through a
@@ -134,6 +149,12 @@ for symbol in \
 done
 
 for symbol in MediaKind Codec TransportMode SlotState; do
+  assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
+done
+
+# Story 2 (R-14, R-33) — additive signalling fields: W on the join response and
+# the KEK push, and the per-subscriber unreachable set on `StreamAssignments`.
+for symbol in kekRotationDebounceSeconds unreachableSenderIds; do
   assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
 done
 

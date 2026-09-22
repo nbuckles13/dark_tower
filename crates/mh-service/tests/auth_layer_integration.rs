@@ -63,6 +63,7 @@ fn req_with_bearer(token: Option<&str>) -> Request<RegisterMeetingRequest> {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 0,
+        server_muted_sources: Vec::new(),
     });
     if let Some(t) = token {
         let value: MetadataValue<_> = format!("Bearer {t}")

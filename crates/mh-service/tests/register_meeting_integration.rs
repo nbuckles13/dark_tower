@@ -57,6 +57,7 @@ fn authed_request(
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 0,
+        server_muted_sources: Vec::new(),
     });
     let value: MetadataValue<_> = format!("Bearer {token}")
         .parse()

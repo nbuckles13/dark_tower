@@ -162,6 +162,17 @@ layer_lifecycle_begin 3
   # guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run
   # it as a production guard as well as here.
   run_and_emit "media-telemetry-deny-selftest" "${__here}/guards/media-telemetry-deny.test.sh" || true
+  # Internal-proto no-key-material SELF-TEST (ADR-0036 §4 "No key material crosses the MC->MH
+  # contract"; rule @security, machinery @infrastructure). The guard is auto-discovered by
+  # run-guards.sh above and is GREEN BY CONSTRUCTION on the real tree, so a real run exercises
+  # none of its failure branches — a path typo would make it a permanent no-op that reads
+  # exactly like a pass. This drives every branch: each `bytes` spelling, each cross-package
+  # spelling (canonical, relative, leading-dot, google.protobuf.*), the enums-only boundary,
+  # the import allowlist and all vacuity tokens — asserting rc AND token on each, so a red for
+  # the wrong reason fails. Hermetic via the DEVLOOP_TEST-gated INTERNAL_PROTO_GUARD_ROOT seam
+  # over copies of the real protos; no cluster, no network, no cargo. Deliberately NOT under
+  # guards/simple/ for the same `find -name '*.sh'` reason as its neighbours.
+  run_and_emit "internal-proto-no-key-material-selftest" "${__here}/guards/validate-internal-proto-no-key-material.test.sh" || true
   # _common.sh unit tests (ADR-0037 §D7 wires this in — it was orphaned/unrun, docs/TODO.md:2006). Hosts
   # the STATUS-aggregation precedence, fail_fast_mode, AND the fmt_mode truth table (incl. the two
   # load-bearing apply-opt-in-loses-to-CI/override cells). Hermetic: pure bash, no cargo/cluster/network.

@@ -13,10 +13,12 @@
 //!
 //! Bounded label values per `docs/observability/metrics/mh-service.md`:
 //!
-//! - `mh_grpc_requests_total`: `method` is **single-valued** —
-//!   `register_meeting` is the only RPC on `MediaHandlerService`, because
-//!   ADR-0036 §8 makes meeting registration the control plane and it gains
-//!   fields rather than sibling RPCs. `status` ∈ {success, error}.
+//! - `mh_grpc_requests_total`: `method` values are derived from
+//!   `MediaHandlerService`'s method names, with the vocabulary at
+//!   `observability::metrics`'s `GRPC_METHOD_*` consts. Only `register_meeting`
+//!   is emitted today; `end_meeting` is not until story-2 task 11 (its RPC
+//!   answers `UNIMPLEMENTED`), so this file asserts the one emitted value.
+//!   `status` ∈ {success, error}.
 //! - `mh_errors_total`: `operation` is a stable identifier from the call site
 //!   (e.g. `register_meeting`, `mc_notify`), `error_type` is from
 //!   `MhError`-variant naming, `status_code` is the HTTP/gRPC status int.

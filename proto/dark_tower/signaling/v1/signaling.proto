@@ -81,17 +81,48 @@ enum SlotState {
   SLOT_STATE_UNSPECIFIED = 0;
   // Steady: a source is assigned and producing.
   SLOT_STATE_ACTIVE = 1;
-  // Steady: the source is present but has muted itself at capture, so no media
-  // leaves its device (ADR-0036 §5 client mute). The receiver renders a
-  // placeholder from this state, never from a substitute frame.
+  // Steady: the source is present but muted, so no media reaches this slot.
+  // Covers BOTH mute paths: CLIENT mute (§5 -- the source muted itself at
+  // capture, so nothing leaves its device) AND SERVER mute (§7 -- a host muted
+  // it and MH drops its frames at ingress). The receiver renders a placeholder
+  // from this state, never from a substitute frame.
+  //
+  // This state deliberately does NOT distinguish the two, and no enum value
+  // will be added to do so. The CAUSE and WHO MUTED WHOM are carried on
+  // `ParticipantMuteUpdate`; a client that needs "muted by host" reads it
+  // there. Splitting the slot state would put a moderation fact on a per-slot
+  // rendering signal and make every consumer handle two values that render
+  // identically.
   SLOT_STATE_SOURCE_MUTED = 2;
   // Transient, and the only genuinely MH-observed state.
   SLOT_STATE_WITHHELD_BY_CONGESTION = 3;
   // Steady: the meeting has fewer sources than the subscriber requested slots.
   SLOT_STATE_FEWER_SOURCES_THAN_SLOTS = 4;
   // Steady: the subscriber requested zero of this kind.
+  //
+  // RETAINED IN THE VOCABULARY, NOT EMITTED IN STORY 2 -- and MC MUST NOT
+  // fabricate a carrier for it. The state rides a `StreamAssignment` whose
+  // `slot_id` ECHOES a `ReceiveSlot.slot_id` the subscriber chose; a subscriber
+  // who declared a slot of this kind did not request zero of it, and one who
+  // declared none chose no id to echo. Inventing a `slot_id` (e.g. 0) to carry
+  // this state would break the echo property on a published contract. So in
+  // story 2 a zero-slot declaration yields no assignment for that kind, and a
+  // declared-but-unfilled slot is `SLOT_STATE_FEWER_SOURCES_THAN_SLOTS`.
+  //
+  // KEPT RATHER THAN RESERVED because per-kind slot declarations (story 3,
+  // video) make it naturally emittable: a subscriber declaring audio slots
+  // and zero video slots has requested zero of a kind while still owning
+  // echoable ids for the other. Reserving it now would force a re-add then.
   SLOT_STATE_ZERO_REQUESTED = 5;
-  // Structurally persistent, unlike the transient states above (ADR-0036 §9).
+  // Structurally persistent, unlike the transient states above (ADR-0036 §9):
+  // the subscriber PINNED a source that is on a different handler, and there
+  // is no cross-handler forwarding.
+  //
+  // RETAINED, NOT EMITTED IN STORY 2: under static fill no client pins, so the
+  // pinned-unreachable case cannot arise. A participant on another handler
+  // consumes NO slot and is reported per subscriber on
+  // `StreamAssignments.unreachable_sender_ids` instead -- never as an empty
+  // slot in this state.
   SLOT_STATE_SOURCE_UNREACHABLE = 6;
   // Transient: a source switch has been commanded and is waiting on the new
   // source's next independently-decodable frame (ADR-0036 §7). Carries the
@@ -197,7 +228,7 @@ message JoinRequest {
   // against it therefore proves only that every frame came from the same
   // keyholder; it never proves WHO that keyholder is, and for a guest it never
   // proves more than a pseudonym. The client-validated AC attestation that
-  // closes this is story 2.
+  // closes this is the attestation story (ADR-0036 addendum).
   //
   // The proto does not validate length. MC MUST length-check 32 before
   // publishing a client-controlled blob to every participant on the roster;
@@ -297,8 +328,9 @@ message Participant {
   // attestation check of any kind. MC publishes what the client sent. A
   // compromised or malicious MC can therefore publish a key it controls for a
   // participant that does not exist, and nothing here detects it; the
-  // client-validated AC attestation that closes this is story 2, and when it
-  // lands the attestation wins over the roster on disagreement.
+  // client-validated AC attestation that closes this is the attestation story
+  // (ADR-0036 addendum), and when it lands the attestation wins over the roster
+  // on disagreement.
   //
   // Empty means no key published: consumers MUST fail closed and MUST NOT fall
   // back to accepting unsigned frames from this participant. MC enforces the
@@ -448,6 +480,56 @@ message JoinResponse {
   // in the two-person case. Logging it inside an already-redacted `Debug` is
   // fine and useful.
   uint32 kek_generation = 10;
+
+  // W: the meeting's KEK rotation debounce window, in seconds -- the same value
+  // MC is configured with via `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (ADR-0036 §4
+  // Rotation, "Participant leaves"). THE canonical statement of this field's
+  // rules; `MeetingKekUpdate.kek_rotation_debounce_seconds` references it.
+  //
+  // Carried here as well as on the push because the reconnect response is
+  // JoinResponse-shaped and a reconnecting participant may hold an older
+  // generation it still needs to open in-flight frames against. A first joiner
+  // holds no previous generation and ignores it.
+  //
+  // WHAT THE CLIENT DERIVES, AND WHY THIS FIELD IS THE GUARANTEE'S HOME. The
+  // client holds at most ONE previous KEK generation, for a retention of
+  // `min(W / 2, ceiling)` computed at the consumer. Deriving it there, from W,
+  // is what makes "retention is shorter than W" STRUCTURAL rather than a
+  // cross-service check: both bounds only ever pull retention DOWN, so
+  // retention < W holds at every value of W. The CEILING exists because
+  // retention serves one purpose -- opening frames already in flight when a
+  // rotation lands, a LATENCY-SCALE need of seconds -- and must not scale with
+  // policy-scale W without bound: at a misconfigured W of a day, W/2 would
+  // hold a superseded KEK in client memory for twelve hours to serve a
+  // thirty-second need (key minimisation against client memory compromise). Do
+  // not delete the `min()` as redundant. The ceiling's value is the client's,
+  // derived from a stated frames-in-flight assumption, and lives at the
+  // client's single config point; no number is restated here.
+  //
+  // The client MUST also check that the derived retention exceeds its own
+  // transmit-key re-wrap latency; a retention shorter than that drops frames
+  // from senders that have not yet re-wrapped.
+  //
+  // ZERO OR ABSENT (a non-optional scalar, so ONE observable): the client
+  // substitutes its documented FLOOR constant, counts it, logs at WARN, and
+  // NEVER hard-fails. An MC one version older does not send this field, and
+  // that is exactly the supported rollback (story 2 R-24); `error` on a
+  // supported path trains responders to ignore it. The count MUST distinguish
+  // FLOOR-SUBSTITUTED (older MC: expected during a rollback) from
+  // CEILING-CLAMPED (MC configured at a scale the client will not follow:
+  // unexpected) -- two conditions with different owners and opposite
+  // expectedness must not share one number. Either two counters or one bounded
+  // dimension; any dimension must ride an attribute key GC's telemetry
+  // allowlist admits (`crates/gc-service/src/services/telemetry_filter.rs`),
+  // with its values homed in the client's vocabulary. That count is the ONLY
+  // signal a fleet is running on the floor or ceiling instead of the negotiated
+  // W, because nothing fails. The WARN line carries the received value and the
+  // substituted one -- never the KEK, never the generation.
+  //
+  // NOT KEY MATERIAL. A duration: safe to log, shown in the clear by the
+  // redacting `Debug`. OBSERVABILITY: bounded by configuration, but a value
+  // rather than a category -- the log line, not a label.
+  uint32 kek_rotation_debounce_seconds = 11;
 }
 
 // Reason for participant leaving.
@@ -766,8 +848,8 @@ message SendDirective {
 // entry's `identity_public_key` to an Ed25519 verification of the frame.
 // Attribution comes from THE SIGNATURE VERIFYING, never from this assignment
 // or from the roster mapping itself — a compromised MC can mis-map either, and
-// this story's chain is rooted in trust-on-first-use because no attestation
-// check exists yet (story 2 adds it).
+// this chain is rooted in trust-on-first-use because no attestation check
+// exists yet (the attestation story in the ADR-0036 addendum adds it).
 message StreamAssignment {
   // Pre-ADR-0036 (the layout-form message that occupied this name): `uint32
   // stream_id = 1`, `uint64 user_id = 2`, `MediaType media_type = 3`, `uint32
@@ -853,8 +935,60 @@ message StreamAssignment {
 // element message's contents changed, and that hazard is reserved for inside
 // `StreamAssignment` above. Reserving tag 1 here would vacate a field that
 // nothing repurposed.
+//
+// FULL SNAPSHOT, REPLACE SEMANTICS, for BOTH fields: each `StreamAssignments`
+// wholly replaces the previous one. Neither field is a delta. Because nothing
+// else tells the client, MC MUST re-emit `StreamAssignments` to a subscriber
+// whenever EITHER field changes for that subscriber -- including when a roster
+// join or leave changes only `unreachable_sender_ids`. Otherwise a peer who
+// later joins on another handler never appears as unreachable.
 message StreamAssignments {
   repeated StreamAssignment assignments = 1;
+
+  // The roster participants THIS subscriber cannot reach: they are on a
+  // different media handler, and there is no cross-handler forwarding
+  // (ADR-0036 §9 visibility rule; story 2 R-33). Each is a sender id; the
+  // client resolves it to a roster entry through `Participant.sender_id`.
+  //
+  // PER SUBSCRIBER, because reachability is relative to the subscriber's own
+  // handler. MC computes the visibility graph and stays authoritative. Do NOT
+  // put each participant's handler on the roster and let clients compute this
+  // -- that exposes topology and contradicts §7/§9.
+  //
+  // MEMBERSHIP, precisely:
+  //   - EXCLUDES the subscriber's own sender id.
+  //   - EXCLUDES same-handler senders left unassigned only because the
+  //     subscriber's slots are full (the N+2th sender). That is "no slot", not
+  //     "can't reach", and telling a user a co-located participant is
+  //     unreachable would be false.
+  //   - Lists only roster participants that HAVE a `sender_id` (it is
+  //     `optional` on `Participant`); a participant without one cannot be named
+  //     here.
+  //   - An unreachable participant consumes NO slot. It is never represented as
+  //     an empty slot, and `SLOT_STATE_SOURCE_UNREACHABLE` is reserved for the
+  //     pinned case, which cannot arise under static fill.
+  //
+  // A message MAY carry zero `assignments` and a non-empty set here (every
+  // other participant is elsewhere); that is well-formed, not malformed.
+  //
+  // THE CLIENT MARKS THESE ROSTER ENTRIES DISTINCTLY -- never a spinner, never
+  // an empty slot, never inferred from silence (§6 "absence of frames is not a
+  // signal"; §9 "needs distinct treatment in the interface").
+  //
+  // WHAT THIS DELIBERATELY DOES NOT DISCLOSE, so nobody widens it believing it
+  // is already a topology channel. It is one bit per roster entry, relative to
+  // this subscriber. It carries no handler identity or URL for these
+  // participants, no handler count for the meeting, and no other subscriber's
+  // partition. A client MUST NOT infer co-location AMONG the unreachable set:
+  // being absent from my reachable set says nothing about whether two
+  // unreachable peers share a handler with each other. Grouping them is the
+  // step that turns a reachability bit into a topology map. The subscriber's own
+  // handler is already known to it (`StreamAssignment.media_handler_url`,
+  // `JoinResponse.media_servers`); nothing here adds to that.
+  //
+  // OBSERVABILITY (ADR-0036 §11): sender ids -- never a metric label, never a
+  // span attribute, never a per-frame log dimension.
+  repeated uint32 unreachable_sender_ids = 2;
 }
 
 // ============================================================================
@@ -863,11 +997,18 @@ message StreamAssignments {
 
 // A new meeting KEK, pushed to every member on rotation (ADR-0036 §4 step 6).
 //
-// Defined additively and UNUSED THIS STORY, so that story 2's rotation is a
-// behaviour change only. MC rotates on participant departure, debounced; the
-// joiner path uses `JoinResponse` instead, which touches no existing member.
-// Receivers retain the previous KEK for a bounded window so frames in flight,
-// and frames from senders that have not yet re-wrapped, still open.
+// Pushed by MC on leave-debounced rotation (story 2): MC rotates on
+// participant departure, debounced to at most once per W; the joiner path uses
+// `JoinResponse` instead, which touches no existing member. Defined additively
+// in story 1 so that story 2's rotation is a behaviour change plus the one
+// additive field below. Receivers retain the previous KEK for a bounded window
+// so frames in flight, and frames from senders that have not yet re-wrapped,
+// still open; that window is derived from `kek_rotation_debounce_seconds` below,
+// and its rule lives at `JoinResponse.kek_rotation_debounce_seconds`.
+//
+// On receipt, every sender also rotates its own transmit keys (ADR-0036 §4
+// Rotation, "Meeting KEK rotated"): re-wrapping alone cannot revoke a transmit
+// key a leaver already holds in plaintext.
 message MeetingKekUpdate {
   // The new meeting key-encryption key. AES-256: exactly 32 bytes. See
   // `JoinResponse.meeting_kek` for the full custody, logging and fail-closed
@@ -883,6 +1024,14 @@ message MeetingKekUpdate {
   // rules as `JoinResponse.kek_generation` — the two MUST NOT diverge, or
   // rotation breaks in a way that only shows up as undecryptable frames.
   uint32 kek_generation = 2;
+
+  // W, the meeting's KEK rotation debounce window in seconds. The full rule --
+  // retention derivation, floor, ceiling, counting and logging -- is stated
+  // once at `JoinResponse.kek_rotation_debounce_seconds` and applies
+  // identically here; it is deliberately not restated. Carried on the push as
+  // well as the join so a long-lived member never runs on a W it learned at
+  // join time after MC's configuration changed.
+  uint32 kek_rotation_debounce_seconds = 3;
 }
 
 // ============================================================================

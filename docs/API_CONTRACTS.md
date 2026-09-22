@@ -253,8 +253,9 @@ republished on the roster. **This story performs no attestation check**: MC does
 not verify it against the meeting token's `cnf` thumbprint, so it is trust on
 first use. A verified frame signature therefore proves only that every frame came
 from the same keyholder, never *who* that keyholder is, and for a guest never more
-than a pseudonym. The client-validated AC attestation closes this in story 2;
-when it lands, the attestation wins over the roster on disagreement.
+than a pseudonym. The client-validated AC attestation closes this in the
+attestation story (ADR-0036 addendum); when it lands, the attestation wins over
+the roster on disagreement.
 
 Keys are scoped to one meeting, never reused across meetings — a reused key makes
 a participant linkable by public key regardless of display name.
@@ -574,23 +575,31 @@ Total header size: 42 bytes
 
 ### 4.1 Register Meeting — the MC→MH control plane
 
-`MediaHandlerService` has **exactly one RPC**, by design. ADR-0036 §8 makes
-meeting registration the control plane: it gains *fields* rather than sibling
-RPCs. Authoritative shape, with the normative rules on every field:
+**Forwarding policy gains fields, not sibling RPCs.** ADR-0036 §8 makes meeting
+registration the control plane: anything that changes what the Media Handler
+forwards is a *field* on the full registration snapshot. Meeting lifecycle
+teardown is a distinct concern with its own RPC, `EndMeeting` (§4.2). Until story
+2 this section said `MediaHandlerService` had "exactly one RPC, by design"; that
+invariant is narrowed to forwarding policy, not dropped. Authoritative shape,
+with the normative rules on every field:
 `proto/dark_tower/internal/v1/internal.proto`.
 
 The request carries the meeting identity, MC's callback endpoint, the complete
 forwarding policy as a repeated self-contained `EgressStream` (subscriber slot +
 candidate sources + priority group + supersede-on-independent-frame + transport
-mode), meeting-level `SelectionRules`, and a `policy_generation` derived from MC's
-assignment-output change. The response carries `accepted` (received-and-parsed
+mode), meeting-level `SelectionRules`, a `policy_generation` derived from MC's
+assignment-output change, and the meeting-level `server_muted_sources` set
+(story 2). Server mute is sender-scoped because the Media Handler can neither
+read nor authenticate a publisher's stream number, and it is bounded per meeting.
+The response carries `accepted` (received-and-parsed
 only — **not** evidence of application), the **applied** generation, `handler_id`,
 `process_start_epoch_ms`, and the echoed `transport_mode`.
 
 > **Superseded 2026-09-01 — three RPCs retired.** This section previously
 > specified `RegisterParticipant`/`RegisterParticipantResponse{connection_token}`
-> (§4.1), `RouteMediaCommand` + `RoutingOptions{transcode, target_codec,
-> target_bitrate, mix_audio}` (§4.2), and `MediaTelemetry{..., jitter_ms}` (§4.3).
+> (former §4.1), `RouteMediaCommand` + `RoutingOptions{transcode, target_codec,
+> target_bitrate, mix_audio}` (former §4.2), and `MediaTelemetry{..., jitter_ms}`
+> (former §4.3). Today's §4.2 is the story-2 `EndMeeting` RPC, which is unrelated.
 > All three are deleted from `internal.proto`, and the text is replaced rather
 > than dropped so a reader who relied on it learns why:
 >
@@ -605,6 +614,34 @@ only — **not** evidence of application), the **applied** generation, `handler_
 >   Handler self-monitoring histograms. Its `jitter_ms` measured an ADR-0011
 >   objective the ADR-0036 amendment table strikes as unmeasurable, because the
 >   handler forwards and does not buffer.
+
+### 4.2 End Meeting — handler resource release (story 2)
+
+`EndMeeting(EndMeetingRequest{meeting_id, mc_id}) → EndMeetingResponse{acknowledged}`
+releases a meeting's routing state and egress-edge budget on one handler when the
+meeting ends. The call carries no generation and no reason. It is **not**
+`NotifyMeetingEnded`, which is MC→GC fleet bookkeeping.
+
+- An unknown or already-released meeting is an idempotent no-op that returns
+  `acknowledged: true`. That includes a handler that never received a
+  registration, since MC calls every handler in its assigned set.
+- A matching `mc_id` releases the meeting and forgets its applied generation, so
+  a later re-registration under the same id is a fresh install. Promoted
+  connections are closed. Pending connections are left to the registration
+  timeout.
+- A **mismatched** `mc_id` returns gRPC `FAILED_PRECONDITION`. It never returns
+  `acknowledged: false` and never acts as an idempotent accept, and it must not
+  be retried. `mc_id` is self-asserted and **is not an authorization control**,
+  which is why the status is not `PERMISSION_DENIED`. Channel authenticity comes
+  from the unchanged two-layer `MhAuthLayer` gate: scope `service.write.mh`
+  plus caller `service_type`.
+- Rollout: the Media Handler gains the RPC before any MC calls it. A
+  one-version-older Media Handler answers `UNIMPLEMENTED`. That is expected: MC
+  counts it and does not retry.
+
+The normative text, including the story-4 re-assert fence, the accepted
+meeting-existence oracle and the operator-visible symptom, is on
+`EndMeetingRequest` in `internal.proto`.
 
 ## 5. Global Controller ↔ Meeting Controller
 

@@ -55,8 +55,8 @@ impl std::error::Error for IdentityPublicKeyRejected {}
 /// from **the same keyholder** — *same-keyholder consistency*. It never proves
 /// *who* that keyholder is, and for a guest it never proves more than a
 /// pseudonym (ADR-0036 §4). The client-validated AC attestation that closes
-/// this is **story 2**; when it lands, the attestation wins over the roster on
-/// disagreement.
+/// this is **the attestation story** (ADR-0036 addendum); when it lands, the
+/// attestation wins over the roster on disagreement.
 ///
 /// Because there is no binding, a compromised or malicious MC can publish a key
 /// it controls for a participant that does not exist, and nothing here detects
