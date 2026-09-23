@@ -1,0 +1,57 @@
+# Kind dev-cluster egress budget (story 2 R-19), strategic-merge patch.
+#
+# The prod base (infra/services/mh-service/configmap.yaml) ships
+# MH_EGRESS_BUDGET_BPS as a deliberately-unsized placeholder. That placeholder
+# admits fewer streams than the suite needs, so the Kind cluster must override
+# it. This patch changes that ONE value and nothing else; every other base key
+# is inherited unchanged. Mirrors the configmap-otel-patch.yaml precedent the
+# AC, GC and MC Kind overlays already use.
+#
+# SIZED AGAINST A STATED REQUIREMENT — this is the only place the sizing lives.
+#
+#   Requirement: N+1 participants all hearing each other is (N+1) x N egress
+#   edges, one egress stream per edge. The test suite is locked at N = 3
+#   (12 edges); the budget is sized for the demo at N = 5 (30 edges on one
+#   handler), so the suite runs with headroom rather than at the edge.
+#
+#   Formula: MH derives its stream ceiling as
+#       ceiling = MH_EGRESS_BUDGET_BPS / max(MH_STREAM_COST_AUDIO_BPS,
+#                                            MH_STREAM_COST_VIDEO_BPS)
+#   rounded down. It divides by the VIDEO cost even though story 2 sends only
+#   audio: the larger cost is used so MH stays type-blind. So this value must
+#   satisfy  ceiling >= (N+1) x N  with N = 5, against the DEPLOYED costs.
+#
+# That relationship is ENFORCED, not asserted here: see
+#   crates/env-tests/tests/01_mh_deployment_config.rs::test_kind_egress_stream_ceiling_meets_demo_requirement
+# which reads the budget and both costs from the LIVE ConfigMap and fails if the
+# derived ceiling falls below the requirement. No ceiling literal is written
+# here on purpose — a restated result goes stale the moment either cost moves;
+# the test does not.
+#
+# WHY UNDER-SIZING IS DANGEROUS HERE, SPECIFICALLY. A budget that is too small
+# makes MH reject admission partway through the largest scenario. That presents
+# as "some receivers are missing some senders" — indistinguishable by symptom
+# from the routing bug the suite exists to catch, and able to MASK a real one.
+#
+# GUARD COVERAGE, stated honestly. `dt-guard env-config` reads
+# infra/services/** only, so the BASE key is guard-covered and this patched
+# VALUE is not. That is acceptable because this patch changes a value, never a
+# key — do NOT add keys here. A strategic merge is additive by key name: if the
+# base key is ever renamed, this patch silently contributes a dead key and the
+# base placeholder wins in Kind. The env-test above catches that at runtime (it
+# has a distinct "overlay did not apply" failure); nothing catches it
+# statically (docs/TODO.md §Infrastructure Validation in Devloops, the
+# env-config overlay-coverage entry).
+#
+# CHANGING THIS VALUE needs a pod restart. `kubectl apply -k` updates the
+# ConfigMap but does NOT restart the MH pods, which keep the value they started
+# with. `infra/kind/scripts/setup.sh` restarts them whenever its apply changed
+# this ConfigMap; after a hand `kubectl apply -k`, run:
+#   kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mh-service-config
+  namespace: dark-tower
+data:
+  MH_EGRESS_BUDGET_BPS: "100000000"

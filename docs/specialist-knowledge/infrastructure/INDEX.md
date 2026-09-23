@@ -23,7 +23,7 @@
 - Redis + PostgreSQL manifests (Kustomize bases) -> `infra/services/{redis,postgres}/kustomization.yaml`; PostgreSQL init -> `infra/docker/postgres/init.sql`
 - K8s observability manifests (Prometheus, Loki/Promtail, kube-state-metrics, node-exporter) -> `infra/kubernetes/observability/kustomization.yaml`
 - Grafana manifests, dashboards + provisioning -> `infra/grafana/kustomization.yaml`, `infra/grafana/{dashboards,provisioning}/`
-- Kind overlays: cluster root, observability, per-service patches (OTel endpoint, CORS, NodePorts) -> `infra/kubernetes/overlays/kind/{kustomization.yaml,observability/,services/}`
+- Kind overlays: cluster root, observability, per-service patches (OTel endpoint, CORS, NodePorts, MH egress budget) -> `infra/kubernetes/overlays/kind/{kustomization.yaml,observability/,services/}`
 - Kind cluster config + setup script (also creates MC/MH TLS + MH secrets imperatively) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl`, `infra/kind/scripts/setup.sh`
 - setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, DT_ORG_MAX_CONCURRENT_MEETINGS, --yes, --only, --skip-build, --provision-org) -> ADR-0030
 - setup.sh helpers -> `deploy_mc_service()`/`deploy_mh_service()` (ConfigMap advertise-addr patching), `load_image_to_kind()`, `deploy_only_service()`, `dt_psql()` (in-pod psql SSoT), `provision_run_org()`; tests -> `scripts/setup.test.sh`
@@ -35,7 +35,7 @@
 - Binary + wrapper shape (subcommand-per-policy, clap dispatcher, STATUS line per ADR-0033 §6; wrappers source the shared prelude per ADR-0034 §3) -> `crates/dt-guard/`, `scripts/guards/simple/*.sh`; canonical-home `Lazy<Regex>` convention -> `clippy.toml`
 - Canonical `{ac,gc,mc,mh}` service enumeration SSoT; Bash mirror -> `crates/dt-guard/src/common/services.rs`, `scripts/guards/common.sh`
 - Kustomize policy (build, orphan manifests, kubeconform, securityContext) -> `crates/dt-guard/src/kustomize.rs`, `kustomize_tools.rs`
-- Env-config policy (per-workload env-var coverage, `configMapKeyRef` resolution) -> `crates/dt-guard/src/env_config.rs`
+- Env-config policy (per-workload env-var coverage, `configMapKeyRef` resolution, key==env-name) -> `crates/dt-guard/src/env_config.rs`; live-cluster twin for MH -> `crates/env-tests/tests/01_mh_deployment_config.rs`
 - Observability policy modules -> `crates/dt-guard/src/alert_rules.rs`, `dashboard_panels.rs`, `infrastructure_metrics.rs`, `metric_labels.rs`, `metric_coverage.rs`
 - Release-artifact premise for the ADR-0036 §11 compile gate -> `crates/dt-guard/src/release_build_profile.rs`; real-build demo `scripts/release-feature-gate.test.sh`
 - Insecure browser/TLS flag prohibition -> `crates/dt-guard/src/no_insecure_browser_flags.rs`

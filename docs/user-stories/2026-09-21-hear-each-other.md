@@ -308,7 +308,7 @@ tasks:
   slug: 2026-09-22-hear-each-other-protocol-contract
   tag: story-2026-09-21-hear-each-other-task-1
 - id: 2
-  status: pending
+  status: completed
   specialist: infrastructure
   prompt: |-
     Land media-handler's story-2 configuration surface in `infra/services/mh-service/` (docs/user-stories/2026-09-21-hear-each-other.md, R-19, R-22, R-23, R-24). Manifests land before the code that reads them; the MH code task depends on this one.
@@ -320,6 +320,7 @@ tasks:
     For `MH_MAX_STREAMS`, this story RETIRES but does not delete (two-deploy retirement, ruled by the lead): media-handler's code task removes the code read, `Config::max_streams` and `DEFAULT_MAX_STREAMS`; you fix `.env.example` line ~83 (which says 10000) and `docs/DEVELOPMENT.md` (which says 100); and the ConfigMap key AND both `configMapKeyRef` entries STAY, marked retired-pending-removal. Reason: `kubectl rollout undo` restores the previous Deployment spec with its configMapKeyRef but does not revert the ConfigMap, so a deleted key gives `CreateContainerConfigError` with empty logs on rollback; keeping the refs also satisfies drift-guard rule 3 while the removed read leaves rule 1 nothing to miss. File the follow-up deletion in `docs/TODO.md` as a scheduled removal with its trigger (after the new image is proven in a deploy), not a note — the key already has three disagreeing values across four sites and a retired key with no scheduled removal is how a fourth appears.
 
     Add an env-test asserting a deployed key's value equals what the running pod reports, mirroring story 1's termination-grace test, and extend it to assert the deployed Kind ceiling meets the demo and suite requirement (N=5, 30 edges) — the ConfigMap comment for the Kind override cites that test and the formula rather than an unquantified adverb, and the base value's comment carries no arithmetic at all because that value is deliberately not sized (a numeric relationship between two deployed values is what a check is for; prose truth is not). Add the one-line note to `docs/DATABASE_SCHEMA.md` that `media_handlers.max_streams DEFAULT 1000` is an intentionally retained, unreachable default (GC's register always binds the MH-derived ceiling; no migration, because the ADR-0036 arc forbids one). Keep `dt-guard env-config` green in both directions. Pair with test for the env-test pattern.
+  slug: 2026-09-23-mh-story2-config-surface
   tag: story-2026-09-21-hear-each-other-task-2
 - id: 3
   status: pending

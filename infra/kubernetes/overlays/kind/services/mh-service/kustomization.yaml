@@ -4,6 +4,14 @@ kind: Kustomization
 resources:
   - ../../../../../services/mh-service
 
+# Story 2 R-19: size MH's egress budget for the Kind dev cluster. The prod base
+# ships MH_EGRESS_BUDGET_BPS as a deliberately-unsized placeholder; this
+# strategic-merge patch overrides that one value. The sizing requirement, the
+# formula and the env-test that enforces them are in the patch file. Mirrors
+# the configmap-otel-patch.yaml precedent in the AC, GC and MC Kind overlays.
+patches:
+  - path: configmap-egress-budget-patch.yaml
+
 labels:
   - pairs:
       environment: kind

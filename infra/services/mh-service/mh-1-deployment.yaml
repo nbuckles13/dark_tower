@@ -77,6 +77,15 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_WEBTRANSPORT_BIND_ADDRESS
+        # RETIRED — PENDING REMOVAL, and this reference is deliberately KEPT.
+        # Once the MH code task's image ships, nothing reads MH_MAX_STREAMS.
+        # This ref stays anyway: `kubectl rollout undo` restores a Deployment
+        # spec WITH its configMapKeyRefs but never reverts the ConfigMap, so a
+        # key must never be deleted while a HARD ref to it is reachable by
+        # rollout undo. The removal is itself two deploys (first flip this ref
+        # to `optional: true`, then delete key and refs together) — see
+        # docs/TODO.md §Media Path Obligations. Keep this identical in
+        # mh-0-deployment.yaml and mh-1-deployment.yaml.
         - name: MH_MAX_STREAMS
           valueFrom:
             configMapKeyRef:
@@ -108,6 +117,74 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_CONNECTIONS
+        # Story-2 egress-budget chain (R-19, R-23). Rationale for every value
+        # is in configmap.yaml, which is its single home. HARD references, NOT
+        # `optional:` — the MH code task reads all six as required, so a key
+        # missing here must be a loud CreateContainerConfigError, never a pod
+        # that starts with a value nobody chose. `MH_MEDIA_LATENCY_SAMPLE_RATIO`
+        # below is the ONLY optional ref in this file, deliberately; do not
+        # copy that pattern here.
+        #
+        # PER WORKLOAD, NEVER UNION: mh-0-deployment.yaml and
+        # mh-1-deployment.yaml must carry the identical set. `dt-guard
+        # env-config` rule 1 checks per workload once the reads are required;
+        # until then the env-test in
+        # crates/env-tests/tests/01_mh_deployment_config.rs is what enforces
+        # both instances carry every key.
+        - name: MH_EGRESS_BUDGET_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_EGRESS_BUDGET_BPS
+        - name: MH_STREAM_COST_AUDIO_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_STREAM_COST_AUDIO_BPS
+        - name: MH_STREAM_COST_VIDEO_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_STREAM_COST_VIDEO_BPS
+        - name: MH_EGRESS_REJECTION_RATIO_THRESHOLD
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_EGRESS_REJECTION_RATIO_THRESHOLD
+        - name: MH_MAX_REGISTERED_MEETINGS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_REGISTERED_MEETINGS
+        - name: MH_MAX_MUTED_SOURCES_PER_MEETING
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_MUTED_SOURCES_PER_MEETING
+        # ADR-0036 §8 policy bounds (R-22): resource-exhaustion guards, never
+        # capacity. Values equal the current code defaults, so behaviour is
+        # unchanged at cutover; the MH code task then flips the reads to
+        # required. Same per-workload rule as above.
+        - name: MH_MAX_EGRESS_STREAMS_PER_MEETING
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_EGRESS_STREAMS_PER_MEETING
+        - name: MH_MAX_CANDIDATE_SOURCES_PER_EGRESS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_CANDIDATE_SOURCES_PER_EGRESS
+        - name: MH_MAX_TOTAL_EGRESS_EDGES
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_TOTAL_EGRESS_EDGES
+        - name: MH_POLICY_APPLY_TIMEOUT_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_POLICY_APPLY_TIMEOUT_MS
         # OPTIONAL AT THE MANIFEST LAYER TOO, deliberately — the only key in
         # this file that is.
         #

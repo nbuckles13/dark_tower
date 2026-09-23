@@ -55,6 +55,7 @@ use env_tests::fixtures::alert_rules_loaded::{
     alert_names_in_yaml, loaded_alert_names, mounted_rules_files, RULES_DIR, RULES_KUSTOMIZATION,
 };
 use env_tests::fixtures::PrometheusClient;
+use env_tests::repo_root;
 use std::collections::BTreeSet;
 
 /// Alerts this task shipped. Named individually, and separately from the
@@ -67,15 +68,6 @@ const NEW_ALERTS_THIS_TASK: &[&str] = &[
     "MCMediaMissingKeyMaterial",
     "MHMediaEgressQueueOverflowRate",
 ];
-
-fn repo_root() -> std::path::PathBuf {
-    // CARGO_MANIFEST_DIR is `<repo>/crates/env-tests`.
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("repo root is two levels above the crate manifest")
-        .to_path_buf()
-}
 
 /// Every `alert:` name across the loadable rules files on disk.
 ///

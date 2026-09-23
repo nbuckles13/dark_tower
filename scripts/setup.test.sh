@@ -607,4 +607,29 @@ done
 if [ "$df_count" -ge 4 ]; then PASS=$((PASS + 1)); else
   FAIL=$((FAIL + 1)); FAILURES+=("[dockerfile-cap-nonvacuous] expected >=4 service Dockerfiles, found ${df_count}"); fi
 
+# === apply_reports_configmap_changed: restart only on an IN-PLACE ConfigMap change ==========
+# `kubectl apply` never restarts pods consuming a ConfigMap via configMapKeyRef, so the deploy
+# functions restart on `configured`. These pin the decision table: a false negative leaves
+# pods on stale values (the MH env-test's staleness check then reds); a false positive churns
+# every pod on a fresh bring-up or an idempotent re-run.
+RUN_ARCM='sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; apply_reports_configmap_changed "$out"'
+arcm() { bash -c "$RUN_ARCM" _ "$SETUP" "$1"; }
+
+arcm $'deployment.apps/mh-0 configured\nconfigmap/mh-service-config configured\nservice/mh-0 unchanged'
+assert_rc "arcm-configmap-configured-restarts"   0 $?
+arcm $'configmap/mh-service-config configured (server dry run)'
+assert_rc "arcm-dry-run-suffix-tolerated"        0 $?
+arcm $'configmap/mh-service-config created\ndeployment.apps/mh-0 created'
+assert_rc "arcm-created-no-restart"              1 $?
+arcm $'configmap/mh-service-config unchanged\ndeployment.apps/mh-0 unchanged'
+assert_rc "arcm-unchanged-no-restart"            1 $?
+# A Deployment changing is NOT a reason to restart here: `apply` rolls it out by itself.
+arcm $'configmap/mh-service-config unchanged\ndeployment.apps/mh-0 configured'
+assert_rc "arcm-only-deployment-configured"      1 $?
+# Anchored on the kind: a Secret or a name merely containing "configmap" must not match.
+arcm $'secret/configmap-backup configured'
+assert_rc "arcm-other-kind-no-restart"           1 $?
+arcm ''
+assert_rc "arcm-empty-output-no-restart"         1 $?
+
 report_results "scripts/setup.test.sh"

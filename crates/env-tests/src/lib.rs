@@ -42,6 +42,21 @@
 /// namespace return an empty result set that reads as a clean assertion.
 pub const NAMESPACE: &str = "dark-tower";
 
+/// The repository root, for tests that compare the live cluster against files
+/// in the tree (alert-rule files, overlay patches).
+///
+/// Single home for the same reason as [`NAMESPACE`]: two test files need it,
+/// and a per-file copy is a second encoding of the crate's position in the
+/// repo that drifts the first time the crate moves.
+pub fn repo_root() -> std::path::PathBuf {
+    // CARGO_MANIFEST_DIR is `<repo>/crates/env-tests`.
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root is two levels above the crate manifest")
+        .to_path_buf()
+}
+
 pub mod canary;
 pub mod cluster;
 pub mod eventual;
