@@ -16,6 +16,12 @@
 //!    **naming that ConfigMap**. A key in `mh-0-config` referenced only by
 //!    `mh-0-deployment.yaml` is correct; the same key referenced only by
 //!    `mh-1-deployment.yaml` (which names `mh-1-config`) is an orphan.
+//! 4. Every `configMapKeyRef.key` equals the name of the env var it feeds. A
+//!    crossed reference — env `MH_STREAM_COST_VIDEO_BPS` pointing at key
+//!    `MH_STREAM_COST_AUDIO_BPS` — passes checks 1-3 (the var is declared, the
+//!    pair resolves, the key is referenced) and starts a healthy-looking pod
+//!    running the WRONG value. See [`CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID`] for
+//!    why this is frozen repo-wide and why it is scoped to ConfigMaps only.
 //!
 //! # Discovery
 //!
@@ -34,7 +40,8 @@
 //!
 //! This guard covers `infra/services/<svc>/` **only**. It does NOT cover
 //! `infra/kubernetes/overlays/**`. Kind overlays carry live `data:` keys
-//! (`overlays/kind/services/{ac,gc,mc}-service/configmap-otel-patch.yaml`) that
+//! (`overlays/kind/services/{ac,gc,mc}-service/configmap-otel-patch.yaml`,
+//! `overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`) that
 //! are invisible here, and because a Kustomize strategic merge on a ConfigMap
 //! is *additive*, an overlay can introduce a key that no base ConfigMap
 //! declares and no workload references. Extending coverage to overlays needs a
@@ -94,6 +101,38 @@ pub const MALFORMED_ENV_REFERENCE_RULE_ID: &str = "malformed_env_reference";
 /// a name-scoped resolver whose entire premise is that `metadata.name`
 /// identifies the document — a silent last-wins collapse would hide both.
 pub const DUPLICATE_CONFIGMAP_NAME_RULE_ID: &str = "duplicate_configmap_name";
+/// A `configMapKeyRef`'s `key` differs from the name of the env var it feeds.
+///
+/// **The failure it catches is silent at runtime.** A crossed reference
+/// resolves, the pod starts, readiness passes — and the process runs a value
+/// meant for a different variable. Checks 1-3 all pass over it: the var is
+/// declared, the `(name, key)` pair resolves, and the key is referenced. The
+/// motivating case is story 2's egress chain, where env
+/// `MH_STREAM_COST_VIDEO_BPS` wired to key `MH_STREAM_COST_AUDIO_BPS` in one
+/// workload silently raises that pod's derived stream ceiling by more than an
+/// order of magnitude.
+///
+/// **`key == env name` is FROZEN REPO-WIDE, deliberately.** It was verified
+/// zero-violation across every `configMapKeyRef` in `infra/` when this rule was
+/// introduced (2026-09-23). It forecloses a deliberate "env name differs from
+/// key" pattern for ConfigMaps. If a real need for one ever appears, that is a
+/// rule change to be argued on its own merits — not a mystery red to be
+/// silenced, and not an allow-list entry added in passing.
+///
+/// **Scoped to `configMapKeyRef` ONLY — do not widen it to `secretKeyRef`.**
+/// There is a live, legitimate in-tree counter-example on the secret side:
+/// `infra/services/redis/statefulset.yaml` maps env `REDISCLI_AUTH` to secret
+/// key `REDIS_PASSWORD`, because `redis-cli` reads a fixed env name it does not
+/// choose. "Why not secrets too?" is the obvious next extension, and that file
+/// is the answer.
+///
+/// **Not redundant with the env-test that checks the same invariant.**
+/// `crates/env-tests/tests/01_mh_deployment_config.rs` asserts `key == name` on
+/// the LIVE MH pods. This rule checks declared manifests at Layer 3; the
+/// env-test checks cluster state at Layer 7 and earns its keep exactly when
+/// the cluster does not match the manifests (a hand `kubectl apply -f`, a
+/// partial rollout). Do not delete either as a duplicate of the other.
+pub const CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID: &str = "configmap_key_name_mismatch";
 
 /// Rule-id → FAIL-token, in precedence order. The first id with any hit names
 /// the run.
@@ -125,6 +164,13 @@ const RULE_PRECEDENCE: &[(&str, &str)] = &[
     (CONFIGMAP_NOT_FOUND_RULE_ID, "configmap-not-found"),
     (MISSING_IN_MANIFEST_RULE_ID, "missing-in-manifest"),
     (KEY_NOT_IN_CONFIGMAP_RULE_ID, "key-not-in-configmap"),
+    // After the two runtime-fatal reference faults (they stop a pod starting,
+    // so they outrank), before orphan: a crossed ref starts a healthy-looking
+    // pod on the WRONG value, which is worse than a key that does nothing.
+    (
+        CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
+        "configmap-key-name-mismatch",
+    ),
     (ORPHAN_CONFIGMAP_KEY_RULE_ID, "orphan-key"),
 ];
 
@@ -423,6 +469,19 @@ fn parse_workload(doc: &Value, rel_path: &Path, dir: &str) -> (Option<Workload>,
             let cm_key = cm_ref.get("key").and_then(Value::as_str);
             match (cm_name, cm_key) {
                 (Some(cm_name), Some(cm_key)) => {
+                    // Check 4. Recorded IN ADDITION to the ref, never instead of
+                    // it: the crossed ref is still a real reference to `cm_key`,
+                    // and dropping it would misreport that key as an orphan.
+                    if cm_key != name {
+                        hits.push(Hit {
+                            rule_id: CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
+                            detail: format!(
+                                "{dir}: workload {w} env {name} reads key {cm_key} from ConfigMap {cm_name}; the key must equal the env var name (a crossed ref starts the pod on another variable's value)",
+                                w = metadata_name(doc).unwrap_or("<unnamed>"),
+                            ),
+                            file: rel_path.to_path_buf(),
+                        });
+                    }
                     key_refs.insert((cm_name.to_string(), cm_key.to_string()));
                 }
                 // Missing `name` and/or `key`. Dropping this silently would let
@@ -1193,6 +1252,179 @@ spec:
     }
 
     // -------------------------------------------------------------------------
+    // Check 4 — configMapKeyRef.key must equal the env var name.
+    // -------------------------------------------------------------------------
+
+    /// A Deployment whose env `env_name` reads `key` from `cm_name`. Unlike
+    /// [`deployment_ref`], the env name and the key are independent, so a
+    /// crossed reference can be expressed.
+    fn deployment_env_reads(name: &str, env_name: &str, cm_name: &str, key: &str) -> String {
+        format!(
+            r"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {name}
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        env:
+        - name: {env_name}
+          valueFrom:
+            configMapKeyRef:
+              name: {cm_name}
+              key: {key}
+"
+        )
+    }
+
+    /// The two-cost ConfigMap the crossed-ref cases resolve against, so that
+    /// every OTHER check stays clean and the only possible hit is check 4.
+    const COST_CONFIGMAP: &str = r#"apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mh-service-config
+data:
+  MH_STREAM_COST_AUDIO_BPS: "90000"
+  MH_STREAM_COST_VIDEO_BPS: "2500000"
+"#;
+
+    /// Both instances reading both costs. `crossed` swaps mh-1's VIDEO env to
+    /// read the AUDIO key — the exact motivating defect.
+    fn two_instance_costs(crossed_in_mh1: bool) -> (String, String) {
+        let deployment = |name: &str, video_key: &str| {
+            format!(
+                r"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {name}
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        env:
+        - name: MH_STREAM_COST_AUDIO_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_STREAM_COST_AUDIO_BPS
+        - name: MH_STREAM_COST_VIDEO_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: {video_key}
+"
+            )
+        };
+        let mh1_video_key = if crossed_in_mh1 {
+            "MH_STREAM_COST_AUDIO_BPS"
+        } else {
+            "MH_STREAM_COST_VIDEO_BPS"
+        };
+        (
+            deployment("mh-0", "MH_STREAM_COST_VIDEO_BPS"),
+            deployment("mh-1", mh1_video_key),
+        )
+    }
+
+    #[test]
+    fn crossed_configmap_key_ref_is_flagged() {
+        // POSITIVE CONTROL. Env VIDEO reads key AUDIO. Checks 1-3 all pass over
+        // this — the var is declared, the pair resolves, AUDIO is referenced —
+        // so without check 4 the run is clean while the pod runs the wrong
+        // cost. A matcher that only ever sees conforming input can be green by
+        // matching nothing; this fixture proves it matches.
+        let td = fixture(&[(
+            "mh-service",
+            "",
+            &[
+                (
+                    "mh-0-deployment.yaml",
+                    &deployment_env_reads(
+                        "mh-0",
+                        "MH_STREAM_COST_VIDEO_BPS",
+                        "mh-service-config",
+                        "MH_STREAM_COST_AUDIO_BPS",
+                    ),
+                ),
+                (
+                    "configmap.yaml",
+                    &configmap("mh-service-config", "MH_STREAM_COST_AUDIO_BPS"),
+                ),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        let crossed = hits_for(&report, CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID);
+        assert_eq!(crossed.len(), 1, "hits: {:?}", report.hits);
+        assert!(
+            crossed[0].detail.contains("MH_STREAM_COST_VIDEO_BPS")
+                && crossed[0].detail.contains("MH_STREAM_COST_AUDIO_BPS"),
+            "detail must name both the env var and the key it wrongly reads: {}",
+            crossed[0].detail
+        );
+        // It is the ONLY finding: in particular the crossed ref still counts as
+        // a reference to its key, so AUDIO is not misreported as an orphan.
+        assert_eq!(report.hits.len(), 1, "hits: {:?}", report.hits);
+        assert_eq!(
+            fail_token(&report.hits),
+            "env-config-configmap-key-name-mismatch-1-of-1-findings"
+        );
+    }
+
+    #[test]
+    fn matched_configmap_key_refs_are_clean() {
+        // NEGATIVE CONTROL: the same two-instance, two-cost shape wired
+        // correctly produces no finding of any kind.
+        let (mh0, mh1) = two_instance_costs(false);
+        let td = fixture(&[(
+            "mh-service",
+            "",
+            &[
+                ("mh-0-deployment.yaml", &mh0),
+                ("mh-1-deployment.yaml", &mh1),
+                ("configmap.yaml", COST_CONFIGMAP),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "unexpected hits: {:?}", report.hits);
+    }
+
+    #[test]
+    fn crossed_ref_in_one_instance_only_blames_that_instance() {
+        // The per-workload case: mh-0 is wired correctly, mh-1 crosses VIDEO
+        // onto AUDIO. Exactly one finding, and it names mh-1 — so the
+        // remediation goes to the pod actually running the wrong value.
+        let (mh0, mh1) = two_instance_costs(true);
+        let td = fixture(&[(
+            "mh-service",
+            "",
+            &[
+                ("mh-0-deployment.yaml", &mh0),
+                ("mh-1-deployment.yaml", &mh1),
+                ("configmap.yaml", COST_CONFIGMAP),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        let crossed = hits_for(&report, CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID);
+        assert_eq!(crossed.len(), 1, "hits: {:?}", report.hits);
+        assert!(
+            crossed[0].file.ends_with("mh-1-deployment.yaml"),
+            "expected mh-1 to be blamed, got {}",
+            crossed[0].file.display()
+        );
+        assert!(
+            crossed[0].detail.contains("workload mh-1"),
+            "detail must name the workload: {}",
+            crossed[0].detail
+        );
+        // mh-1 no longer reads the VIDEO key, but mh-0 still does, so no
+        // orphan: the only finding is the crossed ref.
+        assert_eq!(report.hits.len(), 1, "hits: {:?}", report.hits);
+    }
+
+    // -------------------------------------------------------------------------
     // Check 1 — per workload, not union.
     // -------------------------------------------------------------------------
 
@@ -1466,6 +1698,7 @@ spec:
             UNSUPPORTED_ENV_SOURCE_RULE_ID,
             MALFORMED_ENV_REFERENCE_RULE_ID,
             DUPLICATE_CONFIGMAP_NAME_RULE_ID,
+            CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
         ] {
             assert!(
                 RULE_PRECEDENCE.iter().any(|(r, _)| *r == id),

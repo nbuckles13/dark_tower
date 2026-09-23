@@ -486,11 +486,17 @@ See guard script comments and `docs/specialist-knowledge/security/` for the stan
      OTEL_ENABLED, OTLP_ENDPOINT). This is NOT a set-equality contract — a
      future guard asserting equality will red on correct docs.
 
-     STATUS 2026-08-28: the mirror is INCOMPLETE and nothing checks it. 19 of
-     23 required vars are absent; the MC and MH blocks are non-functional as
-     written (each exits at startup on its first MissingEnvVar). Tracked in
-     docs/TODO.md § Cross-Service Duplication (DRY). Do not read the blocks
-     below as a working local configuration until that entry is closed. -->
+     STATUS, PER SERVICE — stated per service on purpose, not as one count,
+     so correcting one block cannot silently falsify a total. NOTHING CHECKS
+     ANY OF THESE; the status is as true as the date on it. Tracked in
+     docs/TODO.md § Cross-Service Duplication (DRY).
+       - MH: CORRECTED 2026-09-23 — complete against its required set.
+       - MC: NON-FUNCTIONAL as written (measured 2026-08-28) — exits at
+         startup on its first MissingEnvVar.
+       - GC: INCOMPLETE (measured 2026-08-28) — lacks GC_CLIENT_ID and
+         GC_CLIENT_SECRET.
+       - AC: complete (measured 2026-08-28).
+     Do not read the MC or GC block as a working local configuration. -->
 
 ### Auth Controller
 
@@ -623,14 +629,51 @@ export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean
 
 ### Media Handler
 
+<!-- ANCHOR (DRY): this block is COMPLETE against MH's required set as of
+     2026-09-23 — every ConfigError::MissingEnvVar in
+     crates/mh-service/src/config.rs::Config::from_vars(), plus the ten story-2
+     keys the MH egress-budget code task makes required. VALUES mirror
+     infra/services/mh-service/configmap.yaml (the budget mirrors the Kind
+     overlay's, so a local run is not starved); that file is the single home —
+     if they disagree, it wins. MH_MAX_STREAMS is deliberately absent: it is
+     retired and no longer read. -->
+
 ```bash
-export RUST_LOG="info,media_handler=debug"
+# The log target is the crate name, mh_service (not "media_handler").
+export RUST_LOG="info,mh_service=debug"
 # MH reads MH_WEBTRANSPORT_BIND_ADDRESS, not the unprefixed BIND_ADDRESS (which it ignores).
 export MH_WEBTRANSPORT_BIND_ADDRESS="0.0.0.0:4434"
-export MH_MAX_STREAMS="100"  # matches the deployed ConfigMap; known-wrong, superseded by the egress-budget chain in story 2
-export AC_CLIENT_ID="<from-service-registration>"
-export AC_CLIENT_SECRET="<from-service-registration>"
-export AC_URL="http://localhost:8082"
+# Advertised addresses (required). gRPC is what MC dials; WebTransport is what clients dial.
+export MH_GRPC_ADVERTISE_ADDRESS="grpc://localhost:50053"
+export MH_WEBTRANSPORT_ADVERTISE_ADDRESS="https://localhost:4434"
+# TLS for WebTransport (required). Generate with ./scripts/generate-dev-certs.sh.
+export MH_TLS_CERT_PATH="infra/docker/certs/mh-webtransport.crt"
+export MH_TLS_KEY_PATH="infra/docker/certs/mh-webtransport.key"
+# OAuth client credentials (required). MH reads MH_-prefixed names, NOT AC_CLIENT_ID/AC_CLIENT_SECRET.
+export MH_CLIENT_ID="media-handler"
+export MH_CLIENT_SECRET="<from-service-registration>"
+# AC endpoints (required). MH reads AC_ENDPOINT, NOT AC_URL.
+export AC_ENDPOINT="http://localhost:8082"
+export AC_JWKS_URL="http://localhost:8082/.well-known/jwks.json"
+# QUIC transport parameters (required; ADR-0036 §1).
+export MH_MAX_CONCURRENT_UNI_STREAMS="64"
+export MH_DATAGRAM_BUFFER_AUDIO_FRAMES="32"
+export MH_KEEPALIVE_INTERVAL_MS="10000"
+export MH_MAX_CONNECTIONS="500"
+# Drain window (required). In-cluster this is derived from the pod's grace period; locally, set it.
+export MH_TERMINATION_GRACE_SECONDS="35"
+# Story 2 egress-budget chain (required once the MH egress-budget code task lands).
+export MH_EGRESS_BUDGET_BPS="100000000"
+export MH_STREAM_COST_AUDIO_BPS="90000"
+export MH_STREAM_COST_VIDEO_BPS="2500000"
+export MH_EGRESS_REJECTION_RATIO_THRESHOLD="0.05"
+export MH_MAX_REGISTERED_MEETINGS="8192"
+export MH_MAX_MUTED_SOURCES_PER_MEETING="512"
+# ADR-0036 §8 policy bounds (required once the same code task lands).
+export MH_MAX_EGRESS_STREAMS_PER_MEETING="512"
+export MH_MAX_CANDIDATE_SOURCES_PER_EGRESS="16"
+export MH_MAX_TOTAL_EGRESS_EDGES="65536"
+export MH_POLICY_APPLY_TIMEOUT_MS="1000"
 export OTLP_ENDPOINT="http://localhost:4317"
 export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
 # leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector

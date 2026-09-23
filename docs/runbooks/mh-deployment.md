@@ -498,9 +498,13 @@ MH refuses to start if any of these is missing or invalid. There is no default
 for any of them: a value nobody chose, running forever because nothing failed,
 is the defect this list exists to prevent.
 
-The **Enforced by** column is the load-bearing one. Three keys begin `MH_MAX_`
-and mean unrelated things; the layer that enforces a bound is what tells them
-apart, and it is also what tells you where to look when one trips.
+The **Enforced by** column is the load-bearing one. Several keys begin `MH_MAX_`
+and mean unrelated things — the transport bound, the connection guard, the
+retired stream count below, and (since story 2) the registered-meeting cap, the
+muted-source bound and three ADR-0036 §8 policy bounds; the layer that enforces
+a bound is what tells them apart, and it is also what tells you where to look
+when one trips. (Stated without a count deliberately: a restated count here is
+what this story's configuration task found false.)
 
 | Key | Source | Kind value | What it bounds — and **who enforces it** |
 |---|---|---|---|
@@ -515,7 +519,7 @@ no way to see why the two `MH_MAX_` keys above are not it:
 
 | Key | Source | Kind value | What it bounds — and who enforces it |
 |---|---|---|---|
-| `MH_MAX_STREAMS` *(not new; not required)* | ConfigMap `mh-service-config` | `100` | **Advertised to GC** as capacity and **enforced only at GC placement** — never on MH's data path. It is also known to be the wrong *unit*: the quantity MH actually needs to bound is an egress bandwidth budget, and a stream count is standing in for it. Its correction is a later story. Do not "fix" it here. |
+| `MH_MAX_STREAMS` *(RETIRED — pending removal; not required)* | ConfigMap `mh-service-config` | `100` | **Retired by story 2.** Superseded by the stream ceiling MH derives from `MH_EGRESS_BUDGET_BPS`, which is what MH advertises to GC once the MH egress-budget code task ships; until that image, this value is still what GC places against, and after it nothing reads it. **The key and both `configMapKeyRef` entries deliberately remain for one deploy**: `kubectl rollout undo` restores a Deployment's refs but not the ConfigMap, so deleting them together turns a rollback into `CreateContainerConfigError`. Do not tune it, and do not delete it by hand — the removal is itself two deploys (flip both refs to `optional: true`, then delete key and refs together, so no reachable revision holds a HARD ref to a missing key) and is scheduled in `docs/TODO.md` §Media Path Obligations. |
 
 Table contributed at the request of the observability review, which found that
 this runbook — unlike GC's, AC's and MC's — had no configuration section at all.

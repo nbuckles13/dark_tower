@@ -1135,6 +1135,62 @@ create_ac_secrets() {
 }
 
 # Build and deploy AC service
+# Did `kubectl apply` change a ConfigMap IN PLACE? Returns 0 iff so.
+#
+# WHY THIS EXISTS: `kubectl apply` updates a ConfigMap but NEVER restarts the
+# pods that consume it through `configMapKeyRef` — env is resolved once, at
+# container start. So re-running this script after a value-only ConfigMap
+# change used to leave every pod running the OLD value while every manifest
+# check passed. For MH that includes the Kind egress budget, where a stale
+# value presents as "some receivers are missing some senders"; the MH env-test
+# (crates/env-tests/tests/01_mh_deployment_config.rs) fails on exactly that
+# staleness, and its precondition is this restart.
+#
+# Only `configured` needs a restart: `created` means the pods are new and
+# already carry the value, and `unchanged` means there is nothing to pick up.
+# Restarting only on `configured` keeps a fresh bring-up and an idempotent
+# re-run free of pod churn. Matches kubectl's `<kind>/<name> <verb>` line
+# (verified against real output; a dry run appends a parenthetical, which the
+# pattern tolerates).
+#
+# IT NARROWS THE STALENESS WINDOW; IT DOES NOT CLOSE IT. This script is ONE
+# deploy path. A human running `kubectl apply -k` against the Kind overlay
+# bypasses it entirely, and that is supported — docs/runbooks/mh-deployment.md
+# tells operators to do exactly that. The fail-closed backstop is the env-test
+# staleness branch (crates/env-tests/tests/01_mh_deployment_config.rs), which
+# covers every path this script does not own.
+#
+# THIS DETECTOR IS FAIL-OPEN, and that is only acceptable because of the above.
+# A missed detection is a SILENTLY stale value — for MH's egress budget that
+# presents as "some receivers are missing some senders", indistinguishable by
+# symptom from a routing bug. So: do NOT delete the env-test staleness branch
+# on the grounds that this script handles it, and do NOT weaken this on the
+# grounds that the env-test catches it. Each is the other's justification; drop
+# either and both halves become useless at once.
+#
+# SCOPE IS THE FOUR APPLICATION SERVICES (AC, GC, MC, MH). Deliberately NOT
+# postgres or redis: those carry state and connection pools, and a restart
+# mid-setup can race whatever is migrating or seeding against them.
+#
+# DO NOT PORT THIS TO A PRODUCTION DEPLOY PATH UNCHANGED. In Kind a restart is
+# cheap. On a real deployment restarting MH drops every live WebTransport
+# session that pod is carrying, so a ConfigMap value edit would silently become
+# a media outage for that pod's meetings. Outside Kind this must be an explicit
+# operator action with that consequence stated, never an implicit consequence
+# of `apply -k`.
+#
+# KNOWN LIMITS — both fail SILENT, which is why they are written here:
+#   - This depends on kubectl's own output wording. If kubectl ever rewords
+#     `configured`, this stops restarting and nothing reports it. MH has a
+#     backstop (the env-test staleness check reds); AC, GC and MC do not.
+#   - A run that dies between the apply and the restart leaves stale pods, and
+#     the next run sees `unchanged` and does not restart either.
+# Neither is a regression: before this helper there was no restart at all on
+# the host path.
+apply_reports_configmap_changed() {
+    grep -Eq '^configmap/[^[:space:]]+ configured( |$)' <<<"$1"
+}
+
 deploy_ac_service() {
     if [[ "${SKIP_BUILD}" != "true" ]]; then
         log_step "Building AC service container image..."
@@ -1147,7 +1203,15 @@ deploy_ac_service() {
     fi
 
     log_step "Deploying AC service to cluster..."
-    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/ac-service/"
+    # Captured, then printed: declared separately so a failing apply still
+    # aborts under `set -e` (`local x=$(...)` would mask its exit status).
+    local apply_out
+    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/ac-service/")
+    printf '%s\n' "${apply_out}"
+    if apply_reports_configmap_changed "${apply_out}"; then
+        log_info "AC ConfigMap changed in place; restarting so the pod picks up the new values..."
+        ${KUBECTL} rollout restart statefulset/ac-service -n dark-tower
+    fi
 
     log_info "Waiting for AC service to be ready..."
     ${KUBECTL} rollout status statefulset/ac-service -n dark-tower --timeout=180s
@@ -1168,7 +1232,13 @@ deploy_gc_service() {
     fi
 
     log_step "Deploying Global Controller to cluster..."
-    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/gc-service/"
+    local apply_out
+    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/gc-service/")
+    printf '%s\n' "${apply_out}"
+    if apply_reports_configmap_changed "${apply_out}"; then
+        log_info "GC ConfigMap changed in place; restarting so the pod picks up the new values..."
+        ${KUBECTL} rollout restart deployment/gc-service -n dark-tower
+    fi
 
     log_info "Waiting for Global Controller to be ready..."
     ${KUBECTL} rollout status deployment/gc-service -n dark-tower --timeout=180s
@@ -1206,7 +1276,16 @@ deploy_mc_service() {
     fi
 
     log_step "Deploying Meeting Controller to cluster..."
-    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mc-service/"
+    local apply_out
+    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mc-service/")
+    printf '%s\n' "${apply_out}"
+    # ONE restart decision for both reasons below, so the devloop path still
+    # restarts exactly once. The host path (no gateway IP) previously never
+    # restarted, leaving a value-only ConfigMap change unapplied.
+    local restart_needed=false
+    if apply_reports_configmap_changed "${apply_out}"; then
+        restart_needed=true
+    fi
 
     # Devloop mode: patch MC advertise addresses to use host-gateway IP + dynamic ports.
     # Static ConfigMaps default to localhost:4433/4435 which are unreachable from the
@@ -1219,6 +1298,9 @@ deploy_mc_service() {
         log_info "Patching MC-1 advertise address: https://${DT_HOST_GATEWAY_IP}:${MC_1_WEBTRANSPORT_PORT}"
         ${KUBECTL} patch configmap mc-1-config -n dark-tower \
             --type merge -p "{\"data\":{\"MC_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MC_1_WEBTRANSPORT_PORT}\"}}"
+        restart_needed=true
+    fi
+    if [[ "${restart_needed}" == "true" ]]; then
         ${KUBECTL} rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
     fi
 
@@ -1271,7 +1353,15 @@ deploy_mh_service() {
     fi
 
     log_step "Deploying Media Handler to cluster..."
-    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mh-service/"
+    local apply_out
+    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mh-service/")
+    printf '%s\n' "${apply_out}"
+    # ONE restart decision for both reasons below (see deploy_mc_service). This
+    # is also what makes the MH env-test's staleness check hold on the host path.
+    local restart_needed=false
+    if apply_reports_configmap_changed "${apply_out}"; then
+        restart_needed=true
+    fi
 
     # Devloop mode: patch MH advertise addresses (same pattern as MC above).
     if [[ -n "${DT_HOST_GATEWAY_IP:-}" ]]; then
@@ -1281,6 +1371,9 @@ deploy_mh_service() {
         log_info "Patching MH-1 advertise address: https://${DT_HOST_GATEWAY_IP}:${MH_1_WEBTRANSPORT_PORT}"
         ${KUBECTL} patch configmap mh-1-config -n dark-tower \
             --type merge -p "{\"data\":{\"MH_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MH_1_WEBTRANSPORT_PORT}\"}}"
+        restart_needed=true
+    fi
+    if [[ "${restart_needed}" == "true" ]]; then
         ${KUBECTL} rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower
     fi
 

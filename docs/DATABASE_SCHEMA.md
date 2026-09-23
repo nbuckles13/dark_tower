@@ -271,6 +271,8 @@ CREATE INDEX idx_handlers_region ON media_handlers(region);
 CREATE INDEX idx_handlers_health ON media_handlers(health_status);
 ```
 
+> **`media_handlers.max_streams DEFAULT 1000` is intentionally retained and unreachable.** The deployed default (in `migrations/20260124000001_mh_registry.sql`, which is authoritative over the sketch above) is never applied: GC's register upsert always binds the `max_streams` value MH advertises (once the MH egress-budget code task ships, the stream ceiling MH derives from its egress budget). It is NOT MH's former `DEFAULT_MAX_STREAMS` constant — the two only coincided numerically. No migration removes it, because the ADR-0036 arc forbids one.
+
 ### 9. Audit Logs Table
 
 Comprehensive audit trail.

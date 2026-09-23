@@ -198,7 +198,8 @@ relationship": a derived value cannot drift; a guard only catches drift after so
 reviews and no guard checks, and it silently disagrees with the panel's declared `Bps` unit. The
 panel then renders bits while claiming bytes. Put the equivalence in prose where a human reads it.
 
-**Live instances** — one is live, one is still a *forward reference*:
+**Live instances** — both keys are live in the ConfigMap; the story-2 key's conversion and gauge are
+still a *forward reference*:
 
 - **Datagram send buffer** (story 1) — **live as of story task 9**, as
   `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` in `infra/services/mh-service/configmap.yaml`; the frames→bytes
@@ -206,9 +207,12 @@ panel then renders bits while claiming bytes. Put the equivalence in prose where
   frames of audio**, not bytes, because quinn's 1 MiB default is ≈93 seconds of queued audio and
   "1 MiB" does not make that visible while "93 seconds" does. quinn's API takes bytes, so the
   conversion happens once at config load.
-- **`MH_EGRESS_BUDGET_BPS`** (story 2) — specified as "bits/s, converted once at load upstream of the
-  enforcement/gauge fork; nothing downstream sees bits", with the derived stream ceiling and the
-  published gauge both reading the converted value.
+- **`MH_EGRESS_BUDGET_BPS`** (story 2) — **live as of story 2's MH configuration task**, as
+  `MH_EGRESS_BUDGET_BPS` in `infra/services/mh-service/configmap.yaml` (in bits/s); the bits→bytes
+  conversion and the `mh_media_egress_budget_bytes_per_second` gauge land with the MH egress-budget
+  code task. Specified as "bits/s, converted once at load upstream of the enforcement/gauge fork;
+  nothing downstream sees bits", with the derived stream ceiling and the published gauge both
+  reading the converted value.
 
 Two independent instances is what makes this a rule rather than a one-off, and why it belongs in a
 conventions doc.

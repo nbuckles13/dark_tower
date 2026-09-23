@@ -23,19 +23,33 @@ data:
   AC_ENDPOINT: "http://ac-service.dark-tower:8082"
   # AC JWKS endpoint for JWT validation
   AC_JWKS_URL: "http://ac-service.dark-tower:8082/.well-known/jwks.json"
-  # Maximum concurrent media streams
+  # RETIRED — PENDING REMOVAL. Do not tune, do not "fix", do not read.
   #
-  # KNOWN-WRONG, DEFERRED — do not "fix" this here. `100` is not a chosen value:
-  # it is the wrong UNIT. The real quantity MH needs to bound is an egress
-  # BANDWIDTH budget; a stream count is standing in for it. Story 2 derives the
-  # ceiling from `MH_EGRESS_BUDGET_BPS` and retires this key. Until then the
-  # value is live and on the wire: mh-service sends it to GC as `max_streams`
-  # from BOTH `register()` and `attempt_reregistration()` in
-  # crates/mh-service/src/grpc/gc_client.rs — so GC does placement against it at
-  # first registration and again after any re-registration.
-  # Enforced by: nothing on MH's data path — GC, at placement.
-  # ANCHOR (DRY): `crates/mh-service/src/config.rs` holds a second, larger
-  # fallback for this key that no manifest supplies; task #12 collapses the pair.
+  # Superseded by the egress-budget chain further down this file: MH derives its
+  # stream ceiling from `MH_EGRESS_BUDGET_BPS` and the two stream-cost keys, and
+  # that derived value is what it advertises to GC in the `max_streams` field.
+  #
+  # WHY IT IS STILL HERE (two-deploy retirement, story 2 R-19/R-24). The MH code
+  # task deletes the code read, `Config::max_streams` and `DEFAULT_MAX_STREAMS`.
+  # This key and BOTH `configMapKeyRef` entries (mh-0-deployment.yaml,
+  # mh-1-deployment.yaml) deliberately survive that deploy: `kubectl rollout
+  # undo` restores the previous Deployment spec WITH its configMapKeyRef but does
+  # NOT revert the ConfigMap. Deleting the key in the same deploy that removes the
+  # read turns a routine rollback into `CreateContainerConfigError` with EMPTY
+  # logs — the pod never starts, so there is nothing to read.
+  #
+  # WHAT IS TRUE WHEN. Until the MH code task's image ships, the value below is
+  # still live on the wire: mh-service sends it to GC as `max_streams` from
+  # `register()` and `attempt_reregistration()` in
+  # crates/mh-service/src/grpc/gc_client.rs, and GC places against it. That
+  # sentence EXPIRES with the next MH image, after which nothing reads this key.
+  # Enforced by: until that image, GC at placement only (never MH's data path);
+  # after it, nothing.
+  # Where an operator sees it: nowhere after that image — watch
+  # `mh_media_egress_stream_ceiling` instead (lands with the MH code task).
+  #
+  # Scheduled removal, with its own two-deploy ordering and trigger:
+  # docs/TODO.md §Media Path Obligations, "Delete the retired `MH_MAX_STREAMS`".
   MH_MAX_STREAMS: "100"
   # TLS certificate paths for WebTransport (mounted from mh-service-tls Secret)
   MH_TLS_CERT_PATH: "/etc/mh-tls/tls.crt"
@@ -173,8 +187,9 @@ data:
 
   # Accept-time resource-exhaustion guard: the maximum number of concurrent
   # WebTransport connections MH will accept. NEVER a capacity figure, never
-  # advertised to GC (that is `MH_MAX_STREAMS` above, a different quantity with
-  # a confusingly similar name). It sits far above expected peak, so rejections
+  # advertised to GC (what GC receives is the stream ceiling MH derives from
+  # `MH_EGRESS_BUDGET_BPS` below — a different quantity; before the MH code task
+  # ships it is the retired `MH_MAX_STREAMS` above). It sits far above expected peak, so rejections
   # attributed to it mean a connection flood or a connection leak, not demand
   # that has outgrown the deployment.
   #
@@ -258,3 +273,429 @@ data:
   # cluster — the manifest wins. If the default is ever re-chosen, revisit this
   # line rather than assuming it follows.
   MH_MEDIA_LATENCY_SAMPLE_RATIO: "0.01"
+
+  # ---------------------------------------------------------------------------
+  # Egress-budget admission chain (story 2 R-19, R-23; ADR-0036 §11
+  # "Admission control is keyed on egress bandwidth, not connection count")
+  #
+  # THIS FILE IS THE SINGLE AUTHORITATIVE HOME FOR EVERY NUMBER IN THIS BLOCK,
+  # and it WINS ON DISAGREEMENT — but it is not the only place they appear.
+  # `.env.example` and the Media Handler block in `docs/DEVELOPMENT.md` mirror
+  # them for LOCAL RUNS and carry `ANCHOR (DRY)` pointers back here; changing a
+  # value here means updating those two. (They mirror the KIND OVERLAY's budget
+  # rather than this file's placeholder, deliberately — see
+  # `MH_EGRESS_BUDGET_BPS` below.) Neither mirror is a consumer: a drifted value
+  # there reaches a developer's laptop, never this cluster and never an alert.
+  #
+  # The MH code task reads all six as REQUIRED keys with no Rust fallback: MH refuses to
+  # start when one is absent or malformed. That is deliberate — a default in
+  # code would be a second, invisible encoding of the same value, and
+  # `dt-guard env-config` can only see a key the code refuses to start
+  # without. These keys land BEFORE the image that reads them (the add-key
+  # half of the rollout-ordering rule), so the current image ignores them.
+  #
+  # The chain: MH derives a STREAM ceiling (never "subscriber ceiling" — a
+  # subscriber now holds N slots) from the budget and the two per-kind costs,
+  # enforces it at stream admission, and advertises the same value to GC in
+  # the register RPC's existing `max_streams` field, where it replaces the
+  # retired `MH_MAX_STREAMS` above. GC placement against it stays SOFT; MH
+  # admission is the hard backstop. The derivation, and the refuse-to-boot
+  # floor under it, are code owned by the MH code task — they are
+  # deliberately not restated here.
+  # ---------------------------------------------------------------------------
+
+  # Egress bandwidth budget for this MH, in BITS per second.
+  #
+  # THIS VALUE IS A PLACEHOLDER AND IS DELIBERATELY NOT SIZED. It is a
+  # force-a-choice placeholder an operator must replace, not a capacity claim —
+  # in the same spirit as the `basis="unmeasured"` label on the budget gauge:
+  # ADR-0036 records that the egress budget has no measurement behind it and
+  # must fail closed, deliberately low. Because every stream is costed at the
+  # VIDEO rate (the ceiling divides by the larger of the two costs below, which
+  # keeps MH type-blind), this placeholder admits fewer streams than even one
+  # small audio-only meeting needs. That is intended. Do not file it as a bug;
+  # replace it.
+  #
+  # SET IT to this deployment's expected peak egress. No arithmetic appears
+  # here on purpose: this value is not sized, so there is no relationship to
+  # state and nothing for a comment to go stale against.
+  #
+  # It announces itself. The MH code task is required to (a) log the
+  # effective derived stream ceiling loudly at startup, and (b) emit a
+  # distinct INFO "configure me" nudge naming THIS key whenever that ceiling
+  # is below MH's advisory recommended minimum. The nudge fires on this
+  # placeholder by design and goes quiet once a real budget is set. Read the
+  # startup log for the effective ceiling — do not compute it by hand.
+  #
+  # THE MARGIN, STATED WITHOUT NUMBERS: this placeholder still boots. It sits
+  # above MH's refuse-to-boot floor on the derived ceiling (a code constant
+  # the MH code task owns). The ONLY correct response to the startup nudge is
+  # a real budget here. NEVER lower that floor to quiet a nagging pod — the
+  # floor exists because a ceiling just above zero passes every validation,
+  # boots, gets placed, and then rejects nearly everything it is handed.
+  #
+  # CONSEQUENCE OF A STARVED BUDGET IS A JOIN OUTAGE, not a media degradation.
+  # The derived ceiling is advertised to GC; once `current_streams` reaches it,
+  # GC has no candidate handler and new meetings fail to place
+  # (ServiceUnavailable at join) — the same mechanism as scaling MH to zero.
+  # Lowering this value is therefore NOT a kill switch or a load-shed lever.
+  #
+  # The Kind dev cluster overrides this key (infra/kubernetes/overlays/kind/
+  # services/mh-service/configmap-egress-budget-patch.yaml), and that patch —
+  # not this file — carries the sizing formula and the requirement it was
+  # sized against.
+  # Enforced by: mh-service at stream admission (hard), and GC at placement
+  # (soft, new meetings only) — both from the ceiling derived from this value.
+  # Where an operator sees it: MH's startup log (effective ceiling and the
+  # configure-me nudge); the `mh_media_egress_budget_bytes_per_second
+  # {basis="unmeasured"}` and `mh_media_egress_stream_ceiling` gauges — both
+  # land with the MH code task, which converts bits to bytes exactly once at
+  # load, so the gauge is in BYTES while this key is in BITS by design.
+  MH_EGRESS_BUDGET_BPS: "10000000"
+
+  # Cost of ONE audio egress stream against the budget above, in BITS per
+  # second.
+  #
+  # PROVABLY INERT TODAY. The derived ceiling divides by the LARGER of this and
+  # `MH_STREAM_COST_VIDEO_BPS`, and video dominates by more than an order of
+  # magnitude; admission counts streams rather than byte-accounting per kind.
+  # So changing this value changes NOTHING an operator can observe — the key is
+  # not broken when tuning it moves no gauge. It becomes operative only when
+  # per-kind costing lands. It is required now so that change is a code edit,
+  # not a manifest rollout.
+  #
+  # PROVENANCE: the ADR-0036 §4 audio figure ("In-band key carriage", its
+  # "Cost, stated plainly" paragraph) — the ADR is the single source of truth
+  # for the cost model and this value mirrors it rather than re-deriving it.
+  # It is that §4 NOMINAL figure, NOT a measured or peak-bitrate wire cost.
+  #
+  # NOT a codec bitrate, and NOT any of these RELATED BUT DIFFERENT values —
+  # DO NOT UNIFY THEM:
+  #   - `MC_AUDIO_MAX_BITRATE_BPS` (infra/services/mc-service/configmap.yaml):
+  #     the MAXIMUM Opus bitrate MC directs a publisher to use;
+  #   - the supported audio bitrate floor and ceiling constants in
+  #     `crates/mh-service/src/config.rs`: the codec payload band MH assumes.
+  # This key is per-EGRESS-STREAM cost including per-packet, key-carriage and
+  # signature overhead, which is why it is larger than any of them.
+  #
+  # RESIDUAL COUPLING, recorded so it is not rediscovered: at MC's maximum
+  # directed bitrate the on-wire audio stream is heavier than this nominal
+  # figure, so this value UNDER-costs audio relative to what MC may direct.
+  # Non-operative while video dominates the ceiling (see above). When per-kind
+  # costing lands it becomes an OVER-ADMISSION bug unless reconciled, and the
+  # reconciliation is an ADR-0036 §4 decision (protocol + meeting-controller),
+  # not a ConfigMap edit. Tracked in docs/TODO.md §Media Path Obligations.
+  # Enforced by: mh-service, as an input to the derived stream ceiling (MH code
+  # task).
+  # Where an operator sees it: nowhere directly — it cannot move the ceiling
+  # today. The MH code task logs it at startup.
+  MH_STREAM_COST_AUDIO_BPS: "90000"
+
+  # Cost of ONE video egress stream against the budget above, in BITS per
+  # second.
+  #
+  # THIS IS THE OPERATIVE COST in story 2, even though story 2 sends only
+  # audio: the stream ceiling is derived against the LARGER of the two costs,
+  # which keeps MH type-blind (ADR-0036 §7) and means every admitted stream is
+  # costed as video. Raising this value LOWERS the ceiling; lowering it RAISES
+  # the ceiling and over-admits once video is real.
+  #
+  # CHOSEN, NOT MEASURED — a nominal single-stream video figure with no
+  # measurement behind it, carried under the same ADR-0036 open item as the
+  # budget. Revisit when video lands.
+  # Enforced by: mh-service, as the dominant input to the derived stream
+  # ceiling (MH code task).
+  # Where an operator sees it: through its effect on
+  # `mh_media_egress_stream_ceiling` (lands with the MH code task); MH logs it
+  # at startup.
+  MH_STREAM_COST_VIDEO_BPS: "2500000"
+
+  # Rejection-ratio threshold for stream admission, 0.0 to 1.0.
+  #
+  # ONE VALUE, TWO CONSUMERS, ONE HOME. MH admission reads it, and the
+  # egress-exhaustion alert reads it — but the alert reads it ONLY through the
+  # `mh_media_stream_admission_rejection_ratio_threshold` gauge, which MH
+  # publishes from THIS SAME FIELD, not from a second reading of it (the
+  # `MH_MEDIA_LATENCY_SAMPLE_RATIO` precedent above). PromQL cannot read a
+  # ConfigMap, so the alert MUST compare gauge-to-gauge and MUST NEVER carry
+  # this number as a PromQL literal: a literal makes one configured value two
+  # encodings on the day it ships, and this file is the half nobody reads.
+  #
+  # CHOSEN, NOT DERIVED. MH has no ratified SLO target (docs/observability/
+  # slos.md carries it OPEN pending story 8), so this is a judgement about what
+  # is worth a business-hours look — warning-grade, never a page — with no
+  # measurement behind it. Revisit when the MH target ratifies. When the alert
+  # fires, investigate; do not tune this number to quiet it.
+  #
+  # Two properties of the published ratio this value is only meaningful
+  # against. Both are REQUIREMENTS ON THE MH CODE TASK, recorded here because
+  # this comment is what reaches that task's author:
+  #   - The ratio is WINDOWED (a sliding window or the last N admission
+  #     decisions), never a lifetime ratio. A lifetime ratio is silent during
+  #     total exhaustion on a long-healthy pod and cannot clear on a fresh one.
+  #   - No admission decisions in the window publishes a value that does not
+  #     fire, but zero accepted with any rejected publishes 1.0, NEVER 0.0 —
+  #     otherwise the alert is quietest exactly when the failure is total.
+  # Enforced by: mh-service (MH code task), and the alert via the threshold
+  # gauge (alerting task).
+  # Where an operator sees it: `mh_media_stream_admission_rejection_ratio` and
+  # `..._threshold`, and alert `MHMediaEgressBudgetExhausted` — all land later
+  # in story 2 (MH code task; alerting task).
+  MH_EGRESS_REJECTION_RATIO_THRESHOLD: "0.05"
+
+  # Resource-exhaustion guard: the maximum number of meeting registrations MH
+  # will hold. NEVER a capacity figure — not advertised to GC, not a placement
+  # input.
+  #
+  # Needed because the egress-edge bound below is structurally blind to one
+  # surface: an empty `egress_streams` set is legal and meaningful, so
+  # arbitrarily many near-free meetings would never trip it. This bounds that.
+  # It is defence-in-depth against a buggy or compromised MC inside the operator
+  # trust boundary (the registration contract authorizes on the
+  # `service.write.mh` scope alone), not against an anonymous caller.
+  #
+  # NOT A CONCURRENCY BOUND TODAY — it counts CUMULATIVELY over pod lifetime.
+  # `SessionState.registered_meetings` is insert-only: nothing removes an ended
+  # meeting's entry, because MH acts on no meeting-ended signal yet. So this
+  # bound is consumed by every DISTINCT meeting ever registered on this pod, at
+  # whatever rate meetings finish — independent of concurrent load, rising with
+  # uptime. Do NOT size it against expected concurrent meetings, and do not
+  # describe reaching it as a bug, a leak or a hostile MC: ordinary turnover
+  # reaches it. That framing was retracted once already for the sibling bound
+  # (docs/TODO.md §Media Path Obligations) and must not come back by this route.
+  # It stays cumulative EVEN AFTER R-20's teardown lands — unlike the sibling
+  # edge bound, this count is not reclaimed by teardown, because a resurrected
+  # empty meeting regrows it at ~0 edge cost. The mechanism and why 8192 does
+  # not move when R-20 merges are in the SIZING block below; this line flags
+  # only that the naive "R-20 fixes it" reading is wrong here.
+  #
+  # AN EMPTY MEETING IS NEAR-FREE TO CREATE BUT NOT FREE TO KEEP, and this is
+  # the half that is easy to miss. THE APPLY PATH IS O(REGISTERED MEETINGS):
+  # `RoutingTable::install` is the only apply path and it calls
+  # `RoutingSnapshot::with_policy` (crates/mh-service/src/routing/mod.rs), which
+  # clones the whole meetings map on EVERY apply. So a retained entry is O(1) to
+  # create and then permanently taxes every subsequent real registration. This
+  # key therefore sizes a PER-APPLY CPU COST, not only memory — and it becomes
+  # O(M^2) steady-state once ADR-0036 §8's periodic re-assert lands (story 4),
+  # because M meetings each re-asserting costs O(M) per apply.
+  #
+  # DO NOT REASON ABOUT THIS KEY FROM ITS MEMORY FOOTPRINT. A retained entry is
+  # small in bytes and costs ~0 edges, so "each slot is near-free, we can afford
+  # many more" is arithmetically true and operationally wrong — it is the exact
+  # reasoning that would raise this value back up, and the apply-cost axis is
+  # the one that binds.
+  #
+  # SIZING — 8192, and why it is not the larger value first proposed. Two owners
+  # weighed in at review and both rulings turn on whether R-20's teardown has
+  # landed:
+  #   - @media-handler: size it so the EDGE bound binds first for any meeting
+  #     carrying real edges, leaving this key to catch only the empty/near-free
+  #     flood the edge bound is structurally blind to. That argues for
+  #     `MH_MAX_TOTAL_EGRESS_EDGES / 2`.
+  #   - @security: that larger value is approved ONLY IF R-20 lands, because
+  #     without reclamation the retained entries are cumulative and each one
+  #     taxes every apply (above). Absent R-20: 8192, knowingly preempting the
+  #     edge bound.
+  # 8192 IS UNCONDITIONAL — it is not a hedge against R-20 slipping. Both
+  # owners' conditions resolve here for the same reason: the bound is cumulative
+  # whether or not teardown lands (see the paragraph below), so it is correct on
+  # the availability axis AND the security axis as the tree stands and as it
+  # will stand after R-20. The sibling edge bound makes the same choice about
+  # R-20 deliberately; sizing this key on an assumption its sibling refuses
+  # would be an internal inconsistency, and a value whose safety depends on an
+  # unlanded task is a masked contingency rather than a chosen bound.
+  #
+  # CONSEQUENCE, STATED PLAINLY: at 8192 this bound is DELIBERATELY TIGHTER in
+  # meeting-equivalents than `MH_MAX_TOTAL_EGRESS_EDGES`, so for small meetings
+  # it PREEMPTS the edge bound — it trips first, not only on an empty-meeting
+  # flood, and it is therefore the binding availability bound for small-meeting
+  # load until reclamation is genuinely closed (fence + resurrection — see
+  # below), not merely until R-20 lands. Chosen knowingly: a capped apply-cost tax is preferable to
+  # an unbounded quadratic one with no saturation signal behind it.
+  #
+  # R-20 LANDING DOES NOT MAKE THIS BOUND CONCURRENT — do not raise this value
+  # on the day teardown merges. `EndMeeting` carries no generation by design, so
+  # a `RegisterMeeting` arriving after a teardown RE-CREATES the meeting;
+  # reclamation therefore rests on an MC-side quiesce that MH does not enforce,
+  # and the caller it rests on is exactly the principal this key is
+  # defence-in-depth against. Teardown-then-resurrect regrows the map without
+  # ever tripping the edge bound, because a resurrected empty meeting is still
+  # ~0 edges. So the bound stays effectively cumulative even after R-20 and 8192
+  # stands. Fuller reasoning lives in docs/TODO.md §Media Path Obligations (the
+  # sibling unreclaimed-routing-entry defect, and the `EndMeeting`-has-no-fence
+  # entry); this comment cites them and restates neither. The honest revisit
+  # trigger is "when the fence and resurrection questions are CLOSED", not "when
+  # R-20 lands".
+  #
+  # REQUIREMENT ON THE MH CODE TASK, recorded here because this comment is what
+  # reaches that task's author: this required read must be validated against a
+  # hard-ceiling constant in `crates/mh-service/src/config.rs`, on the same
+  # footing as the four §8 bounds below. A `> 0` check alone lets a
+  # fat-fingered value silently re-open the surface this key exists to close.
+  # Enforced by: mh-service, rejecting an over-limit registration loudly and
+  # counted by its own reason (MH code task).
+  # Where an operator sees it: `mh_media_registered_meetings` and the rejection
+  # counter — both land with the MH code task. READ THAT GAUGE AS REGISTRATIONS
+  # HELD, NOT MEETINGS IN PROGRESS: until R-20's teardown lands it is
+  # monotonically non-decreasing and does not fall when a meeting ends, so
+  # reading it as concurrency understates exhaustion in the direction that hides
+  # it.
+  MH_MAX_REGISTERED_MEETINGS: "8192"
+
+  # Resource-exhaustion guard, §8-guard family: the maximum size of
+  # `RegisterMeetingRequest.server_muted_sources`, a caller-controlled repeated
+  # field. A PRE-ALLOCATION bound — MH rejects an over-limit registration
+  # BEFORE any per-element work or routing-table build, the same posture as the
+  # egress-stream and candidate-source bounds below. NEVER a capacity figure.
+  #
+  # WHY IT IS NOT SUBSUMED BY THE EGRESS-STREAM BOUND: a hostile snapshot can
+  # carry zero egress streams and a very large muted set. This key is the only
+  # thing sizing the muted set's allocation.
+  #
+  # SIZING, and its precondition. Its number is taken from
+  # `MH_MAX_EGRESS_STREAMS_PER_MEETING` below, which is the SOURCE of it: a
+  # muted source must be a sender in the meeting, and every sender is also a
+  # subscriber holding at least one egress stream, so a legitimate snapshot
+  # can never name more muted senders than that bound admits. That makes this
+  # a LOOSE bound that can never falsely reject a legitimate snapshot — NOT a
+  # statement that a meeting can hold this many senders.
+  #
+  # THE DIRECTION IS LOAD-BEARING: this value must be AT LEAST
+  # `MH_MAX_EGRESS_STREAMS_PER_MEETING`. The two need not be equal, but lowering
+  # this one below that bound breaks the never-falsely-rejects claim above —
+  # a legitimate snapshot naming more muted senders than this admits is then
+  # rejected WHOLE, so server mute silently stops working for large meetings and
+  # the symptom is a rejected registration, which is not mute-shaped. Asserted,
+  # not merely stated, by
+  # crates/env-tests/tests/01_mh_deployment_config.rs::test_story2_keys_wired_into_every_mh_instance.
+  #
+  # WHY THE TWO ARE EQUAL TODAY, and why that is an answer rather than a
+  # coincidence: two pressures meet exactly here. Security wants this value as
+  # SMALL as possible, because it sizes an allocation against a caller-controlled
+  # count. Correctness wants it AT LEAST the egress bound, or legitimate
+  # registrations are rejected. 512 is the tightest value satisfying both — so a
+  # future change to either key has to move both.
+  #
+  # PRECONDITION: the derivation holds only while EVERY participant declares at
+  # least one receive slot. `SLOT_STATE_ZERO_REQUESTED` is already in the
+  # signaling vocabulary (retained, unemitted in story 2). The moment a
+  # zero-slot or send-only participant is real, senders are no longer bounded
+  # by egress streams and this value stops following from anything — the
+  # story that makes that state emittable MUST revisit this bound.
+  #
+  # REQUIREMENT ON THE MH CODE TASK, recorded here because this comment is what
+  # reaches that task's author: this required read must be validated against a
+  # hard-ceiling constant in `crates/mh-service/src/config.rs`, on the same
+  # footing as the four §8 bounds below. The ceiling is what keeps this a
+  # PRE-ALLOCATION guard rather than an operator-settable allocation size:
+  # raised to a huge value by a fat-fingered edit or a well-meaning "raise the
+  # limit" during an incident, this is not a loosened guard but NO guard — MH
+  # pre-allocates against an attacker-supplied count again, the precise
+  # condition this key exists to foreclose. A `> 0` check alone does not do it.
+  # Enforced by: mh-service, in the policy-limit checks, before the routing
+  # table is built (MH server-mute task).
+  # Where an operator sees it: nowhere today — the running image does not parse
+  # the muted-source field at all. Once the MH server-mute task lands the check,
+  # an over-limit registration is expected to surface like the other
+  # pre-allocation bounds below (`rejected_invalid` plus the WARN's `reason`).
+  MH_MAX_MUTED_SOURCES_PER_MEETING: "512"
+
+  # ---------------------------------------------------------------------------
+  # ADR-0036 §8 forwarding-policy bounds (story 2 R-22)
+  #
+  # ALL FOUR ARE RESOURCE-EXHAUSTION GUARDS, NEVER CAPACITY FIGURES. None is
+  # advertised to GC and none participates in placement. They bound what one
+  # `RegisterMeetingRequest` — and the sum of them — may make MH allocate.
+  #
+  # Values are EQUAL TO THE CURRENT CODE DEFAULTS, so behaviour is unchanged at
+  # cutover: the running image still reads these optional-with-default. The MH
+  # code task flips each read to REQUIRED and deletes its code default, after
+  # which this file is the single home for the number.
+  #
+  # ANCHOR (DRY), all four: until that flip, each value here is co-held with
+  # its code default in `crates/mh-service/src/config.rs`, and nothing but this
+  # comment holds the pair in agreement — an anchor, not a guard
+  # (`dt-guard env-config` rule 1 keys off `ConfigError::MissingEnvVar`, which a
+  # defaulted read never emits). Each key also has a HARD CEILING constant in
+  # that file which SURVIVES the flip, because a required read still needs its
+  # upper bound. The anchors below cite that ceiling by ROLE, not by symbol
+  # name, so they stay true through any rename — grep the env var name in
+  # config.rs and you land on it.
+  # ---------------------------------------------------------------------------
+
+  # Per-meeting bound on `RegisterMeetingRequest.egress_streams`.
+  #
+  # The muted-source bound above takes its number from this key, and the
+  # direction matters: its "can never falsely reject a legitimate snapshot"
+  # claim holds only while MH_MAX_MUTED_SOURCES_PER_MEETING >= this value.
+  # RAISING this value above it BREAKS that claim — a legitimate snapshot
+  # naming more muted senders than the muted bound admits is then rejected, and
+  # server mute silently stops working for large meetings. Lowering this value
+  # is safe (the muted bound merely becomes a looser pre-allocation guard).
+  # Asserted, not merely stated, by
+  # crates/env-tests/tests/01_mh_deployment_config.rs::test_story2_keys_wired_into_every_mh_instance.
+  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
+  # the surviving home is the hard-ceiling constant for
+  # `MH_MAX_EGRESS_STREAMS_PER_MEETING` in `crates/mh-service/src/config.rs`.
+  # Enforced by: mh-service, rejecting the WHOLE registration before building
+  # any routing table (live policy for that meeting is left unchanged).
+  # Where an operator sees it: `mh_media_policy_applies_total{outcome="rejected_invalid"}`,
+  # plus a WARN on target `mh.grpc.service` whose `reason` field names the bound
+  # that tripped — the counter alone does not say which bound.
+  MH_MAX_EGRESS_STREAMS_PER_MEETING: "512"
+
+  # Per-egress-stream bound on `EgressStream.candidate_sources`.
+  #
+  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
+  # the surviving home is the hard-ceiling constant for
+  # `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS` in `crates/mh-service/src/config.rs`.
+  # Enforced by: mh-service, rejecting the WHOLE registration before building
+  # any routing table.
+  # Where an operator sees it: as for the egress-stream bound above — the
+  # `rejected_invalid` outcome plus the WARN's `reason` field.
+  MH_MAX_CANDIDATE_SOURCES_PER_EGRESS: "16"
+
+  # Aggregate bound on egress edges across ALL meetings on this MH.
+  #
+  # READ THE CODE BEFORE SIZING THIS. What this bound actually measures, why
+  # raising it is not a remedy, and why an earlier framing of it was retracted
+  # are stated once in `crates/mh-service/src/config.rs` and once in the
+  # docs/TODO.md §Media Path Obligations entry on MH never reclaiming an ended
+  # meeting's routing entry. This comment cites them and restates neither.
+  #
+  # WHERE IN config.rs, and why this names two places: TODAY the reasoning is
+  # the docstring of `crates/mh-service/src/config.rs::DEFAULT_MAX_TOTAL_EGRESS_EDGES`.
+  # The MH code task deletes that default when it makes this read required, and
+  # MOVES the prose — intact, retraction included — to the hard-ceiling
+  # constant for `MH_MAX_TOTAL_EGRESS_EDGES`, which survives the flip. Both
+  # clauses are stated so this citation is true before and after that task.
+  # For the symptom as a responder meets it, see the reclamation note inside
+  # docs/runbooks/mh-incident-response.md, "Scenario 13: RegisterMeeting
+  # Timeout — Clients Kicked" ("Some people can't hear anything in a meeting
+  # that's otherwise working").
+  #
+  # It becomes an ordinary resource guard ONLY ONCE story 2 R-20's teardown
+  # path (`EndMeeting`) reclaims ended meetings. That is conditional on R-20
+  # landing; until then, see the citations above.
+  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
+  # the surviving home is the hard-ceiling constant for
+  # `MH_MAX_TOTAL_EGRESS_EDGES` in `crates/mh-service/src/config.rs`.
+  # Enforced by: mh-service, when a registration would ADD edges.
+  # Where an operator sees it: TODAY, only after the fact —
+  # `mh_media_policy_applies_total{outcome="apply_failed"}` fires when new
+  # meetings are ALREADY dark. There is no saturation signal yet: the
+  # `mh_media_egress_edges` / `mh_media_egress_edges_limit` gauges and alert
+  # `MHMediaEgressEdgeHeadroomLow` land later in story 2.
+  MH_MAX_TOTAL_EGRESS_EDGES: "65536"
+
+  # Bound on awaiting the session actor's config-apply reply, in milliseconds.
+  #
+  # The apply is asynchronous relative to the RPC response (ADR-0036 §8), so a
+  # wedged actor must produce a truthful stale `applied_generation` with
+  # `outcome=apply_failed`, never a hung RPC.
+  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
+  # the surviving home is the hard-ceiling constant for
+  # `MH_POLICY_APPLY_TIMEOUT_MS` in `crates/mh-service/src/config.rs`.
+  # Enforced by: mh-service, on the RegisterMeeting path.
+  # Where an operator sees it: `mh_media_policy_applies_total{outcome="apply_failed"}`.
+  MH_POLICY_APPLY_TIMEOUT_MS: "1000"
