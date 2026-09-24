@@ -3,6 +3,7 @@
 pub mod alert_rules_loaded;
 pub mod auth_client;
 pub mod gc_client;
+pub mod mc_session;
 pub mod media;
 pub mod metric_hygiene;
 pub mod metrics;

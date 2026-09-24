@@ -16,13 +16,14 @@ import {
   makeAudioData,
 } from '@darktower/test-utils';
 
-import { DEFAULT_CLIENT_CONFIG } from '../../../config/clientConfig.js';
+import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../../../config/clientConfig.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { MeetingIdentity } from '../../setup/identity.js';
 import { JoinResponseKekSource } from '../../setup/kekSource.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import type { DatagramSender } from '../../pipeline/egress.js';
+import { buildTestFrame, makeIdentity } from '../../pipeline/__tests__/frameFixtures.js';
 import { AudioPipeline, type AudioPipelineOptions } from '../AudioPipeline.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
@@ -41,6 +42,11 @@ interface Options {
   sender?: DatagramSender | undefined;
   readable?: ReadableStream<Uint8Array> | undefined;
   targets?: string[];
+  /** Handler URLs from `StreamAssignments`; `null` means none were delivered. */
+  receiveUrls?: string[] | null;
+  /** Handler URLs delivered BEFORE `start()` — MC can answer the declaration first. */
+  receiveUrlsBeforeStart?: string[];
+  config?: MediaConfig;
   kekProvisioned?: boolean;
 }
 
@@ -63,7 +69,7 @@ async function makePipeline(opts: Options = {}): Promise<{
   await roster.upsert({ senderId: SENDER_ID, identityPublicKey: identity.publicKey! });
 
   const options: AudioPipelineOptions = {
-    config: DEFAULT_CLIENT_CONFIG.media,
+    config: opts.config ?? DEFAULT_CLIENT_CONFIG.media,
     metrics: new MediaMetrics({ clientVersion: 'v', orgId: 'o' }, sink),
     kekSource,
     roster,
@@ -85,12 +91,18 @@ async function makePipeline(opts: Options = {}): Promise<{
   const pipeline = new AudioPipeline(options);
   const faults: string[] = [];
   pipeline.on('fault', (f) => faults.push(f.stage));
+  if (opts.receiveUrlsBeforeStart) pipeline.setReceiveHandlers(opts.receiveUrlsBeforeStart);
   await pipeline.start();
   pipeline.setSendDirective({
     streamNumber: 1,
     bitrateBps: 32_000,
     targets: opts.targets ?? [MH_URL],
   });
+  // By default, assignments name the handler only when the rig supplies a stream
+  // for it: naming a handler with no connected transport is itself a fault.
+  const receiveUrls =
+    opts.receiveUrls !== undefined ? opts.receiveUrls : opts.readable ? [MH_URL] : null;
+  if (receiveUrls !== null) pipeline.setReceiveHandlers(receiveUrls);
   return {
     pipeline,
     capture,
@@ -206,22 +218,218 @@ describe('receive-side degradation', () => {
     expect(rig.faults).toEqual(['transport']);
   });
 
-  it('starts the read loop ONCE across repeated send directives', async () => {
-    // MC re-issues a directive whenever meeting state changes, and a
-    // `ReadableStream` admits only one reader — so a second `getReader()` throws
-    // from inside a directive handler, where it would present as "media stopped
-    // after someone joined" rather than as what it is.
+  /** A datagram the ingress counts as received (and then rejects as malformed). */
+  const PROBE = Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  const RECEIVED = 'dt_client_media_frames_received_total';
+
+  it('starts the read loop ONCE across repeated StreamAssignments', async () => {
+    // MC re-emits `StreamAssignments` on EVERY structural change in the meeting,
+    // and a `ReadableStream` admits only one reader — so a second `getReader()`
+    // would throw from inside an assignment handler, presenting as "media
+    // stopped after someone joined". A re-emit is a no-op.
     const transport = new MockWebTransport();
     transport.simulateReady();
     const rig = await makePipeline({ readable: transport.datagrams.readable });
-    rig.pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
+    rig.pipeline.setReceiveHandlers([MH_URL]);
+    rig.pipeline.setReceiveHandlers([MH_URL, '']);
+    // Directives no longer touch the read loop at all.
     rig.pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
     await settle();
     expect(rig.faults).toEqual([]);
     // And the one loop still works.
-    transport.simulateIncomingDatagram(Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    transport.simulateIncomingDatagram(PROBE);
     await settle();
-    expect(rig.count('dt_client_media_frames_received_total')).toBe(1);
+    expect(rig.count(RECEIVED)).toBe(1);
+  });
+
+  it('RECEIVES with an EMPTY send target set — the participant nobody holds', async () => {
+    // Static fill, N=1, three participants: C's slot holds A, nobody's holds C.
+    // MC directs C to send nothing (§5), and C must still hear A. Keyed off the
+    // send target, this read loop never started and C was deaf behind an
+    // ACTIVE slot.
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    const rig = await makePipeline({
+      readable: transport.datagrams.readable,
+      targets: [],
+      receiveUrls: [MH_URL],
+    });
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(1);
+    expect(rig.faults).toEqual([]);
+  });
+
+  it('opens nothing while every slot is unassigned, and starts once a slot fills', async () => {
+    // A solo participant: every slot is `fewer_sources` with an EMPTY url, which
+    // the proto defines as "no source assigned" — legitimate, not an error.
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    const rig = await makePipeline({
+      readable: transport.datagrams.readable,
+      targets: [],
+      receiveUrls: [''],
+    });
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    // STRUCTURE, not a counter: no reader was ever taken on the stream. A zero
+    // count alone would only show the probe was not read YET — the stream
+    // buffers it (see the exact count below).
+    expect(transport.datagrams.readable.locked).toBe(false);
+    expect(rig.count(RECEIVED)).toBe(0);
+    expect(rig.faults).toEqual([]);
+
+    // Positive control on the same rig: a peer joins and fills the slot.
+    rig.pipeline.setReceiveHandlers([MH_URL]);
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(transport.datagrams.readable.locked).toBe(true);
+    // Exactly two: the probe the stream BUFFERED while no reader existed, then
+    // the new one. Buffered by the transport's queue, not read and discarded.
+    expect(rig.count(RECEIVED)).toBe(2);
+  });
+
+  it('holds assignments that arrive BEFORE start() and opens the loop at start', async () => {
+    // MC answers the declaration, which `startMedia` sends before `start()`.
+    // Frames must not be read and discarded before the ingress exists, and the
+    // assignment must not be lost either.
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    const rig = await makePipeline({
+      readable: transport.datagrams.readable,
+      receiveUrlsBeforeStart: [MH_URL],
+      receiveUrls: null,
+    });
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(1);
+    expect(rig.faults).toEqual([]);
+  });
+
+  it('keeps a running loop when a later snapshot empties every slot', async () => {
+    // The last co-handler peer leaves: slots go back to `fewer_sources`. The loop
+    // stays, so a later refill needs no reconnect and no second reader.
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    const rig = await makePipeline({ readable: transport.datagrams.readable });
+    expect(transport.datagrams.readable.locked).toBe(true);
+
+    // The snapshot empties. The loop must still be READING — probed now, while
+    // empty, not after the refill (a loop torn down on empty and reopened on
+    // refill would pass that version of this test).
+    rig.pipeline.setReceiveHandlers(['']);
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(transport.datagrams.readable.locked).toBe(true);
+    expect(rig.count(RECEIVED)).toBe(1);
+
+    // And a refill neither reopens nor faults.
+    rig.pipeline.setReceiveHandlers([MH_URL]);
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(2);
+    expect(rig.faults).toEqual([]);
+  });
+
+  it('faults, and opens nothing, when assignments name more than one handler', async () => {
+    // MC places each participant on ONE handler this story. Two urls mean MC
+    // broke its own scoping; the client says so rather than absorbing it.
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    const rig = await makePipeline({
+      readable: transport.datagrams.readable,
+      receiveUrls: [MH_URL, 'https://mh-other.example:4433'],
+    });
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.faults).toEqual(['transport']);
+    expect(rig.count(RECEIVED)).toBe(0);
+  });
+
+  it('faults when assignments name a handler this client is not connected to', async () => {
+    // `readableFor` is a selector over connected transports; it cannot dial.
+    // A url with no connected transport is surfaced, never silently skipped.
+    const rig = await makePipeline({ readable: undefined, receiveUrls: [MH_URL] });
+    await settle();
+    expect(rig.faults).toEqual(['transport']);
+  });
+
+  it('faults, and keeps the running loop, when assignments move to a different handler', async () => {
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    const rig = await makePipeline({ readable: transport.datagrams.readable });
+    rig.pipeline.setReceiveHandlers(['https://mh-other.example:4433']);
+    await settle();
+    expect(rig.faults).toEqual(['transport']);
+    // The original loop was not torn down to follow it.
+    transport.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(1);
+  });
+
+  it('a second, DIFFERENT transport fault is not silenced by the first; a repeat is', async () => {
+    // Faults dedupe on (stage, message). A stage-only key let "not connected"
+    // hide a later "moved mid-session" — the one that names an MC placement
+    // defect — for the rest of the session.
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    const messages: string[] = [];
+    const rig = await makePipeline({ readable: transport.datagrams.readable });
+    rig.pipeline.on('fault', (f) => messages.push(f.message));
+
+    // Two different handlers named at once, then the loop moved mid-session.
+    rig.pipeline.setReceiveHandlers([MH_URL, 'https://mh-other.example:4433']);
+    rig.pipeline.setReceiveHandlers(['https://mh-other.example:4433']);
+    // The same condition again: bounded, so NOT reported twice.
+    rig.pipeline.setReceiveHandlers(['https://mh-other.example:4433']);
+    await settle();
+
+    expect(rig.faults).toEqual(['transport', 'transport']);
+    expect(new Set(messages).size).toBe(2);
+  });
+
+  it('passes the CONFIGURED hop-restart bound to the monitor, not a hardcoded default', async () => {
+    // The config key is validated and the monitor takes the bound as an
+    // argument, but nothing else proves `AudioPipeline` connects the two. Run
+    // the same input under two bounds and require different answers: A at hop
+    // 10 then hop 5 is 5 behind — a RESTART under a bound of 4, a REORDER under
+    // the default of 64. A pipeline that hardcoded the default passes only the
+    // second arm.
+    const signer = await makeIdentity(0x41);
+    const frame = (hopSequence: number, streamSequence: number): Promise<Uint8Array> =>
+      buildTestFrame({
+        keyIdSenderId: SENDER_ID,
+        kek: KEK,
+        signer,
+        plaintext: Uint8Array.of(1, 2, 3),
+        streamId: 0,
+        hopSequence,
+        streamSequence,
+      });
+
+    async function reordersUnder(bound: number): Promise<number> {
+      const transport = new MockWebTransport();
+      transport.simulateReady();
+      const rig = await makePipeline({
+        readable: transport.datagrams.readable,
+        config: {
+          ...DEFAULT_CLIENT_CONFIG.media,
+          ingress: { ...DEFAULT_CLIENT_CONFIG.media.ingress, hopRestartBackwardJumpFrames: bound },
+        },
+      });
+      transport.simulateIncomingDatagram(await frame(10, 0));
+      transport.simulateIncomingDatagram(await frame(5, 1));
+      await settle();
+      // Vacuity guard: both frames reached the ingress, so the hop step ran.
+      expect(rig.count(RECEIVED)).toBe(2);
+      return rig.count('dt_client_media_downlink_reorder_total');
+    }
+
+    expect(DEFAULT_CLIENT_CONFIG.media.ingress.hopRestartBackwardJumpFrames).toBeGreaterThan(5);
+    expect(await reordersUnder(4)).toBe(0);
+    expect(
+      await reordersUnder(DEFAULT_CLIENT_CONFIG.media.ingress.hopRestartBackwardJumpFrames),
+    ).toBe(1);
   });
 
   it('counts a lost inbound datagram as never received at all', async () => {

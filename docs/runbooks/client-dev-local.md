@@ -802,8 +802,12 @@ sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
 # in this breakdown are routine, not faults -- see MH Scenario 17.)
 sum by(reason) (rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
 
-# Does MC agree about the policy MH applied?
+# Does MC agree about the policy MH applied?  After an MC restart this split can
+# read clean BY DESIGN: the restart arm is recorded on the adoption counter below
+# (and a WARN "adopting it as a floor" at mc.register_meeting.trigger), never
+# under an outcome label.
 sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
+sum by(outcome) (increase(mc_media_policy_generation_adoptions_total[15m]))
 ```
 
 **Aggregation floor is pod or service.** There is no `by(meeting_id)`, no `by(participant)` and no
@@ -1316,8 +1320,12 @@ has at least two causes with different remedies, and no client counter separates
    `sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))`. Anything other than `match` (and
    the `handler_id_mismatch` diagnostic, which fires on every ordinary MH restart) sends you to
    [`mc-incident-response.md` Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).
-   **Note it does not self-correct in this build** — the remedy there is to force a rejoin, not to
-   wait.
+   Since story 2 any structural change (join, leave, declaration, mute) re-pushes, so a meeting with
+   churn may clear by itself; a QUIESCENT meeting does not (no periodic re-assert yet) — force a
+   structural change there. **After an MC restart the split can read clean by design**: the
+   restart arm is recorded on `mc_media_policy_generation_adoptions_total` (and a WARN "adopting it
+   as a floor" at `mc.register_meeting.trigger`), never under an `outcome` label — read that counter
+   too before concluding there is no divergence.
 3. **Only then** compare the configured keepalive interval against the mute duration that preceded
    the symptom.
 4. **Only then** take a packet capture.
@@ -1438,7 +1446,12 @@ cargo test -p env-tests --features all            # everything (~8-10 min)
 > bare `cargo test`, sees green, and concludes the cluster is validated has validated nothing.
 
 `crates/env-tests/tests/24_join_flow.rs` is a real end-to-end join across AC, GC and MC;
-`26_mh_quic.rs` covers the MH QUIC path. This is the same Rust suite the devloop's Layer 7 gate runs
+`26_mh_quic.rs` covers the MH QUIC path; `27_mc_slot_placement.rs` is the multi-party proof (five
+participants split across mh-0 and mh-1, real datagrams forwarded between distinct senders) and is
+the one test here that needs **both** MH pods healthy — it hard-fails with `Triage MH handler-set
+health` rather than adapting to a single handler. All three share one WebTransport client
+(`src/fixtures/mc_session.rs`), so a connect/framing/join symptom that hits all three at once is
+that fixture, not three regressions. This is the same Rust suite the devloop's Layer 7 gate runs
 (`scripts/layer7.sh`, `--features all`); failure-mode triage lives in
 `docs/runbooks/devloop-validation.md` §6.7. Layer 7 **also** runs a browser E2E suite (Playwright)
 after the Rust env-tests — diff-triggered and gated on its own preconditions; it is described just

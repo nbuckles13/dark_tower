@@ -10,6 +10,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/mod.rs"]
+mod test_common;
+
 use std::sync::Arc;
 
 use ::common::observability::testing::MetricAssertion;
@@ -143,6 +146,7 @@ async fn join_participant(
             false,
             None,
             outbound_tx,
+            test_common::standalone_join_media(),
         )
         .await
         .expect("join_connection should succeed");
@@ -488,6 +492,7 @@ async fn one_user_with_two_participants_is_ambiguous_and_fails_closed() {
                 false,
                 None,
                 tx,
+                test_common::standalone_join_media(),
             )
             .await
             .expect("join_connection");

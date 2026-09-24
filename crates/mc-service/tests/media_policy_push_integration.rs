@@ -34,7 +34,7 @@ use ::common::observability::testing::{MetricAssertion, MetricSnapshot};
 use mc_service::errors::McError;
 use mc_service::grpc::{MeetingProgramming, MhClient};
 use mc_service::media_routing::PolicyPushOutcome;
-use mc_test_utils::media::{loopback_assignment, TEST_HANDLER_ID};
+use mc_test_utils::media::{two_party_assignment, TEST_HANDLER_ID};
 use mc_test_utils::mock_mh::{
     AppliedGenerationBehaviour, MediaHandlerStub, MediaHandlerStubHandle,
 };
@@ -43,14 +43,24 @@ use proto_gen::dark_tower::signaling::v1::TransportMode;
 
 const KEY_CUSTODY: (&str, &str) = ("key_custody", "operator");
 
-/// Push the loopback policy at `generation` and return the call result.
+/// Push the two-party policy at `generation` and return the call result.
 async fn push(
     stub: &MediaHandlerStubHandle,
     meeting_id: &str,
     generation: u64,
 ) -> Result<(), McError> {
+    push_with(stub, meeting_id, generation, false).await
+}
+
+/// [`push`], with the pusher's first-confirm discriminator set as given.
+async fn push_with(
+    stub: &MediaHandlerStubHandle,
+    meeting_id: &str,
+    generation: u64,
+    restart_floor_adoptable: bool,
+) -> Result<(), McError> {
     let endpoint = stub.endpoint();
-    let assignment = loopback_assignment();
+    let assignment = two_party_assignment();
     let client = MhClient::new(test_token_receiver());
     client
         .register_meeting(&MeetingProgramming {
@@ -61,6 +71,7 @@ async fn push(
             mc_grpc_endpoint: "http://mc-test:50052",
             assignment: &assignment,
             policy_generation: NonZeroU64::new(generation).unwrap(),
+            restart_floor_adoptable,
         })
         .await
 }
@@ -116,7 +127,7 @@ async fn injected_apply_failure_does_not_advance_the_echo_and_drives_the_gauge()
     assert!(
         matches!(
             &result,
-            Err(McError::MediaPolicyDivergence { outcome })
+            Err(McError::MediaPolicyDivergence { outcome, .. })
                 if *outcome == PolicyPushOutcome::GenerationMismatch
         ),
         "a stalled applied generation must fail loud, got {result:?}"
@@ -156,6 +167,64 @@ async fn applied_above_sent_reports_a_positive_magnitude_not_zero_and_not_a_wrap
     snap.gauge("mc_media_generation_divergence")
         .with_labels(&[KEY_CUSTODY])
         .assert_value((STALLED_AT - SENT) as f64);
+}
+
+/// The MC-restart floor: on the FIRST confirm of a (meeting, handler), a higher
+/// echo is the pre-restart MC's number, not a divergence. `confirm` records
+/// NOTHING on the outcome counter (the pusher records exactly one of the
+/// adoption counter or, if adoption fails, `generation_mismatch`), so
+/// `MCMediaGenerationDivergence` does not page on every MC rollout — and the
+/// error still carries the classified outcome for the pusher to adopt from.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restart_floor_on_first_confirm_is_not_recorded_as_a_mismatch() {
+    const HELD: u64 = 9;
+    let stub = MediaHandlerStub::builder()
+        .applied_generation(AppliedGenerationBehaviour::Stall(HELD))
+        .handler_id(TEST_HANDLER_ID)
+        .transport_mode(TransportMode::Datagram)
+        .spawn()
+        .await;
+
+    let snap = MetricAssertion::snapshot();
+    let result = push_with(&stub, "meeting-restart-floor", 1, true).await;
+    assert!(
+        matches!(
+            result,
+            Err(McError::MediaPolicyDivergence {
+                outcome: PolicyPushOutcome::GenerationMismatch,
+                applied_generation: HELD,
+            })
+        ),
+        "got {result:?}"
+    );
+    for outcome in PolicyPushOutcome::ALL {
+        snap.counter("mc_media_policy_pushes_total")
+            .with_labels(&[("outcome", outcome.label()), KEY_CUSTODY])
+            .assert_delta(0);
+    }
+    // Recorded by the pusher, never here, under either disposition.
+    for outcome in ["adopted", "superseded"] {
+        snap.counter("mc_media_policy_generation_adoptions_total")
+            .with_labels(&[("outcome", outcome), KEY_CUSTODY])
+            .assert_delta(0);
+    }
+}
+
+/// The discriminator is fail-closed: with it set, a LOWER echo (the ordinary
+/// transient mismatch) is still recorded and still pages.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lower_echo_on_first_confirm_is_still_a_recorded_mismatch() {
+    let stub = MediaHandlerStub::builder()
+        .applied_generation(AppliedGenerationBehaviour::Stall(2))
+        .handler_id(TEST_HANDLER_ID)
+        .transport_mode(TransportMode::Datagram)
+        .spawn()
+        .await;
+
+    let snap = MetricAssertion::snapshot();
+    let result = push_with(&stub, "meeting-lower-echo-first", 5, true).await;
+    assert!(result.is_err(), "got {result:?}");
+    assert_only_outcome(&snap, PolicyPushOutcome::GenerationMismatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +267,7 @@ async fn accepted_but_nothing_installed_is_no_applied_generation() {
     assert!(
         matches!(
             &result,
-            Err(McError::MediaPolicyDivergence { outcome })
+            Err(McError::MediaPolicyDivergence { outcome, .. })
                 if *outcome == PolicyPushOutcome::NoAppliedGeneration
         ),
         "got {result:?}"
@@ -233,7 +302,7 @@ async fn unspecified_transport_echo_is_a_mismatch_over_the_wire() {
     assert!(
         matches!(
             &result,
-            Err(McError::MediaPolicyDivergence { outcome })
+            Err(McError::MediaPolicyDivergence { outcome, .. })
                 if *outcome == PolicyPushOutcome::TransportModeMismatch
         ),
         "got {result:?}"
@@ -303,11 +372,11 @@ async fn restarted_handler_id_is_observed_but_non_fatal() {
 // What MC actually puts on the wire
 // ---------------------------------------------------------------------------
 
-/// The loopback policy as MH receives it. Pins the §7 per-egress behaviours at
+/// The two-party policy as MH receives it. Pins the §7 per-egress behaviours at
 /// the wire boundary rather than only in the pure computation, so a bug in the
 /// request builder cannot pass the unit tests and ship the wrong flags.
 #[tokio::test(flavor = "current_thread")]
-async fn pushed_request_carries_the_loopback_policy_and_a_non_zero_generation() {
+async fn pushed_request_carries_the_two_party_policy_and_a_non_zero_generation() {
     let stub = MediaHandlerStub::builder()
         .programs_successfully(TEST_HANDLER_ID)
         .spawn()
@@ -315,8 +384,9 @@ async fn pushed_request_carries_the_loopback_policy_and_a_non_zero_generation() 
 
     push(&stub, "meeting-wire-shape", 1).await.unwrap();
 
-    // `MhClient` must not retry internally — the retry budget belongs to
-    // `register_meeting_with_handlers`, which owns the disposition split. If a
+    // `MhClient` must not retry internally — the retry budget belongs to the
+    // per-handler push worker (`media_routing::pusher`), which owns the
+    // disposition split. If a
     // second retry layer ever appeared here, a terminal outcome would be
     // retried despite `PushDisposition::Terminal`, and the loop-level test
     // could not see it.
@@ -337,25 +407,67 @@ async fn pushed_request_carries_the_loopback_policy_and_a_non_zero_generation() 
         "this story declares no selection rules"
     );
 
-    assert_eq!(request.egress_streams.len(), 1, "one audio egress stream");
-    let stream = &request.egress_streams[0];
-    let subscriber = stream.subscriber.as_ref().expect("subscriber present");
     assert_eq!(
-        stream.candidate_sources.len(),
-        1,
-        "one candidate: the subscriber themselves"
+        request.egress_streams.len(),
+        2,
+        "one pinned audio egress stream per subscriber"
     );
-    assert_eq!(
-        stream.candidate_sources[0].sender_id, subscriber.sender_id,
-        "the loopback edge: publisher and subscriber are the same participant"
-    );
+    for stream in &request.egress_streams {
+        let subscriber = stream.subscriber.as_ref().expect("subscriber present");
+        assert_eq!(
+            stream.candidate_sources.len(),
+            1,
+            "exactly one pinned candidate under static fill"
+        );
+        assert_ne!(
+            stream.candidate_sources[0].sender_id, subscriber.sender_id,
+            "no self-edge: loopback is removed (story 2 R-3)"
+        );
+        assert!(
+            !stream.supersede_on_independent_frame,
+            "every audio frame forwards; MH is told the behaviour, never the media type"
+        );
+        assert_eq!(stream.transport_mode, TransportMode::Datagram as i32);
+        assert_ne!(
+            stream.priority_group, 0,
+            "MC assigns the priority group; 0 is the never-set default"
+        );
+    }
+}
+
+/// A gen>0 snapshot with ZERO egress streams — a solo participant, or a handler
+/// nobody is placed on — confirms `match`. Unreachable before story 2 (the
+/// self-edge meant the first push always carried one stream).
+#[tokio::test(flavor = "current_thread")]
+async fn an_empty_snapshot_at_a_non_zero_generation_confirms_match() {
+    // What a real MH answers for an empty set: it installs zero edges, echoes
+    // the generation, and — reading transport mode off the live snapshot —
+    // echoes UNSPECIFIED, which is exactly what MC declares for an empty set.
+    let stub = MediaHandlerStub::builder()
+        .accept(true)
+        .applied_generation(AppliedGenerationBehaviour::EchoSent)
+        .handler_id(TEST_HANDLER_ID)
+        .transport_mode(TransportMode::Unspecified)
+        .spawn()
+        .await;
+    let empty = mc_service::media_routing::HandlerAssignment::default();
+    let snap = MetricAssertion::snapshot();
+    let result = MhClient::new(test_token_receiver())
+        .register_meeting(&MeetingProgramming {
+            mh_grpc_endpoint: &stub.endpoint(),
+            expected_handler_id: TEST_HANDLER_ID,
+            meeting_id: "meeting-empty",
+            mc_id: "mc-test",
+            mc_grpc_endpoint: "http://mc:50052",
+            assignment: &empty,
+            policy_generation: NonZeroU64::new(3).unwrap(),
+            restart_floor_adoptable: false,
+        })
+        .await;
     assert!(
-        !stream.supersede_on_independent_frame,
-        "every audio frame forwards; MH is told the behaviour, never the media type"
+        result.is_ok(),
+        "an empty snapshot must confirm, got {result:?}"
     );
-    assert_eq!(stream.transport_mode, TransportMode::Datagram as i32);
-    assert_ne!(
-        stream.priority_group, 0,
-        "MC assigns the priority group; 0 is the never-set default"
-    );
+    assert_eq!(stub.last_request().unwrap().egress_streams.len(), 0);
+    assert_only_outcome(&snap, PolicyPushOutcome::Match);
 }

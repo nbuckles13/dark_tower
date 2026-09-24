@@ -1,32 +1,30 @@
 //! MC's media-routing control plane (ADR-0036 §7, §8, §9).
 //!
-//! MC owns four things here, and they are deliberately four modules rather than
-//! one:
-//!
 //! | Module | Responsibility |
 //! |---|---|
-//! | [`assignment`] | a **pure function** from meeting state to a per-handler forwarding snapshot |
-//! | [`generation`] | a **change-detector** that numbers those snapshots |
+//! | [`slots`] | per-meeting **join-order slot state** (held by the meeting actor) and its pure render into a per-handler forwarding snapshot |
+//! | [`placement`] | which ONE handler of the meeting's set each participant is placed on — the one home for placement and for client-facing handler urls |
+//! | [`assignment`] | the snapshot's **output types** and the id-packing rules every producer shares |
+//! | [`generation`] | a **change-detector** that numbers those snapshots, plus floor adoption after an MC restart |
 //! | [`confirm`] | a **total classifier** of the handler's reply into one bounded outcome |
-//! | (`grpc::mh_client`) | the **one-shot programming call** that carries a snapshot |
+//! | [`pusher`] | one **push worker per (meeting, handler)**: serialized, latest-wins, meeting-scoped |
+//! | (`grpc::mh_client`) | the programming call that carries a snapshot and confirms the echo |
 //!
-//! The loopback ("hear yourself") is the N=1 evaluation of the first of those,
-//! not a special case inside it.
+//! Loopback is gone (story 2 R-3): visibility is non-reflexive, so a solo
+//! participant hears nothing — the same general computation, not a special case.
 //!
-//! # Scope: the wire contract and one push, nothing else
+//! # Scope: structural re-push, not the §8 cadence
 //!
-//! ADR-0036 §8's handler-restart recovery — periodic re-assert cadence,
-//! connectivity-loss trigger, dispatch jitter, cadence-versus-provisional-timeout
-//! startup validation, re-assert-failure paging, and restart detection off
-//! `process_start_epoch_ms` — is deliberately **not** here. What lands is the
-//! policy fields, the derived generation, the applied-generation echo, and
-//! single-push-plus-confirm.
-//!
-//! That later story is additive rather than a rewrite because of one shape
-//! choice: [`generation::PolicyGenerations`] holds
-//! `(meeting, handler) -> (assignment, generation)`, which is exactly the state
-//! a cadence task walks, and the push path takes a *snapshot* rather than a join
-//! event.
+//! Every structural change — a join, a leave, a capability declaration, a mute —
+//! re-renders the meeting and re-pushes the FULL snapshot to each assigned
+//! handler under a generation that advances only when that handler's snapshot
+//! changed, and confirms MH's applied-generation echo. ADR-0036 §8's
+//! handler-restart recovery — periodic re-assert cadence, connectivity-loss
+//! trigger, dispatch jitter, cadence-versus-provisional-timeout validation, and
+//! restart detection off `process_start_epoch_ms` — is story 4. It lands
+//! additively: [`generation::PolicyGenerations`] holds
+//! `(meeting, handler) -> (assignment, generation)`, exactly the state a
+//! cadence walks, and the push path takes a *snapshot* rather than an event.
 //!
 //! # Key material never appears here
 //!
@@ -38,13 +36,18 @@
 pub mod assignment;
 pub mod confirm;
 pub mod generation;
+pub mod placement;
+pub mod pusher;
+pub mod slots;
 
 pub use assignment::{
-    compute_assignment, AssignmentError, EgressStreamPlan, HandlerAssignment, HandlerId,
-    MeetingAssignment, MeetingRoutingInput, RoutingParticipant, AUDIO_PRIORITY_GROUP,
-    MAIN_AUDIO_SLOT_ID, MAIN_AUDIO_STREAM_NUMBER,
+    AssignmentError, EgressStreamPlan, HandlerAssignment, HandlerId, MeetingAssignment,
+    AUDIO_PRIORITY_GROUP, MAIN_AUDIO_STREAM_NUMBER,
 };
 pub use confirm::{
     divergence_magnitude, evaluate, PolicyPushOutcome, PushDisposition, PushExpectation,
 };
 pub use generation::{GenerationSpaceExhausted, PolicyGenerations};
+pub use placement::{HandlerEndpoint, HandlerSetError, MeetingHandlers};
+pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget};
+pub use slots::{JoinRank, SlotTable, SlotTableError};

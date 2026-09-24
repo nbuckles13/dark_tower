@@ -37,7 +37,7 @@
 - Actors (controller, meeting, participant, messages, metrics) → `actors/*.rs`
 - Server (accept loop, TLS, capacity gate) → `webtransport/server.rs:WebTransportServer`
 - Connection handler (join flow, post-join media dispatch, bridge loop) → `webtransport/connection.rs:handle_connection()`
-- RegisterMeeting trigger (first-participant, async spawn) → `connection.rs:register_meeting_with_handlers()`
+- RegisterMeeting driver (per-(meeting, handler) push worker, re-published on every structural change) → `crates/mc-service/src/media_routing/pusher.rs:HandlerPusher`; published by `actors/meeting_media.rs:render_and_publish()`
 - MhRegistrationClient trait (testable RPC abstraction) → `grpc/mh_client.rs:MhRegistrationClient`
 
 ## Authentication Seams
@@ -69,7 +69,7 @@
 
 ## E2E Env-Tests (`crates/env-tests/`)
 - Cluster infra → `src/cluster.rs:ClusterConnection` | Auth/GC fixtures → `src/fixtures/auth_client.rs`, `gc_client.rs`
-- Join → `tests/24_join_flow.rs` | MH QUIC media loopback → `tests/26_mh_quic.rs` | web-app media loopback → `packages/web-app/e2e/media-loopback.spec.ts`
+- Join → `tests/24_join_flow.rs` | MH QUIC connect/auth → `tests/26_mh_quic.rs` | multi-party MH datagram forwarding → `tests/27_mc_slot_placement.rs` | web-app media loopback → `packages/web-app/e2e/media-loopback.spec.ts`
 
 ## Network Policies & Kind
 - Per-service policies → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml` | Kind setup → `infra/kind/scripts/setup.sh`

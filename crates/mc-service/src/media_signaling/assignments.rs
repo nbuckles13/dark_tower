@@ -1,56 +1,62 @@
 //! What MC tells a subscriber about its **slots** (ADR-0036 §6).
 //!
-//! # This is a join, and every partial case is explicit
+//! # A join of the slot table's render and the subscriber's declaration
 //!
-//! MC composes a subscriber's view from two inputs that arrive at different
-//! times and are numbered in different namespaces:
+//! MC composes a subscriber's view from two inputs:
 //!
-//! 1. the **forwarding policy already pushed to MH**, which fixes what MH stamps
-//!    into each frame's relay-region `stream_id`; and
-//! 2. the subscriber's **capability declaration**, which fixes what that
-//!    subscriber will accept.
+//! 1. the **forwarding assignment** rendered from the meeting's join-order slot
+//!    state — the same value the MC→MH control plane is programmed from — which
+//!    fixes who fills each declared audio slot and what `stream_id` MH stamps;
+//!    and
+//! 2. the subscriber's **capability declaration**, which fixes which slots it
+//!    will accept.
 //!
-//! The assignment is the join of the two, and §6's rule is that *"absence of
-//! frames is not a signal"* — so every partial case is conveyed as an explicit
-//! slot state rather than left to be inferred from silence. A declared slot with
-//! no plan is a source shortage, and says so; it is not confused with a source
-//! that exists but is muted, or one that is unreachable.
+//! Since story 2 the declaration is the assignment's INPUT (declared audio slots
+//! size the subscriber's slot vector), so every declared audio slot is either
+//! filled — `ACTIVE`, or `SOURCE_MUTED` — or unfilled — `FEWER_SOURCES_THAN_SLOTS`.
+//! §6's rule is that *"absence of frames is not a signal"*, so every partial
+//! case is an explicit slot state.
 //!
-//! The one case that is **not** conveyed here is a declaration asking for audio
-//! in a slot MC has no plan for. That is rejected upstream in
-//! [`super::capability`], because reporting it as a source shortage would tell
-//! the client "there is nobody to show you" while MH actively forwards a source
-//! it will drop.
+//! # What this never emits
+//!
+//! `SLOT_STATE_ZERO_REQUESTED` (MC never fabricates a `slot_id` to carry it) and
+//! `SLOT_STATE_SOURCE_UNREACHABLE` (reserved for a pinned source on another
+//! handler, which static fill cannot produce). A participant on ANOTHER handler
+//! consumes no slot and is named in `unreachable_sender_ids` instead — one bit
+//! per roster entry, relative to this subscriber, carrying no topology.
 //!
 //! # Mute lives here and only here
 //!
-//! A source's client mute changes what a **subscriber is told about it**, never
-//! what a **publisher is told to produce**. [`super::directive`] therefore has
-//! no access to mute state at all; this module is the only one that reads it.
+//! A source's mute changes what a **subscriber is told about it**, never what a
+//! **publisher is told to produce**. [`super::directive`] therefore has no
+//! access to mute state at all; this module is the only one that reads it.
 
 use super::capability::{ReceiveCapabilityDeclaration, SlotId};
-use super::directive::HandlerUrls;
+use super::outcome::DirectiveOutcome;
 use crate::media_admission::SenderId;
-use crate::media_routing::{HandlerId, MeetingAssignment};
+use crate::media_routing::{HandlerId, MeetingAssignment, MeetingHandlers};
 use proto_gen::dark_tower::signaling::v1::{
     MediaKind, SlotState, StreamAssignment, StreamAssignments,
 };
 use std::collections::HashMap;
 
-/// Which sources are currently reporting themselves audio-muted.
+/// Which sources are currently audio-muted, for any reason.
 ///
 /// A **read-only projection** of the meeting actor's roster, built per
-/// composition and not retained. MC keeps exactly one home for mute state —
-/// `ParticipantInfo::audio_self_muted`, updated through
-/// `MeetingActorHandle::update_self_mute` — and this type is a view of it, never
-/// a second copy that could disagree.
+/// composition and not retained. The actor builds it from
+/// `audio_self_muted || audio_server_muted`: the wire's single
+/// `SLOT_STATE_SOURCE_MUTED` covers both causes (who muted whom rides on
+/// `ParticipantMuteUpdate`), so a subscriber's view must change when either
+/// flag does. The actor is the one home of both flags; this is a view, never a
+/// second copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceMuteView {
     audio_muted: HashMap<SenderId, bool>,
 }
 
 impl SourceMuteView {
-    /// Build from `(sender id, audio self-muted)` pairs off a roster snapshot.
+    /// Build from `(sender id, audio muted for any reason)` pairs off a roster
+    /// snapshot.
     #[must_use]
     pub fn from_pairs(pairs: impl IntoIterator<Item = (SenderId, bool)>) -> Self {
         Self {
@@ -58,7 +64,7 @@ impl SourceMuteView {
         }
     }
 
-    /// Is this source reporting itself audio-muted?
+    /// Is this source audio-muted?
     ///
     /// An unknown source is reported **not muted**: the roster is the authority
     /// on mute, and a source missing from the snapshot is a staleness question,
@@ -80,19 +86,11 @@ pub struct SlotComposition {
     /// Read off the assignments themselves rather than tracked in parallel, so
     /// the metric and the wire cannot disagree about what MC said.
     pub slot_states: Vec<SlotState>,
-    /// Planned egress slots this subscriber never declared.
-    ///
-    /// Reachable in this story only through the zero-audio exemption: a
-    /// subscriber declaring `{}` or video-only slots is accepted, and MC's
-    /// planned audio slot then matches nothing. MH forwards egress that
-    /// subscriber will never accept — wasted uplink and handler work — which is
-    /// the operational question the counter answers.
-    pub unmatched_plan_slots: usize,
 }
 
 /// Bounded metric-label form for a slot state.
 ///
-/// Exhaustive over **all eight** proto variants, not the four reachable today.
+/// Exhaustive over **all eight** proto variants, not the three reachable today.
 /// A wire-vocabulary mirror is supposed to cover states it does not yet emit:
 /// a hand-picked subset needs editing every time §7 makes `switch_pending` live,
 /// and a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
@@ -112,36 +110,40 @@ pub fn slot_state_label(state: SlotState) -> &'static str {
     }
 }
 
-/// Compose one subscriber's slot assignments.
+/// Compose one subscriber's slot assignments — the ONE construction site of
+/// `StreamAssignments`.
 ///
 /// Total: every declared slot yields exactly one [`StreamAssignment`] carrying
-/// an explicit state, and no slot is silently omitted.
+/// an explicit state, and no slot is silently omitted. `unreachable` is the
+/// slot table's `unreachable_for(subscriber)`, carried verbatim.
 ///
 /// `sender_id` is `Option` throughout and absence is **never coerced to 0** — a
 /// shared zero is not a recycled id but N concurrently-live colliding ones, and
 /// since the key id encodes `(sender, stream, generation)`, two senders at zero
 /// wrap distinct transmit keys under one KEK at one nonce.
-#[must_use]
+///
+/// # Errors
+///
+/// [`DirectiveOutcome::HandlerUrlUnresolved`] if a filled slot's handler has no
+/// url in `handlers`. Unreachable by construction (one frozen handler set feeds
+/// both), and it fails CLOSED: the caller emits nothing for this subscriber
+/// rather than an `ACTIVE` slot with an empty url.
 pub fn build_stream_assignments(
     subscriber: SenderId,
     declaration: &ReceiveCapabilityDeclaration,
     assignment: &MeetingAssignment,
-    handler_urls: &HandlerUrls,
+    handlers: &MeetingHandlers,
     mute: &SourceMuteView,
-) -> SlotComposition {
+    unreachable: &[SenderId],
+) -> Result<SlotComposition, DirectiveOutcome> {
     // The subscriber's own egress plans, keyed by the slot MH will stamp.
-    // Built from the same `compute_assignment` output the MC->MH control plane
-    // is programmed from, so the two sides cannot disagree about who fills what.
     let mut planned: HashMap<SlotId, (&HandlerId, Option<SenderId>)> = HashMap::new();
     for (handler, handler_assignment) in &assignment.per_handler {
         for plan in &handler_assignment.egress_streams {
             if plan.subscriber != subscriber {
                 continue;
             }
-            // Candidates are sorted by the assignment, so `first` is
-            // deterministic rather than incidental. Selection among many
-            // candidates is MH's §7 job; MC names the pool's head as the source
-            // it expects to see.
+            // Exactly one pinned candidate under static fill.
             planned.insert(
                 SlotId::from_u16(plan.slot_id),
                 (handler, plan.candidate_sources.first().copied()),
@@ -149,7 +151,6 @@ pub fn build_stream_assignments(
         }
     }
 
-    let mut matched_plan_slots = 0usize;
     let mut assignments = Vec::with_capacity(declaration.slots().len());
     let mut slot_states = Vec::with_capacity(declaration.slots().len());
 
@@ -164,36 +165,23 @@ pub fn build_stream_assignments(
 
         let (sender_id, media_handler_url, slot_state) = match plan {
             Some((handler, Some(source))) => {
-                matched_plan_slots += 1;
-                match handler_urls.get(handler) {
-                    Some(url) => {
-                        let state = if mute.is_audio_muted(*source) {
-                            // §5: muting signals out of band. The receiver
-                            // renders a placeholder from this state, never from
-                            // a substitute frame — and MC does not touch the
-                            // source's send directive.
-                            SlotState::SourceMuted
-                        } else {
-                            SlotState::Active
-                        };
-                        (Some(u32::from(source.get().get())), url.to_string(), state)
-                    }
-                    // A source MC cannot route to is structurally persistent
-                    // rather than transient (§9), and carries no sender id: the
-                    // subscriber is not being told a source is arriving.
-                    None => (None, String::new(), SlotState::SourceUnreachable),
-                }
+                let url = handlers
+                    .url_of(handler)
+                    .ok_or(DirectiveOutcome::HandlerUrlUnresolved)?;
+                let state = if mute.is_audio_muted(*source) {
+                    // §5: muting signals out of band. The receiver renders a
+                    // placeholder from this state, never from a substitute
+                    // frame — and MC does not touch the source's directive.
+                    SlotState::SourceMuted
+                } else {
+                    SlotState::Active
+                };
+                (Some(u32::from(source.get().get())), url.to_string(), state)
             }
-            // A plan with no candidate is a plan with no source; treat it as
-            // the shortage it is rather than asserting a source.
-            Some((_, None)) => {
-                matched_plan_slots += 1;
-                (None, String::new(), SlotState::FewerSourcesThanSlots)
-            }
-            // Declared, but MC has nothing to put in it. The honest steady
-            // state, and NOT the same thing as the rejected case where a
-            // subscriber asks for audio in a slot MC cannot address at all.
-            None => (None, String::new(), SlotState::FewerSourcesThanSlots),
+            // Declared, but nobody on this subscriber's handler is left to fill
+            // it: the honest steady state of a meeting smaller than N, and of a
+            // solo participant (R-3). The url is empty BY CONTRACT here.
+            Some((_, None)) | None => (None, String::new(), SlotState::FewerSourcesThanSlots),
         };
 
         slot_states.push(slot_state);
@@ -209,26 +197,23 @@ pub fn build_stream_assignments(
         });
     }
 
-    SlotComposition {
+    Ok(SlotComposition {
         assignments: StreamAssignments {
             assignments,
-            // Empty is truthful today: every edge is placed on the meeting's
-            // first handler, so no roster participant is on a different handler
-            // from any subscriber. Story-2 task 6 (per-handler placement and the
-            // unreachable set) populates it.
-            unreachable_sender_ids: Vec::new(),
+            unreachable_sender_ids: unreachable
+                .iter()
+                .map(|s| u32::from(s.get().get()))
+                .collect(),
         },
         slot_states,
-        unmatched_plan_slots: planned.len().saturating_sub(matched_plan_slots),
-    }
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_routing::{compute_assignment, MeetingRoutingInput, RoutingParticipant};
-    use crate::media_signaling::capability::PlannedAudioSlot;
+    use crate::media_routing::{HandlerEndpoint, SlotTable};
     use proto_gen::dark_tower::signaling::v1::{ReceiveCapability, ReceiveSlot};
     use std::num::NonZeroU16;
 
@@ -236,26 +221,13 @@ mod tests {
         SenderId::from_nonzero(NonZeroU16::new(n).unwrap())
     }
 
-    fn loopback() -> (MeetingAssignment, HandlerUrls) {
-        assignment_over(&["mh-0"])
-    }
-
-    /// Build an assignment + url table over the handler list **in the given Vec
-    /// order**, which is the order `MhAssignmentData.handlers` arrives in.
-    fn assignment_over(handlers: &[&str]) -> (MeetingAssignment, HandlerUrls) {
-        let ids: Vec<HandlerId> = handlers.iter().map(|h| HandlerId::new(*h)).collect();
-        let input = MeetingRoutingInput {
-            participants: vec![RoutingParticipant {
-                sender_id: sender(1),
-                handlers: ids.clone(),
-            }],
-            handlers: ids.clone(),
-        };
-        let urls = HandlerUrls::from_pairs(
-            ids.iter()
-                .map(|h| (h.clone(), format!("https://{h}.example:4434"))),
-        );
-        (compute_assignment(&input).unwrap(), urls)
+    fn handler_set(handlers: &[&str]) -> MeetingHandlers {
+        MeetingHandlers::new(handlers.iter().map(|h| HandlerEndpoint {
+            id: HandlerId::new(*h),
+            webtransport_url: format!("https://{h}.example:4434"),
+            grpc_endpoint: format!("http://{h}.example:50053"),
+        }))
+        .unwrap()
     }
 
     fn declare(slots: &[(u32, MediaKind)]) -> ReceiveCapabilityDeclaration {
@@ -269,50 +241,102 @@ mod tests {
                 })
                 .collect(),
         };
-        ReceiveCapabilityDeclaration::parse(
-            &message,
-            64,
-            true,
-            PlannedAudioSlot::new(SlotId::from_u16(0)),
-        )
-        .expect("fixture declaration is valid")
+        ReceiveCapabilityDeclaration::parse(&message, 64, true)
+            .expect("fixture declaration is valid")
     }
 
-    fn compose(slots: &[(u32, MediaKind)], mute: &SourceMuteView) -> SlotComposition {
-        let (assignment, urls) = loopback();
-        build_stream_assignments(sender(1), &declare(slots), &assignment, &urls, mute)
+    /// A meeting on `handlers` where `others` join `mh-0` after subscriber 1,
+    /// which declares `slots`. Returns (assignment, handlers, table).
+    fn meeting(
+        handlers: &[&str],
+        others: &[u16],
+        slots: &[(u32, MediaKind)],
+    ) -> (
+        MeetingAssignment,
+        MeetingHandlers,
+        SlotTable,
+        ReceiveCapabilityDeclaration,
+    ) {
+        let set = handler_set(handlers);
+        let mut table = SlotTable::new();
+        table
+            .admit(sender(1), |_| Some(HandlerId::new("mh-0")))
+            .unwrap();
+        for s in others {
+            table
+                .admit(sender(*s), |_| Some(HandlerId::new("mh-0")))
+                .unwrap();
+        }
+        let declaration = declare(slots);
+        table.set_demand(sender(1), declaration.audio_slot_ids());
+        (table.render(set.ids()).unwrap(), set, table, declaration)
+    }
+
+    fn compose(
+        others: &[u16],
+        slots: &[(u32, MediaKind)],
+        mute: &SourceMuteView,
+    ) -> SlotComposition {
+        let (assignment, set, table, declaration) = meeting(&["mh-0"], others, slots);
+        build_stream_assignments(
+            sender(1),
+            &declaration,
+            &assignment,
+            &set,
+            mute,
+            &table.unreachable_for(sender(1)),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn own_audio_fills_own_slot_and_is_active() {
-        let composition = compose(&[(0, MediaKind::Audio)], &SourceMuteView::default());
+    fn a_filled_slot_names_its_source_and_is_active() {
+        let composition = compose(&[2], &[(0, MediaKind::Audio)], &SourceMuteView::default());
         assert_eq!(composition.assignments.assignments.len(), 1);
         let a = &composition.assignments.assignments[0];
         assert_eq!(a.slot_id, 0);
-        assert_eq!(a.sender_id, Some(1));
+        assert_eq!(
+            a.sender_id,
+            Some(2),
+            "the co-handler peer, never the subscriber itself"
+        );
         assert_eq!(a.media_kind, MediaKind::Audio as i32);
         assert_eq!(a.media_handler_url, "https://mh-0.example:4434");
         assert_eq!(a.slot_state, SlotState::Active as i32);
         // Present iff SWITCH_PENDING, which MC never emits this story.
         assert!(a.switch_command_id.is_none());
-        assert_eq!(composition.unmatched_plan_slots, 0);
+    }
+
+    /// R-3: a solo participant hears nothing, and every declared slot says so
+    /// explicitly.
+    #[test]
+    fn a_solo_subscribers_slots_are_all_fewer_sources_than_slots() {
+        let composition = compose(
+            &[],
+            &[(0, MediaKind::Audio), (1, MediaKind::Audio)],
+            &SourceMuteView::default(),
+        );
+        for a in &composition.assignments.assignments {
+            assert_eq!(a.slot_state, SlotState::FewerSourcesThanSlots as i32);
+            assert!(a.sender_id.is_none());
+            assert!(a.media_handler_url.is_empty());
+        }
+        assert!(composition.assignments.unreachable_sender_ids.is_empty());
     }
 
     #[test]
     fn a_muted_source_is_conveyed_as_source_muted_with_the_sender_still_named() {
-        // The source is PRESENT and has muted itself; the receiver renders a
-        // placeholder from the state, never from a substitute frame. The sender
-        // id stays, because the subscriber still knows who occupies the slot.
-        let mute = SourceMuteView::from_pairs(vec![(sender(1), true)]);
-        let composition = compose(&[(0, MediaKind::Audio)], &mute);
+        let mute = SourceMuteView::from_pairs(vec![(sender(2), true)]);
+        let composition = compose(&[2], &[(0, MediaKind::Audio)], &mute);
         let a = &composition.assignments.assignments[0];
         assert_eq!(a.slot_state, SlotState::SourceMuted as i32);
-        assert_eq!(a.sender_id, Some(1));
+        assert_eq!(a.sender_id, Some(2));
     }
 
     #[test]
-    fn an_extra_slot_is_a_source_shortage_with_sender_id_absent_not_zero() {
+    fn an_unfilled_slot_is_a_source_shortage_with_sender_id_absent_not_zero() {
         let composition = compose(
+            &[2],
             &[(0, MediaKind::Audio), (1, MediaKind::Audio)],
             &SourceMuteView::default(),
         );
@@ -320,8 +344,7 @@ mod tests {
         let extra = &composition.assignments.assignments[1];
         assert_eq!(extra.slot_id, 1);
         assert_eq!(extra.slot_state, SlotState::FewerSourcesThanSlots as i32);
-        // ABSENT, not 0. A shared zero is not a recycled id but N
-        // concurrently-live colliding ones, and the key id encodes the sender.
+        // ABSENT, not 0.
         assert!(extra.sender_id.is_none());
         assert_ne!(extra.sender_id, Some(0));
         assert!(extra.media_handler_url.is_empty());
@@ -329,10 +352,9 @@ mod tests {
 
     #[test]
     fn the_subscribers_own_slot_numbering_is_echoed_not_mcs() {
-        // `{0, 7}`: slot 0 is served, slot 7 must come back carrying 7. A
-        // hardcoded-0 implementation cannot produce this.
         let composition = compose(
-            &[(0, MediaKind::Audio), (7, MediaKind::Audio)],
+            &[2, 3],
+            &[(9, MediaKind::Audio), (7, MediaKind::Audio)],
             &SourceMuteView::default(),
         );
         let ids: Vec<u32> = composition
@@ -341,57 +363,122 @@ mod tests {
             .iter()
             .map(|a| a.slot_id)
             .collect();
-        assert_eq!(ids, vec![0, 7]);
+        assert_eq!(ids, vec![9, 7]);
+        let senders: Vec<Option<u32>> = composition
+            .assignments
+            .assignments
+            .iter()
+            .map(|a| a.sender_id)
+            .collect();
         assert_eq!(
-            composition.assignments.assignments[1].slot_state,
-            SlotState::FewerSourcesThanSlots as i32
+            senders,
+            vec![Some(2), Some(3)],
+            "join order into declaration order"
         );
     }
 
     #[test]
     fn a_video_slot_is_a_shortage_and_never_filled_with_audio() {
-        let composition = compose(&[(1, MediaKind::VideoCamera)], &SourceMuteView::default());
+        let composition = compose(
+            &[2],
+            &[(1, MediaKind::VideoCamera)],
+            &SourceMuteView::default(),
+        );
         let a = &composition.assignments.assignments[0];
         assert_eq!(a.media_kind, MediaKind::VideoCamera as i32);
         assert_eq!(a.slot_state, SlotState::FewerSourcesThanSlots as i32);
         assert!(a.sender_id.is_none());
-        // The audio plan matched nothing: MH forwards egress this subscriber
-        // will not accept.
-        assert_eq!(composition.unmatched_plan_slots, 1);
     }
 
     #[test]
-    fn a_zero_slot_declaration_yields_no_assignments_and_one_unmatched_plan() {
-        // The reachable path for the unmatched-plan counter in this story. It is
-        // legitimate client behaviour ("send but do not receive"), not an
-        // injected fault, and there is no slot to carry ZERO_REQUESTED because
-        // the subscriber declared none — `slot_id` echoes a slot the subscriber
-        // CHOSE, so fabricating id 0 here would break the echo property.
-        let composition = compose(&[], &SourceMuteView::default());
+    fn a_zero_slot_declaration_yields_no_assignments() {
+        // `slot_id` echoes a slot the subscriber CHOSE, so there is no slot to
+        // carry ZERO_REQUESTED and MC never fabricates one.
+        let composition = compose(&[2], &[], &SourceMuteView::default());
         assert!(composition.assignments.assignments.is_empty());
         assert!(composition.slot_states.is_empty());
-        assert_eq!(composition.unmatched_plan_slots, 1);
     }
 
+    /// S-A: a filled slot whose handler has no url fails CLOSED — no message,
+    /// never an ACTIVE slot with an empty url.
     #[test]
-    fn an_unresolvable_handler_makes_the_source_unreachable_with_no_sender_id() {
-        let (assignment, _) = loopback();
+    fn an_unresolvable_handler_fails_closed_rather_than_emitting_an_empty_url() {
+        let (assignment, _, table, declaration) =
+            meeting(&["mh-0"], &[2], &[(0, MediaKind::Audio)]);
+        let outcome = build_stream_assignments(
+            sender(1),
+            &declaration,
+            &assignment,
+            &handler_set(&["mh-9"]),
+            &SourceMuteView::default(),
+            &table.unreachable_for(sender(1)),
+        );
+        assert_eq!(outcome, Err(DirectiveOutcome::HandlerUrlUnresolved));
+    }
+
+    /// No declared slot, of any shape, ever carries a state MC does not emit
+    /// this story.
+    #[test]
+    fn zero_requested_and_source_unreachable_are_never_emitted() {
+        for others in [&[][..], &[2][..], &[2, 3, 4][..]] {
+            let composition = compose(
+                others,
+                &[
+                    (0, MediaKind::Audio),
+                    (1, MediaKind::Audio),
+                    (2, MediaKind::VideoCamera),
+                ],
+                &SourceMuteView::from_pairs(vec![(sender(2), true)]),
+            );
+            for state in &composition.slot_states {
+                assert_ne!(*state, SlotState::ZeroRequested);
+                assert_ne!(*state, SlotState::SourceUnreachable);
+            }
+        }
+    }
+
+    /// R-33: a participant on another handler consumes no slot and is named in
+    /// `unreachable_sender_ids`; a co-handler participant left over by full
+    /// slots is NOT.
+    #[test]
+    fn cross_handler_peers_are_unreachable_and_co_handler_overflow_is_not() {
+        let set = handler_set(&["mh-0", "mh-1"]);
+        let mut table = SlotTable::new();
+        table
+            .admit(sender(1), |_| Some(HandlerId::new("mh-0")))
+            .unwrap();
+        table
+            .admit(sender(2), |_| Some(HandlerId::new("mh-1")))
+            .unwrap();
+        table
+            .admit(sender(3), |_| Some(HandlerId::new("mh-0")))
+            .unwrap();
+        table
+            .admit(sender(4), |_| Some(HandlerId::new("mh-0")))
+            .unwrap();
+        let declaration = declare(&[(0, MediaKind::Audio)]);
+        table.set_demand(sender(1), declaration.audio_slot_ids());
         let composition = build_stream_assignments(
             sender(1),
-            &declare(&[(0, MediaKind::Audio)]),
-            &assignment,
-            &HandlerUrls::default(),
+            &declaration,
+            &table.render(set.ids()).unwrap(),
+            &set,
             &SourceMuteView::default(),
+            &table.unreachable_for(sender(1)),
+        )
+        .unwrap();
+        assert_eq!(composition.assignments.assignments[0].sender_id, Some(3));
+        assert_eq!(
+            composition.assignments.unreachable_sender_ids,
+            vec![2],
+            "exactly the cross-handler participant; 4 is 'no slot', not unreachable"
         );
-        let a = &composition.assignments.assignments[0];
-        assert_eq!(a.slot_state, SlotState::SourceUnreachable as i32);
-        assert!(a.sender_id.is_none());
-        assert!(a.media_handler_url.is_empty());
     }
 
     #[test]
     fn slot_states_mirror_the_wire_and_cannot_disagree_with_it() {
         let composition = compose(
+            &[2],
             &[(0, MediaKind::Audio), (1, MediaKind::Audio)],
             &SourceMuteView::default(),
         );
@@ -407,8 +494,6 @@ mod tests {
 
     #[test]
     fn an_unknown_source_is_reported_not_muted() {
-        // The roster is the authority. Answering "muted" for a source missing
-        // from a stale snapshot would render a placeholder for someone speaking.
         let view = SourceMuteView::from_pairs(vec![(sender(2), true)]);
         assert!(!view.is_audio_muted(sender(1)));
         assert!(view.is_audio_muted(sender(2)));
@@ -416,9 +501,6 @@ mod tests {
 
     #[test]
     fn every_wire_slot_state_has_a_distinct_bounded_label() {
-        // Exhaustive over all eight, not the four reachable today: a hand-picked
-        // subset needs editing the moment §7 makes switch_pending live, and an
-        // UNSPECIFIED on the wire is an MC defect that must be visible.
         let all = [
             SlotState::Unspecified,
             SlotState::Active,
@@ -435,88 +517,30 @@ mod tests {
     }
 
     /// The slot's handler address IS the handler carrying this subscriber's
-    /// egress plan, at N=2 handlers — the receive-side half of the same SSoT
-    /// property [`super::directive`] asserts for the send side.
-    ///
-    /// # What this rejects, by name
-    ///
-    /// `edge_handler` places every edge on the lexicographically smallest shared
-    /// handler, so with `{mh-0, mh-1}` the plan sits on **mh-0** and mh-1 holds a
-    /// correct-by-design EMPTY set. The nameable wrong answer is
-    /// `https://mh-1.example:4434` — what list-order selection produced on the
-    /// live cluster. The `assert_ne!` is that injected adverse condition.
+    /// plan, in a two-handler meeting where everyone sits on mh-0.
     ///
     /// The url is a WRITTEN LITERAL, not sourced from any helper the production
-    /// path also calls; see `internal_roundtrip.rs`'s `65_535`/`65_536` for the
-    /// in-tree register. Do not hoist it to a constant.
+    /// path also calls. The nameable wrong answer — mh-1, present with a
+    /// correct-by-design empty set — is asserted against explicitly.
     #[test]
     fn the_slot_names_the_handler_carrying_this_subscribers_plan_at_n_2() {
-        let (assignment, urls) = assignment_over(&["mh-0", "mh-1"]);
-
-        // Premise: exactly one handler carries the plan, and mh-1 is present but
-        // empty. Without this the assertion could pass over an empty assignment.
-        let carrying: Vec<&HandlerId> = assignment
-            .per_handler
-            .iter()
-            .filter(|(_, h)| h.egress_streams.iter().any(|p| p.subscriber == sender(1)))
-            .map(|(id, _)| id)
-            .collect();
-        assert_eq!(carrying, vec![&HandlerId::new("mh-0")]);
-        assert!(assignment
-            .per_handler
-            .get(&HandlerId::new("mh-1"))
-            .expect("every input handler gets an entry")
+        let (assignment, set, table, declaration) =
+            meeting(&["mh-1", "mh-0"], &[2], &[(0, MediaKind::Audio)]);
+        assert!(assignment.per_handler[&HandlerId::new("mh-1")]
             .egress_streams
             .is_empty());
-
         let composition = build_stream_assignments(
             sender(1),
-            &declare(&[(0, MediaKind::Audio)]),
+            &declaration,
             &assignment,
-            &urls,
+            &set,
             &SourceMuteView::default(),
-        );
+            &table.unreachable_for(sender(1)),
+        )
+        .unwrap();
         let a = &composition.assignments.assignments[0];
         assert_eq!(a.slot_state, SlotState::Active as i32);
-        assert_eq!(
-            a.media_handler_url, "https://mh-0.example:4434",
-            "the slot must name the handler the assignment placed the plan on"
-        );
-        assert_ne!(
-            a.media_handler_url, "https://mh-1.example:4434",
-            "mh-1 holds a correct-by-design EMPTY set; naming it is the story-task-25 defect"
-        );
-    }
-
-    /// Handler list order does not move the slot's handler address.
-    ///
-    /// **Unit-tier shadow, not the load-bearing proof.** `per_handler` is a
-    /// `BTreeMap`, `HandlerUrls` is a `BTreeMap`, and `edge_handler` sorts, so
-    /// most of the permutation is normalised away before this code runs —
-    /// review-protocol §Assertion Vacuity mechanism 4. The seam whose order
-    /// genuinely varies is `MhAssignmentData.handlers` at the Redis boundary,
-    /// reachable only through a real join; the proof lives in
-    /// `crates/mc-service/tests/media_client_signaling_integration.rs`
-    /// (`redis_enumeration_order_cannot_change_where_the_client_is_steered`).
-    /// Kept as a cheap local regression pin. Do not add more inversion here.
-    #[test]
-    fn handler_list_order_does_not_move_the_slot_handler_at_this_tier() {
-        let mut seen = Vec::new();
-        for order in [["mh-0", "mh-1"], ["mh-1", "mh-0"]] {
-            let (assignment, urls) = assignment_over(&order);
-            let composition = build_stream_assignments(
-                sender(1),
-                &declare(&[(0, MediaKind::Audio)]),
-                &assignment,
-                &urls,
-                &SourceMuteView::default(),
-            );
-            let a = &composition.assignments.assignments[0];
-            assert_eq!(a.slot_state, SlotState::Active as i32);
-            seen.push(a.media_handler_url.clone());
-        }
-        // Equal AND equal to mh-0: equality alone is green on two empty strings.
-        assert_eq!(seen[0], seen[1]);
-        assert_eq!(seen[0], "https://mh-0.example:4434");
+        assert_eq!(a.media_handler_url, "https://mh-0.example:4434");
+        assert_ne!(a.media_handler_url, "https://mh-1.example:4434");
     }
 }

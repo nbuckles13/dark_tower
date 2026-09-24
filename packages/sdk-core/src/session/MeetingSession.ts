@@ -32,7 +32,11 @@ import type { JoinedEvent } from '../signaling/events.js';
 import { MediaTransport } from '../media/MediaTransport.js';
 import type { MediaTransportOptions } from '../media/events.js';
 import { MeetingIdentity } from '../media/setup/identity.js';
-import { AudioPipeline, type AudioPipelineOptions } from '../media/lifecycle/AudioPipeline.js';
+import {
+  AudioPipeline,
+  type AudioPipelineOptions,
+  type AudioSendDirective,
+} from '../media/lifecycle/AudioPipeline.js';
 import { JoinResponseKekSource } from '../media/setup/kekSource.js';
 import { MEDIA_KEK_SOURCES, MediaMetrics } from '../media/setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
@@ -539,16 +543,58 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     pipeline.on('firstMediaFrame', (elapsedMs) => this.emit('firstMediaFrame', elapsedMs));
     pipeline.on('fault', (fault) => this.emit('mediaFault', fault));
 
+    // The last audio instruction MC gave, so a withdrawal can be applied to it.
+    let lastAudio: AudioSendDirective | undefined;
     signaling.on('sendDirective', (directive) => {
       const audio = directive.streams.find((s) => s.mediaKind === 'audio');
-      if (!audio) return;
-      pipeline.setSendDirective({
+      if (!audio) {
+        // A directive with NO audio stream is MC directing this client to
+        // produce no audio (`SendDirective`: "What MC directs this client to
+        // produce"). MC sends exactly this — `streams: []` — to a publisher
+        // nobody holds: a solo participant, or one whose last holder left.
+        //
+        // It must NOT be ignored, and the reason is FORWARD SECRECY, not tidy
+        // bookkeeping — do not "simplify" this back to an early return.
+        //
+        // Ignoring it kept the STALE instruction, so the pipeline's target set
+        // never reached zero. `AudioPipeline.setSendDirective` rotates the
+        // transmit key on the empty -> non-empty EDGE, and resume-from-empty is
+        // one of only three `rotate()` call sites (see `lifecycle/transmitKeys.ts`,
+        // "the bound is the interval between two consecutive rotations from any
+        // trigger"). Never seeing "empty" made that call site unreachable on this
+        // path. So a publisher whose last holder left, then picked up by a NEW
+        // holder, resumed under the SAME transmit key generation — which the
+        // DEPARTED holder still has, and can therefore decrypt the resumed media
+        // with. That is the window ADR-0036 §4 rotation exists to close.
+        //
+        // Applied as an empty target set, which is exactly §5's "send nothing" —
+        // so MC's two spellings of it (`streams: []`, and a stream with empty
+        // targets) land identically and both arm the resume rotation. A reader
+        // must not have to know which spelling MC happens to emit.
+        //
+        // With no earlier instruction there is nothing to withdraw: egress was
+        // never started, and no placeholder stream number or bitrate is invented.
+        if (lastAudio && lastAudio.targets.length > 0) {
+          lastAudio = { ...lastAudio, targets: [] };
+          pipeline.setSendDirective(lastAudio);
+        }
+        return;
+      }
+      lastAudio = {
         streamNumber: audio.streamNumber,
         // MC's directed value when present; the configured DEFAULT otherwise.
         // Never a local ceiling applied on top — see `clientConfig.ts`.
         bitrateBps: audio.maxBitrateBps ?? this.#mediaConfig.audio.defaultBitrateBps,
         targets: audio.targets,
-      });
+      };
+      pipeline.setSendDirective(lastAudio);
+    });
+    // RECEIVING comes from the slot assignments, independently of the send
+    // directive: a participant nobody holds gets an empty target set and must
+    // still hear the slots it holds. Subscribed before the declaration below,
+    // because MC's first `StreamAssignments` answers that declaration.
+    signaling.on('streamAssignments', (event) => {
+      pipeline.setReceiveHandlers(event.assignments.map((a) => a.mediaHandlerUrl));
     });
 
     await signaling.sendReceiveCapability([{ slotId, mediaKind: 'audio' }]);

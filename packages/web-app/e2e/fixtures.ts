@@ -862,7 +862,11 @@ export async function recoverByJoining(page: Page, meetingCode: string): Promise
 }
 
 // ============================================================================
-// Media loopback (task #20, ADR-0036 §5/§6/§10)
+// Media path (story 1 task #20; story 2 R-3 removed loopback — ADR-0036 §5/§6/§10)
+//
+// `waitForFirstMediaFrame`, `setMuteViaUi`, `expectEgressAdvances`,
+// `expectIngressAdvances` and `expectEgressFlatWhileMuted` currently have no
+// browser caller: they need a multi-party meeting, which story 2 task 15 owns.
 // ============================================================================
 
 /**
@@ -951,7 +955,7 @@ function diagnoseCounters(samples: readonly FrameCountSample[]): string {
       'READING: datagrams ARE arriving and every one is being REJECTED. The fault is in ' +
       "this client's receive path, NOT in MH forwarding — see lastDropReason above for " +
       "which check failed. (A `no_roster_entry` here means the sender's identity key is " +
-      'missing from the roster resolver; in a loopback the sender is this client itself.)';
+      'missing from the roster resolver.)';
   } else {
     reading = 'READING: media is flowing in both directions.';
   }
@@ -996,12 +1000,13 @@ export async function startAudio(page: Page): Promise<void> {
 }
 
 /**
- * Wait for audio to come back through the media handler, and RETURN the observed
- * end-to-end latency.
+ * Wait for a peer's audio to arrive through the media handler, and RETURN the
+ * observed end-to-end latency.
  *
- * **This is the functional pass/fail of the loopback**: a `firstMediaFrame` event
- * means a frame this client captured, encoded, encrypted, signed and sent came
- * back from MH and completed verify -> replay -> unwrap -> decrypt -> decode.
+ * A `firstMediaFrame` event means a frame a peer captured, encoded, encrypted,
+ * signed and sent arrived via MH and completed verify -> replay -> unwrap ->
+ * decrypt -> decode. (Story 1 used this for the loopback; since story 2 R-3 a
+ * client never receives its own audio, so this needs a co-handler peer.)
  *
  * **The returned number is OBSERVED, NEVER GATED** (ADR-0036 §10). Nothing in
  * this suite compares it against a threshold; a wall-clock target on a local
@@ -1133,6 +1138,51 @@ export async function expectIngressAdvances(page: Page, label: string): Promise<
 }
 
 /**
+ * Assert that the chosen frame counters stay FLAT over an observation window
+ * that starts `settleMs` after `fromMs`.
+ *
+ * The shared home for "nothing moved" on the frame-count sampler, used by the
+ * mute assertion and by the solo-participant assertion. Its vacuity control is
+ * asserted separately and FIRST: flatness is trivially true of zero samples, so
+ * a stalled sampler must be reported as a HARNESS failure, never as a pass.
+ */
+export async function expectCountersFlatOverWindow(
+  page: Page,
+  opts: {
+    readonly fromMs: number;
+    readonly fields: readonly ('framesSent' | 'framesAccepted')[];
+    readonly whyFlat: string;
+    readonly settleMs?: number;
+  },
+): Promise<void> {
+  const settleMs = opts.settleMs ?? MUTE_SETTLE_MS;
+  await page.waitForTimeout(settleMs + MUTE_OBSERVATION_MS);
+
+  const settledAtMs = opts.fromMs + settleMs;
+  const samples = (await frameCountSamples(page)).filter((s) => s.atMs >= settledAtMs);
+
+  expect(
+    samples.length,
+    `the frame-count sampler produced only ${samples.length} sample(s) in the ` +
+      `${MUTE_OBSERVATION_MS}ms observation window (needed >= ${MIN_MUTE_SAMPLES}). This is a ` +
+      `HARNESS failure, not a media failure: with no samples, flatness is vacuously true. Check ` +
+      `that the __E2E_HOOKS__ bus sampler is running and that media was started.`,
+  ).toBeGreaterThanOrEqual(MIN_MUTE_SAMPLES);
+
+  for (const field of opts.fields) {
+    const baseline = samples[0]![field];
+    const moved = samples.filter((s) => s[field] !== baseline);
+    expect(
+      moved,
+      `${field} moved ${baseline} -> ${samples[samples.length - 1]![field]} across ` +
+        `${samples.length} samples spanning ` +
+        `${samples[samples.length - 1]!.atMs - samples[0]!.atMs}ms (window from t=${opts.fromMs}, ` +
+        `baseline taken after a ${settleMs}ms settle). It must be FLAT: ${opts.whyFlat}`,
+    ).toEqual([]);
+  }
+}
+
+/**
  * Assert the egress counter is FLAT for the whole muted window — the STRUCTURAL
  * proof that mute produces silence.
  *
@@ -1145,33 +1195,11 @@ export async function expectIngressAdvances(page: Page, label: string): Promise<
  * @param mutedAtMs when mute was applied, from {@link setMuteViaUi}.
  */
 export async function expectEgressFlatWhileMuted(page: Page, mutedAtMs: number): Promise<void> {
-  await page.waitForTimeout(MUTE_SETTLE_MS + MUTE_OBSERVATION_MS);
-
-  const settledAtMs = mutedAtMs + MUTE_SETTLE_MS;
-  const samples = (await frameCountSamples(page)).filter((s) => s.atMs >= settledAtMs);
-
-  // VACUITY CONTROL, asserted SEPARATELY and with its own message. "Every
-  // sample is equal" is trivially true of zero samples, so a stalled sampler
-  // would otherwise be reported as a working mute — the exact false green this
-  // spec exists to make impossible.
-  expect(
-    samples.length,
-    `the frame-count sampler produced only ${samples.length} sample(s) in the ` +
-      `${MUTE_OBSERVATION_MS}ms muted window (needed >= ${MIN_MUTE_SAMPLES}). This is a HARNESS ` +
-      `failure, not a mute failure: with no samples, flatness is vacuously true. Check that the ` +
-      `__E2E_HOOKS__ bus sampler is running and that media was started.`,
-  ).toBeGreaterThanOrEqual(MIN_MUTE_SAMPLES);
-
-  const baseline = samples[0]!.framesSent;
-  const moved = samples.filter((s) => s.framesSent !== baseline);
-  expect(
-    moved,
-    `MUTE REGRESSION: framesSent moved ${baseline} -> ${samples[samples.length - 1]!.framesSent} ` +
-      `across ${samples.length} samples spanning ` +
-      `${samples[samples.length - 1]!.atMs - samples[0]!.atMs}ms while muted ` +
-      `(mute applied at t=${mutedAtMs}, baseline taken after a ${MUTE_SETTLE_MS}ms queue-drain ` +
-      `settle). Egress must be FLAT while muted: ADR-0036 §5 enforces client mute at capture, so ` +
-      `no encoded audio should exist to leave the device. A counter that keeps advancing means ` +
-      `the indicator is telling the user something the send path is not doing.`,
-  ).toEqual([]);
+  await expectCountersFlatOverWindow(page, {
+    fromMs: mutedAtMs,
+    fields: ['framesSent'],
+    whyFlat:
+      'MUTE REGRESSION — ADR-0036 §5 enforces client mute at capture, so a counter that keeps ' +
+      'advancing means the indicator is telling the user something the send path is not doing.',
+  });
 }

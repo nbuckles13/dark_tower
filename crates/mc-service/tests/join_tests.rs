@@ -584,6 +584,7 @@ async fn test_actor_level_join_success() {
             false,
             test_identity_key(),
             outbound_tx,
+            test_common::standalone_join_media(),
         )
         .await
         .expect("join_connection should succeed");
@@ -631,6 +632,7 @@ async fn test_actor_level_join_meeting_not_found() {
             false,
             test_identity_key(),
             outbound_tx,
+            test_common::standalone_join_media(),
         )
         .await;
 
@@ -686,6 +688,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
             false,
             test_identity_key(),
             tx1,
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();
@@ -712,6 +715,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
             false,
             test_identity_key(),
             tx2,
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();
@@ -772,6 +776,7 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
             false,
             test_identity_key(),
             tx1,
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();
@@ -803,6 +808,7 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
             false,
             test_identity_key(),
             tx2,
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();
@@ -1092,8 +1098,13 @@ async fn test_first_participant_triggers_register_meeting() {
 }
 
 // ============================================================================
-// T13: Second Participant Does NOT Trigger RegisterMeeting
+// T13: A join that changes no handler's snapshot is not re-pushed
 // ============================================================================
+//
+// Neither participant has declared a receive capability, so both hold zero
+// slots and the handler's snapshot is empty before and after Bob joins: the
+// generation does not advance and the push worker sends nothing. (A join that
+// DOES change a snapshot re-pushes — see `slot_placement_integration.rs`.)
 
 #[tokio::test]
 async fn test_second_participant_does_not_trigger_register_meeting() {
@@ -1144,7 +1155,7 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
     let calls_after_second = server.stack.mh_reg_client.calls().len();
     assert_eq!(
         calls_after_second, 1,
-        "Second participant should NOT trigger additional RegisterMeeting"
+        "a join that leaves every snapshot unchanged must not re-push"
     );
 }
 
@@ -1153,7 +1164,7 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_join_multiple_mh_handlers_populates_all() {
+async fn test_join_multiple_mh_handlers_scopes_media_servers_and_registers_all() {
     let server = TestServer::start().await;
     server
         .create_meeting_with_handlers(
@@ -1167,32 +1178,26 @@ async fn test_join_multiple_mh_handlers_populates_all() {
 
     let response = join_and_read_response(&server.url(), "meeting-multi", &token, "Alice").await;
 
-    // JoinResponse populates media_servers with all MH WebTransport URLs (R-6).
+    // JoinResponse carries EXACTLY the participant's placed handler (ADR-0036
+    // §9, R-33): the first joiner (rank 0) lands on the sorted-first handler.
     match &response.message {
         Some(server_message::Message::JoinResponse(join)) => {
-            assert_eq!(
-                join.media_servers.len(),
-                2,
-                "media_servers should include both assigned MHs"
-            );
-            let urls: std::collections::HashSet<String> = join
+            let urls: Vec<&str> = join
                 .media_servers
                 .iter()
-                .map(|m| m.media_handler_url.clone())
+                .map(|m| m.media_handler_url.as_str())
                 .collect();
-            assert!(
-                urls.contains("wt://mh-alpha:4433"),
-                "missing mh-alpha URL, got {urls:?}"
-            );
-            assert!(
-                urls.contains("wt://mh-beta:4433"),
-                "missing mh-beta URL, got {urls:?}"
+            assert_eq!(
+                urls,
+                vec!["wt://mh-alpha:4433"],
+                "media_servers must be scoped to the one placed handler"
             );
         }
         other => panic!("Expected JoinResponse, got {other:?}"),
     }
 
-    // RegisterMeeting fires once per MH (R-12).
+    // The first join registers EVERY assigned handler (possibly with an empty
+    // snapshot), so a participant placed on either can be promoted by MH.
     let calls = server
         .stack
         .mh_reg_client

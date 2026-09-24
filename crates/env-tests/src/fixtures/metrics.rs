@@ -381,42 +381,6 @@ pub fn any_instance_exceeds_baseline(
     !instances_exceeding_baseline(baseline, current).is_empty()
 }
 
-/// How many instances rose above their own baseline — the decision a caller makes
-/// when it must ATTRIBUTE a rise to its own action rather than merely observe one.
-///
-/// Exhaustive on purpose. The three arms have three different owners, and
-/// collapsing any two of them is how an attribution gate stops attributing:
-/// [`Self::None`] is "we were not observed", [`Self::Many`] is "we cannot tell
-/// which rise was ours", and only [`Self::One`] licenses naming an instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RisenOutcome {
-    /// Nothing rose. The caller's action was not observed (yet, or at all).
-    None,
-    /// Exactly one instance rose, and it is named.
-    One(String),
-    /// More than one rose, sorted. **Never reduce this to its first element** —
-    /// picking one would assert an attribution the observation does not support,
-    /// which is the whole failure this type exists to make unrepresentable.
-    Many(Vec<String>),
-}
-
-/// Classify the risen set into the attribution trichotomy.
-///
-/// Pure, and unit-tested on **all three arms** — the [`RisenOutcome::Many`] arm
-/// especially, because it is the one whose degradation to "just take the first"
-/// would rebuild a wrong-instance gate that no test in the tree would notice.
-/// The async poll that consumes this ([`poll_until_exactly_one_instance_rose`])
-/// is a thin loop precisely so this decision is reachable without a cluster.
-#[must_use]
-pub fn exactly_one_risen(baseline: &InstanceCounters, current: &InstanceCounters) -> RisenOutcome {
-    let mut risen = instances_exceeding_baseline(baseline, current);
-    match risen.len() {
-        0 => RisenOutcome::None,
-        1 => RisenOutcome::One(risen.remove(0)),
-        _ => RisenOutcome::Many(risen),
-    }
-}
-
 /// Two per-instance snapshots are equal when they cover the same instances with
 /// (float-)equal values. Counter values are whole numbers, but we compare with
 /// an epsilon for float-safety. The TS families have no stabilize counterpart
@@ -479,102 +443,6 @@ pub async fn poll_until_any_instance_above(
         }
         if Instant::now() > deadline {
             panic!("{}", timeout_message(&current));
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// Poll until ONE NAMED instance's value exceeds its own `baseline` value.
-///
-/// The instance-keyed sibling of [`poll_until_any_instance_above`], for a caller
-/// that has already established WHICH instance it is asking about. The
-/// instance-agnostic form answers "somebody applied a policy"; this answers "the
-/// one I am talking to did" — and those are different questions whenever the
-/// fleet has more than one pod. A gate that asks the first when it means the
-/// second is satisfied by a pod the client never touched, which is
-/// story-task-25's defect in miniature.
-///
-/// # Why a sibling and not a parameterisation of the existing loop
-///
-/// [`poll_until_any_instance_above`] gates three live, non-`#[ignore]`d tests and
-/// has no unit coverage of its own body. Re-expressing it on a shared generic
-/// would make "no behaviour change" a claim to be argued rather than a fact:
-/// a weakened gate does not fail, it passes EARLIER, silently. Leaving that body
-/// untouched makes the preservation structural. The duplication here is ~10
-/// lines of loop against that, and both consume the one comparison rule
-/// ([`instances_exceeding_baseline`]), which is where drift would actually hurt.
-///
-/// Panics on timeout, inside this function — it never returns a value for a
-/// caller to interpret or drop. A gate that returns `bool` becomes a no-op the
-/// first time someone writes `let _ =`, and the tests keep passing while they
-/// stop testing. Same discipline as [`instance_map_from_query`], which panics on
-/// a query error rather than reading it as zero.
-pub async fn poll_until_instance_above(
-    prom: &PrometheusClient,
-    promql: &str,
-    baseline: &InstanceCounters,
-    instance: &str,
-    timeout: Duration,
-    interval: Duration,
-    timeout_message: impl Fn(&InstanceCounters) -> String,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let current = prom.instance_counter_map(promql).await;
-        if instances_exceeding_baseline(baseline, &current)
-            .iter()
-            .any(|risen| risen == instance)
-        {
-            return;
-        }
-        if Instant::now() > deadline {
-            panic!("{}", timeout_message(&current));
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// Poll until EXACTLY ONE instance has risen above its own baseline, and return
-/// it.
-///
-/// The attribution primitive: a caller that has just taken an action and needs to
-/// know **which** instance served it, rather than merely that somebody did. The
-/// decision is [`exactly_one_risen`], which is pure and unit-tested on all three
-/// arms; this is only the loop around it.
-///
-/// Fails closed on BOTH degenerate outcomes, with the caller's own message for
-/// each, because they have different owners: nothing risen within `timeout` is
-/// usually an environment or scrape problem, while more than one risen is a test
-/// isolation problem. **It never returns a `Many` and never reduces one** —
-/// picking an element would assert an attribution the observation does not
-/// support, and would silently produce a gate keyed on the wrong instance.
-///
-/// Panics inside this function rather than returning a `Result`, for the same
-/// reason as [`poll_until_instance_above`]: a gate that hands its verdict to the
-/// call site becomes a no-op the first time someone drops it.
-pub async fn poll_until_exactly_one_instance_rose(
-    prom: &PrometheusClient,
-    promql: &str,
-    baseline: &InstanceCounters,
-    timeout: Duration,
-    interval: Duration,
-    none_message: impl Fn(&InstanceCounters) -> String,
-    ambiguous_message: impl Fn(&[String], &InstanceCounters) -> String,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let current = prom.instance_counter_map(promql).await;
-        match exactly_one_risen(baseline, &current) {
-            RisenOutcome::One(instance) => return instance,
-            // Ambiguity is terminal immediately: waiting cannot un-observe the
-            // extra riser, and every further second makes the misattribution
-            // window wider rather than narrower.
-            RisenOutcome::Many(risen) => panic!("{}", ambiguous_message(&risen, &current)),
-            RisenOutcome::None => {
-                if Instant::now() > deadline {
-                    panic!("{}", none_message(&current));
-                }
-            }
         }
         tokio::time::sleep(interval).await;
     }
@@ -689,7 +557,8 @@ pub async fn poll_until_exactly_one_instance_rose(
 /// by their poll interval, which is why it is called out here and not there.
 ///
 /// Panics on timeout, inside this function, for the same reason as
-/// [`poll_until_instance_above`].
+/// [`poll_until_any_instance_above`]: a gate that hands its verdict to the call
+/// site becomes a no-op the first time someone drops it.
 #[must_use = "the returned map is the STABILISED snapshot and is what the caller must use as its \
               baseline; discarding it and re-reading separately yields a possibly-unstabilised \
               baseline, which is the exact hazard this function exists to prevent"]
@@ -864,82 +733,6 @@ mod tests {
         assert_eq!(risen, vec!["10.0.0.2:8081".to_string()]);
         assert!(risen.iter().any(|i| i == "10.0.0.2:8081"));
         assert!(!risen.iter().any(|i| i == "10.0.0.1:8081"));
-    }
-
-    /// The attribution trichotomy, `None` arm: nothing rose.
-    #[test]
-    fn exactly_one_risen_reports_none_when_nothing_rose() {
-        let snapshot = results_to_instance_map(
-            TEST_PROMQL,
-            &instance_response(&[("10.0.0.1:8081", "5"), ("10.0.0.2:8081", "3")]),
-        );
-        assert_eq!(
-            exactly_one_risen(&snapshot, &snapshot),
-            RisenOutcome::None,
-            "no instance beat its own baseline, so nothing may be attributed"
-        );
-    }
-
-    /// The `One` arm: exactly one rose, and it is the one named — not merely
-    /// "some instance".
-    #[test]
-    fn exactly_one_risen_names_the_single_riser() {
-        let baseline = results_to_instance_map(
-            TEST_PROMQL,
-            &instance_response(&[("10.0.0.1:8081", "1"), ("10.0.0.2:8081", "1")]),
-        );
-        let current = results_to_instance_map(
-            TEST_PROMQL,
-            &instance_response(&[("10.0.0.1:8081", "1"), ("10.0.0.2:8081", "4")]),
-        );
-        assert_eq!(
-            exactly_one_risen(&baseline, &current),
-            RisenOutcome::One("10.0.0.2:8081".to_string())
-        );
-    }
-
-    /// The `Many` arm — **the one that must never degrade to "take the first"**.
-    ///
-    /// This is the arm whose collapse rebuilds a wrong-instance gate: picking an
-    /// element asserts an attribution the observation does not support, and the
-    /// resulting gate would be keyed on a pod the caller never touched while
-    /// looking entirely correct. Asserted as the whole sorted set, so an
-    /// implementation that returned `One(first)` fails here rather than passing.
-    #[test]
-    fn exactly_one_risen_reports_all_risers_and_never_picks_one() {
-        let baseline = results_to_instance_map(
-            TEST_PROMQL,
-            &instance_response(&[("10.0.0.9:8081", "1"), ("10.0.0.1:8081", "1")]),
-        );
-        let current = results_to_instance_map(
-            TEST_PROMQL,
-            &instance_response(&[("10.0.0.9:8081", "2"), ("10.0.0.1:8081", "2")]),
-        );
-        let outcome = exactly_one_risen(&baseline, &current);
-        assert_eq!(
-            outcome,
-            RisenOutcome::Many(vec![
-                "10.0.0.1:8081".to_string(),
-                "10.0.0.9:8081".to_string(),
-            ])
-        );
-        // Stated as its own assertion: `Many` is not `One` of anything, however
-        // tempting the first element looks.
-        assert!(!matches!(outcome, RisenOutcome::One(_)));
-    }
-
-    /// A brand-new instance (absent from baseline) counts as a riser here, the
-    /// same way it does in the rule — the trichotomy adds no second convention.
-    #[test]
-    fn exactly_one_risen_follows_the_rules_absent_from_baseline_convention() {
-        let baseline =
-            results_to_instance_map(TEST_PROMQL, &instance_response(&[("10.0.0.1:8081", "5")]));
-        let current =
-            results_to_instance_map(TEST_PROMQL, &instance_response(&[("10.0.0.2:8081", "1")]));
-        assert_eq!(
-            exactly_one_risen(&baseline, &current),
-            RisenOutcome::One("10.0.0.2:8081".to_string())
-        );
     }
 
     #[test]

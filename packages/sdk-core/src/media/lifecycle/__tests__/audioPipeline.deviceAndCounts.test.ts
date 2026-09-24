@@ -123,6 +123,8 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
     options.startDeviceId !== undefined ? { deviceId: options.startDeviceId } : {},
   );
   pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
+  // Receiving comes from the slot assignments, not from the send directive.
+  pipeline.setReceiveHandlers([MH_URL]);
 
   return {
     pipeline,

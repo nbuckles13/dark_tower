@@ -138,6 +138,15 @@ pub enum McError {
     MediaPolicyDivergence {
         /// Which of the five bounded outcomes the response classified as.
         outcome: crate::media_routing::PolicyPushOutcome,
+        /// The generation the handler truthfully reports it has APPLIED, read
+        /// off the reply the confirm step classified.
+        ///
+        /// Carried so the pusher can adopt it as a floor after an MC restart
+        /// (`PolicyGenerations::adopt_floor`). Present only on this variant: a
+        /// structurally rejected push is a gRPC error with no reply body, so
+        /// there is no echo to carry. Not part of the display text — a
+        /// generation is never a metric label.
+        applied_generation: u64,
     },
 
     /// Internal error with context.

@@ -37,6 +37,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/mod.rs"]
+mod test_common;
+
 use std::time::Duration;
 
 use ::common::observability::testing::MetricAssertion;
@@ -101,6 +104,7 @@ async fn clean_close_removes_immediately_emits_voluntary_and_broadcasts_left_fra
             false,
             test_identity_key(),
             Some(b_tx),
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();
@@ -114,6 +118,7 @@ async fn clean_close_removes_immediately_emits_voluntary_and_broadcasts_left_fra
             false,
             test_identity_key(),
             None,
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();
@@ -173,6 +178,7 @@ async fn abrupt_loss_keeps_grace_emits_connection_lost_then_timeout_left_after_g
             false,
             test_identity_key(),
             Some(b_tx),
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();
@@ -185,6 +191,7 @@ async fn abrupt_loss_keeps_grace_emits_connection_lost_then_timeout_left_after_g
             false,
             test_identity_key(),
             None,
+            test_common::standalone_join_media(),
         )
         .await
         .unwrap();

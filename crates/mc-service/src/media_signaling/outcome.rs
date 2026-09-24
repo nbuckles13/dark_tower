@@ -41,9 +41,7 @@
 /// Partitions **declarations**: every declaration lands in exactly one variant,
 /// which is what makes the success set `{accepted, accepted_unchanged}` complete
 /// and `outcome!~"accepted|accepted_unchanged"` a complete count of rejections. A rejection reported
-/// on some other metric would silently break that relationship, which is why
-/// [`CapabilityOutcome::SlotIdNotPlanned`] lives here despite its remedy
-/// differing in kind from its neighbours.
+/// on some other metric would silently break that relationship.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityOutcome {
     /// Validated and ACTED ON: MC composed and emitted a directive and
@@ -80,26 +78,13 @@ pub enum CapabilityOutcome {
     /// zero is what a pre-ADR-0036 peer's `AUDIO = 0` decodes to — not a client
     /// that forgot a field. Read a rising rate as client-fleet skew first.
     MediaKindUnspecified,
-    /// The declaration asked for audio in a slot MC has no egress plan for.
-    ///
-    /// **NOT a client defect**, and the only variant here that is not. The
-    /// declaration is well-formed and the wire contract permits it; MC cannot
-    /// serve it because the join-time forwarding-policy push fixes the egress
-    /// slot id before the client can declare. The fix is the
-    /// capability-triggered re-push, not a change to the client.
-    ///
-    /// The mirror of `mc_media_unmatched_plan_slots_total`: the two are the
-    /// directions of one join — *the client's slot has no plan* here, *the
-    /// plan's slot was not declared* there. Easy to transpose under pressure;
-    /// read the direction off the name.
-    SlotIdNotPlanned,
     /// The connection exhausted its budget of accepted declarations.
     DeclarationBudgetExhausted,
 }
 
 impl CapabilityOutcome {
     /// Every variant, for exhaustive metric-vocabulary tests.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Accepted,
         Self::AcceptedUnchanged,
         Self::DuplicateSlotId,
@@ -108,7 +93,6 @@ impl CapabilityOutcome {
         Self::PinnedSenderIdZero,
         Self::PinnedSenderIdOutOfRange,
         Self::MediaKindUnspecified,
-        Self::SlotIdNotPlanned,
         Self::DeclarationBudgetExhausted,
     ];
 
@@ -124,7 +108,6 @@ impl CapabilityOutcome {
             Self::PinnedSenderIdZero => "pinned_sender_id_zero",
             Self::PinnedSenderIdOutOfRange => "pinned_sender_id_out_of_range",
             Self::MediaKindUnspecified => "media_kind_unspecified",
-            Self::SlotIdNotPlanned => "slot_id_not_planned",
             Self::DeclarationBudgetExhausted => "declaration_budget_exhausted",
         }
     }
@@ -146,9 +129,6 @@ impl CapabilityOutcome {
                 "receive capability rejected: invalid pinned sender id"
             }
             Self::MediaKindUnspecified => "receive capability rejected: slot media kind unset",
-            Self::SlotIdNotPlanned => {
-                "receive capability rejected: no media is assigned to the declared audio slot"
-            }
             Self::DeclarationBudgetExhausted => {
                 "receive capability rejected: too many declarations on this connection"
             }
@@ -173,24 +153,16 @@ impl CapabilityOutcome {
 /// assignment failure can never also be reported as an unresolved handler url,
 /// because url resolution is never reached.
 ///
-/// # Two entry points, ONE vocabulary, and that is deliberate
+/// # Recorded by the meeting actor, on every composition
 ///
-/// The same stages run at two moments, and both report here:
-///
-/// 1. **once per connection at join**, resolving the per-connection signalling
-///    context; and
-/// 2. **per accepted declaration**, composing the directive itself.
-///
-/// A join-time failure is the more severe of the two — it silences the client
-/// for the WHOLE session rather than for one declaration — so it must not be
-/// the one case that moves no counter. Giving it its own metric instead would
-/// break the property this vocabulary exists to hold: *every* reason a client
-/// was not told to send is a value on `mc_media_send_directives_total`, so
-/// "clients are not being directed, and why" is one query rather than a join
-/// across two.
-///
-/// [`Self::NoPlannedEgressSlot`] is reachable only from the join-time entry
-/// point; the rest are reachable from either.
+/// Since story 2 the meeting actor composes every participant's view (after a
+/// join, leave, capability declaration or mute), so every composition failure
+/// records here unconditionally — including those triggered by a peer's action
+/// rather than this participant's own. *Every* reason a client was not told to
+/// send is a value on `mc_media_send_directives_total`, so "clients are not
+/// being directed, and why" is one query. The one pre-actor failure — the
+/// connection could not obtain the meeting handle at join — also records
+/// [`Self::MeetingStateUnavailable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveOutcome {
     /// Emitted with at least one target.
@@ -207,27 +179,18 @@ pub enum DirectiveOutcome {
     /// A plan carried no transport mode. **MC defect** — never defaulted to
     /// datagram; the enum's zero is a rejection, not a convenience.
     TransportModeUnspecified,
-    /// A plan's handler had no resolvable client-facing url. Environmental.
+    /// A plan's handler had no client-facing url in the meeting's handler set.
+    ///
+    /// **MC defect since story 2**: every url MC hands out — `media_servers`,
+    /// `StreamAssignment.media_handler_url`, `SendTarget.media_handler_url` —
+    /// comes from one frozen `MeetingHandlers` value, so a miss cannot happen
+    /// by construction. Fails closed: the participant's view is not emitted at
+    /// all, never an ACTIVE slot or a send target with an empty url.
     HandlerUrlUnresolved,
     /// Meeting state could not be read. Environmental.
     MeetingStateUnavailable,
     /// The forwarding assignment could not be computed. Environmental.
     AssignmentFailed,
-    /// The assignment named no egress slot for this subscriber, so MC has no
-    /// slot to route its audio into and cannot validate a declaration against
-    /// one. Environmental.
-    ///
-    /// **Join-time only.** Distinct from
-    /// [`Self::AssignmentFailed`]: the assignment computed *successfully* and
-    /// simply contains no egress plan naming this subscriber. Collapsing the two
-    /// would hide the difference between "MC could not compute a plan" and "MC
-    /// computed a plan that does not include you", which have different causes
-    /// and different remedies.
-    ///
-    /// Not to be confused with `slot_id_not_planned` on the capability counter:
-    /// that is a client naming a slot MC did not plan, this is MC planning no
-    /// slot at all.
-    NoPlannedEgressSlot,
 }
 
 /// Disposition of one client `MuteRequest` (ADR-0036 §5 client mute).
@@ -259,22 +222,17 @@ pub enum DirectiveOutcome {
 /// That is a worse failure than the amplification it would prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuteOutcome {
-    /// Reported to the meeting actor; recomposition ATTEMPTED.
-    ///
-    /// Deliberately NOT "and recomposed". The counter is recorded BEFORE
-    /// `compose_and_emit` runs and that call's result is discarded, so a
-    /// recomposition that then fails — the meeting-state read or the assignment
-    /// computation — is still counted here. That gap is live and tracked, not
-    /// hypothetical: `docs/TODO.md` §Observability Debt, "Slot-state re-conveyal
-    /// failures on the mute path are loud-but-unqueryable".
+    /// The audio flag moved on a declared connection and was reported to the
+    /// meeting actor, which re-emits the changed slot view to the subscribers
+    /// holding this source. A failed re-emit is counted by the actor itself
+    /// (`mc_media_send_directives_total` and
+    /// `mc_media_slot_view_emissions_total{outcome="composition_failed"}`).
     Applied,
     /// Reported to the meeting actor, with nothing to re-convey.
     ///
-    /// Either the subscriber has not declared a receive capability yet, or only
-    /// `video_muted` changed — and the slot view is derived from
-    /// `audio_self_muted` alone, so recomposing would spend an O(N) roster read
-    /// and an assignment computation to produce a byte-identical
-    /// `StreamAssignments`.
+    /// Either this connection has not declared a receive capability yet, or
+    /// only `video_muted` changed — and the slot view reads only audio mute, so
+    /// no subscriber's view changes.
     ///
     /// A healthy, routine value: it is what a camera button produces.
     AppliedNoRecompose,
@@ -323,9 +281,81 @@ impl MuteOutcome {
     }
 }
 
+/// Disposition of one dirty participant in one slot-view flush turn
+/// (ADR-0036 §5/§6; story 2's server-driven re-emit).
+///
+/// The meeting actor re-emits a participant's `SendDirective` and
+/// `StreamAssignments` whenever meeting state changes what they would say, and
+/// bounds that work per actor turn. Each dirty participant it takes up — or
+/// defers — in a turn lands in exactly one variant.
+///
+/// # This does NOT partition emissions
+///
+/// A participant deferred on three turns and emitted on the fourth increments
+/// four times for one delivered view. `sum()` is flush-turn dispositions, not
+/// views delivered.
+///
+/// # Failure predicate, stated positively on purpose
+///
+/// Success set `{sent, deferred}` — `deferred` is the routine shape of the
+/// bound under load, never a page. The failure predicate is
+/// `outcome=~"delivery_failed|composition_failed"`, written positively (the
+/// `MuteOutcome` precedent) so that a variant added later defaults to NOT being
+/// a failure and has to be classified deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotViewEmission {
+    /// The participant's changed view was handed to its connection.
+    ///
+    /// Spelled `sent`, not `emitted`: the vocabularies here never share a
+    /// spelling (`mc_media_send_directives_total` already owns `emitted`), so a
+    /// token grepped out of a dashboard names exactly one metric.
+    Sent,
+    /// The per-turn bound was reached; the participant stays dirty and is
+    /// flushed on a later turn with whatever the state is then. Routine.
+    Deferred,
+    /// The meeting-actor → participant-handle send found the participant
+    /// actor gone (mailbox closed). **Environmental.** Disjoint from
+    /// `mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`,
+    /// which counts the LATER hop (the participant actor's `try_send` onto a
+    /// full stream channel).
+    DeliveryFailed,
+    /// The view could not be composed. **MC defect** — any non-zero value is a
+    /// bug. The stage is recorded on `mc_media_send_directives_total`, which is
+    /// the alerting and triage home; this value exists so the disposition set
+    /// stays complete. Do not alert on both.
+    CompositionFailed,
+}
+
+impl SlotViewEmission {
+    /// Every variant, for exhaustive metric-vocabulary tests.
+    pub const ALL: [Self; 4] = [
+        Self::Sent,
+        Self::Deferred,
+        Self::DeliveryFailed,
+        Self::CompositionFailed,
+    ];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Deferred => "deferred",
+            Self::DeliveryFailed => "delivery_failed",
+            Self::CompositionFailed => "composition_failed",
+        }
+    }
+
+    /// Is this one of the two failure values?
+    #[must_use]
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::DeliveryFailed | Self::CompositionFailed)
+    }
+}
+
 impl DirectiveOutcome {
     /// Every variant, for exhaustive metric-vocabulary tests.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Emitted,
         Self::EmittedEmptyTargets,
         Self::UnknownStreamNumber,
@@ -333,7 +363,6 @@ impl DirectiveOutcome {
         Self::HandlerUrlUnresolved,
         Self::MeetingStateUnavailable,
         Self::AssignmentFailed,
-        Self::NoPlannedEgressSlot,
     ];
 
     /// Bounded metric-label form.
@@ -347,7 +376,6 @@ impl DirectiveOutcome {
             Self::HandlerUrlUnresolved => "handler_url_unresolved",
             Self::MeetingStateUnavailable => "meeting_state_unavailable",
             Self::AssignmentFailed => "assignment_failed",
-            Self::NoPlannedEgressSlot => "no_planned_egress_slot",
         }
     }
 
@@ -428,6 +456,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_slot_view_emission_has_a_distinct_label_and_only_two_are_failures() {
+        let labels: HashSet<&str> = SlotViewEmission::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), SlotViewEmission::ALL.len());
+        for outcome in SlotViewEmission::ALL {
+            let expected = matches!(
+                outcome,
+                SlotViewEmission::DeliveryFailed | SlotViewEmission::CompositionFailed
+            );
+            assert_eq!(
+                outcome.is_failure(),
+                expected,
+                "{} classified wrongly",
+                outcome.label()
+            );
+        }
+    }
+
     /// No two vocabularies may share a label spelling.
     ///
     /// They land on different metrics, so a collision is not a cardinality bug —
@@ -435,13 +481,14 @@ mod tests {
     /// finds it documented under two metrics with different remedies has to
     /// guess which they are looking at.
     #[test]
-    fn the_three_vocabularies_do_not_share_spellings() {
+    fn the_four_vocabularies_do_not_share_spellings() {
         let mut seen: HashSet<&str> = HashSet::new();
         for label in CapabilityOutcome::ALL
             .iter()
             .map(|o| o.label())
             .chain(DirectiveOutcome::ALL.iter().map(|o| o.label()))
             .chain(MuteOutcome::ALL.iter().map(|o| o.label()))
+            .chain(SlotViewEmission::ALL.iter().map(|o| o.label()))
         {
             assert!(
                 seen.insert(label),

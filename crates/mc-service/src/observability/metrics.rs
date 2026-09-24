@@ -15,8 +15,10 @@
 //! Maximum 1,000 unique label combinations per metric.
 
 use crate::media_admission::SenderBindingOutcome;
-use crate::media_routing::{divergence_magnitude, PolicyPushOutcome};
-use crate::media_signaling::{slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome};
+use crate::media_routing::{divergence_magnitude, FloorAdoption, PolicyPushOutcome};
+use crate::media_signaling::{
+    slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome, SlotViewEmission,
+};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::num::NonZeroU64;
@@ -419,9 +421,16 @@ pub fn record_register_meeting(status: &str, duration: Duration) {
 /// **Therefore the detection signal is the counter; the gauge is the magnitude a
 /// responder reads next.**
 ///
-/// **Written ONLY on a registration push.** With no re-assert cadence in this
-/// story it **does not observe a handler restart**: a handler can lose all
-/// policy while this gauge holds its last healthy value.
+/// **Written on every RECORDED registration push**, which since story 2 means
+/// every structural change (join, leave, declaration, mute), not once per
+/// meeting — so the last-write-wins caveat above gets WORSE: a healthy push of
+/// ANY (meeting, handler) on the pod overwrites a diverged reading. With no
+/// re-assert cadence yet (story 4) it still **does not observe a handler
+/// restart**: a handler can lose all policy while this gauge holds its last
+/// healthy value. A successful MC-restart floor adoption never reaches this
+/// function at all (it is recorded on `mc_media_policy_generation_adoptions_total`),
+/// so neither the counter nor the gauge is written for it; a FAILED adoption is
+/// recorded here as `generation_mismatch`.
 pub fn record_media_policy_push(outcome: PolicyPushOutcome, sent: NonZeroU64, applied: u64) {
     counter!(
         "mc_media_policy_pushes_total",
@@ -555,11 +564,10 @@ pub fn record_sender_binding_response(outcome: SenderBindingOutcome) {
 /// [`CapabilityOutcome::AcceptedUnchanged`] for why that distinction is a
 /// security property rather than an accounting nicety.
 ///
-/// Most rejection values are client defects. **`slot_id_not_planned` is not**: the declaration is well-formed and the wire contract permits it, and
-/// MC cannot serve it only because the join-time forwarding-policy push fixes the
-/// egress slot id before the client can declare. Its rate carries roadmap
-/// information rather than a bug report — rising means real clients are choosing
-/// slot ids MC does not plan for, i.e. the story-1 limitation is biting.
+/// Every rejection value is a client defect except
+/// `declaration_budget_exhausted`, which is a client looping. (The story-1
+/// `slot_id_not_planned` value is retired: since story 2 declared audio slots
+/// are the assignment's input, so no well-formed declaration can miss a plan.)
 pub fn record_receive_capability(outcome: CapabilityOutcome) {
     counter!(
         "mc_media_receive_capability_declarations_total",
@@ -585,29 +593,27 @@ pub fn record_receive_capability(outcome: CapabilityOutcome) {
 /// publishers nobody watches. An alerting predicate of `outcome!="emitted"` would
 /// page on a legal state.
 ///
-/// `unknown_stream_number` and `transport_mode_unspecified` are **MC defects** —
-/// any non-zero value indicates a bug. The other **four** failure values are
-/// environmental: `handler_url_unresolved`, `meeting_state_unavailable`,
-/// `assignment_failed` and `no_planned_egress_slot`. All are disjoint by
-/// construction: the emit path is sequential stages and the first failing stage
-/// returns its own value.
+/// `unknown_stream_number`, `transport_mode_unspecified` and — since story 2 —
+/// `handler_url_unresolved` are **MC defects**: any non-zero value indicates a
+/// bug (every handler url now comes from one frozen handler set). The remaining
+/// **two** failure values are environmental: `meeting_state_unavailable` and
+/// `assignment_failed`. All are disjoint by construction: composition is
+/// sequential stages and the first failing stage returns its own value.
 ///
-/// **Recorded at TWO sites**, which is the point of the vocabulary: per
-/// composition in `webtransport::connection::compose_and_emit`, and once per
-/// connection at join in `handle_connection`'s context-resolution step.
-/// `no_planned_egress_slot` is reachable ONLY from the join-time site and is the
-/// most severe value on the metric — it silences a client for its whole session
-/// rather than for one declaration.
+/// **Recorded by the meeting actor on every composition**, unconditionally —
+/// including compositions triggered by a peer's join, leave, declaration or
+/// mute — plus once at join if the connection cannot obtain the meeting handle.
 ///
 /// # The one caveat before concluding anything from a healthy graph
 ///
-/// COMPOSED, not DELIVERED. `emitted` fires before `send_signaling`, so a
-/// directive composed and then lost still reads as `emitted` here. This metric
-/// answers "did MC compose a directive, and if not why" — not "was the client
-/// told to send". The two hops after it are covered by
+/// COMPOSED, not DELIVERED. `emitted` fires before the participant-handle send,
+/// so a directive composed and then lost still reads as `emitted` here. This
+/// metric answers "did MC compose a directive, and if not why" — not "was the
+/// client told to send". The two hops after it are covered by
+/// `mc_media_slot_view_emissions_total{outcome="delivery_failed"}` (participant
+/// mailbox CLOSED) and
 /// `mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`
-/// (mailbox FULL) and the `mc.webtransport.connection` delivery WARN (mailbox
-/// CLOSED). The counter is deliberately NOT moved below the send: that would
+/// (stream channel FULL). The counter is deliberately NOT moved below the send: that would
 /// conflate composition failure with delivery failure and destroy the
 /// disjoint-by-construction property.
 pub fn record_send_directive(outcome: DirectiveOutcome) {
@@ -631,7 +637,8 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 /// mapping.
 ///
 /// The label domain **mirrors the wire enum exhaustively** — all eight
-/// `SlotState` variants, not the four reachable today. A hand-picked subset needs
+/// `SlotState` variants, not the three reachable today (`active`,
+/// `source_muted`, `fewer_sources_than_slots`). A hand-picked subset needs
 /// editing every time §7 makes `switch_pending` live, and a
 /// `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
 /// visible rather than absent. Keeping the vocabulary identical to the wire's is
@@ -645,38 +652,124 @@ pub fn record_slot_state(state: proto_gen::dark_tower::signaling::v1::SlotState)
     .increment(1);
 }
 
-/// Record planned egress slots a subscriber never declared.
+/// Record the disposition of one dirty participant in one slot-view flush turn.
 ///
-/// Metric: `mc_media_unmatched_plan_slots_total`
+/// Metric: `mc_media_slot_view_emissions_total`
+/// Labels: `outcome`, `key_custody`
+/// Cardinality: bounded by `SlotViewEmission::ALL`
+///
+/// The visible edge of the meeting actor's per-turn re-emit bound. Success set
+/// `{sent, deferred}`; the failure predicate is stated positively,
+/// `outcome=~"delivery_failed|composition_failed"`. **Does not partition
+/// emissions** — see [`SlotViewEmission`].
+pub fn record_slot_view_emission(outcome: SlotViewEmission) {
+    counter!(
+        "mc_media_slot_view_emissions_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record the unreachable senders named in one emitted `StreamAssignments`.
+///
+/// Metric: `mc_media_unreachable_senders_total`
 /// Labels: `key_custody` (1)
 /// Cardinality: 1
 ///
-/// MH is forwarding egress that this subscriber will never accept — wasted
-/// uplink and handler work. Reachable in this story through the zero-audio
-/// exemption: a subscriber declaring no audio slot is accepted (it is asking to
-/// send without receiving), and MC's planned audio slot then matches nothing.
-///
-/// **A non-zero value is client-conformance-driven, not necessarily an MC
-/// defect.** The mirror of `slot_id_not_planned` on the capability counter: the
-/// two are the directions of one join — *plan's slot was not declared* here,
-/// *client's slot has no plan* there. Do not transpose them.
-///
-/// Its denominator is per-planned-slot, not per-directive, which is why it is a
-/// separate series rather than a value on the slot-state counter.
-pub fn record_unmatched_plan_slots(count: usize) {
+/// Emission-weighted, NOT a population: it rises with churn in a split meeting
+/// and a stable split meeting emits nothing. Divide by
+/// `mc_media_slot_view_emissions_total{outcome="sent"}` for the mean per
+/// emitted view. Permanently zero on a single-handler deployment. No sender,
+/// meeting or handler identity, ever.
+pub fn record_unreachable_senders(count: usize) {
     if count == 0 {
         return;
     }
-    // The facade owns the width conversion so no call site needs a cast. The
-    // saturation is unreachable (the count is bounded by the declared-slot cap,
-    // itself bounded at 64 by config) and is a total conversion rather than a
-    // panic on a metric path.
+    // Bounded by the roster; saturation is a total conversion, not a panic.
     let count = u64::try_from(count).unwrap_or(u64::MAX);
     counter!(
-        "mc_media_unmatched_plan_slots_total",
+        "mc_media_unreachable_senders_total",
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(count);
+}
+
+/// Record a join whose handler assignment disagreed with the meeting's frozen
+/// handler set.
+///
+/// Metric: `mc_media_handler_set_divergence_total`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// An MC-internal invariant violation: GC freezes a meeting's handler set at
+/// first join, and the actor keeps the frozen set (so no later join or changed
+/// Redis entry can widen it or move a placed participant). Any non-zero value is
+/// a defect to capture and escalate; restarting nothing fixes it.
+pub fn record_handler_set_divergence() {
+    counter!(
+        "mc_media_handler_set_divergence_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record one MC-restart generation-floor reply.
+///
+/// Metric: `mc_media_policy_generation_adoptions_total`
+/// Labels: `outcome` x `key_custody`
+/// Cardinality: bounded at the type level by [`FloorAdoption::ALL`]
+///
+/// Increments once per restart-floor reply — a reply `confirm` deliberately did
+/// NOT record on `mc_media_policy_pushes_total` (see
+/// `MeetingProgramming::restart_floor_adoptable`), so
+/// `MCMediaGenerationDivergence` does not page on every MC rollout with live
+/// meetings. **The two values are not interchangeable**: `adopted` is the
+/// recovery event and is bounded at one per (meeting, handler) per MC process;
+/// `superseded` is routine coalescing with no such bound. A FAILED adoption is
+/// recorded on `mc_media_policy_pushes_total` as `generation_mismatch` and
+/// pages.
+///
+/// Summing BOTH values is what makes
+/// `sum(mc_media_policy_pushes_total) + sum(mc_media_policy_generation_adoptions_total)`
+/// the exact count of evaluated replies.
+///
+/// A sibling counter in MC's own namespace, not a sixth `PolicyPushOutcome`:
+/// that vocabulary (canonical in `internal.proto`) names what MH's reply said
+/// when a response field failed in a way MC must act on. Here nothing on MH's
+/// side failed; what happened next is MC's own decision, and putting it on the
+/// wire would make the MC<->MH contract carry MC-internal control flow.
+pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
+    counter!(
+        "mc_media_policy_generation_adoptions_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Publish the configured receive-slot cap.
+///
+/// Metric: `mc_media_receive_slot_cap`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// A CONFIG ECHO, not a utilisation gauge: set once at boot from
+/// `ClientMediaConfig::max_receive_slots`, the SAME field the capability parse
+/// compares a declaration against, so the published value cannot drift from the
+/// enforced one. There is no numerator to divide it by.
+pub fn set_receive_slot_cap(cap: usize) {
+    // Bounded at 64 at config load; the conversion is total.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "cap is bounded to 1..=64 at config load; exact in f64"
+    )]
+    let value = cap as f64;
+    gauge!(
+        "mc_media_receive_slot_cap",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(value);
 }
 
 /// Record the disposition of one client `MuteRequest`.
@@ -1382,11 +1475,19 @@ pub fn zero_initialize_counters() {
     for o in MuteOutcome::ALL {
         counter!("mc_media_mute_requests_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    for o in FloorAdoption::ALL {
+        counter!("mc_media_policy_generation_adoptions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in SlotViewEmission::ALL {
+        counter!("mc_media_slot_view_emissions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
     for s in SLOT_STATES {
         counter!("mc_media_slot_states_total", "slot_state" => slot_state_label(*s), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
     // key_custody-only media counters (cardinality 1)
-    counter!("mc_media_unmatched_plan_slots_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+    counter!("mc_media_unreachable_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+        .increment(0);
+    counter!("mc_media_handler_set_divergence_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
     counter!("mc_meeting_kek_generated_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
@@ -1625,6 +1726,7 @@ mod tests {
             McError::SenderIdSpaceExhausted,
             McError::MediaPolicyDivergence {
                 outcome: PolicyPushOutcome::ALL[0],
+                applied_generation: 0,
             },
         ];
 

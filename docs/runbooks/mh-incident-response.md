@@ -1517,8 +1517,12 @@ sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 
 Any `generation_mismatch` or `no_applied_generation` sends you to
 [`mc-incident-response.md` Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).
-**Note that in this build divergence does not self-correct** — the resolution there is to force a
-structural change (a rejoin), not to wait.
+Since story 2 any structural change (join, leave, declaration, mute) re-pushes, so a meeting with
+churn may clear by itself; a **quiescent** meeting does not (no periodic re-assert yet) — force a
+structural change there. **An MC restart is under NO `outcome` label by design**: it is recorded on
+`mc_media_policy_generation_adoptions_total` (and a WARN "adopting it as a floor" at
+`mc.register_meeting.trigger`), so after an MC restart read that counter alongside the split rather
+than concluding from a clean breakdown that nothing happened.
 
 **Rung 3 — keepalive configuration.** Only after rungs 1 and 2. Compare the configured QUIC
 keepalive interval against the mute duration that preceded the symptom. A keepalive longer than a

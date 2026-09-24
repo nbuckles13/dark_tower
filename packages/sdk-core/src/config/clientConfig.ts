@@ -31,6 +31,10 @@ import {
   DEFAULT_REPLAY_WINDOW_BITS,
   DEFAULT_TRANSMIT_KEYS_PER_SENDER,
 } from '../media/frame/receivePath.js';
+import {
+  DEFAULT_HOP_RESTART_BACKWARD_JUMP_FRAMES,
+  HOP_HALF_SPACE,
+} from '../media/pipeline/hopSequenceMonitor.js';
 
 /** Opus `application` mode. Mirrors the WebCodecs Opus registration. */
 export type OpusApplication = 'voip' | 'audio' | 'lowdelay';
@@ -195,6 +199,15 @@ export interface IngressConfig {
    * unbounded and keyed by `sender_id` is attacker-influenced memory growth.
    */
   readonly maxCachedIdentityKeys: number;
+  /**
+   * A downlink hop-sequence backward jump DEEPER than this many frames is a
+   * publisher counter restart (a reconnecting publisher gets a fresh MH
+   * forwarder whose counter starts at 0), not a reorder. See
+   * `media/pipeline/hopSequenceMonitor.ts`. Must exceed any plausible datagram
+   * reorder depth; must be below `HOP_HALF_SPACE` (the serial-arithmetic
+   * half-space, imported from the monitor rather than restated here).
+   */
+  readonly hopRestartBackwardJumpFrames: number;
 }
 
 /** Replay-window and transmit-key-cache bounds. */
@@ -313,6 +326,7 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
     ingress: {
       transportIncomingHighWaterMarkFrames: 32,
       maxCachedIdentityKeys: 32,
+      hopRestartBackwardJumpFrames: DEFAULT_HOP_RESTART_BACKWARD_JUMP_FRAMES,
     },
     receiverState: {
       maxReplayContextsPerSender: DEFAULT_REPLAY_CONTEXTS_PER_SENDER,
@@ -387,6 +401,17 @@ export function validateMediaConfig(media: MediaConfig): void {
     'media.ingress.transportIncomingHighWaterMarkFrames',
   );
   positiveInteger(ingress.maxCachedIdentityKeys, 'media.ingress.maxCachedIdentityKeys');
+  positiveInteger(
+    ingress.hopRestartBackwardJumpFrames,
+    'media.ingress.hopRestartBackwardJumpFrames',
+  );
+  if (ingress.hopRestartBackwardJumpFrames >= HOP_HALF_SPACE) {
+    throw new ClientConfigError(
+      'media.ingress.hopRestartBackwardJumpFrames',
+      `media.ingress.hopRestartBackwardJumpFrames must be below ${HOP_HALF_SPACE}, ` +
+        'the hop-sequence serial-arithmetic half-space',
+    );
+  }
   positiveInteger(
     receiverState.maxReplayContextsPerSender,
     'media.receiverState.maxReplayContextsPerSender',

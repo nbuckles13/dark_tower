@@ -16,6 +16,7 @@
 use crate::errors::McError;
 use crate::media_admission::{IdentityPublicKey, MeetingKeyState, SenderId, SenderIdAllocator};
 
+use super::meeting_media::{Affected, JoinMedia, MeetingMedia, RosterEntry};
 use super::messages::{
     DisconnectCause, JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo,
     ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SenderLookup, SignalingPayload,
@@ -23,6 +24,7 @@ use super::messages::{
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
 use super::session::{SessionBindingManager, StoredBinding};
+use crate::media_signaling::ReceiveCapabilityDeclaration;
 
 use common::secret::SecretBox;
 use std::collections::HashMap;
@@ -69,6 +71,8 @@ impl MeetingActorHandle {
     /// * `identity_public_key` - The joiner's Ed25519 identity signing public
     ///   key, parsed at the WebTransport trust boundary; `None` means no key
     ///   published
+    /// * `media` - Media-routing inputs; the first join freezes the meeting's
+    ///   handler set
     #[expect(
         clippy::too_many_arguments,
         reason = "actor join signature threads the full join tuple (ids + display_name + host flag + identity key + stream); bundling into a JoinConnectionParams struct is a larger cross-message refactor tracked in docs/TODO.md"
@@ -82,6 +86,7 @@ impl MeetingActorHandle {
         is_host: bool,
         identity_public_key: Option<IdentityPublicKey>,
         stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+        media: JoinMedia,
     ) -> Result<JoinResult, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
@@ -93,6 +98,7 @@ impl MeetingActorHandle {
                 is_host,
                 identity_public_key,
                 stream_tx,
+                media,
                 respond_to: tx,
             })
             .await
@@ -223,7 +229,35 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
-    /// Update self-mute status (informational).
+    /// Register a validated receive-capability declaration (ADR-0036 §6).
+    ///
+    /// Resolves once the actor has registered the slot demand, re-rendered,
+    /// re-published to every handler and run a first bounded flush.
+    ///
+    /// # Errors
+    ///
+    /// [`McError::Internal`] if the actor is gone; [`McError::ParticipantNotFound`]
+    /// if the participant is no longer on the roster.
+    pub async fn register_receive_capability(
+        &self,
+        participant_id: String,
+        declaration: ReceiveCapabilityDeclaration,
+    ) -> Result<(), McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::RegisterReceiveCapability {
+                participant_id,
+                declaration,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
+    }
+
+    /// Update self-mute status.
     pub async fn update_self_mute(
         &self,
         participant_id: String,
@@ -408,6 +442,9 @@ pub struct MeetingActor {
     media_keys: MeetingKeyState,
     /// Monotonic, non-recycling `sender_id` allocator for this meeting.
     sender_ids: SenderIdAllocator,
+    /// Join-order slots, handler placement, push workers and per-participant
+    /// views (ADR-0036 §5/§6/§8/§9). Dropped with the actor.
+    media: MeetingMedia,
 }
 
 impl MeetingActor {
@@ -443,15 +480,17 @@ impl MeetingActor {
             controller_metrics,
             master_secret,
             SenderIdAllocator::new(),
+            |_| {},
         )
     }
 
     /// Shared construction for [`Self::spawn`] and the `test-seams` variant.
     ///
-    /// The allocator is a parameter rather than always `SenderIdAllocator::new()`
-    /// so the seam threads a pre-seeded cursor without duplicating this body —
-    /// a forked copy would drift from the real construction path and the
-    /// exhaustion test would stop testing production behaviour.
+    /// The allocator and the media configuration hook are parameters so the
+    /// test seams thread their overrides without duplicating this body — a
+    /// forked copy would drift from the real construction path and the seam
+    /// tests would stop testing production behaviour. Production passes a fresh
+    /// allocator and a no-op hook.
     fn spawn_inner(
         meeting_id: String,
         cancel_token: CancellationToken,
@@ -459,6 +498,7 @@ impl MeetingActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         sender_ids: SenderIdAllocator,
+        configure_media: impl FnOnce(&mut MeetingMedia),
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         let (sender, receiver) = mpsc::channel(MEETING_CHANNEL_BUFFER);
 
@@ -490,6 +530,9 @@ impl MeetingActor {
             "Meeting key material provisioned"
         );
 
+        let mut media = MeetingMedia::new(meeting_id.clone(), cancel_token.clone());
+        configure_media(&mut media);
+
         let actor = Self {
             meeting_id: meeting_id.clone(),
             receiver,
@@ -508,6 +551,7 @@ impl MeetingActor {
             self_handle: handle.clone(),
             media_keys,
             sender_ids,
+            media,
         };
 
         let task_handle = tokio::spawn(actor.run());
@@ -515,37 +559,43 @@ impl MeetingActor {
         Ok((handle, task_handle))
     }
 
-    /// Spawn a meeting actor whose `sender_id` allocator is pre-seeded.
+    /// Spawn a meeting actor with test-only construction overrides.
     /// **Test builds only.**
     ///
-    /// Exists so the fail-closed exhaustion reject can be exercised through the
-    /// real join path — `handle_join`, the `JoinResponse` write, and
-    /// `record_session_join`'s `error_type` label — without performing 65535
-    /// joins. Compiled only under the non-default `test-seams` feature, and a
-    /// release build with that feature on fails to compile (see `lib.rs`).
+    /// Exists so seam-dependent behaviour runs through the real join path:
+    /// the `sender_id` exhaustion reject without performing 65535 joins, a
+    /// deterministic split across handlers (placement pins), and an observable
+    /// flush deferral (a small flush bound). Compiled only under the
+    /// non-default `test-seams` feature, and a release build with that feature
+    /// on fails to compile (see `lib.rs`).
     ///
-    /// This IS the exhaustion guard's bypass. It must never be reachable in
-    /// production.
+    /// This IS the exhaustion guard's bypass and a placement steering seam. It
+    /// must never be reachable in production.
     ///
     /// # Errors
     ///
     /// As [`MeetingActor::spawn`].
     #[cfg(feature = "test-seams")]
-    pub fn spawn_with_sender_id_cursor(
+    pub fn spawn_with_seams(
         meeting_id: String,
         cancel_token: CancellationToken,
         metrics: Arc<ActorMetrics>,
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
-        next_sender_id: Option<std::num::NonZeroU16>,
+        seams: &super::meeting_media::MeetingSeams,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
+        let sender_ids = match seams.sender_id_cursor {
+            Some(cursor) => SenderIdAllocator::resuming_from(cursor),
+            None => SenderIdAllocator::new(),
+        };
         Self::spawn_inner(
             meeting_id,
             cancel_token,
             metrics,
             controller_metrics,
             master_secret,
-            SenderIdAllocator::resuming_from(next_sender_id),
+            sender_ids,
+            |media| media.apply_seams(seams),
         )
     }
 
@@ -580,6 +630,13 @@ impl MeetingActor {
                 // Check disconnect grace periods
                 _ = grace_check.tick() => {
                     self.check_disconnect_timeouts().await;
+                }
+
+                // Deferred slot-view work from an earlier turn (the per-turn
+                // flush bound). Interleaves with mailbox traffic rather than
+                // starving it; never drops a view.
+                () = std::future::ready(()), if self.media.has_dirty() => {
+                    self.flush_views().await;
                 }
 
                 // Handle messages
@@ -624,6 +681,7 @@ impl MeetingActor {
                 is_host,
                 identity_public_key,
                 stream_tx,
+                media,
                 respond_to,
             } => {
                 let result = self
@@ -635,6 +693,7 @@ impl MeetingActor {
                         is_host,
                         identity_public_key,
                         stream_tx,
+                        media,
                     )
                     .await;
                 let _ = respond_to.send(result);
@@ -722,12 +781,24 @@ impl MeetingActor {
                 let _ = respond_to.send(lookup);
             }
 
+            MeetingMessage::RegisterReceiveCapability {
+                participant_id,
+                declaration,
+                respond_to,
+            } => {
+                let result = self
+                    .handle_receive_capability(&participant_id, declaration)
+                    .await;
+                let _ = respond_to.send(result);
+            }
+
             MeetingMessage::UpdateSelfMute {
                 participant_id,
                 audio_muted,
                 video_muted,
             } => {
-                self.handle_self_mute(&participant_id, audio_muted, video_muted);
+                self.handle_self_mute(&participant_id, audio_muted, video_muted)
+                    .await;
             }
 
             MeetingMessage::ServerMute {
@@ -769,6 +840,7 @@ impl MeetingActor {
         is_host: bool,
         identity_public_key: Option<IdentityPublicKey>,
         stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+        media: JoinMedia,
     ) -> Result<JoinResult, McError> {
         if self.is_shutting_down {
             return Err(McError::Draining);
@@ -808,6 +880,13 @@ impl MeetingActor {
             McError::SenderIdSpaceExhausted
         })?;
         let sender_id = allocation.sender_id;
+
+        // ADR-0036 §9 placement, BEFORE any other admission state is built, so
+        // a placement failure leaves nothing to unwind (the allocated sender id
+        // is simply never used — sender ids are never recycled either way).
+        // The first join freezes the meeting's handler set.
+        self.media.install(media);
+        let media_handler = self.media.admit(&participant_id, &user_id, sender_id)?;
 
         // `high_watermark_crossed` is the allocator's own one-shot latch (true on
         // exactly the crossing allocation and never again), so there is no
@@ -932,6 +1011,13 @@ impl MeetingActor {
             "Participant joined"
         );
 
+        // Structural change: re-render, re-push every handler (the first join
+        // registers every handler, possibly with an empty snapshot), and
+        // re-emit changed views to existing declared subscribers. The joiner
+        // itself has not declared, so it is sent nothing yet.
+        self.media.reconcile(Affected::All).await;
+        self.flush_views().await;
+
         Ok(JoinResult {
             participant_id,
             correlation_id,
@@ -943,6 +1029,7 @@ impl MeetingActor {
             meeting_kek: Arc::clone(self.media_keys.kek()),
             kek_generation: self.media_keys.generation(),
             participant_handle: conn_handle_for_result,
+            media_handler,
         })
     }
 
@@ -1095,6 +1182,13 @@ impl MeetingActor {
             },
         )
         .await;
+
+        // Structural change, on the SAME choke point every removal takes
+        // (explicit leave, clean close, grace expiry): free only the leaver's
+        // slots, refill earliest-first, re-push, re-emit.
+        self.media.remove(participant_id);
+        self.media.reconcile(Affected::All).await;
+        self.flush_views().await;
     }
 
     /// Handle reconnection attempt.
@@ -1239,6 +1333,12 @@ impl MeetingActor {
             "Participant reconnected"
         );
 
+        // A reconnect keeps rank and slots (the participant never left the
+        // roster). The new connection has received nothing, so its full current
+        // view is re-sent. No re-push: nothing structural changed.
+        self.media.reset_view(&participant_id);
+        self.flush_views().await;
+
         // Get current participant list
         let participants: Vec<ParticipantInfo> = self
             .participants
@@ -1311,7 +1411,8 @@ impl MeetingActor {
                 audio_muted,
                 video_muted,
             } => {
-                self.handle_self_mute(participant_id, audio_muted, video_muted);
+                self.handle_self_mute(participant_id, audio_muted, video_muted)
+                    .await;
             }
             SignalingPayload::LayoutSubscribe { .. } => {
                 // TODO: Handle layout subscription
@@ -1341,57 +1442,90 @@ impl MeetingActor {
         }
     }
 
-    /// Handle self-mute update — records the reported state and does NOT fan out.
+    /// Handle self-mute update — records the reported state and re-emits the
+    /// changed slot view to the subscribers holding this source.
     ///
-    /// # Why there is no `broadcast_update` here
+    /// # No roster `broadcast_update`, and why the slot-view fan-out is different
     ///
-    /// `MuteChanged` has no consumer.
-    /// `webtransport::handler::encode_participant_update` returns `None` for it
-    /// and the roster `Participant` proto carries no mute field, so a broadcast
-    /// from this path delivers **zero bytes to zero clients**: it would clone the
-    /// update N times and await N `send_update`s *on this actor's own task*,
-    /// head-of-line-blocking joins, leaves and every other connection's
-    /// `get_state()`, so that N participant actors could each wake, call the
-    /// encoder, get `None` and emit a DEBUG line.
+    /// `MuteChanged` has no consumer: `webtransport::handler::encode_participant_update`
+    /// returns `None` for it and the roster `Participant` proto carries no mute
+    /// field, so a roster broadcast would deliver zero bytes to zero clients
+    /// while cloning the update N times and awaiting N sends on this task.
+    /// It stays removed.
     ///
-    /// That cost was latent while nothing client-driven reached here. The
-    /// client-facing `MuteRequest` dispatch arm (ADR-0036 §5) makes this path
-    /// client-drivable, and a per-connection rate limit cannot bound a
-    /// **per-meeting** resource: N connections each within their own limit still
-    /// aggregate to O(N) awaited sends per report on one shared task, and a
-    /// buggy client *release* drives all N simultaneously. Removing the producer
-    /// is structural; rate-limiting it would only change the constant.
-    ///
-    /// The subscriber-visible mute signal is `SLOT_STATE_SOURCE_MUTED`, which
-    /// each subscriber composes from its **own** `get_state()` read on its own
-    /// task (`webtransport::connection::compose_and_emit`). Nothing is lost.
-    ///
-    /// # Retirement condition
-    ///
-    /// If `MuteChanged` ever becomes wire-serialized, the broadcast must come
-    /// back — and it needs a **per-meeting** bound at that point, not the
-    /// per-connection `ClientWorkLimiter` on the mute path, for the reason above.
-    ///
-    /// `handle_server_mute` deliberately still broadcasts: it is not
-    /// client-drivable in this story (enforcement is story 2), so it is not this
-    /// diff's amplifier to remove.
-    fn handle_self_mute(&mut self, participant_id: &str, audio_muted: bool, video_muted: bool) {
+    /// The subscriber-visible mute signal is `SLOT_STATE_SOURCE_MUTED`, and since
+    /// story 2 the ACTOR composes it: an audio-flag change marks dirty only the
+    /// subscribers HOLDING this source in a slot, and the per-turn flush bound
+    /// applies — a per-MEETING bound, which is the kind the self-mute lesson
+    /// asked for (a per-connection rate limit cannot bound N connections each
+    /// within their own limit). Each subscriber's message goes only if its view
+    /// actually changed. A video-only change dirties nothing.
+    async fn handle_self_mute(
+        &mut self,
+        participant_id: &str,
+        audio_muted: bool,
+        video_muted: bool,
+    ) {
         let Some(participant) = self.participants.get_mut(participant_id) else {
             return;
         };
 
-        // IDEMPOTENT: a report that changes neither flag is a no-op. Retained
-        // now that the fan-out is gone because it still states the contract —
-        // an unchanged pair is not a transition — and keeps the write off the
-        // hot path for a client repeating one state.
+        // IDEMPOTENT: a report that changes neither flag is a no-op — an
+        // unchanged pair is not a transition.
         if participant.audio_self_muted == audio_muted
             && participant.video_self_muted == video_muted
         {
             return;
         }
 
+        let audio_changed = participant.audio_self_muted != audio_muted;
         participant.audio_self_muted = audio_muted;
         participant.video_self_muted = video_muted;
+        let sender = participant.sender_id;
+
+        if audio_changed {
+            self.media.reconcile(Affected::HoldersOf(sender)).await;
+            self.flush_views().await;
+        }
+    }
+
+    /// Register a validated receive-capability declaration: slot demand is now
+    /// actor state. Structural change — re-render, re-push, re-emit (the
+    /// declarer's own directive and assignments included, directive first).
+    async fn handle_receive_capability(
+        &mut self,
+        participant_id: &str,
+        declaration: ReceiveCapabilityDeclaration,
+    ) -> Result<(), McError> {
+        if !self.participants.contains_key(participant_id) {
+            return Err(McError::ParticipantNotFound(
+                "Participant not found".to_string(),
+            ));
+        }
+        self.media.declare(participant_id, declaration)?;
+        self.media.reconcile(Affected::All).await;
+        self.flush_views().await;
+        Ok(())
+    }
+
+    /// Flush up to the per-turn bound of dirty participants' slot views.
+    async fn flush_views(&mut self) {
+        let roster: std::collections::HashMap<String, RosterEntry<'_>> = self
+            .participants
+            .values()
+            .map(|p| {
+                (
+                    p.participant_id.clone(),
+                    RosterEntry {
+                        sender: p.sender_id,
+                        connection: p.connection.as_ref(),
+                        // One wire state (`SOURCE_MUTED`) covers both causes.
+                        audio_muted: p.audio_self_muted || p.audio_server_muted,
+                    },
+                )
+            })
+            .collect();
+        self.media.flush(&roster).await;
     }
 
     /// Handle a server-mute request (enforced, ADR-0036 §5).
@@ -1423,7 +1557,11 @@ impl MeetingActor {
         }
 
         // Update mute state and extract values for broadcast
+        let mut audio_changed_for = None;
         let update = if let Some(participant) = self.participants.get_mut(target_participant_id) {
+            if participant.audio_server_muted != audio_muted {
+                audio_changed_for = Some(participant.sender_id);
+            }
             participant.audio_server_muted = audio_muted;
             participant.video_server_muted = video_muted;
 
@@ -1448,7 +1586,13 @@ impl MeetingActor {
         // Broadcast mute change after releasing the mutable borrow
         if let Some(update) = update {
             self.broadcast_update(target_participant_id, update).await;
-            // TODO (Phase 6d): Notify MH to enforce mute
+            // Subscribers holding this source see `SOURCE_MUTED` (one wire
+            // state for both causes). Enforcement at MH ingress — the muted set
+            // on the snapshot — is story-2 task 12.
+            if let Some(sender) = audio_changed_for {
+                self.media.reconcile(Affected::HoldersOf(sender)).await;
+                self.flush_views().await;
+            }
             Ok(())
         } else {
             // MINOR-002 fix: Don't include participant ID in error message
@@ -1688,6 +1832,45 @@ mod tests {
         crate::media_admission::fixtures::sample_identity_key()
     }
 
+    /// Media-routing inputs for in-crate actor tests: one handler and an MH
+    /// client that confirms every push. Routing behaviour itself is covered by
+    /// `media_routing` unit tests and the integration suite.
+    fn test_media() -> JoinMedia {
+        use crate::grpc::{MeetingProgramming, MhRegistrationClient};
+        use crate::media_routing::{HandlerEndpoint, MeetingHandlers, PolicyGenerations};
+        use crate::media_signaling::{AudioEncoding, MediaStreamPolicy};
+        use proto_gen::dark_tower::signaling::v1::Codec;
+
+        struct ConfirmingMh;
+        impl MhRegistrationClient for ConfirmingMh {
+            fn register_meeting<'a>(
+                &'a self,
+                _programming: &'a MeetingProgramming<'a>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>>
+            {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        JoinMedia {
+            deps: Arc::new(super::super::meeting_media::MediaRoutingDeps {
+                mh_client: Arc::new(ConfirmingMh),
+                policy_generations: Arc::new(PolicyGenerations::new()),
+                mc_id: "mc-test".to_string(),
+                mc_grpc_endpoint: "http://mc-test:50052".to_string(),
+                stream_policy: MediaStreamPolicy::new(
+                    AudioEncoding::new(Codec::Opus, 48_000, 50).unwrap(),
+                ),
+            }),
+            handlers: MeetingHandlers::new([HandlerEndpoint {
+                id: crate::media_routing::HandlerId::new("mh-0"),
+                webtransport_url: "https://mh-0.test:4434".to_string(),
+                grpc_endpoint: "http://mh-0.test:50053".to_string(),
+            }])
+            .unwrap(),
+        }
+    }
+
     #[tokio::test]
     async fn test_meeting_actor_spawn() {
         let metrics = ActorMetrics::new();
@@ -1732,6 +1915,7 @@ mod tests {
                 false, // not host
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
 
@@ -1768,6 +1952,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
         assert!(result.is_ok());
@@ -1781,6 +1966,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
         assert!(matches!(result, Err(McError::Conflict(_))));
@@ -1812,6 +1998,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
 
@@ -1853,6 +2040,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .expect("join 1");
@@ -1865,6 +2053,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .expect("join 2");
@@ -1915,6 +2104,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .expect("join");
@@ -1953,6 +2143,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
 
@@ -2006,6 +2197,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .expect("join succeeds");
@@ -2070,6 +2262,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .unwrap();
@@ -2128,6 +2321,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .unwrap();
@@ -2187,7 +2381,7 @@ mod tests {
     /// the vacuous-control shape this devloop hit three times. So the real
     /// transition is confirmed to have LANDED, via `get_state()` observing
     /// `audio_self_muted`, on the same read path
-    /// `webtransport::connection::compose_and_emit` uses to derive
+    /// `actors::meeting_media` uses (via the roster) to derive
     /// `SLOT_STATE_SOURCE_MUTED`. That is the mechanism that replaced the
     /// broadcast, so the control exercises the actual delivery route.
     ///
@@ -2220,6 +2414,7 @@ mod tests {
                     false,
                     test_identity_key(),
                     Some(tx),
+                    test_media(),
                 )
                 .await
                 .expect("join succeeds");
@@ -2307,6 +2502,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
 
@@ -2353,6 +2549,7 @@ mod tests {
                 true, // host
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
         let _ = handle
@@ -2364,6 +2561,7 @@ mod tests {
                 false, // not host
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
 
@@ -2410,6 +2608,7 @@ mod tests {
                 false, // not host
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
         let _ = handle
@@ -2421,6 +2620,7 @@ mod tests {
                 false, // not host
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await;
 
@@ -2484,6 +2684,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .unwrap();
@@ -2570,6 +2771,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .unwrap();
@@ -2638,6 +2840,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .unwrap();
@@ -2697,6 +2900,7 @@ mod tests {
                 false,
                 test_identity_key(),
                 None,
+                test_media(),
             )
             .await
             .unwrap();

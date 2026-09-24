@@ -20,7 +20,7 @@
 - Frame v2 cross-language vectors + gate → `proto/test-vectors/frame-v2.vectors.json`, `scripts/guards/simple/validate-frame-vectors.sh`, `crates/media-vector-gen/`
 - Release feature-gate self-test → `scripts/release-feature-gate.test.sh`; release profile guard → `crates/dt-guard/src/release_build_profile.rs`
 - Media metric hygiene kernel + live assertion → `crates/env-tests/src/fixtures/metric_hygiene.rs`, `crates/env-tests/tests/32_media_metric_hygiene.rs`
-- Alert-rules-actually-loaded check → `crates/env-tests/src/fixtures/alert_rules_loaded.rs`, `crates/env-tests/tests/33_alert_rules_loaded.rs`; MH datagram round trip → `crates/env-tests/tests/26_mh_quic.rs`, `crates/env-tests/src/fixtures/media.rs`
+- Alert-rules-actually-loaded check → `crates/env-tests/src/fixtures/alert_rules_loaded.rs`, `crates/env-tests/tests/33_alert_rules_loaded.rs`; MH datagram forwarding between distinct participants → `crates/env-tests/tests/27_mc_slot_placement.rs`, `crates/env-tests/src/fixtures/media.rs`
 - MH alerts → `infra/docker/prometheus/rules/mh-alerts.yaml`; media dashboards → `infra/grafana/dashboards/mh-media.json`, `infra/grafana/dashboards/client-media.json`; open obligations → `docs/TODO.md` §Media Path Obligations
 
 ## Story Workflow (ADR-0035)

@@ -630,7 +630,7 @@ mod tests {
         let (mut actor, _rx) = bare_actor_with_stream(1);
 
         let payload = || SignalingPayload::Raw {
-            message_type: 0,
+            message_type: crate::actors::messages::RAW_SERVER_MESSAGE_TYPE,
             data: vec![1, 2, 3],
         };
 

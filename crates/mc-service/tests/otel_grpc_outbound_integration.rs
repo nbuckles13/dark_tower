@@ -24,7 +24,7 @@ use std::time::Duration;
 use common::secret::SecretString;
 use mc_service::config::Config;
 use mc_service::grpc::{GcClient, MeetingProgramming, MhClient};
-use mc_test_utils::media::{loopback_assignment, TEST_HANDLER_ID};
+use mc_test_utils::media::{two_party_assignment, TEST_HANDLER_ID};
 use mc_test_utils::mock_mh::MediaHandlerStub;
 use mc_test_utils::test_token_receiver;
 use proto_gen::dark_tower::internal::v1::global_controller_service_server::{
@@ -254,7 +254,7 @@ async fn mh_client_register_meeting_injects_active_span_traceparent() {
 
     let span = tracing::info_span!("mc.outbound.mh");
     span.set_parent(known_remote_context());
-    let assignment = loopback_assignment();
+    let assignment = two_party_assignment();
     mh_client
         .register_meeting(&MeetingProgramming {
             mh_grpc_endpoint: &mh_url,
@@ -264,6 +264,7 @@ async fn mh_client_register_meeting_injects_active_span_traceparent() {
             mc_grpc_endpoint: "http://mc:50052",
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
+            restart_floor_adoptable: false,
         })
         .instrument(span)
         .await

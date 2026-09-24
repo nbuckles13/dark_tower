@@ -733,6 +733,9 @@ sum by(outcome) (increase(mh_media_policy_applies_total[15m]))
 # 4. MC agrees about what MH applied. Anything but `match` (and the
 #    `handler_id_mismatch` diagnostic, which fires on every ordinary MH restart
 #    because MH_HANDLER_ID is per-incarnation) means read MC Scenario 15.
+#    OUT OF THIS GATE'S SCOPE: an MC-restart floor adoption appears under NO
+#    outcome label (it is recorded on mc_media_policy_generation_adoptions_total);
+#    it is an MC-rollout event, covered by mc-deployment.md's checklist.
 sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 ```
 

@@ -64,7 +64,7 @@
 
 ## Environment Tests & Cluster (ADR-0030)
 - Bootstrap + fixtures + cluster config → `crates/env-tests/src/`, `src/cluster.rs`, `src/fixtures/`
-- Flows → `crates/env-tests/tests/` (`24_join_flow.rs`, `26_mh_quic.rs`, `30_observability.rs`, media `01_mh_deployment_config.rs`, `32_media_metric_hygiene.rs`, `33_alert_rules_loaded.rs`) + hygiene fixtures `src/fixtures/metric_hygiene.rs`
+- Flows → `crates/env-tests/tests/` (`24_join_flow.rs`, `26_mh_quic.rs`, `27_mc_slot_placement.rs`, `30_observability.rs`, media `01_mh_deployment_config.rs`, `32_media_metric_hygiene.rs`, `33_alert_rules_loaded.rs`) + hygiene fixtures `src/fixtures/metric_hygiene.rs` + shared MC/MH WebTransport client (connect, framing, `JoinRequest`, MH connect envelope) `src/fixtures/mc_session.rs`
 - Per-run org provisioning (Phase 1h) → `scripts/layer7.sh:__generate_org_subdomain`, `infra/kind/scripts/setup.sh:provision_run_org()`
 - Org subdomain resolution, no default → `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`
 - Subdomain-pattern drift guard + self-test → `scripts/guards/simple/validate-subdomain-regex-sync.sh`, `scripts/guards/validate-subdomain-regex-sync.test.sh`

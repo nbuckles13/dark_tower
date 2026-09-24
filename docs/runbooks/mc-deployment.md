@@ -521,6 +521,13 @@ kill %1
 >
 > Full triage for both failure signals — which have **opposite first steps** —
 > and the verified recovery sequence are in §Config-failure triage below.
+>
+> **Rolling the MC image back across story 2's generation-floor adoption
+> leaves every meeting alive across the rollback media-dark** (MH keeps the
+> newer installed generation; the old build pushes 1 and never climbs). Bounded
+> to those meetings; new meetings are unaffected. The remedy is the one
+> exception to "do not restart MH" — see **Carve-out #3** under §Post-Deploy
+> Monitoring Checklist: MC↔MH Coordination.
 
 **Step 1: Identify previous version**
 
@@ -1421,11 +1428,13 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 - [ ] No mc-service pod restarts since deploy completed
 - [ ] **Forwarding policy confirmed live** (ADR-0036 §8): `increase(mc_media_policy_pushes_total{outcome="match"}[30m]) > 0`. **If this is zero the gate is NOT green — it is unrun**: no meeting was programmed in the window, which is also what a broken deploy looks like. Run §Smoke Tests → [Test 5: Join Flow](#test-5-join-flow-webtransport--signaling) to drive one, then re-check. **Do not tick this on an absent series.**
 - [ ] **No unconfirmed pushes**: `increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[30m]) == 0`. **`handler_id_mismatch` is excluded deliberately**: `handler_id` is a per-incarnation token (MH derives it from `HOSTNAME` plus a fresh UUID at process start, and `MH_HANDLER_ID` is unset in all three manifests), so any deploy that rolls — or merely restarts — an MH pod produces that outcome **by construction**. A gate written "no non-`match` outcomes" false-fails every such deploy, and a gate that cries wolf stops being read, including for the real `no_applied_generation` it exists to catch. **Three sites hold this one expression** — this checklist, the metrics catalog entry, and story task 21's alert rule — and they are **one decision with one revert trigger**: remove the exclusion when `2026-09-02-mh-stable-handler-id` lands, in all three places together.
-- [ ] Read `mc_media_generation_divergence` **only after** the gate above has fired. It is the magnitude, never the detection signal, and it is written **only on a registration push** — with the ADR-0036 §8 re-assert cadence deferred, it does not observe a handler restart.
+- [ ] Read `mc_media_generation_divergence` **only after** the gate above has fired. It is the magnitude, never the detection signal, and it is written **only on a recorded registration push** — which since story 2 is every structural change, not once per meeting, so it is last-write-wins across many pushes and a healthy push for any meeting overwrites a diverged reading; a successful MC-restart floor adoption does not write it at all. With the ADR-0036 §8 re-assert cadence deferred, it does not observe a handler restart.
 
 > **Why these two PromQL expressions are inline here, against the section preamble.** That preamble says not to duplicate queries, and the rule is about two divergent copies of one query drifting apart. These two series are **MC-only with no MH-side counterpart**, so there is no second copy and nothing to diverge from — unlike the gates above, they are canonically owned here. Do not move or delete them to satisfy the preamble.
 >
-> **Scope of a green `match`**: it covers **only meetings programmed after the rollout**. Meetings already live on a pod when it rolled were programmed by the previous process, and there is no re-assert cadence to reprove them. Do not read `match > 0` as "forwarding is healthy fleet-wide".
+> **Scope of a green `match`**: it covers **only meetings programmed in the window**. Since story 2, meetings already live when an MC pod rolled are re-programmed by the new process on their next structural change (join, leave, declaration, mute) — via a generation-floor adoption when the handler still holds the old process's number — but a QUIESCENT meeting is not re-proven until something changes: there is still no periodic re-assert cadence (story 4). Do not read `match > 0` as "forwarding is healthy fleet-wide".
+>
+> **MC-restart floor adoptions do NOT appear in the "No unconfirmed pushes" gate, by design.** A rolled MC pod's first push to a live handler is answered with the pre-restart generation; MC records that on `mc_media_policy_generation_adoptions_total` INSTEAD of `generation_mismatch`, so the gate stays green on a healthy rollout. Expect `increase(mc_media_policy_generation_adoptions_total{outcome="adopted"}[30m])` to be non-zero after an MC roll with live meetings — **at most one per live (meeting, handler)**, which is the value with that bound. The sibling `{outcome="superseded"}` counts restart-floor replies discarded for a newer render (routine churn) and has NO such bound, so do not read the unlabelled total as a meeting count. A FAILED adoption is recorded as `generation_mismatch` and fails the gate, correctly. See the metrics catalog entry for why this is a sibling counter and not a sixth `outcome` value.
 - [ ] Cross-check the MH-side checklist (link above) for the full set of MH-side checks (handshake, JWT, timeout, MH→MC delivery success rate, active connections)
 
 **Rollback (MC half)**: same as the join-flow rollback above — `kubectl rollout undo deployment/mc-0 -n dark-tower` and `kubectl rollout undo deployment/mc-1 -n dark-tower` (MC ships as two per-ordinal Deployments; there is no Deployment named `mc-service` — that string is a Service, a PDB and a container name. Form per `docs/runbooks/mh-deployment.md`). **Carve-out — do NOT roll MC back for sustained `no_applied_generation`.** If `mc_media_policy_pushes_total{outcome="no_applied_generation"}` is climbing with retries exhausted after a deploy, MH is below the ADR-0036 §8 contract and **the remedy is to roll MH forward, not MC back**: rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole, not a fix. If the issue is on the MH side (handshake, JWT, RegisterMeeting timeouts), follow the rollback criteria + `mh-service` rollback documented in `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "Rollback criteria".
@@ -1448,6 +1457,30 @@ MC and MH are coupled by the sender_id binding contract".
 contract later: in both cases rolling MC back returns it to a state MH cannot consume,
 and in both cases the intuitive action is the destructive one. Recorded separately rather
 than left to be inferred from the first.
+
+**Carve-out #3 — rolling MC back ACROSS story 2's generation-floor adoption darkens every live
+meeting, and here the remedy IS to restart MH.** Story 2 (task 6) made MC adopt a live handler's
+applied generation as a floor after an MC restart (`PolicyGenerations::adopt_floor`) and re-push on
+every structural change. An MC build predating that has neither: it restarts with an empty
+generation registry and pushes once, at generation 1, when a meeting's first participant joins.
+MH's routing table is install-only and still holds the pre-rollback generation K, so it rejects 1
+as stale — forever, because the old build never climbs. **Every meeting alive across the rollback
+stays media-dark** with no recovery path in the rolled-back code.
+
+- **Blast radius is bounded**: only meetings that were alive on MH across the rollback. A NEW
+  `meeting_id` has no MH entry (installed generation 0), so generation 1 applies normally — new
+  meetings are unaffected.
+- **Remedy — the ONE exception to "DO NOT RESTART MH"**: restart the MH pods (clearing the
+  in-memory, install-only routing tables) or roll MC forward again. Every other divergence path in
+  these runbooks says in bold not to restart MH, because there it sheds sessions and recovers
+  nothing; here the stale installed generation IS the fault and only an MH restart (or an MC build
+  that adopts) removes it. Participants in the affected meetings then rejoin (reload the page).
+- **How it presents**: `mc_media_policy_pushes_total{outcome="generation_mismatch"}` climbing after
+  the rollback with `applied > sent` in the ERROR line, and `MCMediaGenerationDivergence` paging;
+  `mc_media_policy_generation_adoptions_total` absent (the old build does not have it).
+
+Same shape as carve-outs #1 and #2: the rolled-back MC returns to a state MH cannot consume. The
+difference is the remedy, which is why it is written down rather than inferred.
 
 ---
 

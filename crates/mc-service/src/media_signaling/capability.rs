@@ -12,12 +12,11 @@
 //! # Every rejection is decidable without touching the meeting actor
 //!
 //! This is a load-bearing security property, not an incidental one. Every check
-//! below runs against the decoded message plus the caller's cached
-//! [`PlannedAudioSlot`] — an owned `u16` resolved once per connection at join.
-//! Nothing here reads meeting state, so a client looping malformed or
-//! unservable declarations cannot drive O(N) roster clones through the shared
-//! meeting actor's mailbox. Only *accepted* declarations reach that path, and
-//! those are bounded per connection by the declaration budget.
+//! below runs against the decoded message and two configured numbers. Nothing
+//! here reads meeting state, so a client looping malformed declarations cannot
+//! drive work through the shared meeting actor's mailbox. Only *accepted*
+//! declarations reach the actor, and those are bounded per connection by the
+//! declaration budget.
 //!
 //! Keep it that way: if a future check needs meeting state, it belongs in the
 //! composition step, not here.
@@ -140,6 +139,22 @@ impl ReceiveCapabilityDeclaration {
         self.slots.iter().any(|s| s.media_kind == MediaKind::Audio)
     }
 
+    /// The declared AUDIO slot ids, in declaration order.
+    ///
+    /// This is the subscriber's slot demand: its length sizes the subscriber's
+    /// slot vector in the meeting's slot table, and ordinal *i* fills the *i*-th
+    /// entry. Declaration order (never a hash-map order) is what keeps a slot's
+    /// ordinal — and therefore its `egress_stream_id` — stable across a
+    /// re-declaration that keeps the count.
+    #[must_use]
+    pub fn audio_slot_ids(&self) -> Vec<u16> {
+        self.slots
+            .iter()
+            .filter(|s| s.media_kind == MediaKind::Audio)
+            .map(|s| s.slot_id.get())
+            .collect()
+    }
+
     /// Validate a decoded `ReceiveCapability` into a declaration MC can act on.
     ///
     /// # Check order is load-bearing, not stylistic
@@ -162,7 +177,6 @@ impl ReceiveCapabilityDeclaration {
         message: &ReceiveCapability,
         max_slots: usize,
         budget_remaining: bool,
-        planned_audio_slot: PlannedAudioSlot,
     ) -> Result<Self, CapabilityOutcome> {
         if !budget_remaining {
             return Err(CapabilityOutcome::DeclarationBudgetExhausted);
@@ -229,84 +243,12 @@ impl ReceiveCapabilityDeclaration {
             });
         }
 
+        // No slot-id namespace check any more. Declared audio slots are the
+        // INPUT to MC's assignment (story 2), so every well-formed declaration
+        // is servable: the relay-region `stream_id` MH stamps is whatever slot
+        // id this subscriber declared at that ordinal.
         let declaration = Self { slots };
-
-        // The namespace check, and the only one that is NOT a client defect.
-        //
-        // MH stamps the relay-region `stream_id` from the egress slot id in the
-        // policy MC pushed at first-participant join — before this client could
-        // declare anything. A subscriber asking for audio in a slot MC has no
-        // plan for is making a request the wire contract permits and MC cannot
-        // serve: its frames would arrive stamped with a slot it never opened.
-        //
-        // Rejecting is the honest answer. Accepting and reporting the slot as a
-        // source shortage would tell the client "there is nobody to show you"
-        // while MH actively forwards a source it will drop — a false wire state
-        // that leaves a healthy-looking session with no audio.
-        //
-        // ZERO-AUDIO DECLARATIONS ARE EXEMPT. A subscriber that declares no
-        // audio slot is saying "I want to send but not receive audio", which the
-        // contract anticipates and about which MC makes no false claim. Only a
-        // declaration that ASKS for audio and names a slot MC cannot fill is
-        // rejected.
-        //
-        // This rejection is retired — not weakened — by the capability-triggered
-        // policy re-push (see the module doc and `docs/TODO.md` §Media Path
-        // Obligations). Do not relax the equality into a kind-only match to make
-        // it "more flexible"; that darkens the media path silently.
-        if declaration.declares_audio()
-            && !declaration.contains(planned_audio_slot.slot_id(), MediaKind::Audio)
-        {
-            return Err(CapabilityOutcome::SlotIdNotPlanned);
-        }
-
         Ok(declaration)
-    }
-}
-
-/// The audio slot id MC's forwarding assignment routes this subscriber's audio
-/// into, resolved once per connection at join.
-///
-/// # Why this is cached rather than recomputed
-///
-/// Caching is what keeps every rejection decidable without touching the meeting
-/// actor. If the namespace check read live meeting state, a client looping
-/// unservable declarations would drive an O(N) roster clone per message through
-/// the shared actor while never being charged the declaration budget, which
-/// charges only on acceptance.
-///
-/// # Why caching is sound in this story, and when it stops being
-///
-/// The value can only change if the pushed forwarding policy changes, and the
-/// only trigger for that today is the first-participant join, which precedes
-/// every post-join dispatch on every connection. When the capability-triggered
-/// re-push lands, this cache and the [`CapabilityOutcome::SlotIdNotPlanned`]
-/// rejection are retired together.
-///
-/// Derived from the assignment output rather than reconstructed from
-/// `MAIN_AUDIO_SLOT_ID`, so MC keeps exactly one answer to "which slot do I
-/// route into".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlannedAudioSlot {
-    slot_id: SlotId,
-}
-
-impl PlannedAudioSlot {
-    /// Record the slot MC's assignment routes this subscriber's audio into.
-    ///
-    /// Deliberately does NOT carry the subscriber id: the caller already used it
-    /// to *find* the plan, so a stored copy would be state with no reader — and
-    /// dead state kept alive behind an `allow(dead_code)` is exactly what stops
-    /// being one field later.
-    #[must_use]
-    pub fn new(slot_id: SlotId) -> Self {
-        Self { slot_id }
-    }
-
-    /// The planned slot id.
-    #[must_use]
-    pub fn slot_id(self) -> SlotId {
-        self.slot_id
     }
 }
 
@@ -318,10 +260,6 @@ mod tests {
 
     const CAP: usize = 8;
 
-    fn planned(slot: u16) -> PlannedAudioSlot {
-        PlannedAudioSlot::new(SlotId::from_u16(slot))
-    }
-
     fn slot(id: u32, kind: MediaKind, pin: Option<u32>) -> ReceiveSlot {
         ReceiveSlot {
             slot_id: id,
@@ -331,11 +269,11 @@ mod tests {
     }
 
     fn parse(slots: Vec<ReceiveSlot>) -> Result<ReceiveCapabilityDeclaration, CapabilityOutcome> {
-        ReceiveCapabilityDeclaration::parse(&ReceiveCapability { slots }, CAP, true, planned(0))
+        ReceiveCapabilityDeclaration::parse(&ReceiveCapability { slots }, CAP, true)
     }
 
     #[test]
-    fn accepts_the_loopback_declaration() {
+    fn accepts_a_single_audio_slot_declaration() {
         let declaration = parse(vec![slot(0, MediaKind::Audio, None)]).unwrap();
         assert_eq!(declaration.slots().len(), 1);
         assert_eq!(declaration.slots()[0].slot_id.get(), 0);
@@ -375,8 +313,8 @@ mod tests {
 
     #[test]
     fn rejects_slot_id_above_u16_never_truncates() {
-        // 65536 truncates to 0 under `as`, which would silently address the
-        // planned loopback slot. It must be an error.
+        // 65536 truncates to 0 under `as`, which would silently address a
+        // different slot. It must be an error.
         assert_eq!(
             parse(vec![slot(65_536, MediaKind::Audio, None)]),
             Err(CapabilityOutcome::SlotIdOutOfRange)
@@ -389,11 +327,9 @@ mod tests {
 
     #[test]
     fn accepts_slot_id_at_the_u16_boundary() {
-        // 65535 is in range; the bound is inclusive. Rejected only because it
-        // is not the planned slot, which is a different check — asserted here
-        // so an over-tight range check cannot hide behind the namespace one.
-        let outcome = parse(vec![slot(65_535, MediaKind::Audio, None)]);
-        assert_eq!(outcome, Err(CapabilityOutcome::SlotIdNotPlanned));
+        // 65535 is in range; the bound is inclusive.
+        let declaration = parse(vec![slot(65_535, MediaKind::Audio, None)]).unwrap();
+        assert_eq!(declaration.audio_slot_ids(), vec![65_535]);
     }
 
     #[test]
@@ -417,16 +353,10 @@ mod tests {
             },
             3,
             true,
-            planned(0)
         )
         .is_ok());
         assert_eq!(
-            ReceiveCapabilityDeclaration::parse(
-                &ReceiveCapability { slots: three },
-                2,
-                true,
-                planned(0)
-            ),
+            ReceiveCapabilityDeclaration::parse(&ReceiveCapability { slots: three }, 2, true,),
             Err(CapabilityOutcome::SlotCountOverCap)
         );
     }
@@ -475,42 +405,29 @@ mod tests {
         );
     }
 
+    /// Story 2: declared audio slots are the assignment's INPUT, so any
+    /// well-formed audio slot id is servable. The story-1 "slot id not planned"
+    /// rejection is retired, not relaxed.
     #[test]
-    fn rejects_audio_in_a_slot_mc_does_not_plan() {
-        assert_eq!(
-            parse(vec![slot(7, MediaKind::Audio, None)]),
-            Err(CapabilityOutcome::SlotIdNotPlanned)
-        );
-        assert_eq!(
-            parse(vec![
-                slot(1, MediaKind::Audio, None),
-                slot(2, MediaKind::Audio, None)
-            ]),
-            Err(CapabilityOutcome::SlotIdNotPlanned)
-        );
-    }
-
-    #[test]
-    fn accepts_extra_audio_slots_alongside_the_planned_one() {
-        // The predicate is "a planned slot is absent", NOT "an unplanned slot is
-        // present". Rejecting this would swallow the genuine source-shortage
-        // case, which is what `FEWER_SOURCES_THAN_SLOTS` exists to convey.
+    fn any_well_formed_audio_slot_ids_are_accepted_and_their_order_is_the_ordinal_order() {
         let declaration = parse(vec![
-            slot(0, MediaKind::Audio, None),
             slot(7, MediaKind::Audio, None),
+            slot(1, MediaKind::VideoCamera, None),
+            slot(3, MediaKind::Audio, None),
         ])
         .unwrap();
-        assert_eq!(declaration.slots().len(), 2);
+        assert_eq!(declaration.audio_slot_ids(), vec![7, 3]);
     }
 
     #[test]
-    fn zero_audio_declarations_are_exempt_from_the_namespace_check() {
+    fn zero_audio_declarations_are_accepted_and_demand_no_slots() {
         // "I want to send but not receive audio" is a declaration the contract
-        // anticipates, and MC makes no false claim by accepting it — unlike the
-        // asks-for-audio-in-an-unservable-slot case.
-        assert!(parse(vec![]).is_ok());
-        assert!(parse(vec![slot(1, MediaKind::VideoCamera, None)]).is_ok());
-        assert!(parse(vec![slot(9, MediaKind::VideoScreen, None)]).is_ok());
+        // anticipates: it sizes the subscriber's slot vector to zero.
+        assert!(parse(vec![]).unwrap().audio_slot_ids().is_empty());
+        assert!(parse(vec![slot(1, MediaKind::VideoCamera, None)])
+            .unwrap()
+            .audio_slot_ids()
+            .is_empty());
     }
 
     #[test]
@@ -522,7 +439,6 @@ mod tests {
                 },
                 CAP,
                 false,
-                planned(0)
             ),
             Err(CapabilityOutcome::DeclarationBudgetExhausted)
         );

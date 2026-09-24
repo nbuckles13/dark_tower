@@ -36,7 +36,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tonic::transport::Endpoint;
 use tonic::Request;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Default timeout for MH RPC calls.
 const MH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,6 +71,31 @@ pub struct MeetingProgramming<'a> {
     /// generation recomputed per retry attempt would break ADR-0036 §8's
     /// "an unchanged policy carries the same number".
     pub policy_generation: NonZeroU64,
+    /// Set by the pusher iff this `(meeting, handler)` has had NO confirmed
+    /// push and NO adopted floor in this process lifetime — the "first confirm
+    /// after an MC restart" discriminator.
+    ///
+    /// When set, a `generation_mismatch` reply whose applied generation is
+    /// HIGHER than the one sent is the expected MC-restart case (the handler
+    /// still holds the pre-restart MC's number), not a divergence: `confirm`
+    /// does not record it on `mc_media_policy_pushes_total`, and the pusher
+    /// records exactly one of `mc_media_policy_generation_adoptions_total`
+    /// (floor adopted) or `generation_mismatch` (adoption failed, so it still
+    /// pages). Never set on a later push, so a higher echo after a confirm —
+    /// the `u64::MAX` ratchet wedge, or anything else — still pages.
+    pub restart_floor_adoptable: bool,
+}
+
+impl MeetingProgramming<'_> {
+    /// Whether this reply is the MC-restart floor case (see
+    /// [`Self::restart_floor_adoptable`]). One predicate, read by `confirm`
+    /// (to not record it) and the pusher (to adopt), so the two cannot drift.
+    #[must_use]
+    pub fn is_restart_floor(&self, outcome: PolicyPushOutcome, applied_generation: u64) -> bool {
+        self.restart_floor_adoptable
+            && outcome == PolicyPushOutcome::GenerationMismatch
+            && applied_generation > self.policy_generation.get()
+    }
 }
 
 /// Trait for MC->MH meeting registration.
@@ -290,8 +315,13 @@ impl MhClient {
 
     /// Classify the reply, emit both media-path metrics, log, and decide.
     ///
-    /// Metrics are emitted on **every** outcome including `match`, so the
-    /// counter's sum is a usable denominator.
+    /// Metrics are emitted on **every** outcome including `match`, with ONE
+    /// exception: the MC-restart floor on a first confirm
+    /// ([`MeetingProgramming::restart_floor_adoptable`]) is recorded by the
+    /// pusher instead, as exactly one of `mc_media_policy_generation_adoptions_total`
+    /// or (adoption failed) `generation_mismatch`. So the usable denominator of
+    /// evaluated replies is `sum(mc_media_policy_pushes_total) +
+    /// sum(mc_media_policy_generation_adoptions_total)`.
     fn confirm(
         &self,
         programming: &MeetingProgramming<'_>,
@@ -305,12 +335,19 @@ impl MhClient {
             transport_mode: declared_mode,
         };
         let outcome = media_routing::evaluate(&expectation, response);
+        let restart_floor = programming.is_restart_floor(outcome, response.applied_generation);
 
-        record_media_policy_push(
-            outcome,
-            programming.policy_generation,
-            response.applied_generation,
-        );
+        // The MC-restart floor is NOT recorded here: the pusher records exactly
+        // one of the adoption counter or (if adoption fails) this outcome, in
+        // one place, so no scrape can see a mismatch that an adoption then
+        // explains. See `MeetingProgramming::restart_floor_adoptable`.
+        if !restart_floor {
+            record_media_policy_push(
+                outcome,
+                programming.policy_generation,
+                response.applied_generation,
+            );
+        }
         // Keyed on the DISPOSITION, not on `== Match`. `status="success"` on this
         // metric means "the meeting is programmed", which is exactly what
         // `PushDisposition::Programmed` asserts — and `handler_id_mismatch` is
@@ -353,6 +390,23 @@ impl MhClient {
         // `process_start_epoch_ms` is carried for the responder only: restart
         // DETECTION is the deferred handler-restart story, so no outcome and no
         // metric hangs off it here, and `0` reads as "restart undetectable".
+        if restart_floor {
+            info!(
+                target: "mc.grpc.mh_client",
+                key_custody = KEY_CUSTODY_OPERATOR,
+                meeting_id = %programming.meeting_id,
+                sent_generation = programming.policy_generation.get(),
+                applied_generation = response.applied_generation,
+                process_start_epoch_ms = response.process_start_epoch_ms,
+                "Handler holds a higher policy generation on this MC's first push (MC restart \
+                 under a live meeting); handing to the pusher to adopt it as a floor"
+            );
+            return Err(McError::MediaPolicyDivergence {
+                outcome,
+                applied_generation: response.applied_generation,
+            });
+        }
+
         let interim_marker = if outcome == PolicyPushOutcome::HandlerIdMismatch {
             // Read this as the expected stable-id-not-yet-deployed case at a
             // glance; see `media_routing::confirm::evaluate`'s precedence note
@@ -388,9 +442,10 @@ impl MhClient {
             // only the abort is suppressed — never the report.
             media_routing::PushDisposition::Programmed => Ok(()),
             media_routing::PushDisposition::Retryable
-            | media_routing::PushDisposition::Terminal => {
-                Err(McError::MediaPolicyDivergence { outcome })
-            }
+            | media_routing::PushDisposition::Terminal => Err(McError::MediaPolicyDivergence {
+                outcome,
+                applied_generation: response.applied_generation,
+            }),
         }
     }
 
@@ -429,9 +484,7 @@ impl MhRegistrationClient for MhClient {
 mod tests {
     use super::*;
     use crate::media_admission::SenderId;
-    use crate::media_routing::{
-        compute_assignment, HandlerId, MeetingRoutingInput, RoutingParticipant,
-    };
+    use crate::media_routing::{HandlerId, SlotTable};
     use std::num::NonZeroU16;
 
     #[test]
@@ -440,7 +493,7 @@ mod tests {
         assert_eq!(MH_CONNECT_TIMEOUT, Duration::from_secs(5));
     }
 
-    /// Local, and it CANNOT delegate to `mc_test_utils::media::loopback_assignment`
+    /// Local, and it CANNOT delegate to `mc_test_utils::media::two_party_assignment`
     /// even though `test_token_receiver` above does exactly that — the two sit
     /// adjacent and the difference is invisible without this note.
     ///
@@ -449,24 +502,20 @@ mod tests {
     /// instances, so `mc-service`'s **own** types do not unify across the
     /// boundary. Delegating yields
     /// `expected assignment::HandlerAssignment, found HandlerAssignment`.
-    /// `test_token_receiver` works because it returns `common::token_manager::
-    /// TokenReceiver`, a third-crate type, exactly as
-    /// `media_admission/mod.rs` can use `mc_test_utils::media`'s `Vec<u8>`.
     ///
     /// Drift risk is low rather than absent: both this and the shared fixture
-    /// build their input and call the real [`compute_assignment`], so neither
-    /// hand-encodes the policy shape. A note, deliberately not an
-    /// `ANCHOR (DRY):` and not a guard.
-    fn loopback_assignment() -> HandlerAssignment {
+    /// render through the real [`SlotTable`], so neither hand-encodes the
+    /// policy shape. A note, deliberately not an `ANCHOR (DRY):` and not a guard.
+    fn two_party_assignment() -> HandlerAssignment {
         let handler = HandlerId::new("mh-0");
-        let input = MeetingRoutingInput {
-            participants: vec![RoutingParticipant {
-                sender_id: SenderId::from_nonzero(NonZeroU16::new(7).unwrap()),
-                handlers: vec![handler.clone()],
-            }],
-            handlers: vec![handler.clone()],
-        };
-        compute_assignment(&input)
+        let mut table = SlotTable::new();
+        for n in [7, 8] {
+            let sender = SenderId::from_nonzero(NonZeroU16::new(n).unwrap());
+            table.admit(sender, |_| Some(handler.clone())).unwrap();
+            table.set_demand(sender, vec![0]);
+        }
+        table
+            .render([&handler])
             .unwrap()
             .for_handler(&handler)
             .cloned()
@@ -482,6 +531,7 @@ mod tests {
             mc_grpc_endpoint: "http://mc:50052",
             assignment,
             policy_generation: NonZeroU64::MIN,
+            restart_floor_adoptable: false,
         }
     }
 
@@ -492,11 +542,17 @@ mod tests {
     /// drifts silently; an assertion on the built message fails the build.
     #[test]
     fn built_request_satisfies_every_mh_rejection_by_construction() {
-        let assignment = loopback_assignment();
+        let assignment = two_party_assignment();
         let streams = build_egress_streams(&assignment);
 
-        assert_eq!(streams.len(), 1);
+        assert_eq!(streams.len(), 2, "one pinned stream per subscriber");
         let s = &streams[0];
+        assert_eq!(s.candidate_sources.len(), 1, "exactly one pinned candidate");
+        assert_ne!(
+            s.candidate_sources[0].sender_id,
+            s.subscriber.as_ref().unwrap().sender_id,
+            "no self-edge (story 2 R-3)"
+        );
 
         // Subscriber present, and both identifier widths in range.
         let subscriber = s.subscriber.as_ref().expect("subscriber must be present");
@@ -535,9 +591,9 @@ mod tests {
     }
 
     #[test]
-    fn declared_transport_mode_is_datagram_for_the_loopback_policy() {
+    fn declared_transport_mode_is_datagram_for_an_audio_policy() {
         assert_eq!(
-            declared_transport_mode(&loopback_assignment()),
+            declared_transport_mode(&two_party_assignment()),
             TransportMode::Datagram
         );
     }
@@ -556,7 +612,7 @@ mod tests {
     /// Nothing else — and specifically no key material.
     #[test]
     fn built_request_carries_no_key_material() {
-        let assignment = loopback_assignment();
+        let assignment = two_party_assignment();
         let p = programming(&assignment);
         let request = RegisterMeetingRequest {
             meeting_id: p.meeting_id.to_string(),
@@ -571,7 +627,7 @@ mod tests {
         // structural rather than a scan: there is nowhere for a key to go.
         assert_eq!(request.policy_generation, 1);
         assert!(request.selection_rules.is_none());
-        assert_eq!(request.egress_streams.len(), 1);
+        assert_eq!(request.egress_streams.len(), 2);
     }
 
     #[test]
@@ -583,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_meeting_invalid_endpoint() {
         let client = MhClient::new(mc_test_utils::test_token_receiver());
-        let assignment = loopback_assignment();
+        let assignment = two_party_assignment();
         let mut p = programming(&assignment);
         p.mh_grpc_endpoint = "";
 
@@ -598,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_meeting_unreachable_endpoint() {
         let client = MhClient::new(mc_test_utils::test_token_receiver());
-        let assignment = loopback_assignment();
+        let assignment = two_party_assignment();
         let mut p = programming(&assignment);
         p.mh_grpc_endpoint = "http://127.0.0.1:59998";
 

@@ -219,6 +219,17 @@ export function buildSendDirective(init: {
   });
 }
 
+/**
+ * A `SendDirective` with NO streams — what MC sends a publisher nobody holds
+ * (a solo participant, or one whose last holder left).
+ */
+export function framedSendDirectiveWithoutStreams(): Uint8Array {
+  return frameServerMessage({
+    case: 'sendDirective',
+    value: create(SendDirectiveSchema, { headerVersion: 2, streams: [] }),
+  });
+}
+
 /** Build a `StreamAssignments` placing (or explaining) one slot. */
 export function buildStreamAssignments(init: {
   slotId?: number;

@@ -27,7 +27,7 @@
 
 use ::common::observability::testing::MetricAssertion;
 use mc_service::grpc::{MeetingProgramming, MhClient};
-use mc_test_utils::media::{loopback_assignment, TEST_HANDLER_ID};
+use mc_test_utils::media::{two_party_assignment, TEST_HANDLER_ID};
 use mc_test_utils::mock_mh::{AppliedGenerationBehaviour, MediaHandlerStub};
 use mc_test_utils::test_token_receiver;
 
@@ -42,7 +42,7 @@ async fn register_meeting_success_emits_status_success_and_duration_observation(
         .spawn()
         .await;
     let endpoint = stub.endpoint();
-    let assignment = loopback_assignment();
+    let assignment = two_party_assignment();
     let client = MhClient::new(test_token_receiver());
 
     let snap = MetricAssertion::snapshot();
@@ -55,6 +55,7 @@ async fn register_meeting_success_emits_status_success_and_duration_observation(
             mc_grpc_endpoint: "http://mc-test:50052",
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
+            restart_floor_adoptable: false,
         })
         .await;
     assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -83,7 +84,7 @@ async fn register_meeting_not_applied_emits_status_error() {
         .spawn()
         .await;
     let endpoint = stub.endpoint();
-    let assignment = loopback_assignment();
+    let assignment = two_party_assignment();
     let client = MhClient::new(test_token_receiver());
 
     let snap = MetricAssertion::snapshot();
@@ -96,6 +97,7 @@ async fn register_meeting_not_applied_emits_status_error() {
             mc_grpc_endpoint: "http://mc-test:50052",
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
+            restart_floor_adoptable: false,
         })
         .await;
     assert!(
@@ -152,7 +154,7 @@ async fn non_fatal_handler_id_mismatch_records_status_success() {
         .spawn()
         .await;
     let endpoint = stub.endpoint();
-    let assignment = loopback_assignment();
+    let assignment = two_party_assignment();
     let client = MhClient::new(test_token_receiver());
 
     let snap = MetricAssertion::snapshot();
@@ -165,6 +167,7 @@ async fn non_fatal_handler_id_mismatch_records_status_success() {
             mc_grpc_endpoint: "http://mc-test:50052",
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
+            restart_floor_adoptable: false,
         })
         .await;
 

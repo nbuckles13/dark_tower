@@ -33,6 +33,7 @@ use proto_gen::dark_tower::internal::v1::{
     EndMeetingRequest, EndMeetingResponse, RegisterMeetingRequest, RegisterMeetingResponse,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,6 +66,11 @@ pub enum AppliedGenerationBehaviour {
     /// path still reflects. Use `Stall(0)` for "never programmed" and
     /// `Stall(n)` for "stalled at n".
     Stall(u64),
+    /// Apply (and echo) every generation up to and including `n`, then stall
+    /// at `n` — a handler that took the first push and fails every later one.
+    /// The shape of a failed RE-push, which `Stall` cannot express because it
+    /// never confirms the first.
+    EchoUpTo(u64),
 }
 
 /// A configurable tonic `MediaHandlerService` for MC component tests.
@@ -86,6 +92,9 @@ pub struct MediaHandlerStub {
     last_request: Arc<Mutex<Option<RegisterMeetingRequest>>>,
     /// Every `EndMeeting` request served, in order.
     end_meeting_requests: Arc<Mutex<Vec<EndMeetingRequest>>>,
+    /// Per meeting, the transport mode of the LAST snapshot the stub applied —
+    /// what a real MH echoes, since it reads the mode off its live snapshot.
+    live_modes: Mutex<HashMap<String, TransportMode>>,
 }
 
 impl MediaHandlerStub {
@@ -243,6 +252,7 @@ impl MediaHandlerStubBuilder {
             call_count: Arc::new(AtomicU64::new(0)),
             last_request: Arc::new(Mutex::new(None)),
             end_meeting_requests: Arc::new(Mutex::new(Vec::new())),
+            live_modes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -272,6 +282,7 @@ impl MediaHandlerStubBuilder {
             call_count: Arc::clone(&call_count),
             last_request: Arc::clone(&last_request),
             end_meeting_requests: Arc::clone(&end_meeting_requests),
+            live_modes: Mutex::new(HashMap::new()),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -308,6 +319,8 @@ impl MediaHandlerService for MediaHandlerStub {
     ) -> Result<Response<RegisterMeetingResponse>, Status> {
         let req = request.into_inner();
         let sent = req.policy_generation;
+        let req_is_empty = req.egress_streams.is_empty();
+        let meeting_id = req.meeting_id.clone();
 
         self.received_generations
             .lock()
@@ -323,6 +336,39 @@ impl MediaHandlerService for MediaHandlerStub {
             AppliedGenerationBehaviour::ReportZero => 0,
             AppliedGenerationBehaviour::EchoSent => sent,
             AppliedGenerationBehaviour::Stall(at) => at,
+            AppliedGenerationBehaviour::EchoUpTo(limit) => sent.min(limit),
+        };
+
+        // Real MH reads the echoed transport mode off its LIVE snapshot. So:
+        // - when the stub APPLIED what it was sent (accepted and echoing the
+        //   sent generation), the live snapshot is this request's: an empty
+        //   egress set — a solo participant, a handler nobody is placed on —
+        //   echoes UNSPECIFIED (also what MC declares for it), otherwise the
+        //   configured knob;
+        // - when it did NOT apply (Stall, EchoUpTo above the limit, rejected),
+        //   the live snapshot is the last one applied for this meeting, or —
+        //   if none was ever applied — the configured knob.
+        // Modelled so a multi-party component test is neither failed nor
+        // passed by a stub a real handler would never behave like.
+        let request_mode = if req_is_empty {
+            TransportMode::Unspecified
+        } else {
+            self.transport_mode
+        };
+        let applied_now = self.accept && sent != 0 && applied_generation == sent;
+        let transport_mode = {
+            let mut live = self
+                .live_modes
+                .lock()
+                .expect("MediaHandlerStub mutex poisoned");
+            if applied_now {
+                live.insert(meeting_id, request_mode);
+                request_mode
+            } else {
+                live.get(&meeting_id)
+                    .copied()
+                    .unwrap_or(self.transport_mode)
+            }
         };
 
         Ok(Response::new(RegisterMeetingResponse {
@@ -330,7 +376,7 @@ impl MediaHandlerService for MediaHandlerStub {
             applied_generation,
             handler_id: self.handler_id.clone(),
             process_start_epoch_ms: self.process_start_epoch_ms,
-            transport_mode: self.transport_mode as i32,
+            transport_mode: transport_mode as i32,
         }))
     }
 

@@ -19,8 +19,8 @@
 //!    `mh_reg_client` for verifying RegisterMeeting fanout.
 //!
 //! 3. **`mc_id` and `mc_grpc_endpoint` constructor args.** MC's accept loop
-//!    forwards these to `connection::handle_connection` so the spawned
-//!    `register_meeting_with_handlers` task can identify itself to MH; MH has
+//!    forwards these (via `MediaRoutingDeps`) to each meeting actor's
+//!    per-handler push worker so it can identify itself to MH; MH has
 //!    no equivalent. Defaulted to `"mc-test"` / `"http://mc-test:50052"`
 //!    matching the deleted `join_tests.rs:213-246` accept-loop fork.
 //!
@@ -63,6 +63,9 @@ pub struct AcceptLoopRig {
     pub addr: SocketAddr,
     /// Controller handle shared with the accept loop — tests assert actor state via this.
     pub controller_handle: Arc<MeetingControllerActorHandle>,
+    /// The generation registry the server's meetings render into — tests read
+    /// it to prove "no new render" without sleeping.
+    pub policy_generations: Arc<PolicyGenerations>,
     /// Cancellation token wired into the accept loop.
     cancel_token: CancellationToken,
     /// Handle for the spawned accept-loop task.
@@ -139,6 +142,7 @@ impl AcceptLoopRig {
         let (tempdir, cert_path, key_path) = Self::write_self_signed_pems();
 
         let cancel_token = CancellationToken::new();
+        let policy_generations = Arc::new(PolicyGenerations::new());
         let server = WebTransportServer::new(
             "127.0.0.1:0".to_string(),
             cert_path,
@@ -147,7 +151,7 @@ impl AcceptLoopRig {
             jwt_validator,
             mh_store,
             mh_reg_client,
-            Arc::new(PolicyGenerations::new()),
+            Arc::clone(&policy_generations),
             mc_id,
             mc_grpc_endpoint,
             client_media_config,
@@ -178,6 +182,7 @@ impl AcceptLoopRig {
             url,
             addr,
             controller_handle,
+            policy_generations,
             cancel_token,
             accept_loop_handle: Some(accept_loop_handle),
             _tempdir: tempdir,
