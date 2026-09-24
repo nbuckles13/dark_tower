@@ -869,7 +869,7 @@ kubectl logs deployment/gc-service -n dark-tower --tail=100 | grep "select_mc\|m
 ```
 
 **Fix:**
-1. Scale MC pods if none running
+1. If an MC instance (`mc-0` / `mc-1`) has no running pod, restore that singleton Deployment to `replicas: 1` — **MC does not scale by replicas** (extra replicas make joins fail; see `docs/runbooks/gc-incident-response.md` Scenario 3, Remediation Scenario A, for the capacity levers)
 2. Verify MC heartbeat mechanism is working
 3. Check NetworkPolicy allows GC → MC gRPC traffic (TCP:9090)
 4. Add database index on `last_heartbeat` column if query slow

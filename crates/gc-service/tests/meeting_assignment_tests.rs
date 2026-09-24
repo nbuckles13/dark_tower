@@ -490,8 +490,12 @@ async fn test_service_assign_meeting_with_mh_success(pool: PgPool) -> Result<(),
 
     assert_eq!(assignment.mc_assignment.mc_id, "mc-1");
     assert!(!assignment.mc_assignment.grpc_endpoint.is_empty());
-    assert!(!assignment.mh_selection.handlers.is_empty());
-    assert!(!assignment.mh_selection.handlers[0].mh_id.is_empty());
+    let selection = assignment
+        .mh_selection
+        .as_ref()
+        .expect("a new assignment carries the selection sent to MC");
+    assert!(!selection.handlers.is_empty());
+    assert!(!selection.handlers[0].mh_id.is_empty());
 
     Ok(())
 }
@@ -530,6 +534,14 @@ async fn test_service_assign_meeting_with_mh_reuses_healthy(
     assert_eq!(
         second.mc_assignment.mc_id, first_mc,
         "Should reuse existing healthy assignment"
+    );
+    assert!(
+        first.mh_selection.is_some(),
+        "new assignment carries the selection sent to MC"
+    );
+    assert!(
+        second.mh_selection.is_none(),
+        "reuse path performs no MH selection (R-6)"
     );
 
     Ok(())

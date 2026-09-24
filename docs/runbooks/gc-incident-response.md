@@ -201,7 +201,7 @@ curl http://localhost:8080/metrics | grep gc_db_queries_total
 
 ### Scenario 2: High Latency / Slow Responses
 
-**Alert**: `GCHighLatency`
+**Alert**: `GCHighLatency`, `GCHighJoinLatency`
 **Severity**: Critical
 **Runbook Section**: `#scenario-2-high-latency--slow-responses`
 
@@ -227,7 +227,16 @@ histogram_quantile(0.95, sum by(endpoint, le) (rate(gc_http_request_duration_sec
 histogram_quantile(0.95, sum by(operation, le) (rate(gc_db_query_duration_seconds_bucket[5m])))
 
 # 4. Check MC assignment latency (is MC assignment the bottleneck?)
+#    DILUTED since R-6: unfiltered p95 over a bimodal histogram — fast reuse joins vs
+#    slow new assignments, no separating label. A healthy p95 here does NOT rule MC
+#    assignment out as the bottleneck. Use 4b for the new-assignment path.
 histogram_quantile(0.95, sum by(le) (rate(gc_mc_assignment_duration_seconds_bucket[5m])))
+
+# 4b. New-assignment path, undiluted. Both of these are new-assignment-only, so neither
+#     is washed out by reuse joins: MH selection (R-6 made it new-assignment-only) and
+#     the assign_meeting_with_mh RPC (only ever sent on a new assignment).
+histogram_quantile(0.95, sum by(le) (rate(gc_mh_selection_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by(le) (rate(gc_grpc_mc_call_duration_seconds_bucket{method="assign_meeting_with_mh"}[5m])))
 
 # 5. Check token refresh latency (is AC the bottleneck?)
 histogram_quantile(0.95, sum by(le) (rate(gc_token_refresh_duration_seconds_bucket[5m])))
@@ -239,6 +248,8 @@ kubectl top pods -n dark-tower -l app=gc-service
 kubectl logs -n dark-tower -l app=gc-service --tail=1000 | grep -E "duration_ms|slow"
 ```
 
+Step 4b decomposes the new-assignment path rather than replacing step 4's number: MH selection and the MC RPC are its two expensive segments, and step 3's `gc_db_query_duration_seconds` covers the final atomic write. Their sum is **not** identical to `gc_mc_assignment_duration_seconds` on the new path — it excludes the candidate-MC query and retry-loop overhead — so treat 4b as "is either expensive segment slow?", not as a drop-in for step 4. Analysis: `docs/observability/metrics/gc-service.md` "Population note (R-6)".
+
 **Common Root Causes**:
 
 1. **Database Query Slow**: Unoptimized queries, missing indexes
@@ -246,8 +257,8 @@ kubectl logs -n dark-tower -l app=gc-service --tail=1000 | grep -E "duration_ms|
    - Fix: Database team investigates slow queries, adds indexes
 
 2. **MC Assignment Slow**: MC selection or gRPC calls slow
-   - Check: `gc_mc_assignment_duration_seconds` p95
-   - Fix: Scale MC pods, optimize MC selection query
+   - Check: `gc_mc_assignment_duration_seconds` p95 — diluted since R-6, see Diagnosis step 4 before trusting a healthy value
+   - Fix: see Remediation Scenario C below and Scenario 3's Remediation Scenario A. **MC does not scale by replicas** (scaling makes joins fail); the levers are `MC_MAX_MEETINGS` / `MC_MAX_PARTICIPANTS` or another MC instance. Optimize the MC selection query if the DB is the slow part.
 
 3. **Resource Contention**: Insufficient CPU/memory
    - Check: `kubectl top pods` - CPU/memory at limits
@@ -345,14 +356,19 @@ histogram_quantile(0.95, sum by(le) (rate(gc_http_request_duration_seconds_bucke
 ### Scenario 3: MC Assignment Failures
 
 **Alert**: `GCMCAssignmentFailures`, `GCMCAssignmentSlow`
-**Severity**: Critical (failures >5%) / Warning (latency >20ms)
+**Severity**: Critical (failures >5%) / Warning (latency >20ms — reliable only below ~20 mean participants per meeting; see Symptoms)
 **Runbook Section**: `#scenario-3-mc-assignment-failures`
 
 **Symptoms**:
 - MC assignment failure rate >5%
-- MC assignment p95 latency >20ms
+- MC assignment p95 latency >20ms — **reliable only below ~20 mean participants per meeting.** Since R-6 the reuse path is much faster and carries no distinguishing label, so above that size new-assignment slowness sits below the p95 cut and `GCMCAssignmentSlow` will not fire. Triage the undiluted failure-rate signals first (`GCMCAssignmentFailures`, `GCHighJoinFailureRate`). Analysis: `docs/observability/metrics/gc-service.md` "Population note (R-6)".
 - Users unable to join meetings (stuck on "Joining..." screen)
 - Logs: `MC assignment failed`, `No healthy MCs available`, `MC rejected assignment`
+
+**MH pool empty — new meetings fail, existing meetings keep joining (R-6)**:
+- **Signature**: joins into brand-new meetings fail with 503 `No media handlers available in this region`, while joins into meetings that already have a healthy MC assignment keep succeeding — same region, same moment. This partial pattern is expected, not a stranger fault: a join into an assigned meeting reuses the meeting's MC and performs no MH selection, so only a new meeting depends on the live MH pool. With a single MH per ordinal, "MH pool empty" usually means an MH rollout is in progress (see `docs/runbooks/mh-deployment.md`).
+- **Distinguishing query**: `gc_mh_selections_total{status="error"}` rising while `gc_mc_assignments_total{status="success"}` stays healthy. `gc_mh_selections_total{status="error"}` is the empty-pool case and, since R-6, can only come from a new meeting.
+- **Design, not a bug**: the reuse path deliberately waves a sticky join through without re-checking the MH pool or the per-handler stream ceiling (R-19 enforcement at GC is soft and new-meeting-only), because a meeting cannot be split across handlers in story 2 (ADR-0036 §9) — a re-check could only fail the join, never move it. Over-ceiling growth is bounded by MH admission, the hard backstop. A participant who joins a meeting whose handler is gone gets a 200 from GC but no media; the fix is restoring the MH, not anything in GC.
 
 **Diagnosis**:
 

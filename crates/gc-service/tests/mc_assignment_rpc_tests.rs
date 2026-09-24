@@ -97,8 +97,12 @@ async fn test_assign_meeting_with_mh_success(pool: PgPool) {
 
     let assignment = result.unwrap();
     assert!(!assignment.mc_assignment.mc_id.is_empty());
-    assert!(!assignment.mh_selection.handlers.is_empty());
-    assert!(!assignment.mh_selection.handlers[0].mh_id.is_empty());
+    let selection = assignment
+        .mh_selection
+        .as_ref()
+        .expect("a new assignment carries the selection sent to MC");
+    assert!(!selection.handlers.is_empty());
+    assert!(!selection.handlers[0].mh_id.is_empty());
 
     // Verify mock was called once
     assert_eq!(mock_client.call_count(), 1);
@@ -332,6 +336,11 @@ async fn test_assign_meeting_with_mh_no_mcs(pool: PgPool) {
 }
 
 /// Test assignment fails when no MHs available.
+///
+/// NEW-ASSIGNMENT branch: an empty MH pool FAILS a meeting with no assignment.
+/// Read against `test_reuse_path_skips_mh_selection_on_empty_pool`, where the same
+/// empty pool lets a sticky join into an already-assigned meeting SUCCEED (R-6).
+/// The two are not contradictory — they exercise different branches.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_assign_meeting_with_mh_no_mhs(pool: PgPool) {
     // Set up only MCs, no MHs
@@ -360,7 +369,12 @@ async fn test_assign_meeting_with_mh_no_mhs(pool: PgPool) {
     assert_eq!(mock_client.call_count(), 0);
 }
 
-/// Test existing assignment is returned without calling MC.
+/// Test existing assignment is returned without calling MC or selecting MHs.
+///
+/// One shared mock across BOTH calls, so `call_count() == 1` proves `assign_meeting`
+/// ran exactly once for the meeting (a second mock would only prove the second call
+/// made no RPC). Covers the healthy-pool reuse case; the empty-pool reuse case and
+/// its metric proof are in `test_reuse_path_skips_mh_selection_on_empty_pool`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_assign_meeting_with_mh_returns_existing(pool: PgPool) {
     // Set up MCs and MHs
@@ -369,41 +383,153 @@ async fn test_assign_meeting_with_mh_returns_existing(pool: PgPool) {
 
     let mock_client = Arc::new(MockMcClient::accepting());
 
-    // First assignment
-    let result1 = McAssignmentService::assign_meeting_with_mh(
+    // First assignment (new)
+    let assignment1 = McAssignmentService::assign_meeting_with_mh(
         &pool,
         mock_client.clone(),
         "meeting-existing",
         "us-east-1",
         "gc-test",
     )
-    .await;
-    assert!(result1.is_ok());
-    let assignment1 = result1.unwrap();
+    .await
+    .expect("first assignment should succeed");
+    assert!(
+        assignment1.mh_selection.is_some(),
+        "new assignment carries the selection sent to MC"
+    );
 
-    // Reset call count
-    let mock_client2 = Arc::new(MockMcClient::accepting());
-
-    // Second assignment for same meeting
-    let result2 = McAssignmentService::assign_meeting_with_mh(
+    // Second assignment for same meeting (reuse)
+    let assignment2 = McAssignmentService::assign_meeting_with_mh(
         &pool,
-        mock_client2.clone(),
+        mock_client.clone(),
         "meeting-existing",
         "us-east-1",
         "gc-test",
     )
-    .await;
-    assert!(result2.is_ok());
-    let assignment2 = result2.unwrap();
+    .await
+    .expect("reuse should succeed");
 
     // Should return the same MC assignment
     assert_eq!(
         assignment1.mc_assignment.mc_id,
         assignment2.mc_assignment.mc_id
     );
+    assert!(
+        assignment2.mh_selection.is_none(),
+        "reuse path performs no MH selection"
+    );
 
-    // MC client should not be called for existing assignment
-    assert_eq!(mock_client2.call_count(), 0);
+    // MC notified exactly once for the meeting, by the new assignment only
+    assert_eq!(mock_client.call_count(), 1);
+}
+
+/// Mark every MH in `region` unhealthy, leaving the MH candidate pool empty.
+///
+/// Region-scoped rather than per-id, so it cannot silently miss rows if
+/// `setup_mhs` changes its id format. Same mechanism as `make_mhs_unhealthy` in
+/// `tests/meeting_tests.rs` (shared-fixture extraction tracked in docs/TODO.md).
+async fn make_mh_pool_unhealthy(pool: &PgPool, region: &str) {
+    sqlx::query("UPDATE media_handlers SET health_status = 'unhealthy' WHERE region = $1")
+        .bind(region)
+        .execute(pool)
+        .await
+        .expect("Failed to mark MHs unhealthy");
+}
+
+/// R-6: the reuse path performs NO MH selection and does not error on an empty
+/// MH pool.
+///
+/// REUSE branch: read against `test_assign_meeting_with_mh_no_mhs`, where an empty
+/// pool FAILS a new assignment. Here the same empty pool must let a sticky join
+/// into an already-assigned meeting SUCCEED with the same MC — and the positive
+/// control at the end proves the pool really is empty (an unassigned meeting
+/// still fails), so the green reuse result is not coming from a pool that was
+/// never emptied.
+///
+/// No MH-pool or ceiling re-check on reuse is DELIBERATE (R-19 soft,
+/// new-meeting-only; ADR-0036 §9) — see the ANCHOR on the reuse branch in
+/// `src/services/mc_assignment.rs` for the full ceiling-enforcement pairing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_reuse_path_skips_mh_selection_on_empty_pool(pool: PgPool) {
+    setup_mcs(&pool, 2, "us-east-1").await;
+    setup_mhs(&pool, 2, "us-east-1").await;
+
+    let mock_client = Arc::new(MockMcClient::accepting());
+
+    // New assignment while the MH pool is healthy.
+    let first = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mock_client.clone(),
+        "meeting-sticky",
+        "us-east-1",
+        "gc-test",
+    )
+    .await
+    .expect("new assignment should succeed with a healthy MH pool");
+    assert!(first.mh_selection.is_some());
+    assert_eq!(mock_client.call_count(), 1);
+
+    // Empty the MH candidate pool.
+    make_mh_pool_unhealthy(&pool, "us-east-1").await;
+
+    // Snapshot AFTER the first assignment so its legitimate selection emit is not
+    // in the delta. `#[sqlx::test]` runs a current-thread runtime, so the
+    // thread-local recorder sees everything emitted during the awaits below.
+    let snap = MetricAssertion::snapshot();
+
+    let reused = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mock_client.clone(),
+        "meeting-sticky",
+        "us-east-1",
+        "gc-test",
+    )
+    .await
+    .expect("reuse must not depend on a live MH pool");
+
+    assert_eq!(reused.mc_assignment.mc_id, first.mc_assignment.mc_id);
+    assert!(
+        reused.mh_selection.is_none(),
+        "reuse path performs no MH selection"
+    );
+    assert_eq!(mock_client.call_count(), 1, "reuse makes no MC RPC");
+
+    // Proof by observation that no selection ran on reuse, and that the preserved
+    // `record_mc_assignment("success", None, ..)` emitted exactly once.
+    for status in ["success", "error"] {
+        snap.counter("gc_mh_selections_total")
+            .with_labels(&[("status", status)])
+            .assert_delta(0);
+    }
+    snap.counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "success"), ("rejection_reason", "none")])
+        .assert_delta(1);
+
+    // Positive control: in the SAME empty-pool state a meeting with no assignment
+    // still fails on MH selection, and no MC is called. This also proves the
+    // recorder sees selection emits (the error arm fires here).
+    let err = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mock_client.clone(),
+        "meeting-unassigned",
+        "us-east-1",
+        "gc-test",
+    )
+    .await
+    .expect_err("a new assignment must fail with an empty MH pool");
+    assert!(
+        format!("{}", err).contains("media handlers"),
+        "Error should mention media handlers: {}",
+        err
+    );
+    assert_eq!(
+        mock_client.call_count(),
+        1,
+        "no MC call when MH selection fails"
+    );
+    snap.counter("gc_mh_selections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
 }
 
 /// Test assignment with MC RPC errors retries.
@@ -493,17 +619,21 @@ async fn test_mh_selection_includes_multiple_handlers(pool: PgPool) {
 
     assert!(result.is_ok());
     let assignment = result.unwrap();
+    let selection = assignment
+        .mh_selection
+        .as_ref()
+        .expect("a new assignment carries the selection sent to MC");
 
     // Should have multiple MH handlers (since we have multiple MHs)
     assert!(
-        assignment.mh_selection.handlers.len() >= 2,
+        selection.handlers.len() >= 2,
         "Should have multiple MH handlers when multiple MHs available, got {}",
-        assignment.mh_selection.handlers.len()
+        selection.handlers.len()
     );
 
     // Handlers should be different
     assert_ne!(
-        assignment.mh_selection.handlers[0].mh_id, assignment.mh_selection.handlers[1].mh_id,
+        selection.handlers[0].mh_id, selection.handlers[1].mh_id,
         "MH handlers should be different"
     );
 }
@@ -528,14 +658,18 @@ async fn test_mh_selection_single_mh_one_handler(pool: PgPool) {
 
     assert!(result.is_ok());
     let assignment = result.unwrap();
+    let selection = assignment
+        .mh_selection
+        .as_ref()
+        .expect("a new assignment carries the selection sent to MC");
 
     // Should have exactly one MH handler
     assert_eq!(
-        assignment.mh_selection.handlers.len(),
+        selection.handlers.len(),
         1,
         "Should have exactly one MH handler with single MH"
     );
-    assert!(!assignment.mh_selection.handlers[0].mh_id.is_empty());
+    assert!(!selection.handlers[0].mh_id.is_empty());
 }
 
 /// Test concurrent assignments to the same meeting return the same result.

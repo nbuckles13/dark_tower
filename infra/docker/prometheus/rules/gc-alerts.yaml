@@ -64,6 +64,14 @@ groups:
           impact: "Slow user experience during meeting join. SLO violation."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-2-high-latency--slow-responses"
 
+      # POPULATION CAVEAT (R-6, 2026-09-24): this p95 is unfiltered and the underlying histogram
+      # is bimodal. The assignment reuse path is much faster than the new-assignment path and
+      # both emit status="success", with no label separating them. New assignments are ~1/N of
+      # joins for an N-participant meeting, so above mean meeting size ~20 they fall below the
+      # p95 cut and this rule cannot fire on new-assignment slowness. Do NOT tighten the 20ms
+      # threshold against the diluted population — that yields a rule that looks tighter and
+      # detects less. Analysis: docs/observability/metrics/gc-service.md "Population note (R-6)".
+      # Fix tracked: docs/TODO.md §Observability Debt.
       - alert: GCMCAssignmentSlow
         expr: |
           histogram_quantile(0.95,
@@ -412,6 +420,10 @@ groups:
       # INFO ALERTS - Log only, no notification
       # ====================================================================
 
+      # POPULATION CAVEAT (R-6, 2026-09-24): same dilution as GCMCAssignmentSlow —
+      # gc_meeting_join_duration_seconds mixes reuse and new-assignment joins (~1/N new) with no
+      # separating label, so this p95 is dominated by reuse joins. See the GCMCAssignmentSlow
+      # caveat above; one TODO entry covers both rules.
       - alert: GCHighJoinLatency
         expr: |
           histogram_quantile(0.95,
