@@ -133,6 +133,8 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
   const pipeline = new AudioPipeline(options);
   await pipeline.start();
   pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
+  // Receiving comes from the slot assignments, not from the send directive.
+  pipeline.setReceiveHandlers([MH_URL]);
 
   const egress = new EgressPipeline({
     metrics,

@@ -12,7 +12,7 @@
 //! The `src/` pair is reachable from here because `TokenReceiver` is a
 //! **third-crate** type (`common`), so it unifies across the rlib/`--test`
 //! boundary. A helper returning one of `mc-service`'s *own* types would not —
-//! see the note at `grpc/mh_client.rs`'s local `loopback_assignment`.
+//! see the note at `grpc/mh_client.rs`'s local `two_party_assignment`.
 //!
 //! That last difference is the one worth a single home: a `watch::Receiver`
 //! whose sender drops still yields its last value, so both spellings happen to

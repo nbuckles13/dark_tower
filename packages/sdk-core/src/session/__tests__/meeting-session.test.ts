@@ -36,6 +36,7 @@ import {
   framedJoinResponse,
   framedParticipantJoined,
   framedSendDirective,
+  framedSendDirectiveWithoutStreams,
   framedStreamAssignments,
 } from '../../signaling/__tests__/helpers.js';
 import {
@@ -1158,6 +1159,105 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
         (m) => m.message.case === 'muteRequest',
       ),
     );
+    rig.session.disconnect();
+  });
+
+  it('a directive with NO audio stream withdraws sending, so resuming rotates the key (§4/§5)', async () => {
+    // MC sends `streams: []` to a publisher nobody holds — e.g. when its last
+    // holder leaves. Ignoring that kept the stale instruction: the client kept
+    // sending into a handler with no edge for it, and never having seen "empty"
+    // it skipped the transmit-key rotation §4 requires on resume. Rotation is
+    // the observable: it happens ONLY on an empty -> non-empty transition.
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    const start = pipeline.transmitGeneration;
+
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [MEDIA_SERVERS[0]!] }));
+    await waitFor(() => pipeline.transmitGeneration === start + 1n);
+
+    // The last holder leaves: no audio stream at all. Then a new holder arrives.
+    mc.simulateServerMessage(0, framedSendDirectiveWithoutStreams());
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [MEDIA_SERVERS[0]!] }));
+    await waitFor(() => pipeline.transmitGeneration === start + 2n);
+    expect(pipeline.transmitGeneration).toBe(start + 2n);
+    rig.session.disconnect();
+  });
+
+  it('a first directive with NO audio stream withdraws nothing and invents nothing', async () => {
+    // A solo participant's first directive: there is no earlier instruction to
+    // withdraw, so nothing is applied — no placeholder stream number or bitrate.
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const applied = vi.spyOn(pipeline, 'setSendDirective');
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    // A trailing assignment on the same ordered stream is the drain point: once
+    // it reaches the pipeline, the directive before it has been handled.
+    const drained = vi.spyOn(pipeline, 'setReceiveHandlers');
+    mc.simulateServerMessage(0, framedSendDirectiveWithoutStreams());
+    mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, slotState: SlotState.FEWER_SOURCES_THAN_SLOTS }),
+    );
+    await waitFor(() => drained.mock.calls.length === 1);
+    expect(applied).not.toHaveBeenCalled();
+    rig.session.disconnect();
+  });
+
+  it('RECEIVES from the StreamAssignments handler with NO send directive at all', async () => {
+    // The wiring the pipeline tests cannot see: `startMedia` must bridge
+    // `streamAssignments` into the pipeline's receive path. A participant
+    // nobody holds gets an empty (or no) send target and must still hear the
+    // slots it holds.
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({
+        slotId: 0,
+        senderId: 300,
+        mediaHandlerUrl: MEDIA_SERVERS[0]!,
+        slotState: SlotState.ACTIVE,
+      }),
+    );
+    // Deliver datagrams until one lands: the assignment is applied
+    // asynchronously, and a datagram sent before it is (correctly) not read.
+    const mh = rig.mocks.get(MEDIA_SERVERS[0]!)!;
+    await waitFor(() => {
+      mh.simulateIncomingDatagram(Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+      return pipeline.frameCounts.framesReceived > 0;
+    });
+    expect(pipeline.frameCounts.framesReceived).toBeGreaterThan(0);
+    // The structural twin of the solo test's `locked === false`.
+    expect(mh.datagrams.readable.locked).toBe(true);
+    rig.session.disconnect();
+  });
+
+  it('opens no receive path while every assigned slot is empty (solo participant)', async () => {
+    // Negative twin of the test above, on the same rig: an EMPTY handler url is
+    // "no source assigned", so nothing is read.
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    const applied = vi.spyOn(pipeline, 'setReceiveHandlers');
+    mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, slotState: SlotState.FEWER_SOURCES_THAN_SLOTS }),
+    );
+    // DRAIN POINT, not a timer: the assignment reached the PIPELINE (stronger
+    // than the session event, which fires before the pipeline applies it), with
+    // the empty "no source assigned" url. That call is synchronous, so once it
+    // has returned there is nothing left in flight to wait for.
+    await waitFor(() => applied.mock.calls.length === 1);
+    expect(applied.mock.calls[0]?.[0]).toEqual(['']);
+
+    const mh = rig.mocks.get(MEDIA_SERVERS[0]!)!;
+    mh.simulateIncomingDatagram(Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    // STRUCTURE: no reader was ever taken on the handler's datagram stream, so
+    // no read can be pending. The zero count is then a result, not a race.
+    expect(mh.datagrams.readable.locked).toBe(false);
+    expect(pipeline.frameCounts.framesReceived).toBe(0);
     rig.session.disconnect();
   });
 });

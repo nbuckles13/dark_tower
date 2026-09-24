@@ -11,17 +11,12 @@ use crate::actors::{
     BoundedMhStatus, MeetingActorHandle, MeetingControllerActorHandle, MhState,
     ParticipantActorHandle,
 };
+use crate::actors::{JoinMedia, MediaRoutingDeps};
 use crate::auth::McJwtValidator;
 use crate::errors::McError;
-use crate::grpc::{MeetingProgramming, MhRegistrationClient};
-use crate::media_routing::{
-    compute_assignment, HandlerId, MeetingAssignment, MeetingRoutingInput, PolicyGenerations,
-    PushDisposition, RoutingParticipant,
-};
+use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
-    build_send_directive, build_stream_assignments, CapabilityOutcome, DirectiveOutcome,
-    HandlerUrls, MediaStreamPolicy, MuteOutcome, PlannedAudioSlot, ReceiveCapabilityDeclaration,
-    SlotId, SourceMuteView,
+    CapabilityOutcome, DirectiveOutcome, MuteOutcome, ReceiveCapabilityDeclaration,
 };
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
@@ -40,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, warn, Instrument};
+use tracing::{debug, info, instrument, warn};
 use wtransport::endpoint::IncomingSession;
 use wtransport::error::ConnectionError;
 use wtransport::stream::{RecvStream, SendStream};
@@ -80,12 +75,6 @@ const OUTBOUND_CHANNEL_BUFFER: usize = 100;
 /// on a browser tab-close), so the connection handler can't hang. If it elapses,
 /// the cause fails safe to `ConnectionLost` (grace-preserving).
 const CLOSE_CAUSE_RESOLVE_BOUND: Duration = Duration::from_secs(2);
-
-/// Maximum number of attempts for RegisterMeeting RPC per MH.
-const MAX_REGISTER_ATTEMPTS: u32 = 3;
-
-/// Backoff delays between RegisterMeeting retry attempts.
-const REGISTER_BACKOFF_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 
 /// Truncate `s` to at most `max_bytes`, snapping DOWN to a UTF-8 char boundary
 /// so a multi-byte codepoint is never split (R-60 security — bounds
@@ -184,19 +173,12 @@ fn map_connection_state(state: i32) -> MhState {
 /// validate JWT, fire JoinConnection to controller, then hand off to the
 /// connection run loop which owns the streams until disconnect.
 #[instrument(skip_all, name = "mc.webtransport.connection", fields(connection_id = tracing::field::Empty))]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Connection handler wiring; all params are distinct dependencies"
-)]
 pub async fn handle_connection(
     incoming: IncomingSession,
     controller_handle: Arc<MeetingControllerActorHandle>,
     jwt_validator: Arc<McJwtValidator>,
     redis_client: Arc<dyn MhAssignmentStore>,
-    mh_client: Arc<dyn MhRegistrationClient>,
-    policy_generations: Arc<PolicyGenerations>,
-    mc_id: String,
-    mc_grpc_endpoint: String,
+    media_deps: Arc<MediaRoutingDeps>,
     client_media_config: crate::media_signaling::ClientMediaConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), McError> {
@@ -480,6 +462,59 @@ pub async fn handle_connection(
         "absent"
     });
 
+    // Step 6c: resolve the live meeting BEFORE reading its handler assignment,
+    // so a join into a meeting this MC does not host reports NOT_FOUND rather
+    // than a missing assignment. The handle is kept for post-join signalling.
+    let meeting_handle = match controller_handle
+        .get_meeting_handle(meeting_id.clone())
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                error = %e,
+                "Meeting not hosted on this MC"
+            );
+            let _ = send_error(&mut send_stream, e.error_code(), &e.client_message()).await;
+            metrics::record_session_join(
+                "failure",
+                Some(e.error_type_label()),
+                join_start.elapsed(),
+            );
+            return Err(e);
+        }
+    };
+
+    // Step 6d: read the meeting's handler assignment BEFORE admission (R-6).
+    //
+    // A meeting without media handlers is not useful, and placement (ADR-0036
+    // §9) is decided inside the actor's join turn, so the handler set must be
+    // in hand before the join rather than read afterwards. A missing or
+    // malformed assignment now fails the join before any admission state
+    // exists — nothing to unwind.
+    let handlers = match read_meeting_handlers(redis_client.as_ref(), &meeting_id).await {
+        Ok(handlers) => handlers,
+        Err(e) => {
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                error = %e,
+                "No usable MH assignment for this meeting — cannot join without media handlers"
+            );
+            let _ = send_error(&mut send_stream, e.error_code(), &e.client_message()).await;
+            metrics::record_session_join(
+                "failure",
+                Some(e.error_type_label()),
+                join_start.elapsed(),
+            );
+            return Err(e);
+        }
+    };
+
     // Step 7: Create outbound channel BEFORE join so ParticipantActor is spawned with stream wired
     let is_host = claims.role == MeetingRole::Host;
     let participant_id = uuid::Uuid::new_v4().to_string();
@@ -503,6 +538,10 @@ pub async fn handle_connection(
             is_host,
             identity_public_key,
             outbound_tx,
+            JoinMedia {
+                deps: Arc::clone(&media_deps),
+                handlers,
+            },
         )
         .await
     {
@@ -579,28 +618,8 @@ pub async fn handle_connection(
         "Join succeeded"
     );
 
-    // Step 8: Build and send JoinResponse (reads MH assignment data from Redis)
-    let (join_response, mh_data) =
-        match build_join_response(&join_result, redis_client.as_ref(), &meeting_id).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                warn!(
-                    target: "mc.webtransport.connection",
-                    connection_id = %connection_id,
-                    meeting_id = %meeting_id,
-                    error = %e,
-                    "Failed to build JoinResponse"
-                );
-                join_result.participant_handle.cancel();
-                let _ = send_error(&mut send_stream, e.error_code(), &e.client_message()).await;
-                metrics::record_session_join(
-                    "failure",
-                    Some(e.error_type_label()),
-                    join_start.elapsed(),
-                );
-                return Err(e);
-            }
-        };
+    // Step 8: Build and send JoinResponse.
+    let join_response = build_join_response(&join_result);
     // R-57: symmetric outbound injection — carry the current server-side trace
     // context back to the client on the JoinResponse (bounded W3C IDs only).
     let (trace_parent, trace_state) = inject_current_context();
@@ -631,138 +650,12 @@ pub async fn handle_connection(
         "JoinResponse sent"
     );
 
-    // Step 9: [ASYNC, first participant only] Program each assigned MH with the
-    // meeting's forwarding policy (R-12, ADR-0036 §7/§8/§9).
-    //
-    // The trigger is UNCHANGED and that is deliberate: one push on assignment,
-    // then confirm. Structural re-push on every join/leave, the periodic
-    // re-assert cadence, the connectivity-loss trigger and dispatch jitter are
-    // the handler-restart story and are NOT here — they land additively on
-    // `PolicyGenerations`.
-    let is_first_participant = join_result.participants.is_empty();
-    if is_first_participant {
-        debug!(
-            target: "mc.webtransport.connection",
-            connection_id = %connection_id,
-            meeting_id = %meeting_id,
-            "First participant joined — spawning async RegisterMeeting"
-        );
-
-        // Compute the assignment BEFORE the spawn, so a malformed one fails on
-        // the join path where it can be logged against this connection.
-        match build_routing_input(&join_result, &mh_data) {
-            Ok(routing_input) => match compute_assignment(&routing_input) {
-                Ok(assignment) => {
-                    // Cloned for the spawned task: the caller still needs
-                    // `mh_data` below to resolve this connection's handler urls.
-                    let reg_mh_data = mh_data.clone();
-                    let reg_mh_client = Arc::clone(&mh_client);
-                    let reg_generations = Arc::clone(&policy_generations);
-                    let reg_meeting_id = meeting_id.clone();
-                    let reg_mc_id = mc_id.clone();
-                    let reg_mc_grpc_endpoint = mc_grpc_endpoint.clone();
-                    let reg_cancel_token = cancel_token.child_token();
-                    let span = tracing::info_span!(
-                        target: "mc.register_meeting.trigger",
-                        "register_meeting_trigger",
-                        meeting_id = %meeting_id,
-                    );
-                    tokio::spawn(
-                        async move {
-                            register_meeting_with_handlers(
-                                reg_mh_client.as_ref(),
-                                &reg_mh_data,
-                                &assignment,
-                                reg_generations.as_ref(),
-                                &reg_meeting_id,
-                                &reg_mc_id,
-                                &reg_mc_grpc_endpoint,
-                                &reg_cancel_token,
-                            )
-                            .await;
-                        }
-                        .instrument(span),
-                    );
-                }
-                Err(e) => {
-                    // Fail loud: no push at all is better than pushing a policy
-                    // MH will reject whole, and it must not be silent.
-                    error!(
-                        target: "mc.register_meeting.trigger",
-                        connection_id = %connection_id,
-                        meeting_id = %meeting_id,
-                        reason = e.label(),
-                        error = %e,
-                        "Forwarding assignment could not be computed; MH not programmed"
-                    );
-                }
-            },
-            Err(e) => {
-                error!(
-                    target: "mc.register_meeting.trigger",
-                    connection_id = %connection_id,
-                    meeting_id = %meeting_id,
-                    error = %e,
-                    "Routing input could not be built; MH not programmed"
-                );
-            }
-        }
-    } else {
-        debug!(
-            target: "mc.webtransport.connection",
-            connection_id = %connection_id,
-            meeting_id = %meeting_id,
-            "Not first participant — skipping RegisterMeeting"
-        );
-    }
-
-    // Step 9b: Resolve the per-connection media-signalling context (ADR-0036
-    // §5, §6).
-    //
-    // Everything the receive-capability validation path needs is resolved HERE,
-    // once, so that path never touches the meeting actor: the client-facing
-    // handler urls (server-derived, from the Redis assignment — never from a
-    // client's `MediaConnectionUpdate`) and the audio slot MC's forwarding
-    // assignment routes this subscriber into.
-    //
-    // The assignment is computed for EVERY connection, not just the first
-    // participant's. It is a pure function with no I/O and no actor hop, and
-    // reading the planned slot out of its output is what keeps
-    // `compute_assignment` the single producer of "which slot do I route into"
-    // rather than having MC reconstruct it from `MAIN_AUDIO_SLOT_ID` separately.
-    // The MH push remains first-participant-only and is unchanged.
-    let media_context = build_media_signaling_context(
-        &controller_handle,
-        &join_result,
-        &mh_data,
-        &meeting_id,
-        client_media_config,
-    )
-    .await;
-    let mut media_context = match media_context {
-        Ok(context) => Some(context),
-        Err(outcome) => {
-            // COUNTED, not merely warned. This is the one failure that silences
-            // a client for its entire session, so it is the last place the
-            // "every reason MC did not COMPOSE a directive lands on one counter"
-            // claim may be allowed to leak — a WARN alone would make it visible
-            // only to whoever happens to read the logs.
-            //
-            // Loud once, here, where it can be attributed to this connection —
-            // and NOT re-logged per client message. The session stays usable:
-            // the client simply is never directed to send.
-            metrics::record_send_directive(outcome);
-            warn!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                meeting_id = %meeting_id,
-                outcome = outcome.label(),
-                "Media signalling context unavailable; this connection will not receive a send \
-                 directive or slot assignments"
-            );
-            None
-        }
-    };
+    // Step 9: The per-connection media-signalling context (ADR-0036 §5, §6):
+    // the live meeting handle plus the per-connection bounds. The MH push and
+    // every client view are the MEETING ACTOR's work; this connection only
+    // validates, bounds and forwards what its client says.
+    let mut media_context =
+        media_signaling_context(meeting_handle, &join_result, client_media_config);
 
     // Step 10: Run bridge loop — forward ParticipantActor updates to client
     // outbound_tx was passed through the join flow and is now owned by ParticipantActor.
@@ -833,7 +726,7 @@ async fn run_bridge_loop(
     connection: &Connection,
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
-    media: &mut Option<MediaSignalingContext>,
+    media: &mut MediaSignalingContext,
 ) -> DisconnectCause {
     loop {
         tokio::select! {
@@ -895,30 +788,13 @@ async fn run_bridge_loop(
             result = read_framed_message(recv_stream) => {
                 match result {
                     Ok(data) => {
-                        // Media signalling needs the per-connection context
-                        // resolved at join. If it could not be built, the
-                        // connection stays healthy and every other post-join
-                        // message keeps working — the failure was already logged
-                        // loudly at join and must not be re-logged per message.
-                        match media.as_mut() {
-                            Some(media) => {
-                                handle_client_message(
-                                    &data,
-                                    connection_id,
-                                    participant_handle,
-                                    media,
-                                )
-                                .await;
-                            }
-                            None => {
-                                handle_client_message_without_media(
-                                    &data,
-                                    connection_id,
-                                    participant_handle,
-                                )
-                                .await;
-                            }
-                        }
+                        handle_client_message(
+                            &data,
+                            connection_id,
+                            participant_handle,
+                            media,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         // The client's recv stream ended. Resolve the authoritative
@@ -945,23 +821,23 @@ async fn run_bridge_loop(
 /// - `MediaConnectionUpdate` (R-60): records per-MH state on the participant
 ///   actor under its own reparented child span (see
 ///   [`handle_media_connection_update`]).
-/// - `ReceiveCapability` (ADR-0036 §6): validates the declaration, then emits a
-///   send directive and the slot assignments composed from one meeting-state
-///   snapshot.
+/// - `ReceiveCapability` (ADR-0036 §6): validates the declaration and, once
+///   accepted, registers it with the meeting actor, which re-renders, re-pushes
+///   and emits the send directive and slot assignments.
 /// - `MuteRequest` (ADR-0036 §5): records the reported client mute on the
-///   meeting actor and re-conveys slot state. **Never touches the send
-///   directive** — that invariant is enforced by the module boundary in
+///   meeting actor, which re-emits the changed slot view to the subscribers
+///   holding this source. **Never touches the send directive** — that
+///   invariant is enforced by the module boundary in
 ///   `media_signaling::directive`, which has no path to mute state at all.
-/// - `ServerMuteRequest`: consumed as a rename of the former host-mute message
-///   with NO behaviour change. Enforcement is at MH ingress and is story 2.
-/// - All other messages: Ignored (logged at debug level).
+/// - All other messages, INCLUDING `ServerMuteRequest` (no dispatch arm exists
+///   yet; host-only server mute is story-2 task 12): ignored, logged at debug.
 ///
 /// # A client that never declares is never told to send
 ///
-/// Directive emission is triggered by the capability declaration, not by the
-/// join, and that is contractual rather than incidental — see the
-/// `media_signaling` module doc. Such a connection stays healthy: no directive,
-/// no assignments, no error, and every other post-join message keeps working.
+/// The meeting actor emits a participant's view only once it has declared a
+/// receive capability — see the `media_signaling` module doc. Such a connection
+/// stays healthy: no directive, no assignments, no error, and every other
+/// post-join message keeps working.
 async fn handle_client_message(
     data: &[u8],
     connection_id: &str,
@@ -1004,7 +880,7 @@ async fn handle_client_message(
             .await;
         }
         Some(client_message::Message::MuteRequest(request)) => {
-            handle_mute_request(&request, connection_id, participant_handle, media).await;
+            handle_mute_request(&request, connection_id, media).await;
         }
         Some(_) => {
             debug!(
@@ -1210,166 +1086,79 @@ impl ClientWorkLimiter {
 /// `message_kind` for the rejection `ErrorMessage` on the capability path.
 const SIGNALING_KIND_CAPABILITY_REJECTION: &str = "capability_rejection";
 
-/// `message_kind` for the ADR-0036 §5 send directive.
-const SIGNALING_KIND_SEND_DIRECTIVE: &str = "send_directive";
-
-/// `message_kind` for the ADR-0036 §6 slot assignments.
-const SIGNALING_KIND_STREAM_ASSIGNMENTS: &str = "stream_assignments";
-
 /// Per-connection state for the ADR-0036 §5/§6 client-facing media signalling.
 ///
 /// Owned by the single-threaded bridge loop, so no lock: every field is read and
 /// written from one task.
 ///
-/// # Every rejection is decidable from this struct alone
+/// # What lives here, and what does not
 ///
-/// [`Self::planned_audio_slot`] and [`Self::handler_urls`] are resolved ONCE, at
-/// join, from the same `compute_assignment` output the MC→MH control plane is
-/// programmed from. That is what lets the whole receive-capability validation
-/// path run without touching the meeting actor — a client looping unservable
-/// declarations cannot drive an O(N) roster clone per message through the shared
-/// mailbox, and only *accepted* declarations reach `get_state()`, bounded by
-/// [`Self::declaration_budget`].
+/// Only the CLIENT-DRIVEN bounds and short-circuits live here — the declaration
+/// budget, the identical-redeclaration and identical-mute short-circuits, the
+/// mute rate limit and the rejection-reply limit. Every rejection is decided
+/// from this struct alone, so a client looping malformed declarations cannot
+/// drive work through the shared meeting actor's mailbox.
 ///
-/// Caching is sound because the values can only change if the pushed forwarding
-/// policy changes, and the only trigger for that in this story is the
-/// first-participant join, which precedes every post-join dispatch. The
-/// capability-triggered re-push story retires this cache.
+/// Routing state does NOT live here any more. Story 1 cached the handler set and
+/// the "planned" audio slot per connection; both were sound only while MC had
+/// no per-participant placement and pushed once at join. Since story 2 the
+/// meeting actor holds placement, slot demand and slot state, and composes every
+/// participant's view itself (including views changed by SOMEONE ELSE's join,
+/// leave, declaration or mute), so there is no per-connection copy left to go
+/// stale.
 ///
-/// # TWO client-driven paths reach `get_state()`, and BOTH are bounded
+/// # Client-driven paths into the actor, each bounded
 ///
-/// Naming both, because the bound is the security property and a third caller
-/// added without one would reinstate the amplification this struct exists to
-/// prevent:
-///
-/// - **capability** — only *accepted* declarations reach it, bounded per
-///   connection by [`Self::declaration_budget`]; every rejection is decided from
-///   this struct alone.
+/// - **capability** — only *accepted* declarations reach the actor, bounded per
+///   connection by [`Self::declaration_budget`].
 /// - **client mute** — bounded by [`Self::mute_limiter`], a RATE limit rather
-///   than a budget, because mute is a repeatable steady-state user action and a
-///   cumulative budget would permanently deny it. Layered on two
-///   short-circuits that cost nothing: an identical repeat never reaches the
-///   actor, and a video-only change never reaches the recomposition.
+///   than a budget; an identical repeat never reaches the actor.
 ///
-/// **If you add a third caller of `compose_and_emit`, it needs its own bound** —
-/// and see `media_signaling`'s module doc for choosing which KIND of bound.
+/// The actor's own re-emit fan-out is bounded per MEETING, per actor turn
+/// (`actors::meeting_media::SLOT_VIEW_FLUSH_BATCH`) — see `media_signaling`'s
+/// module doc for why that path needs a third kind of bound.
 struct MediaSignalingContext {
     /// Live handle to the meeting actor, taken once at join.
     meeting_handle: MeetingActorHandle,
-    /// This connection's participant id, for the self-mute report.
+    /// This connection's participant id.
     participant_id: String,
-    /// This connection's own sender handle.
-    sender_id: crate::media_admission::SenderId,
-    /// Server-derived client-facing handler urls. NEVER sourced from a client's
-    /// `MediaConnectionUpdate` — see [`HandlerUrls`].
-    handler_urls: HandlerUrls,
-    /// Handlers assigned to this meeting, for rebuilding the routing input.
-    ///
-    /// # A per-connection cache used as a MEETING-WIDE fact
-    ///
-    /// Unlike [`Self::handler_urls`] and [`Self::planned_audio_slot`], which are
-    /// this subscriber's own, this list is applied to EVERY participant on the
-    /// roster when the routing input is rebuilt. That is sound only because the
-    /// handler set is currently a property of the meeting rather than of a
-    /// participant: it is read from the meeting's `MhAssignmentData`, and **MC
-    /// has no per-participant placement input** — nothing on the roster records
-    /// which handler a given participant reached — so every participant is
-    /// described with the meeting's full handler set. That is the same premise
-    /// `routing_input_for` fills in one place.
-    ///
-    /// **The premise is about the routing INPUT, not about steering.** Since
-    /// story task 25 the client does not pick a handler: MC directs it to the one
-    /// `compute_assignment` placed its edges on (ADR-0036 §5). Do not read the
-    /// full-list fill as a surviving `connectAll()` assumption — a client's
-    /// transport bootstrap set and the handler MC directs it to SEND on are two
-    /// different things, and only the second is a routing decision.
-    ///
-    /// **It stops being sound the moment per-participant handler placement
-    /// lands** — participants on different handlers would all be described with
-    /// this connection's set, and the composed assignment would name handlers a
-    /// source is not actually on. The fix then is to carry membership on the
-    /// roster snapshot instead of caching it here; `routing_input_for` is the
-    /// single site that would consume it.
-    ///
-    /// Also stale if a meeting's handler assignment changes mid-session, which
-    /// nothing in this story does — the same soundness condition as
-    /// [`Self::planned_audio_slot`], retired by the same re-push story.
-    handlers: Vec<HandlerId>,
-    /// The audio slot MC's assignment routes this subscriber's audio into.
-    planned_audio_slot: PlannedAudioSlot,
-    /// The stream-number to media-kind/encoding table MC directs from.
-    stream_policy: MediaStreamPolicy,
     /// Configured cap on declared slots per declaration.
     max_receive_slots: usize,
     /// Remaining budget of ACCEPTED declarations on this connection.
     declaration_budget: u32,
-    /// The last accepted declaration, if any.
+    /// The last declaration the meeting actor ACCEPTED, if any.
     ///
     /// Doubles as the identical-redeclaration short-circuit: an unchanged
-    /// declaration is answered without a meeting-state read.
+    /// declaration is answered without an actor hop.
     declaration: Option<ReceiveCapabilityDeclaration>,
     /// The last client-mute pair this connection reported.
     ///
-    /// The mute-path counterpart of the identical-redeclaration short-circuit,
-    /// and it exists for the same reason: `MuteRequest` is otherwise the
-    /// cheapest way to drive an actor round trip plus an O(N) roster clone plus
-    /// an assignment computation, from a ~4-byte message, unbounded — because
-    /// the declaration budget charges only on the capability path.
+    /// The mute-path counterpart of the identical-redeclaration short-circuit:
+    /// `MuteRequest` is otherwise the cheapest way to drive an actor hop from a
+    /// ~4-byte message.
     ///
     /// SOUND because `audio_self_muted`/`video_self_muted` have exactly ONE
     /// writer in the tree (`MeetingActor::handle_self_mute`); `handle_server_mute`
-    /// writes only the `*_server_muted` fields. So a connection-local cache of
-    /// what this client last *reported* cannot drift from actor state.
-    ///
-    /// Behaviour-preserving: a genuine mute→unmute→mute cycle changes the pair
-    /// every time and passes straight through, so R-2's instantaneous unmute is
-    /// untouched. Only true no-ops are dropped. `None` at join, so the first
+    /// writes only the `*_server_muted` fields. `None` at join, so the first
     /// report always passes.
     last_reported_mute: Option<(bool, bool)>,
-    /// Bounds client-driven mute work.
-    ///
-    /// Mute is the only repeatable client-driven path that puts work on the
-    /// SHARED meeting actor's mailbox — one `GetState` roster snapshot per
-    /// composition. The O(N) awaited `broadcast_update` this bound was
-    /// originally sized against was removed by S-2 (`MuteChanged` had no
-    /// consumer), so the meeting-wide blast radius is now a queue slot rather
-    /// than head-of-line blocking, and the dominant remaining cost is the
-    /// per-connection composition. The bound is still required — it is still
-    /// unbounded client-driven work — but it is no longer a meeting-wide
-    /// contention control, and `rate_limited` must not be read as one.
+    /// Bounds client-driven mute work (a RATE limit: mute is a repeatable
+    /// steady-state user action, and a cumulative budget would permanently deny
+    /// it).
     mute_limiter: ClientWorkLimiter,
 
     /// Bounds the rejection RESPONSE, not the counting (ADR-0036 §6).
     ///
     /// A rejected declaration is ~12 bytes inbound and provokes a ~120-byte
-    /// `ErrorMessage` out (the static text plus a 55-byte W3C `traceparent`),
-    /// through a `ServerMessage` clone, a context injection, an encode, an
-    /// awaited participant-mailbox hop and a QUIC stream write — roughly 10x
-    /// egress amplification at 1:1 with inbound, and it shares the 200-slot
-    /// participant mailbox with roster broadcasts, so a flooding client can
-    /// drop its OWN `ParticipantJoined`/`Left` updates.
-    ///
-    /// The counter and the one-shot WARN are deliberately OUTSIDE this bound:
-    /// rejections stay fully observable however fast they arrive, and only the
-    /// reply is rationed. Rejections are also deliberately not budget-charged —
-    /// a budget here would permanently deny, which is the same objection that
-    /// ruled out a cumulative budget for mute.
-    ///
-    /// NOT one-shot per connection: a legitimate client's second rejection is
-    /// usually a genuinely different one it needs to see in order to converge.
+    /// `ErrorMessage` out, sharing the participant mailbox with roster
+    /// broadcasts. The counter and the one-shot WARN are deliberately OUTSIDE
+    /// this bound: rejections stay fully observable however fast they arrive,
+    /// and only the reply is rationed.
     rejection_reply_limiter: ClientWorkLimiter,
     /// Whether the mute rate limit has already been logged on this connection.
-    ///
-    /// Same one-shot discipline as [`Self::rejection_logged`], and for the same
-    /// reason: the condition is client-driven, so a line per message is a
-    /// log-amplification vector and the counter is the complete record.
     mute_rate_limit_logged: bool,
     /// Whether a capability rejection has already been logged on this
-    /// connection.
-    ///
-    /// Rejections are ALWAYS counted; the WARN fires once. A per-message log on
-    /// a client-driven path is a log-amplification vector, and the second
-    /// identical line tells an operator nothing the counter does not.
+    /// connection. Rejections are ALWAYS counted; the WARN fires once.
     rejection_logged: bool,
 
     /// One-shot bound on the rejection-reply-suppressed WARN.
@@ -1394,32 +1183,12 @@ impl MediaSignalingContext {
     }
 }
 
-/// Resolve the audio slot MC's forwarding assignment routes `subscriber` into.
-///
-/// Read out of the assignment output rather than reconstructed from
-/// `MAIN_AUDIO_SLOT_ID`, so MC keeps exactly one answer to "which slot do I route
-/// into" — the assignment computation is the sole producer, here as on the MH
-/// control plane.
-fn planned_audio_slot_for(
-    assignment: &MeetingAssignment,
-    subscriber: crate::media_admission::SenderId,
-) -> Option<SlotId> {
-    assignment
-        .per_handler
-        .values()
-        .flat_map(|h| h.egress_streams.iter())
-        .find(|plan| plan.subscriber == subscriber)
-        .map(|plan| SlotId::from_u16(plan.slot_id))
-}
-
 /// Handle a post-join `ReceiveCapability` (ADR-0036 §6).
 ///
-/// Validate, then compose and emit the send directive and the slot assignments
-/// from ONE meeting-state snapshot — which is what keeps the directive's target
-/// set and the assignments' sources from disagreeing, and costs one actor round
-/// trip rather than two.
-///
-/// Every rejection short-circuits before the snapshot is read.
+/// Validate (every rejection decided here, without touching the actor), then
+/// register the accepted declaration with the meeting actor — the source of
+/// truth for slot demand — which re-renders, re-pushes and emits the send
+/// directive and slot assignments to this and every other affected participant.
 #[instrument(
     target = "mc.webtransport.connection",
     name = "mc.receive_capability",
@@ -1436,11 +1205,14 @@ async fn handle_receive_capability(
 ) {
     reparent_current_span(trace_parent, trace_state);
 
+    // The slot cap is checked HERE, against `media.max_receive_slots` — the
+    // same `ClientMediaConfig::max_receive_slots` field `main.rs` publishes as
+    // `mc_media_receive_slot_cap`. Over the cap is rejected whole and counted
+    // as `slot_count_over_cap` (R-1: loud, never one silent participant).
     let declaration = match ReceiveCapabilityDeclaration::parse(
         capability,
         media.max_receive_slots,
         media.budget_remaining(),
-        media.planned_audio_slot,
     ) {
         Ok(declaration) => declaration,
         Err(outcome) => {
@@ -1449,43 +1221,42 @@ async fn handle_receive_capability(
         }
     };
 
-    // Identical re-declaration: MC does NO work and sends NOTHING — it returns
-    // before `compose_and_emit`, before the meeting-state read, and charges no
-    // budget. Recorded under its own outcome rather than as `Accepted`, because
-    // `accepted` means "declarations MC acted on" and is the denominator for any
-    // rejection ratio; this arm is client-inflatable at near-zero server cost
-    // and must never inflate that denominator.
-    //
-    // No log line: this is a client-driven path, so one line per message is a
-    // log-amplification vector, and the counter is the complete record. Same
-    // reasoning as the one-shot rejection WARN.
+    // Identical re-declaration: MC does NO work and sends NOTHING — no actor
+    // hop, no budget charge. Recorded under its own outcome rather than as
+    // `Accepted`, because `accepted` means "declarations MC acted on" and is the
+    // denominator for any rejection ratio; this arm is client-inflatable at
+    // near-zero server cost. No log line: one per message would be a
+    // log-amplification vector, and the counter is the complete record.
     if media.declaration.as_ref() == Some(&declaration) {
         metrics::record_receive_capability(CapabilityOutcome::AcceptedUnchanged);
         return;
     }
 
+    // Charged on every accepted declaration — including one the actor then
+    // fails to register — which is what keeps retries bounded.
     media.charge_budget();
     metrics::record_receive_capability(CapabilityOutcome::Accepted);
 
-    // ARM the identical-redeclaration short-circuit only if the composition
-    // actually delivered. Same ordering discipline as `last_reported_mute`
-    // below, and for a sharper reason.
-    //
-    // Arming it first and then failing to compose leaves the connection
-    // PERMANENTLY DARK: the client's natural recovery is to re-send the same
-    // declaration, that now matches the stored value, and it is answered
-    // `accepted_unchanged` — no directive, no assignments, no error, and the
-    // rejection WARN is one-shot so nothing is logged either. Only a full
-    // reconnect escapes. Restoring the previous declaration on failure makes the
-    // retry work.
-    //
-    // The budget is deliberately NOT refunded. Charging on every accepted
-    // declaration — including ones whose composition failed — is what keeps
-    // retries bounded, so this stays a retryable path rather than an unbounded
-    // one.
-    let previous = media.declaration.replace(declaration);
-    if !compose_and_emit(connection_id, participant_handle, media, true).await {
-        media.declaration = previous;
+    // ARM the identical-redeclaration short-circuit only once the actor holds
+    // the declaration. Arming it first and then failing would leave the
+    // connection PERMANENTLY DARK: the client's natural recovery — re-sending
+    // the same declaration — would be answered `accepted_unchanged` forever.
+    match media
+        .meeting_handle
+        .register_receive_capability(media.participant_id.clone(), declaration.clone())
+        .await
+    {
+        Ok(()) => media.declaration = Some(declaration),
+        Err(e) => {
+            metrics::record_send_directive(DirectiveOutcome::MeetingStateUnavailable);
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                error = %e,
+                "Meeting actor did not register the receive capability; no media signalling \
+                 will be emitted until the client re-declares"
+            );
+        }
     }
 }
 
@@ -1505,32 +1276,13 @@ async fn reject_capability(
 
     if !media.rejection_logged {
         media.rejection_logged = true;
-        if outcome == CapabilityOutcome::SlotIdNotPlanned {
-            // Not a client defect. The declaration is well-formed and the wire
-            // contract permits it: MH stamps the relay-region stream id from the
-            // policy pushed at first-participant join, before this client could
-            // declare, so MC cannot address a slot it did not plan. Named
-            // explicitly because the bare token reads as "bad client" and sends
-            // an operator into the SDK.
-            warn!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                outcome = outcome.label(),
-                "Rejecting receive capability: the declared audio slot is not the one MC's \
-                 forwarding assignment routes this subscriber into. This is an MC limitation, \
-                 not a client defect — the join-time policy push fixes the egress slot id \
-                 before a client can declare. Further rejections on this connection are \
-                 counted, not logged."
-            );
-        } else {
-            warn!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                outcome = outcome.label(),
-                "Rejecting receive capability declaration. Further rejections on this \
-                 connection are counted, not logged."
-            );
-        }
+        warn!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            outcome = outcome.label(),
+            "Rejecting receive capability declaration. Further rejections on this connection \
+             are counted, not logged."
+        );
     }
 
     // Bound the REPLY only. The counter above already fired and the WARN has
@@ -1575,40 +1327,35 @@ async fn reject_capability(
 
 /// Handle a post-join `MuteRequest` (ADR-0036 §5 client mute).
 ///
-/// Records the reported state on the meeting actor (the single home for mute)
-/// and re-conveys slot state so a subscriber sees `SLOT_STATE_SOURCE_MUTED`.
+/// Records the reported state on the meeting actor (the single home for mute),
+/// which re-emits the changed slot view — `SLOT_STATE_SOURCE_MUTED` — to the
+/// subscribers holding this source.
 ///
 /// # Three guards, in this order, and the order is the security property
 ///
 /// 1. **Identical repeat** — returns before the actor hop and before spending a
 ///    token, so a client stuck on one state costs a tuple compare.
 /// 2. **Rate limit** ([`ClientWorkLimiter`]) — spent only on work about to be
-///    done. This is the bound on the only repeatable client-driven path that
-///    puts work on the SHARED meeting actor's mailbox (one `GetState` per
-///    composition). It is NOT a bound on an O(N) fan-out any more: S-2 removed
-///    `handle_self_mute`'s `broadcast_update`, so the cost is now dominated by
-///    the per-connection composition.
-/// 3. **Audio-only recomposition** — a video-only change is reported to the
-///    actor but never recomposed, because the slot view is derived from
-///    `audio_self_muted` alone.
+///    done. This bounds the repeatable client-driven path into the SHARED
+///    meeting actor per connection; the actor's resulting fan-out to holders is
+///    bounded per MEETING by its per-turn flush bound.
+/// 3. **Audio-only re-emit** — a video-only change is recorded by the actor but
+///    re-emits nothing, because the slot view reads only audio mute.
 ///
 /// # The send directive is not touched, and cannot be
 ///
-/// This function calls [`compose_and_emit`] with `emit_directive = false`, but
-/// that flag is belt and braces: `media_signaling::directive` has no import
-/// through which mute state could arrive and `build_send_directive` takes no
-/// mute argument, so a mute/unmute cycle altering the directive is a compile
-/// error rather than a behaviour to be careful about. That is what keeps
+/// `media_signaling::directive` has no import through which mute state could
+/// arrive and `build_send_directive` takes no mute argument, so a mute/unmute
+/// cycle altering the directive is a compile error rather than a behaviour to
+/// be careful about. That is what keeps
 /// *"MC has not asked you to send"* and *"you have muted yourself"* distinct,
 /// and what makes unmute a purely local decision with no round trip.
 async fn handle_mute_request(
     request: &v1::MuteRequest,
     connection_id: &str,
-    participant_handle: &ParticipantActorHandle,
     media: &mut MediaSignalingContext,
 ) {
-    // Short-circuit a no-op BEFORE the actor hop, before the limiter, and
-    // before `compose_and_emit`.
+    // Short-circuit a no-op BEFORE the actor hop and before the limiter.
     //
     // `MeetingActor::handle_self_mute` is already idempotent, which correctly
     // suppresses a broadcast of a transition that did not occur — but
@@ -1689,188 +1436,16 @@ async fn handle_mute_request(
     // ordering it correctly free.
     media.last_reported_mute = Some(reported);
 
-    // RECOMPOSE ONLY IF THE AUDIO FLAG MOVED.
-    //
-    // `last_reported_mute` is the right dedupe key for "should I report this to
-    // the meeting actor" — the actor stores both flags — and the WRONG key for
-    // "should I recompose". `SourceMuteView` and `build_stream_assignments` read
-    // `audio_self_muted` alone, so a video-only toggle would spend an O(N)
-    // roster read, an assignment computation and an outbound message to produce
-    // a `StreamAssignments` byte-identical to the last one, and would move
-    // `mc_media_slot_states_total` with provably zero information delivered.
-    //
-    // Two consumers reading different fields of one pair is two questions; they
-    // now have two answers. This is not an attack mitigation — it fires the
-    // first time a client wires a camera button, with nobody hostile involved.
+    // `applied` means the audio flag moved on a declared connection, so the
+    // actor re-emits to the holders of this source. A video-only change, or a
+    // report before any declaration, is recorded by the actor and re-emits
+    // nothing: the slot view reads only audio mute. A camera button produces
+    // `applied_no_recompose`, which is routine.
     if media.declaration.is_none() || previously_audio_muted == request.audio_muted {
         metrics::record_mute_request(MuteOutcome::AppliedNoRecompose);
         return;
     }
-
     metrics::record_mute_request(MuteOutcome::Applied);
-
-    // Return value deliberately discarded: it reports whether the DIRECTIVE was
-    // delivered, and this path emits no directive. The declaration must stay
-    // armed regardless — a failed mute re-convey is self-healing on the next
-    // toggle, and disarming here would turn a transient actor hiccup into a
-    // client that gets re-sent a directive it already has.
-    let _ = compose_and_emit(connection_id, participant_handle, media, false).await;
-}
-
-/// Compose the client-facing media messages from one meeting-state snapshot.
-///
-/// `emit_directive` selects §5 plus §6 (a fresh capability declaration) versus
-/// §6 alone (a mute report). The directive is composed from the assignment and
-/// the configured encoding only; the mute view feeds the assignments alone.
-///
-/// # Return value is load-bearing
-///
-/// `true` iff MC delivered everything this call was supposed to deliver. The
-/// caller on the capability path uses it to decide whether to ARM the
-/// identical-redeclaration short-circuit: arming it after a failed composition
-/// would make the client's natural recovery — re-sending the same declaration —
-/// answer `accepted_unchanged` forever, leaving the connection silently dark and
-/// recoverable only by a full reconnect.
-///
-/// A directive failure returns `false` even though the assignments were still
-/// emitted: assignments without a directive still means the client is never told
-/// to send, which is the state the retry needs to be able to escape.
-async fn compose_and_emit(
-    connection_id: &str,
-    participant_handle: &ParticipantActorHandle,
-    media: &mut MediaSignalingContext,
-    emit_directive: bool,
-) -> bool {
-    let Some(declaration) = media.declaration.clone() else {
-        return false;
-    };
-
-    // ONE snapshot for both messages.
-    let state = match media.meeting_handle.get_state().await {
-        Ok(state) => state,
-        Err(e) => {
-            if emit_directive {
-                metrics::record_send_directive(DirectiveOutcome::MeetingStateUnavailable);
-            }
-            warn!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                error = %e,
-                "Meeting state unavailable; not composing media signalling"
-            );
-            return false;
-        }
-    };
-
-    // Through the SINGLE routing-input constructor, not a second inline one:
-    // `compute_assignment` is the one producer of "which slot MC routes into",
-    // and that only holds if its input has one encoding too.
-    let routing_input = match routing_input_for(
-        state.participants.iter().map(|p| p.sender_id),
-        media.handlers.clone(),
-    ) {
-        Ok(routing_input) => routing_input,
-        Err(e) => {
-            if emit_directive {
-                metrics::record_send_directive(DirectiveOutcome::AssignmentFailed);
-            }
-            error!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                error = %e,
-                "Routing input could not be built; no media signalling emitted"
-            );
-            return false;
-        }
-    };
-
-    let assignment = match compute_assignment(&routing_input) {
-        Ok(assignment) => assignment,
-        Err(e) => {
-            if emit_directive {
-                metrics::record_send_directive(DirectiveOutcome::AssignmentFailed);
-            }
-            error!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                reason = e.label(),
-                "Forwarding assignment could not be computed; no media signalling emitted"
-            );
-            return false;
-        }
-    };
-
-    let mut directive_emitted = true;
-
-    if emit_directive {
-        match build_send_directive(
-            media.sender_id,
-            &assignment,
-            &media.handler_urls,
-            &media.stream_policy,
-        ) {
-            Ok((directive, outcome)) => {
-                metrics::record_send_directive(outcome);
-                send_signaling(
-                    participant_handle,
-                    connection_id,
-                    SIGNALING_KIND_SEND_DIRECTIVE,
-                    &ServerMessage {
-                        message: Some(server_message::Message::SendDirective(directive)),
-                        trace_parent: String::new(),
-                        trace_state: String::new(),
-                    },
-                )
-                .await;
-            }
-            Err(outcome) => {
-                metrics::record_send_directive(outcome);
-                directive_emitted = false;
-                error!(
-                    target: "mc.webtransport.connection",
-                    connection_id = %connection_id,
-                    outcome = outcome.label(),
-                    "Send directive could not be composed; client not directed to send"
-                );
-            }
-        }
-    }
-
-    let mute = SourceMuteView::from_pairs(
-        state
-            .participants
-            .iter()
-            .map(|p| (p.sender_id, p.audio_self_muted)),
-    );
-
-    let composition = build_stream_assignments(
-        media.sender_id,
-        &declaration,
-        &assignment,
-        &media.handler_urls,
-        &mute,
-    );
-
-    for state in &composition.slot_states {
-        metrics::record_slot_state(*state);
-    }
-    metrics::record_unmatched_plan_slots(composition.unmatched_plan_slots);
-
-    send_signaling(
-        participant_handle,
-        connection_id,
-        SIGNALING_KIND_STREAM_ASSIGNMENTS,
-        &ServerMessage {
-            message: Some(server_message::Message::StreamAssignments(
-                composition.assignments,
-            )),
-            trace_parent: String::new(),
-            trace_state: String::new(),
-        },
-    )
-    .await;
-
-    directive_emitted
 }
 
 /// Send a `ServerMessage` to the client through the participant actor.
@@ -1894,148 +1469,42 @@ async fn send_signaling(
     message.trace_state = trace_state;
 
     if let Err(e) = participant_handle
-        .send(SignalingPayload::Raw {
-            message_type: 0,
-            data: message.encode_to_vec(),
-        })
+        .send(SignalingPayload::server_message(&message))
         .await
     {
         // WARN, not DEBUG. `ParticipantActorHandle::send` is an awaited mpsc
         // send, so an `Err` means the mailbox is CLOSED — the participant actor
-        // is gone. That is the one hop between "MC decided to direct this client
-        // to send" and "the client was told", and `record_send_directive` has
-        // ALREADY fired `emitted` by the time we get here.
-        //
-        // At the default `RUST_LOG=info` a DEBUG line is invisible, so a client
-        // that never publishes would present as `emitted` incrementing normally,
-        // `accepted` incrementing normally, and nothing anywhere disagreeing.
-        // This is the only evidence that contradicts the counter, so it must be
-        // visible at the level operators actually run.
-        //
-        // Deliberately NOT a delivery-outcome counter: the mailbox-FULL case is
-        // already counted downstream at the actor's `try_send` choke point by
-        // `mc_participant_outbound_messages_dropped_total{payload_kind}`. The
-        // uncovered case is actor-gone, and a WARN is proportionate to it.
+        // is gone. The only thing this path sends is a capability rejection
+        // (directives and slot assignments are the meeting actor's, which
+        // counts its own delivery failures on
+        // `mc_media_slot_view_emissions_total{outcome="delivery_failed"}`).
         warn!(
             target: "mc.webtransport.connection",
             connection_id = %connection_id,
             error = %e,
-            // `message_kind`, NOT `payload_kind`. The two name DISJOINT value
-            // domains across this exact hop: here the domain is
-            // {capability_rejection, send_directive, stream_assignments}, while
-            // the `payload_kind` label on
-            // `mc_participant_outbound_messages_dropped_total` is
-            // {signaling_raw, participant_update} — every `ServerMessage`
-            // leaves as `SignalingPayload::Raw`, so `send_directive` here
-            // becomes `signaling_raw` there. The catalog and the dashboard both
-            // tell an operator to correlate this WARN with that counter; naming
-            // both fields `payload_kind` would invite a pivot that silently
-            // joins on nothing.
+            // `message_kind`, NOT `payload_kind`: the `payload_kind` label on
+            // `mc_participant_outbound_messages_dropped_total` is a DISJOINT
+            // domain ({signaling_raw, participant_update}) on a later hop.
             message_kind = message_kind,
-            "Failed to deliver media signalling to participant actor; the client was NOT told \
-             what the counter says it was told"
+            "Failed to deliver a capability rejection to the participant actor"
         );
     }
 }
 
-/// Resolve the per-connection media-signalling context, or the
-/// [`DirectiveOutcome`] naming the stage that failed.
-///
-/// An `Err` is a **degraded but healthy** connection: signalling for everything
-/// else keeps working and the client is simply never directed to send. It is
-/// logged and COUNTED once at the call site, never per client message.
-///
-/// # Why the error type is `DirectiveOutcome` and not a local enum
-///
-/// This is the most severe way a client can end up never told to send — it
-/// silences the connection for its whole life, not for one declaration — so it
-/// must not be the one such failure that moves no counter. Reporting it on
-/// `mc_media_send_directives_total` keeps that counter's central claim true:
-/// *every* reason MC did not COMPOSE a directive lands on one series, so the 3am
-/// question "did MC compose a directive, and if not why" is one query.
-///
-/// It is NOT every reason a client was not told to send. `emitted` fires before
-/// `send_signaling`, so the two delivery hops after it are covered elsewhere:
-/// mailbox-FULL by
-/// `mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`
-/// and mailbox-CLOSED by the delivery WARN. See this file's `send_signaling`,
-/// which states the same split from the other side.
-///
-/// The stages below are the SAME sequential stages `compose_and_emit` runs, so
-/// the vocabulary's disjoint-by-construction property is preserved rather than
-/// stretched: the first failing stage returns, and later stages are unreachable.
-async fn build_media_signaling_context(
-    controller_handle: &MeetingControllerActorHandle,
+/// Build the per-connection media-signalling context from the live meeting
+/// handle resolved before the join.
+fn media_signaling_context(
+    meeting_handle: MeetingActorHandle,
     join_result: &JoinResult,
-    mh_data: &MhAssignmentData,
-    meeting_id: &str,
     config: crate::media_signaling::ClientMediaConfig,
-) -> Result<MediaSignalingContext, DirectiveOutcome> {
-    // Each stage keeps its underlying error at DEBUG: the outcome token on the
-    // call-site WARN says WHICH stage failed, and this says WHY. Join-time only
-    // — once per connection, never client-drivable — so there is no
-    // log-amplification concern here.
-    let meeting_handle = controller_handle
-        .get_meeting_handle(meeting_id.to_string())
-        .await
-        .map_err(|e| {
-            debug!(
-                target: "mc.webtransport.connection",
-                meeting_id = %meeting_id,
-                error = %e,
-                "Media signalling context: meeting handle unavailable"
-            );
-            DirectiveOutcome::MeetingStateUnavailable
-        })?;
-
-    let routing_input = build_routing_input(join_result, mh_data).map_err(|e| {
-        debug!(
-            target: "mc.webtransport.connection",
-            meeting_id = %meeting_id,
-            error = %e,
-            "Media signalling context: routing input could not be built"
-        );
-        DirectiveOutcome::AssignmentFailed
-    })?;
-
-    let assignment = compute_assignment(&routing_input).map_err(|e| {
-        debug!(
-            target: "mc.webtransport.connection",
-            meeting_id = %meeting_id,
-            reason = e.label(),
-            "Media signalling context: forwarding assignment could not be computed"
-        );
-        DirectiveOutcome::AssignmentFailed
-    })?;
-
-    // NOT `AssignmentFailed`: the assignment computed successfully and simply
-    // contains no egress plan naming this subscriber. "MC could not compute a
-    // plan" and "MC computed a plan that does not include you" have different
-    // causes and different remedies, so they get different tokens.
-    let planned_slot = planned_audio_slot_for(&assignment, join_result.sender_id)
-        .ok_or(DirectiveOutcome::NoPlannedEgressSlot)?;
-
-    // Server-derived urls only. The similar-looking client-supplied map is
-    // `ParticipantActor::mh_statuses`; it must never be a source here.
-    let handler_urls = HandlerUrls::from_pairs(
-        mh_data
-            .handlers
-            .iter()
-            .map(|h| (HandlerId::new(&h.mh_id), h.webtransport_endpoint.clone())),
-    );
-
+) -> MediaSignalingContext {
     // One clock reading for both buckets: they start together at join, so a
     // skew between them would be meaningless state.
     let limiter_start = Instant::now();
 
-    Ok(MediaSignalingContext {
+    MediaSignalingContext {
         meeting_handle,
         participant_id: join_result.participant_id.clone(),
-        sender_id: join_result.sender_id,
-        handler_urls,
-        handlers: routing_input.handlers,
-        planned_audio_slot: PlannedAudioSlot::new(planned_slot),
-        stream_policy: MediaStreamPolicy::new(config.audio_encoding),
         max_receive_slots: config.max_receive_slots,
         declaration_budget: config.max_receive_capability_declarations,
         declaration: None,
@@ -2053,49 +1522,6 @@ async fn build_media_signaling_context(
         mute_rate_limit_logged: false,
         rejection_logged: false,
         rejection_reply_suppressed_logged: false,
-    })
-}
-
-/// Post-join dispatch for a connection with no media-signalling context.
-///
-/// Identical to [`handle_client_message`] minus the two media arms. Split rather
-/// than branching inside each arm so the media handlers cannot be reached at all
-/// without a context, and so this path stays silent per message.
-async fn handle_client_message_without_media(
-    data: &[u8],
-    connection_id: &str,
-    participant_handle: &ParticipantActorHandle,
-) {
-    let Ok(client_message) = ClientMessage::decode(data) else {
-        debug!(
-            target: "mc.webtransport.connection",
-            connection_id = %connection_id,
-            "Failed to decode post-join client message, ignoring"
-        );
-        return;
-    };
-
-    let trace_parent = client_message.trace_parent;
-    let trace_state = client_message.trace_state;
-
-    match client_message.message {
-        Some(client_message::Message::MediaConnectionUpdate(update)) => {
-            handle_media_connection_update(
-                update,
-                &trace_parent,
-                &trace_state,
-                connection_id,
-                participant_handle,
-            )
-            .await;
-        }
-        _ => {
-            debug!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                "Post-join client message ignored (no media signalling context)"
-            );
-        }
     }
 }
 
@@ -2192,18 +1618,29 @@ async fn send_error(
     result
 }
 
-/// Build a protobuf `JoinResponse` from the actor's `JoinResult`.
+/// Read the meeting's handler assignment from Redis and freeze it into a
+/// validated, sorted [`MeetingHandlers`] (R-6: no handlers, no join).
 ///
-/// Reads MH assignment data from Redis to populate `media_servers`.
-/// Returns the `MhAssignmentData` alongside the response so it can be
-/// passed to the async `RegisterMeeting` task without re-reading Redis.
-/// Fails the join if MH assignment data is unavailable — a meeting
-/// without media handlers is not useful (R-6).
-async fn build_join_response(
-    result: &JoinResult,
+/// Every url is server-derived — read from the registration GC wrote — never
+/// client-supplied and never computed from a pod ordinal.
+async fn read_meeting_handlers(
     redis_client: &dyn MhAssignmentStore,
     meeting_id: &str,
-) -> Result<(JoinResponse, MhAssignmentData), McError> {
+) -> Result<MeetingHandlers, McError> {
+    let mh_data: MhAssignmentData = redis_client
+        .get_mh_assignment(meeting_id)
+        .await?
+        .ok_or_else(|| McError::MhAssignmentMissing(meeting_id.to_string()))?;
+    MeetingHandlers::new(mh_data.handlers.into_iter().map(|h| HandlerEndpoint {
+        id: HandlerId::new(h.mh_id),
+        webtransport_url: h.webtransport_endpoint,
+        grpc_endpoint: h.grpc_endpoint,
+    }))
+    .map_err(|e| McError::MhAssignmentMissing(format!("{meeting_id}: {e}")))
+}
+
+/// Build a protobuf `JoinResponse` from the actor's `JoinResult`.
+fn build_join_response(result: &JoinResult) -> JoinResponse {
     let existing_participants = result
         .participants
         .iter()
@@ -2244,408 +1681,56 @@ async fn build_join_response(
         })
         .collect();
 
-    // Read MH assignment data from Redis (R-6)
-    let mh_data = redis_client
-        .get_mh_assignment(meeting_id)
-        .await?
-        .ok_or_else(|| {
-            warn!(
-                target: "mc.webtransport.connection",
-                meeting_id = %meeting_id,
-                "No MH assignment data in Redis — cannot join without media handlers"
-            );
-            McError::MhAssignmentMissing(meeting_id.to_string())
-        })?;
+    // EXACTLY ONE entry: the handler this participant was placed on (ADR-0036
+    // §9, R-33). The client transport is active/active and dials every url it is
+    // given, so a longer list would open transports MC never directs media
+    // over. The same frozen `MeetingHandlers` value supplies
+    // `StreamAssignment.media_handler_url` and `SendTarget.media_handler_url`,
+    // so all three are byte-identical strings — the client looks transports up
+    // by exact url.
+    let media_servers = vec![MediaServerInfo {
+        media_handler_url: result.media_handler.webtransport_url.clone(),
+    }];
 
-    // Connection BOOTSTRAP data, and nothing else: the handlers this meeting is
-    // registered on, for the client to open transports to.
-    //
-    // # NON-AUTHORITATIVE. Selection is the send directive.
-    //
-    // ADR-0036 §5 is that MC directs where a client sends. That instruction is
-    // `SendTarget.media_handler_url` on the `SendDirective`, matching the active
-    // slot's `StreamAssignment.media_handler_url` — both read out of the same
-    // `MeetingAssignment` the MC→MH `RegisterMeeting` push is programmed from, so
-    // steering and placement cannot diverge. This list is not that instruction
-    // and must never be used as one.
-    //
-    // # The order is DELIBERATELY not sorted — a refusal, not an omission
-    //
-    // `edge_handler` places every edge on the lexicographically smallest shared
-    // `mh_id` (`media_routing/assignment.rs`). So ANY ordering of this list keyed
-    // on `mh_id` would correlate with the placement rule: ascending makes
-    // `.first()` accidentally correct, and descending merely relocates the same
-    // defect to `.last()`. The only order that is independent of placement is one
-    // keyed on something unrelated to it — which the Redis enumeration order
-    // already is. Leaving it alone is what keeps the two mechanisms independent
-    // and makes selecting off this list FAIL LOUDLY rather than pass for the
-    // wrong reason. That loudness is not hypothetical: it is how the defect this
-    // comment exists because of was found (three of four media connections on
-    // mh-1 while every edge sat on mh-0).
-    //
-    // # Sorting would silently disarm a live test, and this comment is its only guard
-    //
-    // `crates/mc-service/tests/media_client_signaling_integration.rs`'s
-    // `steering_follows_edge_placement_not_redis_order` seeds the handlers as
-    // `[mh-1, mh-0]` PRECISELY so that list-order selection yields mh-1 while the
-    // assignment places on mh-0. Sorting here collapses those two answers into
-    // one: the test keeps passing while no longer able to fail for the reason it
-    // exists, and nothing else in the tree notices. There is no type, guard or
-    // test that reds when someone sorts this list — this paragraph is the control.
-    //
-    // # The honest cost
-    //
-    // Two env-test sites (`crates/env-tests/tests/26_mh_quic.rs`) legitimately
-    // take `.first()` because they want "any handler this meeting is registered
-    // on", and they therefore get an arbitrary one. Both handlers answer their
-    // question identically (MC pushes `RegisterMeeting` to EVERY assigned
-    // handler), so that is tolerable — and it rotates them across pods over runs,
-    // which surfaces per-pod drift that a sort pinning every test to one handler
-    // would hide.
-    let media_servers: Vec<MediaServerInfo> = mh_data
-        .handlers
-        .iter()
-        .map(|h| MediaServerInfo {
-            media_handler_url: h.webtransport_endpoint.clone(),
-        })
-        .collect();
-
-    Ok((
-        JoinResponse {
-            participant_id: result.participant_id.clone(),
-            existing_participants,
-            media_servers,
-            // ADR-0036 §2/§4. `sender_id` is `NonZeroU16` widened into the
-            // proto's `uint32` — `u32::from`, never `as`, and never 0.
-            sender_id: Some(u32::from(result.sender_id.get().get())),
-            // The joiner receives the meeting KEK. This is the ENTIRE
-            // key-distribution step (§4 step 3): it costs nothing beyond the
-            // join MC already performed and touches no existing member.
-            //
-            // This is the one legitimate egress of the KEK — to a client MC has
-            // just admitted, over its own authenticated session. It goes
-            // nowhere else: not to MH, not into any `dark_tower.internal.v1`
-            // message, not to disk, not to a log, metric, span or error
-            // payload. `JoinResponse`'s derived `Debug` is suppressed in
-            // `crates/proto-gen/build.rs` and the hand-written impl renders this
-            // field as a length only.
-            meeting_kek: result.meeting_kek.expose().to_vec(),
-            // u16 semantics widened into the proto's uint32. Always 0 in this
-            // story — rotation is deferred. Note 0 is a LEGAL first generation,
-            // not a sentinel: the not-provisioned signal is `meeting_kek` not
-            // being exactly 32 bytes, so never gate on `kek_generation != 0`.
-            kek_generation: u32::from(result.kek_generation),
-            // W. Zero until story-2 task 9 (MC KEK lifecycle) reads
-            // `MC_KEK_ROTATION_DEBOUNCE_SECONDS`. Zero is exactly the contract's
-            // older-MC observable: the client substitutes its floor, counts it
-            // and warns, never hard-fails -- and today there is no rotation for
-            // retention to serve.
-            kek_rotation_debounce_seconds: 0,
-            correlation_id: result.correlation_id.clone(),
-            binding_token: result.binding_token.clone(),
-        },
-        mh_data,
-    ))
-}
-
-/// Build the routing computation's input from the join result and the
-/// meeting's handler assignment.
-///
-/// Participant->handler membership is an **input** to the computation, and this
-/// is where it is filled. Every participant gets the meeting's full handler list
-/// — **because MC has no per-participant placement input**, not because a client
-/// chose to connect to all of them: `MhAssignmentData` is a property of the
-/// meeting and nothing on the roster records which handler a participant
-/// reached. When real per-participant placement lands, only this function
-/// changes — [`compute_assignment`] does not.
-///
-/// This is the routing INPUT and says nothing about steering. MC directs each
-/// client to the single handler the assignment places its edges on (ADR-0036
-/// §5); see [`RoutingParticipant::handlers`] for that contract.
-///
-/// The joiner is included alongside the existing roster, so at N=1 the input is
-/// a single participant and the general computation yields the loopback edge.
-///
-/// # Errors
-///
-/// [`McError::MhAssignmentMissing`] if the meeting has no assigned handlers —
-/// there is nothing to program, and silently pushing to zero handlers would
-/// make an unroutable meeting indistinguishable from a healthy one.
-fn build_routing_input(
-    join_result: &JoinResult,
-    mh_data: &MhAssignmentData,
-) -> Result<MeetingRoutingInput, McError> {
-    let handlers: Vec<HandlerId> = mh_data
-        .handlers
-        .iter()
-        .map(|h| HandlerId::new(&h.mh_id))
-        .collect();
-
-    // The joiner is not yet on the roster the join returned, so it is chained
-    // on rather than assumed present.
-    routing_input_for(
-        std::iter::once(join_result.sender_id)
-            .chain(join_result.participants.iter().map(|p| p.sender_id)),
-        handlers,
-    )
-}
-
-/// Build a [`MeetingRoutingInput`] from a set of sender ids and the meeting's
-/// handler list.
-///
-/// # The SINGLE constructor, and why that is load-bearing
-///
-/// The whole design rests on [`compute_assignment`] being the one producer of
-/// "which slot MC routes into". That guarantee is only as good as its INPUT
-/// having one encoding too: two constructors 500 lines apart in this file could
-/// each gain a field, a filter, or a guard the other did not, and the two sides
-/// would then disagree about the meeting while both looking correct. So both
-/// call sites — the join-time context/push path and the per-composition path —
-/// come through here.
-///
-/// Participant->handler membership is an **input** to the computation, and this
-/// is where it is filled. Every participant gets the meeting's full handler list
-/// — **because MC has no per-participant placement input**, not because a client
-/// chose to connect to all of them: `MhAssignmentData` is a property of the
-/// meeting and nothing on the roster records which handler a participant
-/// reached. When real per-participant placement lands, only this function
-/// changes — [`compute_assignment`] does not, and neither does either caller.
-///
-/// This is the routing INPUT and says nothing about steering. MC directs each
-/// client to the single handler the assignment places its edges on (ADR-0036
-/// §5); see [`RoutingParticipant::handlers`] for that contract.
-///
-/// # Errors
-///
-/// [`McError::MhAssignmentMissing`] if the meeting has no assigned handlers —
-/// there is nothing to program, and silently pushing to zero handlers would
-/// make an unroutable meeting indistinguishable from a healthy one. The check
-/// lives HERE rather than at one call site precisely so it cannot hold at one
-/// and not the other.
-fn routing_input_for(
-    senders: impl IntoIterator<Item = crate::media_admission::SenderId>,
-    handlers: Vec<HandlerId>,
-) -> Result<MeetingRoutingInput, McError> {
-    if handlers.is_empty() {
-        return Err(McError::MhAssignmentMissing(
-            "no handlers assigned; cannot compute a forwarding assignment".to_string(),
-        ));
-    }
-
-    let participants = senders
-        .into_iter()
-        .map(|sender_id| RoutingParticipant {
-            sender_id,
-            handlers: handlers.clone(),
-        })
-        .collect();
-
-    Ok(MeetingRoutingInput {
-        participants,
-        handlers,
-    })
-}
-
-/// Program each assigned MH with its slice of the meeting's forwarding
-/// assignment, and confirm each push (R-12, ADR-0036 §8).
-///
-/// Called as a spawned task after the first participant joins. For each
-/// handler: take a generation, push, classify the reply.
-///
-/// This function handles all errors internally (log + continue) since it runs
-/// as a fire-and-forget spawned task with no caller to propagate errors to.
-///
-/// # The generation is taken ONCE per handler, outside the retry loop
-///
-/// Deliberately not inside `MhClient::register_meeting`, where it would be
-/// recomputed on every attempt. ADR-0036 §8 requires an unchanged policy to
-/// carry an unchanged number; a per-attempt recomputation would still return the
-/// same number today (the assignment is unchanged, so `next_generation` is
-/// idempotent) but the guarantee would rest on that coincidence rather than on
-/// where the call sits, and the first structural re-push would break it.
-///
-/// # Retryable versus terminal
-///
-/// Split per [`PushDisposition`]: `generation_mismatch` and
-/// `no_applied_generation` are transient apply failures and consume retries (an
-/// identical re-send is an idempotent MH no-op), while
-/// `transport_mode_mismatch` is terminal — a version-skewed handler does not
-/// become correct after backoff, so MC fails immediately rather than delaying
-/// the loud failure by three attempts. `handler_id_mismatch` is neither: it is
-/// non-fatal for the interim and never reaches this loop as an error at all
-/// (see `media_routing::confirm::evaluate`).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Spawned-task wiring; all params are distinct dependencies"
-)]
-async fn register_meeting_with_handlers(
-    mh_client: &dyn MhRegistrationClient,
-    mh_data: &MhAssignmentData,
-    assignment: &MeetingAssignment,
-    policy_generations: &PolicyGenerations,
-    meeting_id: &str,
-    mc_id: &str,
-    mc_grpc_endpoint: &str,
-    cancel_token: &CancellationToken,
-) {
-    for handler in &mh_data.handlers {
-        let grpc_endpoint = &handler.grpc_endpoint;
-        let handler_id = HandlerId::new(&handler.mh_id);
-
-        let Some(handler_assignment) = assignment.for_handler(&handler_id) else {
-            // The assignment is computed from this same handler list, so this
-            // is unreachable. Log rather than skip silently: if it ever fires,
-            // a handler is going unprogrammed and that must be visible.
-            error!(
-                target: "mc.register_meeting.trigger",
-                mh_grpc_endpoint = %grpc_endpoint,
-                "No assignment computed for this handler; not programming it"
-            );
-            continue;
-        };
-
-        let policy_generation = match policy_generations
-            .next_generation(meeting_id, &handler_id, handler_assignment)
-            .await
-        {
-            Ok(generation) => generation,
-            Err(e) => {
-                error!(
-                    target: "mc.register_meeting.trigger",
-                    mh_grpc_endpoint = %grpc_endpoint,
-                    error = %e,
-                    "Could not derive a policy generation; MH not programmed"
-                );
-                continue;
-            }
-        };
-
-        let programming = MeetingProgramming {
-            mh_grpc_endpoint: grpc_endpoint,
-            expected_handler_id: &handler.mh_id,
-            meeting_id,
-            mc_id,
-            mc_grpc_endpoint,
-            assignment: handler_assignment,
-            policy_generation,
-        };
-
-        let mut last_error = None;
-        // Attempts actually made, and whether the loop stopped because retrying
-        // could not help. Both feed the exit log: a terminal failure that
-        // deliberately did NOT retry must not report a retry history it never
-        // had (see the exit log below).
-        let mut attempts_made = 0_u32;
-        let mut ended_terminally = false;
-        for attempt in 1..=MAX_REGISTER_ATTEMPTS {
-            if cancel_token.is_cancelled() {
-                info!(
-                    target: "mc.register_meeting.trigger",
-                    "RegisterMeeting cancelled during shutdown"
-                );
-                return;
-            }
-            attempts_made = attempt;
-            match mh_client.register_meeting(&programming).await {
-                Ok(()) => {
-                    debug!(
-                        target: "mc.register_meeting.trigger",
-                        mh_grpc_endpoint = %grpc_endpoint,
-                        "RegisterMeeting succeeded"
-                    );
-                    last_error = None;
-                    break;
-                }
-                Err(e) => {
-                    // A terminal divergence does not become correct after
-                    // backoff. Fail once, loudly, rather than three times
-                    // slowly.
-                    let terminal = matches!(
-                        &e,
-                        McError::MediaPolicyDivergence { outcome }
-                            if outcome.disposition() == PushDisposition::Terminal
-                    );
-                    warn!(
-                        target: "mc.register_meeting.trigger",
-                        attempt = attempt,
-                        max_attempts = MAX_REGISTER_ATTEMPTS,
-                        mh_grpc_endpoint = %grpc_endpoint,
-                        terminal = terminal,
-                        error = %e,
-                        "RegisterMeeting attempt failed"
-                    );
-                    last_error = Some(e);
-                    if terminal {
-                        ended_terminally = true;
-                        break;
-                    }
-
-                    // Backoff before next attempt (unless this was the last attempt)
-                    if let Some(&delay) = REGISTER_BACKOFF_DELAYS.get(attempt as usize - 1) {
-                        tokio::select! {
-                            () = cancel_token.cancelled() => {
-                                info!(
-                                    target: "mc.register_meeting.trigger",
-                                    "RegisterMeeting cancelled during shutdown"
-                                );
-                                return;
-                            }
-                            () = tokio::time::sleep(delay) => {}
-                        }
-                    }
-                }
-            }
-        }
-
-        // TWO EXIT MESSAGES, because the two dispositions have OPPOSITE remedies
-        // and this log is where a responder learns which one they have.
+    JoinResponse {
+        participant_id: result.participant_id.clone(),
+        existing_participants,
+        media_servers,
+        // ADR-0036 §2/§4. `sender_id` is `NonZeroU16` widened into the
+        // proto's `uint32` — `u32::from`, never `as`, and never 0.
+        sender_id: Some(u32::from(result.sender_id.get().get())),
+        // The joiner receives the meeting KEK. This is the ENTIRE
+        // key-distribution step (§4 step 3): it costs nothing beyond the
+        // join MC already performed and touches no existing member.
         //
-        // `mc-incident-response.md` Scenario 12 keys on the literal string
-        // "RegisterMeeting retries exhausted" and reads it as flaky coordination
-        // — investigate the transport. A terminal `transport_mode_mismatch` is
-        // the opposite: a genuine two-ends version skew whose remedy is to roll
-        // MH FORWARD, never to roll MC back (`mc-deployment.md`'s rollback
-        // carve-out). Reporting it as "retries exhausted" with
-        // `total_attempts = 3` would assert a retry history that never happened
-        // and route the responder to the wrong branch, under incident pressure.
-        //
-        // Both stay at `error!` on the same target, so the existing runbook
-        // string keeps matching the case it was written for and the new one is
-        // greppable for the case it was not.
-        if let Some(e) = last_error {
-            if ended_terminally {
-                error!(
-                    target: "mc.register_meeting.trigger",
-                    mh_grpc_endpoint = %grpc_endpoint,
-                    attempts_made = attempts_made,
-                    terminal = true,
-                    error = %e,
-                    "RegisterMeeting failed terminally; not retried"
-                );
-            } else {
-                error!(
-                    target: "mc.register_meeting.trigger",
-                    mh_grpc_endpoint = %grpc_endpoint,
-                    total_attempts = MAX_REGISTER_ATTEMPTS,
-                    attempts_made = attempts_made,
-                    terminal = false,
-                    error = %e,
-                    "RegisterMeeting retries exhausted"
-                );
-            }
-        }
+        // This is the one legitimate egress of the KEK — to a client MC has
+        // just admitted, over its own authenticated session. It goes
+        // nowhere else: not to MH, not into any `dark_tower.internal.v1`
+        // message, not to disk, not to a log, metric, span or error
+        // payload. `JoinResponse`'s derived `Debug` is suppressed in
+        // `crates/proto-gen/build.rs` and the hand-written impl renders this
+        // field as a length only.
+        meeting_kek: result.meeting_kek.expose().to_vec(),
+        // u16 semantics widened into the proto's uint32. Always 0 in this
+        // story — rotation is deferred. Note 0 is a LEGAL first generation,
+        // not a sentinel: the not-provisioned signal is `meeting_kek` not
+        // being exactly 32 bytes, so never gate on `kek_generation != 0`.
+        kek_generation: u32::from(result.kek_generation),
+        // W. Zero until story-2 task 9 (MC KEK lifecycle) reads
+        // `MC_KEK_ROTATION_DEBOUNCE_SECONDS`. Zero is exactly the contract's
+        // older-MC observable: the client substitutes its floor, counts it
+        // and warns, never hard-fails -- and today there is no rotation for
+        // retention to serve.
+        kek_rotation_debounce_seconds: 0,
+        correlation_id: result.correlation_id.clone(),
+        binding_token: result.binding_token.clone(),
     }
 }
-
-// Note: build_join_response is async and requires a Redis client.
-// Integration tests in tests/join_tests.rs cover the full join flow
-// including Redis MH assignment data population and media_servers verification.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_routing::PolicyPushOutcome;
 
     // Full R-60 behavioral coverage (all-CONNECTED / partial / all-FAILED state
     // recording + metric + truncation + cap) lives in
@@ -2755,39 +1840,80 @@ mod tests {
         )
     }
 
+    /// A live media-signalling context over a throwaway meeting actor.
+    fn test_media_context() -> (MediaSignalingContext, tokio::task::JoinHandle<()>) {
+        use crate::actors::{ActorMetrics, ControllerMetrics, MeetingActor};
+        let (meeting, task) = MeetingActor::spawn(
+            "test-meeting".to_string(),
+            CancellationToken::new(),
+            ActorMetrics::new(),
+            ControllerMetrics::new(),
+            common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
+        )
+        .expect("system CSPRNG must be available in tests");
+        let config = crate::media_signaling::ClientMediaConfig {
+            max_receive_slots: 8,
+            max_receive_capability_declarations: 4,
+            audio_encoding: crate::media_signaling::AudioEncoding::new(v1::Codec::Opus, 48_000, 50)
+                .expect("in band"),
+        };
+        let limiter_start = Instant::now();
+        (
+            MediaSignalingContext {
+                meeting_handle: meeting,
+                participant_id: "test-part".to_string(),
+                max_receive_slots: config.max_receive_slots,
+                declaration_budget: config.max_receive_capability_declarations,
+                declaration: None,
+                last_reported_mute: None,
+                mute_limiter: ClientWorkLimiter::new(
+                    limiter_start,
+                    MUTE_WORK_BURST,
+                    MUTE_WORK_REFILL_INTERVAL_MS,
+                ),
+                rejection_reply_limiter: ClientWorkLimiter::new(
+                    limiter_start,
+                    CAPABILITY_REJECTION_BURST,
+                    CAPABILITY_REJECTION_REFILL_INTERVAL_MS,
+                ),
+                mute_rate_limit_logged: false,
+                rejection_logged: false,
+                rejection_reply_suppressed_logged: false,
+            },
+            task,
+        )
+    }
+
     #[tokio::test]
     async fn test_handle_client_message_unhandled_type() {
         let (handle, _task) = test_participant_handle();
+        let (mut media, _meeting) = test_media_context();
+        // `ServerMuteRequest` has no dispatch arm yet (story-2 task 12); it
+        // must fall through to the ignored branch without panicking.
         let msg = ClientMessage {
-            message: Some(client_message::Message::MuteRequest(v1::MuteRequest {
-                audio_muted: true,
-                video_muted: false,
-            })),
+            message: Some(client_message::Message::ServerMuteRequest(
+                v1::ServerMuteRequest::default(),
+            )),
             trace_parent: String::new(),
             trace_state: String::new(),
         };
         let data = msg.encode_to_vec();
-        // Should not panic -- exercises the catch-all branch.
-        //
-        // Driven through the no-media-context path deliberately: `MuteRequest`
-        // IS handled on the full path now (ADR-0036 §5), so asserting
-        // "unhandled" there would assert the opposite of the behaviour. What
-        // this still pins is that the decode+dispatch skeleton tolerates a
-        // message it has no arm for.
-        handle_client_message_without_media(&data, "test-conn-3", &handle).await;
+        handle_client_message(&data, "test-conn-3", &handle, &mut media).await;
     }
 
     #[tokio::test]
     async fn test_handle_client_message_invalid_data() {
         let (handle, _task) = test_participant_handle();
+        let (mut media, _meeting) = test_media_context();
         let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
         // Should not panic -- exercises the decode error branch
-        handle_client_message_without_media(&garbage, "test-conn-4", &handle).await;
+        handle_client_message(&garbage, "test-conn-4", &handle, &mut media).await;
     }
 
     #[tokio::test]
     async fn test_handle_client_message_empty_message() {
         let (handle, _task) = test_participant_handle();
+        let (mut media, _meeting) = test_media_context();
         let msg = ClientMessage {
             message: None,
             trace_parent: String::new(),
@@ -2795,7 +1921,7 @@ mod tests {
         };
         let data = msg.encode_to_vec();
         // Should not panic -- exercises the None branch
-        handle_client_message_without_media(&data, "test-conn-5", &handle).await;
+        handle_client_message(&data, "test-conn-5", &handle, &mut media).await;
     }
 
     #[test]
@@ -2862,232 +1988,5 @@ mod tests {
         // Unknown / malformed wire int → Unspecified (allowlist-clamp).
         assert_eq!(map_connection_state(999), MhState::Unspecified);
         assert_eq!(map_connection_state(-1), MhState::Unspecified);
-    }
-
-    // ========================================================================
-    // register_meeting_with_handlers unit tests
-    // ========================================================================
-
-    use crate::redis::MhEndpointInfo;
-    use std::collections::VecDeque;
-    use std::pin::Pin;
-    use std::sync::Mutex;
-
-    /// Mock MhRegistrationClient that returns results from a queue.
-    /// When the queue is empty, returns Ok(()).
-    struct MockRegClient {
-        results: Mutex<VecDeque<Result<(), McError>>>,
-        call_count: Mutex<u32>,
-    }
-
-    impl MockRegClient {
-        fn new(results: Vec<Result<(), McError>>) -> Self {
-            Self {
-                results: Mutex::new(VecDeque::from(results)),
-                call_count: Mutex::new(0),
-            }
-        }
-
-        fn call_count(&self) -> u32 {
-            *self.call_count.lock().unwrap()
-        }
-    }
-
-    impl MhRegistrationClient for MockRegClient {
-        fn register_meeting<'a>(
-            &'a self,
-            _programming: &'a MeetingProgramming<'a>,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>> {
-            *self.call_count.lock().unwrap() += 1;
-            let result = self.results.lock().unwrap().pop_front().unwrap_or(Ok(()));
-            Box::pin(async move { result })
-        }
-    }
-
-    fn make_mh_data(handlers: Vec<MhEndpointInfo>) -> MhAssignmentData {
-        MhAssignmentData {
-            handlers,
-            assigned_at: "2024-01-01T00:00:00Z".to_string(),
-        }
-    }
-
-    /// A one-participant assignment covering exactly the handlers in `mh_data`,
-    /// which is the shape the trigger builds at N=1.
-    fn make_assignment(mh_data: &MhAssignmentData) -> MeetingAssignment {
-        use crate::media_admission::SenderId;
-        use std::num::NonZeroU16;
-
-        let handlers: Vec<HandlerId> = mh_data
-            .handlers
-            .iter()
-            .map(|h| HandlerId::new(&h.mh_id))
-            .collect();
-        compute_assignment(&MeetingRoutingInput {
-            participants: vec![RoutingParticipant {
-                sender_id: SenderId::from_nonzero(NonZeroU16::new(1).unwrap()),
-                handlers: handlers.clone(),
-            }],
-            handlers,
-        })
-        .expect("assignment")
-    }
-
-    /// Drive the trigger's fan-out with a fresh generation registry.
-    async fn run_register(
-        client: &MockRegClient,
-        mh_data: &MhAssignmentData,
-        cancel: &CancellationToken,
-    ) {
-        let assignment = make_assignment(mh_data);
-        let generations = PolicyGenerations::new();
-        register_meeting_with_handlers(
-            client,
-            mh_data,
-            &assignment,
-            &generations,
-            "m1",
-            "mc1",
-            "http://mc:50052",
-            cancel,
-        )
-        .await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_register_retry_succeeds_on_second_attempt() {
-        let client = MockRegClient::new(vec![Err(McError::Grpc("transient".to_string())), Ok(())]);
-        let mh_data = make_mh_data(vec![MhEndpointInfo {
-            mh_id: "mh-1".to_string(),
-            webtransport_endpoint: "wt://mh-1:4433".to_string(),
-            grpc_endpoint: "http://mh-1:50053".to_string(),
-        }]);
-        let cancel = CancellationToken::new();
-
-        run_register(&client, &mh_data, &cancel).await;
-
-        assert_eq!(client.call_count(), 2, "Should succeed on 2nd attempt");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_register_all_retries_exhausted() {
-        let client = MockRegClient::new(vec![
-            Err(McError::Grpc("fail-1".to_string())),
-            Err(McError::Grpc("fail-2".to_string())),
-            Err(McError::Grpc("fail-3".to_string())),
-        ]);
-        let mh_data = make_mh_data(vec![MhEndpointInfo {
-            mh_id: "mh-1".to_string(),
-            webtransport_endpoint: "wt://mh-1:4433".to_string(),
-            grpc_endpoint: "http://mh-1:50053".to_string(),
-        }]);
-        let cancel = CancellationToken::new();
-
-        run_register(&client, &mh_data, &cancel).await;
-
-        assert_eq!(
-            client.call_count(),
-            MAX_REGISTER_ATTEMPTS,
-            "Should attempt exactly MAX_REGISTER_ATTEMPTS times"
-        );
-    }
-
-    /// OPS-3's terminal split, pinned by USE rather than by value.
-    ///
-    /// `confirm.rs` pins what `disposition()` *returns*; nothing pinned that the
-    /// retry loop *acts* on it. Every other test here drives the loop with
-    /// `McError::Grpc`, which is non-terminal, so deleting `if terminal { break }`
-    /// left the whole suite green.
-    ///
-    /// A `transport_mode_mismatch` is a genuine two-ends version skew: backoff
-    /// cannot make a handler running a different transport mode agree, so
-    /// failing three times slowly is strictly worse than failing once loudly.
-    /// This also covers the terminal arm of the split exit log — the path that
-    /// must NOT report "retries exhausted" with `total_attempts = 3`.
-    #[tokio::test(start_paused = true)]
-    async fn test_register_terminal_divergence_fails_without_retrying() {
-        let client = MockRegClient::new(vec![Err(McError::MediaPolicyDivergence {
-            outcome: PolicyPushOutcome::TransportModeMismatch,
-        })]);
-        let mh_data = make_mh_data(vec![MhEndpointInfo {
-            mh_id: "mh-1".to_string(),
-            webtransport_endpoint: "wt://mh-1:4433".to_string(),
-            grpc_endpoint: "http://mh-1:50053".to_string(),
-        }]);
-        let cancel = CancellationToken::new();
-
-        run_register(&client, &mh_data, &cancel).await;
-
-        assert_eq!(
-            client.call_count(),
-            1,
-            "a terminal divergence must fail on the FIRST attempt; retrying a \
-             version-skewed handler only delays the loud failure"
-        );
-    }
-
-    /// The other arm of the same split: a retryable divergence must consume the
-    /// full retry budget. Asserted with a divergence input rather than a generic
-    /// gRPC error, so the two dispositions are pinned by the same input class and
-    /// a mis-classification cannot pass by landing on the other arm's test.
-    #[tokio::test(start_paused = true)]
-    async fn test_register_retryable_divergence_consumes_full_retry_budget() {
-        let client = MockRegClient::new(vec![
-            Err(McError::MediaPolicyDivergence {
-                outcome: PolicyPushOutcome::GenerationMismatch,
-            }),
-            Err(McError::MediaPolicyDivergence {
-                outcome: PolicyPushOutcome::GenerationMismatch,
-            }),
-            Err(McError::MediaPolicyDivergence {
-                outcome: PolicyPushOutcome::GenerationMismatch,
-            }),
-        ]);
-        let mh_data = make_mh_data(vec![MhEndpointInfo {
-            mh_id: "mh-1".to_string(),
-            webtransport_endpoint: "wt://mh-1:4433".to_string(),
-            grpc_endpoint: "http://mh-1:50053".to_string(),
-        }]);
-        let cancel = CancellationToken::new();
-
-        run_register(&client, &mh_data, &cancel).await;
-
-        assert_eq!(
-            client.call_count(),
-            MAX_REGISTER_ATTEMPTS,
-            "a transient apply failure is an idempotent re-send MH-side; it must \
-             consume the retry budget rather than fail once"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_register_multiple_handlers_partial_failure() {
-        // Handler 1 succeeds immediately, handler 2 fails all retries
-        let client = MockRegClient::new(vec![
-            Ok(()),                                   // handler 1, attempt 1
-            Err(McError::Grpc("fail-1".to_string())), // handler 2, attempt 1
-            Err(McError::Grpc("fail-2".to_string())), // handler 2, attempt 2
-            Err(McError::Grpc("fail-3".to_string())), // handler 2, attempt 3
-        ]);
-        let mh_data = make_mh_data(vec![
-            MhEndpointInfo {
-                mh_id: "mh-1".to_string(),
-                webtransport_endpoint: "wt://mh-1:4433".to_string(),
-                grpc_endpoint: "http://mh-1:50053".to_string(),
-            },
-            MhEndpointInfo {
-                mh_id: "mh-2".to_string(),
-                webtransport_endpoint: "wt://mh-2:4433".to_string(),
-                grpc_endpoint: "http://mh-2:50053".to_string(),
-            },
-        ]);
-        let cancel = CancellationToken::new();
-
-        run_register(&client, &mh_data, &cancel).await;
-
-        assert_eq!(
-            client.call_count(),
-            4,
-            "1 call for handler 1 (success) + 3 calls for handler 2 (exhausted)"
-        );
     }
 }

@@ -10,16 +10,23 @@
 //!
 //! # Why these tests exist and the env-test does not replace them
 //!
-//! `crates/env-tests/tests/26_mh_quic.rs::test_mh_forwards_an_audio_datagram_back_to_its_sender`
-//! is R-15's stated end-to-end proof, and it is a **single-participant
-//! loopback**. That is the one configuration in which a wrong binding is
-//! invisible: with exactly one sender in the meeting, "bind the only ordinal in
-//! the pushed policy", "bind a hardcoded 1" and "bind the right one" all produce
-//! byte-identical output, and its `assert_eq!(view.stream_id(), 0)` passes for
-//! any of them because the subscriber's own slot coincides with MC's
-//! `MAIN_AUDIO_SLOT_ID`. Un-`#[ignore]`ing it closes R-15's criterion; it does
-//! **not** close the injection question. The two-participant and two-meeting
-//! arms below are what close it.
+//! Since story 2, R-15's end-to-end proof is the BINDING phase of
+//! `crates/env-tests/tests/27_mc_slot_placement.rs::test_multi_party_slot_placement_across_two_handlers`.
+//! It replaces story 1's single-participant loopback env-test, which was retired
+//! together with the self-edge it depended on (R-3). The loopback was the one
+//! configuration in which a wrong binding is invisible: with exactly one sender,
+//! "bind the only sender in the pushed policy", "bind a hardcoded 1" and "bind
+//! the right one" produce byte-identical output.
+//!
+//! The BINDING phase drives two distinct senders into one subscriber on each
+//! Kind handler. It asserts that each frame arrives on the slot id that the
+//! subscriber's own `StreamAssignments` named for that sender, reading the
+//! expected id off the wire and never from a literal. That proves the binding
+//! end to end, with real MC and real MH, but only for the participants and
+//! meeting that one run contains. It cannot isolate the injection question:
+//! a publisher claiming another participant's sender, or a sender resolving in
+//! the wrong meeting. The two-participant and two-meeting arms below close
+//! that question, and it cannot be closed at the live-cluster tier.
 //!
 //! # Non-vacuity, deliberately constructed rather than asserted
 //!

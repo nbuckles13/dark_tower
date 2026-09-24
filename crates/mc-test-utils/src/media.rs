@@ -32,65 +32,72 @@ pub fn sample_identity_public_key() -> Vec<u8> {
 /// deliberately.
 pub const TEST_HANDLER_ID: &str = "mh-test-0";
 
-/// The N=1 loopback policy for one handler: one participant, one audio egress
-/// stream, one candidate — themselves.
+/// The two-party policy for one handler: two participants who hear each
+/// other, each declaring one audio slot, each slot pinned to the other.
 ///
-/// Produced by calling MC's real [`mc_service::media_routing::compute_assignment`]
-/// rather than hand-building a `HandlerAssignment`. That matters: a hand-built
-/// literal would let the fixture and the production computation drift, and every
-/// test consuming it would keep passing against a shape MC no longer emits.
+/// Produced by calling MC's real [`mc_service::media_routing::SlotTable`]
+/// render rather than hand-building a `HandlerAssignment`. That matters: a
+/// hand-built literal would let the fixture and the production computation
+/// drift, and every test consuming it would keep passing against a shape MC no
+/// longer emits. (Story 1's single-participant loopback fixture is gone with
+/// loopback itself — story 2 R-3.)
 ///
 /// # Panics
 ///
 /// Panics if the assignment cannot be computed or does not cover
 /// [`TEST_HANDLER_ID`] — a fixture failure that must fail the test loudly.
 #[must_use]
-pub fn loopback_assignment() -> mc_service::media_routing::HandlerAssignment {
-    loopback_assignment_for(TEST_HANDLER_ID, 1)
+pub fn two_party_assignment() -> mc_service::media_routing::HandlerAssignment {
+    meeting_assignment_for(TEST_HANDLER_ID, 2)
 }
 
-/// [`loopback_assignment`] with an explicit handler id and participant count,
-/// for tests that need two distinguishable handlers or more than one subscriber.
+/// A full-mesh policy for `participants` participants on one handler: each
+/// declares `participants - 1` audio slots, so everyone hears everyone.
 ///
 /// Sender ids come from a real [`mc_service::media_admission::SenderIdAllocator`]
 /// rather than a test-only constructor, so this fixture needs no `test-seams`
 /// feature — which matters, because enabling that feature here would spread the
-/// sender-id exhaustion bypass to every crate that links these fixtures.
+/// sender-id exhaustion bypass and the placement pin to every crate that links
+/// these fixtures.
 ///
 /// # Panics
 ///
-/// Panics if `participants` is 0, or if the assignment cannot be computed or
-/// does not cover `handler_id`.
+/// Panics if the render fails or does not cover `handler_id`. A single
+/// participant yields an EMPTY policy (a solo participant hears nothing).
 #[must_use]
-pub fn loopback_assignment_for(
+pub fn meeting_assignment_for(
     handler_id: &str,
     participants: usize,
 ) -> mc_service::media_routing::HandlerAssignment {
     use mc_service::media_admission::SenderIdAllocator;
-    use mc_service::media_routing::{
-        compute_assignment, HandlerId, MeetingRoutingInput, RoutingParticipant,
-    };
-
-    assert!(participants > 0, "a meeting fixture needs a participant");
+    use mc_service::media_routing::{HandlerId, SlotTable};
 
     let handler = HandlerId::new(handler_id);
     let mut allocator = SenderIdAllocator::new();
-    let participants: Vec<RoutingParticipant> = (0..participants)
-        .map(|_| RoutingParticipant {
-            sender_id: allocator
+    let mut table = SlotTable::new();
+    let senders: Vec<_> = (0..participants)
+        .map(|_| {
+            let sender = allocator
                 .allocate()
                 .expect("fixture sender-id allocation")
-                .sender_id,
-            handlers: vec![handler.clone()],
+                .sender_id;
+            table
+                .admit(sender, |_| Some(handler.clone()))
+                .expect("fixture admission");
+            sender
         })
         .collect();
+    let slots: Vec<u16> = (0..participants.saturating_sub(1))
+        .map(|i| u16::try_from(i).expect("fixture slot id"))
+        .collect();
+    for sender in senders {
+        table.set_demand(sender, slots.clone());
+    }
 
-    compute_assignment(&MeetingRoutingInput {
-        participants,
-        handlers: vec![handler.clone()],
-    })
-    .expect("loopback assignment must compute")
-    .for_handler(&handler)
-    .cloned()
-    .expect("loopback assignment must cover its own handler")
+    table
+        .render([&handler])
+        .expect("fixture assignment must render")
+        .for_handler(&handler)
+        .cloned()
+        .expect("fixture assignment must cover its own handler")
 }

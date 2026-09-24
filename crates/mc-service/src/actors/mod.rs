@@ -30,6 +30,7 @@
 
 pub mod controller;
 pub mod meeting;
+pub mod meeting_media;
 pub mod messages;
 pub mod metrics;
 pub mod participant;
@@ -38,6 +39,9 @@ pub mod session;
 // Re-export primary types
 pub use controller::{MeetingControllerActor, MeetingControllerActorHandle};
 pub use meeting::{MeetingActor, MeetingActorHandle};
+#[cfg(feature = "test-seams")]
+pub use meeting_media::MeetingSeams;
+pub use meeting_media::{JoinMedia, MediaRoutingDeps, SLOT_VIEW_FLUSH_BATCH};
 pub use messages::*;
 pub use metrics::{ActorMetrics, ControllerMetrics, ControllerMetricsSnapshot, MailboxMonitor};
 pub use participant::{ParticipantActor, ParticipantActorHandle};

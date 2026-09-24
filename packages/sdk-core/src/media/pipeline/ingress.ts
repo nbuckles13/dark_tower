@@ -221,18 +221,38 @@ export class IngressPipeline {
       // one would need a reject token outside the frozen sixteen.
       const decoded = decodeFrame(datagram);
 
+      // The key id lives in the SFrame clear header, so it is readable before
+      // decryption — which is the point: it SELECTS the key.
+      //
+      // Read BEFORE the hop observation, because the hop monitor needs the
+      // sender to tell a slot refill from a reorder. A parse failure is HELD, not
+      // thrown yet: the frame still arrived on the downlink, so it must still be
+      // hop-observed (with no sender) or it would read as a relay gap on top of
+      // being counted as a reject. It is rethrown below with its own token.
+      // The sender is converted ONCE, here, and that one value feeds both the
+      // hop monitor and the roster lookup below.
+      let keyed: { readonly senderId: number } | { readonly error: unknown };
+      try {
+        keyed = { senderId: Number(unpackKeyId(parseSframe(decoded.payload).keyId).senderId) };
+      } catch (error) {
+        keyed = { error };
+      }
+
       // The relay region, quarantined: read once, used only for hop-gap
-      // bookkeeping, and never allowed to influence what follows.
-      const hop = this.#hopMonitor.observe(decoded.streamId, decoded.hopSequence);
+      // bookkeeping, and never allowed to influence what follows. The key-id
+      // sender passed in is unverified here; it only selects whether the slot's
+      // hop baseline resets, and creates no state (see `hopSequenceMonitor.ts`).
+      const hop = this.#hopMonitor.observe(
+        decoded.streamId,
+        decoded.hopSequence,
+        'error' in keyed ? undefined : keyed.senderId,
+      );
       if (hop.undeclaredStreamId) this.#metrics.undeclaredStreamId();
       if (hop.missing > 0) this.#metrics.downlinkGapFrames(hop.missing);
       if (hop.reordered) this.#metrics.downlinkReorder();
 
-      // The key id lives in the SFrame clear header, so it is readable before
-      // decryption — which is the point: it SELECTS the key.
-      const sframe = parseSframe(decoded.payload);
-      const parts = unpackKeyId(sframe.keyId);
-      const senderId = Number(parts.senderId);
+      if ('error' in keyed) throw keyed.error;
+      const { senderId } = keyed;
 
       const identityKey = this.#roster.identityKeyFor(senderId);
       if (!identityKey) {

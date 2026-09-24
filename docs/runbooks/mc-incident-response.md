@@ -79,6 +79,7 @@ container name, so `kubectl ... deployment/mc-service` fails with
    - [Scenario 15: Media Generation Divergence](#scenario-15-media-generation-divergence)
    - [Scenario 16: Missing Key Material](#scenario-16-missing-key-material)
    - [Heap and Core Dumps Contain Live Meeting KEKs](#heap-and-core-dumps-contain-live-meeting-keks) (unnumbered; read **before** taking any memory capture)
+   - [Scenario 18: A Participant Hears Only Part of the Roster](#scenario-18-a-participant-hears-only-part-of-the-roster)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1583,7 +1584,7 @@ Expected recovery time: bounded by the upstream MH/network fix; once resolved, i
 > **Note**: `mc_register_meeting_total{status="error"}` and `mc_register_meeting_duration_seconds` start at zero in production and only emit on the first first-participant join. A brand-new series is not itself an incident; `rate(...{status="error"}[5m]) > 0` against a non-trivial total rate is the actionable signal.
 
 **Symptoms**:
-- `mc_register_meeting_total{status="error"}` non-zero or rising vs baseline. MC retries each MH up to 3 attempts with 1s/2s backoffs (see `register_meeting_with_handlers` in `crates/mc-service/src/webtransport/connection.rs`); a steady error rate means retries are being exhausted.
+- `mc_register_meeting_total{status="error"}` non-zero or rising vs baseline. MC retries each MH up to 3 attempts with 1s/2s backoffs (see the per-(meeting, handler) push worker in `crates/mc-service/src/media_routing/pusher.rs`); a steady error rate means retries are being exhausted. Since story 2 a failed push stays unconfirmed and is re-sent by the meeting's next structural change of any kind.
 - `mc_register_meeting_duration_seconds` p95 climbing — RegisterMeeting RPCs are succeeding but slowly, eating into the MH-side 15s timeout budget.
 - MC error log: `"RegisterMeeting retries exhausted"` (target `mc.register_meeting.trigger`) with `mh_grpc_endpoint`, `attempts_made` and the underlying error. This is the **retryable** class — flaky MC→MH coordination; the symptoms and remedies in this scenario are written for it.
 - MC error log: `"RegisterMeeting failed terminally; not retried"` (same target, `terminal = true`; `attempts_made` is whichever attempt hit the terminal outcome, so it is **not** always 1 — a transport error on attempt 1 followed by a terminal divergence on attempt 2 reports 2. `terminal = true` is the discriminator, never the attempt count) — **a DIFFERENT fault with the OPPOSITE remedy; do not treat it as this scenario.** MC deliberately does not retry it, because a `transport_mode_mismatch` is a genuine two-ends version skew between MC and MH and backoff cannot make a skewed handler agree. **Roll MH FORWARD; do NOT roll MC back** — rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for, i.e. the pre-change media blackhole rather than a fix. See `mc-deployment.md` §"Post-Deploy Monitoring Checklist: MC↔MH Coordination" → Rollback (MC half). The two strings are deliberately distinct so a `grep` for one cannot silently match the other.
@@ -1931,7 +1932,7 @@ meeting, participant or stream identity.
 
 ```bash
 kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
-curl -s http://localhost:8080/metrics | grep -E 'mc_media_(receive_capability_declarations|send_directives|slot_states|unmatched_plan_slots|mute_requests)_total|mc_participant_outbound_messages_dropped_total'
+curl -s http://localhost:8080/metrics | grep -E 'mc_media_(receive_capability_declarations|send_directives|slot_states|slot_view_emissions|unreachable_senders|mute_requests)_total|mc_media_receive_slot_cap|mc_participant_outbound_messages_dropped_total'
 kill %1
 # Repeat for mc-1 -- a symptom on one instance says nothing about the other.
 ```
@@ -1945,20 +1946,18 @@ asking correctly?** Note the failure predicate carefully:
 sum by (outcome) (rate(mc_media_receive_capability_declarations_total{outcome!~"accepted|accepted_unchanged"}[5m]))
 ```
 
-Every rejection token except one names a **client** defect, so a rise is a client
+Every rejection token names a **client** defect, so a rise is a client
 fleet problem and points at a client release, not an MC deploy:
 `duplicate_slot_id`, `slot_count_over_cap` (the client asked for more slots than
-`MC_MAX_RECEIVE_SLOTS`), `slot_id_out_of_range`, `pinned_sender_id_zero`,
+`MC_MAX_RECEIVE_SLOTS` — compare its configured N with the `mc_media_receive_slot_cap`
+gauge; a cap below legitimate clients' N is a configuration mismatch), `slot_id_out_of_range`, `pinned_sender_id_zero`,
 `pinned_sender_id_out_of_range`, `declaration_budget_exhausted` (the client blew
 `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` on one connection — a re-declaration
 loop). `media_kind_unspecified` most often means a **version-skewed** client, not
 one that forgot a field: read a rise as client-fleet skew first.
 
-The exception is **`slot_id_not_planned`**, which is **not** a client defect. The
-declaration is well-formed and MC cannot serve it, because the join-time
-forwarding-policy push fixes the egress slot id before the client can declare.
-The remedy is the capability-triggered re-push (a later story), not a client
-change. **Do not escalate this one to the client team.**
+(`slot_id_not_planned` is retired: since story 2 declared audio slots are the
+assignment's input, so no well-formed declaration can miss a plan.)
 
 Do **not** build a ratio whose denominator includes `accepted_unchanged`: it is
 client-inflatable at near-zero server cost, so any such ratio is evadable. Use
@@ -1969,51 +1968,37 @@ This is the one that answers "why is this participant silent". Failure predicate
 
 ```promql
 # NOT outcome!="emitted" -- `emitted_empty_targets` is a specified success
-# per ADR-0036 §5 and becomes routine once selective forwarding lands.
+# per ADR-0036 §5, and ROUTINE since story 2: anyone nobody holds in a slot
+# (a solo participant included) is directed to send nothing.
 sum by (outcome) (rate(mc_media_send_directives_total{outcome!~"emitted|emitted_empty_targets"}[5m]))
 ```
 
 | Token | What it means | Where to go |
 |---|---|---|
-| `no_planned_egress_slot` | **The severe one.** Failed at join, so it silences the connection for its *whole life*, not one declaration. MC computed a forwarding assignment fine; that assignment simply contains no egress plan naming this subscriber. | MC↔MH coordination — Scenario 12 (`RegisterMeeting`) and `mc_media_policy_pushes_total`. The client is not at fault and reconnecting will not help. |
 | `meeting_state_unavailable` | MC could not get the meeting actor handle. | Actor health — Scenario 1 (mailbox depth) and Scenario 2 (actor panics). |
-| `assignment_failed` | MC could not compute a forwarding assignment at all — distinct from `no_planned_egress_slot`, where the computation succeeded. | Scenario 12; check MH registration and `mc_media_generation_divergence`. |
-| `handler_url_unresolved` | No MH WebTransport endpoint resolved for the assigned handler. | MH health and MC's view of it — Scenario 11 / Scenario 13. |
+| `assignment_failed` | MC could not render the meeting's slot table into a forwarding assignment. | File against `meeting-controller`; also read the `Forwarding assignment could not be rendered` ERROR at `mc.register_meeting.trigger`. |
+| `handler_url_unresolved` | **MC-internal defect since story 2** — every url comes from one frozen handler set, so a miss cannot happen by construction. Fails closed: nothing is sent to that participant. | File against `meeting-controller`. |
 | `unknown_stream_number`, `transport_mode_unspecified` | **MC-internal defects**, fail-closed. Not operator-actionable. | File against `meeting-controller`; these are diagnostics, not pageable. |
 
-Log coverage is **uneven across these values, and the counter is the complete
-record — the logs are not.** Stated precisely, because filtering on a token the
-line does not carry returns nothing and reads like "it never happened":
-
-- **Join-time failures** (`no_planned_egress_slot` and the other
-  context-resolution values) log a **WARN carrying `outcome`**, once at join,
-  never per message. This is the only case where filtering on the token works.
-- **Per-composition `build_send_directive` failures** (`unknown_stream_number`,
-  `transport_mode_unspecified`, `handler_url_unresolved`) log at **ERROR** and do
-  carry `outcome`. All three return through the same `Err(outcome)` arm, so the
-  list is the full set of values `build_send_directive` itself produces — do not
-  read the two MC-defect values as the whole of it.
-- **`meeting_state_unavailable`** logs a WARN with **no `outcome` field**, and
-  **`assignment_failed`** logs at ERROR with no `outcome` field (one of its two
-  sites carries `reason`, which is the assignment error's own label, not this
-  token).
-
-So `level=warn AND outcome=assignment_failed` matches nothing by construction.
-Search the message text, or read the counter:
+**Where the logs are.** Since story 2 the MEETING ACTOR composes every
+participant's view, so every composition failure logs at **ERROR** on
+`mc.actor.meeting` carrying `outcome` ("Media signalling could not be composed").
+The one connection-side value, `meeting_state_unavailable`, is a WARN on
+`mc.webtransport.connection` when the actor did not register a declaration. The
+counter is still the complete record.
 
 ```bash
-kubectl logs deployment/mc-0 -n dark-tower --tail=500 | grep -i "media signalling\|send directive"
+kubectl logs deployment/mc-0 -n dark-tower --tail=500 | grep -i "media signalling\|receive capability"
 ```
 
-A connection whose context failed to build stays otherwise **healthy** — the
-participant remains joined, the roster is correct, mute and every other post-join
-message keep working. That is deliberate graceful degradation, and it is also why
-the failure has no other symptom.
+A participant whose view failed to compose stays otherwise **healthy** — joined,
+on the roster, every other post-join message working. That is deliberate graceful
+degradation, and it is also why the failure has no other symptom.
 
 **3. `mc_media_slot_states_total{slot_state}` — are the slots MC filled actually
 carrying anything?** Note the label is **`slot_state`**, not `outcome` — this is
 the one of the three that is not an outcome vocabulary. Its domain mirrors the
-wire `SlotState` enum **exhaustively (all eight variants, not the four reachable
+wire `SlotState` enum **exhaustively (all eight variants, not the three reachable
 today)**, which is what makes MC's distribution directly comparable with the
 client's.
 
@@ -2021,23 +2006,16 @@ client's.
 sum by (slot_state) (rate(mc_media_slot_states_total[5m]))
 ```
 
-`active` is the healthy value. `source_muted` is the sender's own mute and is
-normal. `fewer_sources_than_slots` means the client declared more slots than
-there are sources — normal in a small meeting, not a fault. `source_unreachable`
-is the one worth chasing: the source exists and MC cannot reach it. A non-zero
-`unspecified` is an **MC defect** — that value should never reach the wire —
-and is visible here precisely because the vocabulary was not pruned to the
-reachable subset.
-
-`mc_media_unmatched_plan_slots_total` counts the inverse: MC planning into a slot
-the client never declared. It carries **no** `slot_state`/`outcome` label (only
-`key_custody`, so cardinality 1), and it is incremented **by the slot count**,
-not by 1 per composition — so the series is a *slot* rate, not a *composition*
-rate, and it shares no denominator with the counters above. Do not ratio it
-against them. A sustained non-zero rate means MC's
-egress plan and the client's declared layout disagree — the same underlying
-mismatch as `slot_id_not_planned` seen from the other side. Do not transpose the
-two: *plan's slot was not declared* here, *client's slot has no plan* there.
+`active` is the healthy value. `source_muted` is a source's mute — client OR
+server mute (one wire state for both) — and is normal. `fewer_sources_than_slots`
+means the subscriber declared more slots than there are co-handler senders to fill
+them — normal in a meeting smaller than N, and ALWAYS the state of a solo
+participant (loopback is removed, R-3). `source_unreachable` is **no longer
+emitted**: a participant on another handler is named in
+`StreamAssignments.unreachable_sender_ids` instead (see Scenario 18 and
+`mc_media_unreachable_senders_total`). A non-zero `unspecified` is an **MC
+defect** — that value should never reach the wire — and is visible here
+precisely because the vocabulary was not pruned to the reachable subset.
 
 **4. `mc_media_mute_requests_total{outcome}` — is client mute landing, and is one
 connection driving meeting-wide work?** Note the failure predicate is stated
@@ -2052,7 +2030,7 @@ sum by (outcome) (rate(mc_media_mute_requests_total{outcome=~"rate_limited|actor
 
 | Token | Meaning |
 |---|---|
-| `applied` | Reported to the meeting actor and recomposition **attempted** (not necessarily succeeded — see the mute-path gap in `docs/TODO.md`). |
+| `applied` | The audio flag moved on a declared connection; the meeting actor re-emits the changed slot view to the subscribers HOLDING this source. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
 | `applied_no_recompose` | Reported, nothing to re-convey — no declaration yet, or a **video-only** change. **Expect this to be the largest bucket** once clients wire camera buttons: it is what an ordinary camera button produces, and it is healthy. |
 | `unchanged` | Identical to the report already in force; MC correctly did nothing. **Not a denominator — see below.** |
 | `rate_limited` | The per-connection mute-work token bucket is exhausted (burst 8, sustained 4/s — `MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
@@ -2088,24 +2066,16 @@ audio-leak risk; it is not one.
 
 **Why the bound exists at all, and what it protects**: this is the only
 repeatable client-driven path that puts work on the **shared meeting actor's
-mailbox** — one `GetState` roster snapshot per composition — plus a
-per-connection roster read, assignment computation and outbound message.
-Unbounded, one client toggling in a loop spends all of that at line rate.
-
-**This is NOT a meeting-wide latency pointer, and an earlier revision of this
-section said it was.** The bound was originally sized against
-`handle_self_mute`'s O(N) awaited `broadcast_update`, which did head-of-line-block
-joins, leaves and every other connection's state read. That fan-out was removed
-(`MuteChanged` has no consumer, so it delivered zero bytes to zero clients), and
-the meeting-wide blast radius went with it. The remaining cost is dominated by
-the one connection driving it. **Do not spend an incident here looking for the
-cause of meeting-wide latency** — that symptom's pointers are Scenario 12
-(MC↔MH coordination) and the actor mailbox-depth panels, not this counter.
+mailbox** — one actor hop plus a re-emit to the source's holders. Unbounded, one
+client toggling in a loop spends that at line rate. The resulting fan-out is also
+bounded per MEETING by the actor's per-turn flush bound — whose visible edge is
+`mc_media_slot_view_emissions_total{outcome="deferred"}` (routine under load; the
+views still converge) — so do not route a meeting-wide latency investigation here.
 
 **Caveat that also applies to `mc_media_slot_states_total` above**: both counters
-are **per-composition**, and compositions are partly client-triggered, so a raw
-fleet-wide ratio over either is skewable by a single participant. Any SLO built on
-them needs per-connection normalisation. The skew is bounded by the same limiter.
+are skewable by one participant (and slot states also by meeting churn, since the
+actor re-emits on peers' joins and leaves). Any SLO built on them needs
+per-connection normalisation.
 
 **5. `mc_participant_outbound_messages_dropped_total{payload_kind}` — did the
 client actually RECEIVE what MC decided to send?** Not a media-path metric (no
@@ -2123,13 +2093,13 @@ failure modes sit *after* the counter and neither moves it:
 
 - **Mailbox FULL** — `try_send` fails, the drop is counted **here** under
   `payload_kind="signaling_raw"`. This is the only queryable evidence.
-- **Mailbox CLOSED** (actor gone) — a WARN in `webtransport::connection`, no
-  counter. Deliberate: the FULL case is already covered here, and a WARN is
-  proportionate to actor-gone.
+- **Participant mailbox CLOSED** (participant actor gone) — counted on
+  `mc_media_slot_view_emissions_total{outcome="delivery_failed"}`, an EARLIER hop,
+  disjoint from this one.
 
 So the honest reading of a silent participant is: `accepted` incrementing,
-`emitted` incrementing, nothing disagreeing — **and a non-zero
-`signaling_raw` drop rate is the one signal that contradicts them.** Check it
+`emitted` incrementing — **and a non-zero `signaling_raw` drop rate or
+`delivery_failed` rate is the signal that contradicts them.** Check it
 before concluding from counter 2 that the client was directed.
 
 **The WARN beside it is one-shot per connection; the counter is not.** Every drop
@@ -2139,11 +2109,11 @@ single bad connection, on a path a client can drive. **So log-line volume
 understates this badly**: one line can stand for thousands of drops, and the
 counter is the complete record of repeat occurrences.
 
-**Escalation**: `meeting-controller` for `unknown_stream_number` /
-`transport_mode_unspecified` and any `slot_id_not_planned` rate;
-`media-handler` for `no_planned_egress_slot`, `assignment_failed` and
-`handler_url_unresolved`; `client` for the capability rejection tokens and for a sustained `rate_limited`
-(a repeat loop in the SDK's mute path).
+**Escalation**: `meeting-controller` for `unknown_stream_number`,
+`transport_mode_unspecified`, `handler_url_unresolved`, `assignment_failed` and
+any `composition_failed`; `client` for the capability rejection tokens and for a
+sustained `rate_limited` (a repeat loop in the SDK's mute path). For "I can hear
+some people but not others", go to Scenario 18 first.
 
 ---
 
@@ -2210,18 +2180,32 @@ mailbox and returns success → the mailbox is full, or the apply errors → **M
 generation 7; MH runs generation 4.** The call succeeded. Echoing on *receipt* rather than on
 *apply* would reproduce exactly the bug the field exists to catch.
 
-> **THIS DOES NOT SELF-CORRECT IN THE CURRENT BUILD. DO NOT WAIT FOR CONVERGENCE.**
+> **ANY STRUCTURAL CHANGE RE-PUSHES; FORCE ONE ONLY IF THE MEETING IS QUIESCENT.**
 >
 > ADR-0036 §8 says divergence "is self-correcting — a lost response is re-asserted on the next
-> tick." **That sentence describes a cadence that does not exist yet.** Of §8's four re-fire
-> triggers — structural change, handler-newly-assigned, connectivity loss, and configured cadence —
-> **only structural change is implemented today.** There is no periodic re-assert, no
-> connectivity-loss trigger, and no newly-assigned trigger. With a single participant the only
-> structural change available is a **rejoin**.
+> tick." **That describes a cadence that does not exist yet** (story 4). What does exist since
+> story 2: **every** structural change — a join, a leave, a capability declaration, a mute —
+> re-renders the meeting and re-publishes to every handler, and a push that failed stays
+> UNCONFIRMED, so the next structural change of any kind re-sends it even when that handler's
+> snapshot did not change. In a multi-party meeting with any churn, a divergence therefore often
+> **clears on its own** within the next roster event — check whether it already has (Step 1's
+> counter stops moving) before acting.
 >
-> So the resolution step is **force a structural change**. Nothing will converge on its own, and a
-> responder who waits is waiting on a mechanism that has not shipped. The cadence lands with the
-> handler-restart story; when it does, this paragraph is the one to revise.
+> If the meeting is **quiescent** (nobody joining, leaving or toggling), nothing will re-push: force
+> a structural change. **An MC restart against a live handler is a separate arm and self-corrects on
+> the first post-restart structural change**: MC re-derives generations from 1 while MH still holds
+> K, MH echoes K, and MC adopts K as a floor and re-pushes at K+1 — do not force anything for it;
+> see Scenario 18 arm (e) for what participants see meanwhile. **This arm is NOT under any
+> `outcome` label and does not fire this alert**: it is recorded on
+> `mc_media_policy_generation_adoptions_total{outcome="adopted"}` instead (at most one per live
+> (meeting, handler) per MC restart; the sibling `{outcome="superseded"}` counts replies discarded
+> for a newer render and has no such bound) and logged as a WARN at
+> `mc.register_meeting.trigger` ("adopting it as a floor",
+> carrying `sent_generation`, `applied_generation`, `adopted_generation`). So after an MC restart a
+> clean Step 1 split is expected — read the adoption counter beside it. Conversely, a
+> `generation_mismatch` with `applied > sent` in the ERROR line that DID reach this alert is a
+> FAILED adoption ("Could not adopt the handler's generation") or a higher echo after a confirm
+> (e.g. the `u64::MAX` ratchet wedge): escalate to `meeting-controller`, it will not self-correct.
 
 **Symptoms**:
 - Alert `MCMediaGenerationDivergence` firing.
@@ -2286,9 +2270,10 @@ in the response path, not the apply path.
 > `transport_mode_mismatch` see its row above — a rejoin re-sends the same disagreeing declaration
 > and will not clear it.
 
-1. **Force a structural change on the affected meeting.** With one participant that means a
-   **rejoin** — have the participant leave and rejoin, which fires the structural-change trigger and
-   causes MC to re-assert the full registration. This is the resolution step. It is not a workaround.
+1. **If the meeting is quiescent, force a structural change** — any participant leaving and
+   rejoining (or declaring, or toggling mute) makes MC re-publish, and the unconfirmed push is
+   re-sent. In a meeting with churn this usually happens by itself; confirm Step 1's counter is
+   still moving before acting.
 2. If the rejoin does not clear it, the apply is failing repeatedly rather than transiently: open MH
    and read `mh_media_policy_applies_total{outcome}` and MH's logs for the session actor's mailbox
    state.
@@ -2299,7 +2284,7 @@ in the response path, not the apply path.
 > MH sheds media sessions on restart with no drain (ADR-0036 §11, and `mh-deployment.md`
 > §Rollout With Media Flowing) — it takes down every *working* media session on that pod while
 > recovering none of the ones that were already dark. There is no periodic re-assert in this build to
-> rescue them. A restart makes the blast radius strictly larger and the diagnosis impossible.
+> rescue them (story 4). A restart makes the blast radius strictly larger and the diagnosis impossible.
 
 **Escalation**:
 - `meeting-controller` owns the push side; `media-handler` owns the apply side. The label in Step 1
@@ -2590,6 +2575,108 @@ material to a terminal. The one command above reads two kernel/limit values and 
 
 
 ---
+
+---
+
+### Scenario 18: A Participant Hears Only Part of the Roster
+
+**Alert**: none (see Why no alert)
+**Severity**: triage on report
+**Runbook Section**: `#scenario-18-a-participant-hears-only-part-of-the-roster`
+
+**Symptom**: "I can hear some people but not others", or "I can't hear anyone", in a meeting where
+everyone joined successfully, is on the roster, and no alert is firing. Since story 2 there are FOUR
+causes that present this way, three of them healthy by design. **Fork on the cause before acting —
+their remedies are opposite.**
+
+**Why no alert**: arms (a) and (b) are correct steady states, not faults, and an unfilled slot is
+the steady state of any meeting smaller than N. Paging on them would page on healthy meetings.
+
+**Step 0 — where did each participant land?** The placement INFO line names it (participant id and
+handler id; never a rank or a sender id):
+
+```bash
+kubectl logs deployment/mc-0 -n dark-tower --tail=2000 | grep "Participant placed on media handler"
+# Repeat for mc-1. Match participant_id to the reporter and to who they cannot hear.
+```
+
+Do **not** use `mc_media_unreachable_senders_total` to count who is split: it is emission-weighted
+(it rises with churn), not a population.
+
+**(a) Cross-handler visibility — EXPECTED (ADR-0036 §9, R-33).** The reporter and the silent peer
+are on DIFFERENT handlers. Media routes only within a handler (no cascade until story 6), MC places
+participants round-robin by join order over the meeting's handler set, and the client is told: the
+silent peer is in the reporter's `unreachable_sender_ids`, rendered distinctly (never a spinner). In
+a two-handler meeting ranks 0 and 1 land on different handlers, so a TWO-person meeting hears
+nothing. **Remedy: none at the MC layer — this is placement working as designed.** Co-location-
+preferred placement is deferred (`docs/TODO.md` §Media Path Obligations).
+
+**(b) Over-subscription — EXPECTED.** Reporter and silent peer are on the SAME handler, but the
+reporter's slots are all full with earlier joiners: the N+2th sender gets no slot, is NOT in the
+unreachable set ("no slot" is not "unreachable"), and the reporter's slots show `ACTIVE` for the
+earliest joiners. **Remedy: raise the client's N** (`VITE_DT_RECEIVE_SLOTS`), within
+`MC_MAX_RECEIVE_SLOTS` (published as `mc_media_receive_slot_cap`). A declaration above the cap is
+rejected whole and counted as `slot_count_over_cap` — see the client media signalling section.
+
+**(c) MH refused the WHOLE snapshot on a policy bound — a REAL fault.** Round-robin placement does
+not know a handler's egress ceiling, so a large meeting can exceed a per-meeting or aggregate MH
+bound. MH then rejects the **entire** registration and keeps the previous policy — this surfaces to
+MC as a **gRPC error** on the retry/terminal split ("RegisterMeeting retries exhausted" /
+"failed terminally" at `mc.register_meeting.trigger`), **not** as a generation mismatch. Evidence
+on MH:
+
+```promql
+sum by (outcome) (increase(mh_media_policy_applies_total{outcome="rejected_invalid"}[15m]))
+```
+
+MH's WARN names which bound tripped in its `reason` field. **Remedy: topology/limits, not a
+restart** — `mh-incident-response.md` (egress budget / policy bounds). Nothing re-pushes until the
+next structural change.
+
+**(d) Applied-generation divergence** — the snapshot was accepted but not applied. Go to
+[Scenario 15](#scenario-15-media-generation-divergence).
+
+**(e) After an MC restart: "nobody hears anybody", with client-side `signature_invalid` rather
+than silence.** This is the discriminator: arms (a)–(d) all present as *silence*; signature
+failures mean frames ARE arriving and being REJECTED at the client. **Cause**: an MC restart
+re-issued per-meeting sender ids from 1 (`crates/mc-service/src/media_admission/sender_id.rs`,
+process memory) while MH still held the pre-restart edge table (MH's routing table is install-only
+and `EndMeeting` is not yet implemented), so MH forwards under a table that maps sender ids to the
+wrong people. **It fails closed** — the wrong audio is never played, it is rejected at the signature
+check — so this is an **availability** event, not a confidentiality one; do not escalate it as media
+crossing.
+
+- **Expected resolution**: it self-clears on the first post-restart structural change, when MC
+  adopts MH's echoed generation as a floor and re-pushes above it, replacing MH's table wholesale.
+  **Where to see it**: `mc_media_policy_generation_adoptions_total{outcome="adopted"}` rises (at
+  most one per live (meeting, handler)) and the WARN "adopting it as a floor" appears at
+  `mc.register_meeting.trigger` — NOT a `generation_mismatch` on `mc_media_policy_pushes_total`,
+  which by design stays clean for this arm. If it does NOT clear on the next structural change,
+  adoption is not working (an ERROR "Could not adopt the handler's generation", recorded as
+  `generation_mismatch`, pages `MCMediaGenerationDivergence`): capture MC's
+  `mc.register_meeting.trigger` log lines and escalate to `meeting-controller`.
+- **If MC was ROLLED BACK to a build without floor adoption**, this arm does not self-clear at all:
+  see `mc-deployment.md` §Rollback, the one case where restarting MH IS the remedy.
+- **REQUIRED STEP — every participant who was connected to a meeting on that MC before the restart
+  RELOADS THE PAGE.** A client's media connection to MH outlives an MC restart (the SDK does not
+  tear the MH transport down when MC signalling drops, and has no reconnect path), and MH bound that
+  connection's sender id when it connected — so if the client's rejoin gets a DIFFERENT sender id,
+  no policy push can ever correct that connection. A page reload is what drops the MH transport;
+  "leave and click join again" may not. **Scope it to meetings on the restarted MC and tell ALL
+  their pre-restart participants — do not try to find "the affected ones".** The affected set is
+  unobservable from the client's presentation: the SDK renders no banner (the error is only
+  stored), slots still claim `ACTIVE`, and silence looks exactly like arms (a)–(d). Participants may
+  report "I can't hear anyone" — or nothing at all.
+- **Do not restart MH to clear it.** It sheds every session on the pod, recovers no affected
+  meeting, and destroys the evidence.
+
+**(f) `mc_media_handler_set_divergence_total` is non-zero.** A join carried a handler set that
+differs from the meeting's frozen set (Redis and the actor disagree). MC kept the frozen set, so no
+participant was moved. This is an MC-internal invariant violation: **capture and escalate** to
+`meeting-controller`; restarting nothing fixes it.
+
+**Escalation**: none for (a)/(b); `media-handler` + operations for (c); per Scenario 15 for (d);
+`meeting-controller` for (e) if it does not self-clear, and for (f).
 
 ## Diagnostic Commands
 

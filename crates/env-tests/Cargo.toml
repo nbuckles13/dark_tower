@@ -43,6 +43,30 @@ tracing = { workspace = true }
 # Regex for sanitizing error bodies
 regex = "1.10"
 
+# The signalling client fixtures (`fixtures/mc_session.rs`) live in the LIB, so
+# the WebTransport client, the generated wire types, and the framing primitives
+# must be ordinary dependencies — the lib target has to name `ServerMessage` and
+# open wtransport streams. This is a deliberate reversal of the former dev-only
+# placement: promoting them is what lets the duplicated MC/MH client collapse
+# into one home. The suite still links ZERO service crates (proto-gen is a
+# wire-contract crate), so the ADR-0028 black-box layering is intact.
+#
+# "env-tests is never shipped" is NOT what keeps `dangerous-configuration` (a
+# certificate-validation bypass) out of a service image — a non-shipped member
+# can still hand its features to a shipped one, because cargo's resolver-v2
+# unification applies per invocation and a NORMAL dependency's features unify
+# even when the dev targets are not built. What keeps it out is that each image
+# builds `cargo build --release --package <svc>` (`infra/docker/*/Dockerfile`),
+# a graph env-tests is not in. A Dockerfile widened to `--workspace` would
+# compile the bypass into mc/mh, and `dt-guard release-build-profile` checks the
+# PROFILE of those cargo lines, not their scope — so keep the `--package` form.
+# Class entry (the widened test-utils/dev-only-feature guard): docs/TODO.md,
+# §"No mechanical guard stops a `*-test-utils` crate…".
+wtransport = { workspace = true, features = ["dangerous-configuration"] }
+proto-gen = { path = "../proto-gen" }
+prost = { workspace = true }
+bytes = { workspace = true }
+
 [dev-dependencies]
 # JWT validation
 jsonwebtoken = { workspace = true }
@@ -56,19 +80,13 @@ serial_test = "3.1"
 # Time utilities for timestamp checks
 chrono = { workspace = true }
 
-# WebTransport client for MC connection tests
-wtransport = { workspace = true, features = ["dangerous-configuration"] }
-
-# Protobuf encoding/decoding for signaling messages
-proto-gen = { path = "../proto-gen" }
 # The frame-v2 wire format, for building and decoding media datagrams. A
 # wire-format crate, not a service crate — this suite still links zero service
 # crates. Why depending on it is the DRY-CORRECT choice rather than a tolerated
 # boundary crossing is stated at the fixture that uses it:
-# `tests/26_mh_quic.rs::audio_datagram`.
+# `tests/27_mc_slot_placement.rs::audio_datagram`. Test-only: no lib fixture
+# builds media datagrams, so this stays a dev-dependency.
 media-protocol = { path = "../media-protocol" }
-prost = { workspace = true }
-bytes = { workspace = true }
 
 # OTLP message structs for building telemetry-proxy payloads (31_gc_telemetry.rs).
 # Same crate/version GC's telemetry proxy decodes with (root Cargo.toml), so the

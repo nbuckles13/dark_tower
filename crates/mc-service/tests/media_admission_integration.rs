@@ -76,7 +76,13 @@ impl Server {
             // `None` cursor == the space is ALREADY exhausted, so the very
             // next admission is the reject. Seeding at 65535 instead would
             // succeed once first, which the allocator unit test already covers.
-            .create_meeting_with_sender_id_cursor(meeting_id.to_string(), None)
+            .create_meeting_with_seams(
+                meeting_id.to_string(),
+                mc_service::actors::MeetingSeams {
+                    sender_id_cursor: Some(None),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("create meeting");
         // Handler data only — the meeting itself was just created above with

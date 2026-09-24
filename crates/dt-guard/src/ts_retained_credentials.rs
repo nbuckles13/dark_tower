@@ -84,6 +84,22 @@
 //! 4. **`passphrase` / `passcode` are not matched.** Neither is in CATEGORY_A, and
 //!    adding `pass` as a stem would match `passRate` / `passCount` / `passedChecks`.
 //!    Documented gap, deliberately preferred over a false-positive class.
+//! 5. **Module syntax is masked lexically, not parsed.** [`mask_module_syntax`] blanks
+//!    `import` statements and `export { … }` specifier lists so an inline type-only
+//!    specifier (`type Foo,`) is not read as a `type Foo` declaration. The mask ends at
+//!    the statement's `;` when no specifier list precedes it, so a declaration sharing a
+//!    line with an import (`import Def from './x.js'; export interface X {`) is still
+//!    indexed and a second module statement on that line is masked in its turn
+//!    (@security 2026-09-24 — before that the DECLARATION's `{` was taken as the list
+//!    opener and the real `X` was deleted from the index). What remains is
+//!    line-oriented: an unterminated (ASI) braceless import blanks the rest of its own
+//!    line, and [`strip_noise`] does not carry string state across lines, so a
+//!    multi-line template literal whose text looks like module syntax is masked as
+//!    though it were code. Neither loses a declaration in `packages/**` today, but both
+//!    are gaps, not theorems: the masker is a line-oriented approximation of module
+//!    grammar. What it must never do is point itself at a brace region that *nests* —
+//!    see [`IMPORT_STMT_RE`] on why `import(`/`import.meta` are excluded from the
+//!    keyword.
 //!
 //! ## Amending the predicate invalidates fixtures
 //!
@@ -330,6 +346,119 @@ static DECL_START_RE: Lazy<Regex> = Lazy::new(|| {
     clippy::expect_used,
     reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
+static IMPORT_STMT_RE: Lazy<Regex> = Lazy::new(|| {
+    // Import STATEMENTS only — `import {…}`, `import X from …`, `import type X from …`,
+    // `import * as ns from …`. Deliberately NOT `\bimport\b`: `import(` and
+    // `import.meta` open a line with the same keyword but are EXPRESSIONS, and their
+    // first `{` opens a callback/object body that nests and closes lines later —
+    // precisely what this mask may not be pointed at (see
+    // `dynamic_import_expressions_are_not_masked_as_module_syntax`). The regex crate
+    // has no lookaround, so the exclusion is spelled positively: whitespace-then-`{`,
+    // or whitespace-then-an-identifier-start. `(` and `.` satisfy neither.
+    //
+    // A bare side-effect `import './polyfill.js';` also matches neither, because
+    // `strip_noise` has already elided the quotes — correct by consequence rather than
+    // by design: it carries no specifier, so there is nothing to mask, and leaving the
+    // line intact is strictly safer than blanking it.
+    Regex::new(r"^\s*import\s*\{|^\s*import\s+[A-Za-z_$*]").expect("static pattern compiles")
+});
+
+#[expect(
+    clippy::disallowed_methods,
+    clippy::expect_used,
+    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
+)]
+static EXPORT_SPECIFIER_OPEN_RE: Lazy<Regex> = Lazy::new(|| {
+    // `export { … }` / `export type { … }` re-export lists ONLY. The `{` must follow the
+    // keyword (modulo a `type` modifier) — which is exactly what keeps `export type Foo =
+    // {` and `export interface Foo {` out: both put an identifier before the brace.
+    Regex::new(r"^\s*export\s*(?:type\s+)?\{").expect("static pattern compiles")
+});
+
+/// Blank TypeScript **module syntax** — `import` statements and `export { … }`
+/// specifier lists — out of an already-[`strip_noise`]d line, so that declaration-start
+/// matching never runs over it.
+///
+/// Why this is not cosmetic: an inline type-only specifier is *lexically* a
+/// declaration. In
+///
+/// ```text
+/// import {
+///   AudioPipeline,
+///   type AudioPipelineOptions,
+/// } from '../media/lifecycle/AudioPipeline.js';
+/// ```
+///
+/// the line `  type AudioPipelineOptions,` matches [`DECL_START_RE`] exactly as a real
+/// `type AudioPipelineOptions` declaration would. It is not an alias (no `=`) and opens
+/// no body (no `{`), so the block walk concluded the body had simply not opened yet and
+/// scanned FORWARD until some later, unrelated brace block opened and closed — harvesting
+/// that block's fields and merging them, via `decls.remove(&name)`, into the REAL
+/// same-named declaration collected from the file the type was imported from. Result:
+/// three false `auth_state_password_with_token` findings on a tree where nothing retained
+/// a credential (2026-09-24). The single-line form `import { X, type Y } from '…'` has the
+/// same flaw from the other side: the after-text has a `}` but no `{`, so `opened` never
+/// becomes true and the walk runs on. `export { type Y } from '…'` likewise.
+///
+/// The HEAD tree passed only because no such specifier existed yet — this was a latent
+/// defect waiting on the first inline `type` import, not a regression in the tree.
+///
+/// `in_specifiers` carries "inside an unterminated specifier list" across lines, because
+/// the multi-line form is the common one. Callers must thread ONE state through every
+/// line of a file in order, alongside `in_block_comment`.
+///
+/// Masking rather than skipping the line: a specifier list can share a line with other
+/// code, and the returned text still feeds the brace counters — so the region's `{` and
+/// `}` must BOTH disappear, or the depth bookkeeping goes wrong in the other direction.
+/// A specifier list cannot nest braces, so it ends at the first `}` after its `{`.
+fn mask_module_syntax(line: &str, in_specifiers: &mut bool) -> String {
+    let mut rest = line;
+    let mut out = String::new();
+    loop {
+        if *in_specifiers {
+            let Some(close) = rest.find('}') else {
+                return out; // the list continues on the next line
+            };
+            *in_specifiers = false;
+            rest = rest.get(close + 1..).unwrap_or("");
+            continue;
+        }
+        if !IMPORT_STMT_RE.is_match(rest) && !EXPORT_SPECIFIER_OPEN_RE.is_match(rest) {
+            out.push_str(rest);
+            return out;
+        }
+        // An import STATEMENT ends at its `;`. When the terminator comes BEFORE any
+        // `{`, the statement carries no specifier list, and the mask must stop at the
+        // terminator instead of anchoring on a later, unrelated brace: on
+        // `import X from './x.js'; export interface Creds {` the old code took the
+        // interface's `{` as the list opener, found no `}` on the line, and swallowed
+        // forward to the next `}` — deleting a REAL credential-bearing declaration from
+        // the index and silencing every retention site that named it (@security,
+        // 2026-09-24). Resuming after the `;` keeps the rest of the line intact, so the
+        // declaration is indexed exactly as if it stood on its own line.
+        let open = rest.find('{');
+        if let Some(semi) = rest.find(';').filter(|s| open.is_none_or(|o| *s < o)) {
+            rest = rest.get(semi + 1..).unwrap_or("");
+            continue;
+        }
+        let Some(open) = open else {
+            return out; // unterminated braceless `import x from '…'` (ASI)
+        };
+        match rest.get(open + 1..).and_then(|tail| tail.find('}')) {
+            Some(rel) => rest = rest.get(open + rel + 2..).unwrap_or(""),
+            None => {
+                *in_specifiers = true;
+                return out;
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    clippy::expect_used,
+    reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
+)]
 static FIELD_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^\s*(?:readonly\s+)?(?:#)?([A-Za-z_$][\w$]*)\s*\??\s*:")
         .expect("static pattern compiles")
@@ -456,11 +585,16 @@ fn collect_fields_from(fragment: &str, decl: &mut Decl) {
 fn collect_from_file(path: &Path, content: &str, decls: &mut BTreeMap<String, Decl>) {
     let lines = script_scoped_lines(path, content);
     let mut in_block_comment = false;
+    // ONE specifier-list state for the whole file, threaded through BOTH the header scan
+    // and the block walk below — the walk consumes lines the header loop then skips, so a
+    // second state would miss exactly the lines the first never saw.
+    let mut in_specifiers = false;
     let mut idx = 0usize;
     while idx < lines.len() {
         let Some(raw) = lines.get(idx) else { break };
         let (stripped, ends_comment) = strip_noise(raw, in_block_comment);
         in_block_comment = ends_comment;
+        let stripped = mask_module_syntax(&stripped, &mut in_specifiers);
 
         let Some(caps) = DECL_START_RE.captures(&stripped) else {
             idx += 1;
@@ -546,6 +680,7 @@ fn collect_from_file(path: &Path, content: &str, decls: &mut BTreeMap<String, De
             };
             let (body, ends) = strip_noise(raw_body, in_block_comment);
             in_block_comment = ends;
+            let body = mask_module_syntax(&body, &mut in_specifiers);
             // `depth` is nesting INSIDE the declaration body: 1 == a direct member.
             if depth <= field_depth_limit && paren_depth == 0 {
                 collect_fields_from(&body, &mut decl);
@@ -849,11 +984,16 @@ pub fn largest_declaration_span(files: &[(PathBuf, String)]) -> Option<(PathBuf,
     for (path, content) in files {
         let lines = script_scoped_lines(path, content);
         let mut in_block_comment = false;
+        // Same masking as the scanner: a measuring implementation that disagreed with the
+        // one being measured is the divergence this guard exists to detect. Without it an
+        // inline type-only specifier would contribute a phantom span to the cap headroom.
+        let mut in_specifiers = false;
         let mut idx = 0usize;
         while idx < lines.len() {
             let Some(raw) = lines.get(idx) else { break };
             let (stripped, ends) = strip_noise(raw, in_block_comment);
             in_block_comment = ends;
+            let stripped = mask_module_syntax(&stripped, &mut in_specifiers);
             let Some(caps) = DECL_START_RE.captures(&stripped) else {
                 idx += 1;
                 continue;
@@ -872,6 +1012,7 @@ pub fn largest_declaration_span(files: &[(PathBuf, String)]) -> Option<(PathBuf,
                 };
                 let (body, ends2) = strip_noise(body_raw, in_block_comment);
                 in_block_comment = ends2;
+                let body = mask_module_syntax(&body, &mut in_specifiers);
                 depth += body.matches('{').count() as i64;
                 depth -= body.matches('}').count() as i64;
                 if depth > 0 {
@@ -1493,6 +1634,259 @@ mod tests {
         )]);
         assert!(i.is_credential_bearing("OneLine"));
         assert!(i.is_token_bearing("OneLine"));
+    }
+
+    // --- inline type-only import/export specifiers (2026-09-24) -----------------
+    //
+    // An inline `type X` specifier is lexically a `type X` declaration.
+    //
+    // Which of these reproduced pre-fix, stated exactly, because "it fails without the
+    // fix" is the only thing that makes a regression test one: the MULTI-LINE import and
+    // BOTH multi-line re-export shapes ran the forward walk and contaminated; so did the
+    // braceless `import type Default from '…'`. The single-line `import { X, type Y }
+    // from '…'` did NOT contaminate on this code path — the line's own `{`/`}` leave
+    // `opened` true at depth 0, so the walk never starts and the specifier only
+    // manufactures an empty index entry. It is pinned anyway, as required behaviour: the
+    // difference between "harmless" and "harmful" there is one brace on the same line,
+    // and the next edit to the walk's `opened` seeding would flip it.
+
+    /// The reproducer, reduced: the specifier list is in one file and the REAL
+    /// declaration in another, so the phantom decl and the real one collide by name in
+    /// the shared index (`decls.remove(&name)` merges them). The unrelated brace block
+    /// the walk harvested supplies the credential + token fields.
+    #[test]
+    fn inline_type_import_does_not_contaminate_the_real_declaration() {
+        let i = idx(&[
+            (
+                "packages/sdk-core/src/media/lifecycle/AudioPipeline.ts",
+                "export interface AudioPipelineOptions {\n  readonly sampleRate: number;\n}\n\
+                 export class AudioPipeline {\n  readonly #opts: AudioPipelineOptions;\n}\n",
+            ),
+            (
+                "packages/sdk-core/src/session/MeetingSession.ts",
+                "import {\n  AudioPipeline,\n  type AudioPipelineOptions,\n} from '../media/lifecycle/AudioPipeline.js';\n\
+                 interface Unrelated {\n  readonly password: string;\n  readonly userToken: string;\n}\n",
+            ),
+        ]);
+        assert!(
+            !i.is_credential_bearing("AudioPipelineOptions"),
+            "a multi-line inline type-only specifier must not harvest a later block's \
+             fields into the same-named real declaration"
+        );
+        assert!(!i.is_token_bearing("AudioPipelineOptions"));
+        // The block the walk used to swallow is a declaration in its own right and must
+        // still be indexed on its own terms.
+        assert!(i.is_credential_bearing("Unrelated"));
+    }
+
+    /// The single-line specifier list, plus the braceless single-line import that DOES
+    /// contaminate: `import type Default from '…'` has no brace at all, so `opened` is
+    /// false and the walk runs forward into the next block it finds.
+    #[test]
+    fn single_line_inline_type_imports_declare_nothing() {
+        for (label, src) in [
+            (
+                "inline specifier list",
+                "import { Thing, type ThingOptions } from './thing.js';\n\
+                 interface Later {\n  readonly password: string;\n  readonly userToken: string;\n}\n",
+            ),
+            (
+                "braceless default type import",
+                "import type ThingOptions from './thing.js';\n\
+                 interface Later {\n  readonly password: string;\n  readonly userToken: string;\n}\n",
+            ),
+        ] {
+            let i = idx(&[
+                (
+                    "packages/x/src/thing.ts",
+                    "export interface ThingOptions {\n  readonly sampleRate: number;\n}\n",
+                ),
+                ("packages/x/src/a.ts", src),
+            ]);
+            assert!(
+                !i.is_credential_bearing("ThingOptions"),
+                "{label}: a single-line import specifier must declare nothing and must \
+                 not contaminate the real same-named declaration"
+            );
+            assert!(!i.is_token_bearing("ThingOptions"), "{label}");
+            assert!(i.is_credential_bearing("Later"), "{label}");
+        }
+    }
+
+    /// `export { type X } from '…'` re-exports are the same shape on the export side,
+    /// in both spellings of the list.
+    #[test]
+    fn type_only_reexport_specifiers_declare_nothing() {
+        for (label, src) in [
+            (
+                "single-line",
+                "export { Thing, type ThingOptions } from './thing.js';\n\
+                 interface Later {\n  readonly password: string;\n}\n",
+            ),
+            (
+                "multi-line",
+                "export {\n  Thing,\n  type ThingOptions,\n} from './thing.js';\n\
+                 interface Later {\n  readonly password: string;\n}\n",
+            ),
+            (
+                "export type { … } list",
+                "export type {\n  ThingOptions,\n} from './thing.js';\n\
+                 interface Later {\n  readonly password: string;\n}\n",
+            ),
+        ] {
+            let i = idx(&[("packages/x/src/index.ts", src)]);
+            assert!(
+                !i.is_credential_bearing("ThingOptions"),
+                "{label}: a re-export specifier is not a declaration"
+            );
+            assert!(i.is_credential_bearing("Later"), "{label}");
+        }
+    }
+
+    /// Positive control for the mask: the shapes it must NOT eat. `export type X = …`,
+    /// `export type X = {…}`, `interface` and `class` all still index exactly as before,
+    /// and a real credential+token type retained at a real retention site still FIRES —
+    /// a masker that silenced the detector would pass every negative above.
+    #[test]
+    fn real_declarations_survive_the_module_syntax_mask() {
+        let i = idx(&[(
+            "packages/x/src/t.ts",
+            "import { Other, type OtherOptions } from './other.js';\n\
+             export type AliasOfCreds = LoginCredentials;\n\
+             export type InlineCreds = {\n  readonly password: string;\n};\n\
+             export interface LoginCredentials {\n  readonly password: string;\n  readonly userToken: string;\n}\n\
+             export class ClassCreds {\n  password: string = '';\n  userToken: string = '';\n}\n",
+        )]);
+        assert!(i.is_credential_bearing("AliasOfCreds"), "alias closure");
+        assert!(
+            i.is_credential_bearing("InlineCreds"),
+            "inline type literal"
+        );
+        assert!(i.is_credential_bearing("LoginCredentials"), "interface");
+        assert!(
+            i.is_token_bearing("LoginCredentials"),
+            "interface token limb"
+        );
+        assert!(i.is_credential_bearing("ClassCreds"), "class");
+        assert!(!i.is_credential_bearing("OtherOptions"), "specifier");
+
+        let hits = scan(
+            "packages/x/src/hold.svelte",
+            "<script lang=\"ts\">\n  import { LoginCredentials } from './t.js';\n  let a = $state<LoginCredentials | undefined>(undefined);\n</script>\n",
+            &i,
+        );
+        assert_eq!(hits.len(), 1, "the real detector must still fire: {hits:?}");
+        assert_eq!(hits[0].rule_id, AUTH_STATE_RULE_ID);
+        assert_eq!(hits[0].line, 3);
+    }
+
+    /// `import(` and `import.meta` open a line with the `import` KEYWORD but are
+    /// expressions, not module syntax. They carry no specifier list, so the first `{`
+    /// on the line opens a callback body whose matching `}` is lines away — and the
+    /// mask, which assumes a brace region that cannot nest, ends at the first inner
+    /// `}` it meets. The opener is then deleted while the real closer is still
+    /// counted, so the ENCLOSING declaration's walk sees its depth return to zero
+    /// early and every member after that point is silently never collected. A false
+    /// negative on a guard with no bypass hatch — the shape this module calls its
+    /// worst. Pinned as a class body, because that is where a dynamic import lives.
+    #[test]
+    fn dynamic_import_expressions_are_not_masked_as_module_syntax() {
+        for (label, call) in [
+            ("dynamic import", "import('./x.js').then((m) => {"),
+            ("import.meta", "import.meta.hot?.accept(() => {"),
+        ] {
+            let i = idx(&[(
+                "packages/x/src/lazy.ts",
+                &format!(
+                    "export class Loader {{\n  load() {{\n    {call}\n      const cfg = {{ a: 1 }};\n      void cfg;\n    }});\n  }}\n  password: string = '';\n  userToken: string = '';\n}}\n"
+                ),
+            )]);
+            assert!(
+                i.is_credential_bearing("Loader"),
+                "{label}: masking an expression's brace truncates the enclosing class \
+                 body and drops the members after it"
+            );
+            assert!(i.is_token_bearing("Loader"), "{label}");
+        }
+    }
+
+    /// A declaration may legally share a line with the import statement above it. The
+    /// import carries no specifier list, so the mask used to take the DECLARATION's `{`
+    /// as its list opener, find no `}` on the line, and swallow forward to the next one
+    /// — deleting a real credential-bearing declaration from the index, which silences
+    /// every retention site that names it. Same fail-open class as
+    /// [`dynamic_import_expressions_are_not_masked_as_module_syntax`], reached from the
+    /// statement side rather than the expression side: the mask must end at the
+    /// statement's `;` (@security, 2026-09-24).
+    #[test]
+    fn a_declaration_sharing_a_line_with_an_import_statement_is_still_indexed() {
+        for (label, head) in [
+            ("default import", "import Def from './x.js'; "),
+            ("named import", "import { Named } from './x.js'; "),
+            ("type import", "import type T from './x.js'; "),
+            ("namespace import", "import * as ns from './x.js'; "),
+            ("side-effect import", "import './polyfill.js'; "),
+            (
+                "two statements, one line",
+                "import A from './a.js'; import { type B } from './b.js'; ",
+            ),
+        ] {
+            let i = idx(&[(
+                "packages/x/src/one-liner.ts",
+                &format!(
+                    "{head}export interface Creds {{\n  readonly password: string;\n  readonly userToken: string;\n}}\n"
+                ),
+            )]);
+            assert!(
+                i.is_credential_bearing("Creds"),
+                "{label}: masking must stop at the import statement's `;`, not at a \
+                 later unrelated brace"
+            );
+            assert!(i.is_token_bearing("Creds"), "{label}");
+            // The trailing inline specifier must still not become a declaration.
+            // NOTE this assertion cannot fail and is kept only as documentation of
+            // intent: an unindexed name and a phantom EMPTY decl both answer `false`
+            // here, so it reads green either way. The binding version is below.
+            assert!(!i.is_credential_bearing("B"), "{label}");
+        }
+
+        // What the loop's `B` assertion could not check, pinned on the masker itself.
+        // Inputs are written post-[`strip_noise`] (quotes elided), because that is what
+        // the masker is fed.
+        //
+        // Case 1 is the discriminating one: with no other brace on the line, removing
+        // the `;` branch makes the mask anchor on the declaration's `{`, find no `}`,
+        // and return empty with `in_specifiers` LEFT SET — so it eats the following
+        // lines too. Both assertions below go red in that state (verified by deleting
+        // the branch), and the leaked state is why the third one is here.
+        let mut st = false;
+        let masked = mask_module_syntax("import Def from ; export interface Creds {", &mut st);
+        assert!(
+            masked.contains("export interface Creds {"),
+            "a declaration sharing the line must survive intact: {masked:?}"
+        );
+        assert!(
+            !st,
+            "a braceless import opens no specifier list; the state must not leak to the \
+             following lines: {masked:?}"
+        );
+
+        // Case 2 documents in-turn masking of the second statement. It does NOT bind
+        // the `;` branch on its own — stated rather than implied, because the first
+        // statement's mask happens to land on the second statement's list even without
+        // the branch, so this input reads green either way and would be mistaken for
+        // coverage it does not provide.
+        let mut st2 = false;
+        let masked2 = mask_module_syntax(
+            "import A from ; import { type B } from ; export interface Creds {",
+            &mut st2,
+        );
+        assert!(
+            !masked2.contains("type B"),
+            "the second statement's specifier list must be masked: {masked2:?}"
+        );
+        assert!(masked2.contains("export interface Creds {"), "{masked2:?}");
+        assert!(!st2, "{masked2:?}");
     }
 
     /// The runaway backstop must still fire on genuinely degenerate input — retuning it

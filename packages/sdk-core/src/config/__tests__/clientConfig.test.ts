@@ -14,6 +14,7 @@ import {
   validateMediaConfig,
   type MediaConfig,
 } from '../clientConfig.js';
+import { DEFAULT_HOP_RESTART_BACKWARD_JUMP_FRAMES } from '../../media/pipeline/hopSequenceMonitor.js';
 
 function withEgress(overrides: Partial<MediaConfig['egress']>): MediaConfig {
   return {
@@ -146,5 +147,49 @@ describe('validation throws rather than clamping', () => {
       audio: { ...DEFAULT_CLIENT_CONFIG.media.audio, opusComplexity: 11 },
     };
     expect(() => validateMediaConfig(bad)).toThrow(ClientConfigError);
+  });
+});
+
+describe('the downlink hop-restart bound', () => {
+  function withIngress(overrides: Partial<MediaConfig['ingress']>): MediaConfig {
+    return {
+      ...DEFAULT_CLIENT_CONFIG.media,
+      ingress: { ...DEFAULT_CLIENT_CONFIG.media.ingress, ...overrides },
+    };
+  }
+
+  function configKeyOf(config: MediaConfig): string | undefined {
+    try {
+      validateMediaConfig(config);
+      return undefined;
+    } catch (err) {
+      expect(err).toBeInstanceOf(ClientConfigError);
+      return (err as ClientConfigError).configKey;
+    }
+  }
+
+  it('ships the monitor-owned default, not a second literal', () => {
+    // SSoT: the default is defined beside the class that uses it and imported
+    // here, the same `config -> media` direction as the receive-path bounds.
+    expect(DEFAULT_CLIENT_CONFIG.media.ingress.hopRestartBackwardJumpFrames).toBe(
+      DEFAULT_HOP_RESTART_BACKWARD_JUMP_FRAMES,
+    );
+  });
+
+  it('rejects a non-positive or non-integer bound, naming the key', () => {
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      expect(configKeyOf(withIngress({ hopRestartBackwardJumpFrames: bad }))).toBe(
+        'media.ingress.hopRestartBackwardJumpFrames',
+      );
+    }
+  });
+
+  it('rejects a bound at or above the serial-arithmetic half-space', () => {
+    // At 2^31 a backward jump can no longer be told from a forward one, so the
+    // restart rule would be meaningless. Rejected at config, not at first frame.
+    expect(configKeyOf(withIngress({ hopRestartBackwardJumpFrames: 2 ** 31 }))).toBe(
+      'media.ingress.hopRestartBackwardJumpFrames',
+    );
+    expect(configKeyOf(withIngress({ hopRestartBackwardJumpFrames: 2 ** 31 - 1 }))).toBeUndefined();
   });
 });

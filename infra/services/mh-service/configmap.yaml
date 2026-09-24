@@ -553,12 +553,22 @@ data:
   # thing sizing the muted set's allocation.
   #
   # SIZING, and its precondition. Its number is taken from
-  # `MH_MAX_EGRESS_STREAMS_PER_MEETING` below, which is the SOURCE of it: a
-  # muted source must be a sender in the meeting, and every sender is also a
-  # subscriber holding at least one egress stream, so a legitimate snapshot
-  # can never name more muted senders than that bound admits. That makes this
-  # a LOOSE bound that can never falsely reject a legitimate snapshot — NOT a
-  # statement that a meeting can hold this many senders.
+  # `MH_MAX_EGRESS_STREAMS_PER_MEETING` below. The muted set rides ONE handler's
+  # snapshot, and MC filters it per handler (story 2 task 12), so the real
+  # invariant is: muted senders on a handler <= P_h, the participants placed on
+  # THIS handler. And P_h <= the egress-stream bound whenever P_h >= 2 and
+  # every one of them has declared at least one slot (each then holds >= 1
+  # stream). Under that condition a legitimate snapshot can never name more
+  # muted senders than the egress bound admits, which makes this a LOOSE bound
+  # that can never falsely reject a legitimate snapshot — NOT a statement that
+  # a meeting can hold this many senders.
+  #
+  # CORRECTION (story 2 task 6). This paragraph previously rested on "every
+  # sender is also a subscriber holding at least one egress stream". That was
+  # true only because story 1's visibility predicate was REFLEXIVE — the
+  # self-edge guaranteed every sender a stream. Story 2 R-3 removes loopback,
+  # so it is no longer true (see the PRECONDITION below). Practical impact is
+  # nil: a false reject needs more than 512 muted senders on one handler.
   #
   # THE DIRECTION IS LOAD-BEARING: this value must be AT LEAST
   # `MH_MAX_EGRESS_STREAMS_PER_MEETING`. The two need not be equal, but lowering
@@ -576,12 +586,18 @@ data:
   # registrations are rejected. 512 is the tightest value satisfying both — so a
   # future change to either key has to move both.
   #
-  # PRECONDITION: the derivation holds only while EVERY participant declares at
-  # least one receive slot. `SLOT_STATE_ZERO_REQUESTED` is already in the
-  # signaling vocabulary (retained, unemitted in story 2). The moment a
-  # zero-slot or send-only participant is real, senders are no longer bounded
-  # by egress streams and this value stops following from anything — the
-  # story that makes that state emittable MUST revisit this bound.
+  # PRECONDITION: the derivation holds only while every participant on a
+  # handler holds at least one egress stream. THREE cases break that, and two
+  # are already real in story 2 (both hold ZERO streams):
+  #   - a joined-but-undeclared participant (MC admits a joiner with zero slots
+  #     until it declares a receive capability);
+  #   - a participant ALONE on its handler (P_h = 1: no co-handler peer to hold,
+  #     since loopback is removed);
+  #   - a zero-slot / send-only participant (`SLOT_STATE_ZERO_REQUESTED` stays
+  #     retained-but-unemitted in story 2).
+  # Senders on a handler can then exceed that handler's egress streams, and
+  # this value stops following from the egress bound — the story that makes
+  # large send-only meetings real MUST revisit this bound.
   #
   # REQUIREMENT ON THE MH CODE TASK, recorded here because this comment is what
   # reaches that task's author: this required read must be validated against a
@@ -625,6 +641,17 @@ data:
 
   # Per-meeting bound on `RegisterMeetingRequest.egress_streams`.
   #
+  # WHAT BINDS SINCE STORY 2 (static join-order slot fill): each registration
+  # carries ONE egress stream per FILLED receive slot, each with exactly one
+  # pinned source, so this is now the binding per-meeting constraint — and it
+  # is PER HANDLER: the count is the sum, over subscribers PLACED ON THIS
+  # HANDLER, of min(N_s, P_h - 1), where N_s is that subscriber's declared
+  # slots and P_h the participants placed on this handler (not the meeting).
+  # With a uniform N that is P_h x min(N, P_h - 1). Round-robin placement halves
+  # P per handler, so sizing against the meeting's P over-provisions. (Story 1's
+  # one-stream-per-subscriber-with-every-source shape made the candidate bound
+  # below the binding one instead.)
+  #
   # The muted-source bound above takes its number from this key, and the
   # direction matters: its "can never falsely reject a legitimate snapshot"
   # claim holds only while MH_MAX_MUTED_SOURCES_PER_MEETING >= this value.
@@ -645,6 +672,11 @@ data:
   MH_MAX_EGRESS_STREAMS_PER_MEETING: "512"
 
   # Per-egress-stream bound on `EgressStream.candidate_sources`.
+  #
+  # NO LONGER BINDS under story 2's static fill: every stream carries exactly
+  # one MC-pinned source. It REBINDS when story 5's MH-side §7 selection
+  # returns multi-candidate streams, so do not lower it to 1 because today's
+  # traffic never exceeds 1.
   #
   # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
   # the surviving home is the hard-ceiling constant for

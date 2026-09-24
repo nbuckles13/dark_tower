@@ -1,49 +1,40 @@
 // File: packages/web-app/e2e/media-loopback.spec.ts
 //
-// Task #20 (ADR-0036 story 1): the headline objective, in a real browser against
-// the live cluster — **a participant hears their own audio returned through MH**,
-// and muting stops it.
+// ADR-0036 story 2 R-3 (loopback REMOVED): a participant never hears their own
+// audio. Alone in a meeting, a client hears nothing — with an explicit
+// "fewer sources" slot state, never a spinner — and is directed to send nothing.
+//
+// (The file keeps its story-1 name so the Layer-7 lane's spec inventory does
+// not churn; its subject is now the solo case of the multi-party model.)
 //
 // This is the Env-Test tier of ADR-0028: real Chromium, real WebTransport with
-// `serverCertificateHashes` pinning, real WebCodecs, real WebCrypto, real QUIC
-// datagrams through a real media handler. Capture is synthesized and the
-// microphone permission auto-granted by the fake-device / fake-ui launch flags
-// already present in `playwright.config.ts` — nothing is added here, and no
+// `serverCertificateHashes` pinning, real QUIC to a real media handler. No
 // setting that weakens certificate validation, web security or origin trust
-// appears anywhere in this suite. Such a setting would make the pinning
-// assertion decoration while every test below stayed green.
+// appears anywhere in this suite.
 //
 // ---------------------------------------------------------------------------
-// WHAT THIS PROVES THAT THE UNIT TIER CANNOT
+// COVERAGE LOSS, STATED LOUDLY
 // ---------------------------------------------------------------------------
 //
-// `sdk-core`'s loopback test feeds a pipeline's own egress into its own ingress.
-// That proves WIRING and nothing about composition. Here the frames actually
-// leave the machine, are routed by MC's assignment and forwarded by MH, and come
-// back — so this is the first place the client's codec, the Rust relay, and the
-// controller's slot assignment are proven to agree with each other.
+// Story 1's test 1 here was the only browser-tier proof of STRUCTURAL client
+// mute: egress flat while muted, then resuming. That proof needs egress to
+// advance, which needs someone to hold this client in a slot. A solo client is
+// held by nobody, so egress never advances and the proof cannot live here. A
+// two-party browser meeting in Kind does not restore it either: round-robin
+// placement puts ranks 0 and 1 on different handlers, so the pair has zero
+// edges. OWNER: story 2 task 15 (the multi-context browser S-tests on the
+// task-14 N+1 helper) must name client structural mute explicitly. Until it
+// lands, `expectEgressFlatWhileMuted` has no browser caller.
 //
 // ---------------------------------------------------------------------------
-// TWO ASSERTION DISCIPLINES, BOTH LOAD-BEARING
+// WHY FLAT IS NOT VACUOUS HERE
 // ---------------------------------------------------------------------------
 //
-// 1. **Latency is OBSERVED, NEVER GATED** (§10). The functional pass/fail is
-//    whether audio came back AT ALL. The measured round trip is annotated and
-//    printed; nothing compares it to a threshold. A wall-clock target on a local
-//    cluster is a permanent flake, ADR-0028 forbids quarantining gates, so the
-//    test would be deleted and the headline objective would end with zero
-//    coverage. If a threshold ever appears here, that is the defect §10
-//    describes — not a tightening.
-//
-// 2. **Mute is proven STRUCTURALLY, not acoustically.** Sampling audio energy
-//    would show only that this client's playback went quiet, which is equally
-//    what a dead decoder looks like. A flat send counter proves no encoded audio
-//    LEFT THE DEVICE, which is what §5 actually requires.
-//
-// Every assertion here has a positive control, because each one passes trivially
-// on a pipeline that never worked: silence is indistinguishable from success for
-// a mute test, and "no threshold breached" is indistinguishable from "nothing
-// measured" for a latency observation.
+// "Nothing moved" is trivially true of a client that never started. So the
+// PRIMARY assertion is a specific, non-default wire token: slot 0 polls to
+// exactly `fewer_sources`, which proves MC's assignment ARRIVED. Only after
+// that are the flat counters meaningful, and the flat-window helper carries its
+// own sample-count vacuity check.
 //
 // Requires a live host-side Kind cluster (see e2e/global-setup.ts + README).
 
@@ -51,122 +42,83 @@ import { expect, test } from 'playwright/test';
 import {
   authAsSharedUser,
   bootstrapMeeting,
-  expectEgressAdvances,
-  expectEgressFlatWhileMuted,
-  expectIngressAdvances,
-  frameCountSamples,
+  expectCountersFlatOverWindow,
   joinAsUser,
-  setMuteViaUi,
   startAudio,
   waitForAllMediaConnected,
-  waitForFirstMediaFrame,
   waitForJoined,
 } from './fixtures.js';
 
-test.describe('media loopback through MH (ADR-0036 story 1)', () => {
-  test('own audio returns through MH; mute is structurally silent; unmute resumes', async ({
-    page,
-  }, testInfo) => {
-    // Registration budget: ZERO. The shared valid user signs in (registered once
-    // per run by the first spec that needs it), and the meeting is created
-    // Node-side rather than through the create view.
+test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () => {
+  test('a solo participant hears nothing and is directed to send nothing', async ({ page }) => {
+    // Registration budget: ZERO. The shared valid user signs in, and the
+    // meeting is created Node-side rather than through the create view.
     await page.goto('/');
     const token = await authAsSharedUser(page);
-    const meetingCode = await bootstrapMeeting(token, 'E2E media loopback meeting');
+    const meetingCode = await bootstrapMeeting(token, 'E2E solo participant meeting');
 
-    // --- Join, and confirm the media path's preconditions ------------------
     await joinAsUser(page, meetingCode);
     const joined = await waitForJoined(page);
-    expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
+    // C2 scoping, observable from the browser: MC hands a client EXACTLY its
+    // placed handler — the transport is active/active and dials every url.
+    expect(joined.mediaServers.length, 'media_servers must be scoped to one handler').toBe(1);
     await waitForAllMediaConnected(page, joined.mediaServers);
-
-    // --- Start capture -----------------------------------------------------
     await startAudio(page);
 
-    // --- THE HEADLINE ASSERTION -------------------------------------------
-    //
-    // Functional pass/fail: audio this client captured, encoded, encrypted,
-    // signed and sent came back through MH and completed verify -> replay ->
-    // unwrap -> decrypt -> Opus decode. Every one of those steps is real.
-    const firstMediaMs = await waitForFirstMediaFrame(page);
+    // PRIMARY — the positive control. A specific, non-default wire token: MC's
+    // assignment arrived and says "nobody to hear", not merely "not awaiting".
+    const slot = page.getByTestId('slot-0');
+    await expect(slot, 'the declared slot must be rendered').toBeVisible();
+    await expect
+      .poll(async () => slot.getAttribute('data-slot-state'), {
+        message:
+          'a solo participant must see its slot in the explicit fewer-sources state (R-3). ' +
+          '"awaiting-assignment" means no StreamAssignments arrived; "active" means MC routed ' +
+          'the participant to itself — the loopback this story removes.',
+        timeout: 20_000,
+      })
+      .toBe('fewer_sources');
+    const assignedAtMs = Date.now();
 
-    // OBSERVED AND REPORTED, NEVER GATED. The annotation carries the number into
-    // the run's artifacts; the log line puts it where someone watching a devloop
-    // will see it. Neither is a comparison.
-    testInfo.annotations.push({
-      type: 'observed-loopback-latency-ms',
-      description: `${firstMediaMs} (OBSERVED ONLY — ADR-0036 §10 forbids gating on this)`,
+    // SECONDARY — both counters flat. Egress is flat because MC directs no
+    // audio stream to a publisher nobody holds (a SendDirective with NO
+    // streams, ADR-0036 §5), so no send instruction is ever applied — NOT
+    // because of mute: nothing here mutes. Ingress is flat
+    // because MC pushed no edge into this client. `waitForFirstMediaFrame` is
+    // deliberately not called: no frame is ever expected.
+    await expectCountersFlatOverWindow(page, {
+      fromMs: assignedAtMs,
+      fields: ['framesSent', 'framesAccepted'],
+      whyFlat:
+        'a solo participant is held by nobody (a SendDirective with no streams, §5) and holds nobody ' +
+        '(no edge into it) — a moving counter means a self-edge survived (R-3).',
     });
-    console.log(`[media-loopback] observed round trip to first decoded frame: ${firstMediaMs}ms`);
-
-    // The ONLY assertions on the number: that it is a real measurement. A
-    // threshold here would be the §10 defect.
-    expect(Number.isFinite(firstMediaMs), 'first-media latency must be a real measurement').toBe(
-      true,
-    );
-    expect(firstMediaMs).toBeGreaterThanOrEqual(0);
-
-    // --- Positive control, before anything is asserted about mute ----------
-    //
-    // Without this, every assertion below passes just as well on a pipeline that
-    // never sent a frame: "flat while muted" is trivially true of a dead client.
-    await expectEgressAdvances(page, 'before mute');
-
-    // --- Mute: the indicator and the send path must agree ------------------
-    const mutedAtMs = await setMuteViaUi(page, true);
-    // `setMuteViaUi` already asserts that the DOM indicator and the SDK's
-    // client-mute state on the bus agree. That pairing is the point: an
-    // indicator that can disagree with what gates capture is a hot mic wearing a
-    // "muted" label.
-    await expectEgressFlatWhileMuted(page, mutedAtMs);
-
-    // --- Unmute: audio resumes, at BOTH ends -------------------------------
-    await setMuteViaUi(page, false);
-    // Sent: the capture gate reopened.
-    await expectEgressAdvances(page, 'after unmute');
-    // AND accepted: the audio is actually coming back. Asserting only the send
-    // side would call it a pass if MH had stopped forwarding during the mute —
-    // the resumption failure that matters most to a user, and the one a
-    // send-only assertion cannot see.
-    await expectIngressAdvances(page, 'after unmute');
-
-    // --- Report what was observed, for the devloop record ------------------
-    const samples = await frameCountSamples(page);
-    const last = samples[samples.length - 1];
-    console.log(
-      `[media-loopback] final counters: sent=${last?.framesSent} accepted=${last?.framesAccepted} ` +
-        `over ${samples.length} samples`,
-    );
   });
 
   test('slot state is rendered from the wire, not inferred from silence', async ({ page }) => {
     // ADR-0036 §6: "Slot state is explicit on the wire. Absence of frames is not
-    // a signal." This asserts the client renders MC's assignment rather than
-    // guessing — the property that keeps a congestion hold, an under-filled grid
-    // and an unreachable participant from all showing the same spinner.
+    // a signal." For a solo participant the wire says, specifically,
+    // `fewer_sources` — asserting merely "not awaiting-assignment" would be
+    // vacuous under R-3.
     await page.goto('/');
     const token = await authAsSharedUser(page);
     const meetingCode = await bootstrapMeeting(token, 'E2E slot state meeting');
 
     await joinAsUser(page, meetingCode);
     const joined = await waitForJoined(page);
+    expect(joined.mediaServers.length, 'media_servers must be scoped to one handler').toBe(1);
     await waitForAllMediaConnected(page, joined.mediaServers);
     await startAudio(page);
 
     const slot = page.getByTestId('slot-0');
     await expect(slot, 'the declared slot must be rendered').toBeVisible();
-
     // The attribute carries the WIRE token, so this asserts on the protocol's
     // vocabulary rather than on display copy a copy edit could change.
     await expect
       .poll(async () => slot.getAttribute('data-slot-state'), {
-        message:
-          'the slot must reach an MC-assigned state. Staying at "awaiting-assignment" means ' +
-          'no StreamAssignments arrived — which is a REAL condition the client renders ' +
-          'honestly rather than a test failure to paper over, but it means the controller ' +
-          'never filled the slot this client declared.',
+        message: "a solo participant's slot must reach exactly the fewer-sources state",
         timeout: 20_000,
       })
-      .not.toBe('awaiting-assignment');
+      .toBe('fewer_sources');
   });
 });

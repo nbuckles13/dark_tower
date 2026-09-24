@@ -32,7 +32,9 @@
 
 use super::outcome::DirectiveOutcome;
 use crate::media_admission::SenderId;
-use crate::media_routing::{HandlerId, MeetingAssignment, MAIN_AUDIO_STREAM_NUMBER};
+use crate::media_routing::{
+    HandlerId, MeetingAssignment, MeetingHandlers, MAIN_AUDIO_STREAM_NUMBER,
+};
 use media_protocol::frame::PROTOCOL_VERSION;
 use proto_gen::dark_tower::signaling::v1::{
     Codec, EncodingParameters, MediaKind, SendDirective, SendStream, SendTarget, TransportMode,
@@ -336,38 +338,6 @@ impl MediaStreamPolicy {
     }
 }
 
-/// Client-facing handler urls, resolved once per connection.
-///
-/// # Not the other url-keyed map
-///
-/// Every url here comes from `MhAssignmentData` — **server-derived**, read from
-/// Redis, never client-supplied. MC holds a second, similar-looking url-keyed
-/// map: `ParticipantActor::mh_statuses`, keyed by the truncated `mh_url` a
-/// client sends in a `MediaConnectionUpdate`. **That map must never be a source
-/// for this one.** A client-controlled url reaching a `SendTarget` is a redirect
-/// primitive — it is MC telling a client where to send its media — and the two
-/// maps are one careless lookup apart.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HandlerUrls {
-    urls: BTreeMap<HandlerId, String>,
-}
-
-impl HandlerUrls {
-    /// Build from server-derived `(handler id, client-facing url)` pairs.
-    #[must_use]
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (HandlerId, String)>) -> Self {
-        Self {
-            urls: pairs.into_iter().collect(),
-        }
-    }
-
-    /// This handler's client-facing url.
-    #[must_use]
-    pub fn get(&self, handler: &HandlerId) -> Option<&str> {
-        self.urls.get(handler).map(String::as_str)
-    }
-}
-
 /// The meeting-wide frame header version MC directs.
 ///
 /// **Derived, never a literal.** The version rides in the signed publisher
@@ -395,9 +365,14 @@ fn header_version() -> u32 {
 ///
 /// The target set is **derived from the same [`MeetingAssignment`]** the MC→MH
 /// control plane is programmed from — the handlers carrying an egress stream
-/// whose candidate sources include this publisher. There is deliberately no
-/// parallel loopback derivation: at N=1 the general walk yields the self-edge,
-/// and the same walk yields an N-participant answer unchanged.
+/// whose candidate sources include this publisher. Under static fill that is
+/// exactly the publisher's own placed handler, and only while some co-handler
+/// subscriber holds it in a slot; a publisher nobody holds — including a solo
+/// participant — gets the empty set, "send nothing" (§5).
+///
+/// Target urls come from the meeting's frozen [`MeetingHandlers`], the same
+/// value `JoinResponse.media_servers` and `StreamAssignment.media_handler_url`
+/// are read from, so the three are byte-identical strings.
 ///
 /// An empty target set is a **specified success** (§5: "A target set may be
 /// empty. That means send nothing."), reported as
@@ -411,7 +386,7 @@ fn header_version() -> u32 {
 pub fn build_send_directive(
     publisher: SenderId,
     assignment: &MeetingAssignment,
-    handler_urls: &HandlerUrls,
+    meeting_handlers: &MeetingHandlers,
     policy: &MediaStreamPolicy,
 ) -> Result<(SendDirective, DirectiveOutcome), DirectiveOutcome> {
     // stream number -> targets, ordered so an unchanged meeting produces an
@@ -450,7 +425,7 @@ pub fn build_send_directive(
 
         let mut targets = Vec::with_capacity(handlers.len());
         for (handler, transport_mode) in handlers {
-            let Some(url) = handler_urls.get(&handler) else {
+            let Some(url) = meeting_handlers.url_of(&handler) else {
                 // Fail loud rather than emit a target with an empty url: a
                 // client cannot connect to "" and would report a media
                 // connection failure MC could not explain.
@@ -493,9 +468,7 @@ pub fn build_send_directive(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_routing::{
-        compute_assignment, MeetingRoutingInput, RoutingParticipant, MAIN_AUDIO_SLOT_ID,
-    };
+    use crate::media_routing::{HandlerEndpoint, SlotTable};
     use std::num::NonZeroU16;
 
     fn sender(n: u16) -> SenderId {
@@ -506,20 +479,27 @@ mod tests {
         AudioEncoding::new(Codec::Opus, 48_000, 50).unwrap()
     }
 
-    fn loopback(handlers: &[&str]) -> (MeetingAssignment, HandlerUrls) {
-        let ids: Vec<HandlerId> = handlers.iter().map(|h| HandlerId::new(*h)).collect();
-        let input = MeetingRoutingInput {
-            participants: vec![RoutingParticipant {
-                sender_id: sender(1),
-                handlers: ids.clone(),
-            }],
-            handlers: ids.clone(),
-        };
-        let urls = HandlerUrls::from_pairs(
-            ids.iter()
-                .map(|h| (h.clone(), format!("https://{h}.example:4434"))),
-        );
-        (compute_assignment(&input).unwrap(), urls)
+    fn handler_set(handlers: &[&str]) -> MeetingHandlers {
+        MeetingHandlers::new(handlers.iter().map(|h| HandlerEndpoint {
+            id: HandlerId::new(*h),
+            webtransport_url: format!("https://{h}.example:4434"),
+            grpc_endpoint: format!("http://{h}.example:50053"),
+        }))
+        .unwrap()
+    }
+
+    /// Senders 1 and 2 placed on `mh-0`, each declaring one audio slot, in a
+    /// meeting assigned `handlers` (in the given, arbitrary, order).
+    fn two_party(handlers: &[&str]) -> (MeetingAssignment, MeetingHandlers) {
+        let set = handler_set(handlers);
+        let mut table = SlotTable::new();
+        for s in [1, 2] {
+            table
+                .admit(sender(s), |_| Some(HandlerId::new("mh-0")))
+                .unwrap();
+            table.set_demand(sender(s), vec![0]);
+        }
+        (table.render(set.ids()).unwrap(), set)
     }
 
     #[test]
@@ -530,8 +510,8 @@ mod tests {
     }
 
     #[test]
-    fn loopback_directive_names_one_audio_stream_on_one_datagram_target() {
-        let (assignment, urls) = loopback(&["mh-0"]);
+    fn a_held_publisher_is_directed_to_one_audio_stream_on_one_datagram_target() {
+        let (assignment, urls) = two_party(&["mh-0"]);
         let (directive, outcome) = build_send_directive(
             sender(1),
             &assignment,
@@ -573,7 +553,7 @@ mod tests {
         // ADR-0036 §5: an empty target set is a SPECIFIED SUCCESS ("that means
         // send nothing"), not a failure — so the outcome must sit in the success
         // set, or an `outcome != "emitted"` alert would page on a legal state.
-        let (assignment, urls) = loopback(&["mh-0"]);
+        let (assignment, urls) = two_party(&["mh-0"]);
         let (directive, outcome) = build_send_directive(
             sender(9),
             &assignment,
@@ -588,11 +568,13 @@ mod tests {
 
     #[test]
     fn an_unresolvable_handler_url_fails_loud_rather_than_emitting_an_empty_url() {
-        let (assignment, _) = loopback(&["mh-0"]);
+        let (assignment, _) = two_party(&["mh-0"]);
+        // A handler set that does not contain the handler the plan names: an
+        // MC defect by construction, and it must fail closed.
         let outcome = build_send_directive(
             sender(1),
             &assignment,
-            &HandlerUrls::default(),
+            &handler_set(&["mh-9"]),
             &MediaStreamPolicy::new(encoding()),
         );
         assert_eq!(outcome, Err(DirectiveOutcome::HandlerUrlUnresolved));
@@ -604,7 +586,7 @@ mod tests {
         // SendDirective/SendStream/SendTarget. A client able to name its own
         // group could promote itself past the salience bound §7 relies on.
         // This test documents the property; the proto enforces it.
-        let (assignment, urls) = loopback(&["mh-0"]);
+        let (assignment, urls) = two_party(&["mh-0"]);
         let (directive, _) = build_send_directive(
             sender(1),
             &assignment,
@@ -654,15 +636,15 @@ mod tests {
     /// build path, which are the ones that decide whether a defaulted-datagram
     /// or assumed-audio directive can ever be EMITTED.
     fn assignment_with(stream_number: u8, transport_mode: TransportMode) -> MeetingAssignment {
-        use crate::media_routing::{HandlerAssignment, MAIN_AUDIO_SLOT_ID};
+        use crate::media_routing::HandlerAssignment;
         let mut per_handler = BTreeMap::new();
         per_handler.insert(
             HandlerId::new("mh-0"),
             HandlerAssignment {
                 egress_streams: vec![crate::media_routing::EgressStreamPlan {
-                    egress_stream_id: 1,
-                    subscriber: sender(1),
-                    slot_id: MAIN_AUDIO_SLOT_ID,
+                    egress_stream_id: 0x200,
+                    subscriber: sender(2),
+                    slot_id: 0,
                     candidate_sources: vec![sender(1)],
                     stream_number,
                     priority_group: 0,
@@ -674,11 +656,8 @@ mod tests {
         MeetingAssignment { per_handler }
     }
 
-    fn urls_for_mh0() -> HandlerUrls {
-        HandlerUrls::from_pairs(vec![(
-            HandlerId::new("mh-0"),
-            "https://mh-0.example:4434".to_string(),
-        )])
+    fn urls_for_mh0() -> MeetingHandlers {
+        handler_set(&["mh-0"])
     }
 
     #[test]
@@ -804,52 +783,53 @@ mod tests {
         // What makes "the directive did not move across a mute cycle" assertable
         // as bytes rather than as a field-by-field comparison.
         use prost::Message;
-        let (assignment, urls) = loopback(&["mh-1", "mh-0", "mh-2"]);
+        let (assignment, urls) = two_party(&["mh-1", "mh-0", "mh-2"]);
         let policy = MediaStreamPolicy::new(encoding());
         let (a, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
         let (b, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
         assert_eq!(a.encode_to_vec(), b.encode_to_vec());
     }
 
+    /// R-3: a solo participant is held by nobody, so it is told to send
+    /// nothing — a specified success, never a self-edge.
     #[test]
-    fn the_planned_slot_constant_is_the_assignments_own_answer() {
-        // The directive path and the assignment path must not develop two
-        // answers to "which slot"; `compute_assignment` is the sole producer.
-        let (assignment, _) = loopback(&["mh-0"]);
-        let plan = assignment
-            .per_handler
-            .values()
-            .flat_map(|h| h.egress_streams.iter())
-            .find(|p| p.subscriber == sender(1))
+    fn a_solo_participant_is_directed_to_send_nothing() {
+        let set = handler_set(&["mh-0"]);
+        let mut table = SlotTable::new();
+        table
+            .admit(sender(1), |_| Some(HandlerId::new("mh-0")))
             .unwrap();
-        assert_eq!(plan.slot_id, MAIN_AUDIO_SLOT_ID);
+        table.set_demand(sender(1), vec![0]);
+        let (directive, outcome) = build_send_directive(
+            sender(1),
+            &table.render(set.ids()).unwrap(),
+            &set,
+            &MediaStreamPolicy::new(encoding()),
+        )
+        .unwrap();
+        assert_eq!(outcome, DirectiveOutcome::EmittedEmptyTargets);
+        assert!(directive.streams.is_empty());
     }
 
     /// The directive's target handler IS the handler carrying this publisher's
-    /// edges, at N=2 handlers.
+    /// edges, in a two-handler meeting.
     ///
     /// # What this rejects, by name
     ///
-    /// `edge_handler` places every edge on the lexicographically smallest shared
-    /// handler, so with `{mh-0, mh-1}` every edge sits on **mh-0** and mh-1 holds
-    /// a correct-by-design EMPTY edge set. The nameable wrong answer is therefore
-    /// `https://mh-1.example:4434` — which is exactly what list-order selection
-    /// produced on the live cluster, where three of four media connections landed
-    /// on mh-1 while every edge sat on mh-0 (story task 24 escalation,
-    /// `docs/devloop-outputs/2026-09-05-sender-id-binding-contract/main.md`
-    /// §Resume). The `assert_ne!` below is that injected adverse condition, not
-    /// a redundant assertion.
+    /// Both participants are placed on **mh-0**, so mh-1 holds a
+    /// correct-by-design EMPTY edge set. The nameable wrong answer is
+    /// `https://mh-1.example:4434` — what list-order selection produced on the
+    /// live cluster in story 1 (three of four media connections on mh-1 while
+    /// every edge sat on mh-0). The `assert_ne!` below is that injected adverse
+    /// condition, not a redundant assertion.
     ///
     /// The expected url is a WRITTEN LITERAL, deliberately not sourced from any
     /// helper the production path also calls: a test that computes its
     /// expectation the same way the code does passes through the divergence it
-    /// exists to catch. Same discipline as
-    /// `crates/proto-gen/tests/internal_roundtrip.rs`'s `65_535`/`65_536` —
-    /// production code references the bound, boundary tests restate it. Do not
-    /// hoist these to a constant.
+    /// exists to catch. Do not hoist these to a constant.
     #[test]
     fn the_directive_targets_the_handler_carrying_this_publishers_edges_at_n_2() {
-        let (assignment, urls) = loopback(&["mh-0", "mh-1"]);
+        let (assignment, urls) = two_party(&["mh-0", "mh-1"]);
 
         // Premise check: the assignment really does place this publisher's edges
         // on exactly one handler, and that handler is mh-0. Without this the
@@ -906,39 +886,24 @@ mod tests {
         assert_ne!(
             targets[0].media_handler_url, "https://mh-1.example:4434",
             "mh-1 holds a correct-by-design EMPTY edge set; steering a client there is the defect \
-             story task 25 fixes — three of four live-cluster media connections landed on mh-1 \
-             while every edge sat on mh-0"
+             story 1 task 25 fixed"
         );
     }
 
-    /// Redis enumeration order cannot change where the client is steered.
+    /// Registration order cannot change where the client is steered.
     ///
-    /// # This is the unit-tier SHADOW of the real proof, and says so on purpose
-    ///
-    /// At THIS tier the inversion is largely normalised away before the code
-    /// under test runs: `MeetingAssignment::per_handler` is a `BTreeMap`,
-    /// `edge_handler` does `shared.sort()`, and `build_send_directive`
-    /// accumulates into a `BTreeMap<HandlerId, _>`. So a permutation test built
-    /// on a hand-made [`MeetingRoutingInput`] asserts a property the TYPES
-    /// guarantee and could not fail — review-protocol §Assertion Vacuity
-    /// mechanism 4.
-    ///
-    /// The seam whose order genuinely varies is the Redis `MhAssignmentData.handlers`
-    /// `Vec`, which reaches the outcome through two private paths in
-    /// `webtransport/connection.rs` (`routing_input_for` into the assignment,
-    /// `HandlerUrls::from_pairs` into the urls) and is only drivable through a
-    /// real join. **The load-bearing proof is therefore
-    /// `crates/mc-service/tests/media_client_signaling_integration.rs`'s
-    /// `redis_enumeration_order_cannot_change_where_the_client_is_steered`.**
-    /// This test is kept as the cheap local regression pin; do not read its green
-    /// as covering the seam, and do not "add symmetry" by writing more of the
-    /// inversion at this tier.
+    /// A unit-tier pin only: `MeetingHandlers` sorts at construction, so the
+    /// property is a type guarantee here (review-protocol §Assertion Vacuity
+    /// mechanism 4). The seam whose order genuinely varies — the Redis
+    /// `MhAssignmentData.handlers` list reaching placement through a real join —
+    /// is proven by `crates/mc-service/tests/media_client_signaling_integration.rs`'s
+    /// `redis_enumeration_order_cannot_change_where_the_client_is_steered`.
     #[test]
     fn handler_list_order_does_not_move_the_directive_at_this_tier() {
         use prost::Message;
         let policy = MediaStreamPolicy::new(encoding());
-        let (ascending, urls_a) = loopback(&["mh-0", "mh-1"]);
-        let (inverted, urls_b) = loopback(&["mh-1", "mh-0"]);
+        let (ascending, urls_a) = two_party(&["mh-0", "mh-1"]);
+        let (inverted, urls_b) = two_party(&["mh-1", "mh-0"]);
 
         let (a, _) = build_send_directive(sender(1), &ascending, &urls_a, &policy).unwrap();
         let (b, _) = build_send_directive(sender(1), &inverted, &urls_b, &policy).unwrap();

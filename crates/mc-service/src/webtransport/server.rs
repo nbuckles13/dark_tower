@@ -9,7 +9,7 @@
 //! 1. Stop accepting new connections
 //! 2. Child tokens propagate cancellation to active connection handlers
 
-use crate::actors::MeetingControllerActorHandle;
+use crate::actors::{MediaRoutingDeps, MeetingControllerActorHandle};
 use crate::auth::McJwtValidator;
 use crate::grpc::MhRegistrationClient;
 use crate::media_routing::PolicyGenerations;
@@ -54,17 +54,12 @@ pub struct WebTransportServer {
     jwt_validator: Arc<McJwtValidator>,
     /// Redis client for reading MH assignment data during join.
     redis_client: Arc<dyn MhAssignmentStore>,
-    /// MH registration client for async RegisterMeeting RPCs.
-    mh_client: Arc<dyn MhRegistrationClient>,
-    /// Per-(meeting, handler) `policy_generation` registry (ADR-0036 §8).
-    ///
-    /// Shared with the controller actor, which evicts a meeting's entries on
-    /// teardown.
-    policy_generations: Arc<PolicyGenerations>,
-    /// This MC's identifier.
-    mc_id: String,
-    /// This MC's gRPC advertise address (for MH->MC callbacks).
-    mc_grpc_endpoint: String,
+    /// Media-routing dependencies every meeting actor is handed at join: the
+    /// MH registration client, the `policy_generation` registry (shared with
+    /// the controller actor, which evicts a meeting's entries on teardown),
+    /// this MC's id and advertised gRPC endpoint, and the directed-encoding
+    /// table. Built once, here.
+    media_deps: Arc<MediaRoutingDeps>,
     /// Maximum concurrent connections (bounds resource exhaustion).
     max_connections: usize,
     /// Client-facing media-signalling configuration (ADR-0036 §5, §6).
@@ -102,6 +97,12 @@ impl WebTransportServer {
         quic_max_idle_timeout: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
+        // `mc_media_receive_slot_cap` is published HERE, once, from the very
+        // `ClientMediaConfig` every connection's capability parse compares a
+        // declaration against — so the published cap and the enforced cap are
+        // one value, not a config read and a parallel constant.
+        metrics::set_receive_slot_cap(client_media_config.max_receive_slots);
+
         Self {
             bind_address,
             tls_cert_path,
@@ -109,10 +110,15 @@ impl WebTransportServer {
             controller_handle,
             jwt_validator,
             redis_client,
-            mh_client,
-            policy_generations,
-            mc_id,
-            mc_grpc_endpoint,
+            media_deps: Arc::new(MediaRoutingDeps {
+                mh_client,
+                policy_generations,
+                mc_id,
+                mc_grpc_endpoint,
+                stream_policy: crate::media_signaling::MediaStreamPolicy::new(
+                    client_media_config.audio_encoding,
+                ),
+            }),
             client_media_config,
             max_connections,
             quic_max_idle_timeout,
@@ -248,10 +254,7 @@ impl WebTransportServer {
                     let controller_handle = Arc::clone(&self.controller_handle);
                     let jwt_validator = Arc::clone(&self.jwt_validator);
                     let redis_client = Arc::clone(&self.redis_client);
-                    let mh_client = Arc::clone(&self.mh_client);
-                    let policy_generations = Arc::clone(&self.policy_generations);
-                    let mc_id = self.mc_id.clone();
-                    let mc_grpc_endpoint = self.mc_grpc_endpoint.clone();
+                    let media_deps = Arc::clone(&self.media_deps);
                     let client_media_config = self.client_media_config;
                     let connection_token = self.cancel_token.child_token();
 
@@ -261,10 +264,7 @@ impl WebTransportServer {
                             controller_handle,
                             jwt_validator,
                             redis_client,
-                            mh_client,
-                            policy_generations,
-                            mc_id,
-                            mc_grpc_endpoint,
+                            media_deps,
                             client_media_config,
                             connection_token,
                         )

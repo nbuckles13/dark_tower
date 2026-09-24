@@ -48,12 +48,12 @@ pub enum ControllerMessage {
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
 
-    /// Create a meeting with a pre-seeded `sender_id` cursor.
-    /// **Test builds only** — the exhaustion-guard bypass.
+    /// Create a meeting with test-only construction overrides (sender-id
+    /// cursor, placement pins, flush bound). **Test builds only.**
     #[cfg(feature = "test-seams")]
-    CreateMeetingWithSenderIdCursor {
+    CreateMeetingWithSeams {
         meeting_id: String,
-        next_sender_id: Option<std::num::NonZeroU16>,
+        seams: super::meeting_media::MeetingSeams,
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
 
@@ -86,6 +86,9 @@ pub enum ControllerMessage {
         is_host: bool,
         /// Sender for writing framed protobuf bytes to the WebTransport stream.
         stream_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        /// Media-routing inputs: server dependencies and the meeting's handler
+        /// set as read for this join (frozen by the actor at the first join).
+        media: super::meeting_media::JoinMedia,
         /// Response channel sent back to the WebTransport connection actor.
         respond_to: oneshot::Sender<Result<JoinResult, McError>>,
     },
@@ -117,6 +120,8 @@ pub enum MeetingMessage {
         is_host: bool,
         /// Sender for writing framed protobuf bytes to the WebTransport stream.
         stream_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+        /// Media-routing inputs (see `ControllerMessage::JoinConnection`).
+        media: super::meeting_media::JoinMedia,
         /// Response channel for join result.
         respond_to: oneshot::Sender<Result<JoinResult, McError>>,
     },
@@ -201,6 +206,20 @@ pub enum MeetingMessage {
         /// Response channel. See [`SenderLookup`] — the ambiguous arm is a real
         /// outcome, not an error.
         respond_to: oneshot::Sender<SenderLookup>,
+    },
+
+    /// Register a participant's validated receive-capability declaration
+    /// (ADR-0036 §6), making the actor the source of truth for slot demand.
+    ///
+    /// Only ACCEPTED declarations arrive here: every rejection (cap, budget,
+    /// malformed) is decided connection-side without touching the actor, and
+    /// an identical re-declaration is short-circuited there too. The actor
+    /// resizes the participant's slots, re-renders, re-pushes and re-emits.
+    RegisterReceiveCapability {
+        participant_id: String,
+        declaration: crate::media_signaling::ReceiveCapabilityDeclaration,
+        /// `Ok` once the declaration is registered (and a first flush ran).
+        respond_to: oneshot::Sender<Result<(), McError>>,
     },
 
     /// Update participant mute status (self-mute, informational).
@@ -394,9 +413,21 @@ pub struct JoinResult {
     pub kek_generation: u16,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
+    /// The ONE media handler this participant was placed on (ADR-0036 §9).
+    /// `JoinResponse.media_servers` carries exactly this handler's url.
+    pub media_handler: crate::media_routing::HandlerEndpoint,
 }
 
 /// Result of a successful reconnection.
+///
+/// **No handler field yet, and that is deliberate** (reconnect is not wired
+/// into the WebTransport path; `handle_reconnect` has no caller). When it is:
+/// the proto's reconnect response is `JoinResponse`-shaped, and its
+/// `media_servers` MUST carry exactly the participant's PLACED handler — from
+/// `SlotTable::handler_of` resolved through the meeting's frozen
+/// `MeetingHandlers` (ADR-0036 §9, C3: a reconnect gets the SAME single
+/// handler) — never the registration's (Redis) handler list, which would
+/// silently re-widen `media_servers`. Mirror `JoinResult::media_handler`.
 #[derive(Debug, Clone)]
 pub struct ReconnectResult {
     /// Confirmed participant ID.
@@ -616,6 +647,25 @@ pub enum SignalingPayload {
     Chat { content: String },
     /// Generic signaling data (protobuf bytes).
     Raw { message_type: u32, data: Vec<u8> },
+}
+
+/// `SignalingPayload::Raw::message_type` for an encoded `ServerMessage`, the
+/// only kind MC sends raw today. Named once so the discriminant is not a bare
+/// `0` at every send site.
+pub const RAW_SERVER_MESSAGE_TYPE: u32 = 0;
+
+impl SignalingPayload {
+    /// The envelope for one `ServerMessage`: encode it under
+    /// [`RAW_SERVER_MESSAGE_TYPE`]. Policy-free by design: each caller keeps
+    /// its own trace-context injection point and its own delivery-failure
+    /// accounting (they legitimately differ).
+    pub fn server_message(message: &proto_gen::dark_tower::signaling::v1::ServerMessage) -> Self {
+        use prost::Message as _;
+        Self::Raw {
+            message_type: RAW_SERVER_MESSAGE_TYPE,
+            data: message.encode_to_vec(),
+        }
+    }
 }
 
 #[cfg(test)]

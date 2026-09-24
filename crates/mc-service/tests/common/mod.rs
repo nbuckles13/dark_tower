@@ -15,6 +15,7 @@
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 pub mod accept_loop_rig;
+pub mod media_session;
 pub mod otel_capture;
 
 use std::pin::Pin;
@@ -99,6 +100,8 @@ pub struct RegisterMeetingCall {
     pub policy_generation: u64,
     /// How many egress streams the pushed policy carried.
     pub egress_stream_count: usize,
+    /// The pushed policy itself, for per-handler edge assertions.
+    pub assignment: mc_service::media_routing::HandlerAssignment,
 }
 
 pub struct MockMhRegistrationClient {
@@ -187,6 +190,7 @@ impl MhRegistrationClient for MockMhRegistrationClient {
                 mc_grpc_endpoint: programming.mc_grpc_endpoint.to_string(),
                 policy_generation: programming.policy_generation.get(),
                 egress_stream_count: programming.assignment.egress_streams.len(),
+                assignment: programming.assignment.clone(),
             });
         self.call_notify.notify_one();
         let result = match &self.result {
@@ -317,6 +321,56 @@ pub fn seed_mh_assignment_only(handles: &TestStackHandles, meeting_id: &str) {
 /// Thin wrapper over [`seed_meeting_with_handlers`] for the common case.
 pub async fn seed_meeting_with_mh(handles: &TestStackHandles, meeting_id: &str) {
     seed_meeting_with_handlers(handles, meeting_id, vec![mh_handler("mh-test-1")]).await;
+}
+
+/// Media-routing inputs for actor-level joins in the integration suite: the
+/// stack's recording MH client and a meeting handler set of `handlers`.
+///
+/// # Panics
+///
+/// Panics on an empty or duplicate handler list — a fixture defect.
+pub fn test_join_media(
+    handles: &TestStackHandles,
+    handlers: &[MhEndpointInfo],
+) -> mc_service::actors::JoinMedia {
+    join_media_with(
+        Arc::clone(&handles.mh_reg_client) as Arc<dyn MhRegistrationClient>,
+        handlers,
+    )
+}
+
+/// [`test_join_media`] for tests that drive the actor without a
+/// [`TestStackHandles`]: a fresh recording MH client and the single default
+/// handler `mh-test-1`.
+pub fn standalone_join_media() -> mc_service::actors::JoinMedia {
+    join_media_with(
+        Arc::new(MockMhRegistrationClient::new()),
+        &[mh_handler("mh-test-1")],
+    )
+}
+
+fn join_media_with(
+    mh_client: Arc<dyn MhRegistrationClient>,
+    handlers: &[MhEndpointInfo],
+) -> mc_service::actors::JoinMedia {
+    use mc_service::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
+    mc_service::actors::JoinMedia {
+        deps: Arc::new(mc_service::actors::MediaRoutingDeps {
+            mh_client,
+            policy_generations: Arc::new(PolicyGenerations::new()),
+            mc_id: "mc-test".to_string(),
+            mc_grpc_endpoint: "http://mc-test:50052".to_string(),
+            stream_policy: mc_service::media_signaling::MediaStreamPolicy::new(
+                client_media_config().audio_encoding,
+            ),
+        }),
+        handlers: MeetingHandlers::new(handlers.iter().map(|h| HandlerEndpoint {
+            id: HandlerId::new(&h.mh_id),
+            webtransport_url: h.webtransport_endpoint.clone(),
+            grpc_endpoint: h.grpc_endpoint.clone(),
+        }))
+        .expect("fixture handler set is non-empty and duplicate-free"),
+    }
 }
 
 /// A syntactically valid Ed25519 identity public key for join-path tests.
