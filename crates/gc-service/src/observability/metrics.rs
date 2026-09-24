@@ -200,6 +200,25 @@ fn normalize_endpoint(path: &str) -> String {
         "/metrics" => "/metrics".to_string(),
         "/api/v1/me" => "/api/v1/me".to_string(),
         "/api/v1/meetings" => "/api/v1/meetings".to_string(),
+        // The two OTLP telemetry paths. Fixed spec literals with no dynamic
+        // segment, so they belong in the static arm and add exactly two label
+        // values.
+        //
+        // WITHOUT THESE THEY COLLAPSE INTO `/other`, and that bucket also holds
+        // every 404, scanner hit and typo — so a telemetry 401 becomes
+        // unattributable. That matters because auth on these routes is a
+        // `route_layer`: it rejects BEFORE the handler, so `IngestGuard` never
+        // runs and `gc_telemetry_ingest_total` does not increment even as a
+        // rejection. `gc_http_requests_total` is the only counter that fires,
+        // and in `/other` it cannot answer "is a client's token broken?" — which
+        // otherwise reads identically to "no browser is connected": empty panels,
+        // silent console, ingest counter at zero. No attacker needed; an expired
+        // token is enough.
+        //
+        // Both routes, not just metrics: traces has the identical shape, and
+        // fixing one would be a half-applied rule.
+        "/api/v1/telemetry/v1/metrics" => "/api/v1/telemetry/v1/metrics".to_string(),
+        "/api/v1/telemetry/v1/traces" => "/api/v1/telemetry/v1/traces".to_string(),
         _ => normalize_dynamic_endpoint(path),
     }
 }
@@ -1209,6 +1228,28 @@ mod tests {
             normalize_endpoint("/api/v1/meetings/550e8400-e29b-41d4-a716-446655440000/settings"),
             "/api/v1/meetings/{id}/settings"
         );
+    }
+
+    /// The telemetry routes must attribute, not fall into `/other`.
+    ///
+    /// Auth on these routes is a `route_layer`, so a rejected export never
+    /// reaches the handler and never touches `gc_telemetry_ingest_total`.
+    /// `gc_http_requests_total` is the ONLY counter that fires — and in the
+    /// `/other` bucket, alongside every 404 and scanner hit, it cannot
+    /// distinguish "a client's token is broken" from "nobody is connected".
+    #[test]
+    fn normalize_endpoint_attributes_telemetry_paths() {
+        assert_eq!(
+            normalize_endpoint("/api/v1/telemetry/v1/metrics"),
+            "/api/v1/telemetry/v1/metrics"
+        );
+        assert_eq!(
+            normalize_endpoint("/api/v1/telemetry/v1/traces"),
+            "/api/v1/telemetry/v1/traces"
+        );
+        // Both, deliberately: fixing only the metrics route would be a
+        // half-applied rule, and traces has the identical shape.
+        assert_ne!(normalize_endpoint("/api/v1/telemetry/v1/traces"), "/other");
     }
 
     #[test]

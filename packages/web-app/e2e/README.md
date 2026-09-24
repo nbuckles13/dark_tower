@@ -314,4 +314,10 @@ gitignored, treat as sensitive**. They persist across pipeline runs by design
 (they live outside `DEVLOOP_TMP`'s per-run `layer-*.log` cleanup — that is what
 makes them useful for triage). The tokens are disposable per-run values for a
 local dev cluster, but do not promote artifacts to shared storage or attach
-them to issues.
+them to issues. Since R-27 the telemetry path is also a token carrier: every
+metric export to `/api/v1/telemetry/v1/metrics` sends the user bearer in its
+`Authorization` **header** (`createMetricExporter` in
+`packages/sdk-core/src/telemetry/telemetryConfig.ts`), roughly every 10 s for the
+life of each session — so a retained trace holds many copies of the token in
+headers, not one per join in bodies, which is why the policy above applies with
+more force, not less.

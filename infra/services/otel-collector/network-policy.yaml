@@ -67,9 +67,36 @@ spec:
     ports:
     - protocol: TCP
       port: 13133
+  # Prometheus scrape of the browser `dt_client_*` series (:8889) and of the
+  # collector's own telemetry (:8888). Prometheus runs in the OTHER namespace, so
+  # both selectors are required.
+  #
+  # BOTH SELECTORS ARE KEYS OF ONE LIST ELEMENT, SO THEY AND TOGETHER. Written as
+  # two `-` entries they would OR, opening the whole `dark-tower-observability`
+  # namespace to these unauthenticated metrics endpoints. This mirrors
+  # `infra/services/mh-service/network-policy.yaml` byte-for-byte in shape; keep
+  # the family greppable.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower-observability
+      podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8889
+    - protocol: TCP
+      port: 8888
   egress:
-  # DNS only — dev exporters are debug/logging (no network sink). UDP + TCP 53
-  # (TCP for large/truncated responses).
+  # DNS only. The rule itself is unchanged and still correct — what changed is the
+  # justification: the metrics path now has a real exporter, but the `prometheus`
+  # exporter is PULL-SERVED (Prometheus connects IN on :8889, see the ingress rule
+  # above), so it opens no outbound connection. `debug` writes to the container
+  # log. There is still no network SINK, hence still no egress rule beyond DNS.
+  # Adding `prometheusremotewrite` would change that — and was rejected for the
+  # unauthenticated-write-surface reason recorded in the ConfigMap.
+  # UDP + TCP 53 (TCP for large/truncated responses).
   - to:
     - namespaceSelector:
         matchLabels:

@@ -796,7 +796,8 @@ All GC service metrics follow strict cardinality bounds per ADR-0011:
 | Label | Bound | Values |
 |-------|-------|--------|
 | `method` | 7 max | GET, POST, PATCH, DELETE, PUT, HEAD, OPTIONS |
-| `endpoint` | ~10 | /health, /metrics, /api/v1/me, /api/v1/meetings/{code}, etc. |
+<!-- ANCHOR (DRY): source of truth = `normalize_endpoint` in crates/gc-service/src/observability/metrics.rs. Deliberately NO integer here: the Bound column exists to say a label CANNOT grow unbounded, and a count answers a weaker question. An approximate count also cannot go red — `~10` is not wrong at 12 — so it drifts indefinitely, which is exactly what happened to this row. -->
+| `endpoint` | closed by construction | every path is mapped by `normalize_endpoint` to a fixed literal or placeholder, and anything unmatched collapses to a single sentinel — so the label is bounded no matter how many arms exist. Read the arms there; they are not mirrored here. |
 | `status_code` | ~15 realistic | 200, 201, 400, 401, 403, 404, 429, 500, 503, etc. (HTTP metrics only) |
 | `status` | 5 | success, error, timeout, rejected, accepted (non-HTTP outcome metrics: mc_assignments, db_queries, token_refresh, ac_requests, grpc_mc_calls, mh_selections, meeting_creation, meeting_join) |
 | `operation` | ~18 | select_mc, atomic_assign, update_heartbeat, ac_meeting_token, ac_guest_token, mc_grpc, etc. |

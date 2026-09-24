@@ -52,11 +52,62 @@ export function loadConfig(): DemoConfig {
   }));
 
   const telemetryEndpoint = env.VITE_TELEMETRY_ENDPOINT;
+  const gcBaseUrl = env.VITE_GC_BASE_URL ?? '';
+  if (telemetryEndpoint) {
+    assertTelemetrySharesGcOrigin(telemetryEndpoint, gcBaseUrl);
+  }
   return {
     acOriginTemplate: env.VITE_AC_ORIGIN_TEMPLATE ?? 'http://{subdomain}.localhost:5173',
-    gcBaseUrl: env.VITE_GC_BASE_URL ?? '',
+    gcBaseUrl,
     env: toTelemetryEnv(env.MODE),
     devCertHashes,
     ...(telemetryEndpoint ? { telemetryEndpoint } : {}),
   };
+}
+
+/**
+ * Catch a telemetry endpoint that DIVERGES from the GC API's origin.
+ *
+ * READ WHAT THIS DOES AND DOES NOT DO. On the default path it is VACUOUSLY TRUE:
+ * the browser endpoint is relative and `gcBaseUrl` defaults to `''`, so both
+ * resolve to `location.origin` and the comparison cannot fail whatever either
+ * value contains. What keeps telemetry same-origin on that path is the RELATIVE
+ * SPELLING, not this assertion. Do not read it as a guarantee, and in particular
+ * do not make the endpoint absolute on the reasoning that this will catch a
+ * mistake — on the default configuration it cannot fire.
+ *
+ * What it DOES catch is divergence once either side is absolute: a baked
+ * per-subdomain endpoint against a live page origin, or an endpoint repointed at
+ * another host.
+ *
+ * Every metric export carries the user's bearer token (GC's telemetry proxy is
+ * behind `require_user_auth`), so this value decides who receives a live user
+ * credential. The invariant is deliberately "the same service we ALREADY give
+ * this token to", not "the same origin as the page" — the latter would break a
+ * CDN-hosted app for no security gain, since the page origin never sees the token.
+ *
+ * THROWN, NOT WARNED, AND CHECKED AT CONFIG LOAD. The failure it guards is a
+ * deploy misconfiguration pointing telemetry at a third-party collector, which
+ * ships user JWTs off-estate silently and works perfectly from the app's point of
+ * view. A doc comment does not run at deploy time and a console warning at
+ * startup is read by nobody; failing to boot is the only signal that cannot be
+ * ignored.
+ *
+ * Both values default to RELATIVE (`gcBaseUrl` is `''`, and the telemetry
+ * endpoint is `/api/v1/telemetry`), so both are resolved against
+ * `location.origin` before comparing. That makes both-relative, both-absolute
+ * and mixed cases behave the same way instead of needing three branches.
+ */
+function assertTelemetrySharesGcOrigin(telemetryEndpoint: string, gcBaseUrl: string): void {
+  const base = typeof location === 'undefined' ? 'http://localhost' : location.origin;
+  const telemetryOrigin = new URL(telemetryEndpoint, base).origin;
+  const gcOrigin = new URL(gcBaseUrl, base).origin;
+  if (telemetryOrigin !== gcOrigin) {
+    throw new Error(
+      `VITE_TELEMETRY_ENDPOINT (${telemetryOrigin}) must share an origin with the GC API ` +
+        `(${gcOrigin}). Client metric exports carry the user's bearer token, so a telemetry ` +
+        `endpoint on another origin would send a live user credential to a service that is ` +
+        `not GC. Point it at the GC origin, or leave it unset to disable telemetry.`,
+    );
+  }
 }

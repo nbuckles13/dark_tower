@@ -289,6 +289,87 @@ are **correctly** unguarded — a container memory *limit* denominator is never 
 
 ---
 
+## Metric expiration vs the rate window `[guard-enforced: G5]`
+
+**Same failure class as the non-zero-denominator guard above: an alert that goes
+QUIET instead of red.** That is why it lives here and not in a config reference.
+
+Series reaching Prometheus through the OTel collector's `prometheus` exporter are
+dropped from `/metrics` after `metric_expiration` of no new datapoints. Two
+relations bind that knob to the rules in this repo. Both are enforced from a single
+parsed window by `dt-guard` (G5), which requires the keys to be **present** — a
+renamed key at the next image bump goes red in the hands of the person doing the
+bump, rather than passing as "no findings".
+
+1. **`metric_expiration` MUST exceed the longest range-vector window over any
+   `dt_client_*` selector in a loaded rule.** If the exporter drops a series
+   mid-window because a client is merely slow, the denominator guard
+   (`sum(rate(..._received_total[…])) > 0`) goes false and the alert **stops
+   evaluating rather than firing** — a silent hole exactly where the alert is
+   load-bearing.
+2. **`delta_to_cumulative`'s `max_stale` MUST be >= `metric_expiration` PLUS that
+   same longest window.** `>=` expiration alone is not sufficient. At equal clocks
+   the two events race: the accumulator can forget while the exporter is still
+   holding the old cumulative, so the next delta re-enters low. If that value
+   *exceeds* the last exposed one while the old samples are still inside a `rate()`
+   window, Prometheus sees no reset and **under-counts** silently. Adding the window
+   guarantees every sample of the previously-exposed series has aged out before the
+   accumulator can forget, so no window can span both values.
+
+The values live in `infra/services/otel-collector/configmap.yaml`; the windows live
+in the rule files. **Neither number is restated here and the configmap must not
+restate the derivation** — the reasoning is the durable part, the numbers are not.
+
+---
+
+## Threshold provenance: measure it, don't infer it from the name `[reviewer-only]`
+
+`## How to pick a threshold` above asks for provenance. This names the way
+provenance is usually missing, because in every case found so far the author was
+being careful and still got it wrong.
+
+**Ask: what does this read on a HEALTHY cluster — measured, not assumed?** Four
+thresholds in one devloop were derived from what a metric is *called* rather than
+from what it reads when nothing is wrong, and every one of them would have fired on
+a working system and been muted within days:
+
+- A **filter-processor drop counter** is healthy-**nonzero** at all times — discarding
+  non-allowlisted metrics is the filter doing its job. Never alert on its absolute value.
+- A **series-count floor** derived from a label cross-product fires *hardest when
+  everything works*: OTel JS creates a series lazily per label set, so a cluster with
+  zero drops legitimately has no drop-family series at all. Derive a floor from the
+  **unconditionally-emitted** series only.
+- A **series-count ceiling** sized for one tenant reds on every CI run, because
+  `scripts/layer7.sh` provisions a fresh per-run organization and its series persist
+  for a full `metric_expiration` after the run ends. Tolerate at least one window of
+  overlap, and say that the overlap is a dev-cluster artefact of per-run provisioning
+  rather than a production shape.
+- A **capacity ratio** against a remembered limit. See below — this one is nastier.
+
+**And measure it against the artifact as THIS COMMIT LEAVES IT.** A value that
+co-changes in the same diff makes the current tree the *wrong oracle*: you read the
+right file, get the right number, and are still wrong, because you read the
+pre-change state of something this commit is changing. This survives the standard
+"go and check" defence, which is exactly what makes it worth naming — nobody
+believes they are writing from memory.
+
+**A measurement recorded without naming what it was taken against becomes
+unrecoverable the moment that configuration changes.** Collector RSS measured at
+~196 MiB reads as ~38% of a 512Mi limit and as ~77% of a 256Mi one; record the
+baseline, or the reason a limit was raised is lost from the tree the moment it is
+raised. Where a threshold's inputs are not derivable from two in-tree artifacts, a
+guard cannot recompute it and provenance is the only instrument left.
+
+Operationally, the whole of the above reduces to one mechanical step that costs a
+single file open: **before writing a threshold or a pointer, open the thing it
+refers to.** Its absence produced every instance listed here. The taxonomy is not
+what prevents the defect — that step is. What the taxonomy prevents is the *repair*
+being wrong: widening a hedged count, rewording a stale warning, or leaving a
+"pointer pending" placeholder are all plausible edits that a reviewer without it
+would approve.
+
+---
+
 ## Burn-Rate Alert Shapes `[reviewer-only]`
 
 Burn-rate alerts fire when the SLO error budget is consuming faster than

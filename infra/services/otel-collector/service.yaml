@@ -24,4 +24,17 @@ spec:
     protocol: TCP
     port: 13133
     targetPort: 13133
+  # Browser `dt_client_*` series in Prometheus exposition format (R-27).
+  # Prometheus discovers the POD (kubernetes_sd role: pod) rather than this
+  # Service, but the port is published here too so the endpoint is reachable by
+  # name for debugging and port-forward without addressing a pod directly.
+  - name: prom-metrics
+    protocol: TCP
+    port: 8889
+    targetPort: 8889
+  # The collector's own telemetry (drop counters, stream counts, RSS).
+  - name: self-metrics
+    protocol: TCP
+    port: 8888
+    targetPort: 8888
   sessionAffinity: None

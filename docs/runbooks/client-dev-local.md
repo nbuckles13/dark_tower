@@ -817,17 +817,33 @@ in this ladder and there will not be one.
 
 #### Where these counters can actually be read
 
-**Honest limitation, so you do not spend an afternoon on it:** `dt_client_*` metrics **do not reach
-Prometheus in this deployment.** The OTLP collector's metrics pipeline exports to `debug` — the
-collector's own container log — and no Prometheus job scrapes the collector. So:
+**`dt_client_*` metrics DO reach Prometheus as of 2026-09-23.** This section previously said they
+did not — that was true then and is the reason the export path was built. Query them in Prometheus
+or Grafana normally. Three things about their shape will otherwise cost you an afternoon:
 
-- **Prometheus and Grafana will not show you any `dt_client_*` series.** An empty query result is
-  the expected outcome, not a sign that the client is broken.
-- The counters *are* emitted and *are* reaching the collector. `kubectl logs -n dark-tower
-  -l app=otel-collector` shows the debug exporter's received-metric names and counts, which is
-  enough to tell "emitted" from "not emitted" — and nothing more.
-- **No `dt_client_*` alert can fire**, including `MCMediaMissingKeyMaterial`. Wiring the export path
-  is tracked in `docs/TODO.md` §Observability Debt.
+- **Only the 14 media metrics are exported.** The five join-flow metrics
+  (`dt_client_join_attempts_total` and friends) are deliberately NOT exported, because they carry
+  `meeting_id_hash` and ADR-0036 §11 grandfathers that label *as emitted*, not *as stored in central
+  Prometheus*. So an empty query for a join-flow metric is correct behaviour, not a broken client.
+  The exported set is the `Exported:` markers in `docs/observability/metrics/client.md`.
+- **`instance` on a client series names the COLLECTOR POD, not a browser.** `honor_labels` is left
+  at its default (false), so the scrape's own `job`/`instance` win and the SDK's identity lands
+  under `exported_job="darktower-sdk-core"`. There is no `exported_instance` and there cannot be —
+  a per-session `service.instance.id` is barred as a participant dimension (§11). **Grouping a
+  `dt_client_*` series by `instance` groups by collector**, and every browser collapses into one
+  series per `{client_version, org_id, key_custody}`. That is deliberate: it is what lets the
+  collector sum across browsers without a per-participant label.
+- **An empty result no longer means one thing.** Five controls on the collector's metrics path drop
+  client data by design — the name allowlist, the temporality gate (a stale browser bundle emitting
+  cumulative), `keep_keys`, the stream cap, and `memory_limiter` under pressure — and all five look
+  identical to "no browser is running". Ladder for telling them apart:
+  `gc-deployment.md` §When the client series go quiet. Start with
+  `up{job="otel-collector"}`.
+
+The collector log is still a useful first rung for "emitted at all": `kubectl logs -n dark-tower
+-l app=otel-collector` shows the `debug` exporter's received-metric names and counts, **before** any
+of the five drops above are applied — so a name visible there but absent from Prometheus localises
+the problem to the collector's filtering rather than to the client.
 
 Server-side counters (`mh_media_*`, `mc_media_*`) reach Prometheus normally; rung 6 works.
 
@@ -1370,9 +1386,12 @@ counters that corroborate the roster arm, and the reason the KEK arm has no serv
 all.
 
 **Two things to know before you go there**, because they change how you read a quiet system:
-- **No alert will have fired.** `dt_client_*` metrics do not reach Prometheus in this deployment
-  (§4.5, *Where these counters can actually be read*), so `MCMediaMissingKeyMaterial` cannot fire.
-  Silence from alerting is not evidence of health.
+- **An alert MAY have fired — and its silence still is not evidence of health.**
+  `MCMediaMissingKeyMaterial` became able to fire on 2026-09-23 (§4.5, *Where these counters can
+  actually be read*), so check it. But it is a *ratio* over a 5-minute window held for 15 minutes,
+  so a short local repro will not trip it, and the series can go missing entirely without the alert
+  firing — five collector-side controls drop client data by design and all of them look like "no
+  browser is running".
 - **Do not add a log line to check whether the KEK is present.** ADR-0036 §11 puts KEK and
   transmit-key material inside the credential-leak guard's scope for exactly this moment. A KEK in a
   log is a KEK in the log pipeline.

@@ -7,6 +7,7 @@
 // provider construction).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AggregationTemporality } from '@opentelemetry/sdk-metrics';
 
 // Mock the OTLP exporter so no real exporter / network is constructed. Capture
 // the constructor options to assert the `/v1/metrics` endpoint suffix.
@@ -52,6 +53,25 @@ describe('configureTelemetry', () => {
     expect(exporterCtor).toHaveBeenCalledTimes(1);
     expect(exporterCtor).toHaveBeenCalledWith({
       url: 'https://gc.example/api/v1/telemetry/v1/metrics',
+      // Delta temporality: N same-identity browsers must SUM at the collector
+      // rather than overwrite each other (ADR-0036 §11 bars a per-browser label).
+      //
+      // THIS ASSERTION IS THE WEAK HALF AND IS NOT THE REAL COVERAGE. The
+      // exporter is mocked here, so this only proves what we PASSED. The
+      // exporter's own selector compares against a DIFFERENT enum
+      // (`AggregationTemporalityPreference`) that agrees with this one only
+      // because both use 0 — a renumbering would pass right through this mock
+      // and silently fall back to cumulative. `telemetryConfig.delta.test.ts`
+      // builds the REAL exporter and asserts what it SELECTS; that is the test
+      // that would catch it.
+      temporalityPreference: AggregationTemporality.DELTA,
+      // A per-export header factory carrying the user bearer (GC's telemetry
+      // proxy is behind `require_user_auth`). Asserted only as "a function is
+      // passed" — WHAT it yields, and that the exporter re-asks on every export,
+      // are asserted against the REAL exporter in `telemetryConfig.delta.test.ts`.
+      // A mock cannot show either, and the re-ask is the whole credential-lifetime
+      // property.
+      headers: expect.any(Function),
     });
   });
 

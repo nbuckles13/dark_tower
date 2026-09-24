@@ -49,7 +49,22 @@ export function buildMeetingSession(config: DemoConfig): MeetingSession {
  * stays on NoopMetricsSink otherwise). `env` comes from config (Vite mode),
  * never hardcoded `production`.
  */
-export function configureTelemetryIfEnabled(config: DemoConfig): void {
+export function configureTelemetryIfEnabled(
+  config: DemoConfig,
+  authTokenProvider: () => string | undefined,
+): void {
   if (!config.telemetryEndpoint) return;
-  MeetingSession.configure({ env: config.env, telemetryEndpoint: config.telemetryEndpoint });
+  MeetingSession.configure({
+    env: config.env,
+    telemetryEndpoint: config.telemetryEndpoint,
+    // A GETTER READING `App.svelte`'s SESSION STATE — never a copy of the token.
+    // GC's telemetry proxy requires a bearer credential, but telemetry is
+    // configured once at mount while the token arrives at sign-in, changes on
+    // re-auth and is cleared on sign-out and on the 401 drop. A second holder of
+    // that credential would need its own clearing on both those paths and would
+    // drift from `AuthSession.userToken` the moment one was cleared and the other
+    // was not — the defect class `lib/types.ts` documents. The closure stores
+    // nothing, so the token keeps exactly one home.
+    authTokenProvider,
+  });
 }

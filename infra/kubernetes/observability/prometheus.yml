@@ -107,6 +107,82 @@ scrape_configs:
         action: keep
         regex: "8083"
 
+  # ==========================================================================
+  # OTel collector — the browser `dt_client_*` series (R-27).
+  # ==========================================================================
+  #
+  # DELIBERATELY NOT SHAPED LIKE THE FOUR SERVICE JOBS ABOVE, and deliberately
+  # NOT keyed on the ac/gc/mh/mc enumeration in
+  # `crates/dt-guard/src/common/services.rs`. This is not a Dark Tower service
+  # exposing its own metrics; it is a relay exposing OTHER processes' metrics
+  # (browsers), and every guard, dashboard convention and alert-inventory rule
+  # that iterates "the four services" must keep skipping it.
+  #
+  # `scrape_interval: 10s` on the JOB, not globally. It matches the SDK's export
+  # cadence — scraping faster only samples the same values twice, because the
+  # collector re-exposes whatever it last accumulated. ANCHOR (DRY):
+  # `DEFAULT_METRIC_EXPORT_INTERVAL_MS` in
+  # `packages/sdk-core/src/telemetry/telemetryConfig.ts` is the value this
+  # matches; YAML cannot import it, so if that constant moves, move this.
+  #
+  # `honor_labels` IS LEFT AT ITS DEFAULT (false), AND THAT IS A SECURITY
+  # CONTROL, not just a naming choice. With it true, a client-supplied `job` or
+  # `instance` would OVERRIDE the scrape's own — letting a patched browser
+  # impersonate a service job and either forge an alert or suppress one. Left
+  # false, the scrape identity wins and client-origin labels are prefixed.
+  #
+  # CONSEQUENCE FOR READING A CLIENT SERIES: it carries `job="otel-collector"` and
+  # an `instance` naming the COLLECTOR POD, not a browser, with the SDK's own
+  # identity under `exported_job="darktower-sdk-core"`. There is NO
+  # `exported_instance`, because GC's filter passes only `service.name` and
+  # `service.version` at the resource level and the SDK sets no
+  # `service.instance.id` (barred as a participant dimension, ADR-0036 §11). So
+  # grouping a `dt_client_*` series by `instance` groups by collector. The
+  # authoritative stored-label shape lives in
+  # `docs/observability/metrics/client.md` — one home, not restated here.
+  - job_name: 'otel-collector'
+    scrape_interval: 10s
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - dark-tower
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: otel-collector
+      - source_labels: [__meta_kubernetes_pod_container_port_number]
+        action: keep
+        regex: "8889"
+
+  # The collector's OWN telemetry — a SEPARATE job on purpose.
+  #
+  # Keeping this off the `otel-collector` job is what lets
+  # `up{job="otel-collector"} == 1` keep meaning "the client-series endpoint is
+  # being scraped", which is step 1 of the empty-panel discriminator on the
+  # client dashboards and the positive control in
+  # `crates/env-tests/tests/32_media_metric_hygiene.rs`. Two surfaces, two
+  # scrape semantics, two `up` series.
+  #
+  # This is the only channel through which the metrics path's five silent drops
+  # (name allowlist, temporality gate, keep_keys, max_streams, memory_limiter)
+  # are observable at all — see the ConfigMap's `service.telemetry` comment. The
+  # default 15s global interval is fine here; these are the collector's own
+  # counters, not client data on a 10s cadence.
+  - job_name: 'otel-collector-telemetry'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - dark-tower
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: otel-collector
+      - source_labels: [__meta_kubernetes_pod_container_port_number]
+        action: keep
+        regex: "8888"
+
   # Scrape kube-state-metrics for cluster-level metrics
   - job_name: 'kube-state-metrics'
     kubernetes_sd_configs:

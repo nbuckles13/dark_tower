@@ -15,6 +15,9 @@ vi.mock('../lib/session.js', () => ({
   buildMeetingSession: () => holder.session,
   buildAuthClient: () => ({}),
   buildMeetingClient: () => ({}),
+  // Signature is now `(config, authTokenProvider)` since telemetry gained a
+  // per-export token getter; this suite does not exercise export, so the stub
+  // ignores its arguments entirely.
   configureTelemetryIfEnabled: () => {},
 }));
 

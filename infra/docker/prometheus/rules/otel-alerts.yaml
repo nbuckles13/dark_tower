@@ -8,10 +8,20 @@
 # Scope: OTel-pipeline alerts that are not specific to one service. The single
 # alert here fires per-service when runtime OTLP export degrades.
 #
-# DORMANT until the emitter lands: `dt_otel_export_failures_total` is NOT yet
-# emitted by any code on this branch — R-54 defers the counter to the service
-# OTel exporter init wiring (R-55). Until then this rule cannot fire. See
-# docs/runbooks/gc-deployment.md#otel-collector-upgrade-discipline.
+# STILL DORMANT — AND NOT FOR THE REASON THIS COMMENT USED TO GIVE.
+#
+# It previously said "dormant until R-55 lands". R-55 HAS landed: AC, GC, MC and
+# MH all call `init_otel`, and AC/GC/MC probe the collector at init in the Kind
+# overlay. The rule is dormant because `dt_otel_export_failures_total` has NO
+# EMITTER anywhere in `crates/` — nothing increments it, so it cannot fire.
+#
+# The correction matters because the two reasons expire differently: the old one
+# would have cleared itself when R-55 landed, so a reader checking "has R-55
+# landed?" would conclude this alert was live. It is not. Until a counter emitter
+# exists, this rule's silence says NOTHING about export health.
+#
+# See docs/runbooks/gc-deployment.md#otel-collector-upgrade-discipline, which
+# carries the same note at the triage step that references this alert.
 
 groups:
   - name: otel-pipeline-warning

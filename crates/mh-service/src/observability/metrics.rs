@@ -806,6 +806,14 @@ impl MediaLatencyPhase {
 /// Modelled on [`PolicyApplyOutcome`]: an `ALL` array plus a wildcard-free
 /// `as_str`, so a typo or a new value is a compile error rather than a new
 /// time series discovered in production.
+/// RESERVED SENTINEL: `invalid` must never become a real token here. The
+/// collector rewrites any client label value failing its charset check to
+/// exactly that string (`infra/services/otel-collector/configmap.yaml`), and
+/// four of these spellings are deliberately mirrored by the client's
+/// `MEDIA_SEND_DROP_REASONS` so `sum by(reason)` compares across the hop — so a
+/// real token spelled `invalid` here would become indistinguishable from a
+/// rewritten junk value on the client side of the same query.
+/// `dt-guard client-metrics-export` (G6) fails the build if one appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaDropReason {
     /// MH's bounded ingress queue shed its oldest frame. MH ingest is

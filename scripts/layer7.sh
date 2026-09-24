@@ -1181,6 +1181,31 @@ __layer7_main() {
     # here would trip that check on the first mismatch. One knob, one encoding.
     export E2E_ORG_SUBDOMAIN="$ENV_TEST_ORG_SUBDOMAIN"
     export VITE_AC_PROXY_TARGET="$ENV_TEST_AC_URL" VITE_GC_PROXY_TARGET="$ENV_TEST_GC_URL"
+    # Browser telemetry is OPT-IN and OFF unless this is set: web-app's
+    # `configureTelemetryIfEnabled` returns early when `telemetryEndpoint` is
+    # absent (`packages/web-app/src/lib/config.ts` reads it from here). Without
+    # it the whole client metrics pipeline — SDK -> GC proxy -> collector ->
+    # Prometheus — carries nothing, and a `dt_client_*` read-back would query an
+    # empty Prometheus and pass or fail for reasons unrelated to the code.
+    #
+    # RELATIVE, SAME-ORIGIN, ON PURPOSE — and an absolute value silently breaks
+    # every other run. `packages/web-app/vite.config.ts` proxies `/api/v1/telemetry`
+    # to GC, so the exporter's `fetch` stays on the page origin and never becomes a
+    # CORS preflight (which a browser fails silently, in the console). The page
+    # origin here is per-run AND per-org — `packages/web-app/e2e/env.ts` derives
+    # `http://${orgSubdomain}.localhost:5173` — while this value is baked into
+    # `import.meta.env` at dev-server start. An absolute URL would pin ONE subdomain;
+    # every run with another org would go cross-origin, put `Authorization` on a
+    # preflight GC does not answer, and lose telemetry with no signal. A relative
+    # value is resolved against the live page origin at exporter construction, so
+    # it tracks the per-run subdomain by itself. (`e2e/env.ts` documents the same
+    # collapse-to-one-origin mechanism for the AC origin.) Base URL only: the OTel
+    # exporter appends `/v1/metrics` itself.
+    #
+    # The `loadConfig()` origin assertion CANNOT catch a bad value here — on this
+    # path it compares `location.origin` with itself — so review is the only place
+    # this drift is catchable.
+    export VITE_TELEMETRY_ENDPOINT="/api/v1/telemetry"
     if [[ -n "${ENV_TEST_PROMETHEUS_URL:-}" ]]; then
       export E2E_PROMETHEUS_URL="$ENV_TEST_PROMETHEUS_URL"
     fi

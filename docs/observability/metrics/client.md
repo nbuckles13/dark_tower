@@ -2,7 +2,8 @@
 
 **Service**: Browser SDK (`@darktower/sdk-core`)
 **Implementation**: `packages/sdk-core/src/telemetry/` (sinks, name guard, providers)
-**Job Label**: `darktower-sdk-core` (OTel resource `service.name`)
+**Stored labels**: `job="otel-collector"`, `exported_job="darktower-sdk-core"` — the
+SDK's `service.name` does **not** become `job`. Full shape in §Stored series shape.
 
 > ## Scope
 >
@@ -25,37 +26,100 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 `OtelMetricsSink`) and exported OTLP-HTTP/proto to the GC telemetry proxy
 (`POST /api/v1/telemetry/v1/metrics`).
 
-> ## NOT ONE METRIC IN THIS CATALOG IS QUERYABLE FROM PROMETHEUS TODAY
+> ## WHICH METRICS IN THIS CATALOG ARE QUERYABLE — 14 OF 19, AND THE SPLIT IS DELIBERATE
 >
-> **Emitted and exported is not the same as queryable, and the chain stops one
-> hop short.** The GC proxy forwards to the OTLP collector, whose metrics
-> pipeline is `receivers: [otlp]` / `exporters: [debug]`
-> (`infra/services/otel-collector/configmap.yaml`). `debug` writes names and
-> counts to the collector's own container log. There is no `prometheus` or
-> `prometheusremotewrite` exporter, and no Prometheus job scrapes the collector.
+> This block **replaces** a "not one metric here is queryable" notice. It was not
+> deleted when the exporter landed, because deleting it would have left a catalog
+> of 19 metrics under a header implying all 19 are queryable — the same
+> overclaim-by-omission the original was written to prevent, inverted. Read the
+> per-metric **`Exported:`** marker; it is authoritative and machine-checked
+> (`dt-guard client-metrics-export` asserts set-equality against the collector's
+> name allowlist in both directions, so a metric marked exported and absent from
+> the collector, or vice versa, is a red build).
 >
-> **So every metric below is real, correctly emitted, carries the labels this
-> file documents — and cannot be graphed, alerted on, or queried.** One alert
-> already rests on this (`MCMediaMissingKeyMaterial`); it is loaded, evaluating,
-> and structurally incapable of matching. Tracked in `docs/TODO.md`
-> §Observability Debt, owner infrastructure for the wiring.
+> **The 14 media-path metrics ARE queryable.** Verified end to end on the Kind
+> stack from sdk-core's own built bundle through the GC proxy — not a synthetic
+> payload. `MCMediaMissingKeyMaterial`'s full expression returned `0.286` against
+> live data; it had never been able to match before.
 >
-> **"Not queryable" does not mean "not implemented", and the distinction matters
-> more now than it did.** The media-path metrics are emitted, exported,
-> catalogued **and dashboarded**: `infra/grafana/dashboards/client-media.json`
-> exists, is registered in the Grafana kustomization, and renders "No data" on
-> every panel *for this reason and no other*. The exporter is the **sole
-> remaining hop** — everything on either side of it is built. A reader deciding
-> whether to invest in this signal should read that as "one infrastructure
-> change away", not as "nobody has done the work".
+> **The 5 ADR-0028 join-flow metrics are deliberately NOT exported.** They are the
+> only `dt_client_*` metrics carrying `meeting_id_hash`, and:
 >
-> This block exists because the sentence above it — accurate about emission and
-> export — invites the inference that the chain continues, and a catalog is
-> exactly where someone goes to decide whether a signal is available before
-> building on it. Stating the export path and stopping is how a reader concludes
-> the metric is usable. Delete this block when the exporter lands, **not before,
-> and not because the catalog looks pessimistic**: the state it describes is the
-> state of the tree.
+> > §11 grandfathers the label's presence on those metrics as emitted, not its
+> > export into central Prometheus storage; the harm R1 bars is realised at the
+> > stored series, not at emission.
+>
+> That sentence is the **test**, not just the outcome — apply it before adding a
+> 15th name to the allowlist. Stripping the hash and exporting anyway was
+> considered and rejected: it would publish a series whose shape contradicts this
+> catalog, which is worse than an absent one. Two independent controls keep the
+> hash out of storage (the name allowlist, and the collector's `keep_keys`), and
+> `{__name__=~"dt_client_.+",meeting_id_hash!=""}` returns empty on the live
+> cluster.
+>
+> **Absence is no longer proof of a broken pipeline — and that is a real loss.**
+> Before, an empty panel meant exactly one thing. Now it is ambiguous between
+> "no drops occurred", "no browser connected recently", and "the pipeline broke".
+> There is **no per-browser `up` signal and there structurally cannot be one** (a
+> per-session `service.instance.id` is barred by ADR-0036 §11), so series presence
+> is the *only* liveness signal for the client fleet. Discriminate with the
+> three-step procedure in `docs/observability/dashboards.md` §Client SDK Media
+> Path; do not guess from an empty panel.
+
+---
+
+## Stored series shape
+
+What the SDK emits and what Prometheus stores are not the same label set. Observed
+on the live cluster, not inferred:
+
+| Stored label | Value | Why |
+|---|---|---|
+| `job` | `otel-collector` | the **scrape's** job. `honor_labels` is left at its default (false), so the scrape wins. |
+| `instance` | the collector pod | **not a browser.** There is no per-browser instance and cannot be one (§11). |
+| `exported_job` | `darktower-sdk-core` | the SDK's `service.name`, demoted by the `exported_` prefix. |
+| `exported_instance` | *absent* | no `service.instance.id` exists. Its absence is the §11 decision, not an oversight. |
+| `otel_scope_name`, `otel_scope_version` | scope identity | added by the **exporter**, downstream of `keep_keys` — which therefore cannot drop them and must not be expected to. |
+| `client_version`, `org_id`, `key_custody` + one discriminator | see each entry | the only attributes surviving `keep_keys`. |
+
+**Assert on the absence of `meeting_id_hash`, never on an exact label set.** The
+`otel_scope_*` pair is version-dependent, so an exact-set assertion breaks on an
+image bump for no real reason.
+
+**No dashboard or alert selects on `job`, `instance` or `exported_job`** — every
+`dt_client_*` expression uses a bare `sum()`/`max()`. Keep it that way; a job
+selector added here would silently pin queries to one collector deployment.
+
+### Timestamps are collector-arrival, not browser-event
+
+Delta points are restamped with the collector's clock before accumulation (this
+removes the misaligned-start-timestamp class outright rather than tuning around
+it). Values are unaffected — a delta's value does not depend on its timestamps —
+but **temporal attribution is arrival time**, which produces two spike-shaped
+artefacts that are *not* bursts:
+
+1. **Session teardown.** `flushMetrics()` forces pending deltas out off-cadence,
+   so a session's residual counts land at one instant rather than spread across
+   the session that produced them.
+2. **A backgrounded tab.** Browsers throttle background timers; a resumed tab
+   flushes accumulated deltas at resume. This one happens with nobody doing
+   anything.
+
+A collector outage therefore does not merely lose data, it **re-dates** whatever
+the browsers buffered across it — the recovery spike is an artefact of the outage,
+not a second incident.
+
+### How long until a fresh series is queryable
+
+Three terms, none restated here because all three are set elsewhere and would
+drift: the SDK export interval (`DEFAULT_METRIC_EXPORT_INTERVAL_MS`,
+`packages/sdk-core/src/telemetry/telemetryConfig.ts`), accumulation in the
+collector, and the scrape interval of the `otel-collector` job
+(`infra/kubernetes/observability/prometheus.yml`). The **shape** is
+`export interval + accumulation + scrape interval`, and that shape survives any
+configuration; a computed total would only ever have been true of one.
+`flushMetrics()` collapses the first term, which is why a test that joins, tears
+down, then polls is reliable where "join, then query" flakes.
 
 ---
 
@@ -119,17 +183,33 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
       emitted with the sentinel `meeting_id_hash="none"`. So `meeting_id_hash="none"`
       is the expected, bounded value for early-stage failures — not a bug or a
       cardinality leak (it is a single fixed series).
-  - `org_id` = the org **subdomain** (PLAIN, not hashed — a public, org-level,
-    low-cardinality, non-PII identifier). NOTE: this is the client-visible
-    subdomain, NOT the server's org UUID; correlating client↔server metrics by
-    org requires the subdomain→uuid mapping. (If a real org UUID ever lands in an
-    API response, swap it — non-blocking follow-up.)
+  - `org_id` = the org **UUID**, stamped server-side by GC from the authenticated
+    `UserClaims.org_id`. **The payload value is never trusted** — GC overwrites it,
+    so a client cannot label its telemetry with another tenant's identifier, and the
+    value is bounded by construction rather than by assuming an honest client. That
+    second property is the load-bearing one: the GC filter bounds attribute *keys*
+    and never descends into *values*, so a client-chosen `org_id` would have been an
+    unbounded series generator against shared Prometheus storage — an availability
+    concern, not only an attribution one.
+    - **This replaced the org subdomain**, and the caveat that used to sit here —
+      "correlating client↔server metrics by org requires the subdomain→uuid
+      mapping" — is now resolved rather than merely edited: client and server org
+      dimensions occupy the **same identifier space** and join directly. Recorded
+      rather than deleted so a reader of the old note can see where it went.
+    - The cost, stated plainly: a UUID is not human-readable on a legend. No panel
+      breaks out by org today, so nothing regressed. It was accepted because a value
+      an operator can *trust* and *join* beats one they can read.
+    - The change was free of migration cost only because **nothing had ever been
+      exported** — no historical series existed under the old semantics. A
+      label-value semantics change is normally expensive precisely because both
+      coexist under one name. That window will not reopen.
 
 ---
 
 ## Join-flow metrics (R-25)
 
 ### `dt_client_join_attempts_total`
+- **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
 - **Type**: Counter
 - **Description**: Total client-side meeting-join attempts, by outcome and the
   stage a failure occurred at.
@@ -184,6 +264,7 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
   stages the server cannot, e.g. `mc_signaling_connect`, `mh_connect`).
 
 ### `dt_client_time_to_signaling_ready_ms`
+- **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
 - **Type**: Histogram
 - **Description**: Wall-clock ms from `MeetingSession.join` to the MC
   `JoinResponse` being received (signaling readiness).
@@ -193,6 +274,7 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
   server-side handler timing cannot capture (includes browser→MC RTT).
 
 ### `dt_client_time_to_first_mh_connected_ms`
+- **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
 - **Type**: Histogram
 - **Description**: Wall-clock ms from `MeetingSession.join` to the first MH
   connection being established.
@@ -209,6 +291,7 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
   The two are separated by what they observe, not by what they are called.
 
 ### `dt_client_signaling_connection_total`
+- **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
 - **Type**: Counter
 - **Description**: Client signaling (browser→MC) connection outcomes.
 - **Labels**:
@@ -237,6 +320,7 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
   common failure paths.
 
 ### `dt_client_mh_connection_total`
+- **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
 - **Type**: Counter
 - **Description**: Client media-handler (browser→MH) connection outcomes.
 - **Labels**:
@@ -388,12 +472,14 @@ the comment's reader.
 ---
 
 ### `dt_client_media_frames_sent_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Description**: Frames that left the device on the media datagram path.
 - **Labels**: base only.
 - **Usage**: the denominator for the send-drop ratio.
 
 ### `dt_client_media_send_dropped_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Labels**: `reason` — a NEW bounded vocabulary, **not** the frame reject
   taxonomy.
@@ -423,6 +509,7 @@ the comment's reader.
   `dt_client_media_mute_transitions_total` and nothing else.
 
 ### `dt_client_media_send_queue_depth`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Gauge
 - **Description**: Current depth of the bounded application egress queue, in
   frames.
@@ -431,8 +518,19 @@ the comment's reader.
   20 ms/frame). The application bound trips BEFORE the transport high-water mark
   — asserted at setup — so a rising depth here is back-pressure we can count
   rather than loss inside the user agent.
+- **SINGLE-WRITER-MEANINGFUL — with N browsers this is the most recent reporter's
+  depth, NOT a fleet maximum.** It is a Gauge, and every browser writes to one
+  stream identity (no per-instance label, §11), so the stored value is
+  last-writer-wins rather than an aggregate. `max()` over it on the dashboard is a
+  max over **one** series and does not mean "the worst browser". Two consequences:
+  a healthy browser can mask a backed-up one, and on the dev cluster a *finished*
+  run's stale value can dominate the panel until the collector's `metric_expiration`
+  elapses. No processor can fix this without an identity dimension, and identity
+  dimensions are barred — so this is a stated limitation, not an open defect. If
+  you need per-browser queue depth, it is not available from this signal at all.
 
 ### `dt_client_media_frames_received_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Description**: Datagrams received on the media path, counted **at the wire**
   before any parse or verification.
@@ -442,6 +540,7 @@ the comment's reader.
   counting-point migration note.
 
 ### `dt_client_media_frames_dropped_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Labels**: `reason` — the frozen frame-reject vocabulary, whose SSoT is
   `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Membership of
@@ -477,6 +576,7 @@ the comment's reader.
   protocol violation, not a third key reason and not a decode reject.
 
 ### `dt_client_media_frames_accepted_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Description**: Frames that completed the receive path — verified, replay-
   checked, decrypted — and were handed to the audio decoder.
@@ -487,6 +587,7 @@ the comment's reader.
   **not** that frames are playing. See the identity above.
 
 ### `dt_client_media_key_wrap_outcomes_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Labels**: `outcome` — the two NON-DROPPING wrapped-key outcomes. The frame
   was ACCEPTED in both cases; neither ever reaches the drop counter.
@@ -520,6 +621,7 @@ the comment's reader.
   forces a non-dropping outcome off the drop counter in the first place.
 
 ### `dt_client_media_downlink_gap_frames_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Description**: Frames MISSING between the media handler's egress and this
   client's ingress, measured as gaps in the relay hop sequence.
@@ -548,6 +650,7 @@ the comment's reader.
   > end can.
 
 ### `dt_client_media_downlink_reorder_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Description**: Datagrams arriving at or below the running hop-sequence
   high-water mark.
@@ -556,6 +659,7 @@ the comment's reader.
   counter so the subtraction is possible at all.
 
 ### `dt_client_media_undeclared_stream_id_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Description**: Frames arriving on a relay `stream_id` this client never
   declared in its `ReceiveCapability`.
@@ -567,6 +671,7 @@ the comment's reader.
   to slots this subscriber did not ask for.
 
 ### `dt_client_media_decoder_errors_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Description**: The audio decoder's terminal error callback fired.
 - **Labels**: base only. **No `reason`** — `AudioDecoder` provides no bounded
@@ -577,6 +682,7 @@ the comment's reader.
   per-frame.
 
 ### `dt_client_media_mute_transitions_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Labels**: `action` — `mute`, `unmute`.
 - **Usage**: client mute is enforced at CAPTURE and does not depend on the server
@@ -585,6 +691,7 @@ the comment's reader.
   network died* are indistinguishable from absence alone.
 
 ### `dt_client_media_kek_updates_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
 - **Labels**: `source` — `join_response` (the only source this story;
   KEK-push rotation adds one when it lands).
@@ -595,6 +702,7 @@ the comment's reader.
   per-meeting generation series a membership-change trace.
 
 ### `dt_client_time_to_first_media_frame_ms`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Histogram
 - **Description**: Wall-clock ms from media pipeline start to the first media
   frame arriving at the wire.

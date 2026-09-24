@@ -544,6 +544,14 @@ if $DO_INSTALL; then
     pnpm install
 fi
 
+# Browser telemetry is opt-in and off unless this is set; with it set, a manual
+# demo session populates the same `dt_client_*` series the dashboards read.
+# RELATIVE ON PURPOSE: in a manual session the developer may open ANY
+# `<org>.localhost:5173`, so an absolute value would work for one org and silently
+# go cross-origin (a preflight GC does not answer) for every other. The full
+# argument lives at the browser-e2e export in scripts/layer7.sh — one home.
+export VITE_TELEMETRY_ENDPOINT="${VITE_TELEMETRY_ENDPOINT:-/api/v1/telemetry}"
+
 echo; echo "== Starting web-app dev server =="
 echo "   Open Chrome at: http://${DEMO_HOST}:5173"
 echo

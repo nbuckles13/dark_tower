@@ -371,18 +371,46 @@ groups:
       # MCMediaMissingKeyMaterial - client-side counter, MC-side remedy
       # ====================================================================
       #
-      # !! THIS ALERT CANNOT FIRE TODAY. THAT IS STATED, NOT HEDGED. !!
-      # `dt_client_*` metrics do not reach Prometheus in this deployment: the
-      # OTLP collector's metrics pipeline exports to `debug` (its own
-      # container log) and no Prometheus job scrapes the collector. So the
-      # series does not exist and this rule cannot fire at any threshold for
-      # any reason. It lands anyway, so that wiring the exporter is the single
-      # remaining step rather than a rule nobody wrote -- and the premise
-      # failure is recorded at five sites (this comment, the fire/apply table
-      # in the devloop record, the docs/observability/alerts.md inventory
-      # entry, mc-incident-response.md Scenario 16, and the docs/TODO.md
-      # entry) so that nothing reads it as coverage.
-      # Tracked: docs/TODO.md §Observability Debt (collector metrics export).
+      # THIS ALERT CAN NOW FIRE. It could not before 2026-09-23, and the
+      # previous version of this comment said so at length. The export path was
+      # built and PROVEN end to end: the full expression below was evaluated
+      # against live data emitted by sdk-core's own built bundle through GC into
+      # Prometheus and returned 0.286 -- non-empty, for the first time ever.
+      #
+      # WHAT THAT MEANS, PRECISELY: the premise that the series does not exist
+      # has cleared. NOTHING ELSE IN THIS COMMENT HAS CLEARED. The typo gap, the
+      # for:/rate() shape, the threshold provenance and the denominator argument
+      # below are all unchanged by the export landing, and the typo gap matters
+      # MORE now, not less, because a green CI over a believed-live alert is
+      # more misleading than a green CI over an admittedly-dead one.
+      #
+      # THE FOUR PREMISES THIS ALERT NOW RESTS ON, so the next reader can
+      # re-falsify them instead of trusting that someone once checked:
+      #   1. The collector SUMS same-identity delta datapoints from N browsers.
+      #      VERSION-DEPENDENT: it is `delta_to_cumulative` on
+      #      otel/opentelemetry-collector-contrib:0.161.0. The previously pinned
+      #      0.103.1 did NOT ship that processor and silently failed to sum.
+      #      The image tag and the collector ConfigMap are one atomic rollback
+      #      unit -- see docs/runbooks/gc-deployment.md §Rollback.
+      #   2. GC's telemetry filter PASSES the `reason` key. This numerator
+      #      selects on it; GC stripped it until 2026-09-23, which alone would
+      #      have zeroed this alert even with a perfect collector.
+      #      (crates/gc-service/src/services/telemetry_filter.rs)
+      #   3. A Prometheus job scrapes the collector
+      #      (`otel-collector` in infra/kubernetes/observability/prometheus.yml).
+      #   4. `add_metric_suffixes: false` on the prometheus exporter, so the
+      #      names below pass through VERBATIM as authored in TypeScript. With
+      #      suffixing on, `dt_client_time_to_first_media_frame_ms` acquires a
+      #      unit suffix and silently stops matching anything.
+      # Break any one of those four and this alert goes quiet rather than red.
+      #
+      # ABSENCE OF THIS ALERT IS STILL NOT PROOF OF HEALTH, FOR A NEW REASON.
+      # The series can vanish without the alert firing: five controls on the
+      # collector's metrics path drop client data BY DESIGN and all five look
+      # identical to "no browser is running", and there is no per-browser `up`
+      # signal and structurally cannot be one (ADR-0036 §11 bars a per-session
+      # service.instance.id). Triage ladder for a quiet series:
+      # docs/runbooks/gc-deployment.md §When the client series go quiet.
       #
       # NOTHING ELSE COVERS A TYPO IN THIS EXPRESSION. `dt-guard
       # application-metrics` extracts alert metric references with a regex
@@ -390,12 +418,15 @@ groups:
       # crates/dt-guard/src/common/services.rs -- \b((?:ac|gc|mc|mh)_[a-z][a-z0-9_]*).
       # Underscore is a word character, so `dt_client_media_frames_dropped_total`
       # matches nothing and a misspelling here passes CI green while the alert
-      # never fires. The "does it apply" step (the counter arriving in
-      # Prometheus from a real browser client through the SDK OTLP sink and
-      # the GC telemetry proxy) is this rule's SOLE coverage, not
-      # belt-and-braces. When the export lands, that step must read the metric
-      # name back OUT of Prometheus -- OTLP->Prometheus normalisation is not
-      # guaranteed to preserve the `_total` suffix written in TypeScript.
+      # never fires. THIS GAP IS UNCHANGED BY THE EXPORT LANDING and is now the
+      # ONLY thing between a typo here and a silently dead alert. The "does it
+      # apply" step (the counter arriving in Prometheus from a real browser
+      # through the SDK OTLP sink and the GC telemetry proxy) is this rule's
+      # SOLE coverage, not belt-and-braces. That step reads the metric name back
+      # OUT of Prometheus by the exact string used here -- OTLP->Prometheus
+      # normalisation is not guaranteed to preserve the `_total` suffix written
+      # in TypeScript, which is why `add_metric_suffixes: false` is premise 4
+      # above rather than a detail.
       #
       # DENOMINATOR IS `received`, AND THAT IS THE ATTEMPTS SUM.
       # `received = accepted + sum(drops by reason)` is an accounting identity

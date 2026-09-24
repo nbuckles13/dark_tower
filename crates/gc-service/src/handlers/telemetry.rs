@@ -11,8 +11,12 @@
 //!    rejects pathological bodies before unbounded buffering.
 //! 2. Content-Type `application/x-protobuf` → 415 otherwise
 //! 3. per-JWT-`sub` rate limit (`governor`) → 429
-//! 4. decode OTLP-proto (malformed → 400) + 12-key allowlist PII filter +
-//!    re-serialize
+//! 4. decode OTLP-proto (malformed → 400) + PII filter + re-serialize. The
+//!    filter is deny-by-default on attribute keys (the base 12, plus five media
+//!    discriminators on metric datapoints only), drops a `key_custody` carrying
+//!    anything but the one legal value, and STAMPS `org_id` from the
+//!    authenticated claims so the tenant dimension of a stored client series is
+//!    never client-asserted. See `crate::services::telemetry_filter`.
 //! 5. forward filtered bytes to the collector → 502 on failure
 //! 6. 202 Accepted
 //!
@@ -294,7 +298,7 @@ async fn ingest(
                 tracing::debug!(target: "gc.handlers.telemetry", error = %e, "OTLP metrics decode failed");
                 GcError::BadRequest("Malformed OTLP payload".to_string())
             })?;
-            let counts = telemetry_filter::filter_metrics(&mut req);
+            let counts = telemetry_filter::filter_metrics(&mut req, &user_claims.org_id);
             // Total is a bounded count (no key/value content) — safe to log.
             tracing::debug!(target: "gc.handlers.telemetry", dropped = counts.total(), "metrics PII filter applied");
             counts.emit();
@@ -306,7 +310,7 @@ async fn ingest(
                 tracing::debug!(target: "gc.handlers.telemetry", error = %e, "OTLP traces decode failed");
                 GcError::BadRequest("Malformed OTLP payload".to_string())
             })?;
-            let counts = telemetry_filter::filter_traces(&mut req);
+            let counts = telemetry_filter::filter_traces(&mut req, &user_claims.org_id);
             tracing::debug!(target: "gc.handlers.telemetry", dropped = counts.total(), "traces PII filter applied");
             counts.emit();
             req.encode_to_vec()

@@ -70,4 +70,16 @@ assert_rc "glob: package SOURCE shares prefix -> no match"  1 "$(glob_rc 'packag
 assert_rc "glob: package-lock.json suffix differs -> no match" 1 "$(glob_rc 'packages/*/package.json' 'packages/sdk-core/package-lock.json')"
 assert_rc "glob: root package.json does NOT match packages/*/package.json" 1 "$(glob_rc 'packages/*/package.json' 'package.json')"
 
+
+# ---- A missing helper is a FAILURE, not a skipped assertion ----------------
+# Runs a throwaway harness in a CHILD so its report_results/exit cannot end this
+# suite. The child calls one real assertion and one helper that does not exist;
+# it must exit 1 and name the missing helper. Before the file-backed
+# command_not_found_handle this reported "1 passed, 0 failed" and exited 0.
+__missing_out=$(bash -c 'source "$1"; set +e; assert_rc ok 0 0; no_such_helper_abc x 1 1; report_results child' _ "${__here:-$(dirname "${BASH_SOURCE[0]}")}/_test_helpers.sh" 2>/dev/null)
+__missing_rc=$?
+assert_rc "harness: missing helper makes the suite exit 1" 1 "$__missing_rc"
+if [[ "$__missing_out" == *"missing command/helper 'no_such_helper_abc'"* ]]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[harness-missing-named] summary did not name the missing helper: ${__missing_out@Q}"); fi
+
 report_results "scripts/lang/_changed_helpers.test.sh"
