@@ -34,7 +34,7 @@ use mh_service::config::Config;
 use mh_service::errors::MhError;
 use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService, SpanLayer};
 use mh_service::observability::{health_router, HealthState};
-use mh_service::session::SessionManagerHandle;
+use mh_service::session::{SessionManagerHandle, StreamAdmission};
 use mh_service::webtransport::WebTransportServer;
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerServiceServer;
 use tokio::signal;
@@ -109,17 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webtransport_bind_address = %config.webtransport_bind_address,
         grpc_advertise_address = %config.grpc_advertise_address,
         webtransport_advertise_address = %config.webtransport_advertise_address,
-        max_streams = config.max_streams,
         max_connections = config.max_connections,
         register_meeting_timeout_seconds = config.register_meeting_timeout_seconds,
         // ADR-0036 §1 QUIC transport parameters and the derived drain window.
         //
         // Layer-qualified `transport_` prefix on purpose: without it this line
-        // would carry three unrelated `max_`-prefixed fields — `max_streams`
-        // (advertised to GC, enforced only at GC placement), `max_connections`
-        // (enforced by MH at accept), and the QUIC uni-stream bound (enforced
-        // by quinn) — whose names suggest a kinship they do not have. The
-        // prefix states which layer enforces the value.
+        // would carry unrelated `max_`-prefixed fields — `max_connections`
+        // (enforced by MH at accept) and the QUIC uni-stream bound (enforced by
+        // quinn) — whose names suggest a kinship they do not have. The prefix
+        // states which layer enforces the value. (The retired `max_streams` is
+        // deliberately ABSENT from this line: nothing reads `MH_MAX_STREAMS`;
+        // the value advertised to GC is `egress_stream_ceiling` below.)
         //
         // BOTH links of the frames->bytes conversion are printed. Logging only
         // frames hides the conversion at the exact moment an operator is
@@ -163,16 +163,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_margin_seconds = mh_service::config::SHUTDOWN_MARGIN_SECONDS,
         drain_window_seconds = config.drain_window.as_secs(),
         drain_window_source = config.drain_window_source.as_str(),
-        // ADR-0036 §8 policy bounds. Logged because all four are
-        // optional-with-default: without this line an operator cannot tell a
-        // deliberately-configured value from a default nobody chose, which is
-        // the failure mode `MH_MAX_CONNECTIONS`'s 10,000 default already had.
+        // ADR-0036 §8 policy bounds (REQUIRED since story 2 R-22). Logged for
+        // two reasons: this line is where an operator reads the effective
+        // value of every bound without reading the ConfigMap AND the pod start
+        // time, and it is a TEST CONTRACT (below).
         max_egress_streams_per_meeting = config.policy_limits.max_egress_streams_per_meeting,
         max_candidate_sources_per_egress = config.policy_limits.max_candidate_sources_per_egress,
         max_total_egress_edges = config.policy_limits.max_total_egress_edges,
         policy_apply_timeout_ms = config.policy_limits.policy_apply_timeout_ms,
+        // Egress-budget admission chain (story 2 R-19, R-23). BOTH ends of the
+        // single bits->bytes conversion are logged, so it is checkable from
+        // this line: the `_bps` fields are the ConfigMap values verbatim (BITS),
+        // the `_bytes_per_second` fields are what enforcement and the gauges
+        // read. `egress_stream_ceiling` is the value enforced at admission AND
+        // advertised to GC as `max_streams` — the same field.
+        egress_budget_bps = config.egress_admission.budget_bps,
+        egress_budget_bytes_per_second = config.egress_admission.budget_bytes_per_second,
+        stream_cost_audio_bps = config.egress_admission.stream_cost_audio_bps,
+        stream_cost_audio_bytes_per_second =
+            config.egress_admission.stream_cost_audio_bytes_per_second,
+        stream_cost_video_bps = config.egress_admission.stream_cost_video_bps,
+        stream_cost_video_bytes_per_second =
+            config.egress_admission.stream_cost_video_bytes_per_second,
+        egress_stream_ceiling = config.egress_admission.stream_ceiling,
+        egress_stream_ceiling_floor = mh_service::config::MIN_EGRESS_STREAM_CEILING,
+        egress_stream_ceiling_recommended_min =
+            mh_service::config::EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
+        egress_rejection_ratio_threshold = config.egress_admission.rejection_ratio_threshold,
+        // PROVENANCE. Every key above that is a ConfigMap key is a REQUIRED
+        // read, so its provenance is necessarily `env` — absence refuses to
+        // start, and there is no default to confuse it with. The one optional
+        // ConfigMap-backed value on this line reports its source explicitly.
+        media_latency_sample_ratio = config.media_latency_sample_ratio,
+        media_latency_sample_ratio_source = config.media_latency_sample_ratio_source.as_str(),
+        // TEST-LOAD-BEARING: this event's message and these field names are a
+        // test contract. `crates/env-tests/tests/01_mh_deployment_config.rs`
+        // (`CONFIG_LOADED_MESSAGE`, `LOGGED_POLICY_BOUNDS`) reads them off the
+        // running pod and compares them with the deployed ConfigMap. Renaming
+        // either reds that test by design — update its table in the same
+        // change.
         "Configuration loaded successfully"
     );
+
+    // The derived STREAM ceiling, loudly, on its own line (never "subscriber
+    // ceiling": a subscriber holds N slots).
+    info!(
+        egress_stream_ceiling = config.egress_admission.stream_ceiling,
+        egress_budget_bps = config.egress_admission.budget_bps,
+        egress_stream_ceiling_recommended_min =
+            mh_service::config::EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
+        "Egress stream ceiling derived: this handler admits and advertises to GC at most this \
+         many egress streams across all meetings"
+    );
+    // The ADVISORY nudge. INFO, not WARN, deliberately: it fires on the
+    // unsized ConfigMap placeholder by design and goes quiet once a production
+    // budget is set — a configuration state, not a danger. A WARN here would
+    // train operators to ignore WARNs.
+    if config.egress_admission.below_recommended_min() {
+        info!(
+            egress_stream_ceiling = config.egress_admission.stream_ceiling,
+            egress_stream_ceiling_recommended_min =
+                mh_service::config::EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
+            "Configure me: the egress stream ceiling is below the recommended minimum (one \
+             full all-hear-all meeting at the demo size). Set MH_EGRESS_BUDGET_BPS in \
+             infra/services/mh-service/configmap.yaml to this deployment's expected peak \
+             egress. This handler boots and serves as configured."
+        );
+    }
 
     // Initialize Prometheus metrics recorder (ADR-0011)
     // This must happen before any metrics are recorded
@@ -187,6 +244,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // recorder installs and before any event can fire. (The media-frame counters
     // are covered separately by `resolve_media_handles()` below.)
     mh_service::observability::metrics::zero_initialize_counters();
+    // Egress-budget static gauges: AFTER the recorder, or they go nowhere and
+    // the series silently never appear. Published from the same
+    // `EgressAdmission` fields admission and `gc_client` read.
+    mh_service::observability::metrics::publish_egress_admission(&config.egress_admission);
     info!("Prometheus metrics recorder initialized");
 
     // Initialize health state
@@ -247,7 +308,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("JWKS client and JWT validator initialized");
 
     // Create session manager actor for meeting registration and connection tracking
-    let session_manager = SessionManagerHandle::new();
+    // The actor enforces the derived stream ceiling from the ONE
+    // `EgressAdmission` computed at config load (story 2 R-19). Built AFTER the
+    // metrics recorder, so the admission handles it resolves are live.
+    let session_manager =
+        SessionManagerHandle::new(StreamAdmission::from(&config.egress_admission));
+    // GC's `current_streams` reads the same live table admission counts
+    // against (see `GcClient::current_streams`).
+    let routing_table_for_gc = session_manager.routing_table();
     info!("Session manager actor spawned");
 
     // Create MC notification client for MH→MC participant notifications (R-16/R-17)
@@ -438,12 +506,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to Global Controller
     info!("Connecting to Global Controller...");
-    let gc_client = GcClient::new(config.gc_grpc_url.clone(), token_rx.clone(), config.clone())
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to connect to GC");
-            e
-        })?;
+    let gc_client = GcClient::new(
+        config.gc_grpc_url.clone(),
+        token_rx.clone(),
+        config.clone(),
+        routing_table_for_gc,
+    )
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to connect to GC");
+        e
+    })?;
     info!("Connected to Global Controller");
 
     // Spawn GC task (registration + load report heartbeats)

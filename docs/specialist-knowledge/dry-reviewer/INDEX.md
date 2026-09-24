@@ -48,7 +48,7 @@
 - Browser E2E -> `packages/web-app/e2e/`: topology `packages/web-app/e2e/env.ts`, auth/join `packages/web-app/e2e/fixtures.ts`, instance-counter SSoT `packages/web-app/e2e/instanceCounters.ts` consumed by `packages/web-app/e2e/mcMetrics.ts`, loopback spec `packages/web-app/e2e/media-loopback.spec.ts`; division of responsibility -> `packages/web-app/e2e/README.md` (ADR-0028). Script self-tests -> `scripts/**/*.test.sh`, wired at `scripts/layer3.sh`
 
 ## Per-Service Config, gRPC Auth & Clients
-- Per-service `config.rs`; ordinal parsing -> `crates/common/src/config.rs`. `dt-guard env-config` discovers required variables by the literal `MissingEnvVar("KEY")` construction, so a helper or a line wrap blinds it -> `crates/dt-guard/src/env_config.rs`
+- Per-service `config.rs`; ordinal parsing -> `crates/common/src/config.rs`. `dt-guard env-config` discovers required variables by the literal `MissingEnvVar("KEY")` construction, so a `require(vars, key)` helper that erases the literal blinds it (still live — the real hazard); a rustfmt line wrap between paren and literal no longer does (whitespace-tolerant since story 2 task 8), but the matcher is still fail-open and reads comments -> `crates/dt-guard/src/env_config.rs`
 - MC/MH auth layers (near-identical tower Layer/Service; extraction candidate in `docs/TODO.md`) -> `crates/mc-service/src/grpc/auth_interceptor.rs`, `crates/mh-service/src/grpc/auth_interceptor.rs`. Clients, different RPCs and retry policies -> `crates/mc-service/src/grpc/gc_client.rs`, `crates/mc-service/src/grpc/mh_client.rs`, `crates/mh-service/src/grpc/gc_client.rs`, `crates/mh-service/src/grpc/mc_client.rs`; shared `add_auth` extraction candidate -> `docs/TODO.md`
 
 ## MC / MH Service Internals

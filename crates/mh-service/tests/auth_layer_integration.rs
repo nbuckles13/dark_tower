@@ -83,7 +83,7 @@ struct AuthRig {
 impl AuthRig {
     async fn start() -> Self {
         let jwks = JwksRig::start(42, "mh-auth-integ-01").await;
-        let session_manager = SessionManagerHandle::new();
+        let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
         let grpc = GrpcRig::start(jwks.jwks_client(), session_manager.clone()).await;
         Self {
             jwks,

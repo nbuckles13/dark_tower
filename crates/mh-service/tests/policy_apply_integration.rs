@@ -15,7 +15,10 @@
 //!
 //! Bounded label values per `docs/observability/metrics/mh-service.md`:
 //! `outcome` ∈ {applied, rejected_stale, no_generation, rejected_invalid,
-//! apply_failed}, `key_custody` = `operator` (single value).
+//! apply_failed, rejected_stream_ceiling}, `key_custody` = `operator` (single
+//! value). `rejected_stream_ceiling` (story 2 task 8) is driven through the real
+//! session actor in `stream_admission_integration.rs` and the handler tests in
+//! `src/grpc/mh_service.rs`; here it is covered by the `ALL`-iterating tests.
 
 use common::observability::testing::MetricAssertion;
 use mh_service::observability::metrics::{record_media_policy_apply, PolicyApplyOutcome};
@@ -47,7 +50,7 @@ fn each_outcome_emits_its_own_series() {
     }
 }
 
-/// All five values are emittable and distinct.
+/// Every value is emittable and distinct.
 #[test]
 fn every_bounded_outcome_value_is_reachable() {
     let snap = MetricAssertion::snapshot();
@@ -126,7 +129,6 @@ fn no_unbounded_or_identity_label_is_emitted() {
 
 mod counting_boundary {
     use super::*;
-    use mh_service::config::PolicyLimits;
     use mh_service::grpc::MhMediaService;
     use mh_service::session::SessionManagerHandle;
     use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerService as _;
@@ -138,10 +140,10 @@ mod counting_boundary {
 
     fn service() -> MhMediaService {
         MhMediaService::new(
-            SessionManagerHandle::new(),
+            SessionManagerHandle::new(mh_test_utils::admission::never_binding()),
             "mh-boundary-test".to_string(),
             1_700_000_000_000,
-            PolicyLimits::default(),
+            mh_test_utils::admission::fixture_policy_limits(),
         )
     }
 
@@ -205,7 +207,7 @@ mod counting_boundary {
         .expect_err("a duplicate egress_stream_id rejects the whole registration");
 
         // Exactly one outcome per call, and each on its OWN series. Summed
-        // across the five values that is 4 = the number of calls that reached
+        // across every value that is 4 = the number of calls that reached
         // the policy boundary. Asserting each value at 1 rather than only the
         // sum is what makes it a label-swap catcher as well as a denominator
         // check: four calls all landing on `applied` would also sum to 4.

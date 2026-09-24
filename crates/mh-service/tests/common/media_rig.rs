@@ -23,7 +23,7 @@
 //! that ships — which matters specifically for the no-per-frame-allocation
 //! gate, whose whole subject is when the arena reclaims in place.
 
-use mh_service::config::{PolicyLimits, EGRESS_QUEUE_FRAMES, NOMINAL_AUDIO_FRAME_BYTES};
+use mh_service::config::{EGRESS_QUEUE_FRAMES, NOMINAL_AUDIO_FRAME_BYTES};
 use mh_service::media::forward::EgressQueue;
 use mh_service::media::forwarder::ConnectionForwarder;
 use mh_service::media::queue::SharedQueue;
@@ -63,8 +63,11 @@ impl LoopbackRig {
     ) -> Self {
         let handles = Arc::new(resolve_media_handles());
         let request = mh_test_utils::media_policy::register_request(meeting, 1, streams);
-        let policy = MeetingPolicy::from_request(&request, &PolicyLimits::default())
-            .expect("fixture policy must validate");
+        let policy = MeetingPolicy::from_request(
+            &request,
+            &mh_test_utils::admission::fixture_policy_limits(),
+        )
+        .expect("fixture policy must validate");
         let routing = RoutingTable::new();
         routing.install(&policy);
 

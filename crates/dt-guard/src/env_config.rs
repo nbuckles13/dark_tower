@@ -229,8 +229,32 @@ const CONFIGMAP_KIND: &str = "ConfigMap";
     clippy::expect_used,
     reason = "module-local canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
+/// Discovers a service's REQUIRED environment variables from its `config.rs`.
+///
+/// `\s*` after the paren is LOAD-BEARING, not defensive. Without it the paren
+/// and the literal had to be contiguous, so a call site rustfmt wrapped — which
+/// it does as soon as the expression nests deeply enough —
+///
+/// ```text
+/// ConfigError::MissingEnvVar(
+///     "MH_MAX_EGRESS_STREAMS_PER_MEETING".to_string(),
+/// )
+/// ```
+///
+/// silently dropped out of the discovered set. The guard then checked nothing
+/// for that variable — no per-workload manifest coverage, no orphan detection —
+/// **while still printing `STATUS=OK` with a byte-identical REASON token**. That
+/// is a clean verdict over surface it stopped checking, and it is invisible by
+/// construction: nothing fails, so nobody looks. Found in mh-service (story 2
+/// task 8), where one formatting pass hid two keys.
+///
+/// It stays anchored on the literal: the variable name must still be a
+/// contiguous upper-case string literal, because that is what makes a required
+/// variable greppable at all. A `require(vars, key)` helper erases every
+/// literal and no regex can see through it — each service's `config.rs` carries
+/// that warning at its own call sites.
 static MISSING_ENV_VAR_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"MissingEnvVar\("([A-Z_][A-Z0-9_]*)""#).expect("static pattern compiles")
+    Regex::new(r#"MissingEnvVar\(\s*"([A-Z_][A-Z0-9_]*)""#).expect("static pattern compiles")
 });
 
 // -----------------------------------------------------------------------------
@@ -2099,6 +2123,9 @@ spec:
 
     #[test]
     fn extract_required_env_vars_finds_missing_env_var() {
+        // Positive control FIRST: contiguous call sites (the common shape) must
+        // still be discovered, so a pattern typo that breaks all matching is
+        // distinguishable from the wrapped-site case below.
         let content = r#"
             return Err(ConfigError::MissingEnvVar("DATABASE_URL".to_string()));
             return Err(ConfigError::MissingEnvVar("JWT_SECRET".to_string()));
@@ -2107,6 +2134,25 @@ spec:
         assert_eq!(
             vars,
             vec!["DATABASE_URL".to_string(), "JWT_SECRET".to_string()]
+        );
+
+        // A call site rustfmt WRAPPED between the paren and the literal. Copied
+        // from the real emitted shape in `crates/mh-service/src/config.rs`
+        // (open paren, newline, indentation, then the literal), not invented:
+        // this exact text was NOT discovered before `\s*` was added, and two MH
+        // keys silently left the guard's view while it reported STATUS=OK.
+        let wrapped = r#"
+            .ok_or_else(|| {
+                ConfigError::MissingEnvVar(
+                    "MH_MAX_EGRESS_STREAMS_PER_MEETING".to_string(),
+                )
+            })?;
+        "#;
+        assert_eq!(
+            extract_required_env_vars(wrapped),
+            vec!["MH_MAX_EGRESS_STREAMS_PER_MEETING".to_string()],
+            "a rustfmt-wrapped call site must be discovered: missing it makes the guard \
+             report STATUS=OK while checking nothing for that variable"
         );
     }
 

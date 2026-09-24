@@ -254,6 +254,10 @@ The media-path **triage** board: where an operator goes to answer *why*, after
 | Ingress / Egress Drops by Reason | Which condition dropped frames, on which side |
 | Zero-Forever Invariant Drops | Whether an invariant that should never fire has fired |
 | Egress Delivery Ratio | What fraction of egress attempts the transport accepted |
+| Egress Stream Admission Decisions by Outcome | Is MH refusing new streams for capacity, and how often (story 2 R-19) |
+| Stream Admission Rejection Ratio vs Threshold | Is the windowed refusal share above the configured threshold — the same bare gauge-to-gauge comparison the exhaustion alert makes |
+| Installed Egress Streams vs Stream Ceiling | How close each handler is to its stream ceiling, and whether that ceiling is still the unsized placeholder (below the advisory recommended minimum). Until story 2 task 11's teardown, installed streams stay high after an ABNORMAL meeting end (the ratchet) and GC stops placing on a handler at its ceiling; the interim recovery is `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower` |
+| Egress Budget (bytes/s) | What budget the ceiling is derived from, in bytes (the key is in bits) |
 
 Two conventions this board depends on, both easy to break by well-meaning edit:
 
@@ -265,6 +269,13 @@ Two conventions this board depends on, both easy to break by well-meaning edit:
   the deployed 15 s cadence a single drop under `rate()` renders ~0.003/s, which reads
   identical to healthy on the one panel whose purpose is that a single drop is visible;
   and `or vector(0)` would fabricate a series and flatten the by-reason breakdown.
+- **The egress-admission panels preserve the "empty = healthy" reading.** Every series
+  they read is registered eagerly at MH startup: the admission counter's outcomes are
+  zero-initialised, the budget / ceiling / recommended-min / threshold gauges are published
+  right after the recorder installs, and the ratio and installed-streams gauges are published
+  when the session actor is built. A new series added to this board must be registered the
+  same way, or it breaks this board-wide reading. The admission counter panel uses
+  `increase()` for the same single-event reason as the drop panels.
 
 ### Client SDK Media Path
 

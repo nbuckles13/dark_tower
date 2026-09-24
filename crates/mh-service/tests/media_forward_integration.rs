@@ -31,7 +31,7 @@ use common::media_rig::{sender, LoopbackRig};
 
 use bytes::Bytes;
 use media_protocol::codec::decode_datagram;
-use mh_service::config::{PolicyLimits, EGRESS_QUEUE_FRAMES, NOMINAL_AUDIO_FRAME_BYTES};
+use mh_service::config::{EGRESS_QUEUE_FRAMES, NOMINAL_AUDIO_FRAME_BYTES};
 use mh_service::media::forward::{forward_one, EgressQueue, IngressFrame};
 use mh_service::media::forwarder::ConnectionForwarder;
 use mh_service::media::queue::SharedQueue;
@@ -574,7 +574,11 @@ async fn a_sender_valid_in_one_meeting_forwards_nothing_in_another() {
     let table = RoutingTable::new();
     for (meeting, publisher) in [("meeting-a", 5_u32), ("meeting-b", 6_u32)] {
         let request = register_request(meeting, 1, vec![loopback_egress(1, publisher, 0)]);
-        let policy = MeetingPolicy::from_request(&request, &PolicyLimits::default()).unwrap();
+        let policy = MeetingPolicy::from_request(
+            &request,
+            &mh_test_utils::admission::fixture_policy_limits(),
+        )
+        .unwrap();
         table.install(&policy);
     }
     let registry = LocalSubscribers::new();

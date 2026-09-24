@@ -112,6 +112,13 @@ sum(increase(mh_register_meeting_timeouts_total[30m]))
 # the whole task-11 -> task-13 window, so including it would fail every deploy
 # until MC starts emitting policy_generation >= 1. The gate stays valid
 # unchanged when the shape inverts at task 13.
+#
+# `rejected_stream_ceiling` (story 2 task 8) is DELIBERATELY EXCLUDED too, and
+# the regex was revisited rather than left alone by luck: it is a CAPACITY
+# refusal, not a fault, and under the base ConfigMap's deliberately unsized
+# placeholder budget it is expected. Gating a deploy on it would abort rollouts
+# on ordinary capacity pressure. Its signal is the admission rejection ratio
+# against its threshold gauge (the egress-exhaustion alert), not this gate.
 sum(increase(mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}[30m]))
 
 # MC RegisterMeeting RPC success rate (target: >95%, R-36 §operations)
@@ -445,8 +452,9 @@ Full triage: [`mh-incident-response.md` Scenario 15](mh-incident-response.md#sce
 
 #### Rollback ordering: the image may roll back alone, the manifests may not
 
-MH reads five **required** environment variables (see
-[Required environment keys](#required-environment-keys)). That makes the image
+MH reads a set of **required** environment variables (see
+[Required environment keys](#required-environment-keys); stated without a count,
+because story 2 grew the set and a restated count is what went stale). That makes the image
 and the manifests orderable rather than independent:
 
 - **Forward — manifests, then image.** Already satisfied: the ConfigMap keys
@@ -456,8 +464,9 @@ and the manifests orderable rather than independent:
   the two `kubectl rollout undo` commands above are the whole of it. Older MH
   code ignores environment variables it does not read, so extra keys are inert.
 - **Backward — the manifests must NOT roll back alone.** Reverting the ConfigMap
-  to a pre-transport-parameter state while the new image is running strips five
-  variables that image requires. `Config::from_env()` fails, **both** pods enter
+  to an earlier state while the new image is running strips variables that image
+  requires (the ADR-0036 §1 transport parameters, and since story 2 the
+  egress-budget chain and the four §8 policy bounds). `Config::from_env()` fails, **both** pods enter
   `CrashLoopBackOff`, and MH accepts no connections at all.
 
   That last case is **not a media-only degradation**: with no MH, no new meeting
@@ -502,7 +511,7 @@ is the defect this list exists to prevent.
 The **Enforced by** column is the load-bearing one. Several keys begin `MH_MAX_`
 and mean unrelated things — the transport bound, the connection guard, the
 retired stream count below, and (since story 2) the registered-meeting cap, the
-muted-source bound and three ADR-0036 §8 policy bounds; the layer that enforces
+muted-source bound and the ADR-0036 §8 policy bounds; the layer that enforces
 a bound is what tells them apart, and it is also what tells you where to look
 when one trips. (Stated without a count deliberately: a restated count here is
 what this story's configuration task found false.)
@@ -515,12 +524,25 @@ what this story's configuration task found false.)
 | `MH_MAX_CONNECTIONS` | ConfigMap `mh-service-config` | `500` | Maximum concurrent WebTransport connections. **Enforced by mh-service itself**, at accept, before allocating handler resources. A **resource-exhaustion guard, never a capacity figure, never advertised to GC.** It sits far above expected peak, so rejections attributed to it mean a connection **flood or leak** — not demand that has outgrown the deployment. Scaling out is the wrong response. Visible as `mh_webtransport_connections_total{status="rejected"}`. |
 | `MH_TERMINATION_GRACE_SECONDS` | **Not a ConfigMap key** — written into each Deployment's env at build time by the kustomize `replacements:` block | `35` | The pod's own termination grace, from which MH derives its post-cancellation settle window. **Enforced by mh-service** at startup (it refuses to start if the grace leaves no room for the shutdown margin). **Never hand-type this.** It is derived from that instance's own `spec.template.spec.terminationGracePeriodSeconds`, so the two cannot drift; the literal in the deployment file is a `"0"` sentinel. |
 
+**Also required since story 2 task 8, rows pending story 2 task 18** (which owns this
+section's story-2 additions): `MH_EGRESS_BUDGET_BPS`, `MH_STREAM_COST_AUDIO_BPS`,
+`MH_STREAM_COST_VIDEO_BPS`, `MH_EGRESS_REJECTION_RATIO_THRESHOLD` (the egress-budget
+admission chain — a **capacity** figure enforced by mh-service at stream admission and
+advertised to GC as `max_streams`), and the four ADR-0036 §8 policy bounds
+`MH_MAX_EGRESS_STREAMS_PER_MEETING`, `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS`,
+`MH_MAX_TOTAL_EGRESS_EDGES`, `MH_POLICY_APPLY_TIMEOUT_MS` (resource-exhaustion guards,
+never capacity). All live in ConfigMap `mh-service-config`, whose comments carry each
+one's meaning and remedy. Until those rows land, the refusal message itself is the
+runbook: MH also refuses to start when the derived stream ceiling is below 2 (remedy:
+RAISE `MH_EGRESS_BUDGET_BPS`; never lower the floor) or above
+`MH_MAX_TOTAL_EGRESS_EDGES`, and each refusal names the value, the bound and the fix.
+
 One non-required key is listed **for contrast only**, because without it there is
 no way to see why the two `MH_MAX_` keys above are not it:
 
 | Key | Source | Kind value | What it bounds — and who enforces it |
 |---|---|---|---|
-| `MH_MAX_STREAMS` *(RETIRED — pending removal; not required)* | ConfigMap `mh-service-config` | `100` | **Retired by story 2.** Superseded by the stream ceiling MH derives from `MH_EGRESS_BUDGET_BPS`, which is what MH advertises to GC once the MH egress-budget code task ships; until that image, this value is still what GC places against, and after it nothing reads it. **The key and both `configMapKeyRef` entries deliberately remain for one deploy**: `kubectl rollout undo` restores a Deployment's refs but not the ConfigMap, so deleting them together turns a rollback into `CreateContainerConfigError`. Do not tune it, and do not delete it by hand — the removal is itself two deploys (flip both refs to `optional: true`, then delete key and refs together, so no reachable revision holds a HARD ref to a missing key) and is scheduled in `docs/TODO.md` §Media Path Obligations. |
+| `MH_MAX_STREAMS` *(RETIRED — pending removal; not required)* | ConfigMap `mh-service-config` | `100` | **Retired by story 2.** Superseded by the stream ceiling MH derives from `MH_EGRESS_BUDGET_BPS`, which is what MH advertises to GC as of story 2 task 8. **Nothing reads this key any more** — editing it changes nothing, and the startup log's `egress_stream_ceiling` is the value GC places against. **The key and both `configMapKeyRef` entries deliberately remain for one deploy**: `kubectl rollout undo` restores a Deployment's refs but not the ConfigMap, so deleting them together turns a rollback into `CreateContainerConfigError`. Do not tune it, and do not delete it by hand — the removal is itself two deploys (flip both refs to `optional: true`, then delete key and refs together, so no reachable revision holds a HARD ref to a missing key) and is scheduled in `docs/TODO.md` §Media Path Obligations. |
 
 Table contributed at the request of the observability review, which found that
 this runbook — unlike GC's, AC's and MC's — had no configuration section at all.
@@ -567,8 +589,8 @@ splits the failure space three ways before you read any error text:
 >
 > (This ordering is pre-existing and deliberate: the OTel layer needs the
 > endpoint from configuration, and the tracing subscriber can only be
-> initialised once. It is recorded here because five required keys make the
-> configuration branch much more likely than it used to be.)
+> initialised once. It is recorded here because the growing set of required
+> keys makes the configuration branch much more likely than it used to be.)
 
 ### Then, the three causes in likelihood order
 
@@ -583,7 +605,7 @@ splits the failure space three ways before you read any error text:
    `apply -k`. See the sentinel note under
    [Rollback criteria](#rollback-criteria).
 3. **The manifests were rolled back under a newer image.** The image requires
-   five variables the reverted ConfigMap no longer supplies. Roll the image back
+   variables the reverted ConfigMap no longer supplies. Roll the image back
    to match, or restore the ConfigMap. See
    [Rollback ordering](#rollback-ordering-the-image-may-roll-back-alone-the-manifests-may-not).
 
@@ -592,11 +614,21 @@ location travels with it differs by refusal kind, and it is worth knowing which
 you are looking at, because in a CrashLoop the message is the only diagnostic an
 operator gets:
 
-- The four startup **validations** — egress-queue ordering, termination grace,
-  keepalive ratio, and the media latency sample ratio's `0.0..=1.0` range —
-  embed the remediation **inline**: the offending value, the bound it was
-  compared against, and which ConfigMap key or pod-spec field to change.
-  - The fourth is **present-but-invalid**, not missing, so likelihood cause 1
+- The startup **validations** embed the remediation **inline**: the offending
+  value, the bound it was compared against, and which ConfigMap key or pod-spec
+  field to change. They are (listed, deliberately not counted — a count here is
+  what went stale when story 2 added two): egress-queue ordering, termination
+  grace, keepalive ratio, the media latency sample ratio's `0.0..=1.0` range,
+  and — since story 2 task 8 — the two **egress stream ceiling** derivations:
+  - **Ceiling below the refuse-boot floor of 2** (`Derived egress STREAM ceiling
+    … is below the refuse-boot floor`). Every variable is present, so this is
+    not a missing-variable refusal. Remedy: RAISE `MH_EGRESS_BUDGET_BPS`.
+    **Never lower the floor** — it is a code constant, and a handler that small
+    would boot, be placed by GC, and reject nearly every stream.
+  - **Ceiling above `MH_MAX_TOTAL_EGRESS_EDGES`.** The resource guard must sit at
+    or above the capacity it backstops. Remedy: raise `MH_MAX_TOTAL_EGRESS_EDGES`,
+    or lower `MH_EGRESS_BUDGET_BPS`.
+  - The media latency sample ratio is **present-but-invalid**, not missing, so likelihood cause 1
     below ("a required ConfigMap key is missing or renamed") does not cover it:
     `MH_MEDIA_LATENCY_SAMPLE_RATIO` is optional, and an *absent* key is a clean
     fallback to the code default. Only a present value that does not parse, or
@@ -606,14 +638,16 @@ operator gets:
 - A **missing variable** refuses with the variable name alone
   (`Missing required environment variable: MH_...`). That is by design, not an
   omission: its remediation is the
-  [Required environment keys](#required-environment-keys) table above, which
-  names the source of every one of them. Look the variable up there.
+  [Required environment keys](#required-environment-keys) section above, whose
+  table and the paragraph following it together name the source of every one of
+  them. Look the variable up there — the eight keys story 2 task 8 made required
+  are in that paragraph until story 2 task 18 folds them into the table.
 
 Deliberately unchanged, so nobody "improves" it: the missing-variable error
 carries the variable as a **plain string literal**, and `dt-guard env-config`
-discovers MH's thirteen required variables by matching exactly that shape in
+discovers MH's required variables by matching exactly that shape in
 `crates/mh-service/src/config.rs`. Restructuring it to carry a remediation field
-would blind that guard on **all thirteen** while it kept reporting clean.
+would blind that guard on **every one of them** while it kept reporting clean.
 
 ---
 

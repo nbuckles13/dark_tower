@@ -273,6 +273,18 @@ pub enum PolicyApplyOutcome {
     /// MH could not install it — mailbox full, apply timed out, actor gone, or
     /// the aggregate egress-edge bound. The prior generation stays live.
     ApplyFailed,
+    /// Installing would take the handler's installed egress streams above its
+    /// derived egress STREAM ceiling — a CAPACITY refusal (story 2 R-19), not
+    /// an MC bug and not an MH fault. The prior generation stays live.
+    ///
+    /// Its own value, not folded into `ApplyFailed`, because the remedy
+    /// differs (budget / placement, not MH internals) and because under a
+    /// deliberately small placeholder budget it is EXPECTED: folding it into
+    /// `apply_failed` would abort the deploy bake gate in
+    /// `docs/runbooks/mh-deployment.md` on ordinary capacity pressure. The same
+    /// event is counted, with the same token, on
+    /// `mh_media_stream_admission_total` — different denominators; do not sum.
+    RejectedStreamCeiling,
 }
 
 impl PolicyApplyOutcome {
@@ -292,12 +304,13 @@ impl PolicyApplyOutcome {
     /// cardinality of the `outcome` label, so a variant added to this array
     /// without the catalog and the dashboard being revisited fails to compile
     /// here first.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Applied,
         Self::RejectedStale,
         Self::NoGeneration,
         Self::RejectedInvalid,
         Self::ApplyFailed,
+        Self::RejectedStreamCeiling,
     ];
 
     /// The wire label value.
@@ -309,7 +322,166 @@ impl PolicyApplyOutcome {
             Self::NoGeneration => "no_generation",
             Self::RejectedInvalid => "rejected_invalid",
             Self::ApplyFailed => "apply_failed",
+            Self::RejectedStreamCeiling => "rejected_stream_ceiling",
         }
+    }
+}
+
+// =============================================================================
+// Egress-budget admission (story 2 R-19; ADR-0036 §11)
+// =============================================================================
+
+/// Bounded `outcome` values for `mh_media_stream_admission_total`.
+///
+/// One ADMISSION DECISION is made per generation-advancing policy apply the
+/// session actor processes (stale and equal-generation applies are not
+/// admission decisions). Sibling of [`PolicyApplyOutcome`], deliberately not
+/// merged with it: the two counters have different denominators — see the
+/// catalog for the identity between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAdmissionOutcome {
+    /// The projected installed egress streams fit the derived stream ceiling.
+    Admitted,
+    /// The projected installed egress streams exceed the derived stream
+    /// ceiling; nothing was installed.
+    RejectedStreamCeiling,
+}
+
+impl StreamAdmissionOutcome {
+    /// Every value, in catalog order. The one hand-maintained list — same
+    /// reasoning as [`PolicyApplyOutcome::ALL`].
+    pub const ALL: [Self; 2] = [Self::Admitted, Self::RejectedStreamCeiling];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::RejectedStreamCeiling => "rejected_stream_ceiling",
+        }
+    }
+}
+
+/// The `basis` label on `mh_media_egress_budget_bytes_per_second`.
+///
+/// `unmeasured` because ADR-0036 records that the egress budget has "no
+/// measurement behind it" (an open item): the configured budget is a declared
+/// figure, not a measured capacity. When that open item closes this value
+/// changes. A `&'static str` constant for the same reason as
+/// `KEY_CUSTODY_OPERATOR` — never derived from config or a feature flag.
+///
+/// **No panel or alert may select on `basis`**: a `{basis="unmeasured"}`
+/// selector goes silently empty on exactly the day the measurement lands.
+pub const EGRESS_BUDGET_BASIS_UNMEASURED: &str = "unmeasured";
+
+/// Publish the egress-budget admission chain's static gauges. Call ONCE, at
+/// startup, AFTER [`init_metrics_recorder`] — a `gauge!().set()` before the
+/// recorder exists goes nowhere and the series silently never appear.
+///
+/// Every value is read from the ONE [`crate::config::EgressAdmission`] field
+/// its consumer reads, never a parallel constant or a re-conversion:
+/// - `mh_media_egress_budget_bytes_per_second` — the CONVERTED budget (bytes;
+///   the key is bits, converted once at load);
+/// - `mh_media_egress_stream_ceiling` — the derived ceiling, the same field
+///   admission enforces and `gc_client` advertises as `max_streams`;
+/// - `mh_media_egress_stream_ceiling_recommended_min` — the ADVISORY constant
+///   (never an alert input);
+/// - `mh_media_stream_admission_rejection_ratio_threshold` — the same field
+///   the session actor's threshold log reads, so the exhaustion alert is a
+///   bare gauge-to-gauge comparison with no `PromQL` literal.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "gauge values are f64 by the metrics API; a budget above 2^53 bytes/s is not a \
+              real configuration, and the ceiling is bounded far below that at load"
+)]
+pub fn publish_egress_admission(admission: &crate::config::EgressAdmission) {
+    gauge!(
+        "mh_media_egress_budget_bytes_per_second",
+        "basis" => EGRESS_BUDGET_BASIS_UNMEASURED,
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(admission.budget_bytes_per_second as f64);
+    gauge!(
+        "mh_media_egress_stream_ceiling",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(f64::from(admission.stream_ceiling));
+    gauge!(
+        "mh_media_egress_stream_ceiling_recommended_min",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(crate::config::EGRESS_STREAM_CEILING_RECOMMENDED_MIN as f64);
+    gauge!(
+        "mh_media_stream_admission_rejection_ratio_threshold",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(admission.rejection_ratio_threshold);
+}
+
+/// Metric handles the session actor's admission path uses, resolved ONCE when
+/// the actor is built (the session manager is constructed after the recorder
+/// is installed in `main`).
+#[derive(Debug, Clone)]
+pub struct AdmissionMetricHandles {
+    /// Indexed by [`StreamAdmissionOutcome::ALL`] order.
+    decisions: [Counter; 2],
+    rejection_ratio: Gauge,
+    egress_edges: Gauge,
+}
+
+impl AdmissionMetricHandles {
+    /// Count one admission decision.
+    pub fn record(&self, outcome: StreamAdmissionOutcome) {
+        let [admitted, rejected] = &self.decisions;
+        match outcome {
+            StreamAdmissionOutcome::Admitted => admitted.increment(1),
+            StreamAdmissionOutcome::RejectedStreamCeiling => rejected.increment(1),
+        }
+    }
+
+    /// Publish the windowed rejection ratio (never NaN; see
+    /// `session::admission::AdmissionWindow::ratio`).
+    pub fn publish_rejection_ratio(&self, ratio: f64) {
+        self.rejection_ratio.set(ratio);
+    }
+
+    /// Publish installed egress streams on this handler — the same
+    /// `total_edges()` `gc_client` reports as `current_streams`.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "installed egress streams are bounded by MH_MAX_TOTAL_EGRESS_EDGES (<= 2^20)"
+    )]
+    pub fn publish_egress_edges(&self, edges: usize) {
+        self.egress_edges.set(edges as f64);
+    }
+}
+
+/// Resolve the admission handles. Resolving each counter registers its series
+/// at zero, and both gauges are published by the actor at construction, so
+/// every admission series exists from boot.
+///
+/// `mh_media_egress_edges` lands here ahead of story 2 task 11 (which adds
+/// `mh_media_egress_edges_limit` and `mh_media_registered_meetings`) because
+/// this task makes the same quantity live as GC's `current_streams`: a value
+/// wired into placement needs a saturation signal in front of it.
+#[must_use]
+pub fn resolve_admission_handles() -> AdmissionMetricHandles {
+    AdmissionMetricHandles {
+        decisions: StreamAdmissionOutcome::ALL.map(|outcome| {
+            counter!(
+                "mh_media_stream_admission_total",
+                "outcome" => outcome.as_label(),
+                KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+            )
+        }),
+        rejection_ratio: gauge!(
+            "mh_media_stream_admission_rejection_ratio",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        ),
+        egress_edges: gauge!(
+            "mh_media_egress_edges",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        ),
     }
 }
 
@@ -1346,6 +1518,9 @@ pub fn zero_initialize_counters() {
     for o in PolicyApplyOutcome::ALL {
         counter!("mh_media_policy_applies_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    for o in StreamAdmissionOutcome::ALL {
+        counter!("mh_media_stream_admission_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
     for o in MediaSessionStartOutcome::ALL {
         counter!("mh_media_session_starts_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
@@ -1606,6 +1781,22 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_admission_outcome_labels_are_distinct_and_stable() {
+        let labels: Vec<&str> = StreamAdmissionOutcome::ALL
+            .iter()
+            .map(|o| o.as_label())
+            .collect();
+        // Spelled out: the wire contract the ratio and the alert select on.
+        assert_eq!(labels, ["admitted", "rejected_stream_ceiling"]);
+        // The capacity refusal carries the SAME token on both counters (the
+        // catalog documents the relationship), so a responder greps one word.
+        assert_eq!(
+            StreamAdmissionOutcome::RejectedStreamCeiling.as_label(),
+            PolicyApplyOutcome::RejectedStreamCeiling.as_label()
+        );
+    }
+
+    #[test]
     fn test_policy_apply_outcome_labels_are_distinct_and_stable() {
         let labels: Vec<&str> = PolicyApplyOutcome::ALL
             .iter()
@@ -1622,7 +1813,8 @@ mod tests {
                 "rejected_stale",
                 "no_generation",
                 "rejected_invalid",
-                "apply_failed"
+                "apply_failed",
+                "rejected_stream_ceiling"
             ],
             "outcome label values are wire-visible; a rename silently breaks every dashboard and alert selecting on them"
         );

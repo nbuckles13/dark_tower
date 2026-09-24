@@ -42,8 +42,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Notify};
 
+pub mod admission;
+
 use crate::media::forward::EgressQueue;
+use crate::observability::metrics::{
+    resolve_admission_handles, AdmissionMetricHandles, StreamAdmissionOutcome,
+};
 use crate::routing::{MeetingKey, MeetingPolicy, RoutingSnapshot, RoutingTable, SenderId};
+pub use admission::StreamAdmission;
+use admission::{AdmissionWindow, ThresholdCrossing, ThresholdLatch, ADMISSION_WINDOW_BUCKET};
 use arc_swap::ArcSwap;
 
 /// Channel buffer size for the session manager actor mailbox.
@@ -191,6 +198,9 @@ pub enum ApplyFailure {
     ActorUnavailable,
     /// Installing would exceed the handler's aggregate egress-edge bound.
     EdgeCapExceeded,
+    /// Installing would take the handler's installed egress streams above its
+    /// derived egress STREAM ceiling — a capacity refusal (story 2 R-19).
+    StreamCeilingExceeded,
 }
 
 impl ApplyFailure {
@@ -202,6 +212,7 @@ impl ApplyFailure {
             Self::Timeout => "config_apply_timeout",
             Self::ActorUnavailable => "session_actor_unavailable",
             Self::EdgeCapExceeded => "total_egress_edge_cap_exceeded",
+            Self::StreamCeilingExceeded => "egress_stream_ceiling_exceeded",
         }
     }
 }
@@ -251,6 +262,14 @@ pub struct SessionManagerActor {
     config_receiver: mpsc::Receiver<ConfigApplyMessage>,
     state: SessionState,
     routing: Arc<RoutingTable>,
+    /// The derived stream ceiling and the ratio threshold (story 2 R-19).
+    admission: StreamAdmission,
+    /// Sliding window the rejection ratio is computed over.
+    admission_window: AdmissionWindow,
+    /// Edge-triggered reader of the rejection-ratio threshold (log only).
+    threshold_latch: ThresholdLatch,
+    /// Admission counter/gauge handles, resolved once at construction.
+    admission_metrics: AdmissionMetricHandles,
 }
 
 impl SessionManagerActor {
@@ -258,26 +277,66 @@ impl SessionManagerActor {
         receiver: mpsc::Receiver<SessionMessage>,
         config_receiver: mpsc::Receiver<ConfigApplyMessage>,
         routing: Arc<RoutingTable>,
+        admission: StreamAdmission,
     ) -> Self {
+        let admission_metrics = resolve_admission_handles();
+        // Both gauges exist from construction — never lazily on first
+        // decision/install. A gauge-to-gauge alert whose left-hand series is
+        // absent cannot fire, and `mh-media.json`'s "an empty panel means
+        // healthy, because MH registers eagerly" rests on this.
+        admission_metrics.publish_rejection_ratio(0.0);
+        admission_metrics.publish_egress_edges(routing.load().total_edges());
         Self {
             receiver,
             config_receiver,
             state: SessionState::default(),
             routing,
+            admission,
+            admission_window: AdmissionWindow::new(),
+            threshold_latch: ThresholdLatch::default(),
+            admission_metrics,
         }
     }
 
-    /// Main run loop. Selects over both mailboxes until both close.
+    /// Main run loop. Selects over both mailboxes, plus the admission-window
+    /// rotation tick, until both mailboxes close.
     ///
-    /// A closed mailbox yields `None` forever, so the `is_some()` guards stop
-    /// that arm busy-looping while the other still has senders. The loop ends
-    /// only when both channels are closed, which happens at shutdown.
+    /// The tick arm is always ready eventually, so the old `else => break`
+    /// (which fires only when EVERY arm is disabled) would never run and the
+    /// actor would outlive shutdown. Explicit open-flags instead: a mailbox arm
+    /// is disabled once its channel returns `None`, and the loop condition —
+    /// not the tick — decides termination, so the loop still ends exactly when
+    /// both channels are closed.
     pub async fn run(mut self) {
-        loop {
+        let mut lifecycle_open = true;
+        let mut config_open = true;
+        // First tick one bucket from now (an `interval` fires immediately).
+        let mut rotation = tokio::time::interval_at(
+            tokio::time::Instant::now() + ADMISSION_WINDOW_BUCKET,
+            ADMISSION_WINDOW_BUCKET,
+        );
+        // DEFAULT `Burst` missed-tick behaviour, deliberately — do not set
+        // `Skip`. Under `Skip`, ticks missed while the actor is busy are
+        // discarded, so a 60 s stall rotates ONCE instead of six times and data
+        // that should have aged out stays in the window: the effective window
+        // stretches past its documented five minutes exactly when the actor is
+        // under load, which is when the ratio matters. `Burst` catches up, and
+        // catching up is cheap (`rotate` clears one small struct; the latch is
+        // edge-triggered, so a burst logs at most one line).
+        while lifecycle_open || config_open {
             tokio::select! {
-                Some(msg) = self.receiver.recv() => self.handle_message(msg),
-                Some(msg) = self.config_receiver.recv() => self.handle_config_apply(msg),
-                else => break,
+                msg = self.receiver.recv(), if lifecycle_open => match msg {
+                    Some(msg) => self.handle_message(msg),
+                    None => lifecycle_open = false,
+                },
+                msg = self.config_receiver.recv(), if config_open => match msg {
+                    Some(msg) => self.handle_config_apply(msg),
+                    None => config_open = false,
+                },
+                _ = rotation.tick() => {
+                    self.admission_window.rotate();
+                    self.publish_admission_ratio();
+                }
             }
         }
         tracing::debug!(
@@ -355,7 +414,75 @@ impl SessionManagerActor {
                 }
             }
             ApplyOutcome::Applied
+        } else if projected_total_edges > self.admission.stream_ceiling {
+            // EGRESS STREAM ADMISSION (story 2 R-19; ADR-0036 §11) — the HARD
+            // backstop behind GC's soft placement filter. A capacity check,
+            // separate from the resource guard below and first in order.
+            //
+            // Unit: `projected_total_edges` counts EGRESS STREAMS — one
+            // `EgressEdge` per `egress_stream_id`, its `candidates` being the
+            // sources eligible to fill that one stream — summed over every
+            // meeting on this handler, via the same `projected_total_edges`
+            // the edge bound and `with_policy` use (no second accounting). The
+            // same unit as `max_streams` advertised to GC and as
+            // `mh_media_egress_edges`.
+            //
+            // All-or-none: no swap, prior generation stays live. Reached only
+            // by a generation-ADVANCING apply: stale and equal-generation
+            // re-asserts short-circuit above, so an idempotent re-assert on a
+            // full handler can never trip a capacity refusal.
+            //
+            // The WARN names the CONDITION and points at the recovery; it does not
+            // carry the restart command. Deployment names and the namespace are
+            // infra topology (CLAUDE.md: keep it out of application code), and a
+            // restated command goes stale silently — it would name two handlers
+            // the day a third exists, so the recovery half-works and the ratchet
+            // persists on the unnamed pod. `docs/TODO.md` records the same
+            // "point, don't restate" ruling from a prior cert-rotation incident.
+            //
+            // RATCHET, until story 2 task 11's teardown: streams of a meeting
+            // that ended ABNORMALLY (MC crash, lost push) are never released —
+            // ordinary departures re-push shrinking policies and do release.
+            // `installed_meeting_count` / `installed_total_streams` answer "one
+            // fat policy, or accumulated dead meetings?" from this line alone;
+            // both are identity-free aggregates.
+            self.record_admission(StreamAdmissionOutcome::RejectedStreamCeiling);
+            tracing::warn!(
+                target: "mh.session.policy",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                reason = ApplyFailure::StreamCeilingExceeded.reason(),
+                installed_generation = installed,
+                received_generation = policy.generation,
+                projected_total_streams = projected_total_edges,
+                installed_total_streams = snapshot.total_edges(),
+                installed_meeting_count = snapshot.meeting_count(),
+                stream_ceiling = self.admission.stream_ceiling,
+                "Egress stream admission refused: projected streams exceed this handler's \
+                 stream ceiling; prior generation stays live. If installed streams sit at the \
+                 ceiling with no live meeting behind them, that is the ratchet (streams held by \
+                 abnormally ended meetings, until teardown lands): see the interim recovery \
+                 under 'The ratchet' in docs/observability/metrics/mh-service.md"
+            );
+            ApplyOutcome::Failed(ApplyFailure::StreamCeilingExceeded)
         } else if projected_total_edges > max_total_egress_edges {
+            // DEFENSE-IN-DEPTH BACKSTOP, unreachable while config load's
+            // invariant holds: `from_vars` refuses a stream ceiling above
+            // `MH_MAX_TOTAL_EGRESS_EDGES`
+            // (`ConfigError::EgressStreamCeilingExceedsEdgeBound`), so any
+            // projection over this bound is already over the ceiling and was
+            // refused above. Kept honest by that boot test AND by the
+            // deliberately-labelled backstop tests that build an actor whose
+            // ceiling sits above the edge bound (`mh_service` tests,
+            // `apply_failure_does_not_advance_the_acknowledged_generation` and
+            // `reassert_at_the_aggregate_bound_does_not_double_count_itself`).
+            // The admission decision was "admitted" — the resource guard, not
+            // capacity, refuses. That counting choice is itself held up by the
+            // boot invariant: were `EgressStreamCeilingExceedsEdgeBound` ever
+            // relaxed, this arm would become reachable and every refusal here
+            // would inflate the ratio's DENOMINATOR, suppressing the rejection
+            // signal exactly while the handler refuses. Revisit this line if
+            // that invariant is ever loosened.
+            self.record_admission(StreamAdmissionOutcome::Admitted);
             // Aggregate resource-exhaustion guard, NOT a capacity figure and
             // never advertised to GC. All-or-none: no swap, prior generation
             // stays live, so the forward path reflects N-1 rather than neither.
@@ -382,7 +509,10 @@ impl SessionManagerActor {
             );
             ApplyOutcome::Failed(ApplyFailure::EdgeCapExceeded)
         } else {
+            self.record_admission(StreamAdmissionOutcome::Admitted);
             self.routing.install(&policy);
+            self.admission_metrics
+                .publish_egress_edges(self.routing.load().total_edges());
             tracing::info!(
                 target: "mh.session.policy",
                 key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
@@ -395,6 +525,59 @@ impl SessionManagerActor {
         };
 
         let _ = respond_to.send(outcome);
+    }
+
+    /// Count one admission decision, update the window, republish the ratio.
+    fn record_admission(&mut self, outcome: StreamAdmissionOutcome) {
+        self.admission_metrics.record(outcome);
+        self.admission_window.record(outcome);
+        self.publish_admission_ratio();
+    }
+
+    /// Publish the windowed rejection ratio and feed the threshold latch.
+    ///
+    /// The log line is a debugging BREADCRUMB; the Prometheus alert on the
+    /// ratio and threshold gauges is authoritative for paging, and the two may
+    /// disagree at the edges (the alert has its own `for:` and denominator
+    /// guard).
+    fn publish_admission_ratio(&mut self) {
+        let ratio = self.admission_window.ratio();
+        let decisions = self.admission_window.decisions();
+        self.admission_metrics.publish_rejection_ratio(ratio);
+        let threshold = self.admission.rejection_ratio_threshold;
+        let installed_total_streams = self.routing.load().total_edges();
+        match self.threshold_latch.observe(ratio, decisions, threshold) {
+            Some(ThresholdCrossing::Exceeded) => tracing::warn!(
+                target: "mh.session.policy",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                rejection_ratio = ratio,
+                rejection_ratio_threshold = threshold,
+                window_decisions = decisions,
+                installed_total_streams,
+                stream_ceiling = self.admission.stream_ceiling,
+                "Egress stream admission rejection ratio above threshold (debugging \
+                 breadcrumb; the alert is authoritative)"
+            ),
+            // `installed_total_streams` and `stream_ceiling` are on this line so
+            // it cannot be misread as an all-clear. The latch also re-arms when
+            // the window EMPTIES — MC stopped offering, not the handler
+            // recovering — so "recovered, window_decisions=0,
+            // installed_total_streams == stream_ceiling" is a still-full (idle
+            // or ratcheted) handler, and says so from this one line.
+            Some(ThresholdCrossing::Recovered) => tracing::info!(
+                target: "mh.session.policy",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                rejection_ratio = ratio,
+                rejection_ratio_threshold = threshold,
+                window_decisions = decisions,
+                installed_total_streams,
+                stream_ceiling = self.admission.stream_ceiling,
+                "Egress stream admission rejection ratio back below threshold (if \
+                 window_decisions is 0 this only means nothing was offered; compare \
+                 installed_total_streams with stream_ceiling)"
+            ),
+            None => {}
+        }
     }
 
     fn handle_message(&mut self, msg: SessionMessage) {
@@ -1034,8 +1217,8 @@ impl SessionManagerHandle {
     /// Spawns the actor task immediately. The actor runs until all handles
     /// are dropped (channels close).
     #[must_use]
-    pub fn new() -> Self {
-        let (handle, actor) = Self::new_with_parts();
+    pub fn new(admission: StreamAdmission) -> Self {
+        let (handle, actor) = Self::new_with_parts(admission);
         tokio::spawn(actor.run());
         handle
     }
@@ -1052,11 +1235,12 @@ impl SessionManagerHandle {
     /// mailbox stays full because nothing exists that could drain it, and a
     /// reply never arrives because no task holds the sending half.
     #[must_use]
-    pub fn new_with_parts() -> (Self, SessionManagerActor) {
+    pub fn new_with_parts(admission: StreamAdmission) -> (Self, SessionManagerActor) {
         let (sender, receiver) = mpsc::channel(SESSION_CHANNEL_BUFFER);
         let (config_sender, config_receiver) = mpsc::channel(CONFIG_APPLY_CHANNEL_BUFFER);
         let routing = Arc::new(RoutingTable::new());
-        let actor = SessionManagerActor::new(receiver, config_receiver, Arc::clone(&routing));
+        let actor =
+            SessionManagerActor::new(receiver, config_receiver, Arc::clone(&routing), admission);
         (
             Self {
                 sender,
@@ -1369,15 +1553,14 @@ impl SessionManagerHandle {
     }
 }
 
-impl Default for SessionManagerHandle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// There is deliberately no `Default` impl: a session manager with no stream
+// ceiling is not a representable state (story 2 R-19), and a default would
+// have to invent one.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::admission::test_admission;
     use super::*;
 
     fn make_registration(mc_id: &str, endpoint: &str) -> MeetingRegistration {
@@ -1407,7 +1590,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_meeting() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
         assert!(!handle.is_meeting_registered("meeting-1").await);
 
         let pending = handle
@@ -1427,7 +1610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_and_remove_connection() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
         handle
             .register_meeting(
                 "meeting-1".to_string(),
@@ -1453,7 +1636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_connection_promoted_on_register() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
 
         // Add pending connection before RegisterMeeting
         let _notify = handle
@@ -1481,7 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_connection_for_different_meeting_not_promoted() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
 
         // Add pending for meeting-1
         let _notify = handle
@@ -1502,7 +1685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_pending_connection() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
 
         let _notify = handle
             .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
@@ -1523,7 +1706,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_wakes_pending_on_register() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
 
         let notify = handle
             .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
@@ -1553,7 +1736,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registered_connection_not_affected_by_timeout() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
 
         // Register meeting first
         handle
@@ -1581,13 +1764,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_mc_endpoint_unregistered() {
-        let handle = SessionManagerHandle::new();
+        let handle = SessionManagerHandle::new(test_admission());
         assert!(handle.get_mc_endpoint("nonexistent").await.is_none());
     }
 
     #[tokio::test]
-    async fn test_default_impl() {
-        let handle = SessionManagerHandle::default();
+    async fn a_fresh_handle_is_empty() {
+        let handle = SessionManagerHandle::new(test_admission());
         assert!(!handle.is_meeting_registered("any").await);
         assert_eq!(handle.active_connection_count().await, 0);
     }

@@ -411,7 +411,7 @@ tasks:
     Builds on work already landed or queued ahead of this task: task 6 made the sdk-core receive loop open from `StreamAssignment.media_handler_url` and keyed hop-sequence tracking on (slot, sender), and the shared-handler visibility task (id 20) makes the client connect to EVERY handler in `media_servers`, receive different slots on different transports, and send each stream to every `SendTarget`. Extend that work rather than redoing it; the slot-edge gate is per (slot, sender) regardless of which transport a frame arrives on.
   tag: story-2026-09-21-hear-each-other-task-7
 - id: 8
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 2
@@ -425,6 +425,7 @@ tasks:
     Retire `MH_MAX_STREAMS` (code half of the two-deploy retirement ruled by the lead): delete the optional read at `config.rs` ~1359, `DEFAULT_MAX_STREAMS` and the `Config::max_streams` field; the ConfigMap key and deployment refs are retained by infrastructure this deploy and deleted by a scheduled follow-up. Note in the config module that `media_handlers.max_streams DEFAULT 1000` in the GC schema is an intentionally retained unreachable default (register always binds the derived ceiling).
 
     Tests: unit tests for the derivation, the ceiling-at-least-1 rule, bits-converted-once, and required-key refusal; integration tests for admission rejection counted by outcome and the ratio gauge; a Rust env-test against the live Kind cluster for budget exhaustion (scenario S9, MH half): drive registrations past the deployed ceiling and assert rejection counted and the ratio and threshold gauges present, with no wall-clock gate. Update `docs/observability/metric-catalog.md` entries for the new series (observability's later task owns dashboards and the alert-inventory entry).
+  slug: 2026-09-24-mh-egress-budget-admission
   tag: story-2026-09-21-hear-each-other-task-8
 - id: 9
   status: pending

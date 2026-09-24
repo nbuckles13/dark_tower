@@ -116,7 +116,7 @@ async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_pa
     //     handler's fetch_sub+set at server.rs:200-202 on handler exit)
     //   - `mh_webtransport_handshake_duration_seconds` at-least-one observation
     let jwks = JwksRig::start(1, "mh-accept-loop-ok").await;
-    let session_manager = SessionManagerHandle::new();
+    let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
     let rig = start_rig(session_manager.clone(), &jwks, 2).await;
 
     session_manager
@@ -161,7 +161,7 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
     // >= max_connections` at server.rs:166, emits `status=rejected`, and
     // drops `incoming_session` without accepting.
     let jwks = JwksRig::start(2, "mh-accept-loop-rejected").await;
-    let session_manager = SessionManagerHandle::new();
+    let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
     let rig = start_rig(session_manager.clone(), &jwks, 1).await;
 
     session_manager
@@ -210,7 +210,7 @@ async fn accept_loop_emits_error_status_when_handler_returns_err() {
     // 4 and returns `Err(MhError::JwtValidation(_))`. accept_loop emits
     // `status=error` when the spawned task exits with Err at server.rs:205.
     let jwks = JwksRig::start(3, "mh-accept-loop-error").await;
-    let session_manager = SessionManagerHandle::new();
+    let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
     let rig = start_rig(session_manager.clone(), &jwks, 8).await;
 
     let snap = MetricAssertion::snapshot();

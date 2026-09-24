@@ -43,6 +43,12 @@
 //! receive-side flow control, and a shutdown drain window derived from the
 //! pod's own termination grace rather than hardcoded. See [`config`].
 //!
+//! Egress admission is keyed on bandwidth (ADR-0036 §11; story 2 R-19): a
+//! required egress budget and per-stream costs derive ONE stream ceiling at
+//! load, which the session actor enforces at stream admission and
+//! [`grpc::GcClient`] advertises to GC as `max_streams`. See
+//! [`config::EgressAdmission`] and [`session::admission`].
+//!
 //! One contract obligation is **deliberately not** implemented here, with its
 //! enforcement owner named at the code site: rejecting `policy_generation == 0`
 //! (story task 13 — enforcing it before MC emits >= 1 would blackhole every

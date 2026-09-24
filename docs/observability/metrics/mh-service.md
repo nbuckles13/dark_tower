@@ -273,6 +273,7 @@ because story task 21's media metrics need a section to extend.
 | `no_generation` | `policy_generation` was 0 — MC named no generation. | **See the window note below.** Today: nothing. |
 | `rejected_invalid` | The policy failed structural validation (duplicate `egress_stream_id`, duplicate subscriber slot, malformed identifier, count bound, unspecified or heterogeneous transport mode). | MC sent bad policy; the remedy is upstream in MC's assignment computation. |
 | `apply_failed` | MH could not install it: config-apply mailbox full, apply timed out, session actor gone, or the aggregate egress-edge bound. **The prior generation stays live.** | MH-side. Read the `reason` field on the accompanying `mh.session.policy` WARN log line to tell the causes apart — it is deliberately not a label. |
+| `rejected_stream_ceiling` | Installing would take this handler's installed egress streams above its derived egress **stream** ceiling (story 2 R-19) — a **capacity** refusal. **The prior generation stays live.** | Capacity, not an MC bug and not an MH fault: see [Egress Admission Metrics](#egress-admission-metrics). The same event is counted on `mh_media_stream_admission_total{outcome="rejected_stream_ceiling"}`. Deliberately NOT folded into `apply_failed`: under a small placeholder budget it is expected, and the deploy bake gate in `docs/runbooks/mh-deployment.md` alerts on `apply_failed`. |
 
 The idempotent re-assert counts as `applied`, not `rejected_stale`: §8's cadence re-asserts every meeting every ≤10 s in perfect health, so counting it as a rejection would drive that series monotonically upward in the steady state and make any alert on it dead on arrival.
 
@@ -305,6 +306,90 @@ sum(rate(mh_media_policy_applies_total{outcome=~"rejected_stale|rejected_invalid
 The denominator is meaningful because the counter increments on every post-boundary path: `sum(mh_media_policy_applies_total)` is "registrations whose policy MH considered". Pre-boundary rejects (a malformed `mc_grpc_endpoint`, an over-length `mc_id`) are **not** counted here — they land on `mh_grpc_requests_total{status="error"}` alone, because "MC's assignment computation produced a policy MH will not apply" and "this caller's endpoint is malformed" have different owners and different remedies.
 
 No alert rule ships with this metric. A useful threshold depends on MC's re-assert cadence, which task 13 explicitly deferred to the handler-restart story; alerting is story task 21's scope.
+
+---
+
+## Egress Admission Metrics
+
+Story 2 R-19, R-23; ADR-0036 §11 "Admission control is keyed on egress bandwidth, not connection count". MH derives ONE egress **stream** ceiling from `MH_EGRESS_BUDGET_BPS` and the two per-stream cost keys (`infra/services/mh-service/configmap.yaml` is the home of every number). That one value is enforced at stream admission (hard), advertised to GC as `max_streams` (GC placement stays soft), published as `mh_media_egress_stream_ceiling`, and logged at startup. It is a **stream** ceiling, never a "subscriber ceiling": a subscriber holds N slots.
+
+**Bits on the key, bytes on the gauge — one deliberate conversion.** The config keys are bits per second. MH converts ONCE at load, upstream of the enforcement/gauge fork (budget floored, costs ceiled — both fail closed), so `mh_media_egress_budget_bytes_per_second` is in bytes (ADR-0011's throughput rule) while `MH_EGRESS_BUDGET_BPS` is in bits. A factor of 8 between them is correct.
+
+**One unit, three series, two controls.** `mh_media_egress_edges` (measured), `mh_media_egress_stream_ceiling` (capacity) and, from story 2 task 11, `mh_media_egress_edges_limit` (resource guard, `MH_MAX_TOTAL_EGRESS_EDGES`) all count the same thing: aggregate installed egress streams on this pod. The two bounds are **different controls with different remedies** — capacity (raise `MH_EGRESS_BUDGET_BPS`) versus resource-exhaustion guard (`MH_MAX_TOTAL_EGRESS_EDGES`) — not a duplicate. MH refuses to boot when the ceiling exceeds the edge bound, which is what makes the **ceiling** the bound that binds in practice: a saturation panel compares `mh_media_egress_edges` against `mh_media_egress_stream_ceiling`. `_limit` lands in task 11; no saturation alert may be written against it before then.
+
+**Identity with `mh_media_policy_applies_total`.** One admission decision is made per **generation-advancing** policy apply the session actor processes. So `sum(mh_media_stream_admission_total)` is the generation-advancing, actor-processed subset of `sum(mh_media_policy_applies_total)`. The difference is: stale applies (`rejected_stale` only), equal-generation re-asserts (`applied` only), `no_generation`, `rejected_invalid`, and failures before the actor saw the policy (mailbox full, actor gone). An apply-timeout can count an admission decision AND `apply_failed`. A ceiling rejection increments `rejected_stream_ceiling` on **both** counters — the same event under different denominators. **Do not sum them.**
+
+**The ratchet, until story 2 task 11.** Ordinary departures re-push shrinking policies and release streams. A meeting that ends ABNORMALLY (MC crash, lost push) keeps its streams until the pod restarts, and since this task `current_streams` in MH's GC load report is the same value — so a handler at its ceiling drops out of GC placement, and when every handler is there the first join to a NEW meeting fails with 503. `mh_media_egress_edges` sitting at the ceiling with no live meeting behind it is that state. Interim recovery: `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`.
+
+Every series below carries `key_custody=operator` and NO meeting, participant or stream identity (ADR-0036 §11). All are present from process start: the counter is zero-initialised per outcome, the four static gauges are published right after the recorder installs, and the ratio and installed-streams gauges are published when the session actor is built.
+
+### `mh_media_stream_admission_total`
+- **Type**: Counter
+- **Description**: Egress stream admission decisions — one per generation-advancing policy apply.
+- **Labels**:
+  - `outcome`: `admitted` \| `rejected_stream_ceiling` (the `StreamAdmissionOutcome` variants)
+  - `key_custody`: `operator` (single value)
+- **Cardinality**: 2
+- **Usage**: The exhaustion signal's raw counts. Prefer `increase()` on panels — a single rejection must be visible.
+
+| `outcome` | Condition | What a responder does |
+|---|---|---|
+| `admitted` | The **capacity check** passed: projected installed egress streams fit the ceiling. **Not "installed"** — the edge-bound resource-guard backstop and an apply timeout can each still refuse an admitted apply. | Nothing, on its own. To know whether the policy is LIVE, cross-read `mh_media_policy_applies_total` (`applied` vs `apply_failed`). |
+| `rejected_stream_ceiling` | Projected installed egress streams exceed the ceiling; nothing installed, prior generation stays live. | Compare `mh_media_egress_stream_ceiling` with `mh_media_egress_stream_ceiling_recommended_min` first (an unsized placeholder budget?), then `mh_media_egress_edges` (ratchet?). Read the `mh.session.policy` WARN: `installed_meeting_count` and `installed_total_streams` tell one fat policy from accumulated dead meetings. |
+
+```promql
+sum by(outcome) (increase(mh_media_stream_admission_total[$__rate_interval]))
+```
+
+### `mh_media_stream_admission_rejection_ratio`
+- **Type**: Gauge
+- **Description**: Share of admission decisions refused over a **5-minute sliding window** (30 × 10 s buckets, rotated on a timer so it CLEARS when decisions stop). Never a lifetime ratio.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: The left-hand side of the egress-exhaustion alert, compared bare against `mh_media_stream_admission_rejection_ratio_threshold`.
+
+Defined values: **no decisions in the window publishes 0.0** (never NaN, never 1.0 — the alert must be silent on an idle handler); **zero admitted with any rejected publishes 1.0** (never 0.0 — the alert must not be quietest when exhaustion is total).
+
+**This gauge is authoritative for the exhaustion alert.** `rate(…rejected_stream_ceiling[5m]) / rate(…[5m])` computes a similar quantity by a different route and WILL disagree (different window boundaries, Prometheus extrapolation, and the 15 s scrape against 10 s buckets). A responder who computes both should not triage the difference as a bug. The scrape interval also means a sub-30 s excursion can be invisible here; the counter is the record of every decision.
+
+MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above the threshold (only with at least 10 decisions in the window, re-arming at half the threshold). That line is a **debugging breadcrumb**; the Prometheus alert, with its own `for:` and denominator guard, is authoritative for paging, and the two may disagree at the edges.
+
+### `mh_media_stream_admission_rejection_ratio_threshold`
+- **Type**: Gauge
+- **Description**: `MH_EGRESS_REJECTION_RATIO_THRESHOLD`, published from the SAME configuration field the session actor's threshold log reads.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: The right-hand side of the exhaustion alert, so the alert is a bare gauge-to-gauge comparison with no PromQL literal. The number lives only in the ConfigMap.
+
+### `mh_media_egress_budget_bytes_per_second`
+- **Type**: Gauge
+- **Description**: The configured egress budget in **bytes** per second (`MH_EGRESS_BUDGET_BPS / 8`, floored — converted once at load).
+- **Labels**: `basis`: `unmeasured` (single value today); `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: What the ceiling is derived from.
+
+`basis="unmeasured"` records ADR-0036's open item that the budget has no measurement behind it; the value changes when that item closes. **No panel or alert may select on `basis`** — reference the gauge bare. A `{basis="unmeasured"}` selector goes silently empty on exactly the day the measurement lands.
+
+### `mh_media_egress_stream_ceiling`
+- **Type**: Gauge
+- **Description**: The derived egress **stream** ceiling: `budget_bytes / max(cost_audio_bytes, cost_video_bytes)`. The worst-case cost keeps MH type-blind (ADR-0036 §7).
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: The same field enforced at admission and advertised to GC as `max_streams`, so it explains a GC placement decision directly. MH refuses to start when it is below 2 (two participants hearing each other) or above `MH_MAX_TOTAL_EGRESS_EDGES`. `crates/env-tests/tests/01_mh_deployment_config.rs` asserts that the running pods publish the value the deployed ConfigMap derives.
+
+### `mh_media_egress_stream_ceiling_recommended_min`
+- **Type**: Gauge
+- **Description**: The ADVISORY recommended minimum for the ceiling: one full all-hear-all meeting at the story-2 demo size (N+1 = 6 participants each hearing N = 5).
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: The dashboard comparison and the first triage step: is the ceiling below this because the budget is still the unsized placeholder? **Advisory only — never an alert input.** The suffix is deliberately descriptive and not `_threshold`; do not promote it into an alert expression. A deployment below it boots, serves, and logs an INFO "configure me" nudge naming `MH_EGRESS_BUDGET_BPS` at startup. It is a code constant that must never merge with the refuse-boot floor of 2. The same requirement sizes the Kind budget (`infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`), and `01_mh_deployment_config.rs` checks the published value against that requirement.
+
+### `mh_media_egress_edges`
+- **Type**: Gauge
+- **Description**: Installed egress streams across every meeting on this handler — the same `total_edges()` MH reports to GC as `current_streams`.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Saturation against `mh_media_egress_stream_ceiling` (same unit). Published as 0 at startup and then on every install. It does not decay: it falls when a live meeting re-asserts a smaller policy, and stays high after an abnormal meeting end — truthfully, because those streams really are still held (the ratchet above). The name is fixed by the story; `mh_media_egress_edges_limit` and `mh_media_registered_meetings` follow in story 2 task 11.
 
 ---
 

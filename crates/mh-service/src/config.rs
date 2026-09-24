@@ -26,8 +26,20 @@ pub const DEFAULT_HEALTH_BIND_ADDRESS: &str = "0.0.0.0:8083";
 /// Default WebTransport bind address.
 pub const DEFAULT_WEBTRANSPORT_BIND_ADDRESS: &str = "0.0.0.0:4434";
 
-/// Default maximum concurrent streams.
-pub const DEFAULT_MAX_STREAMS: u32 = 1000;
+// `MH_MAX_STREAMS` is RETIRED (story 2 R-19). There is no read, no default and
+// no `Config` field: the value MH advertises to GC in `RegisterMhRequest
+// .max_streams` is the DERIVED stream ceiling ([`EgressAdmission::stream_ceiling`]),
+// the same field admission enforces and `mh_media_egress_stream_ceiling`
+// publishes. The ConfigMap key and both `configMapKeyRef`s survive one deploy
+// for `kubectl rollout undo` safety; their removal is scheduled in
+// `docs/TODO.md` §Media Path Obligations ("Delete the retired `MH_MAX_STREAMS`").
+//
+// `media_handlers.max_streams DEFAULT 1000` in the GC schema
+// (`migrations/20260124000001_mh_registry.sql`) is an INTENTIONALLY RETAINED,
+// UNREACHABLE default: register always binds the derived ceiling, and GC's
+// register upsert overwrites the column (`max_streams = EXCLUDED.max_streams`),
+// so no row ever keeps 1000. It is not a second encoding of anything MH uses
+// and must not be "reconciled" with the ceiling.
 
 /// Default MH instance ID prefix.
 pub const DEFAULT_MH_ID_PREFIX: &str = "mh";
@@ -56,37 +68,52 @@ pub const MAX_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 300;
 // earlier than the routing table.
 //
 // EVERY BOUND HERE IS RESOURCE EXHAUSTION, NEVER CAPACITY. None is advertised
-// to GC and none participates in placement. `Config::max_streams` is a
-// *capacity* figure GC enforces at placement (`gc_client` reports it); it is
-// deliberately NOT reused as an enforcement threshold here — its deployed value
-// and its code default differ by an order of magnitude precisely because it is
-// inert on MH's data path, and it is scheduled for retirement when the egress
-// budget lands (R-22).
+// to GC and none participates in placement. The capacity figure is the derived
+// egress STREAM ceiling ([`EgressAdmission`], below), a different control with a
+// different remedy.
 //
-// Each bound is optional-with-default rather than required: a newly required
-// env var with no manifest is a deploy-time CrashLoop that would strand a
-// rollback. Each also has a hard code-level CEILING, because a `> 0` check
-// alone lets a fat-fingered value silently re-open the surface the bound exists
-// to close, and it would read as configured-on-purpose forever. The ceilings
-// live in code, not in a manifest, so the guarantee holds in every environment
-// including those with no ConfigMap.
+// All four are REQUIRED reads (story 2 R-22) with no code default: their
+// ConfigMap entries in `infra/services/mh-service/configmap.yaml` are the single
+// home for the numbers, and a required read is what gives `dt-guard env-config`
+// rule-1 coverage (it keys on `ConfigError::MissingEnvVar` literals, which a
+// defaulted read never emits). Each also has a hard code-level CEILING, because
+// a `> 0` check alone lets a fat-fingered value silently re-open the surface the
+// bound exists to close, and it would read as configured-on-purpose forever.
+// The ceilings live in code, not in a manifest, so the guarantee holds in every
+// environment including those with no ConfigMap.
 
-/// Default per-meeting bound on `RegisterMeetingRequest.egress_streams`.
-pub const DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING: usize = 512;
+/// Shared consequence clause for the two PRE-ALLOCATION §8 bounds, which fail
+/// the same way: both size work done against a caller-controlled repeated field
+/// before any routing table exists. One home, because two copies of an
+/// operator-facing sentence are what drift.
+const PRE_ALLOCATION_CONSEQUENCE: &str =
+    "the bound sizes work done against a caller-controlled repeated field before any routing \
+     table is built";
 
-/// Hard ceiling for `MH_MAX_EGRESS_STREAMS_PER_MEETING`.
+/// Hard ceiling for `MH_MAX_EGRESS_STREAMS_PER_MEETING` (per-meeting bound on
+/// `RegisterMeetingRequest.egress_streams`).
 pub const MAX_EGRESS_STREAMS_PER_MEETING_CEILING: usize = 8_192;
 
-/// Default per-egress-stream bound on `EgressStream.candidate_sources`.
+/// Hard ceiling for `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS` (per-egress-stream
+/// bound on `EgressStream.candidate_sources`).
 ///
-/// One candidate this story (loopback); the field is repeated because audio
-/// selection among many speakers must be additive (ADR-0036 §7).
-pub const DEFAULT_MAX_CANDIDATE_SOURCES_PER_EGRESS: usize = 16;
-
-/// Hard ceiling for `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS`.
+/// The field is repeated because audio selection among many speakers must be
+/// additive (ADR-0036 §7); story 2 pins exactly one candidate per stream.
 pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 
-/// Default aggregate bound on egress edges across **all** meetings.
+/// Hard ceiling for `MH_MAX_TOTAL_EGRESS_EDGES`, the aggregate bound on egress
+/// edges across **all** meetings.
+///
+/// This docstring is the surviving home of the reasoning that previously sat on
+/// the deleted `DEFAULT_MAX_TOTAL_EGRESS_EDGES` (moved intact when the read
+/// became required, story 2 task 8); `infra/services/mh-service/configmap.yaml`
+/// and `docs/TODO.md` §Media Path Obligations cite it.
+///
+/// It also bounds the derived egress stream ceiling from above: MH refuses to
+/// start when the ceiling exceeds the configured `MH_MAX_TOTAL_EGRESS_EDGES`
+/// ([`ConfigError::EgressStreamCeilingExceedsEdgeBound`]), and this ceiling is
+/// asserted below `i32::MAX` because GC stores the advertised value in an
+/// `INTEGER` column.
 ///
 /// The two per-meeting bounds above bound *one* meeting; `SessionState` caps
 /// no meeting count, so without this the total is per-meeting-bound x
@@ -95,8 +122,9 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 /// a routing table off each entry, which is what makes the aggregate MH's
 /// problem rather than an inherited one.
 ///
-/// Sized FAR above expected peak — single-digit *concurrent* meetings in this
-/// deployment — so that no plausible instantaneous load approaches it.
+/// The configured value is sized FAR above expected peak — single-digit
+/// *concurrent* meetings in this deployment — so that no plausible
+/// instantaneous load approaches it.
 ///
 /// # What this actually bounds: a ratcheting floor, not concurrent load
 ///
@@ -131,7 +159,7 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 /// meeting-ended signal MH is not given and is tracked in `docs/TODO.md`
 /// §Media Path Obligations.
 ///
-/// **Raising this default is not the remedy.** It buys time proportional to the
+/// **Raising the configured value is not the remedy.** It buys time proportional to the
 /// meeting-completion rate and changes nothing else, because the ceiling is
 /// consumed by finished meetings at whatever rate meetings finish — independent
 /// of concurrent load. Doubling the number doubles time-to-onset and fixes
@@ -141,24 +169,117 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 /// `egress_streams` set is legal and meaningful, so near-free meetings never
 /// trip this. That converse gap has its own `docs/TODO.md` entry rather than
 /// being fixed with a number nobody chose.
-pub const DEFAULT_MAX_TOTAL_EGRESS_EDGES: usize = 65_536;
-
-/// Hard ceiling for `MH_MAX_TOTAL_EGRESS_EDGES`.
 pub const MAX_TOTAL_EGRESS_EDGES_CEILING: usize = 1_048_576;
 
-/// Default bound on awaiting the session actor's config-apply reply, in ms.
+// GC persists the advertised ceiling in `media_handlers.max_streams INTEGER`.
+// The derived ceiling is bounded by the configured edge bound, which is bounded
+// by this constant — so this assertion is what makes the advertised value
+// representable at GC by construction rather than by luck.
+const _: () = assert!(
+    MAX_TOTAL_EGRESS_EDGES_CEILING as u64 <= i32::MAX as u64,
+    "the edge-bound ceiling must fit GC's INTEGER max_streams column"
+);
+
+/// Hard ceiling for `MH_POLICY_APPLY_TIMEOUT_MS` (10 seconds), the bound on
+/// awaiting the session actor's config-apply reply.
 ///
 /// The apply is asynchronous relative to the RPC response (ADR-0036 §8), so
-/// this await must be bounded: a wedged actor must produce a truthful stale
+/// that await must be bounded: a wedged actor must produce a truthful stale
 /// `applied_generation` with `outcome=apply_failed`, never a hung RPC.
-pub const DEFAULT_POLICY_APPLY_TIMEOUT_MS: u64 = 1_000;
-
-/// Hard ceiling for `MH_POLICY_APPLY_TIMEOUT_MS` (10 seconds).
 ///
 /// Above ADR-0036 §8's <=10s re-assert cadence the await outlives the interval
 /// that would have retried it, so a longer value cannot help and can only pile
 /// up in-flight calls.
 pub const MAX_POLICY_APPLY_TIMEOUT_MS: u64 = 10_000;
+
+// =============================================================================
+// Egress-budget admission (story 2 R-19, R-23; ADR-0036 §11 "Admission control
+// is keyed on egress bandwidth, not connection count")
+// =============================================================================
+//
+// A CAPACITY figure — unlike every bound in the section above, which is a
+// resource guard. Four REQUIRED keys (`MH_EGRESS_BUDGET_BPS`,
+// `MH_STREAM_COST_AUDIO_BPS`, `MH_STREAM_COST_VIDEO_BPS`,
+// `MH_EGRESS_REJECTION_RATIO_THRESHOLD`) derive ONE value, the egress STREAM
+// ceiling, which is simultaneously:
+//   - what MH enforces at stream admission (`session::admission`, hard);
+//   - what MH advertises to GC in `RegisterMhRequest.max_streams` (GC's
+//     placement filter reads it unchanged and stays SOFT);
+//   - what `mh_media_egress_stream_ceiling` publishes;
+//   - what the startup log reports.
+// All four read [`EgressAdmission::stream_ceiling`], never a re-derivation.
+//
+// A STREAM ceiling, never a "subscriber ceiling": since story 2 a subscriber
+// holds N slots, so one subscriber is N streams.
+//
+// BITS ON THE KEY, BYTES EVERYWHERE ELSE — a deliberate single conversion. The
+// keys are bits per second (the unit operators size links in); MH converts
+// ONCE, in `from_vars`, upstream of the enforcement/gauge fork, so nothing
+// downstream of load sees bits and `mh_media_egress_budget_bytes_per_second`
+// is in bytes (ADR-0011's throughput rule). Both roundings fail CLOSED: the
+// budget floors (`bits / 8`) and each cost ceils (`bits.div_ceil(8)`), so the
+// conversion can only ever admit FEWER streams than an exact one would. The raw
+// bit values are retained on [`EgressAdmission`] for the provenance log line
+// ONLY.
+
+/// Egress streams for `peers + 1` participants who all hear each other: each of
+/// the `peers + 1` subscribers receives every one of its `peers` peers.
+///
+/// ANCHOR (DRY): the same formula, in the same shape and with the same parameter
+/// meaning, is `required_edges(n)` in
+/// `crates/env-tests/tests/01_mh_deployment_config.rs`, and the Kind budget
+/// patch (`infra/kubernetes/overlays/kind/services/mh-service/
+/// configmap-egress-budget-patch.yaml`) states it in prose. They cannot share a
+/// home: env-tests links no service crate (ADR-0028 black-box layering). The
+/// env-test compares the published `mh_media_egress_stream_ceiling_recommended_min`
+/// against its own `required_edges(DEMO_N)`, so the agreement is CHECKED, not
+/// merely anchored.
+#[must_use]
+pub const fn all_hear_all_streams(peers: u64) -> u64 {
+    (peers + 1) * peers
+}
+
+/// REFUSE-BOOT floor on the derived egress stream ceiling.
+///
+/// Requirement: the smallest meeting story 2 defines — two participants, each
+/// hearing the other — must be admissible. A ceiling of 0 is caught loudly
+/// elsewhere (GC rejects a zero `max_streams` at register); a ceiling of exactly
+/// 1 passes every other validation, boots, gets placed, and then rejects nearly
+/// everything it is handed — the black-hole-reporting-healthy shape.
+///
+/// **A code constant, not a config knob, and never to be lowered to quiet a
+/// refusing pod.** The remedy for a refusal is a real `MH_EGRESS_BUDGET_BPS`.
+///
+/// **Must never merge with [`EGRESS_STREAM_CEILING_RECOMMENDED_MIN`].** They are
+/// two different consequences: below THIS, MH refuses to start; below THAT, MH
+/// boots, serves and nudges. A deliberately small deployment below the
+/// recommended minimum must boot. Asserted below and in the unit tests.
+pub const MIN_EGRESS_STREAM_CEILING: u64 = all_hear_all_streams(1);
+
+/// Peers each participant hears in the demo meeting the advisory minimum is
+/// sized for (story 2: N+1 participants all hearing each other, N = 5).
+const RECOMMENDED_MIN_DEMO_PEERS: u64 = 5;
+
+/// ADVISORY recommended minimum for the derived egress stream ceiling.
+///
+/// Requirement: one full all-hear-all meeting at the story-2 demo size fits on
+/// one handler. It is the same anchor the Kind budget is sized against, so one
+/// requirement drives both (see [`all_hear_all_streams`] for the sibling
+/// encodings).
+///
+/// **Advisory only.** Nothing enforces or alerts on it — a placeholder budget is
+/// a configuration state, not an incident. Below it MH boots, serves, and emits
+/// a distinct INFO "configure me" nudge naming `MH_EGRESS_BUDGET_BPS` at
+/// startup; it is published as `mh_media_egress_stream_ceiling_recommended_min`
+/// (suffix descriptive, deliberately not `_threshold`) for the dashboard
+/// comparison and the runbook's first triage step. Never an alert input.
+pub const EGRESS_STREAM_CEILING_RECOMMENDED_MIN: u64 =
+    all_hear_all_streams(RECOMMENDED_MIN_DEMO_PEERS);
+
+const _: () = assert!(
+    MIN_EGRESS_STREAM_CEILING < EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
+    "the refuse-boot floor and the advisory recommended minimum must never merge"
+);
 
 // =============================================================================
 // QUIC transport parameters (ADR-0036 §1)
@@ -739,57 +860,207 @@ pub struct PolicyLimits {
     pub policy_apply_timeout_ms: u64,
 }
 
-impl Default for PolicyLimits {
-    fn default() -> Self {
+impl PolicyLimits {
+    /// Generous fixture bounds for `src/` unit tests that are not ABOUT a
+    /// bound. There is no `Default`: the four keys are required, and a default
+    /// would be exactly the second encoding their required-ness removed.
+    /// `tests/` binaries use `mh_test_utils::admission::fixture_policy_limits`.
+    ///
+    /// **These numbers equal the deployed `ConfigMap` values BY HISTORY, NOT BY
+    /// REQUIREMENT** — they were the code defaults story 2 task 8 deleted. Any
+    /// generous value would do. DO NOT collapse this and the `mh-test-utils`
+    /// twin into one shared constant "because they duplicate the ConfigMap":
+    /// that resurrects, through the test surface, the very default the
+    /// required read removed. (The twin exists because `src/` tests see a
+    /// different `mh_service` crate instance through the dev-dependency.)
+    #[cfg(test)]
+    pub(crate) const fn for_tests() -> Self {
         Self {
-            max_egress_streams_per_meeting: DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING,
-            max_candidate_sources_per_egress: DEFAULT_MAX_CANDIDATE_SOURCES_PER_EGRESS,
-            max_total_egress_edges: DEFAULT_MAX_TOTAL_EGRESS_EDGES,
-            policy_apply_timeout_ms: DEFAULT_POLICY_APPLY_TIMEOUT_MS,
+            max_egress_streams_per_meeting: 512,
+            max_candidate_sources_per_egress: 16,
+            max_total_egress_edges: 65_536,
+            policy_apply_timeout_ms: 1_000,
         }
     }
 }
 
-/// Parse one optional numeric bound, validating both ends.
+/// The egress-budget admission chain, converted and derived ONCE at load.
 ///
-/// Absent -> default. Present and parseable and within `1..=ceiling` -> the
-/// value. Anything else -> a loud [`ConfigError::InvalidValue`] naming the var,
-/// the offending value and the ceiling.
+/// Grouped, and deliberately NOT on [`PolicyLimits`]: that struct's contract is
+/// "resource exhaustion, never capacity", and this is the capacity figure. See
+/// the "Egress-budget admission" section at the top of this module.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EgressAdmission {
+    /// `MH_EGRESS_BUDGET_BPS` as configured, in BITS per second.
+    /// **Log provenance only — do not compute on this field**; every consumer
+    /// reads [`Self::budget_bytes_per_second`].
+    pub budget_bps: u64,
+    /// `MH_STREAM_COST_AUDIO_BPS` as configured, in bits. Log provenance only.
+    pub stream_cost_audio_bps: u64,
+    /// `MH_STREAM_COST_VIDEO_BPS` as configured, in bits. Log provenance only.
+    pub stream_cost_video_bps: u64,
+    /// The budget in BYTES per second (`bits / 8`, floored). What
+    /// `mh_media_egress_budget_bytes_per_second` publishes.
+    pub budget_bytes_per_second: u64,
+    /// Audio stream cost in bytes per second (`bits.div_ceil(8)`).
+    pub stream_cost_audio_bytes_per_second: u64,
+    /// Video stream cost in bytes per second (`bits.div_ceil(8)`).
+    pub stream_cost_video_bytes_per_second: u64,
+    /// The derived egress STREAM ceiling:
+    /// `budget_bytes / max(cost_audio_bytes, cost_video_bytes)`.
+    ///
+    /// The worst-case cost keeps MH type-blind (ADR-0036 §7): every admitted
+    /// stream is costed as the heavier kind. Guaranteed at load to lie in
+    /// `MIN_EGRESS_STREAM_CEILING..=MH_MAX_TOTAL_EGRESS_EDGES`. The ONE value
+    /// enforced at admission, advertised to GC, published and logged.
+    pub stream_ceiling: u32,
+    /// `MH_EGRESS_REJECTION_RATIO_THRESHOLD`, in `0.0..=1.0`. Read by the
+    /// session actor's threshold log AND published as
+    /// `mh_media_stream_admission_rejection_ratio_threshold` — the same field,
+    /// so the exhaustion alert is a bare gauge-to-gauge comparison.
+    pub rejection_ratio_threshold: f64,
+}
+
+impl EgressAdmission {
+    /// Whether the derived ceiling is below the ADVISORY recommended minimum —
+    /// the condition for the startup "configure me" nudge. Never a refusal.
+    #[must_use]
+    pub fn below_recommended_min(&self) -> bool {
+        u64::from(self.stream_ceiling) < EGRESS_STREAM_CEILING_RECOMMENDED_MIN
+    }
+
+    /// Convert, derive and validate the chain. Pure, so the derivation and every
+    /// refusal is unit-testable without an environment.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::EgressStreamCeilingBelowFloor`] when the ceiling is below
+    /// [`MIN_EGRESS_STREAM_CEILING`];
+    /// [`ConfigError::EgressStreamCeilingExceedsEdgeBound`] when it exceeds
+    /// `max_total_egress_edges`. The costs must already be non-zero (checked by
+    /// the caller with `reject_zero`, so the divisor is non-zero by
+    /// construction); a zero divisor is nonetheless mapped to an error rather
+    /// than a panic.
+    pub fn derive(
+        budget_bps: u64,
+        stream_cost_audio_bps: u64,
+        stream_cost_video_bps: u64,
+        rejection_ratio_threshold: f64,
+        max_total_egress_edges: usize,
+    ) -> Result<Self, ConfigError> {
+        // Bits -> bytes, ONCE. Both roundings fail closed (fewer streams).
+        let budget_bytes_per_second = budget_bps / 8;
+        let stream_cost_audio_bytes_per_second = stream_cost_audio_bps.div_ceil(8);
+        let stream_cost_video_bytes_per_second = stream_cost_video_bps.div_ceil(8);
+        let max_cost_bytes =
+            stream_cost_audio_bytes_per_second.max(stream_cost_video_bytes_per_second);
+        let ceiling = budget_bytes_per_second
+            .checked_div(max_cost_bytes)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(
+                    "MH_STREAM_COST_AUDIO_BPS and MH_STREAM_COST_VIDEO_BPS must not both be 0"
+                        .to_string(),
+                )
+            })?;
+
+        if ceiling < MIN_EGRESS_STREAM_CEILING {
+            return Err(ConfigError::EgressStreamCeilingBelowFloor {
+                ceiling,
+                floor: MIN_EGRESS_STREAM_CEILING,
+                budget_bps,
+                max_stream_cost_bps: stream_cost_audio_bps.max(stream_cost_video_bps),
+            });
+        }
+        let edge_bound = u64::try_from(max_total_egress_edges).unwrap_or(u64::MAX);
+        if ceiling > edge_bound {
+            return Err(ConfigError::EgressStreamCeilingExceedsEdgeBound {
+                ceiling,
+                max_total_egress_edges: edge_bound,
+            });
+        }
+        // Unreachable failure: the ceiling is <= the edge bound, which is <=
+        // MAX_TOTAL_EGRESS_EDGES_CEILING (asserted to fit i32, hence u32). Kept
+        // as an error, never a truncating `as`.
+        let stream_ceiling = u32::try_from(ceiling).map_err(|e| {
+            ConfigError::InvalidValue(format!(
+                "derived egress stream ceiling {ceiling} does not fit the max_streams wire \
+                 field: {e}"
+            ))
+        })?;
+
+        Ok(Self {
+            budget_bps,
+            stream_cost_audio_bps,
+            stream_cost_video_bps,
+            budget_bytes_per_second,
+            stream_cost_audio_bytes_per_second,
+            stream_cost_video_bytes_per_second,
+            stream_ceiling,
+            rejection_ratio_threshold,
+        })
+    }
+}
+
+/// Parse one REQUIRED numeric bound whose presence the CALLER has already
+/// checked, validating both ends: `1..=ceiling`.
+///
+/// Takes the resolved `&str`, not the map, and that is load-bearing: the
+/// presence check (`ConfigError::MissingEnvVar` with a string-literal key)
+/// stays written out at every call site for `dt-guard env-config` — see
+/// [`parse_required_number`].
+///
+/// ONE message family. It is a thin wrapper over the same three helpers the
+/// other required integer keys use (`parse_required_number` -> [`reject_zero`]
+/// -> [`reject_above`]), so a malformed, zero or over-ceiling value is explained
+/// identically whichever key it is — the drift this function's predecessor
+/// recorded happening once, when it carried its own message.
 ///
 /// Rejecting rather than clamping is deliberate: a clamped value runs under a
-/// bound the operator did not choose and never learns about, which is the
-/// silent-misconfiguration shape these bounds exist to prevent.
-///
-/// Generic over the integer type rather than duplicated per width. The bodies
-/// are identical modulo the type, and what would actually drift is the pair of
-/// **operator-facing messages**: reword one copy and the four bounds start
-/// explaining a rejection two different ways. `T: Default` supplies the
-/// zero to test against, so nothing here restates a numeric literal either.
-fn parse_bounded<T>(
-    vars: &HashMap<String, String>,
+/// bound the operator did not choose and never learns about.
+fn parse_bounded(
     key: &str,
-    default: T,
-    ceiling: T,
-) -> Result<T, ConfigError>
-where
-    T: std::str::FromStr + Default + PartialOrd + Copy + fmt::Display,
-    <T as std::str::FromStr>::Err: fmt::Display,
-{
-    let Some(raw) = vars.get(key) else {
-        return Ok(default);
-    };
-    // Delegated, not duplicated. This function's docstring above warns that the
-    // thing which would actually drift is the pair of OPERATOR-FACING messages,
-    // and it drifted the moment `parse_required_number` was added: the required
-    // vars explained a malformed value one way and these four bounds another.
-    // Delegating also fixes a real asymmetry — the previous `map_err(|_| ...)`
-    // here DISCARDED the parse error, so an operator debugging a §8 bound got
-    // strictly less detail than one debugging a transport parameter, for no
-    // reason anyone chose.
-    let parsed: T = parse_required_number(key, raw)?;
-    if parsed == T::default() || parsed > ceiling {
+    raw: &str,
+    ceiling: u64,
+    zero_consequence: &str,
+    above_consequence: &str,
+) -> Result<u64, ConfigError> {
+    let parsed: u64 = parse_required_number(key, raw)?;
+    reject_zero(key, parsed, zero_consequence)?;
+    reject_above(key, parsed, ceiling, above_consequence)?;
+    Ok(parsed)
+}
+
+/// Narrow a bound already validated by [`parse_bounded`] to `usize`.
+///
+/// Cannot fail on any supported target (every ceiling is far below
+/// `u32::MAX`); an error rather than a truncating `as` regardless.
+fn bound_to_usize(key: &str, value: u64) -> Result<usize, ConfigError> {
+    usize::try_from(value).map_err(|e| {
+        ConfigError::InvalidValue(format!("{key}={value} does not fit this platform: {e}"))
+    })
+}
+
+/// Parse a ratio in `0.0..=1.0`, preserving the offending text and the parse
+/// error. Presence stays at the call site (see [`parse_required_number`]).
+///
+/// ONE home for the ratio message, shared by `MH_MEDIA_LATENCY_SAMPLE_RATIO`
+/// (optional) and `MH_EGRESS_REJECTION_RATIO_THRESHOLD` (required).
+///
+/// The range check is `!(0.0..=1.0).contains(..)`, NEVER `x < 0.0 || x > 1.0`:
+/// `"NaN".parse::<f64>()` SUCCEEDS, and NaN compares false against everything,
+/// so the two-sided form accepts it. A NaN threshold would make every
+/// comparison false and the exhaustion alert silent forever; the `contains`
+/// form rejects NaN and both infinities.
+fn parse_unit_ratio(key: &str, raw: &str, consequence: &str) -> Result<f64, ConfigError> {
+    let parsed: f64 = raw.trim().parse().map_err(|e| {
+        ConfigError::InvalidValue(format!(
+            "{key} must be a number in 0.0..=1.0, got '{raw}': {e}"
+        ))
+    })?;
+    if !(0.0..=1.0).contains(&parsed) {
         return Err(ConfigError::InvalidValue(format!(
-            "{key} must be in 1..={ceiling}, got {parsed}"
+            "{key} must be in 0.0..=1.0, got {parsed} — {consequence}. Remediation: set {key} \
+             in infra/services/mh-service/configmap.yaml to a value in 0.0..=1.0"
         )));
     }
     Ok(parsed)
@@ -942,11 +1213,15 @@ where
 /// Reject a required numeric bound of zero, naming what zero would silently do.
 ///
 /// Names the `ConfigMap` as the remediation location, which is truthful for
-/// every caller: all three supply keys that live in `mh-service-config`.
-/// Deliberately NOT added to [`parse_required_number`], which also serves the
-/// ADR-0036 §8 policy bounds — those are in no manifest today (`docs/TODO.md`,
-/// the §8-policy-keys entry), so naming a `ConfigMap` path there would send an
-/// operator to look for a key that is not in the file.
+/// every caller: each supplies a key that lives in `mh-service-config`.
+///
+/// CORRECTED (story 2 task 8): this used to say it was deliberately kept out of
+/// the ADR-0036 §8 bounds' path because those keys were "in no manifest
+/// today". That premise expired when the §8 keys landed in the `ConfigMap` and
+/// their reads became required, so [`parse_bounded`] now calls this too — one
+/// message family for every required integer key. It stays separate from
+/// [`parse_required_number`] only because a caller may want the parse without
+/// the zero check.
 fn reject_zero(key: &str, value: u64, consequence: &str) -> Result<(), ConfigError> {
     if value == 0 {
         return Err(ConfigError::InvalidValue(format!(
@@ -974,6 +1249,26 @@ fn reject_above(key: &str, value: u64, ceiling: u64, consequence: &str) -> Resul
     Ok(())
 }
 
+/// Where an optional configuration value came from, for the startup log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueSource {
+    /// Read from the environment (the `ConfigMap`, in a cluster).
+    Env,
+    /// The code default — the key was absent.
+    Default,
+}
+
+impl ValueSource {
+    /// Stable, bounded string form for the structured startup log line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Default => "default",
+        }
+    }
+}
+
 /// Media Handler configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -997,9 +1292,6 @@ pub struct Config {
 
     /// Unique identifier for this MH instance.
     pub handler_id: String,
-
-    /// Maximum concurrent streams this MH can handle.
-    pub max_streams: u32,
 
     /// Authentication Controller endpoint for OAuth token acquisition.
     pub ac_endpoint: String,
@@ -1040,10 +1332,10 @@ pub struct Config {
     /// WebTransport connections MH will accept (env `MH_MAX_CONNECTIONS`,
     /// REQUIRED).
     ///
-    /// **Never a capacity figure, and never advertised to GC.** That is
-    /// [`Self::max_streams`], a different quantity with a confusingly similar
-    /// name which GC enforces at placement and MH does not enforce at all. This
-    /// one is enforced by mh-service itself, in
+    /// **Never a capacity figure, and never advertised to GC.** That is the
+    /// derived egress stream ceiling ([`Self::egress_admission`]), a different
+    /// quantity enforced at stream admission and advertised as `max_streams`.
+    /// This one is enforced by mh-service itself, in
     /// [`crate::webtransport::server`], before allocating handler resources —
     /// unchanged by the ADR-0036 §1 work; only its provenance and its label
     /// changed.
@@ -1090,6 +1382,10 @@ pub struct Config {
     /// Forwarding-policy bounds for the ADR-0036 §8 control plane.
     pub policy_limits: PolicyLimits,
 
+    /// The egress-budget admission chain (story 2 R-19): budget, costs, the
+    /// derived stream ceiling and the rejection-ratio threshold.
+    pub egress_admission: EgressAdmission,
+
     /// Fraction of forwarded frames whose latency is observed into
     /// `mh_media_forward_latency_seconds` (env
     /// `MH_MEDIA_LATENCY_SAMPLE_RATIO`, optional, default
@@ -1108,10 +1404,17 @@ pub struct Config {
     /// and collapsing them would put the media path's leak posture behind a
     /// tracing knob.
     ///
-    /// Optional-with-default rather than required: no newly *required* env var
-    /// this story, so `mh-deployment.md`'s "the image may roll back alone"
-    /// property survives and there is no deploy-time `CrashLoop` risk.
+    /// Optional-with-default rather than required — a REASONED carve-out, not
+    /// a missed instance of story 2's "required keys" flip: both deployments
+    /// declare this the one deliberately `optional:` ref, so the image may roll
+    /// back alone (`infra/services/mh-service/mh-0-deployment.yaml`). Its
+    /// provenance is reported by [`Self::media_latency_sample_ratio_source`].
     pub media_latency_sample_ratio: f64,
+
+    /// Whether [`Self::media_latency_sample_ratio`] came from the environment
+    /// or the code default — logged at startup so an operator can tell a
+    /// chosen value from an unchosen one without reading source.
+    pub media_latency_sample_ratio_source: ValueSource,
 
     /// Whether to initialize the OpenTelemetry SDK (R-55). Default `false`.
     /// When `true`, `main` calls `init_otel` (eager collector probe, fail-hard
@@ -1140,7 +1443,6 @@ impl fmt::Debug for Config {
             .field("region", &self.region)
             .field("gc_grpc_url", &self.gc_grpc_url)
             .field("handler_id", &self.handler_id)
-            .field("max_streams", &self.max_streams)
             .field("ac_endpoint", &self.ac_endpoint)
             .field("client_id", &self.client_id)
             .field("client_secret", &"[REDACTED]")
@@ -1162,9 +1464,14 @@ impl fmt::Debug for Config {
             .field("drain_window", &self.drain_window)
             .field("drain_window_source", &self.drain_window_source)
             .field("policy_limits", &self.policy_limits)
+            .field("egress_admission", &self.egress_admission)
             .field(
                 "media_latency_sample_ratio",
                 &self.media_latency_sample_ratio,
+            )
+            .field(
+                "media_latency_sample_ratio_source",
+                &self.media_latency_sample_ratio_source,
             )
             .field("otel_enabled", &self.otel_enabled)
             .field("otel_endpoint", &self.otel_endpoint)
@@ -1231,6 +1538,47 @@ pub enum ConfigError {
         grace_seconds: u64,
         /// The compile-time shutdown margin, in seconds.
         margin_seconds: u64,
+    },
+
+    /// The derived egress stream ceiling is below the refuse-boot floor.
+    ///
+    /// Until the MH deployment runbook's config-failure section lands (story 2
+    /// task 18) this message IS the runbook: it is all `kubectl logs --previous`
+    /// shows on a `CrashLoopBackOff`.
+    #[error(
+        "Derived egress STREAM ceiling {ceiling} is below the refuse-boot floor of {floor} \
+         (two participants hearing each other). ceiling = MH_EGRESS_BUDGET_BPS \
+         ({budget_bps} bit/s) / max(MH_STREAM_COST_AUDIO_BPS, MH_STREAM_COST_VIDEO_BPS) \
+         ({max_stream_cost_bps} bit/s), converted to bytes and floored. A handler this small \
+         would boot, be placed by GC, and then reject nearly every stream. Remediation: RAISE \
+         MH_EGRESS_BUDGET_BPS in infra/services/mh-service/configmap.yaml. NEVER lower the \
+         floor (a code constant) to quiet this refusal"
+    )]
+    EgressStreamCeilingBelowFloor {
+        /// The derived ceiling.
+        ceiling: u64,
+        /// The refuse-boot floor (`MIN_EGRESS_STREAM_CEILING`).
+        floor: u64,
+        /// `MH_EGRESS_BUDGET_BPS` as configured, in bits per second.
+        budget_bps: u64,
+        /// The larger of the two per-stream costs, in bits per second.
+        max_stream_cost_bps: u64,
+    },
+
+    /// The derived egress stream ceiling exceeds the aggregate edge bound that
+    /// backstops it.
+    #[error(
+        "Derived egress STREAM ceiling {ceiling} exceeds MH_MAX_TOTAL_EGRESS_EDGES \
+         ({max_total_egress_edges}). The resource-exhaustion guard must sit at or above the \
+         capacity it backstops: otherwise GC is advertised a capacity MH refuses at the \
+         resource guard. Remediation: raise MH_MAX_TOTAL_EGRESS_EDGES to at least {ceiling}, or \
+         lower MH_EGRESS_BUDGET_BPS, in infra/services/mh-service/configmap.yaml"
+    )]
+    EgressStreamCeilingExceedsEdgeBound {
+        /// The derived ceiling.
+        ceiling: u64,
+        /// The configured `MH_MAX_TOTAL_EGRESS_EDGES`.
+        max_total_egress_edges: u64,
     },
 
     /// The keepalive interval is too close to the idle timeout.
@@ -1357,11 +1705,6 @@ impl Config {
             .get("GC_GRPC_URL")
             .cloned()
             .unwrap_or_else(|| "http://localhost:50051".to_string());
-
-        let max_streams = vars
-            .get("MH_MAX_STREAMS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_MAX_STREAMS);
 
         let ac_jwks_url = vars
             .get("AC_JWKS_URL")
@@ -1525,65 +1868,154 @@ impl Config {
             };
         let drain_window = std::time::Duration::from_secs(drain_seconds);
 
-        // ADR-0036 §8 policy bounds. Unlike the scalars above these REJECT a
-        // malformed or out-of-range value rather than silently falling back to
-        // the default: a bound that quietly reverts is a bound nobody can rely
-        // on, and the whole point of these four is that exceeding them is a
-        // loud event.
+        // ADR-0036 §8 policy bounds — REQUIRED (story 2 R-22), no code
+        // default: the ConfigMap is the single home. `parse_bounded` does the
+        // rest with the one message family every required integer key shares.
+        //
+        // THE RULE, and it is the whole rule: `MissingEnvVar(` and its string
+        // literal must stay on the SAME LINE. `dt-guard env-config` discovers
+        // MH's required variables by matching that construction in this file
+        // (`crates/dt-guard/src/env_config.rs`), and it cannot match across a
+        // line break between the two. The surrounding `.ok_or_else(...)` chain
+        // may wrap freely — and does, below.
+        //
+        // That is why each raw value is bound at STATEMENT level rather than
+        // nested inside the `parse_bounded(...)` call: nesting pushed two of
+        // these past rustfmt's width, the formatter broke the line at exactly
+        // that point, and the guard went blind to those two keys WHILE STILL
+        // PRINTING STATUS=OK. The construction is deliberately not written out
+        // in this comment — the guard reads comments too, so an illustrative
+        // one is reported as a required variable no manifest declares. A unit
+        // test in this module applies the guard's requirement to this file, so
+        // a future re-wrap fails there rather than silently.
+        let raw_max_egress_streams =
+            vars.get("MH_MAX_EGRESS_STREAMS_PER_MEETING")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MH_MAX_EGRESS_STREAMS_PER_MEETING".to_string())
+                })?;
+        let raw_max_candidate_sources = vars
+            .get("MH_MAX_CANDIDATE_SOURCES_PER_EGRESS")
+            .ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_MAX_CANDIDATE_SOURCES_PER_EGRESS".to_string())
+            })?;
+        let raw_max_total_edges = vars
+            .get("MH_MAX_TOTAL_EGRESS_EDGES")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_MAX_TOTAL_EGRESS_EDGES".to_string()))?;
+        let raw_policy_apply_timeout = vars
+            .get("MH_POLICY_APPLY_TIMEOUT_MS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_POLICY_APPLY_TIMEOUT_MS".to_string()))?;
+
         let policy_limits = PolicyLimits {
-            max_egress_streams_per_meeting: parse_bounded(
-                vars,
+            max_egress_streams_per_meeting: bound_to_usize(
                 "MH_MAX_EGRESS_STREAMS_PER_MEETING",
-                DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING,
-                MAX_EGRESS_STREAMS_PER_MEETING_CEILING,
+                parse_bounded(
+                    "MH_MAX_EGRESS_STREAMS_PER_MEETING",
+                    raw_max_egress_streams,
+                    MAX_EGRESS_STREAMS_PER_MEETING_CEILING as u64,
+                    "every registration carrying an egress stream would be rejected whole",
+                    PRE_ALLOCATION_CONSEQUENCE,
+                )?,
             )?,
-            max_candidate_sources_per_egress: parse_bounded(
-                vars,
+            max_candidate_sources_per_egress: bound_to_usize(
                 "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
-                DEFAULT_MAX_CANDIDATE_SOURCES_PER_EGRESS,
-                MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING,
+                parse_bounded(
+                    "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
+                    raw_max_candidate_sources,
+                    MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING as u64,
+                    "every egress stream naming a source would be rejected",
+                    PRE_ALLOCATION_CONSEQUENCE,
+                )?,
             )?,
-            max_total_egress_edges: parse_bounded(
-                vars,
+            max_total_egress_edges: bound_to_usize(
                 "MH_MAX_TOTAL_EGRESS_EDGES",
-                DEFAULT_MAX_TOTAL_EGRESS_EDGES,
-                MAX_TOTAL_EGRESS_EDGES_CEILING,
+                parse_bounded(
+                    "MH_MAX_TOTAL_EGRESS_EDGES",
+                    raw_max_total_edges,
+                    MAX_TOTAL_EGRESS_EDGES_CEILING as u64,
+                    "no registration carrying an egress edge could ever install",
+                    "the aggregate bound would stop bounding the handler's routing memory",
+                )?,
             )?,
             policy_apply_timeout_ms: parse_bounded(
-                vars,
                 "MH_POLICY_APPLY_TIMEOUT_MS",
-                DEFAULT_POLICY_APPLY_TIMEOUT_MS,
+                raw_policy_apply_timeout,
                 MAX_POLICY_APPLY_TIMEOUT_MS,
+                "every policy apply would time out before the actor could answer",
+                "above ADR-0036 §8's <=10 s re-assert cadence the await outlives the retry \
+                 that would supersede it",
             )?,
         };
 
-        // ADR-0036 §11 media latency sampling. Optional-with-default plus a
-        // hard code-level range check: a ratio outside `0.0..=1.0` is not a
-        // preference, it is a typo, and the two ends fail differently — above 1
-        // silently means "observe everything" (a per-frame histogram write on
-        // the hot path), below 0 silently means "observe nothing" (a histogram
-        // that is empty forever and reads as a healthy quiet path).
-        let media_latency_sample_ratio = match vars.get("MH_MEDIA_LATENCY_SAMPLE_RATIO") {
-            None => DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO,
-            Some(raw) => {
-                let parsed: f64 = raw.trim().parse().map_err(|e| {
-                    ConfigError::InvalidValue(format!(
-                        "MH_MEDIA_LATENCY_SAMPLE_RATIO must be a number in 0.0..=1.0, got \
-                         '{raw}': {e}"
-                    ))
-                })?;
-                if !(0.0..=1.0).contains(&parsed) {
-                    return Err(ConfigError::InvalidValue(format!(
-                        "MH_MEDIA_LATENCY_SAMPLE_RATIO must be in 0.0..=1.0, got {parsed} — \
-                         above 1.0 observes every frame on the per-frame path and below 0.0 \
-                         observes none, which reads as a healthy quiet path. Remediation: set \
-                         MH_MEDIA_LATENCY_SAMPLE_RATIO in \
-                         infra/services/mh-service/configmap.yaml to a value in 0.0..=1.0"
-                    )));
-                }
-                parsed
-            }
-        };
+        // Egress-budget admission chain (story 2 R-19, R-23) — four REQUIRED
+        // keys; see the module-level "Egress-budget admission" section. Costs
+        // refuse zero HERE, so the derivation's divisor is non-zero by
+        // construction.
+        let egress_budget_bps: u64 = parse_required_number(
+            "MH_EGRESS_BUDGET_BPS",
+            vars.get("MH_EGRESS_BUDGET_BPS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MH_EGRESS_BUDGET_BPS".to_string()))?,
+        )?;
+        reject_zero(
+            "MH_EGRESS_BUDGET_BPS",
+            egress_budget_bps,
+            "the derived stream ceiling would be 0 and MH would admit no stream at all",
+        )?;
+        let stream_cost_audio_bps: u64 = parse_required_number(
+            "MH_STREAM_COST_AUDIO_BPS",
+            vars.get("MH_STREAM_COST_AUDIO_BPS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_STREAM_COST_AUDIO_BPS".to_string())
+            })?,
+        )?;
+        reject_zero(
+            "MH_STREAM_COST_AUDIO_BPS",
+            stream_cost_audio_bps,
+            "a free stream cannot be budgeted — it is the divisor of the stream ceiling",
+        )?;
+        let stream_cost_video_bps: u64 = parse_required_number(
+            "MH_STREAM_COST_VIDEO_BPS",
+            vars.get("MH_STREAM_COST_VIDEO_BPS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_STREAM_COST_VIDEO_BPS".to_string())
+            })?,
+        )?;
+        reject_zero(
+            "MH_STREAM_COST_VIDEO_BPS",
+            stream_cost_video_bps,
+            "a free stream cannot be budgeted — it is the divisor of the stream ceiling",
+        )?;
+        let rejection_ratio_threshold = parse_unit_ratio(
+            "MH_EGRESS_REJECTION_RATIO_THRESHOLD",
+            vars.get("MH_EGRESS_REJECTION_RATIO_THRESHOLD")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MH_EGRESS_REJECTION_RATIO_THRESHOLD".to_string())
+                })?,
+            "a threshold outside the ratio's own range can never be crossed (above 1.0) or is \
+             always crossed (below 0.0), and a NaN compares false forever",
+        )?;
+        let egress_admission = EgressAdmission::derive(
+            egress_budget_bps,
+            stream_cost_audio_bps,
+            stream_cost_video_bps,
+            rejection_ratio_threshold,
+            policy_limits.max_total_egress_edges,
+        )?;
+
+        // ADR-0036 §11 media latency sampling. Optional-with-default (a
+        // reasoned carve-out; see the field doc) plus a hard range check: above
+        // 1 silently means "observe everything" (a per-frame histogram write on
+        // the hot path), below 0 silently means "observe nothing".
+        let (media_latency_sample_ratio, media_latency_sample_ratio_source) =
+            match vars.get("MH_MEDIA_LATENCY_SAMPLE_RATIO") {
+                None => (DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO, ValueSource::Default),
+                Some(raw) => (
+                    parse_unit_ratio(
+                        "MH_MEDIA_LATENCY_SAMPLE_RATIO",
+                        raw,
+                        "above 1.0 observes every frame on the per-frame path and below 0.0 \
+                         observes none, which reads as a healthy quiet path",
+                    )?,
+                    ValueSource::Env,
+                ),
+            };
 
         // R-55: OpenTelemetry SDK configuration.
         // Enablement is an explicit boolean (OTEL_ENABLED), NOT presence of the
@@ -1651,7 +2083,6 @@ impl Config {
             region,
             gc_grpc_url,
             handler_id,
-            max_streams,
             ac_endpoint,
             client_id,
             client_secret,
@@ -1667,7 +2098,9 @@ impl Config {
             drain_window,
             drain_window_source,
             policy_limits,
+            egress_admission,
             media_latency_sample_ratio,
+            media_latency_sample_ratio_source,
             otel_enabled,
             otel_endpoint,
             otel_sample_rate,
@@ -1750,7 +2183,52 @@ mod tests {
             // Kustomize-derived from each pod's own
             // `terminationGracePeriodSeconds`; 35 is what both deployments set.
             ("MH_TERMINATION_GRACE_SECONDS".to_string(), "35".to_string()),
+            // ADR-0036 §8 policy bounds, REQUIRED since story 2 R-22. Deployed
+            // values from the base ConfigMap, for the same reason as above.
+            (
+                "MH_MAX_EGRESS_STREAMS_PER_MEETING".to_string(),
+                "512".to_string(),
+            ),
+            (
+                "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS".to_string(),
+                "16".to_string(),
+            ),
+            ("MH_MAX_TOTAL_EGRESS_EDGES".to_string(), "65536".to_string()),
+            ("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "1000".to_string()),
+            // Egress-budget chain (story 2 R-19). The BASE ConfigMap's
+            // deliberately unsized placeholder budget — it must boot (above the
+            // refuse-boot floor) and nudge (below the recommended minimum).
+            ("MH_EGRESS_BUDGET_BPS".to_string(), "10000000".to_string()),
+            ("MH_STREAM_COST_AUDIO_BPS".to_string(), "90000".to_string()),
+            (
+                "MH_STREAM_COST_VIDEO_BPS".to_string(),
+                "2500000".to_string(),
+            ),
+            (
+                "MH_EGRESS_REJECTION_RATIO_THRESHOLD".to_string(),
+                "0.05".to_string(),
+            ),
         ])
+    }
+
+    /// Every key story 2 task 8 makes REQUIRED (the four new egress-chain keys
+    /// and the four flipped §8 bounds). One list, iterated by both the absence
+    /// and the malformed-value tests, so neither can cover a subset.
+    const STORY2_REQUIRED_KEYS: [&str; 8] = [
+        "MH_EGRESS_BUDGET_BPS",
+        "MH_STREAM_COST_AUDIO_BPS",
+        "MH_STREAM_COST_VIDEO_BPS",
+        "MH_EGRESS_REJECTION_RATIO_THRESHOLD",
+        "MH_MAX_EGRESS_STREAMS_PER_MEETING",
+        "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
+        "MH_MAX_TOTAL_EGRESS_EDGES",
+        "MH_POLICY_APPLY_TIMEOUT_MS",
+    ];
+
+    /// Derive with the base costs and a budget chosen so the ceiling is
+    /// exactly `ceiling` (budget = ceiling × the video cost).
+    fn derive_ceiling(ceiling: u64) -> Result<EgressAdmission, ConfigError> {
+        EgressAdmission::derive(ceiling * 2_500_000, 90_000, 2_500_000, 0.05, 65_536)
     }
 
     // =========================================================================
@@ -2309,7 +2787,6 @@ mod tests {
         );
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.gc_grpc_url, "http://localhost:50051");
-        assert_eq!(config.max_streams, DEFAULT_MAX_STREAMS);
         assert!(config.handler_id.starts_with("mh-"));
         assert_eq!(config.ac_endpoint, "http://localhost:8082");
         assert_eq!(config.client_id, "media-handler");
@@ -2352,6 +2829,7 @@ mod tests {
         );
         vars.insert("MH_REGION".to_string(), "eu-west-1".to_string());
         vars.insert("GC_GRPC_URL".to_string(), "http://gc:50051".to_string());
+        // The retired key is IGNORED, never read: setting it changes nothing.
         vars.insert("MH_MAX_STREAMS".to_string(), "500".to_string());
         vars.insert("MH_HANDLER_ID".to_string(), "mh-custom-001".to_string());
 
@@ -2362,7 +2840,10 @@ mod tests {
         assert_eq!(config.webtransport_bind_address, "127.0.0.1:4435");
         assert_eq!(config.region, "eu-west-1");
         assert_eq!(config.gc_grpc_url, "http://gc:50051");
-        assert_eq!(config.max_streams, 500);
+        assert_eq!(
+            config.egress_admission.stream_ceiling, 4,
+            "MH_MAX_STREAMS is retired: the advertised ceiling is derived from the budget"
+        );
         assert_eq!(config.handler_id, "mh-custom-001");
     }
 
@@ -2561,17 +3042,274 @@ mod tests {
     // -- ADR-0036 §8 policy bounds ------------------------------------------
 
     #[test]
-    fn test_policy_limits_default_when_unset() {
+    fn test_policy_limits_are_read_from_the_environment() {
         let config = Config::from_vars(&base_vars()).unwrap();
-        assert_eq!(config.policy_limits, PolicyLimits::default());
-        assert_eq!(
-            config.policy_limits.max_egress_streams_per_meeting,
-            DEFAULT_MAX_EGRESS_STREAMS_PER_MEETING
+        assert_eq!(config.policy_limits.max_egress_streams_per_meeting, 512);
+        assert_eq!(config.policy_limits.max_candidate_sources_per_egress, 16);
+        assert_eq!(config.policy_limits.max_total_egress_edges, 65_536);
+        assert_eq!(config.policy_limits.policy_apply_timeout_ms, 1_000);
+    }
+
+    // -- Story 2 task 8: every flipped/new key is REQUIRED ---------------------
+
+    /// **The guard that watches the guard.** `dt-guard env-config` discovers
+    /// MH's required variables by matching, in THIS FILE, a `MissingEnvVar`
+    /// construction whose opening paren and upper-case string-literal argument
+    /// are CONTIGUOUS (`crates/dt-guard/src/env_config.rs`). That construction
+    /// is deliberately NOT written out here — the guard reads comments too, so
+    /// an illustrative one would be reported as a required variable no manifest
+    /// declares (the corollary recorded on `parse_required_number`, and yes,
+    /// this test tripped it once). It therefore cannot see a call
+    /// site rustfmt has wrapped between the two — and when it cannot see one it
+    /// reports `STATUS=OK` regardless, a clean verdict over surface it silently
+    /// stopped checking.
+    ///
+    /// That is not hypothetical: nesting these calls pushed two of story 2's
+    /// keys past rustfmt's width, the formatter wrapped them, and both keys
+    /// dropped out of the guard's view with no failure anywhere. This test
+    /// replicates the guard's contiguity requirement over this file's own
+    /// source, so a re-wrap fails HERE instead of going quiet.
+    ///
+    /// **Do not satisfy a failure by removing a key from
+    /// [`STORY2_REQUIRED_KEYS`].** The fix is to keep the offending
+    /// `MissingEnvVar(` and its string literal on the SAME LINE — bind the raw
+    /// value at statement level rather than nesting it, as `from_vars` does.
+    /// The surrounding `.ok_or_else(...)` chain may wrap freely.
+    #[test]
+    fn the_env_config_guard_can_see_every_required_key_in_this_file() {
+        // This file's own source, read at COMPILE time — the same bytes the
+        // guard reads from disk, so the test cannot drift from the artifact.
+        const SOURCE: &str = include_str!("config.rs");
+        // The guard's shape, replicated literally rather than by regex (no
+        // regex dependency in this crate, and the property IS contiguity).
+        let discovered: Vec<&str> = SOURCE
+            .match_indices("MissingEnvVar(\"")
+            .filter_map(|(at, m)| {
+                let rest = SOURCE.get(at + m.len()..)?;
+                let end = rest.find('"')?;
+                let key = rest.get(..end)?;
+                key.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    .then_some(key)
+            })
+            .collect();
+
+        // Positive control: a wholesale-empty scan must not pass vacuously.
+        assert!(
+            discovered.len() >= STORY2_REQUIRED_KEYS.len(),
+            "the scan found only {} MissingEnvVar literals in this file, fewer than the \
+             {} story-2 keys alone — the scan itself is broken, not the call sites",
+            discovered.len(),
+            STORY2_REQUIRED_KEYS.len()
         );
-        assert_eq!(
-            config.policy_limits.max_total_egress_edges,
-            DEFAULT_MAX_TOTAL_EGRESS_EDGES
+
+        for key in STORY2_REQUIRED_KEYS {
+            assert!(
+                discovered.contains(&key),
+                "`dt-guard env-config` CANNOT SEE {key}: no contiguous MissingEnvVar \
+                 construction naming {key:?} appears in crates/mh-service/src/config.rs. \
+                 Almost certainly rustfmt wrapped that call site between the paren and the \
+                 literal because it was nested too deeply. The guard would still print \
+                 STATUS=OK while checking nothing for this key — no manifest coverage, no \
+                 orphan detection. FIX: bind the raw value at statement level so the \
+                 construction and its literal sit on the SAME LINE (the surrounding \
+                 `.ok_or_else(...)` chain may wrap freely). DO NOT fix this \
+                 by deleting {key} from STORY2_REQUIRED_KEYS."
+            );
+        }
+    }
+
+    #[test]
+    fn every_story2_key_is_a_loud_refusal_when_absent() {
+        for key in STORY2_REQUIRED_KEYS {
+            assert_required(key);
+        }
+    }
+
+    #[test]
+    fn every_story2_key_refuses_a_malformed_value_never_defaulting() {
+        for key in STORY2_REQUIRED_KEYS {
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), "not-a-number".to_string());
+            match Config::from_vars(&vars) {
+                Err(ConfigError::InvalidValue(msg)) => {
+                    assert!(msg.contains(key), "{key}: {msg}");
+                    assert!(msg.contains("not-a-number"), "{key}: {msg}");
+                }
+                other => panic!("{key}: malformed value must refuse to start; got {other:?}"),
+            }
+        }
+    }
+
+    // -- Story 2 task 8: egress-budget derivation ------------------------------
+
+    #[test]
+    fn the_ceiling_is_budget_over_the_worst_case_cost_in_bytes() {
+        let a = EgressAdmission::derive(100_000_000, 90_000, 2_500_000, 0.05, 65_536).unwrap();
+        // Bits converted ONCE: every downstream field is bytes.
+        assert_eq!(a.budget_bytes_per_second, 12_500_000);
+        assert_eq!(a.stream_cost_audio_bytes_per_second, 11_250);
+        assert_eq!(a.stream_cost_video_bytes_per_second, 312_500);
+        // max(cost) = video: MH stays type-blind (ADR-0036 §7).
+        assert_eq!(a.stream_ceiling, 40);
+        // The raw bits survive only for the provenance log.
+        assert_eq!(a.budget_bps, 100_000_000);
+    }
+
+    #[test]
+    fn the_ceiling_uses_the_larger_cost_whichever_kind_it_is() {
+        let a = EgressAdmission::derive(80_000_000, 4_000_000, 1_000_000, 0.05, 65_536).unwrap();
+        assert_eq!(a.stream_ceiling, 20, "audio is the larger cost here");
+    }
+
+    #[test]
+    fn bits_convert_once_and_both_roundings_fail_closed() {
+        // 7 bits of budget remainder are FLOORED away; a 1-bit cost remainder
+        // is CEILED up. Both directions admit fewer streams, never more.
+        let a = EgressAdmission::derive(8 * 1_000 + 7, 9, 9, 0.05, 65_536).unwrap();
+        assert_eq!(a.budget_bytes_per_second, 1_000);
+        assert_eq!(a.stream_cost_video_bytes_per_second, 2);
+        assert_eq!(a.stream_ceiling, 500);
+    }
+
+    /// The refuse-boot floor is 2, not 1 — tested at 0, 1 AND 2. A test written
+    /// as "at least 1" passes on a build that boots at ceiling 1, which is
+    /// exactly the black-hole-reporting-healthy shape the floor exists for.
+    #[test]
+    fn a_ceiling_of_zero_or_one_refuses_to_boot_and_two_boots() {
+        for ceiling in [0, 1] {
+            match derive_ceiling(ceiling) {
+                Err(ConfigError::EgressStreamCeilingBelowFloor {
+                    ceiling: got,
+                    floor,
+                    ..
+                }) => {
+                    assert_eq!(got, ceiling);
+                    assert_eq!(floor, 2);
+                }
+                other => panic!("ceiling {ceiling} must refuse to boot; got {other:?}"),
+            }
+        }
+        assert_eq!(derive_ceiling(2).unwrap().stream_ceiling, 2);
+    }
+
+    #[test]
+    fn the_floor_refusal_names_the_remedy_and_forbids_lowering_the_floor() {
+        let msg = derive_ceiling(1).unwrap_err().to_string();
+        assert!(msg.contains("MH_EGRESS_BUDGET_BPS"), "{msg}");
+        assert!(msg.contains("NEVER lower the floor"), "{msg}");
+        assert!(msg.contains("STREAM ceiling"), "{msg}");
+        assert!(
+            !msg.contains("subscriber"),
+            "never 'subscriber ceiling': {msg}"
         );
+    }
+
+    #[test]
+    fn a_ceiling_above_the_edge_bound_refuses_to_boot() {
+        match EgressAdmission::derive(41 * 2_500_000, 90_000, 2_500_000, 0.05, 40) {
+            Err(ConfigError::EgressStreamCeilingExceedsEdgeBound {
+                ceiling,
+                max_total_egress_edges,
+            }) => {
+                assert_eq!(ceiling, 41);
+                assert_eq!(max_total_egress_edges, 40);
+            }
+            other => panic!("ceiling above the edge bound must refuse; got {other:?}"),
+        }
+        // Equal is fine: the resource guard sits AT the capacity.
+        assert!(EgressAdmission::derive(40 * 2_500_000, 90_000, 2_500_000, 0.05, 40).is_ok());
+    }
+
+    #[test]
+    fn a_zero_cost_refuses_to_boot_before_the_derivation_divides() {
+        for key in [
+            "MH_STREAM_COST_AUDIO_BPS",
+            "MH_STREAM_COST_VIDEO_BPS",
+            "MH_EGRESS_BUDGET_BPS",
+        ] {
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), "0".to_string());
+            let err = Config::from_vars(&vars).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_threshold_rejects_nan_infinities_and_out_of_range() {
+        for raw in ["NaN", "inf", "-inf", "1.01", "-0.01"] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MH_EGRESS_REJECTION_RATIO_THRESHOLD".to_string(),
+                raw.to_string(),
+            );
+            let err = Config::from_vars(&vars).unwrap_err().to_string();
+            assert!(
+                err.contains("MH_EGRESS_REJECTION_RATIO_THRESHOLD"),
+                "{raw} must be refused: {err}"
+            );
+        }
+        for raw in ["0", "0.05", "1"] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MH_EGRESS_REJECTION_RATIO_THRESHOLD".to_string(),
+                raw.to_string(),
+            );
+            assert!(Config::from_vars(&vars).is_ok(), "{raw} is in range");
+        }
+    }
+
+    /// The floor and the advisory minimum are two constants with two
+    /// consequences and must never merge: a deployment between them boots.
+    #[test]
+    fn the_refuse_boot_floor_never_merges_with_the_recommended_min() {
+        // Two participants hearing each other; N+1 = 6 hearing N = 5. The
+        // ordering itself is a compile-time assertion next to the constants.
+        assert_eq!(MIN_EGRESS_STREAM_CEILING, all_hear_all_streams(1));
+        assert_eq!(MIN_EGRESS_STREAM_CEILING, 2, "the floor is 2, not 1");
+        assert_eq!(
+            EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
+            all_hear_all_streams(5)
+        );
+        let between = derive_ceiling(EGRESS_STREAM_CEILING_RECOMMENDED_MIN - 1).unwrap();
+        assert!(between.below_recommended_min(), "boots, and is nudged");
+        let at = derive_ceiling(EGRESS_STREAM_CEILING_RECOMMENDED_MIN).unwrap();
+        assert!(
+            !at.below_recommended_min(),
+            "the nudge goes quiet at the minimum"
+        );
+    }
+
+    /// The BASE `ConfigMap` placeholder boots and nudges; the KIND overlay budget
+    /// boots, clears the recommended minimum, and fits the edge bound.
+    #[test]
+    fn the_deployed_budgets_boot_base_nudges_and_kind_does_not() {
+        let base = Config::from_vars(&base_vars()).expect("base placeholder must boot");
+        assert_eq!(base.egress_admission.stream_ceiling, 4);
+        assert!(base.egress_admission.below_recommended_min());
+
+        let mut vars = base_vars();
+        vars.insert("MH_EGRESS_BUDGET_BPS".to_string(), "100000000".to_string());
+        let kind = Config::from_vars(&vars).expect("Kind budget must boot");
+        assert_eq!(kind.egress_admission.stream_ceiling, 40);
+        assert!(!kind.egress_admission.below_recommended_min());
+    }
+
+    #[test]
+    fn the_latency_ratio_reports_its_provenance() {
+        let config = Config::from_vars(&base_vars()).unwrap();
+        assert_eq!(
+            config.media_latency_sample_ratio_source,
+            ValueSource::Default
+        );
+        let mut vars = base_vars();
+        vars.insert(
+            "MH_MEDIA_LATENCY_SAMPLE_RATIO".to_string(),
+            "0.5".to_string(),
+        );
+        let config = Config::from_vars(&vars).unwrap();
+        assert_eq!(config.media_latency_sample_ratio_source, ValueSource::Env);
+        assert_eq!(config.media_latency_sample_ratio, 0.5);
     }
 
     #[test]

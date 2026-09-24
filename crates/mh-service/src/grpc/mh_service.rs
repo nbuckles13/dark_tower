@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use crate::config::PolicyLimits;
 use crate::observability::metrics::{self, PolicyApplyOutcome};
 use crate::routing::MeetingPolicy;
-use crate::session::{ApplyOutcome, MeetingRegistration, SessionManagerHandle};
+use crate::session::{ApplyFailure, ApplyOutcome, MeetingRegistration, SessionManagerHandle};
 use common::observability::labels::KEY_CUSTODY_OPERATOR;
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerService;
 use proto_gen::dark_tower::internal::v1::{
@@ -388,7 +388,19 @@ impl From<ApplyOutcome> for PolicyApplyOutcome {
         match outcome {
             ApplyOutcome::Applied => Self::Applied,
             ApplyOutcome::RejectedStale => Self::RejectedStale,
-            ApplyOutcome::Failed(_) => Self::ApplyFailed,
+            // A capacity refusal is not an MH fault: its own outcome, so the
+            // deploy bake gate (which alerts on `apply_failed`) does not abort
+            // on expected capacity pressure. Listed explicitly, before the
+            // catch-all, so a new capacity-shaped failure is a decision.
+            ApplyOutcome::Failed(ApplyFailure::StreamCeilingExceeded) => {
+                Self::RejectedStreamCeiling
+            }
+            ApplyOutcome::Failed(
+                ApplyFailure::MailboxFull
+                | ApplyFailure::Timeout
+                | ApplyFailure::ActorUnavailable
+                | ApplyFailure::EdgeCapExceeded,
+            ) => Self::ApplyFailed,
         }
     }
 }
@@ -410,11 +422,11 @@ mod tests {
     const TEST_EPOCH_MS: u64 = 1_700_000_000_000;
 
     fn make_service() -> (MhMediaService, SessionManagerHandle) {
-        make_service_with_limits(PolicyLimits::default())
+        make_service_with_limits(PolicyLimits::for_tests())
     }
 
     fn make_service_with_limits(limits: PolicyLimits) -> (MhMediaService, SessionManagerHandle) {
-        let sm = SessionManagerHandle::new();
+        let sm = SessionManagerHandle::new(crate::session::admission::test_admission());
         let svc = MhMediaService::new(
             sm.clone(),
             TEST_HANDLER_ID.to_string(),
@@ -433,7 +445,8 @@ mod tests {
     fn make_service_with_unspawned_actor(
         limits: PolicyLimits,
     ) -> (MhMediaService, SessionManagerHandle, SessionManagerActor) {
-        let (sm, actor) = SessionManagerHandle::new_with_parts();
+        let (sm, actor) =
+            SessionManagerHandle::new_with_parts(crate::session::admission::test_admission());
         let svc = MhMediaService::new(
             sm.clone(),
             TEST_HANDLER_ID.to_string(),
@@ -446,7 +459,7 @@ mod tests {
     fn policy_for(meeting: &str, generation: u64, streams: Vec<EgressStream>) -> MeetingPolicy {
         MeetingPolicy::from_request(
             &register_request(meeting, generation, streams),
-            &PolicyLimits::default(),
+            &PolicyLimits::for_tests(),
         )
         .unwrap()
     }
@@ -515,13 +528,21 @@ mod tests {
     ///
     /// Driven by the aggregate egress-edge bound: a static integer threshold
     /// with a live actor over the full handler path, so there is no clock, no
-    /// timer and no race. Asserted on the acknowledged generation **in the
+    /// timer and no race.
+    ///
+    /// **Also a deliberately-labelled BACKSTOP test for that bound.** Since
+    /// story 2 task 8 the stream-ceiling admission check runs first and config
+    /// load refuses a ceiling above the edge bound, so in production this branch
+    /// is unreachable. This service is built with a never-binding admission
+    /// (ceiling far ABOVE the edge bound of 2) — a state `from_vars` refuses —
+    /// precisely so the defense-in-depth branch stays exercised. Do not
+    /// "retarget" it onto the ceiling; the ceiling has its own tests. Asserted on the acknowledged generation **in the
     /// response** rather than on MH internals, so it survives refactoring.
     #[tokio::test]
     async fn apply_failure_does_not_advance_the_acknowledged_generation() {
         let limits = PolicyLimits {
             max_total_egress_edges: 2,
-            ..PolicyLimits::default()
+            ..PolicyLimits::for_tests()
         };
         let (svc, sm) = make_service_with_limits(limits);
 
@@ -575,10 +596,10 @@ mod tests {
     /// race is a flake, so the consumer is removed instead.
     #[tokio::test]
     async fn apply_failure_is_reachable_when_the_config_mailbox_cannot_drain() {
-        use crate::session::{ApplyFailure, CONFIG_APPLY_CHANNEL_BUFFER};
+        use crate::session::CONFIG_APPLY_CHANNEL_BUFFER;
 
-        let (_svc, sm, actor) = make_service_with_unspawned_actor(PolicyLimits::default());
-        let limits = PolicyLimits::default();
+        let (_svc, sm, actor) = make_service_with_unspawned_actor(PolicyLimits::for_tests());
+        let limits = PolicyLimits::for_tests();
         let timeout = Duration::from_millis(5);
 
         // The first send occupies a slot permanently — no consumer exists to
@@ -826,11 +847,16 @@ mod tests {
     /// `total - own_current + new > bound` passes every single-meeting test
     /// that registers once, then turns §8's own cadence into a rotating apply
     /// failure once the handler is half full.
+    ///
+    /// Backstop test for the edge bound (see
+    /// `apply_failure_does_not_advance_the_acknowledged_generation`); the
+    /// stream-ceiling twin of this property is
+    /// `reassert_at_the_stream_ceiling_is_admitted_not_double_counted`.
     #[tokio::test]
     async fn reassert_at_the_aggregate_bound_does_not_double_count_itself() {
         let limits = PolicyLimits {
             max_total_egress_edges: 2,
-            ..PolicyLimits::default()
+            ..PolicyLimits::for_tests()
         };
         let (svc, _sm) = make_service_with_limits(limits);
         let streams = vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6)];
@@ -849,6 +875,80 @@ mod tests {
             resp.applied_generation, 2,
             "a re-assert at the bound must not count its own edges twice"
         );
+    }
+
+    fn make_service_with_ceiling(stream_ceiling: usize) -> (MhMediaService, SessionManagerHandle) {
+        let sm = SessionManagerHandle::new(crate::session::StreamAdmission {
+            stream_ceiling,
+            rejection_ratio_threshold: 0.05,
+        });
+        let svc = MhMediaService::new(
+            sm.clone(),
+            TEST_HANDLER_ID.to_string(),
+            TEST_EPOCH_MS,
+            PolicyLimits::for_tests(),
+        );
+        (svc, sm)
+    }
+
+    /// Stream admission (story 2 R-19): a registration that would take the
+    /// handler's installed egress streams above its ceiling is refused whole,
+    /// the echo does not advance, and the outcome is the capacity refusal —
+    /// NOT `apply_failed`, which the deploy bake gate treats as a fault.
+    #[tokio::test]
+    async fn over_ceiling_is_refused_whole_and_the_echo_does_not_advance() {
+        use common::observability::testing::MetricAssertion;
+        let (svc, sm) = make_service_with_ceiling(2);
+        let ok = svc
+            .register_meeting(make_policy_request(
+                "m-1",
+                5,
+                vec![egress(1, 5, 0, 6), egress(2, 6, 0, 5)],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ok.applied_generation, 5);
+        let before = sm.routing_snapshot();
+
+        let snap = MetricAssertion::snapshot();
+        let refused = svc
+            .register_meeting(make_policy_request("m-2", 1, vec![egress(1, 7, 0, 8)]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(refused.applied_generation, 0, "nothing installed for m-2");
+        assert!(refused.accepted, "the registration itself is accepted");
+        assert!(
+            Arc::ptr_eq(&before, &sm.routing_snapshot()),
+            "no snapshot swap: all-or-none"
+        );
+        snap.counter("mh_media_policy_applies_total")
+            .with_labels(&[
+                ("outcome", "rejected_stream_ceiling"),
+                ("key_custody", "operator"),
+            ])
+            .assert_delta(1);
+        snap.counter("mh_media_policy_applies_total")
+            .with_labels(&[("outcome", "apply_failed"), ("key_custody", "operator")])
+            .assert_delta(0);
+    }
+
+    /// A re-assert at the ceiling projects its own streams once, not twice,
+    /// so a full handler keeps accepting its own meetings' re-asserts.
+    #[tokio::test]
+    async fn reassert_at_the_stream_ceiling_is_admitted_not_double_counted() {
+        let (svc, _sm) = make_service_with_ceiling(2);
+        let streams = vec![egress(1, 5, 0, 6), egress(2, 6, 0, 5)];
+        svc.register_meeting(make_policy_request("m-1", 1, streams.clone()))
+            .await
+            .unwrap();
+        let resp = svc
+            .register_meeting(make_policy_request("m-1", 2, streams))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.applied_generation, 2);
     }
 
     /// A source that resolves to no connection still advances the echo.
@@ -1038,7 +1138,7 @@ mod tests {
     async fn per_meeting_and_per_egress_count_bounds_reject() {
         let (svc, _sm) = make_service_with_limits(PolicyLimits {
             max_egress_streams_per_meeting: 1,
-            ..PolicyLimits::default()
+            ..PolicyLimits::for_tests()
         });
         assert_eq!(
             svc.register_meeting(make_policy_request(
@@ -1054,7 +1154,7 @@ mod tests {
 
         let (svc, _sm) = make_service_with_limits(PolicyLimits {
             max_candidate_sources_per_egress: 1,
-            ..PolicyLimits::default()
+            ..PolicyLimits::for_tests()
         });
         let mut stream = egress(1, 5, 0, 5);
         stream.candidate_sources.push(CandidateSource {

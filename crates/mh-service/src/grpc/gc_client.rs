@@ -17,12 +17,14 @@
 use crate::config::Config;
 use crate::errors::MhError;
 use crate::observability::metrics;
+use crate::routing::RoutingTable;
 use common::observability::otel_grpc::client_interceptor;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_handler_registry_service_client::MediaHandlerRegistryServiceClient;
 use proto_gen::dark_tower::internal::v1::{RegisterMhRequest, SendLoadReportRequest};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
@@ -43,6 +45,30 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Maximum backoff delay.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// The largest `current_streams` GC accepts: `media_handlers.current_streams`
+/// is an `INTEGER`, and GC's load-report handler rejects anything above
+/// `i32::MAX` with `InvalidArgument` (`crates/gc-service/src/grpc/mh_service.rs`,
+/// `send_load_report`) rather than wrapping it negative.
+const GC_MAX_REPORTABLE_STREAMS: u32 = i32::MAX.unsigned_abs();
+
+/// Clamp an installed-stream count to what GC's load report accepts.
+///
+/// Saturates toward FULL, and to GC's column maximum rather than `u32::MAX`.
+/// Saturating to `u32::MAX` would NOT make GC "place less": GC refuses the
+/// whole load report above `i32::MAX`, so the heartbeat goes stale, the handler
+/// drops out through staleness instead, and GC's logs fill with
+/// `InvalidArgument`. Any value this high is still >= every possible stream
+/// ceiling, so GC excludes the handler from placement — the fail-closed intent
+/// — while the report itself is accepted.
+///
+/// Unreachable today (installed streams are bounded by
+/// `MH_MAX_TOTAL_EGRESS_EDGES`, at most 2^20); kept correct regardless.
+fn saturate_for_gc(installed_streams: usize) -> u32 {
+    u32::try_from(installed_streams)
+        .unwrap_or(u32::MAX)
+        .min(GC_MAX_REPORTABLE_STREAMS)
+}
+
 /// GC client for MH→GC communication.
 ///
 /// Uses a tonic `Channel` which is cheaply cloneable and handles
@@ -58,6 +84,11 @@ pub struct GcClient {
     is_registered: AtomicBool,
     /// Load report interval from GC (or default).
     load_report_interval_ms: AtomicU64,
+    /// The live routing table, read at every load report for
+    /// `current_streams`: the installed egress streams on this handler —
+    /// the SAME `total_edges()` the admission check compares against the
+    /// ceiling and the session actor publishes as `mh_media_egress_edges`.
+    routing: Arc<RoutingTable>,
 }
 
 impl GcClient {
@@ -71,6 +102,7 @@ impl GcClient {
         gc_endpoint: String,
         token_rx: TokenReceiver,
         config: Config,
+        routing: Arc<RoutingTable>,
     ) -> Result<Self, MhError> {
         let channel = Endpoint::from_shared(gc_endpoint.clone())
             .map_err(|e| {
@@ -104,6 +136,7 @@ impl GcClient {
                 reason = "10_000ms constant fits in u64 with no truncation risk"
             )]
             load_report_interval_ms: AtomicU64::new(DEFAULT_LOAD_REPORT_INTERVAL.as_millis() as u64),
+            routing,
         })
     }
 
@@ -129,6 +162,41 @@ impl GcClient {
         Ok(grpc_request)
     }
 
+    /// The value advertised to GC as `max_streams`: the derived egress STREAM
+    /// ceiling (story 2 R-19).
+    ///
+    /// The SAME field admission enforces and `mh_media_egress_stream_ceiling`
+    /// publishes — read, never re-derived. GC's placement filter reads it
+    /// unchanged and stays SOFT; MH admission is the hard backstop. Replaces the
+    /// retired `MH_MAX_STREAMS`, which was advertised here and enforced nowhere.
+    #[must_use]
+    pub fn advertised_max_streams(&self) -> u32 {
+        self.config.egress_admission.stream_ceiling
+    }
+
+    /// The value reported to GC as `current_streams`: installed egress streams
+    /// on this handler, in the same unit as [`Self::advertised_max_streams`].
+    ///
+    /// Before story 2 task 8 this was a hardcoded 0, which made GC's soft filter
+    /// `current_streams < max_streams` always true. Now it is real, so a handler
+    /// at its ceiling drops out of GC placement.
+    ///
+    /// Until story 2 task 11's teardown, streams held by a meeting that ended
+    /// ABNORMALLY (MC crash, lost push) are never released, so this can sit at
+    /// the ceiling with no live meeting behind it. When every handler is there,
+    /// the first join to a NEW meeting fails at GC (503). The interim recovery
+    /// is under "The ratchet" in `docs/observability/metrics/mh-service.md`
+    /// (pointed at, not restated: deployment names are infra topology);
+    /// `mh_media_egress_edges` is the same value, as a gauge.
+    ///
+    /// Saturates toward FULL rather than truncating — see
+    /// [`saturate_for_gc`] for why the saturation point is GC's column
+    /// maximum and not `u32::MAX`.
+    #[must_use]
+    pub fn current_streams(&self) -> u32 {
+        saturate_for_gc(self.routing.load().total_edges())
+    }
+
     /// Register with the Global Controller.
     ///
     /// Retries with exponential backoff until success or cancellation.
@@ -143,7 +211,7 @@ impl GcClient {
             region: self.config.region.clone(),
             webtransport_endpoint: self.config.webtransport_advertise_address.clone(),
             grpc_endpoint: self.config.grpc_advertise_address.clone(),
-            max_streams: self.config.max_streams,
+            max_streams: self.advertised_max_streams(),
         };
 
         let mut delay = BACKOFF_BASE;
@@ -244,8 +312,8 @@ impl GcClient {
 
         let request = SendLoadReportRequest {
             handler_id: self.config.handler_id.clone(),
-            current_streams: 0, // Stub: no active streams
-            health: 1,          // HEALTHY
+            current_streams: self.current_streams(),
+            health: 1, // HEALTHY
             cpu_usage_percent: 0.0,
             memory_usage_percent: 0.0,
             bandwidth_usage_percent: 0.0,
@@ -304,7 +372,7 @@ impl GcClient {
             region: self.config.region.clone(),
             webtransport_endpoint: self.config.webtransport_advertise_address.clone(),
             grpc_endpoint: self.config.grpc_advertise_address.clone(),
-            max_streams: self.config.max_streams,
+            max_streams: self.advertised_max_streams(),
         };
 
         match self.try_register(&request).await {
@@ -335,5 +403,23 @@ impl GcClient {
     #[must_use]
     pub fn is_registered(&self) -> bool {
         self.is_registered.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturation_stops_at_the_largest_value_gc_accepts() {
+        // Within range: reported exactly.
+        assert_eq!(saturate_for_gc(40), 40);
+        // At and above GC's INTEGER maximum: clamped to it, never beyond. A value
+        // above i32::MAX makes GC reject the whole load report.
+        let gc_max = usize::try_from(i32::MAX).unwrap_or(usize::MAX);
+        assert_eq!(saturate_for_gc(gc_max), GC_MAX_REPORTABLE_STREAMS);
+        assert_eq!(saturate_for_gc(gc_max + 1), GC_MAX_REPORTABLE_STREAMS);
+        assert_eq!(saturate_for_gc(usize::MAX), GC_MAX_REPORTABLE_STREAMS);
+        assert!(i32::try_from(GC_MAX_REPORTABLE_STREAMS).is_ok());
     }
 }
