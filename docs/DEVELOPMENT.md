@@ -631,8 +631,11 @@ export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean
 
 <!-- ANCHOR (DRY): this block is COMPLETE against MH's required set as of
      2026-09-23 — every ConfigError::MissingEnvVar in
-     crates/mh-service/src/config.rs::Config::from_vars(), plus the ten story-2
-     keys the MH egress-budget code task makes required. VALUES mirror
+     crates/mh-service/src/config.rs::Config::from_vars() (which since story 2
+     task 8 includes the four egress-budget keys and the four ADR-0036 §8
+     bounds), plus MH_MAX_REGISTERED_MEETINGS and
+     MH_MAX_MUTED_SOURCES_PER_MEETING, which story 2 tasks 11 and 10 make
+     required (harmless to set before then). VALUES mirror
      infra/services/mh-service/configmap.yaml (the budget mirrors the Kind
      overlay's, so a local run is not starved); that file is the single home —
      if they disagree, it wins. MH_MAX_STREAMS is deliberately absent: it is

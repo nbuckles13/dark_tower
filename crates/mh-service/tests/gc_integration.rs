@@ -198,7 +198,6 @@ fn test_config(gc_url: &str) -> Config {
         region: "us-east-1".to_string(),
         gc_grpc_url: gc_url.to_string(),
         handler_id: "mh-test-001".to_string(),
-        max_streams: 500,
         ac_endpoint: "https://ac.example.com".to_string(),
         client_id: "media-handler".to_string(),
         client_secret: SecretString::from("test-client-secret"),
@@ -220,13 +219,30 @@ fn test_config(gc_url: &str) -> Config {
             mh_service::config::SHUTDOWN_SETTLE_TARGET_SECONDS,
         ),
         drain_window_source: mh_service::config::DrainWindowSource::SettleTarget,
-        policy_limits: mh_service::config::PolicyLimits::default(),
+        policy_limits: mh_test_utils::admission::fixture_policy_limits(),
+        // Derived through the production function, never hand-assembled, so the
+        // advertised `max_streams` below is a real derivation (Kind-overlay
+        // values: 100 Mbit/s over a 2.5 Mbit/s video cost -> 40 streams).
+        egress_admission: mh_service::config::EgressAdmission::derive(
+            100_000_000,
+            90_000,
+            2_500_000,
+            0.05,
+            mh_test_utils::admission::fixture_policy_limits().max_total_egress_edges,
+        )
+        .expect("fixture budget derives a valid ceiling"),
         media_latency_sample_ratio: mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO,
+        media_latency_sample_ratio_source: mh_service::config::ValueSource::Default,
         otel_enabled: false,
         otel_endpoint: String::new(),
         otel_sample_rate: 1.0,
         environment: "test".to_string(),
     }
+}
+
+/// A routing table with nothing installed: `current_streams` reports 0.
+fn empty_routing() -> std::sync::Arc<mh_service::routing::RoutingTable> {
+    std::sync::Arc::new(mh_service::routing::RoutingTable::new())
 }
 
 /// Create a mock `TokenReceiver` for testing.
@@ -280,7 +296,9 @@ async fn test_gc_client_registration_success() {
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config, empty_routing())
+        .await
+        .unwrap();
 
     assert!(!gc_client.is_registered());
 
@@ -308,7 +326,9 @@ async fn test_gc_client_registration_rejected() {
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config, empty_routing())
+        .await
+        .unwrap();
 
     let snap = MetricAssertion::snapshot();
     let result = gc_client.register().await;
@@ -339,7 +359,7 @@ async fn test_gc_client_registration_content() {
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, token_rx, config.clone())
+    let gc_client = GcClient::new(gc_url, token_rx, config.clone(), empty_routing())
         .await
         .unwrap();
 
@@ -348,7 +368,11 @@ async fn test_gc_client_registration_content() {
     let request = registration_rx.recv().await.unwrap();
     assert_eq!(request.handler_id, config.handler_id);
     assert_eq!(request.region, config.region);
-    assert_eq!(request.max_streams, config.max_streams);
+    // `max_streams` is the DERIVED egress stream ceiling — the same field
+    // admission enforces and `mh_media_egress_stream_ceiling` publishes —
+    // never the retired `MH_MAX_STREAMS`.
+    assert_eq!(request.max_streams, config.egress_admission.stream_ceiling);
+    assert_eq!(request.max_streams, 40);
     assert_eq!(request.grpc_endpoint, config.grpc_advertise_address);
     assert_eq!(
         request.webtransport_endpoint,
@@ -372,7 +396,7 @@ async fn test_gc_client_load_report_success() {
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, token_rx, config.clone())
+    let gc_client = GcClient::new(gc_url, token_rx, config.clone(), empty_routing())
         .await
         .unwrap();
 
@@ -394,6 +418,73 @@ async fn test_gc_client_load_report_success() {
     cancel_token.cancel();
 }
 
+/// `current_streams` is REAL and is the SAME value `mh_media_egress_edges`
+/// publishes (story 2 task 8).
+///
+/// Before this task `current_streams` was a hardcoded 0, which made GC's soft
+/// filter `current_streams < max_streams` always true. Two encodings of one
+/// runtime quantity — the gauge and the wire field — both read
+/// `RoutingTable::total_edges()`; this asserts they agree, so the mh-media
+/// board and GC's placement view cannot disagree about the same pod.
+#[tokio::test]
+async fn test_gc_client_load_report_carries_installed_streams_equal_to_the_gauge() {
+    use mh_service::routing::MeetingPolicy;
+    use mh_service::session::{ApplyOutcome, SessionManagerHandle};
+    use mh_test_utils::admission::{fixture_policy_limits, never_binding};
+    use mh_test_utils::media_policy::{egress, register_request};
+
+    // Snapshot FIRST: the actor resolves its handles at construction, on this
+    // (current-thread) runtime's thread.
+    let snap = MetricAssertion::snapshot();
+    let session_manager = SessionManagerHandle::new(never_binding());
+    snap.gauge("mh_media_egress_edges")
+        .with_labels(&[("key_custody", "operator")])
+        .assert_value(0.0);
+
+    let limits = fixture_policy_limits();
+    let policy = MeetingPolicy::from_request(
+        &register_request(
+            "m-load",
+            1,
+            vec![egress(1, 1, 0, 2), egress(2, 2, 0, 1), egress(3, 3, 0, 1)],
+        ),
+        &limits,
+    )
+    .unwrap();
+    let outcome = session_manager
+        .apply_policy(
+            policy,
+            limits.max_total_egress_edges,
+            Duration::from_millis(limits.policy_apply_timeout_ms),
+        )
+        .await;
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    let (load_report_tx, mut load_report_rx) = mpsc::channel(1);
+    let mock_gc = MockGcServer::accepting().with_load_report_channel(load_report_tx);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+    let gc_client = GcClient::new(
+        gc_url,
+        mock_token_receiver(),
+        config,
+        session_manager.routing_table(),
+    )
+    .await
+    .unwrap();
+    gc_client.register().await.unwrap();
+    gc_client.send_load_report().await.unwrap();
+
+    let request = load_report_rx.recv().await.unwrap();
+    assert_eq!(request.current_streams, 3, "three installed egress streams");
+    snap.gauge("mh_media_egress_edges")
+        .with_labels(&[("key_custody", "operator")])
+        .assert_value(f64::from(request.current_streams));
+
+    cancel_token.cancel();
+}
+
 #[tokio::test]
 async fn test_gc_client_load_report_skipped_when_not_registered() {
     let mock_gc = MockGcServer::accepting();
@@ -403,7 +494,9 @@ async fn test_gc_client_load_report_skipped_when_not_registered() {
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config, empty_routing())
+        .await
+        .unwrap();
 
     // Don't register - load report should be silently skipped
     assert!(!gc_client.is_registered());
@@ -425,7 +518,9 @@ async fn test_gc_client_load_report_not_found_clears_registration() {
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config, empty_routing())
+        .await
+        .unwrap();
 
     // Register (mock accepts registrations even in NotFound mode)
     gc_client.register().await.unwrap();
@@ -493,7 +588,9 @@ async fn test_gc_client_register_injects_traceparent_matching_ambient_span() {
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
-    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config, empty_routing())
+        .await
+        .unwrap();
 
     let span = tracing::info_span!("test_register_root");
     span.set_parent(known_remote_context());
@@ -534,7 +631,9 @@ async fn test_gc_client_send_load_report_injects_traceparent_matching_ambient_sp
     let gc_url = format!("http://{addr}");
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
-    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config, empty_routing())
+        .await
+        .unwrap();
 
     // Register outside any ambient span (its own #[instrument] root span
     // still injects SOME traceparent — drain and discard it below).
@@ -576,7 +675,9 @@ async fn test_gc_client_load_report_interval_from_gc() {
     let config = test_config(&gc_url);
     let token_rx = mock_token_receiver();
 
-    let gc_client = GcClient::new(gc_url, token_rx, config).await.unwrap();
+    let gc_client = GcClient::new(gc_url, token_rx, config, empty_routing())
+        .await
+        .unwrap();
 
     gc_client.register().await.unwrap();
 

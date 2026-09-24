@@ -66,6 +66,17 @@ use env_tests::fixtures::PrometheusClient;
 /// metrics and are not what these rules are about.
 const JOBS: &str = "ac-service|gc-service|mc-service|mh-service|otel-collector";
 
+/// MH's egress-admission series, all eagerly present from process start.
+const MH_EAGER_ADMISSION_SERIES: &[&str] = &[
+    "mh_media_stream_admission_total",
+    "mh_media_stream_admission_rejection_ratio",
+    "mh_media_stream_admission_rejection_ratio_threshold",
+    "mh_media_egress_budget_bytes_per_second",
+    "mh_media_egress_stream_ceiling",
+    "mh_media_egress_stream_ceiling_recommended_min",
+    "mh_media_egress_edges",
+];
+
 /// The presence anchor. Eagerly registered at MH startup, so its absence means
 /// MH is not up, not scraped, or its registration path broke.
 const MH_ANCHOR_METRIC: &str = "mh_media_frames_forwarded_total";
@@ -174,6 +185,23 @@ async fn media_metric_labels_carry_no_meeting_identifier_and_no_overclaim() {
          even though the anchor query found it — the job selector `{JOBS}` does \
          not cover the MH job, so this suite is inspecting the wrong surface."
     );
+
+    // The egress-admission series (story 2 task 8) are ALSO eagerly
+    // registered at MH startup — the counter's outcomes are zero-initialised,
+    // the static gauges are published right after the recorder installs, and
+    // the ratio and installed-streams gauges are published when the session
+    // actor is built. So they are gated exactly like the anchor: absent is a
+    // fault (a publish that ran before the recorder, or a lazy regression),
+    // never "zero". Listed so the §11 label checks below demonstrably inspect
+    // them rather than passing over their absence.
+    for name in MH_EAGER_ADMISSION_SERIES {
+        assert!(
+            series.iter().any(|s| s.name == *name),
+            "{TRIAGE_SCRAPE}: `{name}` is absent from the scrape. It is published \
+             eagerly at MH startup (story 2 task 8), so absence means the publish \
+             path regressed to lazy or ran before the metrics recorder was installed."
+        );
+    }
 
     // MC is RECORDED, not gated. Its media metrics are lazily created, so
     // absence on an idle cluster is expected and must never fail the run.

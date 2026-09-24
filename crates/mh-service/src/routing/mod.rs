@@ -844,7 +844,7 @@ mod tests {
     fn policy(meeting: &str, generation: u64, streams: Vec<EgressStream>) -> MeetingPolicy {
         MeetingPolicy::from_request(
             &request(meeting, generation, streams),
-            &PolicyLimits::default(),
+            &PolicyLimits::for_tests(),
         )
         .unwrap()
     }
@@ -945,7 +945,7 @@ mod tests {
     fn duplicate_egress_stream_id_rejects_whole_registration() {
         let req = request("m", 1, vec![egress(1, 5, 0, 5), egress(1, 6, 1, 6)]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::DuplicateEgressStreamId)
         );
     }
@@ -955,7 +955,7 @@ mod tests {
         // Same (sender, slot) twice means "two sources into one slot".
         let req = request("m", 1, vec![egress(1, 5, 3, 5), egress(2, 5, 3, 6)]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::DuplicateSubscriberSlot)
         );
     }
@@ -965,7 +965,7 @@ mod tests {
         // The reciprocal of the previous test: slot ids are subscriber-scoped,
         // so two subscribers both choosing slot 0 must NOT collide.
         let req = request("m", 1, vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6)]);
-        assert!(MeetingPolicy::from_request(&req, &PolicyLimits::default()).is_ok());
+        assert!(MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()).is_ok());
     }
 
     #[test]
@@ -974,7 +974,7 @@ mod tests {
         stream.subscriber = None;
         let req = request("m", 1, vec![stream]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::MissingSubscriber)
         );
     }
@@ -983,14 +983,14 @@ mod tests {
     fn malformed_sender_id_rejects_on_subscriber_and_on_candidate() {
         let req = request("m", 1, vec![egress(1, 0, 0, 5)]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::Id(IdError::SenderIdZero))
         );
         // The candidate side is the ingress-side lookup, where a global index
         // is most tempting — it carries the identical rule.
         let req = request("m", 1, vec![egress(1, 5, 0, 0)]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::Id(IdError::SenderIdZero))
         );
     }
@@ -1001,7 +1001,7 @@ mod tests {
         stream.candidate_sources[0].stream_number = 256;
         let req = request("m", 1, vec![stream]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::Id(IdError::StreamNumberOutOfRange))
         );
     }
@@ -1012,7 +1012,7 @@ mod tests {
         stream.transport_mode = TransportMode::Unspecified as i32;
         let req = request("m", 1, vec![stream]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::UnspecifiedTransportMode)
         );
     }
@@ -1023,7 +1023,7 @@ mod tests {
         stream.transport_mode = 9_999;
         let req = request("m", 1, vec![stream]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::UnspecifiedTransportMode)
         );
     }
@@ -1034,7 +1034,7 @@ mod tests {
         second.transport_mode = TransportMode::StreamPerGroup as i32;
         let req = request("m", 1, vec![egress(1, 5, 0, 5), second]);
         assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::default()),
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
             Err(PolicyRejection::HeterogeneousTransportModes)
         );
     }
@@ -1043,7 +1043,7 @@ mod tests {
     fn count_bounds_reject_before_any_per_element_work() {
         let limits = PolicyLimits {
             max_egress_streams_per_meeting: 1,
-            ..PolicyLimits::default()
+            ..PolicyLimits::for_tests()
         };
         // Two streams that ALSO duplicate their egress_stream_id: the count
         // bound must be what fires, proving it ran before duplicate detection
@@ -1056,7 +1056,7 @@ mod tests {
 
         let limits = PolicyLimits {
             max_candidate_sources_per_egress: 1,
-            ..PolicyLimits::default()
+            ..PolicyLimits::for_tests()
         };
         let mut stream = egress(1, 5, 0, 5);
         stream.candidate_sources.push(CandidateSource {
@@ -1073,7 +1073,7 @@ mod tests {
     #[test]
     fn empty_egress_set_is_legal_and_names_no_transport_mode() {
         let parsed =
-            MeetingPolicy::from_request(&request("m", 1, vec![]), &PolicyLimits::default())
+            MeetingPolicy::from_request(&request("m", 1, vec![]), &PolicyLimits::for_tests())
                 .unwrap();
         assert!(parsed.edges.is_empty());
         assert_eq!(

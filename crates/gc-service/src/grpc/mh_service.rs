@@ -149,6 +149,14 @@ impl MediaHandlerRegistryService for MhService {
                 "max_streams must be greater than 0",
             ));
         }
+        // `media_handlers.max_streams` is INTEGER. A truncating `as i32` wraps a
+        // value above i32::MAX NEGATIVE, and `current_streams < max_streams`
+        // then excludes the handler from placement forever — a healthy-looking
+        // black hole with no error anywhere. Refuse it loudly instead. (MH
+        // bounds its derived ceiling far below this at boot; this is the GC
+        // half of the same invariant, for any caller.)
+        let max_streams = i32::try_from(req.max_streams)
+            .map_err(|_| Status::invalid_argument("max_streams exceeds the supported maximum"))?;
 
         // Register the handler
         MediaHandlersRepository::register_mh(
@@ -157,7 +165,7 @@ impl MediaHandlerRegistryService for MhService {
             &req.region,
             &req.webtransport_endpoint,
             &req.grpc_endpoint,
-            req.max_streams as i32,
+            max_streams,
         )
         .await
         .map_err(|e| {
@@ -198,6 +206,17 @@ impl MediaHandlerRegistryService for MhService {
         // Validate handler_id with format checks
         Self::validate_handler_id(&req.handler_id)?;
 
+        // Same INTEGER column shape as `max_streams`, and it FAILS OPEN if
+        // wrapped: a negative `current_streams` makes `current_streams <
+        // max_streams` always true and sorts the handler as LEAST loaded, so
+        // a handler reporting exhaustion would be placed on preferentially.
+        // Rejected rather than saturated: MH bounds its own value by its
+        // ceiling, so an overflow is a malformed or foreign report, and
+        // refusing it beats placing against it.
+        let current_streams = i32::try_from(req.current_streams).map_err(|_| {
+            Status::invalid_argument("current_streams exceeds the supported maximum")
+        })?;
+
         // Convert health status from proto enum
         let health_status = match req.health {
             0 => HealthStatus::Pending,
@@ -212,7 +231,7 @@ impl MediaHandlerRegistryService for MhService {
         let updated = MediaHandlersRepository::update_load_report(
             &self.pool,
             &req.handler_id,
-            req.current_streams as i32,
+            current_streams,
             health_status,
             if req.cpu_usage_percent > 0.0 {
                 Some(req.cpu_usage_percent)
@@ -454,6 +473,46 @@ mod integration_tests {
         });
         let result = service.register_mh(request).await;
         assert!(result.is_err());
+
+        // max_streams above i32::MAX would wrap NEGATIVE in the INTEGER
+        // column and exclude the handler from placement forever: refused.
+        let request = Request::new(RegisterMhRequest {
+            handler_id: "test-mh".to_string(),
+            region: "us-east-1".to_string(),
+            webtransport_endpoint: "https://mh:443".to_string(),
+            grpc_endpoint: "grpc://mh:50051".to_string(),
+            max_streams: u32::try_from(i32::MAX).unwrap() + 1,
+        });
+        let result = service.register_mh(request).await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    /// `current_streams` above i32::MAX would wrap NEGATIVE, making an
+    /// exhausted handler sort as the least loaded — fail-open placement.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_send_load_report_rejects_current_streams_above_i32(pool: PgPool) {
+        let service = MhService::new(Arc::new(pool.clone()));
+        MediaHandlersRepository::register_mh(
+            &pool,
+            "overflow-mh",
+            "us-east-1",
+            "https://mh:443",
+            "grpc://mh:50051",
+            1000,
+        )
+        .await
+        .unwrap();
+
+        let request = Request::new(SendLoadReportRequest {
+            handler_id: "overflow-mh".to_string(),
+            current_streams: u32::try_from(i32::MAX).unwrap() + 1,
+            health: 1,
+            cpu_usage_percent: 0.0,
+            memory_usage_percent: 0.0,
+            bandwidth_usage_percent: 0.0,
+        });
+        let result = service.send_load_report(request).await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

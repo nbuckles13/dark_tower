@@ -46,7 +46,7 @@ impl GrpcRig {
             session_manager.clone(),
             "mh-test-handler".to_string(),
             mh_service::process::sample_process_start_epoch_ms(),
-            mh_service::config::PolicyLimits::default(),
+            mh_test_utils::admission::fixture_policy_limits(),
         );
 
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);

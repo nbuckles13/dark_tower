@@ -413,11 +413,14 @@ const STORY2_KEYS: &[(&str, ValueShape)] = &[
 /// `crates/mh-service/src/main.rs`. A TEST CONTRACT — see the module doc.
 const CONFIG_LOADED_MESSAGE: &str = "Configuration loaded successfully";
 
-/// `(ConfigMap key, startup-event field)` for every value the running MH
-/// process reports. ONE table: the MH code task APPENDS rows here (budget,
-/// costs, derived stream ceiling) once MH logs them, rather than writing a
-/// second copy. Once the derived ceiling is logged, parity on it becomes the
-/// checked version of the ANCHOR (DRY) formula in the Kind sizing test.
+/// `(ConfigMap key, startup-event field)` for every integer value the running
+/// MH process reports verbatim. ONE table. The egress-chain rows (budget and
+/// both costs, logged in BITS exactly as configured) were appended by the MH
+/// egress-budget code task (story 2 task 8). The derived stream ceiling is not
+/// a ConfigMap key, so its parity is checked against the published gauge in
+/// [`test_running_mh_publishes_the_deployed_stream_ceiling`] rather than here;
+/// the ratio threshold is a float and is checked against its gauge by
+/// `28_mh_egress_admission.rs`.
 const LOGGED_POLICY_BOUNDS: &[(&str, &str)] = &[
     (
         "MH_MAX_EGRESS_STREAMS_PER_MEETING",
@@ -429,6 +432,9 @@ const LOGGED_POLICY_BOUNDS: &[(&str, &str)] = &[
     ),
     ("MH_MAX_TOTAL_EGRESS_EDGES", "max_total_egress_edges"),
     ("MH_POLICY_APPLY_TIMEOUT_MS", "policy_apply_timeout_ms"),
+    ("MH_EGRESS_BUDGET_BPS", "egress_budget_bps"),
+    ("MH_STREAM_COST_AUDIO_BPS", "stream_cost_audio_bps"),
+    ("MH_STREAM_COST_VIDEO_BPS", "stream_cost_video_bps"),
 ];
 
 /// The demo requirement the Kind budget is sized against: N+1 participants
@@ -952,11 +958,11 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     // Branch 2: the patch applied; is the value it set big enough? Computed
     // from DEPLOYED values, never a literal.
     //
-    // ANCHOR (DRY): a deliberate, temporary second encoding of the MH code
-    // task's derivation (budget / max(cost_audio, cost_video), floored). It is
-    // checked only once that task's env-test compares MH's published
-    // `mh_media_egress_stream_ceiling` against this — tracked in docs/TODO.md
-    // §Observability Debt.
+    // A second encoding of MH's derivation (budget / max(cost_audio,
+    // cost_video), floored), and now a CHECKED one:
+    // `test_running_mh_publishes_the_deployed_stream_ceiling` compares MH's
+    // published `mh_media_egress_stream_ceiling` against the same deployed
+    // values, so this formula cannot silently disagree with the enforced one.
     //
     // CONSERVATIVE OVER BOTH CONVERSION ORDERS. The keys are in bits; the MH
     // code task converts to bytes once at load. With integer division,
@@ -997,4 +1003,89 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
          bug. Fix: RAISE the budget in {PATCH}. Do not lower the costs and do not \
          lower N."
     );
+}
+
+/// MH's rule for the ceiling, EXACTLY as `crates/mh-service/src/config.rs`
+/// states it: bits converted to bytes ONCE — the budget floored, each cost
+/// ceiled (both fail closed) — then budget / max(cost). Written out here so the
+/// running pod's published gauge is compared against the documented rule, not
+/// against itself.
+fn mh_documented_ceiling(budget_bps: u64, audio_bps: u64, video_bps: u64) -> u64 {
+    let max_cost_bytes = audio_bps.div_ceil(8).max(video_bps.div_ceil(8));
+    assert!(max_cost_bytes > 0, "stream costs must be non-zero");
+    (budget_bps / 8) / max_cost_bytes
+}
+
+/// The running MH processes publish the stream ceiling the DEPLOYED ConfigMap
+/// derives, and the advisory recommended minimum this suite's own demo
+/// requirement derives (story 2 task 8; closes the docs/TODO.md §Observability
+/// Debt entry on the Kind ceiling test's re-derived formula).
+///
+/// Three encodings of one requirement meet here and are CHECKED rather than
+/// anchored: MH's `EGRESS_STREAM_CEILING_RECOMMENDED_MIN` (published as a
+/// gauge), this file's `required_edges(DEMO_N)`, and the Kind budget patch
+/// sized against it.
+#[tokio::test]
+async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
+    use env_tests::cluster::ClusterConnection;
+    use env_tests::fixtures::metrics::gauge_by_instance_present;
+    use env_tests::fixtures::PrometheusClient;
+    use std::time::Duration;
+
+    let cm = fetch_configmap(SHARED_CONFIGMAP);
+    let budget = parse_positive(
+        "MH_EGRESS_BUDGET_BPS",
+        &configmap_value(&cm, "MH_EGRESS_BUDGET_BPS"),
+    );
+    let audio = parse_positive(
+        "MH_STREAM_COST_AUDIO_BPS",
+        &configmap_value(&cm, "MH_STREAM_COST_AUDIO_BPS"),
+    );
+    let video = parse_positive(
+        "MH_STREAM_COST_VIDEO_BPS",
+        &configmap_value(&cm, "MH_STREAM_COST_VIDEO_BPS"),
+    );
+    let expected = mh_documented_ceiling(budget, audio, video);
+
+    let cluster = ClusterConnection::new()
+        .await
+        .expect("Failed to connect to cluster - ensure port-forwards are running");
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let instances = MH_INSTANCES.len();
+
+    let ceilings = gauge_by_instance_present(
+        &prom,
+        "mh_media_egress_stream_ceiling",
+        instances,
+        Duration::from_secs(60),
+    )
+    .await;
+    for (instance, value) in &ceilings {
+        assert_eq!(
+            *value, expected as f64,
+            "MH instance {instance} publishes mh_media_egress_stream_ceiling={value}, but \
+             the deployed ConfigMap (MH_EGRESS_BUDGET_BPS={budget}, \
+             MH_STREAM_COST_AUDIO_BPS={audio}, MH_STREAM_COST_VIDEO_BPS={video}) derives \
+             {expected} under MH's documented rule. Either the pod predates a ConfigMap \
+             change (restart it) or MH's derivation diverged from its documentation."
+        );
+    }
+
+    let mins = gauge_by_instance_present(
+        &prom,
+        "mh_media_egress_stream_ceiling_recommended_min",
+        instances,
+        Duration::from_secs(60),
+    )
+    .await;
+    let required = required_edges(DEMO_N);
+    for (instance, value) in &mins {
+        assert_eq!(
+            *value, required as f64,
+            "MH instance {instance} publishes \
+             mh_media_egress_stream_ceiling_recommended_min={value}, but this suite's demo \
+             requirement is required_edges(DEMO_N={DEMO_N})={required}. The two encode ONE \
+             requirement (one full all-hear-all meeting at N={DEMO_N}); change both together."
+        );
+    }
 }

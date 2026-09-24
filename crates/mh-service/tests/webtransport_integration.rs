@@ -92,7 +92,7 @@ struct WtSuite {
 impl WtSuite {
     async fn start(register_meeting_timeout: Duration, mc_client: Arc<McClient>) -> Self {
         let jwks = JwksRig::start(42, "mh-wt-integ-01").await;
-        let session_manager = SessionManagerHandle::new();
+        let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
         let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
 
         let wt = AcceptLoopRig::start_with(

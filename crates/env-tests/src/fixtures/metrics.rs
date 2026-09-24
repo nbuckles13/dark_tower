@@ -583,6 +583,47 @@ pub async fn poll_until_stable(
     }
 }
 
+/// Read an EAGERLY-REGISTERED gauge per `instance`, polling until the series is
+/// present on at least `min_instances` instances or `timeout` elapses.
+///
+/// For gauges a service publishes from process start (the MH egress-admission
+/// gauges, for example): ABSENCE IS A FAILURE, never zero. That is the
+/// difference from [`PrometheusClient::instance_counter_map`], where an empty
+/// vector legitimately means "not observed yet". A query error panics (via
+/// `instance_counter_map`), and a non-finite sample panics, so the three
+/// readings — error, absent, value — never collapse.
+///
+/// The poll is a scrape-convergence bound (a new pod is scraped within one
+/// interval), not a wall-clock assertion about the service.
+///
+/// # Panics
+///
+/// When fewer than `min_instances` instances carry the series by `timeout`.
+pub async fn gauge_by_instance_present(
+    prom: &PrometheusClient,
+    metric: &str,
+    min_instances: usize,
+    timeout: Duration,
+) -> InstanceCounters {
+    let promql = format!("max by (instance) ({metric})");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current = prom.instance_counter_map(&promql).await;
+        if current.len() >= min_instances {
+            return current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "gauge `{metric}` is present on {} instance(s), expected at least \
+             {min_instances} within {timeout:?}. It is published eagerly at process \
+             start, so absence means the pod is not up, not scraped, or the publish \
+             path ran before the metrics recorder was installed — not 'zero'.",
+            current.len()
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

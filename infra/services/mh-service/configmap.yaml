@@ -38,15 +38,14 @@ data:
   # read turns a routine rollback into `CreateContainerConfigError` with EMPTY
   # logs — the pod never starts, so there is nothing to read.
   #
-  # WHAT IS TRUE WHEN. Until the MH code task's image ships, the value below is
-  # still live on the wire: mh-service sends it to GC as `max_streams` from
+  # WHAT IS TRUE NOW (story 2 task 8). NOTHING READS THIS KEY. mh-service
+  # advertises its DERIVED stream ceiling to GC as `max_streams` (from
   # `register()` and `attempt_reregistration()` in
-  # crates/mh-service/src/grpc/gc_client.rs, and GC places against it. That
-  # sentence EXPIRES with the next MH image, after which nothing reads this key.
-  # Enforced by: until that image, GC at placement only (never MH's data path);
-  # after it, nothing.
-  # Where an operator sees it: nowhere after that image — watch
-  # `mh_media_egress_stream_ceiling` instead (lands with the MH code task).
+  # crates/mh-service/src/grpc/gc_client.rs); editing this value changes
+  # nothing. (Before that image, the value below was what GC placed against.)
+  # Enforced by: nothing.
+  # Where an operator sees it: nowhere — watch `mh_media_egress_stream_ceiling`
+  # and the startup log's `egress_stream_ceiling` instead.
   #
   # Scheduled removal, with its own two-deploy ordering and trigger:
   # docs/TODO.md §Media Path Obligations, "Delete the retired `MH_MAX_STREAMS`".
@@ -188,8 +187,7 @@ data:
   # Accept-time resource-exhaustion guard: the maximum number of concurrent
   # WebTransport connections MH will accept. NEVER a capacity figure, never
   # advertised to GC (what GC receives is the stream ceiling MH derives from
-  # `MH_EGRESS_BUDGET_BPS` below — a different quantity; before the MH code task
-  # ships it is the retired `MH_MAX_STREAMS` above). It sits far above expected peak, so rejections
+  # `MH_EGRESS_BUDGET_BPS` below — a different quantity). It sits far above expected peak, so rejections
   # attributed to it mean a connection flood or a connection leak, not demand
   # that has outgrown the deployment.
   #
@@ -287,12 +285,17 @@ data:
   # `MH_EGRESS_BUDGET_BPS` below.) Neither mirror is a consumer: a drifted value
   # there reaches a developer's laptop, never this cluster and never an alert.
   #
-  # The MH code task reads all six as REQUIRED keys with no Rust fallback: MH refuses to
-  # start when one is absent or malformed. That is deliberate — a default in
+  # All six are REQUIRED keys with no Rust fallback, read by two different
+  # tasks: the four egress-chain keys (budget, both costs, threshold) by the
+  # MH egress-budget code task (story 2 task 8, landed), and
+  # `MH_MAX_REGISTERED_MEETINGS` / `MH_MAX_MUTED_SOURCES_PER_MEETING` by the
+  # MH capacity-guard and server-mute tasks (story 2 tasks 11 and 10) — until
+  # those land, the current image ignores those two. MH refuses to start when
+  # a key it reads is absent or malformed. That is deliberate — a default in
   # code would be a second, invisible encoding of the same value, and
   # `dt-guard env-config` can only see a key the code refuses to start
-  # without. These keys land BEFORE the image that reads them (the add-key
-  # half of the rollout-ordering rule), so the current image ignores them.
+  # without. The keys landed BEFORE the images that read them (the add-key
+  # half of the rollout-ordering rule).
   #
   # The chain: MH derives a STREAM ceiling (never "subscriber ceiling" — a
   # subscriber now holds N slots) from the budget and the two per-kind costs,
@@ -300,8 +303,8 @@ data:
   # the register RPC's existing `max_streams` field, where it replaces the
   # retired `MH_MAX_STREAMS` above. GC placement against it stays SOFT; MH
   # admission is the hard backstop. The derivation, and the refuse-to-boot
-  # floor under it, are code owned by the MH code task — they are
-  # deliberately not restated here.
+  # floor under it, are code (`EgressAdmission` in
+  # crates/mh-service/src/config.rs) — they are deliberately not restated here.
   # ---------------------------------------------------------------------------
 
   # Egress bandwidth budget for this MH, in BITS per second.
@@ -320,16 +323,16 @@ data:
   # here on purpose: this value is not sized, so there is no relationship to
   # state and nothing for a comment to go stale against.
   #
-  # It announces itself. The MH code task is required to (a) log the
-  # effective derived stream ceiling loudly at startup, and (b) emit a
-  # distinct INFO "configure me" nudge naming THIS key whenever that ceiling
-  # is below MH's advisory recommended minimum. The nudge fires on this
+  # It announces itself. MH (a) logs the effective derived stream ceiling
+  # loudly at startup, and (b) emits a distinct INFO "configure me" nudge
+  # naming THIS key whenever that ceiling is below MH's advisory recommended
+  # minimum (`mh_media_egress_stream_ceiling_recommended_min`). The nudge fires on this
   # placeholder by design and goes quiet once a real budget is set. Read the
   # startup log for the effective ceiling — do not compute it by hand.
   #
   # THE MARGIN, STATED WITHOUT NUMBERS: this placeholder still boots. It sits
-  # above MH's refuse-to-boot floor on the derived ceiling (a code constant
-  # the MH code task owns). The ONLY correct response to the startup nudge is
+  # above MH's refuse-to-boot floor on the derived ceiling (a code constant,
+  # `MIN_EGRESS_STREAM_CEILING` in crates/mh-service/src/config.rs). The ONLY correct response to the startup nudge is
   # a real budget here. NEVER lower that floor to quiet a nagging pod — the
   # floor exists because a ceiling just above zero passes every validation,
   # boots, gets placed, and then rejects nearly everything it is handed.
@@ -348,9 +351,9 @@ data:
   # (soft, new meetings only) — both from the ceiling derived from this value.
   # Where an operator sees it: MH's startup log (effective ceiling and the
   # configure-me nudge); the `mh_media_egress_budget_bytes_per_second
-  # {basis="unmeasured"}` and `mh_media_egress_stream_ceiling` gauges — both
-  # land with the MH code task, which converts bits to bytes exactly once at
-  # load, so the gauge is in BYTES while this key is in BITS by design.
+  # {basis="unmeasured"}` and `mh_media_egress_stream_ceiling` gauges (live
+  # since story 2 task 8). MH converts bits to bytes exactly once at load, so
+  # the gauge is in BYTES while this key is in BITS by design.
   MH_EGRESS_BUDGET_BPS: "10000000"
 
   # Cost of ONE audio egress stream against the budget above, in BITS per
@@ -385,10 +388,9 @@ data:
   # costing lands it becomes an OVER-ADMISSION bug unless reconciled, and the
   # reconciliation is an ADR-0036 §4 decision (protocol + meeting-controller),
   # not a ConfigMap edit. Tracked in docs/TODO.md §Media Path Obligations.
-  # Enforced by: mh-service, as an input to the derived stream ceiling (MH code
-  # task).
+  # Enforced by: mh-service, as an input to the derived stream ceiling.
   # Where an operator sees it: nowhere directly — it cannot move the ceiling
-  # today. The MH code task logs it at startup.
+  # today. MH logs it at startup (`stream_cost_audio_bps`).
   MH_STREAM_COST_AUDIO_BPS: "90000"
 
   # Cost of ONE video egress stream against the budget above, in BITS per
@@ -404,10 +406,10 @@ data:
   # measurement behind it, carried under the same ADR-0036 open item as the
   # budget. Revisit when video lands.
   # Enforced by: mh-service, as the dominant input to the derived stream
-  # ceiling (MH code task).
+  # ceiling.
   # Where an operator sees it: through its effect on
-  # `mh_media_egress_stream_ceiling` (lands with the MH code task); MH logs it
-  # at startup.
+  # `mh_media_egress_stream_ceiling`; MH logs it at startup
+  # (`stream_cost_video_bps`).
   MH_STREAM_COST_VIDEO_BPS: "2500000"
 
   # Rejection-ratio threshold for stream admission, 0.0 to 1.0.
@@ -428,19 +430,19 @@ data:
   # fires, investigate; do not tune this number to quiet it.
   #
   # Two properties of the published ratio this value is only meaningful
-  # against. Both are REQUIREMENTS ON THE MH CODE TASK, recorded here because
-  # this comment is what reaches that task's author:
+  # against (both implemented by story 2 task 8 — the window is 5 minutes;
+  # see docs/observability/metrics/mh-service.md):
   #   - The ratio is WINDOWED (a sliding window or the last N admission
   #     decisions), never a lifetime ratio. A lifetime ratio is silent during
   #     total exhaustion on a long-healthy pod and cannot clear on a fresh one.
   #   - No admission decisions in the window publishes a value that does not
   #     fire, but zero accepted with any rejected publishes 1.0, NEVER 0.0 —
   #     otherwise the alert is quietest exactly when the failure is total.
-  # Enforced by: mh-service (MH code task), and the alert via the threshold
-  # gauge (alerting task).
+  # Enforced by: mh-service (a debugging-breadcrumb WARN when the windowed
+  # ratio crosses it), and the alert via the threshold gauge (alerting task).
   # Where an operator sees it: `mh_media_stream_admission_rejection_ratio` and
-  # `..._threshold`, and alert `MHMediaEgressBudgetExhausted` — all land later
-  # in story 2 (MH code task; alerting task).
+  # `..._threshold` (live since story 2 task 8); alert
+  # `MHMediaEgressBudgetExhausted` lands with story 2's alerting task.
   MH_EGRESS_REJECTION_RATIO_THRESHOLD: "0.05"
 
   # Resource-exhaustion guard: the maximum number of meeting registrations MH
@@ -527,15 +529,17 @@ data:
   # trigger is "when the fence and resurrection questions are CLOSED", not "when
   # R-20 lands".
   #
-  # REQUIREMENT ON THE MH CODE TASK, recorded here because this comment is what
-  # reaches that task's author: this required read must be validated against a
-  # hard-ceiling constant in `crates/mh-service/src/config.rs`, on the same
-  # footing as the four §8 bounds below. A `> 0` check alone lets a
-  # fat-fingered value silently re-open the surface this key exists to close.
+  # REQUIREMENT ON THE MH CAPACITY-GUARD TASK (story 2 task 11, which reads
+  # this key — the egress-budget task, task 8, deliberately does not), recorded
+  # here because this comment is what reaches that task's author: this
+  # required read must be validated against a hard-ceiling constant in
+  # `crates/mh-service/src/config.rs`, on the same footing as the four §8
+  # bounds below. A `> 0` check alone lets a fat-fingered value silently
+  # re-open the surface this key exists to close.
   # Enforced by: mh-service, rejecting an over-limit registration loudly and
-  # counted by its own reason (MH code task).
+  # counted by its own reason (story 2 task 11; not yet in the running image).
   # Where an operator sees it: `mh_media_registered_meetings` and the rejection
-  # counter — both land with the MH code task. READ THAT GAUGE AS REGISTRATIONS
+  # counter — both land with story 2 task 11. READ THAT GAUGE AS REGISTRATIONS
   # HELD, NOT MEETINGS IN PROGRESS: until R-20's teardown lands it is
   # monotonically non-decreasing and does not fall when a meeting ends, so
   # reading it as concurrency understates exhaustion in the direction that hides
@@ -623,20 +627,16 @@ data:
   # advertised to GC and none participates in placement. They bound what one
   # `RegisterMeetingRequest` — and the sum of them — may make MH allocate.
   #
-  # Values are EQUAL TO THE CURRENT CODE DEFAULTS, so behaviour is unchanged at
-  # cutover: the running image still reads these optional-with-default. The MH
-  # code task flips each read to REQUIRED and deletes its code default, after
-  # which this file is the single home for the number.
+  # REQUIRED READS since story 2 task 8, with NO code default: this file is
+  # the single home for each number, and `dt-guard env-config` rule 1 now sees
+  # all four (it keys off `ConfigError::MissingEnvVar`). The values were chosen
+  # equal to the former code defaults, so behaviour did not change at cutover.
   #
-  # ANCHOR (DRY), all four: until that flip, each value here is co-held with
-  # its code default in `crates/mh-service/src/config.rs`, and nothing but this
-  # comment holds the pair in agreement — an anchor, not a guard
-  # (`dt-guard env-config` rule 1 keys off `ConfigError::MissingEnvVar`, which a
-  # defaulted read never emits). Each key also has a HARD CEILING constant in
-  # that file which SURVIVES the flip, because a required read still needs its
-  # upper bound. The anchors below cite that ceiling by ROLE, not by symbol
-  # name, so they stay true through any rename — grep the env var name in
-  # config.rs and you land on it.
+  # Each key also has a HARD CEILING constant in
+  # `crates/mh-service/src/config.rs`, because a required read still needs its
+  # upper bound. The notes below cite that ceiling by ROLE, not by symbol name,
+  # so they stay true through any rename — grep the env var name in config.rs
+  # and you land on it.
   # ---------------------------------------------------------------------------
 
   # Per-meeting bound on `RegisterMeetingRequest.egress_streams`.
@@ -661,8 +661,7 @@ data:
   # is safe (the muted bound merely becomes a looser pre-allocation guard).
   # Asserted, not merely stated, by
   # crates/env-tests/tests/01_mh_deployment_config.rs::test_story2_keys_wired_into_every_mh_instance.
-  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
-  # the surviving home is the hard-ceiling constant for
+  # Code-side home: the hard-ceiling constant for
   # `MH_MAX_EGRESS_STREAMS_PER_MEETING` in `crates/mh-service/src/config.rs`.
   # Enforced by: mh-service, rejecting the WHOLE registration before building
   # any routing table (live policy for that meeting is left unchanged).
@@ -678,8 +677,7 @@ data:
   # returns multi-candidate streams, so do not lower it to 1 because today's
   # traffic never exceeds 1.
   #
-  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
-  # the surviving home is the hard-ceiling constant for
+  # Code-side home: the hard-ceiling constant for
   # `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS` in `crates/mh-service/src/config.rs`.
   # Enforced by: mh-service, rejecting the WHOLE registration before building
   # any routing table.
@@ -695,12 +693,10 @@ data:
   # docs/TODO.md §Media Path Obligations entry on MH never reclaiming an ended
   # meeting's routing entry. This comment cites them and restates neither.
   #
-  # WHERE IN config.rs, and why this names two places: TODAY the reasoning is
-  # the docstring of `crates/mh-service/src/config.rs::DEFAULT_MAX_TOTAL_EGRESS_EDGES`.
-  # The MH code task deletes that default when it makes this read required, and
-  # MOVES the prose — intact, retraction included — to the hard-ceiling
-  # constant for `MH_MAX_TOTAL_EGRESS_EDGES`, which survives the flip. Both
-  # clauses are stated so this citation is true before and after that task.
+  # WHERE IN config.rs: the docstring of the hard-ceiling constant for
+  # `MH_MAX_TOTAL_EGRESS_EDGES`. Story 2 task 8 deleted the former code default
+  # when it made this read required, and MOVED that prose — intact,
+  # retraction included — to the ceiling constant, which survives.
   # For the symptom as a responder meets it, see the reclamation note inside
   # docs/runbooks/mh-incident-response.md, "Scenario 13: RegisterMeeting
   # Timeout — Clients Kicked" ("Some people can't hear anything in a meeting
@@ -709,14 +705,18 @@ data:
   # It becomes an ordinary resource guard ONLY ONCE story 2 R-20's teardown
   # path (`EndMeeting`) reclaims ended meetings. That is conditional on R-20
   # landing; until then, see the citations above.
-  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
-  # the surviving home is the hard-ceiling constant for
+  # Code-side home: the hard-ceiling constant for
   # `MH_MAX_TOTAL_EGRESS_EDGES` in `crates/mh-service/src/config.rs`.
-  # Enforced by: mh-service, when a registration would ADD edges.
-  # Where an operator sees it: TODAY, only after the fact —
-  # `mh_media_policy_applies_total{outcome="apply_failed"}` fires when new
-  # meetings are ALREADY dark. There is no saturation signal yet: the
-  # `mh_media_egress_edges` / `mh_media_egress_edges_limit` gauges and alert
+  # Enforced by: mh-service, when a registration would ADD edges — as a
+  # DEFENSE-IN-DEPTH BACKSTOP since story 2 task 8: the derived egress stream
+  # ceiling (same unit) is checked FIRST, and MH refuses to start when that
+  # ceiling exceeds this value, so this bound must stay AT OR ABOVE the ceiling.
+  # Where an operator sees it: the saturation signal is `mh_media_egress_edges`
+  # (installed streams, live since story 2 task 8) against
+  # `mh_media_egress_stream_ceiling` — the ceiling binds first, as
+  # `rejected_stream_ceiling`. If this backstop ever trips it shows as
+  # `mh_media_policy_applies_total{outcome="apply_failed"}` plus the WARN's
+  # `reason`. The `mh_media_egress_edges_limit` gauge and alert
   # `MHMediaEgressEdgeHeadroomLow` land later in story 2.
   MH_MAX_TOTAL_EGRESS_EDGES: "65536"
 
@@ -725,8 +725,7 @@ data:
   # The apply is asynchronous relative to the RPC response (ADR-0036 §8), so a
   # wedged actor must produce a truthful stale `applied_generation` with
   # `outcome=apply_failed`, never a hung RPC.
-  # ANCHOR (DRY): co-held with its code default until the MH code task's flip;
-  # the surviving home is the hard-ceiling constant for
+  # Code-side home: the hard-ceiling constant for
   # `MH_POLICY_APPLY_TIMEOUT_MS` in `crates/mh-service/src/config.rs`.
   # Enforced by: mh-service, on the RegisterMeeting path.
   # Where an operator sees it: `mh_media_policy_applies_total{outcome="apply_failed"}`.

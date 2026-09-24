@@ -243,7 +243,7 @@ async fn test_inbound_register_meeting_reparents_handler_span_to_injected_trace(
     let capture = SpanCapture::install();
 
     let jwks = JwksRig::start(42, "mh-otel-integ-01").await;
-    let session_manager = SessionManagerHandle::new();
+    let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
     let rig = GrpcRig::start(jwks.jwks_client(), session_manager.clone()).await;
     let mut client = connect_client(&rig).await;
 
@@ -312,7 +312,7 @@ async fn test_inbound_register_meeting_no_traceparent_gets_fresh_trace_id() {
     let capture = SpanCapture::install();
 
     let jwks = JwksRig::start(43, "mh-otel-integ-02").await;
-    let session_manager = SessionManagerHandle::new();
+    let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
     let rig = GrpcRig::start(jwks.jwks_client(), session_manager.clone()).await;
     let mut client = connect_client(&rig).await;
 

@@ -422,17 +422,27 @@ groups:
       # ADR-0036 §1's transport-parameter bound: MH owns a bounded egress
       # datagram queue above quinn's send buffer, drop-oldest, sized to trip
       # BEFORE the transport ceiling so the drop is countable in our code
-      # rather than discarded silently inside quinn. There is no egress
-      # bandwidth budget, no capacity gauge, no stream ceiling and no
-      # admission threshold in this build -- that whole chain is a later
-      # story. Do not describe this counter in those terms.
+      # rather than discarded silently inside quinn. Do not describe this
+      # counter in budget, capacity, stream-ceiling or admission terms -- and
+      # the reason is the MECHANISM, not absence: since story 2 task 8 the
+      # egress-budget chain EXISTS, but it is an ADMISSION-time control. It
+      # refuses a forwarding policy at RegisterMeeting (counted on
+      # mh_media_stream_admission_total, alerted on
+      # mh_media_stream_admission_rejection_ratio against its threshold gauge)
+      # and never sheds a datagram. This counter is a QUEUE-time shed on an
+      # already-admitted stream. The two cannot move for the same reason, so
+      # neither may be widened to cover the other.
+      # (CORRECTED 2026-09-24: this block previously said the chain did not
+      # exist "in this build". That premise expired with story 2 task 8; the
+      # instruction it justified still stands on the mechanism above.)
       #
       # THE "DOES IT APPLY" HALF IS STRUCTURAL, NOT CONFIRMATORY. If quinn
       # absorbed the drop instead, this counter would never increment and the
       # alert would be DEAD BY CONSTRUCTION. That cannot happen silently:
       # the ordering is enforced at startup as
-      # ConfigError::EgressQueueDoesNotBindFirst
-      # (crates/mh-service/src/config.rs:1211, raised at :1474), so a config
+      # ConfigError::EgressQueueDoesNotBindFirst (defined and raised in
+      # crates/mh-service/src/config.rs; cited by symbol, not line, because
+      # story 2 task 8 moved both), so a config
       # violating it fails startup rather than producing a quiet dead alert.
       #
       # ZERO-DENOMINATOR GUARD IS ON THE FULL ATTEMPTS SUM, matching the
@@ -472,7 +482,7 @@ groups:
           component: media-egress
         annotations:
           summary: "MH shedding media datagrams on its egress queue bound ({{ $value | humanizePercentage }} of egress attempts)"
-          description: "More than 1% of egress datagram attempts are being dropped because MH's bounded application egress queue is full - a subscriber the queue cannot drain into fast enough. This is the ADR-0036 §1 transport-parameter bound tripping, NOT a bandwidth budget; no such budget exists in this build. Read the full reason breakdown before concluding back-pressure: connection_closed is routine (participants leave), and no_subscriber is counted once per FRAME rather than per subscriber, so it reads as 100% of egress in an unsubscribed meeting. Neither is included here, deliberately."
+          description: "More than 1% of egress datagram attempts are being dropped because MH's bounded application egress queue is full - a subscriber the queue cannot drain into fast enough. This is the ADR-0036 §1 transport-parameter bound tripping, NOT a bandwidth budget; the egress budget is a separate ADMISSION-time control with its own signal (mh_media_stream_admission_rejection_ratio against mh_media_stream_admission_rejection_ratio_threshold) and does not shed datagrams. Read the full reason breakdown before concluding back-pressure: connection_closed is routine (participants leave), and no_subscriber is counted once per FRAME rather than per subscriber, so it reads as 100% of egress in an unsubscribed meeting. Neither is included here, deliberately."
           impact: "Audible loss for affected subscribers. Audio is carried one frame per QUIC datagram with no retransmission, so a dropped datagram is a dropped frame. MH readiness, handshake latency and connection-accept rate all read healthy throughout. The client-side send drop is NOT covered by this rule and cannot be - it happens in the sender and MH structurally cannot observe it; see the runbook's client-side ladder."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-17-media-datagram-drop"
 

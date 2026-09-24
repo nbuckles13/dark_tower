@@ -1243,7 +1243,8 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let _guard = ::metrics::set_default_local_recorder(&recorder);
 
-        let session_manager = SessionManagerHandle::new();
+        let session_manager =
+            SessionManagerHandle::new(crate::session::admission::test_admission());
         let meeting_id = "meeting-1";
         let connection_id = "conn-1";
         let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
@@ -1277,7 +1278,8 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let _guard = ::metrics::set_default_local_recorder(&recorder);
 
-        let session_manager = SessionManagerHandle::new();
+        let session_manager =
+            SessionManagerHandle::new(crate::session::admission::test_admission());
         let meeting_id = "meeting-2";
         let connection_id = "conn-2";
         let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
@@ -1312,7 +1314,8 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let _guard = ::metrics::set_default_local_recorder(&recorder);
 
-        let session_manager = SessionManagerHandle::new();
+        let session_manager =
+            SessionManagerHandle::new(crate::session::admission::test_admission());
         let meeting_id = "meeting-3";
         let connection_id = "conn-3";
         let notify = setup_pending(&session_manager, meeting_id, connection_id).await;

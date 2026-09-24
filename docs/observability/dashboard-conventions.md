@@ -198,8 +198,7 @@ relationship": a derived value cannot drift; a guard only catches drift after so
 reviews and no guard checks, and it silently disagrees with the panel's declared `Bps` unit. The
 panel then renders bits while claiming bytes. Put the equivalence in prose where a human reads it.
 
-**Live instances** — both keys are live in the ConfigMap; the story-2 key's conversion and gauge are
-still a *forward reference*:
+**Live instances** — both keys are live in the ConfigMap, and both conversions are live in code:
 
 - **Datagram send buffer** (story 1) — **live as of story task 9**, as
   `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` in `infra/services/mh-service/configmap.yaml`; the frames→bytes
@@ -209,10 +208,10 @@ still a *forward reference*:
   conversion happens once at config load.
 - **`MH_EGRESS_BUDGET_BPS`** (story 2) — **live as of story 2's MH configuration task**, as
   `MH_EGRESS_BUDGET_BPS` in `infra/services/mh-service/configmap.yaml` (in bits/s); the bits→bytes
-  conversion and the `mh_media_egress_budget_bytes_per_second` gauge land with the MH egress-budget
-  code task. Specified as "bits/s, converted once at load upstream of the enforcement/gauge fork;
-  nothing downstream sees bits", with the derived stream ceiling and the published gauge both
-  reading the converted value.
+  conversion and the `mh_media_egress_budget_bytes_per_second` gauge are **live as of story 2
+  task 8**: "bits/s, converted once at load upstream of the enforcement/gauge fork; nothing
+  downstream sees bits", with the derived stream ceiling and the published gauge both reading the
+  converted value (`crates/mh-service/src/config.rs::EgressAdmission`).
 
 Two independent instances is what makes this a rule rather than a one-off, and why it belongs in a
 conventions doc.
@@ -302,9 +301,11 @@ guard so the two files cannot silently rediverge again.
 - **State which config is authoritative** whenever a cadence is referenced.
 - **A config value published as a gauge must read the same value its consumer reads** — never a
   parallel constant. Story 2's `mh_media_egress_budget_bytes_per_second{basis="unmeasured"}` gauge is
-  a **forward reference**, not in the tree today, landing with the egress-budget chain. The MH
-  sample-ratio gauge **is** in the tree as of story task 16 and follows the rule structurally rather
-  than by convention: `mh_media_latency_sample_ratio` publishes
+  **live as of story 2 task 8** and follows the rule structurally: it and the stream-ceiling and
+  threshold gauges publish the `EgressAdmission` fields admission and `gc_client` read, and a
+  component test (`crates/mh-service/tests/stream_admission_integration.rs`) asserts each published
+  value equals its field. Select it bare — never on `basis`, which is designed to change. The MH
+  sample-ratio gauge is in the tree as of story task 16 and follows the rule the same way: `mh_media_latency_sample_ratio` publishes
   `Config::media_latency_sample_ratio`, the same field the sampler is constructed from, and a
   component test asserts the published value equals it. A ratio computed separately from the one in
   force is a gauge that lies exactly when someone is using it to interpret a histogram.
