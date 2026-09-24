@@ -17,6 +17,7 @@
 #   --rebuild         Force rebuild the dev container image (exits if no task-slug)
 #   --recreate        Destroy and recreate containers, preserving the local clone
 #   --refresh-creds   Copy fresh OAuth credentials into a running container
+#                     (credentials mode only; token mode redirects to --recreate)
 #
 # Examples:
 #   ./devloop.sh td-42-rate-limiting                     # branches from current branch
@@ -29,7 +30,12 @@
 #
 # Prerequisites:
 #   - podman installed
-#   - Authenticated with Claude Code (run 'claude' once to log in)
+#   - Authenticated with Claude Code, EITHER:
+#       token mode (preferred for unattended story runs): run infra/devloop/claude-token.sh
+#         once — it runs `claude setup-token` and writes the token file
+#         (~/.config/dark-tower/claude-oauth-token, override DEVLOOP_CLAUDE_TOKEN_FILE).
+#         Rotate before expiry: rerun it, then --recreate any live slug.
+#       credentials mode: run 'claude' once to log in (~/.claude/.credentials.json)
 #
 # See: docs/decisions/adr-0025-containerized-devloop.md
 
@@ -182,7 +188,20 @@ CONTAINER_LEDGER_BASE="/home/dev/.cache/devloop/story-runs"
 
 # ─── Quick actions (early exit) ───────────────────────────────────
 
+# Token mode: path, file format, reader (load_oauth_token) and writer all live in
+# claude-token.sh so the format has one home. Sourcing it defines functions only.
+# shellcheck source-path=SCRIPTDIR source=claude-token.sh
+source "$(dirname "${BASH_SOURCE[0]}")/claude-token.sh"
+
 refresh_credentials() {
+    if $TOKEN_MODE; then
+        echo "Token mode (${CLAUDE_TOKEN_FILE}): the token is set when the container is created," >&2
+        echo "  so there is nothing to refresh in place. To pick up a rotated token (or to move a" >&2
+        echo "  container created in credentials mode onto the token), recreate its containers —" >&2
+        echo "  the clone, story-run ledgers and Kind cluster are preserved:" >&2
+        echo "    devloop.sh --recreate ${TASK_SLUG}" >&2
+        exit 1
+    fi
     if [ ! -f "${HOME}/.claude/.credentials.json" ]; then
         echo "No credentials file found at ${HOME}/.claude/.credentials.json" >&2
         exit 1
@@ -194,6 +213,8 @@ refresh_credentials() {
     podman cp "${HOME}/.claude/.credentials.json" "${DEV_CONTAINER}:/home/dev/.claude/.credentials.json"
     echo "Credentials refreshed in ${DEV_CONTAINER}"
 }
+
+load_oauth_token
 
 if $REFRESH_CREDS; then
     refresh_credentials
@@ -224,7 +245,7 @@ cleanup() {
         if is_helper_process_alive "$pid"; then
             echo "Stopping helper (PID $pid)..."
             kill "$pid" 2>/dev/null || true
-            for i in $(seq 1 10); do
+            for _ in $(seq 1 10); do
                 kill -0 "$pid" 2>/dev/null || break
                 sleep 0.5
             done
@@ -368,7 +389,7 @@ launch_helper() {
 
     # Wait for socket to appear (up to 10s)
     local socket_path="$HELPER_RUNTIME_DIR/helper.sock"
-    for i in $(seq 1 20); do
+    for _ in $(seq 1 20); do
         if [ -S "$socket_path" ]; then
             echo "Helper ready (PID $helper_pid)"
             return 0
@@ -511,8 +532,9 @@ if ! command -v podman &>/dev/null; then
     exit 1
 fi
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${HOME}/.claude/.credentials.json" ]; then
-    echo "ERROR: No authentication found. Either set ANTHROPIC_API_KEY or log in with 'claude' first." >&2
+if ! $TOKEN_MODE && [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f "${HOME}/.claude/.credentials.json" ]; then
+    echo "ERROR: No authentication found. Either run infra/devloop/claude-token.sh (token mode)," >&2
+    echo "  set ANTHROPIC_API_KEY, or log in with 'claude' first." >&2
     exit 1
 fi
 
@@ -572,7 +594,8 @@ if command -v kind &>/dev/null; then
         build_helper
         # Ensure runtime dir exists before launching (helper creates it too,
         # but we need it for the stderr log redirect)
-        mkdir -p -m 0700 "$HELPER_RUNTIME_DIR"
+        # umask, not `mkdir -p -m`: -m applies only to the deepest directory.
+        (umask 077 && mkdir -p "$HELPER_RUNTIME_DIR")
         if launch_helper; then
             # Mount the helper runtime directory into the container. This is a read-write
             # mount because: (1) the unix socket requires rw for client connections, and
@@ -644,11 +667,17 @@ if ! is_container_running "$DEV_CONTAINER"; then
     if [ -f "${HOME}/.claude.json" ]; then
         EXTRA_PODMAN_ARGS+=(-v "${HOME}/.claude.json:/tmp/claude-user-config.json:ro")
     fi
-    if [ -f "${HOME}/.claude/.credentials.json" ]; then
+    if $TOKEN_MODE; then
+        # By NAME, not NAME=value: podman copies the value from this process's
+        # environment (exported by load_oauth_token), so the token never appears in
+        # argv — i.e. never in `ps` output or shell history on the host.
+        EXTRA_PODMAN_ARGS+=(-e CLAUDE_CODE_OAUTH_TOKEN)
+    elif [ -f "${HOME}/.claude/.credentials.json" ]; then
         EXTRA_PODMAN_ARGS+=(-v "${HOME}/.claude/.credentials.json:/tmp/claude-credentials.json:ro")
     fi
     if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-        EXTRA_PODMAN_ARGS+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+        # By name, same reason as the token above.
+        EXTRA_PODMAN_ARGS+=(-e ANTHROPIC_API_KEY)
     fi
 
     # Story-runner ledger mount (ADR-0037 D5) — UNCONDITIONAL (not gated on kind,
@@ -662,7 +691,8 @@ if ! is_container_running "$DEV_CONTAINER"; then
     # NOT relax it to 0755. The .ledger-mount marker is run-story's positive control
     # that the bind actually happened (a writable dir that ISN'T this mount would
     # otherwise pass silently and lose the ledger on destroy — LEDGER-NOT-PERSISTENT).
-    mkdir -p -m 0700 "$STORY_RUNS_HOST"
+    # umask, not `mkdir -p -m`: -m applies only to the deepest directory.
+    (umask 077 && mkdir -p "$STORY_RUNS_HOST")
     : > "$STORY_RUNS_HOST/.ledger-mount"
     EXTRA_PODMAN_ARGS+=(-v "${STORY_RUNS_HOST}:${CONTAINER_LEDGER_BASE}:z")
     EXTRA_PODMAN_ARGS+=(-e "DEVLOOP_STORY_RUN_BASE=${CONTAINER_LEDGER_BASE}")
@@ -776,7 +806,18 @@ fi
 
 # Refresh OAuth credentials before each attach (host sessions may have rotated
 # the refresh token since the container started, invalidating the container's copy).
-if [ -f "${HOME}/.claude/.credentials.json" ]; then
+# Token mode: nothing to copy — but a container REUSED here keeps the environment it
+# was created with, so check it actually carries the current token. Compared with
+# grep -q so the value is never printed.
+if $TOKEN_MODE; then
+    if ! podman inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$DEV_CONTAINER" \
+        | grep -qxF "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}"; then
+        echo "WARNING: ${DEV_CONTAINER} was not created with the current token (it predates token" >&2
+        echo "  mode, or the token was rotated since). It is still using whatever credential it" >&2
+        echo "  started with. Recreate it (clone, ledgers and cluster preserved):" >&2
+        echo "    devloop.sh --recreate ${TASK_SLUG}" >&2
+    fi
+elif [ -f "${HOME}/.claude/.credentials.json" ]; then
     podman exec "$DEV_CONTAINER" mkdir -p /home/dev/.claude 2>/dev/null || true
     podman cp "${HOME}/.claude/.credentials.json" "${DEV_CONTAINER}:/home/dev/.claude/.credentials.json"
 fi
@@ -850,7 +891,7 @@ echo ""
 COMMITS=$(git -C "$CLONE_DIR" log --oneline "${BASE_BRANCH}..HEAD" 2>/dev/null || true)
 
 # Check if a PR already exists for this branch
-PR_URL=$(cd "$CLONE_DIR" && gh pr list --head "$BRANCH_NAME" --state open --json url -q '.[0].url' 2>/dev/null || true)
+PR_URL=$(cd "$CLONE_DIR" && gh pr list --head "$BRANCH_NAME" --state open --json url -q '.[0].url' 2>/dev/null) || true
 
 if [ -n "$PR_URL" ]; then
     echo "=== PR exists: ${PR_URL} ==="
