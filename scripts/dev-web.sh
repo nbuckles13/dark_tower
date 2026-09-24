@@ -19,6 +19,13 @@
 #     no resolver (getent). Enumerative, not illustrative — the
 #     runbook cites this block as the severity SSoT, so it must not
 #     under-list. See the contract below.
+#   - client N (VITE_DT_RECEIVE_SLOTS) is an integer >= 1     [HARD FAIL]
+#     and <= the MC server cap MC_MAX_RECEIVE_SLOTS, read
+#     from infra/services/mc-service/configmap.yaml. N above
+#     the cap is one silent participant per browser.
+#   - ...including when the cap CANNOT BE READ. All THREE causes  [HARD FAIL]
+#     are hard fails and are diagnosed separately: cap file absent,
+#     key absent, value not an integer (all REPO/CONFIG DRIFT).
 #   - demo.localhost resolves (/etc/hosts)                    [WARN — browser only]
 #
 # THE CONTRACT (rewritten, not just retagged — the old rule stopped explaining
@@ -67,6 +74,58 @@
 # reaches a reader through `--help`, at a terminal, which is where a prohibited
 # browser flag gets typed. Keeping a smaller duplicate is deliberate and is
 # guarded on both sides by scripts/dev-web.test.sh.
+#
+# WHY NOT A SECOND MACHINE — verified against the tree, not caution. A LAN
+# address cannot host a participant, and no browser setting changes that:
+#   1. Secure context. The dev origin http://demo.localhost:5173 is potentially
+#      trustworthy (a .localhost name); http://<lan-ip>:5173 is not, so
+#      getUserMedia and WebTransport are both unavailable there (SECURE CONTEXT
+#      above; the runbook section it cites).
+#   2. The advertise addresses are loopback literals (127.0.0.1): every
+#      infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml advertises a
+#      https://127.0.0.1:<port> URL. GC hands those to the browser, so a second
+#      machine's browser dials ITS OWN loopback and reaches nothing. (The ports
+#      are deliberately not restated here — they are in those files and in this
+#      preflight's own output, and a copied set goes silently false the day an
+#      instance is added or moved.)
+#   3. The MC/MH dev leaves carry DNS-only SANs: generate_service_cert() in
+#      scripts/generate-dev-certs.sh writes only DNS: entries, and the
+#      mc-/mh-webtransport leaves list localhost plus service names, no IP.
+#      SCOPED, deliberately: the browser trusts these leaves by
+#      serverCertificateHashes pinning, which matches the hash and checks no
+#      name (infra/kind/scripts/setup.sh's devloop advertise-address patch relies
+#      on exactly that), so this is NOT a browser-side blocker. It bars a
+#      name-verifying client pointed at a LAN IP. 1 and 2 are each sufficient.
+# So one machine it is — and still never a browser flag (above).
+#
+# N+1 PARTICIPANTS ON ONE MACHINE (story 2026-09-21-hear-each-other, R-25):
+#   THE RULE: N+1 DISTINCT REGISTERED ACCOUNTS, one per browsing context. Reusing
+#   an account is what silently produces a short roster.
+#   Mechanics: separate Chrome PROFILES are the recommended, known-good shape.
+#   The auth session is NOT the reason — it is per-context in-memory state
+#   (packages/web-app/src/App.svelte, never persisted per R-23; persisting it is
+#   a named finding in scripts/guards/semantic/checks.md §Client Credential
+#   Lifetime), so tabs of one profile are already independently signed in.
+#   Whether N+1 simultaneously-capturing tabs in ONE profile behave as well is
+#   UNVERIFIED; profiles are recommended because they are known-good, not
+#   because tabs are known-bad. Symptom if contexts ever DID share a session:
+#   every one shows as the SAME participant (a roster of 1) — look at the client,
+#   not MC routing. Use profiles made for the demo, not your daily one, and
+#   remove them afterwards — but NOT because they hold a session: they do not,
+#   which is the R-23 guarantee above. What a profile accumulates for the dev
+#   origin is browser-level site state (site permissions, history, autofill and
+#   saved-password prompts for the demo account), which is worth keeping out of
+#   the profile you use for everything else.
+#   Audio: one microphone feeding N participants feeds back. The answer is the
+#   test-tone send mode (R-7) — a constant per-participant tone in place of the
+#   microphone, enabled by the Vite BUILD-TIME define __DT_TEST_TONE__ (owned by
+#   the client; never a runtime setting, never in a production bundle). This
+#   script does not switch it on. Headphones are for the separate one-microphone
+#   human-audibility pass, not the answer to N-way feedback.
+#   N: VITE_DT_RECEIVE_SLOTS, the client's audio receive-slot count — each
+#   participant hears at most N others. Exported by this script (default 3) and
+#   echoed in the preflight beside the MC cap. ONE value per dev server: every
+#   tab and profile it serves gets the same N; re-run the script to change it.
 #
 # Usage:
 #   scripts/dev-web.sh              # preflight + install (if needed) + dev server
@@ -514,6 +573,137 @@ for cm in "${WT_CONFIGMAPS[@]}"; do
     check_wt_endpoint "$cm" "$label"
 done
 
+# ─── Receive slots: client N vs the MC server cap (HARD FAIL) ───
+# "Why can't I hear the sixth person?" is answered by N — each participant
+# declares N audio receive slots and hears at most N others — so the preflight
+# prints the effective N beside the server cap it must fit under.
+#
+# N is VITE_DT_RECEIVE_SLOTS (client N; read by
+# packages/sdk-core/src/config/clientConfig.ts via packages/web-app/src/lib/config.ts).
+# This launcher ALWAYS exports it — the operator's value, or DEMO_RECEIVE_SLOTS —
+# so the N echoed here is by construction the N every client of this dev server
+# declares. DEMO_RECEIVE_SLOTS is the launcher's demo topology (N=3: four
+# participants each hear the other three), NOT the SDK's default: the SDK's own
+# default is its home for non-dev builds and is never consulted in a dev-web
+# session. Same shape as VITE_TELEMETRY_ENDPOINT below.
+#
+# ONE VALUE PER DEV SERVER, not per tab or profile: one Vite process serves every
+# browsing context on one origin, and import.meta.env is fixed when the server
+# starts. Changing N means re-running this script.
+#
+# The cap is MC_MAX_RECEIVE_SLOTS, READ from the shared MC ConfigMap (its SSoT),
+# never copied here. MC rejects an over-cap declaration WHOLE — never clamps,
+# never accepts a prefix (see the key's comment there) — so N > cap is a
+# participant that joins and hears nobody: a HARD FAIL by the contract above.
+# This script does not clamp N either.
+#
+# TWO READERS, NOT ONE HELPER (@dry-reviewer D-2): check_wt_endpoint reads a
+# URL from a PER-INSTANCE ConfigMap with a deliberately UNANCHORED key match;
+# this reads an integer from the SHARED ConfigMap anchored on the indented data
+# line, so prose that ever names the key in a comment can never match. A shared
+# helper would have to branch on both the anchoring and the value shape.
+#
+# Same stale-on-disk caveat as the WebTransport block (docs/TODO.md,
+# "dev-web.sh's WebTransport preflight reads the on-disk ConfigMap"): on a
+# devloop cluster the live value can differ, so every cap message prints the
+# live command, and the in-cluster AUTHORITY is MC's own counter.
+MC_SHARED_CONFIGMAP="infra/services/mc-service/configmap.yaml"
+DEMO_RECEIVE_SLOTS=3
+if [[ -n "${VITE_DT_RECEIVE_SLOTS+x}" ]]; then
+    N_SOURCE="set by you"
+else
+    VITE_DT_RECEIVE_SLOTS="$DEMO_RECEIVE_SLOTS"
+    N_SOURCE="launcher demo default"
+fi
+export VITE_DT_RECEIVE_SLOTS
+
+cap_live_value_cmd() {
+    # SHARED ConfigMap (consumed by mc-0 AND mc-1), namespace spelled out: without
+    # -n the command returns NotFound in another namespace, which reads as "the
+    # cluster has no cap either". Deliberately NOT wt_live_value_cmd, which
+    # derives PER-INSTANCE names.
+    printf "kubectl get cm mc-service-config -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}'"
+}
+
+# The authority framing, printed on EVERY branch that names a cap — including
+# the PASS branch. The failure that actually reaches a demo is the on-disk cap
+# reading 8 while the live ConfigMap has been patched to 2: the operator is
+# standing on a GREEN line holding a number the cluster does not enforce, so
+# "the file may be lying, here is what does enforce it" is most load-bearing
+# exactly where everything looked fine. One home so the two cannot drift.
+cap_authority_note() {
+    echo "      That cap is an ON-DISK pre-flight read; the in-cluster authority is"
+    echo "      mc_media_receive_capability_declarations_total{outcome=\"slot_count_over_cap\"}"
+    echo "      (docs/observability/metrics/mc-service.md). Live cap: $(cap_live_value_cmd)"
+}
+
+check_receive_slots() {
+    local cap_line cap
+    # FILE-ABSENT IS ITS OWN DIAGNOSIS, not folded into "the key is missing". A
+    # message naming a path implies that path exists, and "the shared ConfigMap
+    # both MC pods mount is GONE" is a deployment problem while "the key was
+    # renamed" is a repo one — different first moves. Same wrong-and-confident
+    # class the `ss`-failed branch and `wt_live_value_cmd` were written about.
+    if [[ ! -f "$MC_SHARED_CONFIGMAP" ]]; then
+        fail "receive slots: CANNOT VERIFY — ${MC_SHARED_CONFIGMAP} DOES NOT EXIST, so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap. (The file is absent — this is NOT a missing key inside it.)"
+        echo "      This is REPO/CONFIG DRIFT (the shared MC ConfigMap both mc-0 and mc-1 mount),"
+        echo "      not your environment. Nothing to fix locally: report it. A check that did not"
+        echo "      run must never read as one that passed."
+        echo "      The live value discriminates the cause — set there but not on disk means the"
+        echo "      file drifted; absent in both is larger: $(cap_live_value_cmd)"
+        return
+    fi
+    # `|| true`: grep's no-match exit must reach the CANNOT VERIFY branch below,
+    # not kill the preflight via pipefail + set -e (see check_wt_endpoint).
+    cap_line="$(grep -E '^[[:space:]]+MC_MAX_RECEIVE_SLOTS:[[:space:]]*' "$MC_SHARED_CONFIGMAP" 2>/dev/null | head -1 || true)"
+    # THREE CAUSES, THREE BRANCHES — deliberately not one message with the value
+    # interpolated. Each has a different first move: the file is gone (deploy),
+    # the key is gone or this script's anchored match drifted (repo), the value
+    # is malformed (repo, one line). Collapsing them makes the message
+    # wrong-and-confident for two of the three.
+    if [[ -z "$cap_line" ]]; then
+        fail "receive slots: CANNOT VERIFY — ${MC_SHARED_CONFIGMAP} exists but declares no MC_MAX_RECEIVE_SLOTS data key, so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap."
+        echo "      This is REPO/CONFIG DRIFT — the key was removed or renamed, or this script's"
+        echo "      anchored match drifted from the file's shape. NOT your environment, and note"
+        echo "      the match is anchored on the indented data line, so a comment mentioning the"
+        echo "      key never satisfies it. Nothing to fix locally: report it."
+        echo "      The live value discriminates: present live but not on disk means the file"
+        echo "      drifted; absent in both means the key really is gone:"
+        echo "        $(cap_live_value_cmd)"
+        return
+    fi
+    cap="$(printf '%s' "$cap_line" | sed -E 's/^[[:space:]]+MC_MAX_RECEIVE_SLOTS:[[:space:]]*"?([^"[:space:]]*)"?.*$/\1/')"
+    if [[ ! "$cap" =~ ^[1-9][0-9]*$ ]]; then
+        fail "receive slots: CANNOT VERIFY — MC_MAX_RECEIVE_SLOTS in ${MC_SHARED_CONFIGMAP} is not an integer >= 1 (got '${cap}'), so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap."
+        echo "      This is REPO/CONFIG DRIFT — the KEY IS PRESENT and its VALUE is malformed (MC"
+        echo "      refuses to start outside its own configured bound, so this would not deploy"
+        echo "      either). The bound's figures live in crates/mc-service/src/config.rs and are"
+        echo "      deliberately not restated here — same rule this diff applies to W."
+        echo "      Not your environment. Nothing to fix locally: report it."
+        echo "      Live value for comparison: $(cap_live_value_cmd)"
+        return
+    fi
+    if [[ ! "$VITE_DT_RECEIVE_SLOTS" =~ ^[1-9][0-9]*$ ]]; then
+        fail "receive slots: VITE_DT_RECEIVE_SLOTS='${VITE_DT_RECEIVE_SLOTS}' (${N_SOURCE}) is not an integer >= 1 — clients would declare no valid receive capability and hear nobody. Not starting the dev server."
+        echo "      Fix: unset VITE_DT_RECEIVE_SLOTS (demo default ${DEMO_RECEIVE_SLOTS}), or set an integer 1..${cap}."
+        return
+    fi
+    # Compare by digit count first, so an absurdly long N cannot overflow bash
+    # arithmetic into a small or negative number and pass.
+    if (( ${#VITE_DT_RECEIVE_SLOTS} > ${#cap} )) || { (( ${#VITE_DT_RECEIVE_SLOTS} == ${#cap} )) && [[ "$VITE_DT_RECEIVE_SLOTS" > "$cap" ]]; }; then
+        fail "receive slots: client N=${VITE_DT_RECEIVE_SLOTS} (${N_SOURCE}) exceeds the server cap MC_MAX_RECEIVE_SLOTS=${cap} (${MC_SHARED_CONFIGMAP}). MC rejects the WHOLE declaration, so every participant would present as one silent participant. Not starting the dev server."
+        echo "      Fix: VITE_DT_RECEIVE_SLOTS=${cap} scripts/dev-web.sh   (or any value 1..${cap}; never clamped for you)"
+        cap_authority_note
+        return
+    fi
+    pass "receive slots: effective N=${VITE_DT_RECEIVE_SLOTS} (${N_SOURCE}) <= server cap MC_MAX_RECEIVE_SLOTS=${cap} (${MC_SHARED_CONFIGMAP})"
+    echo "      Each participant hears at most N others: with N=${VITE_DT_RECEIVE_SLOTS}, $((VITE_DT_RECEIVE_SLOTS + 1)) participants"
+    echo "      each hear the other ${VITE_DT_RECEIVE_SLOTS}; one more finds some receivers' slots already full —"
+    echo "      that participant is the fewer-sources case, not a bug. One N per dev server: re-run to change it."
+    cap_authority_note
+}
+check_receive_slots
+
 # ─── demo.localhost resolution (WARN — WSL2-side tooling only) ───
 # This checks THIS machine's resolver (/etc/hosts + glibc). It is NOT the browser's:
 # a host browser reads its own hosts file, and Chromium resolves *.localhost to
@@ -530,6 +720,16 @@ fi
 echo
 if [[ "$HARD_FAIL" -ne 0 ]]; then
     echo "${RED}Preflight failed.${NC} Resolve the ✗ items above, then re-run." >&2
+    # THE COUNTER-MESSAGE, printed on the hard-fail exit only (docs/TODO.md,
+    # "dev-web.sh's secure-context counter-message is reachable only through
+    # --help"). A blocked developer at this prompt is who reaches for a browser
+    # setting; a block that always printed would be a block nobody reads. Names
+    # the CLASS, never a flag literal — this file is scanned by
+    # `dt-guard no-insecure-browser-flags`.
+    echo "Never a browser flag: no setting makes a non-loopback origin trustworthy, and the" >&2
+    echo "ones that loosen certificate handling defeat the pinning MC/MH trust depends on." >&2
+    echo "Fix the ✗ items above — each carries its own remedy; see --help (SECURE CONTEXT," >&2
+    echo "WHY NOT A SECOND MACHINE)." >&2
     exit 1
 fi
 echo "${GRN}Preflight OK.${NC}"
@@ -554,6 +754,10 @@ export VITE_TELEMETRY_ENDPOINT="${VITE_TELEMETRY_ENDPOINT:-/api/v1/telemetry}"
 
 echo; echo "== Starting web-app dev server =="
 echo "   Open Chrome at: http://${DEMO_HOST}:5173"
+echo "   N+1 participants (N=${VITE_DT_RECEIVE_SLOTS}, ${N_SOURCE}): open $((VITE_DT_RECEIVE_SLOTS + 1)) browsing contexts on"
+echo "   THIS machine — demo Chrome profiles recommended, one per participant — each signed"
+echo "   in as a DISTINCT registered account, all joining the same meeting code."
+echo "   Audio for N-way: the test-tone build (__DT_TEST_TONE__, see --help), not one shared mic."
 echo
 # Launch through the Nx `dev` target, NOT `pnpm --filter … dev`. The web-app
 # `dev` target declares `dependsOn: proto-gen:codegen`, so Nx generates the

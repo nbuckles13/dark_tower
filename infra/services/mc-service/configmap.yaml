@@ -182,3 +182,57 @@ data:
   # client honours the send directive (story task 19). MC composes and sends the
   # directive today; nothing consumes it yet. Tuning them before then changes
   # nothing, and no metric moves.
+  # ==========================================================================
+  # Meeting KEK lifecycle (ADR-0036 §4 Rotation, "Participant leaves") — story
+  # 2026-09-21-hear-each-other R-12; manifest story task 4, read by MC task 9.
+  #
+  # W: the KEK rotation debounce window, in seconds. Every roster removal
+  # schedules a rotation, debounced to at most once per W measured from the
+  # OLDEST un-rotated removal. R-12 states the leaver exposure bound AS W.
+  #
+  # REQUIRED, NO RUST DEFAULT — the same precedent, for the same reason, as the
+  # five client-facing media signalling keys above: a Rust-defaulted key wired
+  # into mc-0 and forgotten on mc-1 passes `dt-guard env-config` green while the
+  # two instances behave differently. For W that divergence is a SECURITY
+  # defect, not a tuning one: the leaver exposure bound becomes whichever pod
+  # owns the meeting, and nobody outside can tell which. The documented default
+  # is the value below — this file is its home, not a constant in config.rs.
+  #
+  # W REACHES EVERY PARTICIPANT. MC carries it on the wire as
+  # `kek_rotation_debounce_seconds` on JoinResponse and MeetingKekUpdate, and
+  # clients derive their previous-KEK retention from it. The rule lives at
+  # `JoinResponse.kek_rotation_debounce_seconds` in
+  # proto/dark_tower/signaling/v1/signaling.proto and is deliberately not
+  # restated here. So tuning W moves client key hygiene too, not just a server
+  # timer; and an already-connected client keeps the old W until its next
+  # MeetingKekUpdate, so server-side rotation and client-side retention disagree
+  # for a bounded interval by construction.
+  #
+  # ORDERING: the ROLLBACK ORDERING / COUPLED SET IS THREE ARTIFACTS block above
+  # governs this key unchanged (this ConfigMap + BOTH Deployments + the image,
+  # applied with-or-before each other). The W-specific consequence:
+  # kustomization.yaml lists ConfigMaps under `resources:`, NOT
+  # `configMapGenerator:`, so a later VALUE EDIT of W here DOES NOT ROLL THE
+  # PODS — a wrong W stays latent until the next restart, and the exposure bound
+  # in force is not the one on disk. (The change that introduced this key did
+  # roll both pods once, because it also added the env reference to each
+  # Deployment's pod template.) Once MC task 9's image is deployed, never remove
+  # this key in the same deploy that removes its read — that is a CrashLoop.
+  #
+  # Enforced by: NOTHING in the tree today. MC task 9 adds the required read
+  # (ConfigError::MissingEnvVar) and a both-sides bound at config load; the
+  # bound's figures live in crates/mc-service/src/config.rs, not here. Until
+  # then a missing key is still loud at the Kubernetes layer: both Deployments
+  # reference it with a non-optional configMapKeyRef, so a pod without it gets
+  # CreateContainerConfigError.
+  # Where an operator sees it: nothing today — see the NOTE below. From task 9:
+  # mc_meeting_kek_rotation_window_seconds (W as the pod loaded it), beside
+  # mc_meeting_kek_generated_total{trigger} and
+  # mc_meeting_kek_rotation_pending_age_seconds.
+  #
+  # NOTE: NO OBSERVABLE EFFECT until MC task 9 lands. Nothing reads this key
+  # yet; tuning it changes nothing and no metric moves. For the same reason
+  # docs/runbooks/mc-deployment.md §Configuration Reference has no row for it
+  # yet: that table's Required column is derived from config.rs, so the row
+  # lands with task 9 (tracked in docs/TODO.md).
+  MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"
