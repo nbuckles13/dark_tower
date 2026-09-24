@@ -25,11 +25,42 @@ spec:
         fsGroup: 10001
       containers:
       - name: otel-collector
-        # Pinned to a specific contrib tag (not `latest`) so a collector upgrade
-        # is a deliberate, reviewable change — see the collector-upgrade-discipline
-        # runbook section (R-54 fail-hard-at-init makes botched upgrades fleet-wide
-        # once R-55 lands).
-        image: otel/opentelemetry-collector-contrib:0.103.1
+        # Pinned to a specific contrib tag (not `latest`) so a collector upgrade is
+        # a deliberate, reviewable change. R-54 fail-hard-at-init makes a botched
+        # upgrade fleet-wide RIGHT NOW, not hypothetically: AC, GC and MC all have
+        # `OTEL_ENABLED: "true"` in the Kind overlay and probe this collector at
+        # init. (MH does NOT — it has no `OTEL_ENABLED` and no 4317 egress rule, so
+        # it is code-ready but infra-disabled; enabling it needs the egress rule
+        # FIRST or it will CrashLoop on the NetworkPolicy, not on the collector.)
+        #
+        # THE IMAGE AND THE ConfigMap ARE ONE ATOMIC ROLLBACK UNIT. `config.yaml`
+        # references `delta_to_cumulative`, which does not exist in 0.103.1 —
+        # reverting this tag WITHOUT reverting the ConfigMap is an immediate
+        # startup CrashLoop, and a collector that is actually down takes AC/GC/MC
+        # with it on their next restart. See the collector-upgrade-discipline and
+        # §Rollback sections of `docs/runbooks/gc-deployment.md`.
+        #
+        # VERIFIED DIGEST for this tag:
+        #   sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+        # `delta_to_cumulative`, `filter`, `transform`, `memory_limiter`,
+        # `health_check`, the `otlp` receiver and the `prometheus` exporter were all
+        # confirmed present by running `otelcol-contrib components` from THAT digest
+        # — not read from release notes. 0.103.1 is the proof that matters: it
+        # loads this same config far enough to CrashLoop on a missing processor.
+        # The reference below is by TAG, not `tag@sha256`, because `setup.sh`'s
+        # preload path (`kustomize | grep image:` -> `podman save` ->
+        # `kind load image-archive`) is unproven with a digest reference and a
+        # broken preload breaks whole-cluster bring-up — a worse failure than the
+        # one immutability would prevent.
+        #
+        # SO THIS IS A PROCESS CONTROL, NOT AN IMMUTABILITY GUARANTEE. A tag is
+        # mutable; the digest above is only checked when someone follows the
+        # runbook's pre-upgrade step and compares the running pod's `imageID`
+        # against it. Nothing fails automatically on a re-pushed tag. The
+        # structural fix (assert the loaded image's digest at bring-up, after
+        # `load_image_to_kind`) needs a machine-readable home for this digest
+        # first — tracked in `docs/TODO.md` (collector image digest).
+        image: otel/opentelemetry-collector-contrib:0.161.0
         imagePullPolicy: IfNotPresent
         args:
         - --config=/etc/otelcol-contrib/config.yaml
@@ -43,13 +74,44 @@ spec:
         - name: health
           containerPort: 13133
           protocol: TCP
+        # Prometheus exposition of the browser `dt_client_*` series (R-27).
+        # Scraped by the `otel-collector` job; PULL, never remote-write.
+        - name: prom-metrics
+          containerPort: 8889
+          protocol: TCP
+        # The collector's OWN telemetry. Scraped by the separate
+        # `otel-collector-telemetry` job so that `up{job="otel-collector"}` keeps
+        # meaning "the client-series endpoint". Every drop on the metrics path is
+        # silent without this — see the ConfigMap's `service.telemetry` comment.
+        - name: self-metrics
+          containerPort: 8888
+          protocol: TCP
+        # MEMORY: request == limit, i.e. Guaranteed QoS. This is a SINGLETON whose
+        # unavailability is a fleet-wide service-init outage (AC/GC/MC fail hard at
+        # init when it is unreachable), so it must be the LAST thing evicted under
+        # node memory pressure — and eviction ranking is driven by the REQUEST, not
+        # the limit. On Kind the cost of matching them is nil.
+        #
+        # 512Mi is MEASURED, not guessed. `otelcol_process_memory_rss` on 0.161.0:
+        #   ~201-210 MiB   under the acceptance harness (run with NO limit, so this
+        #                  is an unconstrained steady-state FLOOR, not a peak)
+        #   ~195.5 MiB     on the deployed collector under normal cluster traffic
+        #
+        # ALWAYS QUOTE THE DENOMINATOR WITH THE FIGURE. The same ~200 MiB is ~77%
+        # of the PREVIOUS 256Mi limit and ~38% of this 512Mi one — a bare number
+        # loses the very reason the limit moved the moment it moves again. Against
+        # the old limit the collector was already near its cap BEFORE this change,
+        # and the two new stateful components (`delta_to_cumulative` holds one
+        # accumulator per stream; the prometheus exporter holds each series for
+        # `metric_expiration`) both grow with series count. So this bump is
+        # load-bearing, not comfort.
         resources:
           requests:
             cpu: 100m
-            memory: 128Mi
+            memory: 512Mi
           limits:
             cpu: 500m
-            memory: 256Mi
+            memory: 512Mi
         securityContext:
           runAsNonRoot: true
           runAsUser: 10001
@@ -81,9 +143,11 @@ spec:
           mountPath: /etc/otelcol-contrib
           readOnly: true
         # readOnlyRootFilesystem is true; the collector needs a writable scratch
-        # dir. With debug/logging exporters only (no file_storage / persistent
-        # queue) an emptyDir at /tmp is sufficient — if a write error ever appears
-        # the fix is an emptyDir mount, NOT loosening securityContext (per security).
+        # dir. With debug + prometheus exporters (no file_storage / persistent
+        # queue — the prometheus exporter holds series in memory and is scraped,
+        # it does not spool) an emptyDir at /tmp is sufficient. If a write error
+        # ever appears the fix is another emptyDir mount, NOT loosening
+        # securityContext (per security).
         - name: tmp
           mountPath: /tmp
       volumes:

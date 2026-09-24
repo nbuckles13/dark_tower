@@ -107,25 +107,39 @@ const OVERCLAIM_SUBSTRINGS: &[&str] =
 /// The client SDK's reserved metric-name namespace.
 ///
 /// Enforced for the client by `R26_NAME_RE` in
-/// `crates/dt-guard/src/ts_metric_naming.rs`; no Rust crate emits it. Used as a
-/// premise pin rather than a hygiene rule — see [`scrape_reachable_client_series`].
+/// `crates/dt-guard/src/ts_metric_naming.rs`; no Rust crate emits it. Series in
+/// this namespace ARE scrape-reachable as of R-27 (they arrive under
+/// `job="otel-collector"`), so this is now a SELECTOR for the client leg of the
+/// hygiene rules — see [`scrape_reachable_client_series`] — and no longer the
+/// subject of a non-reachability premise pin.
 const CLIENT_METRIC_PREFIX: &str = "dt_client_";
 
 /// Evaluate both rules over a series set.
 ///
-/// **No allowlist, and the empty allowlist is the point.** ADR-0036 §11
-/// grandfathers exactly one set — the ADR-0028 join-flow metrics of the *client
-/// SDK*, which carry `meeting_id_hash`. Those are TypeScript and structurally
-/// cannot reach a Prometheus scrape: the OTel collector declares a single
-/// `debug` exporter and there is no otel-collector scrape job. So over Rust
-/// service jobs the exception has **zero members**. An allowlist here would be
-/// dead on the day it was written and would swallow the first real violation
-/// after that. If a carve-out ever seems necessary, the diagnosis is that the
-/// job selector was widened past the Rust services — narrow it back.
+/// **No allowlist, and the empty allowlist is still the point — but the reason
+/// changed, and the old reason is now false.** ADR-0036 §11 grandfathers exactly
+/// one set: the ADR-0028 join-flow metrics of the *client SDK*, which carry
+/// `meeting_id_hash`.
 ///
-/// (The structural facts are cited deliberately, not the collector's
-/// `verbosity: normal`: verbosity is a knob someone can turn, the missing
-/// exporter and missing scrape job are not.)
+/// This used to rest on those metrics being structurally unable to reach a
+/// scrape — the collector declared a single `debug` exporter and no job scraped
+/// it. **Both of those facts are false as of R-27**: the collector has a
+/// `prometheus` exporter and an `otel-collector` scrape job, and client series
+/// are now examined by this module.
+///
+/// The conclusion survives on a stronger premise. The collector's metric-NAME
+/// allowlist (`infra/services/otel-collector/configmap.yaml`) admits exactly the
+/// media set and EXCLUDES all five grandfathered join-flow metrics, so no
+/// `meeting_id_hash`-carrying series is exported at all. The exception therefore
+/// still has **zero members**, now by curation rather than by accident. Had the
+/// join-flow metrics been exported with the hash stripped instead, this empty
+/// allowlist would have had to become a real carve-out — which is an independent
+/// reason the name list is curated the way it is.
+///
+/// An allowlist here would still be dead on the day it was written and would
+/// swallow the first real violation after that. If a carve-out ever seems
+/// necessary, the diagnosis is that the collector's name allowlist was widened
+/// to a metric carrying a meeting dimension — fix it there, not here.
 #[must_use]
 pub fn check_series(series: &[Series]) -> Vec<Violation> {
     let mut out = Vec::new();
@@ -192,13 +206,15 @@ pub fn check_series(series: &[Series]) -> Vec<Violation> {
 
 /// Series whose metric name is in the client SDK's reserved namespace.
 ///
-/// **A premise pin, not a hygiene rule.** Client media metrics are covered at
-/// the node tier by task 19 and are not re-asserted here. What this pins is that
-/// they are not scrape-reachable — trivially true today. If someone adds a
-/// Prometheus exporter to the OTel collector, this becomes non-empty and forces
-/// this suite's job list to be extended, rather than the client surface silently
-/// remaining unexamined. A non-empty result means "extend the suite", **not**
-/// "a leak occurred".
+/// **A selector, not a premise pin.** It used to pin that client series were not
+/// scrape-reachable; R-27 made them reachable, so the pin was replaced by the
+/// client leg of the hygiene rules in `32_media_metric_hygiene.rs`. A non-empty
+/// result is now the NORMAL case whenever a browser has emitted recently, and an
+/// EMPTY result is not evidence of anything — on an idle cluster no browser has
+/// emitted within the collector's `metric_expiration`. That is why callers must
+/// carry a browser-independent positive control (`up{job="otel-collector"}`)
+/// rather than gating on this being non-empty, which would red on every idle
+/// run.
 ///
 /// Keyed on the metric-name prefix rather than on a `client_version` label:
 /// `client_version` is not intrinsically client-only (a server-side

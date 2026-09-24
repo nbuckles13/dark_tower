@@ -696,9 +696,10 @@ async fn telemetry_drops_pii_but_forwards_filtered_bytes(pool: PgPool) -> Result
     });
 
     let now = Utc::now().timestamp();
+    let claims_org_id = Uuid::new_v4().to_string();
     let token = keypair.sign_user_token(&TestUserClaims {
         sub: "user-pii".to_string(),
-        org_id: Uuid::new_v4().to_string(),
+        org_id: claims_org_id.clone(),
         email: "u@e.com".to_string(),
         roles: vec!["user".to_string()],
         iat: now,
@@ -732,6 +733,26 @@ async fn telemetry_drops_pii_but_forwards_filtered_bytes(pool: PgPool) -> Result
         .attributes;
     let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
     assert!(keys.contains(&"org_id"), "allowlisted key must survive");
+    // ...and it must carry the AUTHENTICATED tenant, not whatever the payload
+    // said. Key-presence alone cannot see a filter that rewrites values, which
+    // is why this assertion reads the value off the wire. The payload sends
+    // `org-123`; the claim is a UUID, so a passthrough would be visible here.
+    let forwarded_org = attrs
+        .iter()
+        .find(|kv| kv.key == "org_id")
+        .and_then(|kv| kv.value.as_ref())
+        .and_then(|v| v.value.as_ref())
+        .and_then(|v| match v {
+            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s) => {
+                Some(s.clone())
+            }
+            _ => None,
+        })
+        .expect("org_id must be a scalar string on the wire");
+    assert_eq!(
+        forwarded_org, claims_org_id,
+        "org_id must be stamped from the authenticated claim, never proxied from the payload"
+    );
     assert!(
         !keys.contains(&"secret_user"),
         "disallowed key must be stripped from the forwarded bytes"

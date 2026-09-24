@@ -666,7 +666,12 @@ sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[
 **Impact**: Affected participants hear nothing while every server-side signal reads healthy — MH never opens a frame and structurally cannot observe either condition.
 **Runbook**: [Scenario 16: Missing Key Material](../runbooks/mc-incident-response.md#scenario-16-missing-key-material)
 
-> **THIS ALERT CANNOT FIRE TODAY, AND THAT IS NOT A THRESHOLD PROBLEM.** `dt_client_*` metrics reach no Prometheus in this deployment: the OTLP collector's metrics pipeline exports to `debug` (its own container log) and no Prometheus job scrapes the collector, so the series does not exist. **The absence of this alert firing is not evidence that key delivery is healthy.** The rule lands so that wiring the exporter is the single remaining step rather than a rule nobody wrote; the wiring is tracked in `docs/TODO.md` §Observability Debt. Stated here, adjacent to the PromQL, because every other entry in this file is written in the present tense and an unmarked entry would read as coverage.
+> **THIS ALERT CAN NOW FIRE, AND HAS BEEN PROVEN TO MATCH.** It previously carried a notice that it was structurally incapable of matching, because `dt_client_*` metrics reached no Prometheus. That is fixed: the collector's `prometheus` exporter, the `otel-collector` scrape job and the GC telemetry-filter widening landed together, and the expression below returned `0.286` against live data driven by sdk-core's own built bundle through the GC proxy. Recorded as an event rather than deleted, because "this alert has never fired" means something different before and after that date, and a responder reading history needs to know which side of it they are on.
+>
+> **Two scope limits that are NOT threshold problems and will not show up as a failure.**
+>
+> 1. **Guest participants are invisible to this alert.** GC's telemetry routes require user claims (`route_layer(require_user_auth)`), so guest tokens receive a 401 and emit nothing. Both the numerator and the denominator therefore exclude every guest in the meeting. A meeting whose affected participants are all guests reads completely healthy here. Tracked as a latent gap in `docs/TODO.md`; the practical consequence today is that every browser in an N+1 demo must sign in as a registered user or the detector is blind to it.
+> 2. **Absence of data is still not evidence of health.** The series is now lazily created on first emission, so it is absent — not zero — until a browser reports. The non-zero-denominator guard in the expression correctly suppresses the alert in that state, which is right, but it means silence spans both "key delivery is healthy" and "no client has been connected recently". Discriminate before concluding: `docs/observability/dashboards.md` §Client SDK Media Path carries the three-step procedure.
 
 **PromQL**:
 ```promql
@@ -887,6 +892,133 @@ and
 >   number is **not ratified against the current SLI**. The alert is legitimate future work, but it
 >   cannot carry a number until story 8 ratifies one; see `docs/observability/slos.md`. Left out of
 >   the candidate list above rather than restated with a stale threshold.
+
+---
+
+## Telemetry Pipeline Alerts (OTel collector) — SPECIFIED, NOT LOADED
+
+> ## NONE OF THE THREE BELOW EXISTS AS A RULE. NOTHING FIRES ON ANY OF THESE CONDITIONS TODAY.
+>
+> These are **specifications for rules to be written**, not inventory entries.
+> They are in this file because the definitions and their derivations are
+> `observability`'s and this is where that reasoning lives; the rule files are
+> `operations`-owned (ADR-0011 §Documentation Ownership) and no rule file under
+> `infra/docker/prometheus/rules/` contains any of these names. **Do not read
+> this section as coverage** — that is the precise failure this file's own
+> inventory guard exists to prevent, whose message reads: *"An inventory entry
+> reads as coverage; a responder searching for what covers a failure mode would
+> find this and stop looking. Delete it, or land the rule."*
+>
+> **The heading level below is `###` DELIBERATELY, and must not be promoted to
+> `####` until the rules land.** `dt-guard alert-rules` parses `#### <AlertName>`
+> as an inventory entry and requires a matching rule plus a byte-identical
+> `promql` block; promoting these headings before the rules exist turns the guard
+> red, which is correct behaviour and the reason the distinction is mechanical
+> rather than a matter of tone. **When the rules land, promote the headings in the
+> same commit** — that is what moves them from specification to inventory and puts
+> them under the guard.
+>
+> Tracked in `docs/TODO.md` §Observability Debt.
+>
+> This block was added after review found that the section, as first written, was
+> indistinguishable from the loaded entries above it *and* sat below the guard's
+> detection threshold — so the guard reported clean having examined nothing. Both
+> halves are recorded because the second is the more dangerous one.
+
+**Why these three are a SET and must not be pruned as redundant.** The collector's
+metrics path is composed entirely of allowlists — a metric-name filter, a temporality
+filter, `keep_keys`, `max_streams`, `memory_limiter` — and **every allowlist fails by
+making something absent**. On the client-media board absence is already ambiguous with
+"no browser connected", so a pipeline built only of fail-quiet controls has no way to
+report its own breakage. These three give it one: **the band watches the output, the
+drop counters watch the machine, and the anchor watches the drop counters.** Remove any
+one and the remaining two lose the property that motivated them.
+
+Rule files are `operations`-owned (ADR-0011 §Documentation Ownership); the definitions
+and reasoning below are `observability`'s.
+
+### ClientSeriesCountOutOfBand
+
+**Severity**: Warning
+**Signal**: `count({job="otel-collector"})` against a derived band.
+
+**A BAND, NOT A CEILING — deliberately.** A ceiling is structurally blind to the failure
+this is most likely to see: a label key missing from `keep_keys` makes several series
+**collapse into one**, so the count goes *down*. Inflation and collapse are both real and
+they move in opposite directions.
+
+Derivation constraints, all three of which are load-bearing and none re-derivable from the
+rule file:
+
+- **The floor derives from the UNCONDITIONALLY-EMITTED series only**, never from the label
+  cross-product. OTel JS creates a series lazily per label set, so a healthy cluster with
+  zero drops legitimately has no drop-family series at all; a cross-product floor fires
+  hardest when everything works.
+- **The floor is conditioned on the pipe being live** via the *send* counter, not the
+  receive counter. A solo browser with nobody listening legitimately receives nothing, so
+  a receive-keyed condition would disable the floor in exactly the single-browser case
+  someone is most likely to be looking at.
+- **The ceiling tolerates at least one full `metric_expiration` of tenant overlap.**
+  `scripts/layer7.sh` provisions a fresh per-run organization and GC stamps its UUID as
+  `org_id`, so at every CI run boundary the previous run's series are still exported and
+  the count legitimately sits at a multiple of the single-tenant expectation. **This is a
+  dev-cluster artefact of per-run provisioning, not a production shape** — in a real
+  deployment `org_id` is stable and no overlap exists. Do not carry the headroom into
+  production, and do not size for production and then get paged by CI.
+
+**What it does NOT catch**: a *single* metric losing *one* label key. Two series becoming
+one against a fleet-sized band is noise. That residual is tracked in `docs/TODO.md`
+(client metric label keys are unguarded) and is not closed by this alert.
+
+### CollectorDroppingTelemetry
+
+**Severity**: Warning
+**Signal**: the healthy-**zero** `otelcol_*` families at `> 0` — receiver refused, processor
+refused (the `memory_limiter` backpressure signal), exporter send-failed, and the
+`delta_to_cumulative` stream-limit counter.
+
+**NEVER alert on the filter processor's own drop count.** Discarding every metric outside
+the name allowlist is the filter doing its job on every batch, so that family is
+healthy-**nonzero** at all times and an alert on it fires continuously on a working
+collector. It belongs on a panel, not in a rule. (It also carries no `processor` label, so
+it cannot distinguish the two filters even if you wanted it to.)
+
+**The partition is a MEASURED FACT about a specific image, not a derivation** — read off
+the running pod, recorded with its tag and digest in the devloop record. Nothing recomputes
+it, and the event that invalidates it is an image bump. Two live traps confirming that: the
+exposed family keeps the **old** `deltatocumulative` spelling even though the processor is
+configured as `delta_to_cumulative`; and every metric-flavoured family is **absent until the
+first datapoint flows**, so absence here means "nothing has failed *or* nothing has run" —
+which is why the anchor below exists. Re-read the names at every bump; the pre-upgrade
+checklist in the collector runbook is the human control and inherits every weakness of that
+class.
+
+### CollectorSelfTelemetryAbsent
+
+**Severity**: Warning
+**Signal**: `absent()` on a process gauge from `job="otel-collector-telemetry"` — a family
+that is present-at-idle from process start and does not depend on any pipeline activity.
+
+**This is the positive control for the rule above, and without it that rule inherits the
+defect it was added to fix.** If a family is renamed at the next image bump,
+`CollectorDroppingTelemetry` silently stops matching and goes quiet — two rules added to
+detect silent drops, failing silently. This anchor turns a wholesale rename, a format change
+or a broken scrape **red**.
+
+**Scope, stated so the anchor does not read as full coverage**: it catches wholesale loss,
+**not** an individually renamed family. That remains the pre-upgrade checklist's job.
+
+**`for:` differs from the capacity gauge over the same series, and that is why there are two
+rules rather than one.** The anchor needs a `for:` long enough to ride out a collector
+restart or a missed scrape without flapping; a capacity reading wants none. Do not collapse
+them as duplicates.
+
+**Capacity note**: the collector runs Guaranteed QoS (`requests.memory == limits.memory`).
+A utilisation ratio alerts against **`limits.memory`** — the limit is what OOMKills, the
+request only affects scheduling — and the comment must name which, because the two were
+different values earlier in this design's history and a bare figure is ambiguous between
+them. Record what any measured RSS figure was taken against; the same number reads as
+comfortable or alarming depending on a limit that has already changed twice.
 
 ---
 

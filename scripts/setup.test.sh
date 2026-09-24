@@ -632,4 +632,29 @@ assert_rc "arcm-other-kind-no-restart"           1 $?
 arcm ''
 assert_rc "arcm-empty-output-no-restart"         1 $?
 
+# ---- extract_manifest_images: a comment must never become an image ----------------
+# Regression for Gate 2 attempt 1: a ConfigMap-literal comment "# image: without this"
+# was extracted as an image and `podman pull docker.io/without` broke bring-up.
+RUN_EMI='sp="$1"; in="$2"; set --; source "$sp" >/dev/null 2>&1; printf "%s" "$in" | extract_manifest_images'
+emi() { bash -c "$RUN_EMI" _ "$SETUP" "$1"; }
+# Value-equality check on the extractor's OUTPUT, feeding the shared PASS/FAIL
+# counters. An exit code cannot express "extracted nothing" vs "extracted the wrong
+# thing", and extracting a wrong thing is precisely the regression.
+emi_expect() {
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$actual" == "$expected" ]]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); FAILURES+=("[${label}] expected=${expected@Q} actual=${actual@Q}"); fi
+}
+
+emi_out=$(emi $'      containers:\n      - name: c\n        image: otel/opentelemetry-collector-contrib:0.161.0\n')
+emi_expect "emi-real-image-key"         "otel/opentelemetry-collector-contrib:0.161.0" "$emi_out"
+emi_out=$(emi $'      - image: redis:7.2-alpine\n')
+emi_expect "emi-list-item-image-key"    "redis:7.2-alpine" "$emi_out"
+emi_out=$(emi $'      # image: without this, the second writer is dropped\n')
+emi_expect "emi-comment-never-matches"  "" "$emi_out"
+emi_out=$(emi $'    # Measured on the pinned image: without this, the total reads 29\n')
+emi_expect "emi-midline-prose-never-matches" "" "$emi_out"
+emi_out=$(emi $'  data:\n    note: the image: field is set elsewhere\n')
+emi_expect "emi-value-text-never-matches" "" "$emi_out"
+
 report_results "scripts/setup.test.sh"

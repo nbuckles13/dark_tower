@@ -20,6 +20,7 @@ pub mod alert_rules;
 pub mod api_version;
 pub mod application_metrics;
 pub mod cite_extract;
+pub mod client_metrics_export;
 pub mod common;
 pub mod counter_zero_init;
 pub mod cross_boundary_classification;

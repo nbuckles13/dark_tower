@@ -54,11 +54,37 @@ use env_tests::fixtures::PrometheusClient;
 /// Rust service jobs. Deliberately ALL four, not just the media pair: R1 is
 /// "no meeting identifier on any metric anywhere in this design", and narrowing
 /// to media metrics would leave the broader rule unasserted.
-const JOBS: &str = "ac-service|gc-service|mc-service|mh-service";
+/// `otel-collector` IS INCLUDED, and it is the whole reason R1 has anything to
+/// say about client series. With `honor_labels: false` the browser `dt_client_*`
+/// series arrive under `job="otel-collector"`, so a selector listing only the
+/// four Rust services would never see them — the absence checks would keep
+/// passing while examining an empty set, which is a control that has been
+/// blinded rather than satisfied.
+///
+/// NOT `otel-collector-telemetry`: that job carries the collector's own
+/// `otelcol_*` counters, which are neither client nor service application
+/// metrics and are not what these rules are about.
+const JOBS: &str = "ac-service|gc-service|mc-service|mh-service|otel-collector";
 
 /// The presence anchor. Eagerly registered at MH startup, so its absence means
 /// MH is not up, not scraped, or its registration path broke.
 const MH_ANCHOR_METRIC: &str = "mh_media_frames_forwarded_total";
+
+/// The collector-leg positive control.
+///
+/// `up` for a scrape target is synthesised by Prometheus itself on every scrape,
+/// so it is present the moment the job exists and the target is reachable —
+/// INCLUDING on a completely idle cluster where no browser has ever emitted.
+/// That is precisely what makes it usable here: it proves this suite reached a
+/// verdict over a real scrape of the collector, rather than reading empty
+/// because the selector was wrong, the job was missing, or the query path was
+/// broken.
+///
+/// A client-series presence anchor would NOT do this job. Client series only
+/// exist while a browser has emitted within `metric_expiration`, so gating on
+/// one would red on every idle run — the identical trap this file already
+/// reasons about for MC's lazily-created metrics, and how a control dies.
+const COLLECTOR_UP_QUERY: &str = r#"up{job="otel-collector"}"#;
 
 /// Distinct triage strings. **Keyed by the runbook §8 rows** — if either side is
 /// reworded the row silently stops matching, which is the extraction-vacuity
@@ -183,31 +209,102 @@ async fn media_metric_labels_carry_no_meeting_identifier_and_no_overclaim() {
     );
 }
 
-/// Premise pin: client media metrics are not scrape-reachable.
+/// The client-series leg of R1, now that client metrics ARE scrape-reachable.
 ///
-/// Trivially true today and that is the point — it *documents* the
-/// non-reachability at the artifact rather than in a comment that can rot. The
-/// client surface is covered at the node tier by task 19
-/// (`packages/sdk-core/src/media/setup/__tests__/mediaMetrics.test.ts` and
-/// `ingress.attribution.test.ts`); no second assertion of it is added here.
+/// # This test replaced a premise pin that this very change would have blinded
+///
+/// It used to assert that `dt_client_*` was NOT scrape-reachable, and instructed
+/// a future reader to extend the suite if that ever changed. That change is
+/// this one. Left as written it would not have failed and prompted the
+/// extension — it would have kept passing, because the old job selector listed
+/// only the four Rust services while client series arrive under
+/// `job="otel-collector"`. A control whose subject moves out of its selector
+/// reports clean forever, having observed nothing.
+///
+/// # Why the §11 exception still has zero members — for a NEW reason
+///
+/// The old reasoning was structural non-reachability: the collector had one
+/// `debug` exporter and nothing scraped it. Both facts are now false. The
+/// conclusion survives on a better premise: the collector's metric-name
+/// allowlist EXCLUDES all five grandfathered join-flow metrics
+/// (`infra/services/otel-collector/configmap.yaml`), so no
+/// `meeting_id_hash`-carrying series is exported at all. Had we instead exported
+/// them and stripped the hash, this empty allowlist would have had to become a
+/// real carve-out — which is an independent reason the name list is curated the
+/// way it is.
+///
+/// # Vacuity, stated rather than hidden
+///
+/// On an idle cluster no browser has emitted within the collector's
+/// `metric_expiration`, so there are no client series and the R1 leg over them
+/// is ACKNOWLEDGED-VACUOUS: it passes having examined nothing. The positive
+/// control below keeps that honest by proving the scrape path itself is live, so
+/// a vacuous pass is distinguishable from a broken query. The NON-vacuous proof
+/// that `keep_keys` actually drops `meeting_id_hash` lives in the client-owned
+/// browser read-back, which asserts presence AND absence in the same fetch, in a
+/// run where a browser is guaranteed to have emitted. Do not read this leg as
+/// that proof.
 #[tokio::test]
-async fn client_media_metrics_are_not_scrape_reachable() {
+async fn client_series_carry_no_meeting_identifier_when_present() {
     let cluster = cluster().await;
     let client = PrometheusClient::new(&cluster.prometheus_base_url);
-    let series = fetch_all_series(&client).await;
 
-    let reachable = scrape_reachable_client_series(&series);
+    // POSITIVE CONTROL FIRST. Without it, every assertion below is satisfiable
+    // by a wholesale-empty result.
+    let up = client
+        .query(env_tests::fixtures::metrics::QueryRequest::instant(
+            COLLECTOR_UP_QUERY,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{TRIAGE_SCRAPE}: querying {COLLECTOR_UP_QUERY} failed: {e}"));
     assert!(
-        reachable.is_empty(),
-        "Client SDK metrics are now scrape-reachable: {reachable:?}\n\n\
-         THIS IS NOT A LEAK and must not be triaged as one. It means someone \
-         added a Prometheus exporter to the OTel collector, or an \
-         otel-collector scrape job. The obligation it creates is to EXTEND this \
-         suite: the client join-flow metrics legitimately carry \
-         `meeting_id_hash` as ADR-0036 §11's grandfathered set, so once they are \
-         scraped the empty-allowlist reasoning above no longer holds and the \
-         grandfathered roster in `docs/observability/metrics/client.md` has to \
-         become a real carve-out here."
+        up.data.result.iter().any(|s| s
+            .value
+            .as_ref()
+            .and_then(|(_, v)| v.parse::<f64>().ok())
+            .is_some_and(|v| v >= 1.0)),
+        "{TRIAGE_SCRAPE}: `{COLLECTOR_UP_QUERY}` is not 1.\n\n\
+         The otel-collector scrape target is not up, so this suite cannot see \
+         client series AT ALL and every absence assertion below would pass \
+         vacuously. Check the `otel-collector` job in \
+         `infra/kubernetes/observability/prometheus.yml`, the :8889 container \
+         port, and the Prometheus ingress rule in the collector NetworkPolicy. \
+         This is an environment failure, not a policy violation."
+    );
+
+    let series = fetch_all_series(&client).await;
+    // One home for "what counts as a client series" — the same predicate the
+    // fixture's own unit tests exercise, rather than a second inline prefix test.
+    let client_names = scrape_reachable_client_series(&series);
+    let owned: Vec<Series> = series
+        .iter()
+        .filter(|s| client_names.contains(&s.name))
+        .cloned()
+        .collect();
+
+    // Not an anchor: see the vacuity paragraph above. Reported so a reader of a
+    // green run knows which case they got.
+    if owned.is_empty() {
+        eprintln!(
+            "NOTE: no `dt_client_*` series present — no browser has emitted within \
+             the collector's metric_expiration. The R1 leg over client series is \
+             vacuous for this run; the non-vacuous proof is the browser read-back."
+        );
+    }
+
+    let violations = check_series(&owned);
+    assert!(
+        violations.is_empty(),
+        "{TRIAGE_VIOLATION}: client series reached Prometheus carrying a meeting \
+         identifier or an overclaim token:\n{}\n\n\
+         The metrics-path `keep_keys` in \
+         `infra/services/otel-collector/configmap.yaml` is the control that should \
+         have prevented this — check it before looking anywhere else.",
+        violations
+            .iter()
+            .map(|v| format!("  - [{:?}] {} :: {}", v.rule, v.series, v.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 

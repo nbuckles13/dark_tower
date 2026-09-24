@@ -38,11 +38,23 @@
 // service.version=__SDK_VERSION__ (build-time define), service.namespace=
 // darktower, deployment.environment=<env>.
 
-import { metrics, propagation, type Meter, type Tracer } from '@opentelemetry/api';
+import {
+  diag,
+  DiagConsoleLogger,
+  DiagLogLevel,
+  metrics,
+  propagation,
+  type Meter,
+  type Tracer,
+} from '@opentelemetry/api';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
 import { resourceFromAttributes } from '@opentelemetry/resources';
-import { MeterProvider, PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+import {
+  AggregationTemporality,
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from '@opentelemetry/sdk-metrics';
 import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
 import {
   ATTR_SERVICE_NAME,
@@ -68,8 +80,34 @@ export interface TelemetryConfig {
   /**
    * Base URL of the GC telemetry proxy, e.g. `https://gc.example/api/v1/telemetry`.
    * The OTLP-proto metric exporter appends `/v1/metrics` (per task #12).
+   *
+   * **THIS URL RECEIVES THE USER'S BEARER TOKEN.** Every export carries
+   * `Authorization: Bearer <userToken>` when {@link authTokenProvider} yields one
+   * (GC's telemetry route is behind `require_user_auth` and rejects otherwise).
+   * So this is not merely "where metrics go" — pointing it at a third-party
+   * collector hands that party a live user credential. It is deliberately
+   * config-supplied rather than user-supplied, and the app points it same-origin.
    */
   readonly telemetryEndpoint: string;
+  /**
+   * Returns the CURRENT user bearer token, or `undefined` when unauthenticated.
+   *
+   * A GETTER, NOT A TOKEN, and that is the whole point. GC's telemetry proxy is
+   * behind `require_user_auth`, so exports need a credential — but telemetry is
+   * configured once while the token arrives later, changes on re-auth, and is
+   * cleared on sign-out. Passing a VALUE here would capture whichever of those
+   * moments happened to be first.
+   *
+   * It must READ the application's single session home rather than hold a copy.
+   * A second holder of a bearer credential needs its own clearing on sign-out and
+   * on the 401 path, and drifts from the first the moment one is cleared and the
+   * other is not — which is the defect class `lib/types.ts` documents at length
+   * for `AuthSession.userToken`.
+   *
+   * The SDK never stores the returned value: it is read per export and used to
+   * build one header.
+   */
+  readonly authTokenProvider?: () => string | undefined;
   /** Deployment environment; drives the name-guard mode + resource attribute. */
   readonly env: TelemetryEnv;
   /**
@@ -106,6 +144,92 @@ function guardModeFor(env: TelemetryEnv): GuardMode {
 }
 
 /**
+ * Build the OTLP metric exporter. Extracted so the temporality choice below is
+ * testable against the REAL exporter rather than against the argument passed to
+ * it — see `__tests__/telemetryConfig.test.ts`.
+ *
+ * ---------------------------------------------------------------------------
+ * DELTA IS DELIBERATE: AGGREGATION HAPPENS IN THE COLLECTOR, NOT PER BROWSER
+ * ---------------------------------------------------------------------------
+ *
+ * Every browser in a meeting emits the SAME series identity
+ * (`{client_version, org_id, key_custody}` — ADR-0036 §11 permits no participant
+ * dimension, and a per-session `service.instance.id` is the same thing under
+ * another name). With CUMULATIVE temporality, N browsers each export their own
+ * lifetime total under one identity and the collector's exporter keeps whichever
+ * arrived last: the stored series oscillates between unrelated totals and
+ * `rate()` sees a reset on nearly every scrape.
+ *
+ * With DELTA, each export carries only that interval's increment, so the
+ * collector's `delta_to_cumulative` processor SUMS them into one correct
+ * cumulative series with no per-browser label
+ * (`infra/services/otel-collector/configmap.yaml`). That is the entire reason
+ * the fleet can be counted without identifying anyone.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE TEST ASSERTS BEHAVIOUR AND NOT THIS ARGUMENT
+ * ---------------------------------------------------------------------------
+ *
+ * The exporter's internal selector compares against
+ * `AggregationTemporalityPreference.DELTA`, a DIFFERENT enum from the
+ * `AggregationTemporality.DELTA` passed here. They agree today only because both
+ * happen to use the value `0`; `AggregationTemporalityPreference` is not
+ * re-exported by the proto package, so using it would mean a new dependency for
+ * a numerically identical value. If either enum is ever renumbered, this silently
+ * falls through to CUMULATIVE and the whole client pipeline goes quietly wrong —
+ * which is why the test builds the real exporter and asserts what it SELECTS.
+ */
+export function createMetricExporter(
+  telemetryEndpoint: string,
+  authTokenProvider?: () => string | undefined,
+): OTLPMetricExporter {
+  return new OTLPMetricExporter({
+    // The browser exporter appends `v1/metrics`; pass the proxy base URL.
+    url: `${telemetryEndpoint}/v1/metrics`,
+    temporalityPreference: AggregationTemporality.DELTA,
+    // A FACTORY, NOT A FIXED RECORD, AND IT MUST STAY ONE. The exporter awaits
+    // this on EVERY export (`otlp-exporter-base`'s `HeadersFactory`).
+    //
+    // TWO reasons, and the second is the one that gets optimised away. (1)
+    // ROTATION: telemetry is configured once at mount, the token appears at
+    // sign-in and changes on re-auth, so a header record captured at construction
+    // would freeze whichever of those was true first — for the app's real
+    // ordering, "no token", forever. (2) RETENTION: caching the resolved token
+    // here would give a bearer credential a SECOND home inside the SDK, one that
+    // no sign-out path clears — so a token the user revoked would keep being sent.
+    // THERE IS NO MECHANICAL BACKSTOP FOR THIS, which is why it is spelled out
+    // rather than left to review. `crates/dt-guard/src/ts_retained_credentials.rs`
+    // does scan this package, but it indexes DECLARATION MEMBERS — interface and
+    // class fields — so a `let cached` inside this closure matches nothing it
+    // inspects. The per-export unit test in
+    // `__tests__/telemetryConfig.delta.test.ts` is the only executable defence,
+    // and it asserts through the real exporter's factory precisely so it proves
+    // the EXPORTER re-asks rather than merely that the provider works.
+    //
+    // So: do not memoise the token "to save an await". The SDK holds the function
+    // REFERENCE and never a resolved value.
+    //
+    // Without this, every export 401s at GC's `require_user_auth`. That failure
+    // is INVISIBLE on both sides: the middleware is a route layer, so it rejects
+    // before the handler and `gc_telemetry_ingest_total` never increments even as
+    // a rejection; and OTel reports export failure through `diag`. The result
+    // would be empty panels, a silent console and a zero counter — exactly the
+    // shape of "no browser connected".
+    //
+    // The header is OMITTED ENTIRELY when there is no token, never sent as
+    // `Bearer undefined`. In practice the unauthenticated case does not arise:
+    // `PeriodicExportingMetricReader` skips the export when nothing was recorded,
+    // and every `dt_client_*` metric fires after sign-in. So an export with no
+    // token means something real — post-sign-out residue, or a misconfigured
+    // provider — and is worth letting fail rather than suppressing.
+    headers: () => {
+      const token = authTokenProvider?.();
+      return Promise.resolve(token === undefined ? {} : { Authorization: `Bearer ${token}` });
+    },
+  });
+}
+
+/**
  * Configure the SDK's single global telemetry providers. Idempotent-ish: a
  * second call replaces the previous configuration (last-config-wins). Safe to
  * call before any join; until called, the SDK uses `NoopMetricsSink` (telemetry
@@ -114,6 +238,34 @@ function guardModeFor(env: TelemetryEnv): GuardMode {
  * R-22's `MeetingSession.configure` will delegate here.
  */
 export function configureTelemetry(config: TelemetryConfig): MetricsSink {
+  // OUTSIDE PRODUCTION, MAKE EXPORT FAILURE AUDIBLE. OTel reports export errors
+  // — a 401 from the telemetry proxy, a CORS rejection, an unreachable endpoint —
+  // through `diag`, and nothing registers a `diag` logger by default, so they go
+  // nowhere. Combined with GC's route-layer auth (which rejects before the handler
+  // and so never increments the ingest counter), a broken token produces empty
+  // panels, a silent console and a zero counter: indistinguishable from nobody
+  // being connected. One console logger in dev/test removes that blind spot at
+  // the only moment anyone is watching.
+  //
+  // NOT in production, following `guardModeFor`'s existing precedent for the same
+  // trade-off: a per-export console error on a flaky network is noise a user
+  // cannot act on.
+  //
+  // VERSION-CHECKED, NOT ASSUMED: this logger could itself become the leak if the
+  // exporter put the outgoing request in its error. At the pinned
+  // `otlp-exporter-base` 0.221.0 it does not — `fetch-transport.js` builds the
+  // non-retryable error as `Fetch request failed with non-retryable status
+  // ${response.status}` (the status number only), network errors pass the fetch
+  // rejection as `cause`, and both `diag` calls interpolate `${error}`, never the
+  // request. So no `Authorization` header can reach the console.
+  //
+  // RE-CHECK THIS ON ANY EXPORTER BUMP. `ts_pii.rs` scans `console.*`/`logger.*`
+  // call sites, so it would give NO signal if a future version started attaching
+  // request context to the error — this is review-enforced, not guarded.
+  if (config.env !== 'production') {
+    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.ERROR);
+  }
+
   const resource = resourceFromAttributes({
     [ATTR_SERVICE_NAME]: SERVICE_NAME,
     // `__SDK_VERSION__` is a build-time Vite define (see vite.config.ts).
@@ -123,10 +275,7 @@ export function configureTelemetry(config: TelemetryConfig): MetricsSink {
   });
 
   // --- Metrics: single MeterProvider exporting OTLP-proto to the GC proxy ---
-  const exporter = new OTLPMetricExporter({
-    // The browser exporter appends `v1/metrics`; pass the proxy base URL.
-    url: `${config.telemetryEndpoint}/v1/metrics`,
-  });
+  const exporter = createMetricExporter(config.telemetryEndpoint, config.authTokenProvider);
   // Read from ONE named configuration point, never a literal here. See
   // `TelemetryConfig.metricExportIntervalMs` for the global blast radius.
   const reader = new PeriodicExportingMetricReader({
@@ -184,6 +333,11 @@ export async function flushMetrics(): Promise<void> {
  * `configureTelemetry` cleanly. Not part of the production join flow.
  */
 export function resetTelemetryForTest(): void {
+  // `configureTelemetry` registers a GLOBAL console `diag` logger outside
+  // production; without this, one test that configured telemetry leaves it
+  // registered for every later test in the worker, breaking this seam's
+  // "re-run cleanly" contract.
+  diag.disable();
   configured = undefined;
   propagation.disable();
 }

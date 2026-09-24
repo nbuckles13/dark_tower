@@ -273,16 +273,31 @@ Two conventions this board depends on, both easy to break by well-meaning edit:
 Receive- and send-path counters from the browser SDK, organised around the receive-path
 accounting identity `received = accepted + sum(drops by reason)`.
 
-> **This board is non-functional in its entirety today** and carries a banner saying so.
-> The SDK emits and exports correctly, but the OTLP collector's metrics pipeline exports
-> to `debug` and no Prometheus job scrapes it, so every panel renders "No data" for that
-> reason alone. It is built now because ADR-0036 §11 makes the client drop counters the
-> only signal for a join or rotation path that has silently stopped delivering keys, and
-> so that wiring the exporter is the single remaining step.
+> **This board is live.** The collector's `prometheus` exporter and the `otel-collector`
+> scrape job landed together with the GC filter widening; verified end to end from
+> sdk-core's own built bundle through the GC proxy on the cluster. A previous note here
+> described the board as non-functional in its entirety — that was true when written and
+> is recorded rather than silently dropped, because the *reason* it was built before it
+> could work still governs it: ADR-0036 §11 makes the client drop counters the only
+> signal for a join or rotation path that has silently stopped delivering keys.
 >
-> **The empty-panel wording on this board is the OPPOSITE of `mh-media.json`'s and must
-> not be copy-pasted between them.** There, empty means no drops occurred — the healthy
-> state. Here, empty means the pipeline is unwired and says nothing about drops at all.
+> **An empty panel here is AMBIGUOUS, and that ambiguity is new.** It no longer means
+> "unwired"; it now spans *no drops occurred*, *no browser connected recently*, and *the
+> pipeline broke*. The board carries a three-step discriminator in its READ FIRST panel:
+> is the collector scraped (`up{job="otel-collector"}`), has any browser emitted within
+> the collector's `metric_expiration` window, and only then does empty mean zero.
+>
+> **Step two is the only liveness signal the client fleet has.** There is no per-browser
+> `up` and there structurally cannot be one — a per-session `service.instance.id` is
+> barred by §11 — so series presence is the whole of it. That is a standing property of
+> the design, not a gap awaiting work.
+>
+> **The empty-panel meaning on this board is still the OPPOSITE of `mh-media.json`'s, and
+> the distinction got SHARPER rather than going away.** There, empty means no drops
+> occurred — unambiguously healthy, because MH registers its media series eagerly at
+> startup and they exist at zero whether or not anything flows. Here, client series are
+> created lazily on first emission, so absence and zero are genuinely different states.
+> Do not copy wording between the two boards in either direction.
 
 ## Platform Dashboards
 

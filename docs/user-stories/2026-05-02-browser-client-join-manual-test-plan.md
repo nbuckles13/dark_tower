@@ -114,8 +114,11 @@ Two acceptable outcomes — the point is to record which one is true:
 
 Observed reality: ______________________
 
-Note: `gc_http_*` normalizes the telemetry route to `endpoint="/other"` — do not use an
-`endpoint=~".*telemetry.*"` selector (tracked in `docs/TODO.md` §Observability Debt).
+Note: this was corrected on 2026-09-23. `gc_http_*` used to normalize the telemetry route to
+`endpoint="/other"`, making it unselectable; `normalize_endpoint` now has explicit arms for the
+OTLP telemetry paths, so `gc_http_requests_total{endpoint="/api/v1/telemetry/v1/metrics"}` is
+attributable and carries its own `status_code`. Select on that exact value — **not** on a
+`.*telemetry.*` regex, which would also match any future sibling route.
 
 ## Phase 6 — Resilience drill (optional)
 

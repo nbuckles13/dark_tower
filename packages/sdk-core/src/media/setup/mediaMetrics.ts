@@ -101,6 +101,14 @@ const KEY_CUSTODY = 'operator';
  * send" is the tempting wrong turn; it would spike the send-drop rate on every
  * mute. Mute is `dt_client_media_mute_transitions_total{action}` and nothing
  * else.
+ *
+ * RESERVED SENTINEL: `invalid` must never become a real token in this or any
+ * neighbouring media vocabulary. The OTel collector rewrites any value failing
+ * its charset check to exactly that string
+ * (`infra/services/otel-collector/configmap.yaml`), so a real token spelled
+ * `invalid` would be indistinguishable from a rewritten junk value from a
+ * patched client. `dt-guard client-metrics-export` (G6) fails the build if it
+ * ever appears here or in MH's `MediaDropReason`.
  */
 export const MEDIA_SEND_DROP_REASONS = {
   /**
@@ -198,7 +206,17 @@ export type ReportableWrapOutcome = Exclude<WrapOutcome, 'absent' | 'cached' | '
 export interface MediaMetricIdentity {
   /** SDK build version. */
   readonly clientVersion: string;
-  /** Organisation subdomain. Bounded cardinality; not a participant dimension. */
+  /**
+   * Organisation subdomain. Not a participant dimension.
+   *
+   * ADVISORY ON THE WIRE: GC replaces this value with the authenticated
+   * `UserClaims.org_id` (an org UUID) before anything is forwarded, so the
+   * stored label is the authenticated tenant and not whatever a browser sent —
+   * see `crates/gc-service/src/services/telemetry_filter.rs`. The previous
+   * "bounded cardinality" claim here was never enforceable from the client (a
+   * patched browser sends what it likes); it is now true for a different and
+   * better reason: the value space is the set of authenticated orgs.
+   */
   readonly orgId: string;
 }
 

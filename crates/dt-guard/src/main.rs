@@ -12,6 +12,7 @@ use dt_guard::alert_rules;
 use dt_guard::api_version;
 use dt_guard::application_metrics;
 use dt_guard::cite_extract;
+use dt_guard::client_metrics_export;
 use dt_guard::common::status::{emit_fail, reason_token};
 use dt_guard::counter_zero_init;
 use dt_guard::cross_boundary_classification;
@@ -156,6 +157,17 @@ enum Command {
     },
     /// Grafana datasources: UID-dedup + Loki-label consistency.
     GrafanaDatasources {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Drift control for the browser metrics export pipeline (R-27): catalog
+    /// <-> collector name sets, export markers, emitters, keep_keys vs the GC
+    /// filter, expiration relations, and the rewrite sentinel.
+    ClientMetricsExport {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -436,6 +448,9 @@ fn run(cli: Cli) -> Result<()> {
             infrastructure_metrics::run(&root, explain)
         }
         Command::GrafanaDatasources { root, explain } => grafana_datasources::run(&root, explain),
+        Command::ClientMetricsExport { root, explain } => {
+            client_metrics_export::run(&root, explain)
+        }
         Command::TsNoSecrets { root, explain } => ts_secrets::run(&root, explain),
         Command::TsNoPiiInLogs { root, explain } => ts_pii::run(&root, explain),
         Command::TsNoRetainedCredentials { root, explain } => {

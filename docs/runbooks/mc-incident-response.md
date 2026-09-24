@@ -2335,15 +2335,41 @@ sustained case is the signal**, and ADR-0036 §11 states it is the *only* signal
 rotation path that has silently stopped delivering keys. That is why the alert's `for:` window is
 long rather than its threshold being high — see the comment on the rule.
 
-> **THIS ALERT CANNOT FIRE TODAY, AND YOU DID NOT GET HERE BY BEING PAGED.**
+> **THIS ALERT CAN NOW FIRE, AND YOU MAY WELL HAVE BEEN PAGED.** Before 2026-09-23 it could not:
+> `dt_client_*` metrics reached no Prometheus. The export path is now built and proven end to end,
+> so a page from this alert is a real signal about real client-side drops.
 >
-> `dt_client_*` metrics do not reach Prometheus in this deployment: the OTLP collector's metrics
-> pipeline exports to `debug` — the collector's own container log — and no Prometheus job scrapes
-> the collector. So the series does not exist, and `MCMediaMissingKeyMaterial` cannot fire at any
-> threshold for any reason. **The absence of a page is not evidence that key delivery is healthy.**
-> You reached this scenario some other way: a user report, or a client-side counter read in a browser
-> devtools session (`client-dev-local.md` §4.5). Wiring the client metric export path is tracked in
-> `docs/TODO.md` §Observability Debt.
+> **But absence of a page is still not evidence that key delivery is healthy**, for a different
+> reason than before. The series can go *missing* without the alert firing: five controls on the
+> collector's metrics path drop client data by design, and on a deployed cluster all five look
+> identical to "no browser is running" — and there is no per-browser `up` signal, nor can there be
+> (ADR-0036 §11 bars a per-session `service.instance.id`), so the presence of a client series is the
+> only liveness signal the browser fleet has. If you arrived here from a user report rather than a
+> page, run the quiet-series ladder in `gc-deployment.md` §When the client series go quiet **before**
+> concluding that drops are not happening.
+>
+> **This alert's coverage is not meeting-wide.** Guest participants produce no client telemetry at
+> all, so a guest-only failure renders identically to a healthy meeting. Latent today (the SDK has no
+> guest join path yet) and tracked in one place — `docs/TODO.md`, the guest-telemetry entry — which
+> is where the mechanism, the trigger and the owner live. Do not restate them here.
+
+> **TIMESTAMPS ON CLIENT SERIES ARE COLLECTOR-ARRIVAL TIME, NOT BROWSER-EVENT TIME — AND THIS
+> SCENARIO IS WHERE THAT BITES.**
+>
+> The collector restamps every delta datapoint on arrival (it must: browsers with skewed clocks share
+> one stream identity, and a single far-future point would otherwise stall the whole fleet's
+> accumulation). Browsers buffer while the collector is unreachable and flush on recovery, so **every
+> buffered point is stamped at the moment of recovery.**
+>
+> **The entire triage below is a correlation between a client-side counter and MC-side events, so a
+> re-dated client series will mis-align that correlation by the full duration of any collector
+> outage** — and the client side will look like it started late. Before correlating, check whether
+> `up{job="otel-collector"} == 0` anywhere in the window: if it was, the client-side onset you are
+> reading is the flush, not the event, and the true onset is somewhere inside the gap. A long outage
+> also overflows the browser's bounded export queue, so the visible burst *understates* what was
+> lost. (The ratio this alert fires on is unaffected — numerator and denominator were buffered in the
+> same batch and compress together — which is why it is ratio-shaped and why an absolute-rate alert
+> on a `dt_client_*` series would fire on the artefact alone.)
 
 **Triage splits on the `reason` label first, because the two arms have different remedies — and
 because they are not equally instrumented.**
@@ -2386,9 +2412,12 @@ The client has no meeting KEK for the generation the frame's wrap announces. Rem
 > entry's own words — **the inference is not computable even in principle**, and **no alert may be
 > built on the absence of that counter moving**.
 >
-> So on this arm you have: a client-side counter that does not reach Prometheus, no MC-side counter,
-> and no alert that can fire. **The absence of a signal here is not evidence that the KEK is
-> present.**
+> The gap narrowed on 2026-09-23 but did not close. The client-side counter now DOES reach
+> Prometheus, so `dt_client_media_kek_updates_total{source="join_response"}` is queryable and this
+> arm has a real client-side signal for the first time. **There is still no MC-side counter, and
+> still nothing that can corroborate from the server.** So the arm remains asymmetric with Arm 1,
+> which has `mc_join_identity_key_presence_total` to answer "are clients publishing keys at all?"
+> directly. **The absence of a signal here is not evidence that the KEK is present.**
 
 **Check the non-dump path first, and completely, before anything else.** Both of these are
 observable without touching MC's memory:

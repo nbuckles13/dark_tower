@@ -21,6 +21,30 @@ PASS=0
 FAIL=0
 FAILURES=()
 
+# ---------------------------------------------------------------------------
+# A MISSING HELPER MUST BE A FAILURE, NOT A SKIPPED ASSERTION.
+# ---------------------------------------------------------------------------
+#
+# Harnesses run under `set +e` so that expected non-zero exits don't abort them.
+# That also means a call to a helper that does not exist — a typo'd `assert_rc`,
+# or one renamed out from under its caller — prints "command not found", moves
+# NEITHER counter, and the suite reports "N passed, 0 failed" and exits 0: the
+# assertion never ran and the harness reads clean. That has already happened
+# once (an `assert_eq` that was never defined, in scripts/setup.test.sh).
+#
+# WHY A FILE AND NOT `FAIL=$((FAIL+1))`: bash invokes `command_not_found_handle`
+# in a SEPARATE EXECUTION ENVIRONMENT, so a counter incremented inside it is
+# discarded on return — the obvious version of this fix is itself vacuous. The
+# handler records the missing name in a file; `report_results` folds it into
+# FAIL/FAILURES. Scope: the harness's own shell only. A `bash -c` child does not
+# inherit the function, which is correct — those children are code under test.
+__DT_HARNESS_MISSING="$(mktemp "${TMPDIR:-/tmp}/dt-harness-missing.XXXXXX")"
+command_not_found_handle() {
+  printf '%s\n' "$1" >>"$__DT_HARNESS_MISSING"
+  printf 'bash: %s: command not found (counted as a harness FAILURE)\n' "$1" >&2
+  return 127
+}
+
 # Increment PASS/FAIL; record failure context.
 # Args: $1=label  $2=expected-exit-code  $3=actual-exit-code
 # Returns: 0 always
@@ -108,6 +132,15 @@ assert_no_marker() {
 # Outputs: stdout=summary line + per-failure detail
 report_results() {
   local label="$1"
+  # Fold in any command-not-found recorded by the handler above.
+  if [[ -s "${__DT_HARNESS_MISSING:-}" ]]; then
+    local missing
+    while IFS= read -r missing; do
+      FAIL=$((FAIL + 1))
+      FAILURES+=("[harness] missing command/helper '${missing}' — an assertion that never ran")
+    done <"$__DT_HARNESS_MISSING"
+  fi
+  rm -f "${__DT_HARNESS_MISSING:-}"
   # THE LEADING PREFIXES ARE LOAD-BEARING — do not "clean up" either printf to
   # start a line at column zero.
   #

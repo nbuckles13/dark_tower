@@ -14,11 +14,29 @@
   import SignIn from './views/SignIn.svelte';
   import CreateMeeting from './views/CreateMeeting.svelte';
   import JoinMeeting from './views/JoinMeeting.svelte';
+  import { configureTelemetryIfEnabled } from './lib/session.js';
 
   let { config }: { config: DemoConfig } = $props();
 
   let view = $state<View>('signup');
   let auth = $state<AuthSession | undefined>(undefined);
+
+  // Telemetry is configured HERE rather than in `main.ts` because it needs a
+  // getter for the current user token — GC's telemetry proxy is behind
+  // `require_user_auth` and rejects an export without one — and `auth` is that
+  // token's only home. The arrow READS the session each time the SDK exports; it
+  // stores nothing, so no second holder of a bearer credential is created.
+  //
+  // Ordering is handled by construction, not by sequencing: the getter is called
+  // per export, long after mount, so a token that appears at sign-in, changes on
+  // re-auth, or is cleared by `onSessionInvalid` is picked up with no
+  // reconfiguration. `configureTelemetry` is also last-config-wins, and App mounts
+  // once.
+  //
+  // A telemetry 401 must NEVER reach `onSessionInvalid`. Export failures stay
+  // inside OTel and do not surface here today; keep it that way, or a telemetry
+  // outage starts signing users out.
+  configureTelemetryIfEnabled(config, () => auth?.userToken);
 
   // Effective view is BIDIRECTIONAL. Each direction closes a dead-end:
   //   authed   + auth-view    -> 'create'  (the control: auth views unreachable)

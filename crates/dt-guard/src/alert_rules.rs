@@ -1277,10 +1277,18 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         // `grafana_datasources.rs` remedy applied here.
         //
         // It stops at "loaded". A rule can be loaded, evaluating, and
-        // INCAPABLE OF EVER MATCHING — `MCMediaMissingKeyMaterial` is exactly
-        // that today, because `dt_client_*` metrics reach no Prometheus (the
-        // OTLP collector's metrics pipeline exports to `debug` and nothing
-        // scrapes it). This token must never be read as "the alerts fire".
+        // INCAPABLE OF EVER MATCHING. `MCMediaMissingKeyMaterial` WAS exactly
+        // that until 2026-09-23 — `dt_client_*` metrics reached no Prometheus,
+        // because the OTLP collector's metrics pipeline exported only to
+        // `debug` and nothing scraped it. That is fixed, and the example is
+        // stated as a past EVENT rather than a present claim precisely because
+        // the present-tense version silently became false while this guard went
+        // on reporting clean. The POINT is unchanged and is not about that
+        // alert: loading is not firing, and nothing here checks firing. A
+        // still-live instance of the same shape — `MCMediaMissingKeyMaterial`
+        // cannot observe guest participants at all, since GC's telemetry routes
+        // require user claims and guests 401. This token must never be read as
+        // "the alerts fire".
         // ALL THREE SCOPES NAMED, NOT TWO. Files linted, loadable files
         // covered, and inventory pairs compared. The third was missing in the
         // first version of this token, which is the same omission the comment

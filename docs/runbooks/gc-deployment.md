@@ -1367,24 +1367,62 @@ for AC/GC/MC/MH OTLP-gRPC traces and the GC `/api/v1/telemetry` OTLP-HTTP proxy
 path (R-2). This section is the upgrade discipline for it and the triage home for
 the `OTelExportFailureRate` alert.
 
-### Current vs. future blast radius (read this first)
+### Blast radius (read this first): THREE of four services, live now
 
-**On this branch the collector is enabled-but-inert.** No service `main.rs` calls
-`init_otel` yet (that per-service wiring is R-55), so the cluster-setup readiness
-gate blocks only on the collector's *own* readiness, and a collector
-outage/upgrade has **no service impact** today.
+**The hazard is ACTIVE on this branch. Do not discount it.** An earlier revision of
+this section said no service called `init_otel` yet and that a collector
+outage had "no service impact" — that was true before R-55 and is false now. It is
+recorded here rather than silently deleted because a runbook that *understates* a
+hazard is the failure mode this section exists to prevent.
 
-**The fleet-wide-CrashLoop hazard described below becomes ACTIVE only once
-per-service `init_otel` wiring (R-55) lands.** Do not over-read the hazard on the
-current branch.
+**Which services actually probe the collector, and which does not:**
 
-### Causal chain (once R-55 is live)
+| Service | Probes the collector at init? | Why |
+|---|---|---|
+| AC | **Yes** | `OTEL_ENABLED: "true"` in the Kind overlay + egress rule on 4317 |
+| GC | **Yes** | same |
+| MC | **Yes** | same |
+| MH | **No** | no `OTEL_ENABLED`, no `OTLP_ENDPOINT`, **and no 4317 egress rule** |
+
+MH's `main.rs` *does* call `init_otel`, but `Config::from_env` defaults
+`otel_enabled` to false and nothing in `infra/services/mh-service/` or the Kind
+overlay turns it on, so it never opens a connection to the collector.
+
+**Say "three of four", never "all four".** Two practical consequences:
+
+- A verification run that brings the stack up against a new collector exercises
+  **AC, GC and MC**. MH's leg passes because it never runs — reporting it as
+  four-of-four coverage is a vacuous green.
+- **MH carries a trap for whoever enables it.** Setting `OTEL_ENABLED=true` for MH
+  without first adding the collector egress rule to
+  `infra/services/mh-service/network-policy.yaml` will CrashLoop MH on the
+  **NetworkPolicy**, not on the collector — and the symptom (fail-hard at init,
+  collector unreachable) looks identical to a collector problem. Add the egress
+  rule first.
+
+### Causal chain
 
 R-54 OTel init is **fail-hard at init**: if `init_otel` cannot reach the collector
 at startup, the service exits non-zero. So a botched collector image/config
-upgrade makes AC, GC, MC, and MH all fail init *simultaneously* → fleet-wide
-`CrashLoopBackoff`. A bad collector change is therefore a fleet-wide outage
+upgrade makes AC, GC and MC fail init *simultaneously* → `CrashLoopBackoff` across
+three of the four services. A bad collector change is a multi-service outage
 trigger, not a localized observability issue.
+
+**What `init_otel` actually probes, because it changes which failures matter.**
+The probe is a `tonic::transport::Endpoint::connect` with a short connect timeout
+(`crates/common/src/observability/otel.rs`) — a **connection** probe, not a data
+export. So:
+
+- A collector that is **gone** (OOMKilled, CrashLooping, evicted, not yet Ready)
+  fails the probe → services fail init.
+- A collector that is **up but refusing or dropping data** (the `memory_limiter`
+  shedding under pressure, a filter discarding datapoints) still accepts the
+  connection → services start normally and lose telemetry instead.
+
+That asymmetry is deliberate and is why `memory_limiter` is first on both
+pipelines: it converts what would be an OOMKill — and therefore a three-service
+init outage — into bounded telemetry loss. **Do not remove it** to "let the
+collector use all its memory."
 
 ### Mitigation: upgrade in a separate change window
 
@@ -1392,8 +1430,55 @@ trigger, not a localized observability issue.
   Never bundle a collector image/config bump with an AC/GC/MC/MH rollout.
 - Verify the collector is `Ready` **independently** (its readiness gate / the
   cluster-health env-test) *before* and *without* rolling any service.
-- Pre-upgrade checklist (one line): confirm the collector is `Ready` after the
-  change, and confirm **no service deploy is scheduled in the same window**.
+
+### Pre-upgrade checklist
+
+Run these **before** committing a new tag. Steps 1-3 are executable; do not
+substitute release notes for any of them — the previously pinned 0.103.1 is the
+standing proof that a component's presence is not derivable from its version
+number.
+
+1. **Acceptance suite against the candidate image, reading the committed config.**
+
+   ```bash
+   scripts/otel-collector/acceptance.sh <candidate-image>
+   ```
+
+   It extracts `config.yaml` from the committed
+   `infra/services/otel-collector/configmap.yaml` (so it cannot drift from what
+   ships) and runs the two-writer, single-writer-idle, clock-skew, staleness and
+   filtering cases. On a readiness failure it prints the `components` hint.
+
+2. **Component presence, from the image itself** — if step 1 fails at startup:
+
+   ```bash
+   kubectl run comp --rm -i --restart=Never \
+     --image=<candidate-image> -- components
+   ```
+
+   `delta_to_cumulative`, `filter`, `transform`, `memory_limiter`, `health_check`,
+   the `otlp` receiver and the `prometheus` exporter must all be listed.
+
+3. **Readiness surface still answers.** The probes and the cluster-setup gate both
+   hit the `health_check` extension at `/` on `:13133`. If a future image drops or
+   renames that extension, the liveness probe, the readiness probe,
+   `deploy_otel_collector()`'s `kubectl wait` in `infra/kind/scripts/setup.sh`, and
+   `crates/env-tests/tests/00_cluster_health.rs` all break **together** and the
+   symptom is a collector that never goes Ready.
+
+4. **Confirm no service deploy is scheduled in the same window.**
+
+5. **After rollout, verify the running image is the one that was tested.** The
+   deployment pins by *tag*, not `tag@sha256` (see §Rollback for why), so the tag
+   alone does not prove which bytes are running:
+
+   ```bash
+   kubectl get pod -n dark-tower -l app=otel-collector \
+     -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'
+   ```
+
+   Compare against the verified digest recorded in the comment on the `image:`
+   line in `infra/services/otel-collector/deployment.yaml`.
 
 ### Triage: which failure mode am I looking at?
 
@@ -1403,20 +1488,165 @@ The key triage step is distinguishing the two modes:
   Spans/metrics are dropping, but the **data plane is UP** and users are
   unaffected. This is fail-soft: the export pipeline is degraded, the services
   are healthy.
-- **Init-time collector failure** — fleet-wide pod `Unready` / `CrashLoopBackoff`
-  across AC/GC/MC/MH. The **services are DOWN**. This is the fail-hard path: the
-  collector is unreachable at service init.
+- **Init-time collector failure** — pod `Unready` / `CrashLoopBackoff` across
+  AC/GC/MC (not MH — see §Blast radius). The **services are DOWN**. This is the
+  fail-hard path: the collector is unreachable at service init.
 
-  > **The `OTelExportFailureRate` alert is dormant until `dt_otel_export_failures_total`
-  > is emitted by the service OTel exporter init (R-55); until then it cannot fire.**
-  > If you somehow see it before R-55 lands, it is a configuration artifact, not a
-  > real signal — do not chase a non-firing alert.
+  > **`OTelExportFailureRate` is still dormant, and the reason is NOT the one this
+  > runbook used to give.** It previously said "dormant until R-55". R-55 has
+  > landed; the alert is dormant because `dt_otel_export_failures_total` **has no
+  > emitter anywhere in `crates/`** — nothing increments it. So it cannot fire, and
+  > its silence says nothing about export health. Do not chase a non-firing alert,
+  > and do not read its silence as a healthy export path. Same note is carried at
+  > the rule itself in `infra/docker/prometheus/rules/otel-alerts.yaml`.
+
+- **Client metrics stopped arriving, but the services are fine.** The collector is
+  up and the data plane is healthy, but `dt_client_*` series are absent. This mode
+  did not exist before R-27 and is the most likely one you will actually meet — see
+  §When the client series go quiet below, because **absence is the designed
+  behaviour of five different controls** and is indistinguishable from "no browser
+  is running" unless you check.
 
 ### Rollback
 
-Revert the collector image tag (and/or config) to the last known-good value and
-re-apply the otel-collector overlay. Because the collector is a single Deployment,
-rollback is a tag revert + `kubectl apply -k` of the overlay.
+> **THE IMAGE TAG AND THE ConfigMap ARE ONE ATOMIC UNIT. REVERTING THE TAG ALONE
+> IS A CRASHLOOP.**
+>
+> `infra/services/otel-collector/configmap.yaml` references the
+> `delta_to_cumulative` processor, which **does not exist in 0.103.1**. Reverting
+> the image without reverting the ConfigMap gives the collector a config naming a
+> component it does not have: it fails at startup, every time, immediately. And a
+> collector that is genuinely down takes AC, GC and MC with it on their next
+> restart — so the "safe" half of a rollback is the half that causes the outage.
+
+**Procedure.** Revert `deployment.yaml` (tag) and `configmap.yaml` **in the same
+change**, then `kubectl apply -k` the otel-collector overlay. Because the collector
+is a single Deployment, that is the whole rollback. Verify with the `imageID` check
+in the pre-upgrade checklist that the pod is running what you think it is.
+
+**Rollout mechanics are on your side — do not "fix" them.** The Deployment has
+`replicas: 1` and **no `strategy:` block**, so the defaults apply (`maxUnavailable`
+25% → 0, `maxSurge` 25% → 1): a new pod must pass readiness on `:13133` before the
+old one is terminated. A bad image therefore **stalls** the rollout with the old
+collector still serving, and `kubectl rollout status` hangs rather than the fleet
+falling over. Do not add `strategy: Recreate` or `maxUnavailable: 1`. The windows
+that *are* genuinely exposed are a fresh cluster bring-up (`setup.sh`) and a
+node/pod reschedule, because in both cases there is no old pod to keep serving.
+
+#### The rollback has a one-way floor, and a browser is what sets it
+
+**Once a delta-emitting SDK bundle has been served to any browser, the collector
+can never be reverted below the tag that introduced `delta_to_cumulative`.**
+
+The SDK exports **delta** temporality so that summing across browsers happens in
+the collector and no per-browser identity label is needed. A delta-emitting browser
+against a collector without `delta_to_cumulative` is the failure this whole design
+exists to fix: same-identity deltas are not summed, the counter oscillates between
+writers' raw per-interval values, `rate()` reads ≈ 0, and delta histogram points are
+dropped outright. It is silent — the series still exists and still has plausible
+values.
+
+**Nothing in the cluster will tell you a browser is what makes the revert unsafe.**
+A browser runs whatever bundle its tab loaded; you cannot roll the client fleet
+forward atomically and you cannot roll it back at all. There is no per-browser `up`
+signal and there structurally cannot be one (a per-session `service.instance.id` is
+barred as a participant dimension, ADR-0036 §11), so you cannot even enumerate which
+bundles are live.
+
+**The floor rests on tag immutability, and that is an assumption, not a guarantee.**
+`deployment.yaml` pins by tag rather than `tag@sha256`, because `setup.sh`'s preload
+path (`kustomize | grep image:` → `podman save` → `kind load image-archive`) is
+unproven with a digest reference, and a broken preload breaks whole-cluster
+bring-up — a worse failure than the one immutability would prevent. The mitigation
+is the `imageID`-against-digest check in the pre-upgrade checklist. If an upstream
+tag is ever re-pushed, that check is what catches it.
+
+#### During a temporality transition the fleet is mixed, and the metric is wrong
+
+Recorded, not fixed — there is no clean remedy that does not reach for the barred
+per-instance identity label.
+
+While a temporality change is rolling out, some tabs still emit the old bundle's
+**cumulative** datapoints while new tabs emit **delta**. Because every browser at a
+given `{client_version, org_id, key_custody}` deliberately shares one stream
+identity, both would write to the *same* stream: `delta_to_cumulative` accumulates
+the delta writers and passes the cumulative writers through untouched, and the
+exporter then interleaves two unrelated cumulative series under one identity —
+spurious resets and wrong totals that **look live**.
+
+The collector's `filter/client_metric_temporality` closes this by **dropping**
+non-delta sums and histograms, so the stale-bundle case reads as *missing* data
+rather than as plausible *wrong* data. That is the right trade, and it is the
+reason the next section exists: a dropped fleet and a quiet fleet look the same
+from the dashboard.
+
+In dev the window is bounded by the env-test reloading its browsers. It is written
+down because it is a standing property of *no per-instance label + an uncontrolled
+client + a temporality change*, and it does not go away when this design meets a
+real fleet.
+
+### When the client series go quiet
+
+**Absence is the designed behaviour of five separate controls on the metrics path,
+and on a deployed cluster all five are indistinguishable from "no browser is
+running".** Because the presence of a client series is the **only** liveness signal
+the browser fleet has (no per-browser `up`, §11), you cannot infer anything from
+quiet without checking. The drops are:
+
+| Control | Drops |
+|---|---|
+| `filter/client_metric_names` | any metric outside the 14-name media allowlist |
+| `filter/client_metric_temporality` | non-delta sums/histograms (a stale browser bundle) |
+| `transform/client_metric_labels` (`keep_keys`) | any label key outside the curated set |
+| `delta_to_cumulative` (`max_streams`) | streams beyond the cap |
+| `memory_limiter` | everything, while shedding under memory pressure |
+
+**Triage ladder, cheapest first:**
+
+1. `up{job="otel-collector"}` — is the client-series endpoint being scraped at all?
+   If `0`, nothing below matters; the collector or the scrape is the problem.
+2. `up{job="otel-collector-telemetry"}` — is the collector's *own* telemetry being
+   scraped? This is a **separate job on purpose**, so that `up{job="otel-collector"}`
+   keeps meaning "the client-series endpoint".
+3. The `otelcol_*` drop counters on that second job. This is the **only** channel
+   through which the five drops above are observable; without it a dropped fleet and
+   a quiet Sunday are the same picture. Read the family names off the running pod on
+   the committed tag — they have moved between collector versions, and some of them
+   are healthy-non-zero (the name allowlist discards non-media metrics on **every**
+   batch, by design), so a naive "points dropped > 0" reading is always true.
+4. Only if 1-3 are clean does quiet mean "no browser is emitting".
+
+#### Reading client series after a collector outage: timestamps are ARRIVAL time
+
+`transform/client_metric_clock` restamps every delta datapoint's `time` and
+`start_time` to the collector's own clock on arrival. This is load-bearing — without
+it, browsers with skewed clocks sharing one stream identity make
+`delta_to_cumulative` decide "out of order" across machines, and a single browser
+stamped far in the future silently stops an honest fleet's accumulation. But it
+means **stored timestamps are collector-arrival time, not browser-event time**, and
+that changes how you read an incident:
+
+1. **Onset is misattributed.** Browsers buffer while the collector is unreachable and
+   flush on recovery; every buffered point is stamped at *arrival*. So "when did the
+   drops start", read from `dt_client_media_frames_dropped_total`, returns the
+   **recovery moment**, not the true onset — and correlating client drops against
+   MC-side events will be off by the full outage duration. This is the trap in
+   `mc-incident-response.md` Scenario 16, whose entire triage is that correlation.
+2. **Ratio-shaped alerts survive this; absolute-rate ones do not.**
+   `MCMediaMissingKeyMaterial` is a ratio, and the browser buffered numerator and
+   denominator in the same batch, so both compress equally and the ratio is
+   preserved. That is a property worth keeping deliberately: an absolute-rate
+   threshold on a `dt_client_*` series would fire on the recovery artefact alone. The
+   convention is recorded in `docs/observability/alert-conventions.md`.
+3. **The artefact is distinguishable, via `up`.** If you see a client-series spike,
+   check whether `up{job="otel-collector"} == 0` anywhere in the preceding window. If
+   it was, the spike is a flush artefact and the true onset is somewhere inside the
+   gap. (This is a second reason the exporter is *pull*, not remote-write: collector
+   loss becomes `up == 0` on a job, which turns out to be load-bearing for reading
+   the data correctly and not merely for liveness.)
+4. **A long outage loses the oldest data outright.** The browser's OTLP exporter queue
+   is bounded, so a sufficiently long outage yields a *partial* re-dated burst: the
+   visible spike understates what was lost, and the gap is not recoverable.
 
 ### Break-glass / escape hatch
 
@@ -1438,7 +1668,17 @@ collector:
   rollout stalls with the old ReplicaSet still serving all traffic. It also does **not**
   self-heal — `kubectl rollout status` hangs indefinitely until an operator intervenes
   (`kubectl rollout undo`, or flip the break-glass lever above).
-- **MC / MH:** still pending (#6 / #27), unchanged.
+- **MC (landed):** OTel init is gated by the explicit `OTEL_ENABLED` flag, same as AC and GC.
+  Break-glass = set `OTEL_ENABLED=false` in MC's ConfigMap (or drop the Kind overlay's
+  `infra/kubernetes/overlays/kind/services/mc-service/configmap-otel-patch.yaml`, which is what
+  flips it to `"true"` for dev) and restart MC; it boots with the OTel layer off and no collector
+  dependency.
+- **MH: no lever is needed, because MH has no collector dependency to break.** It has no
+  `OTEL_ENABLED` and no `OTLP_ENDPOINT` in `infra/services/mh-service/` or the Kind overlay, so
+  `otel_enabled` defaults false and `init_otel` is never called. **Do not "enable OTel on MH" as a
+  break-glass step or as a convenience** — it has no 4317 egress rule either, so turning it on
+  CrashLoops MH on the NetworkPolicy while presenting the same symptom as a collector outage. Add
+  the egress rule to `infra/services/mh-service/network-policy.yaml` first.
 
 ### Escalation / ownership
 

@@ -318,6 +318,20 @@ if [[ ! "${ORG_MAX_CONCURRENT_MEETINGS}" =~ ^[1-9][0-9]{0,8}$ ]]; then
     exit 1
 fi
 
+# Print every container image named in rendered YAML on stdin, one per line.
+#
+# ANCHORED TO A REAL YAML `image:` KEY (optionally a list item), NOT a bare
+# substring. Rendered Kustomize output includes ConfigMap literals, so any comment
+# or prose containing `image: <word>` was once extracted as an image name — a
+# collector-config comment made setup run `podman pull docker.io/without`, the pull
+# was denied, and whole-cluster bring-up failed. A comment must never be able to
+# break setup: after the anchored leading whitespace only `- ` or the key itself
+# may appear, so a `#`-comment line can never match. Pinned by
+# scripts/setup.test.sh (emi-* cases).
+extract_manifest_images() {
+    grep -oP '^\s*(-\s+)?image:\s+\K\S+' || true
+}
+
 # Load a container image into the Kind cluster.
 # Handles podman save/load workaround vs docker direct load.
 # Usage: load_image_to_kind <image-tag>
@@ -575,7 +589,7 @@ preload_third_party_images() {
     # qualifying Docker Hub short names for podman compatibility.
     local IMAGES
     IMAGES=$(${KUBECTL} kustomize "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/" \
-        | grep -oP 'image:\s+\K\S+' \
+        | extract_manifest_images \
         | grep -v '^localhost/' \
         | sort -u)
 
@@ -677,11 +691,13 @@ deploy_observability() {
 # Deploy the dev OTel collector (R-59)
 #
 # Ordered AFTER deploy_observability/deploy_redis and BEFORE the AC/GC/MC/MH
-# services. The readiness gate is load-bearing once R-55 wires init_otel: under
-# R-54 fail-hard-at-init, a service started before the collector is Ready would
-# fail init and CrashLoopBackoff. On THIS branch the gate only blocks on the
-# collector's own readiness (no service calls init_otel yet) — see the
-# collector-upgrade-discipline section in docs/runbooks/gc-deployment.md.
+# services. THE READINESS GATE IS LOAD-BEARING NOW, NOT EVENTUALLY: AC, GC and MC
+# all set OTEL_ENABLED=true in the Kind overlay and probe this collector during
+# init, and under R-54 fail-hard-at-init a service started before the collector
+# is Ready fails init and CrashLoopBackoffs. Do not shorten or skip this wait.
+# (MH is the exception and deliberately so: it has no OTEL_ENABLED and no 4317
+# egress rule, so it never probes. Enabling it needs the egress rule first.)
+# See the collector-upgrade-discipline section in docs/runbooks/gc-deployment.md.
 deploy_otel_collector() {
     log_step "Deploying OTel collector..."
 

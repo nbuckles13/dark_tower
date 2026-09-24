@@ -750,6 +750,15 @@ export function recordRequests(context: BrowserContext): RequestRecorder {
  *      (closes the `Basic base64(email:password)` channel, which the value-scan
  *      cannot see);
  *   4. the GC meeting request(s) authenticate via `Authorization: Bearer`.
+ *
+ * SCOPE LOCK: properties 1-3 deliberately apply to EVERY recorded request, not
+ * only join traffic — in particular to `/api/v1/telemetry/*`, which since R-27
+ * (R15) carries the user's bearer on every metric export. The name says "join"
+ * because property 4 is join-specific; do NOT narrow the 1-3 loop back to join
+ * paths, or the newest token-carrying surface silently leaves this control.
+ * (Whether a telemetry request actually LANDS in the recording window is
+ * timing-dependent and is not asserted here — tracked as client task 15's
+ * obligation in docs/user-stories/2026-09-21-hear-each-other.md.)
  */
 export function assertTokenOnlyJoinTraffic(
   records: readonly RecordedRequest[],
