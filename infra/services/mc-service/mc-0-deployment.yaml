@@ -178,6 +178,18 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_AUDIO_FRAME_RATE_HZ
+        # ---- Meeting KEK lifecycle (ADR-0036 §4; story 2 R-12) ----
+        # W, the KEK rotation debounce window. Required by MC (from task 9) with
+        # no Rust default, and deliberately NOT `optional:` here: R-12's leaver
+        # exposure bound IS W, so an MC running a different W from its sibling
+        # makes that bound depend on which pod owns the meeting. Keep in lockstep
+        # with the other mc-N-deployment.yaml; the three-artifact ordering note
+        # above applies unchanged. See the key's comment in configmap.yaml.
+        - name: MC_KEK_ROTATION_DEBOUNCE_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_KEK_ROTATION_DEBOUNCE_SECONDS
         # Pod IP for gRPC advertise address (downward API)
         - name: POD_IP
           valueFrom:

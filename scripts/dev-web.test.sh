@@ -69,8 +69,13 @@ unset __path_dirs __d __f __n
 
 # Build a temp root. $1 = "with-fingerprints" | "without-fingerprints".
 # $2 = advertise address to write into every configmap ("" = omit the key).
+# $3 = the shared MC ConfigMap's MC_MAX_RECEIVE_SLOTS value (default "8");
+#      "__omit_key__" writes the file without the key, "__no_file__" writes no
+#      file at all. Every root carries a COMMENT decoy naming the key with a
+#      different value, so a reader that is not anchored on the data line reads
+#      the decoy and the cap assertions below go red.
 make_root() {
-  local fingerprints="$1" advertise="${2-}"
+  local fingerprints="$1" advertise="${2-}" cap="${3-8}"
   local root; root="$(mktemp -d "$WORK/root.XXXXXX")"
 
   mkdir -p "$root/scripts" "$root/packages/web-app" "$root/infra/docker/certs"
@@ -99,6 +104,16 @@ JSON
       printf 'data:\n  SOMETHING_ELSE: "x"\n' >"$dir/${svc}-configmap.yaml"
     fi
   done
+  if [[ "$cap" != "__no_file__" ]]; then
+    {
+      printf 'data:\n'
+      printf '  # Prose decoy — MC_MAX_RECEIVE_SLOTS: "99" must never be read from a comment.\n'
+      if [[ "$cap" != "__omit_key__" ]]; then
+        printf '  MC_MAX_RECEIVE_SLOTS: "%s"\n' "$cap"
+      fi
+      printf '  MC_AUDIO_CODEC: "opus"\n'
+    } >"$root/infra/services/mc-service/configmap.yaml"
+  fi
   printf '%s' "$root"
 }
 
@@ -142,9 +157,13 @@ SH
 # Run `dev-web.sh --check` hermetically. Sets RUN_OUT.
 # PATH is stubs + TOOLBOX only — never the outer PATH — so `ss` exists exactly
 # when the stub dir provides it.
+# $3 (optional) = VITE_DT_RECEIVE_SLOTS for the run. When omitted the variable
+# is UNSET (`env -u`), so the developer's own shell can never leak an N in.
 run_check() {
   local root="$1" stubs="$2"
-  RUN_OUT="$(cd "$root" && env PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
+  local -a n_env=(-u VITE_DT_RECEIVE_SLOTS)
+  if [[ $# -ge 3 ]]; then n_env=("VITE_DT_RECEIVE_SLOTS=$3"); fi
+  RUN_OUT="$(cd "$root" && env "${n_env[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
     bash "$root/scripts/dev-web.sh" --check 2>&1 || true)"
 }
 
@@ -592,7 +611,8 @@ assert_absent "ss-broken-does-not-blame-cluster" "nothing listening" "$out"
 #     count must equal the number of causes this list knows about. A fifth
 #     branch therefore reds here until its phrase is added to the header and to
 #     this array — which is the forcing function, not the enumeration itself.
-CANNOT_RUN_CAUSES=("\`ss\` missing" "\`ss\` failed" "no advertise address" "no resolver")
+CANNOT_RUN_CAUSES=("\`ss\` missing" "\`ss\` failed" "no advertise address" "no resolver" \
+                   "cap file absent" "key absent" "value not an integer")
 
 for cause in "${CANNOT_RUN_CAUSES[@]}"; do
     assert_status "header-enumerates-cannot-run-cause" "$cause" "$header_block"
@@ -616,5 +636,191 @@ else
     FAIL=$((FAIL + 1))
     FAILURES+=("[header-cannot-run-count-matches-body] body has ${body_cannot_verify_count} CANNOT VERIFY branches but the header enumerates ${#CANNOT_RUN_CAUSES[@]} causes — add the new cause to BOTH the script header and CANNOT_RUN_CAUSES here")
 fi
+
+# ===========================================================================
+# (10) Receive slots: client N vs the MC server cap (story 2, R-1/R-23/R-25).
+#
+#      N above the cap has MC reject the WHOLE declaration — one silent
+#      participant per browser — so every failure here must be a HARD FAIL
+#      (`✗` present, `!` absent). Expected numbers are DERIVED from the fixture
+#      variables, never typed from memory.
+# ===========================================================================
+stubs="$(make_stubs ss-present 'udp   UNCONN  0  0   127.0.0.1:4434   0.0.0.0:*')"
+OVER_CAP_TEXT="exceeds the server cap"
+
+# (10a) POSITIVE CONTROL — default N, fixture cap 8. N unset in the run, so the
+#       launcher default applies and says so.
+fixture_cap=8
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$fixture_cap")"
+run_check "$root" "$stubs"
+out="$(plain "$RUN_OUT")"
+# EXTRACTION vs CONTENT, as two assertions with two reason tokens — the (10g)
+# shape. The earlier form here was `assert_status "…found" "default=" "default=${default_n:+…}"`,
+# which is `contains("")` wearing a prefix: an empty `default_n` made needle and
+# haystack both the literal `default=`, so the assertion whose whole job is "the
+# constant was found" went GREEN exactly when it was not, and the `[[ -n ]]`
+# guard then SKIPPED the only assertion comparing the echoed N against the
+# script's own constant. Quoting or indenting `DEMO_RECEIVE_SLOTS=3` would have
+# disarmed both, silently. (@dry-reviewer F-DRY-1; review-protocol §Assertion
+# Vacuity mechanism 1.)
+default_n="$(grep -E '^DEMO_RECEIVE_SLOTS=[0-9]+$' "$DEV_WEB" | head -1 | cut -d= -f2 || true)"
+if [[ "$default_n" =~ ^[1-9][0-9]*$ ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[slots-default-n-constant-found] could not extract DEMO_RECEIVE_SLOTS from ${DEV_WEB} (got '${default_n}') — the constant moved or changed shape; this is an EXTRACTION failure, NOT a wrong default. Every assertion below comparing the echo against it is meaningless until this is fixed.")
+fi
+# Unconditional: a skipped assertion is not a passing one.
+assert_status "slots-default-echoes-n-and-cap" \
+  "effective N=${default_n} (launcher demo default) <= server cap MC_MAX_RECEIVE_SLOTS=${fixture_cap}" "$out"
+assert_status "slots-default-is-pass-line" "✓ receive slots: effective N=" "$out"
+assert_absent "slots-default-not-over-cap" "$OVER_CAP_TEXT" "$out"
+assert_absent "slots-default-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
+# The comment decoy's value must never surface as the cap.
+assert_absent "slots-decoy-not-read" "MC_MAX_RECEIVE_SLOTS=99" "$out"
+assert_status "slots-echo-prints-live-cmd" \
+  "kubectl get cm mc-service-config -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}'" "$out"
+# THE AUTHORITY FRAMING ON THE **PASS** BRANCH. The demo-breaking case is an
+# on-disk cap of 8 against a live cap of 2: the operator stands on a GREEN line
+# holding a number the cluster does not enforce, so "this is an on-disk read,
+# here is what enforces it" is most load-bearing exactly where nothing looked
+# wrong (@observability F2). Pinned on both branches so the shared helper cannot
+# be inlined back into one of them.
+assert_status "slots-pass-names-authority-counter" \
+  'outcome="slot_count_over_cap"' "$out"
+assert_status "slots-pass-says-on-disk" "ON-DISK pre-flight read" "$out"
+
+# (10b) The cap is READ from the file, not hardcoded: a non-default cap of 5
+#       with N=5 passes and echoes 5 — and the over-cap text is ABSENT.
+fixture_cap=5
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$fixture_cap")"
+run_check "$root" "$stubs" "$fixture_cap"
+out="$(plain "$RUN_OUT")"
+assert_status "slots-cap-read-from-file" \
+  "effective N=${fixture_cap} (set by you) <= server cap MC_MAX_RECEIVE_SLOTS=${fixture_cap}" "$out"
+assert_absent "slots-at-cap-not-over-cap" "$OVER_CAP_TEXT" "$out"
+
+# (10c) N one above the cap: HARD FAIL, says why in the operator's terms, points
+#       at the in-cluster authority, and does NOT pass.
+run_check "$root" "$stubs" "$((fixture_cap + 1))"
+out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "slots-over-cap" "$OVER_CAP_TEXT" "$out"
+assert_status "slots-over-cap-silent-participant" "one silent participant" "$out"
+assert_status "slots-over-cap-names-authority" 'outcome="slot_count_over_cap"' "$out"
+assert_status "slots-over-cap-remedy" "VITE_DT_RECEIVE_SLOTS=${fixture_cap} scripts/dev-web.sh" "$out"
+assert_absent "slots-over-cap-does-not-pass" "✓ receive slots" "$out"
+
+# (10d) An absurdly long N must not overflow bash arithmetic into a pass.
+run_check "$root" "$stubs" "99999999999999999999999"
+out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "slots-huge-n-over-cap" "$OVER_CAP_TEXT" "$out"
+
+# (10e) N not an integer >= 1: HARD FAIL.
+for bad_n in 0 abc "" -1; do
+  run_check "$root" "$stubs" "$bad_n"
+  out="$(plain "$RUN_OUT")"
+  assert_hard_fail_branch "slots-invalid-n-[${bad_n}]" "is not an integer >= 1" "$out"
+done
+
+# (10f) Cap unreadable — REPO/CONFIG DRIFT lane, for each cause the header names.
+#       FILE-ABSENT IS ASSERTED SEPARATELY, below: naming a path in a message
+#       implies that path exists, and "the shared ConfigMap both MC pods mount is
+#       gone" is a deployment problem while "the key was renamed" is a repo one.
+#       Asserting one shared needle across all three would PIN that collapse.
+#       Each cause asserts its OWN wording AND the absence of the other two
+#       diagnoses, so a future collapse into one shared message reds here.
+for cap_case in __omit_key__ eight; do
+  root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$cap_case")"
+  run_check "$root" "$stubs"
+  out="$(plain "$RUN_OUT")"
+  assert_hard_fail_branch "slots-cap-unreadable-[${cap_case}]" "receive slots: CANNOT VERIFY" "$out"
+  assert_status "slots-cap-unreadable-lane-[${cap_case}]" "REPO/CONFIG DRIFT" "$out"
+  assert_absent "slots-cap-unreadable-no-pass-[${cap_case}]" "✓ receive slots" "$out"
+  assert_status "slots-cap-unreadable-live-cmd-[${cap_case}]" \
+    "kubectl get cm mc-service-config -n dark-tower" "$out"
+  # ...and must NOT claim the file is missing when it is present.
+  assert_absent "slots-cap-unreadable-not-file-absent-[${cap_case}]" "DOES NOT EXIST" "$out"
+done
+
+# Cause 2 — key absent from a file that exists.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' __omit_key__)"
+run_check "$root" "$stubs"
+out="$(plain "$RUN_OUT")"
+assert_status "slots-cap-key-absent-says-so"  "declares no MC_MAX_RECEIVE_SLOTS data key" "$out"
+assert_absent "slots-cap-key-absent-not-malformed" "is not an integer >= 1 (got" "$out"
+
+# Cause 3 — key present, value malformed. The `(got '…')` token must carry the
+# offending value, and the message must say the key IS present.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' eight)"
+run_check "$root" "$stubs"
+out="$(plain "$RUN_OUT")"
+assert_status "slots-cap-malformed-says-so"     "is not an integer >= 1 (got 'eight')" "$out"
+assert_status "slots-cap-malformed-key-present" "KEY IS PRESENT" "$out"
+assert_absent "slots-cap-malformed-not-key-absent" "declares no MC_MAX_RECEIVE_SLOTS data key" "$out"
+
+# (10f-bis) The file itself absent: a DISTINCT diagnosis, not "the key is missing
+# from <path>". Same lane, same hard fail, different first move.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' __no_file__)"
+run_check "$root" "$stubs"
+out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "slots-cap-file-absent" "receive slots: CANNOT VERIFY" "$out"
+assert_status "slots-cap-file-absent-says-so"      "DOES NOT EXIST" "$out"
+assert_status "slots-cap-file-absent-not-key"      "NOT a missing key inside it" "$out"
+assert_status "slots-cap-file-absent-lane"         "REPO/CONFIG DRIFT" "$out"
+assert_status "slots-cap-file-absent-live-cmd"     "kubectl get cm mc-service-config -n dark-tower" "$out"
+assert_absent "slots-cap-file-absent-no-pass"      "✓ receive slots" "$out"
+
+# (10g) REAL-FILE control (@operations condition 2). The fixture shape is ours;
+#       the committed ConfigMap's shape is not. Run the extraction against the
+#       real infra/services/mc-service/configmap.yaml and assert it produced a
+#       non-empty integer >= 1 — no literal value, so raising the cap never reds
+#       this for the wrong reason.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+cp "$REPO_ROOT/infra/services/mc-service/configmap.yaml" "$root/infra/services/mc-service/configmap.yaml"
+run_check "$root" "$stubs" 1
+out="$(plain "$RUN_OUT")"
+real_cap="$(printf '%s\n' "$out" | grep -oE 'server cap MC_MAX_RECEIVE_SLOTS=[0-9]+' | head -1 | cut -d= -f2 || true)"
+if [[ "$real_cap" =~ ^[1-9][0-9]*$ ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[slots-real-configmap-cap-extracted] the cap extraction produced '${real_cap}' from the REAL infra/services/mc-service/configmap.yaml — the reader no longer matches the committed file's shape (not a cap-value problem)")
+fi
+assert_absent "slots-real-configmap-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
+
+# (10h) Hard-fail exit carries the counter-message (docs/TODO.md "dev-web.sh's
+#       secure-context counter-message is reachable only through --help"). Every
+#       hermetic run hard-fails on AC/GC, so this path is always driven here.
+#       Pinned on our own prose, never a flag name (see (1)).
+assert_status "hard-fail-exit-prints-counter-message" "Never a browser flag: no setting makes" "$out"
+
+# (10i) --help carries the N+1 contract, the tone mode and the second-machine
+#       facts with their cited sources. Only VERIFIED statements are pinned —
+#       nothing asserts that tabs work or that tabs fail (D-7a).
+assert_status "help-n-plus-1-distinct-accounts" "N+1 DISTINCT REGISTERED ACCOUNTS" "$help_out"
+assert_status "help-auth-not-shared-cited"      "packages/web-app/src/App.svelte" "$help_out"
+assert_status "help-tabs-question-unverified"   "UNVERIFIED" "$help_out"
+assert_status "help-names-test-tone-define"     "__DT_TEST_TONE__" "$help_out"
+assert_status "help-names-receive-slots-var"    "VITE_DT_RECEIVE_SLOTS" "$help_out"
+assert_status "help-one-n-per-dev-server"       "ONE value per dev server" "$help_out"
+assert_status "help-second-machine-block"       "WHY NOT A SECOND MACHINE" "$help_out"
+# Pins the LOOPBACK claim, which is what the second-machine argument rests on —
+# not a port range. The header used to restate all four advertised ports, which
+# (10j) below could not check (it asserts a prefix), so a new instance or a moved
+# port left the header false with both assertions green (@dry-reviewer F-DRY-2).
+assert_status "help-second-machine-loopback"    "loopback literals (127.0.0.1)" "$help_out"
+assert_status "help-second-machine-sans-scoped" "NOT a browser-side blocker" "$help_out"
+assert_status "help-second-machine-certs-cited" "scripts/generate-dev-certs.sh" "$help_out"
+
+# (10j) The cited facts must still be TRUE of the tree, or the header is the
+#       fail-open document read just before someone types a flag.
+for cm_file in "$REPO_ROOT"/infra/services/mc-service/mc-{0,1}-configmap.yaml \
+               "$REPO_ROOT"/infra/services/mh-service/mh-{0,1}-configmap.yaml; do
+  adv="$(grep -oE 'WEBTRANSPORT_ADVERTISE_ADDRESS: "https://[^"]+"' "$cm_file" || true)"
+  assert_status "fact-loopback-advertise-[${cm_file##*/}]" 'https://127.0.0.1:443' "$adv"
+done
+san_line="$(grep -E 'printf "(DNS|IP):%s"' "$REPO_ROOT/scripts/generate-dev-certs.sh" || true)"
+assert_status "fact-sans-dns-emitted" 'DNS:%s' "$san_line"
+assert_absent "fact-sans-no-ip-emitted" 'IP:%s' "$san_line"
 
 report_results "scripts/dev-web.test.sh"
