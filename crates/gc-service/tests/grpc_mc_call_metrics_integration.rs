@@ -6,8 +6,9 @@
 //!
 //! # WRAPPER-CAT-C framing
 //!
-//! Production recording site: `crates/gc-service/src/services/mc_client.rs`
-//! lines 157, 197, 206, 216 — all four `(method, status)` tuples for the
+//! Production recording site: all four `record_grpc_mc_call` emission sites in
+//! `McClient::assign_meeting` (`crates/gc-service/src/services/mc_client.rs`) — the
+//! four `(method, status)` tuples for the
 //! `assign_meeting_with_mh` RPC (success, rejected, error, plus
 //! connection-failed which lands in error). Driving each branch
 //! end-to-end requires an in-process tonic mock that returns each
@@ -18,6 +19,21 @@
 //! class label-fidelity mirror, ensuring every (method, status) tuple stays
 //! correctly named after refactors.
 //!
+//! The `"assign_meeting_with_mh"` literals in the emission assertions below are
+//! DELIBERATE and must NOT be replaced with
+//! `gc_service::observability::metrics::MC_METHOD_ASSIGN_MEETING_WITH_MH`: a boundary
+//! test restates the bound as a literal while production references the constant (same
+//! convention as `crates/proto-gen/tests/internal_roundtrip.rs`). Substituting the
+//! constant would make every assertion `constant == constant`, green by construction.
+//!
+//! Those restatements are only load-bearing because of
+//! `mc_method_constant_matches_emitted_literal` below — the ONE place here that reads
+//! the constant, pinning it to the wire value. Without that pin this file would merely
+//! prove `record_grpc_mc_call` passes its first argument through to a label, which was
+//! never in doubt, and a drifted constant would still be green. The drift is not
+//! hypothetical: the catalog and the in-file cluster test both documented a
+//! never-emitted `assign_meeting` until 2026-09-24.
+//!
 //! See `docs/TODO.md` §Observability Debt for the orphan disposition tracker
 //! covering full real-recording-site drive.
 
@@ -27,6 +43,22 @@ use std::time::Duration;
 
 use ::common::observability::testing::MetricAssertion;
 use gc_service::observability::metrics::record_grpc_mc_call;
+
+/// The one place this file reads the constant: pinning it to the wire literal is what
+/// makes every other literal here meaningful. Without this, the restatements below are
+/// `record_grpc_mc_call(x, ..)` asserting `x` — green for any value of the constant,
+/// including a drifted one.
+#[test]
+fn mc_method_constant_matches_emitted_literal() {
+    assert_eq!(
+        gc_service::observability::metrics::MC_METHOD_ASSIGN_MEETING_WITH_MH,
+        "assign_meeting_with_mh",
+        "MC_METHOD_ASSIGN_MEETING_WITH_MH changed; update the literals in this file, \
+         the `method` label value in docs/observability/metrics/gc-service.md, and any \
+         PromQL selecting {{method=\"assign_meeting_with_mh\"}} (gc-incident-response.md \
+         Scenario 2 step 4b)"
+    );
+}
 
 const ALL_STATUSES: &[&str] = &["success", "rejected", "error"];
 

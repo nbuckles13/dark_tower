@@ -10,7 +10,9 @@
 //! # Security
 //!
 //! - User-authenticated endpoints validate JWT with UserClaims (org_id, roles)
-//! - Guest endpoint is public but rate limited (5 req/min per IP)
+//! - Guest endpoint is public. Rate limiting and captcha validation are NOT
+//!   IMPLEMENTED (no limiter layer; captcha is only checked non-empty) — see
+//!   docs/TODO.md §Rate Limiting
 //! - Meeting codes and secrets generated using CSPRNG
 //! - Error messages are generic to prevent information leakage
 
@@ -478,18 +480,14 @@ pub async fn join_meeting(
     let duration = start.elapsed();
     metrics::record_meeting_join("user", "success", None, duration);
 
-    let mh_ids: Vec<&str> = assignment_with_mh
-        .mh_selection
-        .handlers
-        .iter()
-        .map(|h| h.mh_id.as_str())
-        .collect();
+    // Per-join record: fires on EVERY join (new assignment and reuse alike).
+    // Handler ids are logged by the service on the new-assignment branch only
+    // ("Meeting assigned to MC with MH"); on reuse the handler set is owned by MC.
     info!(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         user_id = %user_id,
         mc_id = %assignment_with_mh.mc_assignment.mc_id,
-        mh_ids = ?mh_ids,
         participant_type = ?participant_type,
         "User joined meeting"
     );
@@ -512,7 +510,8 @@ pub async fn join_meeting(
 ///
 /// # Rate Limiting
 ///
-/// 5 requests per minute per IP address.
+/// NOT IMPLEMENTED: no rate limiter is applied to this route, and the captcha
+/// token is only checked for non-emptiness. See docs/TODO.md §Rate Limiting.
 ///
 /// # Request Body
 ///
@@ -529,7 +528,8 @@ pub async fn join_meeting(
 /// - 400 Bad Request: Invalid request body
 /// - 403 Forbidden: Guests not allowed
 /// - 404 Not Found: Meeting not found
-/// - 429 Too Many Requests: Rate limit exceeded
+/// - 429 Too Many Requests: NOT currently returned (rate limiting not implemented;
+///   see docs/TODO.md §Rate Limiting)
 /// - 503 Service Unavailable: AC unreachable
 #[instrument(
     skip_all,
@@ -571,7 +571,8 @@ pub async fn get_guest_token(
         GcError::BadRequest(e.to_string())
     })?;
 
-    // TODO: Validate captcha token (integration with captcha service)
+    // NOT IMPLEMENTED: captcha token validation (tracked in docs/TODO.md §Rate Limiting;
+    // ADR-0020 states it is required).
     // For now, we just check that it's not empty (validation handles this)
 
     // Look up meeting by code
@@ -667,18 +668,14 @@ pub async fn get_guest_token(
     let duration = start.elapsed();
     metrics::record_meeting_join("guest", "success", None, duration);
 
-    let mh_ids: Vec<&str> = assignment_with_mh
-        .mh_selection
-        .handlers
-        .iter()
-        .map(|h| h.mh_id.as_str())
-        .collect();
+    // Per-join record: fires on EVERY join (new assignment and reuse alike).
+    // Handler ids are logged by the service on the new-assignment branch only
+    // ("Meeting assigned to MC with MH"); on reuse the handler set is owned by MC.
     info!(
         target: "gc.handlers.meetings",
         meeting_id = %meeting.meeting_id,
         guest_id = %guest_id,
         mc_id = %assignment_with_mh.mc_assignment.mc_id,
-        mh_ids = ?mh_ids,
         waiting_room = meeting.waiting_room_enabled,
         "Guest joined meeting"
     );

@@ -91,12 +91,30 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   > `mc_assignment_metrics_integration.rs`) — with emission is tracked in `docs/TODO.md`
   > §Observability Debt (the `declared/unemitted` tag is provisional pending that reconciliation).
 - **Cardinality**: Low (~18 combinations)
-- **Usage**: Track assignment success rate and failure patterns
+- **Usage**: Track assignment success rate and failure patterns. `status="success"` fires on
+  BOTH paths — a new assignment and the reuse of an existing healthy one (R-6) — so it counts
+  joins that obtained an MC, not new meetings.
 - **Example**:
   ```promql
   sum(rate(gc_mc_assignments_total{status="success"}[5m])) /
   sum(rate(gc_mc_assignments_total[5m]))
   ```
+- **Example — assignment reuse (join stickiness) rate, R-6**:
+  <!-- ANCHOR (DRY): this identity holds only while `select_mhs_for_meeting` has a single
+       callsite, on the new-assignment branch of `assign_meeting_with_mh`
+       (crates/gc-service/src/services/mc_assignment.rs, which carries the mirror anchor).
+       A second callsite must update this expression. -->
+  ```promql
+  1 - (
+    sum(rate(gc_mh_selections_total{status="success"}[5m]))
+    /
+    sum(rate(gc_mc_assignments_total{status="success"}[5m]))
+  )
+  ```
+  Approximate in a known direction: a selection followed by every MC rejecting increments the
+  numerator with no matching `gc_mc_assignments_total{status="success"}`, so this
+  **under-reports** the reuse rate (the safe direction for a stickiness SLI). The reuse-path debug
+  log is off at production log levels, so this is the production answer to "are joins sticky?".
 
 ### `gc_mc_assignment_duration_seconds`
 - **Type**: Histogram
@@ -106,13 +124,37 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Buckets**: [0.005, 0.010, 0.015, 0.020, 0.030, 0.050, 0.100, 0.250, 0.500]
 - **SLO Target**: p95 < 20ms (per ADR-0010)
 - **Cardinality**: Low (3 statuses)
-- **Usage**: Monitor assignment latency for SLO compliance
+- **Usage**: Monitor assignment latency for SLO compliance — subject to the population note below.
 - **Example**:
   ```promql
   histogram_quantile(0.95,
     sum(rate(gc_mc_assignment_duration_seconds_bucket{status="success"}[5m])) by (le)
   ) * 1000
   ```
+- **Population note (R-6)**:
+  <!-- ANCHOR (DRY): the population-dilution caveat is stated in full here; mirrors carrying a
+       one-line pointer — edit in lockstep; SEVEN mirror sites in three files:
+       infra/docker/prometheus/rules/gc-alerts.yaml (GCMCAssignmentSlow, GCHighJoinLatency);
+       docs/runbooks/gc-incident-response.md (Scenario 2 Diagnosis step 4, Scenario 2 Common
+       Root Causes item 2, Scenario 3 Symptoms); docs/observability/alerts.md
+       (GCMCAssignmentSlow, GCHighJoinLatency sections). Cite by name/heading only, never by
+       line number.
+       Resolution options live only in docs/TODO.md §Observability Debt. -->
+  Since the reuse path no longer performs MH selection, reused assignments are substantially
+  faster than new ones and both emit `status="success"` — the histogram is strongly bimodal with
+  no label separating the modes. New assignments are ~1/N of joins for a meeting of N
+  participants, so at mean meeting size ≳ 20 they sit below the p95 cut and `GCMCAssignmentSlow`
+  loses sensitivity to new-assignment latency entirely. Read the p95 drop at the R-6 roll as this
+  population shift, **not** as a latency improvement, and do not tighten the 20 ms threshold
+  against the diluted population. Separating the modes is tracked in `docs/TODO.md`
+  §Observability Debt.
+
+  Latency detection on the new-assignment path is diluted on **both** GC latency rules —
+  `GCMCAssignmentSlow` and `GCHighJoinLatency` (`gc_meeting_join_duration_seconds` mixes the same
+  populations for the same 1/N reason). The surviving detection is **error-side only**:
+  `GCMCAssignmentFailures` and `GCHighJoinFailureRate`, neither touched by this change. Do not
+  build replacement latency coverage — the error-side rules already cover the failure modes; what
+  is lost is sensitivity to *slow* new assignments, not to *failed* ones.
 
 ---
 
@@ -382,9 +424,12 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Type**: Counter
 - **Description**: Total gRPC calls to Meeting Controllers
 - **Labels**:
-  - `method`: gRPC method (assign_meeting)
+  - `method`: gRPC method — one emitted value, `assign_meeting_with_mh` (source of truth:
+    `MC_METHOD_ASSIGN_MEETING_WITH_MH` in `crates/gc-service/src/observability/metrics.rs`,
+    which `GRPC_MC_METHODS` derives from and `services/mc_client.rs` emits, on the
+    new-assignment path)
   - `status`: Call outcome (success, rejected, error)
-- **Cardinality**: Low (~9 combinations)
+- **Cardinality**: Low (3 combinations: 1 method × 3 statuses)
 - **Usage**: Track GC-MC communication rate and errors
 - **Example**:
   ```promql
@@ -395,9 +440,10 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Type**: Histogram
 - **Description**: gRPC call duration to MCs
 - **Labels**:
-  - `method`: gRPC method
+  - `method`: gRPC method — one emitted value, `assign_meeting_with_mh` (see above)
 - **Buckets**: [0.005, 0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.500]
-- **Cardinality**: Low (~3 methods)
+- **Cardinality**: Low (1 method). New-assignment-only by construction (the RPC is sent only on a
+  new assignment), so unlike `gc_mc_assignment_duration_seconds` it is not diluted by reuse joins.
 - **Usage**: Monitor GC-MC latency
 - **Example**:
   ```promql
@@ -443,11 +489,16 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ### `gc_mh_selections_total`
 - **Type**: Counter
-- **Description**: Total MH selection attempts
+- **Description**: Total MH selection attempts. Emitted on the **new-assignment path only** — a
+  join into a meeting that already has a healthy assignment performs no MH selection (R-6).
 - **Labels**:
-  - `status`: Selection outcome (success, error)
+  - `status`: Selection outcome (success, error). `status="error"` is the empty-MH-pool case; since
+    R-6 it **cannot fire for a join into an existing meeting** — only a new meeting can hit it.
   - `has_multiple`: Whether multiple MH peers were selected (true, false)
 - **Cardinality**: Low (4 combinations)
+- **Rate expectation**: volume is per new meeting, not per join. The step-down on the
+  `gc-overview.json` "MH Selections by Status" panel at the R-6 GC roll is expected, not an
+  incident.
 - **Usage**: Track MH selection patterns
 - **Example**:
   ```promql
@@ -457,7 +508,9 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 
 ### `gc_mh_selection_duration_seconds`
 - **Type**: Histogram
-- **Description**: MH selection operation duration
+- **Description**: MH selection operation duration. Emitted on the **new-assignment path only** —
+  a join into a meeting that already has a healthy assignment performs no MH selection (R-6), so
+  the sample count is per new meeting, not per join.
 - **Labels**:
   - `status`: Selection outcome (success, error)
 - **Buckets**: [0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250]

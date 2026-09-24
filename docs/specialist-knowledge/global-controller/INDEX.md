@@ -26,7 +26,7 @@
 - McAssignment -> McAssignmentInfo conversion -> `crates/gc-service/src/handlers/meetings.rs:From<McAssignment>`
 - MC gRPC service (register, heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs:McService`
 - MH gRPC service (register, load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`
-- MC assignment + load balancing -> `crates/gc-service/src/services/mc_assignment.rs:McAssignmentService`
+- MC assignment + load balancing; join stickiness (reuse returns existing MC, no MH selection, `mh_selection: None`, R-6) + soft-ceiling pairing note -> `crates/gc-service/src/services/mc_assignment.rs:assign_meeting_with_mh()`
 - MH selection (active/active `handlers: Vec<MhAssignmentInfo>`; `grpc_endpoint` propagated DB→info→proto) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
 - MC gRPC client (`assign_meeting` RPC carrying per-handler `webtransport_endpoint` + `grpc_endpoint`) -> `crates/gc-service/src/services/mc_client.rs:McClientTrait`
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
@@ -65,7 +65,7 @@
 ## Tests
 - Meeting creation + the three refusal causes -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
-- MC/MH assignment tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`, `crates/gc-service/tests/meeting_assignment_tests.rs`
+- MC/MH assignment tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`, `crates/gc-service/tests/meeting_assignment_tests.rs`; HTTP join stickiness -> `crates/gc-service/tests/meeting_tests.rs` (`test_join_sticky_*`)
 - Auth integration tests -> `crates/gc-service/tests/auth_tests.rs`
 - Per-metric-cluster integration tests (ADR-0032) -> `crates/gc-service/tests/*_metrics_integration.rs`
 - `error_type` label coverage -> `crates/gc-service/tests/meeting_creation_metrics_integration.rs`, `crates/gc-service/tests/errors_metric_integration.rs`

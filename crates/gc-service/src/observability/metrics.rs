@@ -947,11 +947,27 @@ const TELEMETRY_PII_KINDS: &[&str] = &[
 const CORS_ORIGIN_CLASSES: &[&str] = &["allowed", "denied"];
 const CORS_STATUSES: &[&str] = &["200", "403"];
 /// `gc_grpc_mc_calls_total{method, status}` — closed at the emit sites: `method`
-/// is the fixed literal `"assign_meeting_with_mh"` at every prod call
-/// (`services/mc_client.rs:168,213,222,232`), never a runtime gRPC method name;
-/// `status` is one of these three literals. (Un-exempted 2026-09-10: the earlier
-/// "method is a runtime string" exemption was wrong — every call site is a literal.)
-const GRPC_MC_METHODS: &[&str] = &["assign_meeting_with_mh"];
+/// is `MC_METHOD_ASSIGN_MEETING_WITH_MH` at every prod call (`services/mc_client.rs`),
+/// never a runtime gRPC method name; `status` is one of these three literals.
+/// (Un-exempted 2026-09-10: the earlier "method is a runtime string" exemption was
+/// wrong — every call site is a literal.)
+///
+/// Single source of truth for the `method` label value: production emission
+/// (`services/mc_client.rs`), the zero-init loop below, and the cluster test all read
+/// this constant. It tracks the proto RPC name — a rename the compiler enforces at
+/// `client.assign_meeting_with_mh(..)` would otherwise leave these string literals
+/// silently stale, which is how the catalog came to document a never-emitted
+/// `assign_meeting` (corrected 2026-09-24).
+///
+/// Pinned to the wire value by `mc_method_constant_matches_emitted_literal` in
+/// `crates/gc-service/tests/grpc_mc_call_metrics_integration.rs`; that file's other
+/// `"assign_meeting_with_mh"` literals are deliberate restatements and must NOT be
+/// "DRYed" against this constant, or its emission assertions become
+/// `constant == constant`. Changing this value fails that pin, which names the
+/// downstream readers to update (catalog, runbook PromQL).
+pub const MC_METHOD_ASSIGN_MEETING_WITH_MH: &str = "assign_meeting_with_mh";
+
+const GRPC_MC_METHODS: &[&str] = &[MC_METHOD_ASSIGN_MEETING_WITH_MH];
 const GRPC_MC_STATUSES: &[&str] = &["success", "error", "rejected"];
 
 /// `gc_db_queries_total{operation, status}` — the CLOSED set of `operation`
@@ -1613,17 +1629,25 @@ mod tests {
     fn metrics_module_emits_grpc_mc_call_cluster() {
         let snap = MetricAssertion::snapshot();
 
-        record_grpc_mc_call("assign_meeting", "success", Duration::from_millis(25));
-        record_grpc_mc_call("assign_meeting", "rejected", Duration::from_millis(10));
-        record_grpc_mc_call("assign_meeting", "error", Duration::from_millis(100));
+        // Method spellings come from GRPC_MC_METHODS (the production value set),
+        // not a literal: a test that records the spelling it asserts passes no
+        // matter what production emits, which is how "assign_meeting" (never
+        // emitted) survived here until 2026-09-24.
+        for method in GRPC_MC_METHODS {
+            record_grpc_mc_call(method, "success", Duration::from_millis(25));
+            record_grpc_mc_call(method, "rejected", Duration::from_millis(10));
+            record_grpc_mc_call(method, "error", Duration::from_millis(100));
+        }
 
         snap.histogram("gc_grpc_mc_call_duration_seconds")
             .assert_observation_count_at_least(3);
 
-        for status in ["success", "rejected", "error"] {
-            snap.counter("gc_grpc_mc_calls_total")
-                .with_labels(&[("method", "assign_meeting"), ("status", status)])
-                .assert_delta(1);
+        for method in GRPC_MC_METHODS {
+            for status in ["success", "rejected", "error"] {
+                snap.counter("gc_grpc_mc_calls_total")
+                    .with_labels(&[("method", *method), ("status", status)])
+                    .assert_delta(1);
+            }
         }
     }
 

@@ -6,9 +6,11 @@
 //! # Architecture
 //!
 //! This service orchestrates the assignment flow:
-//! 1. Check for existing healthy assignment
-//! 2. If no healthy assignment, select candidate MC via load balancing
-//! 3. Select MHs for the meeting via weighted load balancing
+//! 1. Check for existing healthy assignment. If one exists, return it as-is:
+//!    no MH selection, no MC notification (R-6 join stickiness — the meeting's
+//!    handler set was programmed into MC once, at first join, and MC owns it)
+//! 2. Otherwise select MHs for the meeting via weighted load balancing
+//! 3. Select a candidate MC via load balancing
 //! 4. Call MC via gRPC to notify of assignment (ADR-0010 Section 4a)
 //! 5. On acceptance, atomic DB write
 //! 6. On rejection, retry with different MC (max 3 attempts)
@@ -62,8 +64,22 @@ pub struct McAssignmentService;
 pub struct AssignmentWithMh {
     /// MC assignment info.
     pub mc_assignment: McAssignment,
-    /// MH selection info (active/active peers).
-    pub mh_selection: MhSelection,
+    /// MH selection (active/active peers). `Some` iff this call made a NEW
+    /// assignment — it is exactly the selection sent to MC in the
+    /// once-per-meeting `assign_meeting` RPC. `None` on the reuse path: the
+    /// meeting's handler set was frozen at first join and is owned by MC, so GC
+    /// neither re-selects nor re-reads it.
+    ///
+    /// `None` is the only spelling of "no selection": a `Some` is never empty
+    /// (`select_mhs_for_meeting` guarantees at least one handler), which is the
+    /// premise `selection_is_malformed` relies on.
+    ///
+    /// No production code reads this field: the join response carries only
+    /// `mc_assignment`, and handler ids are logged inside this service. It is the
+    /// service's return contract, asserted by the integration tests to prove which
+    /// branch ran (`None` = no MH selection on reuse).
+    #[allow(dead_code)] // Read only by integration tests (bin target sees no reader)
+    pub mh_selection: Option<MhSelection>,
 }
 
 impl McAssignmentService {
@@ -124,7 +140,10 @@ impl McAssignmentService {
 
     /// Assign a meeting with MH selection and MC notification (ADR-0010 Section 4a).
     ///
-    /// This is the new assignment flow that:
+    /// If the meeting already has a healthy assignment, it is returned as-is
+    /// with `mh_selection: None` — no MH selection and no MC call, so this path
+    /// does not depend on a live MH pool (R-6). Otherwise this is the new
+    /// assignment flow that:
     /// 1. Selects MHs for the meeting
     /// 2. Notifies MC via gRPC BEFORE writing to DB
     /// 3. Handles MC rejection with retry logic
@@ -139,12 +158,15 @@ impl McAssignmentService {
     ///
     /// # Returns
     ///
-    /// Returns `AssignmentWithMh` with MC and MH assignments.
+    /// Returns `AssignmentWithMh`: the MC assignment, plus `Some(selection)` for a
+    /// new assignment or `None` when an existing healthy assignment was reused.
     ///
     /// # Errors
     ///
-    /// - `GcError::ServiceUnavailable` - No healthy MCs/MHs or all MCs rejected
-    /// - `GcError::Database` - Database operation failed
+    /// - `GcError::ServiceUnavailable` - New assignment only: no healthy MCs/MHs,
+    ///   or all MCs rejected. The reuse path cannot fail on MC-candidate or MH-pool
+    ///   state.
+    /// - `GcError::Database` - Database operation failed (either path)
     #[instrument(skip_all, fields(meeting_id = %meeting_id, region = %region, gc_id = %gc_id))]
     pub async fn assign_meeting_with_mh(
         pool: &PgPool,
@@ -164,23 +186,58 @@ impl McAssignmentService {
                 target: "gc.service.assignment",
                 meeting_id = %meeting_id,
                 mc_id = %existing.mc_id,
-                "Found existing healthy assignment"
+                "Existing healthy assignment reused; handler owned by MC, no MH selection performed"
             );
 
-            // For existing assignments, we need to return MH info too
-            // Select MHs (they may have changed since original assignment)
-            let mh_selection = MhSelectionService::select_mhs_for_meeting(pool, region).await?;
-
-            // Record success metrics for reusing existing assignment
+            // Reuse path (R-6): return the already-assigned MC WITHOUT selecting MHs.
+            // The handler set was programmed into MC once, by the `assign_meeting`
+            // RPC on the new-assignment branch below, and MC owns it from then on;
+            // MC learns about each later participant through its own client->MC
+            // signalling, so there is nothing for GC to send. The join response
+            // carries only `mc_assignment`, so a re-selection here would add latency
+            // and DB load and turn a momentarily empty MH pool into a failed join
+            // into a meeting whose handler is fixed and healthy.
+            //
+            // ANCHOR (DRY): canonical statement of the ceiling-enforcement pairing.
+            // Mirrors — edit in lockstep: crates/gc-service/tests/mc_assignment_rpc_tests.rs
+            // (test_reuse_path_skips_mh_selection_on_empty_pool doc, pointer only),
+            // crates/gc-service/tests/meeting_tests.rs (Join Stickiness section header,
+            // pointer only), docs/runbooks/gc-incident-response.md Scenario 3 (operator
+            // register), docs/user-stories/2026-09-21-hear-each-other.md (requirement).
+            //
+            // Ceiling pairing — DELIBERATE, do not "restore" a check here. GC's
+            // enforcement of the MH-advertised `max_streams` (R-19) is SOFT and
+            // new-meeting-only: `get_candidate_mhs` excludes handlers at or over
+            // their ceiling (`current_streams < max_streams`), selection returns
+            // ServiceUnavailable when none remain, there is no reservation, and GC
+            // can over-place between load reports. A sticky join is waved through
+            // with no ceiling re-check because a meeting cannot be split across
+            // handlers in story 2 (ADR-0036 §9): a re-check could only fail the
+            // join, never move it. Over-ceiling growth is bounded by MH admission,
+            // the HARD backstop. Not a regression: before R-6 the re-selection on
+            // this path was discarded by `JoinMeetingResponse::new`, so the soft
+            // ceiling was never enforced on a sticky join. GC consumes `max_streams`
+            // unchanged: `register_mh` stores it, `update_load_report` stores the
+            // MH-reported `current_streams`, `get_candidate_mhs` filters on them — no
+            // GC code change for the egress chain.
             metrics::record_mc_assignment("success", None, start.elapsed());
 
             return Ok(AssignmentWithMh {
                 mc_assignment: existing,
-                mh_selection,
+                mh_selection: None,
             });
         }
 
-        // Step 2: Select MHs for the meeting
+        // Step 2: Select MHs for the meeting. Kept as a concrete `MhSelection`
+        // binding (not `Option`) through the RPC and `selection_is_malformed`, so
+        // an absent selection is structurally unable to reach `assign_meeting`;
+        // it is wrapped in `Some` only at `AssignmentWithMh` construction.
+        //
+        // ANCHOR (DRY): this is the ONLY `select_mhs_for_meeting` callsite, which
+        // makes `gc_mh_selections_total` 1:1 with new assignments. The stickiness
+        // (assignment reuse) rate in docs/observability/metrics/gc-service.md
+        // (under `gc_mc_assignments_total`) depends on that; a second callsite
+        // must update that expression.
         let mh_selection = MhSelectionService::select_mhs_for_meeting(pool, region).await?;
 
         let mh_ids: Vec<&str> = mh_selection
@@ -188,6 +245,9 @@ impl McAssignmentService {
             .iter()
             .map(|h| h.mh_id.as_str())
             .collect();
+        // Deliberately NOT collapsed into the "Meeting assigned to MC with MH" info
+        // below: this fires before the RPC, so it survives an all-MCs-reject
+        // outcome; the info line fires only after an MC accepts.
         tracing::debug!(
             target: "gc.service.assignment",
             meeting_id = %meeting_id,
@@ -266,6 +326,8 @@ impl McAssignmentService {
                         meeting_id = %meeting_id,
                         mc_id = %assignment.mc_id,
                         region = %region,
+                        mh_ids = ?mh_ids,
+                        mh_count = mh_selection.handlers.len(),
                         "Meeting assigned to MC with MH"
                     );
 
@@ -274,7 +336,7 @@ impl McAssignmentService {
 
                     return Ok(AssignmentWithMh {
                         mc_assignment: assignment,
-                        mh_selection,
+                        mh_selection: Some(mh_selection),
                     });
                 }
                 Ok(McAssignmentResult::Rejected(reason)) => {

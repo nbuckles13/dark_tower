@@ -20,6 +20,7 @@
 mod test_common;
 use test_common::jwt_fixtures::{TestKeypair, TestServiceClaims, TestUserClaims};
 
+use ::common::observability::testing::MetricAssertion;
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
@@ -29,7 +30,7 @@ use futures::future::join_all;
 use gc_service::config::Config;
 use gc_service::observability::metrics::init_metrics_recorder;
 use gc_service::routes::{self, AppState};
-use gc_service::services::MockMcClient;
+use gc_service::services::{McAssignmentService, MockMcClient};
 use std::sync::OnceLock;
 
 /// Global metrics handle for test servers
@@ -76,6 +77,12 @@ struct TestMeetingServer {
 
 impl TestMeetingServer {
     async fn spawn(pool: PgPool) -> Result<Self> {
+        Self::spawn_with_mc_client(pool, Arc::new(MockMcClient::accepting())).await
+    }
+
+    /// Spawn with a caller-held MC client, so a test can read the mock's
+    /// `call_count()` after driving joins through the real HTTP stack.
+    async fn spawn_with_mc_client(pool: PgPool, mc_client: Arc<MockMcClient>) -> Result<Self> {
         // Create mock server for JWKS and AC internal endpoints
         let mock_server = MockServer::start().await;
         let keypair = TestKeypair::new(1, "test-key-01");
@@ -137,8 +144,7 @@ impl TestMeetingServer {
         let (_tx, rx) = watch::channel(SecretString::from("test-token"));
         let token_receiver = TokenReceiver::from_watch_receiver(rx);
 
-        // Create application state with MockMcClient (tests production code path)
-        let mock_mc_client = Arc::new(MockMcClient::accepting());
+        // Application state with the caller's MockMcClient (tests production code path)
         let telemetry = gc_service::handlers::TelemetryState::from_config(
             config.otel_collector_endpoint.clone(),
             config.telemetry_proxy_max_bytes,
@@ -148,7 +154,7 @@ impl TestMeetingServer {
         let state = Arc::new(AppState {
             pool: pool.clone(),
             config: config.clone(),
-            mc_client: mock_mc_client,
+            mc_client,
             token_receiver,
             telemetry,
         });
@@ -485,7 +491,12 @@ async fn create_test_meeting(
 /// MC assignment is required for meeting join operations. This helper
 /// creates a healthy MC in the test-region that can handle assignments.
 async fn register_healthy_mc_for_region(pool: &PgPool, region: &str) {
-    let grpc_endpoint = format!("https://mc-test-{}.example.com:50051", region);
+    register_healthy_mc(pool, &format!("mc-test-{}", region), region).await;
+}
+
+/// Register one healthy Meeting Controller with an explicit id.
+async fn register_healthy_mc(pool: &PgPool, controller_id: &str, region: &str) {
+    let grpc_endpoint = format!("https://{}.example.com:50051", controller_id);
     sqlx::query(
         r#"
         INSERT INTO meeting_controllers (
@@ -499,10 +510,10 @@ async fn register_healthy_mc_for_region(pool: &PgPool, region: &str) {
             health_status = 'healthy'
         "#,
     )
-    .bind(format!("mc-test-{}", region))
+    .bind(controller_id)
     .bind(region)
     .bind(&grpc_endpoint)
-    .bind(format!("https://mc-test-{}.example.com:443", region))
+    .bind(format!("https://{}.example.com:443", controller_id))
     .execute(pool)
     .await
     .expect("Failed to register healthy MC for testing");
@@ -2306,6 +2317,301 @@ async fn test_same_org_join_sends_home_org_id_equal_to_user_org_id(pool: PgPool)
         home_org_id, meeting_org_id,
         "For same-org joins, home_org_id must equal meeting_org_id"
     );
+
+    Ok(())
+}
+
+// ============================================================================
+// Join Stickiness Tests (R-6) - one MC, one `assign_meeting`, no live MH pool
+// ============================================================================
+//
+// No MH-pool or ceiling re-check on reuse is DELIBERATE (R-19 soft,
+// new-meeting-only; ADR-0036 §9): the ceiling test below waves a sticky join
+// through while refusing a new meeting in the same at-ceiling state. Full
+// ceiling-enforcement pairing: the ANCHOR on the reuse branch in
+// `src/services/mc_assignment.rs`.
+//
+// No dedicated env-test: cluster-level stickiness is proven transitively by the
+// multi-party browser scenario (N+1 participants hearing each other share one
+// handler set and one MC).
+
+/// GET-join `code` as `user_id`, asserting 200, and return the response body.
+async fn join_as_user(
+    server: &TestMeetingServer,
+    client: &reqwest::Client,
+    code: &str,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> Result<serde_json::Value> {
+    let token = server.create_token_for_user(user_id, org_id);
+    let response = client
+        .get(format!("{}/api/v1/meetings/{}", server.url(), code))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200, "join into {} should succeed", code);
+    Ok(response.json().await?)
+}
+
+/// Request a guest token for `code`, returning the raw response.
+async fn request_guest_token(
+    server: &TestMeetingServer,
+    client: &reqwest::Client,
+    code: &str,
+) -> Result<reqwest::Response> {
+    Ok(client
+        .post(format!(
+            "{}/api/v1/meetings/{}/guest-token",
+            server.url(),
+            code
+        ))
+        .json(&serde_json::json!({
+            "displayName": "Sticky Guest",
+            "captchaToken": "valid-captcha-token"
+        }))
+        .send()
+        .await?)
+}
+
+/// Mark every MH in `region` unhealthy, emptying the MH candidate pool.
+async fn make_mhs_unhealthy(pool: &PgPool, region: &str) {
+    sqlx::query("UPDATE media_handlers SET health_status = 'unhealthy' WHERE region = $1")
+        .bind(region)
+        .execute(pool)
+        .await
+        .expect("Failed to mark MHs unhealthy");
+}
+
+/// Put every MH in `region` at its advertised ceiling (`current_streams =
+/// max_streams`) while leaving it healthy — the R-19 soft-ceiling exclusion.
+async fn put_mhs_at_ceiling(pool: &PgPool, region: &str) {
+    sqlx::query("UPDATE media_handlers SET current_streams = max_streams WHERE region = $1")
+        .bind(region)
+        .execute(pool)
+        .await
+        .expect("Failed to put MHs at ceiling");
+}
+
+/// Two different users joining one meeting resolve to the same MC, and GC calls
+/// `assign_meeting` exactly once (first join only). Two healthy MCs are registered
+/// so "same MC" is not trivially true.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_join_sticky_two_users_same_mc_single_assign_rpc(pool: PgPool) -> Result<()> {
+    let mc_client = Arc::new(MockMcClient::accepting());
+    let server = TestMeetingServer::spawn_with_mc_client(pool.clone(), mc_client.clone()).await?;
+    let client = reqwest::Client::new();
+
+    register_healthy_mc(&server.pool, "mc-sticky-a", "test-region").await;
+    register_healthy_mc(&server.pool, "mc-sticky-b", "test-region").await;
+    register_healthy_mhs_for_region(&server.pool, "test-region").await;
+
+    let org_id = create_test_org(&server.pool, "sticky-org", "Sticky Org").await;
+    let alice = create_test_user(&server.pool, org_id, "alice@test.com", "Alice").await;
+    let bob = create_test_user(&server.pool, org_id, "bob@test.com", "Bob").await;
+    let meeting_id = create_test_meeting(
+        &server.pool,
+        org_id,
+        alice,
+        "STICKY1",
+        "scheduled",
+        false,
+        false,
+        false,
+    )
+    .await;
+
+    let first = join_as_user(&server, &client, "STICKY1", alice, org_id).await?;
+    let second = join_as_user(&server, &client, "STICKY1", bob, org_id).await?;
+
+    let first_mc = first["mcAssignment"]["mcId"]
+        .as_str()
+        .expect("mcAssignment.mcId present");
+    assert!(!first_mc.is_empty());
+    assert_eq!(
+        second["mcAssignment"]["mcId"],
+        first["mcAssignment"]["mcId"]
+    );
+    assert_eq!(
+        second["mcAssignment"]["grpcEndpoint"],
+        first["mcAssignment"]["grpcEndpoint"]
+    );
+
+    // Tie "same MC" to the persisted assignment, not just two bodies agreeing.
+    let persisted =
+        McAssignmentService::get_assignment(&server.pool, &meeting_id.to_string(), "test-region")
+            .await?
+            .expect("assignment row persisted by the first join");
+    assert_eq!(persisted.mc_id, first_mc);
+
+    assert_eq!(
+        mc_client.call_count(),
+        1,
+        "assign_meeting is called once per meeting, by the first join only"
+    );
+
+    Ok(())
+}
+
+/// A join into a meeting with a healthy MC assignment succeeds with ZERO healthy
+/// MHs — for both join callers (user GET and guest-token) — and makes no MC call.
+///
+/// Also proves, through the real HTTP stack, that reuse emits no MH selection and
+/// keeps `gc_mc_assignments_total{status="success"}`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_join_sticky_succeeds_with_zero_healthy_mhs(pool: PgPool) -> Result<()> {
+    let mc_client = Arc::new(MockMcClient::accepting());
+    let server = TestMeetingServer::spawn_with_mc_client(pool.clone(), mc_client.clone()).await?;
+    let client = reqwest::Client::new();
+
+    register_healthy_mc(&server.pool, "mc-sticky-a", "test-region").await;
+    register_healthy_mc(&server.pool, "mc-sticky-b", "test-region").await;
+    register_healthy_mhs_for_region(&server.pool, "test-region").await;
+
+    let org_id = create_test_org(&server.pool, "sticky-org", "Sticky Org").await;
+    let host = create_test_user(&server.pool, org_id, "host@test.com", "Host").await;
+    let member = create_test_user(&server.pool, org_id, "member@test.com", "Member").await;
+    create_test_meeting(
+        &server.pool,
+        org_id,
+        host,
+        "STICKY2",
+        "scheduled",
+        true, // guests allowed, for the guest-token leg
+        false,
+        false,
+    )
+    .await;
+
+    // This test's server runs on the test thread: `#[sqlx::test]` uses a
+    // current-thread runtime, so the `tokio::spawn`ed axum task emits on the thread
+    // that owns the thread-local snapshot. Do NOT switch this test to a
+    // multi-thread runtime — emissions would miss the snapshot and the `+0`
+    // assertions below would pass vacuously. The `+1` on the first (new) join is
+    // the positive control that the recorder sees server-side emissions.
+    let snap_new = MetricAssertion::snapshot();
+    let first = join_as_user(&server, &client, "STICKY2", host, org_id).await?;
+    snap_new
+        .counter("gc_mh_selections_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
+    drop(snap_new);
+    assert_eq!(mc_client.call_count(), 1);
+
+    // Empty the MH pool: the meeting's handler is fixed, the candidate pool is not.
+    make_mhs_unhealthy(&server.pool, "test-region").await;
+
+    let snap_reuse = MetricAssertion::snapshot();
+
+    let second = join_as_user(&server, &client, "STICKY2", member, org_id).await?;
+    assert_eq!(
+        second["mcAssignment"]["mcId"],
+        first["mcAssignment"]["mcId"]
+    );
+
+    let guest = request_guest_token(&server, &client, "STICKY2").await?;
+    assert_eq!(
+        guest.status(),
+        200,
+        "guest join into an assigned meeting should succeed"
+    );
+    let guest: serde_json::Value = guest.json().await?;
+    assert_eq!(
+        guest["mcAssignment"]["mcId"], second["mcAssignment"]["mcId"],
+        "guest and user callers land on the same MC"
+    );
+
+    for status in ["success", "error"] {
+        snap_reuse
+            .counter("gc_mh_selections_total")
+            .with_labels(&[("status", status)])
+            .assert_delta(0);
+    }
+    snap_reuse
+        .counter("gc_mc_assignments_total")
+        .with_labels(&[("status", "success"), ("rejection_reason", "none")])
+        .assert_delta(2);
+
+    assert_eq!(mc_client.call_count(), 1, "reuse joins make no MC RPC");
+
+    Ok(())
+}
+
+/// Ceiling flavour of "no MH candidate": every MH is healthy but at its
+/// advertised `max_streams`. A sticky join still succeeds (no ceiling re-check on
+/// reuse, by design — see the pairing note above), while a NEW meeting in the
+/// same state is refused 503 with no MC call. The refusal is the positive control
+/// that the at-ceiling state really excludes every handler (it would catch a
+/// `<=` off-by-one in the candidate filter).
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_join_sticky_succeeds_with_all_mhs_at_ceiling(pool: PgPool) -> Result<()> {
+    let mc_client = Arc::new(MockMcClient::accepting());
+    let server = TestMeetingServer::spawn_with_mc_client(pool.clone(), mc_client.clone()).await?;
+    let client = reqwest::Client::new();
+
+    register_healthy_mc_for_region(&server.pool, "test-region").await;
+    register_healthy_mhs_for_region(&server.pool, "test-region").await;
+
+    let org_id = create_test_org(&server.pool, "ceiling-org", "Ceiling Org").await;
+    let host = create_test_user(&server.pool, org_id, "host@test.com", "Host").await;
+    let member = create_test_user(&server.pool, org_id, "member@test.com", "Member").await;
+    for code in ["CEIL001", "CEIL002"] {
+        create_test_meeting(
+            &server.pool,
+            org_id,
+            host,
+            code,
+            "scheduled",
+            false,
+            false,
+            false,
+        )
+        .await;
+    }
+
+    let first = join_as_user(&server, &client, "CEIL001", host, org_id).await?;
+    assert_eq!(mc_client.call_count(), 1);
+
+    put_mhs_at_ceiling(&server.pool, "test-region").await;
+
+    // Current-thread runtime: the spawned server emits on this thread (see the
+    // zero-healthy-MH test above). The `{error}` +1 on the refused new meeting
+    // below is this snapshot's capture control for the +0 assertions here.
+    let snap = MetricAssertion::snapshot();
+
+    let second = join_as_user(&server, &client, "CEIL001", member, org_id).await?;
+    assert_eq!(
+        second["mcAssignment"]["mcId"],
+        first["mcAssignment"]["mcId"]
+    );
+    assert_eq!(mc_client.call_count(), 1, "sticky join makes no MC RPC");
+    for status in ["success", "error"] {
+        snap.counter("gc_mh_selections_total")
+            .with_labels(&[("status", status)])
+            .assert_delta(0);
+    }
+
+    // Positive control: a new meeting cannot be placed when every MH is at ceiling.
+    let token = server.create_token_for_user(host, org_id);
+    let refused = client
+        .get(format!("{}/api/v1/meetings/CEIL002", server.url()))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+    assert_eq!(
+        refused.status(),
+        503,
+        "a new meeting must be refused when every MH is at its ceiling"
+    );
+    assert_eq!(
+        mc_client.call_count(),
+        1,
+        "no MC call when MH selection finds no candidate"
+    );
+    // Attribute the 503 to MH selection (not, e.g., an empty MC candidate pool,
+    // which is looked up after MH selection and would also leave call_count at 1).
+    snap.counter("gc_mh_selections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
 
     Ok(())
 }

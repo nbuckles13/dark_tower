@@ -460,10 +460,11 @@ and the manifests orderable rather than independent:
   variables that image requires. `Config::from_env()` fails, **both** pods enter
   `CrashLoopBackOff`, and MH accepts no connections at all.
 
-  That last case is a **join-path outage, not a media-only degradation** — a
-  participant cannot complete a join if no MH will accept them. **Page, do not
-  ticket.** If you must revert the ConfigMap, revert the image in the same
-  action.
+  That last case is **not a media-only degradation**: with no MH, no new meeting
+  can start (GC cannot place it) and media is dead in every in-progress meeting.
+  Joins into already-assigned meetings still return 200 from GC (R-6) but carry
+  no media, so the outage is partly silent. **Page, do not ticket.** If you must
+  revert the ConfigMap, revert the image in the same action.
 
 > **Do not deploy MH with `kubectl apply -f`.** `MH_TERMINATION_GRACE_SECONDS`
 > is not a ConfigMap key: it is written into each Deployment's env at build time
@@ -529,9 +530,10 @@ this runbook — unlike GC's, AC's and MC's — had no configuration section at 
 ## Both pods CrashLoop immediately after apply
 
 Symptom: after a deploy, `mh-0` and `mh-1` both enter `CrashLoopBackOff` and MH
-accepts no connections. **Page, not ticket** — this is a join-path outage, not a
-media-only degradation, because a participant cannot complete a join if no MH
-will accept them.
+accepts no connections. **Page, not ticket** — this is not a media-only
+degradation: no new meeting can start (GC cannot place it) and media is dead in
+every in-progress meeting. Joins into already-assigned meetings still succeed at
+GC (R-6) but carry no media.
 
 Entry point — the container is already dead, so read the previous container's
 logs, not the current one's:
@@ -665,14 +667,18 @@ the shedding stays, the "does not come back on its own" clause goes.
 If you need to stop media, **scaling `mh-0` / `mh-1` to zero replicas is the wrong lever, and it is
 worse than the problem it is reaching for.**
 
-**MH assignment is part of the join flow.** With no MH available, joins do not degrade to
-audio-less meetings — **they fail**. So scaling to zero converts a media-path problem into a **join
-outage**, whose blast radius is strictly wider: it stops every *new* participant in every meeting,
-including meetings that were not affected by whatever prompted the action.
+**MH placement is part of starting a meeting.** With no MH available, GC cannot place a new
+meeting, so **every new meeting fails to start, fleet-wide**. Meetings that already have an MC
+assignment keep admitting participants (a sticky join never re-checks the MH pool, R-6) — **but
+those joins succeed into silence**: GC returns 200, the participant's handler is gone, and no media
+flows. That is worse for the operator than a clean failure, because nothing at the join tells anyone
+it went wrong. So scaling to zero converts a media-path problem into a **new-meeting outage plus
+silent media in every existing meeting**, whose blast radius is strictly wider than the problem it
+was aimed at, including meetings that were not affected by whatever prompted the action.
 
 | Action | Intended blast radius | Actual blast radius |
 |---|---|---|
-| Scale MH to 0 | media on affected meetings | **all joins, fleet-wide**, plus the media it was aimed at |
+| Scale MH to 0 | media on affected meetings | **every new meeting, fleet-wide**, plus media on **every** existing meeting (whose joins still succeed, silently) |
 
 **There is no finer-grained lever in this build.** There is no per-meeting media disable, no feature
 flag, and no runtime toggle. If media must be stopped, the only correct action is a **redeploy** of

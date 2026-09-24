@@ -12,6 +12,7 @@
 
 use crate::errors::GcError;
 use crate::observability::metrics;
+use crate::observability::metrics::MC_METHOD_ASSIGN_MEETING_WITH_MH;
 use crate::services::mh_selection::MhAssignmentInfo;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
@@ -165,7 +166,7 @@ impl McClient {
             Ok(ch) => ch,
             Err(e) => {
                 let duration = rpc_start.elapsed();
-                metrics::record_grpc_mc_call("assign_meeting_with_mh", "error", duration);
+                metrics::record_grpc_mc_call(MC_METHOD_ASSIGN_MEETING_WITH_MH, "error", duration);
                 metrics::record_error("mc_grpc", "connection_failed", 503);
                 return Err(e);
             }
@@ -210,7 +211,7 @@ impl McClient {
         let rpc_duration = rpc_start.elapsed();
 
         let response = response.map_err(|e| {
-            metrics::record_grpc_mc_call("assign_meeting_with_mh", "error", rpc_duration);
+            metrics::record_grpc_mc_call(MC_METHOD_ASSIGN_MEETING_WITH_MH, "error", rpc_duration);
             metrics::record_error("mc_grpc", "service_unavailable", 503);
             warn!(target: "gc.services.mc_client", error = %e, mc_endpoint = %mc_endpoint, "MC RPC failed");
             GcError::ServiceUnavailable("Meeting controller unavailable".to_string())
@@ -219,7 +220,7 @@ impl McClient {
         let inner: AssignMeetingWithMhResponse = response.into_inner();
 
         if inner.accepted {
-            metrics::record_grpc_mc_call("assign_meeting_with_mh", "success", rpc_duration);
+            metrics::record_grpc_mc_call(MC_METHOD_ASSIGN_MEETING_WITH_MH, "success", rpc_duration);
             tracing::info!(
                 target: "gc.services.mc_client",
                 meeting_id = %meeting_id,
@@ -229,7 +230,11 @@ impl McClient {
             Ok(McAssignmentResult::Accepted)
         } else {
             let reason = McRejectionReason::from(inner.rejection_reason);
-            metrics::record_grpc_mc_call("assign_meeting_with_mh", "rejected", rpc_duration);
+            metrics::record_grpc_mc_call(
+                MC_METHOD_ASSIGN_MEETING_WITH_MH,
+                "rejected",
+                rpc_duration,
+            );
             tracing::warn!(
                 target: "gc.services.mc_client",
                 meeting_id = %meeting_id,

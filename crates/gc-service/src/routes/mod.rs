@@ -119,7 +119,7 @@ pub fn build_routes(
         // Health check endpoints (unversioned operational endpoints)
         .route("/health", get(handlers::health_check))
         .route("/ready", get(handlers::readiness_check))
-        // Guest token endpoint (public, rate limited)
+        // Guest token endpoint (public; rate limiting NOT implemented — docs/TODO.md §Rate Limiting)
         .route(
             "/api/v1/meetings/:code/guest-token",
             post(handlers::get_guest_token),

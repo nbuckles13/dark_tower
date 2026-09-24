@@ -155,6 +155,8 @@ histogram_quantile(0.95,
 ```
 `for: 5m`
 
+**Population caveat (R-6)**: the histogram is bimodal (reuse vs new assignment, no separating label) and this expression is unfiltered, so p95 is dominated by the reuse path. See `docs/observability/metrics/gc-service.md` "Population note (R-6)"; fix tracked in `docs/TODO.md` §Observability Debt.
+
 **Response**:
 1. Check MC pod availability
 2. Check database query latency (MC selection)
@@ -595,6 +597,8 @@ histogram_quantile(0.95,
 ) > 2.0
 ```
 `for: 5m`
+
+**Population caveat (R-6)**: the histogram is bimodal (reuse vs new assignment, no separating label) and this expression is unfiltered, so p95 is dominated by the reuse path. See `docs/observability/metrics/gc-service.md` "Population note (R-6)"; fix tracked in `docs/TODO.md` §Observability Debt.
 
 **Response**:
 1. Check "Meeting Join Latency (P50/P95/P99)" dashboard panel for latency trend
