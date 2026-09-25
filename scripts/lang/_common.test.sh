@@ -371,6 +371,91 @@ assert_emit "check-ci-gha"      "CHECK ci-github-actions" "FMT_MODE=check SOURCE
 assert_emit "override-source"   "CHECK check-only-override" "FMT_MODE=check SOURCE=check-only-override"
 assert_emit "invalid-source-none" "INVALID"               "FMT_MODE=invalid SOURCE=none"   # the single-token fallback branch
 
+# =============================================================================
+# layer_register_cleanup — cleanups run on the lifecycle's EXIT path, failure-tolerantly,
+# before STATUS=/LAYER=, on stderr, and without changing the exit code.
+# Each case runs a REAL layer in a child bash so the actual EXIT trap fires.
+# =============================================================================
+__cleanup_marks="$(mktemp -d)"
+
+# Run a child layer that records status $1 and registers two cleanups, the FIRST failing.
+# Prints "<rc>" then the captured stdout; stderr goes to $__cleanup_marks/stderr.
+__run_cleanup_layer() {
+  local status="$1"
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    marks="$2"
+    first_cleanup()  { printf ran > "$marks/first";  printf "first-cleanup-chatter\n"; return 7; }
+    second_cleanup() { printf ran > "$marks/second"; }
+    layer_lifecycle_begin 97
+    layer_register_cleanup first_cleanup
+    layer_register_cleanup second_cleanup
+    __LAYER_STATUSES+=("$3")
+    __LAYER_REASONS+=("child-reason")
+  ' _ "${__here}/_common.sh" "$__cleanup_marks" "$status" 2>"$__cleanup_marks/stderr"
+}
+
+assert_cleanup_case() {
+  local label="$1" status="$2" expected_rc="$3" out rc
+  rm -f "$__cleanup_marks/first" "$__cleanup_marks/second"
+  set +e
+  out="$(__run_cleanup_layer "$status")"
+  rc=$?
+  set -e
+  local ok=1 why=""
+  [[ -f "$__cleanup_marks/first" ]]  || { ok=0; why+=" first-cleanup-did-not-run"; }
+  [[ -f "$__cleanup_marks/second" ]] || { ok=0; why+=" second-cleanup-skipped-after-first-failed"; }
+  [[ "$rc" == "$expected_rc" ]]      || { ok=0; why+=" rc=${rc}-want-${expected_rc}"; }
+  [[ "$out" == "STATUS=${status} REASON=layer97-summary" ]] \
+    || { ok=0; why+=" stdout-not-exactly-the-STATUS-line:[${out}]"; }
+  grep -q '^LAYER=97 START=' "$__cleanup_marks/stderr" || { ok=0; why+=" no-LAYER-line"; }
+  grep -q '^LAYER=97 CLEANUP=first_cleanup RC=7' "$__cleanup_marks/stderr" \
+    || { ok=0; why+=" failed-cleanup-not-reported"; }
+  grep -q 'first-cleanup-chatter' "$__cleanup_marks/stderr" || { ok=0; why+=" cleanup-output-not-on-stderr"; }
+  if [[ "$ok" == 1 ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[cleanup:${label}]${why}")
+  fi
+}
+# The exit code stays status_to_exit_code(result), never the failing cleanup's 7.
+assert_cleanup_case "ok-layer"   "OK"   "$(status_to_exit_code OK)"
+assert_cleanup_case "fail-layer" "FAIL" "$(status_to_exit_code FAIL)"
+
+# ZERO cleanups — the common path (layers 1-6, and layer 7 before its forwards start). An
+# unguarded empty-array expansion under `set -u` (an error on bash 4.0-4.3) would abort the
+# handler before STATUS=/LAYER=, so pin that it emits both and keeps the status's exit code.
+set +e
+__zero_out="$(bash -c 'set -euo pipefail; source "$1"; layer_lifecycle_begin 95; __LAYER_STATUSES+=("OK"); __LAYER_REASONS+=("r")' \
+  _ "${__here}/_common.sh" 2>"$__cleanup_marks/zero-stderr")"; __zero_rc=$?
+set -e
+if [[ "$__zero_rc" == "$(status_to_exit_code OK)" && "$__zero_out" == "STATUS=OK REASON=layer95-summary" ]] \
+   && grep -q '^LAYER=95 START=' "$__cleanup_marks/zero-stderr"; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[cleanup:zero-registered] rc=${__zero_rc} stdout=[${__zero_out}]")
+fi
+
+# Registering before layer_lifecycle_begin is a loud error, never a silent no-op.
+if bash -c 'source "$1"; f() { :; }; layer_register_cleanup f' _ "${__here}/_common.sh" 2>/dev/null; then
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[cleanup:pre-begin] layer_register_cleanup succeeded before layer_lifecycle_begin")
+else
+  PASS=$((PASS + 1))
+fi
+# A name that is not a defined function is refused (nothing is eval'd).
+if bash -c 'source "$1"; layer_lifecycle_begin 96; trap - EXIT; layer_register_cleanup "rm -rf /nope"' \
+     _ "${__here}/_common.sh" 2>/dev/null; then
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[cleanup:not-a-function] a command string was accepted as a cleanup")
+else
+  PASS=$((PASS + 1))
+fi
+rm -rf "$__cleanup_marks"
+
 # Summary.
 printf '\n_common.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

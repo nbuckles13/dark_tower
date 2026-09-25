@@ -624,6 +624,94 @@ pub async fn gauge_by_instance_present(
     }
 }
 
+/// The `instance` entry that belongs to the pod at `pod_ip`, if present.
+///
+/// The metrics scrape's `instance` is `pod IP:port` (see [`InstanceCounters`]),
+/// so a pod is matched on the `"<ip>:"` PREFIX — the colon is load-bearing:
+/// without it `10.0.0.1` would also match `10.0.0.10:8083`, pinning the wrong
+/// pod.
+///
+/// # Panics
+///
+/// When more than one instance matches: one pod exposes one metrics port, so
+/// two matches mean the pin is not identifying a single handler.
+#[must_use]
+pub fn instance_for_pod_ip<'a>(
+    map: &'a InstanceCounters,
+    pod_ip: &str,
+) -> Option<(&'a String, f64)> {
+    let prefix = format!("{pod_ip}:");
+    let mut matches = map
+        .iter()
+        .filter(|(instance, _)| instance.starts_with(&prefix));
+    let first = matches.next().map(|(instance, value)| (instance, *value));
+    let extra: Vec<&String> = matches.map(|(instance, _)| instance).collect();
+    assert!(
+        extra.is_empty(),
+        "more than one instance matches pod IP {pod_ip}: {:?} and {extra:?} — the pin \
+         does not identify one handler",
+        first.map(|(instance, _)| instance)
+    );
+    first
+}
+
+/// Poll ONE pinned instance — the pod at `pod_ip` — until `predicate` holds on
+/// its value, and return that value.
+///
+/// # Why pinned, and not [`poll_until_any_instance_above`]
+///
+/// "Some instance rose" is the right question when the test does not control
+/// which handler acts. When the test CALLED a specific pod, it is the wrong
+/// one: any-instance lets a rise on one handler and a fall on the other satisfy
+/// a single pod's before/after, or lets another suite's activity satisfy it.
+///
+/// # Every read is a sampled, eventually-consistent value
+///
+/// Prometheus scrapes on an interval, so the value may lag the service. The
+/// poll is a scrape-convergence bound, never a wall-clock assertion about the
+/// service — and a FALL must be asserted against a value this helper has
+/// already OBSERVED high (confirm the rise first), or "below" can be true of a
+/// state that was simply never scraped.
+///
+/// # Panics
+///
+/// On timeout, with `phase` first (a distinct token per call site, so a
+/// never-observed rise triages differently from a missing fall), then the
+/// expectation, the pinned instance's last value — or ABSENT — and every
+/// instance present. A query error panics via
+/// [`PrometheusClient::instance_counter_map`].
+#[allow(clippy::too_many_arguments)]
+pub async fn poll_until_pinned_instance(
+    prom: &PrometheusClient,
+    promql: &str,
+    pod_ip: &str,
+    timeout: Duration,
+    interval: Duration,
+    phase: &str,
+    expectation: &str,
+    predicate: impl Fn(f64) -> bool,
+) -> f64 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current = prom.instance_counter_map(promql).await;
+        let pinned = instance_for_pod_ip(&current, pod_ip).map(|(_, value)| value);
+        if let Some(value) = pinned {
+            if predicate(value) {
+                return value;
+            }
+        }
+        if Instant::now() > deadline {
+            let last = pinned.map_or_else(|| "ABSENT".to_string(), |v| v.to_string());
+            panic!(
+                "{phase}: `{promql}` on the pod at {pod_ip} did not reach {expectation} within \
+                 {timeout:?}; last pinned value {last}; all instances {}",
+                format_instance_map(&current)
+            );
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,5 +1002,33 @@ mod tests {
         // Empty is self-describing, not a bare `{}`.
         let empty = InstanceCounters::new();
         assert!(format_instance_map(&empty).contains("no instances"));
+    }
+
+    #[test]
+    fn instance_for_pod_ip_matches_on_the_ip_and_colon_only() {
+        let map: InstanceCounters = std::collections::HashMap::from([
+            ("10.0.0.10:8083".to_string(), 3.0),
+            ("10.0.0.1:8083".to_string(), 7.0),
+        ]);
+        assert_eq!(
+            instance_for_pod_ip(&map, "10.0.0.1").map(|(_, v)| v),
+            Some(7.0),
+            "10.0.0.1 must not pin 10.0.0.10's series"
+        );
+        assert_eq!(
+            instance_for_pod_ip(&map, "10.0.0.10").map(|(_, v)| v),
+            Some(3.0)
+        );
+        assert!(instance_for_pod_ip(&map, "10.0.0.2").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one instance matches pod IP")]
+    fn instance_for_pod_ip_refuses_an_ambiguous_pin() {
+        let map: InstanceCounters = std::collections::HashMap::from([
+            ("10.0.0.1:8083".to_string(), 1.0),
+            ("10.0.0.1:9090".to_string(), 2.0),
+        ]);
+        let _ = instance_for_pod_ip(&map, "10.0.0.1");
     }
 }

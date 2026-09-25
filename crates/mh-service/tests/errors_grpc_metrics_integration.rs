@@ -13,18 +13,17 @@
 //!
 //! Bounded label values per `docs/observability/metrics/mh-service.md`:
 //!
-//! - `mh_grpc_requests_total`: `method` values are derived from
-//!   `MediaHandlerService`'s method names, with the vocabulary at
-//!   `observability::metrics`'s `GRPC_METHOD_*` consts. Only `register_meeting`
-//!   is emitted today; `end_meeting` is not until story-2 task 11 (its RPC
-//!   answers `UNIMPLEMENTED`), so this file asserts the one emitted value.
-//!   `status` ∈ {success, error}.
+//! - `mh_grpc_requests_total`: `method` is one value per RPC on
+//!   `MediaHandlerService` — `register_meeting` and `end_meeting`, the
+//!   `observability::metrics::GrpcMethod` vocabulary, whose source of truth is
+//!   `internal.proto`'s service block. Both are emitted, so this file asserts
+//!   both. `status` ∈ {success, error}.
 //! - `mh_errors_total`: `operation` is a stable identifier from the call site
 //!   (e.g. `register_meeting`, `mc_notify`), `error_type` is from
 //!   `MhError`-variant naming, `status_code` is the HTTP/gRPC status int.
 
 use common::observability::testing::MetricAssertion;
-use mh_service::observability::metrics::{record_error, record_grpc_request};
+use mh_service::observability::metrics::{record_error, record_grpc_request, GrpcMethod};
 
 // ---------------------------------------------------------------------------
 // mh_grpc_requests_total
@@ -33,7 +32,7 @@ use mh_service::observability::metrics::{record_error, record_grpc_request};
 #[test]
 fn record_grpc_request_emits_grpc_requests_counter() {
     let snap = MetricAssertion::snapshot();
-    record_grpc_request("success");
+    record_grpc_request(GrpcMethod::RegisterMeeting, "success");
     snap.counter("mh_grpc_requests_total")
         .with_labels(&[("method", "register_meeting"), ("status", "success")])
         .assert_delta(1);
@@ -42,38 +41,48 @@ fn record_grpc_request_emits_grpc_requests_counter() {
 #[test]
 fn record_grpc_request_emits_separate_series_per_status() {
     let snap = MetricAssertion::snapshot();
-    record_grpc_request("error");
+    record_grpc_request(GrpcMethod::RegisterMeeting, "error");
     snap.counter("mh_grpc_requests_total")
         .with_labels(&[("method", "register_meeting"), ("status", "error")])
         .assert_delta(1);
-    // Adjacency: the success counter for the same method is NOT incremented.
-    // Preserved from the pre-collapse matrix — the `status` dimension is still
-    // two-valued, and a swapped-label bug there is still possible.
+    // Adjacency: the success counter for the same method is NOT incremented —
+    // a swapped-label bug on the two-valued `status` dimension is still
+    // possible.
     snap.counter("mh_grpc_requests_total")
         .with_labels(&[("method", "register_meeting"), ("status", "success")])
         .assert_delta(0);
 }
 
-/// The `method` label VALUE is asserted explicitly, not just carried along.
+/// The two `method` label VALUES are asserted explicitly, each recorded under
+/// its own label and neither under the other's.
 ///
-/// Dropping the `method` parameter made a second value impossible to introduce
-/// from a call site, which is the point — but it moved the one remaining
-/// method-label bug into the emitter: a typo in the
-/// `GRPC_METHOD_REGISTER_MEETING` const. That is invisible to a test which only
-/// asserts "some method label was emitted", and it would silently blank the
-/// runbook queries and dashboard panels that select
-/// `method="register_meeting"` (an unmatched label yields an empty series, not
-/// an error). This assertion is what catches it.
+/// The cross-check is the load-bearing half: a recorder that counted a
+/// teardown as `register_meeting` would forge the R-26 `RegisterMeeting`
+/// receipt signal, and an unmatched label value silently blanks the runbook
+/// queries and panels selecting it (an empty series, not an error).
 #[test]
-fn record_grpc_request_emits_the_single_bounded_method_value() {
+fn record_grpc_request_emits_both_bounded_method_values_and_never_crosses_them() {
     let snap = MetricAssertion::snapshot();
-    record_grpc_request("success");
-    record_grpc_request("error");
+    record_grpc_request(GrpcMethod::EndMeeting, "success");
+    record_grpc_request(GrpcMethod::EndMeeting, "error");
     for status in ["success", "error"] {
         snap.counter("mh_grpc_requests_total")
-            .with_labels(&[("method", "register_meeting"), ("status", status)])
+            .with_labels(&[("method", "end_meeting"), ("status", status)])
             .assert_delta(1);
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "register_meeting"), ("status", status)])
+            .assert_delta(0);
     }
+
+    let snap = MetricAssertion::snapshot();
+    record_grpc_request(GrpcMethod::RegisterMeeting, "success");
+    snap.counter("mh_grpc_requests_total")
+        .with_labels(&[("method", "register_meeting"), ("status", "success")])
+        .assert_delta(1);
+    snap.counter("mh_grpc_requests_total")
+        .with_labels(&[("method", "end_meeting"), ("status", "success")])
+        .assert_delta(0);
+
     // The three values retired by the 2026-09-01 `internal.proto` reshape can
     // never be emitted again — the proto's tombstone block forbids resurrecting
     // the RPC names, so these series must stay dead.

@@ -141,12 +141,21 @@ async fn a_shrinking_policy_releases_streams_and_the_gauge_falls() {
 }
 
 /// Every static gauge publishes the field its consumer reads — never a
-/// re-conversion or a parallel constant.
+/// re-conversion or a parallel constant. That includes the two resource
+/// bounds' `_limit` gauges (story 2 R-21), read from the `PolicyLimits` fields
+/// `MhMediaService` hands the actor.
 #[test]
 fn static_admission_gauges_publish_the_fields_enforcement_reads() {
     let admission = EgressAdmission::derive(100_000_000, 90_000, 2_500_000, 0.05, 65_536).unwrap();
+    // Deliberately distinct from the fixture's values, so a gauge that read
+    // some OTHER source (a constant, the fixture) could not pass by accident.
+    let limits = mh_service::config::PolicyLimits {
+        max_total_egress_edges: 4_321,
+        max_registered_meetings: 1_234,
+        ..fixture_policy_limits()
+    };
     let snap = MetricAssertion::snapshot();
-    publish_egress_admission(&admission);
+    publish_egress_admission(&admission, &limits);
 
     // BYTES: the key is bits, converted once at load; the gauge reads the
     // converted field, so nothing downstream of load sees bits.
@@ -165,4 +174,10 @@ fn static_admission_gauges_publish_the_fields_enforcement_reads() {
     snap.gauge("mh_media_stream_admission_rejection_ratio_threshold")
         .with_labels(&[KEY_CUSTODY])
         .assert_value(admission.rejection_ratio_threshold);
+    snap.gauge("mh_media_egress_edges_limit")
+        .with_labels(&[KEY_CUSTODY])
+        .assert_value(limits.max_total_egress_edges as f64);
+    snap.gauge("mh_media_registered_meetings_limit")
+        .with_labels(&[KEY_CUSTODY])
+        .assert_value(limits.max_registered_meetings as f64);
 }

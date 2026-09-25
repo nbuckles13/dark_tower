@@ -25,9 +25,9 @@
 # - No RegisterMeeting RPC alert: mh_grpc_requests_total{method="register_meeting"}
 #   is the MC->MH inbound path. Its `method` values are derived from
 #   MediaHandlerService's method names: `register_meeting`, plus `end_meeting` for
-#   the story-2 EndMeeting teardown RPC. `end_meeting` is NOT emitted yet (MH
-#   answers it UNIMPLEMENTED until the MH EndMeeting task), so an empty
-#   `end_meeting` series is expected, not a scrape fault.
+#   the story-2 EndMeeting teardown RPC. Both are emitted and both are present at
+#   zero from process start, so a flat-zero `end_meeting` means no MC is ending
+#   meetings on the handler; an ABSENT series is a scrape fault.
 #   CORRECTED 2026-09-22: this note previously said register_meeting was "the
 #   ONLY value that label takes" and that MediaHandlerService "has a single RPC".
 #   Story 2 (R-20) added EndMeeting, so ADR-0036 §8's invariant is now "forwarding
@@ -47,12 +47,12 @@
 # - No teardown-never-arrives alert: if MC's EndMeeting never reaches MH (story 2
 #   R-20), MH holds an ended meeting's routing state and egress-edge budget
 #   indefinitely and the floor under MH_MAX_TOTAL_EGRESS_EDGES rises with uptime.
-#   Its signature is an ABSENT series, the hardest kind to notice. The gate is the
-#   INSTRUMENT, not the rule: omitted until R-21's `mh_media_registered_meetings`
-#   gauge lands in story-2 task 11 (MH EndMeeting teardown). The rule then follows
-#   in story-2 task 18 (media operations), which depends on task 11. Writing a rule
-#   before the gauge exists would be PromQL over a metric that is not there, or an
-#   `absent()` rule that fires on healthy low-traffic handlers.
+#   Its signature is an ABSENT event, the hardest kind to notice. The gate was the
+#   INSTRUMENT, not the rule, and the instrument has landed (story-2 task 11):
+#   `mh_media_registered_meetings` and its `mh_media_registered_meetings_limit`
+#   (so no rule needs the cap as a PromQL literal), plus
+#   `mh_media_meeting_teardowns_total{outcome}`. The rule itself is story-2 task
+#   18's (media operations); it is still omitted HERE, deliberately, until then.
 # - No registration-failure-rate alert: registration is a low-volume one-shot
 #   signal (single register + periodic heartbeats). Heartbeats give a continuous,
 #   larger-denominator signal - MHGCHeartbeatFailureRate below is the canonical

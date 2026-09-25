@@ -31,6 +31,25 @@ impl GrpcRig {
         jwks_client: Arc<JwksClient>,
         session_manager: SessionManagerHandle,
     ) -> Self {
+        Self::start_with_limits(
+            jwks_client,
+            session_manager,
+            mh_test_utils::admission::fixture_policy_limits(),
+        )
+        .await
+    }
+
+    /// [`Self::start`] with explicit policy limits, for tests ABOUT a bound
+    /// (e.g. the registered-meeting cap).
+    #[allow(
+        dead_code,
+        reason = "used by only some of the test binaries that include this module"
+    )]
+    pub async fn start_with_limits(
+        jwks_client: Arc<JwksClient>,
+        session_manager: SessionManagerHandle,
+        policy_limits: mh_service::config::PolicyLimits,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind gRPC TcpListener");
@@ -46,7 +65,7 @@ impl GrpcRig {
             session_manager.clone(),
             "mh-test-handler".to_string(),
             mh_service::process::sample_process_start_epoch_ms(),
-            mh_test_utils::admission::fixture_policy_limits(),
+            policy_limits,
         );
 
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);

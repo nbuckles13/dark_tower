@@ -207,8 +207,10 @@ impl BindingSuite {
                     mc_grpc_endpoint: format!("http://{}", self.mc.addr),
                     registered_at: Instant::now(),
                 },
+                mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
             )
-            .await;
+            .await
+            .expect("a test registration is below the registration cap");
     }
 
     /// Register `meeting_id` pointed at an MC that will never answer.
@@ -224,8 +226,10 @@ impl BindingSuite {
                     mc_grpc_endpoint: "http://127.0.0.1:1".to_string(),
                     registered_at: Instant::now(),
                 },
+                mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
             )
-            .await;
+            .await
+            .expect("a test registration is below the registration cap");
     }
 
     /// Connect as `participant_id` into `meeting_id` and hold the connection.
@@ -812,8 +816,10 @@ async fn an_undialable_mc_endpoint_declines_on_the_registration_outcome() {
                 mc_grpc_endpoint: String::new(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
     let _conn = suite

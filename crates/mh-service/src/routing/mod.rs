@@ -707,11 +707,13 @@ impl RoutingSnapshot {
     /// complete before it is published: apply is all-edges-or-none, so a
     /// partial install is not a representable state.
     fn with_policy(&self, policy: &MeetingPolicy) -> Self {
-        // Deliberately the SAME function the aggregate bound is tested
+        // Deliberately the SAME accounting the aggregate bound is tested
         // against, not a second copy of the same subtract-then-add. Two copies
         // would let the accounting and the check drift, and the direction that
         // drift breaks in is silent: the bound would be enforced against a
-        // total the snapshot does not actually carry.
+        // total the snapshot does not actually carry. `projected_total_edges`,
+        // this function and `without_meeting` all go through ONE kernel,
+        // [`Self::edges_after_displacing`].
         let total_edges = self.projected_total_edges(policy);
         let mut meetings = self.meetings.clone();
         meetings.insert(
@@ -724,6 +726,27 @@ impl RoutingSnapshot {
         }
     }
 
+    /// Build the successor snapshot with `meeting`'s routes REMOVED (story 2
+    /// R-20 `EndMeeting` release).
+    ///
+    /// Removing the entry is also what FORGETS the meeting's applied
+    /// generation: [`Self::generation_for`] reads 0 for an absent meeting, so a
+    /// same-id meeting re-created later installs fresh from generation 1
+    /// rather than being refused as stale. `None` when nothing is installed
+    /// for `meeting`, so the caller can skip the swap.
+    fn without_meeting(&self, meeting: &MeetingKey) -> Option<Self> {
+        if !self.meetings.contains_key(meeting) {
+            return None;
+        }
+        let total_edges = self.edges_after_displacing(meeting);
+        let mut meetings = self.meetings.clone();
+        meetings.remove(meeting);
+        Some(Self {
+            meetings,
+            total_edges,
+        })
+    }
+
     /// Egress-edge total this handler would carry if `policy` were installed.
     ///
     /// **Subtracts the meeting's own currently-installed edges before adding
@@ -734,31 +757,34 @@ impl RoutingSnapshot {
     /// rotating apply failure. That defect passes every single-meeting test.
     #[must_use]
     pub fn projected_total_edges(&self, policy: &MeetingPolicy) -> usize {
-        let displaced = self
-            .meetings
-            .get(&policy.meeting)
-            .map_or(0, |r| r.edges.len());
-        // The two halves of "fail loudly, degrade safely", deliberately split.
-        //
-        // `saturating_sub` rather than `-` in PRODUCTION: `displaced <=
-        // total_edges` holds because `with_policy` is the only writer of
-        // either, but a plain subtraction turns any future break of that
-        // invariant into a release-mode wrap to `usize::MAX` — which reads as
-        // "the handler is over its aggregate bound" and refuses EVERY apply on
-        // the pod, permanently and silently.
-        //
-        // The `debug_assert` is there because saturating alone would mask the
-        // break in the other direction too: an under-reported projection means
-        // the bound is enforced against a total lower than reality and the pod
-        // quietly runs over it. Every test exercising this path runs in debug,
-        // so a broken invariant is loud where it can be fixed and safe where
-        // it cannot.
+        self.edges_after_displacing(&policy.meeting) + policy.edges.len()
+    }
+
+    /// The handler's egress-edge total with `meeting`'s installed edges taken
+    /// out — the ONE accounting kernel behind install, projection and release.
+    ///
+    /// The two halves of "fail loudly, degrade safely", deliberately split.
+    ///
+    /// `saturating_sub` rather than `-` in PRODUCTION: `displaced <=
+    /// total_edges` holds because this snapshot's successors are only ever
+    /// built through this kernel, but a plain subtraction turns any future
+    /// break of that invariant into a release-mode wrap to `usize::MAX` —
+    /// which reads as "the handler is over its aggregate bound" and refuses
+    /// EVERY apply on the pod, permanently and silently.
+    ///
+    /// The `debug_assert` is there because saturating alone would mask the
+    /// break in the other direction too: an under-reported total means the
+    /// bound is enforced against a total lower than reality and the pod quietly
+    /// runs over it. Every test exercising this path runs in debug, so a broken
+    /// invariant is loud where it can be fixed and safe where it cannot.
+    fn edges_after_displacing(&self, meeting: &MeetingKey) -> usize {
+        let displaced = self.meetings.get(meeting).map_or(0, |r| r.edges.len());
         debug_assert!(
             displaced <= self.total_edges,
             "edge accounting broke: one meeting holds {displaced} edges of a {} handler total",
             self.total_edges
         );
-        self.total_edges.saturating_sub(displaced) + policy.edges.len()
+        self.total_edges.saturating_sub(displaced)
     }
 }
 
@@ -808,6 +834,22 @@ impl RoutingTable {
     pub fn install(&self, policy: &MeetingPolicy) {
         let next = self.snapshot.load().with_policy(policy);
         self.snapshot.store(Arc::new(next));
+    }
+
+    /// Remove `meeting`'s routes, mirroring [`Self::install`]: one fully-built
+    /// successor, one swap, so the data plane sees the meeting either wholly
+    /// present or wholly gone. Returns whether an entry was removed.
+    ///
+    /// Same single-writer contract as `install` (the session actor), which is
+    /// why a plain load-modify-store is safe here.
+    pub fn remove(&self, meeting: &MeetingKey) -> bool {
+        match self.snapshot.load().without_meeting(meeting) {
+            Some(next) => {
+                self.snapshot.store(Arc::new(next));
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -1186,6 +1228,56 @@ mod tests {
         table.install(&policy("m", 3, vec![]));
         assert_eq!(table.load().total_edges(), 0);
         assert_eq!(table.load().meeting_count(), 1);
+    }
+
+    // -- release (story 2 R-20) -------------------------------------------
+
+    /// Release returns the meeting's edges, leaves the other meeting's routes
+    /// untouched BY POINTER, and forgets the released meeting's generation.
+    #[test]
+    fn remove_returns_edges_forgets_generation_and_spares_other_meetings() {
+        let table = RoutingTable::new();
+        table.install(&policy(
+            "a",
+            9,
+            vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6)],
+        ));
+        table.install(&policy("b", 3, vec![egress(1, 7, 0, 7)]));
+        assert_eq!(table.load().total_edges(), 3);
+        let b_before = Arc::clone(table.load().routes_for(&MeetingKey::new("b")).unwrap());
+
+        assert!(table.remove(&MeetingKey::new("a")));
+
+        let after = table.load();
+        assert_eq!(after.total_edges(), 1, "a's two edges return to the budget");
+        assert_eq!(after.meeting_count(), 1);
+        assert_eq!(
+            after.generation_for(&MeetingKey::new("a")),
+            0,
+            "release must FORGET the applied generation, or a same-id re-create \
+             at generation 1 reads as stale forever"
+        );
+        assert!(Arc::ptr_eq(
+            &b_before,
+            after.routes_for(&MeetingKey::new("b")).unwrap()
+        ));
+    }
+
+    /// Removing an absent meeting is a no-op WITHOUT a swap, and the accounting
+    /// kernel stays consistent across install -> remove -> re-install.
+    #[test]
+    fn remove_of_an_absent_meeting_does_not_swap_and_reinstall_is_fresh() {
+        let table = RoutingTable::new();
+        table.install(&policy("a", 4, vec![egress(1, 5, 0, 5)]));
+        let before = table.load();
+        assert!(!table.remove(&MeetingKey::new("never")));
+        assert!(Arc::ptr_eq(&before, &table.load()), "no-op must not swap");
+
+        assert!(table.remove(&MeetingKey::new("a")));
+        assert_eq!(table.load().total_edges(), 0);
+        table.install(&policy("a", 1, vec![egress(1, 5, 0, 5)]));
+        assert_eq!(table.load().generation_for(&MeetingKey::new("a")), 1);
+        assert_eq!(table.load().total_edges(), 1);
     }
 
     #[test]

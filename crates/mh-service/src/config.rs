@@ -126,24 +126,23 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 /// *concurrent* meetings in this deployment — so that no plausible
 /// instantaneous load approaches it.
 ///
-/// # What this actually bounds: a ratcheting floor, not concurrent load
+/// # What this actually bounds: a floor that ratchets unless teardown arrives
 ///
-/// **Nothing releases an ENDED meeting's edges.** `RoutingSnapshot::with_policy`
-/// is the only mutator of the meeting map and it only inserts; `SessionState`
-/// is likewise insert-only. The meeting-ended signal now EXISTS on the contract
-/// — `MediaHandlerService.EndMeeting` (story 2 R-20) — but this handler answers
-/// it `UNIMPLEMENTED` until story-2 task 11 implements the release, so nothing
-/// acts on it yet. Headroom is freed only when a
-/// still-**live** meeting re-asserts a smaller policy — the per-meeting
-/// subtraction makes 5 edges shrinking to 4 install and drop the total by one —
-/// so the total is not monotone, but the portion held by meetings that have
-/// finished is unreclaimable and rises at the pod's meeting-completion rate.
+/// **An ENDED meeting's edges are released only by `EndMeeting`** (story 2
+/// R-20): the registering MC's call removes the meeting's routes through
+/// `RoutingTable::remove`, which returns its edges to this total. Otherwise
+/// headroom is freed only when a still-**live** meeting re-asserts a smaller
+/// policy — the per-meeting subtraction makes 5 edges shrinking to 4 install
+/// and drop the total by one.
 ///
-/// So the honest statement is the opposite of "reaching this means a bug, a
-/// leak, or a hostile MC, never growth". An earlier draft of this docstring
-/// asserted exactly that, and it was false as written: ordinary turnover is the
-/// growth path, and a future reader sizing this key would have trusted the
-/// promise.
+/// So the floor still ratchets for every meeting whose MC NEVER calls
+/// `EndMeeting`: every meeting before MC begins calling it (story 2 task 12),
+/// and permanently for any meeting whose MC dies without calling it. That
+/// portion is unreclaimable until the pod restarts and rises at the rate such
+/// meetings end. "Reaching this means a bug, a leak, or a hostile MC, never
+/// growth" was false as first written and is still false for those meetings:
+/// uncalled teardown IS a growth path, and a future reader sizing this key
+/// would trust the promise.
 ///
 /// The pod degrades **toward** the bound rather than falling off a cliff, which
 /// is harder to diagnose than a cliff would be. Already-installed meetings
@@ -151,24 +150,23 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 /// cap is tested, so they keep reporting healthy; what fails is every
 /// registration that would ADD an edge — a new meeting, or an existing healthy
 /// meeting admitting a new participant. Onset is intermittent, clearing when
-/// some unrelated meeting happens to shrink, and worsening with uptime.
+/// some unrelated meeting happens to shrink or end, and worsening with uptime.
 /// Meanwhile `RegisterMeeting` still answers `accepted: true` and GC keeps
 /// placing meetings here, because these bounds are resource guards and are
-/// deliberately not advertised. Symptom, discriminator and interim remedy are
-/// in `docs/runbooks/mh-incident-response.md` Scenario 13; reclamation needs a
-/// meeting-ended signal MH is not given and is tracked in `docs/TODO.md`
-/// §Media Path Obligations.
+/// deliberately not advertised. Symptom, discriminator and remedy are in
+/// `docs/runbooks/mh-incident-response.md` Scenario 13; the never-called
+/// residual is tracked in `docs/TODO.md` §Media Path Obligations.
 ///
 /// **Raising the configured value is not the remedy.** It buys time proportional to the
-/// meeting-completion rate and changes nothing else, because the ceiling is
-/// consumed by finished meetings at whatever rate meetings finish — independent
-/// of concurrent load. Doubling the number doubles time-to-onset and fixes
+/// rate unreleased meetings accumulate and changes nothing else, because the
+/// ceiling is consumed by them at whatever rate they end — independent of
+/// concurrent load. Doubling the number doubles time-to-onset and fixes
 /// nothing.
 ///
-/// Does NOT bound the number of registered meetings either: an empty
-/// `egress_streams` set is legal and meaningful, so near-free meetings never
-/// trip this. That converse gap has its own `docs/TODO.md` entry rather than
-/// being fixed with a number nobody chose.
+/// Does NOT bound the number of registered meetings: an empty `egress_streams`
+/// set is legal and meaningful, so near-free meetings never trip this. That
+/// converse gap is closed by its own bound, `MH_MAX_REGISTERED_MEETINGS`
+/// ([`MAX_REGISTERED_MEETINGS_CEILING`]).
 pub const MAX_TOTAL_EGRESS_EDGES_CEILING: usize = 1_048_576;
 
 // GC persists the advertised ceiling in `media_handlers.max_streams INTEGER`.
@@ -179,6 +177,44 @@ const _: () = assert!(
     MAX_TOTAL_EGRESS_EDGES_CEILING as u64 <= i32::MAX as u64,
     "the edge-bound ceiling must fit GC's INTEGER max_streams column"
 );
+
+/// Hard ceiling for `MH_MAX_REGISTERED_MEETINGS`, the bound on how many meetings
+/// this handler holds registered at once (story 2 R-21).
+///
+/// A RESOURCE-EXHAUSTION guard, never a capacity figure, and never advertised
+/// to GC. It exists because the egress-edge bound is structurally blind to
+/// EMPTY meetings: `internal.proto` makes an empty `egress_streams` set legal
+/// and meaningful ("forward nothing"), so arbitrarily many near-free
+/// registrations would never trip `MH_MAX_TOTAL_EGRESS_EDGES`. `EndMeeting`
+/// (R-20) reclaims ended meetings, but it bounds nothing a caller that never
+/// ends its meetings creates.
+///
+/// This ceiling is the fat-finger bound on the KEY, on the same footing as the
+/// four §8 ceilings above: a `> 0` check alone would let a copy-pasted value
+/// silently disarm the guard. 8x the deployed value; a registration is a
+/// length-capped `MeetingRegistration` plus an `Arc<MeetingRoutes>`, so even at
+/// the ceiling the map is tens of MB.
+///
+/// ITS NUMERIC EQUALITY WITH THE DEPLOYED `MH_MAX_TOTAL_EGRESS_EDGES` VALUE IS
+/// ACCIDENTAL. Different units — meetings here, egress edges there — and
+/// different remedies. Do not fold the two into one constant because they
+/// print the same.
+///
+/// Zero is refused by the shared `parse_bounded` path: a configured 0 would
+/// deny every registration while the handler reports healthy.
+pub const MAX_REGISTERED_MEETINGS_CEILING: usize = 65_536;
+
+/// ADVISORY lower bound for `MH_MAX_REGISTERED_MEETINGS`: below this MH logs a
+/// WARN at startup (it still boots — the value is legal, just implausible).
+///
+/// Not a refuse-boot floor: a small deployment may genuinely want a small cap.
+/// A WARN rather than the INFO the egress-ceiling nudge uses, because that
+/// nudge fires on the deployed placeholder by design, whereas this one fires
+/// only when someone has lowered a value deployed at 8192 — the cap is
+/// cumulative across uptime until reclamation is fenced (see
+/// `infra/services/mh-service/configmap.yaml`), so a low value is a
+/// registration outage waiting for uptime.
+pub const REGISTERED_MEETINGS_ADVISORY_MIN: usize = 100;
 
 /// Hard ceiling for `MH_POLICY_APPLY_TIMEOUT_MS` (10 seconds), the bound on
 /// awaiting the session actor's config-apply reply.
@@ -856,13 +892,19 @@ pub struct PolicyLimits {
     pub max_candidate_sources_per_egress: usize,
     /// Max egress edges across **all** meetings on this handler.
     pub max_total_egress_edges: usize,
-    /// Bound on awaiting the session actor's config-apply reply, in ms.
+    /// Bound on awaiting the session actor's config-apply reply, in ms. Also
+    /// bounds the `EndMeeting` release reply — one bound on "how long an RPC
+    /// waits for the session actor", never a second literal.
     pub policy_apply_timeout_ms: u64,
+    /// Max meetings held registered on this handler at once
+    /// (`MH_MAX_REGISTERED_MEETINGS`, story 2 R-21). Refuses only a NEW
+    /// meeting id; a re-registration of a held meeting is never refused.
+    pub max_registered_meetings: usize,
 }
 
 impl PolicyLimits {
     /// Generous fixture bounds for `src/` unit tests that are not ABOUT a
-    /// bound. There is no `Default`: the four keys are required, and a default
+    /// bound. There is no `Default`: the five keys are required, and a default
     /// would be exactly the second encoding their required-ness removed.
     /// `tests/` binaries use `mh_test_utils::admission::fixture_policy_limits`.
     ///
@@ -880,6 +922,7 @@ impl PolicyLimits {
             max_candidate_sources_per_egress: 16,
             max_total_egress_edges: 65_536,
             policy_apply_timeout_ms: 1_000,
+            max_registered_meetings: 8_192,
         }
     }
 }
@@ -1904,6 +1947,9 @@ impl Config {
         let raw_policy_apply_timeout = vars
             .get("MH_POLICY_APPLY_TIMEOUT_MS")
             .ok_or_else(|| ConfigError::MissingEnvVar("MH_POLICY_APPLY_TIMEOUT_MS".to_string()))?;
+        let raw_max_registered_meetings = vars
+            .get("MH_MAX_REGISTERED_MEETINGS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MH_MAX_REGISTERED_MEETINGS".to_string()))?;
 
         let policy_limits = PolicyLimits {
             max_egress_streams_per_meeting: bound_to_usize(
@@ -1943,6 +1989,17 @@ impl Config {
                 "every policy apply would time out before the actor could answer",
                 "above ADR-0036 §8's <=10 s re-assert cadence the await outlives the retry \
                  that would supersede it",
+            )?,
+            max_registered_meetings: bound_to_usize(
+                "MH_MAX_REGISTERED_MEETINGS",
+                parse_bounded(
+                    "MH_MAX_REGISTERED_MEETINGS",
+                    raw_max_registered_meetings,
+                    MAX_REGISTERED_MEETINGS_CEILING as u64,
+                    "every new meeting registration would be refused while the handler reports \
+                     healthy",
+                    "the guard would stop bounding the handler's registration map",
+                )?,
             )?,
         };
 
@@ -2195,6 +2252,8 @@ mod tests {
             ),
             ("MH_MAX_TOTAL_EGRESS_EDGES".to_string(), "65536".to_string()),
             ("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "1000".to_string()),
+            // Registered-meeting cap (story 2 R-21), the deployed value.
+            ("MH_MAX_REGISTERED_MEETINGS".to_string(), "8192".to_string()),
             // Egress-budget chain (story 2 R-19). The BASE ConfigMap's
             // deliberately unsized placeholder budget — it must boot (above the
             // refuse-boot floor) and nudge (below the recommended minimum).
@@ -2211,10 +2270,11 @@ mod tests {
         ])
     }
 
-    /// Every key story 2 task 8 makes REQUIRED (the four new egress-chain keys
-    /// and the four flipped §8 bounds). One list, iterated by both the absence
-    /// and the malformed-value tests, so neither can cover a subset.
-    const STORY2_REQUIRED_KEYS: [&str; 8] = [
+    /// Every key story 2 makes REQUIRED: task 8's four new egress-chain keys
+    /// and four flipped §8 bounds, and task 11's registered-meeting cap. One
+    /// list, iterated by both the absence and the malformed-value tests, so
+    /// neither can cover a subset.
+    const STORY2_REQUIRED_KEYS: [&str; 9] = [
         "MH_EGRESS_BUDGET_BPS",
         "MH_STREAM_COST_AUDIO_BPS",
         "MH_STREAM_COST_VIDEO_BPS",
@@ -2223,6 +2283,7 @@ mod tests {
         "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
         "MH_MAX_TOTAL_EGRESS_EDGES",
         "MH_POLICY_APPLY_TIMEOUT_MS",
+        "MH_MAX_REGISTERED_MEETINGS",
     ];
 
     /// Derive with the base costs and a budget chosen so the ceiling is
@@ -3325,12 +3386,14 @@ mod tests {
         );
         vars.insert("MH_MAX_TOTAL_EGRESS_EDGES".to_string(), "1024".to_string());
         vars.insert("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "250".to_string());
+        vars.insert("MH_MAX_REGISTERED_MEETINGS".to_string(), "300".to_string());
 
         let config = Config::from_vars(&vars).unwrap();
         assert_eq!(config.policy_limits.max_egress_streams_per_meeting, 64);
         assert_eq!(config.policy_limits.max_candidate_sources_per_egress, 4);
         assert_eq!(config.policy_limits.max_total_egress_edges, 1024);
         assert_eq!(config.policy_limits.policy_apply_timeout_ms, 250);
+        assert_eq!(config.policy_limits.max_registered_meetings, 300);
     }
 
     /// Zero is rejected, not clamped.
@@ -3345,6 +3408,7 @@ mod tests {
             "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
             "MH_MAX_TOTAL_EGRESS_EDGES",
             "MH_POLICY_APPLY_TIMEOUT_MS",
+            "MH_MAX_REGISTERED_MEETINGS",
         ] {
             let mut vars = base_vars();
             vars.insert(key.to_string(), "0".to_string());
@@ -3378,6 +3442,10 @@ mod tests {
             (
                 "MH_MAX_TOTAL_EGRESS_EDGES",
                 MAX_TOTAL_EGRESS_EDGES_CEILING + 1,
+            ),
+            (
+                "MH_MAX_REGISTERED_MEETINGS",
+                MAX_REGISTERED_MEETINGS_CEILING + 1,
             ),
         ];
         for (key, value) in cases {

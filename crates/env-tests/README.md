@@ -12,7 +12,8 @@ Before running these tests, ensure:
    - Prometheus: `localhost:9090`
    - Grafana: `localhost:3000`
    - Loki (optional): `localhost:3100`
-3. **kubectl in PATH**: Required for NetworkPolicy diagnostics and secret exposure validation
+3. **kubectl in PATH**: Required for NetworkPolicy diagnostics, secret exposure validation, and reading the deployed ConfigMaps
+4. **MH gRPC forwards (for `29_mh_meeting_teardown`)**: Layer 7 (`scripts/layer7.sh`, step (i)) starts a per-POD `kubectl port-forward` to each MH pod's gRPC port and exports `ENV_TEST_MH_{0,1}_GRPC_URL` and `ENV_TEST_MH_{0,1}_POD_IP`. The setup script does NOT start these. Run that test through Layer 7, or export the four variables yourself; it fails loudly when they are unset.
 
 ## Test Categories
 
@@ -84,6 +85,8 @@ The kind cluster has these credentials seeded for testing:
 - **Client ID**: `test-client`
 - **Client Secret**: `test-client-secret-dev-999`
 - **Scopes**: `test:all`
+
+`29_mh_meeting_teardown` also uses the seeded **`meeting-controller`** service client — reading its id from the live `mc-0` Deployment and its secret from the live `mc-service-secrets` Secret, never a copy — narrowed to `service.write.mh`, to call MH's `MediaHandlerService` directly: MC does not call `EndMeeting` yet, and a mismatched `mc_id` cannot be produced through MC at all. That relaxes the suite's credential convention only; ADR-0028's layering is unchanged — the MH client comes from `proto-gen`, and the suite links no service crate. The test registers only uuid-named meetings of its own and releases them on every exit path.
 
 ## Observability Stack
 

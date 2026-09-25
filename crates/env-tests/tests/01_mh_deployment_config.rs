@@ -416,7 +416,8 @@ const CONFIG_LOADED_MESSAGE: &str = "Configuration loaded successfully";
 /// `(ConfigMap key, startup-event field)` for every integer value the running
 /// MH process reports verbatim. ONE table. The egress-chain rows (budget and
 /// both costs, logged in BITS exactly as configured) were appended by the MH
-/// egress-budget code task (story 2 task 8). The derived stream ceiling is not
+/// egress-budget code task (story 2 task 8), and the registered-meeting cap by
+/// the MH teardown task (story 2 task 11). The derived stream ceiling is not
 /// a ConfigMap key, so its parity is checked against the published gauge in
 /// [`test_running_mh_publishes_the_deployed_stream_ceiling`] rather than here;
 /// the ratio threshold is a float and is checked against its gauge by
@@ -432,6 +433,7 @@ const LOGGED_POLICY_BOUNDS: &[(&str, &str)] = &[
     ),
     ("MH_MAX_TOTAL_EGRESS_EDGES", "max_total_egress_edges"),
     ("MH_POLICY_APPLY_TIMEOUT_MS", "policy_apply_timeout_ms"),
+    ("MH_MAX_REGISTERED_MEETINGS", "max_registered_meetings"),
     ("MH_EGRESS_BUDGET_BPS", "egress_budget_bps"),
     ("MH_STREAM_COST_AUDIO_BPS", "stream_cost_audio_bps"),
     ("MH_STREAM_COST_VIDEO_BPS", "stream_cost_video_bps"),

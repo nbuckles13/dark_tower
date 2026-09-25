@@ -97,7 +97,7 @@ sum(increase(mh_register_meeting_timeouts_total[30m]))
 # Forwarding-policy apply failures in the bake window (target: 0).
 #
 # RegisterMeeting SUCCEEDING DOES NOT MEAN POLICY APPLIED. The RPC answers
-# `accepted: true` and records mh_grpc_requests_total{status="success"} on
+# `accepted: true` and records mh_grpc_requests_total{method="register_meeting",status="success"} on
 # apply_failed, rejected_stale and rejected_invalid alike — correct RPC
 # semantics, but it means every other RegisterMeeting gate in this file is
 # blind to a build that refuses all policy. See mh-incident-response.md
@@ -531,8 +531,12 @@ admission chain — a **capacity** figure enforced by mh-service at stream admis
 advertised to GC as `max_streams`), and the four ADR-0036 §8 policy bounds
 `MH_MAX_EGRESS_STREAMS_PER_MEETING`, `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS`,
 `MH_MAX_TOTAL_EGRESS_EDGES`, `MH_POLICY_APPLY_TIMEOUT_MS` (resource-exhaustion guards,
-never capacity). All live in ConfigMap `mh-service-config`, whose comments carry each
-one's meaning and remedy. Until those rows land, the refusal message itself is the
+never capacity) — and, since story 2 task 11, `MH_MAX_REGISTERED_MEETINGS` (the
+registered-meeting cap, a resource-exhaustion guard enforced by mh-service when a NEW
+meeting registers; refusals count as
+`mh_media_policy_applies_total{outcome="rejected_meeting_cap"}`; 0 and values above its
+hard ceiling refuse to start). All live in ConfigMap `mh-service-config`, whose
+comments carry each one's meaning and remedy. Until those rows land, the refusal message itself is the
 runbook: MH also refuses to start when the derived stream ceiling is below 2 (remedy:
 RAISE `MH_EGRESS_BUDGET_BPS`; never lower the floor) or above
 `MH_MAX_TOTAL_EGRESS_EDGES`, and each refusal names the value, the bound and the fix.
@@ -786,6 +790,8 @@ regression.
 ## Rollback
 
 For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For other rollback scenarios (general service restore, configuration regression), follow the same `kubectl rollout undo` pattern; deeper operational steps will be filled in alongside the deployment-procedure stub.
+
+**`EndMeeting` rollout order (story 2 R-20, R-24).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: `MH_MAX_REGISTERED_MEETINGS` stays in the ConfigMap (a `rollout undo` restores Deployment refs, not the ConfigMap), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
 
 ---
 

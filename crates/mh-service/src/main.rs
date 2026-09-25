@@ -171,6 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_candidate_sources_per_egress = config.policy_limits.max_candidate_sources_per_egress,
         max_total_egress_edges = config.policy_limits.max_total_egress_edges,
         policy_apply_timeout_ms = config.policy_limits.policy_apply_timeout_ms,
+        // Registered-meeting cap (story 2 R-21), a resource guard.
+        max_registered_meetings = config.policy_limits.max_registered_meetings,
         // Egress-budget admission chain (story 2 R-19, R-23). BOTH ends of the
         // single bits->bytes conversion are logged, so it is checkable from
         // this line: the `_bps` fields are the ConfigMap values verbatim (BITS),
@@ -231,6 +233,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Registered-meeting cap, implausibly low. A WARN (unlike the egress nudge
+    // above): the deployed value is far above this, so reaching it means
+    // someone lowered the key — and the cap is consumed by every meeting whose
+    // MC never calls EndMeeting, so a low value is a registration outage
+    // waiting for uptime. It still boots: a small cap is legal.
+    if config.policy_limits.max_registered_meetings
+        < mh_service::config::REGISTERED_MEETINGS_ADVISORY_MIN
+    {
+        warn!(
+            max_registered_meetings = config.policy_limits.max_registered_meetings,
+            registered_meetings_advisory_min = mh_service::config::REGISTERED_MEETINGS_ADVISORY_MIN,
+            "MH_MAX_REGISTERED_MEETINGS is implausibly low: new meetings are refused once \
+             this many are registered, and a meeting whose MC never sends EndMeeting stays \
+             registered until restart. Check the value in \
+             infra/services/mh-service/configmap.yaml"
+        );
+    }
+
     // Initialize Prometheus metrics recorder (ADR-0011)
     // This must happen before any metrics are recorded
     info!("Initializing Prometheus metrics recorder...");
@@ -247,7 +267,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Egress-budget static gauges: AFTER the recorder, or they go nowhere and
     // the series silently never appear. Published from the same
     // `EgressAdmission` fields admission and `gc_client` read.
-    mh_service::observability::metrics::publish_egress_admission(&config.egress_admission);
+    mh_service::observability::metrics::publish_egress_admission(
+        &config.egress_admission,
+        &config.policy_limits,
+    );
     info!("Prometheus metrics recorder initialized");
 
     // Initialize health state

@@ -287,10 +287,11 @@ data:
   #
   # All six are REQUIRED keys with no Rust fallback, read by two different
   # tasks: the four egress-chain keys (budget, both costs, threshold) by the
-  # MH egress-budget code task (story 2 task 8, landed), and
-  # `MH_MAX_REGISTERED_MEETINGS` / `MH_MAX_MUTED_SOURCES_PER_MEETING` by the
-  # MH capacity-guard and server-mute tasks (story 2 tasks 11 and 10) — until
-  # those land, the current image ignores those two. MH refuses to start when
+  # MH egress-budget code task (story 2 task 8, landed),
+  # `MH_MAX_REGISTERED_MEETINGS` by the MH capacity-guard task (story 2 task
+  # 11, landed), and `MH_MAX_MUTED_SOURCES_PER_MEETING` by the MH server-mute
+  # task (story 2 task 10) — until that lands, the current image ignores that
+  # one. MH refuses to start when
   # a key it reads is absent or malformed. That is deliberate — a default in
   # code would be a second, invisible encoding of the same value, and
   # `dt-guard env-config` can only see a key the code refuses to start
@@ -529,21 +530,21 @@ data:
   # trigger is "when the fence and resurrection questions are CLOSED", not "when
   # R-20 lands".
   #
-  # REQUIREMENT ON THE MH CAPACITY-GUARD TASK (story 2 task 11, which reads
-  # this key — the egress-budget task, task 8, deliberately does not), recorded
-  # here because this comment is what reaches that task's author: this
-  # required read must be validated against a hard-ceiling constant in
+  # Hard ceiling: validated against `MAX_REGISTERED_MEETINGS_CEILING` in
   # `crates/mh-service/src/config.rs`, on the same footing as the four §8
-  # bounds below. A `> 0` check alone lets a fat-fingered value silently
-  # re-open the surface this key exists to close.
-  # Enforced by: mh-service, rejecting an over-limit registration loudly and
-  # counted by its own reason (story 2 task 11; not yet in the running image).
-  # Where an operator sees it: `mh_media_registered_meetings` and the rejection
-  # counter — both land with story 2 task 11. READ THAT GAUGE AS REGISTRATIONS
-  # HELD, NOT MEETINGS IN PROGRESS: until R-20's teardown lands it is
-  # monotonically non-decreasing and does not fall when a meeting ends, so
-  # reading it as concurrency understates exhaustion in the direction that hides
-  # it.
+  # bounds below (a `> 0` check alone would let a fat-fingered value silently
+  # re-open the surface this key exists to close), and 0 is refused.
+  # Enforced by: mh-service, refusing a NEW meeting id loudly (RESOURCE_EXHAUSTED)
+  # and counting it by its own reason,
+  # `mh_media_policy_applies_total{outcome="rejected_meeting_cap"}`. A
+  # re-registration of a held meeting is never refused.
+  # Where an operator sees it: `mh_media_registered_meetings` against
+  # `mh_media_registered_meetings_limit`, and that rejection outcome. READ THE
+  # GAUGE AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an
+  # `EndMeeting` releases a meeting, so a meeting whose MC never calls it (any
+  # MC before story 2 task 12; an MC that crashed) stays counted until the pod
+  # restarts — reading it as concurrency understates exhaustion in the
+  # direction that hides it.
   MH_MAX_REGISTERED_MEETINGS: "8192"
 
   # Resource-exhaustion guard, §8-guard family: the maximum size of
@@ -702,9 +703,11 @@ data:
   # Timeout — Clients Kicked" ("Some people can't hear anything in a meeting
   # that's otherwise working").
   #
-  # It becomes an ordinary resource guard ONLY ONCE story 2 R-20's teardown
-  # path (`EndMeeting`) reclaims ended meetings. That is conditional on R-20
-  # landing; until then, see the citations above.
+  # MH implements the R-20 teardown path (`EndMeeting` reclaims an ended
+  # meeting's edges), but that makes this an ordinary resource guard only for
+  # meetings whose MC CALLS it: MC begins calling it in story 2 task 12, and a
+  # meeting whose MC dies without calling it still holds its edges until the
+  # pod restarts. See the citations above.
   # Code-side home: the hard-ceiling constant for
   # `MH_MAX_TOTAL_EGRESS_EDGES` in `crates/mh-service/src/config.rs`.
   # Enforced by: mh-service, when a registration would ADD edges — as a
@@ -716,8 +719,9 @@ data:
   # `mh_media_egress_stream_ceiling` — the ceiling binds first, as
   # `rejected_stream_ceiling`. If this backstop ever trips it shows as
   # `mh_media_policy_applies_total{outcome="apply_failed"}` plus the WARN's
-  # `reason`. The `mh_media_egress_edges_limit` gauge and alert
-  # `MHMediaEgressEdgeHeadroomLow` land later in story 2.
+  # `reason`. `mh_media_egress_edges_limit` publishes this value (the same field
+  # enforcement reads); the alert `MHMediaEgressEdgeHeadroomLow` lands later in
+  # story 2.
   MH_MAX_TOTAL_EGRESS_EDGES: "65536"
 
   # Bound on awaiting the session actor's config-apply reply, in milliseconds.

@@ -137,8 +137,10 @@ async fn test_wt_valid_traceparent_reparents_connection_span() {
                 mc_grpc_endpoint: suite.mc_endpoint(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let token = mint_meeting_token(&suite.jwks.keypair, "otel-wt-meeting", OTEL_WT_PARTICIPANT);
     let (conn, mut send, recv) = connect_and_open_bi(&suite.wt.url).await;
@@ -198,8 +200,10 @@ async fn test_wt_empty_trace_fields_stays_parentless_root_span() {
                 mc_grpc_endpoint: suite.mc_endpoint(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let token = mint_meeting_token(
         &suite.jwks.keypair,
