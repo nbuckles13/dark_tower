@@ -186,6 +186,14 @@ pub struct ParticipantActor {
     /// Per-MH connection statuses reported by the client (R-60), keyed by the
     /// truncated `mh_url`. Bounded to `MAX_MH_STATUSES_PER_PARTICIPANT` distinct
     /// keys; only ever holds truncated, bounded values.
+    ///
+    /// **DIAGNOSTIC ONLY — NOT the connectivity source, and deliberately NOT one
+    /// map with it.** Who hears whom is decided from what the HANDLERS report
+    /// (`media_routing/connectivity.rs`, held by the meeting actor). This map is
+    /// client-ASSERTED: unifying the two would let a client place its own edges,
+    /// make itself unreachable to peers, churn meeting-wide recomputes, or — if a
+    /// url here ever reached a send target — redirect media. Never read it for
+    /// routing, never narrow connectivity from it, never take a url from it.
     mh_statuses: HashMap<String, BoundedMhStatus>,
     /// Shared disconnect-cause cell (see [`ParticipantActorHandle::disconnect_cause`]).
     /// Read once on exit to tell the meeting whether to skip or keep the grace

@@ -524,6 +524,39 @@ Plus `key_custody=operator` (§Key custody). That is the whole set.
 > sites, because it and the R3 negative test assert opposite things and are both correct. See
 > §The grandfathered set below.
 
+### No per-handler dimension on client media metrics — asked twice, answered once
+
+**Standing ruling (2026-09-25, story 2 task 20).** Since a client may hold sessions to several
+handlers (ADR-0036 §9), "frames are arriving, but not from handler X" and "which lane is dropping"
+became natural questions. They were asked twice in one devloop — by `operations` on the send side and
+by `client` on the receive side. **The answer is no, and it is not close**, so it is recorded here
+rather than re-decided per task.
+
+1. **R3 is closed and this would reopen it.** The set is `client_version` + `org_id` + `key_custody`.
+   A handler dimension is not an addition to a list; it is a change to the allow-list projection's
+   *shape* (`mediaMetricLabels` takes two named strings), which is the mechanism that makes the rule
+   structural instead of documentary.
+2. **The cardinality argument does not save it, and this is the part that surprises people.** A
+   handler id is bounded (2 today) and carries no participant identity, so it looks safe by the R1/R2
+   tests. It is not: `org_id` × handler at the 10 s client export cadence, in an org small enough to
+   hold one meeting, is a per-stream arrival time series — **the voice-activity trace R2 exists to
+   prevent**, reached by a different route. Client-side aggregation has no `pod` floor to hide behind;
+   `org_id` *is* the floor, and a small org is not a corner case.
+3. **The question is already answerable, on the other end of the hop.** Each handler is a pod, and
+   MH's own media counters are per-pod by construction — so "is handler X forwarding anything" is
+   read at handler X's own `mh_media_frames_forwarded_total`, and the cross-end comparison documented
+   in `docs/observability/metrics/client.md` closes the loop without a client-side label. A
+   client-side split would buy a *second*, weaker view of a question the server already answers
+   exactly.
+4. **What is genuinely client-only** — a lane whose directed target has no transport — is carried by
+   `dt_client_media_send_dropped_total{reason="not_connected"}`, which is a bounded reason token, not
+   a handler identity. That is the shape to reach for: **when per-handler detail is wanted, find the
+   bounded outcome that distinguishes the cases, not the identity that enumerates them.**
+
+**If this is ever reopened**, it needs the small-org aggregation argument in (2) answered, not just
+the cardinality one — and the trigger would be a case the server end genuinely cannot see, which (3)
+has not yet produced.
+
 ### The grandfathered set, and the line that decides membership
 
 **The test is what a metric OBSERVES, not which directory it lives in.** Connect-lifecycle — once per

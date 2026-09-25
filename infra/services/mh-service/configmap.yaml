@@ -559,14 +559,25 @@ data:
   #
   # SIZING, and its precondition. Its number is taken from
   # `MH_MAX_EGRESS_STREAMS_PER_MEETING` below. The muted set rides ONE handler's
-  # snapshot, and MC filters it per handler (story 2 task 12), so the real
-  # invariant is: muted senders on a handler <= P_h, the participants placed on
-  # THIS handler. And P_h <= the egress-stream bound whenever P_h >= 2 and
-  # every one of them has declared at least one slot (each then holds >= 1
-  # stream). Under that condition a legitimate snapshot can never name more
-  # muted senders than the egress bound admits, which makes this a LOOSE bound
-  # that can never falsely reject a legitimate snapshot — NOT a statement that
-  # a meeting can hold this many senders.
+  # snapshot, and the per-handler filter is "muted senders that SEND TO this
+  # handler" — senders owning at least one edge on it (story 2 task 20's edge
+  # model; implemented by the MC server-mute task). Each such sender is the
+  # pinned source of at least one of this handler's egress streams, so the
+  # invariant is: muted senders on a handler <= distinct sources on it <= its
+  # egress streams <= the egress-stream bound. Under that filter a legitimate
+  # snapshot can never name more muted senders than the egress bound admits,
+  # which makes this a LOOSE bound that can never falsely reject a legitimate
+  # snapshot — NOT a statement that a meeting can hold this many senders.
+  # Until that filter exists, an UNFILTERED set is bounded only by the
+  # meeting's muted count, and the never-falsely-rejects claim needs that
+  # count to stay within this value.
+  #
+  # CORRECTION (story 2 task 20). The invariant above previously read "muted
+  # senders on a handler <= P_h, the participants PLACED ON this handler" —
+  # task 6's one-handler-per-participant placement, which task 20 replaced.
+  # Participants are no longer placed on a handler; edges are. The per-sender
+  # form above needs no slot-declaration precondition: a sender that sends to
+  # the handler holds a stream there by definition.
   #
   # CORRECTION (story 2 task 6). This paragraph previously rested on "every
   # sender is also a subscriber holding at least one egress stream". That was
@@ -591,18 +602,21 @@ data:
   # registrations are rejected. 512 is the tightest value satisfying both — so a
   # future change to either key has to move both.
   #
-  # PRECONDITION: the derivation holds only while every participant on a
-  # handler holds at least one egress stream. THREE cases break that, and two
-  # are already real in story 2 (both hold ZERO streams):
-  #   - a joined-but-undeclared participant (MC admits a joiner with zero slots
-  #     until it declares a receive capability);
-  #   - a participant ALONE on its handler (P_h = 1: no co-handler peer to hold,
-  #     since loopback is removed);
-  #   - a zero-slot / send-only participant (`SLOT_STATE_ZERO_REQUESTED` stays
-  #     retained-but-unemitted in story 2).
-  # Senders on a handler can then exceed that handler's egress streams, and
-  # this value stops following from the egress bound — the story that makes
-  # large send-only meetings real MUST revisit this bound.
+  # PRECONDITION: the derivation holds only while the muted set MC sends a
+  # handler is filtered to senders that SEND TO that handler (own at least one
+  # edge on it). The invariant counts senders by the streams they SOURCE on the
+  # handler, and such a sender sources one by definition; a muted sender that
+  # sends nowhere on this handler is filtered out and costs nothing here.
+  #   What still breaks it: an UNFILTERED set (the state until the MC
+  #   server-mute task lands), or a filter by any other rule — the task that
+  #   implements server mute MUST filter by edge ownership, not by
+  #   connectivity: a sender CONNECTED to a handler need not send to it.
+  #   What no longer breaks it (story 2 task 20): the three zero-stream
+  #   participant cases listed here before — a joined-but-undeclared
+  #   participant, a participant with no peer on its handler, and a zero-slot /
+  #   send-only participant. Each holds zero streams as a SUBSCRIBER, which
+  #   mattered only while the invariant counted participants placed on the
+  #   handler; it now counts sources.
   #
   # REQUIREMENT ON THE MH CODE TASK, recorded here because this comment is what
   # reaches that task's author: this required read must be validated against a
@@ -645,13 +659,25 @@ data:
   # WHAT BINDS SINCE STORY 2 (static join-order slot fill): each registration
   # carries ONE egress stream per FILLED receive slot, each with exactly one
   # pinned source, so this is now the binding per-meeting constraint — and it
-  # is PER HANDLER: the count is the sum, over subscribers PLACED ON THIS
-  # HANDLER, of min(N_s, P_h - 1), where N_s is that subscriber's declared
-  # slots and P_h the participants placed on this handler (not the meeting).
-  # With a uniform N that is P_h x min(N, P_h - 1). Round-robin placement halves
-  # P per handler, so sizing against the meeting's P over-provisions. (Story 1's
-  # one-stream-per-subscriber-with-every-source shape made the candidate bound
-  # below the binding one instead.)
+  # is PER HANDLER: the count is the number of edges THIS handler OWNS — one
+  # per filled receive slot whose edge MC assigned here. SIZE IT AGAINST THE
+  # WHOLE MEETING, not a share of it: MC co-locates edges (fewest send targets
+  # per sender), so in a meeting where everyone is connected to every handler
+  # ALL of its edges land on ONE handler. The worst case per handler is
+  # therefore the meeting's sum over subscribers of min(N_s, P - 1), where N_s
+  # is that subscriber's declared slots and P the meeting's participants; with
+  # a uniform N that is P x min(N, P - 1). With `MC_MAX_RECEIVE_SLOTS` = 8 that
+  # reaches this value at P = 64; the egress-budget admission ceiling above
+  # binds far earlier, so this remains a structural backstop, not the limit an
+  # operator meets. (Story 1's one-stream-per-subscriber-with-every-source
+  # shape made the candidate bound below the binding one instead.)
+  #
+  # CORRECTION (story 2 task 20). This note previously sized against P_h, "the
+  # participants placed on this handler", and said round-robin placement halves
+  # P per handler so meeting-P sizing over-provisions. Task 20 replaced
+  # one-handler-per-participant placement with the shared-handler edge model,
+  # and co-location concentrates rather than splits: the halving argument is
+  # false in the UNSAFE direction. No value changed.
   #
   # The muted-source bound above takes its number from this key, and the
   # direction matters: its "can never falsely reject a legitimate snapshot"

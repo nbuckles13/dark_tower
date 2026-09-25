@@ -1,11 +1,20 @@
-//! Multi-party static join-order slot placement, end to end through the real
-//! join path (story 2 R-1..R-4, R-33; ADR-0036 §6, §8, §9).
+//! Multi-party join-order slots and shared-handler edges, end to end through the
+//! real join path and the real MH→MC connectivity path (story 2 R-1..R-4, R-33;
+//! ADR-0036 §6, §8, §9).
 //!
-//! What these tests add over the pure `media_routing::slots` unit tests and
-//! model check: that the meeting actor is wired to them — every structural
-//! change (join, leave via each removal path, declaration, mute) re-renders,
-//! re-pushes ONLY what changed, and re-emits every affected participant's view
-//! — and that placement scopes every handler url a client is given.
+//! What these tests add over the pure `media_routing::{slots, connectivity}`
+//! unit tests and model check: that the meeting actor is wired to them — every
+//! structural change (join, leave via each removal path, declaration, mute, and
+//! a SETTLED connectivity change reported by a handler) re-renders, re-pushes
+//! ONLY what changed, and re-emits every affected participant's view — and that
+//! every client is offered the FULL handler set.
+//!
+//! Connectivity is always produced the way production produces it: a
+//! `NotifyParticipantConnected` / `Disconnected` through the real
+//! `McMediaCoordinationService` (`common::media_session::notify_*`). There is
+//! no placement seam. Every assertion is a PROPERTY — an edge is on a handler
+//! both parties are connected to, a sender's targets are the handlers owning
+//! its edges — never WHICH handler MC chose.
 //!
 //! "No push" assertions read the recording MH client's call list and each
 //! handler's generations, never only a metric. No fixed sleep gates any
@@ -28,7 +37,7 @@
 #[path = "common/mod.rs"]
 mod test_common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +50,10 @@ use mc_test_utils::mock_mh::{AppliedGenerationBehaviour, MediaHandlerStub};
 use proto_gen::dark_tower::signaling::v1::{SlotState, TransportMode};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::media_session::{audio_slots, capability_frame, join_as, mute_frame, start_stack};
+use test_common::media_session::{
+    audio_slots, capability_frame, connection_id_for, join_as, join_as_on, mute_frame,
+    notify_connected, notify_disconnected, start_stack,
+};
 use test_common::{
     build_test_stack, client_media_config, mh_handler, seed_meeting_with_handlers,
     seed_meeting_with_mh, test_identity_key, test_join_media, RegisterMeetingCall,
@@ -127,6 +139,61 @@ fn generations_for(calls: &[RegisterMeetingCall], grpc_endpoint: &str) -> Vec<u6
 
 fn senders_in(a: &proto_gen::dark_tower::signaling::v1::StreamAssignments) -> Vec<Option<u32>> {
     a.assignments.iter().map(|s| s.sender_id).collect()
+}
+
+/// The LAST snapshot pushed to each handler endpoint, as `(subscriber, source)`
+/// edges.
+fn latest_edges(calls: &[RegisterMeetingCall]) -> BTreeMap<String, BTreeSet<(u32, u32)>> {
+    let mut out: BTreeMap<String, BTreeSet<(u32, u32)>> = BTreeMap::new();
+    for call in calls {
+        let edges = call
+            .assignment
+            .egress_streams
+            .iter()
+            .filter_map(|p| {
+                p.candidate_sources.first().map(|source| {
+                    (
+                        u32::from(p.subscriber.get().get()),
+                        u32::from(source.get().get()),
+                    )
+                })
+            })
+            .collect();
+        out.insert(call.mh_grpc_endpoint.clone(), edges);
+    }
+    out
+}
+
+/// A sender's targets as MH sees them: the handler endpoints whose latest
+/// snapshot carries at least one edge FROM it.
+fn targets_at_mh(calls: &[RegisterMeetingCall], sender: u32) -> BTreeSet<String> {
+    latest_edges(calls)
+        .into_iter()
+        .filter(|(_, edges)| edges.iter().any(|(_, source)| *source == sender))
+        .map(|(endpoint, _)| endpoint)
+        .collect()
+}
+
+/// A subscriber's sources across every handler.
+fn heard_by(calls: &[RegisterMeetingCall], subscriber: u32) -> BTreeSet<u32> {
+    latest_edges(calls)
+        .values()
+        .flatten()
+        .filter(|(sub, _)| *sub == subscriber)
+        .map(|(_, source)| *source)
+        .collect()
+}
+
+/// The handler endpoint carrying the `subscriber <- source` edge, if any.
+fn edge_owner(calls: &[RegisterMeetingCall], subscriber: u32, source: u32) -> Option<String> {
+    latest_edges(calls)
+        .into_iter()
+        .find(|(_, edges)| edges.contains(&(subscriber, source)))
+        .map(|(endpoint, _)| endpoint)
+}
+
+fn endpoint_of(handler_id: &str) -> String {
+    format!("http://{handler_id}:50053")
 }
 
 // ============================================================================
@@ -217,84 +284,343 @@ async fn an_unfilled_slot_only_change_is_not_pushed() {
 }
 
 // ============================================================================
-// R-33: a cross-handler join or leave re-emits the unreachable set with NO push
-// and NO generation bump on EITHER handler
+// R-33: one general rule — hear iff a connected handler is shared
 // ============================================================================
 
+/// THE CANONICAL CASE. A is connected to both handlers, B only to mh-0, C only
+/// to mh-1. A hears B and C; B hears only A; C hears only A; B and C are each
+/// unreachable to the other; A sends to both handlers. Every client was offered
+/// BOTH handlers — the split is produced only by which ones they reached.
 #[tokio::test]
-async fn a_cross_handler_join_and_leave_re_emit_unreachable_without_any_push() {
-    let (stack, rig) = start_stack("slot-cross").await;
+async fn canonical_partial_connectivity_routes_only_through_shared_handlers() {
+    let snap = MetricAssertion::snapshot();
+    let (stack, rig) = start_stack("slot-canon").await;
+    // Redis enumerates mh-1 first: order must not matter anywhere.
     seed_meeting_with_handlers(
         &stack,
-        "slot-cross",
+        "slot-canon",
         vec![mh_handler("mh-1"), mh_handler("mh-0")],
     )
     .await;
-    let mut a = join_as(&rig, &stack, "slot-cross", "user-a").await; // rank 0 -> mh-0
-    assert_eq!(a.media_servers, vec!["wt://mh-0:4433".to_string()]);
-    a.write(capability_frame(audio_slots(1))).await;
-    let _ = a.settle().await;
-    // The first join registers BOTH handlers (the mh-1 one empty), so a
-    // participant later placed on mh-1 can be promoted by MH.
-    assert_eq!(
-        pushes_caught_up(&stack, &rig, "slot-cross", "mh-0").await,
-        vec![1]
-    );
-    assert_eq!(
-        pushes_caught_up(&stack, &rig, "slot-cross", "mh-1").await,
-        vec![1]
-    );
-
-    let snap = MetricAssertion::snapshot();
-    let b = join_as(&rig, &stack, "slot-cross", "user-b").await; // rank 1 -> mh-1
-    assert_eq!(b.media_servers, vec!["wt://mh-1:4433".to_string()]);
-    let with_b = a
-        .assignments_until("B named unreachable", |x| {
-            !x.unreachable_sender_ids.is_empty()
-        })
-        .await;
-    assert_eq!(with_b.unreachable_sender_ids, vec![b.sender_id]);
-    assert_eq!(
-        with_b.assignments[0].slot_state,
-        SlotState::FewerSourcesThanSlots as i32,
-        "a cross-handler peer consumes no slot"
-    );
-
-    snap.counter("mc_media_unreachable_senders_total")
-        .with_labels(&[("key_custody", "operator")])
-        .assert_delta(1);
-
-    b.close();
-    let without_b = a
-        .assignments_until("B no longer unreachable", |x| {
-            x.unreachable_sender_ids.is_empty()
-        })
-        .await;
-    assert!(without_b.unreachable_sender_ids.is_empty());
-
-    actor_drained(&stack, "slot-cross").await;
-    for handler in ["mh-0", "mh-1"] {
+    let mut a = join_as_on(&rig, &stack, "slot-canon", "user-a", &["mh-0", "mh-1"]).await;
+    let mut b = join_as_on(&rig, &stack, "slot-canon", "user-b", &["mh-0"]).await;
+    let mut c = join_as_on(&rig, &stack, "slot-canon", "user-c", &["mh-1"]).await;
+    for s in [&a, &b, &c] {
+        let mut offered = s.media_servers.clone();
+        offered.sort();
         assert_eq!(
-            rendered(&rig, "slot-cross", handler).await,
-            Some(1),
-            "{handler}: a cross-handler join and leave render nothing new"
+            offered,
+            vec!["wt://mh-0:4433".to_string(), "wt://mh-1:4433".to_string()],
+            "every participant is offered the FULL registered set"
         );
     }
-    let calls_after = stack.mh_reg_client.calls();
+    for s in [&mut a, &mut b, &mut c] {
+        s.write(capability_frame(audio_slots(2))).await;
+    }
+
+    // B and C settle at the window's end (they never reach every handler);
+    // poll the views rather than sleeping.
+    // Directive before assignments within one flush, so read A's converged
+    // directive first, then the assignments that follow it.
+    let a_directive = a
+        .directive_until("A targets both handlers", |d| {
+            d.streams.first().is_some_and(|s| s.targets.len() == 2)
+        })
+        .await;
+    let a_view = a
+        .assignments_until("A hears B and C", |x| {
+            let mut heard: Vec<u32> = x.assignments.iter().filter_map(|s| s.sender_id).collect();
+            heard.sort_unstable();
+            let mut want = vec![b.sender_id, c.sender_id];
+            want.sort_unstable();
+            heard == want
+        })
+        .await;
+    assert!(a_view.unreachable_sender_ids.is_empty());
+    let b_view = b
+        .assignments_until("B hears only A; C unreachable", |x| {
+            senders_in(x) == vec![Some(a.sender_id), None]
+                && x.unreachable_sender_ids == vec![c.sender_id]
+        })
+        .await;
+    let c_view = c
+        .assignments_until("C hears only A; B unreachable", |x| {
+            senders_in(x) == vec![Some(a.sender_id), None]
+                && x.unreachable_sender_ids == vec![b.sender_id]
+        })
+        .await;
+
+    // Each slot is read on the handler that owns that edge — one the pair
+    // shares, which for B's and C's single handler is forced.
+    assert_eq!(b_view.assignments[0].media_handler_url, "wt://mh-0:4433");
+    assert_eq!(c_view.assignments[0].media_handler_url, "wt://mh-1:4433");
+    for slot in &a_view.assignments {
+        let from = slot.sender_id.unwrap();
+        let expected = if from == b.sender_id {
+            "wt://mh-0:4433"
+        } else {
+            "wt://mh-1:4433"
+        };
+        assert_eq!(
+            slot.media_handler_url, expected,
+            "A reads each slot where its edge is"
+        );
+    }
+
+    // A sends to both handlers.
+    let mut a_targets: Vec<String> = a_directive.streams[0]
+        .targets
+        .iter()
+        .map(|t| t.media_handler_url.clone())
+        .collect();
+    a_targets.sort();
+    assert_eq!(a_targets, vec!["wt://mh-0:4433", "wt://mh-1:4433"]);
+
+    // Telemetry: B and C were named unreachable to each other on delivered
+    // views; while B and C were still settling, their peers' views counted
+    // them as not yet connected; A's two-target directive counted two targets.
+    assert!(
+        snap.counter("mc_media_unreachable_senders_total")
+            .with_labels(&[("key_custody", "operator")])
+            .delta()
+            >= 2
+    );
+    assert!(
+        snap.counter("mc_media_not_yet_connected_senders_total")
+            .with_labels(&[("key_custody", "operator")])
+            .delta()
+            >= 1,
+        "B and C were counted while establishing"
+    );
+    assert!(
+        snap.counter("mc_media_send_targets_total")
+            .with_labels(&[("key_custody", "operator")])
+            .delta()
+            >= 2
+    );
+
+    // MH side: each handler holds exactly the edges it owns.
+    pushes_caught_up(&stack, &rig, "slot-canon", "mh-0").await;
+    pushes_caught_up(&stack, &rig, "slot-canon", "mh-1").await;
+    let calls = stack.mh_reg_client.calls();
     assert_eq!(
-        generations_for(&calls_after, "http://mh-0:50053"),
-        vec![1],
-        "no forwarding edge changed on mh-0: no push, no bump"
+        latest_edges(&calls)[&endpoint_of("mh-0")],
+        BTreeSet::from([(a.sender_id, b.sender_id), (b.sender_id, a.sender_id)])
     );
     assert_eq!(
-        generations_for(&calls_after, "http://mh-1:50053"),
-        vec![1],
-        "the empty handler stays at its first-join generation and is never re-pushed"
+        latest_edges(&calls)[&endpoint_of("mh-1")],
+        BTreeSet::from([(a.sender_id, c.sender_id), (c.sender_id, a.sender_id)])
     );
 }
 
+/// All-connected: everyone hears everyone, and each sender has exactly ONE
+/// target — co-location, which is what the general rule produces, not a
+/// separate path. Asserted without naming the handler.
+#[tokio::test]
+async fn all_connected_everyone_hears_everyone_with_one_target_per_sender() {
+    let (stack, rig) = start_stack("slot-allconn").await;
+    seed_meeting_with_handlers(
+        &stack,
+        "slot-allconn",
+        vec![mh_handler("mh-0"), mh_handler("mh-1")],
+    )
+    .await;
+    let mut sessions = Vec::new();
+    for user in ["user-a", "user-b", "user-c", "user-d"] {
+        let mut s = join_as(&rig, &stack, "slot-allconn", user).await;
+        assert_eq!(s.media_servers.len(), 2, "the full set is offered");
+        s.write(capability_frame(audio_slots(3))).await;
+        sessions.push(s);
+    }
+    let ids: Vec<u32> = sessions.iter().map(|s| s.sender_id).collect();
+    for s in &mut sessions {
+        let (directive, view) = s.settle().await;
+        let view = view.expect("view");
+        let heard: BTreeSet<u32> = view
+            .assignments
+            .iter()
+            .filter_map(|x| x.sender_id)
+            .collect();
+        let others: BTreeSet<u32> = ids.iter().copied().filter(|x| *x != s.sender_id).collect();
+        assert_eq!(heard, others, "everyone hears everyone");
+        assert!(view.unreachable_sender_ids.is_empty());
+        assert_eq!(
+            directive.expect("directive").streams[0].targets.len(),
+            1,
+            "one send target per sender"
+        );
+    }
+    pushes_caught_up(&stack, &rig, "slot-allconn", "mh-0").await;
+    pushes_caught_up(&stack, &rig, "slot-allconn", "mh-1").await;
+    let calls = stack.mh_reg_client.calls();
+    for id in &ids {
+        assert_eq!(
+            targets_at_mh(&calls, *id).len(),
+            1,
+            "MH agrees: one handler per sender"
+        );
+    }
+}
+
+/// A connectivity change is a structural change with the SAME machinery as a
+/// join or leave: generations advance only when a snapshot changed.
+///
+/// - A disconnect from the handler NOT carrying the pair's edges changes no
+///   snapshot: no render advance, no push (negative, deterministic).
+/// - A disconnect from the handler that DOES carry them moves the edges to the
+///   other shared handler: both handlers' snapshots change and both advance.
+/// - A duplicate Connected (MH retry) changes nothing.
+#[tokio::test]
+async fn a_connectivity_change_re_pushes_with_generation_advance_only_on_change() {
+    let (stack, rig) = start_stack("slot-conn").await;
+    seed_meeting_with_handlers(
+        &stack,
+        "slot-conn",
+        vec![mh_handler("mh-0"), mh_handler("mh-1")],
+    )
+    .await;
+    let mut a = join_as(&rig, &stack, "slot-conn", "user-a").await;
+    let mut b = join_as(&rig, &stack, "slot-conn", "user-b").await;
+    a.write(capability_frame(audio_slots(1))).await;
+    b.write(capability_frame(audio_slots(1))).await;
+    let _ = a.settle().await;
+    let _ = b.settle().await;
+    pushes_caught_up(&stack, &rig, "slot-conn", "mh-0").await;
+    pushes_caught_up(&stack, &rig, "slot-conn", "mh-1").await;
+    let calls = stack.mh_reg_client.calls();
+    let owner = edge_owner(&calls, a.sender_id, b.sender_id).expect("A holds B");
+    let (carrying, idle) = if owner == endpoint_of("mh-0") {
+        ("mh-0", "mh-1")
+    } else {
+        ("mh-1", "mh-0")
+    };
+    let gen = |h: &'static str| rendered(&rig, "slot-conn", h);
+    let before = (gen(carrying).await, gen(idle).await);
+
+    // Duplicate Connected for a live key: idempotent.
+    b.connect_to(&stack, carrying, &connection_id_for("user-b", carrying))
+        .await;
+    actor_drained(&stack, "slot-conn").await;
+    assert_eq!(
+        (gen(carrying).await, gen(idle).await),
+        before,
+        "a retry changes nothing"
+    );
+
+    // B leaves the idle handler: no edge was there.
+    b.disconnect_from(&stack, idle, &connection_id_for("user-b", idle))
+        .await;
+    actor_drained(&stack, "slot-conn").await;
+    assert_eq!(
+        (gen(carrying).await, gen(idle).await),
+        before,
+        "no snapshot changed, so no generation advanced"
+    );
+
+    // B leaves the carrying handler: the pair still shares nothing else? B is
+    // on no handler now -> not connected, no edges, not unreachable.
+    b.disconnect_from(&stack, carrying, &connection_id_for("user-b", carrying))
+        .await;
+    let view = a
+        .assignments_until("B dropped from A's slot, not reported unreachable", |x| {
+            senders_in(x) == vec![None]
+        })
+        .await;
+    assert!(
+        view.unreachable_sender_ids.is_empty(),
+        "a participant with no connection is not-yet-connected, never unreachable"
+    );
+    let after = pushes_caught_up(&stack, &rig, "slot-conn", carrying).await;
+    assert!(
+        Some(*after.last().unwrap()) > before.0,
+        "the carrying handler's snapshot changed and advanced"
+    );
+}
+
+/// An edge MOVES (keeping its slot and its sender) when its handler leaves one
+/// party's set while another shared handler remains — and moves only then.
+#[tokio::test]
+async fn an_edge_moves_to_the_remaining_shared_handler_and_keeps_its_slot() {
+    let (stack, rig) = start_stack("slot-move").await;
+    seed_meeting_with_handlers(
+        &stack,
+        "slot-move",
+        vec![mh_handler("mh-0"), mh_handler("mh-1")],
+    )
+    .await;
+    let mut a = join_as(&rig, &stack, "slot-move", "user-a").await;
+    let mut b = join_as(&rig, &stack, "slot-move", "user-b").await;
+    a.write(capability_frame(audio_slots(1))).await;
+    b.write(capability_frame(audio_slots(1))).await;
+    let (_, first) = a.settle().await;
+    let first = first.unwrap();
+    let _ = b.settle().await;
+    let url = first.assignments[0].media_handler_url.clone();
+    let carrying = if url == "wt://mh-0:4433" {
+        "mh-0"
+    } else {
+        "mh-1"
+    };
+
+    let snap = MetricAssertion::snapshot();
+    b.disconnect_from(&stack, carrying, &connection_id_for("user-b", carrying))
+        .await;
+    let moved = a
+        .assignments_until("A's slot now read on the other handler", |x| {
+            x.assignments[0].media_handler_url != url
+        })
+        .await;
+    assert_eq!(
+        senders_in(&moved),
+        vec![Some(b.sender_id)],
+        "same sender, same slot"
+    );
+    assert_eq!(moved.assignments[0].slot_id, first.assignments[0].slot_id);
+    snap.counter("mc_media_edge_moves_total")
+        .with_labels(&[
+            ("reason", "connectivity_change"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(2); // A<-B and B<-A
+    snap.counter("mc_media_edge_moves_total")
+        .with_labels(&[("reason", "unexpected"), ("key_custody", "operator")])
+        .assert_delta(0);
+}
+
+/// R1: a stale Disconnected from a superseded session does not remove a handler
+/// a newer session of the same participant is live on.
+#[tokio::test]
+async fn a_stale_disconnect_does_not_remove_a_handler_a_newer_session_is_live_on() {
+    let (stack, rig) = start_stack("slot-stale").await;
+    seed_meeting_with_mh(&stack, "slot-stale").await;
+    let mut a = join_as(&rig, &stack, "slot-stale", "user-a").await;
+    let b = join_as(&rig, &stack, "slot-stale", "user-b").await;
+    a.write(capability_frame(audio_slots(1))).await;
+    a.assignments_until("A hears B", |x| senders_in(x) == vec![Some(b.sender_id)])
+        .await;
+    let before = rendered(&rig, "slot-stale", "mh-test-1").await;
+
+    // B's transport reconnects: session 2 opens BEFORE session 1's close is
+    // reported (idle-timeout ordering).
+    b.connect_to(&stack, "mh-test-1", "user-b@mh-test-1#2")
+        .await;
+    b.disconnect_from(
+        &stack,
+        "mh-test-1",
+        &connection_id_for("user-b", "mh-test-1"),
+    )
+    .await;
+    actor_drained(&stack, "slot-stale").await;
+    assert_eq!(
+        rendered(&rig, "slot-stale", "mh-test-1").await,
+        before,
+        "B is still live on the handler through session 2: nothing changed"
+    );
+    a.expect_no_media().await;
+}
+
 // ============================================================================
-// Placement pins (test-seams) and S10b in-process
+// The per-meeting flush bound: deferred, never dropped, and per meeting
 // ============================================================================
 
 async fn seamed_meeting(
@@ -316,128 +642,6 @@ async fn seamed_meeting(
         },
     );
 }
-
-/// S10b in-process: A, C and E on mh-0; B and D on mh-1. Each handler's
-/// snapshot carries only its own participants' edges, and each subscriber's
-/// unreachable set is EXACTLY the other handler's participants.
-#[tokio::test]
-async fn a_split_meeting_programs_each_handler_with_only_its_own_edges() {
-    let (stack, rig) = start_stack("slot-split").await;
-    seed_meeting_with_handlers(
-        &stack,
-        "slot-split",
-        vec![mh_handler("mh-0"), mh_handler("mh-1")],
-    )
-    .await;
-    let mut sessions = Vec::new();
-    for user in ["user-a", "user-b", "user-c", "user-d", "user-e"] {
-        let mut s = join_as(&rig, &stack, "slot-split", user).await;
-        s.write(capability_frame(audio_slots(4))).await;
-        sessions.push(s);
-    }
-    let on_mh0: Vec<u32> = [0, 2, 4].iter().map(|i| sessions[*i].sender_id).collect();
-    let on_mh1: Vec<u32> = [1, 3].iter().map(|i| sessions[*i].sender_id).collect();
-
-    for (i, s) in sessions.iter_mut().enumerate() {
-        let (_, view) = s.settle().await;
-        let view = view.expect("every declared participant has a view");
-        let (mine, other) = if i % 2 == 0 {
-            (&on_mh0, &on_mh1)
-        } else {
-            (&on_mh1, &on_mh0)
-        };
-        let mut unreachable = view.unreachable_sender_ids.clone();
-        unreachable.sort_unstable();
-        let mut expected = other.clone();
-        expected.sort_unstable();
-        assert_eq!(
-            unreachable, expected,
-            "participant {i}: unreachable == the other handler, exactly"
-        );
-        for slot in view.assignments.iter().filter_map(|a| a.sender_id) {
-            assert!(
-                mine.contains(&slot),
-                "participant {i}: a slot holds only a co-handler sender"
-            );
-            assert_ne!(slot, s.sender_id, "never itself");
-        }
-    }
-
-    pushes_caught_up(&stack, &rig, "slot-split", "mh-0").await;
-    pushes_caught_up(&stack, &rig, "slot-split", "mh-1").await;
-    let calls = stack.mh_reg_client.calls();
-    for (endpoint, members) in [
-        ("http://mh-0:50053", &on_mh0),
-        ("http://mh-1:50053", &on_mh1),
-    ] {
-        let last = calls
-            .iter()
-            .rev()
-            .find(|c| c.mh_grpc_endpoint == endpoint)
-            .expect("every handler is programmed");
-        for plan in &last.assignment.egress_streams {
-            let subscriber = u32::from(plan.subscriber.get().get());
-            let source = u32::from(plan.candidate_sources[0].get().get());
-            assert!(
-                members.contains(&subscriber) && members.contains(&source),
-                "{endpoint} carries a foreign edge"
-            );
-        }
-        // Full mesh within the handler: every member holds every other member.
-        assert_eq!(
-            last.assignment.egress_streams.len(),
-            members.len() * (members.len() - 1)
-        );
-    }
-}
-
-#[tokio::test]
-async fn a_placement_pin_co_locates_two_participants_and_a_pin_outside_the_set_fails_the_join() {
-    let (stack, rig) = start_stack("slot-pin").await;
-    let mut pins = BTreeMap::new();
-    pins.insert("user-b".to_string(), HandlerId::new("mh-0"));
-    seamed_meeting(
-        &stack,
-        "slot-pin",
-        vec![mh_handler("mh-0"), mh_handler("mh-1")],
-        MeetingSeams {
-            placement_pins: pins,
-            ..Default::default()
-        },
-    )
-    .await;
-    let mut a = join_as(&rig, &stack, "slot-pin", "user-a").await;
-    let b = join_as(&rig, &stack, "slot-pin", "user-b").await;
-    assert_eq!(
-        b.media_servers, a.media_servers,
-        "pinned onto A's handler, not round-robin"
-    );
-    a.write(capability_frame(audio_slots(1))).await;
-    let (_, view) = a.settle().await;
-    assert_eq!(view.unwrap().assignments[0].sender_id, Some(b.sender_id));
-
-    // A pin naming a handler outside the meeting's set fails LOUDLY — no
-    // fallback to round-robin or to handler[0].
-    let mut bad = BTreeMap::new();
-    bad.insert("user-x".to_string(), HandlerId::new("mh-9"));
-    seamed_meeting(
-        &stack,
-        "slot-pin-bad",
-        vec![mh_handler("mh-0")],
-        MeetingSeams {
-            placement_pins: bad,
-            ..Default::default()
-        },
-    )
-    .await;
-    let rejected =
-        test_common::media_session::try_join_as(&rig, &stack, "slot-pin-bad", "user-x").await;
-    assert!(rejected.is_err(), "an out-of-set pin must fail the join");
-}
-
-// ============================================================================
-// The per-meeting flush bound: deferred, never dropped, and per meeting
-// ============================================================================
 
 #[tokio::test]
 async fn the_flush_bound_defers_but_every_subscriber_converges() {
@@ -609,6 +813,10 @@ async fn grace_expiry_drives_the_same_re_push_as_a_clean_leave() {
             .unwrap();
     }
     for p in ["a", "b", "c"] {
+        // Every participant reaches the one handler, as MH would report.
+        notify_connected(&stack, "slot-grace", &format!("user-{p}"), "mh-test-1", p).await;
+    }
+    for p in ["a", "b", "c"] {
         let decl = mc_service::media_signaling::ReceiveCapabilityDeclaration::parse(
             &proto_gen::dark_tower::signaling::v1::ReceiveCapability {
                 slots: audio_slots(1),
@@ -702,6 +910,14 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
                 .await
                 .unwrap(),
         );
+        notify_connected(
+            &stack,
+            "slot-reconnect",
+            &format!("user-{p}"),
+            "mh-test-1",
+            p,
+        )
+        .await;
         meeting
             .register_receive_capability(format!("part-{p}"), decl())
             .await
@@ -709,7 +925,8 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
     }
     virtual_turns().await;
 
-    // B drops without a clean close: grace, not removal.
+    // B drops without a clean close: grace, not removal. (Its MEDIA connection
+    // is a separate transport and stays up, so B stays routable.)
     meeting
         .connection_disconnected(
             "conn-b".to_string(),
@@ -734,6 +951,7 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
         )
         .await
         .unwrap();
+    notify_connected(&stack, "slot-reconnect", "user-c", "mh-test-1", "c").await;
     virtual_turns().await;
     let pushes_before = stack.mh_reg_client.calls().len();
     let a_holds = stack
@@ -775,8 +993,8 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
 
 /// S-C: the handler set frozen at the first join is the meeting's authority. A
 /// later join carrying a DIFFERENT set (Redis changed, or was tampered with)
-/// is counted and logged, and cannot widen the set or move anyone: the joiner
-/// is placed on the frozen set.
+/// is counted and logged, and cannot widen the set: the joiner is offered the
+/// FROZEN set, never the injected handler.
 #[tokio::test]
 async fn a_later_join_cannot_widen_the_frozen_handler_set() {
     let stack = build_test_stack("slot-frozen").await;
@@ -812,18 +1030,19 @@ async fn a_later_join_cannot_widen_the_frozen_handler_set() {
             .counter("mc_media_handler_set_divergence_total")
             .with_labels(&[("key_custody", "operator")])
             .delta();
-        results.push((joined.media_handler.id, divergences));
+        let offered: Vec<HandlerId> = joined.media_handlers.ids().cloned().collect();
+        results.push((offered, divergences));
     }
     assert_eq!(
         results[0],
-        (HandlerId::new("mh-0"), 0),
+        (vec![HandlerId::new("mh-0")], 0),
         "the first join freezes the set"
     );
     assert_eq!(
         results[1],
-        (HandlerId::new("mh-0"), 1),
-        "a divergent later join is counted, and rank 1 round-robins over the FROZEN \
-         one-handler set, never onto the injected handler"
+        (vec![HandlerId::new("mh-0")], 1),
+        "a divergent later join is counted and offered the FROZEN one-handler set, never \
+         the injected handler"
     );
 }
 
@@ -931,4 +1150,315 @@ async fn the_published_slot_cap_is_the_enforced_cap() {
     snap.gauge("mc_media_receive_slot_cap")
         .with_labels(&[("key_custody", "operator")])
         .assert_value(expected);
+}
+
+// ============================================================================
+// The connect settle window (`media_routing/connectivity.rs`), on paused time
+// ============================================================================
+
+/// An actor-level meeting on `handlers` with `users` joined (not connected).
+async fn actor_meeting(
+    label: &str,
+    handlers: &[&str],
+    users: &[&str],
+) -> (
+    TestStackHandles,
+    mc_service::actors::MeetingActorHandle,
+    Vec<u32>,
+    Vec<tokio::sync::mpsc::Receiver<bytes::Bytes>>,
+) {
+    let stack = build_test_stack(label).await;
+    let endpoints: Vec<_> = handlers.iter().map(|h| mh_handler(h)).collect();
+    seed_meeting_with_handlers(&stack, label, endpoints.clone()).await;
+    let meeting = stack
+        .controller_handle
+        .get_meeting_handle(label.to_string())
+        .await
+        .unwrap();
+    let mut senders = Vec::new();
+    // Held by the caller so each participant's outbound channel stays open.
+    let mut outbound = Vec::new();
+    for user in users {
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+        outbound.push(rx);
+        let joined = meeting
+            .connection_join(
+                format!("conn-{user}"),
+                (*user).to_string(),
+                format!("part-{user}"),
+                String::new(),
+                false,
+                test_identity_key(),
+                Some(tx),
+                test_join_media(&stack, &endpoints),
+            )
+            .await
+            .unwrap();
+        senders.push(u32::from(joined.sender_id.get().get()));
+        let decl = mc_service::media_signaling::ReceiveCapabilityDeclaration::parse(
+            &proto_gen::dark_tower::signaling::v1::ReceiveCapability {
+                slots: audio_slots(3),
+            },
+            8,
+            true,
+        )
+        .unwrap();
+        meeting
+            .register_receive_capability(format!("part-{user}"), decl)
+            .await
+            .unwrap();
+    }
+    (stack, meeting, senders, outbound)
+}
+
+fn window() -> Duration {
+    client_media_config().connect_settle_window
+}
+
+/// THE TRIPWIRE for the settle window (named in `media_routing/connectivity.rs`).
+///
+/// Everyone ends up connected to both handlers, but the connects arrive
+/// interleaved so that, WITHOUT the window, A would become routable on both
+/// handlers while B was on mh-1 only and C on mh-0 only — placing A->B on mh-1
+/// and A->C on mh-0 — and since a still-valid edge never moves, A would send to
+/// both handlers forever. With the window every participant settles on its
+/// FULL set, so each sender ends with exactly one target.
+#[tokio::test(start_paused = true)]
+async fn staggered_connects_settle_to_one_target_per_sender() {
+    let label = "slot-stagger";
+    let (stack, _meeting, s, _rx) =
+        actor_meeting(label, &["mh-0", "mh-1"], &["user-a", "user-b", "user-c"]).await;
+    for (user, handler) in [
+        ("user-a", "mh-0"),
+        ("user-b", "mh-1"),
+        ("user-a", "mh-1"),
+        ("user-c", "mh-0"),
+        ("user-b", "mh-0"),
+        ("user-c", "mh-1"),
+    ] {
+        notify_connected(
+            &stack,
+            label,
+            user,
+            handler,
+            &connection_id_for(user, handler),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(window() * 2).await;
+    virtual_turns().await;
+
+    let calls = stack.mh_reg_client.calls();
+    for (i, sender) in s.iter().enumerate() {
+        let heard = heard_by(&calls, *sender);
+        let others: BTreeSet<u32> = s.iter().copied().filter(|x| x != sender).collect();
+        assert_eq!(heard, others, "participant {i}: everyone hears everyone");
+        assert_eq!(
+            targets_at_mh(&calls, *sender).len(),
+            1,
+            "participant {i}: all-connected yields ONE target per sender, whatever the connect order"
+        );
+    }
+}
+
+/// A participant that never reaches every handler settles at the window's end
+/// with what was observed — and is neither routed nor named unreachable before.
+#[tokio::test(start_paused = true)]
+async fn a_partial_participant_settles_at_the_window_and_is_counted() {
+    let label = "slot-partial";
+    let (stack, _meeting, s, _rx) =
+        actor_meeting(label, &["mh-0", "mh-1"], &["user-a", "user-b"]).await;
+    let snap = MetricAssertion::snapshot();
+    for handler in ["mh-0", "mh-1"] {
+        notify_connected(
+            &stack,
+            label,
+            "user-a",
+            handler,
+            &connection_id_for("user-a", handler),
+        )
+        .await;
+    }
+    notify_connected(
+        &stack,
+        label,
+        "user-b",
+        "mh-1",
+        &connection_id_for("user-b", "mh-1"),
+    )
+    .await;
+    virtual_turns().await;
+    assert!(
+        heard_by(&stack.mh_reg_client.calls(), s[0]).is_empty(),
+        "B is still establishing: no edge before the window elapses"
+    );
+
+    tokio::time::sleep(window()).await;
+    virtual_turns().await;
+    let calls = stack.mh_reg_client.calls();
+    assert_eq!(heard_by(&calls, s[0]), BTreeSet::from([s[1]]));
+    assert_eq!(
+        edge_owner(&calls, s[0], s[1]),
+        Some(endpoint_of("mh-1")),
+        "the only handler the pair shares"
+    );
+    snap.counter("mc_media_connect_settles_total")
+        .with_labels(&[("outcome", "complete"), ("key_custody", "operator")])
+        .assert_delta(1);
+    snap.counter("mc_media_connect_settles_total")
+        .with_labels(&[("outcome", "window_elapsed"), ("key_custody", "operator")])
+        .assert_delta(1);
+}
+
+/// The deadline is set ONCE, by the first MH-observed connect: repeated
+/// connects (new sessions, retries) do not re-arm it.
+#[tokio::test(start_paused = true)]
+async fn repeated_connects_do_not_re_arm_the_settle_window() {
+    let label = "slot-rearm";
+    let (stack, _meeting, s, _rx) =
+        actor_meeting(label, &["mh-0", "mh-1"], &["user-a", "user-b"]).await;
+    for handler in ["mh-0", "mh-1"] {
+        notify_connected(
+            &stack,
+            label,
+            "user-a",
+            handler,
+            &connection_id_for("user-a", handler),
+        )
+        .await;
+    }
+    notify_connected(&stack, label, "user-b", "mh-0", "b-1").await;
+    for n in 2..6 {
+        tokio::time::sleep(window() / 5).await;
+        notify_connected(&stack, label, "user-b", "mh-0", &format!("b-{n}")).await;
+        notify_connected(&stack, label, "user-b", "mh-0", "b-1").await; // a retry
+    }
+    // 4/5 of the window has passed since B's first connect; one more fifth
+    // (plus a turn) reaches the ORIGINAL deadline.
+    tokio::time::sleep(window() / 5 + Duration::from_millis(10)).await;
+    virtual_turns().await;
+    assert_eq!(
+        heard_by(&stack.mh_reg_client.calls(), s[0]),
+        BTreeSet::from([s[1]]),
+        "B settled at its FIRST connect's deadline, not a re-armed one"
+    );
+}
+
+/// S10: a client cycling its media transports drives at most one settle per
+/// window, and only ever delays itself — and a storm of cycles cancelled before
+/// settling does not push its return out further than one window.
+#[tokio::test(start_paused = true)]
+async fn a_reconnect_storm_is_floored_to_one_episode_per_window() {
+    let label = "slot-storm";
+    let (stack, meeting, s, _rx) = actor_meeting(label, &["mh-0"], &["user-a", "user-b"]).await;
+    let rig_gens = || async {
+        let _ = meeting.get_state().await;
+        stack.mh_reg_client.calls().len()
+    };
+    notify_connected(&stack, label, "user-a", "mh-0", "a").await;
+    notify_connected(&stack, label, "user-b", "mh-0", "b-0").await;
+    virtual_turns().await;
+    let settled = rig_gens().await;
+
+    // B drops and reconnects its only transport ten times, immediately.
+    for n in 1..=10 {
+        notify_disconnected(&stack, label, "user-b", "mh-0", &format!("b-{}", n - 1)).await;
+        notify_connected(&stack, label, "user-b", "mh-0", &format!("b-{n}")).await;
+    }
+    virtual_turns().await;
+    let during = rig_gens().await - settled;
+    assert!(
+        during <= 1,
+        "ten drop/reconnect cycles inside one window drove {during} pushes; the floor allows one"
+    );
+    tokio::time::sleep(window() * 2).await;
+    virtual_turns().await;
+    assert_eq!(
+        heard_by(&stack.mh_reg_client.calls(), s[0]),
+        BTreeSet::from([s[1]]),
+        "B is routable again once the floor has passed"
+    );
+}
+
+/// Characterization of R3's no-repair property: a participant whose connected
+/// set empties stays not-connected — no edges, unreachable to no one — and
+/// NOTHING re-adds it without a new connect. There is no repair event to wait
+/// for: MH sends Connected once per session.
+#[tokio::test(start_paused = true)]
+async fn losing_every_handler_stays_not_connected_with_no_spontaneous_regain() {
+    let label = "slot-lost";
+    let (stack, _meeting, s, _rx) = actor_meeting(label, &["mh-0"], &["user-a", "user-b"]).await;
+    notify_connected(&stack, label, "user-a", "mh-0", "a").await;
+    notify_connected(&stack, label, "user-b", "mh-0", "b").await;
+    virtual_turns().await;
+    assert_eq!(
+        heard_by(&stack.mh_reg_client.calls(), s[0]),
+        BTreeSet::from([s[1]])
+    );
+
+    notify_disconnected(&stack, label, "user-b", "mh-0", "b").await;
+    virtual_turns().await;
+    let pushes = stack.mh_reg_client.calls().len();
+    assert!(heard_by(&stack.mh_reg_client.calls(), s[0]).is_empty());
+
+    tokio::time::sleep(window() * 10).await;
+    virtual_turns().await;
+    assert_eq!(
+        stack.mh_reg_client.calls().len(),
+        pushes,
+        "nothing re-asserts connectivity on its own: no generation re-advance"
+    );
+    assert!(
+        heard_by(&stack.mh_reg_client.calls(), s[0]).is_empty(),
+        "never spontaneously regained"
+    );
+}
+
+/// Formation burst: every participant connects to BOTH handlers, i.e. 2N
+/// notifications — yet each participant changes routing only once (at settle),
+/// so the carrying handler sees at most one push per settled participant, not
+/// one per notification.
+#[tokio::test(start_paused = true)]
+async fn a_formation_burst_coalesces_to_at_most_one_push_per_settle() {
+    const N: usize = 6;
+    let label = "slot-burst";
+    let users: Vec<String> = (0..N).map(|i| format!("user-{i}")).collect();
+    let user_refs: Vec<&str> = users.iter().map(String::as_str).collect();
+    let (stack, _meeting, _s, _rx) = actor_meeting(label, &["mh-0", "mh-1"], &user_refs).await;
+    let before = stack.mh_reg_client.calls().len();
+    for user in &users {
+        for handler in ["mh-0", "mh-1"] {
+            notify_connected(
+                &stack,
+                label,
+                user,
+                handler,
+                &connection_id_for(user, handler),
+            )
+            .await;
+        }
+    }
+    virtual_turns().await;
+    let calls = stack.mh_reg_client.calls();
+    for handler in ["mh-0", "mh-1"] {
+        let pushes = calls[before..]
+            .iter()
+            .filter(|c| c.mh_grpc_endpoint == endpoint_of(handler))
+            .count();
+        assert!(
+            pushes <= N,
+            "{handler}: {pushes} pushes for {} notifications — must coalesce to <= one per settle",
+            2 * N
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_published_settle_window_is_the_enforced_window() {
+    let snap = MetricAssertion::snapshot();
+    let (_stack, _rig) = start_stack("slot-settle-gauge").await;
+    snap.gauge("mc_media_connect_settle_window_seconds")
+        .with_labels(&[("key_custody", "operator")])
+        .assert_value(window().as_secs_f64());
 }

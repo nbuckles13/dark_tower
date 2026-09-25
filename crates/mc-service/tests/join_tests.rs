@@ -29,7 +29,6 @@ use bytes::{BufMut, BytesMut};
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::grpc::MhRegistrationClient;
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::{make_expired_meeting_claims, make_meeting_claims, TestKeypair};
 use prost::Message;
@@ -563,7 +562,6 @@ async fn test_actor_level_join_success() {
         metrics,
         controller_metrics,
         master_secret,
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     );
 
@@ -616,7 +614,6 @@ async fn test_actor_level_join_meeting_not_found() {
         metrics,
         controller_metrics,
         master_secret,
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     );
 
@@ -667,7 +664,6 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
         metrics,
         controller_metrics,
         master_secret,
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     );
 
@@ -755,7 +751,6 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
         metrics,
         controller_metrics,
         master_secret,
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     );
     controller
@@ -1164,12 +1159,14 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_join_multiple_mh_handlers_scopes_media_servers_and_registers_all() {
+async fn test_join_multiple_mh_handlers_offers_the_full_set_and_registers_all() {
     let server = TestServer::start().await;
     server
         .create_meeting_with_handlers(
             "meeting-multi",
-            vec![mh_handler("mh-alpha"), mh_handler("mh-beta")],
+            // Redis enumerates beta first: the offered set must not depend on
+            // enumeration order, and nothing may rely on which is first.
+            vec![mh_handler("mh-beta"), mh_handler("mh-alpha")],
         )
         .await;
 
@@ -1178,26 +1175,31 @@ async fn test_join_multiple_mh_handlers_scopes_media_servers_and_registers_all()
 
     let response = join_and_read_response(&server.url(), "meeting-multi", &token, "Alice").await;
 
-    // JoinResponse carries EXACTLY the participant's placed handler (ADR-0036
-    // §9, R-33): the first joiner (rank 0) lands on the sorted-first handler.
+    // JoinResponse offers the meeting's FULL registered handler set (ADR-0036
+    // §9, R-33): every participant connects to all it can, and MC routes each
+    // pair through a handler both are observed on. Compared as a SET — the
+    // order carries no meaning.
     match &response.message {
         Some(server_message::Message::JoinResponse(join)) => {
-            let urls: Vec<&str> = join
+            let urls: std::collections::BTreeSet<&str> = join
                 .media_servers
                 .iter()
                 .map(|m| m.media_handler_url.as_str())
                 .collect();
             assert_eq!(
                 urls,
-                vec!["wt://mh-alpha:4433"],
-                "media_servers must be scoped to the one placed handler"
+                std::collections::BTreeSet::from(["wt://mh-alpha:4433", "wt://mh-beta:4433"]),
+                "media_servers must carry every registered handler"
             );
+            assert_eq!(join.media_servers.len(), 2, "each handler exactly once");
         }
         other => panic!("Expected JoinResponse, got {other:?}"),
     }
 
     // The first join registers EVERY assigned handler (possibly with an empty
-    // snapshot), so a participant placed on either can be promoted by MH.
+    // snapshot): MH reports a participant's connection only once the meeting is
+    // registered on that handler, so a handler owning no edges must still be
+    // registered or its connectivity could never be observed.
     let calls = server
         .stack
         .mh_reg_client

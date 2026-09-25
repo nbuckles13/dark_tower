@@ -36,11 +36,17 @@
 // to avoid.
 //
 // DTX-off has a second consequence, load-bearing elsewhere: because the frame
-// rate is constant and independent of speech, a frame COUNT is not a
-// voice-activity trace, which is what makes `EgressPipeline.framesSent` and
-// `IngressPipeline.framesAccepted` safe to expose where ADR-0036 §11 bars
-// per-frame sizes. Turning DTX on would silently turn both of those — and the
-// production `dt_client_media_frames_sent_total` — into that trace.
+// rate is constant and independent of speech, a DATAGRAM COUNT is not a
+// voice-activity trace, which is what makes `EgressPipeline.framesSent` (a read
+// of `#datagramsSent`) and `IngressPipeline.framesAccepted` safe to expose where
+// ADR-0036 §11 bars per-frame sizes. Turning DTX on would silently turn both of
+// those — and the production `dt_client_media_frames_sent_total` — into that
+// trace.
+//
+// The unit is datagrams rather than captured frames, because a sender whose edges
+// span two handlers sends each frame to both (§9). That does NOT weaken the
+// argument above: the per-lane count is still constant and speech-independent, so
+// the sum over lanes is too. What would break it is DTX, exactly as before.
 //
 // ---------------------------------------------------------------------------
 // CLIENT MUTE DOES NOT RELEASE THE CAPTURE DEVICE, AND MUST NOT

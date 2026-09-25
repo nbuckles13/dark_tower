@@ -78,6 +78,18 @@ impl McClient {
     /// * `meeting_id` - Meeting the participant connected to
     /// * `participant_id` - Participant who connected (from JWT `sub` claim)
     /// * `handler_id` - This MH instance's identifier
+    /// * `connection_id` - This WebTransport session's opaque id (see below)
+    ///
+    /// # `connection_id`
+    ///
+    /// The per-session uuid minted once at accept. MC keys live connectivity on
+    /// `(handler, connection_id)`, so it is what lets a stale disconnect from a
+    /// superseded session be told apart from the live one. Two rules, both owed
+    /// by the CALLER and both stated at `internal.proto`: never reuse an id
+    /// within the process, and send the SAME id on every retry of this call and
+    /// on the session's `NotifyParticipantDisconnected`. It is not an identity
+    /// and not authorization input — participant identity is `participant_id`
+    /// alone, and is never re-derived from this.
     ///
     /// # Returns
     ///
@@ -102,11 +114,15 @@ impl McClient {
         meeting_id: &str,
         participant_id: &str,
         handler_id: &str,
+        connection_id: &str,
     ) -> Result<NotifyParticipantConnectedResponse, MhError> {
+        // Built ONCE, outside the retry loop: every attempt clones this value,
+        // so every retry carries the same `connection_id` by construction.
         let request = NotifyParticipantConnectedRequest {
             meeting_id: meeting_id.to_string(),
             participant_id: participant_id.to_string(),
             handler_id: handler_id.to_string(),
+            connection_id: connection_id.to_string(),
         };
 
         self.send_with_retry(
@@ -134,6 +150,9 @@ impl McClient {
     /// * `meeting_id` - Meeting the participant disconnected from
     /// * `participant_id` - Participant who disconnected
     /// * `handler_id` - This MH instance's identifier
+    /// * `connection_id` - The SAME id this session's
+    ///   `notify_participant_connected` carried. A disconnect is terminal for
+    ///   its id: MC retires only this session's entry, never a sibling session's
     /// * `reason` - Disconnect reason (proto `DisconnectReason` enum value)
     ///
     /// # Errors
@@ -149,12 +168,14 @@ impl McClient {
         meeting_id: &str,
         participant_id: &str,
         handler_id: &str,
+        connection_id: &str,
         reason: i32,
     ) -> Result<(), MhError> {
         let request = NotifyParticipantDisconnectedRequest {
             meeting_id: meeting_id.to_string(),
             participant_id: participant_id.to_string(),
             handler_id: handler_id.to_string(),
+            connection_id: connection_id.to_string(),
             reason,
         };
 
@@ -423,7 +444,7 @@ mod tests {
         let client = McClient::new(token_rx);
 
         let result = client
-            .notify_participant_connected("", "meeting-1", "user-1", "mh-1")
+            .notify_participant_connected("", "meeting-1", "user-1", "mh-1", "conn-1")
             .await;
 
         // Pinned to the exact variant, not `Config | Grpc`: the media path now
@@ -443,7 +464,7 @@ mod tests {
         let client = McClient::new(token_rx);
 
         let result = client
-            .notify_participant_disconnected("", "meeting-1", "user-1", "mh-1", 1)
+            .notify_participant_disconnected("", "meeting-1", "user-1", "mh-1", "conn-1", 1)
             .await;
 
         assert!(
@@ -458,7 +479,13 @@ mod tests {
         let client = McClient::new(token_rx);
 
         let result = client
-            .notify_participant_connected("http://127.0.0.1:59997", "meeting-1", "user-1", "mh-1")
+            .notify_participant_connected(
+                "http://127.0.0.1:59997",
+                "meeting-1",
+                "user-1",
+                "mh-1",
+                "conn-1",
+            )
             .await;
 
         assert!(
@@ -478,6 +505,7 @@ mod tests {
                 "meeting-1",
                 "user-1",
                 "mh-1",
+                "conn-1",
                 1,
             )
             .await;

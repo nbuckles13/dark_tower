@@ -3525,7 +3525,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of MH\u2192MC participant connection/disconnection notifications by event type.",
+      "description": "Rate of MH\u2192MC participant connection/disconnection notifications by event type. Since story 2 task 20 these notifications ARE MC's source of truth for who hears whom (ADR-0036 \u00a79): a flat `connected` rate while joins continue means the MH\u2192MC notification path is broken and nobody is routed - MC Scenario 18 / MH Scenario 10.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3715,7 +3715,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of per-MH connection statuses recorded from client MediaConnectionUpdate messages, by reported state (R-60). A rising failed share signals client-perceived MH connectivity problems.",
+      "description": "Rate of per-MH connection statuses recorded from client MediaConnectionUpdate messages, by reported state (R-60). A rising failed share signals client-perceived MH connectivity problems. Client-asserted and DIAGNOSTIC ONLY - it is NOT MC's connectivity source: routing uses what the HANDLERS report (MH Notifications panel, Media Connectivity row). Do not triage MC routing off this series.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4399,7 +4399,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Whether MC could resolve a participant's sender_id for the Media Handler that asked, and if not why (ADR-0036 \u00a72, \u00a74; R-15). Increments once per NotifyParticipantConnected RESPONSE MC emits. READ THIS BEFORE COMPARING WITH MH: MH sees only sender_id==0 and structurally cannot tell the four unresolved outcomes apart - its declined_no_sender_binding is the UNION of all four. This panel is the only place the split exists, and the outcomes triage differently: meeting_unknown is a routing/registration fault whose remedy is in the MC-MH registration path; participant_unknown is an expected low-rate race between MH's connect notification and MC's join completing; registry_full is the per-meeting connection cap declining to hand out a binding for a connection MC is not tracking - its remedy is capacity, not a lifecycle investigation; user_ambiguous is one user with two roster entries for one sub, which NEVER self-clears and which RECONNECTING CAUSES - so the participant_unknown remedy (reconnect) is actively HARMFUL here and there is no operator remedy (full triage in mh-incident-response.md Scenario 15 Step 2). THE sender_id VALUE IS NEVER A LABEL (ADR-0036 \u00a711): outcome carries the triage signal as a bounded token instead of 65535 values. No meeting id, participant id or sender id appears as a label. DENOMINATOR NOTE: sum() over this metric equals mc_mh_notifications_received_total{event_type=\"connected\"} by construction - same path, same gate - so do not alert on both as if they were independent.",
+      "description": "Whether MC could resolve a participant's sender_id for the Media Handler that asked, and if not why (ADR-0036 \u00a72, \u00a74; R-15). Increments once per NotifyParticipantConnected RESPONSE MC emits. READ THIS BEFORE COMPARING WITH MH: MH sees only sender_id==0 and structurally cannot tell the three unresolved outcomes apart - its declined_no_sender_binding is the UNION of all three. This panel is the only place the split exists, and the outcomes triage differently: meeting_unknown is a routing/registration fault whose remedy is in the MC-MH registration path; participant_unknown is an expected low-rate race between MH's connect notification and MC's join completing; registry_full is RETIRED (story 2 task 20: the connection registry and its cap are gone; MC never declines a binding for capacity) - a non-zero value can only come from an MC image predating the retirement during a rolling deploy, version skew, NOT a capacity signal; user_ambiguous is one user with two roster entries for one sub, which NEVER self-clears and which RECONNECTING CAUSES - so the participant_unknown remedy (reconnect) is actively HARMFUL here and there is no operator remedy (full triage in mh-incident-response.md Scenario 15 Step 2). connection_id does NOT resolve it: it tells MH connections apart, not MC joins (docs/TODO.md, 'user_ambiguous has no operator remedy'). THE sender_id VALUE IS NEVER A LABEL (ADR-0036 \u00a711): outcome carries the triage signal as a bounded token instead of 65535 values. No meeting id, participant id or sender id appears as a label. DENOMINATOR NOTE: sum() over this metric equals mc_mh_notifications_received_total{event_type=\"connected\"} by construction - same path, same gate - so do not alert on both as if they were independent.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4767,7 +4767,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Send-directive compositions by disposition (ADR-0036 \u00a75), recorded by the MEETING ACTOR on every composition - including those triggered by a peer's join, leave, declaration or mute - and only when the directive CHANGED. EMITTED MEANS COMPOSED, NOT DELIVERED: two hops follow it, each on its own series - participant mailbox CLOSED is Slot View Emissions outcome=delivery_failed, stream channel FULL is Dropped Outbound Messages payload_kind=signaling_raw. THE SUCCESS SET IS {emitted, emitted_empty_targets}, NOT {emitted}. \u00a75 makes an empty target set a SPECIFIED success (\"that means send nothing\"), and since story 2 it is ROUTINE: a solo participant, and anyone no co-handler subscriber holds in a slot, is directed to send nothing, then re-sent a non-empty directive the moment someone holds it. Both are GREEN and any failure predicate must read outcome!~\"emitted|emitted_empty_targets\" - PERMANENT, grounded in \u00a75, unlike the temporary carve-out on Media Policy Pushes. RED is the three MC DEFECTS (any non-zero value is a bug): unknown_stream_number, transport_mode_unspecified and handler_url_unresolved (every url comes from one frozen handler set; fails CLOSED - nothing is sent). ORANGE is the two ENVIRONMENTAL values: meeting_state_unavailable and assignment_failed. The failure values are disjoint by construction: composition is sequential stages and the first failing stage returns its own value.",
+      "description": "Send-directive compositions by disposition (ADR-0036 \u00a75), recorded by the MEETING ACTOR on every composition - including those triggered by a peer's join, leave, declaration or mute - and only when the directive CHANGED. EMITTED MEANS COMPOSED, NOT DELIVERED: two hops follow it, each on its own series - participant mailbox CLOSED is Slot View Emissions outcome=delivery_failed, stream channel FULL is Dropped Outbound Messages payload_kind=signaling_raw. THE SUCCESS SET IS {emitted, emitted_empty_targets}, NOT {emitted}. \u00a75 makes an empty target set a SPECIFIED success (\"that means send nothing\"), and it is ROUTINE: a solo participant, anyone nobody holds in a slot, and anyone not yet connected to a handler (or inside the connect settle window) is directed to send nothing, then re-sent a non-empty directive the moment someone holds it. 'Holds' means SHARES A CONNECTED HANDLER WITH (story 2 task 20) - not 'placed on the same handler', task 6's retired meaning. Under round-robin this was routine in every split two-person meeting; under the edge model an all-connected meeting co-locates, so the expected magnitude dropped. A directive may now carry several targets (every handler owning one of the sender's edges; Mean Send Targets per Directive). Both are GREEN and any failure predicate must read outcome!~\"emitted|emitted_empty_targets\" - PERMANENT, grounded in \u00a75, unlike the temporary carve-out on Media Policy Pushes. RED is the three MC DEFECTS (any non-zero value is a bug): unknown_stream_number, transport_mode_unspecified and handler_url_unresolved (every url comes from one frozen handler set, and an edge's owning handler is only ever a member of it; fails CLOSED - nothing is sent). ORANGE is the two ENVIRONMENTAL values: meeting_state_unavailable and assignment_failed. The failure values are disjoint by construction: composition is sequential stages and the first failing stage returns its own value.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4906,7 +4906,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Slot states MC conveys to subscribers (ADR-0036 \u00a76), one increment per declared slot per StreamAssignments the actor actually SENDS. The bucketed slot-state signal \u00a711 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (all eight SlotState variants, not the three reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. EMISSIONS ARE CLIENT- AND SERVER-DRIVEN since story 2: the actor re-emits on a PEER's join, leave, declaration or audio-mute change, so the distribution is weighted by meeting churn as well as by any one client - normalise before building a ratio. fewer_sources_than_slots is every declared-but-unfilled slot - a solo participant (loopback removed, R-3) and any meeting smaller than N; it is the healthy steady state of a small meeting. source_muted covers client AND server mute (one wire state). source_unreachable is NO LONGER EMITTED: a participant on another handler is named in unreachable_sender_ids instead (see Unreachable Senders Named); a non-zero red line here is therefore an MC defect, as is unspecified. zero_requested may be unemittable in principle (open protocol question, docs/TODO.md); withheld_by_congestion arrives with the MH slot-state notification and switch_pending with \u00a77 switching.",
+      "description": "Slot states MC conveys to subscribers (ADR-0036 \u00a76), one increment per declared slot per StreamAssignments the actor actually SENDS. The bucketed slot-state signal \u00a711 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (all eight SlotState variants, not the three reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. EMISSIONS ARE CLIENT- AND SERVER-DRIVEN since story 2: the actor re-emits on a PEER's join, leave, declaration or audio-mute change, so the distribution is weighted by meeting churn as well as by any one client - normalise before building a ratio. fewer_sources_than_slots is every declared-but-unfilled slot - a solo participant (loopback removed, R-3), any meeting smaller than N, and every slot of a participant not yet connected to a handler; it is the healthy steady state of a small meeting. source_muted covers client AND server mute (one wire state). source_unreachable stays UNEMITTED under the story-2 edge model: a participant the subscriber shares NO connected handler with is named in unreachable_sender_ids instead (the state is reserved for a PINNED source with no shared handler, which static fill cannot produce) (see Unreachable Senders Named); a non-zero red line here is therefore an MC defect, as is unspecified. zero_requested may be unemittable in principle (open protocol question, docs/TODO.md); withheld_by_congestion arrives with the MH slot-state notification and switch_pending with \u00a77 switching.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5569,7 +5569,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Joins whose Redis handler assignment differed from the meeting's handler set frozen at first join. EXPECTED EMPTY: the frozen set is the meeting's authority, so MC kept it and moved nobody - but any non-zero value is an MC-internal invariant violation (Redis and the actor disagree). Capture and escalate to meeting-controller (MC runbook Scenario 18 arm f); restarting nothing fixes it. Zero is healthy; an ABSENT series is NOT a zero - it means the metrics pipeline is broken.",
+      "description": "Joins whose Redis handler assignment differed from the meeting's handler set frozen at first join. EXPECTED EMPTY: the frozen set is the meeting's authority, so MC kept it and moved no edge - but any non-zero value is an MC-internal invariant violation (Redis and the actor disagree). Capture and escalate to meeting-controller (MC runbook Scenario 18 arm f); restarting nothing fixes it. Zero is healthy; an ABSENT series is NOT a zero - it means the metrics pipeline is broken.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5663,7 +5663,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Roster participants named in StreamAssignments.unreachable_sender_ids (on a different media handler; ADR-0036 \u00a79, story 2 R-33), summed over emitted views. EMISSION-WEIGHTED, NOT A POPULATION: it rises with churn in a split meeting and a stable split meeting emits nothing - it does NOT count how many people are cross-handler (use the placement INFO log, MC runbook Scenario 18). Mean per emitted view = this / Slot View Emissions outcome=sent. Permanently zero on a single-handler deployment, by construction. No sender, meeting or handler identity.",
+      "description": "Roster participants named in StreamAssignments.unreachable_sender_ids - a routable participant whose CONNECTED handler set is disjoint from the subscriber's (ADR-0036 \u00a79, story 2 R-33, task 20), summed over emitted views. A NON-ZERO RATE IS A CONNECTIVITY-DEGRADATION SIGNAL: every client is offered every handler and an all-connected meeting co-locates, so a healthy meeting emits zero here. EMISSION-WEIGHTED, NOT A POPULATION: it does NOT count who cannot reach whom (use the connectivity INFO lines and Connect Settles window_elapsed, MC runbook Scenario 18). Mean per emitted view = this / Slot View Emissions outcome=sent. Permanently zero on a single-handler deployment, by construction - because every ROUTABLE participant is on that handler and a not-yet-connected participant is never unreachable (see Not-Yet-Connected Senders). The field is a wire contract the client must render, not optional. No sender, meeting or handler identity.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5750,6 +5750,763 @@
       ],
       "title": "Unreachable Senders Named",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 224
+      },
+      "id": 163,
+      "panels": [],
+      "title": "Media Connectivity (ADR-0036 \u00a79)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MH connect/disconnect notifications that did NOT become (or change) participant connectivity, by reason (story 2 task 20). Connectivity decides who hears whom, so every way a notification fails to become routing input is counted. READ PER REASON, NEVER AS ONE RATE: unknown_connection is ROUTINE (every declined connection's Disconnected); participant_unknown is a low-rate join race; user_ambiguous and meeting_unknown are faults; a SUSTAINED handler_not_in_set means an MH restarted under a new id and story-4 re-registration has not happened (stale connectivity does not self-clear, MC runbook Scenario 18); connection_bound_refused is EXPECTED-EMPTY (red); retired_connection is a Connected delivered after its own Disconnected, refused by MC's tombstone. No meeting, participant, handler or connection identity.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unknown_connection"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "participant_unknown"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(handler_not_in_set|retired_connection)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(connection_bound_refused|user_ambiguous|meeting_unknown)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 225
+      },
+      "id": 164,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(mc_mh_notifications_unapplied_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MH Notifications Unapplied by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Participants' connectivity episodes settling (story 2 task 20). PER EPISODE, so it IS a population: window_elapsed counts participants that did NOT reach every handler of their meeting within MC_MEDIA_CONNECT_SETTLE_MS - Scenario 18 Step 0's count of 'who failed to connect everywhere'. complete = reached every handler (settles at its last connect, no added latency). The window withholds routing while a participant establishes (no edges, not unreachable); window_elapsed is the visible edge of that mask. Read against Connect Settle Window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "complete"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "window_elapsed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 225
+      },
+      "id": 165,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_connect_settles_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Connect Settles by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Roster members NOT routable (not yet connected to any handler, inside their settle window, or re-establishing) counted per emitted StreamAssignments, the subscriber ITSELF INCLUDED (so a subscriber's own all-fewer_sources view, identical to a small meeting's, is not invisible). The partner of Unreachable Senders Named: that one is silence because connected sets are disjoint, this one is silence because someone is not connected yet. NOT EXPECTED-EMPTY - every join passes through it; PERSISTENCE, not rate, is the fault. Emission-weighted: normalise by Slot View Emissions outcome=sent. Mixes the subscriber's own contribution (at most 1) with its peers'.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 233
+      },
+      "id": 166,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_media_not_yet_connected_senders_total[$__rate_interval]))",
+          "legendFormat": "not-yet-connected senders",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Not-Yet-Connected Senders",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Send targets per emitted SendDirective (story 2 task 20): a sender sends to every handler owning one of its edges, and MC's edge policy co-locates to minimise that. ~1 when participants reach every handler; above 1 only with genuinely partial connectivity. A sustained rise with healthy connectivity means co-location degraded - visible otherwise only as client uplink cost. Changed directives only (the emitted boundary).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 233
+      },
+      "id": 167,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_media_send_targets_total[$__rate_interval])) / sum(rate(mc_media_send_directives_total{outcome=\"emitted\"}[$__rate_interval]))",
+          "legendFormat": "targets per directive",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mean Send Targets per Directive",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Publisher->subscriber edges that changed handler between two renders (story 2 task 20). connectivity_change is routine: the edge's handler left one party's connected set and the edge moved, keeping its slot and sender. unexpected is EXPECTED-EMPTY and RED: an edge moved while both parties were still on its old handler - an edge-stability invariant violation; capture and escalate (ERROR at mc.actor.meeting names both handlers). Detected by diffing consecutive renders, independently of the code it checks.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "connectivity_change"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unexpected"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 241
+      },
+      "id": 168,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(mc_media_edge_moves_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Edge Moves by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MH notifications with an EMPTY connection_id - an MH image predating the field (story 2 task 20). The degraded legacy path: one implicit key per (participant, handler), i.e. the stale-disconnect hazard connection_id closes. Non-zero means an old MH is still in the fleet (rolling deploy or stuck pod). Retirement condition: once flat for a full MH rollout, MC's legacy branch is deleted.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 241
+      },
+      "id": 169,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_mh_notifications_without_connection_id_total[$__rate_interval]))",
+          "legendFormat": "legacy notifications",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Notifications Without Connection Id",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The connect settle window this MC enforces (MC_MEDIA_CONNECT_SETTLE_MS), published from the SAME field the meeting actors enforce. A CONFIG ECHO. Cost it names: time-to-first-audio for a participant that does not reach every handler is delayed by up to this; it never appears in join latency (which stops at the JoinResponse). Read Connect Settles window_elapsed against it.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 249
+      },
+      "id": 170,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_connect_settle_window_seconds)",
+          "instant": true,
+          "legendFormat": "settle window",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Connect Settle Window",
+      "type": "stat"
     }
   ],
   "refresh": "10s",

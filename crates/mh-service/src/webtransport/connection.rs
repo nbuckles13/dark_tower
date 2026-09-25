@@ -195,6 +195,12 @@ pub async fn handle_connection(
         MhError::WebTransportError(format!("Session accept failed: {e}"))
     })?;
 
+    // Also the `connection_id` on this session's MH→MC notifications
+    // (`internal.proto`), and this ONE binding is the only source for it: minted
+    // once here, random, never reused within the process, and threaded — never
+    // re-minted — into the Connected call, every retry of it, and whichever of
+    // the two disconnect paths runs. MC keys live connectivity on it, so a
+    // second mint anywhere would let a disconnect retire the wrong session.
     let connection_id = uuid::Uuid::new_v4().to_string();
     tracing::Span::current().record("connection_id", connection_id.as_str());
 
@@ -674,6 +680,10 @@ pub async fn handle_connection(
         let meeting_id = meeting_id.clone();
         let participant_id = participant_id.clone();
         let handler_id = handler_id.clone();
+        // The SAME id this session's `NotifyParticipantConnected` carried: MC
+        // retires only this session's connectivity entry, so a disconnect from
+        // a session superseded by a reconnect cannot remove the live one.
+        let connection_id = connection_id.clone();
         let reason = reason as i32;
         tokio::spawn(async move {
             if let Err(e) = mc_client
@@ -682,6 +692,7 @@ pub async fn handle_connection(
                     &meeting_id,
                     &participant_id,
                     &handler_id,
+                    &connection_id,
                     reason,
                 )
                 .await
@@ -895,7 +906,7 @@ fn start_media_session(
 ///
 /// [`mc_may_hold_a_registration`] decides whether `NotifyParticipantDisconnected`
 /// is owed: MC that registered this connection (definitely, having answered, or
-/// possibly, having timed out after `add_connection`) must be told it is going
+/// possibly, having timed out after recording it) must be told it is going
 /// away, while MC that never reached its handler saw no connection and would
 /// receive a disconnection for something it never knew about — a state
 /// divergence, not a courtesy.
@@ -924,6 +935,10 @@ async fn close_declined_connection(
                     meeting_id,
                     participant_id,
                     handler_id,
+                    // The id the abandoned or refused `NotifyParticipantConnected`
+                    // carried — one binding in `handle_connection`, never re-minted —
+                    // so MC can retire exactly the entry it may hold.
+                    connection_id,
                     proto_gen::dark_tower::internal::v1::DisconnectReason::Error as i32,
                 )
                 .await
@@ -972,29 +987,39 @@ enum SenderBindingOutcome {
 /// outcome already records how far the start sequence got and two fields
 /// encoding one fact can disagree. The question is not "did MC *answer*" — it is
 /// "could MC be left holding a live registration if MH walks away silently",
-/// because that ghost entry consumes one of MC's per-meeting connection-cap
-/// slots (@security S4) until something clears it, and only MH can.
+/// and only MH can clear one.
 ///
-/// MC registers the connection (`registry.add_connection`) **before** it awaits
-/// the meeting actor to resolve the ordinal, so registration precedes the slow
-/// part of the handler. That splits the outcomes three ways:
+/// **What a ghost entry costs** (story 2 task 20). MC records this connection
+/// as *connectivity* — participant P is reachable on this handler — in the
+/// meeting actor, in the same turn that resolves the ordinal, and routes media
+/// edges from it: a subscriber hears a sender only through a handler both are
+/// connected to. A ghost entry is therefore **phantom connectivity**: MC keeps
+/// placing edges for P on a handler P is no longer on, and those edges carry
+/// nothing — silence, not misdelivered media — and no later event from MH is
+/// guaranteed to clear it: this notice is the clearing event. (Before task 20
+/// the same ghost cost one slot of a per-meeting connection cap; the registry
+/// holding that cap is gone, and the stakes of this predicate went up, not
+/// down.)
+///
+/// MC records the connection **before** the RPC returns, so a slow MC can
+/// record it and still miss MH's deadline. That splits the outcomes three ways:
 ///
 /// - **MC answered** (`0`, out-of-range, or an ordinal MH refused as a
-///   collision): the handler ran to completion, so the connection is
-///   registered — notify. Definite.
+///   collision): the handler ran to completion, so the connection may be
+///   recorded — notify. MC records connectivity only for a resolved, in-set
+///   participant, so after a `0` there is usually nothing to clear; the notice
+///   is then a no-op MC counts, and that is the cheap side of the trade.
 /// - **RPC did not complete** (`DeclinedMcUnavailable`: timeout, transport
-///   failure, or a non-auth status after every retry): a slow-but-alive MC can
-///   register and then miss MH's deadline, so MH **cannot know** whether a ghost
-///   entry exists. Notify anyway — MC's disconnect handler is idempotent
-///   (`registry.remove_connection` is a no-op on an absent entry), so the false
-///   positive costs one wasted RPC while the false negative strands a cap slot
-///   for the meeting's lifetime. This is the arm @security flagged as the S4
-///   shape on the side S4 did not reach, and it is a regression fixed here: the
-///   pre-contract path kept the connection up and cleaned up at teardown.
+///   failure, or a non-auth status after every retry): MH **cannot know**
+///   whether a ghost entry exists. Notify anyway — a disconnect for something
+///   MC does not hold is a counted no-op, so the false positive costs one RPC
+///   while the false negative is phantom connectivity for the rest of the
+///   session. This is the arm @security flagged as the S4 shape on the side S4
+///   did not reach.
 /// - **The request never reached MC's handler** (`DeclinedMcAuthRejected`: MC's
 ///   auth interceptor refused MH's credential *before* the handler, or MH never
 ///   built one; `DeclinedMcEndpointUnknown`: no dialable endpoint, so nothing
-///   was sent): `add_connection` never ran, so there is nothing to clear —
+///   was sent): MC never recorded anything, so there is nothing to clear —
 ///   notifying would tell MC about a connection it never saw, a state
 ///   divergence rather than a courtesy.
 ///
@@ -1006,9 +1031,9 @@ const fn mc_may_hold_a_registration(outcome: metrics::MediaSessionStartOutcome) 
         metrics::MediaSessionStartOutcome::DeclinedNoSenderBinding
         | metrics::MediaSessionStartOutcome::DeclinedSenderBindingOutOfRange
         | metrics::MediaSessionStartOutcome::DeclinedSenderBindingConflict
-        // Uncertain, so notify: a timeout after `add_connection` leaves a ghost
-        // entry, and the disconnect handler is idempotent, so the safe default
-        // is to clear what might exist.
+        // Uncertain, so notify: MC may have recorded the connection and then
+        // missed MH's deadline, and a disconnect for an entry MC does not hold
+        // is a no-op, so the safe default is to clear what might exist.
         | metrics::MediaSessionStartOutcome::DeclinedMcUnavailable => true,
         metrics::MediaSessionStartOutcome::DeclinedMcAuthRejected
         | metrics::MediaSessionStartOutcome::DeclinedMcEndpointUnknown => false,
@@ -1086,37 +1111,18 @@ async fn resolve_sender_binding(
     };
 
     let response = match mc_client
-        .notify_participant_connected(&mc_endpoint, meeting_id, participant_id, handler_id)
+        .notify_participant_connected(
+            &mc_endpoint,
+            meeting_id,
+            participant_id,
+            handler_id,
+            connection_id,
+        )
         .await
     {
         Ok(response) => response,
         Err(e) => {
-            // A registration that named an undialable endpoint and a reachable
-            // endpoint that would not answer are DIFFERENT faults with different
-            // first moves — fix the registration vs. fix MC or the network — so
-            // they get different outcomes. `MhError::McEndpointInvalid` exists to
-            // carry that split: `MhError::Config` would have folded in an
-            // auth-header parse failure, which is neither.
-            // Three faults with three different services to open, so three
-            // outcomes. A credential rejection in particular must NOT report as
-            // unavailability: MC dialled fine and refused MH's token, so MC is
-            // healthy and the remedy is MH's outbound auth. An expired service
-            // token fires it for every connection on the handler at once.
-            let outcome = match e {
-                MhError::McEndpointInvalid(_) => {
-                    metrics::MediaSessionStartOutcome::DeclinedMcEndpointUnknown
-                }
-                // Two routes, one remedy: MC refused MH's credential, or MH
-                // could not build one. Both are MH's outbound auth and both
-                // start at `mh_token_refresh_total{status="error"}`; neither is
-                // a reason to open MC's health. They differ only in timing —
-                // the refusal is terminal, the build failure is retried because
-                // a refresh landing mid-budget can fix it.
-                MhError::JwtValidation(_) | MhError::OutboundAuthUnavailable(_) => {
-                    metrics::MediaSessionStartOutcome::DeclinedMcAuthRejected
-                }
-                _ => metrics::MediaSessionStartOutcome::DeclinedMcUnavailable,
-            };
+            let outcome = decline_for_notify_error(&e);
             warn!(
                 target: "mh.webtransport.connection",
                 connection_id = %connection_id,
@@ -1214,6 +1220,38 @@ async fn resolve_sender_binding(
     }
 
     SenderBindingOutcome::Bound(sender)
+}
+
+/// The decline outcome for a `NotifyParticipantConnected` that returned no
+/// response at all.
+///
+/// A registration that named an undialable endpoint and a reachable endpoint
+/// that would not answer are DIFFERENT faults with different first moves — fix
+/// the registration vs. fix MC or the network — so they get different outcomes.
+/// `MhError::McEndpointInvalid` exists to carry that split: `MhError::Config`
+/// would have folded in an auth-header parse failure, which is neither.
+///
+/// Three faults with three different services to open, so three outcomes. A
+/// credential rejection in particular must NOT report as unavailability: MC
+/// dialled fine and refused MH's token, so MC is healthy and the remedy is MH's
+/// outbound auth. An expired service token fires it for every connection on the
+/// handler at once.
+fn decline_for_notify_error(error: &MhError) -> metrics::MediaSessionStartOutcome {
+    match error {
+        MhError::McEndpointInvalid(_) => {
+            metrics::MediaSessionStartOutcome::DeclinedMcEndpointUnknown
+        }
+        // Two routes, one remedy: MC refused MH's credential, or MH could not
+        // build one. Both are MH's outbound auth and both start at
+        // `mh_token_refresh_total{status="error"}`; neither is a reason to open
+        // MC's health. They differ only in timing — the refusal is terminal, the
+        // build failure is retried because a refresh landing mid-budget can fix
+        // it.
+        MhError::JwtValidation(_) | MhError::OutboundAuthUnavailable(_) => {
+            metrics::MediaSessionStartOutcome::DeclinedMcAuthRejected
+        }
+        _ => metrics::MediaSessionStartOutcome::DeclinedMcUnavailable,
+    }
 }
 
 /// Read a length-prefixed message from a `RecvStream`.

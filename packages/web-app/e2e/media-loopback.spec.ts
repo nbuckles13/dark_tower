@@ -19,12 +19,20 @@
 // Story 1's test 1 here was the only browser-tier proof of STRUCTURAL client
 // mute: egress flat while muted, then resuming. That proof needs egress to
 // advance, which needs someone to hold this client in a slot. A solo client is
-// held by nobody, so egress never advances and the proof cannot live here. A
-// two-party browser meeting in Kind does not restore it either: round-robin
-// placement puts ranks 0 and 1 on different handlers, so the pair has zero
-// edges. OWNER: story 2 task 15 (the multi-context browser S-tests on the
-// task-14 N+1 helper) must name client structural mute explicitly. Until it
-// lands, `expectEgressFlatWhileMuted` has no browser caller.
+// held by nobody, so egress never advances and the proof cannot live here.
+//
+// WHAT THE GAP IS NOW, AND WHAT IT IS NOT. It is the missing SECOND BROWSER
+// CONTEXT — this spec has no helper to drive two participants — and nothing
+// else. It is NOT "the pair would have no edges": that was true under task 6's
+// round-robin placement, which put ranks 0 and 1 on different handlers, and it
+// is false under the ADR-0036 §9 edge model, where two browsers each connected
+// to both Kind handlers share both and co-location puts their edge on one. So a
+// reader who knows round-robin is gone must not conclude the coverage is back:
+// the edge now exists and the proof still does not.
+//
+// OWNER: story 2 task 15 (the multi-context browser S-tests on the task-14 N+1
+// helper) must name client structural mute explicitly. Until it lands,
+// `expectEgressFlatWhileMuted` has no browser caller.
 //
 // ---------------------------------------------------------------------------
 // WHY FLAT IS NOT VACUOUS HERE
@@ -59,9 +67,18 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
 
     await joinAsUser(page, meetingCode);
     const joined = await waitForJoined(page);
-    // C2 scoping, observable from the browser: MC hands a client EXACTLY its
-    // placed handler — the transport is active/active and dials every url.
-    expect(joined.mediaServers.length, 'media_servers must be scoped to one handler').toBe(1);
+    // R-33, observable from the browser: MC offers EVERY registered handler and
+    // the transport dials all of them (active/active). The claim lives in
+    // `waitForAllMediaConnected`, which diffs connected against offered and names
+    // what is missing — strictly stronger than the handler COUNT that used to be
+    // asserted here, back when MC scoped the list to one placed handler.
+    //
+    // DELIBERATELY NOT A COUNT: `e2e/env.ts` keeps MH endpoints out of this tier
+    // by design, so an "equals the full registered set" assertion could only be
+    // satisfied by hard-coding 2 or importing Kind topology. Registered-set
+    // equality is asserted where the set is knowable — MC's own tests and
+    // `crates/env-tests/tests/27_mc_slot_placement.rs`.
+    expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
     await waitForAllMediaConnected(page, joined.mediaServers);
     await startAudio(page);
 
@@ -106,7 +123,9 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
 
     await joinAsUser(page, meetingCode);
     const joined = await waitForJoined(page);
-    expect(joined.mediaServers.length, 'media_servers must be scoped to one handler').toBe(1);
+    // Non-empty plus connect-to-all; see the first test for why there is no
+    // handler-count assertion at this tier.
+    expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
     await waitForAllMediaConnected(page, joined.mediaServers);
     await startAudio(page);
 

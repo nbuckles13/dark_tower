@@ -73,8 +73,7 @@ struct Programmed {
 /// the one-shot push against a *registry* rather than against a join event is
 /// what makes that later story purely additive.
 ///
-/// `tokio::sync::RwLock`, matching `mh_connection_registry.rs` and
-/// `redis/client.rs` — the in-tree idiom for a shared map read on an async
+/// `tokio::sync::RwLock`, matching `redis/client.rs` — the in-tree idiom for a shared map read on an async
 /// path. A `std::sync::Mutex` would need poison handling that cannot use
 /// `unwrap`/`expect` under the workspace lints.
 #[derive(Debug, Default)]
@@ -228,9 +227,9 @@ impl PolicyGenerations {
 
     /// Drop every entry for a meeting.
     ///
-    /// Called from `actors/controller.rs::remove_meeting()`, on the same line
-    /// that already clears `mh_connection_registry` — the meeting-teardown
-    /// choke point, matching the in-tree precedent where `redis/client.rs`
+    /// Called from BOTH meeting-teardown paths in `actors/controller.rs` —
+    /// `remove_meeting()` and the `check_meeting_health()` reaper, one teardown
+    /// contract at two sites — matching the in-tree precedent where `redis/client.rs`
     /// clears its `local_generation` on `delete_meeting`. Without it the map
     /// retains a whole `HandlerAssignment` per ended meeting for the pod's
     /// lifetime.

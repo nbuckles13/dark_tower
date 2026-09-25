@@ -365,10 +365,14 @@ fn header_version() -> u32 {
 ///
 /// The target set is **derived from the same [`MeetingAssignment`]** the MC→MH
 /// control plane is programmed from — the handlers carrying an egress stream
-/// whose candidate sources include this publisher. Under static fill that is
-/// exactly the publisher's own placed handler, and only while some co-handler
-/// subscriber holds it in a slot; a publisher nobody holds — including a solo
-/// participant — gets the empty set, "send nothing" (§5).
+/// whose candidate sources include this publisher, i.e. **every handler that
+/// owns at least one of its edges** (ADR-0036 §9 multi-handler send). Under the
+/// shared-handler edge model that is one handler when MC could co-locate the
+/// publisher's edges, several when its subscribers share different handlers
+/// with it, and none for a publisher nobody holds — including a solo
+/// participant, or one not yet connected — which gets the empty set, "send
+/// nothing" (§5). One target per handler, never per edge: the client encrypts
+/// each frame once and transmits it to every target.
 ///
 /// Target urls come from the meeting's frozen [`MeetingHandlers`], the same
 /// value `JoinResponse.media_servers` and `StreamAssignment.media_handler_url`
@@ -488,15 +492,13 @@ mod tests {
         .unwrap()
     }
 
-    /// Senders 1 and 2 placed on `mh-0`, each declaring one audio slot, in a
+    /// Senders 1 and 2 connected only to `mh-0`, each declaring one audio slot, in a
     /// meeting assigned `handlers` (in the given, arbitrary, order).
     fn two_party(handlers: &[&str]) -> (MeetingAssignment, MeetingHandlers) {
         let set = handler_set(handlers);
         let mut table = SlotTable::new();
         for s in [1, 2] {
-            table
-                .admit(sender(s), |_| Some(HandlerId::new("mh-0")))
-                .unwrap();
+            table.admit_on(sender(s), &set, &["mh-0"]);
             table.set_demand(sender(s), vec![0]);
         }
         (table.render(set.ids()).unwrap(), set)
@@ -796,9 +798,7 @@ mod tests {
     fn a_solo_participant_is_directed_to_send_nothing() {
         let set = handler_set(&["mh-0"]);
         let mut table = SlotTable::new();
-        table
-            .admit(sender(1), |_| Some(HandlerId::new("mh-0")))
-            .unwrap();
+        table.admit_on(sender(1), &set, &["mh-0"]);
         table.set_demand(sender(1), vec![0]);
         let (directive, outcome) = build_send_directive(
             sender(1),
@@ -811,30 +811,25 @@ mod tests {
         assert!(directive.streams.is_empty());
     }
 
-    /// The directive's target handler IS the handler carrying this publisher's
-    /// edges, in a two-handler meeting.
+    /// The directive's targets ARE the handlers carrying this publisher's edges
+    /// — a property, asserted without naming which handler that is.
     ///
     /// # What this rejects, by name
     ///
-    /// Both participants are placed on **mh-0**, so mh-1 holds a
-    /// correct-by-design EMPTY edge set. The nameable wrong answer is
-    /// `https://mh-1.example:4434` — what list-order selection produced on the
-    /// live cluster in story 1 (three of four media connections on mh-1 while
-    /// every edge sat on mh-0). The `assert_ne!` below is that injected adverse
-    /// condition, not a redundant assertion.
+    /// Both participants reach only **mh-0**, so mh-1 holds a correct-by-design
+    /// EMPTY edge set. The nameable wrong answer is `https://mh-1.example:4434`
+    /// — what list-order selection produced on the live cluster in story 1
+    /// (three of four media connections on mh-1 while every edge sat on mh-0).
+    /// The `assert_ne!` below is that injected adverse condition, and it is
+    /// forced by connectivity (mh-0 is the ONLY shared handler), not by which
+    /// handler a chooser happens to prefer.
     ///
-    /// The expected url is a WRITTEN LITERAL, deliberately not sourced from any
-    /// helper the production path also calls: a test that computes its
-    /// expectation the same way the code does passes through the divergence it
-    /// exists to catch. Do not hoist these to a constant.
+    /// The urls are WRITTEN LITERALS, deliberately not sourced from any helper
+    /// the production path also calls.
     #[test]
-    fn the_directive_targets_the_handler_carrying_this_publishers_edges_at_n_2() {
+    fn the_directive_targets_exactly_the_handlers_carrying_this_publishers_edges() {
         let (assignment, urls) = two_party(&["mh-0", "mh-1"]);
-
-        // Premise check: the assignment really does place this publisher's edges
-        // on exactly one handler, and that handler is mh-0. Without this the
-        // assertions below could pass over an assignment that placed nothing.
-        let carrying: Vec<&HandlerId> = assignment
+        let carrying: Vec<String> = assignment
             .per_handler
             .iter()
             .filter(|(_, h)| {
@@ -842,21 +837,8 @@ mod tests {
                     .iter()
                     .any(|p| p.candidate_sources.contains(&sender(1)))
             })
-            .map(|(id, _)| id)
+            .map(|(id, _)| urls.url_of(id).unwrap().to_string())
             .collect();
-        assert_eq!(
-            carrying,
-            vec![&HandlerId::new("mh-0")],
-            "premise: exactly one handler carries the publisher's edges, and it is mh-0"
-        );
-        // And the OTHER handler is present with an empty edge set — the
-        // correct-by-design state a client used to be steered into.
-        assert!(assignment
-            .per_handler
-            .get(&HandlerId::new("mh-1"))
-            .expect("every input handler gets an entry")
-            .egress_streams
-            .is_empty());
 
         let (directive, outcome) = build_send_directive(
             sender(1),
@@ -865,28 +847,59 @@ mod tests {
             &MediaStreamPolicy::new(encoding()),
         )
         .unwrap();
+        assert_eq!(outcome, DirectiveOutcome::Emitted);
+        let targets: Vec<String> = directive.streams[0]
+            .targets
+            .iter()
+            .map(|t| t.media_handler_url.clone())
+            .collect();
+        assert_eq!(
+            targets, carrying,
+            "targets == owners of the publisher's edges"
+        );
+        assert_eq!(targets, vec!["https://mh-0.example:4434".to_string()]);
+        assert_ne!(
+            targets[0], "https://mh-1.example:4434",
+            "mh-1 holds a correct-by-design EMPTY edge set; steering a client there is the defect \
+             story 1 task 25 fixed"
+        );
+    }
 
+    /// ADR-0036 §9 multi-handler send: A shares mh-0 with B and mh-1 with C, so
+    /// A's edges genuinely span both handlers and its ONE stream carries BOTH
+    /// targets — one per handler, each a registered url verbatim.
+    #[test]
+    fn a_publisher_whose_edges_span_handlers_is_directed_to_every_owner() {
+        let set = handler_set(&["mh-0", "mh-1"]);
+        let mut table = SlotTable::new();
+        table.admit_on(sender(1), &set, &["mh-0", "mh-1"]);
+        table.admit_on(sender(2), &set, &["mh-0"]);
+        table.admit_on(sender(3), &set, &["mh-1"]);
+        for s in [1, 2, 3] {
+            table.set_demand(sender(s), vec![0, 1]);
+        }
+        let (directive, outcome) = build_send_directive(
+            sender(1),
+            &table.render(set.ids()).unwrap(),
+            &set,
+            &MediaStreamPolicy::new(encoding()),
+        )
+        .unwrap();
         assert_eq!(outcome, DirectiveOutcome::Emitted);
         assert_eq!(
             directive.streams.len(),
             1,
-            "one publisher stream this story"
+            "one stream, many targets — never two streams"
         );
-        let targets = &directive.streams[0].targets;
+        let mut targets: Vec<&str> = directive.streams[0]
+            .targets
+            .iter()
+            .map(|t| t.media_handler_url.as_str())
+            .collect();
+        targets.sort_unstable();
         assert_eq!(
-            targets.len(),
-            1,
-            "one client, one directed handler; >1 target means §9 multi-handler send landed and \
-             this test must be revisited rather than relaxed"
-        );
-        assert_eq!(
-            targets[0].media_handler_url, "https://mh-0.example:4434",
-            "MC must steer the client to the handler its edges were placed on"
-        );
-        assert_ne!(
-            targets[0].media_handler_url, "https://mh-1.example:4434",
-            "mh-1 holds a correct-by-design EMPTY edge set; steering a client there is the defect \
-             story 1 task 25 fixed"
+            targets,
+            vec!["https://mh-0.example:4434", "https://mh-1.example:4434"]
         );
     }
 
@@ -895,9 +908,9 @@ mod tests {
     /// A unit-tier pin only: `MeetingHandlers` sorts at construction, so the
     /// property is a type guarantee here (review-protocol §Assertion Vacuity
     /// mechanism 4). The seam whose order genuinely varies — the Redis
-    /// `MhAssignmentData.handlers` list reaching placement through a real join —
-    /// is proven by `crates/mc-service/tests/media_client_signaling_integration.rs`'s
-    /// `redis_enumeration_order_cannot_change_where_the_client_is_steered`.
+    /// `MhAssignmentData.handlers` list reaching MC through a real join — is
+    /// proven by `crates/mc-service/tests/media_client_signaling_integration.rs`'s
+    /// `every_client_is_offered_the_full_set_and_steered_only_to_owning_handlers`.
     #[test]
     fn handler_list_order_does_not_move_the_directive_at_this_tier() {
         use prost::Message;

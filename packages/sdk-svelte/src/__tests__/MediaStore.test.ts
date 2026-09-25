@@ -69,12 +69,83 @@ test('slot assignments REPLACE rather than merge', () => {
   // merging would resurrect a slot MC has dropped — a grid cell for a
   // participant the controller has already removed.
   const store = new MediaStore();
-  store.applyStreamAssignments({ assignments: [slot({ slotId: 0 }), slot({ slotId: 1 })] });
+  store.applyStreamAssignments({
+    unreachableSenderIds: [],
+    assignments: [slot({ slotId: 0 }), slot({ slotId: 1 })],
+  });
   expect(store.slots).toHaveLength(2);
 
-  store.applyStreamAssignments({ assignments: [slot({ slotId: 0 })] });
+  store.applyStreamAssignments({ unreachableSenderIds: [], assignments: [slot({ slotId: 0 })] });
   expect(store.slots).toHaveLength(1);
   expect(store.slots[0]?.slotId).toBe(0);
+});
+
+test('the unreachable set REPLACES rather than merges — a flicker does not latch', () => {
+  // ---------------------------------------------------------------------------
+  // WHAT THIS PINS, AND FOR WHOM
+  // ---------------------------------------------------------------------------
+  //
+  // `StreamAssignments.unreachable_sender_ids` (ADR-0036 §9) names the roster
+  // participants THIS subscriber shares no connected handler with. Without a
+  // settle rule on the controller side, a peer can enter and leave that set
+  // during an ordinary multi-handler join, between its first and second handler
+  // connection.
+  //
+  // So the property that matters operationally is not "unreachable renders" — it
+  // is that leaving the set returns to normal WITHOUT needing a "now reachable"
+  // signal of its own. A merged set would latch the transient into a permanent
+  // "can't hear X" badge on a meeting whose audio is fine, which is
+  // indistinguishable to the user from the real fault and sends oncall chasing a
+  // connectivity break that does not exist.
+  //
+  // This is the seam task 15 renders from, so the no-latch property is pinned
+  // here, where it is observable, rather than asserted of a DOM that does not
+  // exist yet.
+  const store = new MediaStore();
+  expect(store.unreachableSenderIds).toEqual([]);
+
+  // B and C are each unreachable to the other: the canonical three-participant
+  // case, seen from B.
+  store.applyStreamAssignments({
+    assignments: [slot({ slotId: 0, senderId: 258 })],
+    unreachableSenderIds: [259, 260],
+  });
+  expect(store.unreachableSenderIds).toEqual([259, 260]);
+
+  // C's second handler connection lands. C is reachable now, and says so only by
+  // being ABSENT from the new set.
+  store.applyStreamAssignments({
+    assignments: [slot({ slotId: 0, senderId: 258 })],
+    unreachableSenderIds: [259],
+  });
+  expect(store.unreachableSenderIds).toEqual([259]);
+
+  // Everyone is connected everywhere: the set empties. A merge would still be
+  // holding 259 and 260 here, which is the bug.
+  store.applyStreamAssignments({
+    assignments: [slot({ slotId: 0, senderId: 258 })],
+    unreachableSenderIds: [],
+  });
+  expect(store.unreachableSenderIds).toEqual([]);
+});
+
+test('the unreachable set is independent of the slot list', () => {
+  // A message MAY carry zero assignments and a non-empty unreachable set — every
+  // other participant is elsewhere — and that is well-formed, not malformed
+  // (`signaling.proto`). An unreachable participant consumes NO slot, so the two
+  // must not be derived from one another in either direction.
+  const store = new MediaStore();
+  store.applyStreamAssignments({ assignments: [], unreachableSenderIds: [259] });
+  expect(store.slots).toEqual([]);
+  expect(store.unreachableSenderIds).toEqual([259]);
+
+  // And slots can refill while the set stays put.
+  store.applyStreamAssignments({
+    assignments: [slot({ slotId: 0, senderId: 258 })],
+    unreachableSenderIds: [259],
+  });
+  expect(store.slots).toHaveLength(1);
+  expect(store.unreachableSenderIds).toEqual([259]);
 });
 
 test('slot state is carried through verbatim, including the muted and unreachable cases', () => {
@@ -83,6 +154,7 @@ test('slot state is carried through verbatim, including the muted and unreachabl
   // and render completely differently. The store must not collapse them.
   const store = new MediaStore();
   store.applyStreamAssignments({
+    unreachableSenderIds: [],
     assignments: [
       slot({ slotId: 0, slotState: 'source_muted' }),
       slot({ slotId: 1, slotState: 'withheld_congestion' }),
@@ -118,7 +190,10 @@ test('bindMeetingSession wires all four media events into store.media', async ()
   session.fire('firstMediaFrame', 42);
   await expect.element(screen.getByTestId('first-media-ms')).toHaveTextContent('42');
 
-  session.fire('streamAssignments', { assignments: [slot(), slot({ slotId: 1 })] });
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [slot(), slot({ slotId: 1 })],
+  });
   await expect.element(screen.getByTestId('slot-count')).toHaveTextContent('2');
 
   session.fire('mediaFault', { stage: 'playback', message: 'playback stopped', fatal: false });
@@ -140,7 +215,7 @@ test('unmount tears down the media subscriptions too — no leak', async () => {
   expect(() => {
     session.fire('muteChanged', { audioMuted: false });
     session.fire('firstMediaFrame', 1);
-    session.fire('streamAssignments', { assignments: [slot()] });
+    session.fire('streamAssignments', { unreachableSenderIds: [], assignments: [slot()] });
     session.fire('mediaFault', { stage: 'crypto', message: 'x', fatal: false });
   }).not.toThrow();
 });

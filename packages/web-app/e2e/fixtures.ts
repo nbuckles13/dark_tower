@@ -1006,7 +1006,11 @@ export async function startAudio(page: Page): Promise<void> {
  * A `firstMediaFrame` event means a frame a peer captured, encoded, encrypted,
  * signed and sent arrived via MH and completed verify -> replay -> unwrap ->
  * decrypt -> decode. (Story 1 used this for the loopback; since story 2 R-3 a
- * client never receives its own audio, so this needs a co-handler peer.)
+ * client never receives its own audio, so this needs a peer that SHARES A
+ * CONNECTED HANDLER with this client — ADR-0036 §9's visibility rule. With every
+ * participant connected to every handler that is any peer; it stops being any
+ * peer only under partial connectivity, where a peer sharing none is carried in
+ * `unreachable_sender_ids` and is not a candidate for this event at all.)
  *
  * **The returned number is OBSERVED, NEVER GATED** (ADR-0036 §10). Nothing in
  * this suite compares it against a threshold; a wall-clock target on a local

@@ -613,7 +613,14 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           mediaHandlerUrl: a.mediaHandlerUrl,
           slotState: mapSlotState(a.slotState),
         }));
-        const event: StreamAssignmentsEvent = { assignments };
+        const event: StreamAssignmentsEvent = {
+          assignments,
+          // Copied out of the decoded message rather than aliased, so nothing
+          // downstream holds a reference into the protobuf object graph. The
+          // client MARKS these roster entries distinctly (`signaling.proto`) —
+          // never a spinner, never an empty slot, never inferred from silence.
+          unreachableSenderIds: [...message.value.unreachableSenderIds],
+        };
         this.emit('streamAssignments', event);
         return;
       }

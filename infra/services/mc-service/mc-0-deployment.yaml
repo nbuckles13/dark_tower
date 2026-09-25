@@ -190,6 +190,16 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_KEK_ROTATION_DEBOUNCE_SECONDS
+        # ---- Connect settle window (ADR-0036 §9; story 2 task 20) ----
+        # Required by MC with no Rust default, deliberately NOT `optional:`: a
+        # pod without it must fail loudly (CreateContainerConfigError) rather
+        # than start with a guessed window. Keep in lockstep with the other
+        # mc-N-deployment.yaml; the three-artifact ordering note above applies.
+        - name: MC_MEDIA_CONNECT_SETTLE_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MEDIA_CONNECT_SETTLE_MS
         # Pod IP for gRPC advertise address (downward API)
         - name: POD_IP
           valueFrom:

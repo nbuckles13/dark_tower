@@ -134,6 +134,11 @@ sum(rate(mh_mc_notifications_total{status="success"}[5m]))
 /
 sum(rate(mh_mc_notifications_total[5m]))
 
+# Every MH pod rolled to the `connection_id` image (story 2 task 20; target: 0).
+# MC counts each MH notification that arrives WITHOUT a connection_id; any
+# non-zero rate after the roll means an MH predating the field is still serving.
+sum(rate(mc_mh_notifications_without_connection_id_total[5m]))
+
 # Media sessions that actually STARTED in the bake window (target: >0 once
 # test traffic flows). THIS IS THE POSITIVE CONTROL FOR THE BINDING CONTRACT
 # AND IT IS THE ONLY GATE IN THIS FILE A VERSION SKEW CAN FAIL.
@@ -187,6 +192,7 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 - [ ] `mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}` increase over 30m = 0 (forwarding policy actually took effect — **receipt is not application**; the `mc_register_meeting_total` gate below cannot see this). `no_generation` is excluded and is the expected value until story task 13.
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
+- [ ] `sum(rate(mc_mh_notifications_without_connection_id_total[5m])) == 0` — every MH pod rolled to the `connection_id` image (story 2 task 20). Non-zero means an MH predating the field is still in the fleet and MC is on the degraded legacy-key path for it; see §Rollback "`connection_id` coupling".
 - [ ] `mh_media_session_starts_total{outcome="started"}` increase over 30m **> 0** once test traffic is flowing (**the binding contract works end to end on this build**). This is the only gate in this checklist a MC/MH version skew can fail — every other one is green throughout a total media blackout. If it is zero while connections are being accepted, **stop and read the decline-share gate below before proceeding**; do not sign the deploy off on the other nine.
 - [ ] `mh_media_session_starts_total` **decline share < 0.20** over 30m (run the query above). Breach ⇒ break down by `outcome` and follow `mh-incident-response.md` §Scenario 15, which partitions on *which service to open* before the label is read. **`mh_mc_notifications_total{status="success"}` above cannot cover this**: an MC image predating the `sender_id` field answers `acknowledged: true, sender_id: 0`, so delivery succeeds at 100% while every session declines.
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
@@ -792,6 +798,8 @@ regression.
 For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For other rollback scenarios (general service restore, configuration regression), follow the same `kubectl rollout undo` pattern; deeper operational steps will be filled in alongside the deployment-procedure stub.
 
 **`EndMeeting` rollout order (story 2 R-20, R-24).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: `MH_MAX_REGISTERED_MEETINGS` stays in the ConfigMap (a `rollout undo` restores Deployment refs, not the ConfigMap), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
+
+**`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. There is **no hard ordering either way**, but rolling MH back alone (or an MH pod left on the old image) **degrades** MC to the legacy per-(participant, handler) key: a stale disconnect can then remove a live connection, silencing that participant for the peers routed through that handler until it rejoins. Signalled by `mc_mh_notifications_without_connection_id_total` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
 
 ---
 

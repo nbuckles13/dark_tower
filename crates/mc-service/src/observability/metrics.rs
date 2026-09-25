@@ -15,7 +15,9 @@
 //! Maximum 1,000 unique label combinations per metric.
 
 use crate::media_admission::SenderBindingOutcome;
-use crate::media_routing::{divergence_magnitude, FloorAdoption, PolicyPushOutcome};
+use crate::media_routing::{
+    divergence_magnitude, FloorAdoption, PolicyPushOutcome, SettleOutcome, Unapplied,
+};
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome, SlotViewEmission,
 };
@@ -487,9 +489,11 @@ pub fn record_media_policy_push(outcome: PolicyPushOutcome, sent: NonZeroU64, ap
 /// unresolved outcome produced it — its
 /// `mh_media_session_starts_total{outcome="declined_no_sender_binding"}` is the
 /// *union* of MC's `0`-answering outcomes: `meeting_unknown` (routing fault),
-/// `participant_unknown` (join race, self-clearing), `registry_full` (capacity,
-/// never self-clears), `user_ambiguous` (one user, two roster entries — never
-/// self-clears, and **reconnecting causes it**). Only MC can split them, and
+/// `participant_unknown` (join race, self-clearing), `user_ambiguous` (one user,
+/// two roster entries — never self-clears, and **reconnecting causes it**).
+/// (`registry_full` is retired; see `SenderBindingOutcome`'s docs in
+/// `media_admission/binding_response.rs` for its version-skew note.) Only MC
+/// can split them, and
 /// each wants a different action. This series therefore carries strictly more
 /// information than any function of the MH series. **Do not "discover" the
 /// redundancy and delete either one.**
@@ -680,8 +684,11 @@ pub fn record_slot_view_emission(outcome: SlotViewEmission) {
 /// Emission-weighted, NOT a population: it rises with churn in a split meeting
 /// and a stable split meeting emits nothing. Divide by
 /// `mc_media_slot_view_emissions_total{outcome="sent"}` for the mean per
-/// emitted view. Permanently zero on a single-handler deployment. No sender,
-/// meeting or handler identity, ever.
+/// emitted view. Permanently zero on a single-handler deployment, because every
+/// ROUTABLE participant then shares that handler and a participant not yet
+/// connected is never unreachable (it is counted on
+/// `mc_media_not_yet_connected_senders_total` instead). No sender, meeting or
+/// handler identity, ever.
 pub fn record_unreachable_senders(count: usize) {
     if count == 0 {
         return;
@@ -695,6 +702,167 @@ pub fn record_unreachable_senders(count: usize) {
     .increment(count);
 }
 
+/// Record how many roster members were NOT routable (not yet connected, or
+/// settling) when a `StreamAssignments` was sent — the composed subscriber
+/// itself INCLUDED.
+///
+/// Metric: `mc_media_not_yet_connected_senders_total`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// The partner of `mc_media_unreachable_senders_total`: that one is "silent
+/// because the connected sets are disjoint", this one is "silent because
+/// someone is not connected yet". NOT expected-empty — every join passes
+/// through the state — so persistence, not rate, is the fault signal.
+/// Emission-weighted; mixes the subscriber's own contribution (at most 1) with
+/// its peers'.
+pub fn record_not_yet_connected_senders(count: usize) {
+    if count == 0 {
+        return;
+    }
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    counter!(
+        "mc_media_not_yet_connected_senders_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(count);
+}
+
+/// Record the targets on an emitted `SendDirective`, summed over its streams.
+///
+/// Metric: `mc_media_send_targets_total`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// Mean targets per sender = this / `mc_media_send_directives_total{outcome="emitted"}`.
+/// The co-location objective (fewest send targets per sender) made
+/// observable: ~1 in an all-connected meeting, rising only with genuinely
+/// partial connectivity.
+pub fn record_send_targets(count: usize) {
+    if count == 0 {
+        return;
+    }
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    counter!(
+        "mc_media_send_targets_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(count);
+}
+
+/// Why an edge changed handler between two renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMove {
+    /// The old handler left one party's connected set. Expected.
+    ConnectivityChange,
+    /// Both parties are still on the old handler: an edge-stability invariant
+    /// violation. Expected-empty.
+    Unexpected,
+}
+
+impl EdgeMove {
+    /// Every value, for zero-initialisation.
+    pub const ALL: [Self; 2] = [Self::ConnectivityChange, Self::Unexpected];
+
+    /// The metric label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ConnectivityChange => "connectivity_change",
+            Self::Unexpected => "unexpected",
+        }
+    }
+}
+
+/// Record one edge moving between handlers.
+///
+/// Metric: `mc_media_edge_moves_total`
+/// Labels: `reason` x `key_custody`
+/// Cardinality: bounded by [`EdgeMove::ALL`]
+///
+/// `unexpected` is expected-empty and alertable at `> 0`.
+pub fn record_edge_move(reason: EdgeMove) {
+    counter!(
+        "mc_media_edge_moves_total",
+        "reason" => reason.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record a handler notification that did not become connectivity.
+///
+/// Metric: `mc_mh_notifications_unapplied_total`
+/// Labels: `reason` x `key_custody`
+/// Cardinality: bounded by `Unapplied::ALL`
+///
+/// Connectivity decides who hears whom, so every way a notification fails to
+/// become connectivity is counted. Per-value expectations differ:
+/// `unknown_connection` is routine (every declined connection's Disconnected);
+/// `connection_bound_refused` is expected-empty; a sustained
+/// `handler_not_in_set` means an MH restarted under a new id. No meeting,
+/// participant, handler or connection identity.
+pub fn record_notification_unapplied(reason: Unapplied) {
+    counter!(
+        "mc_mh_notifications_unapplied_total",
+        "reason" => reason.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record a handler notification with an EMPTY `connection_id` (a pre-field MH).
+///
+/// Metric: `mc_mh_notifications_without_connection_id_total`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// The degraded legacy path: one implicit key per (participant, handler), i.e.
+/// the stale-disconnect hazard `connection_id` exists to close. Non-zero means
+/// an old MH is still in the fleet; the legacy branch is deleted once this has
+/// been flat for a full rollout.
+pub fn record_notification_without_connection_id() {
+    counter!(
+        "mc_mh_notifications_without_connection_id_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record how an establishing participant settled.
+///
+/// Metric: `mc_media_connect_settles_total`
+/// Labels: `outcome` x `key_custody`
+/// Cardinality: bounded by `SettleOutcome::ALL`
+///
+/// Per episode, so it IS a population: `window_elapsed` counts participants
+/// that did not reach every handler of their meeting within the window.
+pub fn record_connect_settle(outcome: SettleOutcome) {
+    counter!(
+        "mc_media_connect_settles_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Publish the configured connect settle window.
+///
+/// Metric: `mc_media_connect_settle_window_seconds`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// A CONFIG ECHO set once at boot from the SAME field the actor enforces
+/// (`MC_MEDIA_CONNECT_SETTLE_MS`), so the published and enforced windows cannot
+/// drift. Read `window_elapsed` against it.
+pub fn set_connect_settle_window(window: Duration) {
+    gauge!(
+        "mc_media_connect_settle_window_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(window.as_secs_f64());
+}
+
 /// Record a join whose handler assignment disagreed with the meeting's frozen
 /// handler set.
 ///
@@ -704,7 +872,7 @@ pub fn record_unreachable_senders(count: usize) {
 ///
 /// An MC-internal invariant violation: GC freezes a meeting's handler set at
 /// first join, and the actor keeps the frozen set (so no later join or changed
-/// Redis entry can widen it or move a placed participant). Any non-zero value is
+/// Redis entry can widen it or move anyone's edges). Any non-zero value is
 /// a defect to capture and escalate; restarting nothing fixes it.
 pub fn record_handler_set_divergence() {
     counter!(
@@ -1489,6 +1657,20 @@ pub fn zero_initialize_counters() {
         .increment(0);
     counter!("mc_media_handler_set_divergence_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
+    counter!("mc_media_not_yet_connected_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+        .increment(0);
+    counter!("mc_media_send_targets_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    counter!("mc_mh_notifications_without_connection_id_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+        .increment(0);
+    for r in EdgeMove::ALL {
+        counter!("mc_media_edge_moves_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for r in Unapplied::ALL {
+        counter!("mc_mh_notifications_unapplied_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in SettleOutcome::ALL {
+        counter!("mc_media_connect_settles_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
     counter!("mc_meeting_kek_generated_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
 

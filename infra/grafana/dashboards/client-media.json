@@ -546,7 +546,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames that left the device on the media datagram path; the denominator for the send-drop ratio. MUTE IS NOT VISIBLE HERE AND MUST NOT BE INFERRED FROM IT: while client-muted nothing is encoded, so nothing is sent and nothing is dropped. Muted, silent and the-network-died are indistinguishable from absence alone - read the mute-transitions panel. AN EMPTY PANEL HERE IS AMBIGUOUS - it does not by itself mean zero drops. Run the three-step discriminator in the READ FIRST panel before concluding anything from absence. ",
+      "description": "Datagrams that left the device on the media datagram path; the denominator for the send-drop ratio. ONE INCREMENT PER TARGET HANDLER PER CAPTURED FRAME, NOT ONE PER FRAME: a sender whose edges span two handlers (ADR-0036 §9) advances this TWICE for one captured frame, so this is not a capture rate and must not be read as one. THE NAME SAYS FRAMES AND THE VALUE COUNTS DATAGRAMS - deliberately, matching dt_client_media_frames_received_total, which has counted datagrams-at-the-wire since story 1. Both ends of the ratio are therefore in the same unit: the send-drop counter is raised inside the per-lane send path, so counting frames here would make one captured frame that succeeded on handler A and was refused on handler B read as 50% loss on a sender that reached A perfectly. MUTE IS NOT VISIBLE HERE AND MUST NOT BE INFERRED FROM IT: while client-muted nothing is encoded, so nothing is sent and nothing is dropped. Muted, silent and the-network-died are indistinguishable from absence alone - read the mute-transitions panel. AN EMPTY PANEL HERE IS AMBIGUOUS - it does not by itself mean zero drops. Run the three-step discriminator in the READ FIRST panel before concluding anything from absence. ",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -555,7 +555,7 @@
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Frames",
+            "axisLabel": "Datagrams",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -626,12 +626,12 @@
           },
           "editorMode": "code",
           "expr": "sum(increase(dt_client_media_frames_sent_total[$__rate_interval]))",
-          "legendFormat": "frames sent",
+          "legendFormat": "datagrams sent",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Send Path - Frames Sent",
+      "title": "Send Path - Datagrams Sent",
       "type": "timeseries"
     },
     {
@@ -732,7 +732,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Current depth of the bounded application egress queue, in frames. Read against the configured bound - `media.egress.maxQueueFrames` and `media.audio.frameDurationMs` in `packages/sdk-core/src/config/clientConfig.ts` (10 frames x 20 ms = 200 ms at the defaults in force at time of writing; cited rather than restated so the figure cannot silently drift from the config). The application bound trips BEFORE the transport high-water mark - asserted at setup - so a rising depth here is back-pressure we can count rather than loss inside the user agent. NOT an egress budget, capacity or ceiling: no such gauge exists in this story. AN EMPTY PANEL HERE IS AMBIGUOUS - it does not by itself mean zero drops. Run the three-step discriminator in the READ FIRST panel before concluding anything from absence. ",
+      "description": "Depth of the DEEPEST of the sender's bounded egress lanes (one per target handler, each bounded independently), in frames. A full gauge with healthy frames_sent means ONE lane (one handler's path) is stalled, not the sender. Read against the configured bound - `media.egress.maxQueueFrames` and `media.audio.frameDurationMs` in `packages/sdk-core/src/config/clientConfig.ts` (10 frames x 20 ms = 200 ms at the defaults in force at time of writing; cited rather than restated so the figure cannot silently drift from the config). The application bound trips BEFORE the transport high-water mark - asserted at setup - so a rising depth here is back-pressure we can count rather than loss inside the user agent. NOT an egress budget, capacity or ceiling: no such gauge exists in this story. AN EMPTY PANEL HERE IS AMBIGUOUS - it does not by itself mean zero drops. Run the three-step discriminator in the READ FIRST panel before concluding anything from absence. ",
       "fieldConfig": {
         "defaults": {
           "color": {

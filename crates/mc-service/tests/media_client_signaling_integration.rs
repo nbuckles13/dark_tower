@@ -157,7 +157,11 @@ async fn capability_yields_send_directive_and_slot_assignment() {
     let configured = client_media_config().audio_encoding.to_proto();
     assert_eq!(encoding.max_bitrate_bps, configured.max_bitrate_bps);
     assert_eq!(encoding.frame_rate, configured.frame_rate);
-    assert_eq!(stream.targets.len(), 1, "one target: A's placed handler");
+    assert_eq!(
+        stream.targets.len(),
+        1,
+        "one target: the one handler A shares with B"
+    );
     assert_eq!(
         stream.targets[0].media_handler_url, a.media_servers[0],
         "the send target and media_servers are the same string"
@@ -808,6 +812,83 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
     }
 }
 
+/// S4 pin (a) + S3, in the per-EDGE shape: in a two-handler meeting where the
+/// pair's edge sits on one handler, a client reporting (a) an attacker url as
+/// connected and (b) the edge's REAL handler as failed changes nothing — the
+/// client-reported map is never a url source and never narrows connectivity.
+/// Connectivity is only what the handlers report.
+#[tokio::test]
+async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
+    let (stack, rig) = start_stack("mcs-redirect-edge").await;
+    seed_meeting_with_handlers(
+        &stack,
+        "mcs-meeting-edge",
+        vec![mh_handler("mh-0"), mh_handler("mh-1")],
+    )
+    .await;
+    let mut a = join_as(&rig, &stack, "mcs-meeting-edge", "user-a").await;
+    let mut b = test_common::media_session::join_as_on(
+        &rig,
+        &stack,
+        "mcs-meeting-edge",
+        "user-b",
+        &["mh-1"],
+    )
+    .await;
+    a.write(capability_frame(audio_slots(1))).await;
+    b.write(capability_frame(audio_slots(1))).await;
+    let before = a
+        .assignments_until("A holds B on mh-1", |x| {
+            x.assignments[0].sender_id == Some(b.sender_id)
+        })
+        .await;
+    assert_eq!(before.assignments[0].media_handler_url, "wt://mh-1:4433");
+
+    let status = |url: &str, state: proto_gen::dark_tower::signaling::v1::ConnectionState| {
+        MhConnectionStatus {
+            mh_url: url.to_string(),
+            state: state as i32,
+            failure_reason: None,
+            failure_code: None,
+            observed_at: None,
+        }
+    };
+    for s in [&mut a, &mut b] {
+        s.write(encode_framed(&ClientMessage {
+            trace_parent: String::new(),
+            trace_state: String::new(),
+            message: Some(client_message::Message::MediaConnectionUpdate(
+                MediaConnectionUpdate {
+                    statuses: vec![
+                        status(
+                            ATTACKER_URL,
+                            proto_gen::dark_tower::signaling::v1::ConnectionState::Connected,
+                        ),
+                        status(
+                            "wt://mh-1:4433",
+                            proto_gen::dark_tower::signaling::v1::ConnectionState::Failed,
+                        ),
+                    ],
+                },
+            )),
+        }))
+        .await;
+    }
+    settle_no_reply_message().await;
+    // Nothing moved: no new view at all for A, so the edge is still on mh-1.
+    a.expect_no_media().await;
+    b.write(capability_frame(audio_slots(2))).await; // force B a fresh view
+    let (_, b_view) = b.settle().await;
+    let b_view = b_view.expect("B's view");
+    let needle = ATTACKER_URL.as_bytes();
+    assert!(!b_view
+        .encode_to_vec()
+        .windows(needle.len())
+        .any(|w| w == needle));
+    assert_eq!(b_view.assignments[0].media_handler_url, "wt://mh-1:4433");
+    assert_eq!(b_view.assignments[0].sender_id, Some(a.sender_id));
+}
+
 // ============================================================================
 // A client that never declares
 // ============================================================================
@@ -849,7 +930,7 @@ async fn a_client_that_never_declares_is_never_directed_and_stays_healthy() {
 }
 
 // ============================================================================
-// Placement is the SINGLE source of truth for every handler url a client sees
+// Every handler url a client sees comes from the ONE frozen handler set
 // (ADR-0036 §9, R-33)
 // ============================================================================
 //
@@ -858,18 +939,15 @@ async fn a_client_that_never_declares_is_never_directed_and_stays_healthy() {
 // whatever that symbol becomes. If `mh_handler`'s url format ever changes,
 // these go RED rather than silently tracking it.
 
-/// Redis enumeration order cannot change where a participant is placed, and
-/// `media_servers`, the send target and the slot's handler url are the ONE
-/// placed handler.
-///
-/// Seeded `[mh-1, mh-0]`, so the Redis head is mh-1. Round-robin over the
-/// SORTED set places ranks 0 and 2 on mh-0 and rank 1 on mh-1. `MeetingHandlers`
-/// sorts at construction; this is the real-join proof that the order which
-/// genuinely varies — the Redis `MhAssignmentData.handlers` list — cannot reach
-/// placement.
+/// Whatever order Redis enumerates the handlers in, every client is offered
+/// the FULL registered set, and every send target and slot url it is given is
+/// one of those urls verbatim — the url of the handler that owns that edge.
+/// Properties only: nothing here asserts WHICH handler carries an edge except
+/// where the pair shares exactly one.
 #[tokio::test]
-async fn redis_enumeration_order_cannot_change_where_the_client_is_steered() {
+async fn every_client_is_offered_the_full_set_and_steered_only_to_owning_handlers() {
     let (stack, rig) = start_stack("mcs-steer-order").await;
+    let registered = ["wt://mh-0:4433".to_string(), "wt://mh-1:4433".to_string()];
 
     for (index, order) in [["mh-0", "mh-1"], ["mh-1", "mh-0"]].into_iter().enumerate() {
         let meeting = format!("mcs-meeting-order-{index}");
@@ -879,46 +957,51 @@ async fn redis_enumeration_order_cannot_change_where_the_client_is_steered() {
             order.iter().map(|h| mh_handler(h)).collect(),
         )
         .await;
+        // A reaches both handlers; B only mh-0; C both.
         let mut a = join_as(&rig, &stack, &meeting, "user-a").await;
-        let b = join_as(&rig, &stack, &meeting, "user-b").await;
+        let b = test_common::media_session::join_as_on(&rig, &stack, &meeting, "user-b", &["mh-0"])
+            .await;
         let mut c = join_as(&rig, &stack, &meeting, "user-c").await;
 
-        assert_eq!(
-            a.media_servers,
-            vec!["wt://mh-0:4433".to_string()],
-            "order {order:?}"
-        );
-        assert_eq!(
-            b.media_servers,
-            vec!["wt://mh-1:4433".to_string()],
-            "order {order:?}"
-        );
-        assert_eq!(
-            c.media_servers,
-            vec!["wt://mh-0:4433".to_string()],
-            "order {order:?}"
-        );
-        assert_ne!(
-            a.media_servers[0], "wt://mh-1:4433",
-            "the Redis head must not decide placement"
-        );
+        for s in [&a, &b, &c] {
+            let mut offered = s.media_servers.clone();
+            offered.sort();
+            assert_eq!(
+                offered, registered,
+                "order {order:?}: the full set, every time"
+            );
+        }
 
-        a.write(capability_frame(audio_slots(1))).await;
+        a.write(capability_frame(audio_slots(2))).await;
         c.write(capability_frame(audio_slots(1))).await;
-        // Full-replace semantics: the LAST messages are A's view.
-        let (directive, assignments) = a.settle().await;
-        let directive = directive.expect("A's directive");
-        let assignments = assignments.expect("A's slot view");
-
-        let targets = &directive.streams[0].targets;
-        assert_eq!(targets.len(), 1, "one client, one directed handler");
-        assert_eq!(targets[0].media_handler_url, "wt://mh-0:4433");
-        assert_eq!(
-            assignments.assignments[0].media_handler_url,
-            "wt://mh-0:4433"
-        );
-        assert_eq!(assignments.assignments[0].sender_id, Some(c.sender_id));
-        // B is on the other handler: named unreachable, consuming no slot.
-        assert_eq!(assignments.unreachable_sender_ids, vec![b.sender_id]);
+        let assignments = a
+            .assignments_until("A holds B and C", |x| {
+                x.assignments
+                    .iter()
+                    .filter(|s| s.sender_id.is_some())
+                    .count()
+                    == 2
+            })
+            .await;
+        for slot in &assignments.assignments {
+            assert!(
+                registered.contains(&slot.media_handler_url),
+                "order {order:?}: a slot url is a registered url verbatim"
+            );
+            if slot.sender_id == Some(b.sender_id) {
+                assert_eq!(
+                    slot.media_handler_url, "wt://mh-0:4433",
+                    "order {order:?}: the only handler A and B share"
+                );
+            }
+        }
+        assert!(assignments.unreachable_sender_ids.is_empty());
+        let (directive, _) = c.settle().await;
+        for target in &directive.expect("C's directive").streams[0].targets {
+            assert!(
+                registered.contains(&target.media_handler_url),
+                "order {order:?}: a send target is a registered url verbatim"
+            );
+        }
     }
 }

@@ -51,20 +51,27 @@ const structuralTokens = file.reject_reasons
   .filter((r) => r.layer === 'codec' && r.has_vector)
   .map((r) => r.token);
 
-function makeIngress(): { sink: InMemoryMetricsSink; ingress: IngressPipeline } {
+function makeIngress(): {
+  sink: InMemoryMetricsSink;
+  ingress: IngressPipeline;
+  hopMonitor: HopSequenceMonitor;
+} {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
   const kek = new JoinResponseKekSource();
+  // ONE MONITOR PER TRANSPORT. These harnesses model a single transport, so one
+  // monitor per harness — created here rather than shared at module scope,
+  // which would carry hop high-water marks between tests.
+  const hopMonitor = new HopSequenceMonitor([0]);
   const ingress = new IngressPipeline({
     metrics,
     roster: new RosterIdentityKeys(8),
     keys: kek,
     cache: new TransmitKeyCache(8),
     replay: new ReplayWindow(8, 64),
-    hopMonitor: new HopSequenceMonitor([0]),
     firstMedia: new FirstMediaObserver(metrics, () => 0),
   });
-  return { sink, ingress };
+  return { sink, ingress, hopMonitor };
 }
 
 function reasonsFrom(sink: InMemoryMetricsSink): string[] {
@@ -87,8 +94,8 @@ describe('structural codec rejects reach the drop counter individually', () => {
 
   for (const row of decodeRejectRows) {
     it(`emits ${String(row.reject_reason)} verbatim for the ${row.name} vector`, async () => {
-      const { sink, ingress } = makeIngress();
-      await ingress.accept(hexToBytes(row.frame_hex));
+      const { sink, ingress, hopMonitor } = makeIngress();
+      await ingress.accept(hexToBytes(row.frame_hex), hopMonitor);
 
       // VERBATIM. No mapping table, no bucket, no `other`, no layer-based
       // collapse: the label value IS `FrameRejectedError.rejectReason`, and the

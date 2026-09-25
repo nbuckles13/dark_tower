@@ -11,6 +11,7 @@ import { context, propagation } from '@opentelemetry/api';
 import {
   FakeAudioCodecs,
   FakeCaptureSource,
+  makeAudioData,
   InMemoryMetricsSink,
   RecordingPlaybackSink,
   type MockWebTransport,
@@ -1231,6 +1232,77 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     expect(pipeline.frameCounts.framesReceived).toBeGreaterThan(0);
     // The structural twin of the solo test's `locked === false`.
     expect(mh.datagrams.readable.locked).toBe(true);
+    rig.session.disconnect();
+  });
+
+  it('RECEIVES on EVERY handler the assignments name, each on its own transport', async () => {
+    // THE CANONICAL CASE, at the session seam (ADR-0036 §9). A is connected to
+    // both handlers; B's edge sits on one and C's on the other, so A must read
+    // both transports. The pipeline suite proves the loop behaviour; this proves
+    // `startMedia` bridges a MULTI-handler snapshot into it, which is the wiring
+    // that was previously impossible — two urls used to raise a fault and open
+    // nothing.
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({
+        slotId: 0,
+        senderId: 300,
+        mediaHandlerUrl: MEDIA_SERVERS[0]!,
+        extraSlots: [{ slotId: 1, senderId: 301, mediaHandlerUrl: MEDIA_SERVERS[1]! }],
+      }),
+    );
+
+    const first = rig.mocks.get(MEDIA_SERVERS[0]!)!;
+    const second = rig.mocks.get(MEDIA_SERVERS[1]!)!;
+    // STRUCTURE FIRST: a reader on each transport. Stronger than a frame count,
+    // which a single shared loop could also satisfy.
+    await waitFor(() => first.datagrams.readable.locked && second.datagrams.readable.locked);
+
+    // And both actually deliver. Datagrams are re-sent until each lands, because
+    // the assignment applies asynchronously.
+    await waitFor(() => {
+      second.simulateIncomingDatagram(Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+      return pipeline.frameCounts.framesReceived > 0;
+    });
+    const afterSecond = pipeline.frameCounts.framesReceived;
+    await waitFor(() => {
+      first.simulateIncomingDatagram(Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+      return pipeline.frameCounts.framesReceived > afterSecond;
+    });
+    expect(pipeline.frameCounts.framesReceived).toBeGreaterThan(afterSecond);
+    rig.session.disconnect();
+  });
+
+  it('SENDS to every target in the directive, on every named transport', async () => {
+    // A's multi-handler send, at the session seam. `targets` carries both
+    // handlers, so both transports must carry the audio — the old code took
+    // `targets[0]` and silently dropped the rest, which is the "some peers hear
+    // me, some do not" failure with every client-side signal green.
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    mc.simulateServerMessage(
+      0,
+      framedSendDirective({ targets: [MEDIA_SERVERS[0]!, MEDIA_SERVERS[1]!] }),
+    );
+
+    const first = rig.mocks.get(MEDIA_SERVERS[0]!)!;
+    const second = rig.mocks.get(MEDIA_SERVERS[1]!)!;
+    // Feed capture until both lanes have carried something. The directive applies
+    // asynchronously, so a frame emitted before it lands is correctly not sent.
+    await waitFor(() => {
+      rig.capture.emit(makeAudioData({ samples: Float32Array.of(1, 2, 3) }));
+      return first.getOutboundDatagrams().length > 0 && second.getOutboundDatagrams().length > 0;
+    });
+    expect(first.getOutboundDatagrams().length).toBeGreaterThan(0);
+    expect(second.getOutboundDatagrams().length).toBeGreaterThan(0);
+    // Datagrams, not captured frames: the counter sums the lanes.
+    expect(pipeline.frameCounts.framesSent).toBeGreaterThanOrEqual(
+      first.getOutboundDatagrams().length + second.getOutboundDatagrams().length,
+    );
     rig.session.disconnect();
   });
 

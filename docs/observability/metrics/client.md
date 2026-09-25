@@ -474,9 +474,10 @@ the comment's reader.
 ### `dt_client_media_frames_sent_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
-- **Description**: Frames that left the device on the media datagram path.
+- **Description**: Datagrams that left the device on the media datagram path — **one increment per target handler per captured frame**, not one per frame. A sender whose edges span two handlers (ADR-0036 §9; story 2 task 20) advances this twice for one captured frame.
+- **THE NAME SAYS FRAMES; THE VALUE COUNTS DATAGRAMS — and that matches `dt_client_media_frames_received_total`**, which has counted datagrams-at-the-wire since story 1 (stated in `docs/runbooks/client-dev-local.md`'s green-signal table). The divergence is a **family convention documented on both sides**, not a defect on one: sent and received are in the SAME unit, so the loopback pair and every cross-end comparison against `mh_media_*` stay unit-comparable — a two-handler sender's datagrams are split across two handlers, and each handler sees only its own, so the aggregate still reconciles. Do not "fix" either name without moving both.
 - **Labels**: base only.
-- **Usage**: the denominator for the send-drop ratio.
+- **Usage**: the denominator for the send-drop ratio — **and the unit is the reason it is correct.** `dt_client_media_send_dropped_total` is raised inside the per-lane send path (`packages/sdk-core/src/media/pipeline/egress.ts`), so it is per-send-attempt by construction. Counting *frames* here while counting *attempts* there would make one captured frame that succeeded on handler A and was refused on handler B read as **50% loss on a sender that reached handler A perfectly**. Both sides count datagrams, so the ratio is a real loss fraction. Any future change to either counting point must move both or the ratio silently stops meaning loss.
 
 ### `dt_client_media_send_dropped_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
@@ -487,11 +488,11 @@ the comment's reader.
 
   | `reason` | Shared with MH? | Meaning and triage |
   |---|---|---|
-  | `egress_queue_overflow` | **shared** | The SDK's bounded queue was full and the OLDEST frame was evicted. Back-pressure at the application layer, where we can see it. |
+  | `egress_queue_overflow` | **shared** | A lane's bounded queue (one lane per target handler, each bounded independently) was full and that lane's OLDEST frame was evicted — so a sender under back-pressure on two lanes counts two evictions per captured frame. Back-pressure at the application layer, where we can see it. |
   | `transport_send_refused` | **shared** | The transport refused a datagram it should have accepted. **Fleet contract: reads zero forever; alertable at `> 0`.** |
   | `oversize_datagram` | **shared** | The frame exceeded the transport maximum and was never offered. Separate from the row above precisely so a configuration condition cannot poison an invariant counter. |
   | `connection_closed` | **shared** | The connection closed underneath a send. **Routine** — a participant leaves every meeting, many times. Not alertable. |
-  | `not_connected` | **client-only** | A send attempted before any transport was up. A lifecycle ordering bug; **reads zero forever; alertable at `> 0`.** |
+  | `not_connected` | **client-only** | The lane's directed target has no connected transport. **Reads zero forever; alertable at `> 0`** — but since story 2 task 20 it has TWO arms with opposite owners, and the alert must not presume the first. (1) **Client lifecycle ordering** — a send attempted before any transport was up. (2) **Server-side, and this is the new one**: MC directed this sender at a handler the client has no session with. MC derives a sender's targets from the handlers owning its edges, and an edge exists only where *both* parties are connected to that handler (ADR-0036 §9), so a directed target outside this client's own connected set means **MC's connectivity view is stale** — not a client bug. Fork on whether the client holds any transport at all: none means arm (1), some-but-not-this-one means arm (2). Arm (2) is the only signal available today for stale MC connectivity after a lost `NotifyParticipantDisconnected`, so it is a **partial mitigation** for the MH-observed-vs-client-reported divergence counter deferred in `docs/TODO.md` — partial because it fires only for a *sender* holding an edge on the stale handler. |
 
 - **Cross-end comparison**: the four shared spellings match
   `MediaDropReason` in `crates/mh-service/src/observability/metrics.rs`, so
@@ -511,13 +512,18 @@ the comment's reader.
 ### `dt_client_media_send_queue_depth`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Gauge
-- **Description**: Current depth of the bounded application egress queue, in
-  frames.
+- **Description**: Depth, in frames, of the DEEPEST of the sender's bounded
+  application egress lanes — one lane per target handler (story 2 task 20: a
+  sender sends to every handler owning one of its edges), each bounded
+  independently.
 - **Labels**: base only.
 - **Usage**: read against the configured bound (default 10 frames = 200 ms at
   20 ms/frame). The application bound trips BEFORE the transport high-water mark
   — asserted at setup — so a rising depth here is back-pressure we can count
-  rather than loss inside the user agent.
+  rather than loss inside the user agent. Because it is the deepest lane, a full
+  gauge beside healthy `dt_client_media_frames_sent_total` means ONE lane
+  (one handler's path) is stalled, not the whole sender — do not go to
+  capture/encode/device on it. A low depth still means no lane is backed up.
 - **SINGLE-WRITER-MEANINGFUL — with N browsers this is the most recent reporter's
   depth, NOT a fleet maximum.** It is a Gauge, and every browser writes to one
   stream identity (no per-instance label, §11), so the stored value is
@@ -623,7 +629,7 @@ the comment's reader.
 ### `dt_client_media_downlink_gap_frames_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
-- **Description**: Frames MISSING between the media handler's egress and this
+- **Description**: Frames MISSING between each media handler's egress and this
   client's ingress, measured as gaps in the relay hop sequence.
 - **Labels**: base only. `stream_id` is bounded internal state and is **never** a
   label.

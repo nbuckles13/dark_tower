@@ -29,7 +29,7 @@ async fn test_notify_connected_success() {
     let client = McClient::new(test_token_receiver());
 
     let result = client
-        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
         .await;
 
     assert!(result.is_ok());
@@ -43,7 +43,7 @@ async fn test_notify_disconnected_success() {
     let client = McClient::new(test_token_receiver());
 
     let result = client
-        .notify_participant_disconnected(&mc_url, "meeting-1", "user-1", "mh-1", 1)
+        .notify_participant_disconnected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1", 1)
         .await;
 
     assert!(result.is_ok());
@@ -61,7 +61,7 @@ async fn test_retry_succeeds_after_transient_failure() {
     let client = McClient::new(test_token_receiver());
 
     let result = client
-        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
         .await;
 
     assert!(result.is_ok());
@@ -93,7 +93,7 @@ async fn a_terminal_error_short_circuits_while_a_transient_one_takes_the_full_bu
     let client = McClient::new(test_token_receiver());
     let started = std::time::Instant::now();
     let result = client
-        .notify_participant_connected("", "meeting-1", "user-1", "mh-1")
+        .notify_participant_connected("", "meeting-1", "user-1", "mh-1", "conn-1")
         .await;
     let terminal_elapsed = started.elapsed();
 
@@ -121,7 +121,7 @@ async fn a_terminal_error_short_circuits_while_a_transient_one_takes_the_full_bu
 
     let started = std::time::Instant::now();
     let result = client
-        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
         .await;
     let transient_elapsed = started.elapsed();
 
@@ -172,7 +172,7 @@ async fn test_retry_returns_the_successful_attempts_response_not_a_default() {
     let client = McClient::new(test_token_receiver());
 
     let response = client
-        .notify_participant_connected(&mc_url, "meeting-1", "user-retry", "mh-1")
+        .notify_participant_connected(&mc_url, "meeting-1", "user-retry", "mh-1", "conn-1")
         .await
         .expect("the second attempt succeeds, so the call must return Ok");
 
@@ -194,7 +194,7 @@ async fn test_retry_exhaustion_after_max_attempts() {
     let client = McClient::new(test_token_receiver());
 
     let result = client
-        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
         .await;
 
     assert!(
@@ -211,7 +211,7 @@ async fn test_unauthenticated_error_skips_retry() {
     let client = McClient::new(test_token_receiver());
 
     let result = client
-        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
         .await;
 
     // Should fail immediately with JwtValidation (mapped from UNAUTHENTICATED)
@@ -229,7 +229,7 @@ async fn test_permission_denied_skips_retry() {
     let client = McClient::new(test_token_receiver());
 
     let result = client
-        .notify_participant_disconnected(&mc_url, "meeting-1", "user-1", "mh-1", 1)
+        .notify_participant_disconnected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1", 1)
         .await;
 
     // Should fail immediately with JwtValidation (mapped from PERMISSION_DENIED)
@@ -293,5 +293,73 @@ fn the_mc_auth_build_failure_log_is_pinned_to_its_message_and_target() {
             && !gc_client.contains("mh.grpc.mc_client"),
         "gc_client emitting on the mc_client target would collapse the discriminator — the \
          same message on the same target from two sources"
+    );
+}
+
+/// Every retry of one `NotifyParticipantConnected` carries the SAME
+/// `connection_id` the caller passed, and a disconnect carries the value it was
+/// handed — the client never mints, rewrites or drops it.
+///
+/// MC keys live connectivity on `(handler, connection_id)` and tombstones an id
+/// once its disconnect lands (`internal.proto`). An id that drifted between
+/// attempts would leave MC holding an entry the session's disconnect can never
+/// retire — phantom connectivity, i.e. media edges placed on a handler the
+/// participant is not on. So the assertion is over EVERY attempt the mock saw,
+/// not just the one that succeeded, and it first proves there WERE several
+/// attempts (a single-attempt run would pass vacuously).
+#[tokio::test]
+async fn test_every_retry_and_the_disconnect_carry_the_callers_connection_id() {
+    // Deliberately unlike every other string in the fixture.
+    const CONNECTION_ID: &str = "conn-4c1d-only-this-session";
+    const FAIL_FIRST: u32 = 2;
+
+    let (connected_tx, mut connected_rx) = mpsc::channel(8);
+    let (disconnected_tx, mut disconnected_rx) = mpsc::channel(8);
+    let mc = start_mock_mc_server(
+        MockMcServer::new(MockBehavior::FailThenAccept {
+            fail_count: FAIL_FIRST,
+        })
+        .with_connected_tx(connected_tx)
+        .with_disconnected_tx(disconnected_tx),
+    )
+    .await;
+
+    let mc_url = format!("http://{}", mc.addr);
+    let client = McClient::new(test_token_receiver());
+
+    client
+        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", CONNECTION_ID)
+        .await
+        .expect("the attempt after the transient failures succeeds");
+    client
+        .notify_participant_disconnected(&mc_url, "meeting-1", "user-1", "mh-1", CONNECTION_ID, 1)
+        .await
+        .expect("the mock accepts once past its failure budget");
+
+    let mut connected_ids = Vec::new();
+    while let Ok(req) = connected_rx.try_recv() {
+        connected_ids.push(req.connection_id);
+    }
+    assert_eq!(
+        connected_ids.len(),
+        usize::try_from(FAIL_FIRST + 1).unwrap(),
+        "precondition: the mock must have seen every attempt (the failures plus the success), \
+         or the per-attempt assertion below is vacuous"
+    );
+    for (attempt, id) in connected_ids.iter().enumerate() {
+        assert_eq!(
+            id, CONNECTION_ID,
+            "attempt {attempt} carried a different connection_id; every retry must carry the \
+             caller's value so MC's entry and the session's disconnect name the same session"
+        );
+    }
+
+    let disconnect = disconnected_rx
+        .try_recv()
+        .expect("the disconnect must have reached the mock");
+    assert_eq!(
+        disconnect.connection_id, CONNECTION_ID,
+        "the disconnect must carry the id the caller passed, or MC cannot retire the entry the \
+         Connected created"
     );
 }

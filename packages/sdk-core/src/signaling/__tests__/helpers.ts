@@ -236,6 +236,10 @@ export function buildStreamAssignments(init: {
   senderId?: number;
   mediaHandlerUrl?: string;
   slotState?: SlotState;
+  /** Extra slots, for the multi-handler cases (ADR-0036 §9). */
+  extraSlots?: { slotId: number; senderId?: number; mediaHandlerUrl: string }[];
+  /** Roster participants this subscriber shares no connected handler with. */
+  unreachableSenderIds?: number[];
 }) {
   return create(StreamAssignmentsSchema, {
     assignments: [
@@ -246,7 +250,19 @@ export function buildStreamAssignments(init: {
         mediaHandlerUrl: init.mediaHandlerUrl ?? '',
         slotState: init.slotState ?? SlotState.ACTIVE,
       }),
+      ...(init.extraSlots ?? []).map((slot) =>
+        create(StreamAssignmentSchema, {
+          slotId: slot.slotId,
+          ...(slot.senderId !== undefined ? { senderId: slot.senderId } : {}),
+          mediaKind: MediaKind.AUDIO,
+          mediaHandlerUrl: slot.mediaHandlerUrl,
+          slotState: SlotState.ACTIVE,
+        }),
+      ),
     ],
+    ...(init.unreachableSenderIds !== undefined
+      ? { unreachableSenderIds: init.unreachableSenderIds }
+      : {}),
   });
 }
 

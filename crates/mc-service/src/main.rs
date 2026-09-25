@@ -52,7 +52,6 @@ use mc_service::grpc::{
     GcClient, McAssignmentService, McAuthLayer, McMediaCoordinationService, MhClient,
     MhRegistrationClient,
 };
-use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::observability::{health_router, HealthState};
 use mc_service::redis::FencedRedisClient;
 use mc_service::system_info::gather_system_info;
@@ -299,9 +298,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SecretBox::new(Box::new(secret_bytes))
     };
 
-    // Create MH connection registry for tracking participant→MH connections (R-18)
-    let mh_connection_registry = Arc::new(MhConnectionRegistry::new());
-
     // Per-(meeting, handler) `policy_generation` registry (ADR-0036 §8).
     // Shared between the WebTransport push path (which takes generations) and
     // the controller actor (which evicts them on meeting teardown).
@@ -312,7 +308,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&actor_metrics),
         Arc::clone(&controller_metrics),
         master_secret,
-        Arc::clone(&mh_connection_registry),
         Arc::clone(&policy_generations),
     ));
     info!("Actor system initialized");
@@ -380,10 +375,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create MediaCoordinationService for MH→MC notifications (R-15)
-    let media_coord_service = McMediaCoordinationService::new(
-        Arc::clone(&mh_connection_registry),
-        Arc::clone(&controller_handle),
-    );
+    // Participant connectivity is recorded by the meeting actors (one home);
+    // this service only validates and routes notifications to them.
+    let media_coord_service = McMediaCoordinationService::new(Arc::clone(&controller_handle));
 
     // Create JWKS-based auth layer for gRPC service token validation (R-22)
     // Applied at the server level: validates JWT signature + expiry for ALL

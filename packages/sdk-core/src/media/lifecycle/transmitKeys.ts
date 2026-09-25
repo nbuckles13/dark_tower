@@ -401,6 +401,28 @@ export class TransmitKeyManager {
    *
    * Monotonic per (sender, stream) for the life of the session. Deliberately has
    * no reset, no seek, and no argument.
+   *
+   * ---------------------------------------------------------------------------
+   * THIS OBJECT'S IDENTITY IS THE NONCE-UNIQUENESS BOUNDARY
+   * ---------------------------------------------------------------------------
+   *
+   * ADR-0036 §2 fixes the required counting scope at per (sender, stream), and
+   * the returned value is the AEAD nonce input. But the state below is keyed per
+   * MANAGER INSTANCE by stream number — so the required scope and the actual
+   * scope coincide ONLY because exactly one manager exists per sender.
+   *
+   * That makes this object, not any caller, the thing that carries the
+   * invariant: **a second `TransmitKeyManager` for the same sender is a nonce
+   * repeat under one key**, whatever the code above it looks like. Under AES-GCM
+   * a repeat does not merely expose the two frames — it leaks the authentication
+   * subkey and permits forgery (§2). So this must never be constructed inside
+   * anything that can exist more than once per sender, which is a rule a future
+   * author can check mechanically against their own diff.
+   *
+   * The multi-target send path is where this nearly went wrong: see
+   * `pipeline/egress.ts::submit`, which allocates ONE sequence above the
+   * per-target fan-out and names the forbidden "one pipeline per target"
+   * decomposition as an example of violating this rule.
    */
   nextStreamSequence(streamNumber: number): number {
     const next = this.#streamSequences.get(streamNumber) ?? 0;

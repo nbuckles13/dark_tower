@@ -25,6 +25,15 @@
 //! release test asserts the registered-meetings gauge FALLS (with a two-meeting
 //! positive control: it must first read 2), the routes entry is gone, and the
 //! edges are back in the budget.
+//!
+//! # Exact occupancy accounting lives HERE, not in env-test 29
+//!
+//! On a live pod the occupancy gauges are shared with every concurrent suite,
+//! so env-test 29 proves release for its own meeting from MH's direct replies
+//! (stale-then-fresh generation-1 re-registration) and never asserts a gauge
+//! value. That registered meetings and edges return EXACTLY to their previous
+//! values after a release — with unrelated load held — is proved by
+//! `a_release_returns_registered_meetings_and_edges_to_their_previous_values`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -185,6 +194,109 @@ async fn release_over_grpc_drops_the_gauge_the_routes_and_the_edges() {
     snap.counter("mh_grpc_requests_total")
         .with_labels(&[("method", "end_meeting"), ("status", "success")])
         .assert_delta(1);
+}
+
+/// The exact occupancy accounting env-test 29 cannot make on a shared pod:
+/// with OTHER load already held, a meeting's full lifecycle (register at a
+/// held generation, stale probe, foreign release, release, re-create, release)
+/// moves `mh_media_registered_meetings` and `mh_media_egress_edges` by exactly
+/// this meeting's share, and every release returns both to their PREVIOUS
+/// values — the gauges AND the routing snapshot they are published from.
+/// Nothing else runs against this rig, so equality is sound here.
+#[tokio::test]
+async fn a_release_returns_registered_meetings_and_edges_to_their_previous_values() {
+    let snap = MetricAssertion::snapshot();
+    let mut rig = Rig::start(fixture_policy_limits()).await;
+    // One count, two readings: the gauge and the routing snapshot it is
+    // published from are both checked against the same `usize`.
+    let edges = |rig: &Rig, snap: &MetricSnapshot, expected: usize| {
+        snap.gauge("mh_media_egress_edges")
+            .with_labels(&[KEY_CUSTODY])
+            .assert_value(f64::from(u32::try_from(expected).unwrap()));
+        assert_eq!(
+            rig.session_manager.routing_snapshot().total_edges(),
+            expected
+        );
+    };
+    let two_edges = || vec![egress(1, 5, 0, 6), egress(2, 6, 0, 5)];
+    let this_meeting_edges = two_edges().len();
+
+    // Background load the lifecycle must never disturb.
+    let background = vec![egress(1, 7, 0, 8)];
+    let prev_edges = background.len();
+    rig.register("m-background", "mc-other", 1, background)
+        .await
+        .unwrap();
+    let prev_meetings = 1.0;
+    registered_meetings(&snap, prev_meetings);
+    edges(&rig, &snap, prev_edges);
+
+    let held = |rig: &Rig, snap: &MetricSnapshot| {
+        registered_meetings(snap, prev_meetings + 1.0);
+        edges(rig, snap, prev_edges + this_meeting_edges);
+    };
+    let back_to_previous = |rig: &Rig, snap: &MetricSnapshot| {
+        registered_meetings(snap, prev_meetings);
+        // Exactly this meeting's edges came back.
+        edges(rig, snap, prev_edges);
+        let routes = rig.session_manager.routing_snapshot();
+        assert!(routes.routes_for(&MeetingKey::new("m-test")).is_none());
+        assert!(
+            routes
+                .routes_for(&MeetingKey::new("m-background"))
+                .is_some(),
+            "the background meeting is untouched"
+        );
+    };
+    assert_eq!(
+        rig.register("m-test", "mc-a", 5, two_edges())
+            .await
+            .unwrap(),
+        5
+    );
+    held(&rig, &snap);
+
+    // Stale probe (as env-test 29 does): OK, echoes 5, occupancy unchanged.
+    assert_eq!(
+        rig.register("m-test", "mc-a", 1, two_edges())
+            .await
+            .unwrap(),
+        5
+    );
+    held(&rig, &snap);
+
+    // A foreign release changes nothing.
+    assert_eq!(
+        rig.end("m-test", "mc-intruder").await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    held(&rig, &snap);
+
+    assert!(rig.end("m-test", "mc-a").await.unwrap(), "acknowledged");
+    back_to_previous(&rig, &snap);
+
+    // A repeat release is a no-op: still exactly the previous values.
+    assert!(
+        rig.end("m-test", "mc-a").await.unwrap(),
+        "no-op acknowledged"
+    );
+    back_to_previous(&rig, &snap);
+
+    // Re-created at generation 1: installs fresh and is counted exactly once
+    // again (the release did not leave a phantom share behind).
+    assert_eq!(
+        rig.register("m-test", "mc-a", 1, two_edges())
+            .await
+            .unwrap(),
+        1
+    );
+    held(&rig, &snap);
+    assert!(rig.end("m-test", "mc-a").await.unwrap());
+    back_to_previous(&rig, &snap);
+
+    teardown_delta(&snap, "released", 2);
+    teardown_delta(&snap, "rejected_ownership", 1);
+    teardown_delta(&snap, "unknown_meeting", 1);
 }
 
 /// A released meeting re-created under the same id at generation 1 installs

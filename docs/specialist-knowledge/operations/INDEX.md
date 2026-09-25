@@ -15,7 +15,7 @@
 - Pod-grace ↔ env drift env-test → `crates/env-tests/tests/01_mh_deployment_config.rs`
 - MH hot path (no telemetry macro reachable under it) → `crates/mh-service/src/media/`; transport seam → `crates/mh-service/src/webtransport/media_transport.rs`, `crates/mh-service/src/transport/mod.rs`; sender bindings → `crates/mh-service/src/session/mod.rs`; routing → `crates/mh-service/src/routing/mod.rs`
 - MC admission (meeting KEK, identity key, sender-id allocator, binding outcome) → `crates/mc-service/src/media_admission/`
-- MC routing + client signaling; handler URL is server-chosen → `crates/mc-service/src/media_routing/`, `crates/mc-service/src/media_signaling/assignments.rs`
+- MC routing + client signaling; handler URL is server-chosen → `crates/mc-service/src/media_routing/`, `crates/mc-service/src/media_signaling/assignments.rs`; MC connect settle window `MC_MEDIA_CONNECT_SETTLE_MS` (required, bounded `100..=10000`, echoed as `mc_media_connect_settle_window_seconds`) → `crates/mc-service/src/config.rs`, `infra/services/mc-service/configmap.yaml`, `docs/runbooks/mc-deployment.md` §Configuration Reference
 - Media-path telemetry deny scope → `scripts/guards/simple/media-telemetry-deny.yaml`, `crates/dt-guard/src/media_telemetry_deny.rs`
 - Frame v2 cross-language vectors + gate → `proto/test-vectors/frame-v2.vectors.json`, `scripts/guards/simple/validate-frame-vectors.sh`, `crates/media-vector-gen/`
 - Release feature-gate self-test → `scripts/release-feature-gate.test.sh`; release profile guard → `crates/dt-guard/src/release_build_profile.rs`
@@ -71,5 +71,5 @@
 ## Services
 - AC: config → `crates/ac-service/src/config.rs`; JWKS/JWT → `crates/common/src/jwt.rs`; GC↔AC token types → `crates/common/src/meeting_token.rs`; service auth → ADR-0003
 - MH: startup/health → `crates/mh-service/src/main.rs`, `observability/health.rs`; gRPC → `crates/mh-service/src/grpc/`; WebTransport → `crates/mh-service/src/webtransport/connection.rs`; rigs → `crates/mh-service/tests/common/accept_loop_rig.rs`
-- MC: startup/config → `crates/mc-service/src/main.rs`, `config.rs`; gRPC → `crates/mc-service/src/grpc/`; MH registry → `crates/mc-service/src/mh_connection_registry.rs`; Redis → `crates/mc-service/src/redis/client.rs`; actors → `crates/mc-service/src/actors/`
+- MC: startup/config → `crates/mc-service/src/main.rs`, `config.rs`; gRPC → `crates/mc-service/src/grpc/`; participant media connectivity (MH-observed, in the meeting actor) → `crates/mc-service/src/media_routing/connectivity.rs`; Redis → `crates/mc-service/src/redis/client.rs`; actors → `crates/mc-service/src/actors/`
 - GC: routes + handlers → `crates/gc-service/src/routes/mod.rs`, `handlers/meetings.rs`; refusal outcomes → `crates/gc-service/src/repositories/meetings.rs:CreateMeetingOutcome`, `crates/gc-service/src/errors.rs`

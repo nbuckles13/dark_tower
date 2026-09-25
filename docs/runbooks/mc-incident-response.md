@@ -1704,53 +1704,45 @@ Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkP
 
 ### Scenario 13: Unexpected MH Notifications
 
-**Alert**: No alert today; diagnostic-only signal in `mc_mh_notifications_received_total` and warn-level log `"Connection registry limit reached for meeting"` at target `mc.grpc.media_coordination` (the gRPC handler emits this when the registry's `add_connection` returns `false`). The registry-internal log `"Meeting connection limit reached, rejecting new connection"` at target `mc.mh_registry` is the lower-level companion emitted from the same code path.
+**Alert**: No alert today; diagnostic signal in `mc_mh_notifications_unapplied_total{reason}` (one bounded reason per notification that did not become participant connectivity) beside `mc_mh_notifications_received_total{event_type}`.
 **Severity**: info (operational drift) / page (if security branch — see Common Root Causes)
 
-> **Note on metric asymmetry**: MC has **no failure metric for inbound MH notifications by design** — `mc_mh_notifications_received_total` only carries an `event_type` label, no `status`. Failures originate and are counted on the MH sender side as `mh_mc_notifications_total{status="error"}`; see [MH Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures). This scenario is the complement: notifications that *successfully reached MC* but reference state MC does not expect.
+> **Why this matters more since story 2 task 20**: MH's `NotifyParticipantConnected` / `Disconnected` are now the **source of truth for who hears whom** (ADR-0036 §9): a participant is routed only through handlers MH reports it connected to, recorded in the meeting actor (the former `MhConnectionRegistry` and its 1000-connection cap are gone). A notification that does not become connectivity can therefore mean silence, not just drift.
 >
-> `mc_mh_notifications_received_total` starts at zero in production and emits on the first MH notification; a brand-new series is not itself an incident. The actionable signal is rate-relative-to-expected (see Diagnosis step 2) and the warn-log on registry-cap hits.
+> **Note on metric asymmetry**: MC counts notifications that REACHED it; delivery failures are counted on the MH sender side as `mh_mc_notifications_total{status="error"}` — see [MH Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures). This scenario is the complement: notifications that reached MC but reference state MC does not expect.
 
-**Symptoms**:
-- `mc_mh_notifications_received_total{event_type}` rate higher than expected for the active-meeting count.
-- MC `debug` logs: `"Connection was not in registry (may have already been removed)"` (target `mc.grpc.media_coordination`) — disconnect notifications arriving for connections MC does not have a record of. Routine occurrence in small numbers; sustained volume is the signal.
-- MC `warn` logs: `"Connection registry limit reached for meeting"` — `MAX_CONNECTIONS_PER_MEETING` (1000) cap hit, new connect notifications silently dropped. This is unusual for normal meeting load and warrants investigation.
-- gRPC access logs: notifications arriving with `meeting_id` values that do not appear in `mc_meetings_active` for this MC.
+**Symptoms** — read `mc_mh_notifications_unapplied_total` PER REASON, never as one rate:
+- `unknown_connection` — **routine**: every connection MC declined to bind sends a Disconnected for a key MC never recorded. Only sustained volume far above the join rate is a signal.
+- `meeting_unknown` — notifications naming a meeting this MC does not hold (both events).
+- `handler_not_in_set` — the MH-asserted `handler_id` is not byte-identical to a handler of the meeting's frozen set. **Sustained**, it means an MH process restarted under a new (per-incarnation) id and story-4 re-registration has not happened: that meeting's connectivity to the dead id is stale and **will not clear on its own** — see Scenario 18 arm (a).
+- `connection_bound_refused` — **expected-empty**: one participant exceeded the per-handler live-connection bound (a reconnect storm or leaked sessions).
+- `retired_connection` — a Connected delivered after its own Disconnected (MH abandoned the RPC); MC's tombstone refused it. Non-zero means MH→MC RPCs are slow enough to be abandoned — check MH Scenario 10.
+- `mc_mh_notifications_without_connection_id_total` non-zero — an MH image predating `connection_id` is still in the fleet: that MH gets the degraded legacy semantics (a stale disconnect can remove a live connection).
 
-**Impact**: Operationally, drift between MC's MhConnectionRegistry and reality. Currently the registry is observability-only (read by future media routing per R-18); a small amount of drift is tolerated by design. **The signal matters for two reasons**:
-1. **Operational drift branch** — diffuse pattern across many `meeting_id` values from many MH source identities suggests GC↔MC↔MH routing has lost coherence (e.g., meeting reassigned but stale MH still notifying). Self-heals as participants reconnect.
-2. **Authenticated-misbehavior branch** — steady-rate stream of unknown-meeting notifications from a single MH service identity suggests a compromised or misconfigured MH that has passed Layer 1 (JWKS) and Layer 2 (caller-type) auth but is sending notifications it should not be. Treat as a potential security incident.
+**Impact**: operational drift in the unknown-meeting shapes; **silence** in the `handler_not_in_set` and `connection_bound_refused` shapes (a participant MC believes is not on a handler gets no edges there). The security reading is unchanged: MC authorizes MH on scope alone and every MH pod shares one service identity, so a compromised MH can assert connections for handlers of a meeting's own set (blast radius: misrouting inside that meeting's registered handlers — never cross-meeting; `docs/TODO.md` §Media Path Obligations).
 
 **Diagnosis**:
 
 ```bash
-# 1. Volume of notifications received
-sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
+# 1. Every way a notification did not become connectivity, per reason
+sum by (reason) (rate(mc_mh_notifications_unapplied_total[5m]))
 
-# 2. Compare against expected: 1 connect notification per (participant × MH)
-#    on first connect, 1 disconnect on departure. Active-conn baseline:
+# 2. Volume against expectation: ~1 connect per (participant x handler) per session
+sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 sum(mc_connections_active)
 
-# 3. Stale-disconnect rate (debug-level log; tail with care)
-kubectl logs -n dark-tower -l app=mc-service --tail=2000 \
-  | grep -c "Connection was not in registry" \
-  || true
+# 3. Is an old MH still sending without connection_id?
+sum(rate(mc_mh_notifications_without_connection_id_total[5m]))
 
-# 4. Registry-cap hits (warn-level)
+# 4. SHAPE the signal — diffuse vs concentrated. Per-notification INFO lines at
+#    mc.grpc.media_coordination carry meeting_id, participant_id, handler_id,
+#    connection_id and the disposition (connectivity=recorded|<reason>).
 kubectl logs -n dark-tower -l app=mc-service --tail=2000 \
-  | grep -i "Connection registry limit reached"
+  | grep -E "Participant (connected to|disconnected from) MH"
+# Look for: one handler_id repeatedly (a restarted MH), or scattered meetings from one
+# MH source identity (misbehaviour).
 
-# 5. SHAPE the signal — diffuse vs concentrated:
-#    Pull MH source identity from gRPC handler logs (target mc.grpc.media_coordination).
-#    The auth interceptor logs the calling service identity at debug level on each request.
-#    `mc_mh_notifications_received_total` itself currently has only `event_type` —
-#    there is no `source_id` label, so attribution must come from logs / traces.
-kubectl logs -n dark-tower -l app=mc-service --tail=2000 \
-  | grep -iE "media_coordination.*meeting_id"
-# Look for: are notifications arriving for the same meeting_id repeatedly from one MH,
-# or scattered across many meetings + many MHs?
-
-# 6. Cross-check with GC's view of meeting assignments (operational-drift hypothesis)
+# 5. Cross-check with GC's view of meeting assignments (operational-drift hypothesis)
 kubectl exec -it deployment/gc-service -n dark-tower -- \
   psql $DATABASE_URL -c \
   "SELECT meeting_id, mc_id, status FROM meetings WHERE updated_at > NOW() - INTERVAL '1 hour' ORDER BY updated_at DESC LIMIT 50;"
@@ -1758,60 +1750,38 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 
 **Common Root Causes**:
 
-Triage by signal shape from Diagnosis step 5:
-
-1. **Diffuse, many-MH, many-meeting → Operational drift.**
-   - GC reassigned meetings but old MH continued to notify briefly.
-   - MC was restarted and lost its in-memory registry; in-flight disconnects from MHs arrive for meetings the new MC instance never registered.
-   - MhConnectionRegistry cleanup race in `controller.rs::remove_meeting()`.
-   - Self-heals; no immediate action. Investigate MhConnectionRegistry behavior for tracking debt.
-
-2. **Concentrated, single-MH source identity, many unknown meetings → Authenticated-MH misbehavior.**
-   - Compromised MH credentials being used by an attacker who passed Layer 1+2 auth and is probing or fuzzing the MediaCoordinationService.
-   - Misconfigured MH instance running with the wrong meeting-routing config and broadcasting notifications to the wrong MC.
-   - **Treat as a security incident**: preserve logs (gRPC access log + handler log + the auth interceptor's caller-identity emission), snapshot `mc_mh_notifications_received_total`, do **NOT** restart MC, escalate to Security Team. Do not remediate operationally until Security has triaged.
-
-3. **Registry cap hit (`MAX_CONNECTIONS_PER_MEETING=1000` reached).**
-   - Legitimate giant-meeting scenario or a runaway MH spamming the same `meeting_id`.
-   - If the meeting's `mc_connections_active` corroborates ~1000 participants, this is a capacity-planning signal — discuss with MC Team.
-   - If `mc_connections_active` is small but the registry is full for the meeting, treat as the authenticated-misbehavior branch (#2 above).
+1. **Diffuse, many-MH, many-meeting `meeting_unknown` → Operational drift.** GC reassigned meetings but an old MH notified briefly; or MC restarted and lost its meeting actors, so in-flight notifications name meetings the new instance never held. Self-heals as participants reconnect (a fresh join re-dials every MH).
+2. **Concentrated, single-MH source identity, many unknown meetings → Authenticated-MH misbehavior.** Compromised MH credentials probing the MediaCoordinationService, or a misconfigured MH notifying the wrong MC. **Treat as a security incident**: preserve logs, snapshot the metrics, do **NOT** restart MC, escalate to Security Team.
+3. **Sustained `handler_not_in_set` on one meeting → an MH restarted.** Its new process registered under a new id outside the meeting's frozen set. Pre-existing gap (story 4 handler-restart detection); see Scenario 18 arm (a) for the remedy participants have today.
+4. **`connection_bound_refused` → reconnect storm / leaked sessions from one participant.** Self-scoped (only that participant is affected). Correlate with the client's reconnect behaviour.
 
 **Remediation**:
 
 ```bash
-# Operational-drift branch (root cause #1):
-# No action — monitor. Drift resolves as participants reconnect or meetings end.
-
-# Authenticated-misbehavior branch (root cause #2):
-# 1. PRESERVE logs first — capture before any restart.
+# Operational-drift branch: no action — monitor.
+# Authenticated-misbehavior branch:
 kubectl logs -n dark-tower -l app=mc-service --tail=5000 \
   > /tmp/mc-incident-$(date -u +%Y%m%dT%H%M%SZ).log
-# 2. Snapshot the metric for forensic baseline.
 kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
-curl -s http://localhost:8080/metrics | grep mc_mh_notifications_received_total \
+curl -s http://localhost:8080/metrics | grep -E "mc_mh_notifications_(received|unapplied)_total" \
   > /tmp/mc-metrics-$(date -u +%Y%m%dT%H%M%SZ).txt
 kill %1
-# 3. Do NOT restart MC. Do NOT rotate the MH service token (yet) — Security needs evidence.
-# 4. Escalate to Security Team via #security-incidents.
-
-# Capacity-cap branch (root cause #3):
-# Confirm legitimate giant meeting via mc_connections_active for the affected meeting_id.
-# If legitimate, file capacity-planning ticket; do not remediate at runtime.
-# If not legitimate, treat as the authenticated-misbehavior branch above.
+# Do NOT restart MC. Do NOT rotate the MH service token (yet) — Security needs evidence.
+# Escalate to Security Team via #security-incidents.
 ```
 
-Expected recovery time: branch-dependent. Operational drift self-heals over the next 5-15m as participants reconnect or meetings end (no runtime action). Authenticated-misbehavior branch: bounded by Security investigation timeline (do not auto-recover). Capacity-cap branch on a legitimate giant meeting: persists until the meeting ends or capacity-planning lifts the cap; not a runtime fix.
+Expected recovery time: branch-dependent. Operational drift self-heals over 5-15m. Authenticated-misbehavior: bounded by Security's investigation (do not auto-recover). `handler_not_in_set`: persists until affected participants rejoin (story 4 closes it).
 
-**What this scenario tells you**: this is a diagnostic-appendix scenario, not an alerting one. Use it when you are ALREADY investigating a different signal (e.g. an MC actor panic, a security review of MH→MC RPCs, or an operational sweep) and you notice elevated `mc_mh_notifications_received_total` rate or `"Connection registry limit reached"` warn-logs that don't fit the surrounding incident. The scenario routes you to the right triage branch without re-deriving "what is `MhConnectionRegistry` and why does it have a registry-cap." If you found this scenario via an alert, the alert is wrong — file an issue.
+**What this scenario tells you**: a diagnostic-appendix scenario. Use it when you are already investigating a different signal and `mc_mh_notifications_unapplied_total` does not fit the surrounding incident. If you found this scenario via an alert, the alert is wrong — file an issue.
 
 **Escalation**:
-- Authenticated-misbehavior branch: Security Team immediately. Do not restart, do not rotate tokens until Security has captured evidence.
+- Authenticated-misbehavior branch: Security Team immediately.
 - Operational-drift branch: no escalation; track for trend.
-- Registry-cap hit on a small meeting: MC Team for investigation.
+- `connection_bound_refused` sustained, or any `handler_not_in_set` without a known MH restart: MC Team.
 
-**Related Alerts**: `MCActorPanic` (if a MeetingActor crashed and lost registry state), MH-side `MHCallerTypeRejected` (Layer 2 caller-type rejections — would indicate misbehaving services that did NOT clear Layer 2; this scenario is the complementary branch where Layer 2 was passed); MH-side [Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures) (the *sender-side* view of the same RPC pair).
+**Related Alerts**: `MCActorPanic`, MH-side `MHCallerTypeRejected`; MH-side [Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures) (the sender-side view of the same RPC pair).
 
-**Dashboards**: MC Overview → MH-coordination row notification panels (if present); rely on log-based triage (target `mc.grpc.media_coordination`) for source-identity attribution since the metric has no `source_id` label today.
+**Dashboards**: MC Overview → Media Connectivity row ("MH Notifications Unapplied by Reason", "Notifications Without Connection Id") and MH Coordination row ("MH Notifications by Event").
 
 ---
 
@@ -2008,11 +1978,12 @@ sum by (slot_state) (rate(mc_media_slot_states_total[5m]))
 
 `active` is the healthy value. `source_muted` is a source's mute — client OR
 server mute (one wire state for both) — and is normal. `fewer_sources_than_slots`
-means the subscriber declared more slots than there are co-handler senders to fill
-them — normal in a meeting smaller than N, and ALWAYS the state of a solo
-participant (loopback is removed, R-3). `source_unreachable` is **no longer
-emitted**: a participant on another handler is named in
-`StreamAssignments.unreachable_sender_ids` instead (see Scenario 18 and
+means the subscriber declared more slots than there are senders it shares a
+CONNECTED handler with to fill them — normal in a meeting smaller than N, ALWAYS
+the state of a solo participant (loopback is removed, R-3), and the state of every
+slot of a participant not yet connected to any handler. `source_unreachable` stays
+**unemitted**: a participant the subscriber shares no connected handler with is
+named in `StreamAssignments.unreachable_sender_ids` instead (see Scenario 18 and
 `mc_media_unreachable_senders_total`). A non-zero `unspecified` is an **MC
 defect** — that value should never reach the wire — and is visible here
 precisely because the vocabulary was not pruned to the reachable subset.
@@ -2137,8 +2108,8 @@ mc_media_sender_binding_responses_total
 | *(series absent or flat)* | **Version skew** — this MC image predates the `sender_id` field | Redeploy MC. See the rollback **Carve-out #2** in `mc-deployment.md`: do NOT roll MC back on a decline spike. |
 | `participant_unknown` | Transient join race **if a small, decaying fraction**; a **systematic identity mismatch** if sustained near 100% | Check the ratio, not the presence — see below |
 | `meeting_unknown` | Routing/lifecycle fault; MC has no such meeting | Not self-clearing; investigate meeting placement |
-| `registry_full` | Per-meeting connection cap refused the registration, so MC correctly answered `0` rather than handing back an ordinal for a connection it is not tracking | **Capacity.** Never self-clearing — do not triage as a join race |
-| `user_ambiguous` | **One user, two participants** — the user joined from two devices, so one token `sub` maps to two roster entries and MC will not guess which | **No operator remedy.** Never self-clearing; the fix is a contract change (`docs/TODO.md`). Field action: have the user leave on one device. **Not an MC defect** — MC is correctly refusing to guess |
+| `registry_full` | **RETIRED** (story 2 task 20): the per-meeting connection registry and its cap are gone; MC never declines a binding for capacity | **Version skew only** — an MC image predating the retirement during a rolling deploy. Redeploy MC; not a capacity signal, there is no cap to raise |
+| `user_ambiguous` | **One user, two participants** — the user joined from two devices, so one token `sub` maps to two roster entries and MC will not guess which | **No operator remedy.** Never self-clearing; the fix is a contract change (`docs/TODO.md`) — and `connection_id` is NOT it (it tells connections apart, not joins). Field action: have the user leave on one device. **Not an MC defect** — MC is correctly refusing to guess, and records connectivity for neither entry |
 | `resolved` | MC answered an ordinal | Should not co-occur with an MH decline; if it does, suspect skew between the pods you are querying |
 
 > **`participant_unknown` is not automatically a join race.** Sustained at ~100% of
@@ -2147,11 +2118,11 @@ mc_media_sender_binding_responses_total
 > never resolve *any* participant. A race is a small fraction and decays; a mismatch is
 > flat and total. **The ratio is the discriminator, not the label.**
 
-**`declined_no_sender_binding` on MH is the UNION of all four unresolved MC outcomes**, and
+**`declined_no_sender_binding` on MH is the UNION of all three unresolved MC outcomes**, and
 MH structurally cannot split them — it observes only `sender_id == 0`. That is why this
-series is not redundant with MH's: all four have different remedies, from "clears itself"
-(`participant_unknown` race) through "add capacity" (`registry_full`) to "no operator
-remedy exists" (`user_ambiguous`).
+series is not redundant with MH's: all three have different remedies, from "clears itself"
+(`participant_unknown` race) through "fix the MC↔MH registration path" (`meeting_unknown`)
+to "no operator remedy exists" (`user_ambiguous`).
 
 **Do not page MC on every MH decline.** Three of MH's **six** decline outcomes
 (`declined_sender_binding_conflict`, `declined_mc_endpoint_unknown`,
@@ -2585,45 +2556,97 @@ material to a terminal. The one command above reads two kernel/limit values and 
 **Runbook Section**: `#scenario-18-a-participant-hears-only-part-of-the-roster`
 
 **Symptom**: "I can hear some people but not others", or "I can't hear anyone", in a meeting where
-everyone joined successfully, is on the roster, and no alert is firing. Since story 2 there are FOUR
-causes that present this way, three of them healthy by design. **Fork on the cause before acting —
-their remedies are opposite.**
+everyone joined successfully, is on the roster, and no alert is firing. **Fork on the cause before
+acting — their remedies are opposite.**
 
-**Why no alert**: arms (a) and (b) are correct steady states, not faults, and an unfilled slot is
-the steady state of any meeting smaller than N. Paging on them would page on healthy meetings.
+**The model, since story 2 task 20 (ADR-0036 §9).** Every participant is offered EVERY handler of
+its meeting and connects to all it can. A subscriber hears a sender **if and only if the two share
+at least one handler both are connected to**, where "connected" is what the HANDLERS report to MC
+(`NotifyParticipantConnected`), never what a client claims. With everyone connected everywhere,
+everyone hears everyone — so **a split is now a connectivity FAULT, not a design outcome.** (Task 6's
+round-robin placement, where a two-person meeting could hear nothing by design, is gone.)
 
-**Step 0 — where did each participant land?** The placement INFO line names it (participant id and
-handler id; never a rank or a sender id):
+**Why no alert**: arm (b) is a correct steady state, and an unfilled slot is the steady state of any
+meeting smaller than N. The connectivity arms are rare and per-participant; their population signal
+is below, and any alert on it would need a duration shape — an operations decision routed to story 2
+task 16 (alert inventory, `docs/user-stories/2026-09-21-hear-each-other.md`), which receives the
+settle and unapplied signals.
+
+**Unreachability is SERVER-SIDE EVIDENCE today.** A peer the reporter shares no connected handler
+with is named in the reporter's `StreamAssignments.unreachable_sender_ids`. The client SDK records
+that field, but **no UI renders it yet** (story 2 task 15 owns the rendering) — so the reporter sees
+only silence, and **asking "does the peer show as unreachable?" cannot rule an arm in or out.** Use
+the evidence below, not the reporter's screen.
+
+**Step 0 — what is each participant connected to, and which handler carries each edge?** Two INFO
+lines at `mc.actor.meeting`, keyed by participant (never by sender id; no urls). The **latest line
+per participant is its current state**:
 
 ```bash
-kubectl logs deployment/mc-0 -n dark-tower --tail=2000 | grep "Participant placed on media handler"
+# Its observed handlers and phase (not_connected | establishing | settled):
+kubectl logs deployment/mc-0 -n dark-tower --tail=5000 | grep "Participant media connectivity changed"
+# How many of its slots each handler carries, e.g. in_edges="mh-...:2,mh-...:1":
+kubectl logs deployment/mc-0 -n dark-tower --tail=5000 | grep "Participant in-edge handlers changed"
 # Repeat for mc-1. Match participant_id to the reporter and to who they cannot hear.
 ```
 
-Do **not** use `mc_media_unreachable_senders_total` to count who is split: it is emission-weighted
-(it rises with churn), not a population.
+**Population signal** — how many participants did NOT reach every handler (per connectivity episode,
+so it IS a count; use it instead of `mc_media_unreachable_senders_total`, which is emission-weighted
+and rises with churn):
 
-**(a) Cross-handler visibility — EXPECTED (ADR-0036 §9, R-33).** The reporter and the silent peer
-are on DIFFERENT handlers. Media routes only within a handler (no cascade until story 6), MC places
-participants round-robin by join order over the meeting's handler set, and the client is told: the
-silent peer is in the reporter's `unreachable_sender_ids`, rendered distinctly (never a spinner). In
-a two-handler meeting ranks 0 and 1 land on different handlers, so a TWO-person meeting hears
-nothing. **Remedy: none at the MC layer — this is placement working as designed.** Co-location-
-preferred placement is deferred (`docs/TODO.md` §Media Path Obligations).
+```promql
+sum(increase(mc_media_connect_settles_total{outcome="window_elapsed"}[1h]))
+/ sum(increase(mc_media_connect_settles_total[1h]))
+```
 
-**(b) Over-subscription — EXPECTED.** Reporter and silent peer are on the SAME handler, but the
+**Known-good, not a fault: the connect settle window.** MC withholds routing for a participant until
+it has connected to every handler or `MC_MEDIA_CONNECT_SETTLE_MS` has passed since its first
+connection (`mc_media_connect_settle_window_seconds`). A participant that reaches every handler pays
+nothing; one that reaches only some **starts hearing and being heard up to one window later**. This
+delays time-to-first-audio only — it never appears in `mc_session_join_duration_seconds` or
+`MCHighJoinLatency`, which stop at the JoinResponse.
+
+**(a) A participant is not connected to a handler it should be — a REAL connectivity fault.** Step 0
+shows the reporter and the silent peer with **disjoint** connected sets, or one of them in
+`not_connected`. Fork on what MH reported:
+
+- **The client never reached the handler** (the handler is missing from its Step-0 set and MH shows
+  no session for it): a client-to-MH path problem — the per-pod UDP NodePorts (4434/4436 in Kind),
+  `infra/services/mh-service/network-policy.yaml`, the handler's certificate, or an unhealthy MH.
+  Go to MH Scenario 1 and the network-policy/NodePort checks. `window_elapsed` rising is this arm.
+- **MH reported a handler MC ignored**: `mc_mh_notifications_unapplied_total{reason="handler_not_in_set"}`
+  is non-zero. **Sustained, it means an MH process restarted under a new id** (the id is
+  per-incarnation) **and story-4 re-registration has not happened; the meeting's connectivity to
+  the dead id is stale and will NOT clear on its own** — MC keeps routing edges to a handler that
+  no longer holds them, so the slots still read `ACTIVE`. Remedy today: the affected participants
+  rejoin (a fresh join re-dials every handler of the meeting's set); the durable fix is story 4.
+- **A client's single MH transport dropped mid-session** (Step 0 shows a handler leaving the set
+  while MC signalling stayed up): MC moved the edges correctly, but the SDK **does not re-dial a
+  single dropped handler** — the participant stays narrowed to its surviving handlers until it
+  rejoins. Pre-existing client limitation; remedy: reload.
+- **Nothing reached MC at all** (every participant `not_connected`, `mc_mh_notifications_received_total`
+  flat while joins continue): the MH→MC notification path is broken — MH Scenario 10.
+
+**(b) Over-subscription — EXPECTED.** Reporter and silent peer share a connected handler, but the
 reporter's slots are all full with earlier joiners: the N+2th sender gets no slot, is NOT in the
 unreachable set ("no slot" is not "unreachable"), and the reporter's slots show `ACTIVE` for the
 earliest joiners. **Remedy: raise the client's N** (`VITE_DT_RECEIVE_SLOTS`), within
 `MC_MAX_RECEIVE_SLOTS` (published as `mc_media_receive_slot_cap`). A declaration above the cap is
 rejected whole and counted as `slot_count_over_cap` — see the client media signalling section.
 
-**(c) MH refused the WHOLE snapshot on a policy bound — a REAL fault.** Round-robin placement does
-not know a handler's egress ceiling, so a large meeting can exceed a per-meeting or aggregate MH
-bound. MH then rejects the **entire** registration and keeps the previous policy — this surfaces to
-MC as a **gRPC error** on the retry/terminal split ("RegisterMeeting retries exhausted" /
-"failed terminally" at `mc.register_meeting.trigger`), **not** as a generation mismatch. Evidence
-on MH:
+**(c) MH refused the WHOLE snapshot on a policy bound — a REAL fault.** MC co-locates edges: in an
+all-connected meeting **every** edge lands on ONE handler while the other carries none, and MC does
+not yet know a handler's egress ceiling (capacity-aware spreading is deferred, `docs/TODO.md`
+§Media Path Obligations). So a large meeting concentrates its whole egress on one handler and can
+exceed a per-meeting or aggregate MH bound there. **WHICH handler is now spread per meeting** (the
+tiebreak is rotated by a hash of the meeting id), so across many meetings the pods should be
+roughly balanced — read each against its OWN ceiling, and treat sustained severe skew as worth
+investigating rather than expected. What is NOT spread is one meeting's own egress: it is all on one
+handler, and the idle sibling is **not** spare capacity for a meeting refused here — MC will not
+move a placed edge there. MH then rejects the **entire** registration and
+keeps the previous policy — this surfaces to MC as a **gRPC error** on the retry/terminal split
+("RegisterMeeting retries exhausted" / "failed terminally" at `mc.register_meeting.trigger`),
+**not** as a generation mismatch. Evidence on MH:
 
 ```promql
 sum by (outcome) (increase(mh_media_policy_applies_total{outcome="rejected_invalid"}[15m]))
@@ -2632,6 +2655,19 @@ sum by (outcome) (increase(mh_media_policy_applies_total{outcome="rejected_inval
 MH's WARN names which bound tripped in its `reason` field. **Remedy: topology/limits, not a
 restart** — `mh-incident-response.md` (egress budget / policy bounds). Nothing re-pushes until the
 next structural change.
+
+**(c2) "Some peers hear ME, some don't" — the sender side.** A sender is directed at every handler
+owning one of its edges, so this is now a first-class symptom. The client counts a frame it was
+directed to send to a handler it holds **no** transport for as
+`dt_client_media_send_dropped_total{reason="not_connected"}`. Split on the client's transports:
+
+- **The client holds NO transport at all** → a client lifecycle bug (sending before any transport
+  is up). Client team.
+- **The client holds some transports, but not the one MC directed it at** → **MC's connectivity
+  view is stale** — a server-side defect by construction, because MC only targets handlers owning
+  the sender's edges and an edge exists only where MH reported both parties connected. This is the
+  only signal today for a lost `NotifyParticipantDisconnected` (the server-side detector is deferred
+  with story 4). Capture Step 0 for the sender and escalate to `meeting-controller`.
 
 **(d) Applied-generation divergence** — the snapshot was accepted but not applied. Go to
 [Scenario 15](#scenario-15-media-generation-divergence).
@@ -2672,10 +2708,12 @@ crossing.
 
 **(f) `mc_media_handler_set_divergence_total` is non-zero.** A join carried a handler set that
 differs from the meeting's frozen set (Redis and the actor disagree). MC kept the frozen set, so no
-participant was moved. This is an MC-internal invariant violation: **capture and escalate** to
+edge moved. This is an MC-internal invariant violation: **capture and escalate** to
 `meeting-controller`; restarting nothing fixes it.
 
-**Escalation**: none for (a)/(b); `media-handler` + operations for (c); per Scenario 15 for (d);
+**Escalation**: none for (b); for (a) per its fork (MH/network for an unreached handler; rejoin for
+`handler_not_in_set`; MH Scenario 10 for a broken notification path); `media-handler` + operations
+for (c); client team or `meeting-controller` for (c2) per its fork; per Scenario 15 for (d);
 `meeting-controller` for (e) if it does not self-clear, and for (f).
 
 ## Diagnostic Commands

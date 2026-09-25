@@ -15,9 +15,10 @@
 - Client config SSoT (Opus, rotation T, queue bounds, metric cadence) → `config/clientConfig.ts`
 - Frame codec + SFrame crypto → `media/frame/`; audio pipeline → `media/{pipeline,lifecycle,setup,teardown}/`
 - Media layout rule (hot path vs siblings, ADR-0036 §11) → `media/__tests__/hotPathLayout.test.ts`
+- Multi-handler (ADR-0036 §9): send seals ONCE then fans out to per-target lanes (own queue/`hop_sequence`/buffer; `TransmitKeyManager` identity is the nonce boundary); `framesSent` counts DATAGRAMS; `not_connected` = directed target with no transport; receive = one read loop + hop monitor PER TRANSPORT → `media/pipeline/{egress,ingress}.ts`, `media/lifecycle/{AudioPipeline,transmitKeys}.ts`, `media/pipeline/__tests__/egress.multiTarget.test.ts`
 - Media metric handles + allow-list labels (only `dt_client_` names under `media/**`) → `media/setup/mediaMetrics.ts`
 - Sampled frame counters (one increment beside each metric call) + live mic swap (`setCaptureDevice`) → `media/pipeline/{egress,ingress}.ts`, `media/lifecycle/AudioPipeline.ts`
-- The four media absence-signals on the session facade (mute / first-media / slot state / fault) → `session/events.ts:MeetingSessionEventMap`
+- The four media absence-signals on the session facade (mute / first-media / slot state / fault) → `session/events.ts:MeetingSessionEventMap`; `unreachable_sender_ids` (§9) carried to `MediaStore`, replace-never-merge, rendering owed by story-2 task 15 → `signaling/events.ts:StreamAssignmentsEvent`
 - Key material seams (KEK, roster keys, identity, transmit keys); **own key self-seeded at join — MC's roster excludes self, so loopback drops every frame without it** → `media/setup/{kekSource,rosterKeys,identity}.ts`, `session/MeetingSession.ts`
 - TS-side KEK sink control → `signaling/kekIntake.ts`, `__tests__/serverMessageSinkScan.test.ts`
 - WebTransport connection mgmt + datagram I/O → `transport/`, `media/MediaTransport.ts`
@@ -28,7 +29,7 @@
 - Roster/participant store (seeded from `existingParticipants`, excludes self) → `stores/MeetingStore.svelte.ts`
 - Media/mute/slot/fault store (one `$state` cell per field; hung off `MeetingStore.media` as a NON-reactive field so mute does not invalidate the roster) → `stores/MediaStore.svelte.ts`
 - Session-to-store binding (one subscription, one aggregate unsubscribe, roster + media alike) → `stores/bindMeetingSession.ts`
-- Re-render granularity proof (counts `$derived` recomputations, with positive control) → `__tests__/MediaStore.test.ts`
+- Re-render granularity proof (counts `$derived` recomputations, with positive control); unreachable-set replace-not-merge (no-latch) → `__tests__/MediaStore.test.ts`
 
 ## Web Application (`packages/web-app/src/`)
 - Roster DOM (`participant-list` / `participant-${id}` testids) → `views/JoinMeeting.svelte`

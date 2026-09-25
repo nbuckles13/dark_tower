@@ -32,6 +32,7 @@ const ACCEPTED = 'dt_client_media_frames_accepted_total';
 interface Harness {
   readonly roster: RosterIdentityKeys;
   readonly ingress: IngressPipeline;
+  readonly hopMonitor: HopSequenceMonitor;
   count(name: string): number;
   dropReasons(): string[];
 }
@@ -42,18 +43,22 @@ function makeHarness(): Harness {
   const roster = new RosterIdentityKeys(8);
   const kekSource = new JoinResponseKekSource();
   kekSource.set(KEK, 0);
+  // ONE MONITOR PER TRANSPORT. These harnesses model a single transport, so one
+  // monitor per harness — created here rather than shared at module scope,
+  // which would carry hop high-water marks between tests.
+  const hopMonitor = new HopSequenceMonitor([SLOT_ID]);
   const ingress = new IngressPipeline({
     metrics,
     roster,
     keys: kekSource,
     cache: new TransmitKeyCache(8),
     replay: new ReplayWindow(8, 64),
-    hopMonitor: new HopSequenceMonitor([SLOT_ID]),
     firstMedia: new FirstMediaObserver(metrics, () => 0),
   });
   return {
     roster,
     ingress,
+    hopMonitor,
     count: (name) =>
       sink
         .getRecordedMetrics()
@@ -117,11 +122,11 @@ describe('ingress passes the key-id sender to the hop monitor', () => {
     // jump to 0 alone reads as a REORDER, so only the key-id sender reaching the
     // monitor can explain zero reorders. From a mark of ~5000 the restart rule
     // would hide an ingress that passed no sender at all.
-    await h.ingress.accept(await frameFrom(SENDER_A, alice, 20, 0));
-    await h.ingress.accept(await frameFrom(SENDER_A, alice, 21, 1));
+    await h.ingress.accept(await frameFrom(SENDER_A, alice, 20, 0), h.hopMonitor);
+    await h.ingress.accept(await frameFrom(SENDER_A, alice, 21, 1), h.hopMonitor);
     // MC refilled the slot with B: same slot id, B's forwarder counts from 0.
     for (let hop = 0; hop < 3; hop += 1) {
-      await h.ingress.accept(await frameFrom(SENDER_B, bob, hop, hop));
+      await h.ingress.accept(await frameFrom(SENDER_B, bob, hop, hop), h.hopMonitor);
     }
 
     // All five frames are genuine and accepted; the refill is not a loss event.
@@ -139,9 +144,9 @@ describe('ingress passes the key-id sender to the hop monitor', () => {
     await h.roster.upsert({ senderId: SENDER_A, identityPublicKey: alice.publicKey });
     await h.roster.upsert({ senderId: SENDER_B, identityPublicKey: bob.publicKey });
 
-    await h.ingress.accept(await frameFrom(SENDER_A, alice, 100, 0));
-    await h.ingress.accept(await frameFrom(SENDER_B, bob, 8000, 0));
-    await h.ingress.accept(await frameFrom(SENDER_B, bob, 8001, 1));
+    await h.ingress.accept(await frameFrom(SENDER_A, alice, 100, 0), h.hopMonitor);
+    await h.ingress.accept(await frameFrom(SENDER_B, bob, 8000, 0), h.hopMonitor);
+    await h.ingress.accept(await frameFrom(SENDER_B, bob, 8001, 1), h.hopMonitor);
 
     expect(h.count(ACCEPTED)).toBe(3);
     expect(h.count(GAP)).toBe(0);
@@ -152,9 +157,9 @@ describe('ingress passes the key-id sender to the hop monitor', () => {
     const h = makeHarness();
     await h.roster.upsert({ senderId: SENDER_A, identityPublicKey: alice.publicKey });
 
-    await h.ingress.accept(await frameFrom(SENDER_A, alice, 1, 0));
-    await h.ingress.accept(frameWithUnreadableKeyId(2));
-    await h.ingress.accept(await frameFrom(SENDER_A, alice, 3, 1));
+    await h.ingress.accept(await frameFrom(SENDER_A, alice, 1, 0), h.hopMonitor);
+    await h.ingress.accept(frameWithUnreadableKeyId(2), h.hopMonitor);
+    await h.ingress.accept(await frameFrom(SENDER_A, alice, 3, 1), h.hopMonitor);
 
     // Rejected with its own token, verbatim. This also proves the frame got
     // past `decodeFrame` to the key-id read, so the hop step was reachable.
@@ -171,8 +176,8 @@ describe('ingress passes the key-id sender to the hop monitor', () => {
     const h = makeHarness();
     await h.roster.upsert({ senderId: SENDER_A, identityPublicKey: alice.publicKey });
 
-    await h.ingress.accept(await frameFrom(SENDER_A, alice, 1, 0));
-    await h.ingress.accept(await frameFrom(SENDER_A, alice, 3, 1));
+    await h.ingress.accept(await frameFrom(SENDER_A, alice, 1, 0), h.hopMonitor);
+    await h.ingress.accept(await frameFrom(SENDER_A, alice, 3, 1), h.hopMonitor);
 
     expect(h.count(ACCEPTED)).toBe(2);
     expect(h.count(GAP)).toBe(1);

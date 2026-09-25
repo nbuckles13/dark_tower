@@ -41,6 +41,16 @@ async function settle(): Promise<void> {
 interface Options {
   sender?: DatagramSender | undefined;
   readable?: ReadableStream<Uint8Array> | undefined;
+  /**
+   * Per-URL readables, for the multi-handler cases (ADR-0036 §9).
+   *
+   * Production resolves a DIFFERENT datagram stream per handler, so a rig that
+   * hands one stream to two urls does not model it — and a `ReadableStream`
+   * takes one reader, so it would model a fault instead.
+   */
+  readables?: Record<string, ReadableStream<Uint8Array>>;
+  /** Per-URL senders, for multi-target send. */
+  senders?: Record<string, DatagramSender>;
   targets?: string[];
   /** Handler URLs from `StreamAssignments`; `null` means none were delivered. */
   receiveUrls?: string[] | null;
@@ -77,8 +87,8 @@ async function makePipeline(opts: Options = {}): Promise<{
     kekGeneration: 0,
     identity,
     declaredSlotIds: [0],
-    senderFor: () => opts.sender,
-    readableFor: () => opts.readable,
+    senderFor: (url) => (opts.senders ? opts.senders[url] : opts.sender),
+    readableFor: (url) => (opts.readables ? opts.readables[url] : opts.readable),
     reportMute: () => {},
     captureFactory: async () => capture as never,
     encoderFactory: codecs.encoderFactory as never,
@@ -159,15 +169,40 @@ describe('send-side degradation', () => {
     expect(reasons).toEqual(['transport_send_refused']);
   });
 
-  it('holds frames rather than counting a drop when no transport is attached', async () => {
-    // A send was never ATTEMPTED, so nothing was refused. Frames age out through
-    // the drop-oldest policy instead, which is a different condition with a
-    // different remedy.
+  it('counts not_connected, and faults ONCE, for a directed target it holds no transport to', async () => {
+    // ---------------------------------------------------------------------
+    // THIS ASSERTS THE COUNTER FIRES, WHICH NO TEST DID BEFORE
+    // ---------------------------------------------------------------------
+    //
+    // `not_connected` was declared in the vocabulary, pinned by a roster test,
+    // given a catalog row and a dashboard note, and taught in a runbook as a
+    // fleet contract that "reads zero forever" — with NO production emitter.
+    // Five sites agreed about a token nothing could increment, which is a
+    // detector over an input that can never arrive: green forever and
+    // indistinguishable from the healthy state it claimed to certify. A roster
+    // test pins SPELLING and structurally cannot pin reachability, so this test
+    // exists to pin reachability.
+    //
+    // The condition is SERVER-side under ADR-0036 §9: MC derives a sender's
+    // targets from the handlers owning that sender's edges, and an edge requires
+    // both parties connected to that handler — so a directed target we hold no
+    // transport to means MC's connectivity view named one we never opened.
+    // Deliberately NOT queued-and-aged: that counted as `egress_queue_overflow`,
+    // which names the mechanism and misdescribes the cause.
     const rig = await makePipeline({ sender: undefined });
     rig.emit();
+    rig.emit();
     await settle();
-    expect(rig.count('dt_client_media_send_dropped_total')).toBe(0);
+
+    const reasons = rig.sink
+      .getRecordedMetrics()
+      .filter((m) => m.name === 'dt_client_media_send_dropped_total')
+      .map((m) => String(m.labels.reason));
+    expect(reasons).toEqual(['not_connected', 'not_connected']);
     expect(rig.count('dt_client_media_frames_sent_total')).toBe(0);
+    // Bounded: the metric counts per frame, the fault is event-once, so a
+    // persistent condition cannot become per-frame telemetry.
+    expect(rig.faults).toEqual(['transport']);
   });
 
   it('sends nothing while the target set is EMPTY, and rotates on resume', async () => {
@@ -331,19 +366,111 @@ describe('receive-side degradation', () => {
     expect(rig.faults).toEqual([]);
   });
 
-  it('faults, and opens nothing, when assignments name more than one handler', async () => {
-    // MC places each participant on ONE handler this story. Two urls mean MC
-    // broke its own scoping; the client says so rather than absorbing it.
-    const transport = new MockWebTransport();
-    transport.simulateReady();
+  it('reads EVERY handler the assignments name, on its own transport', async () => {
+    // THE CANONICAL CASE, receive side (ADR-0036 §9). A is connected to both
+    // handlers and holds B on one, C on the other, so both transports must be
+    // read. This replaces a task-6 test that FAULTED on two urls, back when each
+    // participant had exactly one handler — that check fired on correct server
+    // behaviour under the edge model and left the subscriber deaf on the slot
+    // whose edge sat on the other handler.
+    const first = new MockWebTransport();
+    const second = new MockWebTransport();
+    first.simulateReady();
+    second.simulateReady();
+    const OTHER = 'https://mh-other.example:4433';
     const rig = await makePipeline({
-      readable: transport.datagrams.readable,
-      receiveUrls: [MH_URL, 'https://mh-other.example:4433'],
+      readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
+      receiveUrls: [MH_URL, OTHER],
     });
-    transport.simulateIncomingDatagram(PROBE);
+
+    // A frame on EACH transport is received. Order is deliberately not asserted:
+    // nothing may depend on which handler MC chose, so neither may this test.
+    first.simulateIncomingDatagram(PROBE);
+    second.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(2);
+    expect(rig.faults).toEqual([]);
+    expect(first.datagrams.readable.locked).toBe(true);
+    expect(second.datagrams.readable.locked).toBe(true);
+  });
+
+  it('follows an edge onto a new handler WITHOUT tearing down the running loop', async () => {
+    // A connectivity change moves one sender's edge; the other senders' edges are
+    // untouched and their transport must keep delivering. The task-6 code faulted
+    // with "moved to a different media handler mid-session" and refused to open
+    // the new loop, which is deafness on the moved sender.
+    const first = new MockWebTransport();
+    const second = new MockWebTransport();
+    first.simulateReady();
+    second.simulateReady();
+    const OTHER = 'https://mh-other.example:4433';
+    const rig = await makePipeline({
+      readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
+      receiveUrls: [MH_URL],
+    });
+
+    rig.pipeline.setReceiveHandlers([OTHER]);
+    await settle();
+    expect(rig.faults).toEqual([]);
+
+    // BOTH transports deliver: the new one because the edge moved onto it, the
+    // old one because it was never torn down.
+    second.simulateIncomingDatagram(PROBE);
+    first.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(2);
+  });
+
+  it('opens no second reader when a re-push names handlers already looping', async () => {
+    // MC re-emits StreamAssignments on every structural change. A second
+    // `getReader()` on a locked stream THROWS, and it would throw from inside an
+    // assignment handler — presenting as "media stopped when someone joined".
+    const first = new MockWebTransport();
+    const second = new MockWebTransport();
+    first.simulateReady();
+    second.simulateReady();
+    const OTHER = 'https://mh-other.example:4433';
+    const rig = await makePipeline({
+      readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
+      receiveUrls: [MH_URL, OTHER],
+    });
+
+    rig.pipeline.setReceiveHandlers([MH_URL, OTHER]);
+    rig.pipeline.setReceiveHandlers([OTHER, MH_URL]);
+    await settle();
+    expect(rig.faults).toEqual([]);
+
+    // Still exactly one reader per transport: one datagram in, one counted.
+    first.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(1);
+  });
+
+  it('faults, and still opens the others, when two handlers share one transport', async () => {
+    // A defect elsewhere resolving two urls to one stream must not throw out of
+    // an assignment handler. Named, and the OTHER handler in the same snapshot
+    // still gets its loop.
+    const shared = new MockWebTransport();
+    const third = new MockWebTransport();
+    shared.simulateReady();
+    third.simulateReady();
+    const OTHER = 'https://mh-other.example:4433';
+    const THIRD = 'https://mh-third.example:4433';
+    const rig = await makePipeline({
+      readables: {
+        [MH_URL]: shared.datagrams.readable,
+        [OTHER]: shared.datagrams.readable,
+        [THIRD]: third.datagrams.readable,
+      },
+      receiveUrls: [MH_URL, OTHER, THIRD],
+    });
     await settle();
     expect(rig.faults).toEqual(['transport']);
-    expect(rig.count(RECEIVED)).toBe(0);
+
+    third.simulateIncomingDatagram(PROBE);
+    shared.simulateIncomingDatagram(PROBE);
+    await settle();
+    expect(rig.count(RECEIVED)).toBe(2);
   });
 
   it('faults when assignments name a handler this client is not connected to', async () => {
@@ -352,19 +479,6 @@ describe('receive-side degradation', () => {
     const rig = await makePipeline({ readable: undefined, receiveUrls: [MH_URL] });
     await settle();
     expect(rig.faults).toEqual(['transport']);
-  });
-
-  it('faults, and keeps the running loop, when assignments move to a different handler', async () => {
-    const transport = new MockWebTransport();
-    transport.simulateReady();
-    const rig = await makePipeline({ readable: transport.datagrams.readable });
-    rig.pipeline.setReceiveHandlers(['https://mh-other.example:4433']);
-    await settle();
-    expect(rig.faults).toEqual(['transport']);
-    // The original loop was not torn down to follow it.
-    transport.simulateIncomingDatagram(PROBE);
-    await settle();
-    expect(rig.count(RECEIVED)).toBe(1);
   });
 
   it('a second, DIFFERENT transport fault is not silenced by the first; a repeat is', async () => {
@@ -377,11 +491,19 @@ describe('receive-side degradation', () => {
     const rig = await makePipeline({ readable: transport.datagrams.readable });
     rig.pipeline.on('fault', (f) => messages.push(f.message));
 
-    // Two different handlers named at once, then the loop moved mid-session.
-    rig.pipeline.setReceiveHandlers([MH_URL, 'https://mh-other.example:4433']);
-    rig.pipeline.setReceiveHandlers(['https://mh-other.example:4433']);
-    // The same condition again: bounded, so NOT reported twice.
-    rig.pipeline.setReceiveHandlers(['https://mh-other.example:4433']);
+    // A receive url with no transport, then a SEND target with no transport —
+    // two live transport conditions with different remedies. (The pair used to be
+    // the two task-6 placement faults, which no longer exist.)
+    rig.pipeline.setReceiveHandlers(['https://mh-unconnected.example:4433']);
+    rig.pipeline.setSendDirective({
+      streamNumber: 1,
+      bitrateBps: 32_000,
+      targets: ['https://mh-unconnected.example:4433'],
+    });
+    rig.emit();
+    // The same conditions again: bounded, so NOT reported twice.
+    rig.pipeline.setReceiveHandlers(['https://mh-unconnected.example:4433']);
+    rig.emit();
     await settle();
 
     expect(rig.faults).toEqual(['transport', 'transport']);

@@ -85,7 +85,6 @@ export interface IngressPipelineOptions {
   readonly keys: ReceiverKeys;
   readonly cache: TransmitKeyCache;
   readonly replay: ReplayWindow;
-  readonly hopMonitor: HopSequenceMonitor;
   readonly firstMedia: FirstMediaObserver;
   /** Called for every accepted frame, before the decoder is fed. */
   readonly onAccepted?: (frame: AcceptedFrame) => void;
@@ -105,7 +104,6 @@ export class IngressPipeline {
   readonly #keys: ReceiverKeys;
   readonly #cache: TransmitKeyCache;
   readonly #replay: ReplayWindow;
-  readonly #hopMonitor: HopSequenceMonitor;
   readonly #firstMedia: FirstMediaObserver;
   readonly #onAccepted: ((frame: AcceptedFrame) => void) | undefined;
 
@@ -153,7 +151,6 @@ export class IngressPipeline {
     this.#keys = options.keys;
     this.#cache = options.cache;
     this.#replay = options.replay;
-    this.#hopMonitor = options.hopMonitor;
     this.#firstMedia = options.firstMedia;
     this.#onAccepted = options.onAccepted;
   }
@@ -192,7 +189,26 @@ export class IngressPipeline {
   }
 
   /**
-   * Process one datagram.
+   * Process one datagram that arrived on the transport `hopMonitor` tracks.
+   *
+   * ---------------------------------------------------------------------------
+   * THE HOP MONITOR IS A PARAMETER, NOT PIPELINE STATE
+   * ---------------------------------------------------------------------------
+   *
+   * A subscriber can hold slots on SEVERAL media handlers at once (ADR-0036 §9:
+   * an edge sits on a handler both parties are connected to, and different
+   * senders' edges may sit on different handlers). Every one of those transports
+   * feeds THIS pipeline, because attribution, the replay window and the
+   * transmit-key cache are all per SENDER and must be shared — a per-transport
+   * receiver would reopen the replay surface once per handler.
+   *
+   * `hop_sequence` is the one piece of receive state that is NOT per sender: the
+   * frame format defines it per (connection, media stream), and each media
+   * handler writes its own downlink numbering. So it arrives with the datagram
+   * rather than living here. Sharing one monitor across transports would read
+   * two independent numberings as one, and every edge that moved between
+   * handlers would post a false gap or reorder — inflating a loss signal
+   * precisely during the connectivity change that caused it.
    *
    * NEVER THROWS ON A WIRE CONDITION: every malformed, unverifiable,
    * undecryptable or replayed frame is a bounded, counted drop and a normal
@@ -204,7 +220,7 @@ export class IngressPipeline {
    * a bug cannot hide as a silent frame loss. The read loop catches it, surfaces
    * it once as a typed media error, and continues; see the caller.
    */
-  async accept(datagram: Uint8Array): Promise<void> {
+  async accept(datagram: Uint8Array, hopMonitor: HopSequenceMonitor): Promise<void> {
     // AT THE WIRE. First statement, before any parse.
     // ONE INCREMENT, TWO READERS — same rule as the accepted and dropped pairs
     // below. Kept adjacent so the getter and
@@ -242,7 +258,7 @@ export class IngressPipeline {
       // bookkeeping, and never allowed to influence what follows. The key-id
       // sender passed in is unverified here; it only selects whether the slot's
       // hop baseline resets, and creates no state (see `hopSequenceMonitor.ts`).
-      const hop = this.#hopMonitor.observe(
+      const hop = hopMonitor.observe(
         decoded.streamId,
         decoded.hopSequence,
         'error' in keyed ? undefined : keyed.senderId,

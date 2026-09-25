@@ -508,10 +508,17 @@ mod tests {
     /// policy shape. A note, deliberately not an `ANCHOR (DRY):` and not a guard.
     fn two_party_assignment() -> HandlerAssignment {
         let handler = HandlerId::new("mh-0");
+        let set =
+            crate::media_routing::MeetingHandlers::new([crate::media_routing::HandlerEndpoint {
+                id: handler.clone(),
+                webtransport_url: "https://mh-0.example:4434".to_string(),
+                grpc_endpoint: "http://mh-0.example:50053".to_string(),
+            }])
+            .unwrap();
         let mut table = SlotTable::new();
         for n in [7, 8] {
             let sender = SenderId::from_nonzero(NonZeroU16::new(n).unwrap());
-            table.admit(sender, |_| Some(handler.clone())).unwrap();
+            table.admit_on(sender, &set, &["mh-0"]);
             table.set_demand(sender, vec![0]);
         }
         table

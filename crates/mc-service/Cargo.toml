@@ -83,6 +83,8 @@ media-protocol = { path = "../media-protocol" }
 mc-service = { path = ".", features = ["test-seams"] }
 
 criterion = { workspace = true }
+# Fixed-seed generator for the slot table's property test (workspace dep).
+rand = { workspace = true }
 mc-test-utils = { path = "../mc-test-utils" }
 # Metrics testing
 metrics-util = "0.18"

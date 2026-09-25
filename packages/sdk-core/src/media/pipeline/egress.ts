@@ -79,6 +79,55 @@ interface PendingFrame {
   readonly relayRegionOffset: number;
 }
 
+/**
+ * One media-handler target: its own queue, its own hop sequence, its own buffers.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY PER-TARGET STATE IS EXACTLY THE QUEUE AND THE HOP SEQUENCE
+ * ---------------------------------------------------------------------------
+ *
+ * The frame format draws this line for us, and it draws it between the two
+ * REGIONS rather than between destinations:
+ *
+ *   * PUBLISHER region — `stream_sequence` is per (sender, stream), never reset,
+ *     and it is the AEAD NONCE INPUT. There is exactly ONE of it per frame, and
+ *     it is allocated upstream of the fan-out in `submit()`.
+ *   * RELAY region — `hop_sequence` is "per (connection, media stream) count of
+ *     what the transmitter actually sent" and is explicitly unauthenticated and
+ *     harmless to reset (`crates/media-protocol/src/frame.rs`, the doc comments
+ *     on `stream_sequence` and `hop_sequence`, which close with "do not build a
+ *     symmetric counter type for the two").
+ *
+ * So one counter per lane here is not a convenience: a single hop counter shared
+ * across two lanes would make each media handler see every other number missing
+ * and read ~50% uplink loss. Three independent encodings of this scope agree —
+ * the format doc above, the receive-side `hopSequenceMonitor.ts` (per connection,
+ * per stream), and MH's own per-egress-stream state in
+ * `crates/mh-service/src/media/forwarder.rs`.
+ *
+ * ---------------------------------------------------------------------------
+ * EACH LANE OWNS ITS BUFFERS EXCLUSIVELY
+ * ---------------------------------------------------------------------------
+ *
+ * `writeHopSequence` stamps IN PLACE at `relayRegionOffset`, and lanes drain
+ * concurrently. So the copy is taken at ENQUEUE and each lane holds its own
+ * buffer for that buffer's whole life: the race cannot FORM, rather than being
+ * avoided by careful sequencing. The single-flight `#drain` guarantee is
+ * per-lane and would NOT have covered cross-lane interleaving. The first active
+ * lane takes the original, so N-1 copies are made and the N=1 case — every
+ * participant in an all-connected meeting — allocates nothing extra.
+ */
+interface Lane {
+  /** Whether the latest send directive still names this target. */
+  active: boolean;
+  /** This lane's bounded queue. The `maxQueueFrames` bound is PER LANE. */
+  readonly queue: BoundedDropOldestQueue<PendingFrame>;
+  /** What this transport actually carried. Never reset while the lane lives. */
+  hopSequence: number;
+  /** Single-flight drain flag, per lane. */
+  draining: boolean;
+}
+
 /** Where a built frame is sent. One per media-handler target. */
 export interface DatagramSender {
   /**
@@ -116,12 +165,31 @@ export interface EgressPipelineOptions {
    * through two layers.
    */
   readonly identity: MeetingIdentity;
-  /** Bound on the application egress queue, in frames. */
+  /** Bound on the application egress queue, in frames. PER TARGET. */
   readonly maxQueueFrames: number;
   /** The publisher's stream index from the send directive (8-bit semantics). */
   readonly streamNumber: number;
   /** The relay-region `stream_id` to stamp. Subscriber-scoped; rewritten by MH. */
   readonly streamId: number;
+  /**
+   * Resolves the datagram channel for a media-handler URL, or `undefined`.
+   *
+   * A SELECTOR, NEVER A DIALER: it resolves through
+   * `MediaTransport.getDatagramChannel`, which only looks up transports
+   * `connectAll` already opened. A directed target can pick among those
+   * transports; it can never create one.
+   */
+  readonly senderFor: (mediaHandlerUrl: string) => DatagramSender | undefined;
+  /**
+   * Called when MC directs this client at a target it has no transport for.
+   *
+   * Bounded and event-once at the CALLER (the lifecycle layer dedupes by
+   * (stage, message)), so a persistent condition cannot become per-frame
+   * telemetry. Under the ADR-0036 §9 edge model this is a SERVER-side defect:
+   * MC derives a sender's targets from the handlers owning that sender's edges,
+   * and an edge exists only where both parties are connected to that handler.
+   */
+  readonly onTargetNotConnected: () => void;
 }
 
 /**
@@ -136,18 +204,53 @@ export class EgressPipeline {
   readonly #transmitKeys: TransmitKeyManager;
   readonly #kek: KekForWrapping;
   readonly #identity: MeetingIdentity;
-  readonly #queue: BoundedDropOldestQueue<PendingFrame>;
+  readonly #maxQueueFrames: number;
   readonly #streamNumber: number;
   readonly #streamId: number;
+  readonly #senderFor: (mediaHandlerUrl: string) => DatagramSender | undefined;
+  readonly #onTargetNotConnected: () => void;
 
-  #sender: DatagramSender | undefined;
   /**
-   * Counts only frames ACTUALLY SENT (ADR-0036 §2 / R-8), which is why it
-   * advances at dequeue and never at enqueue. See `writeHopSequence`'s header
-   * for the two-service consequence of getting this backwards.
+   * One lane per media-handler URL this pipeline has ever been directed at.
+   *
+   * Entries are RETAINED when a target leaves the directive rather than deleted,
+   * because `hop_sequence` is per CONNECTION: a target dropped and later
+   * re-directed onto the same transport must not restart its count, which any
+   * receiver tracking that hop would read as a publisher restart. Bounded by the
+   * meeting's registered handler set, which MC froze at the first join.
    */
-  #hopSequence = 0;
-  #draining = false;
+  readonly #lanes = new Map<string, Lane>();
+  /**
+   * Datagrams actually put on a transport, summed over lanes (monotone).
+   *
+   * ---------------------------------------------------------------------------
+   * ONE INCREMENT PER LANE, ONE FIELD, FOUR READERS
+   * ---------------------------------------------------------------------------
+   *
+   * This used to BE `#hopSequence` — one value serving as both the wire hop
+   * counter and the telemetry count. That collapse was correct only while the
+   * two scopes coincided, which they did while there was exactly one target. Now
+   * hop is per (connection, stream) and this is per SENDER, so a getter over one
+   * lane's hop counter would report a two-handler sender's sends at HALF their
+   * true number — and the egress-advances proofs would then watch one lane while
+   * the other went unobserved.
+   *
+   * The discipline the old collapse existed for is unchanged and is why this
+   * increment sits on the line ADJACENT to `this.#metrics.frameSent()`: two
+   * encodings of "how many datagrams went out" that agree today will drift the
+   * first time a drop path lands between the two sites, with the bus field and
+   * `dt_client_media_frames_sent_total` disagreeing and nothing failing.
+   *
+   * UNIT: DATAGRAMS, NOT CAPTURED FRAMES. A sender whose edges span two handlers
+   * advances this twice per captured frame. That is deliberate and it is what
+   * keeps it usable as the denominator of the send-drop ratio, whose numerator
+   * (`dt_client_media_send_dropped_total`) is per send ATTEMPT and therefore
+   * per-lane: counting frames here would report 50% loss for a frame that one
+   * lane delivered and the other refused. `docs/observability/metrics/client.md`
+   * carries the same statement, and the received side has counted datagrams at
+   * the wire since story 1.
+   */
+  #datagramsSent = 0;
   #stopped = false;
 
   constructor(options: EgressPipelineOptions) {
@@ -155,18 +258,19 @@ export class EgressPipeline {
     this.#transmitKeys = options.transmitKeys;
     this.#kek = options.kek;
     this.#identity = options.identity;
-    this.#queue = new BoundedDropOldestQueue<PendingFrame>(options.maxQueueFrames);
+    this.#maxQueueFrames = options.maxQueueFrames;
     this.#streamNumber = options.streamNumber;
     this.#streamId = options.streamId;
+    this.#senderFor = options.senderFor;
+    this.#onTargetNotConnected = options.onTargetNotConnected;
   }
 
   /**
-   * Frames actually sent since construction (monotone).
+   * Datagrams actually sent since construction (monotone).
    *
-   * The same value as `#hopSequence`, which ADR-0036 §2 defines as "what the
-   * transmitter actually sent" — so this is a read of bookkeeping the send path
-   * already maintains, not a second counter. It advances at DEQUEUE, never at
-   * enqueue, and never for a frame the transport refused.
+   * Advances at DEQUEUE, never at enqueue, and never for a frame a transport
+   * refused. See `#datagramsSent` for why this is no longer a read of the hop
+   * counter, and for the unit.
    *
    * Exposed so an embedder can SAMPLE it. It must never become a per-frame
    * emission: this file is the hot path under ADR-0036 §11's layout constraint,
@@ -178,24 +282,89 @@ export class EgressPipeline {
    * and this, along with the production counter, becomes that trace.
    */
   get framesSent(): number {
-    return this.#hopSequence;
+    return this.#datagramsSent;
   }
 
-  /** Attach (or detach, with `undefined`) the transport this pipeline sends on. */
-  setSender(sender: DatagramSender | undefined): void {
-    this.#sender = sender;
-    if (sender) void this.#drain();
+  /**
+   * Apply MC's target set for this stream — EVERY handler owning one of this
+   * sender's edges (ADR-0036 §9; the wire already carries `repeated SendTarget`).
+   *
+   * An empty set means SEND NOTHING (§5). Lanes not named go inactive and their
+   * queues are discarded; a lane named again later resumes on its retained hop
+   * counter.
+   */
+  setTargets(mediaHandlerUrls: readonly string[]): void {
+    if (this.#stopped) return;
+    const wanted = new Set(mediaHandlerUrls.filter((url) => url !== ''));
+    for (const [url, lane] of this.#lanes) {
+      if (wanted.has(url)) continue;
+      lane.active = false;
+      lane.queue.drain();
+    }
+    for (const url of wanted) {
+      const existing = this.#lanes.get(url);
+      if (existing) {
+        existing.active = true;
+        void this.#drain(url, existing);
+        continue;
+      }
+      const lane: Lane = {
+        active: true,
+        queue: new BoundedDropOldestQueue<PendingFrame>(this.#maxQueueFrames),
+        hopSequence: 0,
+        draining: false,
+      };
+      this.#lanes.set(url, lane);
+    }
+    this.#reportQueueDepth();
   }
 
-  /** Stop accepting frames and discard anything queued. */
+  /** Stop accepting frames and discard anything queued, on every lane. */
   stop(): void {
     this.#stopped = true;
-    this.#queue.drain();
+    for (const lane of this.#lanes.values()) {
+      lane.active = false;
+      lane.queue.drain();
+    }
     this.#metrics.sendQueueDepth(0);
   }
 
   /**
-   * Build, sign and queue one encoded audio frame.
+   * Build, sign and queue one encoded audio frame — ONCE, then fan the identical
+   * bytes out to every directed target.
+   *
+   * ---------------------------------------------------------------------------
+   * SEAL ONCE, TRANSMIT N. THE NONCE IS ALLOCATED HERE, ABOVE THE FAN-OUT.
+   * ---------------------------------------------------------------------------
+   *
+   * The normative statement is `proto/dark_tower/signaling/v1/signaling.proto`
+   * on `SendStream`: "A stream sent to several targets is encoded and encrypted
+   * ONCE and transmitted N times", because the alternative "would require either
+   * per-destination encryption (nonce reuse — catastrophic) or two counters per
+   * frame." Read it there; it is not restated here, because a second wording of
+   * a crypto invariant is a second thing to drift.
+   *
+   * What that means for this method: ONE `materialFor`, ONE
+   * `nextStreamSequence`, ONE `sealSframe`, ONE `signFrame`, ONE `finishFrame` —
+   * all of it above `#fanOut`. Per-lane state is the queue and the hop sequence
+   * ONLY. NO PER-LANE COUNTER MAY EVER REACH `sframeNonce`.
+   *
+   * THE INVARIANT LIVES ON THE MANAGER, NOT ON THIS CLASS. ADR-0036 §2 fixes the
+   * counting scope at per (sender, stream), while `nextStreamSequence` keys its
+   * state per MANAGER INSTANCE by stream number. Those two scopes coincide only
+   * because exactly one `TransmitKeyManager` exists per sender — so constructing
+   * a SECOND manager for the same sender is a nonce repeat under one key no
+   * matter how the pipelines above it are arranged, and under AES-GCM a repeat
+   * leaks the authentication subkey and permits forgery rather than merely
+   * exposing two frames (§2). See `lifecycle/transmitKeys.ts`, where that
+   * boundary is stated at the object that carries it.
+   *
+   * THE REFACTOR THAT BREAKS THIS, NAMED SO IT IS NOT REDISCOVERED: "one
+   * `EgressPipeline` per target" is the decomposition this file's own structure
+   * suggests, and it is FORBIDDEN. Because `submit()` calls `nextStreamSequence`
+   * itself, N pipelines means N sequence allocations for one frame at best, and
+   * N managers — nonce reuse — at worst. It is an example of the violation, not
+   * the rule: the rule is the manager's scope above.
    *
    * @throws whatever the crypto layer throws. The caller (the lifecycle
    * orchestrator) surfaces it as a typed media error; a build failure is never
@@ -204,6 +373,10 @@ export class EgressPipeline {
    */
   async submit(frame: EncodedAudioFrame): Promise<void> {
     if (this.#stopped) return;
+    // MC directed no targets: "send nothing" (§5). Nothing is built, so no
+    // sequence is consumed and no drop is counted — "count the frames we did not
+    // send" is the tempting wrong turn, exactly as on the mute path.
+    if (!this.#hasActiveTarget()) return;
 
     const material = await this.#transmitKeys.materialFor(this.#streamNumber, this.#kek);
     const streamSequence = this.#transmitKeys.nextStreamSequence(this.#streamNumber);
@@ -280,36 +453,92 @@ export class EgressPipeline {
     const bytes = finishFrame(unsigned, signature);
 
     if (this.#stopped) return;
-    const evicted = this.#queue.push({ bytes, relayRegionOffset: unsigned.relayRegionOffset });
-    if (evicted !== undefined) {
-      // The drop MH structurally cannot see, counted where the decision is made.
-      this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.EgressQueueOverflow);
+    this.#fanOut(bytes, unsigned.relayRegionOffset);
+  }
+
+  /** True when at least one lane is still named by the latest directive. */
+  #hasActiveTarget(): boolean {
+    for (const lane of this.#lanes.values()) {
+      if (lane.active) return true;
     }
-    this.#metrics.sendQueueDepth(this.#queue.depth);
-    void this.#drain();
+    return false;
   }
 
   /**
-   * Send queued frames until the queue empties or the transport stalls.
+   * Hand ONE sealed, signed frame to every active lane.
    *
-   * Single-flight: a second call while draining returns immediately, so frames
-   * cannot interleave and the hop sequence stays monotonic on the wire.
+   * The first active lane with a transport takes the ORIGINAL buffer; each
+   * further lane takes its own copy, so no two lanes ever hold the same bytes
+   * and the in-place `writeHopSequence` at dequeue needs no coordination. See
+   * {@link Lane}.
    */
-  async #drain(): Promise<void> {
-    if (this.#draining) return;
-    this.#draining = true;
+  #fanOut(bytes: Bytes, relayRegionOffset: number): void {
+    let originalTaken = false;
+    for (const [url, lane] of this.#lanes) {
+      if (!lane.active) continue;
+      if (!this.#senderFor(url)) {
+        // MC directed us at a handler we hold no transport to. Counted with the
+        // token whose documented fleet contract is "reads zero forever", and
+        // reported ONCE through the caller's bounded fault path. Deliberately
+        // NOT queued: frames aging out of a lane that can never send would be
+        // counted as `egress_queue_overflow`, which names the mechanism and
+        // actively misdescribes the cause.
+        this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.NotConnected);
+        this.#onTargetNotConnected();
+        continue;
+      }
+      const laneBytes = originalTaken ? (bytes.slice() as Bytes) : bytes;
+      originalTaken = true;
+      const evicted = lane.queue.push({ bytes: laneBytes, relayRegionOffset });
+      if (evicted !== undefined) {
+        // The drop MH structurally cannot see, counted where the decision is made.
+        this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.EgressQueueOverflow);
+      }
+      void this.#drain(url, lane);
+    }
+    this.#reportQueueDepth();
+  }
+
+  /**
+   * Report the DEEPEST lane, not the sum.
+   *
+   * `maxQueueFrames` bounds each lane independently, so depth-against-bound —
+   * which is what a back-pressure reader is asking — is only meaningful per
+   * lane. A sum would also make the same audio read as twice the back-pressure
+   * purely because a sender spans two handlers.
+   */
+  #reportQueueDepth(): void {
+    let deepest = 0;
+    for (const lane of this.#lanes.values()) {
+      if (lane.queue.depth > deepest) deepest = lane.queue.depth;
+    }
+    this.#metrics.sendQueueDepth(deepest);
+  }
+
+  /**
+   * Send one lane's queued frames until it empties or its transport stalls.
+   *
+   * Single-flight PER LANE: a second call while that lane is draining returns
+   * immediately, so its frames cannot interleave and its hop sequence stays
+   * monotonic on its own wire. Lanes drain independently of each other — that is
+   * what makes a partial send partial: a stalled, closed or missing transport on
+   * one lane neither blocks nor fails the others.
+   */
+  async #drain(url: string, lane: Lane): Promise<void> {
+    if (lane.draining) return;
+    lane.draining = true;
     try {
       for (;;) {
-        const sender = this.#sender;
+        const sender = this.#senderFor(url);
         if (!sender) {
           // Nothing to send on. Frames stay queued and age out through the
           // drop-oldest policy rather than being counted as failures here: a
           // send was never attempted.
           return;
         }
-        const pending = this.#queue.shift();
+        const pending = lane.queue.shift();
         if (pending === undefined) return;
-        this.#metrics.sendQueueDepth(this.#queue.depth);
+        this.#reportQueueDepth();
 
         if (!sender.isOpen) {
           this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.ConnectionClosed);
@@ -327,8 +556,10 @@ export class EgressPipeline {
           continue;
         }
 
-        // Assigned HERE, at dequeue, so it counts only frames actually sent.
-        writeHopSequence(pending.bytes, pending.relayRegionOffset, this.#hopSequence);
+        // Assigned HERE, at dequeue, so it counts only frames actually sent on
+        // THIS lane's transport. Safe in place: this buffer belongs to this lane
+        // alone (see `Lane`).
+        writeHopSequence(pending.bytes, pending.relayRegionOffset, lane.hopSequence);
         try {
           await sender.send(pending.bytes);
         } catch {
@@ -339,19 +570,23 @@ export class EgressPipeline {
           this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.TransportSendRefused);
           continue;
         }
-        // ONE INCREMENT, TWO READERS. `#hopSequence` is the wire hop counter AND
-        // the source of `framesSent` below; it sits adjacent to the counter
-        // deliberately. Separating them would give two encodings of "how many
-        // frames went out" that agree today and drift the first time a drop path
-        // lands between the two sites — with the bus field and
-        // `dt_client_media_frames_sent_total` disagreeing and nothing failing.
-        // Both are AFTER a successful `send()`: every branch above `continue`s,
-        // so neither counts an attempted-but-refused send.
-        this.#hopSequence += 1;
+        // THREE INCREMENTS, TWO SCOPES, ONE SITE. The lane's hop counter is WIRE
+        // scope (per connection, per stream); `#datagramsSent` and
+        // `dt_client_media_frames_sent_total` are SENDER scope. They were one
+        // value until multi-target send existed, and splitting them is what keeps
+        // a two-handler sender from reporting half its sends — see
+        // `#datagramsSent`. They stay on adjacent lines for the reason the old
+        // collapse existed: two encodings of "how many datagrams went out" drift
+        // the first time a drop path lands between the sites, with the bus field
+        // and the production counter disagreeing and nothing failing.
+        // All three are AFTER a successful `send()`: every branch above
+        // `continue`s, so none counts an attempted-but-refused send.
+        lane.hopSequence += 1;
+        this.#datagramsSent += 1;
         this.#metrics.frameSent();
       }
     } finally {
-      this.#draining = false;
+      lane.draining = false;
     }
   }
 }

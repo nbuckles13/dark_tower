@@ -236,3 +236,35 @@ data:
   # yet: that table's Required column is derived from config.rs, so the row
   # lands with task 9 (tracked in docs/TODO.md).
   MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"
+  # ---- Connect settle window (ADR-0036 §9; story 2 task 20) ----
+  # How long MC waits, after the FIRST media-handler connection MH reports for a
+  # participant, before routing on whatever connections it has observed. It ends
+  # EARLY the moment the participant is connected to every handler of its
+  # meeting, so a participant that reaches all handlers pays nothing.
+  # NOT A DEBOUNCE — do not remove or shrink it to "speed things up". Edges never
+  # move while both parties can still use them, so without the window a
+  # participant whose second handler connect lands ~100 ms after its first is
+  # routed on ONE handler and stays there, and in a fully-connected meeting every
+  # sender ends up sending to both handlers permanently.
+  # Derivation of 1500: ~15x the observed gap between one client's parallel
+  # handler connects as MH reports them in Kind (~100 ms), and it must also cover
+  # the first-join RegisterMeeting fan-out to every handler — MH only reports a
+  # connection once the meeting is registered on that handler, so a window
+  # shorter than that fan-out re-creates the split this window exists to
+  # prevent. Bounded 100..=10000 at load: below ~100 ms it stops doing its job;
+  # above 10 s it is a long, silent delay to first audio for anyone who cannot
+  # reach every handler.
+  # Cost: time-to-first-audio for a participant that does NOT reach every
+  # handler is delayed by up to this window. It never appears in join latency
+  # (mc_session_join_duration_seconds stops at the JoinResponse).
+  # Enforced by: mc-service, in-process, in the meeting actor. Required, no Rust
+  # default: a pod without the key crash-loops on MissingEnvVar.
+  # Where an operator sees it: mc_media_connect_settle_window_seconds (the value
+  # the pod enforces) and mc_media_connect_settles_total{outcome="window_elapsed"}
+  # (participants that settled without reaching every handler).
+  # ORDERING: the ROLLBACK ORDERING / COUPLED SET IS THREE ARTIFACTS block above
+  # governs this key unchanged. The key-specific consequence: ConfigMaps are
+  # under `resources:`, not `configMapGenerator:`, so a later VALUE EDIT here
+  # DOES NOT ROLL THE PODS — the window in force stays the old one (check
+  # mc_media_connect_settle_window_seconds) until mc-0/mc-1 are restarted.
+  MC_MEDIA_CONNECT_SETTLE_MS: "1500"

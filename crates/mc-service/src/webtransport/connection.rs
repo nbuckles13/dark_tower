@@ -490,9 +490,10 @@ pub async fn handle_connection(
 
     // Step 6d: read the meeting's handler assignment BEFORE admission (R-6).
     //
-    // A meeting without media handlers is not useful, and placement (ADR-0036
-    // §9) is decided inside the actor's join turn, so the handler set must be
-    // in hand before the join rather than read afterwards. A missing or
+    // A meeting without media handlers is not useful, and the actor freezes the
+    // meeting's handler set in its first join turn (ADR-0036 §9) and offers
+    // every joiner that whole set, so it must be in hand before the join rather
+    // than read afterwards. A missing or
     // malformed assignment now fails the join before any admission state
     // exists — nothing to unwind.
     let handlers = match read_meeting_handlers(redis_client.as_ref(), &meeting_id).await {
@@ -1101,8 +1102,8 @@ const SIGNALING_KIND_CAPABILITY_REJECTION: &str = "capability_rejection";
 ///
 /// Routing state does NOT live here any more. Story 1 cached the handler set and
 /// the "planned" audio slot per connection; both were sound only while MC had
-/// no per-participant placement and pushed once at join. Since story 2 the
-/// meeting actor holds placement, slot demand and slot state, and composes every
+/// no per-participant routing and pushed once at join. Since story 2 the
+/// meeting actor holds observed connectivity, edges, slot demand and slot state, and composes every
 /// participant's view itself (including views changed by SOMEONE ELSE's join,
 /// leave, declaration or mute), so there is no per-connection copy left to go
 /// stale.
@@ -1681,16 +1682,21 @@ fn build_join_response(result: &JoinResult) -> JoinResponse {
         })
         .collect();
 
-    // EXACTLY ONE entry: the handler this participant was placed on (ADR-0036
-    // §9, R-33). The client transport is active/active and dials every url it is
-    // given, so a longer list would open transports MC never directs media
-    // over. The same frozen `MeetingHandlers` value supplies
-    // `StreamAssignment.media_handler_url` and `SendTarget.media_handler_url`,
-    // so all three are byte-identical strings — the client looks transports up
-    // by exact url.
-    let media_servers = vec![MediaServerInfo {
-        media_handler_url: result.media_handler.webtransport_url.clone(),
-    }];
+    // The meeting's FULL frozen handler set (ADR-0036 §9, R-33): every
+    // participant is offered every handler and connects to all it can; MC then
+    // routes each pair through a handler both are observed on. Read from the
+    // actor's frozen `MeetingHandlers` — the same value that supplies every
+    // `StreamAssignment.media_handler_url` and `SendTarget.media_handler_url` —
+    // so all three are byte-identical strings (the client looks transports up by
+    // exact url). Never the Redis list this join happened to read. Order carries
+    // no meaning.
+    let media_servers = result
+        .media_handlers
+        .iter()
+        .map(|h| MediaServerInfo {
+            media_handler_url: h.webtransport_url.clone(),
+        })
+        .collect();
 
     JoinResponse {
         participant_id: result.participant_id.clone(),
@@ -1856,6 +1862,7 @@ mod tests {
             max_receive_capability_declarations: 4,
             audio_encoding: crate::media_signaling::AudioEncoding::new(v1::Codec::Opus, 48_000, 50)
                 .expect("in band"),
+            connect_settle_window: std::time::Duration::from_millis(1500),
         };
         let limiter_start = Instant::now();
         (
