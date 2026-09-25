@@ -21,7 +21,6 @@ use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActor
 use mc_service::grpc::McMediaCoordinationService;
 use mc_service::media_admission::SenderBindingOutcome;
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::mh_connection_registry::MhConnectionRegistry;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
 use proto_gen::dark_tower::internal::v1::{
     NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
@@ -34,22 +33,18 @@ fn make_controller() -> Arc<MeetingControllerActorHandle> {
         ActorMetrics::new(),
         ControllerMetrics::new(),
         SecretBox::new(Box::new(vec![0u8; 32])),
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     ))
 }
 
 fn make_service() -> McMediaCoordinationService {
-    McMediaCoordinationService::new(Arc::new(MhConnectionRegistry::new()), make_controller())
+    McMediaCoordinationService::new(make_controller())
 }
 
 /// A service sharing one controller with the caller, so the test can seed
 /// meetings and participants the handler will then resolve against.
 fn make_service_with(controller: &Arc<MeetingControllerActorHandle>) -> McMediaCoordinationService {
-    McMediaCoordinationService::new(
-        Arc::new(MhConnectionRegistry::new()),
-        Arc::clone(controller),
-    )
+    McMediaCoordinationService::new(Arc::clone(controller))
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +58,7 @@ async fn notify_participant_connected_records_event_connected() {
         meeting_id: "meeting-1".to_string(),
         participant_id: "part-1".to_string(),
         handler_id: "mh-1".to_string(),
+        connection_id: "conn-1".to_string(),
     });
 
     let snap = MetricAssertion::snapshot();
@@ -85,6 +81,7 @@ async fn notify_participant_disconnected_records_event_disconnected() {
         participant_id: "part-1".to_string(),
         handler_id: "mh-1".to_string(),
         reason: 0,
+        connection_id: "conn-1".to_string(),
     });
 
     let snap = MetricAssertion::snapshot();
@@ -184,9 +181,16 @@ fn connected_request(
     Request::new(NotifyParticipantConnectedRequest {
         meeting_id: meeting_id.to_string(),
         participant_id: token_sub.to_string(),
-        handler_id: "mh-1".to_string(),
+        // A handler of the standalone fixture's frozen set, so the resolvable
+        // arms also RECORD connectivity rather than landing on
+        // `handler_not_in_set` (which has its own arm below).
+        handler_id: STANDALONE_HANDLER.to_string(),
+        connection_id: format!("conn-{token_sub}"),
     })
 }
+
+/// The one handler `test_common::standalone_join_media()` registers.
+const STANDALONE_HANDLER: &str = "mh-test-1";
 
 #[tokio::test(flavor = "current_thread")]
 async fn resolvable_participant_gets_its_own_allocated_sender_id() {
@@ -536,6 +540,10 @@ async fn one_user_with_two_participants_is_ambiguous_and_fails_closed() {
             ("key_custody", "operator"),
         ])
         .assert_delta(1);
+    // S2: and connectivity is applied to NEITHER entry, counted as such.
+    snap.counter("mc_mh_notifications_unapplied_total")
+        .with_labels(&[("reason", "user_ambiguous"), ("key_custody", "operator")])
+        .assert_delta(1);
     // Ambiguity is NOT the join race: it does not clear by waiting, and its
     // remedy is a contract change rather than a retry.
     snap.counter("mc_media_sender_binding_responses_total")
@@ -546,4 +554,191 @@ async fn one_user_with_two_participants_is_ambiguous_and_fails_closed() {
         .assert_delta(0);
 
     controller.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Connectivity dispositions (story 2 task 20): every way a notification does
+// not become connectivity is counted, the binding is answered independently,
+// and the legacy empty-id path is counted.
+// ---------------------------------------------------------------------------
+
+fn request_on(
+    meeting_id: &str,
+    token_sub: &str,
+    handler_id: &str,
+    connection_id: &str,
+) -> Request<NotifyParticipantConnectedRequest> {
+    Request::new(NotifyParticipantConnectedRequest {
+        meeting_id: meeting_id.to_string(),
+        participant_id: token_sub.to_string(),
+        handler_id: handler_id.to_string(),
+        connection_id: connection_id.to_string(),
+    })
+}
+
+fn disconnect_on(
+    meeting_id: &str,
+    token_sub: &str,
+    handler_id: &str,
+    connection_id: &str,
+) -> Request<NotifyParticipantDisconnectedRequest> {
+    Request::new(NotifyParticipantDisconnectedRequest {
+        meeting_id: meeting_id.to_string(),
+        participant_id: token_sub.to_string(),
+        handler_id: handler_id.to_string(),
+        reason: 1,
+        connection_id: connection_id.to_string(),
+    })
+}
+
+/// S1a / S4 pin (b): an MH-asserted `handler_id` outside the meeting's frozen
+/// set is never recorded as connectivity and is counted — while the sender
+/// binding is still answered, so MH's binding contract is unchanged.
+#[tokio::test(flavor = "current_thread")]
+async fn an_out_of_set_handler_answers_the_binding_but_records_no_connectivity() {
+    let controller = make_controller();
+    let allocated = seed_participant(&controller, "meeting-oos", "part-oos").await;
+    let svc = make_service_with(&controller);
+    let snap = MetricAssertion::snapshot();
+    for near_miss in ["mh-not-registered", "MH-TEST-1", "mh-test-1 "] {
+        let response = svc
+            .notify_participant_connected(request_on(
+                "meeting-oos",
+                &token_sub_for("part-oos"),
+                near_miss,
+                "conn-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.sender_id, allocated, "binding answered regardless");
+    }
+    snap.counter("mc_mh_notifications_unapplied_total")
+        .with_labels(&[
+            ("reason", "handler_not_in_set"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(3);
+    controller.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unknown_meeting_counts_meeting_unknown_on_both_events() {
+    let svc = make_service();
+    let snap = MetricAssertion::snapshot();
+    svc.notify_participant_connected(request_on("nope", "u", STANDALONE_HANDLER, "c"))
+        .await
+        .unwrap();
+    svc.notify_participant_disconnected(disconnect_on("nope", "u", STANDALONE_HANDLER, "c"))
+        .await
+        .unwrap();
+    snap.counter("mc_mh_notifications_unapplied_total")
+        .with_labels(&[("reason", "meeting_unknown"), ("key_custody", "operator")])
+        .assert_delta(2);
+}
+
+/// Every declined connection produces a Disconnected for a key MC never
+/// recorded: a counted, routine no-op — never an error to MH.
+#[tokio::test(flavor = "current_thread")]
+async fn a_disconnect_for_an_unheld_key_is_a_counted_no_op() {
+    let controller = make_controller();
+    seed_participant(&controller, "meeting-unheld", "part-unheld").await;
+    let svc = make_service_with(&controller);
+    let snap = MetricAssertion::snapshot();
+    let ack = svc
+        .notify_participant_disconnected(disconnect_on(
+            "meeting-unheld",
+            &token_sub_for("part-unheld"),
+            STANDALONE_HANDLER,
+            "never-connected",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ack.acknowledged);
+    snap.counter("mc_mh_notifications_unapplied_total")
+        .with_labels(&[
+            ("reason", "unknown_connection"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(1);
+    controller.cancel();
+}
+
+/// S11: the legacy empty-id path is accepted and counted, on both events.
+#[tokio::test(flavor = "current_thread")]
+async fn an_empty_connection_id_is_counted_as_legacy() {
+    let controller = make_controller();
+    seed_participant(&controller, "meeting-legacy", "part-legacy").await;
+    let svc = make_service_with(&controller);
+    let snap = MetricAssertion::snapshot();
+    let sub = token_sub_for("part-legacy");
+    svc.notify_participant_connected(request_on("meeting-legacy", &sub, STANDALONE_HANDLER, ""))
+        .await
+        .unwrap();
+    svc.notify_participant_disconnected(disconnect_on(
+        "meeting-legacy",
+        &sub,
+        STANDALONE_HANDLER,
+        "",
+    ))
+    .await
+    .unwrap();
+    snap.counter("mc_mh_notifications_without_connection_id_total")
+        .with_labels(&[("key_custody", "operator")])
+        .assert_delta(2);
+    // The legacy disconnect cleared the legacy key: not an unknown connection.
+    snap.counter("mc_mh_notifications_unapplied_total")
+        .with_labels(&[
+            ("reason", "unknown_connection"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(0);
+    controller.cancel();
+}
+
+/// P3: a Connected delivered after its own Disconnected (MH abandoned the
+/// Connected, then sent the decline Disconnected) is refused, not recorded.
+#[tokio::test(flavor = "current_thread")]
+async fn a_connected_after_its_own_disconnect_is_refused_as_retired() {
+    let controller = make_controller();
+    let allocated = seed_participant(&controller, "meeting-late", "part-late").await;
+    let svc = make_service_with(&controller);
+    let sub = token_sub_for("part-late");
+    svc.notify_participant_connected(request_on("meeting-late", &sub, STANDALONE_HANDLER, "c1"))
+        .await
+        .unwrap();
+    svc.notify_participant_disconnected(disconnect_on(
+        "meeting-late",
+        &sub,
+        STANDALONE_HANDLER,
+        "c1",
+    ))
+    .await
+    .unwrap();
+    let snap = MetricAssertion::snapshot();
+    let late = svc
+        .notify_participant_connected(request_on("meeting-late", &sub, STANDALONE_HANDLER, "c1"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(late.sender_id, allocated, "binding unaffected");
+    snap.counter("mc_mh_notifications_unapplied_total")
+        .with_labels(&[
+            ("reason", "retired_connection"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(1);
+    controller.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn every_unapplied_reason_is_emittable() {
+    for reason in mc_service::media_routing::Unapplied::ALL {
+        let snap = MetricAssertion::snapshot();
+        mc_service::observability::metrics::record_notification_unapplied(reason);
+        snap.counter("mc_mh_notifications_unapplied_total")
+            .with_labels(&[("reason", reason.label()), ("key_custody", "operator")])
+            .assert_delta(1);
+    }
 }

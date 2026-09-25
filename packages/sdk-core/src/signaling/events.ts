@@ -231,6 +231,39 @@ export interface StreamAssignmentEvent {
 /** The subscriber's current slot assignments. */
 export interface StreamAssignmentsEvent {
   readonly assignments: readonly StreamAssignmentEvent[];
+  /**
+   * Roster participants THIS subscriber cannot reach (ADR-0036 §9).
+   *
+   * They share no connected media handler with this subscriber, and there is no
+   * cross-handler forwarding. Per-subscriber, because reachability is relative to
+   * the subscriber's own connected set.
+   *
+   * ---------------------------------------------------------------------------
+   * A ROSTER MARK, NOT A SLOT STATE, AND NOT INFERRED FROM SILENCE
+   * ---------------------------------------------------------------------------
+   *
+   * An unreachable participant consumes NO slot, so it never appears as an empty
+   * or `source_unreachable` slot — `signaling.proto` reserves that state for the
+   * pinned case, which static fill cannot produce. The wire carries this because
+   * §6's rule is that absence of frames is not a signal: "withheld by
+   * congestion", "fewer sources" and "cannot be reached" all present as no audio
+   * and must render differently.
+   *
+   * REPLACE, NEVER MERGE, exactly as with `assignments`: each message is MC's
+   * complete current view for this subscriber, and a peer that becomes reachable
+   * simply stops appearing here. Merging would latch a transient into a
+   * permanent "can't hear X" badge on a meeting whose audio is fine — the failure
+   * that costs an incident, because it is indistinguishable to the user from the
+   * real fault.
+   *
+   * WHAT THIS DELIBERATELY DOES NOT DISCLOSE: it is one bit per roster entry,
+   * relative to this subscriber. It carries no handler identity, no handler count
+   * and no other subscriber's partition, and a client MUST NOT infer co-location
+   * AMONG the unreachable set — being absent from my reachable set says nothing
+   * about whether two unreachable peers share a handler with each other.
+   * Grouping them is the step that turns a reachability bit into a topology map.
+   */
+  readonly unreachableSenderIds: readonly number[];
 }
 
 export interface SignalingJoinParams {

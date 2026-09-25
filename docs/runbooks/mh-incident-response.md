@@ -1049,7 +1049,7 @@ mc_media_sender_binding_responses_total
 | **Series absent or flat** | **Version skew** — the mc-service image predates the `sender_id` field | Rebuild and redeploy MC. See §Rollout ordering in `mh-deployment.md`. |
 | `outcome="participant_unknown"` | **Either** a transient join race **or** a systematic identity mismatch — see below | Check whether it is sustained |
 | `outcome="meeting_unknown"` | Routing/lifecycle fault — MC has no such meeting | Not self-clearing; investigate meeting placement |
-| `outcome="registry_full"` | **Capacity** — MC's per-meeting connection cap refused the registration, so it correctly answered `0` rather than handing back an ordinal for a connection it is not tracking | **Never self-clearing.** Raise the cap or add MC capacity. **Do not triage as a join race.** |
+| `outcome="registry_full"` | **Retired** (story 2 task 20) — MC's connection registry and its per-meeting cap were removed; connectivity now lives in MC's meeting actor, which has no refusing cap. Present only from an MC image that predates the retirement | **Version skew.** Redeploy MC. Not a capacity signal on a current image. |
 | `outcome="user_ambiguous"` | **One user, two participants.** The user joined twice (two devices), so one token `sub` maps to two roster entries and the question has no single answer | **Never self-clearing, and no operator remedy exists** — see below. Have the user leave on one device. |
 
 > **`user_ambiguous` is user-triggerable, so expect it in normal traffic.** MH names the
@@ -1549,7 +1549,7 @@ is then a dead end rather than a finding.
 
 | Counter | Proves | Does **not** prove |
 |---|---|---|
-| `dt_client_media_frames_sent_total` | frames left the device | that MH accepted or forwarded them |
+| `dt_client_media_frames_sent_total` | datagrams left the device — one per target handler, so a two-handler sender posts two per captured frame; this is not a capture rate | that MH accepted or forwarded them |
 | `dt_client_media_frames_received_total` | **datagrams arrived at the wire** — counted before any parse, verification or decryption | that they were openable, or that anything was heard |
 | `dt_client_media_frames_dropped_total{reason}` | which post-arrival step rejected, **by name** | anything about frames that never arrived |
 | `dt_client_media_frames_accepted_total` | frames completed the receive path and were handed to the decoder | that anything was **played** — see below |

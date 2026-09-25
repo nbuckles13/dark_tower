@@ -669,9 +669,17 @@ pub fn instance_for_pod_ip<'a>(
 ///
 /// Prometheus scrapes on an interval, so the value may lag the service. The
 /// poll is a scrape-convergence bound, never a wall-clock assertion about the
-/// service — and a FALL must be asserted against a value this helper has
-/// already OBSERVED high (confirm the rise first), or "below" can be true of a
-/// state that was simply never scraped.
+/// service.
+///
+/// # Only for values no other suite can move against the predicate
+///
+/// Pinning isolates the POD, not the test: suites share pods. Use this for
+/// presence, for monotonic counters (`>= own baseline + n`), and for values
+/// published once from config. Never assert the VALUE of a pod-wide occupancy
+/// gauge (e.g. `mh_media_registered_meetings`, `mh_media_egress_edges`):
+/// concurrent suites move it in both directions, so a rise or fall may never be
+/// observed. Prove per-meeting state from the service's direct replies instead,
+/// and put exact gauge accounting in an in-process test that owns the recorder.
 ///
 /// # Panics
 ///

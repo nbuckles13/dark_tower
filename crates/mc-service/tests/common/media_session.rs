@@ -8,13 +8,29 @@
 //! the same stream. So every read here skips roster traffic and returns only
 //! media-signalling messages, and "nothing arrived" is bounded by a read
 //! timeout rather than a sleep.
+//!
+//! # Connectivity is reported, exactly as MH reports it
+//!
+//! Since story 2 task 20 a participant is routable only once the HANDLERS
+//! report its connections (`NotifyParticipantConnected`, ADR-0036 §9). A real
+//! client connects to every handler it is offered, so [`join_as`] joins and then
+//! reports a connection to EVERY handler of the meeting's registered set,
+//! through the real `McMediaCoordinationService` (validation, resolution,
+//! metrics and all) — never by reaching into the actor. [`join_as_on`] reports
+//! a chosen subset, which is how partial connectivity is produced: the same way
+//! an env-test client produces it, by which handlers it actually reaches. Once
+//! a participant has reported every handler it settles at once (no window).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use mc_service::grpc::MhRegistrationClient;
+use mc_service::grpc::{McMediaCoordinationService, MhRegistrationClient};
 use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::make_meeting_claims;
+use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
+use proto_gen::dark_tower::internal::v1::{
+    NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
+};
 use proto_gen::dark_tower::signaling::v1::{
     client_message, server_message, ClientMessage, JoinRequest, MediaKind, MuteRequest,
     ReceiveCapability, ReceiveSlot, SendDirective, ServerMessage, StreamAssignments,
@@ -114,9 +130,50 @@ pub struct Session {
     pub sender_id: u32,
     /// `JoinResponse.media_servers`, as MC sent it.
     pub media_servers: Vec<String>,
+    /// The token `sub` this session joined as (what MH reports).
+    pub user: String,
+    /// The meeting joined.
+    pub meeting_id: String,
 }
 
 impl Session {
+    /// Report, as handler `handler_id` would, that this participant opened
+    /// media connection `connection_id` to it. Returns the `sender_id` MC
+    /// answered (0 = declined).
+    pub async fn connect_to(
+        &self,
+        stack: &TestStackHandles,
+        handler_id: &str,
+        connection_id: &str,
+    ) -> u32 {
+        notify_connected(
+            stack,
+            &self.meeting_id,
+            &self.user,
+            handler_id,
+            connection_id,
+        )
+        .await
+    }
+
+    /// Report, as handler `handler_id` would, that media connection
+    /// `connection_id` closed.
+    pub async fn disconnect_from(
+        &self,
+        stack: &TestStackHandles,
+        handler_id: &str,
+        connection_id: &str,
+    ) {
+        notify_disconnected(
+            stack,
+            &self.meeting_id,
+            &self.user,
+            handler_id,
+            connection_id,
+        )
+        .await;
+    }
+
     /// Close the WebTransport session cleanly (a tab close): MC classifies it
     /// `ClientClosed` and removes the participant immediately, skipping grace.
     pub fn close(self) {
@@ -251,7 +308,79 @@ impl Session {
     }
 }
 
-/// Join `meeting_id` (already seeded) as token subject `user`.
+/// The media connection id this harness reports for `user` on `handler_id`.
+#[must_use]
+pub fn connection_id_for(user: &str, handler_id: &str) -> String {
+    format!("{user}@{handler_id}")
+}
+
+/// A `McMediaCoordinationService` over the stack's controller — the real MH→MC
+/// ingestion path.
+fn coordination(stack: &TestStackHandles) -> McMediaCoordinationService {
+    McMediaCoordinationService::new(Arc::clone(&stack.controller_handle))
+}
+
+/// Send one `NotifyParticipantConnected` exactly as MH would. Returns the
+/// answered `sender_id`.
+pub async fn notify_connected(
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+    handler_id: &str,
+    connection_id: &str,
+) -> u32 {
+    coordination(stack)
+        .notify_participant_connected(tonic::Request::new(NotifyParticipantConnectedRequest {
+            meeting_id: meeting_id.to_string(),
+            participant_id: user.to_string(),
+            handler_id: handler_id.to_string(),
+            connection_id: connection_id.to_string(),
+        }))
+        .await
+        .expect("notify connected")
+        .into_inner()
+        .sender_id
+}
+
+/// Send one `NotifyParticipantDisconnected` exactly as MH would.
+pub async fn notify_disconnected(
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+    handler_id: &str,
+    connection_id: &str,
+) {
+    coordination(stack)
+        .notify_participant_disconnected(tonic::Request::new(
+            NotifyParticipantDisconnectedRequest {
+                meeting_id: meeting_id.to_string(),
+                participant_id: user.to_string(),
+                handler_id: handler_id.to_string(),
+                reason: 1,
+                connection_id: connection_id.to_string(),
+            },
+        ))
+        .await
+        .expect("notify disconnected");
+}
+
+/// Every handler id the meeting is registered on, as seeded.
+pub async fn registered_handlers(stack: &TestStackHandles, meeting_id: &str) -> Vec<String> {
+    stack
+        .mh_store
+        .get_mh_assignment(meeting_id)
+        .await
+        .expect("store read")
+        .expect("meeting seeded")
+        .handlers
+        .into_iter()
+        .map(|h| h.mh_id)
+        .collect()
+}
+
+/// Join `meeting_id` (already seeded) as token subject `user`, then report a
+/// media connection to EVERY registered handler — a real client's
+/// active/active behaviour.
 ///
 /// # Panics
 ///
@@ -262,10 +391,39 @@ pub async fn join_as(
     meeting_id: &str,
     user: &str,
 ) -> Session {
-    match try_join_as(rig, stack, meeting_id, user).await {
+    let all = registered_handlers(stack, meeting_id).await;
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    join_as_on(rig, stack, meeting_id, user, &all).await
+}
+
+/// Join, then report media connections ONLY to `handlers` (possibly none):
+/// partial connectivity, produced the way a real client produces it.
+///
+/// # Panics
+///
+/// Panics if MC answers anything but a `JoinResponse`, or declines a binding
+/// for a handler of the set.
+pub async fn join_as_on(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+    handlers: &[&str],
+) -> Session {
+    let session = match try_join_as(rig, stack, meeting_id, user).await {
         Ok(session) => session,
         Err(e) => panic!("expected JoinResponse, got {e}"),
+    };
+    for handler in handlers {
+        let answered = session
+            .connect_to(stack, handler, &connection_id_for(user, handler))
+            .await;
+        assert_eq!(
+            answered, session.sender_id,
+            "{user} on {handler}: MC must bind the connection to the joiner's own sender id"
+        );
     }
+    session
 }
 
 /// [`join_as`], returning MC's error text instead of panicking on a refusal.
@@ -318,5 +476,7 @@ pub async fn try_join_as(
         recv,
         sender_id,
         media_servers,
+        user: user.to_string(),
+        meeting_id: meeting_id.to_string(),
     })
 }

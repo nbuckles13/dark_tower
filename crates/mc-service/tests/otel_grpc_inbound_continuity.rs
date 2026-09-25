@@ -19,7 +19,7 @@
 //! `.with_interceptor(server_interceptor())` — `MediaCoordinationServiceServer`
 //! and `MeetingControllerServiceServer`. This component-tier test exercises
 //! `MediaCoordinationService` because it constructs with only an in-memory
-//! `MhConnectionRegistry`. `MeetingControllerService` (`McAssignmentService`)
+//! meeting-controller handle. `MeetingControllerService` (`McAssignmentService`)
 //! requires an `Arc<FencedRedisClient>` whose constructor eagerly connects to a
 //! live Redis — not available at the component tier (no MC component test
 //! instantiates `FencedRedisClient`). Both services compose the IDENTICAL
@@ -38,7 +38,6 @@ use std::sync::Arc;
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::grpc::McMediaCoordinationService;
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::mh_connection_registry::MhConnectionRegistry;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_client::MediaCoordinationServiceClient;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationServiceServer;
 use proto_gen::dark_tower::internal::v1::NotifyParticipantConnectedRequest;
@@ -91,10 +90,9 @@ async fn start_test_grpc_server() -> TestGrpcServer {
         ActorMetrics::new(),
         ControllerMetrics::new(),
         common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     ));
-    let svc = McMediaCoordinationService::new(Arc::new(MhConnectionRegistry::new()), controller);
+    let svc = McMediaCoordinationService::new(controller);
 
     let server = TonicServer::builder()
         .layer(tower_http::trace::TraceLayer::new_for_grpc())
@@ -131,6 +129,7 @@ async fn connect(
 
 fn connected_request() -> NotifyParticipantConnectedRequest {
     NotifyParticipantConnectedRequest {
+        connection_id: "conn-otel".to_string(),
         meeting_id: "otel-inbound-meeting".to_string(),
         participant_id: "otel-inbound-part".to_string(),
         handler_id: "mh-otel-1".to_string(),

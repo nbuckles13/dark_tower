@@ -27,27 +27,23 @@
 //! `mh_media_egress_stream_ceiling`, the per-subscriber slot cap from the
 //! deployed MC ConfigMap. Each participant declares `S = min(P - 1,
 //! MC_MAX_RECEIVE_SLOTS)` audio slots, and `P` is the smallest participant
-//! count satisfying BOTH conditions, each a pigeonhole argument over a meeting
-//! that spans at most two handlers:
+//! count satisfying the pigeonhole condition of the shared-handler edge model
+//! (story 2 task 20, ADR-0036 §9): every participant connects to every handler
+//! it is offered, so every subscriber fills all `S` slots, the meeting totals
+//! `P * S` streams across at most two handlers, and whichever edge chooser MC
+//! uses one handler holds at least half. Require `P * S > 2 * ceiling`. (With
+//! MC's co-locating chooser and full connectivity every stream is on ONE
+//! handler, which exceeds the ceiling sooner; the half bound is what holds for
+//! ANY choice, so it is the one sized against.)
 //!
-//! 1. **Co-handler-only visibility (story 2 task 6, today):** a subscriber only
-//!    hears peers on its own handler. GC's weighted-random selection
-//!    (`mh_selection.rs:weighted_random_select`) picks WHICH handlers form the
-//!    meeting's set; MC's round-robin splits participants across it, so one
-//!    handler holds at least `P_h = ceil(P / 2)` of them, and each fills
-//!    `min(S, P_h - 1)` slots there. Require `P_h * min(S, P_h - 1) > ceiling`.
-//! 2. **Any-shared-handler routing (story 2 task 20):** every subscriber fills
-//!    all `S` slots somewhere, so the meeting totals `P * S` streams across at
-//!    most two handlers, and one handler holds at least half. Require
-//!    `P * S > 2 * ceiling`.
+//! Task 6's round-robin placement needed a second, co-handler-only condition;
+//! it is retired with that model. Kind (ceiling 40, S 8): P = 11, which gives
+//! 11 * 8 = 88 > 80 — 11 AC registrations, inside the suite's budget.
 //!
-//! Either model therefore puts more than the ceiling on some handler, whatever
-//! GC draws and however MC spreads. Kind (ceiling 40, S 8): P = 13, which gives
-//! 7 * 6 = 42 > 40 and 13 * 8 = 104 > 80. That is 13 AC registrations, inside
-//! the suite's AC registration budget.
-//!
-//! Every participant also opens an MH session to every handler URL it was
-//! given, so a connectivity-driven placement model sees full connectivity.
+//! Every participant opens an MH session to every handler URL it was offered.
+//! That is load-bearing, not incidental: MC routes only through connectivity MH
+//! OBSERVES, so a participant that opened no session would have no edges at
+//! all and the meeting could never reach the ceiling.
 //!
 //! # Which guard trips — asserted, not assumed
 //!
@@ -107,22 +103,19 @@ const ADMISSION_BOUND: Duration = Duration::from_secs(120);
 /// deployment unsuitable (a ceiling this test cannot exceed economically).
 const MAX_PARTICIPANTS: u64 = 40;
 
-/// Smallest `P` satisfying both pigeonhole conditions (see the module doc),
-/// with the slots each participant declares.
+/// Smallest `P` satisfying the pigeonhole condition (see the module doc), with
+/// the slots each participant declares.
 fn size_meeting(ceiling: u64, slot_cap: u64) -> (u64, u64) {
     for p in 2..=MAX_PARTICIPANTS {
         let s = (p - 1).min(slot_cap);
-        let p_h = p.div_ceil(2);
-        let co_handler = p_h * s.min(p_h - 1) > ceiling;
-        let any_shared = p * s > 2 * ceiling;
-        if co_handler && any_shared {
+        if p * s > 2 * ceiling {
             return (p, s);
         }
     }
     panic!(
         "PRECONDITION: no meeting of at most {MAX_PARTICIPANTS} participants (slot cap \
-         {slot_cap}) exceeds a stream ceiling of {ceiling} under both placement models. \
-         This test is sized for the Kind overlay budget; the deployed budget is not."
+         {slot_cap}) exceeds a stream ceiling of {ceiling} on some handler. This test is \
+         sized for the Kind overlay budget; the deployed budget is not."
     );
 }
 

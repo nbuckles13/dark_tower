@@ -166,6 +166,30 @@ Complete ALL items before deploying to production:
     coupled set then; revisit this line at that point.
   - Note: `## Rollback Procedure` below covers rolling back the *repo*, not a
     *deployment* — a deployment rollback must revert MC and the SDK together.
+  - **Story 2 task 20 (shared-handler edge model) adds a VERSION-SKEW WINDOW,
+    not just an ordering rule** — see Deployment Steps §0. MC now offers every
+    handler and may direct a sender at SEVERAL handlers and a subscriber's slots
+    at different handlers. An SDK predating task 20 **silently** sends only to
+    its first target (no fault, no metric — "some peers hear me, some don't"
+    with every client signal green) and **loudly** faults on slot assignments
+    naming two handlers. Browsers hold cached bundles, so the exposure is "new MC
+    + any old SDK still loaded", whatever order the deploys land in. The
+    reassuring half: an **all-connected** meeting co-locates on one handler (one
+    target per sender, one url per subscriber), which an old SDK handles
+    correctly — the skew bites only under genuinely partial connectivity.
+  - **MH joins the coupled set for `connection_id` (task 20), but with no hard
+    ordering.** A new MC against an old MH sees an empty `connection_id` and
+    falls back to the pre-field per-handler semantics (degraded: a stale
+    disconnect can remove a live connection), counted on
+    `mc_mh_notifications_without_connection_id_total`. An old MC ignores the new
+    field. Degraded, bounded, and signalled — roll either side first.
+  - **A new REQUIRED key rides this release** (`MC_MEDIA_CONNECT_SETTLE_MS`).
+    Apply the ConfigMap and both Deployments with or before the image: a new
+    image against a stale in-cluster ConfigMap crash-loops on
+    `MissingEnvVar("MC_MEDIA_CONNECT_SETTLE_MS")` — and the last time this
+    happened (`MC_MAX_RECEIVE_SLOTS`, recorded in `docs/TODO.md`) the presenting
+    symptom was a *port-allocation* error, not the missing key. There is no MC
+    deployment-config env-test, so nothing catches it before the roll.
   - **Identity-key handling adds NO deploy-ordering constraint** beyond the
     tag-reshape lockstep above. MC admits a joiner that sends no
     `identity_public_key` (length 0 is the contract's NO KEY PUBLISHED state), so
@@ -189,6 +213,20 @@ Complete ALL items before deploying to production:
 ---
 
 ## Deployment Steps
+
+### 0. Roll the browser SDK first (story 2 task 20 and later)
+
+The SDK tolerates an old MC (one handler offered, one target), but an old SDK
+does NOT tolerate the new MC under partial connectivity (see §Coordination: it
+silently sends to only its first target). So:
+
+1. Deploy the web app / SDK bundle carrying multi-target send and multi-transport
+   receive.
+2. Only then roll MC.
+3. Expect a stale-bundle tail regardless: users with a cached old bundle are in
+   the old-SDK case until they reload. It is safe for all-connected meetings; for
+   a report of "some peers hear me, some don't" during that window, ask the user
+   to reload before triaging (`mc-incident-response.md` Scenario 18 arm (c2)).
 
 ### 1. Pre-Deployment Verification
 
@@ -239,7 +277,7 @@ watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 2>/dev
 ### 3. Update Container Image
 
 > **Apply the manifests FIRST if the release changes `infra/services/mc-service/**`.**
-> MC reads fifteen required env vars via `ConfigError::MissingEnvVar` with no Rust
+> MC reads sixteen required env vars via `ConfigError::MissingEnvVar` with no Rust
 > default, and each is injected by a per-key `configMapKeyRef` that lives in the
 > **Deployment**, not the ConfigMap. A release that adds a required key and is
 > shipped with `kubectl set image` alone puts **both MC pods into
@@ -631,6 +669,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` | **Yes** | Per-connection budget on *accepted* capability declarations. Bounds client-driven O(N) meeting-actor work; over-budget declarations are rejected and counted. | `64` (in ConfigMap) | `64` |
 | `MC_AUDIO_CODEC` | **Yes** | Codec MC directs clients to produce for main audio. Parsed to the `Codec` proto enum; unrecognised values, `unspecified`, and video codecs all fail at startup. | `opus` (in ConfigMap) | `opus` |
 | `MC_AUDIO_MAX_BITRATE_BPS` | **Yes** | Max audio bitrate MC directs. Top of the 32–48 kbps band `mh-service` sizes its datagram buffer against; validated against that band at load. | `48000` (in ConfigMap) | `48000` |
+| `MC_MEDIA_CONNECT_SETTLE_MS` | **Yes** | Connect settle window (ADR-0036 §9, story 2 task 20): how long after a participant's FIRST MH-reported connection MC waits before routing on whatever it observed. Ends early once the participant reaches every handler of its meeting. **Not a debounce** — without it an all-connected meeting loses co-location permanently. Validated `100..=10000` at load. Published as `mc_media_connect_settle_window_seconds`. | `1500` (in ConfigMap) | `1500` |
 | `MC_AUDIO_FRAME_RATE_HZ` | **Yes** | Audio frames per second MC directs (50 Hz = 20 ms frames). Same physical quantity as `mh-service`'s `AUDIO_FRAME_DURATION_MS = 20` in the reciprocal unit; changing it moves MH's "32 frames = 640 ms" latency budget. | `50` (in ConfigMap) | `50` |
 | `MC_REGION` | No | Geographic region for this MC. | `us-east-1` | `local` |
 | `GC_GRPC_URL` | No | Global Controller gRPC endpoint. | `http://localhost:50051` | `http://gc-service.dark-tower:50051` |
@@ -651,7 +690,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `DEPLOYMENT_ENVIRONMENT` | No | `deployment.environment` resource attribute (ADR-0011). | `development` | `production` |
 | `RUST_LOG` | No | Logging level. Set as a literal in the Deployment, not via ConfigMap. | `info` | `info,mc_service=debug` |
 
-**The fifteen Required rows are the CrashLoop list.** Each is loaded via
+**The sixteen Required rows are the CrashLoop list.** Each is loaded via
 `ConfigError::MissingEnvVar` in `crates/mc-service/src/config.rs`, so absence
 fails config load before the server binds: the pod enters `CrashLoopBackOff`
 and the reason is the first line of the container log. `MC_TLS_CERT_PATH` and
@@ -864,6 +903,8 @@ data:
   MC_AUDIO_CODEC: "opus"
   MC_AUDIO_MAX_BITRATE_BPS: "48000"            # top of mh-service's 32-48 kbps band
   MC_AUDIO_FRAME_RATE_HZ: "50"                 # 50 Hz = 20 ms frames
+  # ---- ADR-0036 §9 connect settle window (REQUIRED; absent = CrashLoop) ----
+  MC_MEDIA_CONNECT_SETTLE_MS: "1500"           # validated 100..=10000 at load; see configmap.yaml
 ```
 
 **Per-instance ConfigMaps: `mc-0-config`, `mc-1-config`** — carry only
@@ -876,7 +917,7 @@ required** via `ConfigError::MissingEnvVar` — its per-workload check
 does **not** cover it: that rule fires only when *no* workload references the
 key at all, so one of two references satisfies it. A non-required key wired
 into one Deployment and forgotten on the other is therefore **guard-green while
-the two pods run different values**, which is why these five keys are required
+the two pods run different values**, which is why these keys are required
 with no Rust default. A *required* key referenced by only one CrashLoops that
 pod alone, which presents as "the meeting works about half the time" depending
 on which pod GC assigned.
@@ -1401,7 +1442,7 @@ kubectl rollout undo deployment/mc-1 -n dark-tower
 
 ### Post-Deploy Monitoring Checklist: MC↔MH Coordination (RegisterMeeting + Notifications)
 
-Use this checklist after any deployment that touches the MC↔MH coordination path: `RegisterMeeting` RPC client (`crates/mc-service/src/grpc/mh_client.rs`), `MhConnectionRegistry`, or MH→MC notification handling. This is the MC-side companion to the MH-side post-deploy checklist; the canonical full checklist (with all four windows — 30-min, 2-hour, 4-hour, 24-hour — and rollback criteria) lives at:
+Use this checklist after any deployment that touches the MC↔MH coordination path: `RegisterMeeting` RPC client (`crates/mc-service/src/grpc/mh_client.rs`), participant connectivity (`crates/mc-service/src/media_routing/connectivity.rs`, held by the meeting actor), or MH→MC notification handling. This is the MC-side companion to the MH-side post-deploy checklist; the canonical full checklist (with all four windows — 30-min, 2-hour, 4-hour, 24-hour — and rollback criteria) lives at:
 
 - `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination"
 
@@ -1422,7 +1463,10 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 ```
 
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (run the canonical query)
-- [ ] `mc_mh_notifications_received_total` rate non-zero (events arriving means MH is reaching MC)
+- [ ] `mc_mh_notifications_received_total` rate non-zero (events arriving means MH is reaching MC). **Since story 2 task 20 this is load-bearing, not a sanity check**: these notifications ARE who-hears-whom. A flat `connected` rate while joins continue is "nobody hears anybody".
+- [ ] `mc_mh_notifications_unapplied_total{reason="connection_bound_refused"}` flat (expected-empty); `handler_not_in_set` flat unless an MH pod restarted in the window (then it is expected — `mc-incident-response.md` Scenario 18 arm (a))
+- [ ] `mc_mh_notifications_without_connection_id_total` flat once MH has rolled (non-zero = an MH predating `connection_id` still in the fleet)
+- [ ] `mc_media_connect_settle_window_seconds` equals the ConfigMap's `MC_MEDIA_CONNECT_SETTLE_MS` / 1000 on every MC pod (a config echo; a mismatch is a stale ConfigMap or a pod that did not roll)
 - [ ] `mc_participant_mh_status_total` **failed-share < 0.20** over 30m (R-60; canonical ratio query in MH runbook 30-min check). This is a *ratio*, NOT a `{state="failed"}` increase == 0 check — the counter increments on any single per-MH client hiccup, so a bare `== 0` false-fails every deploy. Any breach → investigate the client→MH media plane per `mc-incident-response.md` §"Scenario 11: Media Connection Failures".
 - [ ] No new `MCMediaConnectionAllFailed` alerts firing (`infra/docker/prometheus/rules/mc-alerts.yaml`)
 - [ ] No mc-service pod restarts since deploy completed
@@ -1481,6 +1525,14 @@ stays media-dark** with no recovery path in the rolled-back code.
 
 Same shape as carve-outs #1 and #2: the rolled-back MC returns to a state MH cannot consume. The
 difference is the remedy, which is why it is written down rather than inferred.
+
+**Carve-out #4 — rolling MC back ACROSS story 2 task 20 re-introduces the handler split.** A
+pre-task-20 MC places each participant on ONE handler round-robin and offers only that handler, so
+in any meeting whose handler set has two handlers a TWO-person meeting hears nothing. Rollback is
+therefore not a neutral safety action here. It is tolerated by the new SDK (one url offered, one
+target). Roll back only for a failure worse than that split; prefer rolling forward. After a
+rollback, participants in live meetings rejoin (reload) to be re-offered the old model's single
+handler.
 
 ---
 

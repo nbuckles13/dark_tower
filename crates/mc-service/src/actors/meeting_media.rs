@@ -1,6 +1,29 @@
-//! The meeting actor's media state: join-order slots, handler placement, the
-//! per-handler push workers, and every declared participant's last-emitted view
-//! (ADR-0036 §5, §6, §8, §9; story 2 R-1..R-4, R-33).
+//! The meeting actor's media state: join-order slots and shared-handler edges,
+//! each participant's OBSERVED handler connectivity, the per-handler push
+//! workers, and every declared participant's last-emitted view (ADR-0036 §5,
+//! §6, §8, §9; story 2 R-1..R-4, R-33).
+//!
+//! # Connectivity has one home: here
+//!
+//! Which handlers a participant is connected to is recorded ONLY by this actor,
+//! from MH's `NotifyParticipantConnected` / `NotifyParticipantDisconnected`
+//! (`grpc/media_coordination.rs`), in the same actor turn that resolves the
+//! connection's `sender_id` — so the sender-binding answer and the routing input
+//! cannot drift apart. There is no second store (the former
+//! `MhConnectionRegistry` is gone), and the client-reported
+//! `ParticipantActor::mh_statuses` map is never read. The per-participant state
+//! machine, its keying by MH connection, the tombstone and the settle rule live
+//! in `media_routing/connectivity.rs`. A settled connectivity change is a
+//! structural change like a join or leave: same recompute, generation advance,
+//! re-push and applied-echo machinery.
+//!
+//! **Hazard, out of scope here (Lead ruling R3):** connectivity is edge-
+//! triggered and nothing re-asserts it. An MH that crashes sends no
+//! Disconnected, and its restarted process registers under a new `handler_id`
+//! outside the frozen set, so MC keeps routing edges to the dead id — sticky
+//! silence that presents as healthy — until story 4's handler-restart
+//! detection lands. `mc_mh_notifications_unapplied_total{reason="handler_not_in_set"}`
+//! is the discriminator (`docs/TODO.md` §Media Path Obligations).
 //!
 //! # The actor is the single writer AND the single composer
 //!
@@ -66,8 +89,8 @@ use crate::errors::McError;
 use crate::grpc::MhRegistrationClient;
 use crate::media_admission::SenderId;
 use crate::media_routing::{
-    HandlerEndpoint, HandlerId, HandlerPusher, MeetingAssignment, MeetingHandlers,
-    PolicyGenerations, PushJob, PushTarget, SlotTable,
+    ConnectionKey, HandlerId, HandlerPusher, MeetingAssignment, MeetingHandlers,
+    ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, SlotTable, Unapplied,
 };
 use crate::media_signaling::{
     build_send_directive, build_stream_assignments, DirectiveOutcome, MediaStreamPolicy,
@@ -79,6 +102,8 @@ use proto_gen::dark_tower::signaling::v1::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -106,6 +131,9 @@ pub struct MediaRoutingDeps {
     pub mc_grpc_endpoint: String,
     /// The stream-number to media-kind/encoding table MC directs from.
     pub stream_policy: MediaStreamPolicy,
+    /// The connect settle window (`MC_MEDIA_CONNECT_SETTLE_MS`), see
+    /// `media_routing/connectivity.rs` for why it exists.
+    pub connect_settle_window: Duration,
 }
 
 impl std::fmt::Debug for MediaRoutingDeps {
@@ -113,6 +141,7 @@ impl std::fmt::Debug for MediaRoutingDeps {
         f.debug_struct("MediaRoutingDeps")
             .field("mc_id", &self.mc_id)
             .field("mc_grpc_endpoint", &self.mc_grpc_endpoint)
+            .field("connect_settle_window", &self.connect_settle_window)
             .finish_non_exhaustive()
     }
 }
@@ -139,10 +168,6 @@ pub struct MeetingSeams {
     /// Pre-seed the `sender_id` allocator cursor (`Some`) — the exhaustion
     /// guard's bypass. `None` means a fresh allocator.
     pub sender_id_cursor: Option<Option<std::num::NonZeroU16>>,
-    /// Pin participants, by token `sub`, to a named handler of the meeting's
-    /// own set. A pin naming a handler outside the set FAILS the join; there is
-    /// no fallback to round-robin. Takes an id, never a url, host or port.
-    pub placement_pins: BTreeMap<String, HandlerId>,
     /// Override [`SLOT_VIEW_FLUSH_BATCH`] (e.g. 1, to observe deferral).
     pub slot_view_flush_batch: Option<usize>,
 }
@@ -165,9 +190,10 @@ pub(super) struct RosterEntry<'a> {
     pub audio_muted: bool,
 }
 
-/// One participant's declaration and last-emitted view.
+/// One participant's declaration, observed connectivity and last-emitted view.
 struct View {
     sender: SenderId,
+    connectivity: ParticipantConnectivity,
     declaration: Option<ReceiveCapabilityDeclaration>,
     last_directive: Option<SendDirective>,
     last_assignments: Option<StreamAssignments>,
@@ -189,31 +215,26 @@ pub(super) struct MeetingMedia {
     flush_batch: usize,
     /// The latest render, shared by the push and the flush of one change.
     assignment: Option<MeetingAssignment>,
-    #[cfg(feature = "test-seams")]
-    placement_pins: BTreeMap<String, HandlerId>,
 }
 
 impl MeetingMedia {
     pub(super) fn new(meeting_id: String, cancel: CancellationToken) -> Self {
         Self {
+            slots: SlotTable::for_meeting(&meeting_id),
             meeting_id,
             cancel,
             deps: None,
             handlers: None,
-            slots: SlotTable::new(),
             pushers: BTreeMap::new(),
             views: HashMap::new(),
             dirty: BTreeSet::new(),
             flush_batch: SLOT_VIEW_FLUSH_BATCH,
             assignment: None,
-            #[cfg(feature = "test-seams")]
-            placement_pins: BTreeMap::new(),
         }
     }
 
     #[cfg(feature = "test-seams")]
     pub(super) fn apply_seams(&mut self, seams: &MeetingSeams) {
-        self.placement_pins = seams.placement_pins.clone();
         if let Some(batch) = seams.slot_view_flush_batch {
             self.flush_batch = batch.max(1);
         }
@@ -235,80 +256,197 @@ impl MeetingMedia {
                     meeting_id = %self.meeting_id,
                     "A join carried a handler assignment that differs from this meeting's frozen \
                      handler set; keeping the frozen set. No join can widen a live meeting's set \
-                     or move a placed participant. This is an MC-internal invariant violation: \
+                     or move an edge. This is an MC-internal invariant violation: \
                      capture and escalate."
                 );
             }
         }
     }
 
-    /// Place and admit a participant. Returns the handler it was placed on.
+    /// Admit a participant into slot state. It is not routable until MH
+    /// reports its connections and they settle, so nothing moves yet.
     ///
     /// # Errors
     ///
     /// [`McError::MhAssignmentMissing`] if no handler set is installed;
-    /// [`McError::Internal`] if placement fails (including a test-seam pin
-    /// outside the meeting's set) or the slot table refuses the admission.
-    pub(super) fn admit(
-        &mut self,
-        participant_id: &str,
-        user_id: &str,
-        sender: SenderId,
-    ) -> Result<HandlerEndpoint, McError> {
-        let Some(handlers) = &self.handlers else {
+    /// [`McError::Internal`] if the slot table refuses the admission.
+    pub(super) fn admit(&mut self, participant_id: &str, sender: SenderId) -> Result<(), McError> {
+        if self.handlers.is_none() {
             return Err(McError::MhAssignmentMissing(
                 "no handler set installed for this meeting".to_string(),
             ));
-        };
-
-        #[cfg(feature = "test-seams")]
-        let pinned: Option<HandlerId> = match self.placement_pins.get(user_id) {
-            Some(pin) if handlers.get(pin).is_some() => Some(pin.clone()),
-            Some(_) => {
-                return Err(McError::Internal(
-                    "placement pin names a handler outside the meeting's set".to_string(),
-                ))
-            }
-            None => None,
-        };
-        #[cfg(not(feature = "test-seams"))]
-        let pinned: Option<HandlerId> = {
-            let _ = user_id;
-            None
-        };
-
-        let (_, handler) = self
-            .slots
-            .admit(sender, |rank| {
-                pinned.or_else(|| handlers.place(rank).map(|h| h.id.clone()))
-            })
+        }
+        self.slots
+            .admit(sender)
             .map_err(|e| McError::Internal(format!("slot admission failed: {e}")))?;
-        let endpoint = handlers
-            .get(&handler)
-            .cloned()
-            .ok_or_else(|| McError::Internal("placed handler missing from the set".to_string()))?;
-
         self.views.insert(
             participant_id.to_string(),
             View {
                 sender,
+                connectivity: ParticipantConnectivity::default(),
                 declaration: None,
                 last_directive: None,
                 last_assignments: None,
             },
         );
+        Ok(())
+    }
 
-        // "Which handler did this participant land on" — the operator's first
-        // question when someone hears only part of the roster. Participant id
-        // and handler id only: no rank, no sender id.
+    /// The meeting's frozen handler set — the ONLY source of the full
+    /// `JoinResponse.media_servers` list.
+    pub(super) fn frozen_handlers(&self) -> Option<&MeetingHandlers> {
+        self.handlers.as_ref()
+    }
+
+    /// Record an MH-reported connection for a resolved roster participant.
+    /// Returns whether routing changed (the caller then reconciles).
+    ///
+    /// # Errors
+    ///
+    /// The [`Unapplied`] reason; nothing is recorded on error.
+    pub(super) fn media_connected(
+        &mut self,
+        participant_id: &str,
+        wire_handler_id: &str,
+        key: ConnectionKey,
+        now: Instant,
+    ) -> Result<bool, Unapplied> {
+        let (Some(handlers), Some(deps)) = (&self.handlers, &self.deps) else {
+            return Err(self.invariant_violation("connect", "no frozen handler set"));
+        };
+        // S1a: exact-match membership in the frozen set, or nothing.
+        let Some(endpoint) = handlers.resolve(wire_handler_id).cloned() else {
+            return Err(Unapplied::HandlerNotInSet);
+        };
+        let window = deps.connect_settle_window;
+        let Some(view) = self.views.get_mut(participant_id) else {
+            return Err(self.invariant_violation("connect", "roster participant has no view"));
+        };
+        view.connectivity.connect(&endpoint, key, now, window)?;
+        Ok(self.sync_routing(participant_id, now))
+    }
+
+    /// Record an MH-reported disconnection. Returns whether routing changed.
+    ///
+    /// Scoped to THIS participant's keys (security S12): there is no lookup
+    /// across participants, so a key another participant holds is simply
+    /// unknown here.
+    ///
+    /// # Errors
+    ///
+    /// The [`Unapplied`] reason; nothing is changed on error.
+    pub(super) fn media_disconnected(
+        &mut self,
+        participant_id: &str,
+        wire_handler_id: &str,
+        key: &ConnectionKey,
+        now: Instant,
+    ) -> Result<bool, Unapplied> {
+        let Some(handlers) = &self.handlers else {
+            return Err(self.invariant_violation("disconnect", "no frozen handler set"));
+        };
+        let Some(handler) = handlers.resolve(wire_handler_id).map(|h| h.id.clone()) else {
+            return Err(Unapplied::HandlerNotInSet);
+        };
+        let Some(view) = self.views.get_mut(participant_id) else {
+            return Err(self.invariant_violation("disconnect", "roster participant has no view"));
+        };
+        view.connectivity.disconnect(&handler, key)?;
+        Ok(self.sync_routing(participant_id, now))
+    }
+
+    /// The ONE home for a handler notification that reached this actor for a
+    /// roster-resolved participant but found state MC cannot legitimately be
+    /// in: `admit()` refuses without a handler set, and a view exists exactly
+    /// while the participant is on the roster (both change in the same actor
+    /// turn). The genuine join race is caught upstream (`resolve_user` →
+    /// `NotFound`), so these are NOT the routine `participant_unknown` race —
+    /// the counter reason stays `participant_unknown` (fail closed; no
+    /// vocabulary for a can't-happen branch), and this loud line is what
+    /// distinguishes it (security S-2).
+    fn invariant_violation(&self, event: &'static str, state: &'static str) -> Unapplied {
+        error!(
+            target: "mc.actor.meeting",
+            meeting_id = %self.meeting_id,
+            event,
+            state,
+            "Handler notification for a roster participant found impossible media state; \
+             nothing recorded (counted as participant_unknown). This is an MC-internal \
+             invariant violation: capture and escalate."
+        );
+        Unapplied::ParticipantUnknown
+    }
+
+    /// Settle every establishing participant that is due. Returns whether any
+    /// participant's routing changed.
+    pub(super) fn settle_due(&mut self, now: Instant) -> bool {
+        let due: Vec<String> = self
+            .views
+            .iter()
+            .filter(|(_, v)| {
+                v.connectivity
+                    .next_wake(self.handler_count())
+                    .is_some_and(|w| w <= now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut changed = false;
+        for participant_id in due {
+            changed |= self.sync_routing(&participant_id, now);
+        }
+        changed
+    }
+
+    /// The earliest instant an establishing participant could settle.
+    pub(super) fn next_settle_wake(&self) -> Option<Instant> {
+        let count = self.handler_count();
+        self.views
+            .values()
+            .filter_map(|v| v.connectivity.next_wake(count))
+            .min()
+    }
+
+    fn handler_count(&self) -> usize {
+        self.handlers.as_ref().map_or(0, MeetingHandlers::len)
+    }
+
+    /// Settle this participant if due, and push its routable set into the slot
+    /// table if it differs from what the table holds. Returns whether it did.
+    fn sync_routing(&mut self, participant_id: &str, now: Instant) -> bool {
+        let count = self.handler_count();
+        let Some(handlers) = &self.handlers else {
+            return false;
+        };
+        let Some(view) = self.views.get_mut(participant_id) else {
+            return false;
+        };
+        if let Some(outcome) = view.connectivity.poll(now, count) {
+            metrics::record_connect_settle(outcome);
+        }
+        let routable = view.connectivity.routable(handlers);
+        let sender = view.sender;
+        let phase = view.connectivity.phase();
+        let observed: Vec<String> = view
+            .connectivity
+            .observed()
+            .map(ToString::to_string)
+            .collect();
+        if self.slots.connected_of(sender) == routable.as_ref() {
+            return false;
+        }
+        self.slots.set_connectivity(sender, routable);
+        // Current state for the operator, keyed by participant (never by sender
+        // id, ADR-0036 §11): its observed handlers and its phase. The latest
+        // line per participant is its connectivity now.
         info!(
             target: "mc.actor.meeting",
             meeting_id = %self.meeting_id,
             participant_id = %participant_id,
-            mh_id = %endpoint.id,
-            "Participant placed on media handler"
+            connected_mh_ids = %observed.join(","),
+            phase = phase.label(),
+            "Participant media connectivity changed"
         );
-        Ok(endpoint)
+        true
     }
 
     /// Remove a participant from slot state and view tracking.
@@ -379,6 +517,17 @@ impl MeetingMedia {
         }
     }
 
+    /// Render the slot table and publish each handler's snapshot.
+    ///
+    /// **Note for the story-2 server-mute task (not implemented here):** each
+    /// handler's snapshot will carry `server_muted_sources`. Filter it per
+    /// handler by EDGE OWNERSHIP — the muted senders that are the SOURCE of at
+    /// least one edge this render places on that handler — never by
+    /// connectivity: a sender connected to H need not send to H, and MH
+    /// enforces mute at ingress with no cross-handler forwarding. A sender
+    /// whose edges span handlers is in each of their sets. This is also what
+    /// MH's `MH_MAX_MUTED_SOURCES_PER_MEETING` sizing derivation assumes
+    /// (`infra/services/mh-service/configmap.yaml`).
     async fn render_and_publish(&mut self) {
         let (Some(deps), Some(handlers)) = (&self.deps, &self.handlers) else {
             return;
@@ -443,7 +592,103 @@ impl MeetingMedia {
                 assignment: policy.clone(),
             });
         }
+        self.record_edge_moves(&assignment);
+        self.log_in_edge_changes(&assignment);
         self.assignment = Some(assignment);
+    }
+
+    /// Classify every edge that changed handler between the previous render and
+    /// this one (O-7). An edge may move only because its handler left one
+    /// party's connected set; one that moved while BOTH parties are still on
+    /// the old handler is an invariant violation (`unexpected`, expected-empty).
+    ///
+    /// Deliberately an independent diff of two renders, not a counter inside
+    /// the slot table's mutation code: a regression in that code cannot also
+    /// hide its own evidence.
+    fn record_edge_moves(&self, next: &MeetingAssignment) {
+        let Some(previous) = &self.assignment else {
+            return;
+        };
+        let index = |a: &MeetingAssignment| -> HashMap<u32, (HandlerId, SenderId, SenderId)> {
+            a.per_handler
+                .iter()
+                .flat_map(|(handler, policy)| {
+                    policy.egress_streams.iter().filter_map(move |plan| {
+                        plan.candidate_sources.first().map(|source| {
+                            (
+                                plan.egress_stream_id,
+                                (handler.clone(), plan.subscriber, *source),
+                            )
+                        })
+                    })
+                })
+                .collect()
+        };
+        let before = index(previous);
+        for (stream, (handler, subscriber, source)) in index(next) {
+            let Some((old_handler, old_subscriber, old_source)) = before.get(&stream) else {
+                continue;
+            };
+            if *old_subscriber != subscriber || *old_source != source || *old_handler == handler {
+                continue;
+            }
+            let reason = if self
+                .slots
+                .both_connected_to(subscriber, source, old_handler)
+            {
+                error!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    from_mh_id = %old_handler,
+                    to_mh_id = %handler,
+                    "An edge moved handler while both parties are still connected to its old \
+                     handler (edge-stability invariant violation). Capture and escalate."
+                );
+                metrics::EdgeMove::Unexpected
+            } else {
+                metrics::EdgeMove::ConnectivityChange
+            };
+            metrics::record_edge_move(reason);
+        }
+    }
+
+    /// One INFO line per participant whose in-edge handler summary changed:
+    /// how many of its slots each handler carries (e.g. `mh-0:2,mh-1:1`). No
+    /// per-edge sender identity (ADR-0036 §11).
+    fn log_in_edge_changes(&self, next: &MeetingAssignment) {
+        let summary = |a: Option<&MeetingAssignment>, subscriber: SenderId| -> String {
+            let mut counts: BTreeMap<&HandlerId, usize> = BTreeMap::new();
+            if let Some(a) = a {
+                for (handler, policy) in &a.per_handler {
+                    let n = policy
+                        .egress_streams
+                        .iter()
+                        .filter(|p| p.subscriber == subscriber)
+                        .count();
+                    if n > 0 {
+                        counts.insert(handler, n);
+                    }
+                }
+            }
+            counts
+                .iter()
+                .map(|(h, n)| format!("{h}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for (participant_id, view) in &self.views {
+            let before = summary(self.assignment.as_ref(), view.sender);
+            let after = summary(Some(next), view.sender);
+            if before != after {
+                info!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    participant_id = %participant_id,
+                    in_edges = %after,
+                    "Participant in-edge handlers changed"
+                );
+            }
+        }
     }
 
     /// Flush up to the per-turn bound of dirty participants; defer the rest.
@@ -556,6 +801,7 @@ impl MeetingMedia {
         let mut delivered = true;
         if directive_changed {
             metrics::record_send_directive(directive_outcome);
+            metrics::record_send_targets(directive.streams.iter().map(|s| s.targets.len()).sum());
             delivered &= send(
                 connection,
                 server_message::Message::SendDirective(directive.clone()),
@@ -592,6 +838,10 @@ impl MeetingMedia {
             metrics::record_unreachable_senders(
                 composition.assignments.unreachable_sender_ids.len(),
             );
+            // Pairs with the unreachable count: silence because the sets are
+            // disjoint vs silence because someone (possibly this subscriber
+            // itself) is not connected yet.
+            metrics::record_not_yet_connected_senders(self.slots.not_routable_count());
         }
         if let Some(view) = self.views.get_mut(participant_id) {
             view.last_directive = Some(directive);

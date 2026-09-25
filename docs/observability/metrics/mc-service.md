@@ -428,15 +428,16 @@ which does carry `handler_id`. The label may return once
 - **Type**: Counter
 - **Description**: Whether MC could resolve a participant's `sender_id` for the Media Handler that asked, and if not, why (ADR-0036 §2, §4; R-15)
 - **Labels**:
-  - `outcome`: `resolved`, `meeting_unknown`, `participant_unknown`, `registry_full`, `user_ambiguous`
+  - `outcome`: `resolved`, `meeting_unknown`, `participant_unknown`, `user_ambiguous` (`registry_full` RETIRED, story 2 task 20 — see below)
   - `key_custody`: single value `operator` (ADR-0036 §4 — MC can read media keys; that is accepted operator custody, never described as end-to-end)
 - **Cardinality**: bounded at the type level by `SenderBindingOutcome::ALL`. **Deliberately no restated integer** — the list above is the operator-facing artifact and a second encoding of its length only rots. (This number drifted four times during the devloop that added the metric; the compile-checked length in `ALL: [Self; N]` is the guard, a prose count is an unchecked copy.)
 - **Increment boundary**: once per `NotifyParticipantConnected` **response MC emits**, on every path that produces a response. If the RPC fails before a response is formed, nothing increments here — that population is MH's `mh_media_session_starts_total{outcome="declined_mc_unavailable"}` plus MC's transport-level metrics.
 - **THE `sender_id` VALUE IS NEVER A LABEL.** ADR-0036 §11 bars it as a per-participant metric dimension, span attribute or structured log field. The bounded `outcome` token carries every bit of triage signal the value would, at the `SenderBindingOutcome::ALL` cardinality instead of 65535.
-- **Why this is NOT redundant with MH's counter — read this before deleting either.** MH observes only `sender_id == 0` and **structurally cannot** tell which unresolved outcome produced it; its `mh_media_session_starts_total{outcome="declined_no_sender_binding"}` is the **union of MC's `0`-answering outcomes**: `meeting_unknown` (routing/registration fault, remedy in the MC↔MH registration path), `participant_unknown` (join race — **self-clearing**), `registry_full` (capacity — **never self-clears**; raise the per-meeting cap or add MC capacity), `user_ambiguous` (one user, two roster entries — **never self-clears, and reconnecting CAUSES it**). Only MC can split them. **This series therefore carries strictly more information than any function of the MH series.** The values are named rather than counted deliberately: a restated count is an unchecked copy that goes stale on the next addition, while naming them cannot.
-- **The discriminator for this whole vocabulary is REMEDY, not cause.** Three of the five values exist as separate series because acting on a neighbour's remedy would be wrong or harmful, not because their causes differ. When adding a value, the question is "does a responder do something different?", not "is this a distinct cause?".
+- **Why this is NOT redundant with MH's counter — read this before deleting either.** MH observes only `sender_id == 0` and **structurally cannot** tell which unresolved outcome produced it; its `mh_media_session_starts_total{outcome="declined_no_sender_binding"}` is the **union of MC's `0`-answering outcomes**: `meeting_unknown` (routing/registration fault, remedy in the MC↔MH registration path), `participant_unknown` (join race — **self-clearing**), `user_ambiguous` (one user, two roster entries — **never self-clears, and reconnecting CAUSES it**). Only MC can split them. **This series therefore carries strictly more information than any function of the MH series.** The values are named rather than counted deliberately: a restated count is an unchecked copy that goes stale on the next addition, while naming them cannot.
+- **The discriminator for this whole vocabulary is REMEDY, not cause.** Two of the four values exist as separate series because acting on a neighbour's remedy would be wrong or harmful, not because their causes differ. When adding a value, the question is "does a responder do something different?", not "is this a distinct cause?".
 - **`user_ambiguous`: the folded label would have been actively harmful, which is why it is separate.** MC mints a fresh `participant_id` per join and does not bar a second join, so **a user who reconnects produces a second roster entry for the same `sub`**. If this were folded into `participant_unknown`, the union's documented remedy is "benign race — reconnect", and following that instruction on this cause **converts a transient failure into a permanent one**. This is not merely two remedies in one series; it is a series whose documented remedy is *harmful* for one of its members.
-- **`registry_full` is separate from `participant_unknown` on purpose.** The participant may be perfectly well known; the refusal is about the per-meeting connection cap, and its remedy is capacity, not a lifecycle investigation. It exists because answering a real ordinal for a connection MC declined to register would let MH forward media for a connection MC is not tracking — and will never send `NotifyParticipantDisconnected` for — so the two sides would disagree about whether the connection exists with nothing surfacing the disagreement.
+- **`user_ambiguous` is NOT resolved by `connection_id`** (story 2 task 20). `connection_id` distinguishes MH CONNECTIONS; this ambiguity is between two MC roster ENTRIES (joins) behind one token `sub`, and MC cannot map an MH connection to one of its own joins. The remedy has one home: `docs/TODO.md` §Media Path Obligations, "`user_ambiguous` has no operator remedy". Since task 20 the same fail-closed rule also governs connectivity: an ambiguous `sub` records connectivity for NO entry (counted `mc_mh_notifications_unapplied_total{reason="user_ambiguous"}`).
+- **`registry_full` — RETIRED (story 2 task 20). Version-skew only.** It counted the per-meeting `MhConnectionRegistry` cap declining a binding. The registry and its cap are gone: participant connectivity now lives in the meeting actor, bounded structurally (roster × the meeting's frozen handler set × a small per-handler key bound), and MC never declines a binding for capacity. A non-zero value can only come from an MC image predating the retirement during a rolling deploy — **not a capacity signal; there is no cap to raise.** The actor's own bound refuses a surplus *connection key* without touching the binding, on `mc_mh_notifications_unapplied_total{reason="connection_bound_refused"}`.
 - **Shared denominator, recorded so it is not alerted on twice.** This increments on the same path as `record_mh_notification("connected")`, after the same validation gate, so `sum(mc_media_sender_binding_responses_total)` equals `mc_mh_notifications_received_total{event_type="connected"}` **by construction**. Not duplication — this one carries the resolution dimension the other lacks — but two series encoding one count invite either a double alert or the deletion of the wrong one.
 - **Label key is `outcome`, not `status`**, matching the sibling `mc_media_policy_pushes_total` and MH's counterpart so both ends of one handshake sit side by side in a query.
 - **Usage**: Detect a participant MC cannot bind for MH — and distinguish a routing fault from a join race, which MH alone cannot
@@ -517,9 +518,9 @@ span would record as attributes, on a surface no guard covers.
   - `outcome`: `emitted`, `emitted_empty_targets`, `unknown_stream_number`, `transport_mode_unspecified`, `handler_url_unresolved`, `meeting_state_unavailable`, `assignment_failed`
   - `key_custody`: single value `operator`
 - **Cardinality**: bounded at the type level by `DirectiveOutcome::ALL`. Deliberately no restated integer — the list above is the operator-facing artifact and a second encoding of its length only rots.
-- **THE SUCCESS SET IS `{emitted, emitted_empty_targets}`, NOT `{emitted}`.** ADR-0036 §5 makes an empty target set a *specified success* — "A target set may be empty. That means send nothing." A failure predicate must read `outcome!~"emitted|emitted_empty_targets"`; `outcome!="emitted"` would page on a legal state. **Since story 2, `emitted_empty_targets` is ROUTINE**: a solo participant, and any participant no co-handler subscriber holds in a slot, is directed to send nothing — and is re-sent a non-empty directive the moment someone starts holding it.
+- **THE SUCCESS SET IS `{emitted, emitted_empty_targets}`, NOT `{emitted}`.** ADR-0036 §5 makes an empty target set a *specified success* — "A target set may be empty. That means send nothing." A failure predicate must read `outcome!~"emitted|emitted_empty_targets"`; `outcome!="emitted"` would page on a legal state. **`emitted_empty_targets` is ROUTINE**: a solo participant, a participant nobody holds in a slot, and a participant not yet connected to any handler (or still inside its connect settle window) is directed to send nothing — and is re-sent a non-empty directive the moment someone starts holding it. **"Holds" means shares a CONNECTED handler with** (story 2 task 20, ADR-0036 §9) — not "was placed on the same handler", which was task 6's meaning and is retired. **Frequency shift:** under task 6's round-robin placement this was routine in every split two-person meeting; under the edge model an all-connected meeting co-locates, so it collapses back to solo participants, unheld participants and the settle window. It stays a success either way; only the expected magnitude dropped. A target set now names EVERY handler owning one of the sender's edges, so a single directive may carry several targets (`mc_media_send_targets_total`).
 - **PERMANENT — no revert trigger.** This alternation is a correct, permanent classification grounded in ADR-0036 §5, not a workaround. `mc_media_policy_pushes_total`'s superficially identical `outcome!~"match|handler_id_mismatch"` is a *temporary* carve-out with a recorded revert trigger; **the two share a shape and nothing else.** Do not fold this entry into that decision, and do not strip this alternation as part of any cleanup: doing so starts paging on a routine success while appearing to complete a documented task.
-- **Three values are MC defects — ANY non-zero value indicates a bug**: `unknown_stream_number` (a forwarding plan named a stream number MC has no policy entry for), `transport_mode_unspecified` (a plan carried no transport mode; MC fails closed rather than defaulting to datagram) and — since story 2 — `handler_url_unresolved` (every handler url a client sees comes from one frozen `MeetingHandlers` value, so a miss cannot happen by construction; it fails CLOSED — nothing is emitted for that participant, never an `ACTIVE` slot or a send target with an empty url). The remaining **two** failure values are environmental: `meeting_state_unavailable` and `assignment_failed`. (`no_planned_egress_slot`, story 1's join-time "MC planned no slot for you", is retired: declared slots are now the assignment's input.)
+- **Three values are MC defects — ANY non-zero value indicates a bug**: `unknown_stream_number` (a forwarding plan named a stream number MC has no policy entry for), `transport_mode_unspecified` (a plan carried no transport mode; MC fails closed rather than defaulting to datagram) and — since story 2 — `handler_url_unresolved` (every handler url a client sees comes from one frozen `MeetingHandlers` value — the edge's owning handler id is only ever a member of it, because connectivity can hold only handlers resolved from that value — so a miss cannot happen by construction; it fails CLOSED — nothing is emitted for that participant, never an `ACTIVE` slot or a send target with an empty url). The remaining **two** failure values are environmental: `meeting_state_unavailable` and `assignment_failed`. (`no_planned_egress_slot`, story 1's join-time "MC planned no slot for you", is retired: declared slots are now the assignment's input.)
 - **Recorded by the MEETING ACTOR — failures on every composition, successes only on CHANGE.** Compositions are triggered by the participant's own actions and by a PEER's join, leave, declaration or mute (which the participant's own connection never sees); plus once at join if the connection cannot resolve the meeting. A composition FAILURE records its stage unconditionally, so every reason MC did not **compose** a directive lands on this one series. A SUCCESSFUL composition records `emitted`/`emitted_empty_targets` only when the directive CHANGED (see below); an unchanged recomposition records nothing. Under the story-2 model a roster change recomposes everyone but changes only some directives, so the `emitted` rate is well below the composition rate.
 - **A failure RATIO over this series overstates the failure rate.** Its denominator excludes successful-but-unchanged compositions (never recorded) while failures are recorded every time. No alert divides by it today; if one is added, it must not treat `sum()` as "compositions".
 - **Failure values are DISJOINT BY CONSTRUCTION.** Composition is sequential stages — render the slot table, resolve handler urls, build streams — and the first failing stage returns its own value. An assignment failure can never also be reported as an unresolved handler url, because url resolution is never reached.
@@ -541,7 +542,7 @@ span would record as attributes, on a surface no guard covers.
 - **Cardinality**: bounded at the type level by the proto `SlotState` enum, mirrored exhaustively by `media_signaling::slot_state_label`
 - **The bucketed slot-state signal ADR-0036 §11 mandates**, joined to no identity: it answers *how many and how bad*; **MC's own assignment state answers *who***, at investigation time, in a system that legitimately holds that mapping. There is no per-slot series and must not be one.
 - **The label domain MIRRORS THE WIRE ENUM EXHAUSTIVELY** — all eight `SlotState` variants, not the three MC can reach today. A hand-picked subset needs editing the moment §7 makes `switch_pending` live, and a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be *visible* rather than absent. Keeping the vocabulary identical to the wire's is also what makes this distribution comparable with the client's.
-- **Reachable since story 2**: `active`, `source_muted`, `fewer_sources_than_slots`. **Every declared-but-unfilled slot is `fewer_sources_than_slots`** — a solo participant (loopback is removed, R-3), a meeting smaller than N, a participant alone on its handler. `source_unreachable` is **no longer emitted**: a participant on ANOTHER handler consumes no slot and is named in `StreamAssignments.unreachable_sender_ids` instead (see `mc_media_unreachable_senders_total`); the state is reserved for a PINNED source on another handler, which static fill cannot produce. It stays in the label domain because the domain mirrors the wire. `withheld_by_congestion` is MH-observed (§6) and arrives with the slot-state notification; `switch_pending` arrives with §7 switching; `zero_requested` may be **unemittable in principle** — it means "requested zero of this kind" but rides a message whose `slot_id` echoes a slot the subscriber *declared*, and a subscriber who declared a slot of that kind did not request zero of it. That is an open protocol question recorded in `docs/TODO.md`, not a settled "reachable later".
+- **Reachable since story 2**: `active`, `source_muted`, `fewer_sources_than_slots`. **Every declared-but-unfilled slot is `fewer_sources_than_slots`** — a solo participant (loopback is removed, R-3), a meeting smaller than N, a participant sharing a connected handler with too few peers, and every slot of a participant not yet connected. `source_unreachable` stays **unemitted** under the story-2 edge model: a participant the subscriber shares NO connected handler with consumes no slot and is named in `StreamAssignments.unreachable_sender_ids` instead (see `mc_media_unreachable_senders_total`); the state is reserved for a PINNED source with which the subscriber shares no connected handler, which static fill cannot produce. It stays in the label domain because the domain mirrors the wire. `withheld_by_congestion` is MH-observed (§6) and arrives with the slot-state notification; `switch_pending` arrives with §7 switching; `zero_requested` may be **unemittable in principle** — it means "requested zero of this kind" but rides a message whose `slot_id` echoes a slot the subscriber *declared*, and a subscriber who declared a slot of that kind did not request zero of it. That is an open protocol question recorded in `docs/TODO.md`, not a settled "reachable later".
 - **`source_muted` is client mute (§5) OR server mute (§7)** — one wire state covers both causes (who muted whom rides `ParticipantMuteUpdate`). MC does **not** withdraw or re-issue that source's send directive; the slot state is the entire signal. A `source_muted`/`active` oscillation with a flat `mc_media_send_directives_total` is the healthy shape.
 - **THIS COUNTER IS PER-EMISSION, AND EMISSIONS ARE BOTH CLIENT- AND SERVER-DRIVEN.** One increment per declared slot per `StreamAssignments` the actor actually SENDS (only changed views are sent). Since story 2 the actor re-emits on a PEER's join, leave, declaration or audio-mute change, not only on the subscriber's own declaration, so the distribution is weighted by meeting churn as well as by any one client. **Any SLO or ratio built on it must be per-connection-normalised.**
   - The client-driven share is bounded: mute-driven re-emits are rate-limited per connection (`mc_media_mute_requests_total{outcome="rate_limited"}`), a video-only toggle re-emits nothing, and each re-emit reaches only the subscribers HOLDING the muted source. The server-driven share is bounded per meeting by the actor's per-turn flush bound (`mc_media_slot_view_emissions_total{outcome="deferred"}`).
@@ -595,16 +596,81 @@ span would record as attributes, on a surface no guard covers.
 
 ### `mc_media_unreachable_senders_total`
 - **Type**: Counter
-- **Description**: Roster participants named unreachable (on a different media handler, ADR-0036 §9; story 2 R-33) across emitted `StreamAssignments`
+- **Description**: Roster participants named unreachable across emitted `StreamAssignments` — a routable participant whose connected handler set is DISJOINT from the subscriber's (ADR-0036 §9; story 2 R-33, task 20)
 - **Labels**:
   - `key_custody`: single value `operator`
 - **Cardinality**: 1
 - **Increment boundary**: by the length of `unreachable_sender_ids` on each `StreamAssignments` the actor SENDS — recorded only after the handover succeeded, alongside `mc_media_slot_view_emissions_total{outcome="sent"}`, so a delivery failure moves neither side of the ratio below. No sender, meeting or handler identity, ever.
-- **EMISSION-WEIGHTED, NOT A POPULATION.** It rises with churn in a split meeting, and a stable split meeting emits nothing. It does NOT answer "how many people are currently cross-handler" — that is the placement INFO log (`mc.actor.meeting`, "Participant placed on media handler"). Mean unreachable senders per emitted view: `rate(mc_media_unreachable_senders_total[5m]) / rate(mc_media_slot_view_emissions_total{outcome="sent"}[5m])`.
-- **Permanently zero on a single-handler deployment** — by construction, not a vacuous detector: with one handler nobody is unreachable.
-- **Usage**: How often are participants told that some of the roster is on another handler (split meetings under round-robin placement)?
+- **EMISSION-WEIGHTED, NOT A POPULATION.** It rises with churn among partially-connected participants, and a stable meeting emits nothing. It does NOT answer "who cannot reach whom right now" — that is the connectivity INFO lines at `mc.actor.meeting` ("Participant media connectivity changed", "Participant in-edge handlers changed"), whose latest line per participant is its current state. Mean unreachable senders per emitted view: `rate(mc_media_unreachable_senders_total[5m]) / rate(mc_media_slot_view_emissions_total{outcome="sent"}[5m])`.
+- **A non-zero rate is now a CONNECTIVITY-DEGRADATION signal, not a design-expected steady state.** Every client is offered every handler and co-location puts an all-connected meeting on one handler, so a healthy meeting emits zero here. Non-zero means some participants reached a strict subset of their handlers — rare, and the affected user hears silence from the peers named (see Scenario 18 in `docs/runbooks/mc-incident-response.md`).
+- **Permanently zero on a single-handler deployment** — by construction, not a vacuous detector: with one handler every ROUTABLE participant is connected to it, and a participant not yet connected (or re-establishing after losing every connection) is never named unreachable — it is counted on `mc_media_not_yet_connected_senders_total` instead.
+- **This field is a wire contract, not a courtesy.** `signaling.proto` requires the client to mark these roster entries distinctly; client consumption lands with story 2 task 20 (SDK) and the rendering with task 15 (UI). Its rarity is not a reason for a client to ignore it: an unreachable peer is otherwise wholly silent.
+- **Usage**: How often participants are told part of the roster is unreachable — read as degraded media connectivity
 - **Recorded in**: `actors/meeting_media.rs::flush_one` via `observability/metrics.rs::record_unreachable_senders`
 - **Dashboard**: MC Overview - Unreachable Senders Named (Client Media Signalling row)
+
+### `mc_media_not_yet_connected_senders_total`
+- **Type**: Counter
+- **Description**: Roster members NOT routable — not yet connected to any handler, inside their connect settle window, or re-establishing after losing every connection — counted per emitted `StreamAssignments`, the composed subscriber ITSELF INCLUDED
+- **Labels**:
+  - `key_custody`: single value `operator`
+- **Cardinality**: 1
+- **The partner of `mc_media_unreachable_senders_total`**: that series is "silent because the connected sets are disjoint"; this one is "silent because someone is not connected yet". Together they partition MC-explained silence on a delivered view.
+- **Includes the subscriber itself**, because a subscriber that is not connected receives an all-`fewer_sources_than_slots` view that is byte-identical to a healthy small meeting's on `mc_media_slot_states_total` — counting only its peers would leave that case invisible. **This mixes two populations in one series** (the subscriber's own contribution of at most 1, and its peers' of up to N); no split is kept.
+- **NOT expected-empty** — do not tighten it into one. Every join passes through this state until the handlers report the participant's connections, so the series is non-zero on ordinary churn. **Persistence, not rate, is the fault signal**: a participant that passes through the state at join is healthy; one that stays in it is the fault (its client reached no handler, or MH→MC notifications are not arriving). The rate alone cannot tell those apart — the connectivity INFO lines and `mc_mh_notifications_unapplied_total` can. Any future alert needs a duration-over-threshold shape (an operations decision).
+- **Emission-weighted**: normalise by `mc_media_slot_view_emissions_total{outcome="sent"}`.
+- **Usage**: Is MC silent toward participants because their media connectivity has not been observed?
+- **Recorded in**: `actors/meeting_media.rs::flush_one` via `observability/metrics.rs::record_not_yet_connected_senders`
+- **Dashboard**: MC Overview - Not-Yet-Connected Senders (Media Connectivity row)
+
+### `mc_media_send_targets_total`
+- **Type**: Counter
+- **Description**: Send targets carried on each emitted `SendDirective`, summed over its streams
+- **Labels**:
+  - `key_custody`: single value `operator`
+- **Cardinality**: 1
+- **The co-location objective, made observable.** A sender sends to every handler owning one of its edges (ADR-0036 §9 multi-handler send), and MC's edge policy minimises that. Mean targets per emitted directive: `rate(mc_media_send_targets_total[5m]) / rate(mc_media_send_directives_total{outcome="emitted"}[5m])` — ~1 when participants reach every handler; above 1 only with genuinely partial connectivity. A sustained rise with healthy connectivity means co-location has degraded, which shows up otherwise only as client uplink cost.
+- **Only CHANGED directives are recorded** (same boundary as `emitted`), so this is emission-weighted too.
+- **Usage**: Are senders being spread across handlers more than connectivity requires?
+- **Recorded in**: `actors/meeting_media.rs::flush_one` via `observability/metrics.rs::record_send_targets`
+- **Dashboard**: MC Overview - Mean Send Targets per Directive (Media Connectivity row)
+
+### `mc_media_edge_moves_total`
+- **Type**: Counter
+- **Description**: Publisher→subscriber edges that changed handler between two renders, by why
+- **Labels**:
+  - `reason`: `connectivity_change`, `unexpected`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded by `EdgeMove::ALL`
+- **Per-value expectations differ.** `connectivity_change` is routine: an edge's handler left one party's connected set while another shared handler remained, so the edge moved (keeping its slot and its sender). **`unexpected` is expected-empty and alertable at `> 0`**: an edge moved while BOTH parties are still connected to its old handler — an edge-stability invariant violation (ADR-0036 §9 as implemented in task 20; the same principle as R-4 slot stability). The ERROR line at `mc.actor.meeting` names both handler ids.
+- **Detected independently of the code it checks**: a diff of consecutive renders in `reconcile`, not a counter inside the slot table's mutation path, so a regression there cannot also hide its own evidence.
+- **Usage**: Edge churn from connectivity changes; any `unexpected` is an MC defect to capture and escalate
+- **Recorded in**: `actors/meeting_media.rs::record_edge_moves` via `observability/metrics.rs::record_edge_move`
+- **Dashboard**: MC Overview - Edge Moves by Reason (Media Connectivity row; `unexpected` red)
+
+### `mc_media_connect_settles_total`
+- **Type**: Counter
+- **Description**: Participants' connectivity episodes settling, by how
+- **Labels**:
+  - `outcome`: `complete` (connected to every handler of its meeting before the window's end), `window_elapsed` (the settle window ended with a strict subset)
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded by `SettleOutcome::ALL`
+- **Per EPISODE, so it IS a population**: `window_elapsed` counts participants that did not reach every handler within `MC_MEDIA_CONNECT_SETTLE_MS` — the operator's countable answer to "how many participants failed to connect everywhere". Read against `mc_media_connect_settle_window_seconds`.
+- **The window is a masking mechanism, so it is counted.** While a participant is establishing, MC withholds routing (no edges, not unreachable) rather than act on a partial set; without the window, staggered connects would pin every edge involving the participant to its first handler permanently (see `media_routing/connectivity.rs`). `window_elapsed` is the visible edge of that mask.
+- **Usage**: Scenario 18 Step 0's population signal; a rising `window_elapsed` share is participants that cannot reach every handler
+- **Recorded in**: `actors/meeting_media.rs::sync_routing` via `observability/metrics.rs::record_connect_settle`
+- **Dashboard**: MC Overview - Connect Settles by Outcome (Media Connectivity row)
+
+### `mc_media_connect_settle_window_seconds`
+- **Type**: Gauge
+- **Description**: The connect settle window this pod enforces (`MC_MEDIA_CONNECT_SETTLE_MS`), in seconds
+- **Labels**:
+  - `key_custody`: single value `operator`
+- **Cardinality**: 1
+- **A CONFIG ECHO**, set once at boot from the same `ClientMediaConfig::connect_settle_window` the meeting actors enforce, so the published and enforced windows cannot drift (the `mc_media_receive_slot_cap` pattern). Env-test `27_mc_slot_placement.rs` derives its settle wait from this value.
+- **Cost it names**: time-to-first-audio for a participant that does not reach every handler is delayed by up to this window; it never appears in `mc_session_join_duration_seconds` (which stops at the JoinResponse).
+- **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_connect_settle_window`
+- **Dashboard**: MC Overview - Connect Settle Window (Media Connectivity row, stat panel)
 
 ### `mc_media_handler_set_divergence_total`
 - **Expected-empty**: yes — any non-zero value is an MC-internal invariant violation
@@ -613,7 +679,7 @@ span would record as attributes, on a surface no guard covers.
 - **Labels**:
   - `key_custody`: single value `operator`
 - **Cardinality**: 1
-- **The frozen set is the meeting's authority.** The actor keeps it: no later join and no changed Redis entry can widen a live meeting's handler set or move a placed participant. A non-zero value means Redis and the actor disagree — capture and escalate as an MC defect; restarting nothing fixes it. The ERROR line at `mc.actor.meeting` says the same.
+- **The frozen set is the meeting's authority.** The actor keeps it: no later join and no changed Redis entry can widen a live meeting's handler set or move anyone's edges. A non-zero value means Redis and the actor disagree — capture and escalate as an MC defect; restarting nothing fixes it. The ERROR line at `mc.actor.meeting` says the same.
 - **Recorded in**: `actors/meeting_media.rs::install` via `observability/metrics.rs::record_handler_set_divergence`
 - **Dashboard**: MC Overview - Handler Set Divergence (Client Media Signalling row)
 
@@ -662,9 +728,41 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **Labels**:
   - `event_type`: Notification event type (`connected`, `disconnected`)
 - **Cardinality**: Low (2 event types)
-- **Usage**: Monitor MH→MC notification volume, detect MH connectivity issues
+- **Since story 2 task 20 these notifications ARE the source of truth for media visibility**: a participant hears a sender only if both are connected to a common handler, and "connected" is exactly what these notifications report (ADR-0036 §9). A stall here means participants silently hear nobody — while every slot state reads as a small meeting. Read with `mc_mh_notifications_unapplied_total` (notifications that did not become connectivity) and `mc_media_not_yet_connected_senders_total`.
+- **Usage**: MH→MC notification volume; a flat `connected` rate while joins continue is the "nobody hears anybody" shape
 - **Recorded in**: `grpc/media_coordination.rs` on notification receipt
 - **Dashboard**: MC Overview - MH Notifications by Event (MH Coordination row)
+
+### `mc_mh_notifications_unapplied_total`
+- **Type**: Counter
+- **Description**: MH notifications that did not become (or change) participant connectivity, by reason
+- **Labels**:
+  - `reason`: `meeting_unknown`, `participant_unknown`, `user_ambiguous`, `handler_not_in_set`, `unknown_connection`, `connection_bound_refused`, `retired_connection`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded by `Unapplied::ALL`. Shares its first three spellings with `mc_media_sender_binding_responses_total` deliberately (connect path).
+- **Per-value expectations — read per value, never as one rate**:
+  - `unknown_connection` — **ROUTINE** (disconnect path): every connection MC declined to bind sends a Disconnected for a key MC never recorded; also a Disconnected naming a `sub` that resolves to no single roster entry. Never an error to MH.
+  - `participant_unknown` — low-rate race (connect overtaking join). The connect is then forgotten for connectivity too; MH declines the session and the client's reconnect brings a fresh notification.
+  - `user_ambiguous` — one user with two roster entries: connectivity recorded for NEITHER (fail closed). Never self-clears.
+  - `meeting_unknown` — MH notifying about a meeting MC does not hold (both events).
+  - `handler_not_in_set` — the `handler_id` is not byte-identical to a handler of the meeting's frozen set. **Sustained, it means an MH process restarted under a new id and story-4 re-registration has not happened**; the meeting's stale connectivity to the dead id does not clear on its own (Scenario 18).
+  - `connection_bound_refused` — **expected-empty, alertable at `> 0`**: a participant exceeded the live-connection bound on one handler (a reconnect storm or leaked sessions).
+  - `retired_connection` — a Connected delivered after its own Disconnected (MH abandoned the Connected, then sent the decline Disconnected); refused by MC's tombstone. Rare; non-zero means MH→MC RPCs are slow enough to be abandoned.
+- **No meeting, participant, handler or connection identity.** `connection_id` is unbounded (one per MH session) and appears in the INFO line at `mc.grpc.media_coordination` as a correlation field only.
+- **Usage**: Every way MH-reported connectivity failed to become routing input
+- **Recorded in**: `grpc/media_coordination.rs` via `observability/metrics.rs::record_notification_unapplied`
+- **Dashboard**: MC Overview - MH Notifications Unapplied by Reason (Media Connectivity row; per-reason colours)
+
+### `mc_mh_notifications_without_connection_id_total`
+- **Type**: Counter
+- **Description**: MH notifications carrying an EMPTY `connection_id` (an MH image that predates the field)
+- **Labels**:
+  - `key_custody`: single value `operator`
+- **Cardinality**: 1
+- **The degraded legacy path, counted so it is not silent.** An empty id maps to one implicit key per (participant, handler) — exactly the pre-field semantics, including the stale-disconnect hazard `connection_id` exists to close. Non-zero means an old MH is still in the fleet (a rolling deploy, or a stuck pod). **Retirement condition**: once this has been flat for a full MH rollout, the legacy branch in `media_routing/connectivity.rs` is deleted.
+- **Usage**: Is any MH still running without `connection_id`?
+- **Recorded in**: `grpc/media_coordination.rs` via `observability/metrics.rs::record_notification_without_connection_id`
+- **Dashboard**: MC Overview - Notifications Without Connection Id (Media Connectivity row)
 
 ---
 
@@ -683,6 +781,12 @@ which MC records on the participant actor.
     `disconnected`, `unspecified` (the proto enum is total-matched; an unknown
     wire value clamps to `unspecified`, never panics or drops)
 - **Cardinality**: Low (4 states, bounded by the `MhState` enum)
+- **NOT the connectivity source for visibility.** These statuses are
+  CLIENT-ASSERTED and diagnostic only: MC never reads them to decide who hears
+  whom, never narrows a participant's connectivity from them, and never takes a
+  url from them (a client-controlled url reaching a send target is a redirect
+  primitive). Connectivity is what the HANDLERS report —
+  `mc_mh_notifications_received_total`. Since story 2 task 20.
 - **Usage**: Observe client-perceived MH reachability; a rising `failed` share
   is an early signal of MH-edge connectivity problems the client sees before MC
   does

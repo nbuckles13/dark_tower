@@ -24,6 +24,7 @@ use super::messages::{
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
 use super::session::{SessionBindingManager, StoredBinding};
+use crate::media_routing::{ConnectionKey, Unapplied};
 use crate::media_signaling::ReceiveCapabilityDeclaration;
 
 use common::secret::SecretBox;
@@ -194,37 +195,64 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
-    /// Resolve one participant's allocated `sender_id`.
+    /// An MH reports a participant's media connection: resolve its `sender_id`
+    /// and record the connectivity in one actor turn.
     ///
     /// Returns a [`SenderLookup`]: `Found(sender_id)` for the single roster
     /// match; `NotFound` when no participant on this meeting's roster carries
-    /// the `user_id` — an honest "I do not know this participant"; or
-    /// `Ambiguous` when more than one does, so the token `sub` does not identify
-    /// a single sender. The caller turns **both** `NotFound` and `Ambiguous`
-    /// into the wire value `0` so MH rejects. **Never a licence to invent,
-    /// default to, or reuse an id** — and `Ambiguous` in particular must never
-    /// be resolved by picking a candidate (see [`SenderLookup::Ambiguous`]).
-    ///
-    /// Narrow by design: see [`MeetingMessage::GetSenderIdForUser`] for why
-    /// this is not served by `get_state()`.
+    /// the `user_id`; `Ambiguous` when more than one does. The caller turns
+    /// **both** `NotFound` and `Ambiguous` into the wire value `0` so MH
+    /// rejects — **never a licence to invent, default to, or reuse an id**.
+    /// Alongside it, the reason connectivity was NOT recorded, if it was not:
+    /// connectivity is recorded only for a `Found` participant on a handler of
+    /// the meeting's frozen set (see [`MeetingMessage::MediaConnected`]).
     ///
     /// # Errors
     ///
-    /// Returns [`McError::Internal`] if the meeting actor's mailbox is closed or
-    /// it drops the response channel — i.e. the meeting is gone. A transport
-    /// failure here is **not** a `NotFound`: the caller must keep the two
-    /// distinguishable, because "the meeting actor died" and "this participant
-    /// is not on the roster" have different remedies.
-    pub async fn get_sender_id_for_user(&self, user_id: String) -> Result<SenderLookup, McError> {
+    /// [`McError::Internal`] if the meeting actor is gone. A transport failure
+    /// here is **not** a `NotFound`: "the meeting actor died" and "this
+    /// participant is not on the roster" have different remedies.
+    pub async fn media_connected(
+        &self,
+        user_id: String,
+        handler_id: String,
+        connection_id: String,
+    ) -> Result<(SenderLookup, Option<Unapplied>), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
-            .send(MeetingMessage::GetSenderIdForUser {
+            .send(MeetingMessage::MediaConnected {
                 user_id,
+                handler_id,
+                connection_id,
                 respond_to: tx,
             })
             .await
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
+    }
 
+    /// An MH reports a participant's media connection closed.
+    ///
+    /// # Errors
+    ///
+    /// [`McError::Internal`] if the meeting actor is gone.
+    pub async fn media_disconnected(
+        &self,
+        user_id: String,
+        handler_id: String,
+        connection_id: String,
+    ) -> Result<Option<Unapplied>, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::MediaDisconnected {
+                user_id,
+                handler_id,
+                connection_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
         rx.await
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
@@ -442,7 +470,7 @@ pub struct MeetingActor {
     media_keys: MeetingKeyState,
     /// Monotonic, non-recycling `sender_id` allocator for this meeting.
     sender_ids: SenderIdAllocator,
-    /// Join-order slots, handler placement, push workers and per-participant
+    /// Join-order slots and shared-handler edges, observed connectivity, push workers and per-participant
     /// views (ADR-0036 §5/§6/§8/§9). Dropped with the actor.
     media: MeetingMedia,
 }
@@ -563,13 +591,14 @@ impl MeetingActor {
     /// **Test builds only.**
     ///
     /// Exists so seam-dependent behaviour runs through the real join path:
-    /// the `sender_id` exhaustion reject without performing 65535 joins, a
-    /// deterministic split across handlers (placement pins), and an observable
-    /// flush deferral (a small flush bound). Compiled only under the
+    /// the `sender_id` exhaustion reject without performing 65535 joins, and an
+    /// observable flush deferral (a small flush bound). There is no handler
+    /// placement seam: partial connectivity is produced by reporting (or not)
+    /// real handler connections. Compiled only under the
     /// non-default `test-seams` feature, and a release build with that feature
     /// on fails to compile (see `lib.rs`).
     ///
-    /// This IS the exhaustion guard's bypass and a placement steering seam. It
+    /// This IS the exhaustion guard's bypass. It
     /// must never be reachable in production.
     ///
     /// # Errors
@@ -614,6 +643,7 @@ impl MeetingActor {
         loop {
             // Check for terminated connection actors
             self.check_connection_health().await;
+            let settle_wake = self.media.next_settle_wake();
 
             tokio::select! {
                 // Handle cancellation
@@ -630,6 +660,18 @@ impl MeetingActor {
                 // Check disconnect grace periods
                 _ = grace_check.tick() => {
                     self.check_disconnect_timeouts().await;
+                }
+
+                // An establishing participant's settle window is due
+                // (`media_routing/connectivity.rs`). A tokio timer, so paused
+                // test time drives it deterministically.
+                () = async {
+                    match settle_wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.settle_due().await;
                 }
 
                 // Deferred slot-view work from an earlier turn (the per-turn
@@ -740,45 +782,28 @@ impl MeetingActor {
                 let _ = respond_to.send(state);
             }
 
-            MeetingMessage::GetSenderIdForUser {
+            MeetingMessage::MediaConnected {
                 user_id,
+                handler_id,
+                connection_id,
                 respond_to,
             } => {
-                // Looked up inside THIS meeting's roster and nowhere else, so a
-                // cross-meeting answer is unrepresentable rather than merely
-                // unlikely: `sender_id` 5 exists concurrently in every meeting.
-                //
-                // Matched on `user_id` because that is where MC stores the token
-                // `sub`, which is the only identifier MH holds -- see
-                // `MeetingMessage::GetSenderIdForUser` for the full seam.
-                //
-                // The roster is keyed by MC's per-join UUID, so this is a scan
-                // rather than a map hit. It runs once per media connection, and
-                // the roster is bounded by the per-meeting participant cap.
-                // Deliberately NOT short-circuited on the first match: finding a
-                // second is the whole point, and stopping early would silently
-                // convert an ambiguous answer into a confident wrong one.
-                let mut found = None;
-                let mut ambiguous = false;
-                for participant in self.participants.values() {
-                    if participant.user_id == user_id {
-                        if found.is_some() {
-                            ambiguous = true;
-                            break;
-                        }
-                        found = Some(participant.sender_id);
-                    }
-                }
+                let result = self
+                    .handle_media_connected(&user_id, &handler_id, connection_id)
+                    .await;
+                let _ = respond_to.send(result);
+            }
 
-                let lookup = if ambiguous {
-                    // Fail closed. Never a coin-flip between two of one user's
-                    // participants -- right half the time and undetectable when
-                    // wrong.
-                    SenderLookup::Ambiguous
-                } else {
-                    found.map_or(SenderLookup::NotFound, SenderLookup::Found)
-                };
-                let _ = respond_to.send(lookup);
+            MeetingMessage::MediaDisconnected {
+                user_id,
+                handler_id,
+                connection_id,
+                respond_to,
+            } => {
+                let result = self
+                    .handle_media_disconnected(&user_id, &handler_id, connection_id)
+                    .await;
+                let _ = respond_to.send(result);
             }
 
             MeetingMessage::RegisterReceiveCapability {
@@ -881,12 +906,18 @@ impl MeetingActor {
         })?;
         let sender_id = allocation.sender_id;
 
-        // ADR-0036 §9 placement, BEFORE any other admission state is built, so
-        // a placement failure leaves nothing to unwind (the allocated sender id
-        // is simply never used — sender ids are never recycled either way).
-        // The first join freezes the meeting's handler set.
+        // Media admission, BEFORE any other admission state is built, so a
+        // failure leaves nothing to unwind (the allocated sender id is simply
+        // never used — sender ids are never recycled either way). The first
+        // join freezes the meeting's handler set. The joiner is bound to no
+        // handler: it is offered the whole set, and becomes routable only when
+        // the handlers report its connections (ADR-0036 §9).
         self.media.install(media);
-        let media_handler = self.media.admit(&participant_id, &user_id, sender_id)?;
+        self.media.admit(&participant_id, sender_id)?;
+        let media_handlers =
+            self.media.frozen_handlers().cloned().ok_or_else(|| {
+                McError::MhAssignmentMissing("no handler set installed".to_string())
+            })?;
 
         // `high_watermark_crossed` is the allocator's own one-shot latch (true on
         // exactly the crossing allocation and never again), so there is no
@@ -1029,7 +1060,7 @@ impl MeetingActor {
             meeting_kek: Arc::clone(self.media_keys.kek()),
             kek_generation: self.media_keys.generation(),
             participant_handle: conn_handle_for_result,
-            media_handler,
+            media_handlers,
         })
     }
 
@@ -1509,6 +1540,103 @@ impl MeetingActor {
     }
 
     /// Flush up to the per-turn bound of dirty participants' slot views.
+    /// Resolve a token `sub` to exactly one roster participant.
+    ///
+    /// Looked up inside THIS meeting's roster and nowhere else, so a
+    /// cross-meeting answer is unrepresentable: `sender_id` 5 exists
+    /// concurrently in every meeting. Matched on `user_id` because that is where
+    /// MC stores the token `sub`, the only identifier MH holds. Deliberately
+    /// NOT short-circuited on the first match: finding a second is the whole
+    /// point, and stopping early would silently convert an ambiguous answer
+    /// into a confident wrong one. Runs once per media notification over a
+    /// roster bounded by the participant cap.
+    fn resolve_user(&self, user_id: &str) -> Result<(String, SenderId), SenderLookup> {
+        let mut found: Option<(String, SenderId)> = None;
+        for participant in self.participants.values() {
+            if participant.user_id == user_id {
+                if found.is_some() {
+                    // Fail closed: never a coin-flip between two of one user's
+                    // participants.
+                    return Err(SenderLookup::Ambiguous);
+                }
+                found = Some((participant.participant_id.clone(), participant.sender_id));
+            }
+        }
+        found.ok_or(SenderLookup::NotFound)
+    }
+
+    /// See [`MeetingMessage::MediaConnected`].
+    async fn handle_media_connected(
+        &mut self,
+        user_id: &str,
+        handler_id: &str,
+        connection_id: String,
+    ) -> (SenderLookup, Option<Unapplied>) {
+        let (participant_id, sender_id) = match self.resolve_user(user_id) {
+            Ok(found) => found,
+            // S2: an ambiguous or unknown `sub` applies connectivity to NO
+            // entry. The binding answer is the same fail-closed `0`.
+            Err(SenderLookup::Ambiguous) => {
+                return (SenderLookup::Ambiguous, Some(Unapplied::UserAmbiguous))
+            }
+            Err(lookup) => return (lookup, Some(Unapplied::ParticipantUnknown)),
+        };
+        let now = tokio::time::Instant::now();
+        let applied = self.media.media_connected(
+            &participant_id,
+            handler_id,
+            ConnectionKey::new(connection_id),
+            now,
+        );
+        let unapplied = match applied {
+            Ok(true) => {
+                self.media.reconcile(Affected::All).await;
+                self.flush_views().await;
+                None
+            }
+            Ok(false) => None,
+            Err(reason) => Some(reason),
+        };
+        (SenderLookup::Found(sender_id), unapplied)
+    }
+
+    /// See [`MeetingMessage::MediaDisconnected`].
+    async fn handle_media_disconnected(
+        &mut self,
+        user_id: &str,
+        handler_id: &str,
+        connection_id: String,
+    ) -> Option<Unapplied> {
+        // S12: participant-scoped. A `sub` that resolves to no single entry
+        // holds no key this notification could name.
+        let Ok((participant_id, _)) = self.resolve_user(user_id) else {
+            return Some(Unapplied::UnknownConnection);
+        };
+        let now = tokio::time::Instant::now();
+        match self.media.media_disconnected(
+            &participant_id,
+            handler_id,
+            &ConnectionKey::new(connection_id),
+            now,
+        ) {
+            Ok(true) => {
+                self.media.reconcile(Affected::All).await;
+                self.flush_views().await;
+                None
+            }
+            Ok(false) => None,
+            Err(reason) => Some(reason),
+        }
+    }
+
+    /// Settle every establishing participant whose window is due.
+    async fn settle_due(&mut self) {
+        if self.media.settle_due(tokio::time::Instant::now()) {
+            self.media.reconcile(Affected::All).await;
+            self.flush_views().await;
+        }
+    }
+
     async fn flush_views(&mut self) {
         let roster: std::collections::HashMap<String, RosterEntry<'_>> = self
             .participants
@@ -1861,6 +1989,7 @@ mod tests {
                 stream_policy: MediaStreamPolicy::new(
                     AudioEncoding::new(Codec::Opus, 48_000, 50).unwrap(),
                 ),
+                connect_settle_window: std::time::Duration::from_millis(1500),
             }),
             handlers: MeetingHandlers::new([HandlerEndpoint {
                 id: crate::media_routing::HandlerId::new("mh-0"),

@@ -45,9 +45,9 @@
 // OPS-10 (ADR-0036 §11): the `test-seams` feature exposes
 // `SenderIdAllocator::resuming_from`, which lets a caller seed the allocator
 // cursor arbitrarily — that IS the bypass of the fail-closed exhaustion guard.
-// Since story 2 it also exposes `MeetingSeams::placement_pins`, which pins a
-// participant to a named handler of its meeting's set: a media-steering seam,
-// a wider blast radius than a counter pre-seed.
+// (Story 2 task 6 briefly added a media-handler placement pin to the same
+// seam; task 20 removed it — partial connectivity is now produced by a test
+// client genuinely connecting to a subset of handlers, so MC has no lever.)
 // "Non-default, not enabled in production" is a property nobody re-checks after
 // the next Cargo.toml edit, so the seam fails to COMPILE rather than silently
 // shipping the bypass. ADR-0036 §11 rules on exactly this shape for the dev-only
@@ -139,8 +139,7 @@
 #[cfg(all(feature = "test-seams", not(debug_assertions)))]
 compile_error!(
     "the `test-seams` feature exposes the sender-id exhaustion bypass and \
-     must never be enabled in a release build; it also exposes the media-handler \
-     placement pin, which steers which handler a participant's media lands on"
+     must never be enabled in a release build"
 );
 
 pub mod actors;
@@ -151,7 +150,6 @@ pub mod grpc;
 pub mod media_admission;
 pub mod media_routing;
 pub mod media_signaling;
-pub mod mh_connection_registry;
 pub mod observability;
 pub mod redis;
 pub mod system_info;

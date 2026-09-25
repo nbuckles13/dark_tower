@@ -209,6 +209,7 @@ test('before any assignment the slot reads as awaiting the controller', async ()
 test('each wire slot state renders distinctly, including the far-end-muted case', async () => {
   const { session, screen } = await mount();
   session.fire('streamAssignments', {
+    unreachableSenderIds: [],
     assignments: [
       slot({ slotId: 0, slotState: 'source_muted' }),
       slot({ slotId: 1, slotState: 'withheld_congestion' }),
@@ -242,10 +243,16 @@ test('each wire slot state renders distinctly, including the far-end-muted case'
 
 test('far-end muted is rendered from the wire, not from that slot being silent', async () => {
   const { session, screen } = await mount();
-  session.fire('streamAssignments', { assignments: [slot({ slotState: 'active' })] });
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [slot({ slotState: 'active' })],
+  });
   await expect.element(screen.getByTestId('slot-0')).toHaveAttribute('data-slot-active', 'true');
 
-  session.fire('streamAssignments', { assignments: [slot({ slotState: 'source_muted' })] });
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [slot({ slotState: 'source_muted' })],
+  });
 
   await expect
     .element(screen.getByTestId('slot-0'))

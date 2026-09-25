@@ -220,6 +220,58 @@ describe('stream assignments', () => {
     expect(seen[0]?.assignments[0]?.slotState).toBe('withheld_congestion');
   });
 
+  it('carries unreachable_sender_ids through, and an EMPTY set as empty', async () => {
+    // ADR-0036 §9 / `signaling.proto`: the per-subscriber set of roster
+    // participants this client shares no connected handler with. It was received
+    // and DROPPED here until this task — the field was mapped nowhere, so the
+    // obligation to mark those roster entries distinctly had no data to act on.
+    //
+    // A message may legitimately carry zero assignments and a non-empty set (every
+    // other participant is elsewhere), so the two are asserted independently.
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: StreamAssignmentsEvent[] = [];
+    rig.client.on('streamAssignments', (e) => seen.push(e));
+
+    rig.deliver(
+      framedStreamAssignments({
+        slotId: 0,
+        senderId: 258,
+        mediaHandlerUrl: 'https://mh-0',
+        unreachableSenderIds: [259, 260],
+      }),
+    );
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]?.unreachableSenderIds).toEqual([259, 260]);
+
+    // Absent on the wire is EMPTY, not undefined: a `repeated` field has no
+    // "unset", so a client must not be able to tell them apart.
+    rig.deliver(framedStreamAssignments({ slotId: 0, senderId: 258 }));
+    await waitFor(() => seen.length > 1);
+    expect(seen[1]?.unreachableSenderIds).toEqual([]);
+  });
+
+  it('reads each slot on the handler that OWNS it, across several handlers', async () => {
+    // The canonical case seen from A: B's edge on one handler, C's on the other.
+    // Nothing here depends on which handler MC chose for which edge — only that
+    // each slot's own `media_handler_url` is carried through verbatim.
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: StreamAssignmentsEvent[] = [];
+    rig.client.on('streamAssignments', (e) => seen.push(e));
+    rig.deliver(
+      framedStreamAssignments({
+        slotId: 0,
+        senderId: 259,
+        mediaHandlerUrl: 'https://mh-0:4433',
+        extraSlots: [{ slotId: 1, senderId: 260, mediaHandlerUrl: 'https://mh-1:4433' }],
+      }),
+    );
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]?.assignments.map((a) => a.mediaHandlerUrl)).toEqual([
+      'https://mh-0:4433',
+      'https://mh-1:4433',
+    ]);
+  });
+
   it('passes an ABSENT sender id through rather than coercing it to 0', async () => {
     // 0 is a reserved-invalid sender id, so coercion would turn "no source
     // assigned" into "assigned to an impossible participant".

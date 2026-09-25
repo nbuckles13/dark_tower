@@ -66,8 +66,9 @@
 )]
 
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, EndMeetingRequest, EndMeetingResponse, MutedSource,
-    NotifyParticipantConnectedResponse, RegisterMeetingRequest, RegisterMeetingResponse,
+    CandidateSource, DisconnectReason, EgressStream, EndMeetingRequest, EndMeetingResponse,
+    MutedSource, NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
+    NotifyParticipantDisconnectedRequest, RegisterMeetingRequest, RegisterMeetingResponse,
     SelectionRules, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
@@ -521,4 +522,182 @@ fn default_end_meeting_response_is_not_an_acknowledgement() {
         EndMeetingResponse { acknowledged: true }.encode_to_vec(),
         Vec::<u8>::new()
     );
+}
+
+// ---------------------------------------------------------------------------
+// `connection_id` on both `NotifyParticipant*Request`s (per-session connectivity)
+// ---------------------------------------------------------------------------
+//
+// The field exists so MC can hold connectivity PER SESSION instead of one bit
+// per (participant, handler): a handler leaves connected(P) only when no live
+// `connection_id` remains. What this crate can pin is that the readings the
+// contract distinguishes are REPRESENTABLE and DISTINGUISHABLE on the wire.
+//
+// What these deliberately do NOT assert, because they are MC runtime behaviours
+// that no encode/decode can express — and an inert marker here would be prose
+// masquerading as coverage (the rule this file's header states):
+//
+// - **A retried Connected with the same id is idempotent**, and the rejected
+//   refcount alternative inflates on retry. Both need MC state across two
+//   deliveries.
+// - **MC's REQUIRED receive-order defence** (retiring a late Connected whose
+//   Disconnected already arrived). The distinguishing input is a REORDERED
+//   DELIVERY, which a single-message roundtrip cannot construct.
+// - **Ids are never reused within an MH process**, and **a Disconnected is
+//   terminal for its id**. Both are MH producer obligations; the send-order
+//   guarantee is pinned MH-side by a test that one session's Connected and
+//   Disconnected carry byte-identical ids, including on the MC-unavailable
+//   decline arm.
+// - **The empty branch is DEGRADED and counted.** Counting is MC's.
+
+/// `connection_id` survives the wire on both requests, and the same session's
+/// value is byte-identical across the two message types.
+///
+/// The cross-message equality is the point, not decoration: retiring a
+/// connection is a lookup of the Connected's id by the Disconnected's id, so a
+/// value that did not survive identically on BOTH would make phantom
+/// connectivity unretirable — the exact fail-open this field exists to close.
+#[test]
+fn connection_id_roundtrips_identically_on_both_notify_requests() {
+    let id = "3f6c1f2e-0b7a-4a9d-9c21-7e5f0d8b4a11";
+
+    let connected = roundtrip(&NotifyParticipantConnectedRequest {
+        meeting_id: "meeting-1".to_string(),
+        participant_id: "user-1".to_string(),
+        handler_id: "mh-0".to_string(),
+        connection_id: id.to_string(),
+    });
+    let disconnected = roundtrip(&NotifyParticipantDisconnectedRequest {
+        meeting_id: "meeting-1".to_string(),
+        participant_id: "user-1".to_string(),
+        handler_id: "mh-0".to_string(),
+        reason: DisconnectReason::ClientClosed as i32,
+        connection_id: id.to_string(),
+    });
+
+    assert_eq!(connected.connection_id, id);
+    assert_eq!(disconnected.connection_id, id);
+    assert_eq!(connected.connection_id, disconnected.connection_id);
+}
+
+/// Two sessions of ONE participant on ONE handler are distinguishable.
+///
+/// This is the whole behavioural difference from the pre-field set semantics.
+/// If these two encodings were ever equal, "remove only its own id" would be
+/// unimplementable and a single stale disconnect would again drop a live
+/// handler.
+#[test]
+fn two_connections_of_one_participant_on_one_handler_are_distinguishable() {
+    let first = NotifyParticipantConnectedRequest {
+        meeting_id: "meeting-1".to_string(),
+        participant_id: "user-1".to_string(),
+        handler_id: "mh-0".to_string(),
+        connection_id: "conn-a".to_string(),
+    };
+    let second = NotifyParticipantConnectedRequest {
+        connection_id: "conn-b".to_string(),
+        ..first.clone()
+    };
+
+    assert_ne!(first.encode_to_vec(), second.encode_to_vec());
+    assert_ne!(
+        roundtrip(&first).connection_id,
+        roundtrip(&second).connection_id
+    );
+}
+
+/// An OMITTED `connection_id` and an EMPTY one are ONE observable, on both
+/// requests.
+///
+/// This is what makes "empty means legacy" implementable rather than aspirational:
+/// a pre-field MH omits the field, a proto3 non-optional string decodes it to
+/// `""`, and an empty value emits no bytes. MC therefore cannot — and must not
+/// try to — distinguish "old MH" from "new MH that sent empty"; both take the
+/// degraded per-handler path. A future edit making this field `optional` would
+/// split these two into different readings and break that equivalence, which is
+/// precisely why the field is a bare `string`.
+#[test]
+fn absent_and_empty_connection_id_are_one_observable() {
+    let empty_connected = NotifyParticipantConnectedRequest {
+        meeting_id: "meeting-1".to_string(),
+        participant_id: "user-1".to_string(),
+        handler_id: "mh-0".to_string(),
+        connection_id: String::new(),
+    };
+    let bytes = empty_connected.encode_to_vec();
+
+    // POSITIVE CONTROL FIRST. `0x22` is field 4, wire type 2. Asserting only its
+    // ABSENCE would pass just as happily against a needle that can never appear
+    // (a wrong tag number, or a field that stopped being emitted at all), so the
+    // same needle is first shown to APPEAR when the field is populated. The
+    // surrounding string values deliberately contain no `"` (0x22) byte, which
+    // is what keeps the absence reading unambiguous.
+    let populated_bytes = NotifyParticipantConnectedRequest {
+        connection_id: "conn-a".to_string(),
+        ..empty_connected.clone()
+    }
+    .encode_to_vec();
+    assert!(
+        populated_bytes.contains(&0x22),
+        "positive control: a populated connection_id MUST emit the field-4 tag"
+    );
+    assert!(
+        !bytes.contains(&0x22),
+        "an empty connection_id must emit no field-4 tag, so absent and empty coincide"
+    );
+    assert!(
+        bytes.len() < populated_bytes.len(),
+        "the empty encoding must be strictly shorter than the populated one"
+    );
+    assert_eq!(
+        NotifyParticipantConnectedRequest::decode(&bytes[..])
+            .expect("decodes")
+            .connection_id,
+        ""
+    );
+
+    let empty_disconnected = NotifyParticipantDisconnectedRequest {
+        meeting_id: "meeting-1".to_string(),
+        participant_id: "user-1".to_string(),
+        handler_id: "mh-0".to_string(),
+        reason: DisconnectReason::ClientClosed as i32,
+        connection_id: String::new(),
+    };
+    assert_eq!(
+        roundtrip(&empty_disconnected).connection_id,
+        "",
+        "the legacy reading must be reachable on the disconnect path too"
+    );
+
+    // A default-decoded request is the pre-field peer's message exactly.
+    assert_eq!(
+        NotifyParticipantConnectedRequest::decode(&[][..])
+            .expect("empty decodes")
+            .connection_id,
+        ""
+    );
+    assert_eq!(
+        NotifyParticipantDisconnectedRequest::decode(&[][..])
+            .expect("empty decodes")
+            .connection_id,
+        ""
+    );
+}
+
+/// The field is OPAQUE: a value that is not a UUID survives unchanged.
+///
+/// The proto states MH's v4 UUID as an implementation fact and NOT as contract.
+/// This pins the wire half of that, so a consumer that grows a UUID-shape
+/// assumption is breaking a documented rule rather than an unstated one. The
+/// value below is deliberately not parseable as a UUID.
+#[test]
+fn connection_id_is_opaque_and_not_required_to_be_a_uuid() {
+    let opaque = "s7:not-a-uuid/AAAA==";
+    let out = roundtrip(&NotifyParticipantConnectedRequest {
+        meeting_id: "meeting-1".to_string(),
+        participant_id: "user-1".to_string(),
+        handler_id: "mh-0".to_string(),
+        connection_id: opaque.to_string(),
+    });
+    assert_eq!(out.connection_id, opaque);
 }

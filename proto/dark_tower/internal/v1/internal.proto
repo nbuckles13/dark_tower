@@ -1047,6 +1047,91 @@ message NotifyParticipantConnectedRequest {
   string participant_id = 2;
 
   string handler_id = 3;
+
+  // Identifies THE CONNECTION this notification is about, so MC can hold
+  // per-session connectivity instead of one bit per (participant, handler).
+  // ADR-0036 §9's visibility rule is computed from connected(P), and this is
+  // what makes connected(P) removable at the right time.
+  //
+  // OPAQUE, MH-MINTED, ONE PER WEBTRANSPORT SESSION. MC MUST NOT parse it,
+  // infer structure from it, or derive anything from its contents. Today it is
+  // a v4 UUID (`crates/mh-service/src/webtransport/connection.rs`), minted once
+  // per accepted session; that is an implementation fact, NOT a contract, and
+  // MC must keep working if it becomes any other opaque string.
+  //
+  // SCOPE: unique within `handler_id`. MC keys connectivity on the PAIR
+  // `(handler_id, connection_id)` and NEVER on `connection_id` alone -- id-only
+  // keying would let one handler's retirement suppress a live connection on
+  // another handler.
+  //
+  // WHAT MC DOES WITH IT:
+  //   - A handler leaves connected(participant) ONLY when NO live
+  //     `connection_id` remains for that (meeting, participant, handler). This
+  //     is the whole reason the field exists: with one bit per handler, a single
+  //     stale disconnect makes a live handler vanish permanently.
+  //   - A retried Connected carrying the SAME id is IDEMPOTENT -- it records
+  //     nothing new. MH retries this RPC, so a non-idempotent reading would
+  //     inflate connectivity. (A REFCOUNT was considered and REJECTED for
+  //     exactly this: a retry increments it, and the count never returns to
+  //     zero, leaving phantom connectivity after a real disconnect. That fails
+  //     OPEN. This field fails closed.)
+  //   - A Disconnected removes ONLY its own id.
+  //   - A Disconnected naming an id the participant does not hold is a COUNTED
+  //     NO-OP, never a removal of some other connection. Every declined
+  //     connection produces one, so this is ROUTINE, not an error.
+  //
+  // NOT AN IDENTITY AND NOT AN AUTHORIZATION INPUT. Participant identity
+  // remains `participant_id` (the validated token `sub`, per the rules above)
+  // and MUST NEVER be re-derived from this field. This field also does NOT
+  // resolve the AMBIGUOUS-participant case (two roster entries sharing one
+  // token `sub`): it distinguishes CONNECTIONS, whereas that ambiguity is
+  // between roster ENTRIES, and MH never sees MC's per-join participant
+  // identifier. Anyone reaching for this field to fix that case is reaching for
+  // the wrong tool -- the remedy is a per-JOIN identifier reaching MH.
+  //
+  // THE SAME VALUE RIDES EVERY RETRY of a session's Connected AND its
+  // Disconnected, including a Disconnected sent after MH abandons the Connected.
+  // Without that, a phantom connection could never be retired.
+  //
+  // IDS ARE NEVER REUSED within an MH process, and a Disconnected is TERMINAL
+  // for its id. BOTH ARE LOAD-BEARING CONTRACT, NOT DESCRIPTION: MC's defence
+  // below depends on them, so if either stops holding on the MH side, MC's
+  // defence silently becomes a correctness bug rather than a fix.
+  //
+  // "TERMINAL" IS A SEND-ORDER GUARANTEE, NOT A DELIVERY-ORDER ONE. MH never
+  // SENDS a Connected for an id after SENDING that id's Disconnected (it makes
+  // the Connected call once per session, retries sequentially inside it, and
+  // both disconnect paths run after it). MH CANNOT bound MC's RECEIVE order: a
+  // Connected attempt MH abandoned may still arrive at MC AFTER the
+  // Disconnected. Applying it would record live connectivity to a handler the
+  // participant is not on, which nothing would ever retire -- MC would then
+  // hand a subscriber a `StreamAssignment.media_handler_url` for a transport
+  // that will never carry that stream. So MC IS REQUIRED to defend against
+  // receive-order reordering by retiring such a late Connected (it keeps a
+  // bounded set of recently retired `(handler_id, connection_id)` pairs and
+  // ignores a Connected naming one). THAT DEFENCE IS NOT REDUNDANT WITH THE
+  // TERMINAL RULE ABOVE -- the terminal rule is why the defence is CORRECT, and
+  // receive-order reordering is why it is NECESSARY. Do not delete it on the
+  // strength of reading "terminal".
+  //
+  // EMPTY MEANS LEGACY, NOT "UNSET BY CHOICE". A pre-field MH omits it, so it
+  // decodes to "". MC MUST treat "" as one implicit key per
+  // (participant, handler) -- exactly the pre-field set semantics, INCLUDING
+  // their stale-disconnect hazard. That mode is DEGRADED, not an error, and MC
+  // COUNTS it.
+  //   RETIREMENT CONDITION, so this reads as a rollout affordance with an end
+  //   date rather than as an optional field: the empty branch is retired once
+  //   every MH in the fleet sends the field, which the degraded-mode counter
+  //   makes OBSERVABLE rather than assumed. An old MC simply ignores the field.
+  //
+  // OBSERVABILITY (ADR-0036 §11): per-session identity, UNBOUNDED cardinality.
+  // Never a metric label, never a span attribute, never a per-frame log
+  // dimension. Acceptable as a LOG FIELD for correlation, which is what MH
+  // already does with it.
+  //
+  // NOT A SECRET: not a credential, not PII, and nothing is derived from it, so
+  // no `skip_debug` is owed.
+  string connection_id = 4;
 }
 
 // Response to participant connected notification.
@@ -1166,6 +1251,24 @@ message NotifyParticipantDisconnectedRequest {
   string participant_id = 2;
   string handler_id = 3;
   DisconnectReason reason = 4;
+
+  // WHICH connection of this participant on this handler has gone. Carries the
+  // SAME value MH sent on that session's Connected.
+  //
+  // The full contract -- opacity, `(handler_id, connection_id)` keying, the
+  // remove-only-its-own-id and unknown-id-no-op rules, no reuse, terminal as a
+  // SEND-order guarantee, MC's REQUIRED receive-order defence, empty-means-
+  // legacy with its retirement condition, and the observability and secrecy
+  // boundaries -- is stated ONCE at
+  // `NotifyParticipantConnectedRequest.connection_id` and is deliberately NOT
+  // restated here. Two copies of a rule are two things that drift.
+  //
+  // Attribution is WITHIN the participant resolved from `participant_id`: MC
+  // removes only a connection THAT participant holds, and a key it does not
+  // hold is a counted no-op. There is NO cross-participant lookup, so a rejoin
+  // reusing a `sub` can neither inherit nor retire another session's
+  // connections.
+  string connection_id = 5;
 }
 
 // Response to participant disconnected notification

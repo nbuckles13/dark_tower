@@ -51,7 +51,7 @@
 - GC refusal causes (`CreateMeetingOutcome`, `MeetingRefusal`, `classify_insert_error`) → `crates/gc-service/src/repositories/meetings.rs`, `src/errors.rs`
 - MC auth → `crates/mc-service/src/auth/mod.rs:tests`, `src/grpc/auth_interceptor.rs:tests`, `tests/auth_layer_integration.rs`
 - MC actors → `crates/mc-service/src/actors/`
-- MC join + WebTransport + coordination / heartbeat / token refresh → `crates/mc-service/tests/join_tests.rs`, `webtransport_accept_loop_integration.rs`, `src/webtransport/connection.rs:tests`, `src/mh_connection_registry.rs:tests`, `tests/register_meeting_integration.rs`, `token_refresh_integration.rs`, `gc_integration.rs`, `disconnect_latency_integration.rs`
+- MC join + WebTransport + coordination / heartbeat / token refresh → `crates/mc-service/tests/join_tests.rs`, `webtransport_accept_loop_integration.rs`, `src/webtransport/connection.rs:tests`, `src/media_routing/connectivity.rs:tests`, `tests/register_meeting_integration.rs`, `token_refresh_integration.rs`, `gc_integration.rs`, `disconnect_latency_integration.rs`
 - MH WebTransport + accept loop + token refresh + McClient → `crates/mh-service/tests/webtransport_integration.rs`, `webtransport_accept_loop_integration.rs`, `token_refresh_integration.rs`, `mc_client_integration.rs`, `crates/mh-service/src/grpc/mc_client.rs:tests`
 - Harnesses + rigs → `crates/ac-test-utils/src/`, `crates/gc-test-utils/src/`, `crates/mc-test-utils/src/`, `crates/mc-service/tests/common/`, `crates/mh-service/tests/common/`
 

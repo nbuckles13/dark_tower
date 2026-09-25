@@ -44,6 +44,7 @@ interface Harness {
   readonly metrics: MediaMetrics;
   readonly roster: RosterIdentityKeys;
   readonly ingress: IngressPipeline;
+  readonly hopMonitor: HopSequenceMonitor;
   readonly accepted: AcceptedFrame[];
   /** Every `reason` value the drop counter recorded, in order. */
   dropReasons(): string[];
@@ -57,13 +58,16 @@ function makeHarness(): Harness {
   const kekSource = new JoinResponseKekSource();
   kekSource.set(KEK, 0);
   const accepted: AcceptedFrame[] = [];
+  // ONE MONITOR PER TRANSPORT. These harnesses model a single transport, so one
+  // monitor per harness — created here rather than shared at module scope,
+  // which would carry hop high-water marks between tests.
+  const hopMonitor = new HopSequenceMonitor([SLOT_ID]);
   const ingress = new IngressPipeline({
     metrics,
     roster,
     keys: kekSource,
     cache: new TransmitKeyCache(8),
     replay: new ReplayWindow(8, 64),
-    hopMonitor: new HopSequenceMonitor([SLOT_ID]),
     firstMedia: new FirstMediaObserver(metrics, () => 0),
     onAccepted: (frame) => accepted.push(frame),
   });
@@ -72,6 +76,7 @@ function makeHarness(): Harness {
     metrics,
     roster,
     ingress,
+    hopMonitor,
     accepted,
     dropReasons: () =>
       sink
@@ -113,7 +118,7 @@ describe('ingress attribution comes from the key id, never from the slot assignm
       plaintext: PLAINTEXT,
       streamId: SLOT_ID,
     });
-    await h.ingress.accept(frame);
+    await h.ingress.accept(frame, h.hopMonitor);
 
     expect(h.accepted).toHaveLength(1);
     expect(h.accepted[0]?.senderId).toBe(SENDER_A);
@@ -142,7 +147,7 @@ describe('ingress attribution comes from the key id, never from the slot assignm
       plaintext: PLAINTEXT,
       streamId: SLOT_ID,
     });
-    await h.ingress.accept(forged);
+    await h.ingress.accept(forged, h.hopMonitor);
 
     // Dropped at VERIFY, before any decrypt.
     expect(h.dropReasons()).toEqual(['signature_invalid']);
@@ -172,7 +177,7 @@ describe('the roster fails closed on an absent identity key', () => {
       plaintext: PLAINTEXT,
       streamId: SLOT_ID,
     });
-    await h.ingress.accept(frame);
+    await h.ingress.accept(frame, h.hopMonitor);
 
     expect(h.dropReasons()).toEqual(['no_roster_entry']);
     expect(h.count('dt_client_media_frames_dropped_total')).toBe(1);
@@ -191,7 +196,7 @@ describe('the roster fails closed on an absent identity key', () => {
       plaintext: PLAINTEXT,
       streamId: SLOT_ID,
     });
-    await h.ingress.accept(frame);
+    await h.ingress.accept(frame, h.hopMonitor);
     expect(h.dropReasons()).toEqual(['no_roster_entry']);
   });
 });
@@ -214,7 +219,7 @@ describe('the unauthenticated relay region cannot reach attribution or state', (
       streamId: 0xbeef,
       hopSequence: 999_999,
     });
-    await h.ingress.accept(frame);
+    await h.ingress.accept(frame, h.hopMonitor);
 
     // The frame still verifies and still attributes to its OWN key id.
     expect(h.accepted[0]?.senderId).toBe(SENDER_A);
@@ -260,7 +265,7 @@ describe('receive-path accounting identity', () => {
     const garbage = Uint8Array.of(0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
 
     for (const frame of [good, forged, unknownSender, garbage]) {
-      await h.ingress.accept(frame);
+      await h.ingress.accept(frame, h.hopMonitor);
     }
 
     const received = h.count('dt_client_media_frames_received_total');
@@ -286,11 +291,11 @@ describe('receive-path accounting identity', () => {
       streamId: SLOT_ID,
       streamSequence: 7,
     });
-    await h.ingress.accept(frame);
+    await h.ingress.accept(frame, h.hopMonitor);
     // Byte-identical replay: a valid signature and a valid authentication tag —
     // it WAS legitimately produced — so no cryptographic check can reject it.
     // Only the receiver's window can.
-    await h.ingress.accept(frame);
+    await h.ingress.accept(frame, h.hopMonitor);
 
     expect(h.dropReasons()).toEqual(['replay_detected']);
     expect(h.count('dt_client_media_frames_accepted_total')).toBe(1);
@@ -310,6 +315,7 @@ describe('media metric labels', () => {
         plaintext: PLAINTEXT,
         streamId: SLOT_ID,
       }),
+      h.hopMonitor,
     );
 
     const media = h.sink.getRecordedMetrics().filter((m) => m.name.startsWith('dt_client_media_'));
@@ -352,6 +358,7 @@ describe('non-dropping wrap outcomes are counted separately from drops', () => {
         streamId: SLOT_ID,
         streamSequence: 1,
       }),
+      h.hopMonitor,
     );
     // Second frame: SAME key id and SAME transmit key, but the sender has
     // re-wrapped under a NEW meeting KEK and announces its generation. The
@@ -368,6 +375,7 @@ describe('non-dropping wrap outcomes are counted separately from drops', () => {
         streamId: SLOT_ID,
         streamSequence: 2,
       }),
+      h.hopMonitor,
     );
 
     const outcomes = h.sink
@@ -397,6 +405,7 @@ describe('non-dropping wrap outcomes are counted separately from drops', () => {
         plaintext: PLAINTEXT,
         streamId: SLOT_ID,
       }),
+      h.hopMonitor,
     );
     expect(h.dropReasons()).toEqual(['no_kek_for_generation']);
     expect(h.count('dt_client_media_frames_accepted_total')).toBe(0);
@@ -418,6 +427,7 @@ describe('non-dropping wrap outcomes are counted separately from drops', () => {
         streamId: SLOT_ID,
         keyBearing: false,
       }),
+      h.hopMonitor,
     );
     expect(h.dropReasons()).toEqual(['no_transmit_key']);
   });

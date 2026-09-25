@@ -184,6 +184,25 @@ describe('the send-drop vocabulary', () => {
     // THIS MIRROR HAS NO DRIFT GUARD, unlike the reject-reason mirror three
     // files away, which has a JSON SSoT and a both-directions set-equality test.
     // Nothing compares these five strings to anything.
+    //
+    // ---------------------------------------------------------------------
+    // A ROSTER TEST PINS SPELLING. IT CANNOT PIN REACHABILITY.
+    // ---------------------------------------------------------------------
+    //
+    // `not_connected` sat in this roster, in the catalog, in a runbook's
+    // green-signal table and in a dashboard note — five sites asserting a live
+    // fleet contract ("reads zero forever; alertable at > 0") — while NO
+    // production code could increment it. Every one of those sites was green
+    // throughout, because none of them asks whether the token is reachable. This
+    // assertion would not have failed if the emitter had never been written, and
+    // it will not fail if a future emitter is deleted.
+    //
+    // So a new token needs a test that drives the CONDITION and asserts the
+    // counter moves. For this one that test is `counts not_connected, and faults
+    // once, for a directed target it holds no transport to` in
+    // `media/lifecycle/__tests__/audioPipeline.degradation.test.ts`, with the
+    // per-lane variant in `media/pipeline/__tests__/egress.multiTarget.test.ts`.
+    // Named in both directions so the pair is discoverable from either end.
     expect(MEDIA_SEND_DROP_REASONS.NotConnected).toBe('not_connected');
     expect(MEDIA_SEND_DROP_REASONS.EgressQueueOverflow).toBe('egress_queue_overflow');
     expect(MEDIA_SEND_DROP_REASONS.TransportSendRefused).toBe('transport_send_refused');

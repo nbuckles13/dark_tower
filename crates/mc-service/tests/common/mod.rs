@@ -29,7 +29,6 @@ use mc_service::auth::McJwtValidator;
 use mc_service::errors::McError;
 use mc_service::grpc::{MeetingProgramming, MhRegistrationClient};
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_test_utils::jwt_test::{mount_jwks_mock, TestKeypair};
 use tokio::sync::Notify;
@@ -227,7 +226,7 @@ pub struct TestStackHandles {
 /// `keypair_label` is the only meaningful axis of variation across callers
 /// (test logs cite the label on JWT-validation paths). Everything else is
 /// fixed: 300s clock skew on the validator, zero-byte master secret,
-/// fresh `MhConnectionRegistry`, mc_id `"mc-test"`.
+/// fresh `PolicyGenerations`, mc_id `"mc-test"`.
 pub async fn build_test_stack(keypair_label: &str) -> TestStackHandles {
     let mock_server = MockServer::start().await;
     let keypair = TestKeypair::new(42, keypair_label);
@@ -244,7 +243,6 @@ pub async fn build_test_stack(keypair_label: &str) -> TestStackHandles {
         metrics,
         controller_metrics,
         master_secret,
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     ));
 
@@ -363,6 +361,7 @@ fn join_media_with(
             stream_policy: mc_service::media_signaling::MediaStreamPolicy::new(
                 client_media_config().audio_encoding,
             ),
+            connect_settle_window: client_media_config().connect_settle_window,
         }),
         handlers: MeetingHandlers::new(handlers.iter().map(|h| HandlerEndpoint {
             id: HandlerId::new(&h.mh_id),
@@ -408,6 +407,8 @@ pub fn client_media_config() -> mc_service::media_signaling::ClientMediaConfig {
             50,
         )
         .expect("suite audio encoding is in band"),
+        // `MC_MEDIA_CONNECT_SETTLE_MS` as the ConfigMap ships it.
+        connect_settle_window: std::time::Duration::from_millis(1500),
     }
 }
 

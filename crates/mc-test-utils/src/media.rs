@@ -57,8 +57,11 @@ pub fn two_party_assignment() -> mc_service::media_routing::HandlerAssignment {
 /// Sender ids come from a real [`mc_service::media_admission::SenderIdAllocator`]
 /// rather than a test-only constructor, so this fixture needs no `test-seams`
 /// feature — which matters, because enabling that feature here would spread the
-/// sender-id exhaustion bypass and the placement pin to every crate that links
-/// these fixtures.
+/// sender-id exhaustion bypass to every crate that links these fixtures.
+///
+/// Everyone is connected to the one handler through the production
+/// connectivity path (`ConnectedHandlers` built from a resolved endpoint), so
+/// the fixture exercises the real edge rule rather than bypassing it.
 ///
 /// # Panics
 ///
@@ -70,28 +73,46 @@ pub fn meeting_assignment_for(
     participants: usize,
 ) -> mc_service::media_routing::HandlerAssignment {
     use mc_service::media_admission::SenderIdAllocator;
-    use mc_service::media_routing::{HandlerId, SlotTable};
+    use mc_service::media_routing::{
+        ConnectedHandlers, HandlerEndpoint, HandlerId, MeetingHandlers, SlotTable,
+    };
 
     let handler = HandlerId::new(handler_id);
+    let handlers = MeetingHandlers::new([HandlerEndpoint {
+        id: handler.clone(),
+        webtransport_url: format!("https://{handler_id}.fixture:4434"),
+        grpc_endpoint: format!("http://{handler_id}.fixture:50053"),
+    }])
+    .expect("fixture handler set");
+    let mut connected = ConnectedHandlers::new();
+    connected.insert(
+        handlers
+            .resolve(handler_id)
+            .expect("fixture handler resolves"),
+    );
     let mut allocator = SenderIdAllocator::new();
-    let mut table = SlotTable::new();
+    // The production constructor (the seed-0 `SlotTable::new` is `#[cfg(test)]`
+    // and unreachable from here). With ONE fixture handler the per-meeting
+    // tiebreak rotation has nothing to choose, so the id is arbitrary.
+    let mut table = SlotTable::for_meeting("mc-test-utils-fixture");
     let senders: Vec<_> = (0..participants)
         .map(|_| {
             let sender = allocator
                 .allocate()
                 .expect("fixture sender-id allocation")
                 .sender_id;
-            table
-                .admit(sender, |_| Some(handler.clone()))
-                .expect("fixture admission");
+            table.admit(sender).expect("fixture admission");
             sender
         })
         .collect();
     let slots: Vec<u16> = (0..participants.saturating_sub(1))
         .map(|i| u16::try_from(i).expect("fixture slot id"))
         .collect();
+    for sender in &senders {
+        table.set_demand(*sender, slots.clone());
+    }
     for sender in senders {
-        table.set_demand(sender, slots.clone());
+        table.set_connectivity(sender, Some(connected.clone()));
     }
 
     table

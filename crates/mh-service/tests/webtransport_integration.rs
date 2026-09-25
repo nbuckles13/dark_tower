@@ -593,6 +593,11 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
     assert_eq!(connected.meeting_id, "meeting-wt-notify");
     assert_eq!(connected.participant_id, "user-notify");
     assert_eq!(connected.handler_id, "mh-test-001");
+    assert!(
+        !connected.connection_id.is_empty(),
+        "MH must send a connection_id: an empty one puts MC in its degraded legacy mode, where a \
+         stale disconnect from a superseded session removes the live one"
+    );
 
     // Clean close: finish the send stream so the server's `recv_stream.read()`
     // returns `Ok(None)` (the `ClientClosed` branch in `connection.rs`).
@@ -609,6 +614,13 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
     assert_eq!(disconnected.meeting_id, "meeting-wt-notify");
     assert_eq!(disconnected.participant_id, "user-notify");
     assert_eq!(disconnected.handler_id, "mh-test-001");
+    // Read off the Connected MH actually sent, never a literal: MC retires the
+    // entry keyed on this id, so a disconnect naming any other value leaves the
+    // closed session's connectivity live (phantom connectivity) at MC.
+    assert_eq!(
+        disconnected.connection_id, connected.connection_id,
+        "a session's disconnect must carry the SAME connection_id as its Connected"
+    );
     // ClientClosed corresponds to the read-returned-None branch in connection.rs.
     assert_eq!(
         disconnected.reason,

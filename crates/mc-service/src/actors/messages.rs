@@ -49,7 +49,7 @@ pub enum ControllerMessage {
     },
 
     /// Create a meeting with test-only construction overrides (sender-id
-    /// cursor, placement pins, flush bound). **Test builds only.**
+    /// cursor, flush bound). **Test builds only.**
     #[cfg(feature = "test-seams")]
     CreateMeetingWithSeams {
         meeting_id: String,
@@ -165,7 +165,10 @@ pub enum MeetingMessage {
         respond_to: oneshot::Sender<MeetingState>,
     },
 
-    /// Resolve a media-connecting user's allocated `sender_id` (ADR-0036 §2, §4).
+    /// An MH reports a participant's media connection (ADR-0036 §2, §4, §9):
+    /// resolve the connection's `sender_id` AND record the connectivity, in ONE
+    /// actor turn, so the binding MC answers and the routing input it records
+    /// can never name different roster entries.
     ///
     /// # Why this is keyed on `user_id` and not `participant_id`
     ///
@@ -175,37 +178,45 @@ pub enum MeetingMessage {
     /// (`mh-service/src/webtransport/connection.rs`), which is a **contract
     /// MUST** — that provenance is the entire defence against a client
     /// asserting someone else's identity (@security S1). MC, however, mints a
-    /// **fresh `Uuid` per join** as its `participant_id`
-    /// (`webtransport/connection.rs`) and stores the token `sub` as the
-    /// participant's `user_id`. The two namespaces are disjoint, and MH has
-    /// never seen MC's UUID: it is not on the token and not on any wire MH
-    /// reads.
+    /// **fresh `Uuid` per join** as its `participant_id` and stores the token
+    /// `sub` as the participant's `user_id`. The two namespaces are disjoint,
+    /// and MH has never seen MC's UUID. **Keying this lookup on MC's
+    /// `participant_id` resolves nothing, ever** — the defect Gate 2 attempt 1
+    /// of the binding contract found.
     ///
-    /// So the value arriving in `NotifyParticipantConnectedRequest.participant_id`
-    /// is a token `sub`, and the only field it can be resolved against is
-    /// `user_id`. **Keying this lookup on MC's `participant_id` resolves
-    /// nothing, ever** — it is the defect Gate 2 attempt 1 found, where every
-    /// media connection returned `participant_unknown` and MH forwarded no
-    /// frames.
+    /// Deliberately **not** served by [`Self::GetState`], which clones the whole
+    /// roster to answer a one-field question on a per-connection path (§11
+    /// read-surface discipline).
     ///
-    /// Deliberately **not** served by [`Self::GetState`]. `GetState` clones the
-    /// entire roster — every `ParticipantInfo`, including display names and
-    /// identity public keys — to answer a one-field question, on a path that
-    /// runs once per media connection. This keeps the read surface to the single
-    /// field the caller is entitled to: the §11 read-surface discipline applied
-    /// to an internal path, not just the wire.
-    GetSenderIdForUser {
-        /// The token `sub` MH asked about, scoped to THIS meeting and nothing
-        /// else.
-        ///
-        /// Sender ids are per-meeting ordinals: id 5 exists concurrently in
-        /// every meeting on a handler. Resolution happens inside one meeting
-        /// actor precisely so a cross-meeting answer is unrepresentable rather
-        /// than merely unlikely.
+    /// Scoped to THIS meeting: sender ids are per-meeting ordinals, so a
+    /// cross-meeting answer is unrepresentable rather than merely unlikely.
+    MediaConnected {
+        /// The token `sub` MH reported.
         user_id: String,
-        /// Response channel. See [`SenderLookup`] — the ambiguous arm is a real
-        /// outcome, not an error.
-        respond_to: oneshot::Sender<SenderLookup>,
+        /// The MH-asserted handler id; resolved by exact match against the
+        /// meeting's frozen set, never trusted as a string.
+        handler_id: String,
+        /// MH's opaque per-session connection id (empty = legacy MH).
+        connection_id: String,
+        /// The binding answer and, separately, why connectivity was not
+        /// recorded (if it was not). The binding is answered even when
+        /// connectivity is not (e.g. `handler_not_in_set`), so MH's binding
+        /// contract is unchanged.
+        respond_to: oneshot::Sender<(SenderLookup, Option<crate::media_routing::Unapplied>)>,
+    },
+
+    /// An MH reports a participant's media connection closed. Removes only that
+    /// connection's key, and only from the participant `user_id` resolves to
+    /// (security S12: no lookup across participants).
+    MediaDisconnected {
+        /// The token `sub` MH reported.
+        user_id: String,
+        /// The MH-asserted handler id (exact-match resolved).
+        handler_id: String,
+        /// MH's opaque per-session connection id (empty = legacy MH).
+        connection_id: String,
+        /// `None` if applied, else why not.
+        respond_to: oneshot::Sender<Option<crate::media_routing::Unapplied>>,
     },
 
     /// Register a participant's validated receive-capability declaration
@@ -377,10 +388,11 @@ pub enum SenderLookup {
     /// undetectable when wrong.
     ///
     /// The ambiguity is **inherent in the contract as ruled**, not a bug in this
-    /// lookup: the token `sub` is the only identifier MH holds, so MH's question
-    /// is genuinely ambiguous when a user has two participants. Resolving it
-    /// needs a per-connection identifier on the wire, which is a contract change
-    /// outside this task.
+    /// lookup: the token `sub` is the only participant identity MH holds, so
+    /// MH's question is genuinely ambiguous when a user has two participants.
+    /// `connection_id` does NOT resolve it — it tells MH connections apart, not
+    /// MC joins. The remedy has one home: `docs/TODO.md` §Media Path
+    /// Obligations, "`user_ambiguous` has no operator remedy".
     Ambiguous,
 }
 
@@ -413,9 +425,11 @@ pub struct JoinResult {
     pub kek_generation: u16,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
-    /// The ONE media handler this participant was placed on (ADR-0036 §9).
-    /// `JoinResponse.media_servers` carries exactly this handler's url.
-    pub media_handler: crate::media_routing::HandlerEndpoint,
+    /// The meeting's FROZEN handler set (ADR-0036 §9). `JoinResponse.media_servers`
+    /// carries every handler in it: every participant is offered the whole set
+    /// and connects to all it can. The frozen value, never the Redis read this
+    /// join happened to make, so a divergent registration cannot widen it.
+    pub media_handlers: crate::media_routing::MeetingHandlers,
 }
 
 /// Result of a successful reconnection.
@@ -423,11 +437,9 @@ pub struct JoinResult {
 /// **No handler field yet, and that is deliberate** (reconnect is not wired
 /// into the WebTransport path; `handle_reconnect` has no caller). When it is:
 /// the proto's reconnect response is `JoinResponse`-shaped, and its
-/// `media_servers` MUST carry exactly the participant's PLACED handler — from
-/// `SlotTable::handler_of` resolved through the meeting's frozen
-/// `MeetingHandlers` (ADR-0036 §9, C3: a reconnect gets the SAME single
-/// handler) — never the registration's (Redis) handler list, which would
-/// silently re-widen `media_servers`. Mirror `JoinResult::media_handler`.
+/// `media_servers` MUST carry the meeting's FULL frozen `MeetingHandlers` set
+/// (ADR-0036 §9) — never the registration's (Redis) handler list, which could
+/// have diverged. Mirror `JoinResult::media_handlers`.
 #[derive(Debug, Clone)]
 pub struct ReconnectResult {
     /// Confirmed participant ID.

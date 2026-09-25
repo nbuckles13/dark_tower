@@ -737,7 +737,7 @@ the end of this section about where they can and cannot be read.
 
 | Rung | Read | Localises to |
 |---|---|---|
-| 1 | Is `dt_client_media_frames_sent_total` moving? | **capture / mute** vs everything downstream |
+| 1 | Is `dt_client_media_frames_sent_total` moving? | **capture / mute** vs everything downstream. *Moving/flat is the whole read:* the counter is **per datagram**, one per target handler, so a sender directed at two handlers posts ~2x its capture rate — never compare its rate against a capture rate here. |
 | 2 | Is `dt_client_media_frames_received_total` moving? | **round trip** vs receive-side processing |
 | 3 | Is `dt_client_media_frames_accepted_total` moving? | **crypto/parse** vs **playback** |
 | 4 | `dt_client_media_frames_dropped_total{reason}` | the exact receive step that rejected, **by name** |
@@ -753,7 +753,7 @@ already warns about, and it is worse here because the artifact carries a JWT.
 | Signal | This proves… | It does **NOT** prove |
 |---|---|---|
 | `dt_client_media_mute_transitions_total{action}` moved to `unmute` | the app **believes** it is unmuted | that the capture device produced a sample. Client mute is enforced at capture, so a stuck mute produces silence with no error anywhere. |
-| `dt_client_media_frames_sent_total` rising | frames were **encrypted, signed, and left the device** — capture, encrypt, sign and uplink all ran | that MH accepted or forwarded any of them |
+| `dt_client_media_frames_sent_total` rising | datagrams were encrypted, signed, and left the device — one per target handler, so a two-handler sender posts two per captured frame; this is not a capture rate | that MH accepted or forwarded any of them |
 | `dt_client_media_send_dropped_total{reason}` flat | the SDK's bounded egress queue is not shedding | that the frames reached the network. `transport_send_refused` and `not_connected` are **fleet contracts that read zero forever** — any non-zero is a bug, not a load condition. |
 | `dt_client_media_send_queue_depth` low | no application-layer back-pressure right now | anything about the transport queue beneath it |
 | `dt_client_media_frames_received_total` rising | **datagrams arrived at the wire.** Counted before any parse, verification or decryption — deliberately, so *"nothing is arriving"* is distinguishable from *"arriving and failing to open"* | that a single one was openable, let alone audible |
@@ -1281,7 +1281,9 @@ ever disagree.
 
 **Discriminator.** `dt_client_media_frames_sent_total` flat **while**
 `dt_client_media_mute_transitions_total{action="unmute"}` has incremented. That pair separates this
-from every downstream fault: nothing left, so nothing downstream can be at fault.
+from every downstream fault: nothing left, so nothing downstream can be at fault. (The converse does
+not hold: the counter is per datagram, one per target handler, so non-flat does not by itself mean
+frames were captured at the expected rate.)
 
 **Why.** Client mute is enforced **at capture** — while muted, nothing is encoded, so nothing enters
 the egress queue and nothing is dropped. Mute is therefore invisible on the drop counters by design.
@@ -1446,10 +1448,13 @@ cargo test -p env-tests --features all            # everything (~8-10 min)
 > bare `cargo test`, sees green, and concludes the cluster is validated has validated nothing.
 
 `crates/env-tests/tests/24_join_flow.rs` is a real end-to-end join across AC, GC and MC;
-`26_mh_quic.rs` covers the MH QUIC path; `27_mc_slot_placement.rs` is the multi-party proof (five
-participants split across mh-0 and mh-1, real datagrams forwarded between distinct senders) and is
-the one test here that needs **both** MH pods healthy — it hard-fails with `Triage MH handler-set
-health` rather than adapting to a single handler. All three share one WebTransport client
+`26_mh_quic.rs` covers the MH QUIC path; `27_mc_slot_placement.rs` is the multi-party proof of the
+shared-handler edge model (every participant offered both handlers; mock clients produce partial
+connectivity by which handlers they actually open a media session to; real datagrams forwarded on
+the handler that owns each edge) and is the one test here that needs **both** MH pods healthy and
+reachable — it hard-fails with `Triage MH handler-set health` (fewer than two handlers offered) or
+`Triage MH reachability` (a mock could not open a session to a handler it was told to use) rather
+than adapting to a single handler. All three share one WebTransport client
 (`src/fixtures/mc_session.rs`), so a connect/framing/join symptom that hits all three at once is
 that fixture, not three regressions. This is the same Rust suite the devloop's Layer 7 gate runs
 (`scripts/layer7.sh`, `--features all`); failure-mode triage lives in

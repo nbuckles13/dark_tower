@@ -192,7 +192,6 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   readonly #transmitKeys: TransmitKeyManager;
   readonly #cache: TransmitKeyCache;
   readonly #replay: ReplayWindow;
-  readonly #hopMonitor: HopSequenceMonitor;
   readonly #firstMedia: FirstMediaObserver;
   readonly #clock: () => number;
   readonly #setInterval: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
@@ -208,21 +207,37 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   #ingress: IngressPipeline | undefined;
   #rotationTimer: ReturnType<typeof setInterval> | undefined;
   /**
-   * The handler the inbound read loop runs on, once started; `undefined` before.
+   * The handlers an inbound read loop is running on. One entry per transport.
    *
-   * Started at most ONCE. MC re-emits `StreamAssignments` on every structural
-   * change in the meeting (every join, leave, declaration and mute), so
-   * `#applyReceive` runs many times per session. A `ReadableStream` can be
-   * locked by only ONE reader, so a second `getReader()` throws — and it would
-   * throw from inside an assignment handler, where the failure would present as
-   * "media stopped after someone joined" rather than as what it is. A re-emit
-   * naming the same handler is therefore a no-op: nothing on this path touches
-   * the transport or any receiver state, so the replay window survives every
-   * unrelated roster event.
+   * Each loop is started at most ONCE. MC re-emits `StreamAssignments` on every
+   * structural change in the meeting (every join, leave, declaration, mute and
+   * connectivity change), so `#applyReceive` runs many times per session. A
+   * `ReadableStream` can be locked by only ONE reader, so a second
+   * `getReader()` throws — and it would throw from inside an assignment handler,
+   * where the failure would present as "media stopped after someone joined"
+   * rather than as what it is. A re-emit naming handlers already looping is
+   * therefore a no-op: nothing on this path touches the transport or any
+   * receiver state, so the replay window survives every unrelated roster event.
+   *
+   * A loop is NEVER torn down when an edge leaves its handler. The handler may
+   * carry another edge later, and the frames still arriving on it belong to
+   * senders whose edges have not moved. Tearing down on an assignment change is
+   * how "someone joined and I went deaf" happens.
    */
-  #readLoopUrl: string | undefined;
-  /** The single handler the latest `StreamAssignments` names, awaiting `start()`. */
-  #receiveUrl: string | undefined;
+  readonly #readLoops = new Set<string>();
+  /**
+   * A downlink hop monitor PER TRANSPORT, created with its read loop.
+   *
+   * Not shared: each media handler writes its own `hop_sequence` numbering
+   * (per (connection, media stream) in the frame format), so one monitor across
+   * two transports would read two independent sequences as one and post false
+   * gaps. Bounded by the meeting's registered handler set. See
+   * `IngressPipeline.accept`, which takes the monitor as a parameter for exactly
+   * this reason.
+   */
+  readonly #hopMonitors = new Map<string, HopSequenceMonitor>();
+  /** Every handler the latest `StreamAssignments` names. May be several (§9). */
+  #receiveUrls: readonly string[] = [];
   #directive: AudioSendDirective | undefined;
   #started = false;
   #stopped = false;
@@ -265,10 +280,6 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#replay = new ReplayWindow(
       options.config.receiverState.maxReplayContextsPerSender,
       options.config.receiverState.replayWindowBits,
-    );
-    this.#hopMonitor = new HopSequenceMonitor(
-      options.declaredSlotIds,
-      options.config.ingress.hopRestartBackwardJumpFrames,
     );
     this.#firstMedia = new FirstMediaObserver(options.metrics, this.#clock, (ms) => {
       this.emit('firstMediaFrame', ms);
@@ -409,7 +420,6 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       keys: this.#options.kekSource,
       cache: this.#cache,
       replay: this.#replay,
-      hopMonitor: this.#hopMonitor,
       firstMedia: this.#firstMedia,
       onAccepted: (frame) => this.emit('frameAccepted', frame),
     });
@@ -420,7 +430,8 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#teardown.register('receiver-state', () => {
       this.#cache.clear();
       this.#replay.clear();
-      this.#hopMonitor.clear();
+      for (const monitor of this.#hopMonitors.values()) monitor.clear();
+      this.#hopMonitors.clear();
       this.#firstMedia.clear();
     });
     this.#teardown.register('transmit-keys', () => this.#transmitKeys.clear());
@@ -473,35 +484,35 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * only looks up transports `connectAll` already connected and returns
    * `undefined` for anything else. `connectAll(joined.mediaServers)` is the SOLE
    * dial site in the SDK (`#connectedTransports.set` is reached only from its
-   * fan-out), and THAT is what makes MC's scoping of `JoinResponse.media_servers`
-   * the single control on what this client ever connects to. An assignment URL
-   * can pick among those transports; it can never create one. Any future write
-   * to `#connectedTransports` outside the `connectAll` path breaks this property
-   * and reopens the active/active fan-out MC's scoping exists to prevent.
+   * fan-out), so an assignment URL can pick among the transports this client
+   * already opened; it can never create one. Any future write to
+   * `#connectedTransports` outside the `connectAll` path breaks that property.
    *
-   * MORE THAN ONE DISTINCT HANDLER is a fault, and nothing is opened for it.
-   * MC places each participant on exactly one handler this story (multi-handler
-   * send is story 6), so two URLs mean MC broke its own scoping invariant. This
-   * is the far-end DETECTOR for that server-side break — not a guard against
-   * dialing, which is structurally impossible here — so do not remove it on the
-   * grounds that nothing could be dialed anyway.
+   * ---------------------------------------------------------------------------
+   * SEVERAL HANDLERS AT ONCE IS NORMAL (ADR-0036 §9)
+   * ---------------------------------------------------------------------------
+   *
+   * MC assigns each publisher-to-subscriber edge to ONE handler both parties are
+   * connected to, and different senders' edges may land on different handlers.
+   * The canonical case: A is connected to both handlers, B only to the first, C
+   * only to the second — so A receives B on one transport and C on the other,
+   * and reads each slot on whichever transport its `media_handler_url` names.
+   *
+   * This previously FAULTED on two URLs and refused to follow a moved edge,
+   * because an earlier revision of the model gave each participant exactly one
+   * handler. Both of those checks were removed with that model, NOT relaxed for
+   * convenience: under the edge model they fire on correct server behaviour, and
+   * the "deaf on the slot whose edge is on the other handler" symptom is what
+   * they produced. Nothing here assumes a particular or sorted-first handler.
    */
   setReceiveHandlers(mediaHandlerUrls: readonly string[]): void {
     if (this.#stopped) return;
-    const distinct = new Set(mediaHandlerUrls.filter((url) => url !== ''));
-    if (distinct.size > 1) {
-      this.#fault(
-        MediaFaultStage.Transport,
-        'slot assignments name more than one media handler',
-        false,
-      );
-      return;
-    }
-    const [url] = distinct;
-    // No source in any slot: nothing to receive yet. A running loop stays up,
-    // so a later refill needs no reconnect.
-    if (url === undefined) return;
-    this.#receiveUrl = url;
+    // Empty strings are the proto's "no source assigned" for a slot, not a
+    // handler. A message may legitimately carry nothing but those.
+    this.#receiveUrls = [...new Set(mediaHandlerUrls.filter((url) => url !== ''))];
+    // No source in any slot: nothing to receive yet. Running loops stay up, so a
+    // later refill needs no reconnect.
+    if (this.#receiveUrls.length === 0) return;
     this.#applyReceive();
   }
 
@@ -646,7 +657,13 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   }
 
   /**
-   * Attach the egress pipeline to MC's directed handler.
+   * Attach the egress pipeline to EVERY handler MC directed (ADR-0036 §9).
+   *
+   * A sender's targets are exactly the handlers owning one of its outgoing edges,
+   * so a sender whose edges span handlers sends to all of them — the canonical
+   * case needs A's frames to reach both. The fan-out itself lives in
+   * `EgressPipeline`, because the frame must be sealed and signed ONCE above it
+   * (see `submit`); this method only hands over the target set.
    *
    * SEND ONLY. The read loop is NOT started from here: a participant can hold
    * filled receive slots while being in nobody's slot (static fill, N=1, three
@@ -657,14 +674,13 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   #applyDirective(): void {
     const directive = this.#directive;
     if (!directive || this.#stopped) return;
-    const [target] = directive.targets;
-    if (target === undefined) {
-      // "A target set may be empty. That means send nothing." (§5)
-      this.#egress?.setSender(undefined);
-      return;
-    }
-
+    // An empty target set is "send nothing" (§5) and is applied through the same
+    // path as any other set — NOT short-circuited here. `setTargets([])` makes
+    // every lane inactive and discards what they held.
     if (!this.#egress) {
+      // Nothing to withdraw from: egress has never run, and constructing it just
+      // to tell it to send nothing would invent a stream number and a bitrate.
+      if (directive.targets.length === 0) return;
       this.#egress = new EgressPipeline({
         metrics: this.#metrics,
         transmitKeys: this.#transmitKeys,
@@ -675,55 +691,89 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
         // The relay `stream_id` this client stamps on its uplink. The declared
         // slot id, so the value space matches what MH routes on.
         streamId: this.#options.declaredSlotIds[0] ?? 0,
+        senderFor: (url) => this.#options.senderFor(url),
+        onTargetNotConnected: () => {
+          // Event-once by (stage, message) — see `#fault`. Under §9 MC only
+          // targets handlers owning this sender's edges, and an edge requires
+          // both parties connected to that handler, so this is a SERVER-side
+          // condition: MC's connectivity view names a transport we do not hold.
+          this.#fault(
+            MediaFaultStage.Transport,
+            'the controller directed audio to a media handler this client is not connected to',
+            false,
+          );
+        },
       });
       this.#teardown.register('egress', () => this.#egress?.stop());
     }
-    this.#egress.setSender(this.#options.senderFor(target));
+    this.#egress.setTargets(directive.targets);
   }
 
-  /** Start the read loop on the assigned handler, once, after `start()`. */
+  /**
+   * Start a read loop on every handler the assignments name, each once.
+   *
+   * One loop and one hop monitor per transport; loops already running are left
+   * exactly as they are, including when an edge moves off their handler.
+   */
   #applyReceive(): void {
-    const url = this.#receiveUrl;
     // Before `start()` there is no ingress to hand frames to; `start()` calls
     // this again. Never read and discard.
-    if (url === undefined || !this.#ingress || this.#stopped) return;
-    if (this.#readLoopUrl !== undefined) {
-      if (url !== this.#readLoopUrl) {
-        // MC's placement is frozen per participant (reconnect keeps the
-        // handler), so a DIFFERENT handler mid-session is an MC defect. Say so;
-        // do not tear down a working loop to follow it.
+    if (!this.#ingress || this.#stopped) return;
+    for (const url of this.#receiveUrls) {
+      if (this.#readLoops.has(url)) continue;
+      const readable = this.#options.readableFor(url);
+      if (!readable) {
+        // A slot assigned on a transport we never opened. Structurally a server
+        // condition for the same reason as the send-side one above, and the last
+        // thing this client can do about it is say so loudly.
         this.#fault(
           MediaFaultStage.Transport,
-          'slot assignments moved to a different media handler mid-session',
+          'slot assignments name a media handler this client is not connected to',
           false,
         );
+        continue;
       }
-      return;
-    }
-    const readable = this.#options.readableFor(url);
-    if (!readable) {
-      this.#fault(
-        MediaFaultStage.Transport,
-        'slot assignments name a media handler this client is not connected to',
-        false,
+      if (readable.locked) {
+        // Two DISTINCT urls resolved to one datagram stream. A `ReadableStream`
+        // takes only one reader, so `getReader()` would THROW — from inside an
+        // assignment handler, where it would surface as "media stopped when
+        // someone joined" rather than as what it is. Checked rather than caught
+        // so the condition is named, and so the other handlers in this snapshot
+        // still get their loops.
+        this.#fault(
+          MediaFaultStage.Transport,
+          'two media handlers resolved to the same media transport',
+          false,
+        );
+        continue;
+      }
+      this.#readLoops.add(url);
+      const monitor = new HopSequenceMonitor(
+        this.#options.declaredSlotIds,
+        this.#config.ingress.hopRestartBackwardJumpFrames,
       );
-      return;
+      this.#hopMonitors.set(url, monitor);
+      this.#startReadLoop(readable, monitor);
     }
-    this.#readLoopUrl = url;
-    this.#startReadLoop(readable);
   }
 
-  #startReadLoop(readable: ReadableStream<Uint8Array>): void {
+  #startReadLoop(readable: ReadableStream<Uint8Array>, monitor: HopSequenceMonitor): void {
     const reader = readable.getReader();
-    this.#teardown.register('datagram-reader', () => {
+    // Registered per loop. The name is a static literal plus the LOOP COUNT, not
+    // the URL: a teardown-failure fault interpolates this name, and a handler URL
+    // in a fault message would be an unbounded value on a bounded path.
+    this.#teardown.register(`datagram-reader-${this.#readLoops.size}`, () => {
       void reader.cancel().catch(() => {
         // Already cancelled or errored; the transport close is what matters.
       });
     });
-    void this.#readLoop(reader);
+    void this.#readLoop(reader, monitor);
   }
 
-  async #readLoop(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+  async #readLoop(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    monitor: HopSequenceMonitor,
+  ): Promise<void> {
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -742,7 +792,9 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
         }
         if (value === undefined) continue;
         try {
-          await this.#ingress?.accept(value);
+          // The monitor for THIS transport travels with the datagram: each
+          // handler writes its own hop numbering (see `IngressPipeline.accept`).
+          await this.#ingress?.accept(value, monitor);
         } catch {
           // `accept` returns normally for every WIRE condition; reaching here
           // means a defect. Surfaced ONCE — a repeating defect must not become

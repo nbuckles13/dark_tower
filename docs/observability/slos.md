@@ -357,6 +357,19 @@ omission, and the reasoning is recorded here because the natural instinct is to 
 The number is therefore **observed, not asserted**: the client records first-media-received, and MH
 records the decomposed forward latency above.
 
+### A known additive floor: the connect settle window (story 2 task 20)
+
+A participant that does not complete every offered handler connection waits up to MC's connect
+settle window (`MC_MEDIA_CONNECT_SETTLE_MS`, published as `mc_media_connect_settle_window_seconds`)
+before MC routes it, so join-to-first-media carries that window as an **additive floor for that
+participant**. A participant that connects to every offered handler exits the window early and pays
+nothing. A client permanently unable to reach one handler (firewall, egress policy) therefore pays
+the full window on **every** join — a support-visible "this user's audio always starts late" with a
+config-key answer. Read `mc_media_connect_settles_total{outcome="window_elapsed"}` against the gauge,
+not the aggregate join latency: the window never appears in `mc_session_join_duration_seconds`,
+which stops at the JoinResponse. Why the window exists (and why it is not a debounce):
+`crates/mc-service/src/media_routing/connectivity.rs`.
+
 ### What *is* gated, so "never a gate" is not read as "unverified"
 
 The media path's correctness is gated **structurally** — on invariants that are deterministic and do

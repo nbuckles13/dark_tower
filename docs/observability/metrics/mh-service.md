@@ -178,11 +178,12 @@ rate(mh_caller_type_rejected_total[5m])
 
 ### `mh_mc_notifications_total`
 - **Type**: Counter
-- **Description**: Total MH→MC notification delivery attempts by event type and outcome
+- **Description**: Total MH→MC notifications by event type and terminal outcome (one increment per logical notification, NOT per retry attempt)
 - **Labels**:
   - `event_type`: Notification event type (`connected`, `disconnected`)
   - `status`: Delivery outcome (`success`, `error`)
 - **Cardinality**: Low (2 event types x 2 statuses = 4 series)
+- **ONE INCREMENT PER LOGICAL NOTIFICATION, NOT PER ATTEMPT.** `send_with_retry` (`grpc/mc_client.rs`) makes up to 3 attempts with 1s/2s/4s backoff and records exactly once, on the terminal outcome. Retry volume is therefore NOT derivable from this series — a reader sizing MC-facing load off it underestimates by up to 3x. The failure-ratio example below is correct as written, because both sides count notifications.
 - **Usage**: Monitor MH→MC notification delivery health, detect MC connectivity issues
 - **Dashboard**: MH Overview - MC Notification Delivery
 
@@ -395,7 +396,7 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Description**: Installed egress streams across every meeting on this handler — the same `total_edges()` MH reports to GC as `current_streams`.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: Saturation against `mh_media_egress_stream_ceiling` (same unit). Published as 0 at startup and then on every install and every release. It falls when a live meeting re-asserts a smaller policy and when `EndMeeting` releases a meeting; it stays high after a meeting that ends with no `EndMeeting` — truthfully, because those streams really are still held (the ratchet above). The name is fixed by the story.
+- **Usage**: Saturation against `mh_media_egress_stream_ceiling` (same unit). Published as 0 at startup and then on every install and every release. It falls when a live meeting re-asserts a smaller policy and when `EndMeeting` releases a meeting; it stays high after a meeting that ends with no `EndMeeting` — truthfully, because those streams really are still held (the ratchet above). **Compare each pod against ITS OWN ceiling, never against the fleet.** MC co-locates each meeting's edges onto ONE handler, choosing it by a per-meeting rotation, so pods should be roughly balanced across many meetings but a single large meeting's egress is never split — and the idle sibling is not headroom for a meeting refused on the busy one (edges do not move once placed). Until capacity-aware spreading lands (`docs/TODO.md` §Media Path Obligations, item 1) a few large meetings can therefore skew the pods; sustained severe skew is worth investigating rather than expected. The name is fixed by the story.
 
 ### `mh_media_egress_edges_limit`
 - **Type**: Gauge
@@ -624,7 +625,7 @@ and this change did not create one.
 | `outcome` | Condition | Responder's first move |
 |---|---|---|
 | `started` | Bound; the three media loops were spawned. | Nothing. Health. |
-| `declined_no_sender_binding` | MC answered with no usable `sender_id`. | **Upstream in MC.** The union of MC's `0`-answering outcomes, which MH structurally cannot split: `meeting_unknown` (routing/registration fault), `participant_unknown` (join race — transient and self-clearing), `registry_full` (MC's per-meeting connection cap — capacity, **never** self-clears), `user_ambiguous` (one user, two roster entries — **never** self-clears, and reconnecting *causes* it, so the `participant_unknown` remedy is actively harmful here). `mc_media_sender_binding_responses_total` splits them, which is why neither series is redundant. **Discriminate on the ratio, not the label**: a decaying fraction is a race; flat-and-total is a systematic identity mismatch between what MH names and what MC keys on — the shape of the defect this contract's own first cluster run found. |
+| `declined_no_sender_binding` | MC answered with no usable `sender_id`. | **Upstream in MC.** The union of MC's `0`-answering outcomes, which MH structurally cannot split: `meeting_unknown` (routing/registration fault), `participant_unknown` (join race — transient and self-clearing), `user_ambiguous` (one user, two roster entries — **never** self-clears, and reconnecting *causes* it, so the `participant_unknown` remedy is actively harmful here). `mc_media_sender_binding_responses_total` splits them, which is why neither series is redundant. (`registry_full` retired with MC's connection registry in story 2 task 20; seen only from an MC image that predates it.) **Discriminate on the ratio, not the label**: a decaying fraction is a race; flat-and-total is a systematic identity mismatch between what MH names and what MC keys on — the shape of the defect this contract's own first cluster run found. |
 | `declined_sender_binding_out_of_range` | MC answered above the 16-bit ordinal range. | **Should read zero forever.** MC's allocator **range**. Field corruption in transit, or a mis-versioned or foreign peer answering. |
 | `declined_sender_binding_conflict` | The ordinal is already held by a **different** participant in that meeting; MH refused rather than overwrote. | **Should read zero forever.** Two candidate causes MH cannot separate: MC's allocator **uniqueness / non-recycling**, or MH failing to unbind a previous holder. **Check MH's unbind path for that meeting first.** |
 | `declined_mc_unavailable` | The RPC reached MC (or the network) and yielded no usable response — timeout, transport failure, or a non-auth error status. | **MC availability / network.** Declines only after the whole retry budget, unlike the two fast reachability outcomes below. |

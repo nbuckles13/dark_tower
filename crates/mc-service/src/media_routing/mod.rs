@@ -2,8 +2,10 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
-//! | [`slots`] | per-meeting **join-order slot state** (held by the meeting actor) and its pure render into a per-handler forwarding snapshot |
-//! | [`placement`] | which ONE handler of the meeting's set each participant is placed on — the one home for placement and for client-facing handler urls |
+//! | [`slots`] | per-meeting **join-order slot state and shared-handler edges** (held by the meeting actor): an edge exists iff the pair shares a connected handler, and its pure render into a per-handler forwarding snapshot |
+//! | [`connectivity`] | one participant's OBSERVED connectivity keyed by MH connection, the tombstone, and the settle rule |
+//! | [`edges`] | which shared handler carries one edge — policy only (co-locate), correct for ANY choice |
+//! | [`placement`] | the meeting's frozen handler set (the one home for client-facing handler urls) and [`ConnectedHandlers`], the observed connectivity that can only hold resolved handlers |
 //! | [`assignment`] | the snapshot's **output types** and the id-packing rules every producer shares |
 //! | [`generation`] | a **change-detector** that numbers those snapshots, plus floor adoption after an MC restart |
 //! | [`confirm`] | a **total classifier** of the handler's reply into one bounded outcome |
@@ -15,7 +17,8 @@
 //!
 //! # Scope: structural re-push, not the §8 cadence
 //!
-//! Every structural change — a join, a leave, a capability declaration, a mute —
+//! Every structural change — a join, a leave, a capability declaration, a mute,
+//! a settled connectivity change reported by a handler —
 //! re-renders the meeting and re-pushes the FULL snapshot to each assigned
 //! handler under a generation that advances only when that handler's snapshot
 //! changed, and confirms MH's applied-generation echo. ADR-0036 §8's
@@ -35,6 +38,8 @@
 
 pub mod assignment;
 pub mod confirm;
+pub mod connectivity;
+pub mod edges;
 pub mod generation;
 pub mod placement;
 pub mod pusher;
@@ -47,7 +52,8 @@ pub use assignment::{
 pub use confirm::{
     divergence_magnitude, evaluate, PolicyPushOutcome, PushDisposition, PushExpectation,
 };
+pub use connectivity::{ConnectionKey, ParticipantConnectivity, Phase, SettleOutcome, Unapplied};
 pub use generation::{GenerationSpaceExhausted, PolicyGenerations};
-pub use placement::{HandlerEndpoint, HandlerSetError, MeetingHandlers};
+pub use placement::{ConnectedHandlers, HandlerEndpoint, HandlerSetError, MeetingHandlers};
 pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget};
-pub use slots::{JoinRank, SlotTable, SlotTableError};
+pub use slots::{Edge, JoinRank, SlotTable, SlotTableError};

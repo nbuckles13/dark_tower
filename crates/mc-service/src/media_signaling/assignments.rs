@@ -20,10 +20,18 @@
 //! # What this never emits
 //!
 //! `SLOT_STATE_ZERO_REQUESTED` (MC never fabricates a `slot_id` to carry it) and
-//! `SLOT_STATE_SOURCE_UNREACHABLE` (reserved for a pinned source on another
-//! handler, which static fill cannot produce). A participant on ANOTHER handler
-//! consumes no slot and is named in `unreachable_sender_ids` instead — one bit
-//! per roster entry, relative to this subscriber, carrying no topology.
+//! `SLOT_STATE_SOURCE_UNREACHABLE` (reserved for a pinned source with which the
+//! subscriber shares no connected handler, which static fill cannot produce). A
+//! participant the subscriber shares NO connected handler with consumes no slot
+//! and is named in `unreachable_sender_ids` instead — one bit per roster entry,
+//! relative to this subscriber, carrying no topology. A participant not yet
+//! connected is in neither.
+//!
+//! # Each slot names ITS edge's handler
+//!
+//! `StreamAssignment.media_handler_url` is the handler owning that edge, so one
+//! subscriber may read different slots on different handlers (ADR-0036 §9); the
+//! client reads each slot on the transport its url names.
 //!
 //! # Mute lives here and only here
 //!
@@ -178,7 +186,7 @@ pub fn build_stream_assignments(
                 };
                 (Some(u32::from(source.get().get())), url.to_string(), state)
             }
-            // Declared, but nobody on this subscriber's handler is left to fill
+            // Declared, but no sender this subscriber shares a connected handler with is left to fill
             // it: the honest steady state of a meeting smaller than N, and of a
             // solo participant (R-3). The url is empty BY CONTRACT here.
             Some((_, None)) | None => (None, String::new(), SlotState::FewerSourcesThanSlots),
@@ -245,7 +253,7 @@ mod tests {
             .expect("fixture declaration is valid")
     }
 
-    /// A meeting on `handlers` where `others` join `mh-0` after subscriber 1,
+    /// A meeting on `handlers` where `others` connect only to `mh-0` after subscriber 1,
     /// which declares `slots`. Returns (assignment, handlers, table).
     fn meeting(
         handlers: &[&str],
@@ -259,13 +267,9 @@ mod tests {
     ) {
         let set = handler_set(handlers);
         let mut table = SlotTable::new();
-        table
-            .admit(sender(1), |_| Some(HandlerId::new("mh-0")))
-            .unwrap();
+        table.admit_on(sender(1), &set, &["mh-0"]);
         for s in others {
-            table
-                .admit(sender(*s), |_| Some(HandlerId::new("mh-0")))
-                .unwrap();
+            table.admit_on(sender(*s), &set, &["mh-0"]);
         }
         let declaration = declare(slots);
         table.set_demand(sender(1), declaration.audio_slot_ids());
@@ -298,7 +302,7 @@ mod tests {
         assert_eq!(
             a.sender_id,
             Some(2),
-            "the co-handler peer, never the subscriber itself"
+            "the peer sharing mh-0, never the subscriber itself"
         );
         assert_eq!(a.media_kind, MediaKind::Audio as i32);
         assert_eq!(a.media_handler_url, "https://mh-0.example:4434");
@@ -437,25 +441,17 @@ mod tests {
         }
     }
 
-    /// R-33: a participant on another handler consumes no slot and is named in
-    /// `unreachable_sender_ids`; a co-handler participant left over by full
-    /// slots is NOT.
+    /// R-33: a participant sharing no connected handler consumes no slot and is
+    /// named in `unreachable_sender_ids`; a participant sharing one but left over
+    /// by full slots is NOT.
     #[test]
-    fn cross_handler_peers_are_unreachable_and_co_handler_overflow_is_not() {
+    fn disjoint_peers_are_unreachable_and_sharing_overflow_is_not() {
         let set = handler_set(&["mh-0", "mh-1"]);
         let mut table = SlotTable::new();
-        table
-            .admit(sender(1), |_| Some(HandlerId::new("mh-0")))
-            .unwrap();
-        table
-            .admit(sender(2), |_| Some(HandlerId::new("mh-1")))
-            .unwrap();
-        table
-            .admit(sender(3), |_| Some(HandlerId::new("mh-0")))
-            .unwrap();
-        table
-            .admit(sender(4), |_| Some(HandlerId::new("mh-0")))
-            .unwrap();
+        table.admit_on(sender(1), &set, &["mh-0"]);
+        table.admit_on(sender(2), &set, &["mh-1"]);
+        table.admit_on(sender(3), &set, &["mh-0"]);
+        table.admit_on(sender(4), &set, &["mh-0"]);
         let declaration = declare(&[(0, MediaKind::Audio)]);
         table.set_demand(sender(1), declaration.audio_slot_ids());
         let composition = build_stream_assignments(

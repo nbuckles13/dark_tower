@@ -1272,3 +1272,192 @@ async fn datagrams_arriving_on_a_declined_connection_are_counted_not_silently_di
         ])
         .assert_delta(0);
 }
+
+// ---------------------------------------------------------------------------
+// `connection_id` — the session identity MC keys live connectivity on
+// ---------------------------------------------------------------------------
+//
+// Story 2 task 20: MC derives which handlers a participant can be reached on
+// from these notifications, keyed on `(handler, connection_id)`. Two properties
+// on MH's side keep that exact (`internal.proto`, at both request messages):
+// ids are never reused within the process, and a session's Connected — every
+// retry of it — and its Disconnected carry ONE id. Expected ids are always read
+// back off what the mock received, never written as literals (§Assertion
+// Vacuity, mechanism 4), and no assertion depends on the id's SHAPE: MH mints a
+// v4 uuid today, and that is an implementation fact, not contract.
+
+/// The superseded-session case, from MH's side of the wire.
+///
+/// A client reconnects to the same handler (network change, transport retry)
+/// while its first session is still open; the first session ends later — in
+/// production up to `MAX_IDLE_TIMEOUT_SECONDS` later. Before `connection_id`,
+/// that late disconnect named only (meeting, participant, handler), so MC
+/// removed the handler from the participant's connected set while the second
+/// session was live, and nothing ever repaired it.
+///
+/// Pins: the two sessions carry DIFFERENT ids (no reuse), the late disconnect
+/// carries the FIRST session's id (so MC retires exactly that entry), and MH's
+/// own binding survives the first session's teardown (the MH-side twin of the
+/// same property, compare-and-remove on the connection id — SEC-2).
+#[tokio::test]
+async fn a_superseded_sessions_late_disconnect_names_only_its_own_connection_id() {
+    const PARTICIPANT: &str = "participant-reconnecting";
+    const MEETING: &str = "meeting-superseded-session";
+
+    let replies = SenderReplies::default().with(PARTICIPANT, SENDER_FIRST_TO_CONNECT);
+    let (connected_tx, mut connected_rx) = tokio::sync::mpsc::channel(8);
+    let (disconnected_tx, mut disconnected_rx) = tokio::sync::mpsc::channel(8);
+    let suite = BindingSuite::start_with_capture(
+        MockBehavior::Accept,
+        replies,
+        Some(connected_tx),
+        Some(disconnected_tx),
+    )
+    .await;
+    suite.register(MEETING).await;
+    let meeting = MeetingKey::new(MEETING);
+    let sender = suite.allocated(PARTICIPANT);
+
+    // First session: connect, and wait for its notification and its binding
+    // before the second one starts, so the two Connected payloads are ordered.
+    let (first_conn, mut first_send, _first_recv) = suite.connect(MEETING, PARTICIPANT).await;
+    let first = tokio::time::timeout(Duration::from_secs(5), connected_rx.recv())
+        .await
+        .expect("the first session's NotifyParticipantConnected must arrive within 5s")
+        .expect("connected capture channel closed early");
+    assert_eq!(
+        holder_within(
+            &suite.session_manager,
+            &meeting,
+            sender,
+            Duration::from_secs(5)
+        )
+        .await
+        .as_deref(),
+        Some(PARTICIPANT),
+        "precondition: the first session must be bound before the reconnect"
+    );
+
+    // Second session of the SAME participant on the SAME handler.
+    let _second = suite.connect(MEETING, PARTICIPANT).await;
+    let second = tokio::time::timeout(Duration::from_secs(5), connected_rx.recv())
+        .await
+        .expect("the second session's NotifyParticipantConnected must arrive within 5s")
+        .expect("connected capture channel closed early");
+
+    assert!(
+        !first.connection_id.is_empty() && !second.connection_id.is_empty(),
+        "MH must send a connection_id on every Connected; empty is MC's degraded legacy mode"
+    );
+    assert_ne!(
+        first.connection_id, second.connection_id,
+        "two sessions of one participant on one handler must carry DIFFERENT connection_ids. \
+         With one id, MC holds one entry for both, and the first session's disconnect retires \
+         the live second session's connectivity"
+    );
+
+    // End the FIRST session only. Clean close: the server's read returns
+    // `Ok(None)`, the `ClientClosed` arm.
+    first_send
+        .finish()
+        .await
+        .expect("send.finish() on the first session must succeed");
+    drop(first_conn);
+
+    let disconnect = tokio::time::timeout(Duration::from_secs(5), disconnected_rx.recv())
+        .await
+        .expect("the first session's NotifyParticipantDisconnected must arrive within 5s")
+        .expect("disconnected capture channel closed early");
+    assert_eq!(
+        disconnect.connection_id, first.connection_id,
+        "the late disconnect must name the FIRST session's id — the entry MC must retire"
+    );
+    assert_ne!(
+        disconnect.connection_id, second.connection_id,
+        "the late disconnect must NOT name the live second session; if it did, MC would drop a \
+         handler the participant is still connected to"
+    );
+
+    // MH's own half: the first session's teardown must not clear the binding
+    // the second session took over.
+    assert_eq!(
+        suite
+            .session_manager
+            .sender_bindings()
+            .holder_of(&meeting, sender)
+            .as_deref(),
+        Some(PARTICIPANT),
+        "the superseded session's teardown must leave the live session's binding in place"
+    );
+}
+
+/// MC unreachable for the whole retry budget: MH declines, and the
+/// notify-on-uncertainty Disconnected carries the SAME id as every abandoned
+/// Connected attempt.
+///
+/// This is the arm where the id matters most. MH gave up without an answer, so
+/// MC may have applied an attempt and then missed MH's deadline — and the
+/// Disconnected is the only event that can retire that entry. A different id
+/// here, on any attempt, strands phantom connectivity at MC for the rest of the
+/// session. The mock fails exactly the retry budget and then accepts, so the
+/// decline's Disconnected reaches it and the whole sequence is observable.
+#[tokio::test]
+async fn an_abandoned_connected_and_its_decline_disconnect_carry_one_connection_id() {
+    const PARTICIPANT: &str = "participant-mc-unavailable";
+    const MEETING: &str = "meeting-abandoned-connected";
+    // `McClient`'s retry budget. Every attempt fails, so the whole budget is
+    // spent; the next call (the Disconnected) is accepted.
+    const CONNECTED_ATTEMPTS: u32 = 3;
+
+    let (connected_tx, mut connected_rx) = tokio::sync::mpsc::channel(8);
+    let (disconnected_tx, mut disconnected_rx) = tokio::sync::mpsc::channel(8);
+    let suite = BindingSuite::start_with_capture(
+        MockBehavior::FailThenAccept {
+            fail_count: CONNECTED_ATTEMPTS,
+        },
+        SenderReplies::default(),
+        Some(connected_tx),
+        Some(disconnected_tx),
+    )
+    .await;
+    suite.register(MEETING).await;
+
+    let _conn = suite.connect(MEETING, PARTICIPANT).await;
+
+    // Long enough for the 1s + 2s backoff between the three attempts. The
+    // Disconnected is sent BEFORE the close jitter, so the jitter is not in it.
+    let disconnect = tokio::time::timeout(Duration::from_secs(20), disconnected_rx.recv())
+        .await
+        .expect(
+            "the decline path must send NotifyParticipantDisconnected once the Connected retry \
+             budget is spent — MC may hold an entry MH cannot see",
+        )
+        .expect("disconnected capture channel closed early");
+    assert_eq!(
+        disconnect.reason,
+        proto_gen::dark_tower::internal::v1::DisconnectReason::Error as i32,
+        "precondition: this must be the DECLINE path's disconnect, not a teardown one"
+    );
+
+    let mut attempt_ids = Vec::new();
+    while let Ok(request) = connected_rx.try_recv() {
+        attempt_ids.push(request.connection_id);
+    }
+    assert_eq!(
+        attempt_ids.len(),
+        usize::try_from(CONNECTED_ATTEMPTS).unwrap(),
+        "precondition: the mock must have seen the whole retry budget, or the per-attempt \
+         assertion below is vacuous"
+    );
+    assert!(
+        !disconnect.connection_id.is_empty(),
+        "the decline's disconnect must carry a connection_id"
+    );
+    for (attempt, id) in attempt_ids.iter().enumerate() {
+        assert_eq!(
+            *id, disconnect.connection_id,
+            "Connected attempt {attempt} and the decline's Disconnected carry different ids, so \
+             MC can never retire an entry that attempt may have created"
+        );
+    }
+}

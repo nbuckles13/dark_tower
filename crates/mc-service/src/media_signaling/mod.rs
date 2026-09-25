@@ -103,4 +103,8 @@ pub struct ClientMediaConfig {
     pub max_receive_capability_declarations: u32,
     /// The encoding MC directs for main audio.
     pub audio_encoding: AudioEncoding,
+    /// How long a participant's handler connections may take to settle before
+    /// MC routes on what it observed (`MC_MEDIA_CONNECT_SETTLE_MS`); see
+    /// `media_routing/connectivity.rs` for why the window exists.
+    pub connect_settle_window: std::time::Duration,
 }

@@ -92,7 +92,7 @@ async fn test_mc_client_notify_connected_injects_traceparent_matching_ambient_sp
     span.set_parent(known_remote_context());
     async {
         client
-            .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+            .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
             .await
             .unwrap();
     }
@@ -134,7 +134,7 @@ async fn test_mc_client_notify_connected_no_otel_layer_sends_no_traceparent() {
     let client = McClient::new(test_token_receiver());
 
     let result = client
-        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+        .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
         .await;
     assert!(result.is_ok(), "call must still succeed with OTel absent");
 
@@ -175,7 +175,7 @@ async fn test_mc_client_retry_injects_same_traceparent_on_every_attempt() {
     span.set_parent(known_remote_context());
     async {
         client
-            .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1")
+            .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
             .await
             .unwrap();
     }

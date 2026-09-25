@@ -115,14 +115,14 @@ enum SlotState {
   // echoable ids for the other. Reserving it now would force a re-add then.
   SLOT_STATE_ZERO_REQUESTED = 5;
   // Structurally persistent, unlike the transient states above (ADR-0036 §9):
-  // the subscriber PINNED a source that is on a different handler, and there
-  // is no cross-handler forwarding.
+  // the subscriber PINNED a source with which it shares NO CONNECTED HANDLER,
+  // and there is no cross-handler forwarding.
   //
   // RETAINED, NOT EMITTED IN STORY 2: under static fill no client pins, so the
-  // pinned-unreachable case cannot arise. A participant on another handler
-  // consumes NO slot and is reported per subscriber on
-  // `StreamAssignments.unreachable_sender_ids` instead -- never as an empty
-  // slot in this state.
+  // pinned-unreachable case cannot arise. A roster participant sharing no
+  // connected handler with the subscriber consumes NO slot and is reported per
+  // subscriber on `StreamAssignments.unreachable_sender_ids` instead -- never
+  // as an empty slot in this state.
   SLOT_STATE_SOURCE_UNREACHABLE = 6;
   // Transient: a source switch has been commanded and is waiting on the new
   // source's next independently-decodable frame (ADR-0036 §7). Carries the
@@ -362,14 +362,29 @@ message JoinResponse {
 
   repeated Participant existing_participants = 3;
   // Connection bootstrap only: the media handlers this meeting is registered on,
-  // for the client to open transports to. NON-AUTHORITATIVE for send placement —
-  // this list does not decide where a client sends. Selection is the send
-  // directive: `SendTarget.media_handler_url` (matching the active slot's
-  // `StreamAssignment.media_handler_url`), both read out of the forwarding
-  // assignment. This list is deliberately left unordered and is not the
-  // selection mechanism: relying on its order — selecting off its first
-  // element — silently diverges from the directive. Its first element is not a
-  // selection and carries no relationship to placement.
+  // for the client to open transports to. EVERY handler in this list is OFFERED,
+  // and the client connects to ALL IT CAN — the transport is active/active. What
+  // the client actually reaches becomes its connected set, which is what MC's
+  // §9 reachability is computed from.
+  //
+  // NON-AUTHORITATIVE for send placement — this list does not decide where a
+  // client sends. THE SOLE SOURCE OF A TRANSMIT ADDRESS IS
+  // `SendTarget.media_handler_url`, on the send directive, and a sender sends to
+  // EVERY target it is given.
+  //
+  // DO NOT DERIVE A TRANSMIT ADDRESS FROM A RECEIVE-SIDE FIELD. In particular it
+  // is NOT the active slot's `StreamAssignment.media_handler_url`: that names the
+  // handler carrying a stream this client RECEIVES, and a sender's targets are
+  // the handlers carrying its OUTGOING edges — which are the handlers named on
+  // its SUBSCRIBERS' slots, not on its own. The two coincide in a
+  // single-handler meeting and diverge as soon as edges span handlers, so code
+  // written against the coincidence passes every one-handler test and
+  // mis-addresses in production.
+  //
+  // This list is deliberately left unordered and is not the selection mechanism:
+  // relying on its order — selecting off its first element — silently diverges
+  // from the directive. Its first element is not a selection and carries no
+  // relationship to placement.
   repeated MediaServerInfo media_servers = 4;
   // Session recovery fields (ADR-0023)
   string correlation_id = 6; // UUIDv7, client stores for reconnection
@@ -801,9 +816,37 @@ message SendStream {
   MediaKind media_kind = 2;
   EncodingParameters encoding = 3;
 
-  // Where to send it. AN EMPTY TARGET SET MEANS SEND NOTHING — MC turns off
-  // publishers nobody watches. Resuming from empty is a keyframe event, and
-  // the sender rotates its transmit key at that point (ADR-0036 §4).
+  // Where to send it. ONE TARGET PER HANDLER owning at least one of this
+  // stream's outgoing edges, so a multi-target set is the NORMAL case whenever a
+  // sender's subscribers are spread across handlers.
+  //
+  // SEND TO EVERY TARGET. Dropping targets after the first is SILENT — the
+  // sender transmits, its own uplink looks healthy, and only the subscribers
+  // behind the skipped handlers hear nothing. There is no error and no frame to
+  // count, so this failure presents as "some peers can't hear me" with nothing
+  // red anywhere.
+  //
+  // ENCRYPT ONCE, TRANSMIT N TIMES — and that is a CRYPTO SAFETY rule, not an
+  // efficiency preference. It is stated normatively in THIS FILE at the
+  // `SendStream` message header directly above (per-destination encryption =>
+  // nonce reuse => catastrophic), and deliberately NOT restated here: a second
+  // wording of a nonce-reuse rule is a second thing that can drift, and a reader
+  // who finds the weaker copy stops looking. The header is the single normative
+  // home; this is a pointer into it.
+  //
+  // The mechanical consequence for an implementer, which is where this gets got
+  // wrong: the AEAD sequence is allocated ONCE PER FRAME, per (sender, stream),
+  // BEFORE fanout, and the IDENTICAL sealed bytes go to every target. ADR-0036
+  // §2 fixes that counting scope at per (sender, stream) — NOT per target and
+  // NOT per send path. A per-target counter restarts under the same transmit
+  // key, which is a nonce repeat, and §2 states the consequence: it "leaks the
+  // authentication subkey and permits forgery". So fanning out by giving each
+  // target its own sequence source is not a performance regression, it forfeits
+  // integrity for that key.
+  //
+  // AN EMPTY TARGET SET MEANS SEND NOTHING — MC turns off publishers nobody
+  // watches. Resuming from empty is a keyframe event, and the sender rotates its
+  // transmit key at that point (ADR-0036 §4).
   repeated SendTarget targets = 4;
 }
 
@@ -901,9 +944,19 @@ message StreamAssignment {
 
   MediaKind media_kind = 8;
 
-  // Which handler to receive this slot's media from. Empty when no source is
-  // assigned. Server-to-client. Same spelling as
+  // Which handler to receive this slot's media from: the handler OWNING THIS
+  // EDGE. Empty when no source is assigned. Server-to-client. Same spelling as
   // `MediaServerInfo.media_handler_url`.
+  //
+  // PER SLOT, NOT PER SUBSCRIBER. A subscriber may receive different slots on
+  // DIFFERENT handlers, so a client MUST read each slot on the transport THIS
+  // field names and MUST NOT assume one receive transport for all of its slots.
+  // Collapsing these to a single url — reading every slot off the first
+  // assignment's handler, or off `media_servers[0]` — silently drops the media
+  // of every peer whose edge is on another handler.
+  //
+  // This is a RECEIVE address. It is not a transmit address: see the derivation
+  // warning at `JoinResponse.media_servers`.
   string media_handler_url = 9;
 
   // Why this slot looks the way it does. Explicit because absence of frames is
@@ -939,28 +992,49 @@ message StreamAssignment {
 // FULL SNAPSHOT, REPLACE SEMANTICS, for BOTH fields: each `StreamAssignments`
 // wholly replaces the previous one. Neither field is a delta. Because nothing
 // else tells the client, MC MUST re-emit `StreamAssignments` to a subscriber
-// whenever EITHER field changes for that subscriber -- including when a roster
-// join or leave changes only `unreachable_sender_ids`. Otherwise a peer who
-// later joins on another handler never appears as unreachable.
+// whenever EITHER field changes for that subscriber -- including when the change
+// is only to `unreachable_sender_ids`.
+//
+// THE TRIGGERS ARE NOT ONLY ROSTER CHANGES. A CONNECTIVITY change -- a
+// participant connecting to or disconnecting from a handler, which MC learns
+// from `dark_tower.internal.v1.NotifyParticipantConnected` /
+// `NotifyParticipantDisconnected` -- changes reachability WITHOUT changing the
+// roster, and it obliges the same re-emit. Reachability is a property of the
+// two parties' CONNECTED HANDLER SETS (ADR-0036 §9), and those move
+// independently of joins and leaves. An implementation that re-emits only on
+// roster join or leave satisfies the letter of the sentence above and still
+// strands a subscriber on a stale view: a peer that becomes reachable is never
+// heard, and a peer that becomes unreachable is awaited forever. Re-emit on
+// EVERY change to either field, whatever caused it.
 message StreamAssignments {
   repeated StreamAssignment assignments = 1;
 
-  // The roster participants THIS subscriber cannot reach: they are on a
-  // different media handler, and there is no cross-handler forwarding
-  // (ADR-0036 §9 visibility rule; story 2 R-33). Each is a sender id; the
-  // client resolves it to a roster entry through `Participant.sender_id`.
+  // The roster participants THIS subscriber cannot reach: the subscriber's
+  // connected handler set and the participant's are DISJOINT, and there is no
+  // cross-handler forwarding (ADR-0036 §9 visibility rule; story 2 R-33). Each
+  // is a sender id; the client resolves it to a roster entry through
+  // `Participant.sender_id`.
   //
-  // PER SUBSCRIBER, because reachability is relative to the subscriber's own
-  // handler. MC computes the visibility graph and stays authoritative. Do NOT
-  // put each participant's handler on the roster and let clients compute this
-  // -- that exposes topology and contradicts §7/§9.
+  // PER SUBSCRIBER, because reachability is relative to THE HANDLERS THE
+  // SUBSCRIBER IS CONNECTED TO -- which may be several, and need not be the same
+  // set as any other subscriber's. A subscriber hears a sender if and only if
+  // the two share at least one connected handler. MC computes the visibility
+  // graph and stays authoritative. Do NOT put each participant's handler SET on
+  // the roster and let clients compute this -- that exposes topology and
+  // contradicts §7/§9.
   //
   // MEMBERSHIP, precisely:
   //   - EXCLUDES the subscriber's own sender id.
-  //   - EXCLUDES same-handler senders left unassigned only because the
-  //     subscriber's slots are full (the N+2th sender). That is "no slot", not
-  //     "can't reach", and telling a user a co-located participant is
-  //     unreachable would be false.
+  //   - EXCLUDES senders that DO share a connected handler with the subscriber
+  //     but were left unassigned only because the subscriber's slots are full
+  //     (the N+2th sender). That is "no slot", not "can't reach", and telling a
+  //     user a reachable participant is unreachable would be false.
+  //   - EXCLUDES a participant NOT YET CONNECTED to any handler. Not-yet-
+  //     connected is NOT unreachable: it has no edges yet, and its connected set
+  //     is empty rather than disjoint. A participant still establishing its
+  //     connections would otherwise be reported unreachable and then reachable
+  //     moments later, which is a false statement about a healthy join, and one
+  //     that a client rendering it distinctly would show to a user.
   //   - Lists only roster participants that HAVE a `sender_id` (it is
   //     `optional` on `Participant`); a participant without one cannot be named
   //     here.
@@ -982,9 +1056,10 @@ message StreamAssignments {
   // partition. A client MUST NOT infer co-location AMONG the unreachable set:
   // being absent from my reachable set says nothing about whether two
   // unreachable peers share a handler with each other. Grouping them is the
-  // step that turns a reachability bit into a topology map. The subscriber's own
-  // handler is already known to it (`StreamAssignment.media_handler_url`,
-  // `JoinResponse.media_servers`); nothing here adds to that.
+  // step that turns a reachability bit into a topology map. THE HANDLERS THE
+  // SUBSCRIBER IS CONNECTED TO are already known to it (`JoinResponse.
+  // media_servers` offers the set; each `StreamAssignment.media_handler_url`
+  // names the one carrying that slot); nothing here adds to that.
   //
   // OBSERVABILITY (ADR-0036 §11): sender ids -- never a metric label, never a
   // span attribute, never a per-frame log dimension.
@@ -1106,6 +1181,37 @@ message MhConnectionStatus {
 // Client report of per-MH media connection state (replaces predecessor
 // MediaConnectionFailed; richer per-handler shape supports the SDK's
 // connectAll() resolver in browser-client-join story Task #14).
+//
+// DIAGNOSTIC ONLY. THIS IS NOT THE CONNECTIVITY SOURCE, and MC MUST NOT compute
+// reachability, placement, or any client-facing url from it.
+//
+// connected(participant) -- the input to ADR-0036 §9's visibility rule and to
+// every edge MC places -- is what MC has been TOLD BY HANDLERS, over
+// `dark_tower.internal.v1.NotifyParticipantConnected` /
+// `NotifyParticipantDisconnected`, whose participant identity is derived from a
+// validated meeting token and whose handler identity is the handler's own. That
+// is SERVER-OBSERVED truth. Everything in this message is CLIENT-ASSERTED: a
+// client can claim to be connected to a handler it never dialed, or claim a
+// failure on a handler it is happily using.
+//
+// WHY THE DISTINCTION IS LOAD-BEARING, not stylistic. If reachability were
+// computed from this message, a client could place its own edges — naming a
+// handler to be routed through, or claiming disjointness to make itself
+// unreachable to a peer — and the url MC hands out would trace back to
+// client-supplied input. Routing input MUST NOT be client-assertable.
+//
+// NOTHING IN THIS REPOSITORY READS IT FOR ROUTING TODAY, and the preferred
+// answer remains DO NOT READ IT AT ALL. Its legitimate uses are diagnostic:
+// operator visibility, and detecting DIVERGENCE between what a client believes
+// and what handlers report.
+//
+// The narrow allowance below is NOT A CARVE-OUT FROM THE PROHIBITION ABOVE — it
+// INHERITS it in full. If a consumer uses this message at all, it may serve only
+// as a MEMBERSHIP HINT, matched by EXACT comparison against the meeting's
+// registered handler set, and EVEN THEN it is NEVER the source of any url MC
+// hands to any client and NEVER an input to reachability, placement, or edge
+// assignment. A "hint" that reached any of those would be the client-assertable
+// routing input this whole block exists to forbid.
 message MediaConnectionUpdate {
   repeated MhConnectionStatus statuses = 1;
 }

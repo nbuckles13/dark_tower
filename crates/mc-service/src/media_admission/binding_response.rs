@@ -23,7 +23,7 @@
 /// # Why the four unresolved arms are separate
 ///
 /// Every variant except [`Self::Resolved`] answers `0` on the wire, so there
-/// are **four** unresolved arms, not two. They triage differently, and
+/// are **three** unresolved arms, not two. They triage differently, and
 /// collapsing any of them would mix a should-investigate condition with
 /// expected background — the failure mode
 /// `docs/observability/metrics/mh-service.md`'s drop-reason rule names as "a
@@ -33,19 +33,23 @@
 /// [`Self::MeetingUnknown`] means MH notified MC about a meeting MC does not
 /// hold: a routing/registration fault whose remedy lives in the MC<->MH
 /// registration path. [`Self::ParticipantUnknown`] is an expected low-rate race
-/// between MH's connect notification and MC's join completing. [`Self::RegistryFull`]
-/// is the per-meeting connection cap declining to bind a connection MC is not
-/// tracking — a capacity remedy, not a lifecycle one. [`Self::UserAmbiguous`]
+/// between MH's connect notification and MC's join completing. [`Self::UserAmbiguous`]
 /// is one user with two roster entries for one `sub`; it **never self-clears,
 /// and reconnecting CAUSES it**, so the `participant_unknown` remedy is actively
 /// harmful here.
 ///
+/// `registry_full` is RETIRED (story 2 task 20): the per-meeting
+/// `MhConnectionRegistry` and its cap are gone — connectivity now lives in the
+/// meeting actor, bounded structurally — so MC never declines a binding for
+/// capacity. An MC image predating the retirement can still emit it during a
+/// rolling deploy (version skew; not a capacity signal).
+///
 /// # The information MH structurally cannot have
 ///
 /// MH observes only `sender_id == 0` and **cannot** reconstruct which of the
-/// four unresolved arms produced it. Its own
+/// three unresolved arms produced it. Its own
 /// `mh_media_session_starts_total{outcome="declined_no_sender_binding"}` is the
-/// *union* of the four. That is why this counter is not redundant with MH's, and
+/// *union* of the three. That is why this counter is not redundant with MH's, and
 /// why the catalog entry says so in words: the MC series carries strictly more
 /// information than any function of the MH series.
 ///
@@ -69,16 +73,6 @@ pub enum SenderBindingOutcome {
     /// Expected at a low rate — MH's connect notification can arrive before
     /// MC's join completes. Sustained non-zero is a lifecycle bug.
     ParticipantUnknown,
-    /// MC refused to register the connection (per-meeting registry cap), so it
-    /// declines to hand out a binding for it. Answered `0`.
-    ///
-    /// **Not folded into [`Self::ParticipantUnknown`]**, because the participant
-    /// may be perfectly well known: the refusal is about capacity, and its
-    /// remedy is capacity, not a lifecycle investigation. Answering a real
-    /// ordinal here would let MH forward media for a connection MC is not
-    /// tracking and will never send `NotifyParticipantDisconnected` for — the
-    /// two sides disagreeing about whether the connection exists, invisibly.
-    RegistryFull,
     /// **More than one** participant on the meeting's roster carries the token
     /// `sub` MH asked about, so the question does not identify a single sender.
     /// Answered `0`.
@@ -87,8 +81,14 @@ pub enum SenderBindingOutcome {
     /// race that clears itself, this one does not clear and is not a race. MC
     /// mints a fresh `participant_id` per join and does not bar the same user
     /// joining twice, so a user on two devices lands here and **stays** here.
-    /// Its remedy is a per-connection identifier on the wire — a contract
-    /// change — not waiting.
+    /// It is not resolved by waiting, and NOT by `connection_id` either: that
+    /// distinguishes MH CONNECTIONS, while this ambiguity is between two roster
+    /// ENTRIES (joins) behind one `sub`, and MC cannot map an MH connection to
+    /// one of its own joins. The remedy — something that identifies the JOIN to
+    /// MH — has one home: `docs/TODO.md` §Media Path Obligations, "`user_ambiguous`
+    /// has no operator remedy". Do not restate it here, and do not delete this
+    /// arm as dead once `connection_id` exists: it is the fail-closed guard
+    /// against attributing one join's connectivity or ordinal to the other.
     ///
     /// Answering with either candidate would bind MH's connection to an ordinal
     /// that may belong to the user's *other* participant, and MH would stamp
@@ -111,11 +111,10 @@ impl SenderBindingOutcome {
     /// that was given no spelling — which is the prompt to add the variant here
     /// too. The written-out length is a secondary check that `ALL` and `label`
     /// agree, not a proof that `ALL` names every variant.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::Resolved,
         Self::MeetingUnknown,
         Self::ParticipantUnknown,
-        Self::RegistryFull,
         Self::UserAmbiguous,
     ];
 
@@ -123,13 +122,16 @@ impl SenderBindingOutcome {
     ///
     /// Wildcard-free on purpose: a new variant must be given a spelling here
     /// rather than silently inheriting a neighbour's.
+    ///
+    /// ANCHOR (DRY): `meeting_unknown`, `participant_unknown` and
+    /// `user_ambiguous` are shared with `Unapplied::label`
+    /// (`media_routing/connectivity.rs`), which carries the pin test.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Resolved => "resolved",
             Self::MeetingUnknown => "meeting_unknown",
             Self::ParticipantUnknown => "participant_unknown",
-            Self::RegistryFull => "registry_full",
             Self::UserAmbiguous => "user_ambiguous",
         }
     }
@@ -174,7 +176,6 @@ mod tests {
                 SenderBindingOutcome::Resolved
                 | SenderBindingOutcome::MeetingUnknown
                 | SenderBindingOutcome::ParticipantUnknown
-                | SenderBindingOutcome::RegistryFull
                 | SenderBindingOutcome::UserAmbiguous => {}
             }
         }

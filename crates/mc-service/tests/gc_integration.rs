@@ -18,7 +18,6 @@ use mc_service::config::Config;
 use mc_service::errors::McError;
 use mc_service::grpc::GcClient;
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::mh_connection_registry::MhConnectionRegistry;
 use mc_test_utils::test_token_receiver;
 
 use common::secret::{SecretBox, SecretString};
@@ -284,6 +283,7 @@ fn test_config(gc_url: &str) -> Config {
         otel_sample_rate: 1.0,
         environment: "development".to_string(),
         max_receive_slots: media.max_receive_slots,
+        media_connect_settle_ms: 1500,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
     }
@@ -579,7 +579,6 @@ async fn test_actor_handle_creation() {
         Arc::clone(&actor_metrics),
         Arc::clone(&controller_metrics),
         master_secret,
-        Arc::new(MhConnectionRegistry::new()),
         Arc::new(PolicyGenerations::new()),
     ));
 

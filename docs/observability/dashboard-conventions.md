@@ -175,6 +175,53 @@ Recommended units by metric intent:
 | Time since epoch | `dateTimeFromNow` | last rotation time |
 | Days / hours | `d`, `h` | signing key age |
 
+### Changing a counting point: audit the inferences, not the sentences `[reviewer-only]`
+
+**The chain has a fourth link the three above do not name: the prose that teaches an operator to read
+the number.** Catalog entries, runbook ladders, and panel descriptions are part of the unit chain, and
+they are the link that fails silently — a guard can check that a panel declares `Bps`, and nothing can
+check that a runbook still says something true.
+
+**The review test is NOT whether each sentence survives the change. It is whether the inference the
+reader draws from it survives.** These come apart, and the gap is where the damage is:
+
+- A sentence can remain literally true and still mislead. "Is the counter moving?" is unit-agnostic
+  and survives any counting-point change — but if the rung's job is to localise a fault to *capture*,
+  the operator standing on it is comparing the rate against an expected capture rate. Make the counter
+  per-target instead of per-frame and a two-target sender reads as a 2x capture fault. The sentence
+  passed; the inference inverted.
+- **Order the findings by which failure the reader cannot recover from.** Prose that becomes *vague*
+  is recoverable at 3am — the operator distrusts it and reads another signal. Prose that points at the
+  **wrong subsystem with unchanged confidence** is not: it spends the incident in the wrong service.
+  So a site whose sentence still reads fine but whose implied comparison has broken is a *worse*
+  finding than one that now reads as obviously stale, which is the opposite of the order a
+  sentence-by-sentence pass produces.
+
+**Enumerate every site before fixing any.** Fixing the catalog and dashboard while leaving the
+runbooks ships the rule "everywhere except the place it is read under time pressure" — the
+partial-invariant defect, not a scope boundary. Runbook files are `operations`-owned while the metric
+semantics are `observability`'s, so this is a coordinated edit, not a unilateral one: draft the hunks,
+route them to the file owner, and have **both** owners verify at review.
+
+*Worked instance: story 2 task 20, `dt_client_media_frames_sent_total` becoming a per-target datagram
+count under multi-handler send. Eight sites across catalog, dashboard and three runbooks; three were
+judged genuine no-ops, two were plainly-stale sentences, and the highest-severity one was a sentence
+that survived unchanged.*
+
+**Read the failure precisely, because the imprecise version motivates the wrong fix.** That last site
+was **not missed** — `observability` enumerated it, read it, and passed it on the merits as a no-op,
+in writing. Enumeration was complete; the *judgement applied to an enumerated site* was wrong, because
+the question asked of it was "does this sentence survive" rather than "does the inference survive".
+`operations` then asked the second question of the same site and got the opposite answer.
+
+**So the control that worked is two owners applying different lenses to the same site — not a more
+thorough list.** This matters for anyone tempted to mechanise it: a tool that enumerates the sites
+would have printed a site that was already on the list, and a tool demanding each site be touched or
+recorded as a verified no-op would have been satisfied, honestly, by the wrong answer. That is the
+reasoning recorded in `docs/TODO.md` §Guard Coverage Gap for why no guard is pending here. The
+routing rule above **is** the control; it is cheap, it is written down, and in this instance it cost
+one message exchange.
+
 ### Throughput: the config → metric → panel chain `[reviewer-only]`
 
 Throughput is the case where the three choices most often disagree, because humans and ADRs reason in
@@ -490,6 +537,10 @@ apply their lens.
 - [ ] Units match metric intent (`percentunit` not `percent` for ratios;
   `bytes` not `short` for memory).
 - [ ] Legend format strings are low-cardinality.
+- [ ] If a metric's **counting point or unit** changed, every site that teaches
+  a reader to interpret it was enumerated — catalog, panel description, legend,
+  axis label, and runbook ladders — and each was judged on whether the
+  *inference* survives, not whether the sentence does (see §Units).
 
 ### Operations reviewer
 

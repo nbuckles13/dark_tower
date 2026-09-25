@@ -144,7 +144,12 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
     maxQueueFrames: config.egress.maxQueueFrames,
     streamNumber: 1,
     streamId: 0,
+    senderFor: () => sender,
+    onTargetNotConnected: () => {},
   });
+  // A raw-submit rig still needs a directed target: `submit()` builds nothing
+  // when MC has directed none, which is §5's "send nothing".
+  egress.setTargets([MH_URL]);
 
   const rig: Rig = {
     pipeline,

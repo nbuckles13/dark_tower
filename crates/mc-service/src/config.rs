@@ -70,6 +70,22 @@ pub const DEFAULT_ENVIRONMENT: &str = "development";
 // their documented values live in `infra/services/mc-service/configmap.yaml`.
 // ============================================================================
 
+/// Smallest legal `MC_MEDIA_CONNECT_SETTLE_MS`.
+///
+/// Below ~100 ms the window is shorter than the gap between one client's
+/// parallel handler connects as MH reports them (~100 ms apart in Kind), so it
+/// would stop doing its job: a participant would settle on its first handler
+/// and every edge involving it would stay there (`media_routing/connectivity.rs`).
+pub const MIN_MEDIA_CONNECT_SETTLE_MS: u64 = 100;
+
+/// Largest legal `MC_MEDIA_CONNECT_SETTLE_MS`.
+///
+/// The window is added to time-to-first-audio for every participant that does
+/// NOT reach every handler, so a typo that sets minutes would silently hold
+/// partially-connected participants in silence. Ten seconds is far above any
+/// healthy connect gap and still a bounded wait.
+pub const MAX_MEDIA_CONNECT_SETTLE_MS: u64 = 10_000;
+
 /// Smallest legal `MC_MAX_RECEIVE_SLOTS`.
 ///
 /// Zero would mean no client can ever receive media — a silent total outage
@@ -291,6 +307,14 @@ pub struct Config {
     /// own value is unbounded is not a cap.
     pub max_receive_slots: usize,
 
+    /// Connect settle window in milliseconds (`MC_MEDIA_CONNECT_SETTLE_MS`).
+    ///
+    /// Required, no Rust default, bounded
+    /// [`MIN_MEDIA_CONNECT_SETTLE_MS`]`..=`[`MAX_MEDIA_CONNECT_SETTLE_MS`] at load.
+    /// Not a debounce: it is what keeps an all-connected meeting co-located on
+    /// one handler under staggered connects (`media_routing/connectivity.rs`).
+    pub media_connect_settle_ms: u64,
+
     /// Maximum ACCEPTED receive-capability declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     ///
@@ -356,6 +380,7 @@ impl fmt::Debug for Config {
             .field("otel_sample_rate", &self.otel_sample_rate)
             .field("environment", &self.environment)
             .field("max_receive_slots", &self.max_receive_slots)
+            .field("media_connect_settle_ms", &self.media_connect_settle_ms)
             .field(
                 "max_receive_capability_declarations",
                 &self.max_receive_capability_declarations,
@@ -604,6 +629,19 @@ impl Config {
             MAX_RECEIVE_SLOTS,
         )?;
 
+        // ADR-0036 §9 connect settle window. Required and bounded on both
+        // sides: too short stops it working, too long silently delays audio.
+        let media_connect_settle_ms = bounded(
+            "MC_MEDIA_CONNECT_SETTLE_MS",
+            // `MissingEnvVar(` and the key literal must stay on ONE line for
+            // `dt-guard env-config` (see the note on the next knob below).
+            vars.get("MC_MEDIA_CONNECT_SETTLE_MS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_MEDIA_CONNECT_SETTLE_MS".to_string())
+            })?,
+            MIN_MEDIA_CONNECT_SETTLE_MS,
+            MAX_MEDIA_CONNECT_SETTLE_MS,
+        )?;
+
         // Per-connection budget on ACCEPTED declarations (client-driven
         // meeting-actor work). Bounded on both sides by the same argument.
         let max_receive_capability_declarations = bounded(
@@ -724,6 +762,7 @@ impl Config {
             otel_sample_rate,
             environment,
             max_receive_slots,
+            media_connect_settle_ms,
             max_receive_capability_declarations,
             audio_encoding,
         })
@@ -740,6 +779,7 @@ impl Config {
             max_receive_slots: self.max_receive_slots,
             max_receive_capability_declarations: self.max_receive_capability_declarations,
             audio_encoding: self.audio_encoding,
+            connect_settle_window: std::time::Duration::from_millis(self.media_connect_settle_ms),
         }
     }
 
@@ -815,10 +855,13 @@ mod tests {
             ("MC_AUDIO_CODEC".to_string(), "opus".to_string()),
             ("MC_AUDIO_MAX_BITRATE_BPS".to_string(), "48000".to_string()),
             ("MC_AUDIO_FRAME_RATE_HZ".to_string(), "50".to_string()),
+            // ADR-0036 §9 connect settle window.
+            ("MC_MEDIA_CONNECT_SETTLE_MS".to_string(), "1500".to_string()),
         ])
     }
 
-    /// Every one of the five ADR-0036 client-signalling keys is REQUIRED.
+    /// Every one of the six ADR-0036 client-signalling and connectivity keys is
+    /// REQUIRED.
     ///
     /// This is the sole runtime backstop for their presence: `dt-guard
     /// env-config` discovers them by a single-line regex over this file that a
@@ -833,6 +876,7 @@ mod tests {
             "MC_AUDIO_CODEC",
             "MC_AUDIO_MAX_BITRATE_BPS",
             "MC_AUDIO_FRAME_RATE_HZ",
+            "MC_MEDIA_CONNECT_SETTLE_MS",
         ] {
             let mut vars = base_vars();
             vars.remove(key);
@@ -857,6 +901,7 @@ mod tests {
             ("MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS", "0", "4097"),
             ("MC_AUDIO_MAX_BITRATE_BPS", "31999", "48001"),
             ("MC_AUDIO_FRAME_RATE_HZ", "24", "51"),
+            ("MC_MEDIA_CONNECT_SETTLE_MS", "99", "10001"),
         ] {
             for value in [low, high] {
                 let mut vars = base_vars();

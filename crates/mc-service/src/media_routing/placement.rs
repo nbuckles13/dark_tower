@@ -1,24 +1,43 @@
-//! Which media handler each participant is placed on (ADR-0036 §9; story 2
-//! R-33).
+//! The meeting's handler set, and which of its handlers a participant is
+//! observed to be connected to (ADR-0036 §9; story 2 R-33).
 //!
-//! # One home for placement
+//! # One home for every client-facing handler url
 //!
 //! A meeting's handler SET is programmed once by GC (`assign_meeting`, frozen at
-//! first join). Placement picks ONE handler of that set per participant, and
-//! this module is the only place that decides it. Every client-facing handler
-//! address — `JoinResponse.media_servers`, `StreamAssignment.media_handler_url`
-//! and `SendTarget.media_handler_url` — is read out of the same
-//! [`MeetingHandlers`] value and the participant's placed handler, so the three
-//! are byte-identical strings by construction. The client looks transports up
-//! by exact url, so a mismatch among them is a silent no-send or no-receive.
+//! first join). Every participant is offered the WHOLE set and connects to all
+//! of it it can. Every client-facing handler address — `JoinResponse.media_servers`
+//! (the full set), each `StreamAssignment.media_handler_url` (the handler owning
+//! that edge) and each `SendTarget.media_handler_url` (a handler owning one of
+//! the sender's edges) — is read out of the same [`MeetingHandlers`] value via
+//! [`MeetingHandlers::url_of`], so they are byte-identical strings by
+//! construction. The client looks transports up by exact url, so a mismatch
+//! among them is a silent no-send or no-receive.
 //!
 //! # Sorted by construction, not by a parameter name
 //!
 //! [`MeetingHandlers`] sorts once, at construction, and has no constructor that
-//! accepts an unsorted list. Round-robin placement indexes into that order, so
-//! the order in which Redis enumerates `MhAssignmentData.handlers` can never
-//! change which handler a participant lands on. That used to be a prose control
-//! beside an unsorted `media_servers` list; it is now a property of the type.
+//! accepts an unsorted list, so the order in which Redis enumerates
+//! `MhAssignmentData.handlers` can never change anything MC computes. Nothing
+//! here or downstream may depend on WHICH handler is first: the edge chooser
+//! (`edges.rs`) is correct for any choice.
+//!
+//! # Connectivity is observed, and structurally cannot carry a wire string
+//!
+//! Which handlers a participant is connected to is what the HANDLERS told MC
+//! (`NotifyParticipantConnected` / `NotifyParticipantDisconnected`), never
+//! what a client reported. [`ConnectedHandlers`] is the only representation of
+//! that set, and its only insert takes a `&HandlerEndpoint` — which can only be
+//! obtained from [`MeetingHandlers`] (via [`MeetingHandlers::resolve`], an
+//! exact byte comparison with no normalisation). An MH-asserted `handler_id`
+//! outside the meeting's frozen set therefore cannot become routing state: it
+//! is unconstructible here, not merely checked for.
+//!
+//! **Residual (security S1b)**: every MH pod shares one service identity, so
+//! handler identity is self-asserted among authenticated handlers. Exact-match
+//! membership against the frozen set bounds the blast radius to misrouting
+//! INSIDE the meeting's own registered handlers; it is never a cross-meeting
+//! lever. Closing it needs per-instance service identity (`docs/TODO.md`
+//! §Media Path Obligations).
 //!
 //! # Server-derived only
 //!
@@ -27,13 +46,14 @@
 //! and never from a client. MC holds a similar-looking client-supplied url map,
 //! `ParticipantActor::mh_statuses`, keyed by the truncated `mh_url` a client
 //! reports in `MediaConnectionUpdate`. **That map must never be a source for
-//! this one**: a client-controlled url reaching a `SendTarget` is a redirect
-//! primitive.
+//! this one, nor for [`ConnectedHandlers`]**: a client-controlled url reaching
+//! a `SendTarget` is a redirect primitive, and a client-controlled narrowing of
+//! connectivity is a reachability lever over other participants.
 //!
-//! This is §9 *placement*, not §7 *selection*.
+//! This is §9 edge placement, not §7 selection.
 
 use super::assignment::HandlerId;
-use super::slots::JoinRank;
+use std::collections::BTreeSet;
 
 /// One assigned media handler, as the meeting's registration describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,21 +147,83 @@ impl MeetingHandlers {
         self.get(id).map(|h| h.webtransport_url.as_str())
     }
 
-    /// Round-robin placement keyed by join-order rank over the sorted set.
-    ///
-    /// A single-handler meeting places everyone on that handler; a two-handler
-    /// meeting alternates. Co-location-preferred placement (fill one handler to
-    /// its egress ceiling, then spill) is deferred: it needs the per-handler
-    /// stream ceiling exposed to placement (`docs/TODO.md` §Media Path
-    /// Obligations).
-    ///
-    /// `None` only if the set were empty, which [`Self::new`] makes impossible;
-    /// the `Option` is here so the arithmetic has no panicking path.
+    /// Resolve an MH-asserted handler id against this set by EXACT byte
+    /// comparison. No trimming, no case folding, no prefix match: an id that is
+    /// not byte-identical to a registered handler is not in the set.
     #[must_use]
-    pub fn place(&self, rank: JoinRank) -> Option<&HandlerEndpoint> {
-        let len = u64::try_from(self.sorted.len()).ok()?;
-        let index = rank.get().checked_rem(len)?;
-        self.sorted.get(usize::try_from(index).ok()?)
+    pub fn resolve(&self, wire_handler_id: &str) -> Option<&HandlerEndpoint> {
+        self.sorted
+            .iter()
+            .find(|h| h.id.as_str() == wire_handler_id)
+    }
+
+    /// How many handlers the meeting is registered on.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sorted.len()
+    }
+
+    /// Never true: [`Self::new`] rejects an empty set. Present for the
+    /// `len`/`is_empty` pairing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+}
+
+/// The handlers one participant is observed to be connected to.
+///
+/// The only insert takes a `&HandlerEndpoint`, which only [`MeetingHandlers`]
+/// hands out, so a string copied off the wire can never become a member (see
+/// the module doc). Removal takes a `&HandlerId`: removing can only narrow, so
+/// it cannot inject anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ConnectedHandlers(BTreeSet<HandlerId>);
+
+impl ConnectedHandlers {
+    /// An empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a handler of the meeting's set. Returns `true` if it was new.
+    pub fn insert(&mut self, endpoint: &HandlerEndpoint) -> bool {
+        self.0.insert(endpoint.id.clone())
+    }
+
+    /// Remove a handler. Returns `true` if it was present.
+    pub fn remove(&mut self, id: &HandlerId) -> bool {
+        self.0.remove(id)
+    }
+
+    /// Is this handler in the set?
+    #[must_use]
+    pub fn contains(&self, id: &HandlerId) -> bool {
+        self.0.contains(id)
+    }
+
+    /// Is the set empty?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many handlers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Every handler, in id order.
+    pub fn iter(&self) -> impl Iterator<Item = &HandlerId> {
+        self.0.iter()
+    }
+
+    /// The handlers both sets contain, in id order.
+    #[must_use]
+    pub fn shared_with(&self, other: &Self) -> Vec<HandlerId> {
+        self.0.intersection(&other.0).cloned().collect()
     }
 }
 
@@ -156,10 +238,6 @@ mod tests {
             webtransport_url: format!("https://{id}.example:4434"),
             grpc_endpoint: format!("http://{id}.example:50053"),
         }
-    }
-
-    fn rank(n: u64) -> JoinRank {
-        JoinRank::from_raw(n)
     }
 
     #[test]
@@ -178,36 +256,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_single_handler_meeting_places_everyone_on_it() {
-        let set = MeetingHandlers::new(vec![endpoint("mh-0")]).unwrap();
-        for n in 0..5 {
-            assert_eq!(set.place(rank(n)).unwrap().id, HandlerId::new("mh-0"));
-        }
-    }
-
-    #[test]
-    fn a_two_handler_meeting_alternates_by_rank() {
-        let set = MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
-        let placed: Vec<String> = (0..5)
-            .map(|n| set.place(rank(n)).unwrap().id.to_string())
-            .collect();
-        assert_eq!(placed, vec!["mh-0", "mh-1", "mh-0", "mh-1", "mh-0"]);
-    }
-
     /// The Redis enumeration order is the one input whose order genuinely
     /// varies; sorting at construction is what makes it irrelevant.
     #[test]
-    fn registration_order_cannot_change_placement() {
+    fn registration_order_does_not_change_the_set() {
         let forward = MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
         let reversed = MeetingHandlers::new(vec![endpoint("mh-1"), endpoint("mh-0")]).unwrap();
-        for n in 0..4 {
-            assert_eq!(forward.place(rank(n)), reversed.place(rank(n)));
-        }
         assert_eq!(forward, reversed);
-        // Rank 0 lands on the sorted-first handler, not on the first entry
-        // Redis happened to return.
-        assert_eq!(reversed.place(rank(0)).unwrap().id, HandlerId::new("mh-0"));
+    }
+
+    /// S1a: resolution is exact byte equality. Near-misses an MH could assert
+    /// — case, whitespace, a prefix, a suffix — resolve to nothing.
+    #[test]
+    fn resolve_is_exact_match_only() {
+        let set = MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        assert_eq!(set.resolve("mh-1").map(|h| h.id.as_str()), Some("mh-1"));
+        for near_miss in ["MH-1", " mh-1", "mh-1 ", "mh-", "mh-10", "", "mh-1\0"] {
+            assert!(
+                set.resolve(near_miss).is_none(),
+                "{near_miss:?} must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn connected_handlers_only_admit_resolved_endpoints_and_intersect() {
+        let set = MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        let mut a = ConnectedHandlers::new();
+        let mut b = ConnectedHandlers::new();
+        assert!(a.insert(set.resolve("mh-0").unwrap()));
+        assert!(a.insert(set.resolve("mh-1").unwrap()));
+        assert!(!a.insert(set.resolve("mh-1").unwrap()), "idempotent");
+        assert!(b.insert(set.resolve("mh-1").unwrap()));
+        assert_eq!(a.shared_with(&b), vec![HandlerId::new("mh-1")]);
+        assert!(b.remove(&HandlerId::new("mh-1")));
+        assert!(a.shared_with(&b).is_empty());
     }
 
     #[test]

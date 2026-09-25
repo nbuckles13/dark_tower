@@ -44,15 +44,26 @@ const JOIN_RESPONSE_BOUND: Duration = Duration::from_secs(10);
 /// cert is not committed to the repo; it is generated at Kind setup time by
 /// `scripts/generate-dev-certs.sh`).
 pub async fn connect_wt(url: &str) -> wtransport::Connection {
+    try_connect_wt(url).await.unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`connect_wt`], returning the failure instead of panicking, so a caller can
+/// classify an unreachable endpoint (e.g. as an ENVIRONMENT failure) rather
+/// than letting it read as a product defect.
+///
+/// # Errors
+///
+/// A description of the client-construction or connect failure.
+pub async fn try_connect_wt(url: &str) -> Result<wtransport::Connection, String> {
     let config = wtransport::ClientConfig::builder()
         .with_bind_default()
         .with_no_cert_validation()
         .build();
     wtransport::Endpoint::client(config)
-        .expect("create WebTransport client")
+        .map_err(|e| format!("create WebTransport client: {e}"))?
         .connect(url)
         .await
-        .unwrap_or_else(|e| panic!("connect to WebTransport at {url} failed: {e}"))
+        .map_err(|e| format!("connect to WebTransport at {url} failed: {e}"))
 }
 
 /// 4-byte big-endian length prefix + `encoded` — the one framing used by both
@@ -261,16 +272,32 @@ pub async fn mh_open_connect(
     conn: &wtransport::Connection,
     jwt: &str,
 ) -> (wtransport::SendStream, wtransport::RecvStream) {
+    try_mh_open_connect(conn, jwt)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`mh_open_connect`], returning a stream-open or connect-frame write failure
+/// instead of panicking. The one encoding of "open MH's carrier bi-stream and
+/// write the connect frame".
+///
+/// # Errors
+///
+/// A description of the stream-open or connect-frame write failure.
+pub async fn try_mh_open_connect(
+    conn: &wtransport::Connection,
+    jwt: &str,
+) -> Result<(wtransport::SendStream, wtransport::RecvStream), String> {
     let (mut send, recv) = conn
         .open_bi()
         .await
-        .expect("open bi stream to MH")
+        .map_err(|e| format!("open bi stream to MH: {e}"))?
         .await
-        .expect("MH bi stream ready");
+        .map_err(|e| format!("MH bi stream not ready: {e}"))?;
     send.write_all(&mh_connect_frame(jwt))
         .await
-        .expect("write MH connect request");
-    (send, recv)
+        .map_err(|e| format!("write MH connect request: {e}"))?;
+    Ok((send, recv))
 }
 
 /// One live MH media session: the connection AND the connect (carrier) stream.
@@ -305,11 +332,26 @@ impl MhSession {
 /// Connect to an MH URL, send the connect request, and return the live media
 /// session — connection plus the held carrier stream (see [`MhSession`]).
 pub async fn mh_connect(url: &str, jwt: &str) -> MhSession {
-    let conn = connect_wt(url).await;
-    let (send, recv) = mh_open_connect(&conn, jwt).await;
-    MhSession {
+    try_mh_connect(url, jwt)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`mh_connect`], returning a connect or stream-open failure instead of
+/// panicking — for suites where an unreachable handler must be reported as an
+/// ENVIRONMENT failure, never absorbed into the scenario under test.
+///
+/// # Errors
+///
+/// A description of the connect, stream-open or connect-frame write failure.
+pub async fn try_mh_connect(url: &str, jwt: &str) -> Result<MhSession, String> {
+    let conn = try_connect_wt(url).await?;
+    let (send, recv) = try_mh_open_connect(&conn, jwt)
+        .await
+        .map_err(|e| format!("{e} (MH at {url})"))?;
+    Ok(MhSession {
         conn,
         _send: send,
         _recv: recv,
-    }
+    })
 }

@@ -759,15 +759,17 @@ pub enum MediaSessionStartOutcome {
     /// one-value shape as [`PolicyApplyOutcome::NoGeneration`], and no rename is
     /// needed if explicit presence is ever reintroduced.
     ///
-    /// It is the **union of MC's four unresolved outcomes**
+    /// It is the **union of MC's three unresolved outcomes**
     /// (`mc_media_sender_binding_responses_total{outcome}` in
-    /// `meeting_unknown`, `participant_unknown`, `registry_full`,
-    /// `user_ambiguous`); all four answer the wire value `0`, and MH sees only
-    /// that `0` and structurally cannot reconstruct which produced it. The split
-    /// lives on MC's counter, not here — read it there when this rate moves.
-    /// Note in particular that `registry_full` (MC's per-meeting connection
-    /// registry at capacity) presents as an elevated-but-flat rate, so an
-    /// increase in this MH-side value must not be characterised as a race.
+    /// `meeting_unknown`, `participant_unknown`, `user_ambiguous`); all three
+    /// answer the wire value `0`, and MH sees only that `0` and structurally
+    /// cannot reconstruct which produced it. The split lives on MC's counter,
+    /// not here — read it there when this rate moves. Note in particular that
+    /// `user_ambiguous` never self-clears, so an elevated-but-flat rate in this
+    /// MH-side value must not be characterised as a race. (A fourth outcome,
+    /// `registry_full`, retired with MC's connection registry in story 2 task
+    /// 20; connectivity now lives in MC's meeting actor, bounded by the roster
+    /// and the meeting's handler set rather than by a cap that could refuse.)
     DeclinedNoSenderBinding,
     /// MC answered above the 16-bit key-id field.
     ///
@@ -956,7 +958,8 @@ pub fn record_register_meeting_timeout() {
     counter!("mh_register_meeting_timeouts_total").increment(1);
 }
 
-/// Record an MC notification delivery attempt (R-16/R-17).
+/// Record the terminal outcome of one logical MC notification (R-16/R-17) —
+/// called once per notification by `send_with_retry`, NOT once per retry attempt.
 ///
 /// Metric: `mh_mc_notifications_total`
 /// Labels: `event_type` (connected | disconnected), `status` (success | error)

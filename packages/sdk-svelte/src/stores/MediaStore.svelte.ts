@@ -78,6 +78,22 @@ export class MediaStore {
   #slots = $state<readonly StreamAssignmentEvent[]>([]);
 
   /**
+   * `$unreachableSenderIds` — roster participants this subscriber cannot reach.
+   *
+   * Its OWN `$state` cell, for the same reason every other field here has one: a
+   * connectivity change must not invalidate readers of the slot list or the mute
+   * state. Carried through from the wire (ADR-0036 §9) and never derived from
+   * having noticed that frames stopped.
+   *
+   * Rendering it is task 15's (the multi-participant UI owns the roster surface).
+   * This field is the seam that stops the wire fact being dropped at the SDK
+   * boundary in the meantime — `signaling.proto` states client marking as an
+   * obligation, and until it is rendered the gap is a known unmet one rather than
+   * an invisible one.
+   */
+  #unreachableSenderIds = $state<readonly number[]>([]);
+
+  /**
    * `$lastMediaFault` — the most recent bounded, SDK-authored media fault.
    *
    * Held so a UI can show that the pipeline broke instead of showing silence.
@@ -104,6 +120,11 @@ export class MediaStore {
   /** Reactive getter for `$slots` (readonly view). */
   get slots(): readonly StreamAssignmentEvent[] {
     return this.#slots;
+  }
+
+  /** Reactive getter for `$unreachableSenderIds` (readonly view). */
+  get unreachableSenderIds(): readonly number[] {
+    return this.#unreachableSenderIds;
   }
 
   /** Reactive getter for `$lastMediaFault`. */
@@ -135,6 +156,12 @@ export class MediaStore {
    */
   applyStreamAssignments(event: StreamAssignmentsEvent): void {
     this.#slots = [...event.assignments];
+    // REPLACED, not merged, for the same reason and with sharper stakes: a
+    // merged unreachable set latches a transient into a permanent "can't hear X"
+    // badge on a meeting whose audio is fine, which is indistinguishable to the
+    // user from the real fault. A peer that becomes reachable simply stops
+    // appearing in the set, and needs no "now reachable" signal of its own.
+    this.#unreachableSenderIds = [...event.unreachableSenderIds];
   }
 
   /** Apply a `mediaFault` event. Bounded and SDK-authored; never a platform string. */
