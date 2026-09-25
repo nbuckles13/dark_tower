@@ -1182,6 +1182,7 @@ dependencies = [
  "serial_test",
  "thiserror 1.0.69",
  "tokio",
+ "tonic",
  "tracing",
  "uuid",
  "wtransport",

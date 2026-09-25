@@ -14,8 +14,8 @@
 //!
 //! They are deliberately **not** re-listed here. Four homes used to restate
 //! them and three of the four were wrong: this block claimed `method` had
-//! three values and omitted `register_meeting`, the only value the code has
-//! ever emitted. A docstring that *points at* a binding cannot drift; one that
+//! three values and omitted `register_meeting`, at the time the only value the
+//! code emitted. A docstring that *points at* a binding cannot drift; one that
 //! *restates* an enumeration is a copy.
 
 use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
@@ -161,43 +161,64 @@ pub fn record_token_refresh_metrics(event: &common::token_manager::TokenRefreshE
     record_token_refresh(status, event.error_category, event.duration);
 }
 
-/// The `RegisterMeeting` method on `MediaHandlerService`, as a metric label
-/// value.
+/// The `method` label on `mh_grpc_requests_total`: one value per RPC on
+/// `MediaHandlerService`.
 ///
-/// The `method` label's values are derived from `MediaHandlerService`'s method
-/// names (`internal.proto`'s service block names the method set); these
-/// `GRPC_METHOD_*` consts are the label vocabulary's home. ADR-0036 §8:
-/// FORWARDING POLICY gains fields rather than sibling RPCs, but meeting
-/// lifecycle teardown is a distinct concern with its own RPC, `EndMeeting`
-/// (story 2 R-20), so the service is no longer single-method.
+/// **The method set is `internal.proto`'s `MediaHandlerService` service block,
+/// which is the source of truth: `RegisterMeeting` and `EndMeeting`.** This
+/// enum is its compile-checked local binding, and it is the label vocabulary's
+/// only home (`docs/observability/label-taxonomy.md`). Both values are emitted
+/// and both are zero-initialised with both statuses, so each of the four
+/// series is present from process start.
 ///
-/// **`end_meeting` is not emitted yet** — this handler answers `EndMeeting`
-/// `UNIMPLEMENTED` and records nothing for it — so an empty result for
-/// `method="end_meeting"` today is expected, not a scrape fault. Story-2 task 11
-/// restores the recorder's `method` parameter with a bounded vocabulary, adds
-/// `end_meeting` to [`zero_initialize_counters`] in the same commit, and
-/// re-tightens this comment. The `register`, `route_media` and
-/// `stream_telemetry` values retired with the 2026-09-01 reshape can never
-/// appear again — the proto's tombstone block forbids resurrecting the names.
-const GRPC_METHOD_REGISTER_MEETING: &str = "register_meeting";
+/// ADR-0036 §8: FORWARDING POLICY gains fields, never sibling RPCs, so a new
+/// forwarding knob never lands here. Meeting lifecycle teardown is a distinct
+/// concern with its own RPC (story 2 R-20), which is why the set has two
+/// members. A third RPC on the service is a compile error at
+/// [`GrpcMethod::as_label`] and at the written-out length of
+/// [`GrpcMethod::ALL`], which is the catalogued cardinality. The `register`,
+/// `route_media` and `stream_telemetry` values retired with the 2026-09-01
+/// reshape can never appear again: the proto's tombstone block forbids
+/// resurrecting the names.
+///
+/// A recorder that took a free `&str` method, or none, could count a teardown
+/// as a `RegisterMeeting` receipt — forging the R-26 receipt signal
+/// `method="register_meeting"` exists to be. Taking this enum is what prevents
+/// that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcMethod {
+    /// `MediaHandlerService.RegisterMeeting` — the ADR-0036 §8 control plane.
+    RegisterMeeting,
+    /// `MediaHandlerService.EndMeeting` — meeting teardown (story 2 R-20).
+    EndMeeting,
+}
+
+impl GrpcMethod {
+    /// Every value, in `internal.proto` service-block order. The one
+    /// hand-maintained list — same reasoning as [`PolicyApplyOutcome::ALL`].
+    pub const ALL: [Self; 2] = [Self::RegisterMeeting, Self::EndMeeting];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::RegisterMeeting => "register_meeting",
+            Self::EndMeeting => "end_meeting",
+        }
+    }
+}
 
 /// Record an incoming gRPC request from MC.
 ///
 /// Metric: `mh_grpc_requests_total`
-/// Labels: `method` (only `GRPC_METHOD_REGISTER_MEETING` is emitted today; see
-/// that const for the value set and why `end_meeting` is not yet), `status`
-/// (success | error)
-/// Cardinality: 2 today (1 emitting method x 2 statuses); 4 = 2 emitting
-/// methods x 2 statuses once `end_meeting` emits
-///
-/// This recorder deliberately takes no `method` parameter and so can ONLY
-/// count `register_meeting`: calling it from the `EndMeeting` path would forge
-/// the R-26 `RegisterMeeting` receipt signal. Story-2 task 11 restores the
-/// parameter; until then the `EndMeeting` stub records nothing.
-pub fn record_grpc_request(status: &str) {
+/// Labels: `method` (the two [`GrpcMethod`] values — `internal.proto`'s
+///   service block is the source of truth for the set), `status`
+///   (success | error)
+/// Cardinality: 4 = 2 methods x 2 statuses
+pub fn record_grpc_request(method: GrpcMethod, status: &str) {
     counter!(
         "mh_grpc_requests_total",
-        "method" => GRPC_METHOD_REGISTER_MEETING,
+        "method" => method.as_label(),
         "status" => status.to_string()
     )
     .increment(1);
@@ -214,7 +235,7 @@ pub fn record_grpc_request(status: &str) {
 /// `selection_rules`, `policy_generation`) onward, exactly once. Checks that
 /// read only the caller-identity and reachability scalars (`meeting_id`,
 /// `mc_id`, `mc_grpc_endpoint`) are *pre-boundary* and stay on
-/// `mh_grpc_requests_total{status="error"}` alone: "MC's assignment computation
+/// `mh_grpc_requests_total{method="register_meeting",status="error"}` alone: "MC's assignment computation
 /// produced a policy MH will not apply" and "this caller's endpoint is
 /// malformed" have different owners and different remedies, and folding them
 /// into one series makes the sum unusable as a denominator.
@@ -285,6 +306,22 @@ pub enum PolicyApplyOutcome {
     /// event is counted, with the same token, on
     /// `mh_media_stream_admission_total` — different denominators; do not sum.
     RejectedStreamCeiling,
+    /// The registration would take this handler past `MH_MAX_REGISTERED_MEETINGS`
+    /// (story 2 R-21) — a RESOURCE-EXHAUSTION refusal of a NEW meeting id.
+    /// Nothing was upserted, promoted or applied.
+    ///
+    /// Its own value because the remedy differs from both neighbours: not
+    /// capacity (`rejected_stream_ceiling`: budget / placement) and not an MH
+    /// fault (`apply_failed`: MH internals), but "which meetings are held and
+    /// why were they not released" — leaked registrations (an `EndMeeting` that
+    /// never arrived), an empty-meeting flood, or genuine load. Counted as a
+    /// policy outcome because the check runs AFTER the policy boundary
+    /// (validation has read the policy-bearing fields), so the
+    /// one-outcome-per-post-boundary-path identity requires exactly one value
+    /// here. It is NOT an admission decision — the check is on the register
+    /// path and fires before config-apply admission ever runs — so it has no
+    /// `mh_media_stream_admission_total` counterpart.
+    RejectedMeetingCap,
 }
 
 impl PolicyApplyOutcome {
@@ -304,13 +341,14 @@ impl PolicyApplyOutcome {
     /// cardinality of the `outcome` label, so a variant added to this array
     /// without the catalog and the dashboard being revisited fails to compile
     /// here first.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Applied,
         Self::RejectedStale,
         Self::NoGeneration,
         Self::RejectedInvalid,
         Self::ApplyFailed,
         Self::RejectedStreamCeiling,
+        Self::RejectedMeetingCap,
     ];
 
     /// The wire label value.
@@ -323,6 +361,57 @@ impl PolicyApplyOutcome {
             Self::RejectedInvalid => "rejected_invalid",
             Self::ApplyFailed => "apply_failed",
             Self::RejectedStreamCeiling => "rejected_stream_ceiling",
+            Self::RejectedMeetingCap => "rejected_meeting_cap",
+        }
+    }
+}
+
+// =============================================================================
+// Meeting teardown (story 2 R-20)
+// =============================================================================
+
+/// Bounded `outcome` values for `mh_media_meeting_teardowns_total` — one per
+/// `EndMeeting` the session actor decided.
+///
+/// Three values because there are three remedies. A request refused BEFORE the
+/// actor decided (malformed ids; the actor unreachable or slow) records no
+/// outcome here, only `mh_grpc_requests_total{method="end_meeting",
+/// status="error"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingTeardownOutcome {
+    /// The registering MC ended the meeting: its registration and routes are
+    /// gone, its edges are back in the budget, its active connections closed.
+    Released,
+    /// No registration held for that meeting id — acknowledged as an
+    /// idempotent no-op. Expected: MC calls EVERY handler in the meeting's
+    /// assigned set, including ones it never registered with. Climbing well
+    /// above `released` is an MC-side signal (double sends, or MC ending
+    /// meetings this handler never held).
+    UnknownMeeting,
+    /// A different `mc_id` than the one that registered the meeting asked to
+    /// end it: refused with `FAILED_PRECONDITION`, nothing released. A
+    /// misrouted or stale MC — or a `service.write.mh` holder acting on a
+    /// meeting it does not own (the scope-only authorization model; see
+    /// `docs/TODO.md` "MH does not verify meeting ownership").
+    RejectedOwnership,
+}
+
+impl MeetingTeardownOutcome {
+    /// Every value, in catalog order. The one hand-maintained list — same
+    /// reasoning as [`PolicyApplyOutcome::ALL`].
+    pub const ALL: [Self; 3] = [
+        Self::Released,
+        Self::UnknownMeeting,
+        Self::RejectedOwnership,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::UnknownMeeting => "unknown_meeting",
+            Self::RejectedOwnership => "rejected_ownership",
         }
     }
 }
@@ -374,12 +463,13 @@ impl StreamAdmissionOutcome {
 /// selector goes silently empty on exactly the day the measurement lands.
 pub const EGRESS_BUDGET_BASIS_UNMEASURED: &str = "unmeasured";
 
-/// Publish the egress-budget admission chain's static gauges. Call ONCE, at
+/// Publish the static capacity and resource-guard gauges: the egress-budget
+/// admission chain plus the two resource bounds' limits. Call ONCE, at
 /// startup, AFTER [`init_metrics_recorder`] — a `gauge!().set()` before the
 /// recorder exists goes nowhere and the series silently never appear.
 ///
-/// Every value is read from the ONE [`crate::config::EgressAdmission`] field
-/// its consumer reads, never a parallel constant or a re-conversion:
+/// Every value is read from the ONE config field its enforcement reads, never
+/// a parallel constant or a re-conversion:
 /// - `mh_media_egress_budget_bytes_per_second` — the CONVERTED budget (bytes;
 ///   the key is bits, converted once at load);
 /// - `mh_media_egress_stream_ceiling` — the derived ceiling, the same field
@@ -388,13 +478,24 @@ pub const EGRESS_BUDGET_BASIS_UNMEASURED: &str = "unmeasured";
 ///   (never an alert input);
 /// - `mh_media_stream_admission_rejection_ratio_threshold` — the same field
 ///   the session actor's threshold log reads, so the exhaustion alert is a
-///   bare gauge-to-gauge comparison with no `PromQL` literal.
+///   bare gauge-to-gauge comparison with no `PromQL` literal;
+/// - `mh_media_egress_edges_limit` — `PolicyLimits::max_total_egress_edges`,
+///   the field `MhMediaService` hands the session actor on every apply. A
+///   RESOURCE GUARD, not a saturation denominator: the stream ceiling is the
+///   bound that binds (config load refuses a ceiling above this);
+/// - `mh_media_registered_meetings_limit` —
+///   `PolicyLimits::max_registered_meetings`, the field the actor's
+///   registration cap reads, so a registered-meetings alert needs no literal.
 #[expect(
     clippy::cast_precision_loss,
     reason = "gauge values are f64 by the metrics API; a budget above 2^53 bytes/s is not a \
-              real configuration, and the ceiling is bounded far below that at load"
+              real configuration, and the ceiling and both resource bounds are bounded far \
+              below that at load"
 )]
-pub fn publish_egress_admission(admission: &crate::config::EgressAdmission) {
+pub fn publish_egress_admission(
+    admission: &crate::config::EgressAdmission,
+    policy_limits: &crate::config::PolicyLimits,
+) {
     gauge!(
         "mh_media_egress_budget_bytes_per_second",
         "basis" => EGRESS_BUDGET_BASIS_UNMEASURED,
@@ -416,26 +517,53 @@ pub fn publish_egress_admission(admission: &crate::config::EgressAdmission) {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(admission.rejection_ratio_threshold);
+    gauge!(
+        "mh_media_egress_edges_limit",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(policy_limits.max_total_egress_edges as f64);
+    gauge!(
+        "mh_media_registered_meetings_limit",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(policy_limits.max_registered_meetings as f64);
 }
 
-/// Metric handles the session actor's admission path uses, resolved ONCE when
-/// the actor is built (the session manager is constructed after the recorder
-/// is installed in `main`).
+/// Metric handles the session actor uses — admission, capacity occupancy and
+/// teardown — resolved ONCE when the actor is built (the session manager is
+/// constructed after the recorder is installed in `main`).
+///
+/// One struct because one actor owns every value these publish, and it is the
+/// only place those values change: the gauges are set from the actor's own
+/// state at each mutation site, never maintained by increments elsewhere.
 #[derive(Debug, Clone)]
-pub struct AdmissionMetricHandles {
+pub struct SessionMetricHandles {
     /// Indexed by [`StreamAdmissionOutcome::ALL`] order.
     decisions: [Counter; 2],
     rejection_ratio: Gauge,
     egress_edges: Gauge,
+    registered_meetings: Gauge,
+    /// Indexed by [`MeetingTeardownOutcome::ALL`] order.
+    teardowns: [Counter; 3],
 }
 
-impl AdmissionMetricHandles {
+impl SessionMetricHandles {
     /// Count one admission decision.
     pub fn record(&self, outcome: StreamAdmissionOutcome) {
         let [admitted, rejected] = &self.decisions;
         match outcome {
             StreamAdmissionOutcome::Admitted => admitted.increment(1),
             StreamAdmissionOutcome::RejectedStreamCeiling => rejected.increment(1),
+        }
+    }
+
+    /// Count one `EndMeeting` decision.
+    pub fn record_teardown(&self, outcome: MeetingTeardownOutcome) {
+        let [released, unknown, rejected] = &self.teardowns;
+        match outcome {
+            MeetingTeardownOutcome::Released => released.increment(1),
+            MeetingTeardownOutcome::UnknownMeeting => unknown.increment(1),
+            MeetingTeardownOutcome::RejectedOwnership => rejected.increment(1),
         }
     }
 
@@ -454,19 +582,27 @@ impl AdmissionMetricHandles {
     pub fn publish_egress_edges(&self, edges: usize) {
         self.egress_edges.set(edges as f64);
     }
+
+    /// Publish how many meetings this handler holds registered.
+    ///
+    /// ALWAYS the map's current length, set at every mutation site — never
+    /// incremented or decremented. A delta-maintained gauge drifts permanently
+    /// the first time a removal path is missed and never self-heals.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "registered meetings are bounded by MH_MAX_REGISTERED_MEETINGS (<= 2^16)"
+    )]
+    pub fn publish_registered_meetings(&self, count: usize) {
+        self.registered_meetings.set(count as f64);
+    }
 }
 
-/// Resolve the admission handles. Resolving each counter registers its series
-/// at zero, and both gauges are published by the actor at construction, so
-/// every admission series exists from boot.
-///
-/// `mh_media_egress_edges` lands here ahead of story 2 task 11 (which adds
-/// `mh_media_egress_edges_limit` and `mh_media_registered_meetings`) because
-/// this task makes the same quantity live as GC's `current_streams`: a value
-/// wired into placement needs a saturation signal in front of it.
+/// Resolve the session actor's handles. Resolving each counter registers its
+/// series at zero, and every gauge is published by the actor at construction,
+/// so every series here exists from boot.
 #[must_use]
-pub fn resolve_admission_handles() -> AdmissionMetricHandles {
-    AdmissionMetricHandles {
+pub fn resolve_session_handles() -> SessionMetricHandles {
+    SessionMetricHandles {
         decisions: StreamAdmissionOutcome::ALL.map(|outcome| {
             counter!(
                 "mh_media_stream_admission_total",
@@ -482,6 +618,17 @@ pub fn resolve_admission_handles() -> AdmissionMetricHandles {
             "mh_media_egress_edges",
             KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
         ),
+        registered_meetings: gauge!(
+            "mh_media_registered_meetings",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        ),
+        teardowns: MeetingTeardownOutcome::ALL.map(|outcome| {
+            counter!(
+                "mh_media_meeting_teardowns_total",
+                "outcome" => outcome.as_label(),
+                KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+            )
+        }),
     }
 }
 
@@ -1461,10 +1608,10 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
 // The mh media-frame counters (`mh_media_frames_dropped_total`,
 // `mh_media_frames_forwarded_total`) are covered by `resolve_media_handles()`
 // (marked `dt-guard:zero-init-entrypoint`), NOT re-enumerated here. `mh_errors_total`
-// is catalog-exempt (unbounded `operation`/`status_code`). The two media outcome
-// counters below have `ALL` and are iterated from it; the rest are enum-less
-// `&str` vocabularies, each closed at its emit site (all call sites pass literals
-// or the single `GRPC_METHOD_REGISTER_MEETING` const — never an external string).
+// is catalog-exempt (unbounded `operation`/`status_code`). The media outcome
+// counters and the gRPC `method` label have `ALL` and are iterated from it; the
+// rest are enum-less `&str` vocabularies, each closed at its emit site (all call
+// sites pass literals — never an external string).
 // ============================================================================
 
 /// `status` on the `success`/`error`-shaped counters. Emit sites pass literals.
@@ -1521,6 +1668,12 @@ pub fn zero_initialize_counters() {
     for o in StreamAdmissionOutcome::ALL {
         counter!("mh_media_stream_admission_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    // Teardown: `unknown_meeting` and `rejected_ownership` are rare-to-never,
+    // so without present-at-zero "no teardown failures" and "no EndMeeting
+    // support" would render identically.
+    for o in MeetingTeardownOutcome::ALL {
+        counter!("mh_media_meeting_teardowns_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
     for o in MediaSessionStartOutcome::ALL {
         counter!("mh_media_session_starts_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
@@ -1530,7 +1683,13 @@ pub fn zero_initialize_counters() {
         counter!("mh_gc_registration_total", "status" => *s).increment(0);
         counter!("mh_gc_heartbeats_total", "status" => *s).increment(0);
         counter!("mh_token_refresh_total", "status" => *s).increment(0);
-        counter!("mh_grpc_requests_total", "method" => GRPC_METHOD_REGISTER_MEETING, "status" => *s).increment(0);
+        // Both methods x both statuses: an absent `end_meeting` series would
+        // make "no MC is ending meetings here" indistinguishable from a scrape
+        // fault; present-at-zero makes it a flat zero instead.
+        for m in GrpcMethod::ALL {
+            counter!("mh_grpc_requests_total", "method" => m.as_label(), "status" => *s)
+                .increment(0);
+        }
     }
     for e in TOKEN_ERROR_CATEGORIES {
         counter!("mh_token_refresh_failures_total", "error_type" => *e).increment(0);
@@ -1614,6 +1773,23 @@ mod tests {
         // outcome then key_custody).
         present_at_zero(
             r#"mh_media_session_starts_total{outcome="started",key_custody="operator"}"#,
+        );
+        // Story 2 R-20: the teardown RPC's method label and its rare-to-never
+        // outcomes must be present-at-0, or "no teardown failures" and "no
+        // EndMeeting support" render identically.
+        for status in ["success", "error"] {
+            present_at_zero(&format!(
+                r#"mh_grpc_requests_total{{method="end_meeting",status="{status}"}}"#
+            ));
+        }
+        for outcome in MeetingTeardownOutcome::ALL {
+            present_at_zero(&format!(
+                r#"mh_media_meeting_teardowns_total{{outcome="{}",key_custody="operator"}}"#,
+                outcome.as_label()
+            ));
+        }
+        present_at_zero(
+            r#"mh_media_policy_applies_total{outcome="rejected_meeting_cap",key_custody="operator"}"#,
         );
 
         // Series-count ceiling (security): a future enum variant can't silently
@@ -1707,12 +1883,33 @@ mod tests {
 
     #[test]
     fn test_record_grpc_request() {
-        // Both combinations this recorder can emit: 1 method x 2 statuses. The
-        // recorder takes no `method` parameter, so it covers `register_meeting`
-        // only; `end_meeting` is not emitted until story-2 task 11 restores the
-        // parameter (see `GRPC_METHOD_REGISTER_MEETING`).
-        record_grpc_request("success");
-        record_grpc_request("error");
+        // Every combination this recorder can emit: 2 methods x 2 statuses.
+        for method in GrpcMethod::ALL {
+            record_grpc_request(method, "success");
+            record_grpc_request(method, "error");
+        }
+    }
+
+    /// The method vocabulary is exactly `internal.proto`'s two RPCs, with
+    /// distinct labels. Written against the source of truth's names so that
+    /// dropping `end_meeting` from `ALL` (the partial-restoration failure)
+    /// fails here rather than silently leaving the teardown RPC uncounted.
+    #[test]
+    fn grpc_method_vocabulary_is_the_two_media_handler_service_rpcs() {
+        let labels: Vec<&str> = GrpcMethod::ALL.iter().map(|m| m.as_label()).collect();
+        assert_eq!(labels, ["register_meeting", "end_meeting"]);
+    }
+
+    #[test]
+    fn meeting_teardown_outcome_labels_are_distinct_and_catalogued() {
+        let labels: Vec<&str> = MeetingTeardownOutcome::ALL
+            .iter()
+            .map(|o| o.as_label())
+            .collect();
+        assert_eq!(
+            labels,
+            ["released", "unknown_meeting", "rejected_ownership"]
+        );
     }
 
     #[test]
@@ -1814,7 +2011,8 @@ mod tests {
                 "no_generation",
                 "rejected_invalid",
                 "apply_failed",
-                "rejected_stream_ceiling"
+                "rejected_stream_ceiling",
+                "rejected_meeting_cap"
             ],
             "outcome label values are wire-visible; a rename silently breaks every dashboard and alert selecting on them"
         );
@@ -1895,11 +2093,18 @@ mod tests {
             record_gc_heartbeat(status);
         }
 
-        // The `method` label is single-valued by construction — the value is a
-        // const inside the recorder, so cardinality is bounded by the 2
-        // statuses alone.
-        for status in &valid_statuses {
-            record_grpc_request(status);
+        // The `method` label is bounded by `GrpcMethod::ALL` (the two
+        // `MediaHandlerService` RPCs), so cardinality is 2 methods x 2 statuses.
+        for method in GrpcMethod::ALL {
+            for status in &valid_statuses {
+                record_grpc_request(method, status);
+            }
+        }
+
+        // Teardown `outcome` is bounded by `MeetingTeardownOutcome::ALL`.
+        let handles = resolve_session_handles();
+        for outcome in MeetingTeardownOutcome::ALL {
+            handles.record_teardown(outcome);
         }
 
         // The `outcome` label is bounded by the PolicyApplyOutcome enum.
@@ -2039,8 +2244,8 @@ mod tests {
         record_gc_heartbeat_latency(Duration::from_millis(10));
         record_token_refresh("success", None, Duration::from_millis(50));
         record_token_refresh("error", Some("http"), Duration::from_millis(100));
-        record_grpc_request("success");
-        record_grpc_request("error");
+        record_grpc_request(GrpcMethod::RegisterMeeting, "success");
+        record_grpc_request(GrpcMethod::EndMeeting, "error");
         record_media_policy_apply(PolicyApplyOutcome::Applied);
         record_error("gc_heartbeat", "grpc", 503);
 

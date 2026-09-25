@@ -31,7 +31,7 @@ use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 use crate::webtransport::WtMediaTransport;
 
 use prost::Message;
-use proto_gen::dark_tower::internal::v1::NotifyParticipantConnectedResponse;
+use proto_gen::dark_tower::internal::v1::{DisconnectReason, NotifyParticipantConnectedResponse};
 use proto_gen::dark_tower::signaling::v1::{mh_client_message, MhClientMessage};
 use rand::Rng;
 use std::collections::HashMap;
@@ -84,8 +84,29 @@ async fn await_meeting_registration(
     register_meeting_timeout: Duration,
     cancel_token: &CancellationToken,
 ) -> RegistrationOutcome {
+    // LOST-WAKEUP GUARD. `notify_waiters` wakes only `Notified` futures that
+    // already exist, and this connection's pending entry was added by an
+    // earlier message: if `RegisterMeeting` was processed between that reply and
+    // this point, its wake-up went to nobody and a plain `select!` would sit out
+    // the whole timeout for a meeting that is already registered — then kick
+    // the client. So create (and enable) the future FIRST, then re-check: a
+    // registration from here on is caught by the future, one before it by the
+    // check. A registration that ran first also promoted this connection, so
+    // `Registered` is the truthful answer.
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if session_manager.is_meeting_registered(meeting_id).await {
+        info!(
+            target: "mh.webtransport.connection",
+            connection_id = %connection_id,
+            meeting_id = %meeting_id,
+            "Pending connection promoted by a RegisterMeeting that landed before it began waiting"
+        );
+        return RegistrationOutcome::Registered;
+    }
     tokio::select! {
-        () = notify.notified() => {
+        () = notified => {
             info!(
                 target: "mh.webtransport.connection",
                 connection_id = %connection_id,
@@ -296,6 +317,12 @@ pub async fn handle_connection(
     // Record handshake duration (session accept through JWT validation)
     metrics::record_webtransport_handshake_duration(handshake_start.elapsed());
 
+    // This connection's own close signal. `EndMeeting` release fires it for
+    // every ACTIVE connection of the released meeting (story 2 R-20); a child of
+    // the server shutdown token, so shutdown still reaches everything that
+    // watches it. The media loops watch a child of THIS token, not the server's.
+    let connection_close = cancel_token.child_token();
+
     // Step 5: Check meeting registration status and notify MC
     if session_manager.is_meeting_registered(meeting_id).await {
         // Meeting already registered — add as active connection
@@ -306,6 +333,7 @@ pub async fn handle_connection(
                     connection_id: connection_id.clone(),
                     participant_id: participant_id.clone(),
                     connected_at: Instant::now(),
+                    close: connection_close.clone(),
                 },
             )
             .await;
@@ -332,6 +360,7 @@ pub async fn handle_connection(
             meeting_id: meeting_id.clone(),
             participant_id: participant_id.clone(),
             connected_at: Instant::now(),
+            close: connection_close.clone(),
         };
 
         let notify = session_manager.add_pending_connection(pending).await;
@@ -377,7 +406,7 @@ pub async fn handle_connection(
     // This is the SIBLING half of the layout constraint: spawning, logging and
     // teardown live here, and `crate::media` holds only the loops.
     let meeting_key = MeetingKey::new(meeting_id);
-    let media_cancel = cancel_token.child_token();
+    let media_cancel = connection_close.child_token();
     let media_session = match resolve_sender_binding(
         &mc_client,
         &session_manager,
@@ -454,19 +483,35 @@ pub async fn handle_connection(
     // The connection stays open for future media frame forwarding (separate story).
     // For now, we monitor the recv stream for closure and the cancellation token.
     //
-    // Track the disconnect reason for MC notification
-    let disconnect_reason;
+    // WHY the connection ended decides whether MC is told (see `ConnectionEnd`).
+    let connection_end;
     let mut probe_buf = [0u8; 1];
     loop {
         tokio::select! {
-            () = cancel_token.cancelled() => {
-                debug!(
-                    target: "mh.webtransport.connection",
-                    connection_id = %connection_id,
-                    "Connection cancelled during shutdown"
-                );
-                // Server-initiated shutdown — not a client close or error
-                disconnect_reason = proto_gen::dark_tower::internal::v1::DisconnectReason::Unspecified;
+            () = connection_close.cancelled() => {
+                // Two server-side causes share this arm; the parent token tells
+                // them apart. Neither is a client close or an error.
+                if cancel_token.is_cancelled() {
+                    debug!(
+                        target: "mh.webtransport.connection",
+                        connection_id = %connection_id,
+                        "Connection cancelled during shutdown"
+                    );
+                    connection_end = ConnectionEnd::Shutdown;
+                } else {
+                    // `EndMeeting` released this meeting (or the connection
+                    // arrived for one already released). MH closing the
+                    // connection is NOT the client's meeting-ended signal —
+                    // MC's signalling is — and MC is deliberately NOT told:
+                    // see `ConnectionEnd::MeetingReleased`.
+                    info!(
+                        target: "mh.webtransport.connection",
+                        connection_id = %connection_id,
+                        meeting_id = %meeting_id,
+                        "Closing connection: its meeting was released by EndMeeting"
+                    );
+                    connection_end = ConnectionEnd::MeetingReleased;
+                }
                 break;
             }
             result = recv_stream.read(&mut probe_buf) => {
@@ -478,7 +523,7 @@ pub async fn handle_connection(
                             meeting_id = %meeting_id,
                             "Client disconnected"
                         );
-                        disconnect_reason = proto_gen::dark_tower::internal::v1::DisconnectReason::ClientClosed;
+                        connection_end = ConnectionEnd::ClientClosed;
                         break;
                     }
                     Err(_) => {
@@ -488,7 +533,7 @@ pub async fn handle_connection(
                             meeting_id = %meeting_id,
                             "Client disconnected with error"
                         );
-                        disconnect_reason = proto_gen::dark_tower::internal::v1::DisconnectReason::Error;
+                        connection_end = ConnectionEnd::Error;
                         break;
                     }
                     Ok(Some(_)) => {
@@ -614,13 +659,22 @@ pub async fn handle_connection(
         .remove_connection(meeting_id, &connection_id)
         .await;
 
-    // Notify MC of disconnection (best-effort, fire-and-forget)
-    if let Some(mc_endpoint) = session_manager.get_mc_endpoint(meeting_id).await {
+    // Notify MC of disconnection (best-effort, fire-and-forget) — unless the
+    // cause rules it out. Decided by the CAUSE, never by whether a registration
+    // happens to exist at this moment: see `ConnectionEnd::MeetingReleased`.
+    let mc_endpoint = match connection_end.mc_disconnect_reason() {
+        Some(reason) => session_manager
+            .get_mc_endpoint(meeting_id)
+            .await
+            .map(|endpoint| (endpoint, reason)),
+        None => None,
+    };
+    if let Some((mc_endpoint, reason)) = mc_endpoint {
         let mc_client = Arc::clone(&mc_client);
         let meeting_id = meeting_id.clone();
         let participant_id = participant_id.clone();
         let handler_id = handler_id.clone();
-        let reason = disconnect_reason as i32;
+        let reason = reason as i32;
         tokio::spawn(async move {
             if let Err(e) = mc_client
                 .notify_participant_disconnected(
@@ -684,6 +738,43 @@ pub async fn handle_connection(
 /// writes a datagram; it reads a counter quinn already maintains.
 fn quic_datagram_frames_received(connection: &wtransport::Connection) -> u64 {
     connection.quic_connection().stats().frame_rx.datagram
+}
+
+/// Why an established connection's hold loop ended — which decides whether, and
+/// with which reason, MC is sent `NotifyParticipantDisconnected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionEnd {
+    /// The client closed its stream.
+    ClientClosed,
+    /// The stream failed.
+    Error,
+    /// Server shutdown.
+    Shutdown,
+    /// `EndMeeting` released the connection's meeting (story 2 R-20), or the
+    /// connection arrived for a meeting already released.
+    MeetingReleased,
+}
+
+impl ConnectionEnd {
+    /// The reason MC is told, or `None` when MC must NOT be told.
+    ///
+    /// `MeetingReleased` is `None` STRUCTURALLY, not because the registration
+    /// "is already gone" by the time the notification would be sent: between the
+    /// release and this task's cleanup, MC may legitimately re-create the same
+    /// `meeting_id` (a fresh install from generation 1), and a lookup would then
+    /// find the NEW registration's endpoint and report the OLD connection's
+    /// disconnect to it. MC keys that removal on (meeting, participant, handler),
+    /// not on the connection, so it would drop the participant's NEW connection
+    /// on this handler and could not tell the stale notice from a real one. MC
+    /// ended the meeting; it needs no per-participant notice of its own teardown.
+    const fn mc_disconnect_reason(self) -> Option<DisconnectReason> {
+        match self {
+            Self::ClientClosed => Some(DisconnectReason::ClientClosed),
+            Self::Error => Some(DisconnectReason::Error),
+            Self::Shutdown => Some(DisconnectReason::Unspecified),
+            Self::MeetingReleased => None,
+        }
+    }
 }
 
 /// The three media tasks one connection owns, plus the sender they are bound
@@ -1234,6 +1325,7 @@ mod tests {
                 meeting_id: meeting_id.to_string(),
                 participant_id: "user-1".to_string(),
                 connected_at: Instant::now(),
+                close: tokio_util::sync::CancellationToken::new(),
             })
             .await
     }
@@ -1344,6 +1436,29 @@ mod tests {
             matches!(timeout_counter_value(&recorder), None | Some(0)),
             "registered arm must not record the timeout counter, got {:?}",
             timeout_counter_value(&recorder)
+        );
+    }
+
+    /// A connection closed by `EndMeeting` release never notifies MC, whatever
+    /// registration exists by cleanup time; every other end does, with its own
+    /// reason. The release half is the guarantee: were it decided by a later
+    /// registration lookup, an MC that re-created the same meeting id in the
+    /// window would be told a stale disconnect and drop the participant's NEW
+    /// connection.
+    #[test]
+    fn a_released_meeting_never_notifies_mc_and_every_other_end_does() {
+        assert_eq!(ConnectionEnd::MeetingReleased.mc_disconnect_reason(), None);
+        assert_eq!(
+            ConnectionEnd::ClientClosed.mc_disconnect_reason(),
+            Some(DisconnectReason::ClientClosed)
+        );
+        assert_eq!(
+            ConnectionEnd::Error.mc_disconnect_reason(),
+            Some(DisconnectReason::Error)
+        );
+        assert_eq!(
+            ConnectionEnd::Shutdown.mc_disconnect_reason(),
+            Some(DisconnectReason::Unspecified)
         );
     }
 }

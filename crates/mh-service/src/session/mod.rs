@@ -41,12 +41,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Notify};
+use tokio_util::sync::CancellationToken;
 
 pub mod admission;
 
 use crate::media::forward::EgressQueue;
 use crate::observability::metrics::{
-    resolve_admission_handles, AdmissionMetricHandles, StreamAdmissionOutcome,
+    resolve_session_handles, MeetingTeardownOutcome, SessionMetricHandles, StreamAdmissionOutcome,
 };
 use crate::routing::{MeetingKey, MeetingPolicy, RoutingSnapshot, RoutingTable, SenderId};
 pub use admission::StreamAdmission;
@@ -99,6 +100,11 @@ pub struct ConnectionEntry {
     pub participant_id: String,
     /// When the connection was established.
     pub connected_at: Instant,
+    /// Cancelling this closes the connection. `EndMeeting` release fires it for
+    /// every ACTIVE connection of the released meeting (story 2 R-20); the
+    /// connection task owns the other end and tears itself down. A child of the
+    /// server shutdown token, so shutdown still reaches it.
+    pub close: CancellationToken,
 }
 
 /// A pending connection awaiting `RegisterMeeting`.
@@ -112,6 +118,81 @@ pub struct PendingConnection {
     pub participant_id: String,
     /// When the connection was established.
     pub connected_at: Instant,
+    /// Carried into the [`ConnectionEntry`] this becomes on promotion, so a
+    /// promoted connection is closable by release like any other. Release
+    /// itself never fires it while the connection is still PENDING: pending
+    /// connections are left to the registration timeout (`internal.proto`,
+    /// `EndMeetingRequest`) because one may be a re-join racing the teardown,
+    /// and the next registration rescues it.
+    pub close: CancellationToken,
+}
+
+/// Whether the MC asking about a meeting is the one that registered it.
+///
+/// The ONE comparison behind both the register-path takeover WARN (detection)
+/// and the `EndMeeting` reject (enforcement), so the two cannot drift on
+/// trimming, case or empty-string handling.
+///
+/// BYTE-EXACT `==`, deliberately: no trimming, no case folding, no Unicode
+/// normalisation — any of those widens the accepted set. And NOT a
+/// constant-time compare: `mc_id` is self-asserted and not a secret
+/// (`internal.proto`: "`mc_id` IS SELF-ASSERTED AND IS NOT AN AUTHORIZATION
+/// CONTROL"), so a constant-time compare would misrepresent its trust level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// The caller's `mc_id` is the one that registered the meeting.
+    SameMc,
+    /// A different `mc_id` than the registering one.
+    DifferentMc,
+}
+
+impl Ownership {
+    /// Compare the registered `mc_id` with the caller's.
+    #[must_use]
+    pub fn of(registered_mc_id: &str, caller_mc_id: &str) -> Self {
+        if registered_mc_id == caller_mc_id {
+            Self::SameMc
+        } else {
+            Self::DifferentMc
+        }
+    }
+}
+
+/// Why a registration was refused before any state changed.
+///
+/// A typed refusal the gRPC boundary maps to a status, never a string threaded
+/// out of the actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterRefusal {
+    /// A NEW meeting id while this handler already holds
+    /// `MH_MAX_REGISTERED_MEETINGS` registrations (story 2 R-21).
+    MeetingCapReached {
+        /// Registrations held when the refusal was decided.
+        held: usize,
+        /// The configured cap.
+        cap: usize,
+    },
+}
+
+/// Why an `EndMeeting` could not be decided by the session actor. Neither
+/// failure records a teardown outcome: the actor never decided anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndMeetingFailure {
+    /// The actor is gone (channel closed) — shutdown, or a panicked task.
+    ActorUnavailable,
+    /// The actor did not reply within the bound.
+    Timeout,
+}
+
+impl EndMeetingFailure {
+    /// A bounded operator-facing reason for the log line.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::ActorUnavailable => "session_actor_unavailable",
+            Self::Timeout => "end_meeting_timeout",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,11 +205,21 @@ pub struct PendingConnection {
 /// Request-reply variants carry a `oneshot::Sender` for the response.
 #[derive(Debug)]
 enum SessionMessage {
-    /// Register a meeting. Returns any pending connections that were promoted.
+    /// Register a meeting. Returns any pending connections that were promoted,
+    /// or the refusal if a NEW meeting would exceed the registration cap.
     RegisterMeeting {
         meeting_id: String,
         registration: MeetingRegistration,
-        respond_to: oneshot::Sender<Vec<PendingConnection>>,
+        max_registered_meetings: usize,
+        respond_to: oneshot::Sender<Result<Vec<PendingConnection>, RegisterRefusal>>,
+    },
+    /// Release a meeting (story 2 R-20). On the LIFECYCLE mailbox, not the
+    /// config-apply one: teardown is lifecycle, and sharing a FIFO with
+    /// `RegisterMeeting` orders the two.
+    EndMeeting {
+        meeting_id: String,
+        mc_id: String,
+        respond_to: oneshot::Sender<MeetingTeardownOutcome>,
     },
     /// Check if a meeting is registered.
     IsMeetingRegistered {
@@ -268,8 +359,9 @@ pub struct SessionManagerActor {
     admission_window: AdmissionWindow,
     /// Edge-triggered reader of the rejection-ratio threshold (log only).
     threshold_latch: ThresholdLatch,
-    /// Admission counter/gauge handles, resolved once at construction.
-    admission_metrics: AdmissionMetricHandles,
+    /// Admission, occupancy and teardown handles, resolved once at
+    /// construction.
+    metrics: SessionMetricHandles,
 }
 
 impl SessionManagerActor {
@@ -279,13 +371,16 @@ impl SessionManagerActor {
         routing: Arc<RoutingTable>,
         admission: StreamAdmission,
     ) -> Self {
-        let admission_metrics = resolve_admission_handles();
+        let metrics = resolve_session_handles();
         // Both gauges exist from construction — never lazily on first
         // decision/install. A gauge-to-gauge alert whose left-hand series is
         // absent cannot fire, and `mh-media.json`'s "an empty panel means
         // healthy, because MH registers eagerly" rests on this.
-        admission_metrics.publish_rejection_ratio(0.0);
-        admission_metrics.publish_egress_edges(routing.load().total_edges());
+        metrics.publish_rejection_ratio(0.0);
+        metrics.publish_egress_edges(routing.load().total_edges());
+        // The state is empty at construction; published anyway so the series
+        // is present-at-0 from boot rather than appearing on first register.
+        metrics.publish_registered_meetings(0);
         Self {
             receiver,
             config_receiver,
@@ -294,7 +389,7 @@ impl SessionManagerActor {
             admission,
             admission_window: AdmissionWindow::new(),
             threshold_latch: ThresholdLatch::default(),
-            admission_metrics,
+            metrics,
         }
     }
 
@@ -440,9 +535,11 @@ impl SessionManagerActor {
             // persists on the unnamed pod. `docs/TODO.md` records the same
             // "point, don't restate" ruling from a prior cert-rotation incident.
             //
-            // RATCHET, until story 2 task 11's teardown: streams of a meeting
-            // that ended ABNORMALLY (MC crash, lost push) are never released —
-            // ordinary departures re-push shrinking policies and do release.
+            // RATCHET: MH releases an ended meeting's streams when its MC calls
+            // `EndMeeting` (story 2 R-20). MC begins calling it in story 2 task
+            // 12; before that, and ALWAYS for a meeting whose MC dies without
+            // calling it, the streams stay held until the pod restarts.
+            // Ordinary departures re-push shrinking policies and do release.
             // `installed_meeting_count` / `installed_total_streams` answer "one
             // fat policy, or accumulated dead meetings?" from this line alone;
             // both are identity-free aggregates.
@@ -460,8 +557,8 @@ impl SessionManagerActor {
                 "Egress stream admission refused: projected streams exceed this handler's \
                  stream ceiling; prior generation stays live. If installed streams sit at the \
                  ceiling with no live meeting behind them, that is the ratchet (streams held by \
-                 abnormally ended meetings, until teardown lands): see the interim recovery \
-                 under 'The ratchet' in docs/observability/metrics/mh-service.md"
+                 meetings that ended without an EndMeeting): see 'The ratchet' in \
+                 docs/observability/metrics/mh-service.md"
             );
             ApplyOutcome::Failed(ApplyFailure::StreamCeilingExceeded)
         } else if projected_total_edges > max_total_egress_edges {
@@ -488,13 +585,14 @@ impl SessionManagerActor {
             // stays live, so the forward path reflects N-1 rather than neither.
             //
             // `installed_meeting_count` and `installed_total_edges` are here
-            // because this bound RATCHETS: MH receives no meeting-teardown
-            // signal, so a meeting's edges are released only by that same
-            // meeting re-asserting a smaller policy, never by it ending. The
-            // one question an operator has on seeing this line is "is this one
-            // fat policy, or accumulated dead meetings?", and only these two
-            // counts answer it. Both are bounded aggregates carrying no
-            // identity.
+            // because this bound can RATCHET: a meeting's edges are released by
+            // it re-asserting a smaller policy or by its MC calling `EndMeeting`
+            // (story 2 R-20), and a meeting whose MC never calls it (MC crash,
+            // or any MC before story 2 task 12) keeps them until the pod
+            // restarts. The one question an operator has on seeing this line is
+            // "is this one fat policy, or accumulated dead meetings?", and only
+            // these two counts answer it. Both are bounded aggregates carrying
+            // no identity.
             tracing::warn!(
                 target: "mh.session.policy",
                 key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
@@ -511,7 +609,7 @@ impl SessionManagerActor {
         } else {
             self.record_admission(StreamAdmissionOutcome::Admitted);
             self.routing.install(&policy);
-            self.admission_metrics
+            self.metrics
                 .publish_egress_edges(self.routing.load().total_edges());
             tracing::info!(
                 target: "mh.session.policy",
@@ -529,7 +627,7 @@ impl SessionManagerActor {
 
     /// Count one admission decision, update the window, republish the ratio.
     fn record_admission(&mut self, outcome: StreamAdmissionOutcome) {
-        self.admission_metrics.record(outcome);
+        self.metrics.record(outcome);
         self.admission_window.record(outcome);
         self.publish_admission_ratio();
     }
@@ -543,7 +641,7 @@ impl SessionManagerActor {
     fn publish_admission_ratio(&mut self) {
         let ratio = self.admission_window.ratio();
         let decisions = self.admission_window.decisions();
-        self.admission_metrics.publish_rejection_ratio(ratio);
+        self.metrics.publish_rejection_ratio(ratio);
         let threshold = self.admission.rejection_ratio_threshold;
         let installed_total_streams = self.routing.load().total_edges();
         match self.threshold_latch.observe(ratio, decisions, threshold) {
@@ -585,10 +683,25 @@ impl SessionManagerActor {
             SessionMessage::RegisterMeeting {
                 meeting_id,
                 registration,
+                max_registered_meetings,
                 respond_to,
             } => {
-                let result = self.handle_register_meeting(meeting_id, registration);
+                // Every gauge publish happens INSIDE the handler, i.e. before
+                // this send. A caller reading the gauge after the reply must see
+                // the moved value; do not move a publish after the send.
+                let result =
+                    self.handle_register_meeting(meeting_id, registration, max_registered_meetings);
                 let _ = respond_to.send(result);
+            }
+            SessionMessage::EndMeeting {
+                meeting_id,
+                mc_id,
+                respond_to,
+            } => {
+                // Same ordering rule: the release republishes the gauges before
+                // this reply is sent.
+                let outcome = self.handle_end_meeting(&meeting_id, &mc_id);
+                let _ = respond_to.send(outcome);
             }
             SessionMessage::IsMeetingRegistered {
                 meeting_id,
@@ -650,7 +763,9 @@ impl SessionManagerActor {
     /// Register a meeting and promote any pending connections.
     ///
     /// This runs sequentially inside the actor, eliminating the TOCTOU race
-    /// that existed with `Arc<RwLock<SessionState>>`.
+    /// that existed with `Arc<RwLock<SessionState>>` — and it is why the
+    /// registration cap is checked HERE, atomically with the insert, rather
+    /// than by a caller that read the count first.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "meeting_id is used as owned key in insert/entry calls; &str would require .to_string() at each site"
@@ -659,36 +774,41 @@ impl SessionManagerActor {
         &mut self,
         meeting_id: String,
         registration: MeetingRegistration,
-    ) -> Vec<PendingConnection> {
+        max_registered_meetings: usize,
+    ) -> Result<Vec<PendingConnection>, RegisterRefusal> {
         // An ordinary re-assert and a change of OWNING MC are the same insert,
         // and before this they were also the same INFO line. They are not the
-        // same event, and the generation ratchet this story adds is why:
-        // `handle_config_apply` refuses anything below the installed
-        // generation and has no downward path within the process, so a
-        // registration from a different MC carrying a high `policy_generation`
-        // wedges every subsequent re-assert from the owning MC onto
-        // `rejected_stale` — permanently, while `accepted: true` and
-        // `mh_grpc_requests_total{status="success"}` both stay green.
+        // same event, and the generation ratchet is why: `handle_config_apply`
+        // refuses anything below the installed generation, so a registration
+        // from a different MC carrying a high `policy_generation` wedges every
+        // subsequent re-assert from the owning MC onto `rejected_stale` —
+        // while `accepted: true` and `mh_grpc_requests_total{method="register_meeting",status="success"}`
+        // both stay green. (`EndMeeting` is now the in-process recovery; see the
+        // runbook's ownership-reject arm.)
         //
         // MH cannot decide here whether that is an attack or a legitimate MC
         // failover: `MhAuthLayer` authorizes on scope and `service_type` only
         // and binds no caller to a `meeting_id`, so both look identical on the
-        // wire. Enforcement is a contract question for media-handler +
-        // meeting-controller and is tracked in `docs/TODO.md` §Media Path
-        // Obligations. What lands here is the DETECTION half: the two events
-        // stop sharing a log line and a level.
+        // wire. So registration stays an OVERWRITE — failover semantics are
+        // untouched: a legitimate new owner re-registers first, taking over
+        // `mc_id`, and may then release. What lands here is the DETECTION half,
+        // through the same [`Ownership`] comparison `EndMeeting` enforces on.
         //
         // `mc_id` is safe as a field — a bounded service identity the handler
         // already length-caps and already logs — unlike the per-stream
-        // identities ADR-0036 §11 bars.
+        // identities ADR-0036 §11 bars. The field names match the
+        // `EndMeeting` reject's so one search covers both events.
         match self.state.registered_meetings.get(&meeting_id) {
-            Some(existing) if existing.mc_id != registration.mc_id => {
+            Some(existing)
+                if Ownership::of(&existing.mc_id, &registration.mc_id)
+                    == Ownership::DifferentMc =>
+            {
                 tracing::warn!(
                     target: "mh.session",
                     key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
                     meeting_id = %meeting_id,
-                    previous_mc_id = %existing.mc_id,
-                    new_mc_id = %registration.mc_id,
+                    registered_mc_id = %existing.mc_id,
+                    caller_mc_id = %registration.mc_id,
                     "Meeting registration taken over by a DIFFERENT MC; MH does not \
                      verify meeting ownership, and the installed policy generation \
                      never moves back down"
@@ -701,12 +821,35 @@ impl SessionManagerActor {
                     "Overwriting existing meeting registration"
                 );
             }
+            // A NEW meeting id: the only case the registration cap applies to.
+            // A re-registration of a held meeting is never refused — refusing
+            // it would stop a full handler accepting policy for meetings it is
+            // already serving, a blackhole caused by the resource guard itself.
+            None if self.state.registered_meetings.len() >= max_registered_meetings => {
+                let held = self.state.registered_meetings.len();
+                tracing::warn!(
+                    target: "mh.session",
+                    key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                    registered_meetings = held,
+                    max_registered_meetings,
+                    "Refusing a NEW meeting registration: this handler holds \
+                     MH_MAX_REGISTERED_MEETINGS registrations (a resource guard, not \
+                     capacity). Held registrations are released only by EndMeeting; \
+                     see the meeting-cap arm in docs/runbooks/mh-incident-response.md"
+                );
+                return Err(RegisterRefusal::MeetingCapReached {
+                    held,
+                    cap: max_registered_meetings,
+                });
+            }
             None => {}
         }
 
         self.state
             .registered_meetings
             .insert(meeting_id.clone(), registration);
+        self.metrics
+            .publish_registered_meetings(self.state.registered_meetings.len());
 
         // Drain pending connections for this meeting
         let pending = self
@@ -715,7 +858,8 @@ impl SessionManagerActor {
             .remove(&meeting_id)
             .unwrap_or_default();
 
-        // Promote pending connections to active
+        // Promote pending connections to active, carrying each one's close
+        // token so a later release can close it.
         for conn in &pending {
             let meeting_conns = self
                 .state
@@ -729,18 +873,137 @@ impl SessionManagerActor {
                 connection_id: conn.connection_id.clone(),
                 participant_id: conn.participant_id.clone(),
                 connected_at: conn.connected_at,
+                close: conn.close.clone(),
             });
         }
 
-        // Notify any waiters that the meeting is now registered
-        if let Some(notifier) = self.state.meeting_notifiers.get(&meeting_id) {
+        // Notify any waiters that the meeting is now registered, then drop the
+        // notifier: its only purpose is waking PENDING connections and this
+        // meeting now has none. Waiters hold their own `Arc` clone, so dropping
+        // the map's copy strands nobody, and a later pending connection creates
+        // a fresh one. Without this the map is insert-only — one entry per
+        // meeting that ever had a pending connection, forever.
+        if let Some(notifier) = self.state.meeting_notifiers.remove(&meeting_id) {
             notifier.notify_waiters();
         }
 
-        pending
+        Ok(pending)
+    }
+
+    /// Release a meeting (story 2 R-20; semantics normative on
+    /// `EndMeetingRequest` in `proto/dark_tower/internal/v1/internal.proto`).
+    ///
+    /// Unconditional BY MEETING ID, with no generation, by contract.
+    ///
+    /// STORY-2 ASSUMPTION this rests on: MC stops every `RegisterMeeting` push
+    /// for the meeting before calling `EndMeeting` (the quiesce rule stated on
+    /// `EndMeetingRequest`, which is the source of truth — not restated here).
+    /// MH does not enforce it. The accepted residual: an attempt whose
+    /// client-side deadline expired can still be applied here AFTER this
+    /// release and re-create the meeting, bounded by the RPC deadline.
+    ///
+    /// STORY-4 NOTE: once the periodic §8 re-assert exists, a re-assert racing
+    /// this release RESURRECTS the ended meeting's routes and edge budget on a
+    /// timer. That needs a fence (a teardown tombstone here, or MC-side
+    /// cancellation that happens-before the call) — `docs/TODO.md`
+    /// "`EndMeeting` has no fence against a late `RegisterMeeting`".
+    fn handle_end_meeting(&mut self, meeting_id: &str, mc_id: &str) -> MeetingTeardownOutcome {
+        let Some(registered) = self.state.registered_meetings.get(meeting_id) else {
+            // Nothing held. Routes cannot exist without a registration — every
+            // apply follows its registration's upsert, and release removes both.
+            debug_assert!(
+                self.routing
+                    .load()
+                    .routes_for(&MeetingKey::new(meeting_id))
+                    .is_none(),
+                "routes installed for a meeting with no registration"
+            );
+            tracing::info!(
+                target: "mh.session",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                meeting_id = %meeting_id,
+                caller_mc_id = %mc_id,
+                "EndMeeting for a meeting this handler does not hold; acknowledged as a no-op"
+            );
+            self.metrics
+                .record_teardown(MeetingTeardownOutcome::UnknownMeeting);
+            return MeetingTeardownOutcome::UnknownMeeting;
+        };
+
+        if Ownership::of(&registered.mc_id, mc_id) == Ownership::DifferentMc {
+            // Both ids in the SERVER-SIDE log only; the caller's status carries
+            // neither (a scoped-but-wrong caller must not learn the owner's id,
+            // which is exactly what a matching forged release would need).
+            tracing::warn!(
+                target: "mh.session",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                meeting_id = %meeting_id,
+                registered_mc_id = %registered.mc_id,
+                caller_mc_id = %mc_id,
+                "Refusing EndMeeting from an MC that did not register this meeting; \
+                 nothing released. A legitimate new owner re-registers first"
+            );
+            self.metrics
+                .record_teardown(MeetingTeardownOutcome::RejectedOwnership);
+            return MeetingTeardownOutcome::RejectedOwnership;
+        }
+
+        self.state.registered_meetings.remove(meeting_id);
+        let meeting = MeetingKey::new(meeting_id);
+        // Removing the routes entry is also what FORGETS the applied
+        // generation, so a same-id re-create installs fresh from generation 1.
+        let routes_removed = self.routing.remove(&meeting);
+
+        // Close every ACTIVE connection. Pending ones are left alone (see
+        // `PendingConnection::close`), and so is this meeting's notifier while
+        // any pending connection still waits on it.
+        let mut closed_connections = 0_usize;
+        if let Some(meeting_conns) = self.state.active_connections.remove(meeting_id) {
+            for entry in meeting_conns.values().flatten() {
+                entry.close.cancel();
+                closed_connections += 1;
+            }
+        }
+        if !self.state.pending_connections.contains_key(meeting_id) {
+            self.state.meeting_notifiers.remove(meeting_id);
+        }
+
+        let snapshot = self.routing.load();
+        self.metrics.publish_egress_edges(snapshot.total_edges());
+        self.metrics
+            .publish_registered_meetings(self.state.registered_meetings.len());
+        self.metrics
+            .record_teardown(MeetingTeardownOutcome::Released);
+
+        tracing::info!(
+            target: "mh.session",
+            key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+            meeting_id = %meeting_id,
+            mc_id = %mc_id,
+            routes_removed,
+            closed_connections,
+            installed_total_streams = snapshot.total_edges(),
+            registered_meetings = self.state.registered_meetings.len(),
+            "Meeting released by EndMeeting"
+        );
+        MeetingTeardownOutcome::Released
     }
 
     fn handle_add_connection(&mut self, meeting_id: String, entry: ConnectionEntry) {
+        // The connection task checked registration, THEN sent this — two
+        // messages, so an `EndMeeting` can land between them. Inserting anyway
+        // would leave an entry for a released meeting that nothing will ever
+        // close. Close it instead; the connection tears itself down.
+        if !self.state.registered_meetings.contains_key(&meeting_id) {
+            tracing::info!(
+                target: "mh.session",
+                meeting_id = %meeting_id,
+                connection_id = %entry.connection_id,
+                "Connection arrived for a meeting released since it checked; closing it"
+            );
+            entry.close.cancel();
+            return;
+        }
         let meeting_conns = self.state.active_connections.entry(meeting_id).or_default();
         let participant_conns = meeting_conns
             .entry(entry.participant_id.clone())
@@ -749,18 +1012,34 @@ impl SessionManagerActor {
     }
 
     fn handle_remove_connection(&mut self, meeting_id: &str, connection_id: &str) -> bool {
-        if let Some(meeting_conns) = self.state.active_connections.get_mut(meeting_id) {
-            for participant_conns in meeting_conns.values_mut() {
-                if let Some(pos) = participant_conns
-                    .iter()
-                    .position(|c| c.connection_id == connection_id)
-                {
-                    participant_conns.remove(pos);
-                    return true;
+        let Some(meeting_conns) = self.state.active_connections.get_mut(meeting_id) else {
+            return false;
+        };
+        let mut emptied_participant = None;
+        let mut found = false;
+        for (participant_id, participant_conns) in meeting_conns.iter_mut() {
+            if let Some(pos) = participant_conns
+                .iter()
+                .position(|c| c.connection_id == connection_id)
+            {
+                participant_conns.remove(pos);
+                if participant_conns.is_empty() {
+                    emptied_participant = Some(participant_id.clone());
                 }
+                found = true;
+                break;
             }
         }
-        false
+        // Drop entries this removal emptied, so the map holds only live
+        // connections rather than one husk per participant and meeting ever
+        // seen.
+        if let Some(participant_id) = emptied_participant {
+            meeting_conns.remove(&participant_id);
+        }
+        if meeting_conns.is_empty() {
+            self.state.active_connections.remove(meeting_id);
+        }
+        found
     }
 
     fn handle_add_pending_connection(&mut self, pending: PendingConnection) -> Arc<Notify> {
@@ -787,9 +1066,13 @@ impl SessionManagerActor {
                 .position(|c| c.connection_id == connection_id)
             {
                 pending_list.remove(pos);
-                // Clean up empty entries
+                // Clean up empty entries — and the notifier with the last
+                // pending connection, since waking pending connections is its
+                // only purpose. The waiter holds its own `Arc`; a later pending
+                // connection creates a fresh notifier.
                 if pending_list.is_empty() {
                     self.state.pending_connections.remove(meeting_id);
+                    self.state.meeting_notifiers.remove(meeting_id);
                 }
                 return true;
             }
@@ -1400,28 +1683,75 @@ impl SessionManagerHandle {
     /// Register a meeting on this MH instance.
     ///
     /// Called when MC sends `RegisterMeeting` RPC. Returns any pending
-    /// connections that were waiting for this meeting's registration,
-    /// so the caller can dispatch notifications.
+    /// connections that were waiting for this meeting's registration, so the
+    /// caller can dispatch notifications.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterRefusal::MeetingCapReached`] when this is a NEW meeting id and
+    /// the handler already holds `max_registered_meetings` registrations.
+    /// Nothing was upserted or promoted.
     pub async fn register_meeting(
         &self,
         meeting_id: String,
         registration: MeetingRegistration,
-    ) -> Vec<PendingConnection> {
+        max_registered_meetings: usize,
+    ) -> Result<Vec<PendingConnection>, RegisterRefusal> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
             .send(SessionMessage::RegisterMeeting {
                 meeting_id,
                 registration,
+                max_registered_meetings,
                 respond_to: tx,
             })
             .await
             .is_err()
         {
             tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on register_meeting");
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        rx.await.unwrap_or_default()
+        rx.await.unwrap_or_else(|_| Ok(Vec::new()))
+    }
+
+    /// Release a meeting (story 2 R-20): the actor decides released / unknown
+    /// / rejected-ownership and counts it.
+    ///
+    /// The await is BOUNDED by `timeout` (the caller passes
+    /// `MH_POLICY_APPLY_TIMEOUT_MS`, the one "how long an RPC waits for the
+    /// session actor" bound): a wedged actor must yield an error, not a hung
+    /// RPC that consumes MC's deadline and stacks its retries. Uses the
+    /// lifecycle mailbox's `send().await`, bounded by the same timeout.
+    ///
+    /// # Errors
+    ///
+    /// [`EndMeetingFailure`] when the actor is gone or did not answer in time.
+    /// The actor may still process a timed-out request afterwards; that is
+    /// safe, because a release is idempotent and a later retry of the same
+    /// request answers `unknown_meeting`.
+    pub async fn end_meeting(
+        &self,
+        meeting_id: String,
+        mc_id: String,
+        timeout: Duration,
+    ) -> Result<MeetingTeardownOutcome, EndMeetingFailure> {
+        let (tx, rx) = oneshot::channel();
+        let exchange = async {
+            self.sender
+                .send(SessionMessage::EndMeeting {
+                    meeting_id,
+                    mc_id,
+                    respond_to: tx,
+                })
+                .await
+                .map_err(|_| EndMeetingFailure::ActorUnavailable)?;
+            rx.await.map_err(|_| EndMeetingFailure::ActorUnavailable)
+        };
+        match tokio::time::timeout(timeout, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(EndMeetingFailure::Timeout),
+        }
     }
 
     /// Check if a meeting is registered on this MH instance.
@@ -1563,6 +1893,10 @@ mod tests {
     use super::admission::test_admission;
     use super::*;
 
+    /// The cap tests run with when they are not ABOUT the cap — the `src/`
+    /// fixture's value, so there is one source.
+    const TEST_CAP: usize = crate::config::PolicyLimits::for_tests().max_registered_meetings;
+
     fn make_registration(mc_id: &str, endpoint: &str) -> MeetingRegistration {
         MeetingRegistration {
             mc_id: mc_id.to_string(),
@@ -1576,6 +1910,7 @@ mod tests {
             connection_id: conn_id.to_string(),
             participant_id: participant_id.to_string(),
             connected_at: Instant::now(),
+            close: CancellationToken::new(),
         }
     }
 
@@ -1585,6 +1920,7 @@ mod tests {
             meeting_id: meeting_id.to_string(),
             participant_id: participant_id.to_string(),
             connected_at: Instant::now(),
+            close: CancellationToken::new(),
         }
     }
 
@@ -1597,8 +1933,10 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                TEST_CAP,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert!(handle.is_meeting_registered("meeting-1").await);
         assert!(pending.is_empty());
@@ -1615,8 +1953,10 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                TEST_CAP,
             )
-            .await;
+            .await
+            .unwrap();
 
         handle
             .add_connection("meeting-1", make_connection("conn-1", "user-1"))
@@ -1651,8 +1991,10 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                TEST_CAP,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(promoted.len(), 2);
         assert_eq!(promoted[0].connection_id, "conn-1");
@@ -1676,8 +2018,10 @@ mod tests {
             .register_meeting(
                 "meeting-2".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                TEST_CAP,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert!(promoted.is_empty());
         assert_eq!(handle.active_connection_count().await, 0);
@@ -1727,8 +2071,10 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                TEST_CAP,
             )
-            .await;
+            .await
+            .unwrap();
 
         let result = join_handle.await.unwrap();
         assert!(result, "Meeting should be registered after notify");
@@ -1743,8 +2089,10 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                TEST_CAP,
             )
-            .await;
+            .await
+            .unwrap();
 
         // Add active connection (not pending — meeting is already registered)
         handle
@@ -2026,6 +2374,179 @@ mod tests {
             bindings.holder_of(&meeting_b, key(5)),
             Some("participant-b".to_string()),
             "each meeting holds its own ordinal 5; conflating them is cross-tenant leakage"
+        );
+    }
+
+    // =======================================================================
+    // Story 2 R-20 / R-21: ownership, the registration cap, and release.
+    // Driven on an UNSPAWNED actor so the handlers run synchronously and the
+    // maps the RPC never exposes (notifiers, emptied connection entries) can
+    // be inspected directly.
+    // =======================================================================
+
+    fn unspawned_actor() -> SessionManagerActor {
+        SessionManagerHandle::new_with_parts(test_admission()).1
+    }
+
+    #[test]
+    fn ownership_is_a_byte_exact_comparison_with_no_normalisation() {
+        assert_eq!(Ownership::of("mc-1", "mc-1"), Ownership::SameMc);
+        for different in ["mc-2", "MC-1", " mc-1", "mc-1 ", "", "mc-1\u{0}"] {
+            assert_eq!(
+                Ownership::of("mc-1", different),
+                Ownership::DifferentMc,
+                "{different:?} must not match mc-1: any normalisation widens the accept set"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cap_refuses_only_a_new_meeting_id() {
+        let mut actor = unspawned_actor();
+        actor
+            .handle_register_meeting("m-1".into(), make_registration("mc-1", "http://mc"), 1)
+            .unwrap();
+
+        // The held meeting re-registers at the cap: admitted.
+        assert!(actor
+            .handle_register_meeting("m-1".into(), make_registration("mc-1", "http://mc"), 1)
+            .is_ok());
+        // A new one: refused, with the counts, and nothing inserted.
+        assert_eq!(
+            actor
+                .handle_register_meeting("m-2".into(), make_registration("mc-1", "http://mc"), 1)
+                .unwrap_err(),
+            RegisterRefusal::MeetingCapReached { held: 1, cap: 1 }
+        );
+        assert!(!actor.state.registered_meetings.contains_key("m-2"));
+    }
+
+    /// Release closes every ACTIVE connection, leaves PENDING ones (and the
+    /// notifier they wait on) for the registration timeout, and reclaims the
+    /// registration and the active-connection entry.
+    #[test]
+    fn release_closes_active_connections_and_leaves_pending_ones() {
+        let mut actor = unspawned_actor();
+        let promoted_close = CancellationToken::new();
+        let mut early = make_pending("conn-early", "m-1", "user-1");
+        early.close = promoted_close.clone();
+        actor.handle_add_pending_connection(early);
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                TEST_CAP,
+            )
+            .unwrap();
+        let direct = make_connection("conn-direct", "user-2");
+        let direct_close = direct.close.clone();
+        actor.handle_add_connection("m-1".into(), direct);
+
+        // A re-join racing the teardown: pending, NOT to be closed.
+        let late = make_pending("conn-late", "m-1", "user-3");
+        let late_close = late.close.clone();
+        actor.handle_add_pending_connection(late);
+
+        assert_eq!(
+            actor.handle_end_meeting("m-1", "mc-1"),
+            MeetingTeardownOutcome::Released
+        );
+        assert!(
+            promoted_close.is_cancelled(),
+            "a promoted connection is closed"
+        );
+        assert!(
+            direct_close.is_cancelled(),
+            "a directly-added connection is closed"
+        );
+        assert!(
+            !late_close.is_cancelled(),
+            "a pending connection is left alone"
+        );
+        assert!(!actor.state.registered_meetings.contains_key("m-1"));
+        assert!(!actor.state.active_connections.contains_key("m-1"));
+        assert!(
+            actor.state.meeting_notifiers.contains_key("m-1"),
+            "the pending connection still waits on this meeting's notifier"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_release_mutates_nothing_and_an_unknown_one_is_a_no_op() {
+        let mut actor = unspawned_actor();
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                TEST_CAP,
+            )
+            .unwrap();
+        let conn = make_connection("conn-1", "user-1");
+        let close = conn.close.clone();
+        actor.handle_add_connection("m-1".into(), conn);
+
+        assert_eq!(
+            actor.handle_end_meeting("m-1", "mc-2"),
+            MeetingTeardownOutcome::RejectedOwnership
+        );
+        assert!(actor.state.registered_meetings.contains_key("m-1"));
+        assert!(!close.is_cancelled());
+
+        assert_eq!(
+            actor.handle_end_meeting("nope", "mc-1"),
+            MeetingTeardownOutcome::UnknownMeeting
+        );
+    }
+
+    /// An `AddConnection` that lands after the meeting was released (the
+    /// connection checked registration, then `EndMeeting` ran) is closed, not
+    /// inserted into a map nothing will ever release again.
+    #[test]
+    fn a_connection_arriving_for_a_released_meeting_is_closed_not_inserted() {
+        let mut actor = unspawned_actor();
+        let conn = make_connection("conn-1", "user-1");
+        let close = conn.close.clone();
+        actor.handle_add_connection("released".into(), conn);
+        assert!(close.is_cancelled());
+        assert!(!actor.state.active_connections.contains_key("released"));
+    }
+
+    /// Every meeting-keyed map reclaims its entry: emptied connection entries
+    /// are dropped, and the notifier goes with the last pending connection and
+    /// on promotion. Before this, both maps only grew.
+    #[test]
+    fn meeting_keyed_maps_do_not_keep_husks() {
+        let mut actor = unspawned_actor();
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                TEST_CAP,
+            )
+            .unwrap();
+        actor.handle_add_connection("m-1".into(), make_connection("conn-1", "user-1"));
+        assert!(actor.handle_remove_connection("m-1", "conn-1"));
+        assert!(
+            !actor.state.active_connections.contains_key("m-1"),
+            "an emptied meeting entry is dropped"
+        );
+
+        actor.handle_add_pending_connection(make_pending("conn-2", "m-2", "user-2"));
+        assert!(actor.state.meeting_notifiers.contains_key("m-2"));
+        assert!(actor.handle_remove_pending_connection("m-2", "conn-2"));
+        assert!(!actor.state.meeting_notifiers.contains_key("m-2"));
+
+        actor.handle_add_pending_connection(make_pending("conn-3", "m-3", "user-3"));
+        actor
+            .handle_register_meeting(
+                "m-3".into(),
+                make_registration("mc-1", "http://mc"),
+                TEST_CAP,
+            )
+            .unwrap();
+        assert!(
+            !actor.state.meeting_notifiers.contains_key("m-3"),
+            "promotion empties the pending list, so the notifier goes with it"
         );
     }
 }

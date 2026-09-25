@@ -4,8 +4,9 @@
 //!
 //! **Forwarding policy gains fields, not sibling RPCs** (ADR-0036 §8):
 //! `RegisterMeeting` *is* the MC→MH control plane. Meeting lifecycle teardown is
-//! a distinct concern with its own RPC, `EndMeeting` (story 2 R-20), which this
-//! handler answers `UNIMPLEMENTED` until story-2 task 11. The `Register`,
+//! a distinct concern with its own RPC, `EndMeeting` (story 2 R-20), implemented
+//! here: release on the registering MC's `mc_id`, idempotent acknowledgement for
+//! an unknown meeting, `FAILED_PRECONDITION` on a mismatch. The `Register`,
 //! `RouteMedia` and `StreamTelemetry` stubs were retired with the 2026-09-01
 //! `internal.proto` reshape; see the tombstone block in that file.
 //!
@@ -50,9 +51,12 @@
 use std::time::{Duration, Instant};
 
 use crate::config::PolicyLimits;
-use crate::observability::metrics::{self, PolicyApplyOutcome};
+use crate::observability::metrics::{self, GrpcMethod, MeetingTeardownOutcome, PolicyApplyOutcome};
 use crate::routing::MeetingPolicy;
-use crate::session::{ApplyFailure, ApplyOutcome, MeetingRegistration, SessionManagerHandle};
+use crate::session::{
+    ApplyFailure, ApplyOutcome, EndMeetingFailure, MeetingRegistration, RegisterRefusal,
+    SessionManagerHandle,
+};
 use common::observability::labels::KEY_CUSTODY_OPERATOR;
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerService;
 use proto_gen::dark_tower::internal::v1::{
@@ -155,30 +159,16 @@ impl MediaHandlerService for MhMediaService {
         // a series would also make that counter's sum unusable as a
         // denominator.
         // -------------------------------------------------------------------
-        if req.meeting_id.is_empty() {
-            metrics::record_grpc_request("error");
-            return Err(Status::invalid_argument("meeting_id is required"));
-        }
-        if req.mc_id.is_empty() {
-            metrics::record_grpc_request("error");
-            return Err(Status::invalid_argument("mc_id is required"));
+        if let Err(reason) = validate_caller_ids(&req.meeting_id, &req.mc_id) {
+            metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
+            return Err(Status::invalid_argument(reason));
         }
         if req.mc_grpc_endpoint.is_empty() {
-            metrics::record_grpc_request("error");
+            metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
             return Err(Status::invalid_argument("mc_grpc_endpoint is required"));
         }
-        if req.meeting_id.len() > MAX_ID_LENGTH {
-            metrics::record_grpc_request("error");
-            return Err(Status::invalid_argument(
-                "meeting_id exceeds maximum length",
-            ));
-        }
-        if req.mc_id.len() > MAX_ID_LENGTH {
-            metrics::record_grpc_request("error");
-            return Err(Status::invalid_argument("mc_id exceeds maximum length"));
-        }
         if req.mc_grpc_endpoint.len() > MAX_ENDPOINT_LENGTH {
-            metrics::record_grpc_request("error");
+            metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
             return Err(Status::invalid_argument(
                 "mc_grpc_endpoint exceeds maximum length",
             ));
@@ -187,7 +177,7 @@ impl MediaHandlerService for MhMediaService {
             && !req.mc_grpc_endpoint.starts_with("https://")
             && !req.mc_grpc_endpoint.starts_with("grpc://")
         {
-            metrics::record_grpc_request("error");
+            metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
             return Err(Status::invalid_argument(
                 "mc_grpc_endpoint must use http://, https://, or grpc:// scheme",
             ));
@@ -206,7 +196,7 @@ impl MediaHandlerService for MhMediaService {
             Ok(policy) => policy,
             Err(rejection) => {
                 metrics::record_media_policy_apply(PolicyApplyOutcome::RejectedInvalid);
-                metrics::record_grpc_request("error");
+                metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
                 tracing::warn!(
                     target: "mh.grpc.service",
                     key_custody = KEY_CUSTODY_OPERATOR,
@@ -222,7 +212,15 @@ impl MediaHandlerService for MhMediaService {
         // installed: MH's handler upserts and drains/promotes pending
         // connections, and §8 relies on that to rescue clients sitting in the
         // provisional window after a restart.
-        let promoted = self
+        //
+        // ORDER IS LOAD-BEARING for `EndMeeting`: this upsert runs after
+        // validation and BEFORE the apply, so ANY validation-passing
+        // registration rebinds the meeting's `mc_id` whatever its generation
+        // outcome. A failover MC re-registering below the applied generation
+        // (refused as stale) must still take over ownership, or it could never
+        // release the meeting (`internal.proto`, `EndMeetingRequest`). Do not
+        // move this behind `apply_policy`.
+        let promoted = match self
             .session_manager
             .register_meeting(
                 req.meeting_id.clone(),
@@ -231,8 +229,24 @@ impl MediaHandlerService for MhMediaService {
                     mc_grpc_endpoint: req.mc_grpc_endpoint.clone(),
                     registered_at: Instant::now(),
                 },
+                self.policy_limits.max_registered_meetings,
             )
-            .await;
+            .await
+        {
+            Ok(promoted) => promoted,
+            // Refused whole: nothing upserted, promoted or applied, so this is
+            // the ONLY policy outcome this registration records — never also
+            // `no_generation` or an apply outcome — and the request is an error,
+            // not a success. The actor logged the WARN with the counts.
+            Err(RegisterRefusal::MeetingCapReached { held, cap }) => {
+                metrics::record_media_policy_apply(PolicyApplyOutcome::RejectedMeetingCap);
+                metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
+                return Err(Status::resource_exhausted(format!(
+                    "media handler holds its maximum of {cap} registered meetings \
+                     ({held} held); new meeting refused"
+                )));
+            }
+        };
 
         let declared_mode = policy.transport_mode;
         let received_generation = policy.generation;
@@ -332,7 +346,7 @@ impl MediaHandlerService for MhMediaService {
         }
 
         metrics::record_media_policy_apply(outcome);
-        metrics::record_grpc_request("success");
+        metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "success");
 
         tracing::info!(
             target: "mh.grpc.service",
@@ -349,31 +363,108 @@ impl MediaHandlerService for MhMediaService {
         Ok(Response::new(response))
     }
 
-    /// Release a meeting's handler resources (ADR-0036 §8, story 2 R-20).
+    /// Release a meeting's handler resources (story 2 R-20).
     ///
-    /// **Not implemented yet — answers `UNIMPLEMENTED`, deliberately.** The
-    /// contract (`internal.proto`, `EndMeetingRequest`) landed in the protocol
-    /// task; the release, the `mc_id` ownership check and the reclamation land
-    /// in story-2 task 11 (MH `EndMeeting` teardown). `UNIMPLEMENTED` is the
-    /// contract's own rollback observable, which MC counts and does not retry,
-    /// so an MC that calls early degrades to today's never-reclaimed behaviour
-    /// rather than to a false acknowledgement.
+    /// The normative semantics are on `EndMeetingRequest` in
+    /// `proto/dark_tower/internal/v1/internal.proto`; this implements them:
     ///
-    /// **Records no metric, and must not call `metrics::record_grpc_request`
-    /// here.** That recorder hard-codes `method="register_meeting"`, so calling
-    /// it would count every teardown as a `RegisterMeeting` receipt — forging the
-    /// R-26 receipt signal `mh_grpc_requests_total{method="register_meeting"}`
-    /// exists to be. Task 11 gives the recorder its `method` parameter, adds
-    /// `end_meeting` to `zero_initialize_counters()` in the same commit, and
-    /// instruments this path.
+    /// - unknown or already-released meeting -> `acknowledged: true` (MC calls
+    ///   every handler in the assigned set, including ones never registered);
+    /// - `mc_id` equal to the registering MC's -> release, `acknowledged: true`;
+    /// - `mc_id` MISMATCH -> `FAILED_PRECONDITION`. Never an idempotent accept
+    ///   and never `acknowledged: false` (the decoded default, ambiguous with
+    ///   the no-op). NOT `PERMISSION_DENIED`: `mc_id` is self-asserted and is
+    ///   not an authorization control, and `PERMISSION_DENIED` is what
+    ///   `MhAuthLayer` returns for a real authorization rejection.
+    ///
+    /// Channel authorization is `MhAuthLayer`'s existing two-layer gate (scope
+    /// `service.write.mh`, caller `service_type` = meeting-controller for this
+    /// service's path prefix) — this method adds no auth of its own.
+    ///
+    /// Every exit records exactly one `mh_grpc_requests_total{method=
+    /// "end_meeting"}` sample, and every exit the actor decided records exactly
+    /// one teardown outcome (counted by the actor).
+    #[instrument(skip_all)]
     async fn end_meeting(
         &self,
-        _request: Request<EndMeetingRequest>,
+        request: Request<EndMeetingRequest>,
     ) -> Result<Response<EndMeetingResponse>, Status> {
-        Err(Status::unimplemented(
-            "EndMeeting is not implemented by this media handler yet (story-2 task 11)",
-        ))
+        let req = request.into_inner();
+
+        // Pre-decision checks, before the ids reach the actor or any log line —
+        // the SAME validator `register_meeting` uses.
+        if let Err(reason) = validate_caller_ids(&req.meeting_id, &req.mc_id) {
+            metrics::record_grpc_request(GrpcMethod::EndMeeting, "error");
+            return Err(Status::invalid_argument(reason));
+        }
+
+        let decided = self
+            .session_manager
+            .end_meeting(
+                req.meeting_id,
+                req.mc_id,
+                Duration::from_millis(self.policy_limits.policy_apply_timeout_ms),
+            )
+            .await;
+
+        match decided {
+            Ok(MeetingTeardownOutcome::Released | MeetingTeardownOutcome::UnknownMeeting) => {
+                metrics::record_grpc_request(GrpcMethod::EndMeeting, "success");
+                Ok(Response::new(EndMeetingResponse { acknowledged: true }))
+            }
+            Ok(MeetingTeardownOutcome::RejectedOwnership) => {
+                metrics::record_grpc_request(GrpcMethod::EndMeeting, "error");
+                // Generic on the wire: the registered `mc_id` is in the
+                // server-side WARN only. Echoing it would hand a scoped-but-wrong
+                // caller the exact string a matching forged release needs.
+                Err(Status::failed_precondition(
+                    "meeting is registered to a different mc_id; re-register before ending it",
+                ))
+            }
+            Err(failure) => {
+                metrics::record_grpc_request(GrpcMethod::EndMeeting, "error");
+                tracing::warn!(
+                    target: "mh.grpc.service",
+                    key_custody = KEY_CUSTODY_OPERATOR,
+                    reason = failure.reason(),
+                    "EndMeeting not decided; nothing released on this attempt"
+                );
+                Err(match failure {
+                    EndMeetingFailure::ActorUnavailable => {
+                        Status::unavailable("media handler session actor unavailable")
+                    }
+                    EndMeetingFailure::Timeout => {
+                        Status::unavailable("media handler did not decide EndMeeting in time")
+                    }
+                })
+            }
+        }
     }
+}
+
+/// The caller-identity id checks, shared by BOTH `MediaHandlerService` RPCs so the
+/// rule — presence and [`MAX_ID_LENGTH`] — has one home rather than two copies
+/// held together by a comment. Tightening it (byte vs char length, a charset)
+/// then reaches the teardown RPC too, which is exactly where a stale or
+/// misrouted caller's traffic arrives.
+///
+/// Reads no policy-bearing field, so a failure is PRE-boundary and records no
+/// `mh_media_policy_applies_total` sample; the caller records its own
+/// `mh_grpc_requests_total` error, because the `method` label differs.
+///
+/// Returns the `INVALID_ARGUMENT` message, not a `Status`: the caller builds the
+/// status, which keeps this `Result` small (a `Status` is large enough to trip
+/// `clippy::result_large_err`).
+fn validate_caller_ids(meeting_id: &str, mc_id: &str) -> Result<(), String> {
+    for (field, value) in [("meeting_id", meeting_id), ("mc_id", mc_id)] {
+        if value.is_empty() {
+            return Err(format!("{field} is required"));
+        }
+        if value.len() > MAX_ID_LENGTH {
+            return Err(format!("{field} exceeds maximum length"));
+        }
+    }
+    Ok(())
 }
 
 /// Bridge the actor's outcome to the metric's bounded label set.
@@ -489,33 +580,394 @@ mod tests {
     }
 
     // =======================================================================
-    // Story 2 R-20: the `EndMeeting` stub's two load-bearing properties
+    // Story 2 R-20: EndMeeting
     // =======================================================================
 
-    /// Until story-2 task 11 implements release, `EndMeeting` MUST answer
-    /// `UNIMPLEMENTED`, which is the contract's rollback observable that MC
-    /// counts and does not retry. It must not return a false acknowledgement,
-    /// and it must NOT touch `mh_grpc_requests_total`. That recorder
-    /// hard-codes `method="register_meeting"`, so a call here would forge the
-    /// R-26 `RegisterMeeting` receipt signal. Task 11 replaces this test with
-    /// real release assertions.
-    #[tokio::test]
-    async fn end_meeting_stub_is_unimplemented_and_forges_no_register_meeting_receipt() {
-        use common::observability::testing::MetricAssertion;
+    fn end_request(meeting_id: &str, mc_id: &str) -> Request<EndMeetingRequest> {
+        Request::new(EndMeetingRequest {
+            meeting_id: meeting_id.to_string(),
+            mc_id: mc_id.to_string(),
+        })
+    }
 
+    /// Register `meeting_id` under `mc_id` at `generation` with `streams`.
+    fn owned_policy_request(
+        meeting_id: &str,
+        mc_id: &str,
+        generation: u64,
+        streams: Vec<EgressStream>,
+    ) -> Request<RegisterMeetingRequest> {
+        let mut req = register_request(meeting_id, generation, streams);
+        req.mc_id = mc_id.to_string();
+        Request::new(req)
+    }
+
+    /// The matching `mc_id` releases: routes gone, edges back, generation
+    /// forgotten, registration gone, acknowledged — and the teardown counter
+    /// and the method label select `released` / `end_meeting`.
+    #[tokio::test]
+    async fn end_meeting_from_the_registering_mc_releases_everything() {
+        use common::observability::testing::MetricAssertion;
+        // Snapshot BEFORE building the service: the teardown counters are
+        // handles the actor resolves at construction, bound to whichever
+        // recorder is current then. A snapshot taken afterwards would read 0
+        // whatever the actor did.
         let snap = MetricAssertion::snapshot();
-        let (svc, _sm) = make_service();
+        let (svc, sm) = make_service();
+        svc.register_meeting(owned_policy_request(
+            "m-1",
+            "mc-a",
+            5,
+            vec![egress(1, 5, 0, 6), egress(2, 6, 0, 5)],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(sm.routing_snapshot().total_edges(), 2);
+
+        let resp = svc
+            .end_meeting(end_request("m-1", "mc-a"))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(resp.acknowledged);
+        let after = sm.routing_snapshot();
+        assert_eq!(after.total_edges(), 0, "edges return to the budget");
+        assert!(after.routes_for(&MeetingKey::new("m-1")).is_none());
+        assert_eq!(after.generation_for(&MeetingKey::new("m-1")), 0);
+        assert!(!sm.is_meeting_registered("m-1").await);
+        snap.counter("mh_media_meeting_teardowns_total")
+            .with_labels(&[("outcome", "released"), ("key_custody", "operator")])
+            .assert_delta(1);
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "end_meeting"), ("status", "success")])
+            .assert_delta(1);
+        // Exactly the ONE setup registration: the teardown was not also
+        // counted as a `RegisterMeeting` receipt.
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "register_meeting"), ("status", "success")])
+            .assert_delta(1);
+    }
+
+    /// A different `mc_id` is refused with `FAILED_PRECONDITION` — never
+    /// `PERMISSION_DENIED`, never an ack — the status does not echo the owner's
+    /// id, and NOTHING is released.
+    #[tokio::test]
+    async fn end_meeting_from_a_different_mc_is_refused_and_releases_nothing() {
+        use common::observability::testing::MetricAssertion;
+        // Snapshot BEFORE building the service: the teardown counters are
+        // handles the actor resolves at construction, bound to whichever
+        // recorder is current then. A snapshot taken afterwards would read 0
+        // whatever the actor did.
+        let snap = MetricAssertion::snapshot();
+        let (svc, sm) = make_service();
+        svc.register_meeting(owned_policy_request(
+            "m-1",
+            "mc-a",
+            5,
+            vec![egress(1, 5, 0, 6)],
+        ))
+        .await
+        .unwrap();
+        let before = sm.routing_snapshot();
 
         let status = svc
-            .end_meeting(Request::new(EndMeetingRequest {
-                meeting_id: "meeting-1".to_string(),
-                mc_id: "mc-1".to_string(),
-            }))
+            .end_meeting(end_request("m-1", "mc-b"))
             .await
-            .expect_err("the stub must not acknowledge");
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
+            .expect_err("a mismatch must never be acknowledged");
 
-        snap.counter("mh_grpc_requests_total").assert_unobserved();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_ne!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            !status.message().contains("mc-a"),
+            "the status must not disclose the registering mc_id: {}",
+            status.message()
+        );
+        assert!(Arc::ptr_eq(&before, &sm.routing_snapshot()), "no swap");
+        assert!(sm.is_meeting_registered("m-1").await);
+        snap.counter("mh_media_meeting_teardowns_total")
+            .with_labels(&[
+                ("outcome", "rejected_ownership"),
+                ("key_custody", "operator"),
+            ])
+            .assert_delta(1);
+        snap.counter("mh_media_meeting_teardowns_total")
+            .with_labels(&[("outcome", "released"), ("key_custody", "operator")])
+            .assert_delta(0);
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "end_meeting"), ("status", "error")])
+            .assert_delta(1);
+    }
+
+    /// Unknown and already-released meetings are an acknowledged no-op,
+    /// distinguishable from both the release and the reject.
+    #[tokio::test]
+    async fn end_meeting_for_an_unknown_or_released_meeting_is_an_acknowledged_no_op() {
+        use common::observability::testing::MetricAssertion;
+        // Snapshot BEFORE building the service: the teardown counters are
+        // handles the actor resolves at construction, bound to whichever
+        // recorder is current then. A snapshot taken afterwards would read 0
+        // whatever the actor did.
+        let snap = MetricAssertion::snapshot();
+        let (svc, _sm) = make_service();
+        svc.register_meeting(owned_policy_request("m-1", "mc-a", 1, vec![]))
+            .await
+            .unwrap();
+        svc.end_meeting(end_request("m-1", "mc-a")).await.unwrap();
+
+        for meeting in ["never-registered", "m-1"] {
+            let resp = svc
+                .end_meeting(end_request(meeting, "mc-a"))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(resp.acknowledged, "{meeting}: must acknowledge");
+        }
+        snap.counter("mh_media_meeting_teardowns_total")
+            .with_labels(&[("outcome", "unknown_meeting"), ("key_custody", "operator")])
+            .assert_delta(2);
+        // The setup's one real release, and no more: the two no-ops did not
+        // count as releases.
+        snap.counter("mh_media_meeting_teardowns_total")
+            .with_labels(&[("outcome", "released"), ("key_custody", "operator")])
+            .assert_delta(1);
+        snap.counter("mh_media_meeting_teardowns_total")
+            .with_labels(&[
+                ("outcome", "rejected_ownership"),
+                ("key_custody", "operator"),
+            ])
+            .assert_delta(0);
+    }
+
+    /// The MC-restart / failover case: a new `mc_id` re-registers at a STALE
+    /// generation (refused as stale — no apply), yet that registration still
+    /// rebinds ownership, so the new MC can release. If the rebind were gated
+    /// on the generation outcome the meeting would be stranded forever.
+    #[tokio::test]
+    async fn a_stale_generation_reregistration_still_rebinds_ownership_for_release() {
+        let (svc, sm) = make_service();
+        svc.register_meeting(owned_policy_request(
+            "m-1",
+            "mc-old",
+            9,
+            vec![egress(1, 5, 0, 6)],
+        ))
+        .await
+        .unwrap();
+
+        let stale = svc
+            .register_meeting(owned_policy_request(
+                "m-1",
+                "mc-new",
+                1,
+                vec![egress(1, 5, 0, 6)],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            stale.applied_generation, 9,
+            "the stale policy did not apply"
+        );
+
+        assert_eq!(
+            svc.end_meeting(end_request("m-1", "mc-old"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition,
+            "the previous owner no longer owns it"
+        );
+        assert!(
+            svc.end_meeting(end_request("m-1", "mc-new"))
+                .await
+                .unwrap()
+                .into_inner()
+                .acknowledged
+        );
+        assert!(!sm.is_meeting_registered("m-1").await);
+    }
+
+    /// Release forgets the applied generation, so a same-id meeting re-created
+    /// at generation 1 is a FRESH INSTALL — exactly as on a fresh pod — not a
+    /// `rejected_stale` blackhole.
+    #[tokio::test]
+    async fn release_then_reregister_at_generation_one_installs_fresh() {
+        let (svc, _sm) = make_service();
+        svc.register_meeting(owned_policy_request(
+            "m-1",
+            "mc-a",
+            7,
+            vec![egress(1, 5, 0, 6)],
+        ))
+        .await
+        .unwrap();
+        svc.end_meeting(end_request("m-1", "mc-a")).await.unwrap();
+
+        let resp = svc
+            .register_meeting(owned_policy_request(
+                "m-1",
+                "mc-a",
+                1,
+                vec![egress(1, 5, 0, 6)],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.applied_generation, 1);
+    }
+
+    /// Malformed ids are refused before the actor decides anything: an
+    /// `end_meeting` error, and NO teardown outcome.
+    #[tokio::test]
+    async fn end_meeting_rejects_malformed_ids_without_a_teardown_outcome() {
+        use common::observability::testing::MetricAssertion;
+        // Snapshot BEFORE building the service: the teardown counters are
+        // handles the actor resolves at construction, bound to whichever
+        // recorder is current then. A snapshot taken afterwards would read 0
+        // whatever the actor did.
+        let snap = MetricAssertion::snapshot();
+        let (svc, _sm) = make_service();
+        let long = "x".repeat(MAX_ID_LENGTH + 1);
+        for (meeting, mc) in [
+            ("", "mc"),
+            ("m", ""),
+            (long.as_str(), "mc"),
+            ("m", long.as_str()),
+        ] {
+            assert_eq!(
+                svc.end_meeting(end_request(meeting, mc))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "end_meeting"), ("status", "error")])
+            .assert_delta(4);
+        // POSITIVE CONTROL for the zeros below: one well-formed call on the
+        // same service DOES reach the actor and IS counted, so the zeros are
+        // not an artefact of handles bound to no recorder.
+        svc.end_meeting(end_request("unknown", "mc")).await.unwrap();
+        for outcome in MeetingTeardownOutcome::ALL {
+            let expected = u64::from(outcome == MeetingTeardownOutcome::UnknownMeeting);
+            snap.counter("mh_media_meeting_teardowns_total")
+                .with_labels(&[("outcome", outcome.as_label()), ("key_custody", "operator")])
+                .assert_delta(expected);
+        }
+    }
+
+    /// A wedged actor yields UNAVAILABLE within the bound, never a hung RPC,
+    /// and records no teardown outcome (nothing was decided). Deterministic
+    /// because the actor is built and never spawned.
+    #[tokio::test]
+    async fn end_meeting_against_an_unreachable_actor_is_bounded_unavailable() {
+        let limits = PolicyLimits {
+            policy_apply_timeout_ms: 5,
+            ..PolicyLimits::for_tests()
+        };
+        let (svc, _sm, actor) = make_service_with_unspawned_actor(limits);
+        let status = svc
+            .end_meeting(end_request("m-1", "mc-a"))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        drop(actor);
+    }
+
+    // =======================================================================
+    // Story 2 R-21: the registered-meeting cap
+    // =======================================================================
+
+    /// A NEW meeting past the cap is refused loudly (`RESOURCE_EXHAUSTED`),
+    /// counted under exactly ONE policy outcome (`rejected_meeting_cap`) and a
+    /// `register_meeting` ERROR — not the bottom `success`, and not a second
+    /// outcome — and nothing is upserted.
+    #[tokio::test]
+    async fn a_new_meeting_past_the_cap_is_refused_and_counted_once() {
+        use common::observability::testing::MetricAssertion;
+        let (svc, sm) = make_service_with_limits(PolicyLimits {
+            max_registered_meetings: 2,
+            ..PolicyLimits::for_tests()
+        });
+        for meeting in ["m-1", "m-2"] {
+            svc.register_meeting(owned_policy_request(meeting, "mc-a", 1, vec![]))
+                .await
+                .unwrap();
+        }
+
+        let snap = MetricAssertion::snapshot();
+        let status = svc
+            .register_meeting(owned_policy_request("m-3", "mc-a", 1, vec![]))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(!sm.is_meeting_registered("m-3").await);
+        snap.counter("mh_media_policy_applies_total")
+            .with_labels(&[
+                ("outcome", "rejected_meeting_cap"),
+                ("key_custody", "operator"),
+            ])
+            .assert_delta(1);
+        for other in PolicyApplyOutcome::ALL {
+            if other != PolicyApplyOutcome::RejectedMeetingCap {
+                snap.counter("mh_media_policy_applies_total")
+                    .with_labels(&[("outcome", other.as_label()), ("key_custody", "operator")])
+                    .assert_delta(0);
+            }
+        }
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "register_meeting"), ("status", "error")])
+            .assert_delta(1);
+        snap.counter("mh_grpc_requests_total")
+            .with_labels(&[("method", "register_meeting"), ("status", "success")])
+            .assert_delta(0);
+    }
+
+    /// At the cap, a re-registration of an ALREADY-HELD meeting is admitted:
+    /// refusing it would stop a full handler taking policy for meetings it is
+    /// already serving. And a release frees a slot.
+    #[tokio::test]
+    async fn at_the_cap_held_meetings_still_reassert_and_release_frees_a_slot() {
+        let (svc, _sm) = make_service_with_limits(PolicyLimits {
+            max_registered_meetings: 1,
+            ..PolicyLimits::for_tests()
+        });
+        svc.register_meeting(owned_policy_request(
+            "m-1",
+            "mc-a",
+            1,
+            vec![egress(1, 5, 0, 6)],
+        ))
+        .await
+        .unwrap();
+
+        let reassert = svc
+            .register_meeting(owned_policy_request(
+                "m-1",
+                "mc-a",
+                2,
+                vec![egress(1, 5, 0, 6)],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reassert.applied_generation, 2);
+
+        assert_eq!(
+            svc.register_meeting(owned_policy_request("m-2", "mc-a", 1, vec![]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        svc.end_meeting(end_request("m-1", "mc-a")).await.unwrap();
+        assert!(svc
+            .register_meeting(owned_policy_request("m-2", "mc-a", 1, vec![]))
+            .await
+            .is_ok());
     }
 
     // =======================================================================
@@ -712,6 +1164,7 @@ mod tests {
             meeting_id: "m-1".to_string(),
             participant_id: "user-1".to_string(),
             connected_at: Instant::now(),
+            close: tokio_util::sync::CancellationToken::new(),
         })
         .await;
 
@@ -1401,6 +1854,7 @@ mod tests {
                 meeting_id: "meeting-1".to_string(),
                 participant_id: user.to_string(),
                 connected_at: Instant::now(),
+                close: tokio_util::sync::CancellationToken::new(),
             })
             .await;
         }

@@ -438,11 +438,11 @@ message ComprehensiveHeartbeatRequest {
 //
 // The MH gRPC `method` metric label values are DERIVED from this service's
 // method names; this block names the method set, and the label vocabulary's
-// own home is `crates/mh-service/src/observability/metrics.rs`'s
-// `GRPC_METHOD_*` consts (docs/observability/label-taxonomy.md). Enforcement
-// owner for `end_meeting` emission: the MH EndMeeting task -- until it lands
-// MH answers `EndMeeting` UNIMPLEMENTED and records no `end_meeting` series, so
-// an empty result for that value is expected, not a scrape fault.
+// own home is `crates/mh-service/src/observability/metrics.rs`'s `GrpcMethod`
+// enum (docs/observability/label-taxonomy.md). MH implements `EndMeeting`, and
+// the `end_meeting` value is emitted, zero-initialised and PRESENT AT 0 from
+// process start -- so a FLAT-ZERO count, never an absent series, is what "no
+// MC is ending meetings on this handler" looks like.
 service MediaHandlerService {
   rpc RegisterMeeting(RegisterMeetingRequest) returns (RegisterMeetingResponse);
   rpc EndMeeting(EndMeetingRequest) returns (EndMeetingResponse);
@@ -792,7 +792,8 @@ message RegisterMeetingResponse {
 // story 4 adds a periodic re-assert the same race becomes routine; the fence
 // that closes both is recorded in docs/TODO.md §Media Path Obligations.
 //
-// SEMANTICS (enforcement owner: the MH EndMeeting task):
+// SEMANTICS (enforced by `MhMediaService::end_meeting` and the session actor's
+// release in crates/mh-service):
 //   - UNKNOWN OR ALREADY-RELEASED `meeting_id` -> idempotent no-op,
 //     `acknowledged: true`. This includes a handler in MC's assigned set that
 //     never received a registration: MC calls EVERY handler in the set, not

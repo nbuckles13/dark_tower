@@ -14,11 +14,13 @@
 //! *which* outcome to record is asserted by the handler's own tests.
 //!
 //! Bounded label values per `docs/observability/metrics/mh-service.md`:
-//! `outcome` ∈ {applied, rejected_stale, no_generation, rejected_invalid,
-//! apply_failed, rejected_stream_ceiling}, `key_custody` = `operator` (single
-//! value). `rejected_stream_ceiling` (story 2 task 8) is driven through the real
-//! session actor in `stream_admission_integration.rs` and the handler tests in
-//! `src/grpc/mh_service.rs`; here it is covered by the `ALL`-iterating tests.
+//! `outcome` is the `PolicyApplyOutcome::ALL` set (the catalog lists it),
+//! `key_custody` = `operator` (single value). `rejected_stream_ceiling` (story 2
+//! task 8) is driven through the real session actor in
+//! `stream_admission_integration.rs`, and `rejected_meeting_cap` (story 2 task
+//! 11) over real gRPC in `end_meeting_integration.rs`; both are also covered by
+//! the handler tests in `src/grpc/mh_service.rs`, and here by the
+//! `ALL`-iterating tests.
 
 use common::observability::testing::MetricAssertion;
 use mh_service::observability::metrics::{record_media_policy_apply, PolicyApplyOutcome};
@@ -26,7 +28,7 @@ use mh_service::observability::metrics::{record_media_policy_apply, PolicyApplyO
 /// Every `outcome` value lands in its own series, and adjacency holds.
 ///
 /// The adjacency half is the label-swap catcher: recording `Applied` must not
-/// increment any of the other four. Without it, an emitter that ignored its
+/// increment any of the others. Without it, an emitter that ignored its
 /// argument and always wrote one value would pass a per-value existence check.
 #[test]
 fn each_outcome_emits_its_own_series() {

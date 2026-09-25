@@ -174,8 +174,10 @@ async fn valid_meeting_jwt_connection_accepted_and_tracked() {
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
     let token = mint_meeting_token(&suite.jwks.keypair, "meeting-wt-valid", "user-valid");
@@ -412,8 +414,10 @@ async fn wrong_token_type_guest_rejected_on_wt_accept_path() {
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
     let token = mint_wrong_token_type_token(&suite.jwks.keypair, "meeting-wt-guest");
@@ -517,8 +521,10 @@ async fn provisional_connection_survives_when_register_meeting_arrives_within_wi
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
     });
 
     // Wait well past the provisional timeout. The handler must still be
@@ -570,8 +576,10 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
                 mc_grpc_endpoint: format!("http://{}", mc.addr),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let token = mint_meeting_token(&suite.jwks.keypair, "meeting-wt-notify", "user-notify");
     let (conn, mut send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;

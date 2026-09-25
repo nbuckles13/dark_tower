@@ -551,6 +551,11 @@ worst_reason_for_status() {
 # Layer lifecycle (dry-reviewer §1 + observability O2)
 # -----------------------------------------------------------------------------
 
+# Cleanup registry for the layer's EXIT path (see layer_register_cleanup). Declared at FILE
+# scope so a `set -u` reference is always defined; initialised (emptied) again in
+# layer_lifecycle_begin so a stale array from an earlier sourcing can never drain here.
+__LAYER_CLEANUPS=()
+
 # Begin layer lifecycle: capture start time, init STATUS collector, install EXIT trap.
 #
 # CRITICAL (observability O2): the EXIT trap fires on `set -e` abort or signal,
@@ -573,12 +578,77 @@ layer_lifecycle_begin() {
   # the human-readable stderr cause, never the exit code.
   __LAYER_REASONS=()
   __LAYER_RESULT="UNKNOWN"
+  __LAYER_CLEANUPS=()
   # Export DEVLOOP_LAYER for child processes (dry-reviewer F3).
   # _get_base_ref.sh reads this to namespace the per-layer changed-files cache,
   # avoiding the duplicated `DEVLOOP_LAYER=N` per-line prefix on every layer-script
   # subprocess invocation.
   export DEVLOOP_LAYER="$1"
   trap '__layer_lifecycle_end' EXIT
+}
+
+# Register a cleanup to run when the layer exits — on EVERY exit path, including a
+# `set -e` abort and a precondition_fail, because it runs from the lifecycle's own EXIT trap.
+#
+# This is the ONLY sanctioned way for a layer to clean up on exit. A layer must never install
+# its own `trap`: bash REPLACES an EXIT trap rather than chaining it, so a second trap would
+# clobber __layer_lifecycle_end — the handler that recomputes the layer's exit code from the
+# aggregated status — and the layer would report green over real failures
+# (_layer_skeleton.test.sh asserts no layer script contains `trap`).
+#
+# Takes a shell FUNCTION NAME, not a command string: nothing is eval'd, so what a cleanup
+# captures (PIDs, ports) is explicit in the function body rather than a quoting question at
+# every call site.
+#
+# Calling this before layer_lifecycle_begin is an ERROR, loudly: no trap exists yet to drain
+# the registry, and begin() empties it, so a silent registration would simply never run.
+#
+# Args: $1=function name (must already be defined)
+# Returns: 0 registered; 1 not in a lifecycle, or not a defined function
+layer_register_cleanup() {
+  local fn="${1:-}"
+  if [[ -z "${__LAYER_NUM:-}" ]]; then
+    printf 'layer_register_cleanup: called before layer_lifecycle_begin; cleanup %s would never run\n' \
+      "${fn:-<none>}" >&2
+    return 1
+  fi
+  if [[ -z "$fn" ]] || ! declare -F "$fn" >/dev/null; then
+    printf 'layer_register_cleanup: %s is not a defined shell function\n' "${fn:-<none>}" >&2
+    return 1
+  fi
+  __LAYER_CLEANUPS+=("$fn")
+}
+
+# Run every registered cleanup, in registration order, failure-tolerantly.
+#
+# Invariants __layer_lifecycle_end depends on, each deliberate:
+# - A FAILING cleanup never aborts the handler: it runs as an `if` condition, where `set -e`
+#   does not apply, and every cleanup runs even when an earlier one failed (a `kill` on a
+#   port-forward that already died with its pod is the ordinary case).
+# - Each runs in a SUBSHELL, so a cleanup cannot mutate __LAYER_STATUSES / __LAYER_REASONS /
+#   __LAYER_RESULT, which the aggregation below reads.
+# - All cleanup output goes to STDERR: layer-all.sh and verify-completion.sh parse the stdout
+#   STATUS= line, and cleanup chatter there is a parser hazard.
+# Returns: 0 always
+__run_layer_cleanups() {
+  local fn crc
+  # Guarded like __LAYER_STATUSES below: on bash 4.0-4.3 (which the version tripwire
+  # admits) expanding an EMPTY array under `set -u` is an "unbound variable" error, and
+  # here it would fire BEFORE the STATUS=/LAYER= emission on every layer that registered
+  # nothing — no STATUS line, no lane.
+  if (( ${#__LAYER_CLEANUPS[@]} == 0 )); then
+    return 0
+  fi
+  for fn in "${__LAYER_CLEANUPS[@]}"; do
+    if ( "$fn" ) 1>&2; then
+      :
+    else
+      crc=$?
+      printf 'LAYER=%s CLEANUP=%s RC=%s (failed; remaining cleanups still run)\n' \
+        "${__LAYER_NUM:-?}" "$fn" "$crc" >&2
+    fi
+  done
+  return 0
 }
 
 # Per-step wall-clock for multi-phase layers (Layer 7's cluster bring-up phases). The layer
@@ -629,6 +699,8 @@ tee_collect_statuses() {
 # the answer is just "summary of children". Single hyphen, no §6 collision.
 __layer_lifecycle_end() {
   local end duration result reason worst_reason rc i pairs
+  # Cleanups FIRST, before any STATUS=/LAYER= emission (see __run_layer_cleanups).
+  __run_layer_cleanups
   end=$(date +%s)
   duration=$((end - __LAYER_START))
   if [[ ${#__LAYER_STATUSES[@]} -eq 0 ]]; then

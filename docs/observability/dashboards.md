@@ -256,7 +256,9 @@ The media-path **triage** board: where an operator goes to answer *why*, after
 | Egress Delivery Ratio | What fraction of egress attempts the transport accepted |
 | Egress Stream Admission Decisions by Outcome | Is MH refusing new streams for capacity, and how often (story 2 R-19) |
 | Stream Admission Rejection Ratio vs Threshold | Is the windowed refusal share above the configured threshold — the same bare gauge-to-gauge comparison the exhaustion alert makes |
-| Installed Egress Streams vs Stream Ceiling | How close each handler is to its stream ceiling, and whether that ceiling is still the unsized placeholder (below the advisory recommended minimum). Until story 2 task 11's teardown, installed streams stay high after an ABNORMAL meeting end (the ratchet) and GC stops placing on a handler at its ceiling; the interim recovery is `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower` |
+| Installed Egress Streams vs Stream Ceiling | How close each handler is to its stream ceiling, and whether that ceiling is still the unsized placeholder (below the advisory recommended minimum). The edge-limit backstop is plotted beside them for headroom only: saturation is against the ceiling, never the limit. Streams are released when a meeting's MC calls `EndMeeting` (MC calls it from story 2 task 12); installed streams rising with pod uptime rather than load are meetings nobody ended — recovery under "The ratchet" in `docs/observability/metrics/mh-service.md` |
+| Registered Meetings vs Registration Cap | How many meetings each handler holds registered against `MH_MAX_REGISTERED_MEETINGS` (story 2 R-21) — registrations held, not meetings in progress |
+| Meeting Teardowns by Outcome | Are meetings being released, is MC ending meetings this handler never held, and is any MC ending a meeting it does not own (story 2 R-20) |
 | Egress Budget (bytes/s) | What budget the ceiling is derived from, in bytes (the key is in bits) |
 
 Two conventions this board depends on, both easy to break by well-meaning edit:

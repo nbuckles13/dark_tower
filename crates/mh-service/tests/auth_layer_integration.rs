@@ -13,7 +13,8 @@
 //!
 //! Kept: one proof per outcome class (success, UNAUTHENTICATED,
 //! PERMISSION_DENIED) plus two security-critical attack vectors and two
-//! non-negotiable Layer 2 routing cases.
+//! non-negotiable Layer 2 routing cases, and the same gate on the `EndMeeting`
+//! path (story 2 R-20), which inherits it through the service's path prefix.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -26,7 +27,7 @@ use common::jwt::ServiceClaims;
 use common::observability::testing::MetricAssertion;
 use mh_service::session::SessionManagerHandle;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::dark_tower::internal::v1::RegisterMeetingRequest;
+use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
@@ -346,5 +347,62 @@ async fn alg_hs256_key_confusion_attempt_returns_unauthenticated() {
         err.code(),
         Code::Unauthenticated,
         "HS256 with JWKS pubkey as secret must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// EndMeeting inherits the gate (story 2 R-20)
+// ---------------------------------------------------------------------------
+
+fn end_meeting_with_bearer(token: Option<&str>) -> Request<EndMeetingRequest> {
+    let mut request = Request::new(EndMeetingRequest {
+        meeting_id: "meeting-auth-end".to_string(),
+        mc_id: "mc-auth-end".to_string(),
+    });
+    if let Some(t) = token {
+        let value: MetadataValue<_> = format!("Bearer {t}")
+            .parse()
+            .expect("authorization header parses");
+        request.metadata_mut().insert("authorization", value);
+    }
+    request
+}
+
+/// `EndMeeting` sits under the same `MediaHandlerService` path prefix, so it
+/// gets BOTH layers with no auth code of its own: no bearer is
+/// UNAUTHENTICATED, a non-MC caller is PERMISSION_DENIED, and a valid MC token
+/// reaches the handler.
+///
+/// The PERMISSION_DENIED case is also the reason the handler's own `mc_id`
+/// mismatch answers FAILED_PRECONDITION: this is what a REAL authorization
+/// rejection looks like on this path, and a self-asserted field must not
+/// produce a status that reads as one.
+#[tokio::test]
+async fn end_meeting_path_inherits_both_auth_layers() {
+    let rig = AuthRig::start().await;
+    let mut client = connect_client(&rig.grpc).await;
+
+    let err = client
+        .end_meeting(end_meeting_with_bearer(None))
+        .await
+        .expect_err("missing bearer must be rejected at the layer");
+    assert_eq!(err.code(), Code::Unauthenticated);
+
+    let gc_token = mint_wrong_service_type_token(&rig.jwks.keypair, "global-controller");
+    let err = client
+        .end_meeting(end_meeting_with_bearer(Some(&gc_token)))
+        .await
+        .expect_err("a GC-typed token must not reach EndMeeting");
+    assert_eq!(err.code(), Code::PermissionDenied);
+
+    let mc_token = mint_valid_mc_token(&rig.jwks.keypair);
+    let acked = client
+        .end_meeting(end_meeting_with_bearer(Some(&mc_token)))
+        .await
+        .expect("a valid MC token reaches the handler")
+        .into_inner();
+    assert!(
+        acked.acknowledged,
+        "an unknown meeting is an acknowledged no-op once past the gate"
     );
 }

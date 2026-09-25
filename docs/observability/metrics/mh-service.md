@@ -220,12 +220,12 @@ increase(mh_register_meeting_timeouts_total[$__rate_interval])
 - **Type**: Counter
 - **Description**: Total incoming gRPC requests from MC. Also serves as R-26's `RegisterMeeting` receipt counter when filtered by `method="register_meeting"`.
 - **Labels**:
-  - `method`: RPC method. Values are derived from `MediaHandlerService`'s method names: `proto/dark_tower/internal/v1/internal.proto`'s service block names the method set, and the label vocabulary's home is the `GRPC_METHOD_*` consts in `crates/mh-service/src/observability/metrics.rs`. ADR-0036 §8: *forwarding policy* gains fields rather than sibling RPCs, but meeting teardown is its own RPC, `EndMeeting` (story 2 R-20). **Only `register_meeting` is emitted today.** `end_meeting` is **not emitted yet**: MH answers `EndMeeting` `UNIMPLEMENTED` and records nothing for it until story-2 task 11. **An empty result for `method="end_meeting"` today is expected, not a broken exporter.** The `register`, `route_media` and `stream_telemetry` values this entry previously listed were retired with the 2026-09-01 `internal.proto` reshape and **can never appear again**; that file's tombstone block forbids resurrecting the names, because a gRPC method name is a wire path component.
-  - `status`: Outcome (`success`, `error`)
-- **Cardinality**: Low (2 today = 1 emitting method x 2 statuses; 4 = 2 emitting methods x 2 statuses once `end_meeting` emits)
+  - `method`: RPC method, one value per RPC on `MediaHandlerService`: `register_meeting` and `end_meeting`. `proto/dark_tower/internal/v1/internal.proto`'s service block is the source of truth for the set; the label vocabulary's home is the `GrpcMethod` enum in `crates/mh-service/src/observability/metrics.rs`, whose written-out `ALL` length makes a third RPC a compile error. ADR-0036 §8: *forwarding policy* gains fields rather than sibling RPCs, and meeting teardown is its own RPC, `EndMeeting` (story 2 R-20). **Both values are emitted and both are zero-initialised with both statuses**, so `method="end_meeting"` is present at 0 from process start: a flat zero means no MC is ending meetings on this handler, never a missing exporter. The `register`, `route_media` and `stream_telemetry` values this entry previously listed were retired with the 2026-09-01 `internal.proto` reshape and **can never appear again**; that file's tombstone block forbids resurrecting the names, because a gRPC method name is a wire path component.
+  - `status`: Outcome (`success`, `error`). For `end_meeting`, `error` includes the `mc_id`-mismatch reject (`FAILED_PRECONDITION`) — see `mh_media_meeting_teardowns_total{outcome="rejected_ownership"}` for that cause alone.
+- **Cardinality**: Low (4 = 2 methods x 2 statuses)
 - **Usage**: Monitor MC→MH traffic volume and error rate.
 
-The `method="register_meeting"` selector in runbook queries and dashboard panels is now **load-bearing**: once `end_meeting` emits it separates RegisterMeeting receipts (R-26) from teardowns. An unmatched selector yields an *empty series* rather than an error, so a query that drops it would silently mix the two. `record_grpc_request` currently takes no `method` parameter and so can emit only `register_meeting`. That is deliberate until story-2 task 11: the `EndMeeting` stub must not call it, because that would count every teardown as a RegisterMeeting receipt. Task 11 restores the parameter with a bounded vocabulary, zero-initialises `end_meeting` in the same commit, and re-tightens this entry to the emitted two-member set.
+The `method="register_meeting"` selector in runbook queries and dashboard panels is **load-bearing**: it separates RegisterMeeting receipts (R-26) from teardowns. An unmatched selector yields an *empty series* rather than an error, so a query that drops it silently mixes the two. `record_grpc_request` takes the method as a `GrpcMethod`, never a free string, so a teardown cannot be counted as a RegisterMeeting receipt.
 
 **Scope note.** This counter covers the *transport* outcome — did the RPC succeed. It does **not** tell you whether forwarding policy took effect; that is `mh_media_policy_applies_total` below, and ADR-0036 §8 is explicit that `accepted == true` means only "received and parsed".
 
@@ -241,8 +241,13 @@ increase(mh_grpc_requests_total{method="register_meeting"}[$__rate_interval])
 # {status="error"} series matches only itself, the {status="success"} series
 # has no partner and is dropped, and the panel reads a flat 100% whenever any
 # error exists and "No data" when none does.
-sum(rate(mh_grpc_requests_total{status="error"}[5m]))
-  / sum(rate(mh_grpc_requests_total[5m]))
+#
+# `method="register_meeting"` on BOTH sides is load-bearing too: without it this
+# ratio blends RegisterMeeting with EndMeeting, and an `mc_id`-mismatch reject
+# storm (`end_meeting`, status="error") would move a number that reads as
+# MC->MH registration health.
+sum(rate(mh_grpc_requests_total{method="register_meeting",status="error"}[5m]))
+  / sum(rate(mh_grpc_requests_total{method="register_meeting"}[5m]))
 ```
 
 ---
@@ -274,6 +279,7 @@ because story task 21's media metrics need a section to extend.
 | `rejected_invalid` | The policy failed structural validation (duplicate `egress_stream_id`, duplicate subscriber slot, malformed identifier, count bound, unspecified or heterogeneous transport mode). | MC sent bad policy; the remedy is upstream in MC's assignment computation. |
 | `apply_failed` | MH could not install it: config-apply mailbox full, apply timed out, session actor gone, or the aggregate egress-edge bound. **The prior generation stays live.** | MH-side. Read the `reason` field on the accompanying `mh.session.policy` WARN log line to tell the causes apart — it is deliberately not a label. |
 | `rejected_stream_ceiling` | Installing would take this handler's installed egress streams above its derived egress **stream** ceiling (story 2 R-19) — a **capacity** refusal. **The prior generation stays live.** | Capacity, not an MC bug and not an MH fault: see [Egress Admission Metrics](#egress-admission-metrics). The same event is counted on `mh_media_stream_admission_total{outcome="rejected_stream_ceiling"}`. Deliberately NOT folded into `apply_failed`: under a small placeholder budget it is expected, and the deploy bake gate in `docs/runbooks/mh-deployment.md` alerts on `apply_failed`. |
+| `rejected_meeting_cap` | A NEW meeting id would take this handler past `MH_MAX_REGISTERED_MEETINGS` (story 2 R-21) — a **resource-exhaustion** refusal, never capacity. Nothing upserted, promoted or applied; the RPC answers `RESOURCE_EXHAUSTED`. A re-registration of an already-held meeting is never refused. | Which meetings are held and why they were not released: compare `mh_media_registered_meetings` with `mh_media_registered_meetings_limit`, then tell leaked registrations (an `EndMeeting` that never arrived — occupancy rising with uptime) from an empty-meeting flood or genuine load. Not `rejected_stream_ceiling` (capacity) and not `apply_failed` (MH internals). MC sees only a generic push failure, so this outcome is the discriminator. See the meeting-cap arm in `docs/runbooks/mh-incident-response.md`. |
 
 The idempotent re-assert counts as `applied`, not `rejected_stale`: §8's cadence re-asserts every meeting every ≤10 s in perfect health, so counting it as a rejection would drive that series monotonically upward in the steady state and make any alert on it dead on arrival.
 
@@ -303,7 +309,7 @@ sum(rate(mh_media_policy_applies_total{outcome=~"rejected_stale|rejected_invalid
   / sum(rate(mh_media_policy_applies_total[5m]))
 ```
 
-The denominator is meaningful because the counter increments on every post-boundary path: `sum(mh_media_policy_applies_total)` is "registrations whose policy MH considered". Pre-boundary rejects (a malformed `mc_grpc_endpoint`, an over-length `mc_id`) are **not** counted here — they land on `mh_grpc_requests_total{status="error"}` alone, because "MC's assignment computation produced a policy MH will not apply" and "this caller's endpoint is malformed" have different owners and different remedies.
+The denominator is meaningful because the counter increments on every post-boundary path: `sum(mh_media_policy_applies_total)` is "registrations whose policy MH considered". Pre-boundary rejects (a malformed `mc_grpc_endpoint`, an over-length `mc_id`) are **not** counted here — they land on `mh_grpc_requests_total{method="register_meeting",status="error"}` alone, because "MC's assignment computation produced a policy MH will not apply" and "this caller's endpoint is malformed" have different owners and different remedies.
 
 No alert rule ships with this metric. A useful threshold depends on MC's re-assert cadence, which task 13 explicitly deferred to the handler-restart story; alerting is story task 21's scope.
 
@@ -315,13 +321,13 @@ Story 2 R-19, R-23; ADR-0036 §11 "Admission control is keyed on egress bandwidt
 
 **Bits on the key, bytes on the gauge — one deliberate conversion.** The config keys are bits per second. MH converts ONCE at load, upstream of the enforcement/gauge fork (budget floored, costs ceiled — both fail closed), so `mh_media_egress_budget_bytes_per_second` is in bytes (ADR-0011's throughput rule) while `MH_EGRESS_BUDGET_BPS` is in bits. A factor of 8 between them is correct.
 
-**One unit, three series, two controls.** `mh_media_egress_edges` (measured), `mh_media_egress_stream_ceiling` (capacity) and, from story 2 task 11, `mh_media_egress_edges_limit` (resource guard, `MH_MAX_TOTAL_EGRESS_EDGES`) all count the same thing: aggregate installed egress streams on this pod. The two bounds are **different controls with different remedies** — capacity (raise `MH_EGRESS_BUDGET_BPS`) versus resource-exhaustion guard (`MH_MAX_TOTAL_EGRESS_EDGES`) — not a duplicate. MH refuses to boot when the ceiling exceeds the edge bound, which is what makes the **ceiling** the bound that binds in practice: a saturation panel compares `mh_media_egress_edges` against `mh_media_egress_stream_ceiling`. `_limit` lands in task 11; no saturation alert may be written against it before then.
+**One unit, three series, two controls.** `mh_media_egress_edges` (measured), `mh_media_egress_stream_ceiling` (capacity) and `mh_media_egress_edges_limit` (resource guard, `MH_MAX_TOTAL_EGRESS_EDGES`) all count the same thing: aggregate installed egress streams on this pod. The two bounds are **different controls with different remedies** — capacity (raise `MH_EGRESS_BUDGET_BPS`) versus resource-exhaustion guard (`MH_MAX_TOTAL_EGRESS_EDGES`) — not a duplicate. MH refuses to boot when the ceiling exceeds the edge bound, which is what makes the **ceiling** the bound that binds in practice: a saturation panel compares `mh_media_egress_edges` against `mh_media_egress_stream_ceiling`, **never against `_limit`**, which is plotted beside it only so an operator can see the backstop's headroom.
 
-**Identity with `mh_media_policy_applies_total`.** One admission decision is made per **generation-advancing** policy apply the session actor processes. So `sum(mh_media_stream_admission_total)` is the generation-advancing, actor-processed subset of `sum(mh_media_policy_applies_total)`. The difference is: stale applies (`rejected_stale` only), equal-generation re-asserts (`applied` only), `no_generation`, `rejected_invalid`, and failures before the actor saw the policy (mailbox full, actor gone). An apply-timeout can count an admission decision AND `apply_failed`. A ceiling rejection increments `rejected_stream_ceiling` on **both** counters — the same event under different denominators. **Do not sum them.**
+**Identity with `mh_media_policy_applies_total`.** One admission decision is made per **generation-advancing** policy apply the session actor processes. So `sum(mh_media_stream_admission_total)` is the generation-advancing, actor-processed subset of `sum(mh_media_policy_applies_total)`. The difference is: stale applies (`rejected_stale` only), equal-generation re-asserts (`applied` only), `no_generation`, `rejected_invalid`, `rejected_meeting_cap` (the registration cap is checked on the REGISTER path, before config-apply admission ever runs, so a cap refusal is a policy outcome with no admission decision), and failures before the actor saw the policy (mailbox full, actor gone). An apply-timeout can count an admission decision AND `apply_failed`. A ceiling rejection increments `rejected_stream_ceiling` on **both** counters — the same event under different denominators. **Do not sum them.**
 
-**The ratchet, until story 2 task 11.** Ordinary departures re-push shrinking policies and release streams. A meeting that ends ABNORMALLY (MC crash, lost push) keeps its streams until the pod restarts, and since this task `current_streams` in MH's GC load report is the same value — so a handler at its ceiling drops out of GC placement, and when every handler is there the first join to a NEW meeting fails with 503. `mh_media_egress_edges` sitting at the ceiling with no live meeting behind it is that state. Interim recovery: `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`.
+**The ratchet — now only for meetings nobody ends.** Ordinary departures re-push shrinking policies and release streams, and a meeting whose MC calls `EndMeeting` (story 2 R-20) releases all of its streams and its registration (`mh_media_meeting_teardowns_total{outcome="released"}`, with `mh_media_egress_edges` and `mh_media_registered_meetings` falling). MC begins calling `EndMeeting` in story 2 task 12. Until then, and permanently for any meeting whose MC dies without calling it, the meeting keeps its streams until the pod restarts. `current_streams` in MH's GC load report is the same value — so a handler at its ceiling drops out of GC placement, and when every handler is there the first join to a NEW meeting fails with 503. `mh_media_egress_edges` sitting at the ceiling with no live meeting behind it, and rising with pod uptime rather than with load, is that state. Recovery: `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`; healthy meetings reinstall on their MC's next push.
 
-Every series below carries `key_custody=operator` and NO meeting, participant or stream identity (ADR-0036 §11). All are present from process start: the counter is zero-initialised per outcome, the four static gauges are published right after the recorder installs, and the ratio and installed-streams gauges are published when the session actor is built.
+Every series below carries `key_custody=operator` and NO meeting, participant or stream identity (ADR-0036 §11). All are present from process start: the counter is zero-initialised per outcome, the six static gauges (four admission-chain values plus the two resource-guard `_limit`s) are published right after the recorder installs, and the ratio, installed-streams and registered-meetings gauges are published when the session actor is built.
 
 ### `mh_media_stream_admission_total`
 - **Type**: Counter
@@ -389,7 +395,56 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Description**: Installed egress streams across every meeting on this handler — the same `total_edges()` MH reports to GC as `current_streams`.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: Saturation against `mh_media_egress_stream_ceiling` (same unit). Published as 0 at startup and then on every install. It does not decay: it falls when a live meeting re-asserts a smaller policy, and stays high after an abnormal meeting end — truthfully, because those streams really are still held (the ratchet above). The name is fixed by the story; `mh_media_egress_edges_limit` and `mh_media_registered_meetings` follow in story 2 task 11.
+- **Usage**: Saturation against `mh_media_egress_stream_ceiling` (same unit). Published as 0 at startup and then on every install and every release. It falls when a live meeting re-asserts a smaller policy and when `EndMeeting` releases a meeting; it stays high after a meeting that ends with no `EndMeeting` — truthfully, because those streams really are still held (the ratchet above). The name is fixed by the story.
+
+### `mh_media_egress_edges_limit`
+- **Type**: Gauge
+- **Description**: The configured `MH_MAX_TOTAL_EGRESS_EDGES` — the aggregate egress-edge resource guard, read from the same `PolicyLimits` field the session actor enforces (never a second literal).
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: The backstop's headroom, beside `mh_media_egress_edges` on the installed-streams panel. **Not a saturation denominator**: config load refuses a stream ceiling above this bound, so the ceiling always binds first and a refusal here is the labelled backstop (`apply_failed`). Static; published once at startup.
+
+### `mh_media_registered_meetings`
+- **Type**: Gauge
+- **Description**: Meetings this handler holds registered — the size of the session actor's registration map, set from its length at every mutation (register, release), never incremented or decremented.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Occupancy against `mh_media_registered_meetings_limit`. READ IT AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an `EndMeeting` releases a meeting, so a meeting whose MC never calls `EndMeeting` (any MC before story 2 task 12; an MC that crashed) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with concurrent load is that residual. Many meetings here against a flat `mh_media_egress_edges` is the empty-meeting shape the cap exists for. Published as 0 when the session actor is built.
+
+### `mh_media_registered_meetings_limit`
+- **Type**: Gauge
+- **Description**: The configured `MH_MAX_REGISTERED_MEETINGS` — the registration cap, read from the same `PolicyLimits` field the session actor's cap check reads.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: The denominator for registration occupancy, so no alert or panel needs the number as a PromQL literal. A resource guard, never capacity and never advertised to GC. Static; published once at startup.
+
+---
+
+## Meeting Teardown Metrics
+
+Story 2 R-20. `MediaHandlerService.EndMeeting` releases a meeting's handler resources; its normative semantics are on `EndMeetingRequest` in `proto/dark_tower/internal/v1/internal.proto`.
+
+### `mh_media_meeting_teardowns_total`
+- **Type**: Counter
+- **Description**: `EndMeeting` requests the session actor decided — one per decision. Requests refused before the actor decided (malformed ids, the actor unreachable or slow) are counted only on `mh_grpc_requests_total{method="end_meeting",status="error"}`.
+- **Labels**:
+  - `outcome`: the `MeetingTeardownOutcome` variants (table below)
+  - `key_custody`: `operator`
+- **Cardinality**: Low — bounded at the type level by the compile-checked `MeetingTeardownOutcome::ALL` × one `key_custody` value. Zero-initialised per outcome: `unknown_meeting` and `rejected_ownership` are rare-to-never, and an absent series would make "no teardown failures" indistinguishable from "no `EndMeeting` support".
+
+| `outcome` | Meaning | Remedy |
+|---|---|---|
+| `released` | The registering MC ended the meeting: registration and routes removed (its applied generation forgotten, so a same-id re-create installs fresh), edges returned to the budget, active connections closed. Pending connections are left to the registration timeout. | None — the healthy path. Its rate should track meeting ends. |
+| `unknown_meeting` | No registration held for that meeting id; acknowledged as an idempotent no-op. | Usually none: MC calls every handler in the meeting's assigned set, including ones it never registered with. Climbing well above `released` is an MC-side signal (double sends, or ending meetings this handler never held). |
+| `rejected_ownership` | A different `mc_id` than the registering one asked to end the meeting; refused with `FAILED_PRECONDITION`, nothing released. | A misrouted or stale MC, or a `service.write.mh` holder acting on a meeting it does not own. The WARN line carries `registered_mc_id` and `caller_mc_id`. The recovery order when the wrong MC holds a meeting is in `docs/runbooks/mh-incident-response.md` (ownership-reject arm). |
+
+**Not label material**: `meeting_id` and `mc_id` (raw or hashed) are unbounded and meeting-identifying; both belong in the log line (ADR-0036 §11).
+
+**PromQL example** (per ADR-0029 — low-rate lifecycle counter, prefer `increase`):
+```promql
+# Count panel — teardowns by outcome
+sum by(outcome) (increase(mh_media_meeting_teardowns_total[$__rate_interval]))
+```
 
 ---
 

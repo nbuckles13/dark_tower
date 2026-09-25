@@ -127,8 +127,10 @@ async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_pa
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
     let token = mint_meeting_token(&jwks.keypair, "meeting-accept-ok", "user-accept-ok");
@@ -172,8 +174,10 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
                 registered_at: Instant::now(),
             },
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
-        .await;
+        .await
+        .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
     let token1 = mint_meeting_token(&jwks.keypair, "meeting-rejected", "user-1");

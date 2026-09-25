@@ -106,6 +106,11 @@ if [[ "${DEVLOOP_TEST:-}" == "1" ]]; then
   # deadline they can move; without the knob the only remedy the runbook could offer was
   # "re-run".
   ORG_PROBE="${DEVLOOP_ORG_PROBE:-curl -s -o /dev/null -w %{http_code} --max-time ${DEVLOOP_ORG_PROBE_TIMEOUT:-10}}"
+  # Phase-1i MH gRPC forwards (story 2 task 11): the EXECUTED kubectl, and the TCP readiness
+  # probe. Same trust boundary as DEVLOOP_DEV_CLUSTER_BIN — a stub kubectl would fake which
+  # pod the env-test reaches, and a stub probe would fake the forward's readiness.
+  KUBECTL_BIN="${DEVLOOP_KUBECTL:-kubectl}"
+  MH_FORWARD_PROBE="${DEVLOOP_MH_FORWARD_PROBE:-}"
 else
   DEV_CLUSTER="${__repo_root}/infra/devloop/dev-cluster"
   DEVLOOP_HELPER_SOCKET="/tmp/devloop/helper.sock"
@@ -115,6 +120,8 @@ else
   BROWSER_E2E_CMD_OVERRIDE=""
   SETUP_SH="${__repo_root}/infra/kind/scripts/setup.sh"
   ORG_PROBE="curl -s -o /dev/null -w %{http_code} --max-time ${DEVLOOP_ORG_PROBE_TIMEOUT:-10}"
+  KUBECTL_BIN="kubectl"
+  MH_FORWARD_PROBE=""
 fi
 
 # NOT a DEVLOOP_TEST-gated seam, deliberately: PLAYWRIGHT_BROWSERS_PATH is Playwright's OWN
@@ -289,6 +296,184 @@ __wait_http_ready() {
     waited=$(( waited + 5 ))
   done
   return 0
+}
+
+# -----------------------------------------------------------------------------
+# Phase-1i: per-handler MH gRPC port-forwards for the env-test suite (story 2 task 11)
+# -----------------------------------------------------------------------------
+# PIDs of the forwards this run started; stopped by the lifecycle cleanup below.
+__MH_FORWARD_PIDS=()
+
+# Registered with layer_register_cleanup, so it runs on EVERY exit path from the lifecycle's
+# own EXIT trap. There is deliberately no `trap` here: see _common.sh::layer_register_cleanup.
+# No `|| true` either: a forward that already died (with its pod) makes `kill` fail, the
+# lifecycle reports that as a CLEANUP RC line and runs on — which is information, not noise.
+__stop_mh_grpc_forwards() {
+  if (( ${#__MH_FORWARD_PIDS[@]} > 0 )); then
+    kill "${__MH_FORWARD_PIDS[@]}"
+  fi
+}
+
+# Kill every KUBECTL process whose command line contains $1 — the stale MH forwards of an earlier
+# run (a SIGKILLed layer never ran its cleanup). Scoped by the caller's pattern to THIS
+# cluster's context and to the pod/mh- forwards step (i) starts, so it touches neither the
+# helper's svc/ forwards nor another cluster's (the self-test's fixture context differs).
+#
+# A /proc scan, deliberately NOT `pkill`: the devloop container has no procps (no pkill, no
+# ps). A `pkill ... 2>/dev/null && ...` there is a PERMANENT SILENT NO-OP — command-not-found
+# swallowed by the redirect, and exempt from `set -e` as a non-final `&&` operand. (In an
+# interactive shell here `pkill` may resolve, but only as a shell FUNCTION from a profile
+# this script never sources.) setup.sh/teardown.sh use pkill because they run on the HOST.
+# Reports what it did either way, so "nothing to reap" and "reaped N" are distinguishable,
+# and a /proc it cannot read is a loud failure, never a silent skip.
+__reap_stale_mh_forwards() {
+  local pattern="$1" f pid cmd reaped=0
+  if [[ ! -r /proc/self/cmdline ]]; then
+    precondition_fail mh-grpc-forward-not-ready \
+      "cannot scan /proc to reap stale MH gRPC port-forwards (no readable /proc/self/cmdline)" \
+      "Layer 7 must run inside the devloop container, which has a normal /proc"
+  fi
+  local argv0
+  for f in /proc/[0-9]*/cmdline; do
+    pid="${f#/proc/}"; pid="${pid%/cmdline}"
+    [[ "$pid" == "$$" || "$pid" == "$BASHPID" ]] && continue
+    # A process can exit between the glob and the read; an unreadable entry is simply
+    # gone, not a reaper failure (/proc itself was verified readable above).
+    # Kernel threads have an EMPTY cmdline, on which `read` fails: skip them explicitly
+    # (a bare failing `read` here would trip `set -e` and kill the layer).
+    if ! IFS= read -r -d '' argv0 <"$f" 2>/dev/null; then
+      continue
+    fi
+    # WHAT the process is, before what its argv mentions: only a KUBECTL process is a
+    # candidate. A bare substring match also kills any process whose argv merely
+    # CONTAINS the text — a shell running a script that mentions it, an editor — which
+    # this reaper did to the shell that wrote its own self-test.
+    [[ "${argv0##*/}" == "kubectl" ]] || continue
+    cmd="$(tr '\0' ' ' <"$f" 2>/dev/null)" || continue
+    if [[ "$cmd" == *"$pattern"* ]]; then
+      if kill "$pid" 2>/dev/null; then
+        reaped=$(( reaped + 1 ))
+      fi
+    fi
+  done
+  printf 'Layer7: stale MH gRPC port-forwards reaped: %s\n' "$reaped" >&2
+}
+
+# Is anything accepting TCP on 127.0.0.1:$1? Bash's /dev/tcp, so no extra tool is assumed;
+# swappable under DEVLOOP_TEST (MH_FORWARD_PROBE) so the self-test needs no real listener.
+__mh_forward_accepting() {
+  local port="$1"
+  if [[ -n "$MH_FORWARD_PROBE" ]]; then
+    local -a probe; IFS=' ' read -r -a probe <<<"$MH_FORWARD_PROBE"
+    "${probe[@]}" 127.0.0.1 "$port" >/dev/null 2>&1
+    return
+  fi
+  (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null
+}
+
+# Forward one handler's gRPC port and export how the env-test reaches and identifies it.
+#
+# ONE LOOKUP feeds both the forward target and the exported pod IP, so the pod the test
+# CALLS and the Prometheus `instance` (pod IP:port) it READS provably resolve to the same pod
+# — "any instance" would let a gauge fall be read on the handler that was never torn down.
+# A POD, resolved by the `instance=mh-N` label, never `svc/mh-service`: the Service
+# load-balances, and an unknown-meeting acknowledgement from the wrong pod reads as success.
+#
+# The LOCAL port is this slug's own already-allocated `.ports.mh_N_grpc` from ports.json,
+# NOT a port parsed out of kubectl's output (a foreign format, fail-open on a parse miss).
+# It is collision-free by construction (per-slug allocation) and bindable because this runs
+# inside the devloop container, which has its OWN network namespace (a named podman network,
+# not --network host). On the HOST those same numbers are held by Kind's extraPortMappings,
+# so a host run fails EADDRINUSE — loudly — rather than silently. Do not "fix" this back to
+# a kubectl-chosen port.
+#
+# kubectl port-forward reaches the pod through the API server and kubelet, so it BYPASSES
+# the MH NetworkPolicy (which admits only MC to 50053). That is dev-only, and a separate fact
+# from the channel being PLAINTEXT h2c, which holds in production too (docs/TODO.md,
+# §Media Path Obligations, the plaintext MC↔MH control-channel entry).
+#
+# Args: $1=handler ordinal (0|1)  $2=kube context  $3=allocated local port
+__start_mh_grpc_forward() {
+  local n="$1" context="$2" port="$3" pods pod ip pid waited=0
+  local budget="${DEVLOOP_MH_FORWARD_BUDGET:-30}"
+  local log="${DEVLOOP_TMP}/layer-7-mh-${n}-forward.log"
+  # Live pods only: a pod with a deletionTimestamp is terminating after rebuild-all's
+  # rollout restart and must not be chosen, so the third column must be empty. awk REPRINTS
+  # the two fields rather than passing the line through: the jsonpath leaves a trailing
+  # space when the timestamp is empty, and `${pods##* }` would then yield an EMPTY pod IP —
+  # an instance pin that silently matches nothing.
+  # This `|| precondition_fail` IS reachable although kubectl sits left of a pipe:
+  # the file runs under `set -o pipefail`, which command substitution inherits, so
+  # a failing kubectl fails the whole pipeline. The empty/line-count check below is
+  # the separate gate for "listed fine, but not exactly one live pod". kubectl's
+  # stderr is KEPT: a lost context, an RBAC denial and an unreachable apiserver are
+  # different responses, and the failure text carries its tail.
+  local lookup_err="${DEVLOOP_TMP}/layer-7-mh-${n}-podlookup.err"
+  pods="$("$KUBECTL_BIN" --context "$context" -n dark-tower get pods -l "instance=mh-${n}" \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.status.podIP} {.metadata.deletionTimestamp}{"\n"}{end}' \
+    2>"$lookup_err" | awk 'NF == 2 { print $1, $2 }')" || precondition_fail mh-pod-unresolved \
+      "could not list the mh-${n} pod (label instance=mh-${n}) in context ${context}: $(tail -n 3 "$lookup_err" | tr '\n' ' ')" \
+      "kubectl --context ${context} -n dark-tower get pods -l instance=mh-${n}"
+  if [[ -z "$pods" || "$(printf '%s\n' "$pods" | wc -l)" -ne 1 ]]; then
+    precondition_fail mh-pod-unresolved \
+      "expected exactly one live mh-${n} pod (label instance=mh-${n}), found: [${pods:-none}] — the env-test must call and read ONE identifiable handler" \
+      "kubectl --context ${context} -n dark-tower get pods -l instance=mh-${n}; wait for the rollout to settle and re-run Layer 7"
+  fi
+  pod="${pods%% *}"
+  ip="${pods##* }"
+
+  # The port must be FREE before the forward starts. Otherwise the readiness probe below
+  # could pass against whatever already listens there rather than against the forward: on
+  # the HOST this number is held by Kind's extraPortMapping (docker-proxy ACCEPTS connections
+  # even with nothing behind them), so without this check a host run would pass readiness
+  # and send the env-test's calls into a dead end.
+  #
+  # A BOUNDED POLL, not an instantaneous check: the reap above signals asynchronously, so
+  # a just-killed stale forward may hold the port for a moment. `mh-grpc-port-occupied` is
+  # for a port STILL held when the budget runs out.
+  local free_waited=0
+  while __mh_forward_accepting "$port"; do
+    if (( free_waited >= budget )); then
+      precondition_fail mh-grpc-port-occupied \
+        "something still accepts on 127.0.0.1:${port} ${budget}s after the stale-forward reap, before the mh-${n} gRPC forward started — the forward could not bind it, and a readiness probe would pass against the wrong listener" \
+        "the likely holders: Layer 7 running on the HOST, where Kind's extraPortMapping holds this number (run it inside the devloop container), or a forward the reap could not kill (see its 'reaped:' line above). The container has no ss/lsof; list listeners with: cat /proc/net/tcp"
+    fi
+    sleep 1
+    free_waited=$(( free_waited + 1 ))
+  done
+
+  "$KUBECTL_BIN" --context "$context" -n dark-tower port-forward --address 127.0.0.1 \
+    "pod/${pod}" "${port}:50053" >"$log" 2>&1 &
+  pid=$!
+  __MH_FORWARD_PIDS+=("$pid")
+
+  # Bounded readiness, never a fixed sleep. Liveness FIRST, then acceptance: with the port
+  # verified free above, an accepting port and a live forward process together mean the
+  # FORWARD is accepting. A forward that exits (a vanished pod, a bind failure) fails fast
+  # rather than waiting out the budget.
+  while :; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      precondition_fail mh-grpc-forward-not-ready \
+        "the port-forward to pod/${pod}:50053 on 127.0.0.1:${port} exited before accepting: $(tail -n 3 "$log" | tr '\n' ' ')" \
+        "read ${log}; check the pod is Ready (kubectl --context ${context} -n dark-tower get pod ${pod})"
+    fi
+    if __mh_forward_accepting "$port"; then
+      break
+    fi
+    if (( waited >= budget )); then
+      precondition_fail mh-grpc-forward-not-ready \
+        "the port-forward to pod/${pod}:50053 did not accept on 127.0.0.1:${port} within ${budget}s" \
+        "read ${log}; check the pod is Ready (kubectl --context ${context} -n dark-tower get pod ${pod})"
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  # A forward dies with its pod and is not re-established: a mid-suite MH restart surfaces
+  # as a connection error in the env-test, not here (accepted residual).
+  printf 'Layer7: mh-%s gRPC forward pod/%s (pod IP %s) -> 127.0.0.1:%s\n' \
+    "$n" "$pod" "$ip" "$port" >&2
+  export "ENV_TEST_MH_${n}_GRPC_URL=http://127.0.0.1:${port}"
+  export "ENV_TEST_MH_${n}_POD_IP=${ip}"
 }
 
 # One invocation of a dev-cluster WRITE verb, optionally `timeout`-wrapped.
@@ -1117,6 +1302,39 @@ __layer7_main() {
       "run 'pnpm exec playwright install chromium' (the devloop image is expected to bake it; see infra/devloop/Dockerfile)"
   fi
   emit_step_duration browser-e2e-preconditions "$t_step"
+
+  # (i) MH gRPC port-forwards for the env-test suite (story 2 task 11). The MH teardown
+  #     env-test calls each handler's gRPC directly (as the meeting-controller service
+  #     principal) and reads that SAME pod's metrics; nothing else reaches MH gRPC from here
+  #     (it is ClusterIP-only, and its NetworkPolicy admits only MC). kubectl and the context
+  #     were already verified by step (h), which cannot proceed without them. Stale forwards
+  #     from an earlier run are reaped first by a /proc scan (__reap_stale_mh_forwards) —
+  #     NOT the setup.sh/teardown.sh `pkill` pattern, which is host-side: this container has
+  #     no procps, so a `pkill` here is a permanent silent no-op. The scan is narrowed to
+  #     kubectl processes carrying THIS cluster's pod/mh- forward, so the helper's own svc/
+  #     forwards are untouched. The new forwards are stopped on every exit path through the
+  #     lifecycle's cleanup hook.
+  t_step=$(layer_now)
+  local mh_n mh_port
+  __reap_stale_mh_forwards \
+    "--context kind-${cluster_name} -n dark-tower port-forward --address 127.0.0.1 pod/mh-"
+  layer_register_cleanup __stop_mh_grpc_forwards
+  for mh_n in 0 1; do
+    # `// empty` + the -z check: a ports.json without this key is a DIFFERENT fault from a
+    # missing ports.json (ports-json-missing), so it gets its own token. The `|| mh_port=""`
+    # is the same device as step (h)'s one sanctioned `|| true`, for the same reason: without
+    # it a jq failure kills the layer under `set -e` with no STATUS line and no lane; with it
+    # the emptiness reaches the named lane two lines down. It swallows nothing.
+    mh_port="$(jq -r ".ports.mh_${mh_n}_grpc // empty" "$ENV_TEST_PORTS_JSON" 2>/dev/null)" \
+      || mh_port=""
+    if [[ -z "$mh_port" ]]; then
+      precondition_fail mh-grpc-port-unallocated \
+        "ports.json has no '.ports.mh_${mh_n}_grpc' — no local port is allocated for the mh-${mh_n} gRPC forward the MH teardown env-test needs" \
+        "re-run 'dev-cluster setup' so the helper rewrites /tmp/devloop/ports.json with a complete ports block; inspect it with: jq .ports /tmp/devloop/ports.json"
+    fi
+    __start_mh_grpc_forward "$mh_n" "kind-${cluster_name}" "$mh_port"
+  done
+  emit_step_duration mh-grpc-forwards "$t_step"
 
   # ======================= PHASE 2 — run the suites (no grep) ================
   # Cluster is confirmed healthy. ANY non-zero from a suite is a test FAIL (exit 1,

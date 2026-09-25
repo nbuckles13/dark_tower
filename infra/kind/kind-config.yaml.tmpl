@@ -83,7 +83,12 @@ nodes:
         hostPort: ${HOST_PORT_MH_0_HEALTH}
         listenAddress: "${HOST_GATEWAY_IP}"
         protocol: TCP
-      # Offset +21: MH-0 gRPC (containerPort 30530 = future NodePort)
+      # Offset +21: MH-0 gRPC. NOTHING LISTENS BEHIND THIS HOSTPORT: MH gRPC (50053)
+      # is ClusterIP-only and its NetworkPolicy admits only MC, so no NodePort
+      # for it exists or should be added. The env-test route to MH gRPC is
+      # scripts/layer7.sh's `kubectl port-forward deployment/mh-0`, which binds
+      # this slug's allocated port number INSIDE the devloop container's own
+      # netns. Kept because the port allocation is the devloop helper's.
       - containerPort: 30530
         hostPort: ${HOST_PORT_MH_0_GRPC}
         listenAddress: "${HOST_GATEWAY_IP}"
@@ -100,7 +105,12 @@ nodes:
         hostPort: ${HOST_PORT_MH_1_HEALTH}
         listenAddress: "${HOST_GATEWAY_IP}"
         protocol: TCP
-      # Offset +24: MH-1 gRPC (containerPort 30531 = future NodePort)
+      # Offset +24: MH-1 gRPC. NOTHING LISTENS BEHIND THIS HOSTPORT: MH gRPC (50053)
+      # is ClusterIP-only and its NetworkPolicy admits only MC, so no NodePort
+      # for it exists or should be added. The env-test route to MH gRPC is
+      # scripts/layer7.sh's `kubectl port-forward deployment/mh-1`, which binds
+      # this slug's allocated port number INSIDE the devloop container's own
+      # netns. Kept because the port allocation is the devloop helper's.
       - containerPort: 30531
         hostPort: ${HOST_PORT_MH_1_GRPC}
         listenAddress: "${HOST_GATEWAY_IP}"

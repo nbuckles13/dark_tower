@@ -743,7 +743,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Installed egress streams on each handler (mh_media_egress_edges) against its derived egress STREAM ceiling and the ADVISORY recommended minimum - all three in one unit, aggregate installed egress streams on the pod. Saturation is edges against the CEILING (capacity; remedy: raise MH_EGRESS_BUDGET_BPS), never against the edge limit (a resource guard, task 11). A ceiling below the recommended minimum means the budget is still the unsized placeholder - a configuration state, not an incident; the recommended minimum is never an alert input. Until story 2 task 11's teardown, installed streams stay high after an ABNORMAL meeting end (the ratchet) and GC stops placing on a handler at its ceiling; interim recovery is a rollout restart of mh-0/mh-1. key_custody=operator.",
+      "description": "Installed egress streams on each handler (mh_media_egress_edges) against its derived egress STREAM ceiling, the ADVISORY recommended minimum, and the edge-limit backstop (mh_media_egress_edges_limit) - all four in one unit, aggregate installed egress streams on the pod. Saturation is edges against the CEILING (capacity; remedy: raise MH_EGRESS_BUDGET_BPS), NEVER against the edge limit: that is a resource guard, and MH refuses to boot with a ceiling above it, so the ceiling always binds first - the limit line is plotted only to show the backstop's headroom. A ceiling below the recommended minimum means the budget is still the unsized placeholder - a configuration state, not an incident; the recommended minimum is never an alert input. Streams are released when a meeting's MC calls EndMeeting (story 2 R-20; MC calls it from story 2 task 12); a meeting whose MC never calls it keeps its streams (the ratchet), and GC stops placing on a handler at its ceiling - installed streams rising with pod uptime rather than load is that state; recovery is a rollout restart of mh-0/mh-1. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -848,6 +848,17 @@
           "legendFormat": "recommended min (advisory)",
           "range": true,
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_egress_edges_limit)",
+          "legendFormat": "edge limit (backstop) {{instance}}",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "Installed Egress Streams vs Stream Ceiling",
@@ -944,6 +955,203 @@
         }
       ],
       "title": "Egress Budget (bytes/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Meetings each handler holds registered (mh_media_registered_meetings) against MH_MAX_REGISTERED_MEETINGS (mh_media_registered_meetings_limit), story 2 R-21. A RESOURCE GUARD, never capacity and never advertised to GC. Read the gauge as REGISTRATIONS HELD, not meetings in progress: it falls only when an EndMeeting releases a meeting, so a meeting whose MC never calls EndMeeting (any MC before story 2 task 12, or one that crashed) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with load is that residual; many meetings against flat installed streams is the empty-meeting shape the cap exists for. At the limit, NEW meetings are refused (mh_media_policy_applies_total{outcome=\"rejected_meeting_cap\"}) while held ones keep re-asserting. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Meetings",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_registered_meetings)",
+          "legendFormat": "registered {{instance}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_registered_meetings_limit)",
+          "legendFormat": "limit {{instance}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Registered Meetings vs Registration Cap",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "EndMeeting decisions (story 2 R-20): released (the registering MC ended the meeting; its registration, routes and edges are reclaimed), unknown_meeting (an acknowledged no-op - MC calls every handler in the assigned set, so this is normal; climbing well above released is an MC-side signal), rejected_ownership (a different mc_id asked to end it; FAILED_PRECONDITION, nothing released - a misrouted or stale MC, or a scope holder acting on a meeting it does not own; see the ownership-reject arm in docs/runbooks/mh-incident-response.md). increase(), NOT rate(): teardowns are low-rate. All three outcomes are pre-registered at zero, so the healthy reading is flat-zero rejects, NOT 'No data'. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Teardowns",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mh_media_meeting_teardowns_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Meeting Teardowns by Outcome",
       "type": "timeseries"
     }
   ],

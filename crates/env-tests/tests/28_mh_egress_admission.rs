@@ -10,9 +10,16 @@
 //!
 //! # Why real joins, not a direct `RegisterMeeting`
 //!
-//! Env-tests hold no `service.write.mh` credential and have no port-forward to
-//! MH's gRPC port (ADR-0028 black-box). The only principal that programs MH is
-//! MC, so the test makes MC do it.
+//! Because the path under test is MC-DRIVEN admission, end to end: GC places
+//! the meeting, MC computes each subscriber's slots and pushes the policy, and
+//! MH refuses the push that would cross its ceiling. A direct `RegisterMeeting`
+//! would skip the half that decides how many streams a real meeting asks for.
+//!
+//! (It is no longer that the suite CANNOT call MH directly. Since story 2 task
+//! 11, Layer 7 forwards each MH pod's gRPC port and
+//! `29_mh_meeting_teardown.rs` calls it with the Kind meeting-controller
+//! credential. That relaxes the credential convention only: ADR-0028's crate
+//! layering is unchanged — the suite still links no service crate.)
 //!
 //! # Sizing — deterministic, never a function of placement luck
 //!
@@ -59,10 +66,12 @@
 //! is asserted for presence and range only: MH is scraped every 15 s against a
 //! 10 s window bucket, so a transient ratio value can be invisible.
 //!
-//! # Cleanup — the ratchet, until story 2 task 11
+//! # Cleanup — the ratchet, until MC calls `EndMeeting` (story 2 task 12)
 //!
-//! Streams of a meeting that ends ABNORMALLY are never released until MH's
-//! teardown lands, and a handler at its ceiling drops out of GC placement. So
+//! MH releases a meeting's streams when its MC calls `EndMeeting` (story 2
+//! task 11), but MC begins calling it only in task 12. Until then, streams of a
+//! meeting that ends ABNORMALLY are never released, and a handler at its
+//! ceiling drops out of GC placement. So
 //! the test ends by closing every MC session cleanly: MC's single removal
 //! choke point re-pushes shrinking policies, and each handler returns to zero
 //! streams for this meeting. If the FIRST join fails with 503, the handlers
@@ -71,12 +80,12 @@
 
 #![cfg(feature = "flows")]
 
-use std::process::Command;
 use std::time::Duration;
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
+use env_tests::fixtures::kube::{configmap_key, configmap_u64};
 use env_tests::fixtures::mc_session::{self, McSession, MhSession};
 use env_tests::fixtures::metrics::{gauge_by_instance_present, poll_until_any_instance_above};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
@@ -97,41 +106,6 @@ const ADMISSION_BOUND: Duration = Duration::from_secs(120);
 /// Largest participant count this test will attempt before calling the
 /// deployment unsuitable (a ceiling this test cannot exceed economically).
 const MAX_PARTICIPANTS: u64 = 40;
-
-/// Read one key of a live ConfigMap, never skipping.
-fn configmap_key(configmap: &str, key: &str) -> String {
-    let jsonpath = format!("jsonpath={{.data.{key}}}");
-    let output = Command::new("kubectl")
-        .args([
-            "get",
-            "configmap",
-            configmap,
-            "-n",
-            NAMESPACE,
-            "-o",
-            &jsonpath,
-        ])
-        .output()
-        .unwrap_or_else(|e| panic!("PRECONDITION: could not run kubectl: {e}"));
-    assert!(
-        output.status.success(),
-        "PRECONDITION: kubectl get configmap {configmap} -n {NAMESPACE} failed (exit {:?})",
-        output.status.code()
-    );
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    assert!(
-        !value.is_empty(),
-        "PRECONDITION: live ConfigMap {configmap} has no key {key}"
-    );
-    value
-}
-
-fn configmap_u64(configmap: &str, key: &str) -> u64 {
-    let raw = configmap_key(configmap, key);
-    raw.parse().unwrap_or_else(|e| {
-        panic!("PRECONDITION: {configmap}/{key}={raw:?} is not an integer: {e}")
-    })
-}
 
 /// Smallest `P` satisfying both pigeonhole conditions (see the module doc),
 /// with the slots each participant declares.
@@ -253,7 +227,8 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         let gc_join = match gc.join_meeting(&created.meeting_code, token).await {
             Ok(join) => join,
             Err(GcClientError::RequestFailed { status: 503, body }) if i == 0 => panic!(
-                "PRECONDITION: all MHs at stream ceiling before S9 started; ratchet until task 11 \
+                "PRECONDITION: all MHs at stream ceiling before S9 started; the ratchet (streams \
+                 of meetings no EndMeeting released) \
                  (GC answered 503 to the FIRST join: no handler has headroom). Recovery: \
                  kubectl rollout restart deployment/mh-0 deployment/mh-1 -n {NAMESPACE}. \
                  Body: {body}"
