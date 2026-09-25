@@ -12,6 +12,19 @@
 #
 # Usage: scripts/workflow/run-story.sh <story-file.md | story-slug> \
 #          [--stop-after=N] [--revalidate | --restart <text>]
+#        scripts/workflow/run-story.sh <story-file.md | story-slug> --request-stop
+#
+#   STOPPING A RUN. Ctrl-C once: the run finishes its CURRENT task and that task's
+#                   gate, records it, then exits 0 (like --stop-after for the task
+#                   in flight). The devloop and gate run in their own process
+#                   group, so the keypress never reaches them. Ctrl-C twice:
+#                   abort now — the in-flight step is terminated and left
+#                   recoverable (mid-devloop: task untouched + resume pointer, a
+#                   plain rerun resumes it; mid-gate: escalated reason
+#                   operator-abort, recover with --revalidate). Exit 130.
+#   --request-stop  the Ctrl-C-once request from ANOTHER shell (or the remote-
+#                   control session): the run in flight in this container stops
+#                   after its current task. Takes no other flag.
 #
 #   --stop-after=N  exit 0 after task N completes (skips the story-close gate).
 #                   For staged runs where a human step belongs between tasks.
@@ -32,9 +45,11 @@
 #   the run reaches has no prior escalation, or if that attempt never committed
 #   (a devloop-no-commit escalation has nothing to validate or restart from).
 #
-# Exit: 0  all tasks complete, story-close gate green (or --stop-after reached)
+# Exit: 0  all tasks complete, story-close gate green (or --stop-after reached,
+#          or a requested stop honoured)
 #       1  task escalated (escalation.json path printed) or blocked
 #       2  precondition / infra / manifest failure / retry-flag misuse
+#       130 operator abort (second Ctrl-C)
 set -euo pipefail
 
 # Timestamped console logging (UTC). All STORY_RUN lines route through these so
@@ -318,11 +333,16 @@ __seam_assert_run_dir_isolated() {
       exit 2
       ;;
   esac
-  if [ -e "${resolved}/story-runner/.run-in-flight" ]; then
+  # A pure --request-stop is the ONE invocation meant to run beside a live run: it
+  # installs no EXIT trap (so cannot delete the marker) and writes no run artifact
+  # except the stop request it exists to write. Every other check above still runs.
+  if [ -e "${resolved}/story-runner/.run-in-flight" ] && [ "${__REQUEST_STOP_ARGV:-0}" -ne 1 ]; then
     slogerr "STORY_RUN: SEAM-RUN-DIR-IN-USE — '${resolved}/story-runner/.run-in-flight' already exists, so another runner owns this run dir. This process's EXIT trap would delete that marker and its task artifacts would interleave with that run's evidence. Redirect DEVLOOP_TMP (mktemp -d). If a killed run left this marker stale, remove it deliberately."
     exit 2
   fi
 }
+__REQUEST_STOP_ARGV=0
+for __a in "$@"; do [ "$__a" = "--request-stop" ] && __REQUEST_STOP_ARGV=1; done
 if __test_sentinel_active; then __seam_assert_run_dir_isolated; fi
 
 # dt-story binary. SEAM (see the header): a BUILT ARTIFACT that must NOT move
@@ -374,7 +394,7 @@ if __test_sentinel_active && __any_seam_override_present; then
   slog "STORY_RUN: TEST SEAMS ACTIVE — repo_root=${REPO_ROOT} dt_story=${DT_STORY} run_dir_base=${DEVLOOP_TMP:-<unset>} (NOT a production run)"
 fi
 
-ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text> | --finish | --interactive]}"
+ARG="${1:?usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text> | --finish | --interactive] | --request-stop}"
 shift
 # Flag grammar (order-independent after the story arg). Extra/unknown argv is
 # REFUSED, not silently dropped — a flag that silently does nothing is the same
@@ -390,6 +410,7 @@ REVALIDATE=0
 RESTART=0
 RESTART_TEXT=""
 FINISH=0        # D6/f: model-free commit-intent finisher (reviewed-but-uncommitted)
+REQUEST_STOP=0  # ask the run in flight to stop after its current task (no run of its own)
 INTERACTIVE=0   # D6/g: attach claude to the operator TTY for the escalated task
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -432,7 +453,10 @@ while [ "$#" -gt 0 ]; do
     --interactive)
       [ "$INTERACTIVE" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --interactive given more than once."; exit 2; }
       INTERACTIVE=1 ;;
-    *) slogerr "STORY_RUN: UNKNOWN-ARGUMENT '$1' — usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text> | --finish | --interactive]"; exit 2 ;;
+    --request-stop)
+      [ "$REQUEST_STOP" -eq 0 ] || { slogerr "STORY_RUN: DUPLICATE-FLAG — --request-stop given more than once."; exit 2; }
+      REQUEST_STOP=1 ;;
+    *) slogerr "STORY_RUN: UNKNOWN-ARGUMENT '$1' — usage: run-story.sh <story-file.md | story-slug> [--stop-after=N] [--revalidate | --restart <text> | --finish | --interactive] | --request-stop"; exit 2 ;;
   esac
   shift
 done
@@ -477,6 +501,30 @@ if [ "$RESTART" -eq 1 ]; then
     slogerr "STORY_RUN: RESTART-UNSAFE-TEXT — the --restart text contains a code fence (\`\`\`), which would break the prompt/manifest contract the devloop reads the prompt file under. Remove it; the text is a diagnosis paragraph, not a code block."
     exit 2
   fi
+fi
+# --request-stop: write the stop request for the run in flight and exit. Never
+# starts a run, never touches the manifest or run artifacts. Refuses loudly when
+# there is no run to stop, or it is a different story, so a request can never sit
+# waiting to stop some LATER run (a new run also clears any stale request).
+if [ "$REQUEST_STOP" -eq 1 ]; then
+  if [ "$((SAW_STOP_AFTER + REVALIDATE + RESTART + FINISH + INTERACTIVE))" -gt 0 ]; then
+    slogerr "STORY_RUN: REQUEST-STOP-WITH-FLAGS — --request-stop takes no other flag: it only asks the run already in flight to stop after its current task."
+    exit 2
+  fi
+  __rs_base="$(resolve_run_base marker)"
+  if [ ! -f "${__rs_base}/.run-in-flight" ]; then
+    slogerr "STORY_RUN: NO-RUN-IN-FLIGHT — no run-story owns this container ('${__rs_base}/.run-in-flight' is absent), so there is nothing to stop."
+    exit 2
+  fi
+  __rs_story="$(sed -n 's/^story=\([^ ]*\).*/\1/p' "${__rs_base}/.run-in-flight" 2>/dev/null || true)"
+  __rs_want="$(basename "${ARG%.md}")"
+  if [ -z "$__rs_story" ] || [[ "$__rs_story" != *"$__rs_want" ]]; then
+    slogerr "STORY_RUN: REQUEST-STOP-WRONG-STORY — the run in flight is '${__rs_story:-unknown}', not '${__rs_want}'. Nothing requested."
+    exit 2
+  fi
+  : > "${__rs_base}/.stop-requested"
+  slog "STORY_RUN: STOP-REQUESTED for the run in flight (${__rs_story}) — it stops after its current task and that task's gate finish."
+  exit 0
 fi
 if [ -f "$ARG" ]; then
   STORY_FILE="$ARG"
@@ -713,7 +761,99 @@ INFLIGHT="$RUN_BASE/.run-in-flight"
 mkdir -p "$RUN_BASE"
 printf 'story=%s pid=%s started=%s\n' \
   "$(basename "${STORY_FILE%.md}")" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$INFLIGHT"
-trap 'rm -f "$INFLIGHT"' EXIT
+# Stop request (Ctrl-C once, or --request-stop from another shell). Lives beside
+# the in-flight marker it is scoped to; a new run clears any stale one so a request
+# only ever applies to the run that was in flight when it was made.
+STOP_REQUEST="$RUN_BASE/.stop-requested"
+rm -f "$STOP_REQUEST"
+trap 'rm -f "$INFLIGHT" "$STOP_REQUEST"' EXIT
+
+# Long children (devloop session, gate layers) run in their OWN session via
+# setsid, so a terminal Ctrl-C (SIGINT to the foreground process group) reaches
+# only this runner, never the work in flight. Without it a keypress during the
+# gate killed layer-all mid-run and was recorded as a gate failure. (The canary
+# probe is already isolated by `timeout`, and is short.)
+command -v setsid >/dev/null 2>&1 || { slogerr "STORY_RUN: PRECONDITION — setsid (util-linux) not found; the runner cannot isolate its children from Ctrl-C."; exit 2; }
+__INT_PRESSES=0
+__WAIT_INTERRUPTED=0
+__CHILD_PID=""
+__ABORT_LANE=""   # what a second Ctrl-C must leave recoverable: devloop | gate | "" (just exit)
+
+# run_isolated <lane> <logfile> <cmd...> — run a long child in its own session,
+# appending stdout+stderr to <logfile>, and wait for it INTERRUPTIBLY: a trapped
+# SIGINT returns `wait` early, the handler runs at once, and the loop waits again
+# for the same child (bash keeps a reaped child's status for the re-wait).
+# Returns the child's exit status. Preserves the caller's errexit state.
+run_isolated() {
+  local lane="$1" log="$2" pid rc had_e=0
+  shift 2
+  case "$-" in *e*) had_e=1 ;; esac
+  set +e
+  __ABORT_LANE="$lane"
+  setsid "$@" >>"$log" 2>&1 &
+  pid=$!
+  __CHILD_PID="$pid"
+  while :; do
+    __WAIT_INTERRUPTED=0
+    wait "$pid"
+    rc=$?
+    [ "$__WAIT_INTERRUPTED" -eq 1 ] && continue
+    break
+  done
+  __CHILD_PID=""
+  __ABORT_LANE=""
+  [ "$had_e" -eq 1 ] && set -e
+  return "$rc"
+}
+
+# Terminate the in-flight child's whole session (setsid made it the group leader;
+# `timeout` forwards the TERM to claude), escalating to KILL if it lingers.
+kill_child_group() {
+  local pid="${__CHILD_PID:-}"
+  [ -n "$pid" ] || return 0
+  kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  __CHILD_PID=""
+}
+
+operator_abort() {
+  trap - INT   # a third press must not re-enter mid-cleanup
+  slogerr "STORY_RUN: ABORT (second Ctrl-C) — terminating the in-flight step now."
+  kill_child_group
+  case "$__ABORT_LANE" in
+    devloop)
+      # Same recoverable state as the auth-expired lane: manifest untouched,
+      # resume pointer persisted, so a plain rerun resumes this devloop session.
+      persist_resume_pointer
+      record_infra_incident "$id" operator-abort "operator pressed Ctrl-C twice during the devloop session; the session was terminated" "${tasklog:-}"
+      slogerr "STORY_RUN: recover: rerun without a flag to resume task ${id}'s devloop session over the tree as it was left."
+      exit 130 ;;
+    gate)
+      # The attempt is COMMITTED; escalating makes --revalidate (re-run the gate
+      # only) accept it. escalate() exits 1 with that guidance.
+      escalate "$id" operator-abort "${gatelog:-}" ;;
+    *)
+      slogerr "STORY_RUN: aborted; rerun to continue (nothing in flight needed preserving)."
+      exit 130 ;;
+  esac
+}
+
+on_sigint() {
+  __INT_PRESSES=$((__INT_PRESSES + 1))
+  __WAIT_INTERRUPTED=1
+  if [ "$__INT_PRESSES" -eq 1 ]; then
+    : > "$STOP_REQUEST" || true
+    slogerr "STORY_RUN: STOP-REQUESTED (Ctrl-C) — task ${id:-in flight} and its gate will finish and be recorded, then the run stops. Press Ctrl-C again to abort NOW."
+    return 0
+  fi
+  operator_abort
+}
+trap on_sigint INT
 
 # Concurrent-same-story guard (ADR-0037 D5 / ops). The ledger mount is FLAT/shared,
 # so two containers running the SAME story share one RUN_DIR — which the per-container
@@ -885,8 +1025,10 @@ escalate() {
   # the per-attempt records this escalate() writes). A SUGGESTION only — never an
   # auto-switch into a lane that needs a human who may not be present (that is the
   # operator's call, and --interactive refuses without a TTY).
-  local __esc_count
-  __esc_count="$(ls -1 "$RUN_DIR"/task-"${id}".runner-escalation.*.json 2>/dev/null | grep -c . || true)"
+  local __esc_count=0 __esc_f
+  for __esc_f in "$RUN_DIR"/task-"${id}".runner-escalation.*.json; do
+    [ -e "$__esc_f" ] && __esc_count=$((__esc_count + 1))
+  done
   if [ "${__esc_count:-0}" -ge 2 ]; then
     slogerr "STORY_RUN: SUGGEST task=${id} has now escalated ${__esc_count} times — consider re-running with --interactive to drive it attached to your TTY (the Lead asks you in-session instead of escalating), rather than another headless attempt."
   fi
@@ -911,6 +1053,7 @@ escalate() {
 #   devloop-timeout         headless session exceeded TASK_TIMEOUT -> investigate/raise the ceiling
 #   pipeline-precondition   a gate layer reported operator-class -> fix the environment
 #   git-error               git itself failed -> read the captured stderr; fix the repo/disk/lock
+#   operator-abort          operator pressed Ctrl-C twice mid-devloop -> rerun (resumes the session)
 # (NB `devloop-timeout` also exists as a pre-change `escalate` REASON. Different
 # record types and filenames, so the two never collide in one artifact.)
 #
@@ -1340,14 +1483,14 @@ run_gate() {
   # exported (an export would strip auto-apply from the spawned devloop session, defeating D7 there).
   for n in 1 2 3 4 5 6; do
     set +e
-    DEVLOOP_FMT_CHECK_ONLY=1 "scripts/layer${n}.sh" >>"$gatelog" 2>&1
+    run_isolated gate "$gatelog" env DEVLOOP_FMT_CHECK_ONLY=1 "scripts/layer${n}.sh"
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then gate_rc=$rc; gate_layer=$n; break; fi
   done
   if [ "$gate_rc" -eq 0 ]; then
     set +e
-    scripts/layer7.sh >>"$gatelog" 2>&1
+    run_isolated gate "$gatelog" scripts/layer7.sh
     gate_rc=$?
     set -e
     [ "$gate_rc" -ne 0 ] && gate_layer=7
@@ -1374,7 +1517,7 @@ run_full_gate() {
   # produces the Gate-2 verdict — it must attest a tree it did NOT auto-format, so force the fmt lane
   # CHECK-only (DEVLOOP_FMT_CHECK_ONLY out-ranks any ambient DEVLOOP_FMT_APPLY). Per-invocation prefix,
   # never exported.
-  DEVLOOP_FAIL_FAST=0 DEVLOOP_FMT_CHECK_ONLY=1 ./scripts/layer-all.sh >>"$log" 2>&1
+  run_isolated "" "$log" env DEVLOOP_FAIL_FAST=0 DEVLOOP_FMT_CHECK_ONLY=1 ./scripts/layer-all.sh
   rc=$?
   set -e
   return "$rc"
@@ -1537,11 +1680,10 @@ finish_lane() {
   # different task or a moved tree. NO expiry check — the bindings ARE the control;
   # an age check is a strictly weaker second control whose only reachable effect is
   # a false refusal on a task legitimately picked up weeks later.
-  local i_story i_task i_head i_slug i_msg
+  local i_story i_task i_head i_msg
   i_story="$(jq -r '.story // ""' "$intent")"
   i_task="$(jq -r '.task_id // ""' "$intent")"
   i_head="$(jq -r '.head // ""' "$intent")"
-  i_slug="$(jq -r '.slug // ""' "$intent")"
   i_msg="$(jq -r '.message // ""' "$intent")"
   if [ "$i_story" != "$STORY_FILE" ] || [ "$i_task" != "$id" ] || [ "$i_head" != "$head_before" ]; then
     slogerr "STORY_RUN: FINISH-STALE-INTENT task=${id} — the intent binds to story='${i_story}' task='${i_task}' head='${i_head}', but this run is story='${STORY_FILE}' task='${id}' head='${head_before}'. A stale intent must not replay onto a moved tree or a different task. Rerun WITHOUT --finish to resume."
@@ -1716,6 +1858,13 @@ RETRY_APPLIED=0
 INTERACTIVE_SPAWN=0       # set when --interactive reaches the escalated task; the
 INTERACTIVE_WALL_SECS=0   # spawn site branches on it and records wall-clock for the ledger
 while :; do
+  # Honour a stop request between tasks: every task selected so far has finished,
+  # been gated and been recorded. Before `dt-story next`, which can reopen an
+  # escalated task (a manifest write).
+  if [ -e "$STOP_REQUEST" ]; then
+    slog "STORY_RUN: STOPPED at operator request (Ctrl-C / --request-stop) — every task run so far is complete and recorded; story-close gate NOT run. Rerun to continue."
+    exit 0
+  fi
   set +e
   task_json="$("$DT_STORY" next "$STORY_FILE")"
   next_rc=$?
@@ -2150,8 +2299,13 @@ while :; do
     # is "no human is present to answer the prompt", false by construction here — a
     # prompt the operator can answer beats one bypassed. Preflight's container-boundary
     # gate is unchanged, so this is no bypass.
+    # Ctrl-C here is for the attached claude session, not a stop request: drop the
+    # runner's trap for the spawn (default disposition: bash continues when the
+    # foreground child handles the signal) and restore it after.
+    trap - INT
     env -u DEVLOOP_HEADLESS claude "$interactive_prompt" --model "$STORY_MODEL"
     claude_rc=$?
+    trap on_sigint INT
     set -e
     INTERACTIVE_WALL_SECS=$(( $(date +%s) - __iw_start ))
     # Fall straight through to the UNCHANGED post-loop machinery (escalation-file
@@ -2169,13 +2323,13 @@ while :; do
     # commit-intent (env-passed, same precedent as DEVLOOP_START_HEAD); --finish reads
     # it back. Per-task path under RUN_DIR so it persists with the ledger.
     set +e
-    DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
+    run_isolated devloop "$tasklog" env DEVLOOP_HEADLESS=1 DEVLOOP_START_HEAD="$head_before" \
       DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
       DEVLOOP_COMMIT_INTENT_FILE="$RUN_DIR/task-${id}.commit-intent.json" \
       timeout "$TASK_TIMEOUT" claude -p "$task_prompt" \
       --model "$STORY_MODEL" \
       --output-format stream-json --verbose \
-      --dangerously-skip-permissions >>"$tasklog" 2>&1
+      --dangerously-skip-permissions
     claude_rc=$?
     set -e
 
@@ -2192,7 +2346,7 @@ while :; do
           # and the resume pointer survives, so a rerun picks up cleanly.
           persist_resume_pointer
           record_infra_incident "$id" auth-expired "OAuth credentials rejected; recovery is devloop.sh --refresh-creds on the host"
-          slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — on the host run: /login (if needed) then ./infra/devloop/devloop.sh --refresh-creds ${DEVLOOP_SLUG:-<devloop-slug>}, then rerun to resume (that slug is the container's, not the story's; devloop.sh --run-story exports it as DEVLOOP_SLUG)"
+          slogerr "STORY_RUN: AUTH-EXPIRED task=${id} — on the host: in token mode (CLAUDE_CODE_OAUTH_TOKEN set) rotate with infra/devloop/claude-token.sh then ./infra/devloop/devloop.sh --recreate ${DEVLOOP_SLUG:-<devloop-slug>}; otherwise /login (if needed) then ./infra/devloop/devloop.sh --refresh-creds ${DEVLOOP_SLUG:-<devloop-slug>}. Then rerun to resume (that slug is the container's, not the story's; devloop.sh --run-story exports it as DEVLOOP_SLUG)"
           exit 2
           ;;
         infra)
