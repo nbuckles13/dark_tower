@@ -452,6 +452,21 @@ case "$mode" in
     [ "${FAKE_DEVLOOP_TOUCH_EXISTING:-0}" = "1" ] && \
       printf 'appended by a later devloop\n' >> "docs/devloop-outputs/2026-01-01-prior-devloop/main.md"
     [ -n "${FAKE_DEVLOOP_ESCALATION:-}" ] && printf '%s\n' "$FAKE_DEVLOOP_ESCALATION" > .devloop-escalation.json
+    # FAKE_DEVLOOP_HOLD=<file>: park the session until <file> exists, so a case can
+    # send Ctrl-C while a devloop is genuinely IN FLIGHT. `devloop.released` is
+    # written only if the session survived to be released (never if it was killed).
+    if [ -n "${FAKE_DEVLOOP_HOLD:-}" ]; then
+      : >> "${M}/devloop.held"
+      # SIGINT at its DEFAULT here, like the real CLI (it installs its own handler,
+      # so an inherited "ignored" disposition does not protect it): a runner that
+      # failed to isolate this child would kill it with the Ctrl-C.
+      python3 -c 'import os,signal,sys,time
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+for _ in range(600):
+    if os.path.exists(sys.argv[1]): break
+    time.sleep(0.1)' "$FAKE_DEVLOOP_HOLD" || exit 130
+      : >> "${M}/devloop.released"
+    fi
     if [ "${FAKE_DEVLOOP_COMMIT:-1}" = "1" ]; then
       printf 'work %s\n' "$n" >> work.txt
       git add work.txt >/dev/null 2>&1
@@ -595,6 +610,17 @@ for n in 1 2 3 4 5 6 7; do
   cat > "$TEMPLATE/scripts/layer${n}.sh" <<STUB
 #!/usr/bin/env bash
 : >> "\${DEVLOOP_TEST_MARKERS}/ran.layer${n}"
+# FAKE_LAYER<n>_HOLD=<file>: park this layer until <file> exists (Ctrl-C-during-gate cases).
+if [ -n "\${FAKE_LAYER${n}_HOLD:-}" ]; then
+  : >> "\${DEVLOOP_TEST_MARKERS}/layer${n}.held"
+  # SIGINT at its DEFAULT (see the devloop stub's hold): an unisolated layer dies.
+  python3 -c 'import os,signal,sys,time
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+for _ in range(600):
+    if os.path.exists(sys.argv[1]): break
+    time.sleep(0.1)' "\${FAKE_LAYER${n}_HOLD}" || exit 130
+  : >> "\${DEVLOOP_TEST_MARKERS}/layer${n}.released"
+fi
 # ADR-0037 §D7: record the fmt-lane knob the per-task AUTHORITY gate (run_gate) prefixed onto this
 # layer, so a pin can prove it PROPAGATED to the child (=="1") and cannot regress to unset. \${VAR-x}
 # (not \${VAR:-x}) keeps set-empty distinct from unset.
@@ -730,19 +756,33 @@ run_story() {
     OUTPUT="$(cat "$OUT" 2>/dev/null)"
     return 0
   fi
-  env -i \
-    PATH="${STUB_BIN}:${PATH}" \
-    HOME="$FIXHOME" \
-    GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_CONFIG_SYSTEM=/dev/null \
-    DEVLOOP_TEST_MARKERS="$MARK" \
-    DEVLOOP_TEST=1 \
-    STORY_REPO_ROOT="$FIX" \
-    DT_STORY="$REAL_DT_STORY" \
-    DEVLOOP_TMP="$DT" \
-    STORY_SESSION_LIMIT_RETRIES=0 \
-    "${env_kv[@]}" \
-    bash "$RUN_STORY" "${args[@]}" >"$OUT" 2>"$ERR"
+  local base_env=(
+    PATH="${STUB_BIN}:${PATH}"
+    HOME="$FIXHOME"
+    GIT_CONFIG_GLOBAL=/dev/null
+    GIT_CONFIG_SYSTEM=/dev/null
+    DEVLOOP_TEST_MARKERS="$MARK"
+    DEVLOOP_TEST=1
+    STORY_REPO_ROOT="$FIX"
+    DT_STORY="$REAL_DT_STORY"
+    DEVLOOP_TMP="$DT"
+    STORY_SESSION_LIMIT_RETRIES=0
+  )
+  # BG mode (BG=1): start the runner in the background and return at once with
+  # RUNNER_PID set; wait_runner collects RC/OUTPUT. The runner gets its OWN session
+  # (so `kill -INT -- -$RUNNER_PID` is exactly a terminal Ctrl-C to its foreground
+  # group) with SIGINT at its DEFAULT disposition: an async child of this
+  # non-interactive script would otherwise start with SIGINT ignored, which a bash
+  # script can neither trap nor reset — the python3 shim restores the default
+  # before exec'ing the real invocation. Fail LOUD without it, never skip.
+  if [ -n "${BG:-}" ]; then
+    command -v python3 >/dev/null 2>&1 || { printf 'run-story.test.sh: PRECONDITION — python3 not found; the Ctrl-C cases need it to start the runner with SIGINT at its default. They MUST NOT be silently skipped.\n' >&2; exit 2; }
+    setsid python3 -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
+      env -i "${base_env[@]}" "${env_kv[@]}" bash "$RUN_STORY" "${args[@]}" >"$OUT" 2>"$ERR" &
+    RUNNER_PID=$!
+    return 0
+  fi
+  env -i "${base_env[@]}" "${env_kv[@]}" bash "$RUN_STORY" "${args[@]}" >"$OUT" 2>"$ERR"
   RC=$?
   OUTPUT="$(cat "$OUT" "$ERR" 2>/dev/null)"
 }
@@ -2261,6 +2301,8 @@ assert_exit   "o15b-subset-content-mismatch-exit2" 2 "$RC"
 assert_status "o15b-subset-content-mismatch-token" "FINISH-CONTENT-MISMATCH" "$OUTPUT"
 if [ "$(manifest_status "$FIX" 1)" != "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[o15b-subset-not-completed] a files[]⊊raw --finish completed the task"); fi
+if [ "$(git -C "$FIX" rev-parse HEAD)" = "$o15b_head" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[o15b-subset-no-commit] --finish committed despite FINISH-CONTENT-MISMATCH"); fi
 
 # O16: --finish GREEN commits the RECORDED message + exact file set + zero-cost ledger
 # (test F5/F6). The core of D6/f is "commit with the recorded message/trailers".
@@ -2507,5 +2549,176 @@ assert_marker "o23-task2-headless-ran" "$MARK" 'ran.claude.devloop'
 assert_marker "o23-task2-was-headless" "$MARK" 'devloop.session.headless'
 if [ "$(manifest_status "$FIX" 1)" = "completed" ] && [ "$(manifest_status "$FIX" 2)" = "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[o23-both-completed] expected both tasks completed, got '$(manifest_status "$FIX" 1)' + '$(manifest_status "$FIX" 2)'"); fi
+
+# =============================================================================
+# (SI) STOPPING A RUN — Ctrl-C once / twice, and --request-stop
+# =============================================================================
+# The runner is started in the background in its own session (BG=1) and the
+# test delivers SIGINT to that whole process GROUP, exactly as a terminal
+# Ctrl-C does. A held stub (FAKE_DEVLOOP_HOLD / FAKE_LAYER7_HOLD) keeps a devloop
+# or gate layer genuinely in flight while the keypress lands, so these cases
+# prove the in-flight work is NOT hit by the keypress — the property the
+# runner's setsid isolation exists for.
+
+# wait_runner — collect the BG runner's exit status and output.
+wait_runner() {
+  wait "$RUNNER_PID"
+  RC=$?
+  OUTPUT="$(cat "$OUT" "$ERR" 2>/dev/null)"
+}
+# await <label> <cmd...> — poll (REAL sleep) up to 30s for a condition; a case
+# whose precondition never holds FAILS loudly rather than racing ahead.
+await() {
+  local label="$1" i=0
+  shift
+  while ! "$@" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -ge 300 ]; then
+      FAIL=$((FAIL + 1)); FAILURES+=("[${label}] timed out waiting for: $*")
+      return 1
+    fi
+    "$REAL_SLEEP" 0.1
+  done
+}
+# reap_bg — never leave a held stub or runner behind a failed case.
+reap_bg() {
+  kill -KILL -- "-${RUNNER_PID}" 2>/dev/null || true
+  wait "$RUNNER_PID" 2>/dev/null || true
+}
+SIGSTORY='- id: 1
+  status: pending
+  specialist: test
+  prompt: signal task one
+- id: 2
+  status: pending
+  specialist: test
+  deps: [1]
+  prompt: signal task two'
+mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" "$SIGSTORY"
+git -C "$TEMPLATE" commit --quiet -am "two-task fixture for the stop cases" >/dev/null
+STOP_FILE_OF() { printf '%s/story-runner/.stop-requested' "$1"; }
+
+# SI1: Ctrl-C ONCE during the devloop — acknowledged at once, the session is NOT
+# killed, it finishes, its gate runs, it is recorded, then the run stops before
+# task 2 (and before the story-close gate).
+REL="${WORK}/release.si1"
+BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_DEVLOOP_HOLD="$REL" -- fixture
+await si1-held test -e "$MARK/devloop.held"
+kill -INT -- "-${RUNNER_PID}"
+await si1-ack grep -q "STOP-REQUESTED (Ctrl-C)" "$ERR"
+assert_no_marker "si1-session-still-in-flight" "$MARK" 'devloop.released'
+touch "$REL"
+wait_runner
+assert_exit      "si1-exit0" 0 "$RC"
+assert_status    "si1-stopped" "STOPPED at operator request" "$OUTPUT"
+assert_marker    "si1-session-ran-to-completion" "$MARK" 'devloop.released'
+assert_marker    "si1-gate-ran" "$MARK" 'ran.layer7'
+assert_no_marker "si1-close-gate-skipped" "$MARK" 'ran.layer-all'
+if [ "$(manifest_status "$FIX" 1)" = "completed" ] && [ "$(manifest_status "$FIX" 2)" = "pending" ] \
+   && [ "$(cat "$MARK/devloop.count" 2>/dev/null)" = "1" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[si1-stopped-after-task-1] expected task1 completed, task2 pending, one devloop; got '$(manifest_status "$FIX" 1)' + '$(manifest_status "$FIX" 2)', devloops=$(cat "$MARK/devloop.count" 2>/dev/null)"); fi
+if [ ! -e "$(STOP_FILE_OF "$DT")" ] && [ ! -e "$DT/story-runner/.run-in-flight" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[si1-markers-cleared] stop request or in-flight marker left behind in $DT/story-runner"); fi
+reap_bg
+
+# SI2: Ctrl-C TWICE during the devloop — abort now: the session is terminated
+# (not orphaned), the task stays PENDING (resume, like auth-expired), and an
+# operator-abort incident is recorded. Exit 130.
+REL="${WORK}/release.si2"
+BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_DEVLOOP_HOLD="$REL" -- fixture
+await si2-held test -e "$MARK/devloop.held"
+kill -INT -- "-${RUNNER_PID}"
+await si2-ack grep -q "STOP-REQUESTED (Ctrl-C)" "$ERR"
+kill -INT -- "-${RUNNER_PID}"
+wait_runner
+assert_exit   "si2-exit130" 130 "$RC"
+assert_status "si2-abort" "ABORT (second Ctrl-C)" "$OUTPUT"
+assert_status "si2-recover-guidance" "rerun without a flag to resume task 1" "$OUTPUT"
+assert_status "si2-task-pending" "pending" "$(manifest_status "$FIX" 1)"
+si2_inc="$(ls -1 "$(RUN_DIR_OF "$DT")"/task-1.infra-incident.*.json 2>/dev/null | tail -n 1)"
+assert_status "si2-incident-lane" "operator-abort" "$(jq -r '.lane // "MISSING"' "$si2_inc" 2>/dev/null || echo NO-RECORD)"
+# Proof the session was KILLED, not orphaned: release it and give an orphan the
+# chance to write its completion marker.
+touch "$REL"; "$REAL_SLEEP" 1
+assert_no_marker "si2-session-terminated" "$MARK" 'devloop.released'
+reap_bg
+
+# SI3: Ctrl-C ONCE during the GATE — the gate layer is NOT killed (it would
+# otherwise be recorded as a gate failure); the task completes, then the run stops.
+REL="${WORK}/release.si3"
+BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_LAYER7_HOLD="$REL" -- fixture
+await si3-held test -e "$MARK/layer7.held"
+kill -INT -- "-${RUNNER_PID}"
+await si3-ack grep -q "STOP-REQUESTED (Ctrl-C)" "$ERR"
+touch "$REL"
+wait_runner
+assert_exit   "si3-exit0" 0 "$RC"
+assert_status "si3-stopped" "STOPPED at operator request" "$OUTPUT"
+assert_marker "si3-gate-survived" "$MARK" 'layer7.released'
+assert_status "si3-task1-completed" "completed" "$(manifest_status "$FIX" 1)"
+assert_status "si3-task2-pending" "pending" "$(manifest_status "$FIX" 2)"
+reap_bg
+
+# SI4: Ctrl-C TWICE during the GATE — the gate is terminated and the task is
+# ESCALATED reason operator-abort (the attempt is committed, so --revalidate
+# accepts it). Exit 1, the escalation lane's code.
+REL="${WORK}/release.si4"
+BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_LAYER7_HOLD="$REL" -- fixture
+await si4-held test -e "$MARK/layer7.held"
+kill -INT -- "-${RUNNER_PID}"
+await si4-ack grep -q "STOP-REQUESTED (Ctrl-C)" "$ERR"
+kill -INT -- "-${RUNNER_PID}"
+wait_runner
+assert_exit   "si4-exit1" 1 "$RC"
+assert_status "si4-escalated" "escalated" "$(manifest_status "$FIX" 1)"
+assert_status "si4-reason" "operator-abort" "$(jq -r '.reason // "MISSING"' "$(RUN_DIR_OF "$DT")/escalation.json" 2>/dev/null || echo NO-RECORD)"
+assert_status "si4-revalidate-guidance" "--revalidate" "$OUTPUT"
+touch "$REL"; "$REAL_SLEEP" 1
+assert_no_marker "si4-gate-terminated" "$MARK" 'layer7.released'
+reap_bg
+
+# SI5: --request-stop from ANOTHER process while a devloop is in flight. A
+# wrong-story request is refused and changes nothing; the right one is honoured
+# after the current task.
+REL="${WORK}/release.si5"
+BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_DEVLOOP_HOLD="$REL" -- fixture
+si5_mark="$MARK"; si5_out="$OUT"; si5_err="$ERR"; si5_pid="$RUNNER_PID"
+await si5-held test -e "$MARK/devloop.held"
+REUSE_FIXTURE=1 run_story -- some-other-story --request-stop
+assert_exit   "si5-wrong-story-exit2" 2 "$RC"
+assert_status "si5-wrong-story-token" "REQUEST-STOP-WRONG-STORY" "$OUTPUT"
+if [ ! -e "$(STOP_FILE_OF "$DT")" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[si5-wrong-story-no-request] a refused request still wrote the stop file"); fi
+REUSE_FIXTURE=1 run_story -- fixture --request-stop
+unset REUSE_FIXTURE
+assert_exit   "si5-request-exit0" 0 "$RC"
+assert_status "si5-request-ack" "STOP-REQUESTED for the run in flight" "$OUTPUT"
+MARK="$si5_mark"; OUT="$si5_out"; ERR="$si5_err"; RUNNER_PID="$si5_pid"
+touch "$REL"
+wait_runner
+assert_exit   "si5-exit0" 0 "$RC"
+assert_status "si5-stopped" "STOPPED at operator request" "$OUTPUT"
+assert_status "si5-task2-pending" "pending" "$(manifest_status "$FIX" 2)"
+reap_bg
+
+# SI6: --request-stop with no run in flight is refused loudly and leaves nothing
+# behind (a request must never sit waiting to stop some LATER run).
+run_story -- fixture --request-stop
+assert_exit   "si6-no-run-exit2" 2 "$RC"
+assert_status "si6-no-run-token" "NO-RUN-IN-FLIGHT" "$OUTPUT"
+if [ ! -e "$(STOP_FILE_OF "$DT")" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[si6-no-stop-file] a refused request wrote the stop file"); fi
+
+# SI7: a stale stop request is cleared by a new run, which then runs normally.
+mkdir -p "$DT/story-runner"; : > "$(STOP_FILE_OF "$DT")"
+REUSE_FIXTURE=1 run_story -- fixture
+unset REUSE_FIXTURE
+assert_exit   "si7-stale-request-cleared-exit0" 0 "$RC"
+assert_status "si7-ran-to-completion" "ALL TASKS COMPLETE" "$OUTPUT"
+
+# SI8: --request-stop takes no other flag.
+run_story -- fixture --request-stop --stop-after=1
+assert_exit   "si8-with-flags-exit2" 2 "$RC"
+assert_status "si8-with-flags-token" "REQUEST-STOP-WITH-FLAGS" "$OUTPUT"
 
 report_results "scripts/workflow/run-story.test.sh"
