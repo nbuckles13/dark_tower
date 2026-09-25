@@ -63,7 +63,7 @@
 - Layer-7 browser lane (always-runs since 2026-08-20; gated only by Phase-1g dev-cert + Playwright Chromium preconditions) → `scripts/layer7.sh`
 
 ## Environment Tests & Cluster (ADR-0030)
-- Bootstrap + fixtures + cluster config → `crates/env-tests/src/`, `src/cluster.rs`, `src/fixtures/`
+- Bootstrap + fixtures + cluster config → `crates/env-tests/src/`, `src/cluster.rs`, `src/fixtures/`; evidence rule (public APIs, per-entity evidence, no shared-gauge values) → `crates/env-tests/README.md`
 - Flows → `crates/env-tests/tests/` (`24_join_flow.rs`, `26_mh_quic.rs`, `27_mc_slot_placement.rs`, `30_observability.rs`, media `01_mh_deployment_config.rs`, `32_media_metric_hygiene.rs`, `33_alert_rules_loaded.rs`) + hygiene fixtures `src/fixtures/metric_hygiene.rs` + shared MC/MH WebTransport client (connect, framing, `JoinRequest`, MH connect envelope) `src/fixtures/mc_session.rs`
 - Per-run org provisioning (Phase 1h) → `scripts/layer7.sh:__generate_org_subdomain`, `infra/kind/scripts/setup.sh:provision_run_org()`
 - Org subdomain resolution, no default → `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`

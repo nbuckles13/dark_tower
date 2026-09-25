@@ -102,6 +102,17 @@ For the full architecture and design decisions, see:
 - **ADR-0014**: [docs/decisions/adr-0014-environment-integration-tests.md](../../docs/decisions/adr-0014-environment-integration-tests.md)
 - **Design Debate**: [docs/debates/2025-12-16-environment-integration-tests.md](../../docs/debates/2025-12-16-environment-integration-tests.md)
 
+### Evidence rule: public APIs, per-entity evidence
+
+Suites run in parallel against shared pods, so:
+
+- **Drive the public APIs** (GC/MC signalling, WebTransport clients, the browser). Call an internal API directly only to *observe* an effect the public surface cannot show, or to reach a case no public path can (for example an `EndMeeting` from the wrong owner).
+- **Assert per-entity evidence** a concurrent suite cannot disturb: an RPC reply about your own meeting, frames on your own connection, your own client's counters, a generation or ownership check on your own meeting id.
+- **Never assert the value of a shared pod-level gauge** (`mh_media_egress_edges`, `mh_media_registered_meetings`, ...): other suites move it. A config-published gauge (a limit, ceiling or threshold) is fine, and so is a presence check. A counter rising past your own baseline is weak evidence (another suite can cause the rise), so never the only proof. Exact gauge accounting belongs in the owning service's in-process tests, where nothing else runs.
+- **Do not depend on shared capacity you do not need**: register a zero-edge policy when edges are irrelevant to what the test proves.
+
+`tests/29_mh_meeting_teardown.rs` is the worked example.
+
 ## Future Work
 
 - Resilience tests: pod restart recovery, network partition, DB connection loss (see TODO.md)
