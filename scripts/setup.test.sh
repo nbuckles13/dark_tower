@@ -559,4 +559,20 @@ wk_out="$(PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME=reusecluster \
 assert_rc     "kubeconfig-export-failure-aborts" 1 "$wk_rc"
 assert_status "kubeconfig-export-failure-loud"   "localhost:8080" "$wk_out"
 
+# === (C) --only accepts every target its dispatcher has, including otel =====================
+# deploy_only_service has had an `otel)` arm since the dev collector landed, but the argument
+# parser rejected `otel`, so the documented collector-refresh step (`setup.sh --only otel`,
+# needed whenever the collector ConfigMap changes on an existing cluster) could never run.
+# Parse-level pin: the kind stub reports no clusters, so an ACCEPTED target reaches the
+# dispatcher and stops at its cluster-exists check, while a REJECTED one never gets there.
+reset_marks
+only_out="$(PATH="${STUB_BIN}:${PATH}" LC_ALL=C bash "$SETUP" --only otel 2>&1)"
+assert_status "only-otel-reaches-dispatcher" "does not exist" "$only_out"
+assert_absent "only-otel-not-rejected" "Unknown service" "$only_out"
+reset_marks
+only_out="$(PATH="${STUB_BIN}:${PATH}" LC_ALL=C bash "$SETUP" --only bogus 2>&1)"; only_rc=$?
+assert_rc "only-bogus-rejected-rc" 1 "$only_rc"
+assert_status "only-bogus-lists-otel" "Valid: ac, gc, mc, mh, otel" "$only_out"
+assert_no_marker "only-bogus-never-reaches-kind" "$MARK" 'ran.kind'
+
 report_results "scripts/setup.test.sh"

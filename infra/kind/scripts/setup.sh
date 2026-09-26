@@ -35,7 +35,9 @@
 #
 # Options:
 #   --yes                    Auto-answer yes to all interactive prompts
-#   --only <svc>             Only rebuild+redeploy one service (ac, gc, mc, mh)
+#   --only <svc>             Only rebuild+redeploy one service (ac, gc, mc, mh), or
+#                            re-apply the OTel collector (otel; restarts it if its
+#                            ConfigMap changed)
 #   --skip-build             Skip image builds, only apply manifests
 #   --provision-org <sub>    Create one fresh organization and exit. Requires
 #                            DT_CLUSTER_NAME. Container-runnable (see EXECUTION
@@ -105,6 +107,8 @@ if [[ -n "${DT_PORT_MAP:-}" ]]; then
             exit 1
         fi
     done < "${DT_PORT_MAP}"
+    # Runtime path (the per-slug port map); nothing for shellcheck to follow statically.
+    # shellcheck source=/dev/null
     source "${DT_PORT_MAP}"
 fi
 
@@ -153,13 +157,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         --only)
             if [[ -z "${2:-}" ]]; then
-                echo "ERROR: --only requires a service name (ac, gc, mc, mh)" >&2
+                echo "ERROR: --only requires a service name (ac, gc, mc, mh, otel)" >&2
                 exit 1
             fi
             case "$2" in
-                ac|gc|mc|mh) ONLY_SERVICE="$2" ;;
+                ac|gc|mc|mh|otel) ONLY_SERVICE="$2" ;;
                 *)
-                    echo "ERROR: Unknown service '$2'. Valid: ac, gc, mc, mh" >&2
+                    echo "ERROR: Unknown service '$2'. Valid: ac, gc, mc, mh, otel" >&2
                     exit 1
                     ;;
             esac
