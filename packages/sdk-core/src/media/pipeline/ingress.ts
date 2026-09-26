@@ -3,8 +3,8 @@
 // HOT PATH. Per-frame code only: no logging, no metric names, no label
 // construction. Metric handles arrive pre-bound from `../setup/mediaMetrics.ts`.
 //
-// One QUIC datagram -> decode -> resolve key -> verify -> replay -> unwrap ->
-// decrypt -> Opus decode -> playback.
+// One QUIC datagram -> decode -> resolve key -> verify -> SLOT-EDGE GATE ->
+// replay -> unwrap -> decrypt -> that sender's Opus decoder -> its playback lane.
 //
 // ---------------------------------------------------------------------------
 // COUNTED AT THE WIRE, BEFORE ANY PARSE
@@ -27,11 +27,10 @@
 // THERE IS NO SELF-TRUST BRANCH
 // ---------------------------------------------------------------------------
 //
-// In this story the frames arriving are this client's own, returned by MH. The
-// pipeline does not know that and must not: the loopback is MC's assignment and
-// MH's forwarding. Every frame runs the identical resolve-then-verify path a
-// peer's frame takes, and there is no branch anywhere that accepts a frame
-// because this client signed it.
+// Frames from N senders arrive here, possibly including this client's own if MC
+// ever assigns it. The pipeline does not distinguish them and must not: every
+// frame runs the identical resolve-then-verify path, and there is no branch
+// anywhere that accepts a frame because this client signed it.
 //
 // The identity key is resolved from `key_id.sender_id` AND NOTHING ELSE — never
 // from the slot assignment, never from the relay `stream_id`, never from a
@@ -46,6 +45,25 @@
 // reach exactly one place — the hop-sequence monitor, which creates no state for
 // an undeclared `stream_id` — and they never reach key selection, roster lookup,
 // attribution, the replay window, or any drop-or-play decision.
+//
+// ---------------------------------------------------------------------------
+// THE SLOT-EDGE GATE: VERIFY, THEN GATE, THEN OPEN
+// ---------------------------------------------------------------------------
+//
+// ADR-0036 §9 puts every participant on the roster, including those this client
+// shares no handler with, so "has a roster key" is not the same as "may be
+// decoded here". A frame from a sender MC has not assigned to one of this
+// client's slots is dropped as `sender_not_assigned` — defence in depth against
+// a misrouting or compromised handler; in the honest data plane MH never
+// forwards it.
+//
+// ORDER IS LOAD-BEARING. The gate runs AFTER verify, so the drop is of a frame
+// whose attribution is established and the reason carries no unverified claim.
+// It runs BEFORE `openVerifiedFrame`, so a gated frame neither decrypts, caches a
+// transmit key from its wrap, nor advances the replay window — which is what
+// lets the SAME frame be accepted later if that sender is then assigned. The
+// gate reads the verified key-id sender only; see `receiveLanes.ts` for why its
+// authority is MC's stated assignment and never observed traffic.
 
 import { decodeFrame } from '../frame/frameCodec.js';
 import { parseSframe } from '../frame/sframe.js';
@@ -57,10 +75,10 @@ import {
   type ReplayWindow,
   type TransmitKeyCache,
 } from '../frame/receivePath.js';
-import { FrameRejectedError } from '../frame/rejectReason.js';
+import { FrameRejectedError, assignmentReject } from '../frame/rejectReason.js';
 import type { RejectReason } from '../frame/rejectReason.js';
 import type { MediaMetrics } from '../setup/mediaMetrics.js';
-import type { AudioDecoderSeam } from '../setup/seams.js';
+import type { DecodeLane } from './receiveLanes.js';
 import type { FirstMediaObserver } from '../setup/measurement.js';
 import type { HopSequenceMonitor } from './hopSequenceMonitor.js';
 
@@ -78,10 +96,17 @@ export interface AcceptedFrame {
   readonly plaintext: Uint8Array;
 }
 
+/** The slot-edge gate, as ingress consumes it. See `receiveLanes.ts`. */
+export interface SenderGate {
+  /** The lane for an ASSIGNED sender, or `undefined` for any other. */
+  laneFor(senderId: number): DecodeLane | undefined;
+}
+
 /** Construction options for {@link IngressPipeline}. */
 export interface IngressPipelineOptions {
   readonly metrics: MediaMetrics;
   readonly roster: IdentityKeyResolver;
+  readonly lanes: SenderGate;
   readonly keys: ReceiverKeys;
   readonly cache: TransmitKeyCache;
   readonly replay: ReplayWindow;
@@ -93,21 +118,21 @@ export interface IngressPipelineOptions {
 /**
  * Drives one datagram through the receive path.
  *
- * The decoder is attached separately so a decoder fault can detach and replace
- * it without rebuilding the pipeline's receiver state — the replay window and
- * the transmit-key cache must survive a decoder restart, or a restart would
- * reopen the replay surface.
+ * Decoders live in the per-sender lanes, not here, so a decoder fault replaces
+ * one sender's decoder without touching the pipeline's receiver state — the
+ * replay window and the transmit-key cache must survive a decoder restart, or a
+ * restart would reopen the replay surface.
  */
 export class IngressPipeline {
   readonly #metrics: MediaMetrics;
   readonly #roster: IdentityKeyResolver;
+  readonly #lanes: SenderGate;
   readonly #keys: ReceiverKeys;
   readonly #cache: TransmitKeyCache;
   readonly #replay: ReplayWindow;
   readonly #firstMedia: FirstMediaObserver;
   readonly #onAccepted: ((frame: AcceptedFrame) => void) | undefined;
 
-  #decoder: AudioDecoderSeam | undefined;
   /**
    * Frames that completed the receive path, since construction. Monotone.
    *
@@ -132,9 +157,9 @@ export class IngressPipeline {
    * The most recent reject token, or `undefined` if nothing has been dropped.
    *
    * Safe to expose and to project, and **the TYPE is what makes that true** —
-   * not this comment. `RejectReason` is the frozen sixteen-token union whose
-   * SSoT is `proto/test-vectors/frame-v2.vectors.json`, so the field is bounded
-   * by construction and carries no participant, key or payload information.
+   * not this comment. `RejectReason` is the closed union whose SSoT is
+   * `proto/test-vectors/frame-v2.vectors.json`, so the field is bounded by
+   * construction and carries no participant, key or payload information.
    *
    * Typed as the union rather than `string` deliberately: a bounded telemetry
    * token is always one refactor away from becoming a metric label or a log
@@ -148,6 +173,7 @@ export class IngressPipeline {
   constructor(options: IngressPipelineOptions) {
     this.#metrics = options.metrics;
     this.#roster = options.roster;
+    this.#lanes = options.lanes;
     this.#keys = options.keys;
     this.#cache = options.cache;
     this.#replay = options.replay;
@@ -181,11 +207,6 @@ export class IngressPipeline {
   /** The most recent reject token; `undefined` before the first drop. Bounded by type. */
   get lastDropReason(): RejectReason | undefined {
     return this.#lastDropReason;
-  }
-
-  /** Attach (or detach, with `undefined`) the audio decoder. */
-  setDecoder(decoder: AudioDecoderSeam | undefined): void {
-    this.#decoder = decoder;
   }
 
   /**
@@ -234,7 +255,7 @@ export class IngressPipeline {
       // slicing and returns slices rather than copies, so a reject costs no more
       // than a parse and no allocation is sized from an attacker-controlled
       // field. That is why there is no separate pre-parse byte cap here: adding
-      // one would need a reject token outside the frozen sixteen.
+      // one would need a reject token outside the vectors file's closed set.
       const decoded = decodeFrame(datagram);
 
       // The key id lives in the SFrame clear header, so it is readable before
@@ -291,6 +312,16 @@ export class IngressPipeline {
       // VERIFY BEFORE DECRYPT, structurally: `openVerifiedFrame` below is
       // unreachable without the brand `verifyFrame` applies.
       const verified = await verifyFrame(decoded, identityKey);
+
+      // THE SLOT-EDGE GATE — after verify, before open. See the module header.
+      const lane = this.#lanes.laneFor(senderId);
+      if (!lane) {
+        throw assignmentReject(
+          'sender_not_assigned',
+          "the frame's sender is not assigned to any of this client's receive slots",
+        );
+      }
+
       const opened = await openVerifiedFrame(verified, this.#cache, this.#keys, this.#replay);
 
       // ---------------------------------------------------------------------
@@ -339,7 +370,7 @@ export class IngressPipeline {
       this.#metrics.frameAccepted();
       this.#framesAccepted += 1;
       this.#onAccepted?.({ senderId: Number(opened.senderId), plaintext: opened.plaintext });
-      this.#decoder?.decode({ data: opened.plaintext, timestampUs: 0 });
+      lane.decode({ data: opened.plaintext, timestampUs: 0 });
     } catch (err) {
       if (err instanceof FrameRejectedError) {
         // The token, verbatim. No mapping table, no bucket, no `other`: the
@@ -348,8 +379,8 @@ export class IngressPipeline {
         // keeps `sum by(reason)` comparable with the media handler.
         this.#metrics.frameDropped(err.rejectReason);
         this.#framesDropped += 1;
-        // The verbatim token, from the frozen sixteen. No mapping table here
-        // either — see the comment above this catch.
+        // The verbatim token, from the vectors file's closed set. No mapping
+        // table here either — see the comment above this catch.
         this.#lastDropReason = err.rejectReason;
         return;
       }

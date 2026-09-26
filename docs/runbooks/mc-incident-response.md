@@ -2280,13 +2280,13 @@ in the response path, not the apply path.
 
 **What this is.** A receiving client is dropping frames because it does not have the key material
 needed to open them. The counter is **client-side**, by design: MH never opens a frame and
-**structurally cannot observe either condition** (ADR-0036 §4, §11).
+**structurally cannot observe any of the three conditions** (ADR-0036 §4, §11).
 
 ```promql
-sum by(reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|no_roster_entry"}[5m]))
+sum by(reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"}[5m]))
 ```
 
-**Both reasons are expected as transients** at join and immediately after a KEK rotation. **The
+**All three reasons are expected as transients** at join and immediately after a KEK rotation. **The
 sustained case is the signal**, and ADR-0036 §11 states it is the *only* signal for a join or
 rotation path that has silently stopped delivering keys. That is why the alert's `for:` window is
 long rather than its threshold being high — see the comment on the rule.
@@ -2327,7 +2327,7 @@ long rather than its threshold being high — see the comment on the rule.
 > same batch and compress together — which is why it is ratio-shaped and why an absolute-rate alert
 > on a `dt_client_*` series would fire on the artefact alone.)
 
-**Triage splits on the `reason` label first, because the two arms have different remedies — and
+**Triage splits on the `reason` label first, because the three arms have different remedies — and
 because they are not equally instrumented.**
 
 #### Arm 1 — `no_roster_entry`
@@ -2356,9 +2356,15 @@ Remedy is in MC's **roster publication** path, not key generation.
 
 #### Arm 2 — `no_kek_for_generation`
 
-The client has no meeting KEK for the generation the frame's wrap announces. Remedy is in MC's
-**KEK delivery** path: the join response is the only KEK source in this build
-(`dt_client_media_kek_updates_total{source="join_response"}`).
+The frame's wrap announces a KEK generation **newer** than any the client holds: MC's KEK push has
+not arrived. Remedy is in MC's **KEK delivery** path. There are **two** KEK sources, and a check on
+only one of them excludes half the delivery path:
+
+- `dt_client_media_kek_updates_total{source="join_response"}` — the KEK carried on the join
+  response;
+- `dt_client_media_kek_updates_total{source="kek_update"}` — a rotation pushed to an
+  already-joined client (`MeetingKekUpdate`). **This is the arm's main case after a rotation**, and
+  a query filtered to `join_response` alone cannot see it.
 
 > **THIS ARM HAS NO SERVER-SIDE COUNTER, AND CANNOT HAVE ONE AS THINGS STAND. Read that as a gap,
 > not as reassurance.**
@@ -2369,7 +2375,7 @@ The client has no meeting KEK for the generation the frame's wrap announces. Rem
 > built on the absence of that counter moving**.
 >
 > The gap narrowed on 2026-09-23 but did not close. The client-side counter now DOES reach
-> Prometheus, so `dt_client_media_kek_updates_total{source="join_response"}` is queryable and this
+> Prometheus, so `dt_client_media_kek_updates_total` (both `source` values) is queryable and this
 > arm has a real client-side signal for the first time. **There is still no MC-side counter, and
 > still nothing that can corroborate from the server.** So the arm remains asymmetric with Arm 1,
 > which has `mc_join_identity_key_presence_total` to answer "are clients publishing keys at all?"
@@ -2380,8 +2386,10 @@ observable without touching MC's memory:
 
 1. **The per-join response-side condition.** The KEK is not provisioned for a join when the join
    response's `meeting_kek` is not exactly 32 bytes. This is checkable from the client side.
-2. **`dt_client_media_kek_updates_total{source="join_response"}`** — the client-side observation
-   that a KEK was delivered and cached. Flat at zero across a join means delivery, not usage.
+2. **`sum by(source) (rate(dt_client_media_kek_updates_total[15m]))`** — the client-side
+   observation that a KEK was delivered and cached, split by source. `join_response` flat at zero
+   across a join means join-time delivery, not usage; `kek_update` flat while rotations are
+   expected (participants leaving) means the rotation push is not arriving.
 
 If and only if both are exhausted and you still need to know whether the KEK is live in the meeting
 actor, **stop here and read
@@ -2396,18 +2404,73 @@ you are about to reach for is a heap dump — which is why the gate exists.
 > under incident pressure. A KEK in a log is a KEK in the log pipeline, on every node that ships it,
 > for the retention period.
 
+#### Arm 3 — `kek_generation_stale`
+
+The frame's wrap announces a KEK generation **older** than the client still retains. A client
+holds the current KEK generation plus at most **one** previous generation, and drops the previous
+one after a retention window derived from MC's rotation debounce **W** (roughly W/2, bounded by a
+client-side floor and ceiling). A frame still arriving under a generation that has aged out of
+that window is dropped here. It is not an "MC has not sent it yet" condition (that is Arm 2);
+the key was delivered, then correctly discarded.
+
+A short burst right after a rotation is expected: frames that were already in flight under the
+old generation, or a joiner that arrives after a rotation and sees pre-rotation frames. A
+**sustained** rate means senders keep wrapping under a generation that receivers have already
+retired: either the retention window is too short for the rotation push skew in this deployment,
+or a sender's own rotation push is landing late (check that sender side against Arm 2's
+`source="kek_update"` signal).
+
+**At the shipped default, raising W does NOT help — read this before touching it.** Retention is
+`min(W/2, ceiling)`, and the client ceiling `KEK_RETENTION_CEILING_MS` (30s, in
+`packages/sdk-core/src/config/clientConfig.ts`) is the binding parameter: at the default
+`MC_KEK_ROTATION_DEBOUNCE_SECONDS=60` (`infra/services/mc-service/configmap.yaml`), W/2 equals that
+ceiling EXACTLY, so retention is **already at its design maximum**. Raising W to 90, 120 or 300
+yields the identical 30s — and flips `ceiling_clamped` to permanently non-zero fleet-wide, a second
+signal manufactured by a change that cannot help. If you have already raised W and see
+`ceiling_clamped` climbing, that is the confirmation you hit the ceiling, not a new fault.
+
+So at the default config, sustained `kek_generation_stale` is **not a W-tuning problem**: receiver
+retention is maximal, and the cause is on the SENDER side — go to the rotation push path (Arm 2's
+`source="kek_update"` signal) and find the sender whose push lands late. Lengthening retention
+past 30s means raising the client ceiling, which is a **code change, deliberately bounded** for
+key minimisation (a superseded KEK is held in client memory only as long as in-flight frames need
+it — see the comment at the constant). It is a design decision, not a knob for incident pressure.
+
+**Raising W IS the remedy in exactly one case: a deployment that has LOWERED W below 60s**, where
+W/2 is genuinely under the ceiling and retention tracks it. Above 60s, W affects only MC's
+rotation debounce and no longer affects client retention at all. That decoupling is why this arm
+lives in an MC scenario even though the counter is client-side: MC's KEK-and-roster delivery path
+owns both the push timing and W, as it does for Arms 1 and 2.
+
+Before you change W, check the client's own retention signals, which show whether the client is
+honouring the W it was sent:
+
+- `dt_client_media_kek_retention_anomalies_total{outcome=...}` — `floor_substituted` (the client
+  received no or zero W, as after an MC rollback below the field — see `mc-deployment.md`
+  §Rollback), `ceiling_clamped` (W/2 exceeds the client ceiling, so raising W further buys
+  nothing — see above), `below_rewrap_latency` (W/2 is under the client's send-queue drain time;
+  reachable only when W has been lowered far below the default, and the remedy is raising W back
+  toward 60s).
+- `dt_client_media_kek_generations_retained_total` next to
+  `dt_client_media_kek_updates_total{source="kek_update"}` — rotations arriving while the retained
+  counter stays flat means rotations are happening and **no** previous generation is being kept.
+
+This arm has no server-side counter either (same gap as Arm 2).
+
 #### Neighbouring reasons that are NOT this scenario
 
 | `reason` | What it actually is | Route to |
 |---|---|---|
 | `unwrap_failed` | The **KEK unwrap** failed — key **distribution** | `meeting-controller` |
 | `decrypt_failed` | The **SFrame payload** decrypt failed — the key schedule or the sender | `client` |
-| `no_transmit_key` | A frame with neither a cached key nor a usable wrap — a **protocol violation**, not a third key reason | `protocol` / `client` |
+| `no_transmit_key` | A frame with neither a cached key nor a usable wrap — a **protocol violation**, not a fourth key reason | `protocol` / `client` |
+| `sender_not_assigned` | A verified frame from a sender outside the client's MC-stated slot assignment — **misrouting**, not key delivery; deliberately excluded from this alert | `meeting-controller` (placement) / `media-handler` (forwarding) |
 
 `unwrap_failed` and `decrypt_failed` are both AES-GCM failures on one receive path that route to
 opposite teams. Read the label, not the symptom.
 
-**Escalation**: `meeting-controller` owns both remedies (roster publication, KEK delivery).
+**Escalation**: `meeting-controller` owns all three remedies (roster publication, KEK delivery,
+rotation debounce).
 `security` is a required reviewer on any change to KEK handling.
 
 **Related**:

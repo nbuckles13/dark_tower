@@ -22,7 +22,11 @@
 // metric/log label. `meeting_id_hash` is a SHA-256 digest of the meeting id (R-32:
 // `crypto.subtle.digest`, never `Math.random`).
 
-import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../config/clientConfig.js';
+import {
+  DEFAULT_CLIENT_CONFIG,
+  transmitRewrapLatencyMs,
+  type MediaConfig,
+} from '../config/clientConfig.js';
 import { AuthApiClient } from '../http/AuthApiClient.js';
 import { bytesToHex } from '../media/frame/hex.js';
 import { MeetingApiClient } from '../http/MeetingApiClient.js';
@@ -37,8 +41,9 @@ import {
   type AudioPipelineOptions,
   type AudioSendDirective,
 } from '../media/lifecycle/AudioPipeline.js';
-import { JoinResponseKekSource } from '../media/setup/kekSource.js';
-import { MEDIA_KEK_SOURCES, MediaMetrics } from '../media/setup/mediaMetrics.js';
+import { MeetingKekHolder } from '../media/setup/kekSource.js';
+import { kekObserver, rosterInvalidationListener } from './mediaWiring.js';
+import { MediaMetrics } from '../media/setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
 import { createMicrophoneCapture } from '../media/setup/capture.js';
 import { createAudioDecoder, createAudioEncoder } from '../media/setup/opus.js';
@@ -262,10 +267,18 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   #torn = false;
   readonly #mediaConfig: MediaConfig;
   /**
-   * The KEK-source seam. THE ONLY PLACE THE MEETING KEK LIVES. Never on an
-   * event, never on an error, never persisted, zeroed at disconnect.
+   * The KEK holder: current generation plus at most one retained previous. THE
+   * ONLY PLACE THE MEETING KEK LIVES. Never on an event, never on an error,
+   * never persisted, zeroed at disconnect.
    */
-  readonly #kekSource = new JoinResponseKekSource();
+  readonly #kekSource: MeetingKekHolder;
+  /**
+   * The media metric handles. Built at JOIN rather than at `startMedia()`, so a
+   * KEK arriving on the join response — before media starts — is counted on
+   * arrival rather than inferred later from whether one happens to be held.
+   * Media-path labels are an allow-list of two strings; see `mediaMetrics.ts`.
+   */
+  #mediaMetrics: MediaMetrics | undefined;
   #rosterKeys: RosterIdentityKeys | undefined;
   /**
    * The meeting identity — one non-extractable Ed25519 signing capability plus
@@ -303,6 +316,10 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     this.#joinTimeoutMs = options.joinTimeoutMs;
     this.#metricsSink = options.metricsSink ?? getMetricsSink();
     this.#mediaConfig = options.mediaConfig ?? DEFAULT_CLIENT_CONFIG.media;
+    this.#kekSource = new MeetingKekHolder({
+      rewrapLatencyMs: transmitRewrapLatencyMs(this.#mediaConfig),
+      clock: this.#clock,
+    });
     this.#captureFactory = options.captureFactory ?? createMicrophoneCapture;
     this.#encoderFactory = options.encoderFactory ?? createAudioEncoder;
     this.#decoderFactory = options.decoderFactory ?? createAudioDecoder;
@@ -334,6 +351,12 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       meeting_id_hash: 'none',
     };
     this.#orgId = options.orgSubdomain;
+    const mediaMetrics = new MediaMetrics(
+      { clientVersion: __SDK_VERSION__, orgId: this.#orgId },
+      this.#metricsSink,
+    );
+    this.#mediaMetrics = mediaMetrics;
+    this.#kekSource.setObserver(kekObserver(mediaMetrics));
     let stage: FailureStage = FailureStage.Internal;
     try {
       // --- fetching-token: auth + GC meeting token ---
@@ -493,11 +516,9 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // The media label set is built BY ALLOW-LIST from two named strings. It
     // shares nothing with `this.#metricLabels`, which carries `meeting_id_hash`
     // — the dimension ADR-0036 §11 bars from every media emission.
-    const metrics = new MediaMetrics(
-      { clientVersion: __SDK_VERSION__, orgId: this.#orgId },
-      this.#metricsSink,
-    );
-    if (this.#kekSource.isProvisioned) metrics.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse);
+    const metrics =
+      this.#mediaMetrics ??
+      new MediaMetrics({ clientVersion: __SDK_VERSION__, orgId: this.#orgId }, this.#metricsSink);
 
     const slotId = options.slotId ?? DEFAULT_AUDIO_SLOT_ID;
     const media = this.#media;
@@ -508,7 +529,6 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       roster:
         this.#rosterKeys ?? new RosterIdentityKeys(this.#mediaConfig.ingress.maxCachedIdentityKeys),
       senderId,
-      kekGeneration: signaling.kekGeneration,
       identity,
       declaredSlotIds: [slotId],
       senderFor: (url) => media?.getDatagramChannel(url),
@@ -559,7 +579,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         // Ignoring it kept the STALE instruction, so the pipeline's target set
         // never reached zero. `AudioPipeline.setSendDirective` rotates the
         // transmit key on the empty -> non-empty EDGE, and resume-from-empty is
-        // one of only three `rotate()` call sites (see `lifecycle/transmitKeys.ts`,
+        // one of only four `rotate()` call sites (see `lifecycle/transmitKeys.ts`,
         // "the bound is the interval between two consecutive rotations from any
         // trigger"). Never seeing "empty" made that call site unreachable on this
         // path. So a publisher whose last holder left, then picked up by a NEW
@@ -594,7 +614,15 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // still hear the slots it holds. Subscribed before the declaration below,
     // because MC's first `StreamAssignments` answers that declaration.
     signaling.on('streamAssignments', (event) => {
-      pipeline.setReceiveHandlers(event.assignments.map((a) => a.mediaHandlerUrl));
+      // Slot, sender and handler travel together: the handler URLs pick the
+      // receive transports and the slot -> sender pairs are the slot-edge gate.
+      pipeline.setReceiveAssignments(
+        event.assignments.map((a) => ({
+          slotId: a.slotId,
+          senderId: a.senderId,
+          mediaHandlerUrl: a.mediaHandlerUrl,
+        })),
+      );
     });
 
     await signaling.sendReceiveCapability([{ slotId, mediaKind: 'audio' }]);
@@ -775,6 +803,14 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
 
   #createSignaling(): SignalingClient {
     this.#rosterKeys = new RosterIdentityKeys(this.#mediaConfig.ingress.maxCachedIdentityKeys);
+    // R-18: a roster change to a sender's key purges ITS cached transmit keys
+    // (never its replay state). See `mediaWiring.ts`.
+    this.#rosterKeys.setTransmitKeyInvalidationListener(
+      rosterInvalidationListener(
+        () => this.#mediaMetrics,
+        () => this.#pipeline,
+      ),
+    );
     const opts: SignalingClientOptions = {
       ...(this.#connectFn ? { connect: this.#connectFn } : {}),
       ...(this.#joinTimeoutMs !== undefined ? { joinTimeoutMs: this.#joinTimeoutMs } : {}),

@@ -121,7 +121,7 @@ export interface FrameVector {
 /** A `reject_reasons[]` entry. */
 export interface RejectReasonSpec {
   readonly token: string;
-  readonly layer: 'codec' | 'crypto' | 'key';
+  readonly layer: 'codec' | 'crypto' | 'key' | 'assignment';
   readonly drops_frame: boolean;
   readonly has_vector: boolean;
   readonly fleet_spelling: string | null;

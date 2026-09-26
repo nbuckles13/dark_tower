@@ -48,8 +48,15 @@
 //   * **Unmute after mute** — implemented. Not literally in §4's table; a mute is
 //     a resume-from-empty for the stream, it costs one generation bump, and it
 //     bounds a leaked transmit key across the silent window.
-//   * **Participant leaves / joins** — not a transmit-key trigger at all; those
-//     rotate the KEK, which is MC's.
+//   * **Meeting KEK rotated** — implemented (story 2, R-13): `AudioPipeline`
+//     rotates on `MeetingKekHolder.onCurrentGenerationChanged`, which fires only
+//     AFTER the new KEK is current, so the next mint wraps under it. Without this
+//     the leave bound ADR-0036 §4 states is false: a departed member keeps
+//     decrypting from the unwrapped transmit keys it cached before the rotation,
+//     and re-wrapping under the new KEK cannot revoke a key it already holds in
+//     plaintext — the sender has to move to a key the leaver never held.
+//   * **Participant leaves / joins** — not a transmit-key trigger in itself; MC
+//     rotates the KEK for those, and the KEK row above is what follows.
 //   * **Counter exhaustion** — UNREACHABLE RATHER THAN UNCHECKED, and stated in
 //     the idiom `keyId.ts` uses for the 2^40 generation ceiling. The stream
 //     sequence is a `uint32` (`decodeFrame` reads `getUint32(6)`), so at 50 fps a
@@ -137,7 +144,7 @@ import { aesGcmSeal, AES_256_KEY_BYTES, wrapNonce } from '../frame/sframe.js';
 import { packKeyId } from '../frame/keyId.js';
 import type { WrappedTransmitKey } from '../frame/frameCodec.js';
 import type { Bytes } from '../frame/hex.js';
-import type { MeetingKekSource } from '../setup/kekSource.js';
+import type { KekWrapSource } from '../setup/kekSource.js';
 
 /** Everything the egress path needs to seal and announce one frame. */
 export interface TransmitKeyMaterial {
@@ -159,13 +166,6 @@ export class TransmitKeyError extends Error {
     this.name = 'TransmitKeyError';
     this.reason = reason;
   }
-}
-
-/** Read side of the KEK seam plus the generation to wrap under. */
-export interface KekForWrapping {
-  readonly source: MeetingKekSource;
-  /** The generation to announce on every wrapped block. */
-  readonly generation: number;
 }
 
 /**
@@ -262,11 +262,13 @@ export class TransmitKeyManager {
     // So retirement is deferred by one rotation. **The bound is the interval
     // between two CONSECUTIVE ROTATIONS FROM ANY TRIGGER — not the configured
     // rotation period**, and the distinction is the whole of it: `rotate()` has
-    // three call sites in `AudioPipeline`, and only one of them is the timer.
+    // four call sites in `AudioPipeline`, and only one of them is the timer.
     //
     //   * the rotation interval        (`audioRotationPeriodMs`)
     //   * resume-from-empty            (a send directive going empty -> non-empty)
     //   * unmute                       (`setAudioMuted(false)`)
+    //   * a meeting KEK rotation       (`onCurrentGenerationChanged`, R-13; paced
+    //                                   by MC's leave debounce W, so seconds apart)
     //
     // So two `setAudioMuted(false)` calls in quick succession, or a directive
     // flapping empty -> non-empty -> empty -> non-empty, rotate twice
@@ -308,7 +310,7 @@ export class TransmitKeyManager {
    * the client cannot announce a key it cannot wrap, and sending an unwrapped or
    * unannounced frame is not an available degradation.
    */
-  async materialFor(streamNumber: number, kek: KekForWrapping): Promise<TransmitKeyMaterial> {
+  async materialFor(streamNumber: number, kek: KekWrapSource): Promise<TransmitKeyMaterial> {
     const existing = this.#current.get(streamNumber);
     if (existing) return existing;
 
@@ -342,11 +344,15 @@ export class TransmitKeyManager {
    */
   async #mint(
     streamNumber: number,
-    kek: KekForWrapping,
+    kek: KekWrapSource,
     generation: bigint,
   ): Promise<TransmitKeyMaterial> {
-    const kekBytes = kek.source.kekForGeneration(kek.generation);
-    if (!kekBytes) {
+    // READ AT MINT TIME, NOT CAPTURED ONCE. A generation fixed when the pipeline
+    // was built would keep wrapping under the KEK a departed member holds after
+    // every rotation (R-13), silently. The source returns only the CURRENT
+    // generation, so a retained previous KEK is unreachable from here.
+    const current = kek.currentForWrapping();
+    if (!current) {
       throw new TransmitKeyError(
         'no_kek',
         'no meeting key-encryption key is available, so a transmit key cannot be wrapped',
@@ -371,7 +377,7 @@ export class TransmitKeyManager {
     // single-flight guard above is a crypto requirement rather than an
     // optimisation.
     const wrappedKeyWithTag = await aesGcmSeal({
-      key: kekBytes,
+      key: current.kek,
       nonce: wrapNonce(keyId),
       aad: keyId,
       plaintext: key,
@@ -380,7 +386,7 @@ export class TransmitKeyManager {
     const material: TransmitKeyMaterial = {
       keyId,
       key,
-      wrapped: { kekGeneration: kek.generation, wrappedKeyWithTag },
+      wrapped: { kekGeneration: current.generation, wrappedKeyWithTag },
     };
     // Install ONLY if no rotation happened while this was in flight. Installing
     // a superseded generation would reinstate a key the rotation discarded, so

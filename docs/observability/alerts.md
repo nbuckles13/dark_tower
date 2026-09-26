@@ -680,7 +680,7 @@ sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[
 **PromQL**:
 ```promql
 (
-  sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|no_roster_entry"}[5m]))
+  sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"}[5m]))
   /
   sum(rate(dt_client_media_frames_received_total[5m]))
 ) > 0.05
@@ -689,12 +689,15 @@ sum(rate(dt_client_media_frames_received_total[5m])) > 0
 ```
 `for: 15m`
 
+**The selector is an EXPLICIT TOKEN ENUMERATION, not a pattern over `layer` or a name prefix** — a future key-delivery token joins it only by being added here deliberately (and in `mc-alerts.yaml`). `layer` does no selector work: classify by `docs/observability/label-taxonomy.md` §The discriminator, never by `layer`. **`sender_not_assigned` is EXCLUDED by decision**: it is a frame from a sender outside the client's MC slot-assignment set, so its remedy lives in MH/MC placement, not in KEK or roster delivery, and it is not alerted anywhere this story (the alert inventory is story 2 task 16's). Re-deriving the threshold for the widened three-token selector is also task 16's. Until then it leans SAFE (@operations' derivation, recorded in full at the rule): widening a numerator over an unchanged denominator only moves the ratio up, so the un-re-derived 5% can over-page but never under-page; and the selected population is roughly today's minus the frames retention now rescues into `accepted`.
+
 **Response**:
-1. **Split on the `reason` label first** — the two arms have different remedies and are not equally instrumented.
+1. **Split on the `reason` label first** — the three arms have different remedies and are not equally instrumented.
 2. `no_roster_entry`: no usable identity key for the sender, including the case where MC published an empty key. Signature verification cannot run, so attribution is failing and not merely decryption. Corroborate server-side with `mc_join_identity_key_presence_total{presence}` — a rising `absent` ratio answers "are clients publishing keys?" directly. A *malformed* key is a different condition and lands on `mc_session_join_failures_total{error_type="identity_key_invalid"}`.
-3. `no_kek_for_generation`: no meeting KEK for the generation the frame's wrap announces. **This arm has no server-side counter and cannot have one** — `mc_meeting_kek_generated_total` increments unconditionally and its catalog entry states the inference is not computable even in principle. Absence of a signal here is not evidence the KEK is present.
-4. Check the non-dump path first and completely: the per-join response-side condition (`meeting_kek` not exactly 32 bytes) and `dt_client_media_kek_updates_total{source="join_response"}`. Then read the runbook's dump gate before going further.
-5. Both reasons are **expected transiently** at join and after a KEK rotation. The `for: 15m` window, not the threshold, is what separates the transient from the signal.
+3. `no_kek_for_generation`: the frame's wrap announces a KEK generation NEWER than any this receiver holds — **MC's KEK push has not arrived** (MC delivery path). **This arm has no server-side counter and cannot have one** — `mc_meeting_kek_generated_total` increments unconditionally and its catalog entry states the inference is not computable even in principle. Absence of a signal here is not evidence the KEK is present.
+4. `kek_generation_stale`: the frame's wrap announces a generation OLDER than this receiver still retains (it keeps the current generation plus at most one previous, for `min(W/2, ceiling)` where W is MC's `kek_rotation_debounce_seconds`). At the shipped default W, client retention is **already at its ceiling** (`KEK_RETENTION_CEILING_MS`, 30 s), so raising `MC_KEK_ROTATION_DEBOUNCE_SECONDS` does **not** lengthen it — it only flips the fleet to `ceiling_clamped`. The only lever that lengthens retention past 30 s is the client ceiling itself, an SDK constant requiring a release **and** a deliberate key-lifetime bound (ADR-0036 §4) — a security decision, not a remedy an operator applies. Lowering W *shortens* retention and makes this worse. A sustained `kek_generation_stale` at default configuration therefore points at **sender-side rotation skew**, not at MC's debounce. Read `dt_client_media_kek_retention_anomalies_total{outcome}` for why retention was what it was (`floor_substituted` = an MC older than the field, expected during a deliberate MC rollback; `below_rewrap_latency` = W/2 under the client's re-wrap latency) and `dt_client_media_kek_install_refusals_total{outcome}` for KEK messages the client refused. Both KEK arms fire only when no usable transmit key for the frame's key id is already cached.
+5. Check the non-dump path first and completely: the per-join response-side condition (`meeting_kek` not exactly 32 bytes) and `dt_client_media_kek_updates_total{source=~"join_response|kek_update"}` — the join response is no longer the only KEK source. Then read the runbook's dump gate before going further.
+6. All three reasons are **expected transiently** at join and after a KEK rotation. The `for: 15m` window, not the threshold, is what separates the transient from the signal.
 
 **Threshold provenance**: 5% is not SLO-derived and there is no observed baseline. At 20 ms/frame (50 frames/s) a 1–2 second join transient is well under 1% of a 5-minute window while a sustained delivery failure sits near 100%.
 

@@ -183,6 +183,7 @@ def filtering():
     long_ver = "9" * 200
     post([
         counter("dt_client_not_allowlisted_total", dict(BASE, org_id="filt"), 1, t0, t1),
+        counter("dt_client_media_kek_retention_violations_total", dict(BASE, org_id="filt-newname"), 1, t0, t1),
         counter("dt_client_media_frames_dropped_total",
                 dict(BASE, org_id="filt", reason="no_kek_for_generation", meeting_id_hash="deadbeef"), 3, t0, t1),
         counter("dt_client_media_frames_sent_total", dict(BASE, org_id="filt-ver", client_version=long_ver), 2, t0, t1),
@@ -196,6 +197,22 @@ def filtering():
     settle()
     t = scrape()
     check("(a) unlisted name absent", "dt_client_not_allowlisted_total" in t, False)
+    # (a+) POSITIVE CONTROL FOR THE NAME ALLOWLIST, paired with (a) so both
+    # directions run: an added name arrives, an unlisted name does not. The
+    # `reason="kek_generation_stale"` case below rides an ALREADY-allowlisted
+    # name, so it proves the token survives `keep_keys` and nothing about a new
+    # allowlist ENTRY. ONE new name is sufficient - do not "complete" this to
+    # all six story-2 names: it proves the MECHANISM (a newly-added entry in
+    # `filter/client_metric_names` passes the strict include and reaches :8889),
+    # and six checks would test one mechanism six times. The other five are
+    # covered against DIVERGENCE between the emitter, the `client.md`
+    # `Exported:` marker and the collector list by dt-guard's
+    # `export_set_mismatch` + `exported_without_emitter`. Residual, accepted: a
+    # CONSISTENT misspelling across all three encodings passes that chain; it is
+    # a review-visible content error (a wrong name in a catalog entry a human
+    # reads), not a silent mechanism failure, and no driver case would catch it.
+    v, _ = value(t, "dt_client_media_kek_retention_violations_total", {"org_id": "filt-newname"})
+    check("(a+) newly-allowlisted name present", v, 1.0)
     v, labels = value(t, "dt_client_media_frames_dropped_total", {"org_id": "filt"})
     check("(b) allowlisted name present with reason", (v, (labels or {}).get("reason")), (3.0, "no_kek_for_generation"))
     check("(b) meeting_id_hash stripped", "meeting_id_hash" in (labels or {}), False)
@@ -213,7 +230,7 @@ def filtering():
     check("(nil-guard) never-sent labels stay absent", sorted(k for k in (labels or {}) if k in ("reason", "outcome", "action", "source")), [])
     check("(real) client_version 0.0.0 survives", (labels or {}).get("client_version"), "0.0.0")
     _, labels = value(t, "dt_client_media_frames_dropped_total", {"org_id": "filt-real"})
-    check("(real) future token kek_generation_stale survives", (labels or {}).get("reason"), "kek_generation_stale")
+    check("(real) token kek_generation_stale survives", (labels or {}).get("reason"), "kek_generation_stale")
     check("(real) no_kek_for_generation survives", value(t, "dt_client_media_frames_dropped_total", {"org_id": "filt"})[1].get("reason"), "no_kek_for_generation")
     check("names verbatim (no unit suffix)", "dt_client_time_to_first_media_frame_ms_milliseconds" in t, False)
     check("names verbatim (no doubled _total)", "_total_total" in t, False)

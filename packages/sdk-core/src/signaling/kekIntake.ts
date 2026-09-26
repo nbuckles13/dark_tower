@@ -42,30 +42,47 @@
 // actually buys is deterministic: after intake, the reachable object graph the
 // SDK hands anywhere no longer contains the key.
 
-import { MEETING_KEK_BYTES } from '../media/frame/sframe.js';
+import type { KekArrival, KekInstallResult } from '../media/setup/kekSource.js';
 
 /**
  * Write side of the KEK seam, declared STRUCTURALLY rather than imported.
  *
  * Keeps signaling free of a dependency on the media pipeline's concrete seam:
  * this module needs one method, and naming the method is a smaller contract than
- * naming the class. `JoinResponseKekSource` satisfies it.
+ * naming the class. `MeetingKekHolder` satisfies it.
  */
 export interface MeetingKekSink {
-  /** Install the KEK. Throws on a width or all-zero violation. */
-  set(kek: Uint8Array, generation: number): void;
+  /**
+   * Install the KEK. Never throws on wire input: a refusal is reported through
+   * the result and the holder's own counters.
+   *
+   * @param debounceSeconds W from the SAME message (`kek_rotation_debounce_seconds`).
+   */
+  install(
+    kek: Uint8Array,
+    generation: number,
+    debounceSeconds: number,
+    source: KekArrival,
+  ): KekInstallResult;
 }
 
-/** The two key-bearing message shapes, structurally. */
+/**
+ * The two key-bearing message shapes, structurally: `JoinResponse` (including
+ * the join-shaped reconnect response) and `MeetingKekUpdate`. Both carry W.
+ */
 interface KekBearing {
   meetingKek: Uint8Array;
   kekGeneration: number;
+  kekRotationDebounceSeconds: number;
 }
 
 /** What intake did. Never the key, never its generation. */
 export interface KekIntakeOutcome {
-  /** True when a usable KEK was taken and installed. */
-  readonly installed: boolean;
+  /**
+   * The holder's verdict, or `undefined` when the message carried no key (MC's
+   * "not yet provisioned", a legitimate state).
+   */
+  readonly result: KekInstallResult | undefined;
 }
 
 /**
@@ -81,29 +98,35 @@ export interface KekIntakeOutcome {
  * ADR-0036 §4 / `signaling.proto`: an empty `meeting_kek` means NOT YET
  * PROVISIONED, which is a legitimate state, not an error. There is deliberately
  * no sentinel on `kek_generation` — 0 is a plausible first generation — so the
- * not-provisioned signal is the key not being exactly 32 bytes, and this
- * function must not gate on the generation instead.
+ * not-provisioned signal is the key being EMPTY, and this function must not
+ * gate on the generation instead. A non-empty key of the wrong width is not
+ * "unprovisioned": it is malformed, and the holder refuses and counts it.
  */
-export function takeMeetingKek(message: KekBearing, sink: MeetingKekSink): KekIntakeOutcome {
+export function takeMeetingKek(
+  message: KekBearing,
+  sink: MeetingKekSink,
+  source: KekArrival,
+): KekIntakeOutcome {
   const raw = message.meetingKek;
-  let installed = false;
-  if (raw.length === MEETING_KEK_BYTES) {
-    try {
+  let result: KekInstallResult | undefined;
+  try {
+    // Only EMPTY means "not yet provisioned". Every non-empty value goes to the
+    // holder — including a wrong-width one, which it refuses and COUNTS as
+    // `malformed`. Filtering on the exact width here would scrub such a value
+    // silently: a fail-quietly path on exactly the input that is wrong.
+    if (raw.length !== 0) {
       // The seam TAKES A COPY, which is what makes the zeroing below safe: the
       // seam is not left holding a view of the buffer we are about to overwrite.
-      sink.set(raw, message.kekGeneration);
-      installed = true;
-    } catch {
-      // An all-zero key, refused by the seam. Not installed, still scrubbed. The
-      // cause is not retained: it is key-adjacent by construction and the caller
-      // learns everything actionable from `installed === false`.
-      installed = false;
+      result = sink.install(raw, message.kekGeneration, message.kekRotationDebounceSeconds, source);
     }
+  } finally {
+    // In a `finally`, so the scrub runs even if the sink throws on a defect —
+    // the leak is closed on exactly the path where something has gone wrong.
+    raw.fill(0);
+    // Replace the reference too. Zeroing alone leaves a 32-byte all-zero array
+    // on the message, which a reader could mistake for a real key; an empty
+    // array is unambiguous and matches what MC sends when unprovisioned.
+    message.meetingKek = new Uint8Array(0);
   }
-  raw.fill(0);
-  // Replace the reference too. Zeroing alone leaves a 32-byte all-zero array on
-  // the message, which a reader could mistake for a real key; an empty array is
-  // unambiguous and matches what MC sends when unprovisioned.
-  message.meetingKek = new Uint8Array(0);
-  return { installed };
+  return { result };
 }

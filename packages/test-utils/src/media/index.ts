@@ -115,17 +115,40 @@ export class FakeCaptureSource {
  * byte between encode and decode still travels through the real frame codec and
  * the real crypto.
  */
+/**
+ * One decoder instance a `FakeAudioCodecs.decoderFactory` call produced.
+ *
+ * PER INSTANCE, and that is load-bearing: the SDK runs one decoder PER SENDER
+ * (story 2, R-5), and an isolation test is only meaningful if it can fail ONE
+ * of them and watch the others. A double that routed every decoder's output
+ * through the last-created callback — or could fail only the last one — would
+ * make that test pass vacuously or fail for the wrong reason.
+ */
+export interface FakeDecoderRecord {
+  /** Frames handed to THIS decoder, in order. */
+  readonly decoded: FakeEncodedFrame[];
+  /** Whether `close()` was called on this decoder. */
+  readonly closed: boolean;
+  /** Fire THIS decoder's terminal error callback. */
+  fail(err?: unknown): void;
+}
+
 export class FakeAudioCodecs {
   /** Frames the encoder emitted, in order. */
   readonly encoded: FakeEncodedFrame[] = [];
-  /** Frames handed to the decoder, in order. */
+  /** Frames handed to ANY decoder, in order. The aggregate across instances. */
   readonly decoded: FakeEncodedFrame[] = [];
+  /** Every decoder instance, in creation order. */
+  readonly decoders: FakeDecoderRecord[] = [];
   #onEncoded: ((frame: FakeEncodedFrame) => void) | undefined;
-  #onDecoded: ((data: FakeAudioData) => void) | undefined;
   #encoderError: ((err: unknown) => void) | undefined;
-  #decoderError: ((err: unknown) => void) | undefined;
   encoderClosed = 0;
   decoderClosed = 0;
+  /**
+   * When set, the next `decoderFactory` call rejects with this error instead of
+   * producing a decoder — a decoder that cannot be created at all.
+   */
+  failNextDecoderCreation: unknown = undefined;
 
   encoderFactory = async (options: {
     onOutput: (frame: FakeEncodedFrame) => void;
@@ -158,14 +181,29 @@ export class FakeAudioCodecs {
     onOutput: (data: never) => void;
     onError: (err: unknown) => void;
   }): Promise<{ decode(frame: FakeEncodedFrame): void; close(): void }> => {
-    this.#onDecoded = options.onOutput as unknown as (data: FakeAudioData) => void;
-    this.#decoderError = options.onError;
+    if (this.failNextDecoderCreation !== undefined) {
+      const err = this.failNextDecoderCreation;
+      this.failNextDecoderCreation = undefined;
+      throw err;
+    }
+    // Each instance keeps ITS OWN callbacks. Nothing here is shared across
+    // instances, so output from decoder A can never surface through decoder B.
+    const onOutput = options.onOutput as unknown as (data: FakeAudioData) => void;
+    const onError = options.onError;
+    const record = {
+      decoded: [] as FakeEncodedFrame[],
+      closed: false,
+      fail: (err: unknown = new Error('decoder failed')) => onError(err),
+    };
+    this.decoders.push(record);
     return {
       decode: (frame: FakeEncodedFrame) => {
-        this.decoded.push({ data: Uint8Array.from(frame.data), timestampUs: frame.timestampUs });
+        const copy = { data: Uint8Array.from(frame.data), timestampUs: frame.timestampUs };
+        record.decoded.push(copy);
+        this.decoded.push(copy);
         const samples = new Float32Array(frame.data.length);
         for (let i = 0; i < frame.data.length; i += 1) samples[i] = frame.data[i] ?? 0;
-        this.#onDecoded?.(
+        onOutput(
           makeAudioData({
             samples,
             sampleRate: options.sampleRateHz,
@@ -175,6 +213,8 @@ export class FakeAudioCodecs {
         );
       },
       close: () => {
+        if (record.closed) return;
+        record.closed = true;
         this.decoderClosed += 1;
       },
     };
@@ -185,34 +225,69 @@ export class FakeAudioCodecs {
     this.#encoderError?.(err);
   }
 
-  /** Fire the decoder's terminal error callback. */
+  /**
+   * Fire the terminal error callback of the MOST RECENTLY CREATED decoder that
+   * is still open. Kept for single-decoder suites; an isolation test should
+   * target a specific instance through {@link decoders}.
+   */
   failDecoder(err: unknown = new Error('decoder failed')): void {
-    this.#decoderError?.(err);
+    const open = this.decoders.filter((d) => !d.closed);
+    open[open.length - 1]?.fail(err);
   }
 }
 
-/** A playback sink that records what it was handed and whether it released it. */
+/** One lane's record, in lane-open order on `RecordingPlaybackSink.lanes`. */
+export interface RecordingPlaybackLane {
+  /** What THIS lane played, in order. */
+  readonly played: Uint8Array[];
+  readonly closed: boolean;
+}
+
+/**
+ * A playback sink that records what it was handed and whether it released it.
+ *
+ * Records per LANE as well as in aggregate: the SDK opens one lane per decoded
+ * sender and the sink mixes them, so a test asserting "each sender's audio
+ * reached playback" needs the per-lane view — the aggregate alone would pass a
+ * mixer that sent every frame down one lane.
+ */
 export class RecordingPlaybackSink {
+  /** Everything played on ANY lane, in order. */
   readonly played: Uint8Array[] = [];
+  /** Every lane opened, in order. */
+  readonly lanes: RecordingPlaybackLane[] = [];
   /** Frames handed to `enqueue` that were NOT `close()`d. Must stay empty. */
   leaked = 0;
   closeCount = 0;
 
-  enqueue(data: never): void {
-    const audio = data as unknown as FakeAudioData;
-    const samples = new Float32Array(audio.numberOfFrames);
-    audio.copyTo(samples, { planeIndex: 0 });
-    const bytes = new Uint8Array(samples.length);
-    for (let i = 0; i < samples.length; i += 1) bytes[i] = (samples[i] ?? 0) & 0xff;
-    this.played.push(bytes);
-    this.leaked += 1;
-    audio.close();
-    this.leaked -= 1;
+  openLane(): { enqueue(data: never): void; close(): void } {
+    const lane = { played: [] as Uint8Array[], closed: false };
+    this.lanes.push(lane);
+    return {
+      enqueue: (data: never) => {
+        const audio = data as unknown as FakeAudioData;
+        const samples = new Float32Array(audio.numberOfFrames);
+        audio.copyTo(samples, { planeIndex: 0 });
+        const bytes = new Uint8Array(samples.length);
+        for (let i = 0; i < samples.length; i += 1) bytes[i] = (samples[i] ?? 0) & 0xff;
+        lane.played.push(bytes);
+        this.played.push(bytes);
+        this.leaked += 1;
+        audio.close();
+        this.leaked -= 1;
+      },
+      close: () => {
+        lane.closed = true;
+      },
+    };
   }
 
   close(): void {
     this.closeCount += 1;
   }
 
-  factory = async (): Promise<{ enqueue(data: never): void; close(): void }> => this;
+  factory = async (): Promise<{
+    openLane(): { enqueue(data: never): void; close(): void };
+    close(): void;
+  }> => this;
 }

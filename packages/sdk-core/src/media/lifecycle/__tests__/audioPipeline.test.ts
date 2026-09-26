@@ -33,7 +33,7 @@ import {
 import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../../../config/clientConfig.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { MeetingIdentity } from '../../setup/identity.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import { assignmentsOn, kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import {
@@ -82,8 +82,7 @@ interface Rig {
 async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
-  const kekSource = new JoinResponseKekSource();
-  kekSource.set(KEK, 0);
+  const kekSource = kekHolderWith(KEK, 0);
   const roster = new RosterIdentityKeys(8);
   const identity = await MeetingIdentity.create();
   await roster.upsert({ senderId: SENDER_ID, identityPublicKey: identity.publicKey! });
@@ -114,7 +113,6 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
     kekSource,
     roster,
     senderId: SENDER_ID,
-    kekGeneration: 0,
     identity,
     declaredSlotIds: [0],
     senderFor: () => sender,
@@ -134,12 +132,12 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
   await pipeline.start();
   pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
   // Receiving comes from the slot assignments, not from the send directive.
-  pipeline.setReceiveHandlers([MH_URL]);
+  pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
 
   const egress = new EgressPipeline({
     metrics,
     transmitKeys: new TransmitKeyManager(SENDER_ID),
-    kek: { source: kekSource, generation: 0 },
+    kek: kekSource,
     identity,
     maxQueueFrames: config.egress.maxQueueFrames,
     streamNumber: 1,
@@ -353,8 +351,7 @@ describe('teardown', () => {
     // failure, so teardown must reach a PARTIALLY-CONSTRUCTED pipeline.
     const capture = new FakeCaptureSource();
     const identity = await MeetingIdentity.create();
-    const kekSource = new JoinResponseKekSource();
-    kekSource.set(KEK, 0);
+    const kekSource = kekHolderWith(KEK, 0);
     const sink = new InMemoryMetricsSink();
     const pipeline = new AudioPipeline({
       config: DEFAULT_CLIENT_CONFIG.media,
@@ -362,7 +359,6 @@ describe('teardown', () => {
       kekSource,
       roster: new RosterIdentityKeys(4),
       senderId: SENDER_ID,
-      kekGeneration: 0,
       identity,
       declaredSlotIds: [0],
       senderFor: () => undefined,
@@ -433,15 +429,20 @@ describe('degradation is loud', () => {
     expect(faults).toEqual(['capture']);
   });
 
-  it('counts a decoder error rather than logging one per frame', async () => {
+  it('counts a decoder error once per decoder instance, and it is NOT fatal', async () => {
     const rig = await makeRig();
-    const faults: string[] = [];
-    rig.pipeline.on('fault', (f) => faults.push(f.stage));
+    const faults: { stage: string; fatal: boolean }[] = [];
+    rig.pipeline.on('fault', (f) => faults.push({ stage: f.stage, fatal: f.fatal }));
     rig.codecs.failDecoder();
+    // The faulted sender's decoder is discarded and, with this rig's frozen
+    // clock, stays inside its restart backoff — so a second failure finds no
+    // decoder to fail. That is the bound: at most one decoder, and so one count,
+    // per sender per backoff interval, never per frame.
     rig.codecs.failDecoder();
-    // The counter moves per callback; the FAULT EVENT is once per stage, so a
-    // decoder erroring repeatedly cannot become per-frame telemetry.
-    expect(rig.count('dt_client_media_decoder_errors_total')).toBe(2);
-    expect(faults).toEqual(['decoder']);
+    expect(rig.count('dt_client_media_decoder_errors_total')).toBe(1);
+    // R-5: one sender's decoder failing never stops the pipeline — it used to
+    // be fatal when a single decoder served every sender.
+    expect(faults).toEqual([{ stage: 'decoder', fatal: false }]);
+    expect(rig.capture.stopCount).toBe(0);
   });
 });

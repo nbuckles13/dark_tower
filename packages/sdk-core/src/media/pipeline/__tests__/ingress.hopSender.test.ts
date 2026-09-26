@@ -11,7 +11,7 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { buildUnsignedFrame, finishFrame } from '../../frame/frameCodec.js';
 import { ReplayWindow, TransmitKeyCache } from '../../frame/receivePath.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import { gateFor, kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { FirstMediaObserver } from '../../setup/measurement.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
@@ -41,8 +41,7 @@ function makeHarness(): Harness {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
   const roster = new RosterIdentityKeys(8);
-  const kekSource = new JoinResponseKekSource();
-  kekSource.set(KEK, 0);
+  const kekSource = kekHolderWith(KEK, 0);
   // ONE MONITOR PER TRANSPORT. These harnesses model a single transport, so one
   // monitor per harness — created here rather than shared at module scope,
   // which would carry hop high-water marks between tests.
@@ -50,6 +49,7 @@ function makeHarness(): Harness {
   const ingress = new IngressPipeline({
     metrics,
     roster,
+    lanes: gateFor(SENDER_A, SENDER_B),
     keys: kekSource,
     cache: new TransmitKeyCache(8),
     replay: new ReplayWindow(8, 64),

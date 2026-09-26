@@ -13,18 +13,22 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
+import { AES_256_KEY_BYTES, unwrapTransmitKey } from '../../frame/sframe.js';
 import { bytesToHex } from '../../frame/hex.js';
 import { unpackKeyId } from '../../frame/keyId.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import {
+  NOMINAL_DEBOUNCE_SECONDS,
+  emptyKekHolder,
+  kekHolderWith,
+} from '../../__tests__/helpers.js';
+import type { MeetingKekHolder } from '../../setup/kekSource.js';
 import { TransmitKeyError, TransmitKeyManager } from '../transmitKeys.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 
-function kekFor(): { source: JoinResponseKekSource; generation: number } {
-  const source = new JoinResponseKekSource();
-  source.set(KEK, 3);
-  return { source, generation: 3 };
+/** A holder whose CURRENT generation is 3 — the only one a sender may wrap under. */
+function kekFor(): MeetingKekHolder {
+  return kekHolderWith(KEK, 3);
 }
 
 describe('generation is monotonic per sender and is never reset', () => {
@@ -99,7 +103,7 @@ describe('key material', () => {
 
   it('fails loudly when no meeting KEK is held rather than sending unannounced', async () => {
     const mgr = new TransmitKeyManager(258);
-    const empty = { source: new JoinResponseKekSource(), generation: 0 };
+    const empty = emptyKekHolder();
     await expect(mgr.materialFor(1, empty)).rejects.toBeInstanceOf(TransmitKeyError);
   });
 
@@ -168,7 +172,7 @@ describe('minting is single-flight, because two mints for one key id is (key, no
 
   it('does not wedge the stream when a mint rejects', async () => {
     const mgr = new TransmitKeyManager(258);
-    const empty = { source: new JoinResponseKekSource(), generation: 0 };
+    const empty = emptyKekHolder();
     await expect(mgr.materialFor(1, empty)).rejects.toBeInstanceOf(TransmitKeyError);
     // The in-flight slot must be released on rejection, or the stream is dead
     // for the rest of the session once a KEK arrives.
@@ -242,5 +246,59 @@ describe('a rotation is not undone by a mint that was already in flight', () => 
     mgr.clear();
     expect(gen0.key.every((b) => b === 0)).toBe(true);
     expect(gen1.key.every((b) => b === 0)).toBe(true);
+  });
+});
+
+describe('R-13: a mint in flight when the KEK rotates', () => {
+  it('orphans cleanly: its frame keeps the PRE-rotation generation under a KEK the receiver still retains', async () => {
+    // The "no audio gap" half of R-13 from the SENDER side. A frame whose mint
+    // started before the rotation was committed to the old transmit generation
+    // and the old KEK; it must stay openable, which it is only because the
+    // receiver RETAINS the previous KEK for a window. And the rotation must
+    // still take effect: the NEXT mint moves to a new generation under the new
+    // KEK, the one a departed member never received.
+    const holder = kekHolderWith(KEK, 0);
+    const newKek = new Uint8Array(AES_256_KEY_BYTES).fill(0x22);
+    const mgr = new TransmitKeyManager(258);
+
+    const inFlight = mgr.materialFor(1, holder);
+    // The rotation lands while that mint is awaiting its wrap — installed
+    // FIRST, then the rotate the pipeline's listener performs.
+    expect(holder.install(newKek, 1, NOMINAL_DEBOUNCE_SECONDS, 'kek_update')).toBe(
+      'installed_retaining',
+    );
+    mgr.rotate();
+    const orphan = await inFlight;
+
+    expect(unpackKeyId(orphan.keyId).generation).toBe(0n);
+    expect(orphan.wrapped.kekGeneration).toBe(0);
+    // A receiver that took the same rotation still holds generation 0, and the
+    // orphan's wrap opens under it to exactly the key the frame was sealed with.
+    const retained = holder.kekForGeneration(0);
+    expect(retained).toBeDefined();
+    const unwrapped = await unwrapTransmitKey({
+      kek: retained!,
+      keyId: orphan.keyId,
+      wrappedKeyWithTag: orphan.wrapped.wrappedKeyWithTag,
+    });
+    expect(unwrapped && bytesToHex(unwrapped)).toBe(bytesToHex(orphan.key));
+
+    // And the rotation took effect for everything after.
+    const next = await mgr.materialFor(1, holder);
+    expect(unpackKeyId(next.keyId).generation).toBe(1n);
+    expect(next.wrapped.kekGeneration).toBe(1);
+  });
+
+  it('never wraps under a RETAINED previous KEK: only the current is reachable', async () => {
+    const holder = kekHolderWith(KEK, 0);
+    holder.install(
+      new Uint8Array(AES_256_KEY_BYTES).fill(0x33),
+      1,
+      NOMINAL_DEBOUNCE_SECONDS,
+      'kek_update',
+    );
+    const mgr = new TransmitKeyManager(258);
+    const material = await mgr.materialFor(1, holder);
+    expect(material.wrapped.kekGeneration).toBe(1);
   });
 });

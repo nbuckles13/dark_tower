@@ -26,20 +26,33 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 `OtelMetricsSink`) and exported OTLP-HTTP/proto to the GC telemetry proxy
 (`POST /api/v1/telemetry/v1/metrics`).
 
-> ## WHICH METRICS IN THIS CATALOG ARE QUERYABLE — 14 OF 19, AND THE SPLIT IS DELIBERATE
+> ## WHICH METRICS IN THIS CATALOG ARE QUERYABLE — 20 OF 25, AND THE SPLIT IS DELIBERATE
 >
 > This block **replaces** a "not one metric here is queryable" notice. It was not
 > deleted when the exporter landed, because deleting it would have left a catalog
-> of 19 metrics under a header implying all 19 are queryable — the same
+> of 25 metrics under a header implying all 25 are queryable — the same
 > overclaim-by-omission the original was written to prevent, inverted. Read the
 > per-metric **`Exported:`** marker; it is authoritative and machine-checked
-> (`dt-guard client-metrics-export` asserts set-equality against the collector's
-> name allowlist in both directions, so a metric marked exported and absent from
-> the collector, or vice versa, is a red build).
+> **against the committed collector config** (`dt-guard client-metrics-export`
+> asserts set-equality against the name allowlist in both directions, so a metric
+> marked exported and absent from the collector, or vice versa, is a red build).
+> **Nothing ties that green to the collector that is actually running.** The
+> ConfigMap is not content-hashed, so no mechanism makes a config edit and a pod
+> restart one unit: the scripted deploy restarts the collector, but a bare
+> `kubectl apply -k`, a hand-edited ConfigMap, or a pod rescheduled without a
+> restart all leave the previous filter list in memory with the committed file
+> correct and this guard green. A metric marked `Exported: yes` that is absent
+> from Prometheus for that reason renders identically to "no browser is
+> running" - the same ambiguity this block warns about below, reached by a
+> different route. **So this marker means *catalogued as exported*, not *observed in
+> Prometheus*.** The content-hashed-ConfigMap fix that would close the class is
+> filed in `docs/TODO.md` (owner operations).
 >
-> **The 14 media-path metrics ARE queryable.** Verified end to end on the Kind
-> stack from sdk-core's own built bundle through the GC proxy — not a synthetic
-> payload. `MCMediaMissingKeyMaterial`'s full expression returned `0.286` against
+> **The 20 media-path metrics ARE queryable.** The original 14 were verified end
+> to end on the Kind stack from sdk-core's own built bundle through the GC proxy —
+> not a synthetic payload. The six KEK-custody and decode-lane counters added by
+> ADR-0036 story 2 task 7 are exported by the same allowlist; that end-to-end
+> read-back predates them. `MCMediaMissingKeyMaterial`'s full expression returned `0.286` against
 > live data; it had never been able to match before.
 >
 > **The 5 ADR-0028 join-flow metrics are deliberately NOT exported.** They are the
@@ -49,8 +62,8 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 > > export into central Prometheus storage; the harm R1 bars is realised at the
 > > stored series, not at emission.
 >
-> That sentence is the **test**, not just the outcome — apply it before adding a
-> 15th name to the allowlist. Stripping the hash and exporting anyway was
+> That sentence is the **test**, not just the outcome — apply it before adding
+> any name to the allowlist. Stripping the hash and exporting anyway was
 > considered and rejected: it would publish a series whose shape contradicts this
 > catalog, which is worse than an absent one. Two independent controls keep the
 > hash out of storage (the name allowlist, and the collector's `keep_keys`), and
@@ -449,7 +462,7 @@ exactly one of `dt_client_media_frames_accepted_total` or
 
 **It is an ACCOUNTING identity, not a playback guarantee.** Its job is to prove
 that no drop path fails to count itself. It says nothing about audibility: all
-fifteen `drops_frame: true` reasons fire at or before decoder handoff, so the
+seventeen `drops_frame: true` reasons fire at or before decoder handoff, so the
 identity is exact **by construction** at the crypto/parse boundary, and at the
 playback boundary it would be FALSE — a frame lost between handoff and audible
 decrements nothing on the right-hand side.
@@ -459,7 +472,9 @@ deliberately supersedes that spelling**, because `played` names an identity that
 does not hold: a frame handed to a decoder is not played (the decoder can error,
 the output can be discarded, the context can be suspended). The
 accepted→audible segment is not covered by this identity and is covered only
-partially by `dt_client_media_decoder_errors_total`; extending the identity to
+partially, by `dt_client_media_decoder_errors_total` and
+`dt_client_media_decode_queue_dropped_total` — both POST-ACCEPT, so neither may
+ever become a `frames_dropped_total` reason; extending the identity to
 the playback boundary would require playback-side drop reasons — a vocabulary
 extension needing its own planning, not a word swap.
 
@@ -550,7 +565,7 @@ the comment's reader.
 - **Type**: Counter
 - **Labels**: `reason` — the frozen frame-reject vocabulary, whose SSoT is
   `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Membership of
-  THIS counter is carried by `drops_frame`: fifteen of the sixteen tokens.
+  THIS counter is carried by `drops_frame`: seventeen of the eighteen tokens.
   `wrap_key_id_mismatch` is the only `false` and **must never appear here**: the
   frame it describes is *accepted*, and is already counted on
   `dt_client_media_frames_accepted_total`. Counting it here as well would put one
@@ -568,12 +583,33 @@ the comment's reader.
   (`unknown_version` staying individually visible is how a version-skewed
   rollback is detected — rollback for this feature is redeploy-only with no
   finer-grained control) and breaks `sum by(reason)` comparability with MH.
-- **The two key-material reasons** are `no_kek_for_generation` (no meeting KEK
-  for the generation the frame's wrap announces) and `no_roster_entry` (no usable
-  identity key for the frame's `key_id.sender_id`, INCLUDING the case where MC
-  published an empty key). Both are expected transients at join and after a KEK
-  rotation; **the sustained case is the signal**, and it is the only signal for a
-  join or rotation path that has silently stopped delivering keys.
+- **The three key-material reasons** are `no_kek_for_generation` (the frame's
+  wrap announces a KEK generation NEWER than the newest this receiver holds — MC's
+  push has not arrived), `kek_generation_stale` (the wrap announces a generation
+  OLDER than this receiver still retains — the client holds the current generation
+  plus at most one previous, and the previous is kept only for
+  `min(W/2, ceiling)` where W is MC's `kek_rotation_debounce_seconds`), and
+  `no_roster_entry` (no usable identity key for the frame's `key_id.sender_id`,
+  INCLUDING the case where MC published an empty key). Both KEK tokens fire only
+  when no usable transmit key for the frame's key id is already cached; with one
+  cached, the frame is accepted and counted as the wrap outcome
+  `kek_generation_not_held` instead, from either direction. All three are expected
+  transients at join and after a KEK rotation; **the sustained case is the
+  signal**, and it is the only signal for a join or rotation path that has
+  silently stopped delivering keys. For a sustained `kek_generation_stale`: At the shipped default W, client retention is **already at its ceiling** (`KEK_RETENTION_CEILING_MS`, 30 s), so raising `MC_KEK_ROTATION_DEBOUNCE_SECONDS` does **not** lengthen it — it only flips the fleet to `ceiling_clamped`. The only lever that lengthens retention past 30 s is the client ceiling itself, an SDK constant requiring a release **and** a deliberate key-lifetime bound (ADR-0036 §4) — a security decision, not a remedy an operator applies. Lowering W *shortens* retention and makes this worse. A sustained `kek_generation_stale` at default configuration therefore points at **sender-side rotation skew**, not at MC's debounce.
+  See `dt_client_media_kek_retention_anomalies_total` for why retention was what
+  it was.
+- **`sender_not_assigned`** (layer `assignment`) is a frame that parsed and
+  verified from a sender NOT in this client's MC slot-assignment set; it is
+  dropped at the slot-edge gate, after signature verification and **before**
+  decryption, so it advances no replay window and caches no transmit key. It is
+  not a key-material reason. **A sustained non-zero rate means a media handler
+  forwarded a frame from a sender this client holds no slot for** — MH
+  misrouting, or a compromised handler — or a lagging assignment at a remap edge
+  when brief. It is **deliberately NOT alerted** in this story (the alert
+  inventory is task 16's) and **deliberately EXCLUDED from
+  `MCMediaMissingKeyMaterial`**: its remedy lives in MH/MC placement, not in KEK
+  or roster delivery.
 - **`unwrap_failed` versus `decrypt_failed`** are two AES-GCM failures on one
   receive path routing to opposite teams: `unwrap_failed` is the KEK unwrap, so
   it is key DISTRIBUTION; `decrypt_failed` is the SFrame payload, so it is the
@@ -600,8 +636,14 @@ the comment's reader.
 - **Permitted values**:
   - `kek_generation_not_held` — the frame's wrap announces a KEK generation this
     receiver does not hold, but a usable transmit key for that key id was already
-    cached, so the frame plays off the cache. **This is the KEK-rotation-lag
-    signal**: the sender re-wrapped under a generation whose push has not landed.
+    cached, so the frame plays off the cache. **An honest sender of this SDK
+    cannot produce it**: the wrap is computed once per transmit key, and on
+    every KEK change the sender rotates to a NEW key id (R-13), which arrives
+    uncached and so lands on the drop reasons instead. It needs one key id
+    under a second wrap — a sender that re-wraps an existing transmit key
+    under a new KEK rather than rotating, which the format permits and R-13
+    exists to end. **A sustained non-zero rate means a non-conforming or
+    hostile sender, not rotation lag.**
   - `wrap_key_id_mismatch` — the SSoT spelling, carried verbatim from
     `frame-v2.vectors.json` → `vectors[].expected.outcome`. **A rename toward the
     observable is pending under `docs/TODO.md`** (proposed target spelling:
@@ -679,13 +721,39 @@ the comment's reader.
 ### `dt_client_media_decoder_errors_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
-- **Description**: The audio decoder's terminal error callback fired.
+- **Description**: The audio decoder's terminal error callback fired — **one
+  decoder per ACTIVE SENDER** (one per client before story 2 task 7), counted
+  event-once per decoder instance. A fault class affecting every lane (a codec
+  or platform fault) can therefore advance this up to N times for N active
+  senders, and its magnitude is **not comparable with pre-story-2 history**.
 - **Labels**: base only. **No `reason`** — `AudioDecoder` provides no bounded
   one, and an unbounded label here would be the cardinality hazard §11 exists to
   prevent.
 - **Usage**: the ONLY counter covering the accepted→audible segment, which the
   receive-path identity deliberately does not reach. Event-driven, never
   per-frame.
+
+### `dt_client_media_decode_queue_dropped_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Type**: Counter
+- **Description**: Frames evicted from a per-sender decode lane's bounded pending
+  queue while that lane's decoder is being created or replaced (overflow drops
+  the oldest) — **one increment per evicted frame**.
+- **Labels**: base only.
+- **ACCOUNTING BOUNDARY — POST-ACCEPT, and deliberately NOT a
+  `frames_dropped_total{reason}` value.** Every frame counted here was already
+  counted on `dt_client_media_frames_accepted_total`, so it sits DOWNSTREAM of
+  `received = accepted + sum(drops by reason)`, in the accepted→audible segment.
+  Folding it into `frames_dropped_total` — the natural-looking "fix" for a
+  counter named `..._dropped_total` beside the drop counter — would put one frame
+  on **both** sides of the identity, breaking it silently and only in aggregate:
+  the same failure `wrap_key_id_mismatch`'s `drops_frame: false` exists to
+  prevent. It must never become a reason.
+- **Why it exists**: a queue eviction fires no decoder error callback, so
+  `dt_client_media_decoder_errors_total` does not see this loss. It mirrors the
+  send-side precedent: the bounded egress queue counts its evictions because the
+  platform exposes no event, and a receive-side queue that evicts silently would
+  be that construct with the counter removed.
 
 ### `dt_client_media_mute_transitions_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
@@ -699,13 +767,146 @@ the comment's reader.
 ### `dt_client_media_kek_updates_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
-- **Labels**: `source` — `join_response` (the only source this story;
-  KEK-push rotation adds one when it lands).
+- **Labels**: `source` — `join_response` (the KEK carried on the join
+  response) or `kek_update` (a KEK pushed over signaling). **A reconnect
+  re-issue and a rotation arrive in the same `kek_update` message and are
+  indistinguishable on this label — deliberately**: the discriminator would be
+  the generation, which is barred below. This counter is the denominator for
+  `dt_client_media_kek_retention_anomalies_total`.
 - **Usage**: the KEK arriving through the KEK-source seam. **Never the key
   itself, and never its generation** — the generation is monotonic over the
   meeting's life, so as a label its cardinality is unbounded over TIME rather
   than bounded by its type, and it advances on the leave debounce, which makes a
   per-meeting generation series a membership-change trace.
+
+### `dt_client_media_kek_retention_violations_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Type**: Counter
+- **Description**: The KEK holder would have retained more than one previous
+  generation; the retention guard (run after every install) trimmed and zeroized
+  the excess.
+- **Labels**: base only.
+- **Fleet contract: reads zero forever; alertable at `> 0`** — the same contract
+  form as `dt_client_media_send_dropped_total{reason="transport_send_refused"}`.
+  No alert selects it today; the inventory decision is story 2 task 16's.
+
+### `dt_client_media_kek_retention_anomalies_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Type**: Counter
+- **Labels**: `outcome` — this metric's own domain, exactly
+  `floor_substituted`, `ceiling_clamped`, `below_rewrap_latency`. `outcome` is a
+  per-metric vocabulary (`docs/observability/label-taxonomy.md`); never
+  aggregate it across metric names.
+- **Counting point**: evaluated per KEK message (`join_response` or
+  `kek_update`), when the client derives how long to keep the previous
+  generation: `min(W/2, ceiling)` where W is the message's
+  `kek_rotation_debounce_seconds`. A nominal derivation counts nothing.
+- **Permitted values**:
+  - `floor_substituted` — W was zero or absent, so the client used its retention
+    floor. That means an MC older than the field. **Reads zero forever EXCEPT
+    during a deliberate one-version MC rollback, which is the SUPPORTED path and
+    not an incident** — rolling MC below the field flips every live client to the
+    floor and this climbs fleet-wide; do not page on it and do not roll further
+    back. It is the fleet's rollback detector: the client also logs a WARN, but a
+    browser console reaches no operator, so **this counter is the only
+    cluster-visible evidence**.
+  - `ceiling_clamped` — W/2 exceeded the client ceiling and retention was clamped.
+    **A CONFIGURATION STATE, not an incident**: if
+    `MC_KEK_ROTATION_DEBOUNCE_SECONDS` is raised so W/2 exceeds the ceiling, this
+    is permanently non-zero on a correctly configured fleet. It reads zero at
+    today's W — but only just: at the default W=60, W/2 EQUALS the ceiling, so
+    **ANY increase to W makes this permanently non-zero while changing retention
+    by exactly zero**. It is where an operator meets the fact that W is no longer
+    the binding parameter. **Never an alert input.**
+  - `below_rewrap_latency` — the derived retention does not exceed the client's
+    transmit-key re-wrap latency T (the frames already queued for egress when the
+    sender rotates), so frames wrapped under the previous generation can outlive
+    it at the receiver. The client validates FLOOR > T at startup, so this can
+    only fire when MC's W/2 is below T; **the remedy is in MC** — raise
+    `MC_KEK_ROTATION_DEBOUNCE_SECONDS`. Retention is not raised client-side
+    (that could exceed W).
+- **No denominator of its own**: the denominator is
+  `dt_client_media_kek_updates_total`, and any ratio needs the non-zero-denominator
+  guard (no KEK messages in the window must read as no data, not as 0% or NaN
+  noise).
+
+### `dt_client_media_kek_install_refusals_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Type**: Counter
+- **Labels**: `outcome` — this metric's own domain, exactly `conflicting_key`,
+  `older_generation`, `malformed`. **`outcome`, not `reason`**: `reason` is
+  reserved for per-FRAME drops with exactly two homes
+  (`docs/observability/label-taxonomy.md`), and a third family there would break
+  cross-end `sum by(reason)`.
+- **Permitted values**:
+  - `conflicting_key` — a KEK for the CURRENT generation with different bytes.
+    Refused; the held key is kept (compared in fixed time).
+  - `older_generation` — a generation below the current. Refused; the holder
+    never rolls back.
+  - `malformed` — wrong width, all-zero, or a generation outside `0..65535`.
+    Refused and scrubbed, on both arrival paths.
+- **Usage**: every refusal leaves the held state unchanged and working. **Both
+  `conflicting_key` and `older_generation` are UNREACHABLE in an honest
+  deployment today, and that is what makes this counter a tripwire rather than a
+  delivery metric.** A client's KEK holder is per-session and the client has **no
+  reconnect**, so no holder can outlive the KEK epoch it was given — see the
+  refuse site in `packages/sdk-core/src/media/setup/kekSource.ts` for the
+  MC-lifecycle detail and what the unreachability rests on. **Any increment is a
+  defect — an MC bug, or a client holding one KEK holder across two sessions —
+  not a delivery hiccup**: do not read it as "MC is delivering inconsistent KEK
+  state" in the ordinary-operations sense, and do not go looking for a rollout as
+  the cause. It is **not** reachable by an attacker without compromising MC,
+  which already holds the KEK (ADR-0036 §4 operator custody); note however that a
+  **forced refusal is how leave-rotation would be defeated** — the meeting keeps
+  the key a departed member holds — so if an injection path onto the signaling
+  channel ever appears, this counter is its detector. `malformed` is different in
+  kind (a wire-shape violation, including a non-empty wrong-width key, rather
+  than an epoch conflict) but reads the same way: zero from an honest MC. **The
+  unreachability rests on the absence of client reconnect: re-check this entry
+  when reconnect lands.**
+
+### `dt_client_media_kek_generations_retained_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Type**: Counter
+- **Description**: Retaining installs — **one increment per install that demoted
+  a previous generation and kept it**. Not incremented on the first install at
+  join, nor on an idempotent (same generation, same bytes) or refused install.
+  The increment lands on the install, not on first use of the previous
+  generation.
+- **Labels**: base only.
+- **Fleet signal is the PAIR**: `dt_client_media_kek_updates_total{source="kek_update"}`
+  rising while this stays flat means rotations are happening and nothing is
+  being retained — an audio gap at every rotation. It watches the opposite
+  failure from `dt_client_media_kek_retention_violations_total` (retaining too
+  few, rather than too many).
+- **A counter, not a gauge — deliberately.** The story originally planned a
+  retained-generations gauge over `{1, 2}`; with N browsers writing one stream
+  identity (no per-instance label, §11) a gauge is last-writer-wins, so it would
+  report one arbitrary browser's state. Use `increase()` over a rotation window.
+
+### `dt_client_media_roster_key_rebinds_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Type**: Counter
+- **Description**: Changes to a LIVE sender's roster key — **one increment per
+  event, not per purged key**. A first binding (new sender, or keyless→key) and
+  an equal-bytes update are not counted.
+- **Labels**: `outcome` — a per-metric vocabulary, two values that point at
+  DIFFERENT fixes and carry DIFFERENT contracts:
+  - `rebind` — the live `sender_id` bound to DIFFERENT, well-formed key bytes.
+    MC never legitimately does this (a new key always means a new sender id), so
+    it **reads zero forever** and any increase is an MC defect or an injected
+    roster update.
+  - `downgrade` — a present key replaced by an empty, wrong-width or unusable
+    one. **NOT zero-forever**: MC publishing an empty key is a documented
+    occurrence (see `no_roster_entry` under `dt_client_media_frames_dropped_total`),
+    which is exactly why it is split out — a merged counter could carry no
+    alert contract without firing on a known condition.
+- **Effect**: the sender's cached unwrapped transmit keys are purged (zeroized),
+  and the entry is known-keyless until the new key imports, so its frames drop
+  as `no_roster_entry` in that window. **Replay state is retained** — no roster
+  path touches it. Roster-held identity keys are **trust-on-first-use**; this
+  counter records a change of binding, it says nothing about which binding is
+  authentic.
 
 ### `dt_client_time_to_first_media_frame_ms`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).

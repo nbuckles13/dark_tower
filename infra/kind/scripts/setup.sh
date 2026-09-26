@@ -694,17 +694,43 @@ deploy_observability() {
 # services. THE READINESS GATE IS LOAD-BEARING NOW, NOT EVENTUALLY: AC, GC and MC
 # all set OTEL_ENABLED=true in the Kind overlay and probe this collector during
 # init, and under R-54 fail-hard-at-init a service started before the collector
-# is Ready fails init and CrashLoopBackoffs. Do not shorten or skip this wait.
+# is Ready fails init and CrashLoopBackoffs. The gate is the `rollout status`
+# below; do not shorten, skip, or collapse it back to a label-selector
+# `wait --for=condition=Ready` (see the comment at the site for why). A
+# ConfigMap the pinned collector image rejects now STALLS whole-cluster bring-up
+# loudly at this gate rather than being silently ignored by an already-running
+# pod - that is the intended trade, not a regression.
 # (MH is the exception and deliberately so: it has no OTEL_ENABLED and no 4317
 # egress rule, so it never probes. Enabling it needs the egress rule first.)
 # See the collector-upgrade-discipline section in docs/runbooks/gc-deployment.md.
 deploy_otel_collector() {
     log_step "Deploying OTel collector..."
 
-    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/otel-collector/"
+    # The ConfigMap is not content-hashed and the pod template carries no
+    # checksum annotation, so a config-only apply changes nothing in the pod
+    # spec, and otelcol reads `--config` once at startup with no file watcher.
+    # Without the conditional restart the running pod keeps the OLD filter
+    # list while the committed file (and every file-reading guard) is correct.
+    # Scope and fail-open limits of the detector: see apply_reports_configmap_changed.
+    local apply_out
+    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/otel-collector/")
+    printf '%s\n' "${apply_out}"
+    if apply_reports_configmap_changed "${apply_out}"; then
+        log_info "OTel collector ConfigMap changed in place; restarting so the pod loads the new config..."
+        ${KUBECTL} rollout restart deployment/otel-collector -n dark-tower
+    fi
 
-    log_info "Waiting for OTel collector to be ready..."
-    ${KUBECTL} wait --for=condition=Ready pod -l app=otel-collector -n dark-tower --timeout=120s
+    # `rollout status`, NOT `wait --for=condition=Ready pod -l app=otel-collector`.
+    # deployment.yaml has `replicas: 1` and no `strategy:` block, so the default
+    # RollingUpdate maxUnavailable (25% of 1) rounds to 0: a config the collector
+    # rejects STALLS the rollout with the OLD pod still Ready, and a label-selector
+    # wait would match that old pod and report success over a rejected config.
+    # BUDGET: this timeout must exceed the single-pod readiness budget (120s, the
+    # figure the replaced wait used) PLUS terminationGracePeriodSeconds (30s,
+    # deployment.yaml) - after a restart it covers a new pod becoming Ready AND
+    # the old one terminating, serialized. Do not "tidy" it down to 120s.
+    log_info "Waiting for OTel collector rollout to complete..."
+    ${KUBECTL} rollout status deployment/otel-collector -n dark-tower --timeout=180s
     log_info "OTel collector deployed successfully."
 }
 
@@ -1184,21 +1210,33 @@ create_ac_secrets() {
 # grounds that the env-test catches it. Each is the other's justification; drop
 # either and both halves become useless at once.
 #
-# SCOPE IS THE FOUR APPLICATION SERVICES (AC, GC, MC, MH). Deliberately NOT
-# postgres or redis: those carry state and connection pools, and a restart
+# SCOPE IS THE FOUR APPLICATION SERVICES (AC, GC, MC, MH) PLUS THE OTEL
+# COLLECTOR. The collector qualifies because it is stateless (no connection
+# pool or migration to race) and reads `--config` once at startup with no file
+# watcher, so without a restart a config edit never takes effect. Deliberately
+# NOT postgres or redis: those carry state and connection pools, and a restart
 # mid-setup can race whatever is migrating or seeding against them.
 #
 # DO NOT PORT THIS TO A PRODUCTION DEPLOY PATH UNCHANGED. In Kind a restart is
 # cheap. On a real deployment restarting MH drops every live WebTransport
 # session that pod is carrying, so a ConfigMap value edit would silently become
-# a media outage for that pod's meetings. Outside Kind this must be an explicit
+# a media outage for that pod's meetings. The COLLECTOR is worse, not cheaper,
+# wherever `OTEL_ENABLED=true`: it is a SINGLETON, and under R-54
+# fail-hard-at-init any AC/GC/MC pod that restarts inside its restart gap fails
+# init rather than starting degraded — a fleet-wide init hazard, not a telemetry
+# gap. Production runs `OTEL_ENABLED=false` today (see the AC deployment runbook:
+# "until the collector has an availability SLO"), and that default is the ONLY
+# thing keeping this latent. Outside Kind this must be an explicit
 # operator action with that consequence stated, never an implicit consequence
 # of `apply -k`.
 #
 # KNOWN LIMITS — both fail SILENT, which is why they are written here:
 #   - This depends on kubectl's own output wording. If kubectl ever rewords
 #     `configured`, this stops restarting and nothing reports it. MH has a
-#     backstop (the env-test staleness check reds); AC, GC and MC do not.
+#     backstop (the env-test staleness check reds); AC, GC, MC and the OTel
+#     collector do not. The collector's silent-stale symptom is the worst of
+#     them: an allowlisted metric name absent from Prometheus reads identically
+#     to "no browser is running".
 #   - A run that dies between the apply and the restart leaves stale pods, and
 #     the next run sees `unchanged` and does not restart either.
 # Neither is a regression: before this helper there was no restart at all on

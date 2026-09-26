@@ -105,6 +105,12 @@ data:
               - dt_client_media_decoder_errors_total
               - dt_client_media_mute_transitions_total
               - dt_client_media_kek_updates_total
+              - dt_client_media_kek_retention_violations_total
+              - dt_client_media_kek_retention_anomalies_total
+              - dt_client_media_kek_install_refusals_total
+              - dt_client_media_roster_key_rebinds_total
+              - dt_client_media_kek_generations_retained_total
+              - dt_client_media_decode_queue_dropped_total
               - dt_client_time_to_first_media_frame_ms
 
       # ---------------------------------------------------------------------
@@ -231,8 +237,8 @@ data:
               # that is too permissive admits junk values — cardinality inflation,
               # which is visible in series count and in memory. PREFER THE CONTROL
               # WHOSE FAILURE IS LOUD. Concretely: `MCMediaMissingKeyMaterial`
-              # selects `reason=~"no_kek_for_generation|no_roster_entry"`, which are
-              # `RejectReason` tokens; a list derived from `mediaMetrics.ts`'s own
+              # selects `reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"`,
+              # which are `RejectReason` tokens; a list derived from `mediaMetrics.ts`'s own
               # declarations would NOT contain them and would sentinel every real
               # key-material drop, zeroing the alert's numerator permanently.
               #
@@ -250,8 +256,9 @@ data:
               # THE CAP IS DERIVED, NOT GUESSED: the longest value any of these keys
               # legitimately carries today is the `RejectReason` token
               # `payload_length_exceeds_available` (32 chars), so 64 is 2x the
-              # measured floor. The vocabularies are still growing (story 2 adds
-              # `kek_generation_stale`), and a cap that is TOO TIGHT sentinels a real
+              # measured floor. The vocabularies are still growing (story 2 added
+              # `kek_generation_stale` and `sender_not_assigned`, both well under the
+              # cap), and a cap that is TOO TIGHT sentinels a real
               # token and takes the alert quiet, while one that is too loose costs
               # only bytes. Raise it by re-measuring the longest token, not by
               # copying a bound from an unrelated construct.
@@ -382,6 +389,15 @@ data:
       # organization per run and GC stamps its UUID onto client datapoints, so
       # streams from every run still inside `max_stale` coexist. This value is
       # sized to tolerate several overlapping runs, not one.
+      #
+      # WORST-CASE FIGURE, WITH ITS DENOMINATOR: per per-run `org_id` (with
+      # `client_version` and `key_custody` fixed), counting a histogram as ONE
+      # stream and assuming every reject reason is observed, the allowlist above
+      # is 20 names / 47 streams (was 14 names / 34 streams before story 2's six
+      # KEK/roster/decode-queue counters, +38%). Against `max_streams: 500` that
+      # is ~10 concurrent runs of headroom (was ~14). Realistic counts are well
+      # below worst case, since most reject reasons never fire in a run.
+      # Recompute this figure whenever a name or a label value set is added.
       delta_to_cumulative:
         max_stale: 15m
         max_streams: 500

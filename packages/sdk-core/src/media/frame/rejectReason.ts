@@ -18,10 +18,11 @@
 //   1. Per-arm equality against the vectors' `reject_reason`, in the conformance
 //      harness. Catches a token mapped to the WRONG condition.
 //   2. Set equality against the SSoT's `reject_reasons[].token`, both directions,
-//      all sixteen (`__tests__/rejectReason.test.ts`). This is the ONLY cover for
-//      the three `has_vector: false` tokens — `no_transmit_key`,
-//      `no_kek_for_generation`, `no_roster_entry` — which no row exercises and
-//      where a typo would otherwise ship green.
+//      over every token in `proto/test-vectors/frame-v2.vectors.json`
+//      (`__tests__/rejectReason.test.ts`). This is the ONLY cover for the
+//      `has_vector: false` tokens — the receiver-state-dependent ones no byte
+//      string determines, so no row exercises them and a typo would otherwise
+//      ship green.
 //   3. `drops_frame` read FROM the file rather than hand-written here, so
 //      `wrap_key_id_mismatch`'s non-dropping status cannot become a drop by
 //      someone retyping a boolean.
@@ -96,7 +97,32 @@ export type RejectReason =
   | 'wrap_key_id_mismatch'
   // --- key layer: receiver state is not ready -----------------------------
   | 'no_kek_for_generation'
-  | 'no_roster_entry';
+  | 'no_roster_entry'
+  /**
+   * The wrap announces a KEK generation OLDER than this receiver retains.
+   *
+   * NOT `kek_generation_not_held`, the accepted-frame `WrapOutcome` one word
+   * away, and the two sit on opposite sides of
+   * `received = accepted + sum(drops by reason)`. A wrap announcing a KEK
+   * generation this receiver does not hold splits on ONE question: is a usable
+   * transmit key for this frame's key id already cached? CACHED means the frame
+   * is ACCEPTED and counted as the wrap outcome kek_generation_not_held
+   * (reachable whether the unheld generation is newer or older; here the cache
+   * decides, not the age). NOT CACHED means the frame is DROPPED
+   * and counted as a reject reason, and only there does direction matter:
+   * no_kek_for_generation when newer than the newest held, kek_generation_stale
+   * when older than retention keeps.
+   */
+  | 'kek_generation_stale'
+  // --- assignment layer: the sender is not one this receiver was assigned ---
+  /**
+   * A frame that verified against its sender's roster key, but whose key-id
+   * sender is not in this receiver's MC-stated slot-assignment set. Dropped
+   * BEFORE it is opened: no decrypt, no transmit-key caching, no replay advance.
+   * Defence in depth against a misrouting or compromised handler; in the honest
+   * data plane MH never forwards it.
+   */
+  | 'sender_not_assigned';
 
 /**
  * The tokens, as data, for the set-equality assertion.
@@ -120,6 +146,8 @@ export const ALL_REJECT_REASONS: readonly RejectReason[] = [
   'wrap_key_id_mismatch',
   'no_kek_for_generation',
   'no_roster_entry',
+  'kek_generation_stale',
+  'sender_not_assigned',
 ] as const;
 
 /**
@@ -134,8 +162,15 @@ export const ALL_REJECT_REASONS: readonly RejectReason[] = [
  */
 export const NON_DROPPING_REASON = 'wrap_key_id_mismatch' satisfies RejectReason;
 
-/** Which parsing/crypto stage produced a reason. Mirrors `reject_reasons[].layer`. */
-export type RejectLayer = 'codec' | 'crypto' | 'key';
+/**
+ * Which processing stage produced a reason. Mirrors `reject_reasons[].layer`.
+ *
+ * A STAGE, not the owner of the remedy, and never an alert-selector input:
+ * `no_transmit_key` is `codec` yet fires on key-store membership. Classify a
+ * token by `docs/observability/label-taxonomy.md` §Frame reject reason, never
+ * by this field.
+ */
+export type RejectLayer = 'codec' | 'crypto' | 'key' | 'assignment';
 
 /**
  * Structured detail attached to a reject.
@@ -209,4 +244,13 @@ export function keyReject(
   detail: RejectDetail = {},
 ): FrameRejectedError {
   return new FrameRejectedError(reason, 'key', message, detail);
+}
+
+/** Construct an assignment-layer reject. */
+export function assignmentReject(
+  reason: RejectReason,
+  message: string,
+  detail: RejectDetail = {},
+): FrameRejectedError {
+  return new FrameRejectedError(reason, 'assignment', message, detail);
 }

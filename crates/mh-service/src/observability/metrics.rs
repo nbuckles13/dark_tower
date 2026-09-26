@@ -1110,13 +1110,24 @@ impl MediaLatencyPhase {
 ///
 /// **MH must never emit a crypto- or key-layer token** — `signature_invalid`,
 /// `decrypt_failed`, `unwrap_failed`, `replay_detected`,
-/// `wrap_key_id_mismatch`, `no_kek_for_generation`, `no_roster_entry`,
-/// `no_transmit_key`. MH is keyless and never opens a frame, so such a series
-/// asserts a verification MH is structurally incapable of performing, and an
-/// operator reads it as "MH validates frames" and then relies on a control that
-/// does not exist. The collision test in
-/// `crates/mh-service/tests/media_metrics_integration.rs` pins this against all
-/// sixteen tokens in `proto/test-vectors/frame-v2.vectors.json`.
+/// `wrap_key_id_mismatch`, `no_kek_for_generation`, `kek_generation_stale`,
+/// `no_roster_entry`, `no_transmit_key`. MH is keyless and never opens a frame,
+/// so such a series asserts a verification MH is structurally incapable of
+/// performing, and an operator reads it as "MH validates frames" and then
+/// relies on a control that does not exist.
+///
+/// **MH must also never emit the assignment-layer token `sender_not_assigned`
+/// — for a different reason.** Keylessness does not reach it: MH already
+/// observes and emits the same condition as `no_subscriber`
+/// ([`MediaDropReason::NoSubscriber`], "no egress edge names this sender").
+/// `sender_not_assigned` is the CLIENT's assignment-layer spelling of that
+/// condition, so MH re-spelling it would conflate two drops from different
+/// layers under `sum by(reason)` — the sharpest instance of the
+/// `no_roster_entry` / `no_subscriber` sibling trap.
+///
+/// The collision test in
+/// `crates/mh-service/tests/media_metrics_integration.rs` pins both bars
+/// against every token in `proto/test-vectors/frame-v2.vectors.json`.
 ///
 /// ANCHOR (DRY): the operator-facing meaning of each token, and the split
 /// between the should-read-zero invariant-violation group and the

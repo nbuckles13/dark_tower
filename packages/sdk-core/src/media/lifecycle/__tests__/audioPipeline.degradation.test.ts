@@ -19,7 +19,7 @@ import {
 import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../../../config/clientConfig.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { MeetingIdentity } from '../../setup/identity.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import { assignmentsOn, emptyKekHolder, kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import type { DatagramSender } from '../../pipeline/egress.js';
@@ -69,8 +69,7 @@ async function makePipeline(opts: Options = {}): Promise<{
   count(name: string): number;
 }> {
   const sink = new InMemoryMetricsSink();
-  const kekSource = new JoinResponseKekSource();
-  if (opts.kekProvisioned !== false) kekSource.set(KEK, 0);
+  const kekSource = opts.kekProvisioned !== false ? kekHolderWith(KEK, 0) : emptyKekHolder();
   const capture = new FakeCaptureSource();
   const codecs = new FakeAudioCodecs();
   const playback = new RecordingPlaybackSink();
@@ -84,7 +83,6 @@ async function makePipeline(opts: Options = {}): Promise<{
     kekSource,
     roster,
     senderId: SENDER_ID,
-    kekGeneration: 0,
     identity,
     declaredSlotIds: [0],
     senderFor: (url) => (opts.senders ? opts.senders[url] : opts.sender),
@@ -101,7 +99,8 @@ async function makePipeline(opts: Options = {}): Promise<{
   const pipeline = new AudioPipeline(options);
   const faults: string[] = [];
   pipeline.on('fault', (f) => faults.push(f.stage));
-  if (opts.receiveUrlsBeforeStart) pipeline.setReceiveHandlers(opts.receiveUrlsBeforeStart);
+  if (opts.receiveUrlsBeforeStart)
+    pipeline.setReceiveAssignments(assignmentsOn(opts.receiveUrlsBeforeStart, SENDER_ID));
   await pipeline.start();
   pipeline.setSendDirective({
     streamNumber: 1,
@@ -112,7 +111,7 @@ async function makePipeline(opts: Options = {}): Promise<{
   // for it: naming a handler with no connected transport is itself a fault.
   const receiveUrls =
     opts.receiveUrls !== undefined ? opts.receiveUrls : opts.readable ? [MH_URL] : null;
-  if (receiveUrls !== null) pipeline.setReceiveHandlers(receiveUrls);
+  if (receiveUrls !== null) pipeline.setReceiveAssignments(assignmentsOn(receiveUrls, SENDER_ID));
   return {
     pipeline,
     capture,
@@ -265,8 +264,8 @@ describe('receive-side degradation', () => {
     const transport = new MockWebTransport();
     transport.simulateReady();
     const rig = await makePipeline({ readable: transport.datagrams.readable });
-    rig.pipeline.setReceiveHandlers([MH_URL]);
-    rig.pipeline.setReceiveHandlers([MH_URL, '']);
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, ''], SENDER_ID));
     // Directives no longer touch the read loop at all.
     rig.pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
     await settle();
@@ -315,7 +314,7 @@ describe('receive-side degradation', () => {
     expect(rig.faults).toEqual([]);
 
     // Positive control on the same rig: a peer joins and fills the slot.
-    rig.pipeline.setReceiveHandlers([MH_URL]);
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
     transport.simulateIncomingDatagram(PROBE);
     await settle();
     expect(transport.datagrams.readable.locked).toBe(true);
@@ -352,14 +351,14 @@ describe('receive-side degradation', () => {
     // The snapshot empties. The loop must still be READING — probed now, while
     // empty, not after the refill (a loop torn down on empty and reopened on
     // refill would pass that version of this test).
-    rig.pipeline.setReceiveHandlers(['']);
+    rig.pipeline.setReceiveAssignments(assignmentsOn([''], SENDER_ID));
     transport.simulateIncomingDatagram(PROBE);
     await settle();
     expect(transport.datagrams.readable.locked).toBe(true);
     expect(rig.count(RECEIVED)).toBe(1);
 
     // And a refill neither reopens nor faults.
-    rig.pipeline.setReceiveHandlers([MH_URL]);
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
     transport.simulateIncomingDatagram(PROBE);
     await settle();
     expect(rig.count(RECEIVED)).toBe(2);
@@ -409,7 +408,7 @@ describe('receive-side degradation', () => {
       receiveUrls: [MH_URL],
     });
 
-    rig.pipeline.setReceiveHandlers([OTHER]);
+    rig.pipeline.setReceiveAssignments(assignmentsOn([OTHER], SENDER_ID));
     await settle();
     expect(rig.faults).toEqual([]);
 
@@ -435,8 +434,8 @@ describe('receive-side degradation', () => {
       receiveUrls: [MH_URL, OTHER],
     });
 
-    rig.pipeline.setReceiveHandlers([MH_URL, OTHER]);
-    rig.pipeline.setReceiveHandlers([OTHER, MH_URL]);
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, OTHER], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([OTHER, MH_URL], SENDER_ID));
     await settle();
     expect(rig.faults).toEqual([]);
 
@@ -494,7 +493,9 @@ describe('receive-side degradation', () => {
     // A receive url with no transport, then a SEND target with no transport —
     // two live transport conditions with different remedies. (The pair used to be
     // the two task-6 placement faults, which no longer exist.)
-    rig.pipeline.setReceiveHandlers(['https://mh-unconnected.example:4433']);
+    rig.pipeline.setReceiveAssignments(
+      assignmentsOn(['https://mh-unconnected.example:4433'], SENDER_ID),
+    );
     rig.pipeline.setSendDirective({
       streamNumber: 1,
       bitrateBps: 32_000,
@@ -502,7 +503,9 @@ describe('receive-side degradation', () => {
     });
     rig.emit();
     // The same conditions again: bounded, so NOT reported twice.
-    rig.pipeline.setReceiveHandlers(['https://mh-unconnected.example:4433']);
+    rig.pipeline.setReceiveAssignments(
+      assignmentsOn(['https://mh-unconnected.example:4433'], SENDER_ID),
+    );
     rig.emit();
     await settle();
 

@@ -1194,7 +1194,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     const mc = rig.mocks.get(MC_ENDPOINT)!;
     // A trailing assignment on the same ordered stream is the drain point: once
     // it reaches the pipeline, the directive before it has been handled.
-    const drained = vi.spyOn(pipeline, 'setReceiveHandlers');
+    const drained = vi.spyOn(pipeline, 'setReceiveAssignments');
     mc.simulateServerMessage(0, framedSendDirectiveWithoutStreams());
     mc.simulateServerMessage(
       0,
@@ -1312,17 +1312,21 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     const rig = await joinedWithMedia();
     const pipeline = await rig.session.startMedia();
     const mc = rig.mocks.get(MC_ENDPOINT)!;
-    const applied = vi.spyOn(pipeline, 'setReceiveHandlers');
+    const applied = vi.spyOn(pipeline, 'setReceiveAssignments');
     mc.simulateServerMessage(
       0,
       framedStreamAssignments({ slotId: 0, slotState: SlotState.FEWER_SOURCES_THAN_SLOTS }),
     );
     // DRAIN POINT, not a timer: the assignment reached the PIPELINE (stronger
     // than the session event, which fires before the pipeline applies it), with
-    // the empty "no source assigned" url. That call is synchronous, so once it
-    // has returned there is nothing left in flight to wait for.
+    // the empty "no source assigned" url and NO sender — absent, never coerced
+    // to 0. That call is synchronous, so once it has returned there is nothing
+    // left in flight to wait for.
     await waitFor(() => applied.mock.calls.length === 1);
-    expect(applied.mock.calls[0]?.[0]).toEqual(['']);
+    expect(applied.mock.calls[0]?.[0]).toEqual([
+      { slotId: 0, senderId: undefined, mediaHandlerUrl: '' },
+    ]);
+    expect(pipeline.assignedSenders).toEqual([]);
 
     const mh = rig.mocks.get(MEDIA_SERVERS[0]!)!;
     mh.simulateIncomingDatagram(Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0));

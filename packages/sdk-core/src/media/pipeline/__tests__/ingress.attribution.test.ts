@@ -22,7 +22,7 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { ReplayWindow, TransmitKeyCache } from '../../frame/receivePath.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import { gateFor, kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { FirstMediaObserver } from '../../setup/measurement.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
@@ -55,8 +55,7 @@ function makeHarness(): Harness {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
   const roster = new RosterIdentityKeys(8);
-  const kekSource = new JoinResponseKekSource();
-  kekSource.set(KEK, 0);
+  const kekSource = kekHolderWith(KEK, 0);
   const accepted: AcceptedFrame[] = [];
   // ONE MONITOR PER TRANSPORT. These harnesses model a single transport, so one
   // monitor per harness — created here rather than shared at module scope,
@@ -65,6 +64,7 @@ function makeHarness(): Harness {
   const ingress = new IngressPipeline({
     metrics,
     roster,
+    lanes: gateFor(SENDER_A, SENDER_B),
     keys: kekSource,
     cache: new TransmitKeyCache(8),
     replay: new ReplayWindow(8, 64),
@@ -338,11 +338,12 @@ describe('media metric labels', () => {
 
 describe('non-dropping wrap outcomes are counted separately from drops', () => {
   it('plays a frame off the cache when the carried KEK generation is not held', async () => {
-    // THE KEK-ROTATION-LAG SIGNAL. The sender re-wrapped under a generation
-    // whose push has not landed yet. Dropping a PLAYABLE frame because a key we
-    // do not need is unavailable would turn a benign race into an audio gap —
-    // so the frame plays, and the condition is counted on its own counter rather
-    // than folded into `absent`, whose semantics are "nothing to do".
+    // One key id under a SECOND wrap, announcing a KEK this receiver lacks. An
+    // honest sender of this SDK never produces it — it rotates to a new key id
+    // on every KEK change (R-13) — so this is a non-conforming sender that
+    // re-wraps. The frame is still PLAYABLE off the cached key, so it plays; and
+    // the condition is counted on its own counter rather than folded into
+    // `absent`, whose semantics are "nothing to do".
     const h = makeHarness();
     const alice = await makeIdentity(0x41);
     await h.roster.upsert({ senderId: SENDER_A, identityPublicKey: alice.publicKey });
@@ -361,10 +362,12 @@ describe('non-dropping wrap outcomes are counted separately from drops', () => {
       h.hopMonitor,
     );
     // Second frame: SAME key id and SAME transmit key, but the sender has
-    // re-wrapped under a NEW meeting KEK and announces its generation. The
-    // receiver does not hold that generation yet — the push has not landed —
-    // and the wrap block therefore differs from the one it cached, so the
-    // cached-wrap skip does not apply and the unwrap is actually attempted.
+    // RE-WRAPPED that key under a NEW meeting KEK — the non-conforming pattern
+    // the `kek_generation_not_held` arm exists to observe (an honest R-13 sender
+    // rotates to a fresh key id instead; see the `WrapOutcome` doc). The receiver
+    // does not hold the announced generation, and the wrap block therefore
+    // differs from the one it cached, so the cached-wrap skip does not apply and
+    // the unwrap is attempted.
     await h.ingress.accept(
       await buildTestFrame({
         keyIdSenderId: SENDER_A,
