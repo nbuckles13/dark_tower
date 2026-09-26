@@ -48,6 +48,7 @@
 // boolean, because the default deployment is neither.
 
 import type { MetricLabels, MetricsSink } from '../../telemetry/MetricsSink.js';
+import type { KekRetentionOutcome } from '../../config/clientConfig.js';
 import type { RejectReason } from '../frame/rejectReason.js';
 import type { WrapOutcome } from '../frame/receivePath.js';
 
@@ -173,16 +174,83 @@ export type MediaMuteAction = (typeof MEDIA_MUTE_ACTIONS)[keyof typeof MEDIA_MUT
 /**
  * Bounded `source` vocabulary for `dt_client_media_kek_updates_total`.
  *
- * One value this story. KEK-push rotation adds `kek_update` when story 2 lands;
- * the vocabulary is declared as a map rather than a bare literal so that
- * addition is additive.
+ * TWO values, and the merge inside `kek_update` is deliberate: a reconnect
+ * re-issue and a rotation arrive in the same `MeetingKekUpdate` message and are
+ * not distinguishable at the client.
+ *
+ * The ONE home of this vocabulary. `kekSource.ts`'s arrival type is DERIVED from
+ * it, never retyped, so an addition cannot land in one copy only.
  */
 export const MEDIA_KEK_SOURCES = {
   JoinResponse: 'join_response',
+  KekUpdate: 'kek_update',
 } as const;
 
 /** One of {@link MEDIA_KEK_SOURCES}. */
 export type MediaKekSource = (typeof MEDIA_KEK_SOURCES)[keyof typeof MEDIA_KEK_SOURCES];
+
+/**
+ * Bounded `outcome` vocabulary for `dt_client_media_kek_retention_anomalies_total`.
+ *
+ * Every retention outcome EXCEPT `nominal`, spelled here as literals so the
+ * collector-sentinel check (`dt-guard client-metrics-export` G6, which reads this
+ * file) can see them, and tied to the config's `KekRetentionOutcome` by the
+ * `satisfies` below so the two cannot drift: a new outcome added there without
+ * one here is a type error.
+ *
+ * A PER-METRIC vocabulary. `outcome` carries no cross-metric aggregation
+ * contract (`docs/observability/label-taxonomy.md`), so these values never mean
+ * anything summed against `key_wrap_outcomes_total`'s or the refusals counter's.
+ */
+export const MEDIA_KEK_RETENTION_ANOMALIES = {
+  FloorSubstituted: 'floor_substituted',
+  CeilingClamped: 'ceiling_clamped',
+  BelowRewrapLatency: 'below_rewrap_latency',
+} as const satisfies Record<string, Exclude<KekRetentionOutcome, 'nominal'>>;
+
+/** One of {@link MEDIA_KEK_RETENTION_ANOMALIES}. */
+export type MediaKekRetentionAnomaly =
+  (typeof MEDIA_KEK_RETENTION_ANOMALIES)[keyof typeof MEDIA_KEK_RETENTION_ANOMALIES];
+
+/**
+ * Bounded `outcome` vocabulary for `dt_client_media_kek_install_refusals_total`.
+ *
+ * `outcome`, NOT `reason`: `reason` is scoped to per-FRAME media-path drops with
+ * exactly two named homes (`label-taxonomy.md`), and a KEK install refusal is
+ * not a frame drop. A per-metric vocabulary, like the one above.
+ */
+export const MEDIA_KEK_INSTALL_REFUSALS = {
+  /** Same generation already held, DIFFERENT bytes. The held key is kept. */
+  ConflictingKey: 'conflicting_key',
+  /** A generation below the current. Never rolls the current back. */
+  OlderGeneration: 'older_generation',
+  /** Wrong width, all-zero, or a generation outside the wire's u16 range. */
+  Malformed: 'malformed',
+} as const;
+
+/**
+ * Bounded `outcome` vocabulary for `dt_client_media_roster_key_rebinds_total`.
+ *
+ * Split because the two point at DIFFERENT fixes, and because only one of them
+ * can carry a reads-zero-forever contract: MC never legitimately rebinds a live
+ * sender to different bytes, but it DOES publish empty keys (the `no_roster_entry`
+ * catalog entry documents it), so a merged counter would make any alert on it
+ * fire on a known, expected condition. A per-metric vocabulary.
+ */
+export const MEDIA_ROSTER_KEY_CHANGES = {
+  /** A live sender bound to DIFFERENT, well-formed key bytes. Should read zero. */
+  Rebind: 'rebind',
+  /** A live sender's key replaced by an empty, wrong-width or unusable one. */
+  Downgrade: 'downgrade',
+} as const;
+
+/** One of {@link MEDIA_ROSTER_KEY_CHANGES}. */
+export type MediaRosterKeyChange =
+  (typeof MEDIA_ROSTER_KEY_CHANGES)[keyof typeof MEDIA_ROSTER_KEY_CHANGES];
+
+/** One of {@link MEDIA_KEK_INSTALL_REFUSALS}. */
+export type MediaKekInstallRefusal =
+  (typeof MEDIA_KEK_INSTALL_REFUSALS)[keyof typeof MEDIA_KEK_INSTALL_REFUSALS];
 
 /**
  * The wrap outcomes that are REPORTED.
@@ -379,18 +447,24 @@ export class MediaMetrics {
    * freely and nobody signs it — so it is validated against the declared slot
    * set before ANY receiver state is created for it. The frame itself is still
    * verified, attributed from its own key id, and played; only the hop-sequence
-   * bookkeeping is withheld. No frame reject token is minted for this: the
-   * sixteen are frozen, and the condition is not a decode failure.
+   * bookkeeping is withheld. No frame reject token is minted for this, because
+   * the frame is NOT DROPPED — it plays — so it has no place in a drop
+   * vocabulary; and the condition is not a decode failure either.
    */
   undeclaredStreamId(): void {
     this.#sink?.counter('dt_client_media_undeclared_stream_id_total', this.#base);
   }
 
   /**
-   * The audio decoder raised its error callback.
+   * An audio decoder raised its error callback.
+   *
+   * COUNTING POINT: one decoder per ACTIVE SENDER (story 2), event-once per
+   * decoder INSTANCE — so one fault class can advance this up to N times, and
+   * the magnitude is not comparable with the one-decoder-per-client history.
    *
    * BOUNDED / EVENT-DRIVEN, never per frame: a decoder erroring on every frame
-   * must not become per-frame telemetry. No `reason` label — `AudioDecoder`
+   * must not become per-frame telemetry, which is why a faulted sender's decoder
+   * is replaced at most once per `ingress.decoderRestartBackoffMs`. No `reason` label — `AudioDecoder`
    * gives no bounded one, and an unbounded label here would be the cardinality
    * hazard §11 exists to prevent.
    *
@@ -411,6 +485,86 @@ export class MediaMetrics {
   /** A meeting KEK arrived through the KEK-source seam. Never the key itself. */
   kekUpdate(source: MediaKekSource): void {
     this.#sink?.counter('dt_client_media_kek_updates_total', { ...this.#base, source });
+  }
+
+  /**
+   * The KEK holder would have retained more than one previous generation.
+   *
+   * A TRIPWIRE for a state no production path can reach: reads zero forever, and
+   * alertable at `> 0`. It watches for the refactor most likely to remove its own
+   * call site, which is why a test pins that the call site is on the live
+   * install path. A counter rather than a gauge: with N browsers at one stream
+   * identity a gauge is last-writer-wins and hides the rare value that matters.
+   */
+  kekRetentionViolation(): void {
+    this.#sink?.counter('dt_client_media_kek_retention_violations_total', this.#base);
+  }
+
+  /**
+   * A KEK message's W produced a non-nominal retention window. One per message.
+   *
+   * `floor_substituted` is the one-version MC rollback detector — the only
+   * cluster-visible evidence of it, since the WARN log reaches a browser console
+   * no operator has.
+   */
+  kekRetentionAnomaly(outcome: MediaKekRetentionAnomaly): void {
+    this.#sink?.counter('dt_client_media_kek_retention_anomalies_total', {
+      ...this.#base,
+      outcome,
+    });
+  }
+
+  /** A delivered KEK was refused. Never the key, never its generation. */
+  kekInstallRefused(outcome: MediaKekInstallRefusal): void {
+    this.#sink?.counter('dt_client_media_kek_install_refusals_total', {
+      ...this.#base,
+      outcome,
+    });
+  }
+
+  /**
+   * An install demoted the previous current generation and RETAINED it.
+   *
+   * The opposite tripwire to {@link kekRetentionViolation}: that one watches for
+   * retaining too MANY, a state no path reaches; this one is what goes flat when a
+   * refactor retains NONE, whose only other symptom is an audio gap at every
+   * rotation. Read against `kek_updates_total{source="kek_update"}`. Not
+   * incremented by a first install or by an idempotent or refused one.
+   */
+  kekGenerationRetained(): void {
+    this.#sink?.counter('dt_client_media_kek_generations_retained_total', this.#base);
+  }
+
+  /**
+   * A roster update changed a live sender's key: a `rebind` to different bytes,
+   * or a `downgrade` to none. ONE increment per EVENT, not per purged key. No
+   * sender dimension.
+   */
+  rosterKeyRebind(outcome: MediaRosterKeyChange): void {
+    this.#sink?.counter('dt_client_media_roster_key_rebinds_total', {
+      ...this.#base,
+      outcome,
+    });
+  }
+
+  /**
+   * A frame was evicted from a decode lane's bounded pending queue.
+   *
+   * ---------------------------------------------------------------------------
+   * THIS IS A POST-ACCEPT LOSS AND MUST NEVER BE A `frames_dropped_total` REASON
+   * ---------------------------------------------------------------------------
+   *
+   * It measures the ACCEPTED -> AUDIBLE segment, downstream of the accounting
+   * boundary: the frame it counts was already counted on
+   * `dt_client_media_frames_accepted_total`. A counter named `..._dropped_total`
+   * one method from {@link frameDropped} reads like a reason someone forgot to
+   * add — and "fixing" that would put one frame on BOTH sides of
+   * `received = accepted + sum(drops by reason)`, breaking it silently and only
+   * in aggregate. That is exactly the failure `wrap_key_id_mismatch`'s
+   * `drops_frame: false` exists to prevent. One increment per evicted frame.
+   */
+  decodeQueueDropped(): void {
+    this.#sink?.counter('dt_client_media_decode_queue_dropped_total', this.#base);
   }
 
   /**

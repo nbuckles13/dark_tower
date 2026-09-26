@@ -50,7 +50,8 @@ import { sealSframe, serializeSframe, sframeObjectLength } from '../frame/sframe
 import { deriveSframeKeys, sframeNonce } from '../frame/sframeKeySchedule.js';
 import { AES_256_KEY_BYTES, SFRAME_CIPHER_SUITE_ID, SFRAME_SALT_BYTES } from '../frame/sframe.js';
 import type { Bytes } from '../frame/hex.js';
-import type { KekForWrapping, TransmitKeyManager } from '../lifecycle/transmitKeys.js';
+import type { TransmitKeyManager } from '../lifecycle/transmitKeys.js';
+import type { KekWrapSource } from '../setup/kekSource.js';
 import type { MeetingIdentity } from '../setup/identity.js';
 import { MEDIA_SEND_DROP_REASONS, type MediaMetrics } from '../setup/mediaMetrics.js';
 import type { EncodedAudioFrame } from '../setup/seams.js';
@@ -147,7 +148,7 @@ export interface DatagramSender {
 export interface EgressPipelineOptions {
   readonly metrics: MediaMetrics;
   readonly transmitKeys: TransmitKeyManager;
-  readonly kek: KekForWrapping;
+  readonly kek: KekWrapSource;
   /**
    * The meeting identity, passed as the HOLDER rather than as a bare signing
    * capability.
@@ -202,7 +203,7 @@ export interface EgressPipelineOptions {
 export class EgressPipeline {
   readonly #metrics: MediaMetrics;
   readonly #transmitKeys: TransmitKeyManager;
-  readonly #kek: KekForWrapping;
+  readonly #kek: KekWrapSource;
   readonly #identity: MeetingIdentity;
   readonly #maxQueueFrames: number;
   readonly #streamNumber: number;

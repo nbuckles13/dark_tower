@@ -228,6 +228,14 @@ silently sends to only its first target). So:
    a report of "some peers hear me, some don't" during that window, ask the user
    to reload before triaging (`mc-incident-response.md` Scenario 18 arm (c2)).
 
+**The SDK-first rule above does NOT extend to `kek_rotation_debounce_seconds`.**
+That field (the rotation debounce W that MC sends with the KEK, from which the
+client derives how long it keeps the previous KEK generation) imposes **no**
+SDK<->MC ordering constraint. The client substitutes a retention floor for a
+zero or absent W, so it tolerates an MC without the field. An old SDK ignores
+the field, so an MC that sends it is also safe. Either may roll first. Do not
+generalise task 20's rule to this field.
+
 ### 1. Pre-Deployment Verification
 
 **Verify current state:**
@@ -566,6 +574,16 @@ kill %1
 > to those meetings; new meetings are unaffected. The remedy is the one
 > exception to "do not restart MH" — see **Carve-out #3** under §Post-Deploy
 > Monitoring Checklist: MC↔MH Coordination.
+>
+> **Rolling MC back below `kek_rotation_debounce_seconds` flips every live
+> client to the KEK retention floor.** The old build sends no W, so each client
+> falls back to its floor, and
+> `dt_client_media_kek_retention_anomalies_total{outcome="floor_substituted"}`
+> climbs **fleet-wide**, once per KEK message. This is the **SUPPORTED** path and
+> not an incident. Do not chase it, and do not roll further back to "fix" it. The
+> counter reads zero outside such a rollback. It is the only cluster-visible
+> evidence, because the client's accompanying warning goes to a browser console
+> that no operator can see.
 
 **Step 1: Identify previous version**
 

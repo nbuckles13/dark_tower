@@ -54,6 +54,41 @@
 // resolve-then-Ed25519-verify path a peer's frame takes, and a frame that fails
 // to verify against that key is dropped exactly as a peer's would be. There is
 // no branch anywhere that trusts a frame because this client signed it.
+//
+// ---------------------------------------------------------------------------
+// A REBIND PURGES THAT SENDER'S TRANSMIT KEYS — AND NEVER ITS REPLAY STATE
+// ---------------------------------------------------------------------------
+//
+// Story 2 R-18. MC never legitimately rebinds a LIVE sender id to a different
+// identity key: a new key always means a new sender id. So a roster update that
+// does is either an MC defect or a cache-poisoning attempt, and the transmit
+// keys this client unwrapped for that sender under the OLD binding must not keep
+// opening frames. The decision compares the published BYTES (public, so a plain
+// comparison), and it is made SYNCHRONOUSLY at `upsert` entry — before the
+// `importKey` await — so two updates for one sender cannot resolve out of order
+// and let the older key win.
+//
+//   * equal bytes                       -> no-op (an LRU touch only)
+//   * not on the roster, or keyless     -> a FIRST BINDING, not a rebind
+//   * key present -> different key      -> REBIND: purge + count
+//   * key present -> empty / malformed  -> a DOWNGRADE, treated as a rebind:
+//                                          purge + count, entry known-keyless
+//
+// On a rebind the entry goes KNOWN-KEYLESS immediately, so frames arriving while
+// the new key imports fail closed as `no_roster_entry` rather than verifying
+// against the old key. An import that fails leaves the entry known-keyless — it
+// never leaves the previous `CryptoKey` in place.
+//
+// Replay state (contexts, bitmaps, generation high-water) is NOT touched by any
+// path in this file: clearing it would permit a rebind-BACK replay, in which an
+// attacker rebinds away and back and replays frames the window had rejected.
+//
+// Forgetting a sender's bytes — `remove()`, or LRU eviction — also invalidates
+// its transmit keys, because afterwards a re-add is indistinguishable from a
+// first binding and the rebind check above would be blind to it. That purge is
+// memory hygiene and is not counted as a rebind.
+//
+// The roster key stays TRUST-ON-FIRST-USE. Nothing here makes it anything more.
 
 import { ED25519_PUBLIC_KEY_BYTES, importVerifyKey } from '../frame/ed25519.js';
 
@@ -64,15 +99,42 @@ export interface RosterIdentityEntry {
   /**
    * The raw Ed25519 public key as MC published it.
    *
-   * NOT attested, NOT verified, NOT trusted — this story performs no attestation
-   * check of any kind, and `identity_public_key` is the honest spelling. A
-   * signature verifying against it proves only that every frame came from the
-   * same keyholder; it never proves WHO. The AC attestation that closes this is
-   * story 2.
+   * Trust-on-first-use and nothing more: this story performs no attestation of
+   * any kind, and `identity_public_key` is the honest spelling. A signature
+   * verifying against it proves only that every frame came from the same
+   * keyholder; it never proves WHO. Closing that is the attestation story
+   * (ADR-0036 addendum).
    *
    * EMPTY means no key published. See the module header.
    */
   readonly identityPublicKey: Uint8Array;
+}
+
+/** Why a sender's cached transmit keys must be dropped. */
+export type TransmitKeyInvalidation =
+  /** A live sender was bound to DIFFERENT, well-formed key bytes. Counted. */
+  | 'rebind'
+  /**
+   * A live sender's key was replaced by an empty, wrong-width or otherwise
+   * unusable one. Counted SEPARATELY from `rebind`: the two point at different
+   * fixes (a true rebind is an MC defect or an injected roster update; a
+   * downgrade is MC publishing an empty key, which the tree documents occurring).
+   */
+  | 'downgrade'
+  /** The roster forgot the sender's bytes (removal or LRU eviction). Not counted. */
+  | 'forgotten';
+
+/** Receives transmit-key invalidations. Wired by the session to the pipeline's cache. */
+export type TransmitKeyInvalidationListener = (
+  senderId: number,
+  cause: TransmitKeyInvalidation,
+) => void;
+
+/** One roster entry. `key` undefined records a KNOWN-KEYLESS participant. */
+interface RosterEntry {
+  readonly key: CryptoKey | undefined;
+  /** The published bytes, copied. Empty for keyless and malformed entries. */
+  readonly bytes: Uint8Array;
 }
 
 /**
@@ -85,11 +147,23 @@ export interface RosterIdentityEntry {
  */
 export class RosterIdentityKeys {
   readonly #maxEntries: number;
-  /** Insertion-ordered for LRU. `undefined` records a KNOWN-KEYLESS participant. */
-  readonly #keys = new Map<number, CryptoKey | undefined>();
+  /** Insertion-ordered for LRU. */
+  readonly #entries = new Map<number, RosterEntry>();
+  /**
+   * The latest upsert per sender. An import resolving for an OLDER upsert is
+   * discarded, so out-of-order `importKey` completions cannot install a stale key.
+   */
+  readonly #latestUpsert = new Map<number, number>();
+  #upsertSeq = 0;
+  #onInvalidate: TransmitKeyInvalidationListener | undefined;
 
   constructor(maxEntries: number) {
     this.#maxEntries = maxEntries;
+  }
+
+  /** Wire where transmit-key invalidations go. One listener; replaces any earlier one. */
+  setTransmitKeyInvalidationListener(listener: TransmitKeyInvalidationListener | undefined): void {
+    this.#onInvalidate = listener;
   }
 
   /**
@@ -108,12 +182,34 @@ export class RosterIdentityKeys {
     const { senderId, identityPublicKey } = entry;
     if (!Number.isInteger(senderId) || senderId <= 0) return;
 
-    if (identityPublicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
-      // Covers BOTH the empty case (length 0, what MC publishes for a joiner
-      // that sent none) and the malformed case. Neither is "skip verification".
-      this.#insert(senderId, undefined);
+    const wellFormed = identityPublicKey.length === ED25519_PUBLIC_KEY_BYTES;
+    const bytes = wellFormed ? Uint8Array.from(identityPublicKey) : new Uint8Array(0);
+    const existing = this.#entries.get(senderId);
+
+    // ---- SYNCHRONOUS: the rebind decision, before any await. ----
+    if (existing && existing.bytes.length > 0 && wellFormed && sameBytes(existing.bytes, bytes)) {
+      // The same key again. An LRU touch; no import, no purge.
+      this.#insert(senderId, existing);
       return;
     }
+    const hadKey = existing !== undefined && existing.bytes.length > 0;
+    if (hadKey) {
+      // A different key, or a downgrade to none. Either way the old binding's
+      // transmit keys must not keep opening frames; the two are reported apart.
+      this.#onInvalidate?.(senderId, wellFormed ? 'rebind' : 'downgrade');
+    }
+
+    const seq = (this.#upsertSeq += 1);
+    this.#latestUpsert.set(senderId, seq);
+    // Known-keyless NOW, so nothing verifies against the old key while the new
+    // one imports. Frames arriving meanwhile are `no_roster_entry` — fail closed.
+    this.#insert(senderId, { key: undefined, bytes });
+    if (!wellFormed) {
+      // Covers BOTH the empty case (length 0, what MC publishes for a joiner
+      // that sent none) and the malformed case. Neither is "skip verification".
+      return;
+    }
+
     let key: CryptoKey | undefined;
     try {
       key = await importVerifyKey(identityPublicKey);
@@ -124,12 +220,24 @@ export class RosterIdentityKeys {
       // `rejectReason.ts`'s no-key-material-in-messages rule applies.
       key = undefined;
     }
-    this.#insert(senderId, key);
+    // A later upsert for this sender supersedes this one; so does a removal.
+    if (this.#latestUpsert.get(senderId) !== seq) return;
+    if (!this.#entries.has(senderId)) return;
+    // Unimportable keeps the entry known-keyless, bytes and all: it is still
+    // this sender's published key for rebind comparison.
+    this.#insert(senderId, { key, bytes });
   }
 
-  /** Forget a participant, e.g. on `ParticipantLeft`. */
+  /**
+   * Forget a participant, e.g. on `ParticipantLeft`.
+   *
+   * The sender's transmit keys go with it (see the module header): a leaver's
+   * frames then fail at `no_roster_entry` BEFORE verify, independently of the
+   * slot-edge gate. Replay state is kept.
+   */
   remove(senderId: number): void {
-    this.#keys.delete(senderId);
+    this.#latestUpsert.delete(senderId);
+    if (this.#entries.delete(senderId)) this.#onInvalidate?.(senderId, 'forgotten');
   }
 
   /**
@@ -143,23 +251,34 @@ export class RosterIdentityKeys {
    * them permissively.
    */
   identityKeyFor(senderId: number): CryptoKey | undefined {
-    return this.#keys.get(senderId);
+    return this.#entries.get(senderId)?.key;
   }
 
   /** Drop all entries. Public keys are not secret; this is a memory bound reset. */
   clear(): void {
-    this.#keys.clear();
+    this.#entries.clear();
+    this.#latestUpsert.clear();
   }
 
-  #insert(senderId: number, key: CryptoKey | undefined): void {
+  #insert(senderId: number, entry: RosterEntry): void {
     // Delete-then-set so a refreshed entry moves to the end of the insertion
     // order and LRU eviction stays meaningful.
-    this.#keys.delete(senderId);
-    this.#keys.set(senderId, key);
-    while (this.#keys.size > this.#maxEntries) {
-      const oldest = this.#keys.keys().next().value;
+    this.#entries.delete(senderId);
+    this.#entries.set(senderId, entry);
+    while (this.#entries.size > this.#maxEntries) {
+      const oldest = this.#entries.keys().next().value;
       if (oldest === undefined) break;
-      this.#keys.delete(oldest);
+      this.#entries.delete(oldest);
+      this.#latestUpsert.delete(oldest);
+      // Its bytes are gone, so a later re-add would read as a first binding.
+      this.#onInvalidate?.(oldest, 'forgotten');
     }
   }
+}
+
+/** Plain byte equality. Public key material, so timing reveals nothing. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
 }

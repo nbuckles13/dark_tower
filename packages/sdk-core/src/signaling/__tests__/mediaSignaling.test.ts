@@ -8,7 +8,8 @@ import { describe, expect, it } from 'vitest';
 import { MockWebTransport } from '@darktower/test-utils';
 
 import { MEETING_KEK_BYTES } from '../../media/frame/sframe.js';
-import { JoinResponseKekSource } from '../../media/setup/kekSource.js';
+import { emptyKekHolder } from '../../media/__tests__/helpers.js';
+import type { MeetingKekHolder } from '../../media/setup/kekSource.js';
 import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
 import { generateIdentityKeyPair } from '../../media/frame/ed25519.js';
 import { SignalingClient } from '../SignalingClient.js';
@@ -17,7 +18,9 @@ import {
   decodeOutboundClientMessages,
   framedJoinResponse,
   framedMeetingKekUpdate,
+  framedParticipantLeft,
   framedSendDirective,
+  LeaveReason,
   framedStreamAssignments,
   MediaKind,
   SlotState,
@@ -30,7 +33,7 @@ const KEK = new Uint8Array(MEETING_KEK_BYTES).fill(0x11);
 interface Rig {
   readonly client: SignalingClient;
   readonly transport: MockWebTransport;
-  readonly kekSource: JoinResponseKekSource;
+  readonly kekSource: MeetingKekHolder;
   readonly roster: RosterIdentityKeys;
   deliver(bytes: Uint8Array): void;
   outbound(): ReturnType<typeof decodeOutboundClientMessages>;
@@ -38,7 +41,7 @@ interface Rig {
 
 async function joinedRig(joinResponse: Uint8Array, identityPublicKey?: Uint8Array): Promise<Rig> {
   const transport = new MockWebTransport();
-  const kekSource = new JoinResponseKekSource();
+  const kekSource = emptyKekHolder();
   const roster = new RosterIdentityKeys(8);
   const client = new SignalingClient({
     connect: () => transport,
@@ -101,7 +104,7 @@ describe('the meeting KEK never survives the decode boundary', () => {
     const transport = new MockWebTransport();
     const client = new SignalingClient({
       connect: () => transport,
-      kekSink: new JoinResponseKekSource(),
+      kekSink: emptyKekHolder(),
     });
     const joining = client.join({
       webtransportEndpoint: ENDPOINT,
@@ -117,9 +120,9 @@ describe('the meeting KEK never survives the decode boundary', () => {
     expect(Object.keys(joined)).not.toContain('meetingKek');
   });
 
-  it('scrubs a KEK-push message even though rotation is UNUSED this story', async () => {
-    // Leaving key material on a decoded message because nothing consumes it yet
-    // is exactly how a latent leak becomes a live one.
+  it('routes a KEK-push message through the holder, as the push source', async () => {
+    // A rotation (or reconnect re-issue) lands in the SAME holder the join
+    // response fed, through the same scrubbing intake.
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     rig.deliver(framedMeetingKekUpdate(new Uint8Array(MEETING_KEK_BYTES).fill(0x22), 9));
     await waitFor(() => rig.kekSource.isProvisioned);
@@ -328,5 +331,53 @@ describe('client sends', () => {
     const client = new SignalingClient({ connect: () => new MockWebTransport() });
     await expect(client.sendReceiveCapability([])).rejects.toThrow();
     await expect(client.sendMuteRequest(true)).rejects.toThrow();
+  });
+});
+
+describe("a leave removes the leaver's roster key — a second cutoff beside the slot gate", () => {
+  it("forgets the leaver's identity key, resolved from the roster the join carried", async () => {
+    // `ParticipantLeft` names only the participant; the sender id comes from the
+    // roster this client already saw. Once forgotten, the leaver's frames drop at
+    // `no_roster_entry` BEFORE verify, independently of the slot-edge gate.
+    const peer = await generateIdentityKeyPair();
+    const rig = await joinedRig(
+      framedJoinResponse({
+        senderId: 258,
+        participants: [
+          { participantId: 'p1', name: 'Peer', senderId: 77, identityPublicKey: peer.publicKey },
+        ],
+      }),
+    );
+    await waitFor(() => rig.roster.identityKeyFor(77) !== undefined);
+
+    const forgotten: number[] = [];
+    rig.roster.setTransmitKeyInvalidationListener((id, cause) => {
+      if (cause === 'forgotten') forgotten.push(id);
+    });
+    rig.deliver(framedParticipantLeft('p1', LeaveReason.VOLUNTARY));
+    await waitFor(() => rig.roster.identityKeyFor(77) === undefined);
+    // Its transmit keys are invalidated with it (the pipeline purges on this).
+    expect(forgotten).toEqual([77]);
+  });
+
+  it('ignores a leave for a participant it never saw, and leaves others untouched', async () => {
+    const peer = await generateIdentityKeyPair();
+    const rig = await joinedRig(
+      framedJoinResponse({
+        senderId: 258,
+        participants: [
+          { participantId: 'p1', name: 'Peer', senderId: 77, identityPublicKey: peer.publicKey },
+        ],
+      }),
+    );
+    await waitFor(() => rig.roster.identityKeyFor(77) !== undefined);
+    const seen: unknown[] = [];
+    rig.client.on('streamAssignments', (e) => seen.push(e));
+    rig.deliver(framedParticipantLeft('stranger', LeaveReason.VOLUNTARY));
+    // DRAIN POINT: a later message on the same ordered stream. Once it has been
+    // dispatched, the leave before it has been handled.
+    rig.deliver(framedStreamAssignments({ slotId: 0, senderId: 77 }));
+    await waitFor(() => seen.length === 1);
+    expect(rig.roster.identityKeyFor(77)).toBeDefined();
   });
 });

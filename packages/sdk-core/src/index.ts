@@ -253,7 +253,11 @@ export {
   DEFAULT_CLIENT_CONFIG,
   DEFAULT_METRIC_EXPORT_INTERVAL_MS,
   MIN_AUDIO_ROTATION_PERIOD_MS,
+  KEK_RETENTION_CEILING_MS,
+  KEK_RETENTION_FLOOR_MS,
   ClientConfigError,
+  deriveKekRetention,
+  transmitRewrapLatencyMs,
   validateMediaConfig,
 } from './config/clientConfig.js';
 export type {
@@ -261,6 +265,8 @@ export type {
   ClientConfig,
   EgressConfig,
   IngressConfig,
+  KekRetention,
+  KekRetentionOutcome,
   KeyRotationConfig,
   MediaConfig,
   OpusApplication,
@@ -277,11 +283,15 @@ export type {
   MediaFrameCounts,
   AudioSendDirective,
   MediaFault,
+  PipelineKekSource,
+  ReceiveAssignment,
 } from './media/lifecycle/AudioPipeline.js';
 export { MuteState } from './media/lifecycle/muteState.js';
 export type { MuteSnapshot } from './media/lifecycle/muteState.js';
 
 export {
+  MEDIA_KEK_INSTALL_REFUSALS,
+  MEDIA_KEK_RETENTION_ANOMALIES,
   MEDIA_KEK_SOURCES,
   MEDIA_MUTE_ACTIONS,
   MEDIA_SEND_DROP_REASONS,
@@ -289,6 +299,8 @@ export {
   mediaMetricLabels,
 } from './media/setup/mediaMetrics.js';
 export type {
+  MediaKekInstallRefusal,
+  MediaKekRetentionAnomaly,
   MediaKekSource,
   MediaMetricIdentity,
   MediaMuteAction,
@@ -296,10 +308,26 @@ export type {
   ReportableWrapOutcome,
 } from './media/setup/mediaMetrics.js';
 
-export { JoinResponseKekSource } from './media/setup/kekSource.js';
-export type { MeetingKekSource } from './media/setup/kekSource.js';
+// `RetentionGuard` is deliberately NOT exported: it is the retention tripwire's
+// evaluator, reachable in production only through `MeetingKekHolder.install`. A
+// public copy would be a way to exercise the guard that does not go through the
+// install path it exists to watch.
+export { MAX_KEK_GENERATION, MeetingKekHolder } from './media/setup/kekSource.js';
+export type {
+  KekArrival,
+  KekForWrapping,
+  KekHolderObserver,
+  KekInstallResult,
+  KekWrapSource,
+  MeetingKekHolderOptions,
+  MeetingKekSource,
+} from './media/setup/kekSource.js';
 export { RosterIdentityKeys } from './media/setup/rosterKeys.js';
-export type { RosterIdentityEntry } from './media/setup/rosterKeys.js';
+export type {
+  RosterIdentityEntry,
+  TransmitKeyInvalidation,
+  TransmitKeyInvalidationListener,
+} from './media/setup/rosterKeys.js';
 export { CaptureFailure, MediaCaptureError, listMicrophones } from './media/setup/capture.js';
 export { AudioCodecUnsupportedError } from './media/setup/opus.js';
 export { MediaPlaybackError, PlaybackFailure } from './media/setup/audioPlayback.js';
@@ -311,6 +339,7 @@ export type {
   CaptureSource,
   CaptureSourceFactory,
   EncodedAudioFrame,
+  PlaybackLane,
   PlaybackSink,
   PlaybackSinkFactory,
 } from './media/setup/seams.js';

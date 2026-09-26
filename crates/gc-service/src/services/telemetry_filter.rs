@@ -92,9 +92,9 @@ pub const ALLOWLIST: [&str; 12] = [
 /// time someone adds a 13th base key to one array and not the other.
 ///
 /// Without these, `MCMediaMissingKeyMaterial` cannot match: its numerator
-/// selects `reason=~"no_kek_for_generation|no_roster_entry"`, and `reason` was
-/// being stripped here. Every labelled client media counter was corrupted the
-/// same way, even with a single browser.
+/// selects `reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"`,
+/// and `reason` was being stripped here. Every labelled client media counter
+/// was corrupted the same way, even with a single browser.
 ///
 /// Bounded and identity-free on an honest client (see the module header for what
 /// that does and does not promise): `key_custody` is the constant `operator`;

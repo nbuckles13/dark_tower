@@ -27,7 +27,7 @@ import {
 import { DEFAULT_CLIENT_CONFIG } from '../../../config/clientConfig.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { MeetingIdentity } from '../../setup/identity.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import { assignmentsOn, kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import type { DatagramSender } from '../../pipeline/egress.js';
@@ -62,8 +62,7 @@ interface Rig {
 async function makeRig(options: { readonly startDeviceId?: string } = {}): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
-  const kekSource = new JoinResponseKekSource();
-  kekSource.set(KEK, 0);
+  const kekSource = kekHolderWith(KEK, 0);
   const roster = new RosterIdentityKeys(8);
   const identity = await MeetingIdentity.create();
   await roster.upsert({ senderId: SENDER_ID, identityPublicKey: identity.publicKey! });
@@ -94,7 +93,6 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
     kekSource,
     roster,
     senderId: SENDER_ID,
-    kekGeneration: 0,
     identity,
     declaredSlotIds: [0],
     senderFor: () => sender,
@@ -124,7 +122,7 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
   );
   pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
   // Receiving comes from the slot assignments, not from the send directive.
-  pipeline.setReceiveHandlers([MH_URL]);
+  pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
 
   return {
     pipeline,

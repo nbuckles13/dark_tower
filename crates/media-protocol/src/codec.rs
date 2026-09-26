@@ -150,10 +150,9 @@ macro_rules! reject_reasons {
         /// The cross-language reject-reason vocabulary for this codec.
         ///
         /// These are the **structural / parse** subset of a shared `reason`
-        /// label space. Signature, decrypt, replay, `no_kek_for_generation` and
-        /// `no_roster_entry` belong to the cryptography and key layers and are
-        /// added by those layers. **No downstream layer may reuse one of these
-        /// tokens with a different meaning.**
+        /// label space. The cryptography, key and assignment layers add their
+        /// own tokens; the vectors file is the full set. **No downstream layer
+        /// may reuse one of these tokens with a different meaning.**
         ///
         /// ANCHOR (DRY): the cross-language single source of truth is
         /// `proto/test-vectors/frame-v2.vectors.json` (story task 8); both

@@ -24,7 +24,7 @@
 //
 // The frames are the SSoT's own `frame_hex` bytes and the expected tokens are
 // the SSoT's own `reject_reason` values. Nothing is retyped here: a third
-// hand-written list of the sixteen spellings would have no guard behind it, and
+// hand-written list of the token spellings would have no guard behind it, and
 // the whole point of `rejectReason.ts`'s set-equality test is that exactly ONE
 // in-tree mirror earns that status.
 
@@ -33,7 +33,7 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { ReplayWindow, TransmitKeyCache } from '../../frame/receivePath.js';
 import { hexToBytes } from '../../frame/hex.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import { emptyKekHolder, gateFor } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { FirstMediaObserver } from '../../setup/measurement.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
@@ -58,7 +58,7 @@ function makeIngress(): {
 } {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
-  const kek = new JoinResponseKekSource();
+  const kek = emptyKekHolder();
   // ONE MONITOR PER TRANSPORT. These harnesses model a single transport, so one
   // monitor per harness — created here rather than shared at module scope,
   // which would carry hop high-water marks between tests.
@@ -66,6 +66,8 @@ function makeIngress(): {
   const ingress = new IngressPipeline({
     metrics,
     roster: new RosterIdentityKeys(8),
+    // Every row here is a codec reject, decided before the gate runs.
+    lanes: gateFor(),
     keys: kek,
     cache: new TransmitKeyCache(8),
     replay: new ReplayWindow(8, 64),

@@ -12,8 +12,8 @@
 // not redundant with the per-arm assertions either: exhaustiveness proves every
 // error has an arm, NOT that the token on that arm is the right string, because
 // both sides read it from the same file. The per-arm equality in
-// `vectors.conformance.test.ts` covers spelling for the thirteen tokens that have
-// rows; this covers membership for all sixteen.
+// `vectors.conformance.test.ts` covers spelling for the tokens that have rows;
+// this covers membership for every token in the file.
 
 import { describe, expect, it } from 'vitest';
 
@@ -38,12 +38,18 @@ describe('the token set matches the SSoT exactly', () => {
 
   it('covers the tokens no vector row exercises', () => {
     // Named explicitly rather than left implicit in the set comparison: these
-    // three are the reason this file exists, and if the SSoT ever stops carrying
-    // them the omission should be visible here rather than absorbed silently into
-    // a passing set-equality.
+    // receiver-state-dependent tokens are the reason this file exists, and if the
+    // SSoT ever stops carrying one the omission should be visible here rather
+    // than absorbed silently into a passing set-equality.
     const unvectored = file.reject_reasons.filter((r) => !r.has_vector).map((r) => r.token);
     expect(unvectored.sort()).toEqual(
-      ['no_kek_for_generation', 'no_roster_entry', 'no_transmit_key'].sort(),
+      [
+        'no_kek_for_generation',
+        'no_roster_entry',
+        'no_transmit_key',
+        'kek_generation_stale',
+        'sender_not_assigned',
+      ].sort(),
     );
     for (const token of unvectored) {
       expect(ALL_REJECT_REASONS as readonly string[]).toContain(token);

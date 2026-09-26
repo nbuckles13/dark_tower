@@ -208,6 +208,35 @@ export interface IngressConfig {
    * half-space, imported from the monitor rather than restated here).
    */
   readonly hopRestartBackwardJumpFrames: number;
+  /**
+   * Bound on concurrent per-sender decode lanes (one `AudioDecoderSeam` each).
+   *
+   * Lanes exist only for senders in the MC-stated slot-assignment set, so in
+   * practice the count is bounded by this client's declared slots; this is the
+   * independent memory bound behind that, for the same reason every other
+   * per-sender map here has one. Its OWN bound, deliberately not
+   * {@link maxCachedIdentityKeys} or `maxTransmitKeysPerSender`: how many
+   * decoders to run and how many keys to cache are unrelated decisions, and
+   * collapsing them would be a false single source of truth.
+   */
+  readonly maxDecodeLanes: number;
+  /**
+   * Minimum interval between replacements of ONE sender's faulted decoder.
+   *
+   * A decoder fault replaces only that sender's decoder (R-5). Without a bound
+   * a roster member sending frames that fault the decoder every time would turn
+   * `dt_client_media_decoder_errors_total` into per-frame telemetry and churn a
+   * decoder per frame; this makes a replacement at most one per interval per
+   * sender, and the lane count bounds the senders.
+   */
+  readonly decoderRestartBackoffMs: number;
+  /**
+   * Frames a decode lane holds while its decoder is being created or replaced
+   * (the decoder factory is async). Overflow evicts the OLDEST and counts each
+   * eviction on `dt_client_media_decode_queue_dropped_total` — a post-accept
+   * loss, outside the receive-path identity by construction.
+   */
+  readonly decoderPendingFrames: number;
 }
 
 /** Replay-window and transmit-key-cache bounds. */
@@ -294,6 +323,135 @@ export interface ClientConfig {
  */
 export const MIN_AUDIO_ROTATION_PERIOD_MS = 1_000;
 
+// ---------------------------------------------------------------------------
+// KEK PREVIOUS-GENERATION RETENTION (ADR-0036 §4, story 2 R-14)
+// ---------------------------------------------------------------------------
+//
+// ANCHOR (DRY): the RULE — retention = min(W / 2, ceiling), a floor on a zero or
+// absent W, floor-substituted and ceiling-clamped counted distinctly, never a
+// hard failure — is stated ONCE, at the `JoinResponse.kek_rotation_debounce_seconds`
+// field comment in `proto/dark_tower/signaling/v1/signaling.proto`. That field
+// is the authority. What lives HERE is only what the field comment assigns to
+// the client: the two numbers, and the one function that applies the rule.
+// Nothing else in the tree may compute `W / 2`; call `deriveKekRetention`.
+//
+// These are CONSTANTS, NOT CONFIG FIELDS, and that is deliberate: the client
+// never configures retention (it is derived from W, which MC carries). A knob
+// would reopen exactly the "client-side value with a runtime consistency check"
+// shape story 2 decided against.
+
+/**
+ * Retention used when W is zero or absent (a non-optional proto3 scalar, so the
+ * two are one observable).
+ *
+ * The supported one-version MC rollback does not send the field, so this path is
+ * EXPECTED during a rollback and must never hard-fail. Ten seconds is far above
+ * any plausible frames-in-flight window and far below any sane W; it must exceed
+ * the client's transmit-key re-wrap latency, which `validateMediaConfig`
+ * asserts against the configured queues.
+ */
+export const KEK_RETENTION_FLOOR_MS = 10_000;
+
+/**
+ * Upper bound on how long a superseded KEK is held, whatever W says.
+ *
+ * Retention serves ONE purpose: opening frames already in flight when a
+ * rotation lands — a latency-scale need of seconds, not a policy-scale one. At a
+ * misconfigured W of a day, W/2 would hold a superseded KEK in client memory for
+ * twelve hours to serve that; this bounds it (key minimisation against client
+ * memory compromise). At MC's default W of 60 s, W/2 equals this ceiling exactly,
+ * so nothing is clamped by default.
+ *
+ * CROSS-SERVICE COUPLING WITH NO GUARD AND NO SHARED HOME: if an operator raises
+ * `MC_KEK_ROTATION_DEBOUNCE_SECONDS` so that W/2 exceeds this value,
+ * `dt_client_media_kek_retention_anomalies_total{outcome="ceiling_clamped"}`
+ * reads PERMANENTLY NON-ZERO on a correctly configured fleet. That is a
+ * configuration state, not an incident, and must never be an alert input.
+ */
+export const KEK_RETENTION_CEILING_MS = 30_000;
+
+/**
+ * How a retention window was arrived at. `nominal` is the only unremarkable one;
+ * the other three are counted, one increment per KEK message.
+ */
+export type KekRetentionOutcome =
+  | 'nominal'
+  /** W was zero or absent: an older MC (the supported rollback). */
+  | 'floor_substituted'
+  /** W/2 exceeded {@link KEK_RETENTION_CEILING_MS}: a configuration state. */
+  | 'ceiling_clamped'
+  /**
+   * The derived retention does not exceed this client's transmit-key re-wrap
+   * latency, so frames from senders that have not yet re-wrapped would drop.
+   * Reachable only when W/2 is below T, since the floor is validated above T —
+   * so the remedy is in MC (raise `MC_KEK_ROTATION_DEBOUNCE_SECONDS`), not here.
+   */
+  | 'below_rewrap_latency';
+
+/** The derived window and how it was reached. */
+export interface KekRetention {
+  readonly retentionMs: number;
+  readonly outcome: KekRetentionOutcome;
+}
+
+/**
+ * THE ONE PLACE `min(W / 2, ceiling)` IS COMPUTED. See the section header.
+ *
+ * Both bounds only ever pull retention DOWN from W/2, which is what makes
+ * "retention is shorter than W" structural rather than checked. A below-T result
+ * is REPORTED but NOT raised: raising it could push retention to or past W,
+ * breaking that structural property to paper over an MC misconfiguration.
+ *
+ * @param debounceSeconds W as carried on the wire (`uint32`; 0 means absent).
+ * @param rewrapLatencyMs this client's T; see {@link transmitRewrapLatencyMs}.
+ */
+export function deriveKekRetention(debounceSeconds: number, rewrapLatencyMs: number): KekRetention {
+  if (!Number.isFinite(debounceSeconds) || debounceSeconds <= 0) {
+    return { retentionMs: KEK_RETENTION_FLOOR_MS, outcome: 'floor_substituted' };
+  }
+  const halfW = debounceSeconds * 500;
+  if (halfW > KEK_RETENTION_CEILING_MS) {
+    return { retentionMs: KEK_RETENTION_CEILING_MS, outcome: 'ceiling_clamped' };
+  }
+  if (halfW <= rewrapLatencyMs) {
+    return { retentionMs: halfW, outcome: 'below_rewrap_latency' };
+  }
+  return { retentionMs: halfW, outcome: 'nominal' };
+}
+
+/**
+ * The latency the two send-side queues can legitimately hold together, in ms.
+ *
+ * One home for `(maxQueueFrames + transportOutgoingHighWaterMarkFrames) *
+ * frameDurationMs`: both the UA-age backstop check in `validateMediaConfig` and
+ * {@link transmitRewrapLatencyMs} read it, so the two cannot drift.
+ */
+export function sendBufferedLatencyMs(media: MediaConfig): number {
+  const { audio, egress } = media;
+  return (
+    (egress.maxQueueFrames + egress.transportOutgoingHighWaterMarkFrames) * audio.frameDurationMs
+  );
+}
+
+/**
+ * T: how long after a KEK update THIS client may still emit frames wrapped
+ * under the previous KEK.
+ *
+ * On receipt of a new KEK the transmit-key manager rotates synchronously (R-13),
+ * so the next encoded frame mints under the new KEK. What can still leave under
+ * the old one is what is already queued — both send-side queues — plus the one
+ * frame the encoder may be emitting. Derived from existing config; never 0.
+ *
+ * WHAT T DOES NOT COVER, so nobody reads "retention > T" as the whole guarantee:
+ * it bounds only THIS client's queued frames. A peer that has not yet received
+ * the `MeetingKekUpdate` keeps wrapping under the old KEK (cross-client push
+ * delivery skew), and frames spend time on the network in flight. Those are
+ * covered by the floor and the W-derived window, not by T.
+ */
+export function transmitRewrapLatencyMs(media: MediaConfig): number {
+  return sendBufferedLatencyMs(media) + media.audio.frameDurationMs;
+}
+
 /**
  * The client cadence, exported on its own so `telemetryConfig.ts` reads ONE named
  * value rather than a literal at the reader.
@@ -327,6 +485,9 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
       transportIncomingHighWaterMarkFrames: 32,
       maxCachedIdentityKeys: 32,
       hopRestartBackwardJumpFrames: DEFAULT_HOP_RESTART_BACKWARD_JUMP_FRAMES,
+      maxDecodeLanes: 32,
+      decoderRestartBackoffMs: 1_000,
+      decoderPendingFrames: 5,
     },
     receiverState: {
       maxReplayContextsPerSender: DEFAULT_REPLAY_CONTEXTS_PER_SENDER,
@@ -405,6 +566,9 @@ export function validateMediaConfig(media: MediaConfig): void {
     ingress.hopRestartBackwardJumpFrames,
     'media.ingress.hopRestartBackwardJumpFrames',
   );
+  positiveInteger(ingress.maxDecodeLanes, 'media.ingress.maxDecodeLanes');
+  positiveInteger(ingress.decoderRestartBackoffMs, 'media.ingress.decoderRestartBackoffMs');
+  positiveInteger(ingress.decoderPendingFrames, 'media.ingress.decoderPendingFrames');
   if (ingress.hopRestartBackwardJumpFrames >= HOP_HALF_SPACE) {
     throw new ClientConfigError(
       'media.ingress.hopRestartBackwardJumpFrames',
@@ -451,8 +615,7 @@ export function validateMediaConfig(media: MediaConfig): void {
 
   // The UA age bound must be a BACKSTOP, not a competitor: it must exceed the
   // latency both queues can legitimately hold together.
-  const bufferedMs =
-    (egress.maxQueueFrames + egress.transportOutgoingHighWaterMarkFrames) * audio.frameDurationMs;
+  const bufferedMs = sendBufferedLatencyMs(media);
   if (egress.transportOutgoingMaxAgeMs <= bufferedMs) {
     throw new ClientConfigError(
       'media.egress.transportOutgoingMaxAgeMs',
@@ -461,6 +624,21 @@ export function validateMediaConfig(media: MediaConfig): void {
         `((${egress.maxQueueFrames} + ${egress.transportOutgoingHighWaterMarkFrames}) frames x ` +
         `${audio.frameDurationMs}ms); at or below it, the user agent's silent age-discard becomes ` +
         `a routine drop path that neither this client nor the media handler can count`,
+    );
+  }
+
+  // The retention FLOOR must exceed this client's own re-wrap latency, or a
+  // floor-substituted client (an older MC, the supported rollback) would drop
+  // its peers' in-flight frames at every rotation. The floor is a constant and T
+  // is derived from the queues above, so a queue override can break it — which
+  // is why this is checked here rather than asserted once in a test.
+  const rewrapMs = transmitRewrapLatencyMs(media);
+  if (KEK_RETENTION_FLOOR_MS <= rewrapMs) {
+    throw new ClientConfigError(
+      'media.egress.maxQueueFrames',
+      `the send-side queues (${rewrapMs}ms of transmit-key re-wrap latency) must stay below the ` +
+        `KEK retention floor (${KEK_RETENTION_FLOOR_MS}ms); otherwise a client running on the ` +
+        `floor drops frames from senders that have not yet re-wrapped under a rotated KEK`,
     );
   }
 }

@@ -117,6 +117,55 @@ fn reject_reasons() -> Vec<RejectReasonEntry> {
     ));
     out.push(entry("no_roster_entry", "key", true, false, None, None));
 
+    // The older-than-retained half of `no_kek_for_generation`'s split (story 2,
+    // R-14): the receiver holds the current KEK and at most one previous
+    // generation for a retention derived from W, and a wrap under any generation
+    // older than that is dropped here rather than as `no_kek_for_generation`
+    // (which keeps the newer-than-held case, where MC's push has not landed).
+    //
+    // NOT `kek_generation_not_held`, the accepted-frame `WrapOutcome` one word
+    // away. A wrap announcing a KEK generation this receiver does not hold splits
+    // on ONE question: is a usable transmit key for this frame's key id already
+    // cached? CACHED means the frame is ACCEPTED and counted as the wrap outcome
+    // kek_generation_not_held (reachable whether the unheld generation is newer
+    // or older; here the cache decides, not the age). NOT CACHED
+    // means the frame is DROPPED and counted as a reject reason, and only there
+    // does direction matter: no_kek_for_generation when newer than the newest
+    // held, kek_generation_stale when older than retention keeps.
+    //
+    // `has_vector: false`: receiver-held retention state decides it, so no byte
+    // string does. Why that makes it an oracle token rather than a byte-determined
+    // one lives in `docs/observability/label-taxonomy.md` §Frame reject reason
+    // (the partition) - pointed at, not restated here.
+    out.push(entry(
+        "kek_generation_stale",
+        "key",
+        true,
+        false,
+        None,
+        None,
+    ));
+
+    // The slot-edge gate (story 2): a frame that parsed, verified against its
+    // sender's roster key, and whose KEK was held, but whose key-id sender is not
+    // in this receiver's MC-stated slot-assignment set. Dropped before it is
+    // opened, so it neither decrypts, caches a transmit key, nor advances replay.
+    //
+    // Layer `assignment`: the layer axis names the receiver's PROCESSING STAGE
+    // (`codec` the bytes, `crypto` the verification, `key` the held key material,
+    // `assignment` the held slot-assignment set) - not the owner of the remedy.
+    // Nothing selects on `layer`; alert selectors enumerate tokens explicitly.
+    // `has_vector: false` for the same reason as the entry above; see the same
+    // taxonomy section for the partition this token belongs to.
+    out.push(entry(
+        "sender_not_assigned",
+        "assignment",
+        true,
+        false,
+        None,
+        None,
+    ));
+
     out
 }
 

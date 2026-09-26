@@ -124,8 +124,14 @@ async function makeFrame(
 
 const keysWithKek: ReceiverKeys = {
   kekForGeneration: (g) => (g === KEK_GENERATION ? KEK : undefined),
+  isOlderThanRetained: (g) => g < KEK_GENERATION,
 };
-const keysWithoutKek: ReceiverKeys = { kekForGeneration: () => undefined };
+// Nothing held at all: every unheld generation is the NEWER case, because there
+// is no current generation for it to be older than.
+const keysWithoutKek: ReceiverKeys = {
+  kekForGeneration: () => undefined,
+  isOlderThanRetained: () => false,
+};
 
 describe('the happy path', () => {
   it('decodes, verifies, unwraps, caches and decrypts', async () => {
@@ -209,10 +215,10 @@ describe('key-layer rejects', () => {
       keysWithoutKek,
     );
     expect(bytesToHex(opened.plaintext)).toBe(bytesToHex(second.plaintext));
-    // The rotation-lag signal must be OBSERVABLE, not collapsed into `'absent'`
-    // (which means "no wrap at all"). This is the KEK-generation-not-held state:
-    // a wrap was present under a generation we do not hold, we played off the
-    // cache, and task 19 must be able to count it.
+    // The condition must be OBSERVABLE, not collapsed into `'absent'` (which
+    // means "no wrap at all"): a wrap was present under a generation we do not
+    // hold, we played off the cache, and it is counted. A sustained rate means a
+    // sender re-wrapping rather than rotating — see the `WrapOutcome` doc.
     expect(opened.wrapOutcome).toBe('kek_generation_not_held');
   });
 
@@ -240,6 +246,93 @@ describe('key-layer rejects', () => {
         keysWithKek,
       ),
     ).rejects.toMatchObject({ rejectReason: 'unwrap_failed' });
+  });
+});
+
+describe('an unheld KEK generation: accepted vs dropped, and newer vs older', () => {
+  // A receiver that has moved PAST this suite's frames: it holds generations
+  // above `KEK_GENERATION` and retains nothing at or below it.
+  const keysMovedOn: ReceiverKeys = {
+    kekForGeneration: () => undefined,
+    isOlderThanRetained: (g) => g < KEK_GENERATION + 4,
+  };
+
+  it('drops as kek_generation_stale when the generation is older than retention keeps', async () => {
+    const f = await makeFrame();
+    await expect(
+      openVerifiedFrame(
+        await verifyFrame(decodeFrame(f.bytes), f.publicKey),
+        new TransmitKeyCache(),
+        keysMovedOn,
+      ),
+    ).rejects.toMatchObject({ rejectReason: 'kek_generation_stale', layer: 'key' });
+  });
+
+  it('keeps no_kek_for_generation for the NEWER case, on the same frame bytes', async () => {
+    // Same frame, same receiver shape, only the direction flipped: the token
+    // follows receiver state, never anything in the frame.
+    const f = await makeFrame();
+    await expect(
+      openVerifiedFrame(
+        await verifyFrame(decodeFrame(f.bytes), f.publicKey),
+        new TransmitKeyCache(),
+        { kekForGeneration: () => undefined, isOlderThanRetained: () => false },
+      ),
+    ).rejects.toMatchObject({ rejectReason: 'no_kek_for_generation' });
+  });
+
+  it('ACCEPTS an OLDER unheld generation when the transmit key is cached', async () => {
+    // The cache is keyed by KEY ID, never by the wrap's KEK generation, so if one
+    // key id arrives under a second wrap announcing an OLDER unheld generation,
+    // the frame still plays off the cache. Direction splits only the DROP
+    // tokens. NOT an honest-sender pattern for this SDK (it rotates to a new key
+    // id on every KEK change, R-13); this pins the receiver's behaviour for a
+    // sender that re-wraps instead.
+    const cache = new TransmitKeyCache();
+    const first = await makeFrame({ streamSequence: 1 });
+    await openVerifiedFrame(
+      await verifyFrame(decodeFrame(first.bytes), first.publicKey),
+      cache,
+      keysWithKek,
+    );
+    const second = await makeFrame({
+      streamSequence: 2,
+      wrapUnderKeyId: hexToBytes('0000000000000009'),
+    });
+    const opened = await openVerifiedFrame(
+      await verifyFrame(decodeFrame(second.bytes), second.publicKey),
+      cache,
+      keysMovedOn,
+    );
+    expect(bytesToHex(opened.plaintext)).toBe(bytesToHex(second.plaintext));
+    expect(opened.wrapOutcome).toBe('kek_generation_not_held');
+  });
+});
+
+describe('TransmitKeyCache.purgeSender', () => {
+  it('zeroizes and drops ONE sender only, leaving every other sender cached', async () => {
+    // Both senders' keys enter the cache the only way production allows: through
+    // a VERIFIED open. No test primes the cache through `set()`.
+    const cache = new TransmitKeyCache();
+    const a = await makeFrame({ senderId: 258n, streamSequence: 1 });
+    const b = await makeFrame({ senderId: 259n, streamSequence: 1 });
+    const va = await verifyFrame(decodeFrame(a.bytes), a.publicKey);
+    const vb = await verifyFrame(decodeFrame(b.bytes), b.publicKey);
+    await openVerifiedFrame(va, cache, keysWithKek);
+    await openVerifiedFrame(vb, cache, keysWithKek);
+    const heldA = cache.get(va.keyIdParts, va.keyId);
+    const heldB = cache.get(vb.keyIdParts, vb.keyId);
+    expect(heldA).toBeDefined();
+    expect(heldB).toBeDefined();
+
+    cache.purgeSender(va.keyIdParts.senderId);
+
+    expect(cache.has(va.keyIdParts, va.keyId)).toBe(false);
+    // Overwritten, not merely unreferenced: the buffer we held is now zeros.
+    expect(heldA!.every((byte) => byte === 0)).toBe(true);
+    // The other sender is untouched, bytes and all.
+    expect(cache.has(vb.keyIdParts, vb.keyId)).toBe(true);
+    expect(heldB!.some((byte) => byte !== 0)).toBe(true);
   });
 });
 

@@ -916,13 +916,20 @@ under a control-plane one exactly when both matter.
 
 **MH must never emit a crypto- or key-layer token** — `signature_invalid`,
 `decrypt_failed`, `unwrap_failed`, `replay_detected`, `wrap_key_id_mismatch`,
-`no_kek_for_generation`, `no_roster_entry`, `no_transmit_key`. MH is keyless and
+`no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`,
+`no_transmit_key`. MH is keyless and
 never opens a frame, so such a series would assert a verification MH is
 structurally incapable of performing — and an operator reads it as "MH validates
 frames", after which someone relies on a control that does not exist. Those
-tokens are the client's (story task 19). The bar is executable:
+tokens are the client's (story task 19). **MH must also never emit
+`sender_not_assigned`, for a different reason**: it is the client's
+`assignment`-layer sibling of MH's own `no_subscriber` (a policy is installed
+but no egress edge names this sender), so MH is *not* blind to that condition —
+it already names it. The bar exists to avoid a cross-layer spelling collision:
+MH re-spelling it would merge drops from two different layers under one
+`sum by(reason)` token. The bar is executable:
 `crates/mh-service/tests/media_metrics_integration.rs` asserts MH's own
-vocabulary is disjoint from all sixteen tokens in
+vocabulary is disjoint from every token in
 `proto/test-vectors/frame-v2.vectors.json`.
 
 > **Blind spot 1 — relay-side corruption has NO MH-side signal, by

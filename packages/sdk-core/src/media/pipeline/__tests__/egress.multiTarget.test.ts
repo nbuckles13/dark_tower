@@ -29,7 +29,7 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { DEFAULT_CLIENT_CONFIG } from '../../../config/clientConfig.js';
 import { MeetingIdentity } from '../../setup/identity.js';
-import { JoinResponseKekSource } from '../../setup/kekSource.js';
+import { kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { decodeFrame } from '../../frame/frameCodec.js';
@@ -87,8 +87,7 @@ interface Rig {
 async function makeRig(urls: readonly string[]): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: 'v', orgId: 'o' }, sink);
-  const kekSource = new JoinResponseKekSource();
-  kekSource.set(KEK, 0);
+  const kekSource = kekHolderWith(KEK, 0);
   const identity = await MeetingIdentity.create();
   const senders = new Map<string, RecordingSender>();
   for (const url of urls) senders.set(url, new RecordingSender());
@@ -100,7 +99,7 @@ async function makeRig(urls: readonly string[]): Promise<Rig> {
   const egress = new EgressPipeline({
     metrics,
     transmitKeys,
-    kek: { source: kekSource, generation: 0 },
+    kek: kekSource,
     identity,
     maxQueueFrames: DEFAULT_CLIENT_CONFIG.media.egress.maxQueueFrames,
     streamNumber: 1,

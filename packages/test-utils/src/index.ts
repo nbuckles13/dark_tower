@@ -62,5 +62,7 @@ export {
   RecordingPlaybackSink,
   makeAudioData,
   type FakeAudioData,
+  type FakeDecoderRecord,
   type FakeEncodedFrame,
+  type RecordingPlaybackLane,
 } from './media/index.js';

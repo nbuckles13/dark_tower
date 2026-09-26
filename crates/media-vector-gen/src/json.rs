@@ -176,7 +176,10 @@ pub struct ExtensionEntry {
 pub struct RejectReasonEntry {
     /// The wire/metric token.
     pub token: String,
-    /// Owning layer: `codec`, `crypto` or `key`.
+    /// Processing stage that produced the reason: `codec`, `crypto`, `key` or
+    /// `assignment`. A stage, NOT the owner of the remedy, and never an
+    /// alert-selector input (`no_transmit_key` is `codec` yet fires on key-store
+    /// membership; see `docs/observability/label-taxonomy.md` §Frame reject reason).
     pub layer: String,
     /// Whether the frame is dropped. Only `wrap_key_id_mismatch` is false.
     pub drops_frame: bool,

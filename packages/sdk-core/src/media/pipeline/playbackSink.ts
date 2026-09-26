@@ -23,13 +23,23 @@
 // deliberately NOT a jitter buffer — buffering strategy is a later story, and a
 // number chosen here would be the thing that later has to be unpicked.
 
-import type { PlaybackSink } from '../setup/seams.js';
+import type { PlaybackLane, PlaybackSink } from '../setup/seams.js';
 
 /** The scheduling lead, in frames of the decoded audio's own duration. */
 const LEAD_FRAMES = 1;
 
+/** The shape of `AudioContext` this sink uses. */
+type PlaybackContext = BaseAudioContext & {
+  readonly currentTime: number;
+  readonly destination: AudioNode;
+};
+
 /**
  * Build a sink that plays decoded frames through `context`.
+ *
+ * Every lane schedules on its OWN playhead and connects to the same
+ * `context.destination`, which sums everything connected to it — so lanes MIX
+ * rather than queue behind one another. See `PlaybackSink` in `seams.ts`.
  *
  * @param channels expected channel count. A frame arriving with a different
  * count is played on the channels it has, up to this many — the decoder is
@@ -37,16 +47,45 @@ const LEAD_FRAMES = 1;
  * rather than a case to accommodate.
  */
 export function createScheduledPlaybackSink(
-  context: BaseAudioContext & { readonly currentTime: number; readonly destination: AudioNode },
+  context: PlaybackContext,
   channels: number,
 ): PlaybackSink {
+  let sinkClosed = false;
+  const lanes = new Set<PlaybackLane>();
+
+  return {
+    openLane(): PlaybackLane {
+      const lane = createLane(
+        context,
+        channels,
+        () => sinkClosed,
+        () => lanes.delete(lane),
+      );
+      if (sinkClosed) lane.close();
+      else lanes.add(lane);
+      return lane;
+    },
+
+    close(): void {
+      sinkClosed = true;
+      for (const lane of [...lanes]) lane.close();
+    },
+  };
+}
+
+function createLane(
+  context: PlaybackContext,
+  channels: number,
+  isSinkClosed: () => boolean,
+  onClose: () => void,
+): PlaybackLane {
   let playheadSeconds = 0;
   let closed = false;
 
   return {
     enqueue(data: AudioData): void {
-      if (closed) {
-        // Ownership was transferred to this sink, so a late frame must still be
+      if (closed || isSinkClosed()) {
+        // Ownership was transferred to this lane, so a late frame must still be
         // released or the platform's audio buffers leak.
         data.close();
         return;
@@ -69,8 +108,8 @@ export function createScheduledPlaybackSink(
         const frameSeconds = data.numberOfFrames / data.sampleRate;
         const lead = frameSeconds * LEAD_FRAMES;
         const now = context.currentTime;
-        // Behind the clock means the previous run has ended: re-seat rather than
-        // schedule in the past.
+        // Behind the clock means this lane's previous run has ended: re-seat
+        // rather than schedule in the past.
         if (playheadSeconds < now + lead) playheadSeconds = now + lead;
         source.start(playheadSeconds);
         playheadSeconds += frameSeconds;
@@ -83,8 +122,10 @@ export function createScheduledPlaybackSink(
     },
 
     close(): void {
+      if (closed) return;
       closed = true;
       playheadSeconds = 0;
+      onClose();
     },
   };
 }

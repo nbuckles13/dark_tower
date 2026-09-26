@@ -357,9 +357,11 @@ fn no_mh_local_drop_reason_collides_with_a_cross_language_reject_token() {
     // follow-up, so that is live rather than hypothetical. Without this, a file
     // move or a renamed field yields an empty barred set and a vacuously green
     // assertion.
-    // The eight CODEC tokens are DERIVED from `ALL_REJECT_REASONS`; the eight
-    // crypto and key tokens are literals because they have no Rust home at all
-    // — they exist only in the vector file and in the SDK's
+    // The eight CODEC tokens are DERIVED from `ALL_REJECT_REASONS`; the
+    // non-codec tokens (crypto, key, and the assignment token
+    // `sender_not_assigned`) are literals because they have no
+    // `ALL_REJECT_REASONS` home — they have no Rust home at all, and exist
+    // only in the vector file and in the SDK's
     // `rejectReason.ts`, which is the entire reason this test reads the fixture
     // rather than the Rust enum. Deriving the half that can be derived removes
     // eight hand-typed spellings without weakening the pin: a Rust-side rename
@@ -376,7 +378,9 @@ fn no_mh_local_drop_reason_collides_with_a_cross_language_reject_token() {
             "replay_detected",
             "wrap_key_id_mismatch",
             "no_kek_for_generation",
+            "kek_generation_stale",
             "no_roster_entry",
+            "sender_not_assigned",
         ])
         .collect();
     assert!(

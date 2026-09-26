@@ -100,6 +100,8 @@ counterpart of the last of those `outcome` too. The row was missing, which is
 the gap this section's own "add before the second service" rule is meant to
 close.
 
+**`outcome` is a per-metric vocabulary and carries no cross-metric aggregation contract** `[reviewer-only]`. Unlike `reason`, whose two families have named external homes precisely so `sum by(reason)` compares across the two ends of one hop, `outcome`'s value set is metric-local by definition — so `sum by(outcome)` across two metric names is meaningless by design, and no dashboard panel or alert expression may aggregate `outcome` across metric names. Asked twice in one devloop (story 2 task 7, by test and by the implementing specialist) and recorded here rather than re-decided per task. Nothing enforces this mechanically today; a candidate guard shape and its trigger are filed in `docs/TODO.md` §Guard Coverage Gaps.
+
 ### Declared, not yet carried: `media_kind` and `content_kind` `[reviewer-only]`
 
 Registered here **at declaration** rather than at first emission, because §Adding a new
@@ -202,7 +204,7 @@ mechanics* — name, permitted values, which surfaces carry it — this file win
 
 ## Frame reject reason `[reviewer-only]`
 
-**All sixteen `reason` values are emitted individually as `reason` values, without exception
+**All eighteen `reason` values are emitted individually as `reason` values, without exception
 (R-25, R-31). Nothing below bears on that.** This section is where someone will come looking for
 permission to coarsen the vocabulary, and everything after this sentence is about a different axis.
 R-25 already settled the per-token question on 2026-08-31: *"'bucket' names a FAMILY of `reason`
@@ -211,9 +213,9 @@ values, not one collapsed `decode_reject` label"* — collapsing would destroy R
 would break `sum by(reason)` comparability between MH and the client.
 
 **"Without exception" above is about granularity, not about membership of the drop counter. Those are
-different questions and only one of them has the answer "all sixteen".** Which values belong on
+different questions and only one of them has the answer "all eighteen".** Which values belong on
 `dt_client_media_frames_dropped_total{reason}` is carried by **`drops_frame`** in
-`proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Fifteen are `true`.
+`proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Seventeen are `true`.
 **`wrap_key_id_mismatch` is `false`, and is the only one**: it describes a correctly self-signed frame
 whose unusable wrapped key the receiver ignores (ADR-0036 §4), so the frame is otherwise processed
 and **played**. (The token *name* says mis-bound; the receiver cannot actually tell a mis-bound wrap
@@ -236,23 +238,37 @@ so only the state-dependent ones tell them anything new.
 and not `has_vector`.** Those are all *nearly* the same distinction and none of them is it:
 
 - The eight structural rejects are **byte-determined**.
-- `no_kek_for_generation`, `no_roster_entry`, `no_transmit_key`, `signature_invalid`,
-  `decrypt_failed`, `unwrap_failed`, `replay_detected` and `wrap_key_id_mismatch` are
-  **receiver-state-dependent**.
-- **Eight and eight is all sixteen: the two families PARTITION the vocabulary.** Stated because an
-  earlier revision of this list classified fourteen and left `replay_detected` and
+- `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `no_transmit_key`,
+  `signature_invalid`, `decrypt_failed`, `unwrap_failed`, `replay_detected`,
+  `wrap_key_id_mismatch` and `sender_not_assigned` are **receiver-state-dependent**.
+- **Eight and ten is all eighteen: the two families PARTITION the vocabulary.** (Sixteen until story 2
+  task 7 added `kek_generation_stale` and `sender_not_assigned`, both receiver-state-dependent.)
+  Stated because an earlier revision of this list classified fourteen and left `replay_detected` and
   `wrap_key_id_mismatch` in neither — and an unclassified token is not read as unclassified, it is
   read as byte-determined and therefore safe to slice, which is the permissive answer arrived at by
   omission. If a token is added to `reject_reasons`, it lands in one of these two families here or
   this section is wrong.
 - `no_transmit_key` is `layer: "codec"` yet fires on key-store membership, so an attacker choosing
   key ids reads it as *"does this receiver hold key id X?"* — which is why the layer-based version of
-  this rule was wrong.
+  this rule was wrong. The new `layer: "assignment"` value happens to align with this family, and
+  that alignment is a coincidence of naming rather than a rule. The layer axis still names the
+  receiver's **processing stage** (`codec` = the bytes, `crypto` = the verification, `key` = the held
+  key material, `assignment` = the held slot-assignment set), and `no_transmit_key` remains the
+  standing counterexample. Classify by this section, never by `layer`.
 - `signature_invalid` and `decrypt_failed` are byte-determined *given fixed key material*, so they
   carry `has_vector: true` while sitting on the restricted side — which is why the `has_vector`
   version is wrong too.
 - `replay_detected` fires on the sliding window, which is receiver state by definition: a party
   replaying a captured frame reads it as *"has this receiver already advanced past sequence N?"*
+- `kek_generation_stale` fires only when the receiver no longer retains the frame's generation, so a
+  party replaying a captured pre-rotation frame reads it as *"is this receiver still retaining
+  generation N?"* — and because retention is derived from W, a positive answer also times the
+  receiver's position relative to the last rotation. Aggregate counting with no sender dimension is
+  what keeps that from being a per-sender oracle, exactly as for `replay_detected`.
+- `sender_not_assigned` is decided entirely by receiver-held slot-assignment state, so an injected
+  frame from sender X reads as *"does this receiver hold sender X in its assignment set?"* It is the
+  clearest member of this family: the frame parsed, verified **and** decrypted before the gate ran,
+  so nothing about the bytes selects it.
 - `wrap_key_id_mismatch` is the subtlest of the set, and the one whose **name points away from its
   firing condition**. The receiver cannot detect a mis-bound wrap. The wrap's bound key id is nowhere
   on the wire — the key-bearing block is `kek_generation`, 32 wrapped bytes and a 16-byte tag, and
@@ -362,7 +378,8 @@ Three rules bind that family, and only the first is about spelling:
    parse. Same constant, two checks, two conditions, two tokens.
 2. **A relay may never emit a crypto- or key-layer token.** `signature_invalid`,
    `decrypt_failed`, `unwrap_failed`, `replay_detected`, `wrap_key_id_mismatch`,
-   `no_kek_for_generation`, `no_roster_entry`, `no_transmit_key` are the
+   `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`,
+   `no_transmit_key` are the crypto/key members of the
    *receiver-state-dependent* family of the previous section, and a relay holds
    no receiver state and never opens a frame. A relay series carrying one of
    them asserts a verification the relay is structurally incapable of
@@ -370,14 +387,22 @@ Three rules bind that family, and only the first is about spelling:
    which someone relies on a control that does not exist. Note this is a
    **stronger** bar than the oracle argument that governs the client: it is not
    that the label would leak, it is that the value would be false.
+   The family's `assignment`-layer member, `sender_not_assigned`, is barred
+   from relay series too, **for a different reason**: MH is not structurally
+   blind to assignment — it already emits `no_subscriber`, "a policy is
+   installed but no egress edge names this sender", which is the server-side
+   analogue of the client's slot-edge gate. The bar is rule 1's collision
+   argument across layers: `sender_not_assigned` is the CLIENT's spelling of a
+   condition MH already names `no_subscriber`, and MH re-spelling it would merge
+   drops from two different layers under one `sum by(reason)` token.
 3. **Each relay token carries exactly one `direction`.** A token that could
    legitimately occur in both directions is two conditions wearing one name;
    pairing the direction with the token at its definition site is what keeps the
    two labels from disagreeing.
 
 The executable bar for rule 1 and rule 2 is
-`crates/mh-service/tests/media_metrics_integration.rs`, which reads all sixteen
-tokens from the vector file **as data** and asserts MH's own vocabulary is
+`crates/mh-service/tests/media_metrics_integration.rs`, which reads every
+token from the vector file **as data** and asserts MH's own vocabulary is
 disjoint from them. It reads the file rather than the Rust enum deliberately:
 the crypto and key tokens have **no Rust home at all**, so a test against
 `ALL_REJECT_REASONS` would let a relay-local enum define `replay_detected` and

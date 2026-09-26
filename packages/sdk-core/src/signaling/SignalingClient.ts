@@ -72,6 +72,8 @@ import type {
 import { isAuthClass, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
 import { mapLeaveReason } from './events.js';
 import { takeMeetingKek, type MeetingKekSink } from './kekIntake.js';
+import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
+import { RosterKeyFeed } from './rosterKeyFeed.js';
 import type {
   ReceiveSlotDeclaration,
   RosterKeySink,
@@ -268,7 +270,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   #correlationId: string | undefined;
   #bindingToken: string | undefined;
   readonly #kekSink: MeetingKekSink | undefined;
-  readonly #rosterKeys: RosterKeySink | undefined;
+  /** Roster messages -> identity-key resolver operations. See `rosterKeyFeed.ts`. */
+  readonly #rosterKeys: RosterKeyFeed;
   /** The KEK generation MC issued. Never a metric label, never a span attribute. */
   #kekGeneration = 0;
 
@@ -278,7 +281,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     this.#logger = options.logger ?? defaultLogger;
     this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
     this.#kekSink = options.kekSink;
-    this.#rosterKeys = options.rosterKeys;
+    this.#rosterKeys = new RosterKeyFeed(options.rosterKeys);
   }
 
   /**
@@ -547,8 +550,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         // seam and the field is scrubbed, so no later stringify, structured
         // clone, or interpolation of this `ServerMessage` can print it. It is
         // never placed on `JoinedEvent`, which is a public payload.
-        if (this.#kekSink) takeMeetingKek(jr, this.#kekSink);
-        this.#feedRosterKeys(jr.existingParticipants);
+        if (this.#kekSink) takeMeetingKek(jr, this.#kekSink, MEDIA_KEK_SOURCES.JoinResponse);
+        this.#rosterKeys.joined(jr.existingParticipants);
         const event: JoinedEvent = {
           participantId: jr.participantId,
           // `optional uint32` → `number | undefined`. Absence is passed
@@ -569,7 +572,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       case 'participantJoined': {
         const participant = message.value.participant;
         if (participant !== undefined) {
-          this.#feedRosterKeys([participant]);
+          this.#rosterKeys.joined([participant]);
           this.emit('participantJoined', {
             participant: { participantId: participant.participantId, name: participant.name },
           });
@@ -578,6 +581,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       }
       case 'participantLeft': {
         const pl = message.value;
+        // Forgets the leaver's roster key — a second cutoff beside the slot gate.
+        this.#rosterKeys.left(pl.participantId);
         this.emit('participantLeft', {
           participantId: pl.participantId,
           reason: mapLeaveReason(pl.reason),
@@ -625,12 +630,14 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         return;
       }
       case 'meetingKekUpdate': {
-        // Defined additively and UNUSED THIS STORY (KEK-push rotation is story
-        // 2), but the SCRUB runs regardless: the field is key material on a
-        // decoded message the moment it arrives, and leaving it in the object
-        // graph because nothing consumes it yet is exactly how a latent leak
-        // becomes a live one.
-        if (this.#kekSink) takeMeetingKek(message.value, this.#kekSink);
+        // A rotation, or a reconnect re-issue — indistinguishable here, and
+        // deliberately counted under one `source`. The KEK goes straight into the
+        // holder and the decoded field is scrubbed, exactly as for the join
+        // response; the holder decides whether it demotes, is a redelivery, or
+        // is refused.
+        if (this.#kekSink) {
+          takeMeetingKek(message.value, this.#kekSink, MEDIA_KEK_SOURCES.KekUpdate);
+        }
         return;
       }
       case 'error': {
@@ -645,35 +652,6 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         );
         return;
       }
-    }
-  }
-
-  /**
-   * Feed roster identity keys into the media path's resolver.
-   *
-   * Fire-and-forget: `importKey` is async and the dispatch loop is not, and a
-   * roster update must not block the read loop. A key that has not landed yet
-   * simply means the next frame from that sender is dropped and counted as
-   * `no_roster_entry` — which is the correct transient, and is why the roster
-   * update must travel the same signalling path as the KEK and land first.
-   */
-  #feedRosterKeys(
-    participants: readonly {
-      readonly senderId?: number | undefined;
-      readonly identityPublicKey: Uint8Array;
-    }[],
-  ): void {
-    const sink = this.#rosterKeys;
-    if (!sink) return;
-    for (const p of participants) {
-      if (p.senderId === undefined) continue;
-      void sink
-        .upsert({ senderId: p.senderId, identityPublicKey: p.identityPublicKey })
-        .catch(() => {
-          // The resolver already fails closed on an unusable key by recording the
-          // absence; there is nothing further to report and nothing safe to log
-          // about a participant's key material.
-        });
     }
   }
 

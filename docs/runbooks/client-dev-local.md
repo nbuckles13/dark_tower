@@ -786,7 +786,7 @@ tokens are emitted **individually** rather than collapsed. Grouped by what they 
 
 | Reason group | Tokens | Means |
 |---|---|---|
-| **Key material** | `no_kek_for_generation`, `no_roster_entry` | Expected transiently at join and after a KEK rotation. **Sustained is the signal.** → F15 |
+| **Key material** | `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry` | Expected transiently at join and after a KEK rotation. **Sustained is the signal.** For why a KEK was refused or retained as it was, read `dt_client_media_kek_install_refusals_total{outcome}` and `dt_client_media_kek_retention_anomalies_total{outcome}`. → F15 |
 | **Crypto** | `unwrap_failed`, `decrypt_failed`, `signature_invalid` | `unwrap_failed` is the KEK unwrap (key **distribution**); `decrypt_failed` is the SFrame payload (key schedule or sender). Two AES-GCM failures on one path routing to opposite owners. |
 | **Structural / codec** | `unknown_version`, `reserved_flag_bit_set`, `payload_length_exceeds_max`, `payload_length_exceeds_available`, `truncated`, `extensions_too_large`, `extensions_malformed`, `trailing_bytes` | A wire-format disagreement. `unknown_version` specifically is the version-skew tell — see `mh-deployment.md` §Rollout With Media Flowing. |
 | **Protocol violation** | `no_transmit_key` | Neither a cached key nor a usable wrap. Not a third key reason. |
@@ -1371,21 +1371,33 @@ total silence.
 
 ---
 
-### F15 — Sustained key-material drops: `no_kek_for_generation` or `no_roster_entry`
+### F15 — Sustained key-material drops: `no_kek_for_generation`, `kek_generation_stale` or `no_roster_entry`
 
 **Symptom.** `dt_client_media_frames_received_total` rising, `accepted` flat, and
-`dt_client_media_frames_dropped_total{reason}` climbing on one of the two key-material tokens.
+`dt_client_media_frames_dropped_total{reason}` climbing on one of the three key-material tokens.
 
-**Discriminator.** The `reason` label, and **the two arms have different remedies — split on it
+**Discriminator.** The `reason` label, and **the three arms have different remedies — split on it
 first**:
 
-- `no_kek_for_generation` — no meeting KEK for the generation the frame's wrap announces. Check
-  `dt_client_media_kek_updates_total{source="join_response"}`: flat across a join means the KEK was
-  never delivered.
+- `no_kek_for_generation` — the frame's wrap announces a KEK generation NEWER than any this client
+  holds: MC's push has not arrived. Check `dt_client_media_kek_updates_total{source}` —
+  `join_response` flat across a join means the KEK was never delivered; `kek_update` flat while peers
+  rotate means the rotation push is not arriving.
+- `kek_generation_stale` — the wrap announces a generation OLDER than this client still retains (the
+  current generation plus at most one previous, kept for `min(W/2, ceiling)` where W is MC's
+  `kek_rotation_debounce_seconds`). The remedy is MC-side (`MC_KEK_ROTATION_DEBOUNCE_SECONDS`).
 - `no_roster_entry` — no usable identity key for the sender, **including the case where MC published
   an empty key**. This one also means signature verification cannot run at all, not merely decryption.
 
-**Both are EXPECTED as brief transients** at join and immediately after a KEK rotation. **A burst of
+Before going server-side, read the two client counters that explain the KEK arms:
+`dt_client_media_kek_retention_anomalies_total{outcome}` (`floor_substituted` = an MC older than the
+retention field, expected during a deliberate MC rollback; `below_rewrap_latency` = MC's W/2 under
+the client's re-wrap latency; `ceiling_clamped` is a configuration state, not a fault) and
+`dt_client_media_kek_install_refusals_total{outcome}` (`conflicting_key`, `older_generation`,
+`malformed` — a KEK message the client refused, keeping what it held). `sender_not_assigned` is
+**not** a key-material token and does not belong to this scenario.
+
+**All three are EXPECTED as brief transients** at join and immediately after a KEK rotation. **A burst of
 a few frames at join is normal and is not this failure mode.** Sustained is the signal.
 
 **Fix.** The remedy is server-side, in MC's KEK-and-roster delivery path, and it is documented in one

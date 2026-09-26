@@ -118,8 +118,40 @@ export type WrapOutcome =
   /**
    * A key-bearing frame carried a wrap under a KEK generation this receiver does
    * NOT hold, but a usable transmit key was already cached — so the frame PLAYS
-   * off the cache. This is the KEK-ROTATION-LAG signal: the sender re-wrapped
-   * under a generation whose push has not landed yet.
+   * off the cache.
+   *
+   * WHAT PRODUCES IT — AND WHAT DOES NOT. The `TransmitKeyCache` is keyed by the
+   * 8-byte KEY ID (`sender | stream | transmit-key generation`), never by the
+   * wrap's `kek_generation`, and `matchesCachedWrap` compares wrap BYTES. So this
+   * outcome needs ONE key id arriving under a SECOND, different wrap — a
+   * transmit key re-wrapped under another KEK.
+   *
+   * THIS SDK NEVER DOES THAT, and an honest sender of it cannot reach this arm.
+   * The wrap is computed once, at mint (`TransmitKeyManager`), and reused on
+   * every frame of that generation; and on every KEK change the sender ROTATES
+   * to a new transmit key synchronously with the install (R-13). A KEK change
+   * therefore always arrives with a NEW key id — uncached, so a receiver
+   * lacking that KEK DROPS the frame (`no_kek_for_generation` or
+   * `kek_generation_stale`) rather than landing here. Cross-peer rotation lag
+   * lands on the drop tokens, not on this outcome.
+   *
+   * What CAN reach it: a sender that re-wraps an existing transmit key under a
+   * new KEK instead of rotating — which the frame format permits and which is
+   * exactly the behaviour R-13 exists to end (a leaver holding the unwrapped key
+   * keeps decrypting across the rotation). Read a sustained non-zero rate as a
+   * NON-CONFORMING OR HOSTILE SENDER, never as normal rotation traffic. Do not
+   * "restore" re-wrapping on the grounds that this arm expects it.
+   *
+   * NOT `kek_generation_stale`, the reject token one word away, and the two sit
+   * on opposite sides of `received = accepted + sum(drops by reason)`. A wrap
+   * announcing a KEK generation this receiver does not hold splits on ONE
+   * question: is a usable transmit key for this frame's key id already cached?
+   * CACHED means the frame is ACCEPTED and counted as the wrap outcome
+   * kek_generation_not_held (reachable whether the unheld generation is newer or
+   * older; here the cache decides, not the age). NOT CACHED
+   * means the frame is DROPPED and counted as a reject reason, and only there
+   * does direction matter: no_kek_for_generation when newer than the newest
+   * held, kek_generation_stale when older than retention keeps.
    *
    * Named for its cause, and legitimately — unlike `wrap_key_id_mismatch`, which
    * this code cannot substantiate from a one-bit AEAD failure, this state is a
@@ -129,9 +161,9 @@ export type WrapOutcome =
    * `unwrap_failed` and `wrap_key_id_mismatch` split an unwrap failure.
    *
    * NOT `'absent'` (the enum's highest-volume value — every non-key-bearing
-   * frame): folding the rotation-lag signal into that bucket buries it in a noise
-   * floor whose stated semantics are "nothing to do", and ADR-0036 §4 requires
-   * the sustained case be observable. @observability owns this label and ruled
+   * frame): folding a non-conforming-sender signal into that bucket buries it in
+   * a noise floor whose stated semantics are "nothing to do", and ADR-0036 §4
+   * requires the sustained case be observable. @observability owns this label and ruled
    * the spelling; task 19 counts it.
    */
   | 'kek_generation_not_held'
@@ -158,7 +190,13 @@ export interface OpenedFrame {
 /** Receiver state a caller supplies. */
 export interface ReceiverKeys {
   /** Meeting KEKs by generation. */
-  readonly kekForGeneration: (generation: number) => Uint8Array | undefined;
+  kekForGeneration(generation: number): Uint8Array | undefined;
+  /**
+   * Whether an unheld `generation` is OLDER than anything retained, rather than
+   * newer than the current. Consulted only when a frame cannot be opened for want
+   * of that generation's KEK, to choose between the two drop tokens.
+   */
+  isOlderThanRetained(generation: number): boolean;
 }
 
 /**
@@ -440,6 +478,30 @@ export class TransmitKeyCache {
   }
 
   /**
+   * Drop every transmit key cached for ONE sender, overwriting the buffers first.
+   *
+   * Called when that sender's roster binding changes or is forgotten (story 2
+   * R-18). Touches NOTHING else — in particular not the replay window, which a
+   * separate object owns and which must survive a rebind.
+   *
+   * A RACE THIS DOES NOT CLOSE, AND WHY IT DOES NOT NEED TO: a frame that
+   * verified under the old key just before the rebind can finish its unwrap and
+   * `set()` a transmit key after this purge. That key can only ever open frames
+   * that VERIFY against the sender's CURRENT roster key — verification precedes
+   * opening structurally (`VerifiedFrame`) — and every member holds the KEK and
+   * can unwrap any wrap anyway, so the residual grants nothing a member lacks.
+   * A per-sender epoch check at `set()` would close it; it is not worth the
+   * state.
+   */
+  purgeSender(senderId: bigint): void {
+    const key = senderId.toString(16);
+    const forSender = this.#bySender.get(key);
+    if (!forSender) return;
+    for (const entry of forSender.values()) entry.key.fill(0);
+    this.#bySender.delete(key);
+  }
+
+  /**
    * Drop every transmit key, overwriting the buffers first.
    *
    * The CALLER must invoke this on session teardown — ADR-0028 §5's "explicit
@@ -495,12 +557,23 @@ export async function openVerifiedFrame(
       const kek = keys.kekForGeneration(wrapped.kekGeneration);
       if (!kek) {
         // Only fatal if the frame cannot be opened anyway. A receiver that already
-        // holds this key id's transmit key can play the frame through a KEK
-        // rotation whose push has not landed yet — exactly the transient §4
-        // describes at join and at rotation. Dropping a playable frame because a
-        // key we do not need is unavailable would turn a benign race into an
-        // audio gap.
+        // holds this key id's transmit key can still open the frame off the
+        // cache; dropping a playable frame because a KEK we do not NEED is
+        // unavailable would be a needless audio gap. This is the accepting side
+        // of the `kek_generation_not_held` outcome — see its doc above for which
+        // senders actually reach it (not an honest R-13 sender, whose rotations
+        // carry a fresh key id); the code stays permissive because the decision
+        // is "can this frame be opened at all", not "was the sender conforming".
         if (!cache.has(keyIdParts, keyId)) {
+          // Direction matters only here, where the frame is lost: older than
+          // retention keeps and newer than the current are different faults with
+          // different remedies. No generation value reaches either message.
+          if (keys.isOlderThanRetained(wrapped.kekGeneration)) {
+            throw keyReject(
+              'kek_generation_stale',
+              'the carried KEK generation is older than this receiver retains',
+            );
+          }
           throw keyReject('no_kek_for_generation', 'no meeting KEK for the carried KEK generation');
         }
         // Playable off the cache, but the missing KEK is a real condition that
@@ -574,6 +647,7 @@ export const RECEIVE_PATH_REASONS: readonly RejectReason[] = [
   'signature_invalid',
   'replay_detected',
   'no_kek_for_generation',
+  'kek_generation_stale',
   'no_transmit_key',
   'unwrap_failed',
   'decrypt_failed',

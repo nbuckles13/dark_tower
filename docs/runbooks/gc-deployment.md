@@ -1367,6 +1367,17 @@ for AC/GC/MC/MH OTLP-gRPC traces and the GC `/api/v1/telemetry` OTLP-HTTP proxy
 path (R-2). This section is the upgrade discipline for it and the triage home for
 the `OTelExportFailureRate` alert.
 
+> **"A collector change" means one of TWO things, and they have different
+> procedures.** This section was first written for IMAGE changes (a tag bump,
+> alone or with its ConfigMap), which alter the pod template and so roll the pod
+> on their own. A CONFIG-ONLY change (just `configmap.yaml` — e.g. a metric-name
+> allowlist addition) alters nothing in the pod template, so an `apply -k` leaves
+> the running collector on the config it already loaded. Three statements here
+> were once correct for the image case and silent or wrong for the config-only one
+> (the change-window rule, the rollback procedure, and a triage-ladder count).
+> When you read any statement below about changing or reverting the collector,
+> ask WHICH KIND it is scoped to — and when you add one, say.
+
 ### Blast radius (read this first): THREE of four services, live now
 
 **The hazard is ACTIVE on this branch. Do not discount it.** An earlier revision of
@@ -1426,8 +1437,10 @@ collector use all its memory."
 
 ### Mitigation: upgrade in a separate change window
 
-- Upgrade the collector in a **separate change window** from any service deploy.
-  Never bundle a collector image/config bump with an AC/GC/MC/MH rollout.
+- Upgrade the collector **image** (an image bump, or an image bump with its
+  ConfigMap) in a **separate change window** from any service deploy. Never bundle
+  it with an AC/GC/MC/MH rollout. A **config-only** change is scoped out of this
+  rule on purpose — see §Config-only changes for why and for its own procedure.
 - Verify the collector is `Ready` **independently** (its readiness gate / the
   cluster-health env-test) *before* and *without* rolling any service.
 
@@ -1462,7 +1475,7 @@ number.
 3. **Readiness surface still answers.** The probes and the cluster-setup gate both
    hit the `health_check` extension at `/` on `:13133`. If a future image drops or
    renames that extension, the liveness probe, the readiness probe,
-   `deploy_otel_collector()`'s `kubectl wait` in `infra/kind/scripts/setup.sh`, and
+   `deploy_otel_collector()`'s `rollout status` in `infra/kind/scripts/setup.sh`, and
    `crates/env-tests/tests/00_cluster_health.rs` all break **together** and the
    symptom is a collector that never goes Ready.
 
@@ -1479,6 +1492,134 @@ number.
 
    Compare against the verified digest recorded in the comment on the `image:`
    line in `infra/services/otel-collector/deployment.yaml`.
+
+### Config-only changes (ConfigMap edit, no image change)
+
+Steps 1-5 above assume an image change. A change to
+`infra/services/otel-collector/configmap.yaml` alone (a new allowlisted metric
+name, a label rule, a processor setting) follows this path instead.
+
+**The hazard is a SILENTLY STALE collector, not a crash.** The ConfigMap is not
+content-hashed and the pod template carries no checksum annotation, so applying
+a changed ConfigMap changes nothing in the pod spec, and the collector reads
+`--config` once at startup with no file watcher. An un-restarted pod keeps the
+previous config in memory while the committed file is correct and
+`dt-guard client-metrics-export` is green. **Skip-symptom:** a metric name
+present in the committed allowlist and absent from Prometheus. That reads
+identically to "no browser is running".
+
+1. **Run the acceptance suite against the committed config.** It extracts the
+   committed ConfigMap, so it validates what actually ships:
+
+   ```bash
+   scripts/otel-collector/acceptance.sh
+   ```
+
+2. **Restart the collector.** This is **automatic** only through
+   `deploy_otel_collector()` in `infra/kind/scripts/setup.sh`, and only when the
+   apply reports the ConfigMap `configured`. It is **MANUAL** on any cluster not
+   brought up through `setup.sh`, and after a bare `kubectl apply -k` or a
+   hand-edited ConfigMap:
+
+   ```bash
+   kubectl rollout restart deployment/otel-collector -n dark-tower
+   kubectl rollout status deployment/otel-collector -n dark-tower --timeout=180s
+   ```
+
+   `rollout status` alone is **not** evidence of a restart. With no rollout in
+   progress it returns "successfully rolled out" immediately.
+
+3. **Verify the running process started after the content was written.** Run
+   all three checks in order. Each one on its own is fail-open.
+
+   ```bash
+   # (a) BEFORE the apply: capture the pod uid
+   kubectl get pod -l app=otel-collector -n dark-tower -o jsonpath='{.items[*].metadata.uid}'
+   # ... apply + restart ...
+   # (a) AFTER: capture it again; it MUST differ
+   kubectl get pod -l app=otel-collector -n dark-tower -o jsonpath='{.items[*].metadata.uid}'
+   # (b) the new pod's startTime must be STRICTLY LATER than the ConfigMap's last change
+   kubectl get pod -l app=otel-collector -n dark-tower -o jsonpath='{.items[*].status.startTime}'
+   kubectl get configmap otel-collector-config -n dark-tower --show-managed-fields \
+     -o jsonpath='{range .metadata.managedFields[*]}{.time}{"\n"}{end}' | sort | tail -1
+   # (c) THEN confirm the content
+   kubectl get configmap otel-collector-config -n dark-tower \
+     -o jsonpath='{.data.config\.yaml}' | grep <new-name>
+   ```
+
+   Capture the uid **before the apply** so that the check also covers a pod the
+   apply itself replaced. `--show-managed-fields` is required because kubectl
+   strips `managedFields` otherwise. `crates/env-tests/tests/01_mh_deployment_config.rs`
+   uses the same source.
+   **The content check alone is fail-open.** The ConfigMap is mounted without
+   `subPath`, so the kubelet resyncs the file in place on a pod that never
+   restarted. The file can be correct on disk while the process still holds the
+   old config. (The collector image is distroless, so `kubectl exec ... grep`
+   against the mounted file does not run. That is why (c) reads the ConfigMap.
+   Because the mount is a projection of the ConfigMap, (a) plus (b) are what tie
+   that content to the running process.)
+
+   **What each leg tells you when it fails, so the diagnosis is not crossed.**
+   (a) or (b) failing means *the running process predates this config*: the
+   O-A staleness failure, and the remedy is a restart. (c) failing while (a)
+   and (b) pass means *the pod is current but the ConfigMap does not hold what
+   was intended*: the apply or the overlay dropped it, and the remedy is in the
+   edit. Read alike, a staleness failure gets triaged as a content bug.
+
+   **What (c) is and is not.** It is an API-server read of the same desired
+   state the committed file declares and `dt-guard client-metrics-export`
+   already pins. So it confirms that the apply actually WROTE what the file says
+   (a partially failed apply, or an overlay that lost the key, both show here).
+   It is a control-plane round trip. It observes nothing about the collector
+   that is running.
+
+   **A residual no config-inspection check closes.** A projection that is
+   stale but still valid YAML passes all three legs: the collector starts
+   cleanly, goes Ready, `rollout status` succeeds, the uid changed, `startTime`
+   postdates the ConfigMap change, and the ConfigMap holds the new name, while
+   the process serves the previous filter list. `status.startTime` is when the
+   kubelet accepted the pod, which precedes volume population, so ordering (b)
+   is not strictly airtight against a configmap watch event that has not yet
+   landed. The earlier form of this check, a grep of the mounted file, had the
+   same blind spot and concealed it. The only control that closes it is
+   BEHAVIOURAL: observe a new name actually traverse the deployed pipeline to
+   Prometheus. Do not reach for another config-inspection variant to close it —
+   every member of that family shares this gap.
+
+   **Do NOT run that behavioural check casually against the deployed
+   collector.** An injected datapoint lands in the cluster's real Prometheus,
+   survives `metric_expiration` plus retention, and is indistinguishable from
+   browser traffic. Worse, a name inside any loaded alert rule's selector can
+   distort that alert — and the dangerous direction is the SILENT one. For a
+   ratio alert such as `MCMediaMissingKeyMaterial`, injecting into the
+   DENOMINATOR dilutes the ratio and can hold a genuinely firing alert below its
+   threshold. (Injecting only into the numerator does not page anyone: with no
+   denominator series the `sum(rate(...))` is an empty vector, the division is
+   empty, and the rule's non-zero-denominator guard already contains that case.)
+   A "synthetic" `org_id` does not contain either effect: the rule's `sum()`s
+   are unqualified, so there is no `org_id` selector for the marking to fall
+   outside — it helps whoever reads the series later and protects nothing. The
+   procedure, and the constraint that its probe name must appear in NO loaded
+   rule's selector ON EITHER SIDE of any ratio (re-checked against
+   `infra/docker/prometheus/rules/` each time, never assumed), is tracked with
+   the collector config-staleness entry in `docs/TODO.md`.
+   `scripts/otel-collector/acceptance.sh` runs the same traversal against a
+   scratch collector, which is the safe default.
+
+**A green layer 7 says NOTHING about this mechanism.** A fresh cluster's apply
+reports `created`, not `configured`, so the restart branch never fires there.
+If you edit the ConfigMap and reason "layer 7 was green", you have learned
+nothing about whether the change is live.
+
+**Change windows and rollback:**
+
+- A config-only change is **NOT** subject to the separate-change-window rule in
+  §Mitigation. That rule exists for R-54 fail-hard-at-init. A rejected config
+  stalls the rollout with the old pod still Ready and serving, so it does not
+  take the collector away from the services that probe it.
+- §Rollback's "image tag and ConfigMap are one atomic unit" **still binds**. A
+  config-only REVERT is safe. An image revert is not, unless the ConfigMap is
+  reverted in the same change.
 
 ### Triage: which failure mode am I looking at?
 
@@ -1521,8 +1662,16 @@ The key triage step is distinguishing the two modes:
 
 **Procedure.** Revert `deployment.yaml` (tag) and `configmap.yaml` **in the same
 change**, then `kubectl apply -k` the otel-collector overlay. Because the collector
-is a single Deployment, that is the whole rollback. Verify with the `imageID` check
+is a single Deployment and the tag change alters its pod template, the rollout
+happens on its own and that is the whole rollback. Verify with the `imageID` check
 in the pre-upgrade checklist that the pod is running what you think it is.
+
+**A CONFIG-ONLY revert is NOT the whole rollback at `apply -k`.** Reverting just
+`configmap.yaml` (for example, backing out an allowlist addition — the safe
+direction) changes nothing in the pod template, so the apply leaves the running
+collector on the config it already loaded. Follow §Config-only changes for the
+restart and the three-leg check; stopping here reproduces the stale-config state
+that section exists to prevent, while following this procedure verbatim.
 
 **Rollout mechanics are on your side — do not "fix" them.** The Deployment has
 `replicas: 1` and **no `strategy:` block**, so the defaults apply (`maxUnavailable`
@@ -1595,7 +1744,7 @@ quiet without checking. The drops are:
 
 | Control | Drops |
 |---|---|
-| `filter/client_metric_names` | any metric outside the 14-name media allowlist |
+| `filter/client_metric_names` | any metric outside the media-metric allowlist |
 | `filter/client_metric_temporality` | non-delta sums/histograms (a stale browser bundle) |
 | `transform/client_metric_labels` (`keep_keys`) | any label key outside the curated set |
 | `delta_to_cumulative` (`max_streams`) | streams beyond the cap |
@@ -1614,7 +1763,10 @@ quiet without checking. The drops are:
    the committed tag — they have moved between collector versions, and some of them
    are healthy-non-zero (the name allowlist discards non-media metrics on **every**
    batch, by design), so a naive "points dropped > 0" reading is always true.
-4. Only if 1-3 are clean does quiet mean "no browser is emitting".
+4. If the quiet series is a **recently allowlisted** name, check that the running
+   collector pod started after the ConfigMap changed (§Config-only changes, step 3).
+   A stale pod passes 1-3 cleanly.
+5. Only if 1-4 are clean does quiet mean "no browser is emitting".
 
 #### Reading client series after a collector outage: timestamps are ARRIVAL time
 

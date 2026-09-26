@@ -6,15 +6,19 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { JoinResponseKekSource } from '../../media/setup/kekSource.js';
+import { emptyKekHolder, NOMINAL_DEBOUNCE_SECONDS } from '../../media/__tests__/helpers.js';
 import { MEETING_KEK_BYTES } from '../../media/frame/sframe.js';
 import { takeMeetingKek } from '../kekIntake.js';
 
 function message(
   kek: Uint8Array,
   generation = 4,
-): { meetingKek: Uint8Array; kekGeneration: number } {
-  return { meetingKek: kek, kekGeneration: generation };
+): { meetingKek: Uint8Array; kekGeneration: number; kekRotationDebounceSeconds: number } {
+  return {
+    meetingKek: kek,
+    kekGeneration: generation,
+    kekRotationDebounceSeconds: NOMINAL_DEBOUNCE_SECONDS,
+  };
 }
 
 describe('takeMeetingKek', () => {
@@ -22,51 +26,93 @@ describe('takeMeetingKek', () => {
     // The leak this closes: protobuf-es has no `skip_debug`, so
     // `JSON.stringify(serverMessage)` prints the meeting KEK in the clear. After
     // intake the reachable object graph no longer contains it.
-    const source = new JoinResponseKekSource();
+    const holder = emptyKekHolder();
     const msg = message(new Uint8Array(MEETING_KEK_BYTES).fill(0x11));
     const original = new Uint8Array(msg.meetingKek);
 
-    expect(takeMeetingKek(msg, source).installed).toBe(true);
-    expect(source.isProvisioned).toBe(true);
-    expect(source.kekForGeneration(4)).toEqual(original);
+    expect(takeMeetingKek(msg, holder, 'join_response').result).toBe('installed');
+    expect(holder.isProvisioned).toBe(true);
+    expect(holder.kekForGeneration(4)).toEqual(original);
     expect(msg.meetingKek.length).toBe(0);
     expect(JSON.stringify(msg)).not.toContain('17'); // 0x11 as a JSON byte
   });
 
   it('zeroes the ORIGINAL buffer, not merely the reference', () => {
-    const source = new JoinResponseKekSource();
+    const holder = emptyKekHolder();
     const raw = new Uint8Array(MEETING_KEK_BYTES).fill(0x22);
-    takeMeetingKek(message(raw), source);
+    takeMeetingKek(message(raw), holder, 'join_response');
     expect(raw.every((b) => b === 0)).toBe(true);
   });
 
   it('takes a COPY, so scrubbing the message cannot blank the installed key', () => {
-    const source = new JoinResponseKekSource();
+    const holder = emptyKekHolder();
     const raw = new Uint8Array(MEETING_KEK_BYTES).fill(0x33);
-    takeMeetingKek(message(raw, 7), source);
-    expect(source.kekForGeneration(7)?.every((b) => b === 0x33)).toBe(true);
+    takeMeetingKek(message(raw, 7), holder, 'join_response');
+    expect(holder.kekForGeneration(7)?.every((b) => b === 0x33)).toBe(true);
   });
 
   it('SCRUBS even when the value is not a usable key', () => {
     // Refusing to install and refusing to scrub are separate decisions.
     // Conflating them would leave the leak open on exactly the path where
     // something has already gone wrong.
-    const source = new JoinResponseKekSource();
+    const holder = emptyKekHolder();
     const shortKey = new Uint8Array(16).fill(0x44);
-    expect(takeMeetingKek(message(shortKey), source).installed).toBe(false);
+    const msg = message(shortKey);
+    takeMeetingKek(msg, holder, 'kek_update');
     expect(shortKey.every((b) => b === 0)).toBe(true);
-    expect(source.isProvisioned).toBe(false);
+    expect(msg.meetingKek.length).toBe(0);
+    expect(holder.isProvisioned).toBe(false);
   });
 
-  it('treats an ALL-ZERO key as unusable', () => {
+  it.each([
+    ['too short', 16],
+    ['too long', 48],
+  ])('routes a %s NON-EMPTY key to the holder, which refuses and COUNTS it', (_l, width) => {
+    // Only EMPTY means "not yet provisioned". A non-empty wrong-width key is
+    // malformed, and filtering it out here would scrub it without a trace — a
+    // fail-quietly path on exactly the input that is wrong.
+    const refusals: string[] = [];
+    const holder = emptyKekHolder({
+      observer: {
+        kekArrived: () => {},
+        retentionAnomaly: () => {},
+        installRefused: (o) => refusals.push(o),
+        generationRetained: () => {},
+        retentionViolation: () => {},
+        warn: () => {},
+      },
+    });
+    const result = takeMeetingKek(message(new Uint8Array(width).fill(0x45)), holder, 'kek_update');
+    expect(result.result).toBe('refused');
+    expect(refusals).toEqual(['malformed']);
+  });
+
+  it('SCRUBS and replaces the reference even if the sink THROWS on a defect', () => {
+    // Both scrub steps sit in a `finally`: a defect in the sink must not leave
+    // the key on the decoded message.
+    const raw = new Uint8Array(MEETING_KEK_BYTES).fill(0x45);
+    const msg = message(raw);
+    const throwing = {
+      install(): never {
+        throw new Error('defect');
+      },
+    };
+    expect(() => takeMeetingKek(msg, throwing, 'kek_update')).toThrow('defect');
+    expect(raw.every((b) => b === 0)).toBe(true);
+    expect(msg.meetingKek.length).toBe(0);
+  });
+
+  it('treats an ALL-ZERO key as unusable, on the push path as well as the join', () => {
     // `signaling.proto`: "an empty or all-zero KEK is never a usable key". A
     // zero key works cryptographically and is catastrophically wrong, so it must
-    // fail at the boundary or not at all.
-    const source = new JoinResponseKekSource();
-    expect(takeMeetingKek(message(new Uint8Array(MEETING_KEK_BYTES)), source).installed).toBe(
-      false,
-    );
-    expect(source.isProvisioned).toBe(false);
+    // fail at the boundary or not at all — on BOTH arrival paths.
+    for (const source of ['join_response', 'kek_update'] as const) {
+      const holder = emptyKekHolder();
+      expect(
+        takeMeetingKek(message(new Uint8Array(MEETING_KEK_BYTES)), holder, source).result,
+      ).toBe('refused');
+      expect(holder.isProvisioned).toBe(false);
+    }
   });
 
   it('treats an EMPTY key as not-yet-provisioned rather than as an error', () => {
@@ -74,37 +120,26 @@ describe('takeMeetingKek', () => {
     // a legitimate state. And the not-provisioned signal is the KEY's width, not
     // the generation — 0 is a plausible first generation, so gating on it would
     // give one field two meanings.
-    const source = new JoinResponseKekSource();
-    expect(takeMeetingKek(message(new Uint8Array(0), 0), source).installed).toBe(false);
-    expect(source.isProvisioned).toBe(false);
-  });
-});
-
-describe('JoinResponseKekSource', () => {
-  it('answers only for the generation it holds', () => {
-    const source = new JoinResponseKekSource();
-    source.set(new Uint8Array(MEETING_KEK_BYTES).fill(0x55), 9);
-    expect(source.kekForGeneration(9)).toBeDefined();
-    // Previous-KEK retention is out of scope this story, so exactly one
-    // generation is held. A frame carrying another is `no_kek_for_generation`
-    // (dropped) or `kek_generation_not_held` (played off a cached key).
-    expect(source.kekForGeneration(8)).toBeUndefined();
-    expect(source.kekForGeneration(10)).toBeUndefined();
+    const holder = emptyKekHolder();
+    expect(takeMeetingKek(message(new Uint8Array(0), 0), holder, 'join_response').result).toBe(
+      undefined,
+    );
+    expect(holder.isProvisioned).toBe(false);
   });
 
-  it('overwrites the buffer on clear', () => {
-    const source = new JoinResponseKekSource();
-    source.set(new Uint8Array(MEETING_KEK_BYTES).fill(0x66), 1);
-    const held = source.kekForGeneration(1);
-    source.clear();
-    expect(held?.every((b) => b === 0)).toBe(true);
-    expect(source.isProvisioned).toBe(false);
-  });
-
-  it('refuses a wrong-width key rather than handing it to WebCrypto', () => {
-    // WebCrypto accepts a 16-byte AES-GCM key SILENTLY, so there is no platform
-    // backstop here — this check is the whole control.
-    const source = new JoinResponseKekSource();
-    expect(() => source.set(new Uint8Array(16), 0)).toThrow(RangeError);
+  it("passes the SAME message's W to the holder, not one learned earlier", () => {
+    const calls: number[] = [];
+    const recording = {
+      install(_kek: Uint8Array, _g: number, w: number) {
+        calls.push(w);
+        return 'installed' as const;
+      },
+    };
+    const msg = {
+      ...message(new Uint8Array(MEETING_KEK_BYTES).fill(1)),
+      kekRotationDebounceSeconds: 17,
+    };
+    takeMeetingKek(msg, recording, 'kek_update');
+    expect(calls).toEqual([17]);
   });
 });

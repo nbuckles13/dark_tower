@@ -100,7 +100,10 @@ async function scheduleFor(row: FrameVector, transmitKeyHex: string) {
 
 function keysHolding(kekHex: string, generation: number): ReceiverKeys {
   const kek = hexToBytes(kekHex, 'kek_hex');
-  return { kekForGeneration: (g) => (g === generation ? kek : undefined) };
+  return {
+    kekForGeneration: (g) => (g === generation ? kek : undefined),
+    isOlderThanRetained: (g) => g < generation,
+  };
 }
 
 describe('frame-v2 vectors — the file itself', () => {

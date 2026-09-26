@@ -41,13 +41,13 @@ import { TypedEventEmitter } from '../../events/TypedEventEmitter.js';
 import { assertEd25519Available } from '../frame/ed25519.js';
 import { ReplayWindow, TransmitKeyCache } from '../frame/receivePath.js';
 import type { MediaConfig } from '../../config/clientConfig.js';
-import { validateMediaConfig } from '../../config/clientConfig.js';
+import { ClientConfigError, validateMediaConfig } from '../../config/clientConfig.js';
 import { EgressPipeline, type DatagramSender } from '../pipeline/egress.js';
 import { IngressPipeline, type AcceptedFrame } from '../pipeline/ingress.js';
-import { HopSequenceMonitor } from '../pipeline/hopSequenceMonitor.js';
+import { ReceiveLanes, type SlotAssignment } from '../pipeline/receiveLanes.js';
 import { FirstMediaObserver } from '../setup/measurement.js';
 import { MEDIA_MUTE_ACTIONS, type MediaMetrics } from '../setup/mediaMetrics.js';
-import type { MeetingKekSource } from '../setup/kekSource.js';
+import type { KekWrapSource, MeetingKekSource } from '../setup/kekSource.js';
 import type { MeetingIdentity } from '../setup/identity.js';
 import type { RosterIdentityKeys } from '../setup/rosterKeys.js';
 import type {
@@ -62,6 +62,7 @@ import type { RejectReason } from '../frame/rejectReason.js';
 import { TeardownRegistry } from '../teardown/teardown.js';
 import { MuteState, type MuteSnapshot } from './muteState.js';
 import { TransmitKeyManager } from './transmitKeys.js';
+import { ReceiveTransports } from './receiveTransports.js';
 
 /** Why the pipeline reported a fault. Bounded; never a raw platform message. */
 export const MediaFaultStage = {
@@ -105,8 +106,8 @@ export interface MediaFrameCounts {
   /**
    * The most recent reject token, or `undefined` before the first drop.
    *
-   * Bounded by TYPE, not by convention: `RejectReason` is the frozen
-   * sixteen-token union whose SSoT is `proto/test-vectors/frame-v2.vectors.json`,
+   * Bounded by TYPE, not by convention: `RejectReason` is the closed union of
+   * every token in `proto/test-vectors/frame-v2.vectors.json`,
    * so no participant, key or payload string can reach this field and compile.
    */
   readonly lastDropReason: RejectReason | undefined;
@@ -122,6 +123,25 @@ export interface AudioPipelineEventMap {
   frameAccepted: AcceptedFrame;
   /** Something went wrong. Bounded; event-once per condition, never per frame. */
   fault: MediaFault;
+}
+
+/**
+ * The KEK seam as the pipeline needs it: the receive read side, the send side
+ * (current generation only), and the rotation notification R-13 hangs off.
+ * `MeetingKekHolder` satisfies it.
+ */
+export interface PipelineKekSource extends MeetingKekSource, KekWrapSource {
+  /** Fires after a NEWER generation became current. Returns the unsubscribe. */
+  onCurrentGenerationChanged(listener: () => void): () => void;
+}
+
+/**
+ * One slot's assignment, as MC stated it in `StreamAssignments` — the single
+ * input from which BOTH the receive transports and the slot-edge gate derive.
+ */
+export interface ReceiveAssignment extends SlotAssignment {
+  /** The handler owning this edge. Empty when no source is assigned. */
+  readonly mediaHandlerUrl: string;
 }
 
 /** What MC directed this client to produce. Distilled from `SendDirective`. */
@@ -141,12 +161,15 @@ export interface AudioSendDirective {
 export interface AudioPipelineOptions {
   readonly config: MediaConfig;
   readonly metrics: MediaMetrics;
-  readonly kekSource: MeetingKekSource;
+  /**
+   * The KEK holder. The generation to wrap under is read from it at every mint,
+   * never captured here: a generation fixed at construction would keep wrapping
+   * under the KEK a departed member holds after every rotation (R-13).
+   */
+  readonly kekSource: PipelineKekSource;
   readonly roster: RosterIdentityKeys;
   /** MC's per-meeting sender id for this client, from the join response. */
   readonly senderId: number;
-  /** The KEK generation to announce on every wrapped block. */
-  readonly kekGeneration: number;
   /**
    * The meeting identity holder.
    *
@@ -162,7 +185,7 @@ export interface AudioPipelineOptions {
   /**
    * Inbound datagrams for an ALREADY-CONNECTED media handler, or `undefined`.
    *
-   * A selector, never a dialer: see {@link AudioPipeline.setReceiveHandlers}.
+   * A selector, never a dialer: see {@link AudioPipeline.setReceiveAssignments}.
    */
   readonly readableFor: (mediaHandlerUrl: string) => ReadableStream<Uint8Array> | undefined;
   /** Reports client mute to MC. Informational; the local state changes first. */
@@ -205,37 +228,19 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   #encoder: AudioEncoderSeam | undefined;
   #egress: EgressPipeline | undefined;
   #ingress: IngressPipeline | undefined;
+  #lanes: ReceiveLanes | undefined;
+  /**
+   * MC's latest slot assignments, held so `start()` can apply ones that arrived
+   * before it. REPLACED on every snapshot, never merged.
+   */
+  #assignments: readonly ReceiveAssignment[] = [];
   #rotationTimer: ReturnType<typeof setInterval> | undefined;
   /**
-   * The handlers an inbound read loop is running on. One entry per transport.
-   *
-   * Each loop is started at most ONCE. MC re-emits `StreamAssignments` on every
-   * structural change in the meeting (every join, leave, declaration, mute and
-   * connectivity change), so `#applyReceive` runs many times per session. A
-   * `ReadableStream` can be locked by only ONE reader, so a second
-   * `getReader()` throws — and it would throw from inside an assignment handler,
-   * where the failure would present as "media stopped after someone joined"
-   * rather than as what it is. A re-emit naming handlers already looping is
-   * therefore a no-op: nothing on this path touches the transport or any
-   * receiver state, so the replay window survives every unrelated roster event.
-   *
-   * A loop is NEVER torn down when an edge leaves its handler. The handler may
-   * carry another edge later, and the frames still arriving on it belong to
-   * senders whose edges have not moved. Tearing down on an assignment change is
-   * how "someone joined and I went deaf" happens.
+   * The inbound read loops — one loop and one hop monitor per handler
+   * transport, each started at most once and never torn down on an assignment
+   * change. See `receiveTransports.ts`. Created at `start()`, with the ingress.
    */
-  readonly #readLoops = new Set<string>();
-  /**
-   * A downlink hop monitor PER TRANSPORT, created with its read loop.
-   *
-   * Not shared: each media handler writes its own `hop_sequence` numbering
-   * (per (connection, media stream) in the frame format), so one monitor across
-   * two transports would read two independent sequences as one and post false
-   * gaps. Bounded by the meeting's registered handler set. See
-   * `IngressPipeline.accept`, which takes the monitor as a parameter for exactly
-   * this reason.
-   */
-  readonly #hopMonitors = new Map<string, HopSequenceMonitor>();
+  #transports: ReceiveTransports | undefined;
   /** Every handler the latest `StreamAssignments` names. May be several (§9). */
   #receiveUrls: readonly string[] = [];
   #directive: AudioSendDirective | undefined;
@@ -269,6 +274,16 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   constructor(options: AudioPipelineOptions) {
     super();
     validateMediaConfig(options.config);
+    // The per-sender decode lanes are bounded by the declared slots; the config
+    // bound is the independent backstop behind that, so the two must agree.
+    if (options.declaredSlotIds.length > options.config.ingress.maxDecodeLanes) {
+      throw new ClientConfigError(
+        'media.ingress.maxDecodeLanes',
+        `media.ingress.maxDecodeLanes (${options.config.ingress.maxDecodeLanes}) must be at least ` +
+          `the number of declared receive slots (${options.declaredSlotIds.length}); otherwise an ` +
+          `assigned sender would have no decoder and every one of its frames would be dropped`,
+      );
+    }
     this.#options = options;
     this.#config = options.config;
     this.#metrics = options.metrics;
@@ -294,6 +309,29 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   /** The current transmit-key generation. For assertion; never a metric label. */
   get transmitGeneration(): bigint {
     return this.#transmitKeys.generation;
+  }
+
+  /**
+   * Senders currently assigned to a declared slot and so decodable. Sampled,
+   * never per frame; never a metric label.
+   */
+  get assignedSenders(): readonly number[] {
+    return this.#lanes?.assignedSenders ?? [];
+  }
+
+  /** Frames waiting on `senderId`'s decoder. For the per-lane accounting identity. */
+  decodePendingFor(senderId: number): number {
+    return this.#lanes?.pendingFor(senderId) ?? 0;
+  }
+
+  /**
+   * Drop every transmit key cached for `senderId` (story 2 R-18), zeroizing them.
+   *
+   * Called when the roster rebinds or forgets that sender. The replay window is
+   * deliberately NOT touched: clearing it would permit a rebind-back replay.
+   */
+  purgeTransmitKeys(senderId: number): void {
+    this.#cache.purgeSender(BigInt(senderId));
   }
 
   /**
@@ -370,22 +408,33 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     });
     this.#teardown.register('playback', () => playback.close());
 
-    const decoder = await this.#options.decoderFactory({
+    // One decoder PER ASSIGNED SENDER, each on its own playback lane, mixed by
+    // the one sink. Registered after the playback sink, so teardown (reverse
+    // order) closes every lane before the sink they write into.
+    const lanes = new ReceiveLanes({
+      metrics: this.#metrics,
+      decoderFactory: this.#options.decoderFactory,
+      playback,
       sampleRateHz: audio.sampleRateHz,
       channels: audio.channels,
-      onOutput: (data) => playback.enqueue(data),
-      onError: () => {
-        // The codec's terminal error callback, at most once per instance — not a
-        // per-frame path. Counted AND evented; never logged per frame.
-        this.#metrics.decoderError();
+      declaredSlotIds: this.#options.declaredSlotIds,
+      maxLanes: this.#config.ingress.maxDecodeLanes,
+      restartBackoffMs: this.#config.ingress.decoderRestartBackoffMs,
+      pendingFrames: this.#config.ingress.decoderPendingFrames,
+      clock: this.#clock,
+      onDecoderFault: () => {
+        // NON-fatal, and that is R-5: one sender's decoder failing replaces that
+        // sender's decoder and must never silence, corrupt or stall another.
+        // The event-once dedupe in `#fault` keeps a repeating fault bounded.
         this.#fault(
           MediaFaultStage.Decoder,
-          'the audio decoder failed; playback has stopped',
-          true,
+          "one participant's audio decoder failed; it is being replaced",
+          false,
         );
       },
     });
-    this.#teardown.register('decoder', () => decoder.close());
+    this.#lanes = lanes;
+    this.#teardown.register('receive-lanes', () => lanes.close());
 
     const encoder = await this.#options.encoderFactory({
       sampleRateHz: audio.sampleRateHz,
@@ -417,21 +466,31 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#ingress = new IngressPipeline({
       metrics: this.#metrics,
       roster: this.#options.roster,
+      lanes,
       keys: this.#options.kekSource,
       cache: this.#cache,
       replay: this.#replay,
       firstMedia: this.#firstMedia,
       onAccepted: (frame) => this.emit('frameAccepted', frame),
     });
-    this.#ingress.setDecoder(decoder);
+    const ingress = this.#ingress;
+    this.#transports = new ReceiveTransports({
+      readableFor: (url) => this.#options.readableFor(url),
+      declaredSlotIds: this.#options.declaredSlotIds,
+      hopRestartBackwardJumpFrames: this.#config.ingress.hopRestartBackwardJumpFrames,
+      accept: (datagram, monitor) => ingress.accept(datagram, monitor),
+      isStopped: () => this.#stopped,
+      register: (name, dispose) => this.#teardown.register(name, dispose),
+      transportFault: (message) => this.#fault(MediaFaultStage.Transport, message, false),
+      frameFault: (message) => this.#fault(MediaFaultStage.Crypto, message, false),
+    });
 
     // Receive-side state is cleared at teardown: ADR-0028 §5's explicit cleanup,
     // whose wiring the codec task deliberately left to this task.
     this.#teardown.register('receiver-state', () => {
       this.#cache.clear();
       this.#replay.clear();
-      for (const monitor of this.#hopMonitors.values()) monitor.clear();
-      this.#hopMonitors.clear();
+      this.#transports?.clear();
       this.#firstMedia.clear();
     });
     this.#teardown.register('transmit-keys', () => this.#transmitKeys.clear());
@@ -439,6 +498,22 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     // Sampled FROM THE START, before any datagram can arrive, so the measurement
     // exists for every session rather than only for lucky ones.
     this.#firstMedia.start();
+
+    // R-13: every sender rotates its transmit keys on receipt of a new KEK, or a
+    // departed member keeps decrypting from the unwrapped keys it cached before
+    // the rotation. The holder fires this only AFTER the new KEK is current, so
+    // the next mint wraps under it — and never on a redelivery of the same
+    // generation, which would make a reconnect a rotation lever.
+    //
+    // SUBSCRIBED BEFORE `capture.start`, not after. The capture callback is
+    // registered inside that call and can mint before it resolves, so a KEK
+    // demotion landing in that window would otherwise never rotate — leaving the
+    // sender on a transmit key a leaver holds until the next timer or unmute
+    // rotation. A rotate() with nothing minted yet is harmless.
+    const unsubscribe = this.#options.kekSource.onCurrentGenerationChanged(() => {
+      this.#transmitKeys.rotate();
+    });
+    this.#teardown.register('kek-rotation-listener', unsubscribe);
 
     await capture.start(
       (data) => this.#onCapturedFrame(data),
@@ -454,6 +529,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#teardown.register('rotation-timer', () => this.#clearInterval(timer));
 
     this.#applyDirective();
+    lanes.setAssignments(this.#assignments);
     this.#applyReceive();
   }
 
@@ -471,10 +547,17 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   }
 
   /**
-   * Apply the handler URLs from MC's latest `StreamAssignments` — one per
-   * declared slot, EMPTY for a slot with no source (the proto's "Empty when no
+   * Apply MC's latest `StreamAssignments` — one entry per declared slot, its
+   * handler URL EMPTY for a slot with no source (the proto's "Empty when no
    * source is assigned": every `fewer_sources` slot, and every slot of a solo
    * participant). This, not the send directive, is where receiving comes from.
+   *
+   * ONE INPUT, TWO DERIVED VIEWS, so they cannot disagree: the handler URLs pick
+   * which transports to read (below), and the slot -> sender pairs are the
+   * slot-edge gate's authority (`receiveLanes.ts`). A snapshot REPLACES the
+   * previous one. A sender that stays assigned keeps its decoder; only senders
+   * that left the set lose theirs, and no receiver crypto or replay state is
+   * touched either way.
    *
    * ---------------------------------------------------------------------------
    * A SELECTOR OVER CONNECTED TRANSPORTS, NEVER A DIAL TARGET
@@ -505,11 +588,19 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * the "deaf on the slot whose edge is on the other handler" symptom is what
    * they produced. Nothing here assumes a particular or sorted-first handler.
    */
-  setReceiveHandlers(mediaHandlerUrls: readonly string[]): void {
+  setReceiveAssignments(assignments: readonly ReceiveAssignment[]): void {
     if (this.#stopped) return;
+    this.#assignments = assignments.map(({ slotId, senderId, mediaHandlerUrl }) => ({
+      slotId,
+      senderId,
+      mediaHandlerUrl,
+    }));
+    this.#lanes?.setAssignments(this.#assignments);
     // Empty strings are the proto's "no source assigned" for a slot, not a
     // handler. A message may legitimately carry nothing but those.
-    this.#receiveUrls = [...new Set(mediaHandlerUrls.filter((url) => url !== ''))];
+    this.#receiveUrls = [
+      ...new Set(this.#assignments.map((a) => a.mediaHandlerUrl).filter((url) => url !== '')),
+    ];
     // No source in any slot: nothing to receive yet. Running loops stay up, so a
     // later refill needs no reconnect.
     if (this.#receiveUrls.length === 0) return;
@@ -603,7 +694,8 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     if (this.#stopped) return;
     this.#stopped = true;
     this.#egress?.stop();
-    this.#ingress?.setDecoder(undefined);
+    // Before the rest of teardown, so a frame still in flight decodes nowhere.
+    this.#lanes?.close();
     const failures = await this.#teardown.dispose();
     for (const failure of failures) {
       // Surfaced, not swallowed. The NAME is a static string chosen at
@@ -669,7 +761,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * filled receive slots while being in nobody's slot (static fill, N=1, three
    * participants: C's slot holds A, nobody's holds C), and MC then correctly
    * directs an EMPTY target set (§5 "send nothing"). Receiving keyed off the send
-   * target would leave C deaf behind an ACTIVE slot. See `setReceiveHandlers`.
+   * target would leave C deaf behind an ACTIVE slot. See `setReceiveAssignments`.
    */
   #applyDirective(): void {
     const directive = this.#directive;
@@ -684,7 +776,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       this.#egress = new EgressPipeline({
         metrics: this.#metrics,
         transmitKeys: this.#transmitKeys,
-        kek: { source: this.#options.kekSource, generation: this.#options.kekGeneration },
+        kek: this.#options.kekSource,
         identity: this.#options.identity,
         maxQueueFrames: this.#config.egress.maxQueueFrames,
         streamNumber: directive.streamNumber,
@@ -710,109 +802,14 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   }
 
   /**
-   * Start a read loop on every handler the assignments name, each once.
-   *
-   * One loop and one hop monitor per transport; loops already running are left
-   * exactly as they are, including when an edge moves off their handler.
+   * Start a read loop on every handler the assignments name, each once. See
+   * `receiveTransports.ts`.
    */
   #applyReceive(): void {
     // Before `start()` there is no ingress to hand frames to; `start()` calls
     // this again. Never read and discard.
-    if (!this.#ingress || this.#stopped) return;
-    for (const url of this.#receiveUrls) {
-      if (this.#readLoops.has(url)) continue;
-      const readable = this.#options.readableFor(url);
-      if (!readable) {
-        // A slot assigned on a transport we never opened. Structurally a server
-        // condition for the same reason as the send-side one above, and the last
-        // thing this client can do about it is say so loudly.
-        this.#fault(
-          MediaFaultStage.Transport,
-          'slot assignments name a media handler this client is not connected to',
-          false,
-        );
-        continue;
-      }
-      if (readable.locked) {
-        // Two DISTINCT urls resolved to one datagram stream. A `ReadableStream`
-        // takes only one reader, so `getReader()` would THROW — from inside an
-        // assignment handler, where it would surface as "media stopped when
-        // someone joined" rather than as what it is. Checked rather than caught
-        // so the condition is named, and so the other handlers in this snapshot
-        // still get their loops.
-        this.#fault(
-          MediaFaultStage.Transport,
-          'two media handlers resolved to the same media transport',
-          false,
-        );
-        continue;
-      }
-      this.#readLoops.add(url);
-      const monitor = new HopSequenceMonitor(
-        this.#options.declaredSlotIds,
-        this.#config.ingress.hopRestartBackwardJumpFrames,
-      );
-      this.#hopMonitors.set(url, monitor);
-      this.#startReadLoop(readable, monitor);
-    }
-  }
-
-  #startReadLoop(readable: ReadableStream<Uint8Array>, monitor: HopSequenceMonitor): void {
-    const reader = readable.getReader();
-    // Registered per loop. The name is a static literal plus the LOOP COUNT, not
-    // the URL: a teardown-failure fault interpolates this name, and a handler URL
-    // in a fault message would be an unbounded value on a bounded path.
-    this.#teardown.register(`datagram-reader-${this.#readLoops.size}`, () => {
-      void reader.cancel().catch(() => {
-        // Already cancelled or errored; the transport close is what matters.
-      });
-    });
-    void this.#readLoop(reader, monitor);
-  }
-
-  async #readLoop(
-    reader: ReadableStreamDefaultReader<Uint8Array>,
-    monitor: HopSequenceMonitor,
-  ): Promise<void> {
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) {
-          if (!this.#stopped) {
-            // Absence of frames is not a signal (ADR-0036 §6): a datagram stream
-            // that ends while the session continues is a real condition and is
-            // surfaced rather than read as silence.
-            this.#fault(
-              MediaFaultStage.Transport,
-              'the inbound media datagram stream ended while the session was still active',
-              false,
-            );
-          }
-          return;
-        }
-        if (value === undefined) continue;
-        try {
-          // The monitor for THIS transport travels with the datagram: each
-          // handler writes its own hop numbering (see `IngressPipeline.accept`).
-          await this.#ingress?.accept(value, monitor);
-        } catch {
-          // `accept` returns normally for every WIRE condition; reaching here
-          // means a defect. Surfaced ONCE — a repeating defect must not become
-          // per-frame telemetry — and the loop continues, because one bad frame
-          // must not end media for the session.
-          this.#fault(MediaFaultStage.Crypto, 'a media frame could not be processed', false);
-        }
-      }
-    } catch {
-      if (this.#stopped) return;
-      this.#fault(MediaFaultStage.Transport, 'the media datagram reader failed', false);
-    } finally {
-      try {
-        reader.releaseLock();
-      } catch {
-        // Already released during teardown.
-      }
-    }
+    if (this.#stopped) return;
+    this.#transports?.open(this.#receiveUrls);
   }
 
   /**

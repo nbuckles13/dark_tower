@@ -15,6 +15,9 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { ALL_REJECT_REASONS, NON_DROPPING_REASON } from '../../frame/rejectReason.js';
 import { loadFrameVectors } from '../../frame/__tests__/frameVectors.js';
 import {
+  MEDIA_KEK_INSTALL_REFUSALS,
+  MEDIA_ROSTER_KEY_CHANGES,
+  MEDIA_KEK_RETENTION_ANOMALIES,
   MEDIA_KEK_SOURCES,
   MEDIA_MUTE_ACTIONS,
   MEDIA_SEND_DROP_REASONS,
@@ -39,7 +42,14 @@ function emitEverything(metrics: MediaMetrics): void {
   metrics.decoderError();
   metrics.muteTransition(MEDIA_MUTE_ACTIONS.Mute);
   metrics.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse);
+  metrics.kekUpdate(MEDIA_KEK_SOURCES.KekUpdate);
   metrics.timeToFirstMediaFrameMs(42);
+  metrics.kekRetentionViolation();
+  metrics.kekRetentionAnomaly(MEDIA_KEK_RETENTION_ANOMALIES.FloorSubstituted);
+  metrics.kekInstallRefused(MEDIA_KEK_INSTALL_REFUSALS.ConflictingKey);
+  metrics.kekGenerationRetained();
+  metrics.rosterKeyRebind(MEDIA_ROSTER_KEY_CHANGES.Rebind);
+  metrics.decodeQueueDropped();
 }
 
 describe('mediaMetricLabels builds the set by ALLOW-LIST', () => {
@@ -69,7 +79,7 @@ describe('every media emission carries the base set and nothing forbidden', () =
     const sink = new InMemoryMetricsSink();
     emitEverything(new MediaMetrics(IDENTITY, sink));
     const records = sink.getRecordedMetrics();
-    expect(records.length).toBe(15);
+    expect(records.length).toBe(22);
 
     for (const record of records) {
       const keys = new Set(Object.keys(record.labels));
@@ -141,7 +151,7 @@ describe('the drop counter carries the frozen reject vocabulary', () => {
     }
     const emitted = sink.getRecordedMetrics().map((m) => String(m.labels.reason));
     expect(new Set(emitted)).toEqual(new Set(dropping));
-    // Fifteen of sixteen. The sixteenth is the non-dropping outcome.
+    // Every token but one: the one left out is the non-dropping outcome.
     expect(dropping).toHaveLength(ALL_REJECT_REASONS.length - 1);
     expect(dropping).not.toContain(NON_DROPPING_REASON);
   });
@@ -214,5 +224,67 @@ describe('the send-drop vocabulary', () => {
     // While muted nothing is encoded, so nothing enters the queue and nothing is
     // dropped. A `muted` reason would spike the send-drop rate on every mute.
     expect(Object.values(MEDIA_SEND_DROP_REASONS)).not.toContain('muted');
+  });
+});
+
+describe('the story-2 counters carry EXACTLY their stated label sets', () => {
+  // SET EQUALITY, not `toContain`: a later sender, meeting or stream label on
+  // any of these must be a red build rather than a silent ADR-0036 §11
+  // violation. Each row names the one discriminator it may carry, or none.
+  const BASE = ['client_version', 'key_custody', 'org_id'];
+  const cases: [string, (m: MediaMetrics) => void, string | null][] = [
+    ['dt_client_media_kek_retention_violations_total', (m) => m.kekRetentionViolation(), null],
+    [
+      'dt_client_media_kek_retention_anomalies_total',
+      (m) => m.kekRetentionAnomaly(MEDIA_KEK_RETENTION_ANOMALIES.CeilingClamped),
+      'outcome',
+    ],
+    [
+      'dt_client_media_kek_install_refusals_total',
+      (m) => m.kekInstallRefused(MEDIA_KEK_INSTALL_REFUSALS.OlderGeneration),
+      'outcome',
+    ],
+    [
+      'dt_client_media_roster_key_rebinds_total',
+      (m) => m.rosterKeyRebind(MEDIA_ROSTER_KEY_CHANGES.Downgrade),
+      'outcome',
+    ],
+    ['dt_client_media_kek_generations_retained_total', (m) => m.kekGenerationRetained(), null],
+    ['dt_client_media_decode_queue_dropped_total', (m) => m.decodeQueueDropped(), null],
+  ];
+
+  it.each(cases)('%s', (name, emit, discriminator) => {
+    const sink = new InMemoryMetricsSink();
+    emit(new MediaMetrics(IDENTITY, sink));
+    const [record, ...rest] = sink.getRecordedMetrics();
+    expect(rest).toEqual([]);
+    expect(record?.name).toBe(name);
+    const expected = discriminator ? [...BASE, discriminator].sort() : BASE;
+    expect(Object.keys(record!.labels).sort()).toEqual(expected);
+    expect(record!.labels.key_custody).toBe('operator');
+  });
+
+  it('keeps the story-2 outcome vocabularies pairwise DISJOINT', () => {
+    // All ride `outcome`, a per-metric vocabulary with no cross-metric
+    // aggregation contract. Disjoint values mean a mistaken `sum by(outcome)`
+    // across them cannot silently merge, say, a refusal with a rebind.
+    const sets = [
+      Object.values(MEDIA_KEK_RETENTION_ANOMALIES),
+      Object.values(MEDIA_KEK_INSTALL_REFUSALS),
+      Object.values(MEDIA_ROSTER_KEY_CHANGES),
+    ] as const;
+    const all = sets.flat();
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it('carries both KEK arrival sources on the one counter', () => {
+    const sink = new InMemoryMetricsSink();
+    const m = new MediaMetrics(IDENTITY, sink);
+    m.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse);
+    m.kekUpdate(MEDIA_KEK_SOURCES.KekUpdate);
+    expect(sink.getRecordedMetrics().map((r) => r.labels.source)).toEqual([
+      'join_response',
+      'kek_update',
+    ]);
   });
 });

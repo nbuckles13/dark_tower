@@ -445,7 +445,7 @@ groups:
       #
       # `for: 15m` AGAINST A rate(...[5m]) WINDOW IS DELIBERATE AND IS A
       # DOCUMENTED ANTI-SHAPE. alert-conventions.md says to match `for:` to
-      # the rate() window. DO NOT "FIX" THIS TO 5m. Both reasons are EXPECTED
+      # the rate() window. DO NOT "FIX" THIS TO 5m. All three reasons are EXPECTED
       # transients at join and after a KEK rotation (ADR-0036 §11); the
       # sustained case is the signal, so the `for:` window must outlast the
       # transients and is doing the discriminating work that the threshold is
@@ -456,15 +456,40 @@ groups:
       # join transient is well under 1% of a 5-minute window, while a
       # sustained delivery failure sits near 100%. Do not cite it as ratified.
       #
-      # AGGREGATED NUMERATOR, NOT `sum by(reason)`: both reasons share one
-      # runbook scenario, and a per-reason instance would need
+      # AGGREGATED NUMERATOR, NOT `sum by(reason)`: all three reasons share
+      # one runbook scenario, and a per-reason instance would need
       # `/ on() group_left()` broadcasting for the denominator - machinery for
       # no triage gain. The reason fork lives in Scenario 16, which is where
-      # the two remedies diverge.
+      # the three remedies diverge.
+      #
+      # THE SELECTOR IS AN EXPLICIT TOKEN ENUMERATION, NOT A LAYER OR PREFIX
+      # PATTERN. Nothing about a token's `layer` field or spelling puts it in
+      # this alert (`layer` names the processing STAGE, not the remedy owner -
+      # docs/observability/label-taxonomy.md). A future key-delivery token must
+      # be added here DELIBERATELY; no pattern would have caught
+      # `kek_generation_stale`, and none will catch the next one.
+      # `sender_not_assigned` is DELIBERATELY EXCLUDED: it is misrouting (a
+      # verified frame from a sender outside the client's MC-stated slot
+      # assignment), whose remedy is MC placement / MH forwarding, not KEK or
+      # roster delivery. The 5% threshold above was set over two tokens;
+      # re-deriving it over the widened three-token set is story 2 task 16's
+      # work, not re-derived here. WHICH WAY IT LEANS UNTIL THEN (@operations'
+      # derivation — falsify it rather than re-deriving from scratch):
+      #   (1) widening a NUMERATOR over an unchanged denominator can only move
+      #       the ratio UP, so an un-re-derived 0.05 is more sensitive, never
+      #       less. The risk task 16 inherits is a false page, not a miss — the
+      #       safe side, which is what makes shipping the widening ahead of the
+      #       derivation correct rather than merely convenient;
+      #   (2) the selected population is roughly UNCHANGED at the split: with no
+      #       retention before this change, every older-than-retained frame
+      #       already landed on no_kek_for_generation. After it, those frames
+      #       split to kek_generation_stale (still selected) LESS the ones
+      #       retention now rescues into accepted — so the existing threshold is,
+      #       if anything, conservative.
       - alert: MCMediaMissingKeyMaterial
         expr: |
           (
-            sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|no_roster_entry"}[5m]))
+            sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"}[5m]))
             /
             sum(rate(dt_client_media_frames_received_total[5m]))
           ) > 0.05
@@ -477,8 +502,8 @@ groups:
           component: media-keys
         annotations:
           summary: "Clients sustained-dropping media frames for missing key material ({{ $value | humanizePercentage }})"
-          description: "Receiving clients cannot open frames because they lack the meeting KEK for the carried generation (no_kek_for_generation) or a usable identity key for the sender (no_roster_entry). Both are EXPECTED transiently at join and after a KEK rotation; 15 minutes sustained is the signal, and ADR-0036 §11 makes it the only signal for a join or rotation path that has silently stopped delivering keys. Split on the reason label FIRST - the two arms have different remedies and are not equally instrumented. Fires on a client counter but lives here because the remedy is in MC's KEK-and-roster delivery path."
-          impact: "Affected participants hear nothing while every server-side signal reads healthy - MH never opens a frame and structurally cannot observe either condition. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
+          description: "Receiving clients cannot open frames because of missing key material, in three arms: the carried KEK generation is NEWER than any held (no_kek_for_generation - MC's KEK push has not arrived); the carried generation is OLDER than this client retains (kek_generation_stale - the frame predates the client's retention window, which derives from MC's rotation debounce; remedy MC_KEK_ROTATION_DEBOUNCE_SECONDS); or there is no usable identity key for the sender (no_roster_entry). All are EXPECTED transiently at join and after a KEK rotation; 15 minutes sustained is the signal, and ADR-0036 §11 makes it the only signal for a join or rotation path that has silently stopped delivering keys. Split on the reason label FIRST - the three arms have different remedies and are not equally instrumented. Fires on a client counter but lives here because the remedy is in MC's KEK-and-roster delivery path."
+          impact: "Affected participants hear nothing while every server-side signal reads healthy - MH never opens a frame and structurally cannot observe any of the three conditions. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-16-missing-key-material"
 
   - name: mc-service-info

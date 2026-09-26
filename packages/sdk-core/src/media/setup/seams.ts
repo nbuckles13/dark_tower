@@ -51,19 +51,37 @@ export interface AudioDecoderSeam {
 }
 
 /**
- * Where decoded audio goes.
+ * One sender's decoded audio, on its own timeline.
  *
  * `enqueue` is a per-frame method, so an implementation must not log — see
  * `pipeline/`'s layout rule, which applies to any code the frame path reaches
  * regardless of which directory it is declared in.
  */
-export interface PlaybackSink {
+export interface PlaybackLane {
   /**
    * Hand a decoded frame to playback. Takes OWNERSHIP: the implementation is
    * responsible for calling `close()` on the `AudioData`.
    */
   enqueue(data: AudioData): void;
-  /** Release the sink. Idempotent. */
+  /** Release this lane only. Idempotent; other lanes keep playing. */
+  close(): void;
+}
+
+/**
+ * Where decoded audio goes: ONE output, MIXING any number of sender lanes.
+ *
+ * WHY LANES, AND NOT ONE `enqueue`: a single scheduled timeline places every
+ * frame after the previous one. With N senders each producing 50 frames a second
+ * into one 50-frames-a-second playhead, the senders play one AFTER another
+ * rather than together, and the schedule runs further ahead of real time with
+ * every frame — unbounded latency growth that reads as "audio getting later and
+ * later". Each lane has its own timeline; the shared output node sums them,
+ * which is the mix.
+ */
+export interface PlaybackSink {
+  /** Open a new lane on this output. One per actively decoded sender. */
+  openLane(): PlaybackLane;
+  /** Release the sink and every lane on it. Idempotent. */
   close(): void;
 }
 
