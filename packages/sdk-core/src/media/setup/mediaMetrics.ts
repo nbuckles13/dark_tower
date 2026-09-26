@@ -232,13 +232,31 @@ export const MEDIA_KEK_INSTALL_REFUSALS = {
  * Bounded `outcome` vocabulary for `dt_client_media_roster_key_rebinds_total`.
  *
  * Split because the two point at DIFFERENT fixes, and because only one of them
- * can carry a reads-zero-forever contract: MC never legitimately rebinds a live
- * sender to different bytes, but it DOES publish empty keys (the `no_roster_entry`
- * catalog entry documents it), so a merged counter would make any alert on it
- * fire on a known, expected condition. A per-metric vocabulary.
+ * is near-zero by construction: MC never legitimately rebinds a live sender to
+ * different bytes, but it DOES publish empty keys (the `no_roster_entry` catalog
+ * entry documents it), so a merged counter would make any alert on it fire on a
+ * known, expected condition. A per-metric vocabulary.
+ *
+ * `rebind` IS NOT READS-ZERO-FOREVER (story 2 R-16). MC reissues a sender id to a
+ * new identity after a KEK-epoch reset. Normally the old holder's
+ * `ParticipantLeft` arrives first, the roster forgets the id, and the reissue is
+ * a FIRST binding — not counted. But MC sends roster updates with `try_send`,
+ * and a `ParticipantLeft` dropped under outbound backpressure means this client
+ * later sees the id bound to a new key with no prior removal: a `rebind`. So a
+ * non-zero reading has THREE causes: an MC defect, a cache-poisoning attempt, or
+ * a lost `ParticipantLeft`. MC's
+ * `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`
+ * non-zero over the same window makes the third SUPPORTED; zero rules it out.
+ * It is fleet-wide, so it never confirms that any individual increment was a
+ * lost leave. Key hygiene holds on every cause: the `rebind` arm purges the same
+ * transmit keys a removal would have. The underlying delivery gap is filed in
+ * `docs/TODO.md` (roster removals are droppable).
  */
 export const MEDIA_ROSTER_KEY_CHANGES = {
-  /** A live sender bound to DIFFERENT, well-formed key bytes. Should read zero. */
+  /**
+   * A live sender bound to DIFFERENT, well-formed key bytes. Near-zero, not
+   * zero: see the vocabulary's doc for the three causes, one of them benign.
+   */
   Rebind: 'rebind',
   /** A live sender's key replaced by an empty, wrong-width or unusable one. */
   Downgrade: 'downgrade',

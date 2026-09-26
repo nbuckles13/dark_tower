@@ -160,9 +160,10 @@ groups:
       # the pre-restart MC's generation), never reaches this counter: it is
       # recorded on mc_media_policy_generation_adoptions_total INSTEAD, at one
       # site in the pusher, so no rollout page and no scrape-interleaving
-      # residue for a `for:` to absorb. Same idiom as MCActorPanic and
-      # MCSenderIdSpaceExhausted. `for:` MUST STAY BELOW THE increase() WINDOW
-      # or the rule is unsatisfiable by construction.
+      # residue for a `for:` to absorb. Same idiom as MCActorPanic (and the
+      # retired MCSenderIdSpaceExhausted, whose shape the info rule
+      # MCKekEpochResetOnSenderIdExhaustion keeps). `for:` MUST STAY BELOW THE
+      # increase() WINDOW or the rule is unsatisfiable by construction.
       - alert: MCMediaGenerationDivergence
         expr: |
           sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[15m])) > 0
@@ -176,6 +177,54 @@ groups:
           description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook. SINCE STORY 2, ANY STRUCTURAL CHANGE RE-PUSHES: a join, leave, capability declaration or mute re-publishes to every handler and an unconfirmed push is re-sent, so a meeting with churn often clears on the next roster event - check whether the counter stopped moving before acting, and force a structural change only if the meeting is quiescent (there is still no periodic re-assert; story 4). An MC restart against a live handler is NOT counted here: MC adopts MH's generation as a floor and re-pushes above it, and records that on mc_media_policy_generation_adoptions_total instead - deliberately under no outcome label, so read that counter (and the adoption WARN at mc.register_meeting.trigger) alongside the split. A generation_mismatch with applied > sent that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the u64::MAX ratchet wedge) - not rollout noise. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
           impact: "Participants in the affected meeting get no audio while the client stays connected and the UI reads healthy. Blast radius is per (meeting, handler), not fleet-wide. DO NOT RESTART MH as a remedy: it sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-15-media-generation-divergence"
+
+      # ------------------------------------------------------------------
+      # ADR-0031 block — MCKekRotationOverdue (story 2 task 9, R-12, R-26)
+      #
+      # WHAT IT MEANS: a departed participant still holds a working KEK and
+      # the rotation that should have revoked it has not happened. A
+      # CONFIDENTIALITY exposure, not media quality — which is why it pages.
+      #
+      # BARE GAUGE-VS-GAUGE, NO ARITHMETIC: both sides are published by MC
+      # from the value its timer enforces, so W never appears in PromQL. The
+      # rule DEPENDS ON LABEL-SET IDENTITY: `a > b` matches series with equal
+      # label sets, so a label added to ONE of these two gauges silently
+      # empties the comparison and the page never fires. Keep them in step.
+      #
+      # THRESHOLD PROVENANCE: the threshold is W x KEK_ROTATION_OVERDUE_MULTIPLIER
+      # (= 2, compile-time asserted >= 2 in media_admission/rotation.rs).
+      # Healthy pending age climbs to at most W plus rotation latency and
+      # drops to 0 at each rotation, so a healthy steady state can never
+      # reach 2W. At a multiplier of 1 it would reach the threshold just
+      # before every rotation.
+      #
+      # DETECTION LATENCY, the accepted cost: 2W + for: 2m. At the W ceiling
+      # of 300 s that is ~12 min after the oldest un-rotated departure,
+      # against an R-12 promise of 5. So this page does NOT mean "W is about
+      # to be missed"; it means W has already been exceeded by ~2x. Stated in
+      # the `impact` annotation, which is what Alertmanager renders.
+      #
+      # PENDING AGE is a MAXIMUM across live meetings, sampled every 5 s from
+      # times the meeting actors recorded — so a WEDGED actor still ages,
+      # which is the case this exists for. It is cleared AT ROTATION, not on
+      # push success: undelivered pushes are MCKekPushFailureRate's job.
+      #
+      # DEMONSTRATION (ADR-0036 §11, both halves): stall the rotation timer
+      # and watch pending age cross the threshold gauge; the rule then fires.
+      # ------------------------------------------------------------------
+      - alert: MCKekRotationOverdue
+        expr: |
+          mc_meeting_kek_rotation_pending_age_seconds > mc_meeting_kek_rotation_overdue_threshold_seconds
+        for: 2m
+        labels:
+          severity: page
+          service: mc-service
+          component: media-keys
+        annotations:
+          summary: "MC KEK rotation overdue: a departed participant still holds a working meeting KEK"
+          description: "The oldest un-rotated departure in some meeting on {{ $labels.instance }} is older than twice the rotation window. Fork FIRST on mc_meeting_kek_rotation_failures_total{reason}: rng (overwhelmingly the likelier arm; CSPRNG failure, retried after W, confirm it clears) versus generation_exhausted (the meeting's u16 KEK generation is at its ceiling; permanent, this page will not clear until that meeting ends; effectively unreachable, ~22.7 days of uninterrupted rotation at the W floor). If NEITHER is moving, the rotation is not being attempted: suspect a wedged meeting actor and read mc_actor_mailbox_depth. Then confirm mc_meeting_kek_rotation_window_seconds matches the ConfigMap's MC_KEK_ROTATION_DEBOUNCE_SECONDS on this pod."
+          impact: "CONFIDENTIALITY, not media quality: at least one departed participant still holds a KEK that opens every current participant's media in that meeting. When this fires the exposure bound W has ALREADY been exceeded by roughly 2x, for at least 2 minutes; it is not a leading indicator."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-19-kek-rotation-stalled"
 
   - name: mc-service-warning
     interval: 60s
@@ -310,28 +359,123 @@ groups:
           impact: "Some users unable to join meetings via WebTransport. Investigate join failure types in MC Overview dashboard."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-8-join-failures"
 
-      # Absolute count, NOT a ratio, deliberately: a single meeting exhausting
-      # its 65535-id namespace cannot move the fleet-wide MCHighJoinFailureRate
-      # ratio above, so that rule is structurally blind to this condition. No
-      # threshold judgement is involved — any occurrence is one permanently
-      # broken meeting.
-      - alert: MCSenderIdSpaceExhausted
+      # ------------------------------------------------------------------
+      # ADR-0031 block — MCKekPushFailureRate (story 2 task 9, R-26)
+      #
+      # WHAT IT MEANS: KEK pushes are not reaching members. SECURITY
+      # RESIDUAL: a member whose push is not delivered never rotates its own
+      # transmit keys, so a departed participant keeps opening THAT member's
+      # media past W. This counter is the only control for it.
+      #
+      # NEGATED SELECTOR, deliberately: `outcome!~"delivered|participant_gone"`
+      # excludes the success and the one benign outcome (a grace-period member
+      # with no connection, which receives the current KEK on return), so any
+      # outcome value added later fails CLOSED into this alert rather than
+      # silently outside it. First paid off on `timed_out`.
+      #
+      # DENOMINATOR COMPLETENESS: every rostered recipient yields exactly one
+      # outcome, including one that never answers (`timed_out`, emitted after
+      # a 2 s deadline). Without that, a wedged recipient would leave BOTH the
+      # numerator and the denominator and this ratio would get QUIETER as
+      # participant actors wedged.
+      #
+      # NON-ZERO-DENOMINATOR GUARD on the same expression that forms the
+      # denominator (alert-conventions.md). 1% / 10m is the story's figure,
+      # not SLO-derived; there is no observed baseline.
+      #
+      # DEMONSTRATION: fill a participant's outbound channel and force a
+      # rotation; `dropped_outbound` moves and the ratio crosses.
+      # ------------------------------------------------------------------
+      - alert: MCKekPushFailureRate
         expr: |
-          increase(mc_session_join_failures_total{error_type="sender_id_space_exhausted"}[15m]) > 0
-        # 0m, matching MCActorPanic above (same absolute-count "any occurrence"
-        # shape): the 15m increase window already smooths, the condition cannot
-        # flap because it is permanent, and a `for:` delay would only postpone
-        # paging on an already-irreversible state.
-        for: 0m
+          (
+            sum(rate(mc_meeting_kek_pushes_total{outcome!~"delivered|participant_gone"}[10m]))
+            /
+            sum(rate(mc_meeting_kek_pushes_total[10m]))
+          ) > 0.01
+          and
+          sum(rate(mc_meeting_kek_pushes_total[10m])) > 0
+        for: 10m
         labels:
           severity: warning
           service: mc-service
-          component: meeting-join
+          component: media-keys
         annotations:
-          summary: "MC refused a join: meeting sender_id space exhausted"
-          description: "A meeting consumed all 65535 per-meeting sender_ids and MC refused the admission rather than reusing a live id (invariant R-35). NOT SELF-CLEARING: that meeting has permanently stopped admitting participants and the only remediation is to end it and have participants rejoin a new one, so the underlying state persists whether or not this alert re-fires. Namespace use is cumulative lifetime admissions, not concurrent participants, so MC_MAX_PARTICIPANTS does not bound it. Identify the meeting from the MC log record 'sender_id space exhausted' and treat a sudden onset as possibly driven — see the runbook."
-          impact: "One meeting can admit no further participants, permanently. Existing participants are unaffected."
-          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-8-join-failures"
+          summary: "MC KEK pushes failing to reach meeting members ({{ $value | humanizePercentage }})"
+          description: "More than 1% of MeetingKekUpdate pushes were neither delivered nor to a benign grace-period member, for 10 minutes. Split on the outcome label: dropped_outbound (the member's outbound channel was full or closed - a slow or wedged client connection), actor_unavailable (the participant actor exited or its mailbox closed - MCActorPanic territory), timed_out (no answer within 2s - read mc_actor_mailbox_depth, MCHighMailboxDepthCritical territory). Clients whose push failed drop frames as no_kek_for_generation, which is MCMediaMissingKeyMaterial's selector; that alert is a fleet-wide client ratio and cannot see a small population, so this is the small-denominator detector."
+          impact: "Members that miss a KEK push cannot open frames under the new generation, and do not rotate their own transmit keys, so a departed participant can keep decrypting their media past the rotation window. There is NO re-push: an affected member recovers only at the next rotation or on a fresh join (page reload), so in a quiet meeting this does not clear on its own."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-16-missing-key-material"
+
+      # ------------------------------------------------------------------
+      # ADR-0031 block — MCKekRotationStorm (story 2 task 9, R-26)
+      #
+      # WHAT IT MEANS: leave-triggered rotations are happening faster than the
+      # debounce allows — the debounce is not applying somewhere.
+      #
+      # POSITIVE SELECTOR `trigger="participant_left"`, NOT keyed on the
+      # exhaustion arm. The 2/W threshold is derived ENTIRELY from the
+      # debounce; `sender_space_exhausted` is exempt from the debounce and
+      # bounded by 65,536 admissions, so it can never approach 2/W and a
+      # per-trigger series here would read as coverage while being unable to
+      # fire. Its visibility is MCKekEpochResetOnSenderIdExhaustion below.
+      # PARTITION — every trigger value must be classified into exactly one:
+      #   participant_left       -> this rule
+      #   sender_space_exhausted -> MCKekEpochResetOnSenderIdExhaustion (info)
+      #   meeting_created        -> neither
+      # A NEW value is silently unalerted until classified here — the one
+      # place the KEK rules trade fail-closed for semantic honesty.
+      #
+      # THRESHOLD PROVENANCE: the debounce bounds each meeting to at most one
+      # leave rotation per W, so the fleet AVERAGE per meeting is also <= 1/W.
+      # Anything above that proves the debounce is broken fleet-wide. K = 2 is
+      # margin. It is a fleet average, so it is DILUTED: it proves the
+      # debounce is broken broadly, not that one meeting is.
+      #
+      # WINDOWS ALIGNED: the denominator is sum(avg_over_time(...[10m])), the
+      # same ten minutes as the numerator's rate. Dividing by an instantaneous
+      # meeting count fired ~25x over threshold on a synchronized fleet drain
+      # (1000 meetings rotating then ending together) with nothing wrong.
+      # avg_over_time over a RAW range vector, not a `[10m:]` subquery: no
+      # subquery exists in any rule file, and a metric name inside new syntax
+      # that dt-guard's extractor missed would pass silently (it fails open).
+      # Precedent for this form: gc-alerts.yaml (absent_over_time). Per-pod
+      # averaging over-estimates the denominator slightly when a pod joins or
+      # leaves mid-window — the conservative direction for a warning.
+      #
+      # TWO CONJUNCTS WITH DIFFERENT JOBS — DO NOT MERGE:
+      #   * `sum(avg_over_time(...)) > 0` is the non-zero-denominator guard,
+      #     on the SAME expression that forms the denominator.
+      #   * `and on() sum(mc_meetings_active) > 0` is a SANITY conjunct ("a
+      #     live meeting exists now"), like MCLowConnectionCount's. A fully
+      #     drained fleet still has rotations inside the window; without this
+      #     it could fire with nothing to act on.
+      #
+      # `scalar(max(mc_meeting_kek_rotation_window_seconds))`: if that gauge is
+      # ever absent the rule is silently non-evaluating (2/NaN is NaN, and
+      # `vector > NaN` is false). Acceptable because MC sets it at boot and the
+      # exporter has no idle_timeout — but a config gauge is load-bearing here.
+      # ------------------------------------------------------------------
+      - alert: MCKekRotationStorm
+        expr: |
+          (
+            sum(rate(mc_meeting_kek_generated_total{trigger="participant_left"}[10m]))
+            /
+            sum(avg_over_time(mc_meetings_active[10m]))
+          ) > 2 / scalar(max(mc_meeting_kek_rotation_window_seconds))
+          and
+          sum(avg_over_time(mc_meetings_active[10m])) > 0
+          and on()
+          sum(mc_meetings_active) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-keys
+        annotations:
+          summary: "MC leave-triggered KEK rotations exceed the debounce bound"
+          description: "Leave-triggered KEK rotations per active meeting exceed twice 1/W, averaged over 10 minutes. The debounce limits each meeting to one leave rotation per W measured from its oldest un-rotated departure, so this is not reachable while it works: suspect the debounce, not the churn. Flapping clients cost join-path work, not extra leave rotations - read mc_meeting_sender_ids_issued_max for that."
+          impact: "Every rotation pushes a new KEK to every member and makes every sender rotate its transmit keys; a storm multiplies control-plane and client key work across the fleet."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-17-kek-rotation-storm--flapping-participant"
 
       - alert: MCHighWebTransportRejections
         expr: |
@@ -512,6 +656,48 @@ groups:
       # ====================================================================
       # INFO ALERTS - Log only, no notification
       # ====================================================================
+
+      # ------------------------------------------------------------------
+      # ADR-0031 block — MCKekEpochResetOnSenderIdExhaustion (story 2 task 9, R-16)
+      #
+      # REPLACES the retired MCSenderIdSpaceExhausted. That rule's
+      # `sender_id_space_exhausted` join-failure label is never emitted again,
+      # and its "NOT SELF-CLEARING" annotation would now be the OPPOSITE of
+      # true: exhaustion triggers an immediate KEK-epoch reset (new KEK, fresh
+      # namespace excluding every bound id) and the join SUCCEEDS.
+      #
+      # SAME SHAPE as the retired rule — 15m increase, `for: 0m` — whose
+      # reasoning still holds ("the 15m increase window already smooths, the
+      # condition cannot flap"). But the CONCLUSION it drew is inverted: it
+      # argued a `for:` delay "would only postpone paging on an
+      # already-irreversible state". The state is no longer irreversible, which
+      # is exactly why this is INFO and pages nobody. `for: 0m` satisfies the
+      # guard floor via the expr window, not `for:`.
+      #
+      # WHY IT EXISTS AT ALL: 65,536 admissions in one meeting is not reachable
+      # by human churn — it means a flapping client or a scripted join loop.
+      # MC still has no join rate limit and no `jti` replay check
+      # (docs/TODO.md §Media Path Obligations), so this is the trip-wire for
+      # a driven cause. Read mc_meeting_sender_ids_issued_max.
+      #
+      # DEPLOY COUPLING: these rules self-roll (configMapGenerator); the MC
+      # image does not. Retire with-or-after the image, restore with-or-before
+      # any image rollback — a pre-R-16 image under these rules would refuse
+      # admissions at exhaustion with NOTHING firing (mc-deployment.md).
+      # ------------------------------------------------------------------
+      - alert: MCKekEpochResetOnSenderIdExhaustion
+        expr: |
+          increase(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: info
+          service: mc-service
+          component: media-keys
+        annotations:
+          summary: "A meeting exhausted its sender_id namespace and MC reset its KEK epoch"
+          description: "A meeting consumed its 65,536-id sender namespace and MC performed an immediate KEK-epoch reset: a new KEK plus a fresh namespace excluding every bound id. Admission SUCCEEDED; the meeting is recovering on its own. Do NOT end the meeting. Human churn does not reach this: treat it as a possibly DRIVEN cause (a flapping client or a scripted join loop). Identify the meeting from the MC log record 'sender_id namespace exhausted; KEK epoch reset and reissue'."
+          impact: "None to availability. Security-relevant as a signal: one authenticated participant can drive this cheaply because MC has no join rate limit."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-17-kek-rotation-storm--flapping-participant"
 
       - alert: MCHighJoinLatency
         expr: |

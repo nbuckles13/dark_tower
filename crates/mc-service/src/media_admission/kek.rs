@@ -53,6 +53,63 @@ impl std::fmt::Display for KekGenerationFailed {
 
 impl std::error::Error for KekGenerationFailed {}
 
+/// A KEK rotation could not be performed. **The KEK is left unchanged.**
+///
+/// Fail closed, and state the EXPOSURE rather than only the detectability
+/// (story 2 task 9, security F-3): while rotation keeps failing, every departed
+/// participant retains a KEK that opens all current media with no forward
+/// bound. The W bound is **suspended, not delayed**, and the overdue page
+/// (`MCKekRotationOverdue`) is the only control. Terminating the meeting instead
+/// would be a worse denial of service, which is why this retries rather than
+/// ends the meeting.
+///
+/// The two arms have OPPOSITE remedies, which is why they are distinct values
+/// on `mc_meeting_kek_rotation_failures_total{reason}`:
+///
+/// - [`Rng`](Self::Rng) — the system CSPRNG failed. Overwhelmingly the live arm.
+///   Transient in principle; the rotation is retried after W.
+/// - [`GenerationExhausted`](Self::GenerationExhausted) — the `u16` generation
+///   is at its ceiling. Permanent for this meeting actor: the overdue page will
+///   not clear until the meeting ends. Effectively unreachable — at the W floor
+///   of 30 s, 65,535 generations is ~22.7 days of uninterrupted rotation in one
+///   meeting, and the KEK dies with the actor on any restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KekRotationFailed {
+    /// The system CSPRNG failed. No fallback RNG, no default key (ADR-0002).
+    Rng,
+    /// The generation counter is at `u16::MAX`. It never wraps: a wrapped
+    /// generation collides at the client's KEK holder (same generation,
+    /// different bytes), and receivers scope replay state by
+    /// `(kek_generation, sender_id)`, so a wrap would also alias that scope.
+    GenerationExhausted,
+}
+
+impl KekRotationFailed {
+    /// Every variant, in `reason`-label order. The exhaustive `label()` match is
+    /// the compile-time witness; this array must be kept in step with it.
+    pub const ALL: [Self; 2] = [Self::Rng, Self::GenerationExhausted];
+
+    /// Bounded `reason` label for `mc_meeting_kek_rotation_failures_total`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rng => "rng",
+            Self::GenerationExhausted => "generation_exhausted",
+        }
+    }
+}
+
+impl std::fmt::Display for KekRotationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rng => f.write_str("secure random generation failed"),
+            Self::GenerationExhausted => f.write_str("KEK generation counter exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for KekRotationFailed {}
+
 /// A meeting's key-encryption key: AES-256, random, in memory only.
 ///
 /// # Custody
@@ -79,8 +136,12 @@ impl std::error::Error for KekGenerationFailed {}
 /// loss reaches backward across meetings — which is why it is generated rather
 /// than computed. The operational consequence: an MC restart or an ADR-0023
 /// ownership move destroys it, so **every participant needs a fresh join to
-/// obtain the new one**. This story ships no KEK-push message and no re-attach
-/// delivery path; both land with KEK rotation in a later story.
+/// obtain the new one** — which also makes an actor teardown a rotation for
+/// every future joiner.
+///
+/// Within the actor's life the KEK is rotated on leave (debounced to at most
+/// once per W) and on sender-id exhaustion, and pushed to members as
+/// `MeetingKekUpdate` (story 2 task 9, ADR-0036 §4 Rotation).
 #[derive(Debug)]
 pub struct MeetingKek(SecretBox<[u8; MEETING_KEK_BYTES]>);
 
@@ -114,18 +175,26 @@ impl MeetingKek {
 
 /// A meeting's current KEK together with its generation counter.
 ///
-/// Generation starts at **0** and never advances in this story — KEK rotation,
-/// and with it the KEK-epoch reset that would reclaim the `sender_id`
-/// namespace, is deferred. `signaling.proto` states that 0 is a legal first
-/// generation and that the not-provisioned signal is `meeting_kek` not being
-/// exactly 32 bytes; **do not** gate on `kek_generation != 0`, which would give
-/// one field two meanings.
+/// Generation starts at **0** and advances by one on every rotation — leave
+/// (debounced) or sender-id exhaustion (immediate) — and never wraps.
+/// `signaling.proto` states that 0 is a legal first generation and that the
+/// not-provisioned signal is `meeting_kek` not being exactly 32 bytes; **do
+/// not** gate on `kek_generation != 0`, which would give one field two meanings.
 ///
 /// The 65535 ceiling implied by `u16` here is **not** `SenderId`'s 65535. Same
 /// magnitude, different concepts: this is a rotation counter, that is an
-/// allocation bound with a never-recycled-while-a-KEK-is-live invariant. Do not
-/// introduce a shared constant or a shared validation helper — collapsing them
-/// silently loses the allocation invariant.
+/// allocation bound whose invariant is **no id is reissued within one KEK
+/// generation**. Do not introduce a shared constant or a shared validation
+/// helper — collapsing them silently loses the allocation invariant.
+///
+/// That scope is **generation**, not KEK *liveness*, and the difference is
+/// load-bearing (story 2 task 9, security F-7). Receivers retain the previous
+/// generation for `min(W/2, ceiling)`, so a reissued id genuinely coexists with
+/// a still-usable old KEK. A reader who took the invariant as "never recycled
+/// while a KEK is live" and scoped receiver state on KEK liveness would collapse
+/// `(G, X)` and `(G+1, X)` into one bucket during the retention window and
+/// reintroduce the reissued-sender blackout. Retention is WHY the key is the
+/// generation.
 #[derive(Debug)]
 pub struct MeetingKeyState {
     kek: std::sync::Arc<MeetingKek>,
@@ -168,6 +237,62 @@ impl MeetingKeyState {
     pub fn generation(&self) -> u16 {
         self.generation
     }
+
+    /// Replace the KEK with a fresh one from the system CSPRNG and advance the
+    /// generation by one. **Atomic and fail-closed:** on any error the key and
+    /// generation are both left exactly as they were.
+    ///
+    /// The generation is checked BEFORE the RNG is drawn, so an exhausted
+    /// counter never consumes entropy or builds a key it will discard.
+    ///
+    /// # What happens to the old key
+    ///
+    /// The old `Arc<MeetingKek>` handle is dropped here, and `SecretBox`
+    /// zeroizes it when the LAST handle drops. MC keeps no previous-KEK field:
+    /// retention of the prior generation is the client's job (derived there from
+    /// W), and MC performs no retention derivation.
+    ///
+    /// **Stated residual, same register as [`Self::kek`]'s** (story 2 task 9,
+    /// security F-4): "dropped here" is true of the actor, not of every copy. A
+    /// `MeetingKekUpdate` push queued in a participant mailbox before this call
+    /// holds its own `Arc` clone, so that generation's key stays resident until
+    /// the mailbox drains — zeroize is deferred past the rotation, not
+    /// coincident with it. Bounded by mailbox depth.
+    ///
+    /// # Errors
+    ///
+    /// [`KekRotationFailed`] — see its docs for the exposure while it persists.
+    pub fn rotate(&mut self, rng: &SystemRandom) -> Result<(), KekRotationFailed> {
+        let next = self
+            .generation
+            .checked_add(1)
+            .ok_or(KekRotationFailed::GenerationExhausted)?;
+        let kek = MeetingKek::generate(rng).map_err(|_| KekRotationFailed::Rng)?;
+        // Both fallible steps are done; only now is state touched.
+        self.kek = std::sync::Arc::new(kek);
+        self.generation = next;
+        Ok(())
+    }
+
+    /// Key state at an arbitrary generation. **`#[cfg(test)]` ONLY.**
+    ///
+    /// Plain `cfg(test)`, deliberately NOT `feature = "test-seams"` and never a
+    /// production constructor (story 2 task 9, security F-2). A generation seed
+    /// is more dangerous than the sender-id cursor seed: a caller who can set the
+    /// generation can make two DIFFERENT KEKs share one generation, and the
+    /// client's holder cannot tell — its install is idempotent on an
+    /// already-held generation, so it REFUSES the new key and keeps the old one.
+    /// That is a silent downgrade to a KEK a departed participant still holds,
+    /// which is the property rotation exists to remove. `cfg(test)` confines it
+    /// to this crate's own unit tests, which is strictly stronger than a feature
+    /// flag and needs no release guard.
+    #[cfg(test)]
+    pub(crate) fn at_generation(rng: &SystemRandom, generation: u16) -> Self {
+        Self {
+            kek: std::sync::Arc::new(MeetingKek::generate(rng).expect("test CSPRNG")),
+            generation,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +331,59 @@ mod tests {
         let a = MeetingKeyState::generate(&rng).unwrap();
         let b = MeetingKeyState::generate(&rng).unwrap();
         assert_ne!(a.kek().expose(), b.kek().expose());
+    }
+
+    #[test]
+    fn rotate_replaces_the_key_and_advances_the_generation() {
+        let rng = SystemRandom::new();
+        let mut state = MeetingKeyState::generate(&rng).unwrap();
+        let before = *state.kek().expose();
+        state.rotate(&rng).unwrap();
+        assert_eq!(state.generation(), 1);
+        assert_ne!(
+            *state.kek().expose(),
+            before,
+            "a rotation that keeps the bytes is not a rotation"
+        );
+    }
+
+    /// The old handle is released by the rotation: with no other clone alive,
+    /// it is gone, so `SecretBox` has zeroized it. A `Weak` is the only way to
+    /// observe that without holding the key alive yourself.
+    #[test]
+    fn rotate_releases_the_old_key() {
+        let rng = SystemRandom::new();
+        let mut state = MeetingKeyState::generate(&rng).unwrap();
+        let old = std::sync::Arc::downgrade(state.kek());
+        state.rotate(&rng).unwrap();
+        assert!(
+            old.upgrade().is_none(),
+            "MC keeps no previous-KEK copy; retention is the client's"
+        );
+    }
+
+    /// Fail closed at the ceiling, and leave BOTH key and generation untouched.
+    /// Also carries the failure-reason assertion (@test item 6).
+    #[test]
+    fn rotate_fails_closed_at_the_generation_ceiling_and_changes_nothing() {
+        let rng = SystemRandom::new();
+        let mut state = MeetingKeyState::at_generation(&rng, u16::MAX);
+        let before = *state.kek().expose();
+        let err = state.rotate(&rng).unwrap_err();
+        assert_eq!(err, KekRotationFailed::GenerationExhausted);
+        assert_eq!(err.label(), "generation_exhausted");
+        assert_eq!(state.generation(), u16::MAX, "the generation never wraps");
+        assert_eq!(
+            *state.kek().expose(),
+            before,
+            "a failed rotation touches no key"
+        );
+    }
+
+    #[test]
+    fn rotation_failure_labels_are_the_two_documented_values() {
+        let labels: Vec<_> = KekRotationFailed::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels, ["rng", "generation_exhausted"]);
     }
 
     #[test]

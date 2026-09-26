@@ -10,7 +10,7 @@
 //! | Generation | Home | Advances on |
 //! |---|---|---|
 //! | Redis **fencing** generation | `redis/client.rs` (`get_generation()` / `increment_generation()`) | any fenced write, including writes that change no forwarding output |
-//! | `JoinResponse.kek_generation` | `media_admission/kek.rs` | KEK rotation (deferred; always 0 today) |
+//! | `JoinResponse.kek_generation` | `media_admission/kek.rs` | KEK rotation — leave-debounced, or an immediate epoch reset on `sender_id` exhaustion |
 //! | **`policy_generation`** | this module | the forwarding assignment's output actually changing |
 //!
 //! The one that matters is the first. `internal.proto` names the field
@@ -29,9 +29,13 @@ use tokio::sync::RwLock;
 
 /// The generation space for one (meeting, handler) pair is exhausted.
 ///
-/// Terminal for that pair within this process. Modelled on
-/// [`crate::media_admission::SenderIdSpaceExhausted`]: a bounded namespace that
-/// **refuses** rather than wraps or saturates.
+/// Terminal for that pair within this process. Modelled on the `sender_id`
+/// allocator's never-wrap discipline
+/// ([`crate::media_admission::SenderIdSpaceExhausted`]): a bounded namespace
+/// that **refuses** rather than wraps or saturates. The analogy is to that
+/// type's refusal, not to meeting-level terminality — since story 2 R-16 a
+/// meeting recovers from `sender_id` exhaustion with a KEK-epoch reset. This
+/// namespace has no such recovery, and does not need one.
 ///
 /// Saturating at `u64::MAX` would be a silent regression of exactly the kind
 /// this module exists to prevent — a *changed* assignment would carry the

@@ -284,6 +284,7 @@ fn test_config(gc_url: &str) -> Config {
         environment: "development".to_string(),
         max_receive_slots: media.max_receive_slots,
         media_connect_settle_ms: 1500,
+        kek_rotation_debounce_seconds: 60,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
     }
@@ -580,6 +581,7 @@ async fn test_actor_handle_creation() {
         Arc::clone(&controller_metrics),
         master_secret,
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     ));
 
     // Controller should be created without error

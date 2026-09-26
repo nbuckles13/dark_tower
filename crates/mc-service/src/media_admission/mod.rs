@@ -8,7 +8,12 @@
 //! |---|---|---|
 //! | [`kek::MeetingKek`] | secret MC generates and must never let escape | the operator-custody claim becomes false |
 //! | [`identity_key::IdentityPublicKey`] | client-supplied blob, shape-checked before republication | a malformed blob fans out to every roster |
-//! | [`sender_id::SenderId`] | bounded monotonic namespace, never reused | AES-GCM (key, nonce) collision — R-35 |
+//! | [`sender_id::SenderId`] | bounded namespace, never reissued within one KEK generation | AES-GCM (key, nonce) collision — R-35 |
+//!
+//! The KEK and the namespace are held together in [`epoch::AdmissionEpoch`],
+//! because the namespace may be reclaimed only together with a new KEK. The
+//! rotation lifecycle — debounce, vocabularies, fleet gauges, push outcomes —
+//! is [`rotation`].
 //!
 //! # The security floor, stated once for everything below
 //!
@@ -38,13 +43,22 @@
 //! `key_custody=operator` instead.
 
 pub mod binding_response;
+pub mod epoch;
 pub mod identity_key;
 pub mod kek;
+pub mod rotation;
 pub mod sender_id;
 
 pub use binding_response::SenderBindingOutcome;
+pub use epoch::{AdmissionEpoch, AdmitFailed, Admitted, HandedOutBindings};
 pub use identity_key::{IdentityPublicKey, IdentityPublicKeyRejected, IDENTITY_PUBLIC_KEY_BYTES};
-pub use kek::{KekGenerationFailed, MeetingKek, MeetingKeyState, MEETING_KEK_BYTES};
+pub use kek::{
+    KekGenerationFailed, KekRotationFailed, MeetingKek, MeetingKeyState, MEETING_KEK_BYTES,
+};
+pub use rotation::{
+    KekLifecycle, KekPushOutcome, KekRotationDebounce, RotationTrigger,
+    KEK_ROTATION_OVERDUE_MULTIPLIER,
+};
 pub use sender_id::{Allocation, SenderId, SenderIdAllocator, SenderIdSpaceExhausted};
 
 /// Admission fixtures for `src/` unit tests.
@@ -76,5 +90,20 @@ pub(crate) mod fixtures {
     /// A stand-in allocated id. MC allocates a real one at admission.
     pub(crate) fn sample_sender_id() -> SenderId {
         SenderId::from_nonzero(std::num::NonZeroU16::MIN)
+    }
+
+    /// The rotation lifecycle every controller and meeting actor needs.
+    ///
+    /// Takes W from `mc_test_utils::kek`, the suite's single home for the test
+    /// W, and builds the lifecycle HERE. It cannot return
+    /// `mc_test_utils::kek::kek_lifecycle()` directly: `src/` unit tests see a
+    /// second copy of `mc_service` through `mc-test-utils`, so that crate's
+    /// `KekLifecycle` is a different type to this one. A primitive crosses the
+    /// boundary (a plain `u32` here); the struct does not — the same reason `sample_identity_key`
+    /// above takes bytes rather than a key.
+    pub(crate) fn kek_lifecycle() -> std::sync::Arc<super::KekLifecycle> {
+        std::sync::Arc::new(super::KekLifecycle::new(
+            mc_test_utils::kek::TEST_KEK_ROTATION_WINDOW_SECONDS,
+        ))
     }
 }

@@ -633,9 +633,9 @@ histogram_quantile(0.95,
 
 ### Critical Alerts
 
-Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`, `MCMediaGenerationDivergence`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
+Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`, `MCMediaGenerationDivergence`, `MCKekRotationOverdue`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
 
-**That list is complete; the entries below it are not.** Only `MCMediaGenerationDivergence` has a full inventory entry — it landed with its alert, so byte-identical PromQL was applied at authoring time. The other four are **named here and uninventoried**, exactly as in §Media Handler Alerts. The `inventory_expr_drift` guard checks byte-identity for what is inventoried; it does not require that every rule have an entry, so nothing mechanical will report this section incomplete.
+**That list is complete; the entries below it are not.** Only `MCMediaGenerationDivergence` has a full inventory entry — it landed with its alert, so byte-identical PromQL was applied at authoring time. The other five are **named here and uninventoried** (`MCKekRotationOverdue`'s entry, with the two KEK warnings and the info rule that replaced `MCSenderIdSpaceExhausted`, is story 2 task 16's), exactly as in §Media Handler Alerts. The `inventory_expr_drift` guard checks byte-identity for what is inventoried; it does not require that every rule have an entry, so nothing mechanical will report this section incomplete.
 
 #### MCMediaGenerationDivergence
 

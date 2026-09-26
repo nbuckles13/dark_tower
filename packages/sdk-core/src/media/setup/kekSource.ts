@@ -62,7 +62,7 @@
 // member still holds, which is precisely what R-13's rotation-on-KEK-receipt
 // exists to end.
 
-import { MEETING_KEK_BYTES } from '../frame/sframe.js';
+import { MEETING_KEK_BYTES, fixedTimeEqual } from '../frame/sframe.js';
 import { deriveKekRetention, type KekRetentionOutcome } from '../../config/clientConfig.js';
 import type {
   MediaKekInstallRefusal,
@@ -204,27 +204,22 @@ export class RetentionGuard {
     return this.#evaluations;
   }
 
-  /** Check the bound on `held` and fail safe if it is exceeded. */
-  evaluate(held: HeldKek[]): void {
+  /**
+   * Check the bound on `held` and fail safe if it is exceeded.
+   *
+   * @returns the generations the fail-safe DROPPED (empty when the bound held).
+   * Returned rather than swallowed because a generation leaving the holder by ANY
+   * path must be announced: receive-side state scoped to it is discarded on that
+   * announcement, and a silent drop here would leak that scope forever.
+   */
+  evaluate(held: HeldKek[]): readonly number[] {
     this.#evaluations += 1;
-    if (held.length <= MAX_HELD_GENERATIONS) return;
+    if (held.length <= MAX_HELD_GENERATIONS) return [];
     this.#onViolation();
-    for (const excess of held.splice(MAX_HELD_GENERATIONS)) excess.kek.fill(0);
+    const dropped = held.splice(MAX_HELD_GENERATIONS);
+    for (const excess of dropped) excess.kek.fill(0);
+    return dropped.map((d) => d.generation);
   }
-}
-
-/**
- * Compare two KEKs in time independent of where they differ.
- *
- * Both sides are secret, so an early-exit comparison would leak the length of
- * the matching prefix. Lengths are checked first; KEKs are fixed-width, so a
- * length mismatch reveals nothing about either key.
- */
-function sameKeyFixedTime(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  return diff === 0;
 }
 
 /** Construction options for {@link MeetingKekHolder}. */
@@ -281,6 +276,7 @@ export class MeetingKekHolder implements MeetingKekSource, KekWrapSource {
   readonly #held: HeldKek[] = [];
   #expiryTimer: ReturnType<typeof setTimeout> | undefined;
   readonly #listeners = new Set<() => void>();
+  readonly #dropListeners = new Set<(generation: number) => void>();
   readonly #retentionGuard = new RetentionGuard(() => this.#observer?.retentionViolation());
 
   constructor(options: MeetingKekHolderOptions) {
@@ -328,6 +324,26 @@ export class MeetingKekHolder implements MeetingKekSource, KekWrapSource {
   }
 
   /**
+   * Subscribe to "a KEK generation left this holder". Fired SYNCHRONOUSLY, with
+   * the dropped generation, AFTER its KEK is zeroized, from EVERY path that drops
+   * one: the retention timer, the lazy `#expireIfDue` backstop, a demotion
+   * displacing the old previous, and the `RetentionGuard` fail-safe. Not fired by
+   * `clear()` — teardown clears receive-side state itself. Returns the
+   * unsubscribe.
+   *
+   * THE SINGLE SOURCE for which generations are live (story 2 C-3). Receive-side
+   * state scoped to a generation — replay buckets and cached transmit keys — is
+   * DERIVED from this holder and has no lifetime of its own: it is discarded on
+   * this event and nowhere else, so "the holder and the receive path disagree
+   * about which generations are live" is unrepresentable, not merely avoided.
+   * There is no second timer; do not add one.
+   */
+  onGenerationDropped(listener: (generation: number) => void): () => void {
+    this.#dropListeners.add(listener);
+    return () => this.#dropListeners.delete(listener);
+  }
+
+  /**
    * Install a delivered KEK.
    *
    * TAKES A COPY. The caller's buffer is a slice of a decoded protobuf message
@@ -351,7 +367,9 @@ export class MeetingKekHolder implements MeetingKekSource, KekWrapSource {
     } finally {
       // EVERY path, including the refusals and the idempotent redelivery. This
       // is the live call site the violations tripwire depends on.
-      this.#retentionGuard.evaluate(this.#held);
+      for (const dropped of this.#retentionGuard.evaluate(this.#held)) {
+        this.#announceDropped(dropped);
+      }
     }
   }
 
@@ -387,7 +405,7 @@ export class MeetingKekHolder implements MeetingKekSource, KekWrapSource {
     }
 
     if (generation === current.generation) {
-      if (sameKeyFixedTime(kek, current.kek)) {
+      if (fixedTimeEqual(kek, current.kek)) {
         // A reconnect redelivering the current generation. NEVER demotes on
         // equal, never re-arms or extends the previous's retention, never
         // rotates transmit keys.
@@ -502,6 +520,7 @@ export class MeetingKekHolder implements MeetingKekSource, KekWrapSource {
     for (const held of this.#held) held.kek.fill(0);
     this.#held.length = 0;
     this.#listeners.clear();
+    this.#dropListeners.clear();
   }
 
   /**
@@ -516,13 +535,23 @@ export class MeetingKekHolder implements MeetingKekSource, KekWrapSource {
     }
   }
 
-  /** Zeroize and drop the retained previous generation, if any. */
+  /**
+   * Zeroize and drop the retained previous generation, if any, and announce it.
+   *
+   * The ONE drop path for timer expiry, the lazy backstop and demotion alike, so
+   * the announcement cannot be skipped by any of them.
+   */
   #dropPrevious(): void {
     this.#cancelExpiry();
     const previous = this.#held[1];
     if (!previous) return;
     previous.kek.fill(0);
     this.#held.splice(1, 1);
+    this.#announceDropped(previous.generation);
+  }
+
+  #announceDropped(generation: number): void {
+    for (const listener of this.#dropListeners) listener(generation);
   }
 
   #cancelExpiry(): void {

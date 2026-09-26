@@ -60,10 +60,16 @@
 // ---------------------------------------------------------------------------
 //
 // Story 2 R-18. MC never legitimately rebinds a LIVE sender id to a different
-// identity key: a new key always means a new sender id. So a roster update that
-// does is either an MC defect or a cache-poisoning attempt, and the transmit
+// identity key. It DOES reissue a sender id to a new identity after a KEK-epoch
+// reset (R-16) — but only an id whose holder has LEFT, and the old holder's
+// `ParticipantLeft` reaches this client first, so the reissue arrives as a FIRST
+// binding (see `remove()`), not a rebind. A rebind therefore means an MC defect,
+// a cache-poisoning attempt, or a `ParticipantLeft` that MC dropped under
+// outbound backpressure (`try_send`) so the removal never arrived — see
+// `MEDIA_ROSTER_KEY_CHANGES` in `mediaMetrics.ts` for how the three are told
+// apart, and `docs/TODO.md` for the delivery gap. In every case the transmit
 // keys this client unwrapped for that sender under the OLD binding must not keep
-// opening frames. The decision compares the published BYTES (public, so a plain
+// opening frames — and the rebind arm purges exactly what a removal would have. The decision compares the published BYTES (public, so a plain
 // comparison), and it is made SYNCHRONOUSLY at `upsert` entry — before the
 // `importKey` await — so two updates for one sender cannot resolve out of order
 // and let the older key win.
@@ -79,9 +85,13 @@
 // against the old key. An import that fails leaves the entry known-keyless — it
 // never leaves the previous `CryptoKey` in place.
 //
-// Replay state (contexts, bitmaps, generation high-water) is NOT touched by any
-// path in this file: clearing it would permit a rebind-BACK replay, in which an
-// attacker rebinds away and back and replays frames the window had rejected.
+// Replay state (contexts, bitmaps, generation high-water, in EVERY KEK-generation
+// scope) is NOT touched by any path in this file: clearing it would permit a
+// rebind-BACK replay, in which an attacker rebinds away and back and replays
+// frames the window had rejected. A reissued id's new holder is not blocked by
+// that retained state, because it sends under a NEWER KEK generation and replay
+// state is scoped by generation (`ReplayWindow`); the old holder's scope ends
+// when its generation leaves retention, not on any roster event.
 //
 // Forgetting a sender's bytes — `remove()`, or LRU eviction — also invalidates
 // its transmit keys, because afterwards a re-add is indistinguishable from a

@@ -219,22 +219,18 @@ data:
   # Deployment's pod template.) Once MC task 9's image is deployed, never remove
   # this key in the same deploy that removes its read — that is a CrashLoop.
   #
-  # Enforced by: NOTHING in the tree today. MC task 9 adds the required read
-  # (ConfigError::MissingEnvVar) and a both-sides bound at config load; the
-  # bound's figures live in crates/mc-service/src/config.rs, not here. Until
-  # then a missing key is still loud at the Kubernetes layer: both Deployments
+  # Enforced by: mc-service, at config load (ConfigError::MissingEnvVar if
+  # absent; rejects a value outside the bound). The bound's figures and their
+  # derivation live in crates/mc-service/src/config.rs
+  # (MIN_/MAX_KEK_ROTATION_DEBOUNCE_SECONDS), deliberately not restated here.
+  # A missing key is also loud at the Kubernetes layer: both Deployments
   # reference it with a non-optional configMapKeyRef, so a pod without it gets
   # CreateContainerConfigError.
-  # Where an operator sees it: nothing today — see the NOTE below. From task 9:
-  # mc_meeting_kek_rotation_window_seconds (W as the pod loaded it), beside
-  # mc_meeting_kek_generated_total{trigger} and
-  # mc_meeting_kek_rotation_pending_age_seconds.
-  #
-  # NOTE: NO OBSERVABLE EFFECT until MC task 9 lands. Nothing reads this key
-  # yet; tuning it changes nothing and no metric moves. For the same reason
-  # docs/runbooks/mc-deployment.md §Configuration Reference has no row for it
-  # yet: that table's Required column is derived from config.rs, so the row
-  # lands with task 9 (tracked in docs/TODO.md).
+  # Where an operator sees it: mc_meeting_kek_rotation_window_seconds (W as the
+  # pod loaded it — it must equal the value below on every MC pod), beside
+  # mc_meeting_kek_rotation_pending_age_seconds and
+  # mc_meeting_kek_generated_total{trigger}. docs/runbooks/mc-deployment.md
+  # §Configuration Reference carries its row.
   MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"
   # ---- Connect settle window (ADR-0036 §9; story 2 task 20) ----
   # How long MC waits, after the FIRST media-handler connection MH reports for a

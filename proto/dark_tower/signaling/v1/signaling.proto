@@ -425,9 +425,26 @@ message JoinResponse {
   // same KEK at the same nonce — AES-GCM authentication-key recovery, not
   // merely a confidentiality loss (ADR-0036 §4).
   //
-  // Nonce-uniqueness invariants this id participates in: a key id is never
-  // reused under one KEK; generation is monotonic per sender and never reset;
-  // a `sender_id` is never recycled while a KEK is live.
+  // Nonce-uniqueness invariants this id participates in, ALL scoped to one KEK
+  // GENERATION (ADR-0036 §4, amendment 2026-09-26 under "Key identifiers and
+  // stop/start"):
+  //   1. Within one KEK generation a `sender_id` is bound to at most one
+  //      identity, EVER — never reissued in that generation, even after its
+  //      holder leaves. The only path to reissue is MC's sender-id epoch reset
+  //      on namespace exhaustion, which atomically bumps the KEK generation
+  //      and reclaims every id MC cannot show is free — held by a rostered
+  //      member (reconnect-grace members included) OR still bound at a media
+  //      handler (MH releases a binding only on connection close, which can
+  //      outlive roster removal). A later joiner may therefore legitimately receive
+  //      a departed participant's id under a NEWER generation.
+  //   2. Transmit-key generation is monotonic per (KEK generation,
+  //      `sender_id`); a key id is never reused under one KEK.
+  //
+  // NOT "never recycled while a KEK is live": receivers retain the previous
+  // generation for a bounded window, so a reissued id does coexist with a
+  // still-usable old KEK. The scope is the generation, not KEK liveness — and
+  // receiver state must be keyed the same way. That receiver obligation has no
+  // wire representation; it lives in the ADR, not here.
   //
   // This is a PER-MEETING id MC allocates. It is NOT derived from, and NOT, a
   // stable user identity — carrying a durable user id into the media path
@@ -479,9 +496,12 @@ message JoinResponse {
   //
   // Note 65535 here and 65535 on `sender_id` are the same magnitude and
   // DIFFERENT CONCEPTS. Do not share a constant or a validation helper between
-  // them: sender allocation and key rotation are unrelated, and collapsing
-  // them silently loses `sender_id`'s never-recycled-while-a-KEK-is-live
-  // invariant. Same recorded boundary as `AEAD_TAG_BYTES` versus AC's at-rest
+  // them: the two bounds are independent — a sender-id epoch reset DOES
+  // trigger a KEK rotation (so the events are coupled), but the id namespace
+  // and the generation counter exhaust at unrelated rates and mean unrelated
+  // things — and collapsing them silently loses `sender_id`'s
+  // never-reissued-within-one-KEK-generation invariant (`sender_id` above).
+  // Same recorded boundary as `AEAD_TAG_BYTES` versus AC's at-rest
   // storage-envelope tag length.
   //
   // OBSERVABILITY: never a metric label, never a span attribute, and never a
@@ -712,11 +732,11 @@ message ReceiveSlot {
   // signed key id, not the relay region (the reciprocal of the disclaimer on
   // that field). This is NOT `sender_id`'s bound either: that one is an
   // allocation bound
-  // (key-id derived, never recycled while a KEK is live), this one is a
+  // (key-id derived, never reissued within one KEK generation), this one is a
   // validation bound (relay-region derived, per-subscriber, freely reusable
   // across declarations). Do NOT introduce a shared `MAX_16BIT_ID` constant or
   // a shared `validate_16bit_id()` helper — collapsing them silently loses
-  // `sender_id`'s non-recycling invariant.
+  // `sender_id`'s per-generation non-reissue invariant.
   //
   // SECURITY: client-controlled input that MC forwards into the relay-region
   // address space. MC MUST validate the 16-bit range and the server-side slot

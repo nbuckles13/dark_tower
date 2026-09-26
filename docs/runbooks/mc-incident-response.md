@@ -79,7 +79,9 @@ container name, so `kubectl ... deployment/mc-service` fails with
    - [Scenario 15: Media Generation Divergence](#scenario-15-media-generation-divergence)
    - [Scenario 16: Missing Key Material](#scenario-16-missing-key-material)
    - [Heap and Core Dumps Contain Live Meeting KEKs](#heap-and-core-dumps-contain-live-meeting-keks) (unnumbered; read **before** taking any memory capture)
+   - [Scenario 17: KEK Rotation Storm / Flapping Participant](#scenario-17-kek-rotation-storm--flapping-participant)
    - [Scenario 18: A Participant Hears Only Part of the Roster](#scenario-18-a-participant-hears-only-part-of-the-roster)
+   - [Scenario 19: KEK Rotation Stalled](#scenario-19-kek-rotation-stalled)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1059,6 +1061,47 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
 
 11. **`sender_id_space_exhausted`**: The meeting consumed all 65535 per-meeting `sender_id`s and MC
     refused the admission rather than wrapping onto a live id (invariant R-35).
+
+    > **Corrected 2026-09-26 (story 2 task 9, R-16) — sender-id exhaustion is no longer terminal.
+    > DO NOT act on the Fix below: ending the meeting destroys a session that is already
+    > recovering.** MC now performs an immediate KEK-epoch reset and reissues ids from a fresh
+    > namespace, so admission succeeds and the meeting repairs itself. This `error_type` value is
+    > never emitted any more.
+    >
+    > **Six claims below are superseded, and only these six.** (1) that MC "refused the admission" —
+    > it now admits; (2) the **Fix** ("end the meeting… the only remediation", and that the epoch
+    > reset "is deferred with all KEK rotation") — that deferral is closed; (3) "do not attempt to
+    > 'reset' the allocator" — MC now does exactly that, and **live** is the operative word: it
+    > reissues only ids whose holders have already left; (4) "the meeting is permanently broken";
+    > (5) the bare claim "**Ids are never recycled**" — ids ARE now reissued, but only after a reset
+    > that bumps the KEK generation, and **never within one KEK generation**; (6) "**LIFETIME**" in
+    > "cumulative lifetime admissions" — consumption is cumulative **since the last epoch reset**,
+    > which is what `mc_meeting_sender_ids_issued_max` reports; computing headroom over the meeting's
+    > whole life gives a number that gauge never shows. A reader trusting (2) would have
+    > **destroyed a healthy meeting and every participant's session**, and waited for
+    > `MCSenderIdSpaceExhausted`, which is retired (replacement: the info rule
+    > `MCKekEpochResetOnSenderIdExhaustion`).
+    >
+    > **Everything else below stands — including the REASON attached to claim (5).** "Because reusing
+    > one under a live KEK collides two senders on one key id… on one AES-GCM nonce" is still true,
+    > and it is exactly **why the reset is sound**: the reset installs a new KEK, so a reissued id is
+    > never under the KEK its previous holder used. "Consumed by admissions, not concurrent
+    > participants" and "`MC_MAX_PARTICIPANTS` does not bound this" still hold, per epoch.
+    >
+    > **Triage commands changed.** Start with the counter, not the log:
+    > `mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}` is the fail-closed answer to
+    > *whether this happened*. The `"sender_id space exhausted"` record below is no longer emitted,
+    > so for *which meeting* grep `"sender_id namespace"` (with `--tail`, as below), which matches
+    > both the reset — `sender_id namespace exhausted; KEK epoch reset and reissue` — and the one-shot
+    > `sender_id namespace past high watermark`. **That watermark WARN now fires before EACH reset
+    > rather than once before a permanent break**, so it is the closest thing this scenario has to a
+    > pre-event signal. Also read `mc_meeting_sender_ids_issued_max` and
+    > [Scenario 17](#scenario-17-kek-rotation-storm--flapping-participant).
+    >
+    > **The driven/accidental split below still applies**, and so does the security response: a
+    > deliberate namespace burn is still cheap (no join rate limit, no `jti` replay check —
+    > `docs/TODO.md` §Media Path Obligations). What changed is the consequence — a self-repairing
+    > rotation storm rather than a permanently broken meeting. Full rewrite: story 2 task 18.
     - Check: `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id space exhausted"`
       — **`--tail` is required**: with a label selector and no `--tail`, kubectl returns only the
       last 10 lines per pod and this grep silently prints nothing. The JSON record carries
@@ -2055,7 +2098,9 @@ is **the completeness caveat on counter 2**.
 
 ```promql
 sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[5m]))
-# payload_kind ∈ {signaling_raw, participant_update}
+# payload_kind ∈ {signaling_raw, participant_update_joined, participant_update_left, meeting_kek_update}
+# (participant_update split into _joined/_left in story 2 task 9; payload_kind=~"participant_update.*"
+#  recovers the old merged series)
 ```
 
 **`emitted` does not mean the client was told.** `record_send_directive` fires
@@ -2274,9 +2319,30 @@ in the response path, not the apply path.
 
 ### Scenario 16: Missing Key Material
 
-**Alert**: `MCMediaMissingKeyMaterial`
+**Alert**: `MCMediaMissingKeyMaterial`, `MCKekPushFailureRate`
 **Severity**: Warning
 **Runbook Section**: `#scenario-16-missing-key-material`
+
+> **`MCKekPushFailureRate` routes here too** (story 2 task 9). A KEK push that did not reach a member
+> IS missing key material at that client, one hop earlier: the server-side cause of the
+> `no_kek_for_generation` arm below. Split on `mc_meeting_kek_pushes_total{outcome}` first —
+> `dropped_outbound` (the member's outbound channel was full or closed: a slow or wedged client
+> connection), `actor_unavailable` (the participant actor exited: MC Scenario 2), `timed_out` (no
+> answer within 2 s: read `mc_actor_mailbox_depth`, MC Scenario 1). `participant_gone` is benign and
+> is excluded from the alert. This counter is also the **small-denominator** detector that
+> `MCMediaMissingKeyMaterial`'s fleet-wide client ratio cannot be. Security consequence to hold in
+> mind: a member that misses a push does not rotate its own transmit keys, so a departed participant
+> keeps opening that member's media past W.
+>
+> **Do not wait for it to clear: there is NO re-push.** A dropped `MeetingKekUpdate` is counted and
+> never re-sent, and the client has no message to ask for the key again. The member stays on the
+> stale generation until the NEXT rotation's push reaches it, or it rejoins. In a quiet meeting
+> nobody leaves, so that is **indefinitely**. Meanwhile it cannot open frames under the new
+> generation, and once the others' retention of the old generation lapses they drop its media as
+> stale, so it can no longer be heard either. The remedy for an affected member is a page reload,
+> which is a fresh join and carries the current KEK. The durable fix is task-sized and tracked in
+> `docs/TODO.md` §Media Path Obligations, "Control-plane messages that must not be lost ride a
+> droppable channel". The full rotation arm of this scenario is story 2 task 18.
 
 **What this is.** A receiving client is dropping frames because it does not have the key material
 needed to open them. The counter is **client-side**, by design: MH never opens a frame and
@@ -2554,6 +2620,10 @@ remedy; it is half of it.
 
 - The lever is **MC's KEK rotation** (ADR-0036 §4): MC generates a new KEK and pushes it to every
   member over signalling, and senders wrap under the new KEK from then on.
+- **There is no operator-triggered rotation** (story 2 task 9 adds none). MC rotates only on a roster
+  departure — debounced to at most once per W — or on `sender_id` exhaustion. A departure or an
+  exhaustion that happens anyway will rotate the KEK, but you cannot make one happen on demand, so in
+  practice the remedy for a dump-compromised live meeting is the next line.
 - **If rotation cannot be driven for a live meeting, end the meeting.** An unrotated meeting whose
   KEK is in a file on someone's laptop is not a meeting that should continue.
 - A procedure that protects the file and not the meetings is not a procedure.
@@ -2611,6 +2681,51 @@ material to a terminal. The one command above reads two kernel/limit values and 
 ---
 
 ---
+
+### Scenario 17: KEK Rotation Storm / Flapping Participant
+
+**Alert**: `MCKekRotationStorm` (warning), `MCKekEpochResetOnSenderIdExhaustion` (info)
+**Severity**: Warning / Info
+**Runbook Section**: `#scenario-17-kek-rotation-storm--flapping-participant`
+
+> **Minimal section, landed with story 2 task 9 so these alerts' `runbook_url` resolves.** Operations'
+> story 2 task 18 expands it in place under this same heading. The heading is the story's reserved
+> text verbatim, so the anchor does not move.
+
+**Fork FIRST on the `trigger` label** of `mc_meeting_kek_generated_total`: the two rotation triggers
+have different bounds and different causes.
+
+```promql
+sum by(trigger) (rate(mc_meeting_kek_generated_total{trigger!="meeting_created"}[10m]))
+```
+
+- **`participant_left` (`MCKekRotationStorm`)** — leave-triggered rotation is **bounded at one per
+  meeting per W** by the debounce, measured from the oldest un-rotated departure. A rate per active
+  meeting above 1/W is not reachable while the debounce works: **suspect the debounce, not the churn.**
+  Many departures in a busy meeting do NOT raise this — they coalesce (MC Overview → KEK Departures
+  Coalesced per Rotation).
+- **`sender_space_exhausted` (`MCKekEpochResetOnSenderIdExhaustion`)** — immediate and exempt from W,
+  self-limited to once per 65,536 admissions in one meeting. **Human churn does not reach this.** Treat it
+  as a possibly **driven** cause — a flapping client or a scripted join loop — until ruled out; MC has no
+  join rate limit and no `jti` replay check. Identify the meeting from
+  `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id namespace"` (the reset and
+  the high-watermark records share that stem). The meeting is **recovering, not broken — do not end it.**
+
+**Flapper eviction does not ship — a recorded decision, with this residual.** The debounce bounds
+leave-triggered rotation to one per W; exhaustion-triggered rotation is immediate but self-limited to
+once per 65,536 admissions; **nothing bounds a flapping client's join-path cost** — per cycle a roster
+read, a meeting-wide assignment recompute and a control-plane push to MH: O(N) work plus a gRPC call at
+the flapper's rate, with leverage that grows with meeting size (so a two-person test shows nothing).
+**The visibility for it is `mc_meeting_sender_ids_issued_max`** (the maximum across live meetings, not a
+sum, so one meeting near a reset is not hidden). It measures namespace consumption **since the last
+epoch reset**, not admissions, and deliberately has no alert.
+
+**If a reset happened and ONE sender then went inaudible to incumbents only**, suspect a **stale SDK
+bundle** before anything server-side: a pre-story-2 client scopes replay state by `sender_id` alone and
+drops a reissued sender's frames as replays, silently and permanently until the user reloads. No MC
+signal shows it and `MCMediaMissingKeyMaterial` cannot (the frame opens, then is refused as a replay).
+Cross-reference [Scenario 18](#scenario-18-a-participant-hears-only-part-of-the-roster) and
+`mc-deployment.md` §Coordination (SDK before MC).
 
 ### Scenario 18: A Participant Hears Only Part of the Roster
 
@@ -2778,6 +2893,56 @@ edge moved. This is an MC-internal invariant violation: **capture and escalate**
 `handler_not_in_set`; MH Scenario 10 for a broken notification path); `media-handler` + operations
 for (c); client team or `meeting-controller` for (c2) per its fork; per Scenario 15 for (d);
 `meeting-controller` for (e) if it does not self-clear, and for (f).
+
+### Scenario 19: KEK Rotation Stalled
+
+**Alert**: `MCKekRotationOverdue`
+**Severity**: Page
+**Runbook Section**: `#scenario-19-kek-rotation-stalled`
+
+**What this is.** A departed participant still holds a working meeting KEK, and the rotation that should
+have revoked it has not happened. **This is a confidentiality exposure, not a media-quality problem**:
+that departed participant can open every current participant's media in the meeting.
+
+**The page is NOT a leading indicator.** It fires when the oldest un-rotated departure's age exceeds
+twice W for 2 minutes — so when you are paged, the exposure bound W has **already been exceeded by
+roughly 2x**. At the W ceiling (300 s) that is ~12 minutes after the departure.
+
+**Step 1 — confirm the rule, don't re-derive it.** The page compares two gauges MC publishes; read both:
+
+```promql
+max(mc_meeting_kek_rotation_pending_age_seconds)            # oldest un-rotated departure, max across meetings
+max(mc_meeting_kek_rotation_overdue_threshold_seconds)      # W x 2
+max(mc_meeting_kek_rotation_window_seconds)                 # W as this pod loaded it
+```
+
+`mc_meeting_kek_rotation_window_seconds` must equal the ConfigMap's `MC_KEK_ROTATION_DEBOUNCE_SECONDS`
+on every MC pod. A mismatch is a stale ConfigMap or a pod that did not roll (the MC ConfigMap does
+not roll pods on edit) — and for W that is a security fact, since W is the exposure bound.
+
+**Step 2 — fork on whether rotation is failing or not being attempted.**
+
+```promql
+sum by(reason) (increase(mc_meeting_kek_rotation_failures_total[15m]))
+```
+
+1. **`reason="rng"` rising — check this first; it is overwhelmingly the likelier arm.** The system
+   CSPRNG failed. MC fails closed — no key change, no fallback RNG, no default key — and retries after
+   W. The MC log carries `Meeting KEK rotation failed` at ERROR on `mc.kek.lifecycle`. Confirm the page
+   clears after the next retry; if the CSPRNG keeps failing, the pod's entropy source is broken —
+   restart the pod (the KEK dies with the actor, so every future joiner gets a new one) and escalate.
+2. **`reason="generation_exhausted"` — permanent for that meeting, and effectively unreachable.** The
+   meeting's `u16` KEK generation is at its ceiling (~22.7 days of uninterrupted rotation at the W
+   floor, in one meeting that never restarted). MC will never rotate it again; **this page will not
+   clear until that meeting ends.** End the meeting — participants rejoin into a new KEK.
+3. **Neither is moving — the rotation is not being attempted.** Suspect a wedged meeting actor: read
+   `mc_actor_mailbox_depth{actor_type="meeting"}` and MC Scenario 1. Pending age is sampled from times
+   the actors recorded, so a wedged actor keeps ageing here even though it is doing nothing. A pod
+   restart ends the exposure (the KEK dies with the actor) at the cost of every session on the pod.
+
+**Not this scenario:** pushes that fail AFTER a successful rotation do not keep pending age up — it
+clears at rotation. Undelivered pushes are `MCKekPushFailureRate`
+([Scenario 16](#scenario-16-missing-key-material)).
 
 ## Diagnostic Commands
 

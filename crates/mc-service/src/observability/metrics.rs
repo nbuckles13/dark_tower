@@ -91,7 +91,32 @@ fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
                 0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000,
             ],
         )
-        .map_err(|e| format!("Failed to set register meeting buckets: {e}"))
+        .map_err(|e| format!("Failed to set register meeting buckets: {e}"))?
+        // KEK rotation duration: rotate -> last per-recipient outcome. Top
+        // buckets cover the collector's 2s outcome timeout, so a fully
+        // timed-out rotation lands in a real bucket, not +Inf.
+        //
+        // Each KEK histogram gets its OWN matcher on its FULL name: a shared
+        // `mc_meeting_kek` prefix would also catch the coalesced-leaves
+        // histogram, which is a COUNT, not seconds. Spelled `Matcher::Prefix`
+        // of the full name: MC's bucket convention is Prefix-only, a deliberate
+        // decision recorded at `dt-guard`'s `histogram_buckets.rs` (@observability
+        // S2 — no `Matcher::Full`). A prefix equal to the full name matches
+        // exactly that metric, since no other name extends it.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_meeting_kek_rotation_duration_seconds".to_string()),
+            &[
+                0.0005, 0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500,
+            ],
+        )
+        .map_err(|e| format!("Failed to set KEK rotation duration buckets: {e}"))?
+        // Departures folded into one rotation: integer counts, bounded above by
+        // the participant cap.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_meeting_kek_rotation_coalesced_leaves".to_string()),
+            &[1.0, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0],
+        )
+        .map_err(|e| format!("Failed to set KEK coalesced-leaves buckets: {e}"))
 }
 
 // ============================================================================
@@ -990,10 +1015,24 @@ pub fn record_mute_request(outcome: MuteOutcome) {
 //   - **No `key_custody` label.** This is the generic outbound signalling choke
 //     point, not a media-path metric. Fleet-wide `key_custody` rollout is
 //     R-26 / story task 22.
-//   - **The label domain is NOT an exhaustive enum.** `payload_kind` is a
-//     `&'static str` bounded by there being exactly two `try_send` sites in
-//     `actors/participant.rs`, each naming its own constant. A third call site
-//     must add a constant there rather than pass a literal.
+//   - **The label domain is NOT an exhaustive enum**, and its bound is
+//     stated precisely rather than as a convention. `payload_kind` is a
+//     `&'static str` bounded by: (a) one constant per `try_send` site in
+//     `actors/participant.rs` (`signaling_raw`, `meeting_kek_update`); plus (b)
+//     `ParticipantStateUpdate::payload_kind()`'s `Some` arms for the roster
+//     updates, derived beside `encode_participant_update` — the single place
+//     that decides wire-visibility — so making a third update variant
+//     wire-visible FORCES a label decision there instead of inheriting a
+//     call-site literal. A new `try_send` site must add a constant, never pass
+//     a literal.
+//
+//     `participant_update` was SPLIT into `_joined` / `_left` (story 2 task 9)
+//     because a named consumer — the client's R-18 rebind correlation — cannot
+//     do its job with the two merged. The rule is demonstrated consumer need,
+//     NOT message-type taxonomy: `signaling_raw` also spans several message
+//     types and stays merged because nothing needs them apart. The shared
+//     `participant_update` stem keeps `payload_kind=~"participant_update.*"`
+//     recovering the old series.
 //
 // Mirrors the section split in `docs/observability/metrics/mc-service.md`.
 // ============================================================================
@@ -1002,7 +1041,7 @@ pub fn record_mute_request(outcome: MuteOutcome) {
 ///
 /// Metric: `mc_participant_outbound_messages_dropped_total`
 /// Labels: `payload_kind`
-/// Cardinality: bounded by the two `try_send` sites in `actors/participant.rs`
+/// Cardinality: bounded as stated in this section's header
 ///
 /// A full or closed participant outbound channel means the client did not
 /// receive something MC decided to send. Previously WARN-only, which made the
@@ -1185,35 +1224,175 @@ pub fn record_display_name_resolution(outcome: &str) {
 // resolving through this module unchanged.
 pub use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
 
-/// Record that a meeting KEK was generated (one per meeting-actor creation).
+/// Record that a meeting KEK was generated.
 ///
 /// Metric: `mc_meeting_kek_generated_total`
-/// Labels: `key_custody` (single value `operator`; cardinality 1)
+/// Labels: `trigger`, `key_custody`
+/// Cardinality: bounded by `RotationTrigger::ALL`
 ///
-/// KEK ISSUANCE RATE, and the carrier for the `key_custody` label. That is the
-/// whole of what it measures.
+/// KEK issuance rate, split by what caused it. Since story 2 task 9 this is no
+/// longer identically the meeting-creation count: `meeting_created` is one per
+/// meeting actor, `participant_left` is the leave-debounced rotation (at most
+/// one per meeting per W), and `sender_space_exhausted` is the immediate
+/// KEK-epoch reset. The three are never summed into one rate — they have
+/// different bounds and different alerts; see `RotationTrigger` for the alert
+/// partition every value must be classified into.
 ///
-/// **This is NOT a "missing key material" signal, and must not be described as
-/// one.** It increments unconditionally, once per meeting-actor creation, so it
-/// is identically the meeting-creation count — there is no path where the actor
-/// exists and this does not fire. Detecting absent key material would need a
-/// second series to divide by, and MC has no meeting-creation counter
-/// (`mc_meetings_active` is a gauge), so the inference is not computable even in
-/// principle. The real not-provisioned condition is defined on the
-/// join-response side — `signaling.proto`: "the not-provisioned signal is
-/// `meeting_kek` not being exactly 32 bytes" — which is per-join, not per-meeting.
+/// Still **not** a missing-key-material signal: that is defined on the
+/// receiving client (`MCMediaMissingKeyMaterial`).
 ///
-/// Forward-compatible: when KEK rotation lands this counts rotations too and
-/// genuinely diverges from meeting creation.
-///
-/// Emits NO key material, no `meeting_id`, and no `meeting_id_hash` (ADR-0036
-/// §11 bars any meeting identifier on any metric in this design). Which meeting
+/// Emits NO key material, no `meeting_id`, no generation (ADR-0036 §11 — a
+/// per-meeting generation series is a membership-change trace). Which meeting
 /// is answered by the meeting actor's own span.
-pub fn record_meeting_kek_generated() {
-    counter!("mc_meeting_kek_generated_total",
+pub fn record_meeting_kek_generated(trigger: crate::media_admission::RotationTrigger) {
+    counter!(
+        "mc_meeting_kek_generated_total",
+        "trigger" => trigger.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
+}
+
+/// Record one recipient's outcome for one `MeetingKekUpdate`.
+///
+/// Metric: `mc_meeting_kek_pushes_total`
+/// Labels: `outcome`, `key_custody`
+/// Cardinality: bounded by `KekPushOutcome::ALL`
+///
+/// Exactly ONE increment per rostered recipient per rotation, including a
+/// recipient that never answered (`timed_out`) — so the failure ratio's
+/// denominator is complete and `MCKekPushFailureRate` cannot get quieter as
+/// participant actors wedge. `participant_gone` is the only benign value.
+///
+/// This is the only control for a security residual: a member whose push is
+/// not delivered never rotates its own transmit keys, so a departed participant
+/// keeps opening that member's media past W. Participant identity stays on the
+/// span, never here.
+pub fn record_kek_push(outcome: crate::media_admission::KekPushOutcome) {
+    counter!(
+        "mc_meeting_kek_pushes_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record a rotation that could not be performed. The KEK is unchanged.
+///
+/// Metric: `mc_meeting_kek_rotation_failures_total`
+/// Labels: `reason`, `key_custody`
+/// Cardinality: bounded by `KekRotationFailed::ALL`
+///
+/// The two reasons have OPPOSITE remedies, which is the point of the label:
+/// `rng` is transient and retried after W; `generation_exhausted` is permanent
+/// for the meeting and `MCKekRotationOverdue` will not clear until it ends.
+/// While either persists the W bound is SUSPENDED: departed participants keep a
+/// working KEK.
+pub fn record_kek_rotation_failure(reason: crate::media_admission::KekRotationFailed) {
+    counter!(
+        "mc_meeting_kek_rotation_failures_total",
+        "reason" => reason.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record how many departures one leave-triggered rotation covered.
+///
+/// Metric: `mc_meeting_kek_rotation_coalesced_leaves`
+/// Labels: `key_custody`
+///
+/// Unit-last spelling (`_leaves`), since this is the tree's first unitless
+/// histogram. Observed for `participant_left` rotations only.
+pub fn record_kek_rotation_coalesced_leaves(leaves: u32) {
+    histogram!(
+        "mc_meeting_kek_rotation_coalesced_leaves",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .record(f64::from(leaves));
+}
+
+/// Record how long a rotation took to reach every recipient.
+///
+/// Metric: `mc_meeting_kek_rotation_duration_seconds`
+/// Labels: `key_custody`
+///
+/// From the rotation decision to the LAST per-recipient outcome — the window in
+/// which some members already hold the new key and others do not. Bounded by
+/// the collector's outcome timeout, which the top bucket covers.
+pub fn record_kek_rotation_duration(duration: Duration) {
+    histogram!(
+        "mc_meeting_kek_rotation_duration_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Publish W as MC enforces it.
+///
+/// Metric: `mc_meeting_kek_rotation_window_seconds`
+/// Labels: `key_custody`
+///
+/// A config echo set once at boot from the SAME `Duration` the debounce timer
+/// and the wire field use, so the published and enforced W cannot drift.
+pub fn set_kek_rotation_window(window: Duration) {
+    gauge!(
+        "mc_meeting_kek_rotation_window_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(window.as_secs_f64());
+}
+
+/// Publish the overdue threshold, W × the overdue multiplier.
+///
+/// Metric: `mc_meeting_kek_rotation_overdue_threshold_seconds`
+/// Labels: `key_custody`
+///
+/// Exists so `MCKekRotationOverdue` compares two gauges with no arithmetic.
+/// Its label set MUST stay identical to pending age's, or `a > b` matches
+/// nothing and the page silently never fires.
+pub fn set_kek_rotation_overdue_threshold(threshold: Duration) {
+    gauge!(
+        "mc_meeting_kek_rotation_overdue_threshold_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(threshold.as_secs_f64());
+}
+
+/// Publish the age of the oldest un-rotated departure across live meetings.
+///
+/// Metric: `mc_meeting_kek_rotation_pending_age_seconds`
+/// Labels: `key_custody`
+///
+/// A MAXIMUM across live meetings, sampled on a timer from actor-written
+/// `Instant`s — not written by the actors themselves. Last-writer-wins would let
+/// a healthy meeting's 0 erase an overdue one; event-driven writes would go
+/// stale; and sampling what the actors wrote means a wedged actor still ages.
+pub fn set_kek_rotation_pending_age(age: Duration) {
+    gauge!(
+        "mc_meeting_kek_rotation_pending_age_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(age.as_secs_f64());
+}
+
+/// Publish the highest `sender_id` namespace consumption across live meetings.
+///
+/// Metric: `mc_meeting_sender_ids_issued_max`
+/// Labels: `key_custody`
+///
+/// A MAXIMUM, not a sum, so one meeting near a reset is not hidden behind fleet
+/// noise. Measures **cursor consumption in the current epoch, including ids
+/// skipped by an epoch reset's exclusion snapshot** — namespace pressure, NOT a
+/// count of admissions and not comparable to a join count. Resets with each
+/// epoch. Flapper visibility; deliberately no alert on it, because exhaustion
+/// self-repairs.
+pub fn set_sender_ids_issued_max(issued: u32) {
+    gauge!(
+        "mc_meeting_sender_ids_issued_max",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(f64::from(issued));
 }
 
 /// Record whether an admitted joiner published an identity signing key.
@@ -1387,40 +1566,6 @@ const fn slot_actor_type(v: McActorType) -> usize {
     }
 }
 
-/// `mc_participant_leaves_total{reason}` domain; label via `LeaveReason::label`.
-const LEAVE_REASONS: &[LeaveReason] = &[
-    LeaveReason::Voluntary,
-    LeaveReason::Timeout,
-    LeaveReason::Removed,
-    LeaveReason::MeetingEnded,
-];
-
-/// Sole drift control for `LEAVE_REASONS` — see `slot_actor_type` for the rule.
-const fn slot_leave_reason(v: LeaveReason) -> usize {
-    match v {
-        LeaveReason::Voluntary => 0,
-        LeaveReason::Timeout => 1,
-        LeaveReason::Removed => 2,
-        LeaveReason::MeetingEnded => 3,
-    }
-}
-
-/// `mc_participant_disconnects_total{cause}` domain; label via `.label()`.
-const DISCONNECT_CAUSES: &[DisconnectCause] = &[
-    DisconnectCause::ClientClosed,
-    DisconnectCause::ConnectionLost,
-    DisconnectCause::ServerInitiated,
-];
-
-/// Sole drift control for `DISCONNECT_CAUSES` — see `slot_actor_type`.
-const fn slot_disconnect_cause(v: DisconnectCause) -> usize {
-    match v {
-        DisconnectCause::ClientClosed => 0,
-        DisconnectCause::ConnectionLost => 1,
-        DisconnectCause::ServerInitiated => 2,
-    }
-}
-
 /// `mc_media_slot_states_total{slot_state}` domain — all eight wire `SlotState`
 /// variants (label via the pub `slot_state_label`). Proto enum, enumerated
 /// in-domain with a witness so a regen adding a variant fails to compile here.
@@ -1488,8 +1633,6 @@ const fn slot_rejection_reason(v: proto_gen::dark_tower::internal::v1::Rejection
 // lint. No restated variant COUNT here (defers to the exhaustive match).
 const _: () = {
     let _ = slot_actor_type(McActorType::Controller);
-    let _ = slot_leave_reason(LeaveReason::Voluntary);
-    let _ = slot_disconnect_cause(DisconnectCause::ClientClosed);
     let _ = slot_slot_state(proto_gen::dark_tower::signaling::v1::SlotState::Unspecified);
     let _ =
         slot_rejection_reason(proto_gen::dark_tower::internal::v1::RejectionReason::Unspecified);
@@ -1536,7 +1679,6 @@ const JOIN_FAILURE_ERROR_TYPES: &[&str] = &[
     "mc_capacity_exceeded",
     "meeting_capacity_exceeded",
     "identity_key_invalid",
-    "sender_id_space_exhausted",
     "session_binding",
     "conflict",
     "draining",
@@ -1572,11 +1714,15 @@ const ASSIGNMENT_REJECTION_REASONS: &[&str] = &[
     "invalid_request",
     "unspecified",
 ];
-/// `mc_participant_outbound_messages_dropped_total{payload_kind}` — bounded by
-/// the two `try_send` sites in `actors/participant.rs`, each naming its own
-/// const. Emit sites pass those two `&'static str` constants, never a runtime
-/// value.
-const OUTBOUND_PAYLOAD_KINDS: &[&str] = &["signaling_raw", "participant_update"];
+/// `mc_participant_outbound_messages_dropped_total{payload_kind}` — the bound
+/// is stated in the "Participant outbound delivery" section header. Emit sites
+/// pass `&'static str` constants, never a runtime value.
+const OUTBOUND_PAYLOAD_KINDS: &[&str] = &[
+    "signaling_raw",
+    "participant_update_joined",
+    "participant_update_left",
+    "meeting_kek_update",
+];
 /// `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` —
 /// the Layer-2 (ADR-0003) rejection combinations. `grpc_service`/`expected_type`
 /// are fixed literals chosen by the gRPC path at the `grpc/auth_interceptor.rs`
@@ -1671,18 +1817,25 @@ pub fn zero_initialize_counters() {
     for o in SettleOutcome::ALL {
         counter!("mc_media_connect_settles_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    counter!("mc_meeting_kek_generated_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
-        .increment(0);
+    for t in crate::media_admission::RotationTrigger::ALL {
+        counter!("mc_meeting_kek_generated_total", "trigger" => t.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in crate::media_admission::KekPushOutcome::ALL {
+        counter!("mc_meeting_kek_pushes_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for r in crate::media_admission::KekRotationFailed::ALL {
+        counter!("mc_meeting_kek_rotation_failures_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
 
     // --- fieldless domain enums (VARIANTS + witness, label via method) ---
     for a in ACTOR_TYPES {
         counter!("mc_actor_panics_total", "actor_type" => a.as_str()).increment(0);
         counter!("mc_messages_dropped_total", "actor_type" => a.as_str()).increment(0);
     }
-    for r in LEAVE_REASONS {
+    for r in LeaveReason::ALL {
         counter!("mc_participant_leaves_total", "reason" => r.label()).increment(0);
     }
-    for c in DISCONNECT_CAUSES {
+    for c in DisconnectCause::ALL {
         counter!("mc_participant_disconnects_total", "cause" => c.label()).increment(0);
     }
 
@@ -1843,7 +1996,7 @@ mod tests {
         let handle = recorder.handle();
         {
             let _guard = metrics::set_default_local_recorder(&recorder);
-            counter!("mc_meeting_kek_generated_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+            counter!("mc_meeting_kek_generated_total", "trigger" => "meeting_created", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
                 .increment(0);
         }
         assert!(
@@ -1905,7 +2058,6 @@ mod tests {
             McError::TokenAcquisition(String::new()),
             McError::TokenAcquisitionTimeout,
             McError::IdentityKeyInvalid,
-            McError::SenderIdSpaceExhausted,
             McError::MediaPolicyDivergence {
                 outcome: PolicyPushOutcome::ALL[0],
                 applied_generation: 0,
@@ -1922,7 +2074,6 @@ mod tests {
                 | McError::McCapacityExceeded
                 | McError::MeetingCapacityExceeded(_)
                 | McError::IdentityKeyInvalid
-                | McError::SenderIdSpaceExhausted
                 | McError::SessionBinding(_)
                 | McError::Conflict(_)
                 | McError::Draining => true,

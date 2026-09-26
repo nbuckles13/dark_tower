@@ -38,10 +38,16 @@ This ADR establishes **requirements and patterns**. Living documentation is main
 |----------|-------|----------|---------|
 | Service Metrics Catalog | Observability + Service specialists | `docs/observability/metrics/` | Definitive list of all metrics |
 | SLO Definitions | Observability + Operations | `docs/observability/slos.md` | Current SLO targets |
-| Alert Definitions | Operations | `infra/docker/prometheus/rules/` | Prometheus alert rule files (YAML) |
+| Alert Definitions | **Operations — PARTIALLY SUPERSEDED 2026-09-26, see note below** | `infra/docker/prometheus/rules/` | Prometheus alert rule files (YAML) |
 | Runbooks | Operations | `docs/runbooks/` | Operational runbooks (linked from alerts) |
 | Dashboard Specs | Observability | `infra/grafana/dashboards/` | JSON dashboard definitions |
 | Span Catalog | Observability + Service specialists | `docs/observability/spans/` | Per-service span documentation |
+
+> **PARTIALLY SUPERSEDED 2026-09-26 (story 2 task 9) — Alert Definitions row.** [ADR-0031](./adr-0031-service-owned-dashboards-alerts.md) §Ownership split moved **authorship of per-service `<svc>-alerts.yaml` files to the owning service specialist** (ac/gc/mc/mh), with operations as a mandatory cross-cutting *reviewer*. ADR-0031 is authoritative for per-service rule-file authorship; this row is not.
+>
+> **What operations still owns, unchanged**: alert-rule *semantics* — severity routing, runbook linkage, SLO budget impact, annotation hygiene — plus `scripts/guards/simple/validate-alert-rules.sh` (ADR-0031 §Prerequisite guardrails #1) and the adjacent `Runbooks` row. Cross-service and fleet-level rule files are not per-service and are unaffected.
+>
+> **Why this note exists rather than a silent row edit.** ADR-0031 overtook this row without amending it, and the row is only *half* wrong, which is what made it durable: a reader who checks it against reality finds operations genuinely involved in alert rules and stops reading. The observed cost is a real one — during story 2 task 9 the observability and operations reviewers each concluded the other owned `mc-alerts.yaml`, from this row and a downstream index that cited it faithfully, which would have left the rules unwritten while both waited. Cite ADR-0031, not this table, for who *writes* a per-service alert rule.
 
 **Observability Specialist Responsibility**: During code reviews, ensure any changes to metrics, spans, or logging update the corresponding documentation in `docs/observability/`.
 

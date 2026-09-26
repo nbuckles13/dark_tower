@@ -133,6 +133,12 @@ export interface AudioPipelineEventMap {
 export interface PipelineKekSource extends MeetingKekSource, KekWrapSource {
   /** Fires after a NEWER generation became current. Returns the unsubscribe. */
   onCurrentGenerationChanged(listener: () => void): () => void;
+  /**
+   * Fires synchronously when a generation leaves the holder by any path. The
+   * ONLY trigger for discarding receive-side state scoped to it (C-3). Returns
+   * the unsubscribe.
+   */
+  onGenerationDropped(listener: (generation: number) => void): () => void;
 }
 
 /**
@@ -325,10 +331,13 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   }
 
   /**
-   * Drop every transmit key cached for `senderId` (story 2 R-18), zeroizing them.
+   * Drop every transmit key cached for `senderId` (story 2 R-18), in EVERY KEK
+   * generation scope, zeroizing them (@security F-8: an older retained scope
+   * holds the DEPARTED holder's keys).
    *
    * Called when the roster rebinds or forgets that sender. The replay window is
-   * deliberately NOT touched: clearing it would permit a rebind-back replay.
+   * deliberately NOT touched, in any scope: clearing it would permit a
+   * rebind-back replay.
    */
   purgeTransmitKeys(senderId: number): void {
     this.#cache.purgeSender(BigInt(senderId));
@@ -494,6 +503,29 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       this.#firstMedia.clear();
     });
     this.#teardown.register('transmit-keys', () => this.#transmitKeys.clear());
+
+    // C-3 (story 2 R-16): a KEK generation leaving retention takes its replay
+    // scope and its transmit keys with it, TOGETHER, in this one synchronous
+    // listener. Both are DERIVED from the holder, which is authoritative for
+    // which generations are live; they have no lifetime of their own, so the two
+    // cannot disagree with it or with each other. There is no other timer — the
+    // holder's retention timer, its lazy backstop, a demotion and its
+    // `RetentionGuard` fail-safe all arrive here. Subscribed before any datagram
+    // can reach the ingress, so no scope can be created that this does not see.
+    // NOT RE-ENTRANT, STRUCTURALLY (@security). The body is two synchronous map
+    // deletions and nothing else: no await, no emit, no metric, no call back into
+    // the ingress — so although this fires from INSIDE frame processing (the
+    // holder's lazy expiry runs on the receive path's own KEK lookup), it cannot
+    // re-enter `openVerifiedFrame`. Registered exactly ONCE here, so "one
+    // synchronous listener" is a property of this call site rather than of
+    // whatever happens to be subscribed. Keep it that way: anything async or
+    // anything that emits would make the discard interleave with the frame whose
+    // lookup triggered it.
+    const unsubscribeDropped = this.#options.kekSource.onGenerationDropped((generation) => {
+      this.#replay.discardGeneration(generation);
+      this.#cache.discardGeneration(generation);
+    });
+    this.#teardown.register('kek-generation-dropped-listener', unsubscribeDropped);
 
     // Sampled FROM THE START, before any datagram can arrive, so the measurement
     // exists for every session rather than only for lucky ones.

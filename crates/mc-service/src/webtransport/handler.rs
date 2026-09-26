@@ -8,11 +8,39 @@ use proto_gen::dark_tower::signaling::v1::{
 };
 use tracing::debug;
 
-/// Encode a `ParticipantStateUpdate` as a `ServerMessage`.
+/// A roster update encoded for the wire, with the `payload_kind` label it is
+/// counted under if the outbound channel drops it.
+///
+/// The label travels WITH the message deliberately. This function is the single
+/// place that decides which updates are wire-visible, so returning the label
+/// from here means a newly wire-visible variant cannot compile without choosing
+/// one — the difference between a bounded label domain and a convention. The
+/// alternative, a literal at the `try_send` call site, would silently hand every
+/// future variant whatever label happened to be there.
+#[derive(Debug)]
+pub struct EncodedUpdate {
+    /// The encoded message.
+    pub server_message: ServerMessage,
+    /// `mc_participant_outbound_messages_dropped_total{payload_kind}` value.
+    pub payload_kind: &'static str,
+}
+
+/// `payload_kind` for a dropped `ParticipantJoined`.
+pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_JOINED: &str = "participant_update_joined";
+
+/// `payload_kind` for a dropped `ParticipantLeft`. Split from joins (story 2
+/// task 9) because a dropped leave has a consequence a dropped join does not:
+/// the client keeps a stale roster entry and later counts a legitimate
+/// `sender_id` reissue as an R-18 rebind. Non-zero here over a window makes
+/// that explanation SUPPORTED — not confirmed for any single rebind increment,
+/// since this counter is fleet-wide.
+pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT: &str = "participant_update_left";
+
+/// Encode a `ParticipantStateUpdate` for the wire.
 ///
 /// Only `ParticipantJoined` and `ParticipantLeft` are serialized to the wire.
 /// Other variants are logged but return `None`.
-pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<ServerMessage> {
+pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<EncodedUpdate> {
     match update {
         ParticipantStateUpdate::Joined(info) => {
             let participant = Participant {
@@ -47,14 +75,17 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
             // R-57: carry the current server-side trace context to the client on
             // the fan-out broadcast (bounded W3C IDs only).
             let (trace_parent, trace_state) = inject_current_context();
-            Some(ServerMessage {
-                message: Some(server_message::Message::ParticipantJoined(
-                    ParticipantJoined {
-                        participant: Some(participant),
-                    },
-                )),
-                trace_parent,
-                trace_state,
+            Some(EncodedUpdate {
+                payload_kind: PAYLOAD_KIND_PARTICIPANT_UPDATE_JOINED,
+                server_message: ServerMessage {
+                    message: Some(server_message::Message::ParticipantJoined(
+                        ParticipantJoined {
+                            participant: Some(participant),
+                        },
+                    )),
+                    trace_parent,
+                    trace_state,
+                },
             })
         }
         ParticipantStateUpdate::Left {
@@ -68,13 +99,16 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Serv
                 LeaveReason::MeetingEnded => v1::LeaveReason::MeetingEnded,
             };
             let (trace_parent, trace_state) = inject_current_context();
-            Some(ServerMessage {
-                message: Some(server_message::Message::ParticipantLeft(ParticipantLeft {
-                    participant_id: participant_id.clone(),
-                    reason: proto_reason as i32,
-                })),
-                trace_parent,
-                trace_state,
+            Some(EncodedUpdate {
+                payload_kind: PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT,
+                server_message: ServerMessage {
+                    message: Some(server_message::Message::ParticipantLeft(ParticipantLeft {
+                        participant_id: participant_id.clone(),
+                        reason: proto_reason as i32,
+                    })),
+                    trace_parent,
+                    trace_state,
+                },
             })
         }
         ParticipantStateUpdate::MuteChanged { participant_id, .. } => {
@@ -137,7 +171,7 @@ mod tests {
         assert!(result.is_some());
 
         let msg = result.unwrap();
-        match msg.message.unwrap() {
+        match msg.server_message.message.unwrap() {
             server_message::Message::ParticipantJoined(joined) => {
                 let p = joined.participant.unwrap();
                 assert_eq!(p.participant_id, "part-1");
@@ -145,6 +179,25 @@ mod tests {
             }
             other => panic!("Expected ParticipantJoined, got {other:?}"),
         }
+    }
+
+    /// Joins and leaves carry DIFFERENT drop labels. They were one bucket until
+    /// story 2 task 9, which made a dropped leave indistinguishable from a
+    /// dropped join — and only the leave explains a client counting a
+    /// legitimate `sender_id` reissue as an R-18 rebind.
+    #[test]
+    fn joins_and_leaves_are_labelled_apart_for_the_drop_counter() {
+        let joined = encode_participant_update(&ParticipantStateUpdate::Joined(
+            make_participant_info("p", "P"),
+        ))
+        .unwrap();
+        let left = encode_participant_update(&ParticipantStateUpdate::Left {
+            participant_id: "p".to_string(),
+            reason: LeaveReason::Voluntary,
+        })
+        .unwrap();
+        assert_eq!(joined.payload_kind, "participant_update_joined");
+        assert_eq!(left.payload_kind, "participant_update_left");
     }
 
     #[test]
@@ -158,7 +211,7 @@ mod tests {
         assert!(result.is_some());
 
         let msg = result.unwrap();
-        match msg.message.unwrap() {
+        match msg.server_message.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
                 assert_eq!(left.participant_id, "part-2");
                 assert_eq!(left.reason, v1::LeaveReason::Voluntary as i32);
@@ -175,7 +228,7 @@ mod tests {
         };
 
         let msg = encode_participant_update(&update).unwrap();
-        match msg.message.unwrap() {
+        match msg.server_message.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
                 assert_eq!(left.reason, v1::LeaveReason::Timeout as i32);
             }
@@ -191,7 +244,7 @@ mod tests {
         };
 
         let msg = encode_participant_update(&update).unwrap();
-        match msg.message.unwrap() {
+        match msg.server_message.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
                 assert_eq!(left.reason, v1::LeaveReason::Kicked as i32);
             }
@@ -207,7 +260,7 @@ mod tests {
         };
 
         let msg = encode_participant_update(&update).unwrap();
-        match msg.message.unwrap() {
+        match msg.server_message.message.unwrap() {
             server_message::Message::ParticipantLeft(left) => {
                 assert_eq!(left.reason, v1::LeaveReason::MeetingEnded as i32);
             }

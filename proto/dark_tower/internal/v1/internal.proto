@@ -1238,7 +1238,8 @@ message NotifyParticipantConnectedResponse {
   // two-event distinction above is enforced by the type, not by a caller
   // remembering to branch. MC deliberately has NO such constructor: its
   // allocator is the sole production constructor, which is what makes the
-  // never-recycled invariant a property of the type system. THAT ASYMMETRY IS
+  // never-reissued-within-one-KEK-generation invariant (signaling.proto,
+  // `JoinResponse.sender_id`) a property of the type system. THAT ASYMMETRY IS
   // LOAD-BEARING, NOT AN OMISSION -- "harmonizing" the two types by adding the
   // missing constructor is the single edit that would let MC invent an
   // ordinal.

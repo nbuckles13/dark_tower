@@ -447,14 +447,16 @@ pub async fn handle_connection(
     //
     // DELIBERATELY recorded here, at the parse, NOT after the join succeeds —
     // so this counts authenticated join *attempts that passed identity-key
-    // validation*, and a join that later fails on capacity, `sender_id`
-    // exhaustion, Conflict or Draining is still counted. That is the correct
-    // denominator for the question this metric exists to answer, which is a
-    // question about the CLIENT population ("are client builds publishing
-    // keys?"), not about server admission: conditioning it on server capacity
-    // would answer a different question, and it would make the series go dead
-    // during precisely the incident (`sender_id_space_exhausted`) in which an
-    // operator would consult it. `sum()` of this metric therefore does NOT
+    // validation*, and a join that later fails on capacity, Conflict or
+    // Draining is still counted. That is the correct denominator for the
+    // question this metric exists to answer, which is a question about the
+    // CLIENT population ("are client builds publishing keys?"), not about
+    // server admission: conditioning it on server capacity would answer a
+    // different question, and it would make the series go dead during
+    // precisely the capacity incident in which an operator would consult it.
+    // (`sender_id` exhaustion is no longer such an incident — since story 2
+    // R-16 it triggers a KEK-epoch reset and the join succeeds.) `sum()` of
+    // this metric therefore does NOT
     // equal `mc_session_joins_total{status="success"}`; the catalog says so.
     metrics::record_join_identity_key_presence(if identity_public_key.is_some() {
         "present"
@@ -1717,17 +1719,20 @@ fn build_join_response(result: &JoinResult) -> JoinResponse {
         // `crates/proto-gen/build.rs` and the hand-written impl renders this
         // field as a length only.
         meeting_kek: result.meeting_kek.expose().to_vec(),
-        // u16 semantics widened into the proto's uint32. Always 0 in this
-        // story — rotation is deferred. Note 0 is a LEGAL first generation,
-        // not a sentinel: the not-provisioned signal is `meeting_kek` not
-        // being exactly 32 bytes, so never gate on `kek_generation != 0`.
+        // u16 semantics widened into the proto's uint32. The CURRENT
+        // generation, which advances on every rotation. Note 0 is a LEGAL
+        // first generation, not a sentinel: the not-provisioned signal is
+        // `meeting_kek` not being exactly 32 bytes, so never gate on
+        // `kek_generation != 0`.
         kek_generation: u32::from(result.kek_generation),
-        // W. Zero until story-2 task 9 (MC KEK lifecycle) reads
-        // `MC_KEK_ROTATION_DEBOUNCE_SECONDS`. Zero is exactly the contract's
-        // older-MC observable: the client substitutes its floor, counts it
-        // and warns, never hard-fails -- and today there is no rotation for
-        // retention to serve.
-        kek_rotation_debounce_seconds: 0,
+        // W, from the same `Duration` the rotation debounce enforces
+        // (`Config::kek_lifecycle`). The client derives its previous-KEK
+        // retention as `min(W/2, ceiling)` from this, so MC performs no
+        // retention derivation and no retention check — the relationship is
+        // structural. Never 0 from this MC: W is required and bounded at load,
+        // and 0 is reserved as the older-MC observable the client floor-
+        // substitutes on.
+        kek_rotation_debounce_seconds: result.kek_rotation_debounce_seconds,
         correlation_id: result.correlation_id.clone(),
         binding_token: result.binding_token.clone(),
     }
@@ -1855,6 +1860,7 @@ mod tests {
             ActorMetrics::new(),
             ControllerMetrics::new(),
             common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
+            crate::media_admission::fixtures::kek_lifecycle(),
         )
         .expect("system CSPRNG must be available in tests");
         let config = crate::media_signaling::ClientMediaConfig {

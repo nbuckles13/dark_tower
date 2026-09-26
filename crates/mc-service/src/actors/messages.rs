@@ -258,6 +258,18 @@ pub enum MeetingMessage {
         /// Response channel for confirmation.
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
+
+    /// Run the leave-debounced KEK rotation NOW, as if W had elapsed.
+    /// **Test builds only.**
+    ///
+    /// Integration tests must not wait out a real wall-clock W (ADR-0028
+    /// zero-retry): a small real window races the removals it is meant to
+    /// coalesce, so coalescing would hold by timing luck. With
+    /// `MeetingSeams::kek_debounce_manual` the actor never auto-fires, and this
+    /// fires it after the removals are recorded — so coalescing holds
+    /// STRUCTURALLY. Responds `true` iff a rotation was pending and performed.
+    #[cfg(feature = "test-seams")]
+    ForceKekRotation { respond_to: oneshot::Sender<bool> },
 }
 
 /// Messages sent to `ParticipantActor`.
@@ -277,6 +289,22 @@ pub enum ParticipantMessage {
     /// actor can never hold an untruncated field.
     RecordMhStatuses {
         statuses: Vec<(String, BoundedMhStatus)>,
+    },
+
+    /// Deliver a new meeting KEK to this participant's client
+    /// (`MeetingKekUpdate`, ADR-0036 §4 step 6), and report the outcome.
+    ///
+    /// A dedicated variant rather than a `Send { SignalingPayload::Raw }`: the
+    /// KEK travels through the mailbox as a redacting `Arc<MeetingKek>` handle
+    /// and leaves it only at the participant actor's encode. Routing it as a raw
+    /// `Vec<u8>` would put unredacted key bytes in a message type whose `Debug`
+    /// prints its payload, and would count a dropped KEK update as generic
+    /// `signaling_raw`.
+    KekUpdate {
+        push: KekPush,
+        /// Exactly one outcome per recipient; see `KekPushOutcome`. A dropped
+        /// sender is read by the collector as `actor_unavailable`.
+        respond_to: oneshot::Sender<crate::media_admission::KekPushOutcome>,
     },
 
     /// Close the participant actor gracefully.
@@ -421,8 +449,13 @@ pub struct JoinResult {
     /// bytes out with `expose().to_vec()` for the one legitimate egress, and
     /// that copy is not zeroized. See `MeetingKeyState::kek`.
     pub meeting_kek: std::sync::Arc<crate::media_admission::MeetingKek>,
-    /// Generation of `meeting_kek`. Always 0 in this story — rotation deferred.
+    /// Generation of `meeting_kek` — the CURRENT one, which advances on every
+    /// rotation. 0 is a legal first generation, not a sentinel.
     pub kek_generation: u16,
+    /// W, from the same `Duration` the rotation debounce enforces. Filled onto
+    /// `JoinResponse.kek_rotation_debounce_seconds`; the client derives its
+    /// previous-generation retention from it, so MC derives nothing.
+    pub kek_rotation_debounce_seconds: u32,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
     /// The meeting's FROZEN handler set (ADR-0036 §9). `JoinResponse.media_servers`
@@ -450,6 +483,20 @@ pub struct ReconnectResult {
     pub new_binding_token: String,
     /// Current participant list.
     pub participants: Vec<ParticipantInfo>,
+    /// The CURRENT meeting KEK (R-15, ADR-0036 §4 Rotation "Reconnect").
+    ///
+    /// Re-issued WITHOUT a rotation. Required since story 2 task 9, when the
+    /// KEK began to rotate: without it a participant that reconnects inside
+    /// grace after a rotation holds a stale KEK and silently fails to unwrap
+    /// every frame, which reads as a client bug. An `Arc` handle, as on
+    /// `JoinResult`, so the redacting `Debug` and the custody story hold.
+    pub meeting_kek: std::sync::Arc<crate::media_admission::MeetingKek>,
+    /// Generation of `meeting_kek`. The client's install is idempotent on an
+    /// already-held generation, so a reconnect that rotated nothing is a no-op.
+    pub kek_generation: u16,
+    /// W. A reconnecting participant may hold an older generation it still
+    /// needs for in-flight frames, and re-derives its retention from this.
+    pub kek_rotation_debounce_seconds: u32,
 }
 
 /// Information about a participant.
@@ -500,6 +547,22 @@ pub enum ParticipantStatus {
     Reconnecting,
 }
 
+/// One `MeetingKekUpdate`, as it travels to a participant actor.
+///
+/// Derived `Debug` is safe: `MeetingKek`'s own `Debug` redacts through
+/// `SecretBox`, so this renders the handle as `[REDACTED]`. Do not replace the
+/// `Arc<MeetingKek>` with bytes — that is the redaction the derive relies on.
+#[derive(Debug, Clone)]
+pub struct KekPush {
+    /// The new KEK. A handle, never a copy of the bytes.
+    pub kek: std::sync::Arc<crate::media_admission::MeetingKek>,
+    /// Its generation. Log-only, never a label.
+    pub generation: u16,
+    /// W, carried on every update so a long-lived member never runs on a W it
+    /// learned at join after MC's configuration changed.
+    pub kek_rotation_debounce_seconds: u32,
+}
+
 /// State update for a participant (broadcast to other connections).
 #[derive(Debug, Clone)]
 pub enum ParticipantStateUpdate {
@@ -538,6 +601,20 @@ pub enum LeaveReason {
 }
 
 impl LeaveReason {
+    /// Every variant, for zero-initialising `mc_participant_leaves_total`.
+    ///
+    /// The house `label()` + `ALL` idiom, hoisted here from an in-domain
+    /// containment array in `observability/metrics.rs` (docs/TODO.md trigger:
+    /// an MC specialist editing this file). The exhaustive, wildcard-free
+    /// `label()` match below is the witness: a new variant fails to compile
+    /// there, beside this array, and must be added to both.
+    pub const ALL: [Self; 4] = [
+        Self::Voluntary,
+        Self::Timeout,
+        Self::Removed,
+        Self::MeetingEnded,
+    ];
+
     /// Bounded, low-cardinality metric-label form for
     /// `mc_participant_leaves_total{reason}` (exactly 4 values).
     ///
@@ -589,6 +666,15 @@ pub enum DisconnectCause {
 }
 
 impl DisconnectCause {
+    /// Every variant, for zero-initialising `mc_participant_disconnects_total`.
+    /// Same idiom and witness as [`LeaveReason::ALL`]: the wildcard-free
+    /// `label()` match below.
+    pub const ALL: [Self; 3] = [
+        Self::ClientClosed,
+        Self::ConnectionLost,
+        Self::ServerInitiated,
+    ];
+
     /// Encode as a `u8` for the lock-free cause cell.
     #[must_use]
     pub fn as_u8(self) -> u8 {

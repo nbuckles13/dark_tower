@@ -67,15 +67,16 @@ impl Server {
         seed_meeting_with_mh(&self.stack, meeting_id).await;
     }
 
-    /// Create a meeting whose `sender_id` cursor sits at the last issuable id,
-    /// so the NEXT admission is the one that hits the wall.
+    /// Create a meeting whose `sender_id` namespace is already exhausted, so
+    /// the NEXT admission is the one that resets the KEK epoch.
     #[cfg(feature = "test-seams")]
     async fn create_meeting_with_exhausted_sender_ids(&self, meeting_id: &str) {
         self.stack
             .controller_handle
             // `None` cursor == the space is ALREADY exhausted, so the very
-            // next admission is the reject. Seeding at 65535 instead would
-            // succeed once first, which the allocator unit test already covers.
+            // next admission performs the KEK-epoch reset. Seeding at 65535
+            // instead would succeed once first, which the allocator unit test
+            // already covers.
             .create_meeting_with_seams(
                 meeting_id.to_string(),
                 mc_service::actors::MeetingSeams {
@@ -204,6 +205,12 @@ async fn kek_is_generated_at_meeting_create_and_returned_in_join_response() {
         a.kek_generation, 0,
         "first generation is 0, and 0 is legal rather than a not-provisioned sentinel"
     );
+    assert_eq!(
+        a.kek_rotation_debounce_seconds,
+        mc_test_utils::kek::TEST_KEK_ROTATION_WINDOW_SECONDS,
+        "W rides the join response from the SAME value the debounce enforces; 0 would be the \
+         older-MC observable the client floor-substitutes on"
+    );
 
     let (_c2, _s2, _r2, msg_b) = join_keep_open(
         &server.url(),
@@ -221,8 +228,12 @@ async fn kek_is_generated_at_meeting_create_and_returned_in_join_response() {
     );
 }
 
-/// The KEK-issuance counter fires once per meeting-actor creation and carries
-/// `key_custody=operator`.
+/// The KEK-issuance counter fires once per meeting-actor creation, under
+/// `trigger="meeting_created"`, and carries `key_custody=operator`.
+///
+/// Pinned to the trigger since story 2 task 9: the counter now also counts
+/// leave-triggered rotations and epoch resets, and a meeting creation miscounted
+/// as either would corrupt the storm rule's per-meeting rate.
 ///
 /// Asserts the LABEL as much as the count: `key_custody` is a constraint, not a
 /// snapshot, and it exists in place of an end-to-end or zero-trust boolean —
@@ -235,8 +246,13 @@ async fn meeting_kek_generation_is_counted_with_operator_key_custody() {
     server.create_meeting("kek-metric-meeting").await;
 
     snap.counter("mc_meeting_kek_generated_total")
-        .with_labels(&[("key_custody", "operator")])
+        .with_labels(&[("trigger", "meeting_created"), ("key_custody", "operator")])
         .assert_delta(1);
+    for rotation in ["participant_left", "sender_space_exhausted"] {
+        snap.counter("mc_meeting_kek_generated_total")
+            .with_labels(&[("trigger", rotation)])
+            .assert_delta(0);
+    }
 }
 
 // ============================================================================
@@ -563,20 +579,25 @@ async fn roster_carries_the_joiner_identity_public_key_and_sender_id() {
 }
 
 // ============================================================================
-// 5. Exhaustion rejects the admission
+// 5. Exhaustion resets the KEK epoch; the joiner is ADMITTED
 // ============================================================================
 
-/// At the wall MC refuses the admission rather than allocating.
+/// At the wall MC no longer refuses: it rotates the KEK and reissues from a
+/// fresh namespace, over the real WebTransport join path (story 2 R-16).
 ///
-/// A warn-and-continue that still wrapped would silently reissue a live
-/// `sender_id` and produce exactly the key-id collision R-35 exists to prevent.
+/// Rewritten in place from the pre-R-16 `sender_id_exhaustion_rejects_the_admission`,
+/// which asserted a capacity refusal and `error_type="sender_id_space_exhausted"`
+/// — a label MC no longer emits. The actor-level version, with incumbents, a
+/// grace-period member and the frame ordering, is in
+/// `kek_rotation_integration.rs`; this one proves the CLIENT-facing contract:
+/// a `JoinResponse`, not an error, carrying the new generation.
 ///
 /// Uses the `test-seams` cursor seed rather than performing 65535 joins. The
 /// seam is compiled only under a non-default feature and a release build with it
 /// enabled fails to compile.
 #[cfg(feature = "test-seams")]
 #[tokio::test(flavor = "current_thread")]
-async fn sender_id_exhaustion_rejects_the_admission() {
+async fn sender_id_exhaustion_resets_the_epoch_and_admits_the_joiner() {
     let snap = MetricAssertion::snapshot();
     let server = Server::start().await;
     server
@@ -591,27 +612,31 @@ async fn sender_id_exhaustion_rejects_the_admission() {
     )
     .await;
 
-    let err = expect_error(msg);
+    let join = expect_join_response(msg);
     assert_eq!(
-        err.code,
-        v1::ErrorCode::CapacityExceeded as i32,
-        "exhaustion is refused, never wrapped onto a live id"
+        join.sender_id,
+        Some(1),
+        "admitted from the fresh namespace; nobody was bound, so the cursor starts at 1"
     );
     assert_eq!(
-        err.message, "Meeting is at capacity",
-        "byte-identical to an ordinary capacity refusal: a client must not be able to \
-         distinguish namespace exhaustion from a participant cap"
+        join.kek_generation, 1,
+        "the reset always bumps the generation — never a reissue under the old KEK"
     );
+    assert_eq!(join.meeting_kek.len(), MEETING_KEK_BYTES);
 
-    // `record_session_join` fires AFTER the error frame is written, so reading
-    // the response does not guarantee the metric has landed. Bounded window on
+    // `record_session_join` fires AFTER the response frame is written, so reading
+    // it does not guarantee the metric has landed. Bounded window on
     // `current_thread` (the same pattern as
     // `webtransport_accept_loop_integration.rs`), not a race-y bare assert.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Pinned to the FULL label set, not a broader match, so a sibling test
-    // incrementing this counter under `identity_key_invalid` cannot perturb it.
-    snap.counter("mc_session_join_failures_total")
-        .with_labels(&[("error_type", "sender_id_space_exhausted")])
+    snap.counter("mc_meeting_kek_generated_total")
+        .with_labels(&[("trigger", "sender_space_exhausted")])
         .assert_delta(1);
+    snap.counter("mc_session_joins_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
+    snap.counter("mc_session_joins_total")
+        .with_labels(&[("status", "failure")])
+        .assert_delta(0);
 }

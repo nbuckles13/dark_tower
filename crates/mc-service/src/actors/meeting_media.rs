@@ -170,6 +170,15 @@ pub struct MeetingSeams {
     pub sender_id_cursor: Option<Option<std::num::NonZeroU16>>,
     /// Override [`SLOT_VIEW_FLUSH_BATCH`] (e.g. 1, to observe deferral).
     pub slot_view_flush_batch: Option<usize>,
+    /// Where a post-reset allocator's cursor starts, instead of 1. Lets a test
+    /// place a KEK-epoch reset's exclusion snapshot in the cursor's path — the
+    /// only way to exercise "an excluded id is never reissued in its epoch"
+    /// through the real join path without 65,535 joins.
+    pub epoch_reset_cursor: Option<std::num::NonZeroU16>,
+    /// Never auto-fire the leave-debounced rotation; tests drive it with
+    /// `MeetingMessage::ForceKekRotation` once the removals are recorded, so
+    /// coalescing holds structurally instead of racing a real wall-clock W.
+    pub kek_debounce_manual: bool,
 }
 
 /// Which declared participants a structural change may have affected.

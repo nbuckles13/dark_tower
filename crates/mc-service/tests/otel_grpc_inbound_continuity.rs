@@ -91,6 +91,7 @@ async fn start_test_grpc_server() -> TestGrpcServer {
         ControllerMetrics::new(),
         common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     ));
     let svc = McMediaCoordinationService::new(controller);
 

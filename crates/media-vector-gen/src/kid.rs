@@ -44,7 +44,12 @@ pub struct KeyIdParts {
     /// sender-scoped, one byte, and cryptographically bound via the key
     /// derivation.
     pub stream: u64,
-    /// Monotonic per sender across its membership; never reset.
+    /// Monotonic for one holder of `sender_id` across its membership, and never
+    /// reset by that holder. NOT monotonic per `sender_id` across a meeting: a
+    /// reissued id's new holder restarts under a newer KEK generation (ADR-0036
+    /// §4, amendment 2026-09-26), so rely on it only within one
+    /// (KEK generation, `sender_id`) scope. Mirror of
+    /// `packages/sdk-core/src/media/frame/keyId.ts` — keep the two in step.
     pub generation: u64,
 }
 

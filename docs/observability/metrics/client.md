@@ -631,8 +631,10 @@ the comment's reader.
 ### `dt_client_media_key_wrap_outcomes_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
 - **Type**: Counter
-- **Labels**: `outcome` — the two NON-DROPPING wrapped-key outcomes. The frame
-  was ACCEPTED in both cases; neither ever reaches the drop counter.
+- **Labels**: `outcome` — the NON-DROPPING wrapped-key outcomes (no count is
+  restated here: the list below is the operator-facing artifact, and a second
+  encoding of its length only rots). The frame was ACCEPTED in every case; none
+  ever reaches the drop counter.
 - **Permitted values**:
   - `kek_generation_not_held` — the frame's wrap announces a KEK generation this
     receiver does not hold, but a usable transmit key for that key id was already
@@ -644,6 +646,20 @@ the comment's reader.
     under a new KEK rather than rotating, which the format permits and R-13
     exists to end. **A sustained non-zero rate means a non-conforming or
     hostile sender, not rotation lag.**
+  - `wrap_generation_conflict` — the frame's wrap is for a key id whose
+    transmit key is ALREADY cached, and it announces a KEK generation this
+    receiver DOES hold but which is not the generation that key id was
+    unwrapped under. **The refusal is what makes it a conflict rather than an
+    overwrite**: the wrap is not unwrapped and no second cache entry is created
+    (story 2 E-1; ADR-0036 §4 invariant 3), and the frame plays off the cached
+    key. Refused because replay state is scoped by the generation a key id was
+    unwrapped under; moving the key id to the newer generation would let a
+    captured frame without a wrapped key replay into a bucket that never saw
+    it. **Reads zero for R-13-conforming senders** — they rotate to a new key id
+    on every KEK change and structurally cannot reach this outcome. **A sustained
+    non-zero rate means a non-conforming or hostile sender.** Not a
+    reads-zero-forever contract: the format permits the behaviour, and this SDK
+    does not control every sender.
   - `wrap_key_id_mismatch` — the SSoT spelling, carried verbatim from
     `frame-v2.vectors.json` → `vectors[].expected.outcome`. **A rename toward the
     observable is pending under `docs/TODO.md`** (proposed target spelling:
@@ -667,6 +683,37 @@ the comment's reader.
   **The two CANNOT be summed or ratio'd in a single expression**, and the reason
   is the identity above: `received = accepted + sum(drops by reason)` is what
   forces a non-dropping outcome off the drop counter in the first place.
+- **Cross-reference — `kek_generation_not_held` and `wrap_generation_conflict`
+  are two halves of one R-13 non-conformance**: *one condition — a key id
+  already cached, and a wrap announcing a KEK generation other than the one it
+  was unwrapped under — forked purely by receiver state: the announced
+  generation is not held (`kek_generation_not_held`) or held
+  (`wrap_generation_conflict`). In both the wrap is ignored and the frame plays
+  off the cache.* Same cause, same remedy (find the sender that re-wraps instead
+  of rotating).
+  **Unlike the pair above, these two SHOULD be summed**: they are values of the
+  SAME metric under the same label, so
+  `sum(rate(dt_client_media_key_wrap_outcomes_total{outcome=~"kek_generation_not_held|wrap_generation_conflict"}[…]))`
+  is the correct answer to "is a non-conforming re-wrap sender present?", and
+  neither value alone is. The prohibition above does not carry across: that
+  pair spans two metric NAMES, and summing it would break the accepted/dropped
+  identity; this pair lives inside one metric. (`label-taxonomy.md`'s
+  no-cross-metric-aggregation rule for `outcome` concerns metric names, not
+  values within one metric.)
+- **Deliberately NOT alerted** (the non-conforming re-wrap pair; @security,
+  story 2 task 9). Two reasons. **Bounded, self-directed impact**: a sender that
+  re-wraps instead of rotating weakens protection only of media IT authored, and
+  the beneficiary is a departed member who already held the old KEK; it cannot
+  touch another sender's streams, read anything new, or forge — §3's signature
+  still binds every frame to a roster key. **No attribution available**: the
+  media-path label set is closed (`client_version`, `org_id`, `key_custody`), so
+  a firing alert could say only "somewhere in the fleet a sender is not
+  rotating", with no path from the alert to the sender — an alert whose
+  provenance cannot support its own runbook. A low-rate warning on the summed
+  pair was considered (@observability) and overruled on the attribution
+  argument. **The panel and this entry are the whole control.** **Revisit
+  when**: per-sender attribution becomes available to an operator, or either
+  outcome becomes reachable by a frame WITHOUT a valid roster signature.
 
 ### `dt_client_media_downlink_gap_frames_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
@@ -893,9 +940,21 @@ the comment's reader.
 - **Labels**: `outcome` — a per-metric vocabulary, two values that point at
   DIFFERENT fixes and carry DIFFERENT contracts:
   - `rebind` — the live `sender_id` bound to DIFFERENT, well-formed key bytes.
-    MC never legitimately does this (a new key always means a new sender id), so
-    it **reads zero forever** and any increase is an MC defect or an injected
-    roster update.
+    MC never legitimately rebinds a LIVE id. It DOES reissue an id to a new
+    identity after a KEK-epoch reset (story 2 R-16), but only one whose holder
+    has left, and that holder's `ParticipantLeft` normally arrives first, so the
+    reissue is a FIRST binding — not counted. **Near-zero, NOT
+    reads-zero-forever.** A non-zero reading has three causes: an MC defect, an
+    injected roster update, or a `ParticipantLeft` MC dropped under outbound
+    backpressure (roster updates are sent with `try_send`), so this client saw
+    the reissued id bound to a new key with no prior removal.
+    `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`
+    non-zero over the same window makes the third cause **supported**; zero
+    **rules it out**. That counter is fleet-wide and per-mailbox, so it never
+    confirms that any individual increment here was a lost leave. The delivery
+    gap behind the third cause is filed in `docs/TODO.md` (roster removals are
+    droppable). Key hygiene holds on all three: the purge below runs either
+    way.
   - `downgrade` — a present key replaced by an empty, wrong-width or unusable
     one. **NOT zero-forever**: MC publishing an empty key is a documented
     occurrence (see `no_roster_entry` under `dt_client_media_frames_dropped_total`),
@@ -903,8 +962,9 @@ the comment's reader.
     alert contract without firing on a known condition.
 - **Effect**: the sender's cached unwrapped transmit keys are purged (zeroized),
   and the entry is known-keyless until the new key imports, so its frames drop
-  as `no_roster_entry` in that window. **Replay state is retained** — no roster
-  path touches it. Roster-held identity keys are **trust-on-first-use**; this
+  as `no_roster_entry` in that window. The purge spans **every** KEK-generation
+  scope (an older retained scope holds the departed holder's keys). **Replay
+  state is retained** — no roster path touches it, in any scope. Roster-held identity keys are **trust-on-first-use**; this
   counter records a change of binding, it says nothing about which binding is
   authentic.
 

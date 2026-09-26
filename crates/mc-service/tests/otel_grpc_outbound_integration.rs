@@ -183,6 +183,7 @@ fn test_config(gc_url: &str) -> Config {
         // asserts that silently and drifts the moment the ConfigMap moves.
         max_receive_slots: media.max_receive_slots,
         media_connect_settle_ms: 1500,
+        kek_rotation_debounce_seconds: 60,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
     }

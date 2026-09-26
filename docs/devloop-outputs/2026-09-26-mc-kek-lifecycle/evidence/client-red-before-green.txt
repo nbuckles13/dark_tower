@@ -1,0 +1,39 @@
+== 01 SHIPPED receivePath.ts (git HEAD) ==
+ × src/media/frame/__tests__/receivePathIntegration.test.ts > S-1: a reissued sender id after an epoch reset > D1 — ACCEPTS the new holder at transmit generation 0 under the new KEK generation 13ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B2 — a replayed wrapless frame does NOT reach a bucket that never saw it after a cross-generation re-wrap 5ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(i) — a NEW sender s first key id under a newer held generation is cached, not refused 2ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(ii) — the SAME sender rotating to a new key id under a newer held generation is cached, not refused 3ms
+ × src/media/frame/__tests__/receivePathIntegration.test.ts > provenance: a captured frame lands in the bucket that saw it (D2, C7) > C7 — a g frame reordered after the first g+1 frame is ACCEPTED while g is retained 4ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  2 failed | 3 passed | 19 skipped (24)
+== MUTANT scoped_overwrite ==
+ × src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B2 — a replayed wrapless frame does NOT reach a bucket that never saw it after a cross-generation re-wrap 16ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(i) — a NEW sender s first key id under a newer held generation is cached, not refused 3ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(ii) — the SAME sender rotating to a new key id under a newer held generation is cached, not refused 3ms
+ × src/media/frame/__tests__/receivePathIntegration.test.ts > E-1 — the refusal itself > B1 — a cross-generation re-wrap of a cached key id is refused; entry, scope and key untouched; the frame plays 4ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  2 failed | 2 passed | 20 skipped (24)
+== MUTANT m1 ==
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B2 — a replayed wrapless frame does NOT reach a bucket that never saw it after a cross-generation re-wrap 12ms
+ × src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(i) — a NEW sender s first key id under a newer held generation is cached, not refused 5ms
+ × src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(ii) — the SAME sender rotating to a new key id under a newer held generation is cached, not refused 3ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1 — the refusal itself > B1 — a cross-generation re-wrap of a cached key id is refused; entry, scope and key untouched; the frame plays 3ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  2 failed | 2 passed | 20 skipped (24)
+== MUTANT m2 ==
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B2 — a replayed wrapless frame does NOT reach a bucket that never saw it after a cross-generation re-wrap 12ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(i) — a NEW sender s first key id under a newer held generation is cached, not refused 3ms
+ × src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(ii) — the SAME sender rotating to a new key id under a newer held generation is cached, not refused 5ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1 — the refusal itself > B1 — a cross-generation re-wrap of a cached key id is refused; entry, scope and key untouched; the frame plays 3ms
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+      Tests  1 failed | 3 passed | 20 skipped (24)
+== FIXED ==
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > S-1: a reissued sender id after an epoch reset > D1 — ACCEPTS the new holder at transmit generation 0 under the new KEK generation 11ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B2 — a replayed wrapless frame does NOT reach a bucket that never saw it after a cross-generation re-wrap 5ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(i) — a NEW sender s first key id under a newer held generation is cached, not refused 3ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1: one key id resolves to one scope > B1′(ii) — the SAME sender rotating to a new key id under a newer held generation is cached, not refused 4ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > E-1 — the refusal itself > B1 — a cross-generation re-wrap of a cached key id is refused; entry, scope and key untouched; the frame plays 3ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > provenance: a captured frame lands in the bucket that saw it (D2, C7) > C7 — a g frame reordered after the first g+1 frame is ACCEPTED while g is retained 4ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > provenance: a captured frame lands in the bucket that saw it (D2, C7) > C7 twin / D2 — the SAME frame replayed after g+1 began is still replay_detected from g s bucket 3ms
+ ✓ src/media/frame/__tests__/receivePathIntegration.test.ts > provenance: a captured frame lands in the bucket that saw it (D2, C7) > D2 / C7 expired — after g leaves retention the same replay is kek_generation_stale, never a fresh bucket 3ms
+      Tests  8 passed | 16 skipped (24)
