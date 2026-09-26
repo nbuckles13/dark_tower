@@ -53,6 +53,15 @@ Media-path key material, per ADR-0036 §4 and §11. **These are separate items r
 
 Scope: `crates/mc-service/**` production code, plus any construction of a `dark_tower.internal.v1` message anywhere in the tree.
 
+**Emission sites to read with particular care (story 2 task 9 — KEK rotation).** Additive emphasis inside the scope above, not a narrowing of it. Rotation added the only NEW places MC's KEK is created, carried or delivered, and they are exactly where items 12–13 bite:
+
+- `media_admission/kek.rs` — `MeetingKeyState::rotate`, and `media_admission/epoch.rs` — `AdmissionEpoch::admit`'s epoch reset. Both create a KEK; neither may log, format or error with it.
+- The **KEK push path**: `ParticipantMessage::KekUpdate` in `actors/messages.rs` carries the key as a typed redacting `Arc<MeetingKek>` handle (`KekPush`), and `ParticipantActor::handle_kek_update` in `actors/participant.rs` is the ONE place a pushed KEK leaves that handle, straight into a `MeetingKekUpdate` encode. A concrete instance of items 12/13's "judge the value, not the name": **a KEK must never travel as an untyped `SignalingPayload::Raw` `Vec<u8>` through a mailbox.** That enum derives `Debug` over a raw payload, so routing key bytes through it defeats the redacting-wrapper carve-out (item 13) and puts plaintext key bytes one `{:?}` away from a sink (item 12).
+- The **rotation lifecycle log** — `collect_push_outcomes` in `media_admission/rotation.rs` (target `mc.kek.lifecycle`) and `rotation_failed` in `actors/meeting.rs`. It must carry trigger, counts, generation, duration and `key_custody`, and never key bytes, never a participant identifier.
+- **`ReconnectResult`'s KEK handle** (`actors/messages.rs`) — the reconnect re-issue path, a second delivery route beside the join response.
+
+`MeetingKekUpdate` delivered to an admitted client stays on the SAFE list below as §4's delivery mechanism. The join-response path is unchanged.
+
 **Who is entitled to hold what** — the whole check is "did this value reach someone not in this table":
 
 | Material | Entitled holders | Never |

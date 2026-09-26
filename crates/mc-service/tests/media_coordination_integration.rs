@@ -34,6 +34,7 @@ fn make_controller() -> Arc<MeetingControllerActorHandle> {
         ControllerMetrics::new(),
         SecretBox::new(Box::new(vec![0u8; 32])),
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     ))
 }
 

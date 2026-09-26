@@ -72,6 +72,7 @@ fn spawn_meeting(meeting_id: &str) -> (MeetingActorHandle, tokio::task::JoinHand
         ActorMetrics::new(),
         ControllerMetrics::new(),
         SecretBox::new(Box::new(vec![0u8; 32])),
+        mc_test_utils::kek::kek_lifecycle(),
     )
     .expect("system CSPRNG must be available in tests")
 }

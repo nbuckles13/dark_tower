@@ -60,6 +60,9 @@ impl MeetingControllerActorHandle {
     ///   redacted Debug output).
     /// * `policy_generations` - Per-(meeting, handler) `policy_generation`
     ///   registry (ADR-0036 §8). Evicted on meeting teardown.
+    /// * `kek_lifecycle` - W, the overdue threshold and the per-meeting rotation
+    ///   state the KEK fleet gauges sample (ADR-0036 §4). Evicted on meeting
+    ///   teardown, on the same sites as `policy_generations`.
     #[must_use]
     pub fn new(
         mc_id: String,
@@ -67,6 +70,7 @@ impl MeetingControllerActorHandle {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         policy_generations: Arc<PolicyGenerations>,
+        kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(CONTROLLER_CHANNEL_BUFFER);
         let cancel_token = CancellationToken::new();
@@ -79,6 +83,7 @@ impl MeetingControllerActorHandle {
             Arc::clone(&controller_metrics),
             master_secret,
             policy_generations,
+            kek_lifecycle,
         );
 
         tokio::spawn(actor.run());
@@ -309,6 +314,10 @@ pub struct MeetingControllerActor {
     /// Per-(meeting, handler) `policy_generation` registry (ADR-0036 §8).
     /// Cleaned up when meetings are removed, on the same choke point.
     policy_generations: Arc<PolicyGenerations>,
+    /// KEK rotation lifecycle: W, the overdue threshold, and each meeting's
+    /// rotation state for the fleet gauges. Evicted on BOTH teardown paths,
+    /// beside `policy_generations`.
+    kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
 }
 
 impl MeetingControllerActor {
@@ -326,6 +335,12 @@ impl MeetingControllerActor {
     ///   Cleaned up when meetings are removed.
     /// * `policy_generations` - Per-(meeting, handler) `policy_generation`
     ///   registry. Cleaned up when meetings are removed.
+    /// * `kek_lifecycle` - KEK rotation lifecycle. Cleaned up when meetings are
+    ///   removed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor threads the two shared per-meeting registries alongside the actor wiring"
+    )]
     fn new(
         mc_id: String,
         receiver: mpsc::Receiver<ControllerMessage>,
@@ -334,6 +349,7 @@ impl MeetingControllerActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         policy_generations: Arc<PolicyGenerations>,
+        kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
     ) -> Self {
         let mailbox = MailboxMonitor::new(ActorType::Controller, &mc_id);
 
@@ -348,6 +364,7 @@ impl MeetingControllerActor {
             mailbox,
             master_secret,
             policy_generations,
+            kek_lifecycle,
         }
     }
 
@@ -570,6 +587,7 @@ impl MeetingControllerActor {
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.controller_metrics),
                 meeting_secret,
+                Arc::clone(&self.kek_lifecycle),
                 &seams,
             )?,
             None => MeetingActor::spawn(
@@ -578,6 +596,7 @@ impl MeetingControllerActor {
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.controller_metrics),
                 meeting_secret,
+                Arc::clone(&self.kek_lifecycle),
             )?,
         };
         #[cfg(not(feature = "test-seams"))]
@@ -589,6 +608,7 @@ impl MeetingControllerActor {
             Arc::clone(&self.metrics),
             Arc::clone(&self.controller_metrics),
             meeting_secret,
+            Arc::clone(&self.kek_lifecycle),
         )?;
 
         let created_at = chrono::Utc::now().timestamp();
@@ -723,6 +743,9 @@ impl MeetingControllerActor {
                 // generations, or it would restart at 1 mid-meeting and MH would
                 // correctly ignore the push as stale.
                 self.policy_generations.remove_meeting(meeting_id).await;
+                // Same teardown contract: a removed meeting must not pin the KEK
+                // fleet gauges (the actor also evicts itself on a clean exit).
+                self.kek_lifecycle.remove_meeting(meeting_id).await;
 
                 info!(
                     target: "mc.actor.controller",
@@ -898,6 +921,10 @@ impl MeetingControllerActor {
                 // `MhConnectionRegistry`; connectivity now lives in the meeting
                 // actor and is released with it.)
                 self.policy_generations.remove_meeting(&meeting_id).await;
+                // The reaping path is the one that matters most here: a
+                // panicked actor never reaches its own eviction, and a stale
+                // pending age would page forever.
+                self.kek_lifecycle.remove_meeting(&meeting_id).await;
             }
         }
     }
@@ -962,6 +989,7 @@ mod tests {
             ControllerMetrics::new(),
             test_secret(),
             Arc::clone(&generations),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         actor
@@ -1036,6 +1064,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         // Create a meeting
@@ -1062,6 +1091,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         // Create first meeting
@@ -1086,6 +1116,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         let result = handle.get_meeting("nonexistent".to_string()).await;
@@ -1105,6 +1136,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         // Create a meeting
@@ -1133,6 +1165,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         // Get initial status
@@ -1163,6 +1196,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         // Create a meeting
@@ -1192,6 +1226,7 @@ mod tests {
             controller_metrics,
             test_secret(),
             test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
         );
 
         assert!(!handle.is_cancelled());

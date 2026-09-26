@@ -468,3 +468,99 @@ describe('arrivals are counted by source', () => {
     expect(calls.arrived).toEqual(['join_response', 'kek_update']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Story 2 C-3: the ONE generation-dropped event. Receive-side state scoped to a
+// generation (replay buckets, cached transmit keys) is discarded on it and
+// nowhere else, so every path that drops a generation must announce it — once.
+// ---------------------------------------------------------------------------
+
+describe('onGenerationDropped: every drop path announces, exactly once (C1, C2)', () => {
+  function watching() {
+    const r = rig();
+    const dropped: number[] = [];
+    r.holder.onGenerationDropped((g) => dropped.push(g));
+    return { ...r, dropped };
+  }
+
+  it('C2 — NEVER EARLIER: nothing is announced while the previous is retained', () => {
+    const { install, sched, holder, dropped } = watching();
+    install(1, 1);
+    install(2, 2);
+    sched.advance(NOMINAL_RETENTION_MS - 1);
+    expect(dropped).toEqual([]);
+    expect(holder.kekForGeneration(1)).toBeDefined();
+  });
+
+  it('C1 — the retention TIMER announces the generation it drops, after zeroizing it', () => {
+    const { install, sched, holder, dropped } = watching();
+    install(1, 1);
+    install(2, 2);
+    // The holder keeps a COPY; read back the buffer it actually holds.
+    const previous = holder.kekForGeneration(1)!;
+    const seenZeroed: boolean[] = [];
+    holder.onGenerationDropped(() => seenZeroed.push(previous.every((b) => b === 0)));
+    sched.advance(NOMINAL_RETENTION_MS);
+    expect(dropped).toEqual([1]);
+    expect(seenZeroed).toEqual([true]);
+  });
+
+  it('C1 — the LAZY BACKSTOP announces when the timer has not fired, and the late timer does not announce again', () => {
+    // A throttled background tab: the clock moves, the timer does not fire. The
+    // first lookup drops the previous — and must announce, or the receive-side
+    // scope outlives its KEK until the late timer.
+    const { install, sched, holder, dropped } = watching();
+    install(1, 1);
+    install(2, 2);
+    sched.advanceWithoutTimers(NOMINAL_RETENTION_MS);
+    expect(holder.kekForGeneration(1)).toBeUndefined();
+    expect(dropped).toEqual([1]);
+    sched.advance(0);
+    expect(dropped).toEqual([1]);
+  });
+
+  it('C1 — a DEMOTION that displaces the old previous announces it', () => {
+    const { install, dropped } = watching();
+    install(1, 1);
+    install(2, 2);
+    install(3, 3);
+    expect(dropped).toEqual([1]);
+  });
+
+  it('C1 — the RetentionGuard fail-safe REPORTS what it dropped, so the holder can announce it', () => {
+    // The fourth path, and the one most likely to leak a scope: the fail-safe
+    // splices generations out SILENTLY unless its result is forwarded. The
+    // holder's `install` forwards every generation this returns to
+    // `onGenerationDropped`. No honest path over-retains, so the list is
+    // fabricated, exactly as the tripwire's own test does.
+    const held: HeldKek[] = [
+      { generation: 9, kek: key(1) },
+      { generation: 8, kek: key(2), expiresAtMs: 0 },
+      { generation: 7, kek: key(3), expiresAtMs: 0 },
+      { generation: 6, kek: key(4), expiresAtMs: 0 },
+    ];
+    expect(new RetentionGuard(() => {}).evaluate(held)).toEqual([7, 6]);
+    expect(new RetentionGuard(() => {}).evaluate(held)).toEqual([]);
+  });
+
+  it('is NOT announced by clear() — teardown clears receive-side state itself — nor by a same-generation redelivery', () => {
+    const { install, holder, dropped } = watching();
+    install(1, 1);
+    install(2, 2);
+    install(2, 2);
+    holder.clear();
+    expect(dropped).toEqual([]);
+  });
+
+  it('C4 — ONE retention timer per demotion; the event needs no timer of its own', () => {
+    // A parallel expiry path for receive-side state is what C-3 forbids. The
+    // holder's timer is the only one; the pipeline's discard hangs off it.
+    const { install, sched } = watching();
+    install(1, 1);
+    expect(sched.pending).toBe(0);
+    install(2, 2);
+    expect(sched.pending).toBe(1);
+    install(3, 3);
+    expect(sched.pending).toBe(1);
+  });
+});

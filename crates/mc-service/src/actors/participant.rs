@@ -34,15 +34,21 @@ const PARTICIPANT_CHANNEL_BUFFER: usize = 200;
 /// `payload_kind` label for a raw signalling payload dropped on the outbound
 /// channel.
 ///
-/// Two `&'static str` constants rather than an enum: there are exactly two
-/// `try_send` sites in this file and each names its own, so the label domain is
-/// bounded by there being no third call site. If a third arrives, it must add a
-/// constant here rather than pass a literal.
+/// The label domain is bounded two ways, stated precisely in
+/// `observability/metrics.rs`'s "Participant outbound delivery" header: one
+/// constant per `try_send` site here (this one, and
+/// [`OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE`]), plus the roster-update labels that
+/// `webtransport::handler::encode_participant_update` returns WITH each
+/// wire-visible update. A new `try_send` site must add a constant here, never
+/// pass a literal.
 const OUTBOUND_PAYLOAD_SIGNALING_RAW: &str = "signaling_raw";
 
-/// `payload_kind` label for a participant state update dropped on the outbound
-/// channel.
-const OUTBOUND_PAYLOAD_PARTICIPANT_UPDATE: &str = "participant_update";
+/// `payload_kind` label for a `MeetingKekUpdate` dropped on the outbound
+/// channel. Also recorded as `mc_meeting_kek_pushes_total{outcome=
+/// "dropped_outbound"}` — the two count the same event from two angles: this
+/// one as a delivery failure among all outbound traffic, that one as a
+/// rotation that did not reach a member.
+const OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE: &str = "meeting_kek_update";
 
 /// Maximum distinct MH statuses recorded per participant (R-60 security cap).
 ///
@@ -98,6 +104,33 @@ impl ParticipantActorHandle {
             .send(ParticipantMessage::ParticipantUpdate { update })
             .await
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
+    }
+
+    /// Enqueue a `MeetingKekUpdate` for this participant and return the channel
+    /// its outcome will arrive on.
+    ///
+    /// Awaits the mailbox exactly as [`Self::send_update`] does — a KEK push is
+    /// not given a different back-pressure policy from the roster broadcast it
+    /// travels beside.
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the mailbox is closed; the caller records that as
+    /// `actor_unavailable`.
+    pub async fn send_kek_update(
+        &self,
+        push: super::messages::KekPush,
+    ) -> Result<tokio::sync::oneshot::Receiver<crate::media_admission::KekPushOutcome>, McError>
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ParticipantMessage::KekUpdate {
+                push,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        Ok(rx)
     }
 
     /// Record per-MH connection statuses reported by the client (R-60).
@@ -439,6 +472,14 @@ impl ParticipantActor {
                 false
             }
 
+            ParticipantMessage::KekUpdate { push, respond_to } => {
+                let outcome = self.handle_kek_update(&push);
+                // A dropped receiver means the collector already gave up on
+                // us (timed out); nothing further to report.
+                let _ = respond_to.send(outcome);
+                false
+            }
+
             ParticipantMessage::Close { reason } => {
                 self.graceful_close(&reason).await;
                 true
@@ -521,19 +562,73 @@ impl ParticipantActor {
             "Sending participant update to client"
         );
 
-        // Encode to protobuf if it's a wire-visible update
-        if let Some(server_msg) = crate::webtransport::handler::encode_participant_update(&update) {
+        // Encode to protobuf if it's a wire-visible update. The drop label comes
+        // back WITH the encoding, from the one function that decides
+        // wire-visibility, so it can never be a stale call-site literal.
+        if let Some(encoded) = crate::webtransport::handler::encode_participant_update(&update) {
             let dropped = match &self.stream_tx {
                 Some(tx) => {
                     use prost::Message;
-                    let encoded = server_msg.encode_to_vec();
-                    tx.try_send(bytes::Bytes::from(encoded)).is_err()
+                    let bytes = encoded.server_message.encode_to_vec();
+                    tx.try_send(bytes::Bytes::from(bytes)).is_err()
                 }
                 None => false,
             };
             if dropped {
-                self.record_outbound_drop(OUTBOUND_PAYLOAD_PARTICIPANT_UPDATE);
+                self.record_outbound_drop(encoded.payload_kind);
             }
+        }
+    }
+
+    /// Deliver a new meeting KEK to the client, and say whether it got out.
+    ///
+    /// The ONE place in MC where a pushed KEK leaves its `Arc` handle: it is
+    /// copied onto the `MeetingKekUpdate` here and encoded straight into the
+    /// outbound frame. The same stated residual as the join response applies —
+    /// the transient `Vec` and prost's encode buffer are not zeroized; `SecretBox`
+    /// covers the long-lived handle only. Nothing here logs, formats or
+    /// `Debug`-prints the bytes: `MeetingKekUpdate`'s `Debug` is suppressed in
+    /// `proto-gen/build.rs` and hand-written to print a length.
+    fn handle_kek_update(
+        &mut self,
+        push: &super::messages::KekPush,
+    ) -> crate::media_admission::KekPushOutcome {
+        use crate::media_admission::KekPushOutcome;
+        use prost::Message;
+        use proto_gen::dark_tower::signaling::v1::{
+            server_message, MeetingKekUpdate, ServerMessage,
+        };
+
+        // The connection is being torn down. Benign for the same reason as a
+        // grace-period member: a returning participant gets the current KEK.
+        if self.is_closing {
+            return KekPushOutcome::ParticipantGone;
+        }
+        let Some(tx) = &self.stream_tx else {
+            // Nothing wired to send on: the client did not receive it.
+            self.record_outbound_drop(OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE);
+            return KekPushOutcome::DroppedOutbound;
+        };
+        let (trace_parent, trace_state) = crate::webtransport::trace::inject_current_context();
+        let message = ServerMessage {
+            message: Some(server_message::Message::MeetingKekUpdate(
+                MeetingKekUpdate {
+                    meeting_kek: push.kek.expose().to_vec(),
+                    kek_generation: u32::from(push.generation),
+                    kek_rotation_debounce_seconds: push.kek_rotation_debounce_seconds,
+                },
+            )),
+            trace_parent,
+            trace_state,
+        };
+        if tx
+            .try_send(bytes::Bytes::from(message.encode_to_vec()))
+            .is_ok()
+        {
+            KekPushOutcome::Delivered
+        } else {
+            self.record_outbound_drop(OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE);
+            KekPushOutcome::DroppedOutbound
         }
     }
 
@@ -654,10 +749,10 @@ mod tests {
             .with_labels(&[("payload_kind", "signaling_raw")])
             .assert_delta(1);
 
-        // The two payload kinds are separate series; a signalling drop must not
-        // be attributed to a participant update.
+        // The payload kinds are separate series; a signalling drop must not be
+        // attributed to a roster update.
         snap.counter("mc_participant_outbound_messages_dropped_total")
-            .with_labels(&[("payload_kind", "participant_update")])
+            .with_labels(&[("payload_kind", "participant_update_left")])
             .assert_delta(0);
     }
 
@@ -675,11 +770,81 @@ mod tests {
         actor.handle_update(update()).await;
 
         snap.counter("mc_participant_outbound_messages_dropped_total")
-            .with_labels(&[("payload_kind", "participant_update")])
+            .with_labels(&[("payload_kind", "participant_update_left")])
             .assert_delta(1);
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "participant_update_joined")])
+            .assert_delta(0);
         snap.counter("mc_participant_outbound_messages_dropped_total")
             .with_labels(&[("payload_kind", "signaling_raw")])
             .assert_delta(0);
+    }
+
+    fn kek_push() -> super::super::messages::KekPush {
+        let rng = ring::rand::SystemRandom::new();
+        super::super::messages::KekPush {
+            kek: std::sync::Arc::new(crate::media_admission::MeetingKek::generate(&rng).unwrap()),
+            generation: 3,
+            kek_rotation_debounce_seconds: 60,
+        }
+    }
+
+    /// The push reaches the wire as a `MeetingKekUpdate` carrying the KEK,
+    /// its generation and W — the three things the client installs from.
+    #[tokio::test]
+    async fn kek_push_is_delivered_as_a_meeting_kek_update() {
+        use prost::Message;
+        use proto_gen::dark_tower::signaling::v1::{server_message, ServerMessage};
+        let (mut actor, mut rx) = bare_actor_with_stream(1);
+        let push = kek_push();
+        let outcome = actor.handle_kek_update(&push);
+        assert_eq!(outcome, crate::media_admission::KekPushOutcome::Delivered);
+        let frame = rx.try_recv().expect("a frame was sent");
+        let decoded = ServerMessage::decode(frame).unwrap();
+        match decoded.message {
+            Some(server_message::Message::MeetingKekUpdate(u)) => {
+                assert_eq!(u.meeting_kek.as_slice(), push.kek.expose());
+                assert_eq!(u.kek_generation, 3);
+                assert_eq!(u.kek_rotation_debounce_seconds, 60);
+            }
+            other => panic!("expected MeetingKekUpdate, got {other:?}"),
+        }
+    }
+
+    /// `dropped_outbound` driven behaviourally (@test 4): it is the numerator of
+    /// `MCKekPushFailureRate`, and a zero-init render alone would never prove
+    /// the path live. Both counters move, each under its own name.
+    #[tokio::test]
+    async fn a_full_outbound_channel_drops_the_kek_push_and_counts_it_twice_over() {
+        let snap = MetricAssertion::snapshot();
+        let (mut actor, _rx) = bare_actor_with_stream(1);
+        // Fill the one slot with something else first.
+        actor
+            .handle_send(SignalingPayload::Raw {
+                message_type: crate::actors::messages::RAW_SERVER_MESSAGE_TYPE,
+                data: vec![0],
+            })
+            .await;
+        let outcome = actor.handle_kek_update(&kek_push());
+        assert_eq!(
+            outcome,
+            crate::media_admission::KekPushOutcome::DroppedOutbound
+        );
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "meeting_kek_update")])
+            .assert_delta(1);
+    }
+
+    /// A closing connection is benign `participant_gone`, not a failure: a
+    /// returning participant gets the current KEK.
+    #[tokio::test]
+    async fn a_closing_actor_reports_participant_gone() {
+        let (mut actor, _rx) = bare_actor_with_stream(1);
+        actor.is_closing = true;
+        assert_eq!(
+            actor.handle_kek_update(&kek_push()),
+            crate::media_admission::KekPushOutcome::ParticipantGone
+        );
     }
 
     /// Build a bare, un-spawned `ParticipantActor` for directly exercising the

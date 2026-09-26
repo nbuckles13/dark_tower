@@ -303,18 +303,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the controller actor (which evicts them on meeting teardown).
     let policy_generations = Arc::new(mc_service::media_routing::PolicyGenerations::new());
 
+    // KEK rotation lifecycle (ADR-0036 §4 Rotation). Built ONCE from the W
+    // validated at load, then shared: every meeting actor's debounce, the
+    // `kek_rotation_debounce_seconds` wire field and the published window gauge
+    // read W from this one value, so they cannot drift.
+    let kek_lifecycle = Arc::new(config.kek_lifecycle());
+    kek_lifecycle.publish_config_gauges();
+
     let controller_handle = Arc::new(MeetingControllerActorHandle::new(
         config.mc_id.clone(),
         Arc::clone(&actor_metrics),
         Arc::clone(&controller_metrics),
         master_secret,
         Arc::clone(&policy_generations),
+        Arc::clone(&kek_lifecycle),
     ));
     info!("Actor system initialized");
 
     // Create shutdown token as child of controller's token
     // This ensures all tasks are cancelled when the controller shuts down
     let shutdown_token = controller_handle.child_token();
+
+    // KEK fleet gauges: pending age (paged on) and sender-id consumption, each a
+    // MAXIMUM across live meetings. Sampled on a timer from `Instant`s the
+    // actors wrote — not pushed by the actors — so a WEDGED actor still shows a
+    // growing age, which is the case `MCKekRotationOverdue` exists for. The
+    // interval's first tick is immediate, so both gauges read 0 from boot rather
+    // than "No data".
+    let kek_gauge_token = shutdown_token.child_token();
+    let kek_gauge_lifecycle = Arc::clone(&kek_lifecycle);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(
+            mc_service::media_admission::rotation::KEK_GAUGE_REFRESH_INTERVAL,
+        );
+        loop {
+            tokio::select! {
+                () = kek_gauge_token.cancelled() => break,
+                _ = ticker.tick() => kek_gauge_lifecycle.publish_fleet_gauges().await,
+            }
+        }
+    });
 
     // Start health HTTP server (MUST succeed - fail startup if it doesn't)
     // This provides liveness/readiness probes and Prometheus /metrics endpoint

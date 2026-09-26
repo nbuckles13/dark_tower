@@ -244,6 +244,7 @@ pub async fn build_test_stack(keypair_label: &str) -> TestStackHandles {
         controller_metrics,
         master_secret,
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     ));
 
     let mh_store: Arc<MockMhAssignmentStore> = Arc::new(MockMhAssignmentStore::new());

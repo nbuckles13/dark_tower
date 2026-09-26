@@ -563,6 +563,7 @@ async fn test_actor_level_join_success() {
         controller_metrics,
         master_secret,
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     );
 
     controller
@@ -615,6 +616,7 @@ async fn test_actor_level_join_meeting_not_found() {
         controller_metrics,
         master_secret,
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     );
 
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(100);
@@ -665,6 +667,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
         controller_metrics,
         master_secret,
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     );
 
     controller
@@ -752,6 +755,7 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
         controller_metrics,
         master_secret,
         Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
     );
     controller
         .create_meeting("meeting-dn-metric".to_string())

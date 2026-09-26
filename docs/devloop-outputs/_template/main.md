@@ -280,6 +280,7 @@ If this devloop needs to be reverted:
 4. Hard reset (clean revert): `git reset --hard {start_commit}`
 5. For schema changes: rollback requires a forward migration — `git reset` alone is insufficient if migrations were applied
 6. For infrastructure changes: may require `skaffold delete` or `kubectl delete -f` if manifests were applied
+7. **Safe-revert unit** (answer explicitly, even if "the whole commit"): can any part of this diff be reverted or cherry-picked on its own, or does a partial revert reconstruct a state worse than either endpoint (e.g. a security fix split from the change that made it necessary, or a client/server/alert-rule set that must move together)? If partial reverts are unsafe, name the unit and the safe direction. **Answer**: `{the whole commit | <unit + safe direction>}` (This converts silence into a visible unanswered slot; it cannot distinguish a checked answer from a reflexive one.)
 
 ---
 

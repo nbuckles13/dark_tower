@@ -237,10 +237,13 @@ groups:
       # reasoning as the window-derivation comment on
       # `GCMeetingCreationOrgStateInvalid` in gc-alerts.yaml.
       #
-      # `for: 0m` matches MCSenderIdSpaceExhausted and MCActorPanic (mc-alerts.yaml),
-      # the two other any-occurrence rules in this tree: the 15m increase window
-      # supplies the >=30s smoothing the guard requires, and a `for:` delay would
-      # only postpone reporting an already-irreversible fact.
+      # `for: 0m` matches the other any-occurrence rules in this tree,
+      # MCActorPanic and MCKekEpochResetOnSenderIdExhaustion (mc-alerts.yaml), on
+      # ONE shared ground: the 15m increase window supplies the >=30s smoothing
+      # the guard requires. The further argument — a `for:` delay would only
+      # postpone reporting an already-irreversible fact — is THIS rule's own and
+      # is not shared: the MC exhaustion condition is no longer irreversible
+      # (story 2 R-16), which is why that rule is info.
       - alert: MHMediaSenderBindingOutOfRange
         expr: |
           sum(increase(mh_media_session_starts_total{outcome="declined_sender_binding_out_of_range"}[15m])) > 0

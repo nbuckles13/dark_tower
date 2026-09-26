@@ -323,6 +323,22 @@ export function wrapNonce(keyId: Uint8Array): Bytes {
 }
 
 /**
+ * Compare two secret byte strings in time independent of where they differ.
+ *
+ * Both sides are secret (KEKs, transmit keys), so an early-exit comparison would
+ * leak the length of the matching prefix. Lengths are checked first; every
+ * caller compares fixed-width keys, so a length mismatch reveals nothing about
+ * either. The ONE home for this: `setup/kekSource.ts` and this layer's
+ * `TransmitKeyCache` both import it (the dependency runs `setup -> frame`).
+ */
+export function fixedTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return diff === 0;
+}
+
+/**
  * Unwrap a transmit key from a frame's wrapped-key block.
  *
  * ---------------------------------------------------------------------------
@@ -367,8 +383,12 @@ export function wrapNonce(keyId: Uint8Array): Bytes {
  *     Ed25519 signature. ADR-0036 §4, in terms: "MH can neither attach, strip, nor
  *     replay it." MH cannot get a forged wrap into a frame at all, so tag-forgery
  *     capability is unreachable.
- *   * Honest senders cannot cause it, because generation is monotonic per sender
- *     and never reset — the caller obligation below.
+ *   * Honest senders cannot cause it, because an honest key id is unique under
+ *     ONE KEK. That rests on TWO premises together, and neither alone gives it:
+ *     MC binds a `sender_id` to at most one identity, ever, within one KEK
+ *     generation (ADR-0036 §4 invariant 1 — a reissued id always arrives under a
+ *     NEW generation); and a sender's transmit-key generation is monotonic within
+ *     that generation. See the caller obligation below.
  *
  * ** THE DEPENDENCY IS THE LOAD-BEARING PART: this is unexploitable BECAUSE §3's
  * signature covers the publisher region. Weakening that coverage turns this from a
@@ -376,9 +396,18 @@ export function wrapNonce(keyId: Uint8Array): Bytes {
  * conclusion without this clause to a site where it does not hold.
  *
  * CALLER OBLIGATION: never wrap two DIFFERENT transmit keys under the same key
- * id. One transmit key wraps to one ciphertext per key id — byte-identical from
- * frame to frame within a generation — so nonce uniqueness under the KEK reduces
- * to key-id uniqueness, which generation monotonicity gives.
+ * id under the same KEK. One transmit key wraps to one ciphertext per key id —
+ * byte-identical from frame to frame within a generation — so nonce uniqueness
+ * under a KEK reduces to key-id uniqueness UNDER THAT KEK. Transmit-key
+ * generation monotonicity gives that only while a `sender_id` has one holder;
+ * once MC reissues ids (story 2 R-16), it is monotonicity PLUS ADR-0036 §4
+ * invariant 1 (one identity per `sender_id` per KEK generation). Either alone
+ * does not.
+ *
+ * The same key id DOES recur across KEK generations — a reissued id's new holder
+ * starts again at transmit-key generation 0. The nonce repeats, and that is
+ * safe, because the key does not: it is a different KEK, so the `(key, nonce)`
+ * pair differs.
  *
  * @param keyId the RECEIVED 8-byte slice. NOT `(sender, stream, generation)`, and
  * deliberately not reconstructible from them here: a value re-packed from decoded

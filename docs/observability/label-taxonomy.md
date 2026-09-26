@@ -154,6 +154,15 @@ Labels that exist only in one service (e.g., MC's `actor_type`,
 GC's `controller_type`, MH's `grpc_service`) do not need a taxonomy entry,
 but must follow all other rules (snake_case, bounded, no PII).
 
+- **MC's `trigger`** (`mc_meeting_kek_generated_total`, story 2 task 9) — what
+  caused a KEK to be generated: `meeting_created` | `participant_left` |
+  `sender_space_exhausted` (`media_admission::RotationTrigger::ALL`). Recorded
+  here because two neighbours are close enough that a later "cleanup" would
+  reach for them, and both would be wrong: `event_type` is already bound to
+  connect/disconnect event enums in MC and MH (reusing it breaks "one selector
+  means one thing fleet-wide"), and `reason` is reserved for the per-frame
+  media-path drop families and must not acquire a third home.
+
 ---
 
 ## Key custody `[reviewer-only]`

@@ -567,16 +567,119 @@ describe('KEK rotation on the receive side (R-14)', () => {
     r.install(1, 'join_response');
     await r.admit(a);
     await r.assign(a);
-    // ORDER MATTERS, and it is the realistic one: the in-flight pre-rotation
-    // frame reaches the joiner FIRST. Delivered after a newer transmit
-    // generation, it would be `replay_detected` instead — the replay window's
-    // per-(sender, stream) generation high-water runs before the KEK lookup, and
-    // that precedence is correct.
+    // The in-flight pre-rotation frame reaches the joiner first — the realistic
+    // order — but the ORDER NO LONGER DECIDES THE TOKEN: replay state is scoped
+    // by KEK generation, and a frame under a generation this receiver never held
+    // is refused BEFORE any replay state is consulted (story 2 R-16). So it is
+    // `kek_generation_stale` whichever transmit generation arrived first.
     await send(r, a, { transmitGen: 2, kekGen: 0 });
     await send(r, a, { transmitGen: 3, kekGen: 1 });
     await r.drain();
     expect(r.decodedFor(a)).toBe(1);
     expect(r.drops('kek_generation_stale')).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 2 R-16 under (A'): receiver state scoped by (kek_generation, sender_id),
+// through the REAL holder and the pipeline's one generation-dropped listener.
+// Case ids are the devloop plan's ("sdk-core test cases").
+// ---------------------------------------------------------------------------
+
+describe('scoped receiver state, end to end (story 2 R-16, C-3)', () => {
+  it('D1 — a reissued sender id is heard: new identity, same id, new generation, transmit gen 0', async () => {
+    // Red against: the shipped unscoped high-water — the departed holder's
+    // transmit generation 40 deafened the new holder forever (S-1).
+    const { r, a } = await threeSenderMeeting();
+    await send(r, a, { transmitGen: 40, kekGen: 0 });
+    await r.drain();
+    expect(r.decodedFor(a)).toBe(1);
+
+    // The departed holder's ParticipantLeft, then MC's epoch reset (a new
+    // generation), then the new holder's ParticipantJoined on the SAME id.
+    r.roster.remove(a.id);
+    r.install(1);
+    const reissued = await makePeer(a.id, 0xe5, a.slot, a.handler);
+    await r.admit(reissued);
+    await send(r, reissued, { transmitGen: 0, kekGen: 1 });
+    await send(r, reissued, { transmitGen: 0, kekGen: 1 });
+    await r.drain();
+
+    expect(r.decodedFor(reissued)).toBe(2);
+    expect(r.drops('replay_detected')).toBe(0);
+    // A first binding after a removal, not an MC-defect rebind.
+    expect(r.metric('dt_client_media_roster_key_rebinds_total', { outcome: 'rebind' })).toBe(0);
+    expect(r.identityHolds()).toBe(true);
+  });
+
+  it('C3 — at expiry, the scope s replay state AND its transmit keys go together, before replay is consulted', async () => {
+    // Red against: discarding later, or on a separate timer, or only one of
+    // the two. One observation after the holder's timer fires: a REPLAY of an
+    // accepted frame is `kek_generation_stale` (refused before any replay state
+    // — not `replay_detected`), and a wrapless frame under the same key id finds
+    // no transmit key (`no_transmit_key`).
+    const { r, a } = await threeSenderMeeting();
+    const accepted = await send(r, a, { transmitGen: 3, kekGen: 0 });
+    await r.drain();
+    r.install(1);
+    r.sched.advance(RETENTION_MS - 1);
+    // C2, never earlier: still retained, the replay is caught by g's own bucket.
+    r.deliver(a.handler, accepted);
+    await r.drain();
+    expect(r.drops('replay_detected')).toBe(1);
+
+    r.sched.advance(1);
+    r.deliver(a.handler, accepted);
+    await send(r, a, { transmitGen: 3, kekGen: 0, keyBearing: false });
+    await r.drain();
+    expect(r.drops('kek_generation_stale')).toBe(1);
+    expect(r.drops('no_transmit_key')).toBe(1);
+    expect(r.drops('replay_detected')).toBe(1);
+    expect(r.identityHolds()).toBe(true);
+  });
+
+  it('C6 — retention, not LRU, decides cross-generation admission', async () => {
+    // Red against: scope lifetime driven by an LRU over generations, or a
+    // context budget shared across scopes. Flooding the sender's NEW scope far
+    // past its per-scope budget leaves its RETAINED scope intact — the replay is
+    // still caught there — and only the holder's expiry ends it.
+    const { r, a } = await threeSenderMeeting();
+    const accepted = await send(r, a, { transmitGen: 3, kekGen: 0 });
+    await r.drain();
+    r.install(1);
+    const budget = DEFAULT_CLIENT_CONFIG.media.receiverState.maxReplayContextsPerSender;
+    for (let t = 4; t < 4 + budget + 8; t += 1) await send(r, a, { transmitGen: t, kekGen: 1 });
+    await r.drain();
+
+    r.deliver(a.handler, accepted);
+    await r.drain();
+    expect(r.drops('replay_detected')).toBe(1);
+
+    r.sched.advance(RETENTION_MS);
+    r.deliver(a.handler, accepted);
+    await r.drain();
+    expect(r.drops('kek_generation_stale')).toBe(1);
+  });
+
+  it('B6 — the E-1 refusal is COUNTED as wrap_generation_conflict, and is not a drop', async () => {
+    // Red against: the value missing from `ReportableWrapOutcome`, or the refusal
+    // counted as a drop (which would break received = accepted + sum(drops)).
+    const { r, a } = await threeSenderMeeting();
+    r.install(1);
+    // Cached under the retained generation 0...
+    await send(r, a, { transmitGen: 5, kekGen: 0 });
+    await r.drain();
+    const dropsBefore = r.pipeline.frameCounts.framesDropped;
+    // ...then the SAME transmit key re-wrapped under the held current 1.
+    await send(r, a, { transmitGen: 5, kekGen: 1 });
+    await r.drain();
+
+    expect(
+      r.metric('dt_client_media_key_wrap_outcomes_total', { outcome: 'wrap_generation_conflict' }),
+    ).toBe(1);
+    expect(r.pipeline.frameCounts.framesDropped).toBe(dropsBefore);
+    expect(r.decodedFor(a)).toBe(2);
+    expect(r.identityHolds()).toBe(true);
   });
 });
 

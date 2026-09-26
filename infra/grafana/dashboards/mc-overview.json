@@ -3079,7 +3079,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Meeting key-encryption keys generated (ADR-0036 Sec 4), one per meeting-actor creation. Carries key_custody=operator: media is encrypted between clients; MH, transport and storage cannot read it; MC can. That is accepted operator custody, NOT end-to-end and NOT zero-trust. This is KEK issuance rate only. It is NOT a missing-key-material signal: it increments unconditionally, so it is identically the meeting-creation count and cannot move differently in the failure case. Do not alert on its absence.",
+      "description": "Meeting key-encryption keys generated (ADR-0036 Sec 4), split by what caused them. meeting_created is one per meeting actor; participant_left is the leave-debounced rotation (at most one per meeting per W); sender_space_exhausted is the immediate KEK-epoch reset when a meeting's sender_id namespace runs out. Never read the three as one rate: they have different bounds and different alerts (participant_left -> MCKekRotationStorm; sender_space_exhausted -> MCKekEpochResetOnSenderIdExhaustion, info). Carries key_custody=operator: media is encrypted between clients; MH, transport and storage cannot read it; MC can. That is accepted operator custody, NOT end-to-end and NOT zero-trust. NOT a missing-key-material signal; that is the client-side MCMediaMissingKeyMaterial.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3158,13 +3158,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by(key_custody) (increase(mc_meeting_kek_generated_total[$__rate_interval]))",
-          "legendFormat": "{{key_custody}}",
+          "expr": "sum by(trigger) (increase(mc_meeting_kek_generated_total[$__rate_interval]))",
+          "legendFormat": "{{trigger}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Meeting KEK Issuance",
+      "title": "Meeting KEK Issuance by Trigger",
       "type": "timeseries"
     },
     {
@@ -6506,6 +6506,602 @@
         }
       ],
       "title": "Connect Settle Window",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 253
+      },
+      "id": 171,
+      "panels": [],
+      "title": "KEK Lifecycle (ADR-0036 \u00a74 Rotation)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Age of the OLDEST un-rotated departure across live meetings (a MAXIMUM, sampled every 5s from times the meeting actors recorded, so a wedged actor still ages), beside the overdue threshold (W x 2) and W itself. MCKekRotationOverdue pages when pending age exceeds the threshold for 2m. Healthy: a sawtooth that climbs to about W and drops to 0 at each rotation, never reaching the threshold. While pending age is above zero, a departed participant still holds a working KEK: this is a confidentiality exposure window, not a media-quality one. Pending age is cleared AT ROTATION, not when every push succeeds - undelivered pushes are the KEK Push Outcomes panel.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 254
+      },
+      "id": 172,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_kek_rotation_pending_age_seconds)",
+          "legendFormat": "pending age (oldest)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_kek_rotation_overdue_threshold_seconds)",
+          "legendFormat": "overdue threshold",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_kek_rotation_window_seconds)",
+          "legendFormat": "W",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "KEK Rotation Pending Age vs Overdue Threshold",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "One MeetingKekUpdate outcome per rostered recipient per rotation (ADR-0036 Sec 4). delivered = handed to the connection's outbound stream (not a client ack). participant_gone = rostered but no live connection (reconnect grace) - BENIGN, it gets the current KEK on return. dropped_outbound = outbound channel full or closed. actor_unavailable = participant actor exited or its mailbox closed (MCActorPanic territory). timed_out = no answer within 2s (read mc_actor_mailbox_depth; MCHighMailboxDepthCritical territory). Every non-delivered, non-gone push is a security residual: that member never rotates its own transmit keys, so a departed participant keeps opening THAT member's media past W. MCKekPushFailureRate fires on outcome!~\"delivered|participant_gone\" above 1% for 10m.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 254
+      },
+      "id": 173,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(mc_meeting_kek_pushes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KEK Push Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Time from the rotation decision to the LAST per-recipient push outcome - the window in which some members hold the new key and others do not. Bounded above by the 2s outcome timeout, which the top bucket covers. The p99 tail matters most: it is the portion that can overlap the next rotation.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 262
+      },
+      "id": 174,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_meeting_kek_rotation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_meeting_kek_rotation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_meeting_kek_rotation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "KEK Rotation Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "How many roster removals each leave-triggered rotation covered. The debounce is measured from the OLDEST un-rotated departure and never reset by a later one, so a busy meeting coalesces several departures into one rotation per W. Observed for participant_left rotations only.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 262
+      },
+      "id": 175,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_meeting_kek_rotation_coalesced_leaves_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_meeting_kek_rotation_coalesced_leaves_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "KEK Departures Coalesced per Rotation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Rotations that could not be performed; the KEK was left UNCHANGED. Zero is healthy. While this is non-zero every departed participant keeps a working KEK (the W bound is SUSPENDED, not delayed) and MCKekRotationOverdue pages. rng is the live arm (CSPRNG failure, retried after W). generation_exhausted is permanent for the meeting (u16 KEK generation at its ceiling, ~22.7 days of uninterrupted rotation at the W floor) and the page will not clear until the meeting ends.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 270
+      },
+      "id": 176,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(reason) (increase(mc_meeting_kek_rotation_failures_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KEK Rotation Failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The highest sender_id namespace consumption across live meetings, in the CURRENT epoch - cursor consumption including ids skipped by an epoch reset's exclusion snapshot, so NOT a count of admissions and not comparable to a join count. Resets at each epoch. At 65535 MC rotates the KEK and reissues from a fresh namespace (sender_space_exhausted on the issuance panel); the meeting keeps admitting. A high value means a flapping client or a scripted join loop: flapper eviction does not ship, and this is its visibility. Deliberately no alert.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 270
+      },
+      "id": 177,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_sender_ids_issued_max)",
+          "instant": true,
+          "legendFormat": "max consumed",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Sender ID Namespace Consumption (max)",
       "type": "stat"
     }
   ],

@@ -328,6 +328,7 @@ mod tests {
             crate::actors::ControllerMetrics::new(),
             ::common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
             Arc::new(crate::media_routing::PolicyGenerations::new()),
+            crate::media_admission::fixtures::kek_lifecycle(),
         )))
     }
 

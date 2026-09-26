@@ -82,7 +82,14 @@ export interface KeyIdParts {
    * key derivation.
    */
   readonly stream: bigint;
-  /** Monotonic per sender across its membership; never reset. */
+  /**
+   * The transmit-key generation. Monotonic for one HOLDER across its
+   * membership; never reset by that holder. NOT monotonic per `sender_id` across
+   * a meeting: after a KEK-epoch reset MC reissues ids, and a reissued id's new
+   * holder restarts at 0 under a NEW KEK generation (story 2 R-16; ADR-0036 §4
+   * invariant 1). So a receiver may rely on monotonicity only within one
+   * `(kek_generation, sender_id)` scope — see `ReplayWindow`.
+   */
   readonly generation: bigint;
 }
 

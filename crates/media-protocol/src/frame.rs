@@ -608,6 +608,14 @@ impl<'a> MediaFrameView<'a> {
     /// scope: monotonic per **sender**, shared across all of that sender's
     /// streams, never reset. Two counters, two scopes.
     ///
+    /// "Sender" in both counters means one **holder** of a `sender_id` — not
+    /// the `sender_id` across a meeting's life. After a sender-id epoch reset
+    /// a departed holder's id may be reissued under a NEWER KEK generation, and
+    /// the new holder's counters start afresh (ADR-0036 §4, amendment
+    /// 2026-09-26). Nonce uniqueness is unaffected — the new holder's transmit
+    /// keys are its own — but a receiver may rely on either counter's
+    /// monotonicity only within one (KEK generation, `sender_id`) scope.
+    ///
     /// Resetting the sequence at a generation bump is §2's forbidden
     /// silent-nonce-repeat path. Under AES-GCM a repeated (key, nonce) pair
     /// does not merely expose two frames: it leaks the authentication subkey

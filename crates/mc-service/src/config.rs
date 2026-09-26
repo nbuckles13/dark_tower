@@ -86,6 +86,24 @@ pub const MIN_MEDIA_CONNECT_SETTLE_MS: u64 = 100;
 /// healthy connect gap and still a bounded wait.
 pub const MAX_MEDIA_CONNECT_SETTLE_MS: u64 = 10_000;
 
+/// Smallest legal `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (W).
+///
+/// The floor is set by the CLIENT, not by MC: the client derives its
+/// previous-KEK retention as `min(W/2, ceiling)`, and that retention must
+/// exceed its own transmit-key re-wrap latency or frames from senders that have
+/// not yet re-wrapped are dropped at every rotation. At the client's floor of
+/// 10 s (`KEK_RETENTION_FLOOR_MS` in sdk-core), W/2 ≥ 15 s keeps a margin.
+/// Security's Gate-1 input (story 2, recorded in `docs/TODO.md`).
+pub const MIN_KEK_ROTATION_DEBOUNCE_SECONDS: u32 = 30;
+
+/// Largest legal `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (W).
+///
+/// W IS the exposure bound on a departed participant (story 2 R-12, plus one
+/// transmit-key interval per R-13): the timer here is unclamped, so an
+/// unbounded W would let a typo turn "a leaver loses access within a minute"
+/// into "within a day". Five minutes. Security's Gate-1 input.
+pub const MAX_KEK_ROTATION_DEBOUNCE_SECONDS: u32 = 300;
+
 /// Smallest legal `MC_MAX_RECEIVE_SLOTS`.
 ///
 /// Zero would mean no client can ever receive media — a silent total outage
@@ -315,6 +333,19 @@ pub struct Config {
     /// one handler under staggered connects (`media_routing/connectivity.rs`).
     pub media_connect_settle_ms: u64,
 
+    /// W, the KEK rotation debounce window in seconds
+    /// (`MC_KEK_ROTATION_DEBOUNCE_SECONDS`, ADR-0036 §4 Rotation).
+    ///
+    /// Required, no Rust default, bounded
+    /// [`MIN_KEK_ROTATION_DEBOUNCE_SECONDS`]`..=`[`MAX_KEK_ROTATION_DEBOUNCE_SECONDS`]
+    /// at load. Every roster removal schedules a rotation debounced to at most
+    /// once per W, measured from the oldest un-rotated removal. W is also carried
+    /// on the wire (`kek_rotation_debounce_seconds`), and clients derive their
+    /// previous-KEK retention from it — so tuning W moves client key hygiene,
+    /// not just a server timer. Projected once through [`Config::kek_lifecycle`]
+    /// so the timer, the wire field and the published gauge share one value.
+    pub kek_rotation_debounce_seconds: u32,
+
     /// Maximum ACCEPTED receive-capability declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     ///
@@ -381,6 +412,10 @@ impl fmt::Debug for Config {
             .field("environment", &self.environment)
             .field("max_receive_slots", &self.max_receive_slots)
             .field("media_connect_settle_ms", &self.media_connect_settle_ms)
+            .field(
+                "kek_rotation_debounce_seconds",
+                &self.kek_rotation_debounce_seconds,
+            )
             .field(
                 "max_receive_capability_declarations",
                 &self.max_receive_capability_declarations,
@@ -642,6 +677,21 @@ impl Config {
             MAX_MEDIA_CONNECT_SETTLE_MS,
         )?;
 
+        // ADR-0036 §4 KEK rotation debounce, W. Required and bounded on both
+        // sides: W is the exposure bound on a departed participant, so an
+        // unbounded W is a security defect, and a too-small W starves the
+        // client's derived retention. `MissingEnvVar(` and the key literal stay
+        // on ONE line for `dt-guard env-config`'s single-line discovery regex.
+        let kek_rotation_debounce_seconds = bounded(
+            "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
+            vars.get("MC_KEK_ROTATION_DEBOUNCE_SECONDS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_KEK_ROTATION_DEBOUNCE_SECONDS".to_string())
+                })?,
+            MIN_KEK_ROTATION_DEBOUNCE_SECONDS,
+            MAX_KEK_ROTATION_DEBOUNCE_SECONDS,
+        )?;
+
         // Per-connection budget on ACCEPTED declarations (client-driven
         // meeting-actor work). Bounded on both sides by the same argument.
         let max_receive_capability_declarations = bounded(
@@ -763,6 +813,7 @@ impl Config {
             environment,
             max_receive_slots,
             media_connect_settle_ms,
+            kek_rotation_debounce_seconds,
             max_receive_capability_declarations,
             audio_encoding,
         })
@@ -781,6 +832,16 @@ impl Config {
             audio_encoding: self.audio_encoding,
             connect_settle_window: std::time::Duration::from_millis(self.media_connect_settle_ms),
         }
+    }
+
+    /// The KEK rotation lifecycle, built from W as validated at load.
+    ///
+    /// The ONE place W becomes a `Duration`. The meeting actors' debounce, the
+    /// `kek_rotation_debounce_seconds` wire field and the published window gauge
+    /// all read it from the value returned here, so the three cannot drift.
+    #[must_use]
+    pub fn kek_lifecycle(&self) -> crate::media_admission::KekLifecycle {
+        crate::media_admission::KekLifecycle::new(self.kek_rotation_debounce_seconds)
     }
 
     /// Build an [`OtelConfig`] iff OTel is enabled (R-55).
@@ -857,11 +918,16 @@ mod tests {
             ("MC_AUDIO_FRAME_RATE_HZ".to_string(), "50".to_string()),
             // ADR-0036 §9 connect settle window.
             ("MC_MEDIA_CONNECT_SETTLE_MS".to_string(), "1500".to_string()),
+            // ADR-0036 §4 KEK rotation debounce (W).
+            (
+                "MC_KEK_ROTATION_DEBOUNCE_SECONDS".to_string(),
+                "60".to_string(),
+            ),
         ])
     }
 
-    /// Every one of the six ADR-0036 client-signalling and connectivity keys is
-    /// REQUIRED.
+    /// Every one of the ADR-0036 client-signalling, connectivity and KEK-rotation
+    /// keys is REQUIRED.
     ///
     /// This is the sole runtime backstop for their presence: `dt-guard
     /// env-config` discovers them by a single-line regex over this file that a
@@ -877,6 +943,7 @@ mod tests {
             "MC_AUDIO_MAX_BITRATE_BPS",
             "MC_AUDIO_FRAME_RATE_HZ",
             "MC_MEDIA_CONNECT_SETTLE_MS",
+            "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
         ] {
             let mut vars = base_vars();
             vars.remove(key);
@@ -902,6 +969,7 @@ mod tests {
             ("MC_AUDIO_MAX_BITRATE_BPS", "31999", "48001"),
             ("MC_AUDIO_FRAME_RATE_HZ", "24", "51"),
             ("MC_MEDIA_CONNECT_SETTLE_MS", "99", "10001"),
+            ("MC_KEK_ROTATION_DEBOUNCE_SECONDS", "29", "301"),
         ] {
             for value in [low, high] {
                 let mut vars = base_vars();
@@ -916,6 +984,24 @@ mod tests {
         }
     }
 
+    /// W's bounds are INCLUSIVE at both ends, and the value reaches the
+    /// lifecycle unchanged — the timer, the wire field and the gauge all read W
+    /// from this one projection.
+    #[test]
+    fn test_kek_rotation_debounce_accepts_its_bounds_and_projects_once() {
+        for (value, seconds) in [("30", 30), ("300", 300), ("60", 60)] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MC_KEK_ROTATION_DEBOUNCE_SECONDS".to_string(),
+                value.to_string(),
+            );
+            let config = Config::from_vars(&vars).expect("in-bounds W must load");
+            let lifecycle = config.kek_lifecycle();
+            assert_eq!(lifecycle.window(), std::time::Duration::from_secs(seconds));
+            assert_eq!(u64::from(lifecycle.window_seconds()), seconds);
+        }
+    }
+
     /// Non-numeric values fail loud rather than silently reverting.
     #[test]
     fn test_from_vars_media_signalling_non_numeric_fails_loud() {
@@ -924,6 +1010,7 @@ mod tests {
             "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS",
             "MC_AUDIO_MAX_BITRATE_BPS",
             "MC_AUDIO_FRAME_RATE_HZ",
+            "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
         ] {
             let mut vars = base_vars();
             vars.insert(key.to_string(), "not-a-number".to_string());

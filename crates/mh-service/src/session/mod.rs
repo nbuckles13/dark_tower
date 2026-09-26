@@ -1318,10 +1318,19 @@ impl LocalSubscribers {
 ///
 /// Residual, bounded rather than chased: a participant reconnecting with a
 /// **different** MC-allocated ordinal leaves its old entry held until the old
-/// connection tears down. Reaching a stale entry that outlives its connection
-/// requires MC to reallocate an ordinal for a live participant, which
-/// contradicts the non-recycling allocation bound `internal.proto` states on
-/// `sender_id`.
+/// connection tears down. Since ADR-0036 §4's 2026-09-26 amendment a `sender_id`
+/// CAN be reissued — but only across a KEK-generation boundary, via MC's epoch
+/// reset, whose exclusion snapshot covers every id MC has answered a binding for
+/// and not yet seen released (MC's `HandedOutBindings`, keyed by
+/// (handler, `connection_id`) — the same key this map's teardown clears on).
+/// MH binds on that answer; teardown unbinds *here* BEFORE MH sends
+/// `NotifyParticipantDisconnected` (see `webtransport::connection`), which is
+/// what releases the id at MC — so an id MC is free to reissue has already been
+/// cleared here. If the two ever race,
+/// incumbent-wins is the fail-closed backstop: it refuses the newcomer rather
+/// than handing over a live holder's edges, and crosses no media. Uniqueness is
+/// therefore scoped per (KEK generation, `sender_id`); the older
+/// non-recycling-across-a-meeting bound no longer holds.
 #[derive(Debug)]
 pub struct SenderBindings {
     bindings: ArcSwap<HashMap<(MeetingKey, SenderId), BoundConnection>>,

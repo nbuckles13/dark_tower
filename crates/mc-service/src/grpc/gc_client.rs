@@ -692,6 +692,7 @@ mod tests {
             environment: "development".to_string(),
             max_receive_slots: 8,
             media_connect_settle_ms: 1500,
+            kek_rotation_debounce_seconds: 60,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,
@@ -750,6 +751,7 @@ mod tests {
             environment: "development".to_string(),
             max_receive_slots: 8,
             media_connect_settle_ms: 1500,
+            kek_rotation_debounce_seconds: 60,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,

@@ -183,13 +183,50 @@ Complete ALL items before deploying to production:
     disconnect can remove a live connection), counted on
     `mc_mh_notifications_without_connection_id_total`. An old MC ignores the new
     field. Degraded, bounded, and signalled — roll either side first.
-  - **A new REQUIRED key rides this release** (`MC_MEDIA_CONNECT_SETTLE_MS`).
+  - **A new REQUIRED key rides this release** (`MC_MEDIA_CONNECT_SETTLE_MS`;
+    and, from story 2 task 9, `MC_KEK_ROTATION_DEBOUNCE_SECONDS`).
     Apply the ConfigMap and both Deployments with or before the image: a new
     image against a stale in-cluster ConfigMap crash-loops on
-    `MissingEnvVar("MC_MEDIA_CONNECT_SETTLE_MS")` — and the last time this
+    `MissingEnvVar("MC_MEDIA_CONNECT_SETTLE_MS")` (or
+    `MissingEnvVar("MC_KEK_ROTATION_DEBOUNCE_SECONDS")`) — and the last time this
     happened (`MC_MAX_RECEIVE_SLOTS`, recorded in `docs/TODO.md`) the presenting
     symptom was a *port-allocation* error, not the missing key. There is no MC
     deployment-config env-test, so nothing catches it before the roll.
+  - **The browser SDK must roll BEFORE this MC image (story 2 task 9, R-16) —
+    and nothing on the wire can tell you it hasn't.** This MC reissues a
+    `sender_id` after a meeting exhausts its namespace (a KEK-epoch reset). A
+    pre-story-2 SDK scopes its replay state by `sender_id` alone, so it drops
+    the reissued sender's frames as replays of the id's previous holder:
+    **that sender becomes inaudible to that participant, silently and
+    permanently**, until the user reloads. The reverse (old MC, new SDK) is
+    benign — the finer scope is simply never exercised. **This fix needed no
+    wire change, which is exactly why there is no detector**: no field, no
+    negotiation, no counter; MC cannot tell an old client from a new one.
+    Do not read "no protocol change" as "nothing to coordinate". Unlike the
+    `connection_id` skew above (detectable on
+    `mc_mh_notifications_without_connection_id_total`, roll either side),
+    this one is one-directional. And it is **not** the task-20 tail's kind:
+    that degradation is transient and self-correcting, this one is permanent
+    for the affected sender until the page is reloaded and invisible to both
+    parties — the distinction that matters when deciding whether to force a
+    bundle refresh. It is an **availability** failure, not a security one:
+    a pre-story-2 receiver drops rather than mis-attributes, verification
+    always uses the current roster key, and the one-`sender_id`-per-identity-
+    per-KEK-generation invariant holds server-side whatever the client version.
+    It only bites in a meeting that has exhausted 65,536 admissions.
+  - **The Prometheus rules are a FOURTH artifact in this release's coupled
+    set, and the coupling runs both ways.** `infra/docker/prometheus/rules/`
+    is content-hashed through `configMapGenerator`
+    (`infra/kubernetes/observability/kustomization.yaml`), so it self-rolls;
+    the MC ConfigMap does not. This release retires `MCSenderIdSpaceExhausted`
+    (exhaustion now self-repairs). **Retire it with or after the MC image, and
+    restore it with or before any MC image rollback**: a pre-story-2 image
+    under the new rules refuses admissions at exhaustion permanently with
+    NOTHING firing — the terminal reject is back, its detector is gone, and the
+    replacement info rule keys on a trigger that image never emits. Rules that
+    land ahead of the image are benign but SILENT (they compare series the old
+    image does not emit), so an operator who sees no KEK alerts after shipping
+    the rules has not learned that rotation is healthy.
   - **Identity-key handling adds NO deploy-ordering constraint** beyond the
     tag-reshape lockstep above. MC admits a joiner that sends no
     `identity_public_key` (length 0 is the contract's NO KEY PUBLISHED state), so
@@ -285,8 +322,9 @@ watch -n 10 'kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 2>/dev
 ### 3. Update Container Image
 
 > **Apply the manifests FIRST if the release changes `infra/services/mc-service/**`.**
-> MC reads sixteen required env vars via `ConfigError::MissingEnvVar` with no Rust
-> default, and each is injected by a per-key `configMapKeyRef` that lives in the
+> MC reads every **Required** row in [§Configuration Reference](#configuration-reference)
+> via `ConfigError::MissingEnvVar` with no Rust default (that table is the one place
+> the count lives — do not restate it here), and each is injected by a per-key `configMapKeyRef` that lives in the
 > **Deployment**, not the ConfigMap. A release that adds a required key and is
 > shipped with `kubectl set image` alone puts **both MC pods into
 > `CrashLoopBackOff`** — new image, old pod template, no reference to the new key.
@@ -688,6 +726,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `MC_AUDIO_CODEC` | **Yes** | Codec MC directs clients to produce for main audio. Parsed to the `Codec` proto enum; unrecognised values, `unspecified`, and video codecs all fail at startup. | `opus` (in ConfigMap) | `opus` |
 | `MC_AUDIO_MAX_BITRATE_BPS` | **Yes** | Max audio bitrate MC directs. Top of the 32–48 kbps band `mh-service` sizes its datagram buffer against; validated against that band at load. | `48000` (in ConfigMap) | `48000` |
 | `MC_MEDIA_CONNECT_SETTLE_MS` | **Yes** | Connect settle window (ADR-0036 §9, story 2 task 20): how long after a participant's FIRST MH-reported connection MC waits before routing on whatever it observed. Ends early once the participant reaches every handler of its meeting. **Not a debounce** — without it an all-connected meeting loses co-location permanently. Validated `100..=10000` at load. Published as `mc_media_connect_settle_window_seconds`. | `1500` (in ConfigMap) | `1500` |
+| `MC_KEK_ROTATION_DEBOUNCE_SECONDS` | **Yes** | W, the meeting KEK rotation debounce window (ADR-0036 §4 Rotation, story 2 task 9). Every roster removal schedules a KEK rotation, debounced to at most once per W measured from the OLDEST un-rotated removal. **W is the exposure bound on a departed participant**, so the value is a security setting, not a tuning one. Carried to clients as `kek_rotation_debounce_seconds`; they derive their previous-KEK retention from it, so changing W moves client key hygiene too. Validated both sides at load; the bounds and their derivation live in `crates/mc-service/src/config.rs` (`MIN_`/`MAX_KEK_ROTATION_DEBOUNCE_SECONDS`). Published as `mc_meeting_kek_rotation_window_seconds`. | `60` (in ConfigMap) | `60` |
 | `MC_AUDIO_FRAME_RATE_HZ` | **Yes** | Audio frames per second MC directs (50 Hz = 20 ms frames). Same physical quantity as `mh-service`'s `AUDIO_FRAME_DURATION_MS = 20` in the reciprocal unit; changing it moves MH's "32 frames = 640 ms" latency budget. | `50` (in ConfigMap) | `50` |
 | `MC_REGION` | No | Geographic region for this MC. | `us-east-1` | `local` |
 | `GC_GRPC_URL` | No | Global Controller gRPC endpoint. | `http://localhost:50051` | `http://gc-service.dark-tower:50051` |
@@ -708,7 +747,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `DEPLOYMENT_ENVIRONMENT` | No | `deployment.environment` resource attribute (ADR-0011). | `development` | `production` |
 | `RUST_LOG` | No | Logging level. Set as a literal in the Deployment, not via ConfigMap. | `info` | `info,mc_service=debug` |
 
-**The sixteen Required rows are the CrashLoop list.** Each is loaded via
+**The seventeen Required rows are the CrashLoop list.** Each is loaded via
 `ConfigError::MissingEnvVar` in `crates/mc-service/src/config.rs`, so absence
 fails config load before the server binds: the pod enters `CrashLoopBackOff`
 and the reason is the first line of the container log. `MC_TLS_CERT_PATH` and
@@ -923,6 +962,8 @@ data:
   MC_AUDIO_FRAME_RATE_HZ: "50"                 # 50 Hz = 20 ms frames
   # ---- ADR-0036 §9 connect settle window (REQUIRED; absent = CrashLoop) ----
   MC_MEDIA_CONNECT_SETTLE_MS: "1500"           # validated 100..=10000 at load; see configmap.yaml
+  # ---- ADR-0036 §4 KEK rotation (REQUIRED; absent = CrashLoop) ----
+  MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"       # W; bounds in config.rs; see configmap.yaml
 ```
 
 **Per-instance ConfigMaps: `mc-0-config`, `mc-1-config`** — carry only
@@ -1485,6 +1526,7 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 - [ ] `mc_mh_notifications_unapplied_total{reason="connection_bound_refused"}` flat (expected-empty); `handler_not_in_set` flat unless an MH pod restarted in the window (then it is expected — `mc-incident-response.md` Scenario 18 arm (a))
 - [ ] `mc_mh_notifications_without_connection_id_total` flat once MH has rolled (non-zero = an MH predating `connection_id` still in the fleet)
 - [ ] `mc_media_connect_settle_window_seconds` equals the ConfigMap's `MC_MEDIA_CONNECT_SETTLE_MS` / 1000 on every MC pod (a config echo; a mismatch is a stale ConfigMap or a pod that did not roll)
+- [ ] `mc_meeting_kek_rotation_window_seconds` equals the ConfigMap's `MC_KEK_ROTATION_DEBOUNCE_SECONDS` on every MC pod. Same config-echo reading as above, but for W a mismatch is a **security** fact: W is the exposure bound on a departed participant, and two pods with different W give meetings different bounds depending on which pod owns them
 - [ ] `mc_participant_mh_status_total` **failed-share < 0.20** over 30m (R-60; canonical ratio query in MH runbook 30-min check). This is a *ratio*, NOT a `{state="failed"}` increase == 0 check — the counter increments on any single per-MH client hiccup, so a bare `== 0` false-fails every deploy. Any breach → investigate the client→MH media plane per `mc-incident-response.md` §"Scenario 11: Media Connection Failures".
 - [ ] No new `MCMediaConnectionAllFailed` alerts firing (`infra/docker/prometheus/rules/mc-alerts.yaml`)
 - [ ] No mc-service pod restarts since deploy completed

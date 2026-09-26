@@ -14,12 +14,19 @@
 //! 3. If not reconnected: participant removed, slots released
 
 use crate::errors::McError;
-use crate::media_admission::{IdentityPublicKey, MeetingKeyState, SenderId, SenderIdAllocator};
+use crate::media_admission::rotation::{
+    collect_push_outcomes, Coalesced, PendingOutcome, RotationReport,
+};
+use crate::media_admission::{
+    AdmissionEpoch, AdmitFailed, HandedOutBindings, IdentityPublicKey, KekLifecycle,
+    KekPushOutcome, KekRotationDebounce, RotationTrigger, SenderId,
+};
 
 use super::meeting_media::{Affected, JoinMedia, MeetingMedia, RosterEntry};
 use super::messages::{
-    DisconnectCause, JoinResult, LeaveReason, MeetingMessage, MeetingState, ParticipantInfo,
-    ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SenderLookup, SignalingPayload,
+    DisconnectCause, JoinResult, KekPush, LeaveReason, MeetingMessage, MeetingState,
+    ParticipantInfo, ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SenderLookup,
+    SignalingPayload,
 };
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
@@ -181,6 +188,27 @@ impl MeetingActorHandle {
             })
             .await
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
+    }
+
+    /// Fire the leave-debounced KEK rotation now, as if W had elapsed.
+    /// **Test builds only** — see `MeetingMessage::ForceKekRotation`.
+    ///
+    /// Returns `true` iff a rotation was pending and was performed. A second
+    /// call right after returns `false`, which is how a test proves every
+    /// recorded departure folded into ONE rotation without waiting on a timer.
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the actor's mailbox is closed.
+    #[cfg(feature = "test-seams")]
+    pub async fn force_kek_rotation(&self) -> Result<bool, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::ForceKekRotation { respond_to: tx })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
     /// Get current meeting state.
@@ -463,13 +491,30 @@ pub struct MeetingActor {
     mailbox: MailboxMonitor,
     /// Handle to self, for passing to child ParticipantActors.
     self_handle: MeetingActorHandle,
-    /// The meeting KEK and its generation (ADR-0036 §4).
+    /// The meeting KEK, its generation, and the `sender_id` namespace — held as
+    /// ONE value, because the namespace may be reclaimed only together with a
+    /// new KEK (ADR-0036 §4; story 2 R-16). There is deliberately no separate
+    /// allocator field here to reseat.
     ///
     /// Generated at meeting-actor creation, held only here, never persisted and
     /// never logged. Dies with the actor.
-    media_keys: MeetingKeyState,
-    /// Monotonic, non-recycling `sender_id` allocator for this meeting.
-    sender_ids: SenderIdAllocator,
+    admission: AdmissionEpoch,
+    /// Every `sender_id` MC has answered a media handler's binding with and not
+    /// yet seen released. Part of the epoch-reset exclusion set, because MH
+    /// holds a binding until the CONNECTION closes, which can outlive the
+    /// participant's roster entry (Gate-3 F-1).
+    mh_bindings: HandedOutBindings,
+    /// The leave debounce: at most one leave-triggered rotation per W, measured
+    /// from the OLDEST un-rotated removal.
+    kek_debounce: KekRotationDebounce,
+    /// W, the overdue threshold, and the fleet-gauge registry this meeting
+    /// reports into. Evicted when the actor exits.
+    kek_lifecycle: Arc<KekLifecycle>,
+    /// One long-lived CSPRNG handle for every rotation (ring recommends reuse).
+    rng: ring::rand::SystemRandom,
+    /// Test seam: never auto-fire the rotation; `ForceKekRotation` drives it.
+    #[cfg(feature = "test-seams")]
+    kek_debounce_manual: bool,
     /// Join-order slots and shared-handler edges, observed connectivity, push workers and per-participant
     /// views (ADR-0036 §5/§6/§8/§9). Dropped with the actor.
     media: MeetingMedia,
@@ -488,6 +533,8 @@ impl MeetingActor {
     /// * `controller_metrics` - Controller metrics for GC heartbeat reporting (participant count)
     /// * `master_secret` - Master secret for HKDF key derivation (ADR-0023). Wrapped in
     ///   SecretBox to ensure secure memory handling (zeroization on drop, redacted Debug).
+    /// * `kek_lifecycle` - W, the overdue threshold and the fleet-gauge registry
+    ///   (ADR-0036 §4 Rotation). This meeting reports its rotation state into it.
     /// # Errors
     ///
     /// [`McError::Internal`] if the system CSPRNG cannot produce the meeting
@@ -500,6 +547,7 @@ impl MeetingActor {
         metrics: Arc<ActorMetrics>,
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
+        kek_lifecycle: Arc<KekLifecycle>,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         Self::spawn_inner(
             meeting_id,
@@ -507,26 +555,37 @@ impl MeetingActor {
             metrics,
             controller_metrics,
             master_secret,
-            SenderIdAllocator::new(),
+            kek_lifecycle,
+            AdmissionEpoch::generate,
             |_| {},
         )
     }
 
     /// Shared construction for [`Self::spawn`] and the `test-seams` variant.
     ///
-    /// The allocator and the media configuration hook are parameters so the
-    /// test seams thread their overrides without duplicating this body — a
-    /// forked copy would drift from the real construction path and the seam
-    /// tests would stop testing production behaviour. Production passes a fresh
-    /// allocator and a no-op hook.
+    /// The admission constructor and the actor hook are parameters so the test
+    /// seams thread their overrides without duplicating this body — a forked
+    /// copy would drift from the real construction path and the seam tests
+    /// would stop testing production behaviour. Production passes
+    /// `AdmissionEpoch::generate` and a no-op hook.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared body for spawn and spawn_with_seams; the two hooks are what keep the seam path identical to production"
+    )]
     fn spawn_inner(
         meeting_id: String,
         cancel_token: CancellationToken,
         metrics: Arc<ActorMetrics>,
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
-        sender_ids: SenderIdAllocator,
-        configure_media: impl FnOnce(&mut MeetingMedia),
+        kek_lifecycle: Arc<KekLifecycle>,
+        build_admission: impl FnOnce(
+            &ring::rand::SystemRandom,
+        ) -> Result<
+            AdmissionEpoch,
+            crate::media_admission::KekGenerationFailed,
+        >,
+        configure: impl FnOnce(&mut Self),
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         let (sender, receiver) = mpsc::channel(MEETING_CHANNEL_BUFFER);
 
@@ -539,14 +598,16 @@ impl MeetingActor {
 
         // ADR-0036 §4: the meeting KEK is generated at meeting-actor creation,
         // random, held only in memory, never persisted and never logged.
-        let media_keys =
-            MeetingKeyState::generate(&ring::rand::SystemRandom::new()).map_err(|_| {
-                // No key material in the error, and none in any log this
-                // produces — the failure is that there IS no key.
-                McError::Internal("Failed to initialise meeting key material".to_string())
-            })?;
+        let rng = ring::rand::SystemRandom::new();
+        let admission = build_admission(&rng).map_err(|_| {
+            // No key material in the error, and none in any log this
+            // produces — the failure is that there IS no key.
+            McError::Internal("Failed to initialise meeting key material".to_string())
+        })?;
 
-        crate::observability::metrics::record_meeting_kek_generated();
+        crate::observability::metrics::record_meeting_kek_generated(
+            RotationTrigger::MeetingCreated,
+        );
 
         // `key_custody=operator` (ADR-0036 §4, §11): media is encrypted between
         // clients; MH, transport and storage cannot read it; MC can. Never
@@ -558,10 +619,10 @@ impl MeetingActor {
             "Meeting key material provisioned"
         );
 
-        let mut media = MeetingMedia::new(meeting_id.clone(), cancel_token.clone());
-        configure_media(&mut media);
+        let media = MeetingMedia::new(meeting_id.clone(), cancel_token.clone());
+        let kek_debounce = KekRotationDebounce::new(kek_lifecycle.window());
 
-        let actor = Self {
+        let mut actor = Self {
             meeting_id: meeting_id.clone(),
             receiver,
             cancel_token,
@@ -577,10 +638,16 @@ impl MeetingActor {
             controller_metrics,
             mailbox: MailboxMonitor::new(ActorType::Meeting, &meeting_id),
             self_handle: handle.clone(),
-            media_keys,
-            sender_ids,
+            admission,
+            mh_bindings: HandedOutBindings::default(),
+            kek_debounce,
+            kek_lifecycle,
+            rng,
+            #[cfg(feature = "test-seams")]
+            kek_debounce_manual: false,
             media,
         };
+        configure(&mut actor);
 
         let task_handle = tokio::spawn(actor.run());
 
@@ -591,15 +658,16 @@ impl MeetingActor {
     /// **Test builds only.**
     ///
     /// Exists so seam-dependent behaviour runs through the real join path:
-    /// the `sender_id` exhaustion reject without performing 65535 joins, and an
-    /// observable flush deferral (a small flush bound). There is no handler
-    /// placement seam: partial connectivity is produced by reporting (or not)
-    /// real handler connections. Compiled only under the
-    /// non-default `test-seams` feature, and a release build with that feature
-    /// on fails to compile (see `lib.rs`).
+    /// sender-id exhaustion and the KEK-epoch reset without performing 65535
+    /// joins, an observable flush deferral (a small flush bound), and a
+    /// manually-fired rotation so coalescing holds structurally rather than by
+    /// racing a real window. There is no handler placement seam: partial
+    /// connectivity is produced by reporting (or not) real handler connections.
+    /// Compiled only under the non-default `test-seams` feature, and a release
+    /// build with that feature on fails to compile (see `lib.rs`).
     ///
-    /// This IS the exhaustion guard's bypass. It
-    /// must never be reachable in production.
+    /// This IS the bypass for the namespace guard. It must never be reachable
+    /// in production.
     ///
     /// # Errors
     ///
@@ -611,20 +679,30 @@ impl MeetingActor {
         metrics: Arc<ActorMetrics>,
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
+        kek_lifecycle: Arc<KekLifecycle>,
         seams: &super::meeting_media::MeetingSeams,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         let sender_ids = match seams.sender_id_cursor {
-            Some(cursor) => SenderIdAllocator::resuming_from(cursor),
-            None => SenderIdAllocator::new(),
+            Some(cursor) => crate::media_admission::SenderIdAllocator::resuming_from(
+                cursor,
+                std::collections::HashSet::new(),
+            ),
+            None => crate::media_admission::SenderIdAllocator::new(),
         };
+        let reset_cursor = seams.epoch_reset_cursor;
+        let manual = seams.kek_debounce_manual;
         Self::spawn_inner(
             meeting_id,
             cancel_token,
             metrics,
             controller_metrics,
             master_secret,
-            sender_ids,
-            |media| media.apply_seams(seams),
+            kek_lifecycle,
+            |rng| AdmissionEpoch::with_seams(rng, sender_ids, reset_cursor),
+            |actor| {
+                actor.media.apply_seams(seams);
+                actor.kek_debounce_manual = manual;
+            },
         )
     }
 
@@ -644,6 +722,7 @@ impl MeetingActor {
             // Check for terminated connection actors
             self.check_connection_health().await;
             let settle_wake = self.media.next_settle_wake();
+            let kek_wake = self.kek_wake();
 
             tokio::select! {
                 // Handle cancellation
@@ -672,6 +751,24 @@ impl MeetingActor {
                     }
                 } => {
                     self.settle_due().await;
+                }
+
+                // The leave-debounced KEK rotation is due (ADR-0036 §4). A
+                // tokio timer, so paused test time drives it deterministically.
+                //
+                // Deliberately NOT gated on `is_shutting_down` (story 2 task 9,
+                // security F-5): a pending rotation may be abandoned only on the
+                // EXIT path — the cancel arm above, which breaks the loop. While
+                // the actor still serves participants the rotation must still
+                // fire, or the W bound would lapse for that window with pending
+                // state already cleared and nothing paging.
+                () = async {
+                    match kek_wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.rotate_due(Instant::now()).await;
                 }
 
                 // Deferred slot-view work from an earlier turn (the per-turn
@@ -703,6 +800,15 @@ impl MeetingActor {
             }
         }
 
+        // One of the two teardown evictions (the controller's `remove_meeting`
+        // is the other, for an actor that panicked before reaching here), so a
+        // dead meeting cannot pin the fleet gauges.
+        //
+        // A pending rotation is DROPPED here, not flushed, and that is sound:
+        // the KEK is never persisted and dies with this actor, so the end of the
+        // actor is itself a rotation for every future joiner.
+        self.kek_lifecycle.remove_meeting(&self.meeting_id).await;
+
         info!(
             target: "mc.actor.meeting",
             meeting_id = %self.meeting_id,
@@ -710,6 +816,15 @@ impl MeetingActor {
             messages_processed = self.mailbox.messages_processed(),
             "MeetingActor stopped"
         );
+    }
+
+    /// When the leave-debounced rotation should fire, if one is pending.
+    fn kek_wake(&self) -> Option<Instant> {
+        #[cfg(feature = "test-seams")]
+        if self.kek_debounce_manual {
+            return None;
+        }
+        self.kek_debounce.next_wake()
     }
 
     /// Handle a single message.
@@ -843,6 +958,17 @@ impl MeetingActor {
                 let result = self.handle_end_meeting(&reason).await;
                 let _ = respond_to.send(result);
             }
+
+            #[cfg(feature = "test-seams")]
+            MeetingMessage::ForceKekRotation { respond_to } => {
+                // Fire as if W had elapsed since the oldest removal.
+                let now = self
+                    .kek_debounce
+                    .next_wake()
+                    .map_or_else(Instant::now, |due| due.max(Instant::now()));
+                let rotated = self.rotate_due(now).await;
+                let _ = respond_to.send(rotated);
+            }
         }
     }
 
@@ -879,39 +1005,97 @@ impl MeetingActor {
         }
 
         // ADR-0036 §2/§4, invariant R-35: allocate the sender id BEFORE any
-        // other admission state is built, so an exhaustion reject costs nothing
-        // and leaves nothing to unwind.
+        // other admission state is built, so a failure costs nothing and leaves
+        // nothing to unwind.
         //
-        // Fail closed. At the wall we REJECT the admission rather than
-        // allocating: a warn-and-continue that still wrapped would silently
-        // reissue a live sender_id and produce exactly the key-id collision
-        // R-35 exists to prevent. The KEK-epoch reset that would reclaim the
-        // namespace is deferred with all KEK rotation, so there is no in-place
-        // operator remedy — the meeting must end and restart.
-        let allocation = self.sender_ids.allocate().map_err(|_| {
-            // OPS-8: logged HERE, not at the connection layer. This function's
-            // span carries `meeting_id`; the WebTransport connection span
-            // carries `connection_id` only, and the metric correctly carries no
-            // meeting identifier — so without this line an operator at the wall
-            // could not tell WHICH meeting exhausted.
+        // At the wall this no longer refuses the joiner (story 2 R-16): the
+        // admission epoch rotates the KEK and reissues from a fresh namespace
+        // whose exclusion snapshot is every id bound right now — live AND
+        // grace-period members, from the same roster map the KEK push goes to
+        // (security D-1). The reset is atomic and immediate, exempt from the
+        // leave debounce: debouncing it would stall joins for up to W.
+        let rng = &self.rng;
+        let participants = &self.participants;
+        let mh_bindings = &self.mh_bindings;
+        let admitted = self
+            .admission
+            .admit(rng, || {
+                // Rostered ids (grace included), PLUS ids a media handler may
+                // still hold for a participant already off the roster (F-1).
+                participants
+                    .values()
+                    .map(|p| p.sender_id)
+                    .chain(mh_bindings.held())
+                    .collect()
+            })
+            .map_err(|failed| {
+                // Fail closed: the joiner is refused and nothing about the key
+                // state or namespace changed. Both arms are near-unreachable;
+                // both are loud.
+                match failed {
+                    AdmitFailed::Rotation(reason) => {
+                        crate::observability::metrics::record_kek_rotation_failure(reason);
+                        error!(
+                            target: "mc.actor.meeting",
+                            reason = reason.label(),
+                            key_custody = crate::observability::metrics::KEY_CUSTODY_OPERATOR,
+                            "sender_id namespace exhausted and the KEK rotation that must accompany an epoch reset failed; refusing admission"
+                        );
+                    }
+                    AdmitFailed::NoAllocatableId => error!(
+                        target: "mc.actor.meeting",
+                        bound = participants.len(),
+                        "sender_id namespace exhausted and a fresh epoch had nothing allocatable after excluding the bound ids; refusing admission"
+                    ),
+                }
+                McError::Internal("Failed to admit participant to the media path".to_string())
+            })?;
+        let allocation = admitted.allocation;
+        let sender_id = allocation.sender_id;
+
+        if admitted.epoch_reset {
+            // The reset rotated the KEK, so it covers any departures still
+            // waiting on the leave debounce too.
+            let absorbed = self.kek_debounce.absorb();
+            self.kek_lifecycle.set_pending(&self.meeting_id, None).await;
+            crate::observability::metrics::record_meeting_kek_generated(
+                RotationTrigger::SenderSpaceExhausted,
+            );
+            // The runbook (mc-incident-response.md Scenario 8, root cause 11)
+            // greps the stem `sender_id namespace`, which this message shares
+            // with the high-watermark record below. Keep that stem contiguous at
+            // the START of a single-line literal: a `\`-continued literal split
+            // inside it still reads correctly in the log but the grep matches
+            // nothing — and nothing reads as "not this cause".
             warn!(
                 target: "mc.actor.meeting",
-                admissions_total = self.sender_ids.issued(),
+                generation = self.admission.keys().generation(),
+                departures_absorbed = absorbed.map_or(0, |c| c.leaves),
+                bound = self.participants.len(),
                 meeting_age_seconds = chrono::Utc::now().timestamp() - self.created_at,
-                "sender_id space exhausted; refusing admission. The namespace is consumed by \
-                 cumulative lifetime admissions, not concurrent participants, so the participant \
-                 cap does not bound it. No in-place remedy: the meeting must end and restart."
+                "sender_id namespace exhausted; KEK epoch reset and reissue"
             );
-            McError::SenderIdSpaceExhausted
-        })?;
-        let sender_id = allocation.sender_id;
+            // Incumbents get the new KEK BEFORE the joiner's ParticipantJoined
+            // is broadcast. The joiner is not yet on the roster, so it is not a
+            // recipient; it receives this KEK in its own JoinResponse.
+            self.push_kek_update(RotationReport {
+                trigger: RotationTrigger::SenderSpaceExhausted,
+                coalesced_leaves: absorbed.map_or(0, |c| c.leaves),
+                generation: self.admission.keys().generation(),
+                started: Instant::now(),
+            })
+            .await;
+        }
+        self.kek_lifecycle
+            .set_sender_ids_issued(&self.meeting_id, self.admission.sender_ids_issued())
+            .await;
 
         // Media admission, BEFORE any other admission state is built, so a
         // failure leaves nothing to unwind (the allocated sender id is simply
-        // never used — sender ids are never recycled either way). The first
-        // join freezes the meeting's handler set. The joiner is bound to no
-        // handler: it is offered the whole set, and becomes routable only when
-        // the handlers report its connections (ADR-0036 §9).
+        // never used). The first join freezes the meeting's handler set. The
+        // joiner is bound to no handler: it is offered the whole set, and
+        // becomes routable only when the handlers report its connections
+        // (ADR-0036 §9).
         self.media.install(media);
         self.media.admit(&participant_id, sender_id)?;
         let media_handlers =
@@ -920,18 +1104,23 @@ impl MeetingActor {
             })?;
 
         // `high_watermark_crossed` is the allocator's own one-shot latch (true on
-        // exactly the crossing allocation and never again), so there is no
-        // second guard here — one latch, unit-tested in `sender_id.rs`.
+        // exactly the crossing allocation and never again per allocator), so
+        // there is no second guard here — one latch, unit-tested in
+        // `sender_id.rs`.
         if allocation.high_watermark_crossed {
-            // Forensic, not actionable: the remedy at 90% and at 100% is
-            // identical, so this exists so that after an exhaustion incident an
-            // operator can reconstruct whether consumption was sudden or
-            // gradual. Answerable from this one line without joining back to
-            // the meeting-create record. Carries no sender_id value.
+            // A LEADING indicator: it precedes a recoverable epoch reset, and
+            // re-arms each epoch because each reset installs a fresh allocator.
+            // The action it prompts is to investigate the driver (a flapping
+            // client or a scripted join loop), not to end the meeting.
+            // Carries no sender_id value.
+            //
+            // The runbook greps this message's `sender_id namespace` stem — keep
+            // it contiguous at the start of a single-line literal (see the
+            // epoch-reset record above).
             warn!(
                 target: "mc.actor.meeting",
-                admissions_total = self.sender_ids.issued(),
-                namespace_remaining = self.sender_ids.remaining(),
+                cursor_consumed = self.admission.sender_ids_issued(),
+                namespace_remaining = self.admission.sender_ids_remaining(),
                 meeting_age_seconds = chrono::Utc::now().timestamp() - self.created_at,
                 "sender_id namespace past high watermark"
             );
@@ -1056,9 +1245,11 @@ impl MeetingActor {
             participants,
             fencing_generation: self.fencing_generation,
             sender_id,
-            // Arc clone: a handle, never a copy of the key bytes.
-            meeting_kek: Arc::clone(self.media_keys.kek()),
-            kek_generation: self.media_keys.generation(),
+            // Arc clone: a handle, never a copy of the key bytes. The CURRENT
+            // key — after an epoch reset on this very join, the new one.
+            meeting_kek: Arc::clone(self.admission.keys().kek()),
+            kek_generation: self.admission.keys().generation(),
+            kek_rotation_debounce_seconds: self.kek_lifecycle.window_seconds(),
             participant_handle: conn_handle_for_result,
             media_handlers,
         })
@@ -1220,6 +1411,108 @@ impl MeetingActor {
         self.media.remove(participant_id);
         self.media.reconcile(Affected::All).await;
         self.flush_views().await;
+
+        // KEK rotation on leave (ADR-0036 §4; story 2 R-12), scheduled on the
+        // SAME choke point, AFTER the removal above. When it fires, the new KEK
+        // goes to `self.participants` as it stands then — which no longer holds
+        // this leaver — so the leaver is unreachable BY CONSTRUCTION, never by a
+        // filter. Debounced from the OLDEST un-rotated removal; a later removal
+        // never moves that anchor.
+        self.kek_debounce.record_removal(Instant::now());
+        self.kek_lifecycle
+            .set_pending(&self.meeting_id, self.kek_debounce.pending_since())
+            .await;
+    }
+
+    /// Perform the leave-debounced rotation if it is due. Returns whether a
+    /// rotation happened.
+    ///
+    /// Pending age is cleared AT ROTATION, not when every push succeeds
+    /// (security S-3b): one wedged participant must not pin the gauge and page
+    /// forever. Undelivered pushes are the push counter's job.
+    async fn rotate_due(&mut self, now: Instant) -> bool {
+        let Some(coalesced) = self.kek_debounce.take_due(now) else {
+            return false;
+        };
+        if let Err(reason) = self.admission.rotate(&self.rng) {
+            self.rotation_failed(coalesced, reason, now);
+            return false;
+        }
+        self.kek_lifecycle.set_pending(&self.meeting_id, None).await;
+        crate::observability::metrics::record_meeting_kek_generated(
+            RotationTrigger::ParticipantLeft,
+        );
+        crate::observability::metrics::record_kek_rotation_coalesced_leaves(coalesced.leaves);
+        self.push_kek_update(RotationReport {
+            trigger: RotationTrigger::ParticipantLeft,
+            coalesced_leaves: coalesced.leaves,
+            generation: self.admission.keys().generation(),
+            started: now,
+        })
+        .await;
+        true
+    }
+
+    /// A leave rotation failed. Keep the departures pending with their
+    /// ORIGINAL anchor, so the published pending age keeps growing and
+    /// `MCKekRotationOverdue` fires; retry after W rather than spinning.
+    fn rotation_failed(
+        &mut self,
+        coalesced: Coalesced,
+        reason: crate::media_admission::KekRotationFailed,
+        now: Instant,
+    ) {
+        crate::observability::metrics::record_kek_rotation_failure(reason);
+        self.kek_debounce.defer_after_failure(coalesced, now);
+        // ERROR, not WARN: the exposure is real while this persists. Every
+        // departed participant still holds a KEK that opens all current media,
+        // with no forward bound — the W bound is SUSPENDED, not delayed
+        // (security F-3). No key material here, nor any participant id.
+        error!(
+            target: "mc.kek.lifecycle",
+            reason = reason.label(),
+            departures_pending = coalesced.leaves,
+            key_custody = crate::observability::metrics::KEY_CUSTODY_OPERATOR,
+            "Meeting KEK rotation failed; departed participants retain a working KEK until it succeeds. Retrying after W."
+        );
+    }
+
+    /// Push the CURRENT KEK to every rostered participant, and hand their
+    /// outcomes to a detached collector.
+    ///
+    /// Exactly one outcome per rostered recipient. A participant with no live
+    /// connection (inside grace) is `participant_gone` without a send; the rest
+    /// get a `KekUpdate` and answer on a oneshot. The actor never awaits those
+    /// answers — the collector does, bounded — so a participant blocked on this
+    /// actor's mailbox cannot deadlock it.
+    ///
+    /// Stated residual (security S-3a): a member whose push is not delivered
+    /// never rotates its own transmit keys, so a departed participant keeps
+    /// opening THAT member's media past W. `mc_meeting_kek_pushes_total` and
+    /// `MCKekPushFailureRate` are the only control.
+    async fn push_kek_update(&self, report: RotationReport) {
+        let push = KekPush {
+            kek: Arc::clone(self.admission.keys().kek()),
+            generation: self.admission.keys().generation(),
+            kek_rotation_debounce_seconds: self.kek_lifecycle.window_seconds(),
+        };
+        let mut pending = Vec::with_capacity(self.participants.len());
+        for participant in self.participants.values() {
+            let outcome = match &participant.connection {
+                None => PendingOutcome::Decided(KekPushOutcome::ParticipantGone),
+                Some(conn) => match conn.send_kek_update(push.clone()).await {
+                    Ok(rx) => PendingOutcome::Awaiting(rx),
+                    Err(_) => PendingOutcome::Decided(KekPushOutcome::ActorUnavailable),
+                },
+            };
+            pending.push(outcome);
+        }
+        // `push` (and its Arc) drops here; each queued message holds its own
+        // clone until the participant actor encodes it.
+        drop(push);
+        tokio::spawn(tracing::Instrument::in_current_span(collect_push_outcomes(
+            pending, report,
+        )));
     }
 
     /// Handle reconnection attempt.
@@ -1378,11 +1671,19 @@ impl MeetingActor {
             .map(Participant::to_info)
             .collect();
 
+        // R-15: re-issue the CURRENT KEK, generation and W, WITHOUT a rotation.
+        // A reconnect is not a roster removal, so the debounce is untouched.
+        // The client's install is idempotent on an already-held generation, so
+        // a reconnect across no rotation is a no-op for it; across a rotation it
+        // is what stops the participant silently holding a stale KEK.
         Ok(ReconnectResult {
             participant_id,
             new_correlation_id,
             new_binding_token,
             participants,
+            meeting_kek: Arc::clone(self.admission.keys().kek()),
+            kek_generation: self.admission.keys().generation(),
+            kek_rotation_debounce_seconds: self.kek_lifecycle.window_seconds(),
         })
     }
 
@@ -1581,6 +1882,10 @@ impl MeetingActor {
             }
             Err(lookup) => return (lookup, Some(Unapplied::ParticipantUnknown)),
         };
+        // MH binds on THIS answer, whatever happens to connectivity below, so
+        // the binding is recorded here and not from connectivity state (F-1).
+        self.mh_bindings
+            .record(handler_id, &connection_id, sender_id);
         let now = tokio::time::Instant::now();
         let applied = self.media.media_connected(
             &participant_id,
@@ -1607,10 +1912,17 @@ impl MeetingActor {
         handler_id: &str,
         connection_id: String,
     ) -> Option<Unapplied> {
+        // Release the handed-out binding FIRST, before the roster lookup: the
+        // holder may already be off the roster, and its connection closing is
+        // exactly what frees its id for a later epoch (F-1). MH clears its own
+        // binding before it sends this, so the release is correctly ordered.
+        let released = self.mh_bindings.release(handler_id, &connection_id);
         // S12: participant-scoped. A `sub` that resolves to no single entry
         // holds no key this notification could name.
         let Ok((participant_id, _)) = self.resolve_user(user_id) else {
-            return Some(Unapplied::UnknownConnection);
+            // A departed holder's close is not "unknown" if it released a
+            // binding: it did exactly the work this notification exists for.
+            return (!released).then_some(Unapplied::UnknownConnection);
         };
         let now = tokio::time::Instant::now();
         match self.media.media_disconnected(
@@ -1946,6 +2258,7 @@ mod tests {
             metrics,
             controller_metrics,
             master_secret,
+            crate::media_admission::fixtures::kek_lifecycle(),
         )
         .expect("system CSPRNG must be available in tests")
     }

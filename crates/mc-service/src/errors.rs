@@ -104,18 +104,6 @@ pub enum McError {
     #[error("Identity key rejected")]
     IdentityKeyInvalid,
 
-    /// The meeting's 16-bit `sender_id` space is exhausted (invariant R-35).
-    ///
-    /// Fail closed: the admission is refused rather than wrapping onto a live
-    /// id. Distinct from `MeetingCapacityExceeded` so `mc-incident-response.md`
-    /// Scenario 8 can triage it — that runbook keys exclusively on
-    /// `error_type_label()`, and a shared value would route a responder to
-    /// "may require code fix or rollback" for a condition that is neither.
-    /// The client-facing message is deliberately IDENTICAL to
-    /// `MeetingCapacityExceeded`'s.
-    #[error("Sender id space exhausted")]
-    SenderIdSpaceExhausted,
-
     /// A media-policy push did not confirm (ADR-0036 §8).
     ///
     /// The handler's reply did not prove that MC's forwarding policy is live:
@@ -213,8 +201,7 @@ impl McError {
             McError::MeetingCapacityExceeded(_)
             | McError::McCapacityExceeded
             | McError::Draining
-            | McError::Migrating { .. }
-            | McError::SenderIdSpaceExhausted => 7, // CAPACITY_EXCEEDED
+            | McError::Migrating { .. } => 7, // CAPACITY_EXCEEDED
         }
     }
 
@@ -259,7 +246,6 @@ impl McError {
             McError::TokenAcquisition(_) => "token_acquisition",
             McError::TokenAcquisitionTimeout => "token_acquisition_timeout",
             McError::IdentityKeyInvalid => "identity_key_invalid",
-            McError::SenderIdSpaceExhausted => "sender_id_space_exhausted",
             McError::MediaPolicyDivergence { .. } => "media_policy_divergence",
         }
     }
@@ -290,13 +276,7 @@ impl McError {
             // Generic by construction: no length, no cause, nothing the caller
             // could use to probe which validation failed.
             McError::IdentityKeyInvalid => "Invalid join request".to_string(),
-            // Byte-identical BY CONSTRUCTION, not by convention: a client must
-            // not be able to distinguish namespace exhaustion from an ordinary
-            // capacity limit. One arm, so the two cannot drift apart — editing
-            // this string moves both, which is the point.
-            McError::MeetingCapacityExceeded(_) | McError::SenderIdSpaceExhausted => {
-                "Meeting is at capacity".to_string()
-            }
+            McError::MeetingCapacityExceeded(_) => "Meeting is at capacity".to_string(),
         }
     }
 }
