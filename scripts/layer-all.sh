@@ -36,11 +36,16 @@ source "${__here}/lang/_common.sh"
 source "${__here}/lang/_gate2_binding.sh"
 init_devloop_tmp
 
-# Runtime discoverability for the memory cap set in lang/_common.sh: announce the
+# Runtime discoverability for the memory cap (build.jobs in .cargo/config.toml): announce the
 # effective cargo job budget and its escape hatch once at pipeline start, so anyone
 # watching a run sees why parallelism is limited and how to change it.
-printf 'CARGO_BUILD_JOBS=%s (capped for memory; export CARGO_BUILD_JOBS=N or pass --jobs to override)\n' \
-  "${CARGO_BUILD_JOBS:-<unset>}" >&2
+if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+  __cap="${CARGO_BUILD_JOBS} (from the CARGO_BUILD_JOBS env override)"
+else
+  __cap="$(sed -n 's/^jobs[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${__here}/../.cargo/config.toml" | head -n1)"
+  __cap="${__cap:-<unset>} (build.jobs in .cargo/config.toml)"
+fi
+printf 'cargo jobs cap: %s — capped for memory; export CARGO_BUILD_JOBS=N or pass --jobs to override\n' "$__cap" >&2
 
 # --- Layer range (developer fast lane) ---------------------------------------
 # Default: the full authority pipeline, layers 1..7. `--max-layer N` runs layers

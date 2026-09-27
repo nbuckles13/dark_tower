@@ -95,7 +95,6 @@ fn run() -> Result<(), HelperError> {
         registry_path: ports::registry_path(),
         container_runtime,
         host_gateway_ip: args.host_gateway_ip,
-        cargo_build_jobs: args.cargo_build_jobs,
         shutdown: Arc::clone(&shutdown),
         write_state: Arc::new(Mutex::new(commands::WriteState::new())),
         recreate_bound: AtomicBool::new(false),
@@ -474,23 +473,6 @@ struct Args {
     slug: String,
     project_root: Option<PathBuf>,
     host_gateway_ip: Option<String>,
-    /// Cargo parallelism cap for the service image builds (validated; see
-    /// [`parse_cargo_build_jobs`]).
-    cargo_build_jobs: String,
-}
-
-/// Validate the `--cargo-build-jobs` value: a positive integer, or cargo's own
-/// `default` keyword. It becomes one `--build-arg CARGO_BUILD_JOBS=<v>` argv element
-/// (never a shell string), but is still closed-set validated: an empty or malformed
-/// value would make cargo refuse to build, and the helper fails at startup instead.
-fn parse_cargo_build_jobs(v: &str) -> Result<String, HelperError> {
-    if v == "default" || v.parse::<u32>().is_ok_and(|n| n > 0) {
-        Ok(v.to_string())
-    } else {
-        Err(HelperError::InvalidRequest(format!(
-            "--cargo-build-jobs must be a positive integer or 'default', got {v:?}"
-        )))
-    }
 }
 
 /// Parse CLI arguments.
@@ -498,7 +480,7 @@ fn parse_args() -> Result<Args, HelperError> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: devloop-helper <slug> --cargo-build-jobs <n|default> [--project-root <path>] [--host-gateway-ip <ip>]");
+        eprintln!("Usage: devloop-helper <slug> [--project-root <path>] [--host-gateway-ip <ip>]");
         return Err(HelperError::InvalidRequest(
             "missing required argument: slug".to_string(),
         ));
@@ -511,7 +493,6 @@ fn parse_args() -> Result<Args, HelperError> {
 
     let mut project_root = None;
     let mut host_gateway_ip = None;
-    let mut cargo_build_jobs = None;
     let mut i = 2;
     while i < args.len() {
         let arg = args.get(i).ok_or_else(|| {
@@ -532,13 +513,6 @@ fn parse_args() -> Result<Args, HelperError> {
                 })?;
                 host_gateway_ip = Some(val.clone());
             }
-            "--cargo-build-jobs" => {
-                i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    HelperError::InvalidRequest("--cargo-build-jobs requires a value".to_string())
-                })?;
-                cargo_build_jobs = Some(parse_cargo_build_jobs(val)?);
-            }
             other => {
                 return Err(HelperError::InvalidRequest(format!(
                     "unknown argument: {other}"
@@ -548,22 +522,10 @@ fn parse_args() -> Result<Args, HelperError> {
         i += 1;
     }
 
-    // REQUIRED, no default: every service image build the helper runs must be capped
-    // (an uncapped 32-way release build per image exhausted the WSL VM with two devloops
-    // running, 2026-09-27). devloop.sh passes the pipeline's default (see
-    // scripts/lang/_common.sh); a launcher that forgets it fails here, loudly.
-    let cargo_build_jobs = cargo_build_jobs.ok_or_else(|| {
-        HelperError::InvalidRequest(
-            "missing required --cargo-build-jobs (devloop.sh passes the pipeline cap; see scripts/lang/_common.sh)"
-                .to_string(),
-        )
-    })?;
-
     Ok(Args {
         slug,
         project_root,
         host_gateway_ip,
-        cargo_build_jobs,
     })
 }
 
@@ -676,7 +638,6 @@ fn build_test_context(dir: &Path) -> commands::Context {
         registry_path: dir.join("port-registry.json"),
         container_runtime: commands::ContainerRuntime::Podman,
         host_gateway_ip: None,
-        cargo_build_jobs: "6".to_string(),
         shutdown: Arc::new(AtomicBool::new(false)),
         write_state: Arc::new(Mutex::new(commands::WriteState::new())),
         recreate_bound: AtomicBool::new(false),
@@ -704,25 +665,6 @@ fn read_all_ndjson(reader: &mut impl BufRead) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cargo_build_jobs_accepts_positive_integers_and_default() {
-        assert_eq!(parse_cargo_build_jobs("6").unwrap(), "6");
-        assert_eq!(parse_cargo_build_jobs("1").unwrap(), "1");
-        assert_eq!(parse_cargo_build_jobs("default").unwrap(), "default");
-    }
-
-    #[test]
-    fn cargo_build_jobs_rejects_empty_zero_negative_and_junk() {
-        // Each of these would make cargo refuse to build, or smuggle more than a
-        // value into the build arg; the helper must refuse to start instead.
-        for bad in ["", "0", "-1", "six", "6 --no-cache", "Default", "6\n"] {
-            assert!(
-                parse_cargo_build_jobs(bad).is_err(),
-                "accepted invalid --cargo-build-jobs {bad:?}"
-            );
-        }
-    }
 
     #[test]
     fn test_valid_slug() {

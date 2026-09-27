@@ -56,10 +56,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-# Cargo parallelism cap passed into every service image build below (build_image). Same
-# default as scripts/lang/_common.sh, which carries the rationale; scripts/setup.test.sh pins
-# the defaults equal. An operator's exported CARGO_BUILD_JOBS overrides it.
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
 CLUSTER_NAME="${DT_CLUSTER_NAME:-dark-tower}"
 KIND_CONFIG="${PROJECT_ROOT}/infra/kind/kind-config.yaml"
 CALICO_VERSION="v3.27.0"
@@ -556,8 +552,7 @@ build_image() {
     check_build_disk_space "$CONTAINER_CMD"
     local OLD_IMAGE_ID
     OLD_IMAGE_ID=$(${CONTAINER_CMD} images -q "$TAG" 2>/dev/null || true)
-    ${CONTAINER_CMD} build --build-arg "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}" \
-        -t "$TAG" -f "$DOCKERFILE" "$CONTEXT"
+    ${CONTAINER_CMD} build -t "$TAG" -f "$DOCKERFILE" "$CONTEXT"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(${CONTAINER_CMD} images -q "$TAG")" ]; then
         ${CONTAINER_CMD} rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi

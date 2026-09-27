@@ -54,30 +54,9 @@ init_devloop_tmp() {
 # -----------------------------------------------------------------------------
 # Build parallelism cap (memory, not cores)
 # -----------------------------------------------------------------------------
-# Cap concurrent cargo jobs for the WHOLE validation pipeline. Every rust wrapper
-# (compile/test/lint/audit) sources this file.
-#
-# WHY: the RAM peak of a Rust build is the LINK phase — several concurrent links at
-# ~1.5-2GB each. cargo's only self-scaling is to CPU count (nproc=32 here), which is
-# the wrong axis: more cores → more concurrent links → OOM. There is no memory-aware
-# self-throttle in stable cargo, so we cap jobs by hand. On the 16GB WSL dev box the
-# Kind cluster + observability stack take ~3GB, leaving ~11GB; 6 links * ~1.5-2GB fits
-# with margin, 8 does not. The cap is PER cargo invocation: two devloops building at
-# once still double the load (see docs/TODO.md, cross-devloop build coordination).
-#
-# The same default is also passed into every service IMAGE build (their release
-# dependency + service compilation are the heaviest builds on the box, and ran uncapped):
-# infra/kind/scripts/setup.sh and infra/devloop/devloop.sh (for the devloop helper) each
-# carry `${CARGO_BUILD_JOBS:-6}`. scripts/setup.test.sh pins the three defaults EQUAL, so
-# change them together.
-#
-# Precedence (cargo): `--jobs` flag > CARGO_BUILD_JOBS env > build.jobs config.
-# The `:-` respects an operator override — export CARGO_BUILD_JOBS=N (or pass
-# `--jobs`) to raise it on a bigger box or lower it on a weaker one. A bare
-# `cargo build` outside the pipeline is intentionally NOT capped; see the pointer
-# comment in .cargo/config.toml. A deliberate hand-run image build passes
-# CARGO_BUILD_JOBS=default (the Dockerfiles require the arg).
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
+# Cargo parallelism is capped by `build.jobs` in .cargo/config.toml, which every cargo
+# invocation in the workspace reads (the pipeline included), so nothing is exported here.
+# That file holds the number and the rationale; override per machine with CARGO_BUILD_JOBS.
 
 # -----------------------------------------------------------------------------
 # Cargo lockfile enforcement (CI only)
