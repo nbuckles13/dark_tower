@@ -354,6 +354,13 @@ struct DockerfileScan {
 fn scan_dockerfile(content: &str) -> DockerfileScan {
     let mut scan = DockerfileScan::default();
     for (line, text) in logical_lines(content) {
+        // A Dockerfile comment is prose, not an instruction: a comment that merely
+        // MENTIONS a cargo build must not be scanned as one (it produced a false
+        // "selects no profile" violation). No real instruction starts with `#`, so this
+        // cannot hide a build.
+        if text.trim_start().starts_with('#') {
+            continue;
+        }
         if is_cargo_build(&text) {
             scan.build.push(CargoInvocation {
                 line,
@@ -1602,6 +1609,19 @@ mod tests {
         let scan = scan_dockerfile(src);
         assert_eq!(scan.build.len(), 1);
         assert_eq!(scan.cook.len(), 1);
+    }
+
+    #[test]
+    fn dockerfile_scan_ignores_comments_that_mention_cargo_build() {
+        // Comments describing the build are prose; only the real instruction counts, so
+        // a profile-less `cargo build` in a comment raises no "selects no profile" finding.
+        let src = "# policy for bare cargo build invocations: see scripts/lang/_common.sh
+                   #   cargo build --package mh-service
+                   RUN cargo build --release --package mh-service
+";
+        let scan = scan_dockerfile(src);
+        assert_eq!(scan.build.len(), 1);
+        assert!(scan.build[0].text.contains("--release"));
     }
 
     // --- TOML profile parsing ---------------------------------------------

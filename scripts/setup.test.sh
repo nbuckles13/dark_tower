@@ -575,4 +575,60 @@ assert_rc "only-bogus-rejected-rc" 1 "$only_rc"
 assert_status "only-bogus-lists-otel" "Valid: ac, gc, mc, mh, otel" "$only_out"
 assert_no_marker "only-bogus-never-reaches-kind" "$MARK" 'ran.kind'
 
+# === (D) the cargo parallelism cap reaches the service IMAGE builds ==========================
+# The image builds' release `cargo chef cook` + `cargo build` are the heaviest builds on the box
+# and ran uncapped (nproc=32 jobs each) while the pipeline's cargo was capped at 6 — two devloops
+# building images at once exhausted the 16GB WSL VM (2026-09-27). The podman stub records argv,
+# so the build arg is observed, not inferred. `env -u` because layer-all exports the cap into this harness's environment.
+# OWN recording stub dir: the shared ${STUB_BIN}/podman is rewritten by later groups to a
+# touch-only stub, so borrowing it would record nothing and fail for the wrong reason.
+IMG_BIN="${WORK}/img-bin"; mkdir -p "$IMG_BIN"
+cat > "${IMG_BIN}/podman" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${WORK}/img-podman.calls"
+exit 0
+EOF
+chmod +x "${IMG_BIN}/podman"
+BUILD_ONE='sp="$1"; set --; source "$sp" >/dev/null 2>&1; KIND_EXPERIMENTAL_PROVIDER=podman build_image localhost/x:latest Dockerfile . >/dev/null 2>&1'
+rm -f "${WORK}/img-podman.calls"
+env -u CARGO_BUILD_JOBS PATH="${IMG_BIN}:${PATH}" DEVLOOP_MIN_DISK_GB=0 bash -c "$BUILD_ONE" _ "$SETUP"
+assert_status "image-build-gets-default-cap" "build --build-arg CARGO_BUILD_JOBS=6 " "$(cat "${WORK}/img-podman.calls" 2>/dev/null)"
+rm -f "${WORK}/img-podman.calls"
+env CARGO_BUILD_JOBS=3 PATH="${IMG_BIN}:${PATH}" DEVLOOP_MIN_DISK_GB=0 bash -c "$BUILD_ONE" _ "$SETUP"
+assert_status "image-build-honours-override" "build --build-arg CARGO_BUILD_JOBS=3 " "$(cat "${WORK}/img-podman.calls" 2>/dev/null)"
+
+# Every Dockerfile STAGE that runs a cargo build declares the cap as a REQUIRED arg (no default,
+# fail-closed `test -n`) before its first cargo build (ARG scope is per stage): a new service's
+# Dockerfile cannot opt out, and a build path that forgets to pass the arg fails loudly.
+df_count=0
+for df in "${REPO_ROOT}"/infra/docker/*/Dockerfile; do
+  df_count=$((df_count + 1))
+  bad="$(awk '
+    /^FROM /                        { stage=$0; arg=0; req=0; env=0; next }
+    /^ARG CARGO_BUILD_JOBS$/        { arg=1 }
+    /^RUN test -n "\$CARGO_BUILD_JOBS"/ { req=1 }
+    /^ENV CARGO_BUILD_JOBS=\$\{CARGO_BUILD_JOBS\}$/ { env=1 }
+    /^RUN cargo (chef cook|build)/  { if (!(arg && req && env)) print stage }
+  ' "$df" | sort -u)"
+  if [ -z "$bad" ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); FAILURES+=("[dockerfile-cap-declared] ${df#"${REPO_ROOT}"/}: a cargo build runs in stage '${bad}' without the required ARG + fail-closed check + ENV CARGO_BUILD_JOBS before it"); fi
+done
+# The default is hardcoded in THREE places (the pipeline, setup.sh's image builds, devloop.sh's
+# helper launch) rather than shared through a sourced file; pin them equal so none drifts.
+cap_sites=("scripts/lang/_common.sh" "infra/kind/scripts/setup.sh" "infra/devloop/devloop.sh")
+cap_vals=""
+for f in "${cap_sites[@]}"; do
+  v="$(grep -oE 'CARGO_BUILD_JOBS:-[0-9]+' "${REPO_ROOT}/${f}" | sort -u)"
+  if [ "$(printf '%s\n' "$v" | grep -c .)" -ne 1 ]; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[cargo-cap-site] ${f}: expected exactly one CARGO_BUILD_JOBS default, found: ${v:-none}")
+  else
+    PASS=$((PASS + 1)); cap_vals="${cap_vals}${v#CARGO_BUILD_JOBS:-} "
+  fi
+done
+if [ "$(printf '%s' "$cap_vals" | tr ' ' '\n' | grep -v '^$' | sort -u | grep -c .)" -eq 1 ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[cargo-cap-defaults-equal] CARGO_BUILD_JOBS defaults differ across ${cap_sites[*]}: ${cap_vals}"); fi
+# Positive control: the loop must have checked the four service Dockerfiles, not zero.
+if [ "$df_count" -ge 4 ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[dockerfile-cap-nonvacuous] expected >=4 service Dockerfiles, found ${df_count}"); fi
+
 report_results "scripts/setup.test.sh"

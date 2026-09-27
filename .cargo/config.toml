@@ -4,7 +4,7 @@
 # at full parallelism (cargo defaults to your CPU count).
 #
 # The validation pipeline caps it instead: scripts/lang/_common.sh (sourced by
-# every rust wrapper) exports `CARGO_BUILD_JOBS=6`. layer-all.sh compiles ~140
+# every rust wrapper) exports `CARGO_BUILD_JOBS=6`; the service image builds get the same cap. layer-all.sh compiles ~140
 # targets (workspace + 117 integration-test binaries) and the RAM peak is the
 # LINK phase — several concurrent links at ~1.5-2GB each — which on the 16GB WSL
 # dev box (with the Kind cluster + observability stack taking ~3GB) OOMs at full

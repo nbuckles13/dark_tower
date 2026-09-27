@@ -45,6 +45,15 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ========================================
 FROM chef AS builder
 
+# Cargo parallelism cap for the heavy release compilation below (dependencies and the
+# service). REQUIRED build arg with NO default: every image-build path (setup.sh, the
+# devloop helper) passes the pipeline's cap (scripts/lang/_common.sh), and a path
+# that forgets it fails HERE, loudly, instead of silently compiling on every core. A
+# deliberate hand build passes --build-arg CARGO_BUILD_JOBS=default (cargo's "uncapped").
+ARG CARGO_BUILD_JOBS
+RUN test -n "$CARGO_BUILD_JOBS" || { echo "ERROR: build arg CARGO_BUILD_JOBS is required (see scripts/lang/_common.sh); pass --build-arg CARGO_BUILD_JOBS=<n|default>" >&2; exit 1; }
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 # Copy recipe from planner stage
 COPY --from=planner /build/recipe.json recipe.json
 
