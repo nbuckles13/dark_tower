@@ -590,7 +590,7 @@ no `#[instrument]` anywhere in `media_signaling`: its functions take
 `SlotId`/`SenderId`/`&ReceiveCapability` parameters that an auto-instrumented
 span would record as attributes, on a surface no guard covers.
 
-**Scrape periodicity**: MC inherits the global 10 s `scrape_interval` (R-36).
+**Scrape periodicity**: MC is scraped at the `mc-service` job's own per-job `scrape_interval` in `infra/kubernetes/observability/prometheus.yml`, the authoritative config (R-36; see `docs/observability/dashboard-conventions.md` §Periodicity). Cite the key, never a number.
 
 ### `mc_media_receive_capability_declarations_total`
 - **Type**: Counter

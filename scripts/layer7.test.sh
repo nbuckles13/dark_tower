@@ -102,6 +102,8 @@ case "$1" in
   setup)       exit "${FAKE_SETUP_RC:-0}" ;;
   teardown)    exit "${FAKE_TEARDOWN_RC:-0}" ;;
   rebuild-all) exit "${FAKE_REBUILD_RC:-0}" ;;
+  # Phase 1c0 (story 2 task 10): re-apply a service's manifests when the diff touches them.
+  deploy)      exit "${FAKE_DEPLOY_RC:-0}" ;;
   recreate)
     # Append-counter (one line per invocation) so a case can assert EXACTLY one
     # recreate — the once-per-helper-lifetime bound proof at the shell level.

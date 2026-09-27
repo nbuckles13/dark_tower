@@ -39,7 +39,7 @@ pub fn with_ceiling(stream_ceiling: usize) -> StreamAdmission {
 }
 
 /// Generous ADR-0036 §8 policy bounds for `tests/` binaries that are not ABOUT
-/// a bound. `PolicyLimits` has no `Default` — its five keys are required reads
+/// a bound. `PolicyLimits` has no `Default` — its six keys are required reads
 /// and a default would be the second encoding that removed — so the fixture
 /// lives here, named as a fixture. The `src/` twin is
 /// `PolicyLimits::for_tests` (same crate-instance reason as above).
@@ -57,5 +57,6 @@ pub fn fixture_policy_limits() -> mh_service::config::PolicyLimits {
         max_total_egress_edges: 65_536,
         policy_apply_timeout_ms: 1_000,
         max_registered_meetings: 8_192,
+        max_muted_sources_per_meeting: 512,
     }
 }

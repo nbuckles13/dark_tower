@@ -94,6 +94,34 @@ const PRE_ALLOCATION_CONSEQUENCE: &str =
 /// `RegisterMeetingRequest.egress_streams`).
 pub const MAX_EGRESS_STREAMS_PER_MEETING_CEILING: usize = 8_192;
 
+/// Hard ceiling for `MH_MAX_MUTED_SOURCES_PER_MEETING` (per-meeting bound on
+/// `RegisterMeetingRequest.server_muted_sources`, story 2 R-9).
+///
+/// A fat-finger bound on the KEY, on the same footing as the §8 ceilings: a
+/// `> 0` check alone would let a copy-pasted huge value silently turn this
+/// PRE-ALLOCATION guard back into an attacker-sized allocation.
+///
+/// DERIVED from the egress-stream ceiling, never a literal, because the
+/// deployed relation is `MH_MAX_MUTED_SOURCES_PER_MEETING >=
+/// MH_MAX_EGRESS_STREAMS_PER_MEETING` (a legitimate per-handler muted set can
+/// never name more senders than the streams they source there — see
+/// `infra/services/mh-service/configmap.yaml`). A muted ceiling BELOW the egress
+/// ceiling would make some egress value MH accepts impossible to pair with a
+/// legal muted value; boot would then refuse on
+/// [`ConfigError::MutedSourceBoundBelowEgressBound`] for a configuration no
+/// operator can fix. Equal is the tightest value that cannot.
+pub const MAX_MUTED_SOURCES_PER_MEETING_CEILING: usize = MAX_EGRESS_STREAMS_PER_MEETING_CEILING;
+
+// INERT TODAY, deliberately: while the ceiling above is DEFINED as the egress
+// ceiling this is `A >= A` and cannot fail. It is a tripwire for the edit that
+// replaces that derivation with an independent literal — then it fires if the
+// literal is below the egress ceiling. Not a live check of anything now; do not
+// read it as one, and do not delete it as dead.
+const _: () = assert!(
+    MAX_MUTED_SOURCES_PER_MEETING_CEILING >= MAX_EGRESS_STREAMS_PER_MEETING_CEILING,
+    "the muted-source ceiling must admit every muted value the egress ceiling can require"
+);
+
 /// Hard ceiling for `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS` (per-egress-stream
 /// bound on `EgressStream.candidate_sources`).
 ///
@@ -900,11 +928,16 @@ pub struct PolicyLimits {
     /// (`MH_MAX_REGISTERED_MEETINGS`, story 2 R-21). Refuses only a NEW
     /// meeting id; a re-registration of a held meeting is never refused.
     pub max_registered_meetings: usize,
+    /// Max `server_muted_sources` in one registration
+    /// (`MH_MAX_MUTED_SOURCES_PER_MEETING`, story 2 R-9). A PRE-ALLOCATION
+    /// bound checked before any per-element work, like the two above it.
+    /// Load refuses a value below `max_egress_streams_per_meeting`.
+    pub max_muted_sources_per_meeting: usize,
 }
 
 impl PolicyLimits {
     /// Generous fixture bounds for `src/` unit tests that are not ABOUT a
-    /// bound. There is no `Default`: the five keys are required, and a default
+    /// bound. There is no `Default`: the six keys are required, and a default
     /// would be exactly the second encoding their required-ness removed.
     /// `tests/` binaries use `mh_test_utils::admission::fixture_policy_limits`.
     ///
@@ -923,6 +956,7 @@ impl PolicyLimits {
             max_total_egress_edges: 65_536,
             policy_apply_timeout_ms: 1_000,
             max_registered_meetings: 8_192,
+            max_muted_sources_per_meeting: 512,
         }
     }
 }
@@ -1624,6 +1658,29 @@ pub enum ConfigError {
         max_total_egress_edges: u64,
     },
 
+    /// The muted-source bound is below the egress-stream bound (story 2 R-9).
+    ///
+    /// A legitimate per-handler muted set names at most the senders sourcing
+    /// this handler's egress streams, so it is bounded by the egress-stream
+    /// bound. Configured below it, a legitimate large-meeting snapshot is
+    /// rejected WHOLE — that meeting loses every edge, not just its mute — and
+    /// the symptom is a rejected registration, which is not mute-shaped.
+    /// Refused at boot so the inversion is a loud crash, never a runtime outage.
+    #[error(
+        "MH_MAX_MUTED_SOURCES_PER_MEETING ({muted}) is below MH_MAX_EGRESS_STREAMS_PER_MEETING \
+         ({egress}). The muted bound must be AT LEAST the egress bound, or a legitimate \
+         registration naming more muted senders than it admits is rejected whole and the \
+         meeting loses all its edges. Remediation: raise MH_MAX_MUTED_SOURCES_PER_MEETING to at \
+         least {egress}, or lower MH_MAX_EGRESS_STREAMS_PER_MEETING, in \
+         infra/services/mh-service/configmap.yaml"
+    )]
+    MutedSourceBoundBelowEgressBound {
+        /// The configured `MH_MAX_MUTED_SOURCES_PER_MEETING`.
+        muted: u64,
+        /// The configured `MH_MAX_EGRESS_STREAMS_PER_MEETING`.
+        egress: u64,
+    },
+
     /// The keepalive interval is too close to the idle timeout.
     ///
     /// Scope limit, stated so nobody reads this validation as a wire-level
@@ -1950,6 +2007,11 @@ impl Config {
         let raw_max_registered_meetings = vars
             .get("MH_MAX_REGISTERED_MEETINGS")
             .ok_or_else(|| ConfigError::MissingEnvVar("MH_MAX_REGISTERED_MEETINGS".to_string()))?;
+        let raw_max_muted_sources =
+            vars.get("MH_MAX_MUTED_SOURCES_PER_MEETING")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MH_MAX_MUTED_SOURCES_PER_MEETING".to_string())
+                })?;
 
         let policy_limits = PolicyLimits {
             max_egress_streams_per_meeting: bound_to_usize(
@@ -2001,7 +2063,27 @@ impl Config {
                     "the guard would stop bounding the handler's registration map",
                 )?,
             )?,
+            max_muted_sources_per_meeting: bound_to_usize(
+                "MH_MAX_MUTED_SOURCES_PER_MEETING",
+                parse_bounded(
+                    "MH_MAX_MUTED_SOURCES_PER_MEETING",
+                    raw_max_muted_sources,
+                    MAX_MUTED_SOURCES_PER_MEETING_CEILING as u64,
+                    "every registration naming a server-muted source would be rejected whole",
+                    PRE_ALLOCATION_CONSEQUENCE,
+                )?,
+            )?,
         };
+        // Cross-key relation (story 2 R-9): refuse to boot rather than reject
+        // legitimate large-meeting snapshots whole at runtime.
+        if policy_limits.max_muted_sources_per_meeting
+            < policy_limits.max_egress_streams_per_meeting
+        {
+            return Err(ConfigError::MutedSourceBoundBelowEgressBound {
+                muted: policy_limits.max_muted_sources_per_meeting as u64,
+                egress: policy_limits.max_egress_streams_per_meeting as u64,
+            });
+        }
 
         // Egress-budget admission chain (story 2 R-19, R-23) — four REQUIRED
         // keys; see the module-level "Egress-budget admission" section. Costs
@@ -2254,6 +2336,11 @@ mod tests {
             ("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "1000".to_string()),
             // Registered-meeting cap (story 2 R-21), the deployed value.
             ("MH_MAX_REGISTERED_MEETINGS".to_string(), "8192".to_string()),
+            // Muted-source bound (story 2 R-9), the deployed value.
+            (
+                "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+                "512".to_string(),
+            ),
             // Egress-budget chain (story 2 R-19). The BASE ConfigMap's
             // deliberately unsized placeholder budget — it must boot (above the
             // refuse-boot floor) and nudge (below the recommended minimum).
@@ -2271,10 +2358,10 @@ mod tests {
     }
 
     /// Every key story 2 makes REQUIRED: task 8's four new egress-chain keys
-    /// and four flipped §8 bounds, and task 11's registered-meeting cap. One
-    /// list, iterated by both the absence and the malformed-value tests, so
-    /// neither can cover a subset.
-    const STORY2_REQUIRED_KEYS: [&str; 9] = [
+    /// and four flipped §8 bounds, task 11's registered-meeting cap, and task
+    /// 10's muted-source bound. One list, iterated by both the absence and the
+    /// malformed-value tests, so neither can cover a subset.
+    const STORY2_REQUIRED_KEYS: [&str; 10] = [
         "MH_EGRESS_BUDGET_BPS",
         "MH_STREAM_COST_AUDIO_BPS",
         "MH_STREAM_COST_VIDEO_BPS",
@@ -2284,6 +2371,7 @@ mod tests {
         "MH_MAX_TOTAL_EGRESS_EDGES",
         "MH_POLICY_APPLY_TIMEOUT_MS",
         "MH_MAX_REGISTERED_MEETINGS",
+        "MH_MAX_MUTED_SOURCES_PER_MEETING",
     ];
 
     /// Derive with the base costs and a budget chosen so the ceiling is
@@ -3387,6 +3475,10 @@ mod tests {
         vars.insert("MH_MAX_TOTAL_EGRESS_EDGES".to_string(), "1024".to_string());
         vars.insert("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "250".to_string());
         vars.insert("MH_MAX_REGISTERED_MEETINGS".to_string(), "300".to_string());
+        vars.insert(
+            "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+            "96".to_string(),
+        );
 
         let config = Config::from_vars(&vars).unwrap();
         assert_eq!(config.policy_limits.max_egress_streams_per_meeting, 64);
@@ -3394,6 +3486,40 @@ mod tests {
         assert_eq!(config.policy_limits.max_total_egress_edges, 1024);
         assert_eq!(config.policy_limits.policy_apply_timeout_ms, 250);
         assert_eq!(config.policy_limits.max_registered_meetings, 300);
+        assert_eq!(config.policy_limits.max_muted_sources_per_meeting, 96);
+    }
+
+    /// The muted-source bound below the egress-stream bound refuses to boot
+    /// (story 2 R-9): at runtime that inversion would reject a legitimate
+    /// large-meeting snapshot WHOLE, costing the meeting every edge. Equal is
+    /// accepted — it is the deployed shape.
+    #[test]
+    fn test_muted_bound_below_egress_bound_refuses_boot() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+            "511".to_string(),
+        );
+        let err = Config::from_vars(&vars).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::MutedSourceBoundBelowEgressBound {
+                    muted: 511,
+                    egress: 512
+                }
+            ),
+            "got: {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("MH_MAX_MUTED_SOURCES_PER_MEETING"));
+        assert!(text.contains("MH_MAX_EGRESS_STREAMS_PER_MEETING"));
+
+        vars.insert(
+            "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+            "512".to_string(),
+        );
+        assert!(Config::from_vars(&vars).is_ok(), "equal bounds are legal");
     }
 
     /// Zero is rejected, not clamped.
@@ -3409,6 +3535,7 @@ mod tests {
             "MH_MAX_TOTAL_EGRESS_EDGES",
             "MH_POLICY_APPLY_TIMEOUT_MS",
             "MH_MAX_REGISTERED_MEETINGS",
+            "MH_MAX_MUTED_SOURCES_PER_MEETING",
         ] {
             let mut vars = base_vars();
             vars.insert(key.to_string(), "0".to_string());
@@ -3446,6 +3573,10 @@ mod tests {
             (
                 "MH_MAX_REGISTERED_MEETINGS",
                 MAX_REGISTERED_MEETINGS_CEILING + 1,
+            ),
+            (
+                "MH_MAX_MUTED_SOURCES_PER_MEETING",
+                MAX_MUTED_SOURCES_PER_MEETING_CEILING + 1,
             ),
         ];
         for (key, value) in cases {

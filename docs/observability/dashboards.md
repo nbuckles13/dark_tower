@@ -235,8 +235,8 @@ Two conventions this board depends on, both easy to break by well-meaning edit:
   additionally spans a client-influenced phase — see `docs/observability/slos.md`
   §Open: which series the objective attaches to.
 - **The drop panels use `increase()`, not `rate()`**, and carry **no `or vector(0)`**. At
-  the deployed 15 s cadence a single drop under `rate()` renders ~0.003/s, which reads
-  identical to healthy on the one panel whose purpose is that a single drop is visible;
+  any realistic scrape cadence a single discrete drop under `rate()` renders as a near-zero
+  rate, which reads identical to healthy on the one panel whose purpose is that a single drop is visible;
   and `or vector(0)` would fabricate a series and flatten the by-reason breakdown.
 - **The egress-admission panels preserve the "empty = healthy" reading.** Every series
   they read is registered eagerly at MH startup: the admission counter's outcomes are

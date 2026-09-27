@@ -357,7 +357,7 @@ sum by(outcome) (increase(mh_media_stream_admission_total[$__rate_interval]))
 
 Defined values: **no decisions in the window publishes 0.0** (never NaN, never 1.0 — the alert must be silent on an idle handler); **zero admitted with any rejected publishes 1.0** (never 0.0 — the alert must not be quietest when exhaustion is total).
 
-**This gauge is authoritative for the exhaustion alert.** `rate(…rejected_stream_ceiling[5m]) / rate(…[5m])` computes a similar quantity by a different route and WILL disagree (different window boundaries, Prometheus extrapolation, and the 15 s scrape against 10 s buckets). A responder who computes both should not triage the difference as a bug. The scrape interval also means a sub-30 s excursion can be invisible here; the counter is the record of every decision.
+**This gauge is authoritative for the exhaustion alert.** `rate(…rejected_stream_ceiling[5m]) / rate(…[5m])` computes a similar quantity by a different route and WILL disagree (different window boundaries, Prometheus extrapolation, and the `mh-service` job's `scrape_interval` not aligned with the 10 s buckets). A responder who computes both should not triage the difference as a bug. The scrape interval also means an excursion shorter than a few scrapes can be invisible here; the counter is the record of every decision.
 
 MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above the threshold (only with at least 10 decisions in the window, re-arming at half the threshold). That line is a **debugging breadcrumb**; the Prometheus alert, with its own `for:` and denominator guard, is authoritative for paging, and the two may disagree at the edges.
 
@@ -980,6 +980,70 @@ vocabulary is disjoint from every token in
 > so rather than cross-referencing a control nobody built. An MH-side *ingress*
 > hop-gap counter would not substitute: the eviction is on MH's **downlink**, so
 > only the client can see it.
+
+*Policy tokens* (story 2 R-9). A THIRD group, neither an MH fault nor a
+sender fault: the frame was dropped because the control plane told MH to drop
+it. Neither of the groups above fits, because what a responder does differs —
+read the drop against whether it was INTENDED.
+
+| `reason` | `direction` | Condition | What a responder does |
+|---|---|---|---|
+| `server_muted` | ingress | The frame's spawn-bound sender is in this meeting's server-muted set from the current registration snapshot (`RegisterMeetingRequest.server_muted_sources`, ADR-0036 §7). Dropped at the top of `forward_one`, before decode and before fan-out, so it consumes no hop number. | **Not a fault in either direction.** Zero while no mute is active; while a mute IS active it tracks the muted sender's full frame rate, so non-zero is healthy moderation. The diagnostic value is reading it — zero or not — against whether a mute was intended. The remedy for an unwanted mute is the control plane: read the meeting's registration snapshot (MC). |
+
+The series is **present at zero from process start** (pre-registered by
+`resolve_media_handles`, which walks `MediaDropReason::ALL`), so **absent is
+NOT zero**: an absent `server_muted` series means MH is not up or not scraped,
+never "nobody is muted".
+
+**What a deployed zero means depends on a task boundary.**
+
+1. **Enforcement is live at MH as of story 2 task 10.** The drop path and this
+   counter are real and tested end to end (env-test S4 in
+   `crates/env-tests/tests/26_mh_quic.rs`). This is NOT a
+   `stream_rate_limited`- or `partial_frame_discard`-style token with no
+   enforcement behind it.
+2. **No production producer sets the muted set until story 2 task 12.** MC
+   sends `server_muted_sources` empty unconditionally today
+   (`crates/mc-service/src/grpc/mh_client.rs`). So **in a deployed cluster
+   this series is zero BY CONSTRUCTION until task 12 lands, and reading that
+   zero proves nothing about whether mutes are honoured.** After task 12 the
+   same zero becomes informative.
+3. **MC-side signal.** As of task 10 MC exposes no server-mute-specific
+   metric, and the one wire state (`slot_state="source_muted"`) covers client
+   AND server mute, so this counter is the only fleet evidence that a server
+   mute is in force. `mc_media_server_mute_requests_total{action,outcome}` is
+   specified and owned by story 2 task 12. A residual survives even that — a
+   request-EVENT count cannot say whether a mute is in force NOW — and is
+   tracked in `docs/TODO.md` §Media Path Obligations (trigger: task 12).
+
+**Sender-scoped, and per-stream ingress mute is foreclosed.** MH binds the
+sender per connection and never reads the stream number (inside the opaque
+`SFrame` key id); the only stream indicator readable at ingress is the relay
+region, which the muted publisher writes. Keying a mute on either would be
+self-selectable evasion, so per-kind mute (video) moves to MC's egress edge
+set. Single home of the reasoning: `internal.proto` `MutedSource`.
+
+**Who can set it.** A patched CLIENT changes nothing observable: the sender is
+bound at spawn after the JWT gate and the frame carries no sender id, so no
+client input reaches the decision. A holder of the `service.write.mh`
+credential (granted only to MC by AC's default scopes) can set or clear a mute
+through the registration contract, which authorizes on scope alone — that
+principal set also includes any on-path position on the cleartext MC->MH hop,
+as recorded (and bounded) in `docs/TODO.md` §Media Path Obligations. A mute
+installed under a DIFFERENT `mc_id` leaves MH's register-path takeover WARN;
+one installed with the owning MC's own credential leaves nothing but this
+counter. Unsupported and untooled.
+
+**No alert**, recorded: a non-zero rate is healthy moderation, and the inverse
+("a mute that should be dropping is not") needs a per-meeting correlation
+ADR-0036 §11 bars. Not added to the invariant-violations stat panel. The
+`sum by(reason)` ingress-drop panels break it out automatically.
+
+**Interaction with `MHIngressDatagramsNeverRead`.** A muted frame is a real
+ingress attempt, so `server_muted` enters that rule's ingress denominator
+(`forwarded{ingress} + dropped{ingress}`). A sustained mute therefore dilutes
+its `transport_receive_dropped` ratio — the fail-quiet direction; the rule's
+description says so.
 
 ### `mh_media_forward_latency_seconds`
 - **Type**: Histogram

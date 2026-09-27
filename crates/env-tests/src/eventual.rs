@@ -13,7 +13,14 @@ use tokio::time::sleep;
 /// in the cluster environment.
 #[derive(Debug, Clone, Copy)]
 pub enum ConsistencyCategory {
-    /// Prometheus metrics scraping (2x 15s scrape interval = 30s)
+    /// Prometheus metrics scraping: 30s, a FAILURE-ONLY ceiling. It must cover
+    /// two scrapes of the SLOWEST job its callers read — callers span the
+    /// service jobs, `otel-collector` and the global-interval jobs, whose
+    /// cadences are the per-job and global `scrape_interval` keys in
+    /// `infra/kubernetes/observability/prometheus.yml` — plus ingestion lag.
+    /// It is deliberately not tightened when a job's cadence drops: a ceiling
+    /// is spent only when things are slow, so shrinking it buys nothing on a
+    /// green run.
     MetricsScrape,
 
     /// Loki log aggregation (~3x 10s flush interval = 45s, generous for ingestion lag)

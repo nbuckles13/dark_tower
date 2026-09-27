@@ -19,12 +19,41 @@
 #                                            MH_STREAM_COST_VIDEO_BPS)
 #   rounded down. It divides by the VIDEO cost even though story 2 sends only
 #   audio: the larger cost is used so MH stays type-blind. So this value must
-#   satisfy  ceiling >= (N+1) x N  with N = 5, against the DEPLOYED costs.
+#   satisfy, against the DEPLOYED costs, a TWO-SIDED window:
+#     lower:  ceiling >= (N+1) x N  with N = 5            (the demo requirement)
+#     upper:  2 x ceiling < MAX_S9_PARTICIPANTS x slot_cap (the S9 exhaustion
+#             test, 28_mh_egress_admission.rs, must still be able to drive a
+#             registration past the ceiling at an affordable meeting size;
+#             limit and rule have one home in
+#             crates/env-tests/src/fixtures/egress_admission.rs)
+#
+# WHY THIS VALUE (story 2 task 10), and why it is DEV HEADROOM, NOT A CAPACITY
+# MODEL. It was 2.5x smaller, sized for the N = 5 demo alone. During story 2 task
+# 20's Gate 2, mh-0 reached 39 of 40 installed streams and refused a
+# registration outright. The cause was NOT real load: disconnected
+# participants hold their edges through MC's reconnect grace window
+# (MC_DISCONNECT_GRACE_PERIOD_SECONDS, 30 s default) while Layer-7 suites run
+# back to back, so edges from suites that had finished were still installed.
+# Raising the budget MASKS that edge retention — it lifts the ceiling above
+# the retained floor — and a reader of the unreclaimed-edge-floor triage arm
+# (MH incident runbook, egress-budget exhaustion scenario) must know the Kind
+# ceiling was moved for that reason.
+#   Considered and not taken: a shorter Kind grace period. It would remove the
+#   retention at its source, but Kind would then diverge from the grace
+#   behaviour the reconnect tests exercise, trading a capacity symptom for a
+#   dev-vs-prod behavioural gap.
+#   Why not ~10x: the upper side of the window. At 10x the ceiling is far
+#   above what S9 can exceed within its participant limit (the test would fail
+#   its own precondition), and a Kind pod (1Gi) carrying hundreds of egress
+#   streams during S9 risks an OOMKill that takes every meeting on the pod
+#   down — a worse, harder-to-diagnose failure than a clean admission refusal.
+#   The value below sits mid-window: 2.5x the observed peak, S9 at 26 of its
+#   40-participant limit.
 #
 # That relationship is ENFORCED, not asserted here: see
 #   crates/env-tests/tests/01_mh_deployment_config.rs::test_kind_egress_stream_ceiling_meets_demo_requirement
 # which reads the budget and both costs from the LIVE ConfigMap and fails if the
-# derived ceiling falls below the requirement. No ceiling literal is written
+# derived ceiling falls outside that window (either side). No ceiling literal is written
 # here on purpose — a restated result goes stale the moment either cost moves;
 # the test does not.
 #
@@ -54,4 +83,4 @@ metadata:
   name: mh-service-config
   namespace: dark-tower
 data:
-  MH_EGRESS_BUDGET_BPS: "100000000"
+  MH_EGRESS_BUDGET_BPS: "250000000"

@@ -19,7 +19,8 @@
 // with a DIFFERENT driver — the real browser SDK over the real WebTransport API
 // instead of a synthetic Rust client. Same 60s budget / 2s interval as the Rust
 // helper (chain: WT frame -> MC bridge-loop decode -> participant actor record ->
-// counter -> Prometheus scrape, 15s scrape SLA).
+// counter -> Prometheus scrape at the `mc-service` job's per-job
+// `scrape_interval` in infra/kubernetes/observability/prometheus.yml).
 //
 // PER-INSTANCE counter-delta semantics (robust to pod rollover). Every helper
 // here reads a `sum by (instance)(...)` snapshot as a MAP {instance -> value}
@@ -36,7 +37,7 @@
 // counter further up).
 //
 // WHY per-instance, and why the label is `instance` (NOT `pod`) — confirmed by
-// @observability against `infra/kubernetes/observability/prometheus-config.yaml`:
+// @observability against `infra/kubernetes/observability/prometheus.yml` (the file carrying `scrape_configs`):
 // the mc/mh scrape jobs use `role: pod` with relabel_configs that only `keep` on
 // the app label + container port; no relabel emits a `pod` target_label, so
 // Prometheus's default `instance` = `__address__` = pod IP:port is the per-pod
@@ -255,8 +256,9 @@ export async function mcParticipantLeavesByInstance(): Promise<InstanceCounters>
  * must cover MC's worst-case roster-remove latency, catalogued in
  * `docs/observability/metrics/mc-service.md` §"Worst-case roster-remove latency"
  * as `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS + MC_DISCONNECT_GRACE_PERIOD_SECONDS +
- * 5s grace-check` (defaults 10 + 30 + 5 = 45s), PLUS the ~15s Prometheus scrape
- * SLA this counter is read through ≈ 60s — so the 90s default is that worst case
+ * 5s grace-check` (defaults 10 + 30 + 5 = 45s), PLUS one scrape of the
+ * `mc-service` job this counter is read through (its per-job `scrape_interval`,
+ * no coarser than the global one) — under 60s, so the 90s default is that worst case
  * with margin (and stays under the 120s/test ceiling). This is LARGER than the
  * join-side 60s helper precisely because a departure's worst case includes the
  * disconnect grace path. In practice the spec drives a clean close, so this

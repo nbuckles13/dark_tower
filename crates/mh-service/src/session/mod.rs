@@ -492,9 +492,17 @@ impl SessionManagerActor {
             // slot ids and egress stream ids in the log — the per-stream
             // identity ADR-0036 §11 bars, and the back door that opened when
             // StreamTelemetry was deleted.
+            //
+            // The server-muted set is part of that policy (`internal.proto`
+            // field 7: a mute change IS an assignment-output change and MUST
+            // advance the generation), so a mute or unmute re-sent at an
+            // unchanged generation is exactly the contract violation this
+            // detects — and exactly the one that silently never takes effect.
+            // Counts only, never which sender.
             if let Some(current) = snapshot.routes_for(&policy.meeting) {
                 if current.edges() != policy.edges.as_slice()
                     || current.transport_mode() != policy.transport_mode
+                    || !current.server_muted_matches(&policy.server_muted)
                 {
                     tracing::warn!(
                         target: "mh.session.policy",
@@ -502,6 +510,8 @@ impl SessionManagerActor {
                         generation = policy.generation,
                         installed_edge_count = current.edge_count(),
                         received_edge_count = policy.edges.len(),
+                        installed_muted_count = current.server_muted_count(),
+                        received_muted_count = policy.server_muted.len(),
                         "Re-assert at an unchanged policy_generation carries DIFFERENT policy; \
                          honouring the generation and not swapping (ADR-0036 §8). MC's \
                          generation must derive from assignment-output change"

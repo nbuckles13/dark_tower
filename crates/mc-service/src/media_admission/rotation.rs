@@ -57,8 +57,10 @@ pub const KEK_PUSH_OUTCOME_TIMEOUT: Duration = Duration::from_secs(2);
 /// Pending age grows with wall-clock, so an event-driven gauge would read stale
 /// and never cross the threshold. Sampling `Instant`s the actors wrote — rather
 /// than asking the actors — means a WEDGED actor still shows a growing age,
-/// which is the case the page exists for. Well inside the 15 s scrape interval
-/// and the alert's `for: 2m`.
+/// which is the case the page exists for. No coarser than the `mc-service`
+/// job's per-job `scrape_interval` (`infra/kubernetes/observability/prometheus.yml`
+/// — cite the key, not a number), so every scrape sees a fresh value, and well
+/// inside the alert's `for: 2m`.
 pub const KEK_GAUGE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 // ============================================================================

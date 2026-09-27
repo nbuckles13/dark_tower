@@ -416,8 +416,9 @@ const CONFIG_LOADED_MESSAGE: &str = "Configuration loaded successfully";
 /// `(ConfigMap key, startup-event field)` for every integer value the running
 /// MH process reports verbatim. ONE table. The egress-chain rows (budget and
 /// both costs, logged in BITS exactly as configured) were appended by the MH
-/// egress-budget code task (story 2 task 8), and the registered-meeting cap by
-/// the MH teardown task (story 2 task 11). The derived stream ceiling is not
+/// egress-budget code task (story 2 task 8), the registered-meeting cap by
+/// the MH teardown task (story 2 task 11), and the muted-source bound by the
+/// MH server-mute task (story 2 task 10). The derived stream ceiling is not
 /// a ConfigMap key, so its parity is checked against the published gauge in
 /// [`test_running_mh_publishes_the_deployed_stream_ceiling`] rather than here;
 /// the ratio threshold is a float and is checked against its gauge by
@@ -434,6 +435,10 @@ const LOGGED_POLICY_BOUNDS: &[(&str, &str)] = &[
     ("MH_MAX_TOTAL_EGRESS_EDGES", "max_total_egress_edges"),
     ("MH_POLICY_APPLY_TIMEOUT_MS", "policy_apply_timeout_ms"),
     ("MH_MAX_REGISTERED_MEETINGS", "max_registered_meetings"),
+    (
+        "MH_MAX_MUTED_SOURCES_PER_MEETING",
+        "max_muted_sources_per_meeting",
+    ),
     ("MH_EGRESS_BUDGET_BPS", "egress_budget_bps"),
     ("MH_STREAM_COST_AUDIO_BPS", "stream_cost_audio_bps"),
     ("MH_STREAM_COST_VIDEO_BPS", "stream_cost_video_bps"),
@@ -658,10 +663,15 @@ fn assert_story2_keys_wired(instance: &str) {
     //
     // `MH_MAX_MUTED_SOURCES_PER_MEETING` is documented as a bound that can
     // never falsely reject a legitimate snapshot. That holds only while it is
-    // at least `MH_MAX_EGRESS_STREAMS_PER_MEETING`: a muted source must be a
-    // sender, and every sender is also a subscriber holding at least one egress
-    // stream, so the egress bound is the ceiling on how many muted senders a
-    // legitimate snapshot can name.
+    // at least `MH_MAX_EGRESS_STREAMS_PER_MEETING`: MC sends a handler only the
+    // muted senders that SOURCE at least one of its egress streams, so a
+    // legitimate snapshot names at most as many muted senders as it has
+    // streams (derivation: `infra/services/mh-service/configmap.yaml`).
+    //
+    // Since story 2 task 10 MH also REFUSES TO BOOT on the inversion
+    // (`ConfigError::MutedSourceBoundBelowEgressBound`), so a violation here
+    // would additionally show as a crash-looping pod; this assertion names the
+    // cause in seconds.
     //
     // DIRECTION: raising the egress bound above the muted bound breaks the
     // claim; lowering it does not. Without this assertion a one-character edit
@@ -993,6 +1003,26 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     let bytes_ceiling = (deployed / 8) / byte_cost;
     let ceiling = bits_ceiling.min(bytes_ceiling);
     let required = required_edges(DEMO_N);
+
+    // Upper side (story 2 task 10): the S9 exhaustion test must still be able
+    // to drive a registration PAST this ceiling within its economic
+    // participant limit. Checked here, from the live ConfigMaps, in seconds —
+    // rather than discovered as a PRECONDITION panic deep in the Layer-7 flows
+    // run. The limit and the pigeonhole rule have ONE home, shared with test 28.
+    let slot_cap =
+        env_tests::fixtures::kube::configmap_u64("mc-service-config", "MC_MAX_RECEIVE_SLOTS");
+    let feasible = env_tests::fixtures::egress_admission::max_s9_feasible_ceiling(slot_cap);
+    let s9_ceiling = bits_ceiling.max(bytes_ceiling);
+    assert!(
+        s9_ceiling <= feasible,
+        "Kind stream ceiling {s9_ceiling} is ABOVE the largest ceiling the S9 exhaustion test \
+         (28_mh_egress_admission.rs) can exceed: {feasible}, i.e. P x S > 2 x ceiling with at \
+         most {} participants and MC_MAX_RECEIVE_SLOTS={slot_cap}. Both bounds on the Kind \
+         budget: ceiling >= {required} (demo) and ceiling <= {feasible} (S9). Fix: LOWER \
+         MH_EGRESS_BUDGET_BPS in {PATCH}; raising MAX_S9_PARTICIPANTS instead is a decision \
+         about test cost, not a sizing fix.",
+        env_tests::fixtures::egress_admission::MAX_S9_PARTICIPANTS
+    );
 
     assert!(
         ceiling >= required,

@@ -340,7 +340,11 @@ async fn client_series_carry_no_meeting_identifier_when_present() {
 ///
 /// Evaluating stored series equals evaluating what the pod emits ONLY because
 /// nothing strips labels between scrape and storage. That holds today — zero
-/// `metric_relabel_configs` in `prometheus-config.yaml` — but it is a
+/// `metric_relabel_configs` in `infra/kubernetes/observability/prometheus.yml`,
+/// the file that carries `scrape_configs` (`prometheus-config.yaml` beside it is
+/// only the Deployment/RBAC and has NO scrape configuration, so finding nothing
+/// there proves nothing — if the file you are checking has no `scrape_configs`,
+/// you are in the wrong file) — but it is a
 /// configuration fact, not a property. If one is ever added, this suite goes
 /// blind to a label the pod still emits and narrows silently while staying
 /// green, which is the exact failure class this task is about.

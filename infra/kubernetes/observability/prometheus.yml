@@ -42,6 +42,30 @@ global:
 rule_files:
   - "rules/[a-z]*-alerts.yaml"
 
+# SERVICE-JOB CADENCE (story 2 task 10; closes the deployed half of
+# docs/TODO.md D1). The four Dark Tower service jobs below each set
+# `scrape_interval: 5s` PER JOB; `global.scrape_interval` above is deliberately
+# left alone, so the infra jobs (prometheus, kube-state-metrics, node-exporter,
+# kubelet) keep the global cadence and their timeouts, and `otel-collector`
+# keeps its own per-job value.
+#   - MC and GC are 5s ON PURPOSE, finer than the 10s the local-only compose
+#     file (infra/docker/prometheus/prometheus.yml) intends. The env-test
+#     `mh_notifications` serial group gates on per-instance MC counters, so MC
+#     is on the fast path; do not "restore" 10s here.
+#   - The env-tests' stability-wait settle is derived from THIS value
+#     (`SERVICE_JOB_SCRAPE_INTERVAL_SECS` in
+#     crates/env-tests/src/fixtures/metrics.rs, ANCHOR (DRY)) and checked
+#     against the LIVE config before every wait: raising it here without that
+#     constant fails the env-tests loudly (`settle-not-above-scrape-interval`).
+#   - TIMEOUT, a decision rather than an accident: these jobs set no
+#     `scrape_timeout`, so Prometheus clamps the global default (10s) to the
+#     job interval — 5s. If a pod's /metrics ever took longer than that, the
+#     job would go `up == 0` and EVERY Prometheus-gated env-test would fail
+#     with a symptom that does not mention scraping; check
+#     `up{job=~"ac-service|gc-service|mc-service|mh-service"}` first.
+#   - ANCHOR (DRY): the compose file's per-job values diverge from these on
+#     purpose (see its reciprocal note); the sync guard D1 asked for is still
+#     owed (docs/TODO.md D1).
 scrape_configs:
   - job_name: 'prometheus'
     static_configs:
@@ -49,6 +73,7 @@ scrape_configs:
 
   # Scrape AC service pods running in-cluster
   - job_name: 'ac-service'
+    scrape_interval: 5s
     kubernetes_sd_configs:
       - role: pod
         namespaces:
@@ -64,6 +89,7 @@ scrape_configs:
 
   # Scrape Global Controller pods
   - job_name: 'gc-service'
+    scrape_interval: 5s
     kubernetes_sd_configs:
       - role: pod
         namespaces:
@@ -79,6 +105,7 @@ scrape_configs:
 
   # Scrape Meeting Controller pods (metrics on health port)
   - job_name: 'mc-service'
+    scrape_interval: 5s
     kubernetes_sd_configs:
       - role: pod
         namespaces:
@@ -94,6 +121,7 @@ scrape_configs:
 
   # Scrape Media Handler pods (metrics on health port)
   - job_name: 'mh-service'
+    scrape_interval: 5s
     kubernetes_sd_configs:
       - role: pod
         namespaces:

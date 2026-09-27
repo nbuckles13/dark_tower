@@ -27,7 +27,7 @@
 //! describes this crate as providing.
 
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, RegisterMeetingRequest, SubscriberSlot,
+    CandidateSource, EgressStream, MutedSource, RegisterMeetingRequest, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 
@@ -99,4 +99,26 @@ pub fn register_request(
         // the returned value so the mute is visible at the assertion site.
         server_muted_sources: Vec::new(),
     }
+}
+
+/// `register_request` with `server_muted_sources` set to `muted` (story 2 R-9).
+///
+/// A separate builder rather than a parameter on [`register_request`], so the
+/// mute is visible at every call site that sets one and the dozens of sites
+/// that do not stay untouched.
+#[must_use]
+pub fn register_request_muted(
+    meeting_id: &str,
+    policy_generation: u64,
+    streams: Vec<EgressStream>,
+    muted: &[u32],
+) -> RegisterMeetingRequest {
+    let mut request = register_request(meeting_id, policy_generation, streams);
+    request.server_muted_sources = muted
+        .iter()
+        .map(|sender_id| MutedSource {
+            sender_id: *sender_id,
+        })
+        .collect();
+    request
 }

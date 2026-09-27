@@ -169,6 +169,9 @@ impl ForwardOutcome {
 /// remedy is upstream of this handler; `no_subscriber` is MC's assignment; and
 /// `no_local_subscriber` is this handler's own connection state.
 ///
+/// A fourth drop is not a routing failure at all: `server_muted` is the
+/// control plane's deliberate instruction (see the first check in the body).
+///
 /// # The routing table is re-read per frame and nothing is cached
 ///
 /// `RoutingTable::load()` is a plain atomic returning an `Arc` with no guard
@@ -188,6 +191,50 @@ pub fn forward_one(
     subscribers: &LocalSubscriberSnapshot,
     frame: IngressFrame,
 ) -> ForwardOutcome {
+    // SERVER MUTE (ADR-0036 §7 "Server mute is enforced at MH ingress"; story
+    // 2 R-9) — FIRST, before the sampler, before decode, before fan-out.
+    //
+    // SENDER-SCOPED, on `forwarder.sender()`: the publisher bound at spawn,
+    // after the JWT gate, from MC's `NotifyParticipantConnectedResponse`.
+    // Nothing read from the frame participates — frame header v2 carries no
+    // sender id, and this path never parses the SFrame key id. So a PATCHED
+    // CLIENT changes nothing observable: there is no client-reachable input
+    // to this decision. Exact while meetings are audio-only (one stream per
+    // sender).
+    //
+    // PER-STREAM INGRESS MUTE IS FORECLOSED, not merely unimplemented. The
+    // publisher's real stream number is inside the opaque key id MH never
+    // reads (type-blind §7, keyless §4), and the only stream indicator MH CAN
+    // read here — the relay region — is written by the muted publisher
+    // itself. Keying a mute on either is self-selectable evasion. Per-kind
+    // mute moves to MC's egress edge set when video lands (`internal.proto`
+    // `MutedSource`, the single home of this reasoning).
+    //
+    // WHO CAN SET IT: `RegisterMeeting` authorizes on scope alone, so any
+    // holder of `service.write.mh` can set or clear a mute — bounded as
+    // recorded in `docs/TODO.md` §Media Path Obligations (MC instances plus
+    // any on-path position on the cleartext MC->MH hop), deliberately not
+    // restated here. A mute from a DIFFERENT `mc_id` leaves the register-path
+    // takeover WARN (`session::Ownership`); one set with the owning MC's own
+    // credential leaves nothing but this counter.
+    //
+    // NO POLICY is fail-closed by construction: `is_server_muted` reads
+    // `false` for an absent meeting, and that same frame then resolves no
+    // edges below and drops as `no_policy`.
+    //
+    // THE COUNTER IS THE ONLY RECORD: no log, span, macro or per-frame trace
+    // (the forward-path deny scope; a per-frame record would name a moderated
+    // participant). Ingress-direction token, so `forwarded{ingress} +
+    // dropped{ingress}` still counts every datagram, and no hop number is
+    // consumed — the subscriber sees no gap it would read as loss.
+    if snapshot.is_server_muted(forwarder.meeting(), forwarder.sender()) {
+        forwarder
+            .handles()
+            .dropped(MediaDropReason::ServerMuted)
+            .increment(1);
+        return ForwardOutcome::rejected(MediaDropReason::ServerMuted);
+    }
+
     // MEASUREMENT clock (`std::time::Instant`): real elapsed time. A read here
     // on `tokio::time::Instant` would report ~0 under `start_paused`, silently.
     let popped_at = Instant::now();

@@ -453,7 +453,7 @@ tasks:
   slug: 2026-09-26-mc-kek-lifecycle
   tag: story-2026-09-21-hear-each-other-task-9
 - id: 10
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 1
@@ -469,6 +469,7 @@ tasks:
     Env-test speed in `crates/env-tests` (folded in because this task extends `26_mh_quic.rs`). (1) Every Prometheus-gated wait settles on the 15s scrape SLA (global `scrape_interval` in `infra/kubernetes/observability/prometheus.yml`), and every test in the `mh_notifications` serial group pays it. Lower the Kind Prometheus global scrape interval to 5s (via the Kind overlay if the base file ever serves beyond dev) and replace the literal 16s settle values (the shared `poll_until_stable` helper in `crates/env-tests/src/fixtures/metrics.rs` and its callers in `26_mh_quic.rs`) with ONE constant derived as scrape interval plus margin, keeping the documented correctness rule: the settle must exceed one scrape interval, or the stability check compares two reads inside one scrape and passes having observed nothing. Update the derivation comments at every site and scale the 90s/60s budgets with it. (2) Task 6 retired the loopback forward test, so the three JWT tests (`test_mh_accepts_valid_meeting_jwt`, `test_mh_rejects_forged_jwt`, `test_mh_rejects_oversized_jwt`) are now serialized only to keep the per-instance MC notification-counter deltas attributable to the notification tests' own connections. A valid-JWT connect produces connected/disconnected notifications and stays serialized; verify whether a forged or oversized JWT, rejected before a media session exists, produces ANY MH-to-MC notification, and only if it provably does not, take those two out of the serial group (record the evidence; if unsure, leave them). Record the `mh_notifications` group's wall-clock before and after in the task output (evidence only, not a gate).
 
     Kind handler capacity for parallel suites (added 2026-09-25). The Kind egress budget was sized for the N=5 demo (a per-handler stream ceiling of 40); with Layer-7 suites running in parallel and disconnected participants holding edges through the reconnect grace window, mh-0 reached 39 of 40 during task 20's Gate 2 and refused a registration outright. Raise `MH_EGRESS_BUDGET_BPS` in the Kind overlay patch (`infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`) by roughly 10x (a per-handler ceiling in the hundreds; a simple bump, not a sizing model), update the overlay's formula comment and the env-test asserting the Kind ceiling meets the demo requirement, and check env-test 28 (budget exhaustion) still drives registrations past the new ceiling within its bounds (it reads the ceiling from the published gauge, so it may need more registrations, not new logic). The base ConfigMap's placeholder is unchanged. Env-tests follow the evidence rule in `crates/env-tests/README.md` (drive public APIs; assert per-entity evidence; never the value of a shared pod-level gauge).
+  slug: 2026-09-26-mh-server-mute-multi-party-proof
   tag: story-2026-09-21-hear-each-other-task-10
 - id: 11
   status: completed

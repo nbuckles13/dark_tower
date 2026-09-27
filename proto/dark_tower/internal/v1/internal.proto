@@ -342,9 +342,21 @@ message SelectionRules {}
 // AUTHENTICATE the stream component even if it did: a publisher could label any
 // stream 0. What MH CAN attribute is the sender, bound per connection by MC at
 // attach (`NotifyParticipantConnectedResponse.sender_id`). Sender-scoped is exact
-// while meetings are audio-only. Per-kind mute, when video lands (story 3), will
-// key on TRANSPORT -- datagram versus unidirectional stream -- which MH observes
-// directly, not on a stream number it cannot read.
+// while meetings are audio-only, and MH enforces it in
+// `crates/mh-service/src/media/forward.rs::forward_one`, which tests the
+// spawn-bound sender against the muted set BEFORE decode and before fan-out.
+//
+// PER-STREAM (AND PER-KIND) INGRESS MUTE IS FORECLOSED -- a security property,
+// not a missing feature. Every stream indicator MH can read at ingress is one the
+// muted party controls. The publisher's true stream number sits inside the opaque
+// SFrame key id MH never parses (type-blind §7, keyless §4). The only per-frame
+// field MH CAN read is the relay region, and it is OUTSIDE the publisher's signed
+// span and rewritten hop-by-hop by relays, so it carries no authenticated stream
+// identity and the muted publisher can set it to any value on the frames MH
+// evaluates at ingress. Keying an ingress mute on either would let the muted party
+// choose the very value the mute tests -- self-selectable evasion, not merely
+// unimplementable. Per-kind mute therefore moves to MC's egress edge set (where
+// the EDGE, not the frame, names the kind) when video lands (story 3).
 //
 // OBSERVABILITY (ADR-0036 §11): as `SubscriberSlot` -- never a label, never a
 // span attribute, never a per-frame log dimension.

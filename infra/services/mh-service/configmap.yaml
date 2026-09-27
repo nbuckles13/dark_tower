@@ -627,12 +627,15 @@ data:
   # limit" during an incident, this is not a loosened guard but NO guard — MH
   # pre-allocates against an attacker-supplied count again, the precise
   # condition this key exists to foreclose. A `> 0` check alone does not do it.
-  # Enforced by: mh-service, in the policy-limit checks, before the routing
-  # table is built (MH server-mute task).
-  # Where an operator sees it: nowhere today — the running image does not parse
-  # the muted-source field at all. Once the MH server-mute task lands the check,
-  # an over-limit registration is expected to surface like the other
-  # pre-allocation bounds below (`rejected_invalid` plus the WARN's `reason`).
+  # Enforced by: mh-service (story 2 task 10), in the policy-limit checks, before
+  # any per-element work or routing-table build; the hard ceiling is
+  # `MAX_MUTED_SOURCES_PER_MEETING_CEILING` in `crates/mh-service/src/config.rs`,
+  # and MH REFUSES TO BOOT if this value is below
+  # MH_MAX_EGRESS_STREAMS_PER_MEETING (`ConfigError::MutedSourceBoundBelowEgressBound`).
+  # Where an operator sees it: an over-limit (or duplicate-sender) registration
+  # surfaces like the other pre-allocation bounds below —
+  # `mh_media_policy_applies_total{outcome="rejected_invalid"}` plus the WARN's
+  # `reason`; the enforced mute itself is `mh_media_frames_dropped_total{reason="server_muted"}`.
   MH_MAX_MUTED_SOURCES_PER_MEETING: "512"
 
   # ---------------------------------------------------------------------------
