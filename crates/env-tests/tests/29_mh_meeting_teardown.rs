@@ -117,31 +117,19 @@
 
 #![cfg(feature = "flows")]
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::TokenRequest;
-use env_tests::fixtures::kube::{configmap_u64, deployment_env_value, secret_key};
+use env_tests::fixtures::kube::configmap_u64;
 use env_tests::fixtures::metrics::{gauge_by_instance_present, poll_until_pinned_instance};
-use env_tests::fixtures::{AuthClient, PrometheusClient};
+use env_tests::fixtures::mh_grpc::{
+    authed, connect, handlers, mc_service_token, Handler, ReleaseOnDrop,
+};
+use env_tests::fixtures::PrometheusClient;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
-use tonic::metadata::MetadataValue;
-use tonic::transport::{Channel, Endpoint};
-use tonic::{Code, Request};
-
-/// Where MC's own AC client credentials are deployed. The test READS them from
-/// the cluster rather than restating them: the Secret is the single source (it
-/// matches what `infra/kind/scripts/setup.sh` seeds into AC), and a copy here
-/// would drift on rotation and then fail as an apparent environment fault.
-const MC_DEPLOYMENT: &str = "mc-0";
-const MC_CLIENT_ID_ENV: &str = "MC_CLIENT_ID";
-const MC_SECRET: &str = "mc-service-secrets";
-const MC_SECRET_KEY: &str = "MC_CLIENT_SECRET";
-/// Narrowed to the one scope MH's gate needs; the dev client also holds
-/// `service.write.gc`, which this test has no use for.
-const MC_SCOPE: &str = "service.write.mh";
+use tonic::transport::Channel;
+use tonic::Code;
 
 /// Never dialled (see the module docs). Syntactically valid so it passes MH's
 /// scheme check; `.invalid` is reserved, so it cannot resolve by accident.
@@ -166,151 +154,8 @@ fn teardowns(outcome: &str) -> String {
     format!("sum by (instance) (mh_media_meeting_teardowns_total{{outcome=\"{outcome}\"}})")
 }
 
-/// Read a Layer-7-exported variable, never skipping.
-fn required_env(key: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| {
-        panic!(
-            "PRECONDITION: {key} is unset. Layer 7 (scripts/layer7.sh, step (i)) starts the \
-             per-pod MH gRPC port-forwards and exports it; run this suite through Layer 7. \
-             This test is never skipped."
-        )
-    })
-}
-
-struct Handler {
-    name: String,
-    grpc_url: String,
-    pod_ip: String,
-}
-
-fn handlers() -> Vec<Handler> {
-    (0..2)
-        .map(|n| Handler {
-            name: format!("mh-{n}"),
-            grpc_url: required_env(&format!("ENV_TEST_MH_{n}_GRPC_URL")),
-            pod_ip: required_env(&format!("ENV_TEST_MH_{n}_POD_IP")),
-        })
-        .collect()
-}
-
-fn authed<T>(token: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    let value: MetadataValue<_> = format!("Bearer {token}")
-        .parse()
-        .expect("a bearer header parses");
-    request.metadata_mut().insert("authorization", value);
-    request
-}
-
-async fn connect(handler: &Handler) -> MediaHandlerServiceClient<Channel> {
-    let channel = Endpoint::from_shared(handler.grpc_url.clone())
-        .expect("the exported URL parses")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .connect()
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "PRECONDITION: cannot connect to {}'s gRPC at {} ({e}) — the Layer-7 \
-                 port-forward is down (a forward dies with its pod)",
-                handler.name, handler.grpc_url
-            )
-        });
-    MediaHandlerServiceClient::new(channel)
-}
-
-// ---------------------------------------------------------------------------
-// Structural cleanup
-// ---------------------------------------------------------------------------
-
-/// A meeting this test registered: where, and under which `mc_id`.
-struct Owned {
-    grpc_url: String,
-    meeting_id: String,
-    mc_id: String,
-}
-
-/// Releases every meeting still recorded here when dropped — on success AND on
-/// a panic mid-test. Recorded BEFORE each registration call, so even a
-/// registration whose response was lost is released. `Drop` cannot be async,
-/// so it drives the releases on a fresh thread with its own runtime.
-struct ReleaseOnDrop {
-    token: String,
-    owned: Arc<Mutex<Vec<Owned>>>,
-}
-
-impl ReleaseOnDrop {
-    fn record(&self, grpc_url: &str, meeting_id: &str, mc_id: &str) {
-        self.owned.lock().expect("cleanup registry").push(Owned {
-            grpc_url: grpc_url.to_string(),
-            meeting_id: meeting_id.to_string(),
-            mc_id: mc_id.to_string(),
-        });
-    }
-
-    /// The test released it itself; nothing left to clean up.
-    fn forget(&self, meeting_id: &str) {
-        self.owned
-            .lock()
-            .expect("cleanup registry")
-            .retain(|o| o.meeting_id != meeting_id);
-    }
-}
-
-impl Drop for ReleaseOnDrop {
-    fn drop(&mut self) {
-        let owned: Vec<Owned> =
-            std::mem::take(&mut *self.owned.lock().unwrap_or_else(|p| p.into_inner()));
-        if owned.is_empty() {
-            return;
-        }
-        let token = self.token.clone();
-        let released = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("cleanup runtime");
-            runtime.block_on(async move {
-                for o in owned {
-                    let result = async {
-                        let channel = Endpoint::from_shared(o.grpc_url.clone())
-                            .map_err(|e| e.to_string())?
-                            .connect_timeout(Duration::from_secs(5))
-                            .timeout(Duration::from_secs(10))
-                            .connect()
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        MediaHandlerServiceClient::new(channel)
-                            .end_meeting(authed(
-                                &token,
-                                EndMeetingRequest {
-                                    meeting_id: o.meeting_id.clone(),
-                                    mc_id: o.mc_id.clone(),
-                                },
-                            ))
-                            .await
-                            .map_err(|s| format!("{:?}: {}", s.code(), s.message()))
-                    }
-                    .await;
-                    // Loud, but never a panic inside Drop (it would abort a test
-                    // that is already unwinding). The token is never printed.
-                    if let Err(e) = result {
-                        eprintln!(
-                            "CLEANUP: could not release test meeting {} at {}: {e} — it holds a \
-                             registration (and, at a high generation, wedges that id) until that \
-                             pod restarts",
-                            o.meeting_id, o.grpc_url
-                        );
-                    }
-                }
-            });
-        })
-        .join();
-        if released.is_err() {
-            eprintln!("CLEANUP: the release thread panicked; test meetings may be leaked");
-        }
-    }
-}
+// Structural cleanup: `env_tests::fixtures::mh_grpc::ReleaseOnDrop` (hoisted
+// at story 2 task 10; see that module for the mechanism).
 
 // ---------------------------------------------------------------------------
 // The test
@@ -327,27 +172,8 @@ async fn a_long_running_mh_pod_releases_an_ended_meeting_and_admits_like_a_fresh
     // PRECONDITION — the AC-issued meeting-controller token, never minted here,
     // from the credentials MC itself is deployed with. A refusal names the
     // CREDENTIAL, so a rotation mismatch is not triaged as a broken forward.
-    let client_id = deployment_env_value(MC_DEPLOYMENT, MC_CLIENT_ID_ENV);
-    let client_secret = secret_key(MC_SECRET, MC_SECRET_KEY);
-    let token = AuthClient::new(&cluster.ac_base_url)
-        .issue_token(TokenRequest::client_credentials(
-            &client_id,
-            client_secret,
-            MC_SCOPE,
-        ))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "PRECONDITION: AC refused MC's deployed client credentials ({client_id}, secret \
-                 from {MC_SECRET}/{MC_SECRET_KEY}) — a CREDENTIAL fault: the deployed Secret and \
-                 what AC was seeded with disagree. Not a forward or teardown fault. {e}"
-            )
-        })
-        .access_token;
-    let cleanup = ReleaseOnDrop {
-        token: token.clone(),
-        owned: Arc::new(Mutex::new(Vec::new())),
-    };
+    let token = mc_service_token(&cluster.ac_base_url).await;
+    let cleanup = ReleaseOnDrop::new(token.clone());
 
     // LIMITS — both resource-guard limits are published from the value
     // enforcement reads, i.e. equal the DEPLOYED ConfigMap (never a literal here).

@@ -37,8 +37,15 @@
 //! ANY choice, so it is the one sized against.)
 //!
 //! Task 6's round-robin placement needed a second, co-handler-only condition;
-//! it is retired with that model. Kind (ceiling 40, S 8): P = 11, which gives
-//! 11 * 8 = 88 > 80 — 11 AC registrations, inside the suite's budget.
+//! it is retired with that model. The sizing (`size_s9_meeting`) and the
+//! economic participant limit (`MAX_S9_PARTICIPANTS`) live in
+//! `env_tests::fixtures::egress_admission`, their ONE home, because
+//! `01_mh_deployment_config.rs` bounds the Kind budget from ABOVE against the
+//! same limit. Illustration only, derived at run time and printed as the `S9:`
+//! line: with the Kind overlay's budget and `MC_MAX_RECEIVE_SLOTS` = 8 the
+//! ceiling is 100 and P = 26 (26 x 8 = 208 > 200) — 26 AC registrations and
+//! about 52 MH sessions, and the handler genuinely carries about 100 concurrent
+//! egress streams during this test.
 //!
 //! Every participant opens an MH session to every handler URL it was offered.
 //! That is load-bearing, not incidental: MC routes only through connectivity MH
@@ -59,8 +66,10 @@
 //!
 //! Counters are polled to a bound (`poll_until_any_instance_above`); nothing
 //! sleeps-then-asserts, and no latency is asserted. The rejection RATIO gauge
-//! is asserted for presence and range only: MH is scraped every 15 s against a
-//! 10 s window bucket, so a transient ratio value can be invisible.
+//! is asserted for presence and range only: MH is scraped on its job's
+//! `scrape_interval` (`infra/kubernetes/observability/prometheus.yml`), which
+//! is not aligned with the ratio's window buckets, so a transient ratio value
+//! can be invisible.
 //!
 //! # Cleanup — the ratchet, until MC calls `EndMeeting` (story 2 task 12)
 //!
@@ -80,6 +89,9 @@ use std::time::Duration;
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::UserRegistrationRequest;
+use env_tests::fixtures::egress_admission::{
+    max_s9_feasible_ceiling, size_s9_meeting, MAX_S9_PARTICIPANTS,
+};
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
 use env_tests::fixtures::kube::{configmap_key, configmap_u64};
 use env_tests::fixtures::mc_session::{self, McSession, MhSession};
@@ -99,24 +111,20 @@ const GAUGE_PRESENT_BOUND: Duration = Duration::from_secs(60);
 /// Rig bound on MC pushing, MH refusing, and Prometheus scraping the count.
 const ADMISSION_BOUND: Duration = Duration::from_secs(120);
 
-/// Largest participant count this test will attempt before calling the
-/// deployment unsuitable (a ceiling this test cannot exceed economically).
-const MAX_PARTICIPANTS: u64 = 40;
-
 /// Smallest `P` satisfying the pigeonhole condition (see the module doc), with
-/// the slots each participant declares.
+/// the slots each participant declares — or a PRECONDITION failure naming the
+/// arithmetic and the knob.
 fn size_meeting(ceiling: u64, slot_cap: u64) -> (u64, u64) {
-    for p in 2..=MAX_PARTICIPANTS {
-        let s = (p - 1).min(slot_cap);
-        if p * s > 2 * ceiling {
-            return (p, s);
-        }
-    }
-    panic!(
-        "PRECONDITION: no meeting of at most {MAX_PARTICIPANTS} participants (slot cap \
-         {slot_cap}) exceeds a stream ceiling of {ceiling} on some handler. This test is \
-         sized for the Kind overlay budget; the deployed budget is not."
-    );
+    size_s9_meeting(ceiling, slot_cap).unwrap_or_else(|| {
+        panic!(
+            "PRECONDITION: no meeting of at most {MAX_S9_PARTICIPANTS} participants (slot cap \
+             {slot_cap}) exceeds a stream ceiling of {ceiling} on some handler (needs P x S > \
+             2 x ceiling; the largest feasible ceiling is {}). Lower MH_EGRESS_BUDGET_BPS in \
+             infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml \
+             — 01_mh_deployment_config.rs asserts this bound in seconds.",
+            max_s9_feasible_ceiling(slot_cap)
+        )
+    })
 }
 
 fn admission_promql(outcome: &str) -> String {

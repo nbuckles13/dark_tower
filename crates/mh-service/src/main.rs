@@ -173,6 +173,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_apply_timeout_ms = config.policy_limits.policy_apply_timeout_ms,
         // Registered-meeting cap (story 2 R-21), a resource guard.
         max_registered_meetings = config.policy_limits.max_registered_meetings,
+        // Muted-source bound (story 2 R-9), a pre-allocation guard.
+        max_muted_sources_per_meeting = config.policy_limits.max_muted_sources_per_meeting,
         // Egress-budget admission chain (story 2 R-19, R-23). BOTH ends of the
         // single bits->bytes conversion are logged, so it is checkable from
         // this line: the `_bps` fields are the ConfigMap values verbatim (BITS),

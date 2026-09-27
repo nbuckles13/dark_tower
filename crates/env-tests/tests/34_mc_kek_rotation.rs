@@ -38,7 +38,7 @@ use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeeting
 use env_tests::fixtures::mc_session::{self, McSession};
 use env_tests::fixtures::metrics::{
     format_instance_map, gauge_by_instance_present, poll_until_any_instance_above,
-    poll_until_stable, InstanceCounters, PrometheusClient,
+    poll_until_stable, service_job_scrape_settle, InstanceCounters, PrometheusClient,
 };
 use env_tests::fixtures::AuthClient;
 use proto_gen::dark_tower::signaling::v1::{server_message, JoinResponse, MeetingKekUpdate};
@@ -56,8 +56,14 @@ const GAUGE_SCRAPE_BOUND: Duration = Duration::from_secs(60);
 /// not a failure, until the overall deadline.
 const READ_BOUND: Duration = Duration::from_secs(5);
 
-/// Counter settle and rise budgets (Prometheus scrape SLA is 15 s).
-const COUNTER_SETTLE: Duration = Duration::from_secs(16);
+/// Counter stability budget. The SETTLE is not a local constant: both KEK
+/// counters are MC series, scraped by the `mc-service` job, so the wait uses
+/// `SERVICE_JOB_SCRAPE_SETTLE` through `service_job_scrape_settle` (one scrape
+/// interval of that job plus margin, checked against the LIVE config — a settle
+/// inside one scrape would make the baseline vacuous). The budget is a
+/// failure-only ceiling: several non-equal rounds of that settle plus a
+/// cluster-load allowance; it is not scaled with the interval, because a faster
+/// scrape does not make a loaded cluster converge sooner.
 const COUNTER_BUDGET: Duration = Duration::from_secs(90);
 
 const ROTATIONS_PROMQL: &str =
@@ -93,7 +99,8 @@ async fn rotation_window(prom: &PrometheusClient) -> Duration {
 }
 
 async fn settled_baseline(prom: &PrometheusClient, promql: &'static str) -> InstanceCounters {
-    poll_until_stable(prom, promql, COUNTER_SETTLE, COUNTER_BUDGET, |v1, v2| {
+    let settle = service_job_scrape_settle(prom).await;
+    poll_until_stable(prom, promql, settle, COUNTER_BUDGET, |v1, v2| {
         format!(
             "{promql} did not settle within {COUNTER_BUDGET:?} (last reads: v1={}, v2={})",
             format_instance_map(v1),

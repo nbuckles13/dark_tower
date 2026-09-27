@@ -249,6 +249,44 @@ __poll_setup_idle() {
   return 0
 }
 
+# The devloop cluster's name from ports.json (empty when unresolvable — the CALLER decides the
+# failure, never a default) and its kubectl context. ONE home for both derivations: Phase 1h
+# (per-run org), Phase 1i (MH gRPC forwards) and Phase 1e2 (observability apply) all use them.
+# The `|| true` swallows nothing: every caller inspects the value it produced.
+__devloop_cluster_name() {
+  jq -r '.cluster_name // empty' "$ENV_TEST_PORTS_JSON" 2>/dev/null || true
+}
+__kind_context() {  # $1 = cluster name
+  printf 'kind-%s' "$1"
+}
+
+# Apply the Kind observability overlay and wait (bounded) for Prometheus to roll onto it.
+# Exits via precondition_fail on any failure — a config that did not apply is an ENVIRONMENT
+# fault the suite must not run against (its settle precondition would fail every metrics
+# test, attributed to the diff).
+__apply_observability_overlay() {
+  local cluster_name context budget="${DEVLOOP_HEALTH_BUDGET:-300}"
+  cluster_name="$(__devloop_cluster_name)"
+  # An unresolvable context is NOT reported here: Phase 1h resolves the SAME context from the
+  # SAME ports.json field and fails with `org-provision-context-unresolved`, which it always
+  # reaches in this state — so the run still fails loudly, and one fault keeps one token.
+  if [[ -z "$cluster_name" ]]; then
+    printf 'WARN OBSERVABILITY_APPLY_DEFERRED: no .cluster_name in %s — Phase 1h will fail on the same missing context\n' "$ENV_TEST_PORTS_JSON" >&2
+    return 0
+  fi
+  context="$(__kind_context "$cluster_name")"
+  echo "Layer7: observability config changed — applying infra/kubernetes/overlays/kind/observability/ to ${context}" >&2
+  "$KUBECTL_BIN" --context "$context" apply -k "${__repo_root}/infra/kubernetes/overlays/kind/observability/" >&2 \
+    || precondition_fail observability-apply-failed \
+      "kubectl apply -k infra/kubernetes/overlays/kind/observability/ failed against ${context}" \
+      "run the same apply by hand and read its error; a rejected manifest is a diff defect, an unreachable apiserver is the environment"
+  "$KUBECTL_BIN" --context "$context" -n dark-tower-observability rollout status deployment/prometheus \
+    --timeout="${budget}s" >&2 \
+    || precondition_fail observability-apply-failed \
+      "the Prometheus Deployment did not finish rolling onto the new config within ${budget}s" \
+      "kubectl -n dark-tower-observability get pods -l app=prometheus; kubectl -n dark-tower-observability logs deploy/prometheus (a config Prometheus rejects crash-loops the new pod)"
+}
+
 # Wait (bounded) for the cluster to become healthy. `dev-cluster rebuild-all` issues
 # `kubectl rollout restart` and RETURNS BEFORE the new pods finish rolling out, so a
 # one-shot readiness check immediately after rebuild spuriously reports "not ready"
@@ -979,12 +1017,35 @@ __layer7_main() {
   fi
   emit_step_duration infra-change "$t_step"
 
+  # (c0) Re-apply a service's MANIFESTS when the diff touches them (story 2 task 10).
+  #      `rebuild-all` rebuilds images and restarts deployments but applies NO manifests, so
+  #      a ConfigMap edit (base under infra/services/<svc>-service/ or a Kind overlay patch
+  #      under infra/kubernetes/overlays/kind/services/<svc>-service/) would otherwise never
+  #      reach the cluster — and the env-tests that compare the LIVE ConfigMap to the tree
+  #      (01_mh_deployment_config.rs) would fail as "the cluster predates the current patch".
+  #      `dev-cluster deploy <svc>` runs setup.sh --skip-build --only <svc>, which applies the
+  #      overlay and restarts the service's pods when the apply changed its ConfigMap. Runs
+  #      BEFORE rebuild so the rebuilt pods start on the applied config.
+  t_step=$(layer_now)
+  local svc
+  for svc in ac gc mc mh; do
+    if diff_touches_path "infra/services/${svc}-service/" \
+      || diff_touches_path "infra/kubernetes/overlays/kind/services/${svc}-service/"; then
+      echo "Layer7: ${svc}-service manifests changed — applying them (dev-cluster deploy ${svc})" >&2
+      "$DEV_CLUSTER" deploy "$svc" || precondition_fail cluster-rebuild-failed \
+        "dev-cluster deploy ${svc} failed — the changed ${svc}-service manifests could not be applied" \
+        "inspect /tmp/devloop/helper.log; a manifest the apiserver rejects is a diff defect, a helper/cluster failure is the environment"
+    fi
+  done
+  emit_step_duration manifest-apply "$t_step"
+
   # (c) Rebuild service images so the suite runs against the current diff.
   t_step=$(layer_now)
   "$DEV_CLUSTER" rebuild-all || precondition_fail cluster-rebuild-failed \
     "dev-cluster rebuild-all failed — service images could not be rebuilt/redeployed" \
     "inspect /tmp/devloop/helper.log; check image build output and pod status"
   emit_step_duration rebuild "$t_step"
+
 
   # (d) Wire the env-test service URLs from the helper's port map.
   t_step=$(layer_now)
@@ -1006,6 +1067,31 @@ __layer7_main() {
   # __self_heal_cluster returns 0 only if it recovered the cluster.
   __wait_cluster_ready "${DEVLOOP_HEALTH_BUDGET:-300}" || __self_heal_cluster
   emit_step_duration health-confirm "$t_step"
+
+  # (e2) Re-apply the Kind OBSERVABILITY overlay when the diff touches it (story 2 task 10).
+  #      `rebuild-all` redeploys the SERVICES only, and teardown+setup fires only for an
+  #      infra/kind/ diff — so an edit to the Prometheus config (e.g. a scrape cadence) would
+  #      otherwise never reach the cluster, and the env-tests' fail-loud settle precondition
+  #      (crates/env-tests/src/fixtures/metrics.rs::service_job_scrape_settle) would red every
+  #      Prometheus-gated test against a stale config. The generated ConfigMap's content hash
+  #      rolls the Prometheus Deployment; the bounded rollout wait below makes "the config on
+  #      disk is the config Prometheus runs" hold BEFORE the suite. Placed after ports.json is
+  #      wired (d) and the cluster is healthy (e), and before the observability-ready gate (f),
+  #      which then probes the NEW pod.
+  t_step=$(layer_now)
+  #      Trigger = EVERY resource base of the overlay (infra/kubernetes/observability/
+  #      kustomization.yaml pulls in ../../grafana/ and ../../docker/prometheus/, the latter
+  #      generating the prometheus-rules ConfigMap). `diff_touches_path` is a prefix match, so
+  #      the compose-only infra/docker/prometheus/prometheus.yml also triggers — a spurious,
+  #      bounded, idempotent re-apply. That is the correct direction to err: under-triggering
+  #      leaves a stale cluster and a red gate blamed on the diff. Do not "tighten" it.
+  if diff_touches_path "infra/kubernetes/observability/" \
+    || diff_touches_path "infra/kubernetes/overlays/kind/observability/" \
+    || diff_touches_path "infra/docker/prometheus/" \
+    || diff_touches_path "infra/grafana/"; then
+    __apply_observability_overlay
+  fi
+  emit_step_duration observability-apply "$t_step"
 
   # (f) Observability-stack HTTP readiness (Phase-1e completion; task #56 user ruling (a)).
   #     Pods-healthy (1e) confirms the containers are UP; THIS confirms the observability HTTP
@@ -1059,7 +1145,7 @@ __layer7_main() {
   # org-provision-context-unresolved, which is a named operator lane. The `|| true` converts a
   # lane-less death into a diagnosed one; it swallows nothing, because the very next statement
   # inspects the value it produced.
-  cluster_name="$(jq -r '.cluster_name // empty' "$ENV_TEST_PORTS_JSON" 2>/dev/null || true)"
+  cluster_name="$(__devloop_cluster_name)"
   if [[ -z "$cluster_name" ]] || ! command -v kubectl >/dev/null 2>&1; then
     precondition_fail org-provision-context-unresolved \
       "cannot resolve a kubectl context for the devloop cluster (ports.json '.cluster_name'='${cluster_name:-<empty>}', kubectl $(command -v kubectl >/dev/null 2>&1 && echo present || echo MISSING)) — refusing to provision the per-run organization against an unknown database" \
@@ -1317,7 +1403,7 @@ __layer7_main() {
   t_step=$(layer_now)
   local mh_n mh_port
   __reap_stale_mh_forwards \
-    "--context kind-${cluster_name} -n dark-tower port-forward --address 127.0.0.1 pod/mh-"
+    "--context $(__kind_context "$cluster_name") -n dark-tower port-forward --address 127.0.0.1 pod/mh-"
   layer_register_cleanup __stop_mh_grpc_forwards
   for mh_n in 0 1; do
     # `// empty` + the -z check: a ports.json without this key is a DIFFERENT fault from a
@@ -1332,7 +1418,7 @@ __layer7_main() {
         "ports.json has no '.ports.mh_${mh_n}_grpc' — no local port is allocated for the mh-${mh_n} gRPC forward the MH teardown env-test needs" \
         "re-run 'dev-cluster setup' so the helper rewrites /tmp/devloop/ports.json with a complete ports block; inspect it with: jq .ports /tmp/devloop/ports.json"
     fi
-    __start_mh_grpc_forward "$mh_n" "kind-${cluster_name}" "$mh_port"
+    __start_mh_grpc_forward "$mh_n" "$(__kind_context "$cluster_name")" "$mh_port"
   done
   emit_step_duration mh-grpc-forwards "$t_step"
 

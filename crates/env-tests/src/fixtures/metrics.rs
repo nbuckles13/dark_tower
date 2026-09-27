@@ -142,6 +142,22 @@ impl PrometheusClient {
         Ok(response.text().await?)
     }
 
+    /// Fetch the RAW body of `/api/v1/status/config` (a JSON envelope whose
+    /// `data.yaml` is the resolved config as one escaped YAML string). Parsed
+    /// by pure kernels ([`max_service_job_scrape_interval`]), never at the
+    /// call site.
+    pub async fn status_config(&self) -> Result<String, PrometheusError> {
+        let url = format!("{}/api/v1/status/config", self.base_url);
+        let response = self.http_client.get(&url).send().await?;
+        if !response.status().is_success() {
+            return Err(PrometheusError::QueryFailed(format!(
+                "/api/v1/status/config returned status: {}",
+                response.status()
+            )));
+        }
+        Ok(response.text().await?)
+    }
+
     /// Get the raw metrics from a specific endpoint.
     ///
     /// This bypasses Prometheus storage and queries the service's /metrics endpoint directly.
@@ -189,7 +205,7 @@ impl PrometheusClient {
 /// current value.
 ///
 /// # Why `instance` (and not `pod`) — @paired-observability, confirmed against
-/// `infra/kubernetes/observability/prometheus-config.yaml`:
+/// `infra/kubernetes/observability/prometheus.yml` (the file carrying `scrape_configs`):
 /// the mc/mh-service scrape jobs use `kubernetes_sd_configs role: pod` with
 /// relabel_configs that only `keep` on the app label + container port; NO
 /// relabel emits a `pod`/`pod_name` target_label. So Prometheus's default
@@ -448,6 +464,214 @@ pub async fn poll_until_any_instance_above(
     }
 }
 
+/// The settle for a stability wait over a series scraped by one of the four
+/// SERVICE jobs (`ac-service`, `gc-service`, `mc-service`, `mh-service`):
+/// their per-job `scrape_interval` plus [`SCRAPE_SETTLE_MARGIN`].
+///
+/// ANCHOR (DRY): the interval is the per-job `scrape_interval` on those four
+/// jobs in `infra/kubernetes/observability/prometheus.yml`. Rust cannot import
+/// YAML, so this is a COPY — which is why no caller should use it directly:
+/// [`service_job_scrape_settle`] returns it only after checking it against the
+/// LIVE Prometheus config, and fails loudly if it no longer exceeds the
+/// deployed interval. This is the one place a numeral for the cadence belongs;
+/// everywhere else cites the key.
+///
+/// # NOT valid for any other job class
+///
+/// The config carries three cadences, not one. This settle is correct ONLY for
+/// the service jobs. It is WRONG — too short, so a stability wait would compare
+/// two reads inside one scrape and pass having observed nothing — for:
+///
+/// - the `otel-collector` job (its own per-job `scrape_interval`, matched to
+///   the SDK export cadence), which carries every browser `dt_client_*` series.
+///   A live consumer of that class already exists:
+///   `tests/32_media_metric_hygiene.rs` reads `dt_client_*` beside the
+///   service jobs in one selector — the file a future author gating a client
+///   series is most likely to copy from;
+/// - the jobs on the GLOBAL `scrape_interval` (`prometheus`,
+///   `kube-state-metrics`, `node-exporter`, `kubelet`).
+///
+/// A caller gating either class must derive its own settle from that job's
+/// interval.
+pub const SERVICE_JOB_SCRAPE_SETTLE: Duration =
+    Duration::from_secs(SERVICE_JOB_SCRAPE_INTERVAL_SECS + SCRAPE_SETTLE_MARGIN_SECS);
+
+/// The service jobs' per-job `scrape_interval`, in seconds — the copy
+/// [`SERVICE_JOB_SCRAPE_SETTLE`] is derived from (see its ANCHOR).
+pub const SERVICE_JOB_SCRAPE_INTERVAL_SECS: u64 = 5;
+
+/// The margin added to one scrape interval, in seconds.
+///
+/// Its basis is ABSOLUTE: the time one scrape takes plus Prometheus ingestion
+/// latency, so the second read is guaranteed to come from a later scrape than
+/// the first. Neither shrinks when the interval does. **Do not scale this down
+/// with the interval** — the live-config precondition compares the settle
+/// against the CONFIGURED interval and structurally cannot see scrape
+/// duration, so a margin scaled into the noise would pass that check while the
+/// wait silently went vacuous.
+pub const SCRAPE_SETTLE_MARGIN_SECS: u64 = 1;
+
+/// [`SCRAPE_SETTLE_MARGIN_SECS`] as a `Duration`.
+pub const SCRAPE_SETTLE_MARGIN: Duration = Duration::from_secs(SCRAPE_SETTLE_MARGIN_SECS);
+
+/// Greppable token: the live config could not be read or did not have the
+/// expected shape. Deliberately distinct from [`SETTLE_NOT_ABOVE_INTERVAL`] —
+/// if the two looked alike, a parse failure would be triaged as a tuning bug
+/// and "fixed" by relaxing the extractor.
+pub const SCRAPE_CONFIG_UNREADABLE: &str = "scrape-config-unreadable";
+
+/// Greppable token: the deployed service-job scrape interval is at or above
+/// [`SERVICE_JOB_SCRAPE_SETTLE`], so every stability wait using it would be
+/// vacuous.
+pub const SETTLE_NOT_ABOVE_INTERVAL: &str = "settle-not-above-scrape-interval";
+
+/// Why the live scrape interval of the service jobs could not be determined.
+/// Never an empty success: every arm is a loud failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrapeIntervalError {
+    /// The body was not `/api/v1/status/config`'s JSON envelope with a YAML
+    /// string at `data.yaml`, or that YAML did not parse.
+    NotPrometheusConfig,
+    /// A service job is absent from the config.
+    ServiceJobMissing(String),
+    /// A service job's effective interval (per-job, else global) is absent or
+    /// not a Prometheus duration.
+    IntervalUnparseable(String),
+}
+
+/// The LARGEST effective `scrape_interval` over the four service jobs, from a
+/// `/api/v1/status/config` body. A per-job value wins over `global`; Prometheus
+/// marshals the resolved config, so per-job values are normally present.
+///
+/// Pure, so its FIRE fixtures run in the always-on unit lane (the
+/// escaped-JSON defect this repo shipped once passed on every live input).
+///
+/// # Errors
+///
+/// Every [`ScrapeIntervalError`] arm; never a default.
+pub fn max_service_job_scrape_interval(body: &str) -> Result<Duration, ScrapeIntervalError> {
+    use crate::fixtures::metric_hygiene::SERVICE_JOBS;
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| ScrapeIntervalError::NotPrometheusConfig)?;
+    let yaml = envelope
+        .get("data")
+        .and_then(|d| d.get("yaml"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ScrapeIntervalError::NotPrometheusConfig)?;
+    let config: serde_norway::Value =
+        serde_norway::from_str(yaml).map_err(|_| ScrapeIntervalError::NotPrometheusConfig)?;
+
+    let global = config
+        .get("global")
+        .and_then(|g| g.get("scrape_interval"))
+        .and_then(serde_norway::Value::as_str);
+    let jobs = config
+        .get("scrape_configs")
+        .and_then(serde_norway::Value::as_sequence)
+        .ok_or(ScrapeIntervalError::NotPrometheusConfig)?;
+
+    let mut max = Duration::ZERO;
+    for name in SERVICE_JOBS {
+        let job = jobs
+            .iter()
+            .find(|j| j.get("job_name").and_then(serde_norway::Value::as_str) == Some(name))
+            .ok_or_else(|| ScrapeIntervalError::ServiceJobMissing((*name).to_string()))?;
+        let raw = job
+            .get("scrape_interval")
+            .and_then(serde_norway::Value::as_str)
+            .or(global)
+            .ok_or_else(|| ScrapeIntervalError::IntervalUnparseable((*name).to_string()))?;
+        let interval = parse_prometheus_duration(raw)
+            .ok_or_else(|| ScrapeIntervalError::IntervalUnparseable((*name).to_string()))?;
+        max = max.max(interval);
+    }
+    Ok(max)
+}
+
+/// Parse the Prometheus duration forms a scrape interval uses (`500ms`, `5s`,
+/// `1m`, `1h`, and concatenations such as `1m30s`). `None` for anything else
+/// or for zero — never a guess.
+fn parse_prometheus_duration(raw: &str) -> Option<Duration> {
+    let mut total = Duration::ZERO;
+    let mut rest = raw.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let value: u64 = rest.get(..digits)?.parse().ok()?;
+        rest = rest.get(digits..)?;
+        let (unit, len) = if rest.starts_with("ms") {
+            (Duration::from_millis(1), 2)
+        } else if rest.starts_with('s') {
+            (Duration::from_secs(1), 1)
+        } else if rest.starts_with('m') {
+            (Duration::from_secs(60), 1)
+        } else if rest.starts_with('h') {
+            (Duration::from_secs(3_600), 1)
+        } else {
+            return None;
+        };
+        total += unit.checked_mul(u32::try_from(value).ok()?)?;
+        rest = rest.get(len..)?;
+    }
+    (!total.is_zero()).then_some(total)
+}
+
+static LIVE_SERVICE_JOB_INTERVAL: tokio::sync::OnceCell<Duration> =
+    tokio::sync::OnceCell::const_new();
+
+/// [`SERVICE_JOB_SCRAPE_SETTLE`], returned ONLY after the live Prometheus
+/// config proves it exceeds the deployed service-job scrape interval. The
+/// live config is read once per process.
+///
+/// This is the fail-CLOSED binding of the in-tree copy. A cluster still
+/// scraping at an older, slower cadence (an in-tree config change not yet
+/// applied) makes every stability wait compare two reads inside one scrape —
+/// passing, faster, having observed nothing. This turns that into a loud
+/// failure instead.
+///
+/// # Panics
+///
+/// With [`SCRAPE_CONFIG_UNREADABLE`] if the config cannot be read or parsed,
+/// and with [`SETTLE_NOT_ABOVE_INTERVAL`] if the settle does not exceed the
+/// live interval. Never with a message that suggests shortening the settle.
+pub async fn service_job_scrape_settle(prom: &PrometheusClient) -> Duration {
+    let live = *LIVE_SERVICE_JOB_INTERVAL
+        .get_or_init(|| async {
+            let body = prom.status_config().await.unwrap_or_else(|e| {
+                panic!(
+                    "{SCRAPE_CONFIG_UNREADABLE}: could not read Prometheus /api/v1/status/config \
+                     ({e}). Stability waits cannot be proved non-vacuous without the live \
+                     scrape interval; this is an environment/config fault, not a test failure."
+                )
+            });
+            max_service_job_scrape_interval(&body).unwrap_or_else(|e| {
+                panic!(
+                    "{SCRAPE_CONFIG_UNREADABLE}: the live Prometheus config has no readable \
+                     scrape interval for the service jobs ({e:?}). Do not relax the extractor \
+                     to make this pass: a parse that finds nothing is exactly the vacuous case."
+                )
+            })
+        })
+        .await;
+    assert!(
+        SERVICE_JOB_SCRAPE_SETTLE > live,
+        "{SETTLE_NOT_ABOVE_INTERVAL}: SERVICE_JOB_SCRAPE_SETTLE ({SERVICE_JOB_SCRAPE_SETTLE:?}) \
+         does not exceed the LIVE service-job scrape interval ({live:?}), so every stability \
+         wait would compare two reads inside one scrape and pass having observed nothing. The \
+         cluster is most likely running a Prometheus config older than the tree: apply it with \
+         `kubectl apply -k infra/kubernetes/overlays/kind/observability/` (the generated \
+         ConfigMap hash rolls the pod). If the interval was raised on purpose, raise \
+         SERVICE_JOB_SCRAPE_INTERVAL_SECS to match. NEVER shorten the settle to make this pass."
+    );
+    SERVICE_JOB_SCRAPE_SETTLE
+}
+
 /// Poll until two consecutive per-instance reads, `settle` apart, are identical.
 ///
 /// # This is a PRECONDITION, not a delta gate
@@ -480,8 +704,12 @@ pub async fn poll_until_any_instance_above(
 ///   `--query.lookback-delta` (the container args at
 ///   `infra/kubernetes/observability/prometheus-config.yaml` set only
 ///   `--config.file` and `--storage.tsdb.path`), so the gap is the **5m default**
-///   against a 16s settle — nearly **twenty times** the window. An overstatement
-///   on a weak control gets caught; an overstatement on a strong one is what
+///   against [`SERVICE_JOB_SCRAPE_SETTLE`] — about **fifty times** the window.
+///   (It was about twenty times against the former 16s settle: shortening the
+///   settle when the service jobs' scrape cadence dropped is what moved the
+///   ratio. The residual itself is unchanged and structural — see below — so
+///   do not read the larger figure as a new defect.) An overstatement on a
+///   weak control gets caught; an overstatement on a strong one is what
 ///   survives, and this control is otherwise good.
 ///
 ///   **Do not reach for a longer settle — it cannot work.** The settle is
@@ -499,9 +727,11 @@ pub async fn poll_until_any_instance_above(
 ///
 /// # `settle` is a CORRECTNESS parameter, not a budget
 ///
-/// Pass `Prometheus scrape_interval + margin` — 16s against the cluster's 15s
-/// `scrape_interval` (`infra/kubernetes/observability/prometheus-config.yaml`).
-/// **A value at or below one scrape interval makes this VACUOUS rather than
+/// Pass the scrape interval of the job that produces `promql`'s series, plus a
+/// margin. For the ac/gc/mc/mh service jobs that value is
+/// [`SERVICE_JOB_SCRAPE_SETTLE`], obtained through
+/// [`service_job_scrape_settle`], which first checks it against the LIVE
+/// config. **A value at or below one scrape interval makes this VACUOUS rather than
 /// merely fast**: both reads then come from the same scrape, are trivially
 /// identical, and the loop returns having proved nothing. That failure is
 /// invisible on the page, because [`instance_maps_equal`] looks correct at any
@@ -531,6 +761,14 @@ pub async fn poll_until_any_instance_above(
 /// would cause. Callers passing the same pair of values is exactly the adjacency
 /// that makes such a hoist look like an obvious win.
 ///
+/// **A SHARED VALUE PASSED EXPLICITLY IS NOT A DEFAULT.**
+/// [`SERVICE_JOB_SCRAPE_SETTLE`] is one reasoned value, derived from the one
+/// cadence every current caller's series is scraped at, and each caller still
+/// names it at its own call site next to its own why-it-waits paragraph. What
+/// this paragraph forbids is a value a caller ADOPTS BY OMISSION; a caller that
+/// passes the service-job settle has chosen it, and a caller gating a series
+/// from a different job class must choose differently (see that constant).
+///
 /// (Deliberately no count of those callers here. A restated count is the only
 /// part of this paragraph that can rot, and it rots at the first addition — the
 /// argument does not need it.)
@@ -552,7 +790,8 @@ pub async fn poll_until_any_instance_above(
 /// The deadline is evaluated *after* a completed round, so a round that starts
 /// just under the deadline runs to completion: the effective ceiling is
 /// `timeout + settle + two query round trips`. Budget against that number, not
-/// against `timeout` — with the 16s/90s pair the real ceiling is ~106s. The two
+/// against `timeout` — with a 90s budget and [`SERVICE_JOB_SCRAPE_SETTLE`] the
+/// real ceiling is about 96s (timeout + one settle + two query round trips). The two
 /// delta polls in this module have the same post-round shape but overshoot only
 /// by their poll interval, which is why it is called out here and not there.
 ///
@@ -723,6 +962,116 @@ pub async fn poll_until_pinned_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- live scrape-interval precondition --------------------------------
+
+    fn status_config_body(yaml: &str) -> String {
+        serde_json::json!({ "status": "success", "data": { "yaml": yaml } }).to_string()
+    }
+
+    const PER_JOB: &str = "global:\n  scrape_interval: 15s\nscrape_configs:\n\
+        - job_name: ac-service\n  scrape_interval: 5s\n\
+        - job_name: gc-service\n  scrape_interval: 5s\n\
+        - job_name: mc-service\n  scrape_interval: 5s\n\
+        - job_name: mh-service\n  scrape_interval: 5s\n\
+        - job_name: otel-collector\n  scrape_interval: 10s\n\
+        - job_name: kubelet\n  scrape_interval: 15s\n";
+
+    #[test]
+    fn service_job_interval_is_the_per_job_value_not_global_nor_other_jobs() {
+        assert_eq!(
+            max_service_job_scrape_interval(&status_config_body(PER_JOB)),
+            Ok(Duration::from_secs(5)),
+            "the 10s otel-collector and 15s global/kubelet classes must not leak in"
+        );
+    }
+
+    #[test]
+    fn service_job_interval_falls_back_to_global_and_takes_the_max() {
+        let yaml = "global:\n  scrape_interval: 15s\nscrape_configs:\n\
+            - job_name: ac-service\n\
+            - job_name: gc-service\n  scrape_interval: 5s\n\
+            - job_name: mc-service\n  scrape_interval: 5s\n\
+            - job_name: mh-service\n  scrape_interval: 5s\n";
+        assert_eq!(
+            max_service_job_scrape_interval(&status_config_body(yaml)),
+            Ok(Duration::from_secs(15))
+        );
+    }
+
+    /// FIRE: the stale-cluster case the precondition exists for.
+    #[test]
+    fn a_cluster_still_scraping_at_15s_is_not_below_the_settle() {
+        let yaml = PER_JOB.replace("scrape_interval: 5s", "scrape_interval: 15s");
+        let live = max_service_job_scrape_interval(&status_config_body(&yaml)).unwrap();
+        assert!(SERVICE_JOB_SCRAPE_SETTLE <= live, "would panic, as it must");
+    }
+
+    #[test]
+    fn the_settle_exceeds_the_in_tree_interval_by_the_margin() {
+        assert_eq!(
+            SERVICE_JOB_SCRAPE_SETTLE,
+            Duration::from_secs(SERVICE_JOB_SCRAPE_INTERVAL_SECS) + SCRAPE_SETTLE_MARGIN
+        );
+        assert!(
+            SCRAPE_SETTLE_MARGIN >= Duration::from_secs(1),
+            "margin is absolute"
+        );
+    }
+
+    #[test]
+    fn unreadable_configs_fail_closed_with_a_distinct_error() {
+        assert_eq!(
+            max_service_job_scrape_interval("not json"),
+            Err(ScrapeIntervalError::NotPrometheusConfig)
+        );
+        // Escaped-YAML-read-as-lines trap: the envelope WITHOUT data.yaml.
+        assert_eq!(
+            max_service_job_scrape_interval(r#"{"status":"success","data":{}}"#),
+            Err(ScrapeIntervalError::NotPrometheusConfig)
+        );
+        let missing = PER_JOB.replace("mh-service", "mh-renamed");
+        assert_eq!(
+            max_service_job_scrape_interval(&status_config_body(&missing)),
+            Err(ScrapeIntervalError::ServiceJobMissing(
+                "mh-service".to_string()
+            ))
+        );
+        let garbage = PER_JOB.replacen("scrape_interval: 5s", "scrape_interval: soon", 1);
+        assert_eq!(
+            max_service_job_scrape_interval(&status_config_body(&garbage)),
+            Err(ScrapeIntervalError::IntervalUnparseable(
+                "ac-service".to_string()
+            ))
+        );
+        let no_interval_anywhere = "scrape_configs:\n- job_name: ac-service\n\
+            - job_name: gc-service\n- job_name: mc-service\n- job_name: mh-service\n";
+        assert_eq!(
+            max_service_job_scrape_interval(&status_config_body(no_interval_anywhere)),
+            Err(ScrapeIntervalError::IntervalUnparseable(
+                "ac-service".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn prometheus_durations_parse_and_reject() {
+        assert_eq!(
+            parse_prometheus_duration("5s"),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_prometheus_duration("1m30s"),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_prometheus_duration("500ms"),
+            Some(Duration::from_millis(500))
+        );
+        for bad in ["", "5", "s", "5x", "0s", "-5s"] {
+            assert_eq!(parse_prometheus_duration(bad), None, "{bad:?}");
+        }
+    }
 
     /// PromQL literal used in the pure-parse tests (only names the query in
     /// diagnostics; parsing is content-driven, not query-driven).

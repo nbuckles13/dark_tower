@@ -288,11 +288,10 @@ determines what a responder can actually see.
 not restate the number as a literal**, because a literal here becomes a second encoding that drifts
 from the config silently.
 
-> **One deliberate exception, below.** The cadence *numbers* do appear in the drift table and prose
-> that follow, because a drift cannot be described without both sides of it — "the deployed value
-> differs from the intended one" is useless without saying by how much. Those figures are
-> **point-in-time documentation of a defect, not a specification**; the config remains authoritative,
-> and they disappear when D1 closes the gap. Everywhere else, cite the key.
+> **The deployed-cadence gap D1 documented here is CLOSED on the deployed path** (story 2 task 10):
+> the authoritative config now sets a per-job `scrape_interval` on the four service jobs. The drift
+> numbers that used to appear below are gone with it — cite the keys. What remains of D1 is the
+> MECHANISM (two configs, no sync guard), below.
 
 ### Which config is authoritative
 
@@ -300,7 +299,7 @@ There are **two live Prometheus configurations**, and they do not agree:
 
 | File | Applies to | Authority |
 |---|---|---|
-| `infra/kubernetes/observability/prometheus-config.yaml` | The **deployed** Kind cluster (via `infra/kind/scripts/setup.sh` → `infra/kubernetes/overlays/kind/observability/`, a labels-only passthrough) | **AUTHORITATIVE** — this is what runs, and what any triage actually gets |
+| `infra/kubernetes/observability/prometheus.yml` (turned into the `prometheus-config` ConfigMap by `configMapGenerator`; `prometheus-config.yaml` beside it is the Deployment/RBAC only) | The **deployed** Kind cluster (via `infra/kind/scripts/setup.sh` → `infra/kubernetes/overlays/kind/observability/`, a labels-only passthrough; Layer 7 re-applies it when the diff touches it) | **AUTHORITATIVE** — this is what runs, and what any triage actually gets |
 | `infra/docker/prometheus/prometheus.yml` | The local compose stack (`docker-compose.yml`) only | Local-only. Not deployed. |
 
 Naming which one wins is load-bearing: "cite the config key" is meaningless while two keys per
@@ -308,38 +307,34 @@ cadence disagree.
 
 ### Media-path cadences
 
-| Signal | Config key | Deployed value | Intended value |
+| Signal | Config key (authoritative file) | Deployed value | Compose file |
 |---|---|---|---|
-| MH scrape | `scrape_configs[job_name=mh-service].scrape_interval` — **absent** in the authoritative file, so inherits `global.scrape_interval` | **15 s** (inherited) | 5 s, set only in the compose file, with the rationale "more frequent for real-time media metrics" |
-| MC scrape | same shape, `job_name=mc-service` — **absent**, inherits global | **15 s** (inherited) | 10 s (compose only) |
-| GC scrape | same shape, `job_name=gc-service` — **absent**, inherits global | **15 s** (inherited) | 10 s (compose only) |
-| Client SDK OTel export | `DEFAULT_METRIC_EXPORT_INTERVAL_MS` (`packages/sdk-core/src/config/clientConfig.ts`), overridable per session via `TelemetryConfig.metricExportIntervalMs`; read by `PeriodicExportingMetricReader` in `packages/sdk-core/src/telemetry/telemetryConfig.ts` — **read the key, not this cell** | As configured (was the OTel JS default of 60 s before the SDK media pipeline landed) | As configured. **Note the blast radius: the SDK has ONE `MeterProvider` (ADR-0028 R-19/R-24), so this cadence applies to EVERY `dt_client_*` metric, not only the media path.** Do not scope it by adding a second provider. |
+| MH scrape | `scrape_configs[job_name=mh-service].scrape_interval` | **Read the key** (per-job) | Same intent; its own per-job key |
+| MC scrape | `scrape_configs[job_name=mc-service].scrape_interval` | **Read the key** (per-job) — deliberately the SAME as MH, not the coarser value the compose file carries: the env-tests' `mh_notifications` group gates on MC counters | **Deliberately diverges** (coarser); reciprocal `ANCHOR (DRY):` notes in both files |
+| GC scrape | `scrape_configs[job_name=gc-service].scrape_interval` | **Read the key** (per-job) | **Deliberately diverges** (coarser), same note |
+| AC scrape | `scrape_configs[job_name=ac-service].scrape_interval` | **Read the key** (per-job) | Not scraped by compose |
+| Infra jobs (`prometheus`, `kube-state-metrics`, `node-exporter`, `kubelet`) | `global.scrape_interval` (no per-job key) | Read the key | — |
+| Client SDK OTel export | `DEFAULT_METRIC_EXPORT_INTERVAL_MS` (`packages/sdk-core/src/config/clientConfig.ts`), overridable per session via `TelemetryConfig.metricExportIntervalMs`; read by `PeriodicExportingMetricReader` in `packages/sdk-core/src/telemetry/telemetryConfig.ts` — **read the key, not this cell**; the collector's scrape is the `otel-collector` job's own per-job `scrape_interval`, matched to it | As configured (was the OTel JS default of 60 s before the SDK media pipeline landed) | As configured. **Note the blast radius: the SDK has ONE `MeterProvider` (ADR-0028 R-19/R-24), so this cadence applies to EVERY `dt_client_*` metric, not only the media path.** Do not scope it by adding a second provider. |
 | MH latency histogram sample ratio | `MH_MEDIA_LATENCY_SAMPLE_RATIO` (`infra/services/mh-service/configmap.yaml`; optional, code default `mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`) | Published as `mh_media_latency_sample_ratio`, read from the same field the sampler draws against — **read the gauge, not this table**: a number written here would be the parallel constant the rule below forbids | As deployed |
 
-### The deployed cadence is 15 s, and that is a gap
+**Why the service jobs are per-job, not the global.** Moving `global.scrape_interval` would also
+change the infra jobs' cadence AND silently halve their effective `scrape_timeout` (a job with no
+explicit timeout inherits the global default clamped to its interval) — including `kubelet`/cAdvisor
+through the apiserver proxy, the slowest target in the cluster — for no reader's benefit. The
+service jobs' own timeout is clamped to their interval by the same rule; that is recorded in the
+config as a decision, with its failure mode (`up == 0` on the job).
 
-**MH is scraped at 15 s, not 5 s.** The authoritative config declares **no per-job
-`scrape_interval` at all**; every job inherits the global value. The 5 s and 10 s figures exist only
-in the compose file and are **intended-but-not-in-effect on the deployed path**.
+**The env-tests depend on this key.** Their stability-wait settle
+(`crates/env-tests/src/fixtures/metrics.rs`, `SERVICE_JOB_SCRAPE_SETTLE`) is derived from the
+service jobs' cadence and checked against the LIVE config before every wait; a cadence change here
+without that constant fails them loudly (`settle-not-above-scrape-interval`), never vacuously.
 
-This matters operationally rather than cosmetically: **a forwarding-latency histogram is close to
-useless for triage at 15 s resolution.** A media-quality incident is typically shorter than a few
-scrape intervals, so at 15 s a responder sees two or three points across the whole event — not enough
-to distinguish a spike from a ramp, or to tell which of the three latency phases moved. The 5 s
-cadence was chosen precisely so that decomposed media latency would be readable during an incident,
-and that intent is currently not in effect.
+### What remains of D1: the mechanism
 
-This is **not** "cadences vary by environment". It is a single configuration that was written in one
-place and never applied in the other. **Closing it is tracked in `docs/TODO.md` §Observability Debt
-(D1)**, owner infrastructure + operations, together with the reciprocal cross-references and a drift
-guard so the two files cannot silently rediverge again.
-
-> **This subsection inverts when D1 lands.** Every statement above — the Deployed column, "the
-> deployed cadence is 15 s", the Intended/Deployed split, the triage-resolution argument — becomes
-> false the moment the per-job overrides are applied. Updating this subsection is listed in D1's
-> **Fix** clause; it is the tracking half of documenting the gap truthfully in the meantime. Without
-> it, the doc that currently describes the drift accurately becomes the tree's most confident wrong
-> statement about cadence.
+The two files still encode the service cadences twice with no sync guard, so they can rediverge
+silently — and the MC/GC rows above are a divergence now, **deliberate and documented** by reciprocal
+`ANCHOR (DRY):` comments in both files, rather than closed. The guard is tracked in `docs/TODO.md`
+§Observability Debt (D1, narrowed), owner infrastructure.
 
 ### Rules
 

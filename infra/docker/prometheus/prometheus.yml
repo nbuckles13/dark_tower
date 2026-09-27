@@ -48,6 +48,12 @@ scrape_configs:
       - targets: ['localhost:9090']
 
   # Global Controller (when implemented)
+  # ANCHOR (DRY): the DEPLOYED (Kind) cadences live in
+  # infra/kubernetes/observability/prometheus.yml, which scrapes all four
+  # service jobs at 5s per job. The per-job values in THIS local-only compose
+  # file (gc/mc 10s, mh 5s) diverge from that on purpose and are not what any
+  # env-test or triage reads; a sync guard between the two files is still owed
+  # (docs/TODO.md D1).
   - job_name: 'gc-service'
     static_configs:
       - targets: ['gc-service:8000']

@@ -343,6 +343,13 @@ pub struct MeetingPolicy {
     /// The complete egress set. Empty is legal and meaningful: "this handler
     /// forwards nothing for this meeting".
     pub edges: Vec<EgressEdge>,
+    /// The publishers THIS HANDLER must drop at ingress (ADR-0036 §7 server
+    /// mute; `internal.proto` `RegisterMeetingRequest.server_muted_sources`),
+    /// in request order, duplicate-free. Meeting-scoped like every `SenderId`.
+    /// Empty means "nobody is server-muted on this handler". A muted sender
+    /// that is not a candidate here, or not yet connected, is HELD — it is
+    /// never cross-checked against `edges`.
+    pub server_muted: Vec<SenderId>,
 }
 
 /// Why a registration was refused outright.
@@ -368,6 +375,11 @@ pub enum PolicyRejection {
     /// An egress stream named no transport mode. `TRANSPORT_MODE_UNSPECIFIED`
     /// is a rejection, never a datagram default.
     UnspecifiedTransportMode,
+    /// `server_muted_sources` exceeded the configured per-meeting bound.
+    TooManyMutedSources,
+    /// A `sender_id` appeared twice in `server_muted_sources`. Rejected, not
+    /// deduplicated: a duplicate means MC's set construction is broken.
+    DuplicateMutedSource,
     /// Egress streams disagreed on transport mode. The §8 echo is one field
     /// for a per-egress property, so it is unambiguous only while a meeting's
     /// streams are homogeneous. Echoing one of N would make the two-ends-agree
@@ -398,9 +410,11 @@ impl PolicyRejection {
     /// attacker-chosen `sender_id`, `slot_id` and `stream_number` values —
     /// were unpinned in a test asserting they were pinned. Building the list
     /// from `IdError::ALL` makes that class of gap unrepresentable.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::TooManyEgressStreams,
         Self::TooManyCandidateSources,
+        Self::TooManyMutedSources,
+        Self::DuplicateMutedSource,
         Self::MissingSubscriber,
         Self::Id(IdError::SenderIdZero),
         Self::Id(IdError::SenderIdOutOfRange),
@@ -423,6 +437,10 @@ impl PolicyRejection {
             Self::TooManyCandidateSources => {
                 "candidate_sources exceeds the configured per-egress bound"
             }
+            Self::TooManyMutedSources => {
+                "server_muted_sources exceeds the configured per-meeting bound"
+            }
+            Self::DuplicateMutedSource => "duplicate server_muted_sources sender_id",
             Self::MissingSubscriber => "egress stream is missing its subscriber",
             Self::Id(IdError::SenderIdZero) => "sender_id 0 is reserved and never valid",
             Self::Id(IdError::SenderIdOutOfRange) => "sender_id is out of range",
@@ -444,7 +462,7 @@ impl MeetingPolicy {
     ///
     /// # Check order is load-bearing
     ///
-    /// The two **count bounds run first**, before anything that iterates or
+    /// The three **count bounds run first**, before anything that iterates or
     /// allocates per element. `internal.proto` requires them "before building
     /// any routing table"; that is the floor rather than the ceiling, because
     /// duplicate detection builds `HashSet`s sized by the attacker-controlled
@@ -452,7 +470,9 @@ impl MeetingPolicy {
     /// moved earlier than the routing table.
     ///
     /// Order: counts -> shape -> identifier widths -> duplicates -> transport
-    /// mode.
+    /// mode, for the egress set; then the server-muted set, whose count was
+    /// already checked with the others (its dedup `HashSet` is exactly the
+    /// attacker-sized allocation the bound exists to precede).
     ///
     /// # Errors
     ///
@@ -470,6 +490,9 @@ impl MeetingPolicy {
             if stream.candidate_sources.len() > limits.max_candidate_sources_per_egress {
                 return Err(PolicyRejection::TooManyCandidateSources);
             }
+        }
+        if request.server_muted_sources.len() > limits.max_muted_sources_per_meeting {
+            return Err(PolicyRejection::TooManyMutedSources);
         }
 
         let mut edges = Vec::with_capacity(request.egress_streams.len());
@@ -527,11 +550,28 @@ impl MeetingPolicy {
             });
         }
 
+        // ---- server-muted set (ADR-0036 §7; story 2 R-9) ---------------
+        // Count already bounded above. Widths through the same `SenderId`
+        // parse as every other sender field (0 and >16-bit reject); a
+        // duplicate rejects the whole registration. NO cross-check against
+        // `edges`: a muted sender with no candidate edge here, or not yet
+        // connected, is held (the safe direction, per `internal.proto`).
+        let mut server_muted = Vec::with_capacity(request.server_muted_sources.len());
+        let mut seen_muted = HashSet::with_capacity(request.server_muted_sources.len());
+        for muted in &request.server_muted_sources {
+            let sender = SenderId::from_wire(muted.sender_id)?;
+            if !seen_muted.insert(sender) {
+                return Err(PolicyRejection::DuplicateMutedSource);
+            }
+            server_muted.push(sender);
+        }
+
         Ok(Self {
             meeting: MeetingKey::new(&request.meeting_id),
             generation: request.policy_generation,
             transport_mode,
             edges,
+            server_muted,
         })
     }
 }
@@ -565,6 +605,13 @@ pub struct MeetingRoutes {
     /// to prevent — reached through a *performance* change nobody would think
     /// to route past a correctness constraint.
     by_sender: HashMap<SenderId, Vec<usize>>,
+    /// Server-muted publishers (ADR-0036 §7), **inside this meeting's routes
+    /// and keyed by the scoped [`SenderId`]** for the same reason `by_sender`
+    /// is: `sender_id` 5 exists in every meeting on this handler, so a
+    /// handler-global muted set would silence an innocent sender in another
+    /// meeting. Reachable only through [`RoutingSnapshot::is_server_muted`],
+    /// which takes a [`MeetingKey`].
+    server_muted: HashSet<SenderId>,
 }
 
 impl MeetingRoutes {
@@ -580,6 +627,7 @@ impl MeetingRoutes {
             transport_mode: policy.transport_mode,
             edges: policy.edges.clone(),
             by_sender,
+            server_muted: policy.server_muted.iter().copied().collect(),
         }
     }
 
@@ -605,6 +653,21 @@ impl MeetingRoutes {
     #[must_use]
     pub fn edges(&self) -> &[EgressEdge] {
         &self.edges
+    }
+
+    /// Whether this installed policy's server-muted set equals `other`, as a
+    /// SET (order-insensitive). Used by the equal-generation divergence
+    /// detector, which must log counts only — never which sender.
+    #[must_use]
+    pub fn server_muted_matches(&self, other: &[SenderId]) -> bool {
+        other.len() == self.server_muted.len()
+            && other.iter().all(|s| self.server_muted.contains(s))
+    }
+
+    /// How many publishers are server-muted on this handler for this meeting.
+    #[must_use]
+    pub fn server_muted_count(&self) -> usize {
+        self.server_muted.len()
     }
 }
 
@@ -665,6 +728,31 @@ impl RoutingSnapshot {
             }
         }
         visited
+    }
+
+    /// Whether `sender` is server-muted **within `meeting`** (ADR-0036 §7).
+    ///
+    /// Meeting-scoped for the same reason as [`Self::for_each_source`]: the
+    /// same `sender_id` is a different participant in every other meeting on
+    /// this handler, so there is no function taking a `SenderId` alone.
+    /// Borrowing and non-allocating — the forward path calls it on every
+    /// frame, and re-reads it per frame, so an unmute takes effect on the next
+    /// frame after the swap.
+    ///
+    /// # `false` has TWO meanings — the absent-meeting arm is FAIL-OPEN
+    ///
+    /// `false` means "not muted" **or** "no policy is installed for this
+    /// meeting". That is safe at the one current caller, `forward_one`, only
+    /// because the same absent meeting also resolves to zero edges there and
+    /// the frame is dropped as `no_policy`: nothing is forwarded either way.
+    /// Any future caller that ACTS on `false` without also failing closed on
+    /// an absent policy (e.g. by requiring [`Self::routes_for`] to be `Some`)
+    /// turns an unprogrammed handler into a mute bypass.
+    #[must_use]
+    pub fn is_server_muted(&self, meeting: &MeetingKey, sender: SenderId) -> bool {
+        self.meetings
+            .get(meeting)
+            .is_some_and(|routes| routes.server_muted.contains(&sender))
     }
 
     /// The installed routes for one meeting, if any policy is installed.
@@ -859,7 +947,9 @@ mod tests {
     use super::*;
     // One fixture home for all three test sites that build these messages —
     // see `mh_test_utils::media_policy` for why.
-    use mh_test_utils::media_policy::{egress, register_request as request};
+    use mh_test_utils::media_policy::{
+        egress, register_request as request, register_request_muted,
+    };
     use proto_gen::dark_tower::internal::v1::{CandidateSource, EgressStream};
 
     fn sender(v: u32) -> SenderId {
@@ -1278,6 +1368,181 @@ mod tests {
         table.install(&policy("a", 1, vec![egress(1, 5, 0, 5)]));
         assert_eq!(table.load().generation_for(&MeetingKey::new("a")), 1);
         assert_eq!(table.load().total_edges(), 1);
+    }
+
+    // -- server mute (ADR-0036 §7; story 2 R-9) ---------------------------
+
+    #[test]
+    fn server_muted_set_parses_in_order_and_empty_means_nobody() {
+        let parsed = MeetingPolicy::from_request(
+            &register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[6, 9]),
+            &PolicyLimits::for_tests(),
+        )
+        .unwrap();
+        assert_eq!(parsed.server_muted, vec![sender(6), sender(9)]);
+
+        let none =
+            MeetingPolicy::from_request(&request("m", 1, vec![]), &PolicyLimits::for_tests())
+                .unwrap();
+        assert!(
+            none.server_muted.is_empty(),
+            "an absent field is the pre-R-9 wire: nobody muted"
+        );
+    }
+
+    #[test]
+    fn muted_count_bound_fires_before_duplicate_detection_and_width_checks() {
+        let limits = PolicyLimits {
+            max_muted_sources_per_meeting: 1,
+            ..PolicyLimits::for_tests()
+        };
+        // Over the bound AND duplicated AND malformed: the COUNT must be what
+        // fires, proving it ran before the dedup `HashSet` sized by the
+        // attacker-controlled field was allocated.
+        let req = register_request_muted("m", 1, vec![], &[0, 0]);
+        assert_eq!(
+            MeetingPolicy::from_request(&req, &limits),
+            Err(PolicyRejection::TooManyMutedSources)
+        );
+        // At the bound is fine.
+        let req = register_request_muted("m", 1, vec![], &[3]);
+        assert!(MeetingPolicy::from_request(&req, &limits).is_ok());
+    }
+
+    #[test]
+    fn muted_count_bound_precedes_the_egress_shape_walk() {
+        // A malformed egress stream AND an over-limit muted set. The muted
+        // count is the THIRD check in the counts block: it runs AFTER the
+        // egress-stream count and the per-element candidate-count loop (which
+        // does touch every egress element, but allocates nothing), and BEFORE
+        // the per-element shape / width / duplicate walk and every allocation
+        // sized by a repeated field. That is what this proves — not that the
+        // muted check is first. Anyone adding an allocation to the
+        // candidate-count loop must move it after all three counts.
+        let limits = PolicyLimits {
+            max_muted_sources_per_meeting: 1,
+            ..PolicyLimits::for_tests()
+        };
+        let mut stream = egress(1, 5, 0, 5);
+        stream.subscriber = None;
+        let req = register_request_muted("m", 1, vec![stream], &[1, 2]);
+        assert_eq!(
+            MeetingPolicy::from_request(&req, &limits),
+            Err(PolicyRejection::TooManyMutedSources)
+        );
+    }
+
+    #[test]
+    fn duplicate_muted_sender_rejects_whole_registration() {
+        let req = register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[6, 6]);
+        assert_eq!(
+            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
+            Err(PolicyRejection::DuplicateMutedSource)
+        );
+    }
+
+    #[test]
+    fn malformed_muted_sender_id_rejects_through_the_same_width_rule() {
+        for (value, expected) in [
+            (0, IdError::SenderIdZero),
+            (65_536, IdError::SenderIdOutOfRange),
+        ] {
+            let req = register_request_muted("m", 1, vec![], &[value]);
+            assert_eq!(
+                MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
+                Err(PolicyRejection::Id(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn muted_sender_with_no_edge_here_is_held_not_rejected() {
+        // Sender 9 sources nothing on this handler and may not be connected:
+        // `internal.proto` says HOLD (it stays muted when it attaches).
+        let table = RoutingTable::new();
+        let req = register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[9]);
+        table.install(&MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()).unwrap());
+        assert!(table
+            .load()
+            .is_server_muted(&MeetingKey::new("m"), sender(9)));
+    }
+
+    /// The two-meeting pin for the muted set (@security S-2), the exact analog
+    /// of `sender_id_valid_in_one_meeting_does_not_resolve_in_another`. A
+    /// handler-global muted set keyed on the wire integer passes every
+    /// single-meeting test and silences an innocent sender in meeting B.
+    #[test]
+    fn sender_muted_in_one_meeting_is_not_muted_in_another() {
+        let table = RoutingTable::new();
+        let limits = PolicyLimits::for_tests();
+        table.install(
+            &MeetingPolicy::from_request(
+                &register_request_muted("meeting-a", 1, vec![egress(1, 7, 0, 5)], &[5]),
+                &limits,
+            )
+            .unwrap(),
+        );
+        table.install(&policy("meeting-b", 1, vec![egress(1, 7, 0, 5)]));
+
+        let snapshot = table.load();
+        // Positive arm: muted in A.
+        assert!(snapshot.is_server_muted(&MeetingKey::new("meeting-a"), sender(5)));
+        // Negative arm: the same ordinal in B is a different participant.
+        assert!(
+            !snapshot.is_server_muted(&MeetingKey::new("meeting-b"), sender(5)),
+            "sender 5 is muted in meeting A only; muting it in B is cross-tenant"
+        );
+        // And B's sender 5 still resolves its edge, so the negative arm is
+        // not just "meeting B is empty".
+        assert_eq!(
+            sources_for(&snapshot, &MeetingKey::new("meeting-b"), sender(5)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_absent_meeting_reads_not_muted() {
+        // The documented fail-open arm: safe only because the forward path
+        // also finds no edges for an absent meeting (`no_policy`).
+        let table = RoutingTable::new();
+        assert!(!table
+            .load()
+            .is_server_muted(&MeetingKey::new("nowhere"), sender(1)));
+    }
+
+    #[test]
+    fn unmute_is_the_next_generation_without_the_sender() {
+        let table = RoutingTable::new();
+        let limits = PolicyLimits::for_tests();
+        let meeting = MeetingKey::new("m");
+        table.install(
+            &MeetingPolicy::from_request(
+                &register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[6]),
+                &limits,
+            )
+            .unwrap(),
+        );
+        assert!(table.load().is_server_muted(&meeting, sender(6)));
+        table.install(&policy("m", 2, vec![egress(1, 5, 0, 6)]));
+        assert!(!table.load().is_server_muted(&meeting, sender(6)));
+    }
+
+    #[test]
+    fn server_muted_matches_is_order_insensitive_set_equality() {
+        let table = RoutingTable::new();
+        table.install(
+            &MeetingPolicy::from_request(
+                &register_request_muted("m", 1, vec![], &[3, 4]),
+                &PolicyLimits::for_tests(),
+            )
+            .unwrap(),
+        );
+        let snapshot = table.load();
+        let routes = snapshot.routes_for(&MeetingKey::new("m")).unwrap();
+        assert!(routes.server_muted_matches(&[sender(4), sender(3)]));
+        assert!(!routes.server_muted_matches(&[sender(3)]));
+        assert!(!routes.server_muted_matches(&[sender(3), sender(5)]));
+        assert_eq!(routes.server_muted_count(), 2);
     }
 
     #[test]
