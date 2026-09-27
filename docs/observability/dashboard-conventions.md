@@ -248,13 +248,13 @@ panel then renders bits while claiming bytes. Put the equivalence in prose where
 **Live instances** — both keys are live in the ConfigMap, and both conversions are live in code:
 
 - **Datagram send buffer** (story 1) — **live as of story task 9**, as
-  `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` in `infra/services/mh-service/configmap.yaml`; the frames→bytes
+  `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` in `infra/services/mh-service/config.env`; the frames→bytes
   conversion landed with story 1's MH transport-configuration task (`crates/mh-service/src/config.rs`). ADR-0036 §1 requires this be expressed and documented **in
   frames of audio**, not bytes, because quinn's 1 MiB default is ≈93 seconds of queued audio and
   "1 MiB" does not make that visible while "93 seconds" does. quinn's API takes bytes, so the
   conversion happens once at config load.
 - **`MH_EGRESS_BUDGET_BPS`** (story 2) — **live as of story 2's MH configuration task**, as
-  `MH_EGRESS_BUDGET_BPS` in `infra/services/mh-service/configmap.yaml` (in bits/s); the bits→bytes
+  `MH_EGRESS_BUDGET_BPS` in `infra/services/mh-service/config.env` (in bits/s); the bits→bytes
   conversion and the `mh_media_egress_budget_bytes_per_second` gauge are **live as of story 2
   task 8**: "bits/s, converted once at load upstream of the enforcement/gauge fork; nothing
   downstream sees bits", with the derived stream ceiling and the published gauge both reading the
@@ -315,7 +315,7 @@ cadence disagree.
 | AC scrape | `scrape_configs[job_name=ac-service].scrape_interval` | **Read the key** (per-job) | Not scraped by compose |
 | Infra jobs (`prometheus`, `kube-state-metrics`, `node-exporter`, `kubelet`) | `global.scrape_interval` (no per-job key) | Read the key | — |
 | Client SDK OTel export | `DEFAULT_METRIC_EXPORT_INTERVAL_MS` (`packages/sdk-core/src/config/clientConfig.ts`), overridable per session via `TelemetryConfig.metricExportIntervalMs`; read by `PeriodicExportingMetricReader` in `packages/sdk-core/src/telemetry/telemetryConfig.ts` — **read the key, not this cell**; the collector's scrape is the `otel-collector` job's own per-job `scrape_interval`, matched to it | As configured (was the OTel JS default of 60 s before the SDK media pipeline landed) | As configured. **Note the blast radius: the SDK has ONE `MeterProvider` (ADR-0028 R-19/R-24), so this cadence applies to EVERY `dt_client_*` metric, not only the media path.** Do not scope it by adding a second provider. |
-| MH latency histogram sample ratio | `MH_MEDIA_LATENCY_SAMPLE_RATIO` (`infra/services/mh-service/configmap.yaml`; optional, code default `mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`) | Published as `mh_media_latency_sample_ratio`, read from the same field the sampler draws against — **read the gauge, not this table**: a number written here would be the parallel constant the rule below forbids | As deployed |
+| MH latency histogram sample ratio | `MH_MEDIA_LATENCY_SAMPLE_RATIO` (`infra/services/mh-service/config.env`; optional, code default `mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO`) | Published as `mh_media_latency_sample_ratio`, read from the same field the sampler draws against — **read the gauge, not this table**: a number written here would be the parallel constant the rule below forbids | As deployed |
 
 **Why the service jobs are per-job, not the global.** Moving `global.scrape_interval` would also
 change the infra jobs' cadence AND silently halve their effective `scrape_timeout` (a job with no

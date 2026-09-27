@@ -1218,7 +1218,7 @@ impl MediaLatencyPhase {
 /// time series discovered in production.
 /// RESERVED SENTINEL: `invalid` must never become a real token here. The
 /// collector rewrites any client label value failing its charset check to
-/// exactly that string (`infra/services/otel-collector/configmap.yaml`), and
+/// exactly that string (`infra/services/otel-collector/collector.yaml`), and
 /// four of these spellings are deliberately mirrored by the client's
 /// `MEDIA_SEND_DROP_REASONS` so `sum by(reason)` compares across the hop — so a
 /// real token spelled `invalid` here would become indistinguishable from a

@@ -2,9 +2,6 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - configmap.yaml
-  - mh-0-configmap.yaml
-  - mh-1-configmap.yaml
   - mh-0-deployment.yaml
   - mh-1-deployment.yaml
   - service.yaml
@@ -39,6 +36,41 @@ resources:
   - pdb.yaml
   - network-policy.yaml
   # service-monitor.yaml NOT listed — requires Prometheus Operator CRD
+
+# Content-addressed configuration (ADR-0038 §2). Generated, NOT a plain
+# ConfigMap resource: kustomize appends a hash of the rendered data to the name
+# and rewrites every configMapKeyRef to it, so a config change changes the pod
+# template and rolls exactly the workloads that consume it. `namespace:` is
+# load-bearing -- see infra/kubernetes/observability/kustomization.yaml.
+# Env-file format: KEY=VALUE taken literally, so an empty value is `KEY=` and
+# values are never quoted (a quoted value keeps its quotes; `dt-guard` rejects it).
+configMapGenerator:
+  - name: mh-service-config
+    namespace: dark-tower
+    envs:
+      - config.env
+    options:
+      labels:
+        app: mh-service
+        component: media
+  - name: mh-0-config
+    namespace: dark-tower
+    envs:
+      - mh-0-config.env
+    options:
+      labels:
+        app: mh-service
+        component: media
+        instance: mh-0
+  - name: mh-1-config
+    namespace: dark-tower
+    envs:
+      - mh-1-config.env
+    options:
+      labels:
+        app: mh-service
+        component: media
+        instance: mh-1
 
 labels:
   - pairs:

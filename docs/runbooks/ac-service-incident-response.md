@@ -363,11 +363,16 @@ curl http://ac-service:9090/metrics | grep ac_token_issuance_total
 **Remediation**:
 
 ```bash
-# Option 1: Temporarily increase rate limits (requires config change + restart)
-# Edit ConfigMap:
-kubectl edit configmap ac-service-config -n dark-tower
-# Update rate limit values, then:
-kubectl rollout restart deployment/ac-service -n dark-tower
+# Option 1: Temporarily increase rate limits (config change; the apply rolls AC)
+# Edit the AC_RATE_LIMIT_* values in infra/services/ac-service/config.env, then
+# apply the environment root (Kind: ./infra/kind/scripts/setup.sh --skip-build --only ac).
+# The ConfigMap is content-addressed (ADR-0038), so the apply itself rolls the
+# StatefulSet. Do not `kubectl edit` the live ConfigMap: its name is
+# hash-suffixed and the next apply overwrites the edit.
+kubectl rollout status statefulset/ac-service -n dark-tower
+# Fast rollback if the change made things worse (the previous revision still
+# references the previous hash-suffixed ConfigMap, which is not pruned):
+kubectl rollout undo statefulset/ac-service -n dark-tower
 
 # Option 2: Whitelist specific client (emergency - requires code change or future feature)
 # Currently not supported - escalate to engineering team
@@ -859,10 +864,10 @@ kubectl scale deployment/ac-service -n dark-tower --replicas=10
 kubectl patch deployment/ac-service -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"ac-service","resources":{"limits":{"cpu":"2000m","memory":"1Gi"}}}]}}}}'
 
 # Option 3: Rate limiting (future feature - config-based)
-# Edit ConfigMap to reduce rate limits
-kubectl edit configmap ac-service-config -n dark-tower
-# Update: token_issuance_rate_limit: 10 (from 100)
-kubectl rollout restart deployment/ac-service -n dark-tower
+# Reduce the rate limits in infra/services/ac-service/config.env
+# (e.g. token_issuance_rate_limit: 10, down from 100), then apply the environment
+# root. The content-addressed ConfigMap rolls the StatefulSet on apply.
+kubectl rollout status statefulset/ac-service -n dark-tower
 
 # Option 4: Emergency IP blocking (Infrastructure Team)
 # If under attack, provide attacker IPs to Infrastructure Team

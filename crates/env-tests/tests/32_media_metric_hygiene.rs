@@ -255,7 +255,7 @@ async fn media_metric_labels_carry_no_meeting_identifier_and_no_overclaim() {
 /// `debug` exporter and nothing scraped it. Both facts are now false. The
 /// conclusion survives on a better premise: the collector's metric-name
 /// allowlist EXCLUDES all five grandfathered join-flow metrics
-/// (`infra/services/otel-collector/configmap.yaml`), so no
+/// (`infra/services/otel-collector/collector.yaml`), so no
 /// `meeting_id_hash`-carrying series is exported at all. Had we instead exported
 /// them and stripped the hash, this empty allowlist would have had to become a
 /// real carve-out — which is an independent reason the name list is curated the
@@ -326,7 +326,7 @@ async fn client_series_carry_no_meeting_identifier_when_present() {
         "{TRIAGE_VIOLATION}: client series reached Prometheus carrying a meeting \
          identifier or an overclaim token:\n{}\n\n\
          The metrics-path `keep_keys` in \
-         `infra/services/otel-collector/configmap.yaml` is the control that should \
+         `infra/services/otel-collector/collector.yaml` is the control that should \
          have prevented this — check it before looking anywhere else.",
         violations
             .iter()

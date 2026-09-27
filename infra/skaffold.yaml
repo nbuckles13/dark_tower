@@ -44,11 +44,18 @@ deploy:
       before:
         - host:
             command: ["sh", "-c", "echo 'Deploying to kind cluster...'"]
-    manifests:
-      - services/redis/*.yaml
-      - services/ac-service/*.yaml
-      - services/gc-service/*.yaml
-      - services/mc-service/*.yaml
+
+# The Kind environment root, rendered by kustomize — NOT raw `services/*/*.yaml`
+# globs: every pod-consumed ConfigMap is a kustomize generator (ADR-0038 §2), so
+# the raw files contain no ConfigMaps at all. Dev-only, and deliberately the
+# PLAIN root: skaffold has no host-gateway parameters, so it serves the static
+# host topology whose defaults are the plain values. It must never target a
+# devloop cluster — those apply through infra/kind/scripts/setup.sh:apply_env_root
+# (see the header of kubernetes/overlays/kind/kustomization.yaml).
+manifests:
+  kustomize:
+    paths:
+      - kubernetes/overlays/kind
 
 # Port forwarding for local access
 portForward:

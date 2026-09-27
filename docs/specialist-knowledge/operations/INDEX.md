@@ -11,11 +11,11 @@
 ## Media Path (ADR-0036)
 - MH transport parameters, startup validation, derived drain window → `crates/mh-service/src/config.rs:from_vars()`, `QuicTransportParams`, `DrainWindowSource`, `SHUTDOWN_SETTLE_TARGET_SECONDS`, `SHUTDOWN_MARGIN_SECONDS`
 - Transport build + graceful drain → `crates/mh-service/src/webtransport/server.rs:build_transport_config()`, `crates/mh-service/src/main.rs:shutdown_signal()`
-- MH transport ConfigMap keys; per-instance `MH_TERMINATION_GRACE_SECONDS` via kustomize `replacements:` → `infra/services/mh-service/configmap.yaml`, `infra/services/mh-service/kustomization.yaml`
+- MH transport ConfigMap keys; per-instance `MH_TERMINATION_GRACE_SECONDS` via kustomize `replacements:` → `infra/services/mh-service/config.env`, `infra/services/mh-service/kustomization.yaml`
 - Pod-grace ↔ env drift env-test → `crates/env-tests/tests/01_mh_deployment_config.rs`
 - MH hot path (no telemetry macro reachable under it) → `crates/mh-service/src/media/`; transport seam → `crates/mh-service/src/webtransport/media_transport.rs`, `crates/mh-service/src/transport/mod.rs`; sender bindings → `crates/mh-service/src/session/mod.rs`; routing → `crates/mh-service/src/routing/mod.rs`
 - MC admission (meeting KEK, identity key, sender-id allocator, binding outcome) → `crates/mc-service/src/media_admission/`
-- MC routing + client signaling; handler URL is server-chosen → `crates/mc-service/src/media_routing/`, `crates/mc-service/src/media_signaling/assignments.rs`; MC connect settle window `MC_MEDIA_CONNECT_SETTLE_MS` (required, bounded `100..=10000`, echoed as `mc_media_connect_settle_window_seconds`) → `crates/mc-service/src/config.rs`, `infra/services/mc-service/configmap.yaml`, `docs/runbooks/mc-deployment.md` §Configuration Reference
+- MC routing + client signaling; handler URL is server-chosen → `crates/mc-service/src/media_routing/`, `crates/mc-service/src/media_signaling/assignments.rs`; MC connect settle window `MC_MEDIA_CONNECT_SETTLE_MS` (required, bounded `100..=10000`, echoed as `mc_media_connect_settle_window_seconds`) → `crates/mc-service/src/config.rs`, `infra/services/mc-service/config.env`, `docs/runbooks/mc-deployment.md` §Configuration Reference
 - Media-path telemetry deny scope → `scripts/guards/simple/media-telemetry-deny.yaml`, `crates/dt-guard/src/media_telemetry_deny.rs`
 - Frame v2 cross-language vectors + gate → `proto/test-vectors/frame-v2.vectors.json`, `scripts/guards/simple/validate-frame-vectors.sh`, `crates/media-vector-gen/`
 - Release feature-gate self-test → `scripts/release-feature-gate.test.sh`; release profile guard → `crates/dt-guard/src/release_build_profile.rs`
@@ -53,7 +53,7 @@
 - Kind cluster → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_only_service()`, `dt_psql()`, `provision_run_org()`), `teardown.sh`
 - Per-service Kustomize bases (statefulset/deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
 - Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/`; dev certs → `scripts/generate-dev-certs.sh`
-- MC/MH per-instance Deployments + ConfigMaps → `infra/services/mc-service/mc-0-configmap.yaml`, `infra/services/mh-service/mh-0-configmap.yaml`; devloop patching → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
+- MC/MH per-instance Deployments + ConfigMaps → `infra/services/mc-service/mc-0-config.env`, `infra/services/mh-service/mh-0-config.env`; devloop patching → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
 - Per-pod UDP NodePorts `base + ordinal*2` (MC 4433/4435, MH 4434/4436) → `infra/services/mc-service/service.yaml`, `infra/services/mh-service/service.yaml`; netpol → `infra/services/mh-service/network-policy.yaml`; MH→MC gRPC TCP 50052
 - Alert rules → `infra/docker/prometheus/rules/` (`gc-alerts.yaml`, `mc-alerts.yaml`, `mh-alerts.yaml`, `otel-alerts.yaml`, `_template-service-alerts.yaml`)
 

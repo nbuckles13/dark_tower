@@ -37,16 +37,14 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 > asserts set-equality against the name allowlist in both directions, so a metric
 > marked exported and absent from the collector, or vice versa, is a red build).
 > **Nothing ties that green to the collector that is actually running.** The
-> ConfigMap is not content-hashed, so no mechanism makes a config edit and a pod
-> restart one unit: the scripted deploy restarts the collector, but a bare
-> `kubectl apply -k`, a hand-edited ConfigMap, or a pod rescheduled without a
-> restart all leave the previous filter list in memory with the committed file
-> correct and this guard green. A metric marked `Exported: yes` that is absent
-> from Prometheus for that reason renders identically to "no browser is
-> running" - the same ambiguity this block warns about below, reached by a
-> different route. **So this marker means *catalogued as exported*, not *observed in
-> Prometheus*.** The content-hashed-ConfigMap fix that would close the class is
-> filed in `docs/TODO.md` (owner operations).
+> collector config is content-addressed (ADR-0038 §2), so APPLYING an edit rolls
+> the pod; but an edit that was never applied (no deploy route from inside a
+> devloop container yet, see `docs/TODO.md`) or a hand-edited live ConfigMap still
+> leaves the running filter list behind the committed file with this guard green.
+> A metric marked `Exported: yes` that is absent from Prometheus for that reason
+> renders identically to "no browser is running" - the same ambiguity this block
+> warns about below, reached by a different route. **So this marker means
+> *catalogued as exported*, not *observed in Prometheus*.**
 >
 > **The 20 media-path metrics ARE queryable.** The original 14 were verified end
 > to end on the Kind stack from sdk-core's own built bundle through the GC proxy —
@@ -487,7 +485,7 @@ the comment's reader.
 ---
 
 ### `dt_client_media_frames_sent_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Datagrams that left the device on the media datagram path — **one increment per target handler per captured frame**, not one per frame. A sender whose edges span two handlers (ADR-0036 §9; story 2 task 20) advances this twice for one captured frame.
 - **THE NAME SAYS FRAMES; THE VALUE COUNTS DATAGRAMS — and that matches `dt_client_media_frames_received_total`**, which has counted datagrams-at-the-wire since story 1 (stated in `docs/runbooks/client-dev-local.md`'s green-signal table). The divergence is a **family convention documented on both sides**, not a defect on one: sent and received are in the SAME unit, so the loopback pair and every cross-end comparison against `mh_media_*` stay unit-comparable — a two-handler sender's datagrams are split across two handlers, and each handler sees only its own, so the aggregate still reconciles. Do not "fix" either name without moving both.
@@ -495,7 +493,7 @@ the comment's reader.
 - **Usage**: the denominator for the send-drop ratio — **and the unit is the reason it is correct.** `dt_client_media_send_dropped_total` is raised inside the per-lane send path (`packages/sdk-core/src/media/pipeline/egress.ts`), so it is per-send-attempt by construction. Counting *frames* here while counting *attempts* there would make one captured frame that succeeded on handler A and was refused on handler B read as **50% loss on a sender that reached handler A perfectly**. Both sides count datagrams, so the ratio is a real loss fraction. Any future change to either counting point must move both or the ratio silently stops meaning loss.
 
 ### `dt_client_media_send_dropped_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `reason` — a NEW bounded vocabulary, **not** the frame reject
   taxonomy.
@@ -525,7 +523,7 @@ the comment's reader.
   `dt_client_media_mute_transitions_total` and nothing else.
 
 ### `dt_client_media_send_queue_depth`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Gauge
 - **Description**: Depth, in frames, of the DEEPEST of the sender's bounded
   application egress lanes — one lane per target handler (story 2 task 20: a
@@ -551,7 +549,7 @@ the comment's reader.
   you need per-browser queue depth, it is not available from this signal at all.
 
 ### `dt_client_media_frames_received_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Datagrams received on the media path, counted **at the wire**
   before any parse or verification.
@@ -561,7 +559,7 @@ the comment's reader.
   counting-point migration note.
 
 ### `dt_client_media_frames_dropped_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `reason` — the frozen frame-reject vocabulary, whose SSoT is
   `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Membership of
@@ -618,7 +616,7 @@ the comment's reader.
   protocol violation, not a third key reason and not a decode reject.
 
 ### `dt_client_media_frames_accepted_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames that completed the receive path — verified, replay-
   checked, decrypted — and were handed to the audio decoder.
@@ -629,7 +627,7 @@ the comment's reader.
   **not** that frames are playing. See the identity above.
 
 ### `dt_client_media_key_wrap_outcomes_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `outcome` — the NON-DROPPING wrapped-key outcomes (no count is
   restated here: the list below is the operator-facing artifact, and a second
@@ -716,7 +714,7 @@ the comment's reader.
   outcome becomes reachable by a frame WITHOUT a valid roster signature.
 
 ### `dt_client_media_downlink_gap_frames_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames MISSING between each media handler's egress and this
   client's ingress, measured as gaps in the relay hop sequence.
@@ -745,7 +743,7 @@ the comment's reader.
   > end can.
 
 ### `dt_client_media_downlink_reorder_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Datagrams arriving at or below the running hop-sequence
   high-water mark.
@@ -754,7 +752,7 @@ the comment's reader.
   counter so the subtraction is possible at all.
 
 ### `dt_client_media_undeclared_stream_id_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames arriving on a relay `stream_id` this client never
   declared in its `ReceiveCapability`.
@@ -766,7 +764,7 @@ the comment's reader.
   to slots this subscriber did not ask for.
 
 ### `dt_client_media_decoder_errors_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: The audio decoder's terminal error callback fired — **one
   decoder per ACTIVE SENDER** (one per client before story 2 task 7), counted
@@ -781,7 +779,7 @@ the comment's reader.
   per-frame.
 
 ### `dt_client_media_decode_queue_dropped_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames evicted from a per-sender decode lane's bounded pending
   queue while that lane's decoder is being created or replaced (overflow drops
@@ -803,7 +801,7 @@ the comment's reader.
   be that construct with the counter removed.
 
 ### `dt_client_media_mute_transitions_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `action` — `mute`, `unmute`.
 - **Usage**: client mute is enforced at CAPTURE and does not depend on the server
@@ -812,7 +810,7 @@ the comment's reader.
   network died* are indistinguishable from absence alone.
 
 ### `dt_client_media_kek_updates_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `source` — `join_response` (the KEK carried on the join
   response) or `kek_update` (a KEK pushed over signaling). **A reconnect
@@ -827,7 +825,7 @@ the comment's reader.
   per-meeting generation series a membership-change trace.
 
 ### `dt_client_media_kek_retention_violations_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: The KEK holder would have retained more than one previous
   generation; the retention guard (run after every install) trimmed and zeroized
@@ -838,7 +836,7 @@ the comment's reader.
   No alert selects it today; the inventory decision is story 2 task 16's.
 
 ### `dt_client_media_kek_retention_anomalies_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `outcome` — this metric's own domain, exactly
   `floor_substituted`, `ceiling_clamped`, `below_rewrap_latency`. `outcome` is a
@@ -878,7 +876,7 @@ the comment's reader.
   noise).
 
 ### `dt_client_media_kek_install_refusals_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `outcome` — this metric's own domain, exactly `conflicting_key`,
   `older_generation`, `malformed`. **`outcome`, not `reason`**: `reason` is
@@ -913,7 +911,7 @@ the comment's reader.
   when reconnect lands.**
 
 ### `dt_client_media_kek_generations_retained_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Retaining installs — **one increment per install that demoted
   a previous generation and kept it**. Not incremented on the first install at
@@ -932,7 +930,7 @@ the comment's reader.
   report one arbitrary browser's state. Use `increase()` over a rotation window.
 
 ### `dt_client_media_roster_key_rebinds_total`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Changes to a LIVE sender's roster key — **one increment per
   event, not per purged key**. A first binding (new sender, or keyless→key) and
@@ -969,7 +967,7 @@ the comment's reader.
   authentic.
 
 ### `dt_client_time_to_first_media_frame_ms`
-- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/configmap.yaml`).
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Histogram
 - **Description**: Wall-clock ms from media pipeline start to the first media
   frame arriving at the wire.

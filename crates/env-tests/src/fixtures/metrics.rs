@@ -215,7 +215,7 @@ impl PrometheusClient {
 ///
 /// # Two traps this identity depends on (do NOT "fix" `instance` → `pod`):
 /// 1. A `pod` target_label DOES exist — but only in
-///    `infra/kubernetes/observability/promtail-config.yaml` (the logs/Loki
+///    `infra/kubernetes/observability/promtail.yaml` (the logs/Loki
 ///    pipeline), NEVER in the metrics scrape path. For metrics the per-pod
 ///    identity is `instance`.
 /// 2. The mc/mh Deployments carry a STABLE pod *metadata* label

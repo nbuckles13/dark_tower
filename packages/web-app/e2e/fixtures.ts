@@ -62,7 +62,7 @@ function randomPassword(): string {
 /**
  * Fresh throwaway credentials. AC registration is rate-limited — the limit's
  * SSoT for the Kind cluster this suite targets is
- * `infra/services/ac-service/configmap.yaml` (`AC_REGISTRATION_RATE_LIMIT_*`,
+ * `infra/services/ac-service/config.env` (`AC_REGISTRATION_RATE_LIMIT_*`,
  * relaxed to 100/min for dev/test); the suite's per-run registration budget is
  * tracked in e2e/README.md §Budgets (2/run: the shared user V + one distinct
  * second party — see {@link SHARED_USER}).

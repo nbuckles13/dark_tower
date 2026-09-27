@@ -190,7 +190,7 @@ spec:
         # exposure bound IS W, so an MC running a different W from its sibling
         # makes that bound depend on which pod owns the meeting. Keep in lockstep
         # with the other mc-N-deployment.yaml; the three-artifact ordering note
-        # above applies unchanged. See the key's comment in configmap.yaml.
+        # above applies unchanged. See the key's comment in config.env.
         - name: MC_KEK_ROTATION_DEBOUNCE_SECONDS
           valueFrom:
             configMapKeyRef:

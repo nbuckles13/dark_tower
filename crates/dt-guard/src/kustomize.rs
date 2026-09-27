@@ -18,23 +18,34 @@
 //!   values.
 //! * **R-20** (local) — dashboard JSON coverage in Grafana
 //!   `configMapGenerator` (bidirectional).
+//! * **R-21** (build-dependent, FAIL-closed) — every pod-consumed ConfigMap is
+//!   content-addressed (ADR-0038 §2); see `kustomize_content_addressing`.
 //!
-//! Plus two local checks over generated ConfigMaps, in
+//! Plus one local check over generated ConfigMaps, in
 //! [`crate::kustomize_configmaps`] (added at story 2 task 12; no story
 //! R-number): **`configmap_annotation_size`** (every generator under `infra/`
 //! stays under 80% of Kubernetes' 262144-byte annotation cap, measured as
-//! client-side apply actually serialises it) and **`dashboard_configmap_label`**
-//! (every Grafana generator shipping dashboard JSON carries the sidecar's
-//! selector label). Both always run; neither needs a kustomize binary.
+//! client-side apply actually serialises it). It always runs and needs no
+//! kustomize binary.
 //!
 //! Per @operations F1 + @team-lead fix-in-loop 2026-05-22: when
 //! `kustomize`/`kubectl kustomize`/`kubeconform` are absent, each affected
-//! check degrades to WARN (devloop containers may lack kubeconform). Never
-//! FAIL on missing tools. Local-only checks always run.
+//! check degrades to WARN (devloop containers may lack kubeconform). Local-only
+//! checks always run. **Exception: R-21 FAILs when no kustomize tool exists**
+//! (`content_addressing_unverifiable`) — it is the only enforcement of the
+//! ADR-0038 content-addressing invariant, and a WARN would be a skipped gate.
+//! Layer 3 always has one: the devloop image installs kubectl
+//! (`infra/devloop/Dockerfile`) and the GitHub ubuntu runners ship it.
 
 use crate::common::explain::{print_finding, Finding};
+use crate::common::kustomize_generators::parse_config_map_generators;
 use crate::common::scan::warn_skip;
 use crate::common::status::emit_ok;
+use crate::kustomize_content_addressing::{
+    check_rendered, declared_generator_names, NOT_CONTENT_ADDRESSED_RULE_ID,
+    UNREFERENCED_CONFIGMAP_RULE_ID, UNRESOLVED_REFERENCE_RULE_ID, UNVERIFIABLE_RULE_ID,
+    VACUOUS_RULE_ID,
+};
 use crate::kustomize_tools::{
     check_empty_secret_data, check_security_context, detect_kubeconform, detect_kustomize_tool,
     run_kubeconform, run_kustomize_build, KustomizeTool,
@@ -54,6 +65,7 @@ const SERVICE_BASES: &[&str] = &[
     "gc-service",
     "mc-service",
     "mh-service",
+    "otel-collector",
     "postgres",
     "redis",
 ];
@@ -129,7 +141,8 @@ struct Hit {
 
 /// R-16: orphan-manifest check. For each `infra/services/<svc>/`, every
 /// `*.yaml` (excluding `kustomization.yaml` + `service-monitor.yaml`) must
-/// be listed in `kustomization.yaml::resources`.
+/// be listed in `kustomization.yaml::resources` or be a `configMapGenerator`
+/// source.
 fn check_orphan_manifests(repo_root: &Path) -> Result<Vec<Hit>> {
     let mut hits: Vec<Hit> = Vec::new();
     let services_dir = repo_root.join("infra/services");
@@ -150,7 +163,24 @@ fn check_orphan_manifests(repo_root: &Path) -> Result<Vec<Hit>> {
         }
         let kust_content = std::fs::read_to_string(&kustomization)
             .with_context(|| format!("reading {}", kustomization.display()))?;
-        let declared = extract_declared_resources(&kust_content);
+        let mut declared = extract_declared_resources(&kust_content);
+        // Generator sources (ADR-0038 §2: `collector.yaml`, `*.env`, …) are
+        // declared too — read through the ONE structured generator parser.
+        match parse_config_map_generators(&kust_content) {
+            Ok(entries) => {
+                for e in &entries {
+                    declared.extend(e.source_paths().map(str::to_string));
+                }
+            }
+            Err(e) => hits.push(Hit {
+                rule_id: ORPHAN_MANIFEST_RULE_ID,
+                detail: format!("{svc}/kustomization.yaml: configMapGenerator unreadable: {e:#}"),
+                file: kustomization
+                    .strip_prefix(repo_root)
+                    .unwrap_or(&kustomization)
+                    .to_path_buf(),
+            }),
+        }
 
         // Walk one level of `*.yaml` under svc_dir.
         let entries = match std::fs::read_dir(&svc_dir) {
@@ -222,6 +252,12 @@ fn extract_declared_dashboards(kustomization_content: &str) -> Vec<String> {
 ///
 /// The `/` requirement is inherited deliberately: it is what keeps a bare
 /// `- some.yaml` under `resources:` from being read as a generator entry.
+///
+/// For `configMapGenerator` name/envs/files/literals resolution use
+/// [`crate::common::kustomize_generators`], the structured YAML parser R-16,
+/// R-21 and env-config moved to. This line scanner is retained only for R-20
+/// dashboards + alert-rules, whose `- name=/path` (`/`-bullet basename)
+/// property it documents above.
 pub(crate) fn extract_declared_generator_files(
     kustomization_content: &str,
     suffix: &str,
@@ -339,8 +375,16 @@ fn build_targets(repo_root: &Path) -> Vec<(PathBuf, String)> {
             "overlay: overlays/kind/observability".to_string(),
         ));
     }
+    // The environment root itself — what setup.sh applies (ADR-0038 §2).
+    if overlays_dir.is_dir() {
+        out.push((overlays_dir, ENV_ROOT_LABEL.to_string()));
+    }
     out
 }
+
+/// Label of the Kind environment-root build target; R-21's vacuity check and
+/// the OK status line's consumed-ConfigMap count are taken from this target.
+const ENV_ROOT_LABEL: &str = "overlay: overlays/kind (environment root)";
 
 pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     let infra_root = repo_root.join("infra");
@@ -367,9 +411,11 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
             }),
     );
 
-    // R-15/R-17/R-18/R-19 — build-dependent. Gate on `tool`.
+    // R-15/R-17/R-18/R-19/R-21 — build-dependent. Gate on `tool`.
+    let mut consumed_configmaps = 0;
     if let Some(tool) = tool {
-        run_build_dependent_checks(repo_root, tool, has_kubeconform, &mut all_hits)?;
+        consumed_configmaps =
+            run_build_dependent_checks(repo_root, tool, has_kubeconform, &mut all_hits)?;
     } else {
         warn_skip(
             "kustomize tool absent",
@@ -378,6 +424,12 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
                 "neither `kustomize` nor `kubectl kustomize` available; R-15/R-17/R-18/R-19 skipped",
             ),
         );
+        // R-21 does NOT degrade: see the module doc.
+        all_hits.push(Hit {
+            rule_id: UNVERIFIABLE_RULE_ID,
+            detail: "neither `kustomize` nor `kubectl kustomize` is available, so the environment root cannot be rendered and pod-consumed ConfigMaps cannot be verified content-addressed (R-21 fails closed)".to_string(),
+            file: PathBuf::from("infra"),
+        });
     }
     if tool.is_some() && !has_kubeconform {
         warn_skip(
@@ -388,14 +440,33 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     }
 
     if all_hits.is_empty() {
-        match (tool, has_kubeconform) {
-            (Some(_), true) => emit_ok("kustomize-clean"),
-            (Some(_), false) => emit_ok("kustomize-clean-kubeconform-skipped"),
-            (None, _) => emit_ok("kustomize-tool-absent-skipped"),
+        // `tool` is necessarily Some here: its absence is an R-21 hit.
+        if has_kubeconform {
+            emit_ok(format!(
+                "kustomize-clean-{consumed_configmaps}-consumed-configmaps"
+            ));
+        } else {
+            emit_ok(format!(
+                "kustomize-clean-kubeconform-skipped-{consumed_configmaps}-consumed-configmaps"
+            ));
         }
         return Ok(());
     }
 
+    // "Could not check" lines first, as `ERROR: PRECONDITION`, so they survive
+    // head-truncated re-emission (docs/runbooks/devloop-validation.md §6.3
+    // vacuity convention).
+    for hit in all_hits
+        .iter()
+        .filter(|h| h.rule_id == UNVERIFIABLE_RULE_ID || h.rule_id == VACUOUS_RULE_ID)
+    {
+        eprintln!(
+            "ERROR: PRECONDITION [{}] {} — {}",
+            hit.rule_id,
+            hit.file.display(),
+            hit.detail
+        );
+    }
     for hit in &all_hits {
         let file_disp = hit.file.display().to_string();
         if explain {
@@ -415,27 +486,53 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         }
     }
 
-    anyhow::bail!("{}", reason_token(&all_hits))
+    // REASON token grouped by failure-shape class (see `fail_token`).
+    anyhow::bail!("{}", fail_token(&all_hits))
 }
 
-/// The `REASON` token for a failing run: the largest failure-shape class and
-/// its count.
+/// Select the single REASON token for a failing R-15..R-21 run from the
+/// accumulated hits. Extracted pure so the fail-closed precedence and the exact
+/// emitted strings — which runbooks and the OK/skip enum consumers key on — are
+/// unit-testable WITHOUT a kustomize tool on PATH. R-21's unverifiable branch
+/// is unreachable in a normal Layer-3 run (the devloop image always ships
+/// kubectl), so a test on `run()` cannot exercise it; an untested fail-closed
+/// branch is an assertion, not a control (cf. `env_config::clean_outcome`,
+/// extracted for exactly this reason).
 ///
-/// Pure, and separated from [`run`] so the tie-break is testable without a
-/// filesystem or a kustomize binary.
+/// Precedence: a "could not check" class (UNVERIFIABLE, then VACUOUS) outranks
+/// any count of content findings — it means there is unchecked surface, so it
+/// names the run whenever present. Otherwise the largest content-failure class
+/// wins, in the deterministic order R-15 build > R-17 schema > R-18
+/// securityContext > R-19 empty-secret > R-16 orphan > R-20 dashboard > R-21
+/// content-addressing > the generated-ConfigMap size check.
 ///
 /// # Ties go to the FIRST class listed, which needs saying in code
 ///
-/// The ordering below is deliberate (R-15 build > R-17 schema > R-18
-/// securityContext > R-19 empty-secret > R-16 orphan > R-20 dashboard > the
-/// generated-ConfigMap checks): a build failure means the later checks ran on
+/// The order is a ranking: a build failure means the later checks ran on
 /// nothing trustworthy, so it is the reason worth reporting. `max_by_key`
 /// alone returns the LAST maximum, so one build failure plus one
 /// annotation-size finding reported `kustomize-configmap-annotation-size` —
 /// the ordering comment was true of the list and false of the selection.
 /// `Reverse(index)` as the secondary key makes the first listed maximum win.
-fn reason_token(all_hits: &[Hit]) -> String {
+fn fail_token(all_hits: &[Hit]) -> String {
     let by_kind = |id: &str| all_hits.iter().filter(|h| h.rule_id == id).count();
+    // "Could not check" outranks any count of content findings: it means there
+    // is unchecked surface, so it names the run whenever present.
+    for (id, token) in [
+        (
+            UNVERIFIABLE_RULE_ID,
+            "kustomize-content-addressing-unverifiable",
+        ),
+        (VACUOUS_RULE_ID, "kustomize-content-addressing-vacuous"),
+    ] {
+        let n = by_kind(id);
+        if n > 0 {
+            return format!("{token}-{n}");
+        }
+    }
+    let content_addressing = by_kind(NOT_CONTENT_ADDRESSED_RULE_ID)
+        + by_kind(UNRESOLVED_REFERENCE_RULE_ID)
+        + by_kind(UNREFERENCED_CONFIGMAP_RULE_ID);
     let (class, count) = [
         ("kustomize-build-failed", by_kind(BUILD_FAILED_RULE_ID)),
         (
@@ -459,12 +556,12 @@ fn reason_token(all_hits: &[Hit]) -> String {
             by_kind(DASHBOARD_ORPHAN_RULE_ID),
         ),
         (
-            "kustomize-configmap-annotation-size",
-            by_kind(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
+            "kustomize-configmap-not-content-addressed",
+            content_addressing,
         ),
         (
-            "kustomize-dashboard-configmap-label",
-            by_kind(crate::kustomize_configmaps::DASHBOARD_CONFIGMAP_LABEL_RULE_ID),
+            "kustomize-configmap-annotation-size",
+            by_kind(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
         ),
     ]
     .into_iter()
@@ -478,13 +575,27 @@ fn reason_token(all_hits: &[Hit]) -> String {
 /// failures are recorded but do NOT short-circuit subsequent targets;
 /// downstream checks (R-17/R-18/R-19) silently skip the affected target
 /// (their input is the missing rendered stdout). Bash today: same shape.
+/// Returns the number of distinct ConfigMaps pod templates consume in the
+/// environment-root render (R-21's status-line count).
 fn run_build_dependent_checks(
     repo_root: &Path,
     tool: KustomizeTool,
     has_kubeconform: bool,
     all_hits: &mut Vec<Hit>,
-) -> Result<()> {
-    for (dir, label) in build_targets(repo_root) {
+) -> Result<usize> {
+    let targets = build_targets(repo_root);
+    if targets.is_empty() {
+        all_hits.push(Hit {
+            rule_id: VACUOUS_RULE_ID,
+            detail:
+                "no kustomize build targets found under infra/ — nothing rendered, nothing checked"
+                    .to_string(),
+            file: PathBuf::from("infra"),
+        });
+    }
+    let declared_generators = declared_generator_names(repo_root)?;
+    let mut root_consumed: Option<usize> = None;
+    for (dir, label) in targets {
         // R-15: kustomize build.
         let build = run_kustomize_build(tool, &dir)?;
         let rel = dir.strip_prefix(repo_root).unwrap_or(&dir).to_path_buf();
@@ -502,6 +613,30 @@ fn run_build_dependent_checks(
             continue;
         }
         let rendered = &build.stdout;
+
+        // R-21: content-addressed ConfigMaps — every target, bases and
+        // overlays alike (a base with a plain ConfigMap is the defect, and an
+        // overlay can introduce a namespace mismatch).
+        let r21 = check_rendered(rendered, &label, &declared_generators);
+        for f in r21.findings {
+            all_hits.push(Hit {
+                rule_id: f.rule_id,
+                detail: f.detail,
+                file: rel.clone(),
+            });
+        }
+        if label == ENV_ROOT_LABEL {
+            root_consumed = Some(r21.consumed);
+            if r21.consumed == 0 {
+                all_hits.push(Hit {
+                    rule_id: VACUOUS_RULE_ID,
+                    detail: format!(
+                        "{label} — rendered with zero pod-template ConfigMap references; the environment root always consumes configuration, so the reference walk saw nothing"
+                    ),
+                    file: rel.clone(),
+                });
+            }
+        }
 
         // R-17: kubeconform — only if available.
         if has_kubeconform {
@@ -549,12 +684,90 @@ fn run_build_dependent_checks(
             }
         }
     }
-    Ok(())
+    // The root target is always built when infra/ exists; if it did not render
+    // (R-15 hit) the count is 0 and the run is already red.
+    Ok(root_consumed.unwrap_or(0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `Hit` carrying only the rule id — `fail_token` reads nothing else.
+    fn hit(rule_id: &'static str) -> Hit {
+        Hit {
+            rule_id,
+            detail: String::new(),
+            file: PathBuf::new(),
+        }
+    }
+
+    /// R-21's fail-closed token is the ADR-0038 invariant's only enforcement,
+    /// yet its unverifiable branch never fires in a normal Layer-3 run (the
+    /// devloop image always ships kubectl). These pin the exact emitted strings
+    /// (runbooks key on them) and the fail-closed precedence directly, without a
+    /// kustomize tool — an untested fail-closed branch is an assertion, not a
+    /// control (cf. `env_config::clean_outcome`).
+    #[test]
+    fn fail_token_unverifiable_alone_names_the_run() {
+        assert_eq!(
+            fail_token(&[hit(UNVERIFIABLE_RULE_ID)]),
+            "kustomize-content-addressing-unverifiable-1"
+        );
+    }
+
+    #[test]
+    fn fail_token_unverifiable_outranks_content_findings() {
+        // "Could not check" means unchecked surface: it must name the run even
+        // when content findings are also present and more numerous.
+        let hits = [
+            hit(UNVERIFIABLE_RULE_ID),
+            hit(NOT_CONTENT_ADDRESSED_RULE_ID),
+            hit(NOT_CONTENT_ADDRESSED_RULE_ID),
+            hit(BUILD_FAILED_RULE_ID),
+        ];
+        assert_eq!(
+            fail_token(&hits),
+            "kustomize-content-addressing-unverifiable-1",
+            "the unverifiable precedence must not be defeated by a larger content class"
+        );
+    }
+
+    #[test]
+    fn fail_token_vacuous_alone_names_the_run() {
+        assert_eq!(
+            fail_token(&[hit(VACUOUS_RULE_ID), hit(VACUOUS_RULE_ID)]),
+            "kustomize-content-addressing-vacuous-2"
+        );
+    }
+
+    #[test]
+    fn fail_token_content_only_reports_the_max_class_with_count() {
+        // The three content-addressing rule ids fold into one class count.
+        let hits = [
+            hit(NOT_CONTENT_ADDRESSED_RULE_ID),
+            hit(UNRESOLVED_REFERENCE_RULE_ID),
+            hit(UNREFERENCED_CONFIGMAP_RULE_ID),
+            hit(ORPHAN_MANIFEST_RULE_ID),
+        ];
+        assert_eq!(
+            fail_token(&hits),
+            "kustomize-configmap-not-content-addressed-3"
+        );
+    }
+
+    #[test]
+    fn fail_token_reports_the_largest_content_class_by_count() {
+        // Build has the larger count, so it names the run regardless of array
+        // order. (On an equal count the EARLIER class wins — pinned by
+        // `a_tie_is_broken_toward_the_earlier_class_so_build_failures_win`.)
+        let hits = [
+            hit(BUILD_FAILED_RULE_ID),
+            hit(BUILD_FAILED_RULE_ID),
+            hit(DASHBOARD_ORPHAN_RULE_ID),
+        ];
+        assert_eq!(fail_token(&hits), "kustomize-build-failed-2");
+    }
 
     #[test]
     fn extract_declared_resources_finds_yaml_bullets() {
@@ -676,14 +889,6 @@ resources:
         );
     }
 
-    fn hit(rule_id: &'static str) -> Hit {
-        Hit {
-            rule_id,
-            detail: String::new(),
-            file: PathBuf::from("infra"),
-        }
-    }
-
     /// On a TIE the earlier-listed class must win, because the list order is a
     /// ranking: a build failure means the later checks saw untrustworthy input.
     ///
@@ -695,7 +900,7 @@ resources:
     #[test]
     fn a_tie_is_broken_toward_the_earlier_class_so_build_failures_win() {
         assert_eq!(
-            reason_token(&[
+            fail_token(&[
                 hit(BUILD_FAILED_RULE_ID),
                 hit(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
             ]),
@@ -703,15 +908,15 @@ resources:
         );
         // Order of the hits themselves must not matter either.
         assert_eq!(
-            reason_token(&[
-                hit(crate::kustomize_configmaps::DASHBOARD_CONFIGMAP_LABEL_RULE_ID),
+            fail_token(&[
+                hit(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
                 hit(ORPHAN_MANIFEST_RULE_ID),
             ]),
             "kustomize-orphan-manifest-1"
         );
         // A genuine majority still wins over an earlier class.
         assert_eq!(
-            reason_token(&[
+            fail_token(&[
                 hit(BUILD_FAILED_RULE_ID),
                 hit(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
                 hit(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),

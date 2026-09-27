@@ -127,7 +127,7 @@ Infrastructure Team / SRE Lead
 - Previous-pod logs (if crashed): `kubectl logs -n dark-tower <pod> --previous --tail=200`
 - Node health: `kubectl get nodes`, `kubectl describe node <node>`
 - OOMKilled events: `kubectl get events -n dark-tower | grep -i "oom\|killed"`
-- Secrets / config: `kubectl get secret,configmap -n dark-tower | grep mh-service`
+- Secrets / config: `kubectl get secret,configmap -n dark-tower | grep mh-service` (ConfigMap names are content-hash-suffixed, `mh-service-config-<hash>`, and old generations are listed too; the pod template's `configMapKeyRef` names the live one)
 
 **Recovery**:
 
@@ -865,7 +865,7 @@ histogram_quantile(0.95, rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
 # so across pods with different uptimes the numbers are not comparable and a
 # recently-restarted pod reads LOW — i.e. the likeliest suspect in this
 # scenario would look cleanest.
-# PORT 8083, not 8080: MH_HEALTH_BIND_ADDRESS is 0.0.0.0:8083 (configmap.yaml)
+# PORT 8083, not 8080: MH_HEALTH_BIND_ADDRESS is 0.0.0.0:8083 (config.env)
 # and the pod exposes containerPort 8083 — there is no listener on 8080, so a
 # `8080:8080` forward yields connection-refused, not an empty grep.
 # `instance` is `<pod-ip>:8083`, not a pod name (the mh-service scrape job has
@@ -1016,9 +1016,14 @@ kubectl rollout status deployment/mh-service -n dark-tower
 # browser client is in the loop, not for recovering the pod bind.
 
 # Option C: Fix bind address (config/ConfigMap regression)
-kubectl edit configmap mh-service -n dark-tower
-# Then:
-kubectl rollout restart deployment/mh-service -n dark-tower
+# Fast lever: roll back to the previous pod template, which still references the
+# previous content-hash-suffixed ConfigMap (nothing prunes old generations).
+kubectl rollout undo deployment/mh-0 deployment/mh-1 -n dark-tower
+# Durable fix: correct infra/services/mh-service/config.env and apply the
+# environment root (Kind: ./infra/kind/scripts/setup.sh --skip-build --only mh).
+# The ConfigMap is content-addressed (ADR-0038), so the apply rolls both MH
+# pods. Do not `kubectl edit` the live ConfigMap: its name is hash-suffixed and
+# the next apply overwrites it.
 
 # Option D: Single-pod port collision (rare; reschedule the pod)
 kubectl delete pod <pod> -n dark-tower

@@ -23,7 +23,7 @@ GC service Kubernetes manifests are managed via Kustomize with a base/overlay pa
 infra/
 ├── services/gc-service/                    # Base manifests
 │   ├── kustomization.yaml                  # Explicit resource list
-│   ├── configmap.yaml
+│   ├── config.env                          # configMapGenerator source (name hash-suffixed)
 │   ├── deployment.yaml
 │   ├── service.yaml
 │   ├── secret.yaml
@@ -307,7 +307,7 @@ Minimum required smoke tests:
 kubectl port-forward -n dark-tower deployment/gc-service 8080:8080 &
 ```
 
-- An allowed origin must be configured in `CORS_ALLOWED_ORIGINS` (this runbook assumes `http://localhost:5173`; confirm with `kubectl get configmap gc-service -n dark-tower -o yaml | grep CORS_ALLOWED_ORIGINS`). The allowlist is fail-closed (empty ⇒ no origin allowed) and never `*`.
+- An allowed origin must be configured in `CORS_ALLOWED_ORIGINS` (this runbook assumes `http://localhost:5173`; confirm the live value with `kubectl get deployment/gc-service -n dark-tower -o jsonpath='{.spec.template.spec.containers[?(@.name=="gc-service")].env[?(@.name=="CORS_ALLOWED_ORIGINS")].valueFrom.configMapKeyRef.name}'`, which gives the content-hash-suffixed ConfigMap name, then `kubectl get configmap <that-name> -n dark-tower -o yaml | grep CORS_ALLOWED_ORIGINS`). The allowlist is fail-closed (empty ⇒ no origin allowed) and never `*`.
 - A user access token is needed for the authenticated telemetry stanzas. Obtain one with the AC-login pattern from Test 5 (camelCase `accessToken` per the API contract):
 
 ```bash
@@ -661,7 +661,10 @@ kubectl rollout restart deployment/gc-service -n dark-tower
 
 ### Kubernetes ConfigMap
 
-**ConfigMap: `gc-service-config`** (namespace: `dark-tower`)
+**ConfigMap: `gc-service-config`** (namespace: `dark-tower`). It is **generated** from
+`infra/services/gc-service/config.env` by `configMapGenerator`, and the live object's name carries a content
+hash (`gc-service-config-<hash>`, ADR-0038 §2). The block below is the rendered shape,
+with the hash omitted.
 
 ```yaml
 apiVersion: v1
@@ -774,7 +777,11 @@ kubectl exec -it <gc-pod> -n dark-tower -- curl -i $AC_JWKS_URL
 kubectl logs deployment/gc-service -n dark-tower --tail=100 | grep -i "jwks"
 
 # Verify AC_JWKS_URL in ConfigMap
-kubectl get configmap gc-service-config -n dark-tower -o yaml | grep AC_JWKS_URL
+# (the ConfigMap name is content-hash-suffixed; resolve it through the Deployment)
+kubectl get configmap -n dark-tower -o yaml \
+  "$(kubectl get deployment/gc-service -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="gc-service")].env[?(@.name=="AC_JWKS_URL")].valueFrom.configMapKeyRef.name}')" \
+  | grep AC_JWKS_URL
 ```
 
 **Fix:**
@@ -1381,10 +1388,21 @@ for AC/GC/MC/MH OTLP-gRPC traces and the GC `/api/v1/telemetry` OTLP-HTTP proxy
 path (R-2). This section is the upgrade discipline for it and the triage home for
 the `OTelExportFailureRate` alert.
 
+> **STATUS 2026-09-28 — THIS SECTION PREDATES ADR-0038 AND ITS CONFIG-ONLY
+> MECHANICS ARE NOW WRONG.** The collector config is a content-addressed
+> `configMapGenerator` (`infra/services/otel-collector/collector.yaml`), so a
+> config-only change RENAMES the ConfigMap and `apply -k` ROLLS the collector
+> pod, exactly as an image change does. Every statement below that a config-only
+> change "alters nothing in the pod template" or needs a manual restart is
+> superseded. The consequence to weigh before relying on the config-only
+> exemptions here: a config-only change now RESTARTS the singleton collector,
+> which under R-54 fail-hard-at-init is the same hazard as an image change.
+> Rewrite tracked in `docs/TODO.md` (owner operations).
+>
 > **"A collector change" means one of TWO things, and they have different
 > procedures.** This section was first written for IMAGE changes (a tag bump,
 > alone or with its ConfigMap), which alter the pod template and so roll the pod
-> on their own. A CONFIG-ONLY change (just `configmap.yaml` — e.g. a metric-name
+> on their own. A CONFIG-ONLY change (just `collector.yaml` — e.g. a metric-name
 > allowlist addition) alters nothing in the pod template, so an `apply -k` leaves
 > the running collector on the config it already loaded. Three statements here
 > were once correct for the image case and silent or wrong for the config-only one
@@ -1472,7 +1490,7 @@ number.
    ```
 
    It extracts `config.yaml` from the committed
-   `infra/services/otel-collector/configmap.yaml` (so it cannot drift from what
+   `infra/services/otel-collector/collector.yaml` (so it cannot drift from what
    ships) and runs the two-writer, single-writer-idle, clock-skew, staleness and
    filtering cases. On a readiness failure it prints the `components` hint.
 
@@ -1510,7 +1528,7 @@ number.
 ### Config-only changes (ConfigMap edit, no image change)
 
 Steps 1-5 above assume an image change. A change to
-`infra/services/otel-collector/configmap.yaml` alone (a new allowlisted metric
+`infra/services/otel-collector/collector.yaml` alone (a new allowlisted metric
 name, a label rule, a processor setting) follows this path instead.
 
 **The hazard is a SILENTLY STALE collector, not a crash.** The ConfigMap is not
@@ -1667,21 +1685,21 @@ The key triage step is distinguishing the two modes:
 > **THE IMAGE TAG AND THE ConfigMap ARE ONE ATOMIC UNIT. REVERTING THE TAG ALONE
 > IS A CRASHLOOP.**
 >
-> `infra/services/otel-collector/configmap.yaml` references the
+> `infra/services/otel-collector/collector.yaml` references the
 > `delta_to_cumulative` processor, which **does not exist in 0.103.1**. Reverting
 > the image without reverting the ConfigMap gives the collector a config naming a
 > component it does not have: it fails at startup, every time, immediately. And a
 > collector that is genuinely down takes AC, GC and MC with it on their next
 > restart — so the "safe" half of a rollback is the half that causes the outage.
 
-**Procedure.** Revert `deployment.yaml` (tag) and `configmap.yaml` **in the same
+**Procedure.** Revert `deployment.yaml` (tag) and `collector.yaml` **in the same
 change**, then `kubectl apply -k` the otel-collector overlay. Because the collector
 is a single Deployment and the tag change alters its pod template, the rollout
 happens on its own and that is the whole rollback. Verify with the `imageID` check
 in the pre-upgrade checklist that the pod is running what you think it is.
 
 **A CONFIG-ONLY revert is NOT the whole rollback at `apply -k`.** Reverting just
-`configmap.yaml` (for example, backing out an allowlist addition — the safe
+`collector.yaml` (for example, backing out an allowlist addition — the safe
 direction) changes nothing in the pod template, so the apply leaves the running
 collector on the config it already loaded. Follow §Config-only changes for the
 restart and the three-leg check; stopping here reproduces the stale-config state

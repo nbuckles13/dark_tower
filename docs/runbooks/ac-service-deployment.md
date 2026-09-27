@@ -23,7 +23,7 @@ AC service Kubernetes manifests are managed via Kustomize with a base/overlay pa
 infra/
 ├── services/ac-service/                    # Base manifests
 │   ├── kustomization.yaml                  # Explicit resource list
-│   ├── configmap.yaml
+│   ├── config.env                          # configMapGenerator source (name hash-suffixed)
 │   ├── statefulset.yaml
 │   ├── service.yaml
 │   ├── pdb.yaml
@@ -535,7 +535,10 @@ kubectl rollout restart statefulset/ac-service -n dark-tower
 
 ### Kubernetes ConfigMap
 
-**ConfigMap: `ac-service-config`** (namespace: `dark-tower`)
+**ConfigMap: `ac-service-config`** (namespace: `dark-tower`). It is **generated** from
+`infra/services/ac-service/config.env` by `configMapGenerator`, and the live object's name carries a content
+hash (`ac-service-config-<hash>`, ADR-0038 §2). The block below is the rendered shape,
+with the hash omitted.
 
 ```yaml
 apiVersion: v1
@@ -547,17 +550,25 @@ data:
   AC_CLUSTER_NAME: "dark-tower-prod"  # Adjust per cluster
 ```
 
-**Updating ConfigMap:**
+**Updating ConfigMap:** edit `infra/services/ac-service/config.env` and apply
+the environment root. The new content hash changes the StatefulSet's pod
+template, so the apply rolls AC by itself; there is no separate restart step.
+Do not `kubectl edit` the live ConfigMap. Its name is hash-suffixed, and nothing
+references the edited object after the next apply, which overwrites it anyway.
 
 ```bash
-# Edit ConfigMap
-kubectl edit configmap ac-service-config -n dark-tower
+# Kind / devloop cluster: apply the whole environment root, then wait for every workload.
+./infra/kind/scripts/setup.sh --skip-build --only ac
 
-# Or apply updated manifest via Kustomize overlay
-kubectl apply -k infra/kubernetes/overlays/kind/services/ac-service/
+# Read the live value through the name the pod template actually references:
+kubectl get configmap -n dark-tower -o yaml \
+  "$(kubectl get statefulset/ac-service -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="ac-service")].env[?(@.name=="AC_CLUSTER_NAME")].valueFrom.configMapKeyRef.name}')"
 
-# Restart pods to pick up changes
-kubectl rollout restart statefulset/ac-service -n dark-tower
+# Fast rollback: the previous revision still references the previous
+# hash-suffixed ConfigMap, which still exists. Nothing prunes old generations,
+# and any future pruning must spare ones that retained revisions reference.
+kubectl rollout undo statefulset/ac-service -n dark-tower
 ```
 
 ### Resource Limits

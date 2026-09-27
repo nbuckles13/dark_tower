@@ -666,7 +666,7 @@ fn assert_story2_keys_wired(instance: &str) {
     // at least `MH_MAX_EGRESS_STREAMS_PER_MEETING`: MC sends a handler only the
     // muted senders that SOURCE at least one of its egress streams, so a
     // legitimate snapshot names at most as many muted senders as it has
-    // streams (derivation: `infra/services/mh-service/configmap.yaml`).
+    // streams (derivation: `infra/services/mh-service/config.env`).
     //
     // Since story 2 task 10 MH also REFUSES TO BOOT on the inversion
     // (`ConfigError::MutedSourceBoundBelowEgressBound`), so a violation here
@@ -901,6 +901,15 @@ fn tree_budget(rel_path: &str) -> u64 {
     let path = repo_root().join(rel_path);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    // The base is a configMapGenerator env file (ADR-0038 §2: `KEY=VALUE`, taken
+    // literally); the Kind overlay's patch is still a strategic-merge YAML patch.
+    if rel_path.ends_with(".env") {
+        let raw = text
+            .lines()
+            .find_map(|l| l.strip_prefix("MH_EGRESS_BUDGET_BPS="))
+            .unwrap_or_else(|| panic!("{} has no MH_EGRESS_BUDGET_BPS= line", path.display()));
+        return parse_positive("MH_EGRESS_BUDGET_BPS", raw);
+    }
     let doc: serde_norway::Value = serde_norway::from_str(&text)
         .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
     let raw = doc
@@ -918,7 +927,7 @@ fn tree_budget(rel_path: &str) -> u64 {
 async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     const PATCH: &str =
         "infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml";
-    const BASE: &str = "infra/services/mh-service/configmap.yaml";
+    const BASE: &str = "infra/services/mh-service/config.env";
 
     let cm = fetch_configmap(SHARED_CONFIGMAP);
 

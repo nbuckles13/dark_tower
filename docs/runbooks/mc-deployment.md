@@ -72,7 +72,7 @@ MC service Kubernetes manifests are managed via Kustomize with a base/overlay pa
 infra/
 ├── services/mc-service/                    # Base manifests
 │   ├── kustomization.yaml                  # Explicit resource list
-│   ├── configmap.yaml
+│   ├── config.env                          # configMapGenerator source (name hash-suffixed)
 │   ├── deployment.yaml
 │   ├── service.yaml
 │   ├── secret.yaml
@@ -499,7 +499,7 @@ kubectl logs deployment/mc-1 -n dark-tower | grep "Configuration loaded successf
 
 - [ ] `max_receive_slots`, `max_receive_capability_declarations`, `audio_codec`,
       `audio_max_bitrate_bps`, `audio_frame_rate_hz` are present on the line and
-      match `infra/services/mc-service/configmap.yaml`
+      match `infra/services/mc-service/config.env`
 - [ ] **mc-0 and mc-1 report identical values.** They read one shared ConfigMap,
       so a difference means one Deployment's `configMapKeyRef` block is stale —
       the guard-green split-brain the ConfigMap banner warns about.
@@ -661,14 +661,13 @@ kill %1
 >   old `env` block — self-consistent by construction. Reverting only the image
 >   (`kubectl set image` to an older tag) is also safe: surplus env is ignored.
 > - **Do NOT revert the ConfigMap on its own.** A `git revert` of
->   `infra/services/mc-service/configmap.yaml` followed by an apply leaves both
->   Deployments holding a `configMapKeyRef` for a key that no longer exists. This
->   fails **latently**: `kustomization.yaml` uses `resources:`, not
->   `configMapGenerator:`, so there is no content hash and the apply does not roll
->   the pods. The running pods keep working, and the next restart — a node drain,
->   an eviction, an unrelated deploy, hours or days later — comes up
->   `CreateContainerConfigError` with **empty logs**, disconnected in time from the
->   change that caused it.
+>   `infra/services/mc-service/config.env` followed by an apply leaves both
+>   Deployments holding a `configMapKeyRef` for a key that no longer exists. The
+>   ConfigMap is a `configMapGenerator` with a content hash in its name
+>   (ADR-0038 §2), so the apply changes the pod template and **rolls the pods
+>   immediately**. The new pods come up `CreateContainerConfigError` with
+>   **empty logs** and the rollout stalls. The failure is at least immediate
+>   rather than latent, but it is still a failed deploy.
 > - **Do not revert the manifests without the image, or apply the image against
 >   stale manifests.** Both MC pods fail identically at startup, so the PDB offers
 >   no protection: this is a full signalling-plane outage, not a partial one.
@@ -888,13 +887,21 @@ and exits is the stale pod template.
 
 **Rollout ordering.** The manifest change and the code change roll **together**.
 The ConfigMap must never be reverted independently of the image, and the image
-must never be applied against a stale ConfigMap. Note that
-`infra/services/mc-service/kustomization.yaml` uses `resources:`, not
-`configMapGenerator:` — so there is **no content hash on the ConfigMap and
-editing it does not roll the pods**. Env is read once at process start, so a
-ConfigMap edit takes effect only on the next restart, and a wrong one is latent
-until then. Both MC pods fail identically at startup in either case, so the PDB
-offers no protection: this is a full signalling-plane outage, not a partial one.
+must never be applied against a stale ConfigMap. The ConfigMaps are
+`configMapGenerator` entries in `infra/services/mc-service/kustomization.yaml`,
+**content-addressed** (ADR-0038 §2). kustomize puts a hash of the data in each
+name and rewrites the pods' references, so **applying a ConfigMap change rolls
+exactly the pods that consume it**. A wrong value therefore fails at deploy
+time, not at some later restart. Editing the live object (`kubectl edit
+configmap`) does nothing useful: nothing references the name you would edit
+after the next apply, and the next apply of the environment root overwrites it
+anyway. Both MC pods fail identically at startup, so the PDB offers no
+protection: this is a full signalling-plane outage, not a partial one.
+
+**A `redis-config` change is now a stateful restart.** Redis consumes a
+content-addressed ConfigMap too, so a `infra/services/redis/redis.conf` change
+rolls the Redis StatefulSet. In the Kind dev cluster that drops MC session
+state; in production it is a planned stateful restart, not a config reload.
 
 **Recovery — applying the ConfigMap alone is NOT enough.** This was observed on
 2026-09-03 during the validation of the change that introduced these five keys,
@@ -906,46 +913,40 @@ kubectl get pods -n dark-tower -l app=mc-service          # CrashLoopBackOff?
 kubectl logs -n dark-tower deployment/mc-0 --previous | head -5
 #   -> Error: MissingEnvVar("MC_MAX_RECEIVE_SLOTS")
 
-# 2. Apply the OVERLAY, which carries the whole coupled set in one object
-#    stream: the ConfigMap supplies the value, and the Deployment supplies the
-#    configMapKeyRef that injects it. Applying only the ConfigMap leaves the
-#    pods crashing on the SAME key, because the running pod template still has
-#    no reference to it -- which reads as "my fix did nothing" and invites a
-#    second, wrong diagnosis.
+# 2. Apply the ENVIRONMENT ROOT, which carries the whole coupled set in one
+#    object stream: the ConfigMap supplies the value, and the Deployment supplies
+#    the configMapKeyRef that injects it. The ConfigMap is content-addressed, so
+#    the apply changes both pod templates and rolls exactly the pods whose
+#    configuration changed. There is no separate restart step.
 #
-#    APPLY THE OVERLAY, NOT THE BASE. `kubectl apply -f
-#    infra/services/mc-service/configmap.yaml` looks like the obvious move and
-#    is wrong: the Kind overlay strategic-merge-patches OTEL_ENABLED="true" into
-#    mc-service-config (infra/kubernetes/overlays/kind/services/mc-service/
-#    configmap-otel-patch.yaml), and `apply -f` on the base rewrites
-#    last-applied-configuration to the base content, so the three-way merge
-#    flips OTel export back OFF and drops the `environment: kind` /
-#    `managed-by: dark-tower` labels. Step 3's rollout then makes that take
-#    effect -- i.e. the documented recovery for a signalling-plane outage would
-#    disable MC's own span export at the moment you most need it, silently.
-#    This is the same overlay `dev-cluster deploy mc` and
-#    infra/kind/scripts/setup.sh use. Selectors are unaffected
-#    (includeSelectors: false), so there is no second, louder symptom to catch
-#    the mistake -- the pods come back healthy and the procedure reads as having
-#    worked, while the traces you would use for the post-incident review are
-#    gone.
+#    Do NOT apply a single file or a base directly. `config.env` is a
+#    configMapGenerator SOURCE, not a manifest. Applying the service BASE
+#    (`kubectl apply -k infra/services/mc-service/`) skips the Kind overlay's
+#    patches (OTEL_ENABLED="true" in mc-service-config via
+#    infra/kubernetes/overlays/kind/services/mc-service/configmap-otel-patch.yaml)
+#    and silently turns MC's span export OFF at the moment you most need it.
+#    On a devloop cluster, applying even the plain overlay root reverts the
+#    per-cluster advertise addresses. Go through setup.sh, which chooses the
+#    right render (infra/kind/scripts/setup.sh:apply_env_root):
 #
-# 2a. Devloop / Kind cluster -- go through the OVERLAY.
-kubectl apply -k infra/kubernetes/overlays/kind/services/mc-service/
-#     (equivalently, and preferred on a devloop cluster: dev-cluster deploy mc)
+# 2a. Devloop / Kind cluster:
+./infra/kind/scripts/setup.sh --skip-build --only mc
+#     (equivalently: dev-cluster deploy mc). This applies the whole environment
+#     root and waits for EVERY workload in it, not just MC.
 
-# 2b. A cluster deployed from the base with NO overlay -- here the base IS the
-#     deployed artifact and the -f form is correct.
-kubectl apply -f infra/services/mc-service/configmap.yaml
-kubectl apply -f infra/services/mc-service/mc-0-deployment.yaml
-kubectl apply -f infra/services/mc-service/mc-1-deployment.yaml
-
-# 3. Roll. A ConfigMap edit alone does not restart anything (no content hash --
-#    see above), and env is read once at process start.
-kubectl rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
+# 3. Confirm the roll (the apply already started it).
 kubectl rollout status deployment/mc-0 -n dark-tower
 kubectl rollout status deployment/mc-1 -n dark-tower
 ```
+
+**Fast rollback lever.** `kubectl rollout undo deployment/mc-0 deployment/mc-1
+-n dark-tower` returns each pod template to its previous revision, which still
+references the previous hash-suffixed ConfigMap. That ConfigMap still exists
+because nothing prunes old generations. **Any future pruning of old ConfigMap
+generations must spare the ones referenced by retained ReplicaSets or
+ControllerRevisions**, or this lever breaks (`CreateContainerConfigError` /
+`FailedMount` on undo). This runbook deliberately publishes no cleanup
+command. The durable fix is still to change the tree and re-apply.
 
 **On a devloop cluster, a rebuild does NOT apply manifests.** `dev-cluster
 rebuild` / `rebuild-all` build the image, load it and `rollout restart`
@@ -954,8 +955,9 @@ infra-change detector watches `infra/kind/` only (`scripts/layer7.sh`), never
 `infra/services/`. So a diff that changes `infra/services/mc-service/**` and the
 image together produces the new image against the **old** ConfigMap and pod
 template by default — the CrashLoop above is the guaranteed outcome, not bad
-luck. Run `dev-cluster deploy mc` (which does `kubectl apply -k` the overlay)
-after any change under `infra/services/mc-service/`.
+luck. Run `dev-cluster deploy mc` (`setup.sh --skip-build --only mc`, which
+applies the whole environment root; content-addressed ConfigMaps then roll only
+what changed) after any change under `infra/services/`.
 
 **The symptom may not look like a config problem at all.** In the 2026-09-03
 occurrence the first error surfaced was a Layer 7 `PRECONDITION_FAILURE` on
@@ -1015,8 +1017,10 @@ env vars. Keys are `tls.crt` and `tls.key`; `MC_TLS_CERT_PATH` /
 ### Kubernetes ConfigMap
 
 **ConfigMap: `mc-service-config`** (namespace: `dark-tower`) — shared across
-instances. See `infra/services/mc-service/configmap.yaml` for the deployed
-source of truth.
+instances. It is **generated** from `infra/services/mc-service/config.env` (the
+deployed source of truth) by `configMapGenerator`. The live name carries a
+content hash (`mc-service-config-<hash>`, ADR-0038 §2); the block below is the
+rendered shape.
 
 ```yaml
 apiVersion: v1
@@ -1038,10 +1042,10 @@ data:
   OTEL_SAMPLE_RATE: "1.0"
   DEPLOYMENT_ENVIRONMENT: "development"
   # ---- ADR-0036 media signalling (all REQUIRED; absent = CrashLoop) ----
-  # Documented defaults live in infra/services/mc-service/configmap.yaml, not as
+  # Documented defaults live in infra/services/mc-service/config.env, not as
   # Rust constants: the load path has no unwrap_or, so THAT file is the only
   # statement of the intended value. THIS BLOCK IS A COPY — do not edit it to
-  # change a value; edit the ConfigMap and roll (see the ordering banner there).
+  # change a value; edit config.env and apply the root (see the ordering banner there).
   # Same convention as the mc-alerts.yaml pointer further down this file.
   MC_MAX_RECEIVE_SLOTS: "8"                    # validated 1..=64 at load
   MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS: "64"
@@ -1049,9 +1053,9 @@ data:
   MC_AUDIO_MAX_BITRATE_BPS: "48000"            # top of mh-service's 32-48 kbps band
   MC_AUDIO_FRAME_RATE_HZ: "50"                 # 50 Hz = 20 ms frames
   # ---- ADR-0036 §9 connect settle window (REQUIRED; absent = CrashLoop) ----
-  MC_MEDIA_CONNECT_SETTLE_MS: "1500"           # validated 100..=10000 at load; see configmap.yaml
+  MC_MEDIA_CONNECT_SETTLE_MS: "1500"           # validated 100..=10000 at load; see config.env
   # ---- ADR-0036 §4 KEK rotation (REQUIRED; absent = CrashLoop) ----
-  MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"       # W; bounds in config.rs; see configmap.yaml
+  MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"       # W; bounds in config.rs; see config.env
 ```
 
 **Per-instance ConfigMaps: `mc-0-config`, `mc-1-config`** — carry only
@@ -1073,7 +1077,7 @@ on which pod GC assigned.
 
 MC's OTel SDK is initialized in `main.rs` via `init_otel`, gated by the explicit
 `OTEL_ENABLED` flag (see the four `OTEL_*` / `DEPLOYMENT_ENVIRONMENT` env vars
-above). The prod base ConfigMap (`infra/services/mc-service/configmap.yaml`)
+above). The prod base ConfigMap (`infra/services/mc-service/config.env`)
 ships `OTEL_ENABLED="false"`; the Kind overlay
 (`infra/kubernetes/overlays/kind/services/mc-service/configmap-otel-patch.yaml`)
 strategic-merge-patches it to `"true"` for the dev cluster.
@@ -1087,12 +1091,14 @@ collector.
 **Break-glass / escape hatch** — if the collector is unavailable and MC must
 boot without OTel:
 
-1. Set `OTEL_ENABLED=false` in the `mc-service-config` ConfigMap (or, in Kind,
-   drop the `configmap-otel-patch.yaml` from the overlay `kustomization.yaml`).
-2. Restart **both** MC replicas — MC runs as two singleton Deployments
-   (`mc-0`, `mc-1`), so restart each:
+1. Set `OTEL_ENABLED=false` in `infra/services/mc-service/config.env` (or, in
+   Kind, drop the `configmap-otel-patch.yaml` from the overlay
+   `kustomization.yaml`).
+2. Apply the environment root (Kind: `./infra/kind/scripts/setup.sh --skip-build
+   --only mc`). `mc-service-config` is content-addressed, so the apply changes
+   **both** MC pod templates (`mc-0`, `mc-1`) and rolls them. There is no
+   separate restart step:
    ```bash
-   kubectl rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
    kubectl rollout status deployment/mc-0 -n dark-tower
    kubectl rollout status deployment/mc-1 -n dark-tower
    ```
@@ -1167,9 +1173,9 @@ kubectl get svc gc-service -n dark-tower -o jsonpath='{.spec.ports}'
 
 **Fix:**
 1. Ensure GC service is running and ready
-2. Correct `GC_GRPC_URL` in `infra/services/mc-service/configmap.yaml`, then apply
-   **and roll** — see §Config-failure triage; a ConfigMap edit alone does not
-   restart anything
+2. Correct `GC_GRPC_URL` in `infra/services/mc-service/config.env`, then apply
+   the environment root. The ConfigMap is content-addressed, so the apply rolls
+   both MC pods; see §Config-failure triage
 3. Adjust NetworkPolicy to allow MC → GC egress on **TCP:50051**
    (`infra/services/mc-service/network-policy.yaml`); MC's gRPC *ingress* from GC
    is TCP:50052
@@ -1415,7 +1421,7 @@ echo "Join token obtained: $([ -n "$JOIN_TOKEN" ] && echo 'yes' || echo 'no')"
 
 # Step 5: Verify join metrics incremented.
 # PORT 8081 and Deployment `mc-0`, not `mc-service:8080`: MC_HEALTH_BIND_ADDRESS
-# is 0.0.0.0:8081 (configmap.yaml) and the pods declare containerPort 8081 —
+# is 0.0.0.0:8081 (config.env) and the pods declare containerPort 8081 —
 # there is no listener on 8080, and there is no Deployment named `mc-service`
 # (that string is a Service, a PDB and a container name). A `8080:8080` forward
 # to it yields connection-refused, which looks identical to "the metric did not

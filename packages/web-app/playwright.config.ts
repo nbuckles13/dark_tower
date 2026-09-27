@@ -25,7 +25,7 @@ export default defineConfig({
   // module-level memo that only a single worker process makes a per-run
   // singleton; a second worker would get its own memo and re-register. The
   // registration rate-limit SSoT is the TARGET cluster's AC config (Kind dev:
-  // 100/min per infra/services/ac-service/configmap.yaml; prod default 5/60min)
+  // 100/min per infra/services/ac-service/config.env; prod default 5/60min)
   // — see e2e/README.md §Budgets. Escalation path is "more shards" (task #19),
   // not parallel workers against one cluster.
   fullyParallel: false,

@@ -59,7 +59,7 @@
 - Test server harness -> `crates/ac-test-utils/src/server_harness.rs`
 - DB: credentials repo -> `crates/ac-service/src/repositories/service_credentials.rs`
 - DB: signing keys repo -> `crates/ac-service/src/repositories/signing_keys.rs`
-- K8s configmap (rate limits) -> `infra/services/ac-service/configmap.yaml`
+- K8s configmap (rate limits) -> `infra/services/ac-service/config.env`
 - K8s statefulset -> `infra/services/ac-service/statefulset.yaml`
 - Deployment runbook -> `docs/runbooks/ac-service-deployment.md`
 

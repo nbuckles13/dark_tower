@@ -285,19 +285,15 @@ __apply_observability_overlay() {
     || precondition_fail observability-apply-failed \
       "the Prometheus Deployment did not finish rolling onto the new config within ${budget}s" \
       "kubectl -n dark-tower-observability get pods -l app=prometheus; kubectl -n dark-tower-observability logs deploy/prometheus (a config Prometheus rejects crash-loops the new pod)"
-  # Grafana reads dashboard ConfigMaps ONCE, at pod start (k8s-sidecar initContainer,
-  # METHOD: LIST), and disableNameSuffixHash keeps their names stable, so an apply
-  # alone leaves a correct ConfigMap Grafana never reads. Restart and WAIT, as
-  # docs/observability/dashboards.md §Kubernetes prescribes; a timeout fails loudly.
-  "$KUBECTL_BIN" --context "$context" -n dark-tower-observability rollout restart deployment/grafana >&2 \
-    || precondition_fail observability-apply-failed \
-      "kubectl rollout restart deployment/grafana failed against ${context}" \
-      "kubectl -n dark-tower-observability get deploy grafana"
+  # Dashboard ConfigMaps are content-addressed and mounted through one projected
+  # volume (ADR-0038 §2), so a changed dashboard renames its ConfigMap and the apply
+  # above rolls Grafana by itself — no restart. WAIT for that rollout; a timeout fails
+  # loudly (a group missing at runtime fails pod start, since the sources are not optional).
   "$KUBECTL_BIN" --context "$context" -n dark-tower-observability rollout status deployment/grafana \
     --timeout="${budget}s" >&2 \
     || precondition_fail observability-apply-failed \
-      "the Grafana Deployment did not finish restarting onto the new dashboard ConfigMaps within ${budget}s" \
-      "kubectl -n dark-tower-observability get pods -l app=grafana; kubectl -n dark-tower-observability logs deploy/grafana -c k8s-sidecar (the dashboard-listing initContainer)"
+      "the Grafana Deployment did not finish rolling onto the new dashboard ConfigMaps within ${budget}s" \
+      "kubectl -n dark-tower-observability get pods -l app=grafana; kubectl -n dark-tower-observability describe pod -l app=grafana (a projected-volume source that does not exist blocks pod start)"
 }
 
 # Wait (bounded) for the cluster to become healthy. `dev-cluster rebuild-all` issues

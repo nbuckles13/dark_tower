@@ -14,31 +14,10 @@ spec:
         app: grafana
     spec:
       serviceAccountName: grafana
-      initContainers:
-        - name: k8s-sidecar
-          image: kiwigrid/k8s-sidecar:1.26.2
-          securityContext:
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: [ALL]
-          env:
-            - name: LABEL
-              value: grafana_dashboard
-            - name: LABEL_VALUE
-              value: "1"
-            - name: FOLDER
-              value: /var/lib/grafana/dashboards
-            - name: NAMESPACE
-              value: dark-tower-observability
-            - name: METHOD
-              value: LIST
-            - name: LOG_LEVEL
-              value: INFO
-          volumeMounts:
-            - name: dashboards
-              mountPath: /var/lib/grafana/dashboards
+      # Grafana needs no Kubernetes API access now that dashboards are mounted
+      # rather than listed by the removed k8s-sidecar, so a compromised Grafana
+      # holds no API token at all.
+      automountServiceAccountToken: false
       containers:
         - name: grafana
           image: grafana/grafana:10.2.2
@@ -74,5 +53,25 @@ spec:
         - name: dashboards-config
           configMap:
             name: grafana-dashboards-config
+        # Every dashboard group, content-addressed (ADR-0038 §2): a dashboard
+        # edit changes these names and rolls Grafana. Sources are deliberately
+        # NOT `optional:` -- a missing group must fail pod start, not silently
+        # drop dashboards. A group added to infra/grafana/kustomization.yaml but
+        # not listed here fails `dt-guard kustomize` R-21 (unreferenced).
         - name: dashboards
-          emptyDir: {}
+          projected:
+            sources:
+              - configMap:
+                  name: grafana-dashboards-ac
+              - configMap:
+                  name: grafana-dashboards-gc
+              - configMap:
+                  name: grafana-dashboards-mc
+              - configMap:
+                  name: grafana-dashboards-mc-media
+              - configMap:
+                  name: grafana-dashboards-mh
+              - configMap:
+                  name: grafana-dashboards-client
+              - configMap:
+                  name: grafana-dashboards-errors

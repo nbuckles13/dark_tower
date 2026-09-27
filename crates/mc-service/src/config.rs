@@ -67,7 +67,7 @@ pub const DEFAULT_ENVIRONMENT: &str = "development";
 //
 // These are BOUNDS, not defaults. There are deliberately no `DEFAULT_*`
 // constants for the five `MC_*` media-signalling keys — they are required, and
-// their documented values live in `infra/services/mc-service/configmap.yaml`.
+// their documented values live in `infra/services/mc-service/config.env`.
 // ============================================================================
 
 /// Smallest legal `MC_MEDIA_CONNECT_SETTLE_MS`.
@@ -310,7 +310,7 @@ pub struct Config {
     // required vars by matching that literal, so a helper would blind it on all
     // five while it kept printing STATUS=OK.
     //
-    // Documented defaults live in `infra/services/mc-service/configmap.yaml`,
+    // Documented defaults live in `infra/services/mc-service/config.env`,
     // which is the artifact an operator actually reads — deliberately NOT in
     // `DEFAULT_*` constants here, including in test fixtures, since a constant
     // surviving only in a fixture reads as retired while remaining a live second

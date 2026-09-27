@@ -112,7 +112,7 @@ config's own header comment says so), and the browser demo works with exactly on
 | Config | `infra/kind/kind-config.yaml` (committed) | rendered from `infra/kind/kind-config.yaml.tmpl` |
 | Host ports | the fixed `hostPort` values in that file | allocated per-clone, 20000–29999 |
 | Published on | `127.0.0.1` (loopback, per R-37) | the podman host-gateway IP |
-| MC/MH advertise | the committed IPv4 literals in the configmaps | patched to the gateway IP at deploy time |
+| MC/MH advertise | the committed IPv4 literals in the per-instance `*-config.env` files | rendered to the gateway IP at deploy time (`setup.sh:apply_env_root`) |
 
 **Use the static path.** `scripts/dev-web.sh` defaults to the static host ports, and reads the
 MC/MH advertise addresses from the **committed configmap files on disk** — both of which are only
@@ -412,8 +412,9 @@ one.
 
 **One limitation to know — it now blocks rather than misleads.**
 `scripts/dev-web.sh::check_wt_endpoint` reads the MC/MH advertise addresses from the committed
-configmap **files on disk**, not from the live cluster. On the static topology those agree. On a
-devloop cluster the live ConfigMap has been patched and the on-disk file is stale, so the check
+config files (`*-config.env`) **on disk**, not from the live cluster. On the static topology those
+agree. On a devloop cluster the live ConfigMap is rendered with the gateway address and the on-disk
+file holds the host default, so the check
 validates an address nobody is using.
 
 Before the escalation that produced a misleading green. Now the hazard runs both ways: **a red
@@ -423,7 +424,10 @@ the live value before believing the failure (substitute the pod the preflight na
 
 ```bash
 # --- WSL2 ---
-kubectl get cm mh-0-config -n dark-tower -o jsonpath='{.data.MH_WEBTRANSPORT_ADVERTISE_ADDRESS}'
+# ConfigMap names are content-hash-suffixed (ADR-0038); resolve the one the pod uses.
+kubectl get configmap -n dark-tower -o jsonpath='{.data.MH_WEBTRANSPORT_ADVERTISE_ADDRESS}' \
+  "$(kubectl get deployment/mh-0 -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="mh-service")].env[?(@.name=="MH_WEBTRANSPORT_ADVERTISE_ADDRESS")].valueFrom.configMapKeyRef.name}')"
 ```
 
 If that disagrees with the on-disk file, the preflight is reporting stale data and the cluster may
@@ -910,9 +914,9 @@ happy-eyeballs fallback**, so signaling times out. AC and GC keep working over T
 address-family problem.
 
 **Fix.** MC and MH must advertise the IPv4 literal, not `localhost`. This is already the committed
-default in `infra/services/mc-service/mc-0-configmap.yaml` (key
+default in `infra/services/mc-service/mc-0-config.env` (key
 `MC_WEBTRANSPORT_ADVERTISE_ADDRESS`) and its `mc-1` / `mh-0` / `mh-1` siblings. If a live ConfigMap
-disagrees with the committed file, something patched it — go to F8.
+disagrees with the committed file, it was rendered with a gateway address — go to F8.
 
 **Why absence-of-signal is the evidence here.** `accepted` is recorded the moment the accept loop
 yields — on arrival of the QUIC Initial packet, **before the TLS handshake** and before any JWT
@@ -1133,18 +1137,19 @@ every other week, not a first-run-only problem.
 ```bash
 # --- WSL2 ---
 echo "${DT_HOST_GATEWAY_IP:-<unset>}"
-kubectl get configmap mc-0-config -n dark-tower \
-  -o jsonpath='{.data.MC_WEBTRANSPORT_ADVERTISE_ADDRESS}'
+kubectl get configmap -n dark-tower -o jsonpath='{.data.MC_WEBTRANSPORT_ADVERTISE_ADDRESS}' \
+  "$(kubectl get deployment/mc-0 -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="mc-service")].env[?(@.name=="MC_WEBTRANSPORT_ADVERTISE_ADDRESS")].valueFrom.configMapKeyRef.name}')"
 ```
 
 If the variable prints anything, or the live value is a gateway IP rather than the IPv4 loopback
-literal committed in `infra/services/mc-service/mc-0-configmap.yaml`, this is F8. `setup.sh` also
-logs each rewrite as it happens (`Patching MC-0 advertise address: …`), so the setup output is a
-second confirming signal.
+literal committed in `infra/services/mc-service/mc-0-config.env`, this is F8. `setup.sh` also
+logs it when it applies (`Applying environment root … (devloop advertise addresses via <ip>)`), so
+the setup output is a second confirming signal.
 
 **Cause.** `DT_HOST_GATEWAY_IP` was still exported from a previous devloop session. `setup.sh`
-treats it as "you are building a devloop cluster" and patches all four MC/MH advertise addresses to
-that IP — which the Windows browser cannot dial.
+treats it as "you are building a devloop cluster" and renders all four MC/MH advertise addresses
+with that IP — which the Windows browser cannot dial.
 
 **Fix.**
 

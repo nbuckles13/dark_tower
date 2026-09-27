@@ -17,17 +17,17 @@
 - Prometheus config, kustomization, per-service alert rules -> `infra/docker/prometheus/`; K8s scrape config -> `infra/kubernetes/observability/{prometheus.yml,prometheus-config.yaml}`
 - K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
 - Service workloads: AC StatefulSet -> `infra/services/ac-service/statefulset.yaml`; GC Deployment -> `infra/services/gc-service/deployment.yaml`; MC/MH per-instance Deployments + PDB -> `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`, `pdb.yaml`
-- MC/MH ConfigMaps (shared + per-instance; MH transport parameters) -> `infra/services/{mc,mh}-service/configmap.yaml`, `{mc,mh}-{0,1}-configmap.yaml`
+- MC/MH ConfigMap generator sources (shared + per-instance; MH transport parameters) -> `infra/services/{mc,mh}-service/config.env`, `{mc,mh}-{0,1}-config.env`
 - Network policies (per-service ingress/egress) -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC/MH per-instance Services (NodePorts) -> `infra/services/{mc,mh}-service/service.yaml`
 - OTel Collector base (configmap, deployment, service, network policy) -> `infra/services/otel-collector/`; smoke payload -> `infra/smoke/`
 - Redis + PostgreSQL manifests (Kustomize bases) -> `infra/services/{redis,postgres}/kustomization.yaml`; PostgreSQL init -> `infra/docker/postgres/init.sql`
 - K8s observability manifests (Prometheus, Loki/Promtail, kube-state-metrics, node-exporter) -> `infra/kubernetes/observability/kustomization.yaml`
 - Grafana manifests, dashboards + provisioning -> `infra/grafana/kustomization.yaml`, `infra/grafana/{dashboards,provisioning}/`
-- Kind overlays: cluster root, observability, per-service patches (OTel endpoint, CORS, NodePorts, MH egress budget) -> `infra/kubernetes/overlays/kind/{kustomization.yaml,observability/,services/}`
-- Kind cluster config + setup script (also creates MC/MH TLS + MH secrets imperatively) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl`, `infra/kind/scripts/setup.sh`
+- Kind ENVIRONMENT ROOT (ADR-0038; the one thing setup.sh applies), observability, per-service patches (OTel endpoint, CORS, NodePorts, MH egress budget) -> `infra/kubernetes/overlays/kind/{kustomization.yaml,observability/,services/}`
+- Content-addressed ConfigMaps (ADR-0038 §2): every pod-consumed ConfigMap is a `configMapGenerator` (service `*.env`, `otel-collector/collector.yaml`, `redis/redis.conf`, `observability/{loki,promtail,prometheus}.yml`, `infra/grafana/` (dashboards via one projected volume)); guard R-21 -> `crates/dt-guard/src/kustomize_content_addressing.rs`; shared generator parser -> `crates/dt-guard/src/common/kustomize_generators.rs`; pod-template ConfigMap-ref walker -> `crates/dt-guard/src/common/pod_spec.rs`
+- Kind cluster config + setup script (also creates AC secrets + MC/MH TLS imperatively) -> `infra/kind/kind-config.yaml`, `kind-config.yaml.tmpl`, `infra/kind/scripts/setup.sh`; iterate/teardown/Skaffold (on the Kind root) -> `infra/kind/scripts/{iterate,teardown}.sh`, `infra/skaffold.yaml`
 - setup.sh parameterization (DT_CLUSTER_NAME, DT_PORT_MAP, DT_HOST_GATEWAY_IP, DT_ORG_MAX_CONCURRENT_MEETINGS, --yes, --only, --skip-build, --provision-org) -> ADR-0030
-- setup.sh helpers -> `deploy_mc_service()`/`deploy_mh_service()` (ConfigMap advertise-addr patching), `load_image_to_kind()`, `deploy_only_service()`, `dt_psql()` (in-pod psql SSoT), `provision_run_org()`; tests -> `scripts/setup.test.sh`
-- Local iteration / teardown / Skaffold -> `infra/kind/scripts/{iterate,teardown}.sh`, `infra/skaffold.yaml`
+- setup.sh helpers -> `apply_env_root()` (the ONLY root apply; devloop wrapper choice inside), `render_env_overlay()` (per-cluster advertise addresses as a render input), `advertise_instances()`, `env_root_workloads()`/`wait_for_env_root()` (render-derived wait set + failure diagnostics), `build_service_image()`, `load_image_to_kind()`, `deploy_only_service()`, `dt_psql()` (in-pod psql SSoT), `provision_run_org()`; tests -> `scripts/setup.test.sh`
 - Containerized devloop + dev-cluster CLI -> `infra/devloop/{devloop.sh,dev-cluster}`; container start -> `infra/devloop/entrypoint.sh`
 - Web-app demo launcher (topology preflight, then Vite) -> `scripts/dev-web.sh`; test `scripts/dev-web.test.sh`
 

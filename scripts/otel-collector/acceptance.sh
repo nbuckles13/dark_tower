@@ -11,8 +11,8 @@
 # datapoint. So this is the pre-upgrade check: run it against a candidate image
 # BEFORE bumping the tag in `deployment.yaml`.
 #
-# IT READS THE COMMITTED CONFIG. The `config.yaml` block is extracted from
-# `infra/services/otel-collector/configmap.yaml`, so this exercises what
+# IT READS THE COMMITTED CONFIG. It copies
+# `infra/services/otel-collector/collector.yaml` verbatim, so this exercises what
 # actually ships — with ONE exception: the `stale` scenario shortens `max_stale`
 # (see the note at that `sed`; the only permitted divergence). A harness carrying
 # its own copy of the config would only prove something about the copy.
@@ -29,7 +29,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-CONFIGMAP="$REPO_ROOT/infra/services/otel-collector/configmap.yaml"
+CONFIG="$REPO_ROOT/infra/services/otel-collector/collector.yaml"
 DEPLOYMENT="$REPO_ROOT/infra/services/otel-collector/deployment.yaml"
 HERE="$REPO_ROOT/scripts/otel-collector"
 NS=otel-acceptance
@@ -51,8 +51,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 "$HERE/extract_config.py" "$CONFIGMAP" > "$WORK/config.yaml"
-[[ -s "$WORK/config.yaml" ]] || { echo "FAILED to extract config.yaml from $CONFIGMAP"; exit 2; }
+# The committed collector config IS a plain file since ADR-0038 §2 (the ConfigMap is
+# generated from it), so the harness copies it verbatim — no extraction step.
+cp "$CONFIG" "$WORK/config.yaml"
+[[ -s "$WORK/config.yaml" ]] || { echo "FAILED: $CONFIG is empty or unreadable"; exit 2; }
 
 # The stale-reset scenario needs a short `max_stale` to be observable inside a
 # test's lifetime. This is the ONLY permitted divergence from the committed
@@ -64,7 +66,7 @@ if [[ "$SCEN" == stale ]]; then
 fi
 
 echo "image:  $IMAGE"
-echo "config: $CONFIGMAP (committed)"
+echo "config: $CONFIG (committed)"
 
 kubectl delete ns "$NS" --ignore-not-found --wait=true >/dev/null
 kubectl create ns "$NS" >/dev/null

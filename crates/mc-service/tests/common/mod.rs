@@ -495,7 +495,7 @@ pub fn sample_identity_public_key() -> Vec<u8> {
 /// Values are spelled out as literals rather than referenced from a `DEFAULT_*`
 /// constant. There deliberately are no such constants for the five `MC_*`
 /// media-signalling keys — they are required env vars whose documented values
-/// live in `infra/services/mc-service/configmap.yaml` — and a constant surviving
+/// live in `infra/services/mc-service/config.env` — and a constant surviving
 /// only in a test fixture reads as retired to a grep of the load path while
 /// remaining a live second encoding of the value.
 ///

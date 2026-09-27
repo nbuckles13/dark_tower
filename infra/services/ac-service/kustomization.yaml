@@ -2,12 +2,28 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - configmap.yaml
   - statefulset.yaml
   - service.yaml
   - pdb.yaml
   - network-policy.yaml
   # service-monitor.yaml NOT listed — requires Prometheus Operator CRD
+
+# Content-addressed configuration (ADR-0038 §2). Generated, NOT a plain
+# ConfigMap resource: kustomize appends a hash of the rendered data to the name
+# and rewrites every configMapKeyRef to it, so a config change changes the pod
+# template and rolls exactly the workloads that consume it. `namespace:` is
+# load-bearing -- see infra/kubernetes/observability/kustomization.yaml.
+# Env-file format: KEY=VALUE taken literally, so an empty value is `KEY=` and
+# values are never quoted (a quoted value keeps its quotes; `dt-guard` rejects it).
+configMapGenerator:
+  - name: ac-service-config
+    namespace: dark-tower
+    envs:
+      - config.env
+    options:
+      labels:
+        app: ac-service
+        component: auth
 
 labels:
   - pairs:

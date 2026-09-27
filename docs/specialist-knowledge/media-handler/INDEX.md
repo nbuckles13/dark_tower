@@ -69,7 +69,7 @@
 
 ## Infrastructure & Operations
 - K8s deployment (ports, probes, env, downward API, advertise addresses) → `infra/services/mh-service/mh-0-deployment.yaml`, `infra/services/mh-service/mh-1-deployment.yaml`
-- K8s configmap (bind addresses, region, GC URL, AC_JWKS_URL) → `infra/services/mh-service/configmap.yaml`
+- K8s configmap (bind addresses, region, GC URL, AC_JWKS_URL) → `infra/services/mh-service/config.env`
 - MH↔MC network policy → `infra/services/mh-service/network-policy.yaml`, `infra/services/mc-service/network-policy.yaml`
 - Grafana dashboard + kustomization → `infra/grafana/dashboards/mh-overview.json`, `infra/grafana/kustomization.yaml`
 - Deployment runbook (post-deploy checklist) → `docs/runbooks/mh-deployment.md`; incident response → `docs/runbooks/mh-incident-response.md`

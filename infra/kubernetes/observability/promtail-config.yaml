@@ -2,9 +2,13 @@
 #
 # Promtail ships logs from Kubernetes pods to Loki.
 #
-# IMPORTANT: The relabel_configs define which labels are available in Loki.
-# If you add a new target_label here, update the guard validation in:
-#   scripts/guards/simple/grafana-datasources.sh
+# The Promtail config itself lives in `promtail.yaml` and is GENERATED into the
+# `promtail-config` ConfigMap by ./kustomization.yaml (content-addressed,
+# ADR-0038 §2): editing it changes the DaemonSet's pod template and rolls it.
+#
+# IMPORTANT: The relabel_configs in `promtail.yaml` define which labels are
+# available in Loki. `dt-guard grafana-datasources` reads that file directly to
+# derive the valid label set (crates/dt-guard/src/grafana_datasources.rs).
 #
 # Current valid Loki labels:
 #   - namespace: Kubernetes namespace
@@ -21,79 +25,6 @@
 # Dashboard queries MUST use these labels.
 # Using undefined labels like 'job' will cause "no data" errors.
 #
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: promtail-config
-  namespace: dark-tower-observability
-  labels:
-    app: promtail
-    component: logging
-data:
-  promtail.yaml: |
-    server:
-      http_listen_port: 9080
-      grpc_listen_port: 0
-
-    positions:
-      filename: /tmp/positions.yaml
-
-    clients:
-      - url: http://loki:3100/loki/api/v1/push
-
-    scrape_configs:
-      - job_name: kubernetes-pods
-        kubernetes_sd_configs:
-          - role: pod
-        relabel_configs:
-          # Drop pods without a name
-          - source_labels: [__meta_kubernetes_pod_name]
-            action: drop
-            regex: ''
-          # Drop pods in kube-system to reduce noise (optional)
-          - source_labels: [__meta_kubernetes_namespace]
-            action: drop
-            regex: kube-system
-          # Set the __path__ to the pod log directory (containerd/CRI format)
-          - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
-            target_label: __path__
-            separator: /
-            replacement: /var/log/pods/*$1/$2/*.log
-          # Set namespace label
-          - source_labels: [__meta_kubernetes_namespace]
-            action: replace
-            target_label: namespace
-          # Set pod label
-          - source_labels: [__meta_kubernetes_pod_name]
-            action: replace
-            target_label: pod
-          # Set container label
-          - source_labels: [__meta_kubernetes_pod_container_name]
-            action: replace
-            target_label: container
-          # Set app label from pod label
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            action: replace
-            target_label: app
-          # Set component label from pod label
-          - source_labels: [__meta_kubernetes_pod_label_component]
-            action: replace
-            target_label: component
-        pipeline_stages:
-          # Parse container runtime (CRI) format
-          - cri: {}
-          # Parse JSON structured logs emitted by tracing_subscriber::fmt().json()
-          # Example: {"timestamp":"2026-02-13T23:46:24Z","level":"INFO","target":"ac_service","fields":{"message":"Starting Auth Controller"}}
-          - json:
-              expressions:
-                level: level
-                target: target
-                timestamp: timestamp
-          # Promote extracted fields to Loki labels for efficient filtering
-          - labels:
-              level:
-              target:
 ---
 apiVersion: v1
 kind: ServiceAccount

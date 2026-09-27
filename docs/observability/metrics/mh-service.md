@@ -318,7 +318,7 @@ No alert rule ships with this metric. A useful threshold depends on MC's re-asse
 
 ## Egress Admission Metrics
 
-Story 2 R-19, R-23; ADR-0036 §11 "Admission control is keyed on egress bandwidth, not connection count". MH derives ONE egress **stream** ceiling from `MH_EGRESS_BUDGET_BPS` and the two per-stream cost keys (`infra/services/mh-service/configmap.yaml` is the home of every number). That one value is enforced at stream admission (hard), advertised to GC as `max_streams` (GC placement stays soft), published as `mh_media_egress_stream_ceiling`, and logged at startup. It is a **stream** ceiling, never a "subscriber ceiling": a subscriber holds N slots.
+Story 2 R-19, R-23; ADR-0036 §11 "Admission control is keyed on egress bandwidth, not connection count". MH derives ONE egress **stream** ceiling from `MH_EGRESS_BUDGET_BPS` and the two per-stream cost keys (`infra/services/mh-service/config.env` is the home of every number). That one value is enforced at stream admission (hard), advertised to GC as `max_streams` (GC placement stays soft), published as `mh_media_egress_stream_ceiling`, and logged at startup. It is a **stream** ceiling, never a "subscriber ceiling": a subscriber holds N slots.
 
 **Bits on the key, bytes on the gauge — one deliberate conversion.** The config keys are bits per second. MH converts ONCE at load, upstream of the enforcement/gauge fork (budget floored, costs ceiled — both fail closed), so `mh_media_egress_budget_bytes_per_second` is in bytes (ADR-0011's throughput rule) while `MH_EGRESS_BUDGET_BPS` is in bits. A factor of 8 between them is correct.
 
