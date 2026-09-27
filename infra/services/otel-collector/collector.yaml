@@ -1,0 +1,498 @@
+receivers:
+  otlp:
+    protocols:
+      # OTLP-gRPC for in-cluster service traces (AC/GC/MC via R-55 init_otel).
+      grpc:
+        endpoint: 0.0.0.0:4317
+      # OTLP-HTTP for the GC /api/v1/telemetry proxy forward path (R-2).
+      # This is the ONLY way browser metrics enter: GC is the trust boundary
+      # and has already applied its attribute-key allowlist before this point.
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # ---------------------------------------------------------------------
+  # memory_limiter — FIRST on both pipelines.
+  # ---------------------------------------------------------------------
+  #
+  # DO NOT REMOVE. The reason is not generic memory hygiene; it is the
+  # blast radius. AC/GC/MC fail HARD at init when the collector is
+  # unreachable, so an OOMKill here is a fleet-wide init outage on the next
+  # service restart. `init_otel` probes with a tonic
+  # `Endpoint::connect` (`crates/common/src/observability/otel.rs`), i.e. a
+  # CONNECTION probe, not a data export — so this limiter REFUSING DATA does
+  # not fail any service's init. It converts a would-be fleet-wide outage
+  # into bounded telemetry loss. That asymmetry is the whole argument.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # ---------------------------------------------------------------------
+  # (a) METRIC-NAME ALLOWLIST — the anti-forgery control.
+  # ---------------------------------------------------------------------
+  #
+  # GC's filter bounds attribute KEYS and value shape but NEVER inspects
+  # `metric.name`, so a patched browser can name a metric anything it likes —
+  # including a server-authored name like `mc_media_missing_key_material_total`.
+  # Without this list the exporter would publish client-origin series into the
+  # same Prometheus under server names. This list is why a client-origin series
+  # can never share a name with a server-authored one.
+  #
+  # MEMBERSHIP IS OBSERVABILITY'S, NOT INFRASTRUCTURE'S. The SSoT is the
+  # `Exported:` marker in `docs/observability/metrics/client.md`, and
+  # `dt-guard client-metrics-export` asserts SET EQUALITY (both directions)
+  # between the markers and this list. A name here but not catalogued is an
+  # undocumented exported series; a name catalogued `Exported: yes` but
+  # missing here fails CLOSED AND SILENTLY — indistinguishable from "no
+  # browser is running", which is the exact failure that left R-27 dead.
+  # ANCHOR (DRY): `docs/observability/metrics/client.md`,
+  # `crates/dt-guard/src/client_metrics_export.rs`.
+  #
+  # THE FIVE JOIN-FLOW METRICS ARE EXCLUDED ON PURPOSE. ADR-0036 §11
+  # grandfathers `meeting_id_hash` on those metrics AS EMITTED (the SDK needs
+  # it for logs<->metrics correlation in a browser console). It does NOT
+  # grandfather exporting a per-meeting identifier into central Prometheus
+  # storage, which is the cardinality-and-per-meeting-aggregation harm
+  # `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and
+  # exporting them anyway would be worse: a series whose shape does not match
+  # what `client.md` documents is a silently different metric.
+  #
+  # NOT A PREFIX RULE, DELIBERATELY. `dt_client_time_to_first_media_frame_ms`
+  # does not match `dt_client_media_*` and IS a media metric;
+  # `dt_client_mh_connection_total` lives in `media/MediaTransport.ts` and is
+  # NOT one. The test is what a metric observes, not which directory it lives
+  # in — `client.md` carries that paragraph.
+  filter/client_metric_names:
+    error_mode: propagate
+    metrics:
+      include:
+        match_type: strict
+        metric_names:
+          - dt_client_media_frames_sent_total
+          - dt_client_media_send_dropped_total
+          - dt_client_media_send_queue_depth
+          - dt_client_media_frames_received_total
+          - dt_client_media_frames_accepted_total
+          - dt_client_media_frames_dropped_total
+          - dt_client_media_key_wrap_outcomes_total
+          - dt_client_media_downlink_gap_frames_total
+          - dt_client_media_downlink_reorder_total
+          - dt_client_media_undeclared_stream_id_total
+          - dt_client_media_decoder_errors_total
+          - dt_client_media_mute_transitions_total
+          - dt_client_media_kek_updates_total
+          - dt_client_media_kek_retention_violations_total
+          - dt_client_media_kek_retention_anomalies_total
+          - dt_client_media_kek_install_refusals_total
+          - dt_client_media_roster_key_rebinds_total
+          - dt_client_media_kek_generations_retained_total
+          - dt_client_media_decode_queue_dropped_total
+          - dt_client_time_to_first_media_frame_ms
+
+  # ---------------------------------------------------------------------
+  # TEMPORALITY GATE — a stale browser bundle must be ABSENT, not WRONG.
+  # ---------------------------------------------------------------------
+  #
+  # The SDK exports DELTA (`packages/sdk-core/src/telemetry/telemetryConfig.ts`)
+  # precisely so that summing across browsers happens HERE and no per-browser
+  # identity label is needed. But a browser runs whatever bundle its tab
+  # loaded, and tabs cannot be rolled forward or back by an operator — so
+  # during any temporality transition some tabs still emit CUMULATIVE.
+  #
+  # Because there is deliberately no per-instance identity label (§11), a
+  # cumulative writer shares a stream identity with the delta writers:
+  # `delta_to_cumulative` would pass it through untouched while accumulating
+  # the others, and the exporter would then interleave two unrelated
+  # cumulative series under one identity — spurious resets and wrong totals
+  # that LOOK live. Dropping those datapoints makes the stale-bundle case
+  # read as missing data instead of as plausible wrong data.
+  #
+  # THIS DROP IS VISIBLE ONLY IN AGGREGATE, and that is an accepted limit,
+  # not something the :8888 telemetry solves. The filter-drop counter cannot
+  # attribute a drop to THIS processor (why: `docs/observability/alerts.md`,
+  # which is the one home for that fact), and `filter/client_metric_names`
+  # drops on every batch by design and dominates it. So a stale-bundle browser
+  # is STRUCTURALLY UNOBSERVABLE from inside the cluster: its series never
+  # appear, which reads identically to "that browser is not connected" — the
+  # consequence of having no per-instance identity (§11). The only planned
+  # detection is coarse and indirect: a fleet-wide temporality regression
+  # would move the client-series COUNT out of band — a SPECIFICATION in
+  # `docs/observability/alerts.md` §Telemetry Pipeline Alerts
+  # (`ClientSeriesCountOutOfBand`), NOT yet a loaded rule. Until it lands,
+  # nothing fires on this case.
+  #
+  # THIS SENTENCE HAS AN EXPIRY: it becomes false the moment that rule lands,
+  # and nothing mechanical will notice — `dt-guard` does not read config
+  # comments. It is one of THREE sites that must move in the same commit (the
+  # rule file, the `###` -> `####` heading promotion in `alerts.md`, and this
+  # comment); the coupling is recorded in `docs/TODO.md` under "THREE
+  # TELEMETRY-PIPELINE ALERTS ARE SPECIFIED BUT NOT LOADED". If you are here
+  # because you just landed that rule, this is the site that entry predicted
+  # would be missed.
+  #
+  # Gauges carry no temporality and are unaffected.
+  filter/client_metric_temporality:
+    error_mode: propagate
+    metrics:
+      metric:
+        - (type == METRIC_DATA_TYPE_SUM or type == METRIC_DATA_TYPE_HISTOGRAM) and aggregation_temporality != AGGREGATION_TEMPORALITY_DELTA
+
+  # ---------------------------------------------------------------------
+  # (b) LABEL-KEY ALLOWLIST + (c) VALUE SHAPE — the metrics path only.
+  # ---------------------------------------------------------------------
+  transform/client_metric_labels:
+    error_mode: propagate
+    metric_statements:
+      - context: datapoint
+        statements:
+          # --- (b) keep_keys: exactly seven keys, in two owned groups ---
+          #
+          # GROUP 1 — the ADR-0036 §11 media contract label set (observability's).
+          #   client_version, org_id, key_custody
+          # Built by allow-list in `packages/sdk-core/src/media/setup/mediaMetrics.ts`
+          # and restated in `docs/observability/label-taxonomy.md` R3.
+          #
+          # GROUP 2 — the per-metric discriminators (global-controller's + security's),
+          # the same five-key widening applied to GC's datapoint tier minus
+          # key_custody: reason, outcome, action, source.
+          #
+          # Two groups rather than a flat seven because the next editor must
+          # know WHICH owner to consult for a given key; flattened, they edit
+          # whichever they found first.
+          #
+          # `meeting_id_hash` IS ABSENT BY OMISSION, NOT BY A NAMED DELETE.
+          # That is the whole point: `MediaTransport.ts` (~417-419) spreads the
+          # join label bag carrying that hash INSIDE the media directory, so an
+          # already-name-allowlisted metric can ACQUIRE the identifier later. A
+          # denylist would pass it; an allow-list fails closed.
+          #
+          # `le` IS NOT A KEY AND MUST NOT BE ADDED. Histogram bucket bounds are
+          # structural in OTLP (explicit bounds on the datapoint); `le` is
+          # synthesised by the prometheus exporter DOWNSTREAM of this processor.
+          # Likewise `otel_scope_name`/`otel_scope_version` are added by the
+          # exporter after this point — keep_keys structurally cannot drop them
+          # and must not be expected to.
+          #
+          # THIS IS THE METRICS PATH ONLY. Traces keep `meeting_id_hash`
+          # deliberately: that is what makes one session traceable without
+          # putting a meeting dimension into a stored, indexed, retained series.
+          #
+          # THREE LISTS, DELIBERATELY NOT ONE. This list, GC's `ALLOWLIST`, and
+          # GC's `MEDIA_DATAPOINT_EXTRA` (both in
+          # `crates/gc-service/src/services/telemetry_filter.rs`) answer
+          # DIFFERENT questions:
+          #   - GC's:  may this key cross the browser->cluster trust boundary at all?
+          #   - this:  may this key become a dimension of a STORED, indexed,
+          #            retained, joinable series?
+          # Different blast radii, which is why `meeting_id_hash` is admissible
+          # to one and not the other. Collapse toward GC's list and the meeting
+          # identifier reaches a stored series (§11 breach); collapse toward this
+          # one and traces lose their correlation key and join-flow diagnostics
+          # go dark. NO MERGED LIST IS CORRECT FOR BOTH QUESTIONS.
+          # `dt-guard client-metrics-export` (G4) asserts this list is a SUBSET
+          # of GC's two, so the two encodings cannot drift apart silently.
+          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source"])
+
+          # --- key_custody: asserted here, not accepted from a browser ---
+          #
+          # ADR-0036 §4 fixes this at `operator` and §11 bars any end-to-end or
+          # zero-trust claim. A patched client sending `key_custody="end_to_end"`
+          # would land a FALSE CUSTODY CLAIM in a stored series that the
+          # dashboards and the catalog read as fact. The value domain is a
+          # singleton, so the honest control is to SET it rather than to hope.
+          # (GC independently DROPS a mismatching key_custody at the trust
+          # boundary; this is the second, structural half.)
+          - set(attributes["key_custody"], "operator")
+
+          # --- (c) value shape: charset first, length as a backstop ---
+          #
+          # WHY A SHAPE CHECK AND NOT A VALUE ALLOWLIST. A value allowlist and a
+          # value shape-check fail in OPPOSITE directions. An allowlist that
+          # falls behind its vocabulary rejects legitimate values and the alert
+          # goes quiet — silent, and indistinguishable from health. A shape check
+          # that is too permissive admits junk values — cardinality inflation,
+          # which is visible in series count and in memory. PREFER THE CONTROL
+          # WHOSE FAILURE IS LOUD. Concretely: `MCMediaMissingKeyMaterial`
+          # selects `reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"`,
+          # which are `RejectReason` tokens; a list derived from `mediaMetrics.ts`'s own
+          # declarations would NOT contain them and would sentinel every real
+          # key-material drop, zeroing the alert's numerator permanently.
+          #
+          # THE CHARSET IS THE CONTROL; THE LENGTH IS A BACKSTOP. `[a-z_]`
+          # structurally excludes emails, UUIDs, hex hashes and base64 from ever
+          # riding an allowlisted key into a stored label — that is a PII-shape
+          # control. The length cap bounds BYTES PER SERIES, **not** the number
+          # of distinct series: a patched client sending a million distinct
+          # 8-character values defeats it entirely. Nothing here bounds
+          # distinct-value COUNT for these four keys, and no comment may claim
+          # it does. The accepted exposure is series-count inflation, which is
+          # visible in series count, in `memory_limiter`, and in
+          # `delta_to_cumulative`'s `max_streams`.
+          #
+          # THE CAP IS DERIVED, NOT GUESSED: the longest value any of these keys
+          # legitimately carries today is the `RejectReason` token
+          # `payload_length_exceeds_available` (32 chars), so 64 is 2x the
+          # measured floor. The vocabularies are still growing (story 2 added
+          # `kek_generation_stale` and `sender_not_assigned`, both well under the
+          # cap), and a cap that is TOO TIGHT sentinels a real
+          # token and takes the alert quiet, while one that is too loose costs
+          # only bytes. Raise it by re-measuring the longest token, not by
+          # copying a bound from an unrelated construct.
+          #
+          # BOTH ANCHORS ARE LOAD-BEARING. OTTL's `IsMatch` is Go RE2 and matches
+          # a SUBSTRING: an unanchored `[a-z_]{1,64}` is satisfied by any value
+          # containing one lowercase letter, so `victim@example.com` would pass.
+          # This is the only control here that could fail OPEN — everything else
+          # fails by making something absent — which makes it the hardest to
+          # catch in review, because nothing looks missing.
+          #
+          # EVERY STATEMENT IS NIL-GUARDED. Without `!= nil`, the condition is
+          # TRUE when the attribute is absent and `set` CREATES it — stamping
+          # e.g. `reason="invalid"` onto the twelve media metrics that never
+          # carry `reason`, changing their series identity and putting a fourth
+          # dimension on counters whose label set §11 fixes at three. That would
+          # make this collector an unauthorised author of the media contract
+          # label set — the same class of thing `add_metric_suffixes: false`
+          # exists to prevent.
+          #
+          # `invalid` IS A RESERVED SENTINEL. It must never become a real token
+          # in any of these vocabularies, or a rewritten junk value would become
+          # indistinguishable from a legitimate one. `dt-guard
+          # client-metrics-export` (G6) asserts that, reading BOTH the TypeScript
+          # vocabularies and MH's `MediaDropReason`.
+          #
+          # `org_id` HAS NO SHAPE CHECK HERE, AND DOES NOT NEED ONE: GC stamps it
+          # from the authenticated `UserClaims.org_id`, so it is bounded by the
+          # number of authenticated orgs — strictly stronger than any regex. Its
+          # legitimate charset is also wider (UUIDs carry digits and hyphens), so
+          # `[a-z_]` would sentinel every real value.
+          - set(attributes["client_version"], "invalid") where attributes["client_version"] != nil and not IsString(attributes["client_version"])
+          - set(attributes["client_version"], "invalid") where IsString(attributes["client_version"]) and not IsMatch(attributes["client_version"], "^[0-9A-Za-z.+-]{1,64}$")
+          - set(attributes["reason"], "invalid") where attributes["reason"] != nil and (not IsString(attributes["reason"]) or not IsMatch(attributes["reason"], "^[a-z_]{1,64}$"))
+          - set(attributes["outcome"], "invalid") where attributes["outcome"] != nil and (not IsString(attributes["outcome"]) or not IsMatch(attributes["outcome"], "^[a-z_]{1,64}$"))
+          - set(attributes["action"], "invalid") where attributes["action"] != nil and (not IsString(attributes["action"]) or not IsMatch(attributes["action"], "^[a-z_]{1,64}$"))
+          - set(attributes["source"], "invalid") where attributes["source"] != nil and (not IsString(attributes["source"]) or not IsMatch(attributes["source"], "^[a-z_]{1,64}$"))
+
+  # ---------------------------------------------------------------------
+  # COLLECTOR-CLOCK RESTAMP — the ordering authority at the trust boundary.
+  # ---------------------------------------------------------------------
+  #
+  # Datapoint timestamps are BROWSER WALL-CLOCK, and GC's prost re-encode
+  # preserves them. Because every browser at a given
+  # {client_version, org_id, key_custody} deliberately shares ONE stream
+  # identity (no per-instance label, §11), `delta_to_cumulative` would decide
+  # "out of order" ACROSS MACHINES with skewed clocks. Measured on the pinned
+  # collector version, without this, the second writer's FIRST point is dropped (its start
+  # predates the stream's) and the two-writer total reads 29 instead of 36. A
+  # 30s-slow browser, a retried export, or a single point stamped in the year
+  # 2100 would each silently stop an honest fleet's accumulation — a
+  # denial-of-detection any authenticated participant could trigger.
+  #
+  # THIS IS NOT THE TIMESTAMP-ZEROING WORKAROUND THAT WAS RULED OUT. That one
+  # set timestamps to 0 to satisfy the PROMETHEUS EXPORTER's internal
+  # `start == prev.end` accumulator check, depended on those internals, and
+  # hid genuine resets. This gives `delta_to_cumulative` monotonic,
+  # collector-owned timestamps so its DOCUMENTED ordering contract holds. It
+  # hides no reset, because a delta datapoint has no reset semantics: each
+  # point is an increment, and a browser that restarts its counters must be
+  # summed into the fleet total, not subtracted from it.
+  #
+  # WHAT IT DOES ERASE, PERMANENTLY: in OTLP delta semantics a counter RESET
+  # is signalled by a change in `start_time_unix_nano`. Overwriting it on every
+  # point removes the collector's ability to distinguish "the SDK's counters
+  # restarted" from "the next delta arrived". For a fleet sum over browsers
+  # that join and leave constantly that is exactly right — a per-browser reset
+  # must NOT reset the fleet total. But it is irreversible AT THIS LAYER: if
+  # client-side reset visibility is ever needed, this restamp is the thing that
+  # ate it, and the answer is to revisit this processor, not to look downstream.
+  #
+  # CONSEQUENCE FOR READING THE BOARD: stored timestamps are collector-ARRIVAL,
+  # not browser-event, time. The reading guidance (teardown flush spikes,
+  # backgrounded tabs, outage re-dating) lives in
+  # `docs/observability/metrics/client.md` and the runbooks — ONE home, not
+  # restated here.
+  transform/client_metric_clock:
+    error_mode: propagate
+    metric_statements:
+      - context: datapoint
+        conditions:
+          - metric.aggregation_temporality == AGGREGATION_TEMPORALITY_DELTA
+        statements:
+          - set(time, Now())
+          - set(start_time, time)
+
+  # ---------------------------------------------------------------------
+  # DELTA -> CUMULATIVE — where N browsers become one series.
+  # ---------------------------------------------------------------------
+  #
+  # The SDK's delta temporality is a deliberate choice so that aggregation
+  # happens HERE rather than per-browser. This processor is what turns N
+  # same-identity delta streams into one cumulative series with NO
+  # per-instance identity label. A per-session `service.instance.id` is BARRED
+  # as an alternative (§11: it is a participant dimension under another name).
+  #
+  # NOTE THE SPELLING: `delta_to_cumulative`. The old `deltatocumulative`
+  # alias still loads but logs a deprecation warning, and the processor is NOT
+  # present at all in the previously pinned 0.103.1 — a config referencing it
+  # there is a startup CrashLoop. That is why the image tag and this file are
+  # a SINGLE atomic rollback unit; see the collector-upgrade-discipline
+  # section of `docs/runbooks/gc-deployment.md`.
+  #
+  # `max_stale` — MUST BE >= the exporter's `metric_expiration` PLUS the
+  # longest `dt_client_*` range-vector window in a loaded rule. If the
+  # accumulator can forget while samples of the exposed series are still
+  # inside a `rate()` window, a re-entering low value lands with no visible
+  # reset and the window under-counts. At this setting every sample of a
+  # forgotten series has already aged out of any window, so the reappearance
+  # is unambiguous. The derivation, and the `metric_expiration` constraint it
+  # builds on, live in `docs/observability/alert-conventions.md`
+  # §Metric expiration — do NOT restate the window length here.
+  # `dt-guard client-metrics-export` (G5) enforces both relations and requires
+  # both keys to be PRESENT, so a key renamed by a future collector version
+  # goes red rather than quietly passing.
+  #
+  # `max_stale` IS A LOWER BOUND ON FORGETTING, NOT AN EXACT TIME: streams are
+  # evicted by a periodic sweep, so a stream can survive past it by up to the
+  # sweep period (measured: a 40s idle against a 20s max_stale still
+  # accumulated; a 130s idle reset). Forgetting LATE only lengthens accumulator
+  # memory, which is the safe side of the constraint above.
+  #
+  # `max_streams` is a FAIL-CLOSED GUARD AGAINST AN UNFORESEEN LABEL, NOT A
+  # CAPACITY ESTIMATE. Streams are bounded by metrics x observed label values x
+  # live `org_id`s — NOT by browser count, since with no per-instance identity
+  # all browsers collapse into one stream per label set. On the dev cluster
+  # `org_id` is a PER-RUN dimension: `scripts/layer7.sh` provisions a fresh
+  # organization per run and GC stamps its UUID onto client datapoints, so
+  # streams from every run still inside `max_stale` coexist. This value is
+  # sized to tolerate several overlapping runs, not one.
+  #
+  # WORST-CASE FIGURE, WITH ITS DENOMINATOR: per per-run `org_id` (with
+  # `client_version` and `key_custody` fixed), counting a histogram as ONE
+  # stream and assuming every reject reason is observed, the allowlist above
+  # is 20 names / 47 streams (was 14 names / 34 streams before story 2's six
+  # KEK/roster/decode-queue counters, +38%). Against `max_streams: 500` that
+  # is ~10 concurrent runs of headroom (was ~14). Realistic counts are well
+  # below worst case, since most reject reasons never fire in a run.
+  # Recompute this figure whenever a name or a label value set is added.
+  delta_to_cumulative:
+    max_stale: 15m
+    max_streams: 500
+
+exporters:
+  # `debug` is the dev sink — writes received span/metric counts + names to
+  # the collector log. (R-59 item 1 also names `logging`, but `logging` was
+  # deprecated upstream at collector v0.86.0 and REMOVED at v0.111.0 in favor
+  # of `debug`. It is a redundant alias of `debug`, not a second sink, so
+  # `debug` alone is the correct, forward-safe dev config.)
+  #
+  # verbosity is `normal`, NOT `detailed`: `detailed` dumps every span
+  # attribute value to the pod log, so any PII/secret on a span would land in
+  # the collector log in cleartext — and `test_secrets_not_in_logs` only scans
+  # ac-service logs, not the collector pod, so that leak path would be
+  # unguarded. `normal` removes the leak path while still giving span
+  # names/counts for dev debugging (@security).
+  debug:
+    verbosity: normal
+
+  # -------------------------------------------------------------------
+  # PROMETHEUS EXPORTER — PULL, not remote-write.
+  # -------------------------------------------------------------------
+  #
+  # `prometheusremotewrite` would require enabling the remote-write RECEIVER
+  # on a Prometheus whose Service is a NodePort mapped to host 9090 — the same
+  # unauthenticated-write-surface argument that removed `--web.enable-lifecycle`
+  # on 2026-09-09 and is still recorded in
+  # `infra/kubernetes/observability/prometheus-config.yaml`. Pull also makes
+  # collector loss an `up == 0` on a job, which turns out to be load-bearing
+  # for READING the data correctly and not merely for liveness: it is how a
+  # recovery spike is distinguished from a real burst (see the restamp above).
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+    # Names pass through VERBATIM. With suffixing on, the exporter appends unit
+    # and `_total` suffixes with dedupe behaviour that has varied across
+    # collector versions: `dt_client_time_to_first_media_frame_ms` would acquire
+    # a unit suffix and stop matching any rule or panel, and this collector
+    # would become a SECOND AUTHOR of strings that are authored and guarded in
+    # TypeScript (`packages/sdk-core/src/telemetry/nameGuard.ts` + the `dt-guard`
+    # ts-name-guard-dt-client rule). One author, one spelling.
+    add_metric_suffixes: false
+
+    # OFF, deliberately. The three contract labels (`client_version`, `org_id`,
+    # `key_custody`) are PER-DATAPOINT metric attributes
+    # (`packages/sdk-core/src/media/setup/mediaMetrics.ts`), not resource
+    # attributes, so they arrive WITHOUT this — turning it on adds nothing the
+    # contract needs. And the SDK's resource set
+    # (`packages/sdk-core/src/telemetry/telemetryConfig.ts`) is not curated as a
+    # label set: it exists to identify the SDK build, not to be projected onto
+    # every series.
+    resource_to_telemetry_conversion:
+      enabled: false
+
+    # A series must not expire mid-window while a client is merely slow. If it
+    # does, the non-zero-denominator guard on `MCMediaMissingKeyMaterial` goes
+    # false and the alert STOPS EVALUATING rather than firing — a silent hole
+    # exactly where the alert is load-bearing. The constraint (this value must
+    # exceed the longest `dt_client_*` range-vector window in any loaded rule)
+    # spans two files and cannot be derived from either alone, so it is recorded
+    # in `docs/observability/alert-conventions.md` §Metric expiration and
+    # enforced by `dt-guard client-metrics-export` (G5). Do NOT restate the
+    # window length here — one number, one home.
+    metric_expiration: 10m
+
+extensions:
+  # Liveness/readiness surface on :13133 — the K8s probes hit this, and the
+  # NetworkPolicy/Service expose only this port for health (no telemetry).
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+
+  # -------------------------------------------------------------------
+  # THE COLLECTOR'S OWN TELEMETRY — because every control above fails QUIET.
+  # -------------------------------------------------------------------
+  #
+  # The metrics path drops in five places, and EVERY ONE of them fails by
+  # making something ABSENT: the name allowlist, the temporality gate,
+  # `keep_keys`, `delta_to_cumulative`'s `max_streams`, and `memory_limiter`.
+  # On a deployed cluster all five are indistinguishable from "no browser
+  # connected" — and because there is no per-browser `up` and structurally
+  # cannot be one (§11), the presence of a client series is the ONLY liveness
+  # signal the browser fleet has. So a stale-bundle fleet whose datapoints are
+  # all dropped renders IDENTICALLY to a quiet Sunday.
+  #
+  # Exposing this makes those drops countable IN AGGREGATE — the machine-level
+  # counters exist and can go non-zero — but NOT attributable per drop point:
+  # see the temporality gate's comment for the case this cannot separate.
+  # Scraped by the
+  # `otel-collector-telemetry` job — deliberately a SEPARATE job from
+  # `otel-collector`, so that `up{job="otel-collector"}` keeps meaning
+  # "the client-series endpoint is being scraped".
+  #
+  # NOTE FOR WHOEVER WRITES RULES ON THIS (observability): the `otelcol_*`
+  # families split into healthy-ZERO and healthy-NONZERO, and the split is NOT
+  # derivable from the metric names. The filter processor drops points BY
+  # DESIGN on every batch (the name allowlist discards everything outside the
+  # list), so a rule on "points dropped" fires forever on a healthy collector.
+  # Read the families off the running pod on the committed tag before writing
+  # a threshold; the names have moved between collector versions.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/client_metric_names, filter/client_metric_temporality, transform/client_metric_labels, transform/client_metric_clock, delta_to_cumulative]
+      exporters: [debug, prometheus]

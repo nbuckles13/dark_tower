@@ -56,6 +56,27 @@ configMapGenerator:
         component: monitoring
     files:
       - prometheus.yml
+  # Loki and Promtail server configs: same shape and same reasons as
+  # `prometheus-config` above (hash suffix -> the StatefulSet / DaemonSet pod
+  # template changes -> the pod rolls; `namespace:` load-bearing). Every
+  # ConfigMap a pod template consumes is generated like this (ADR-0038 §2);
+  # `dt-guard kustomize` R-21 fails the build on a plain one.
+  - name: loki-config
+    namespace: dark-tower-observability
+    options:
+      labels:
+        app: loki
+        component: logging
+    files:
+      - loki.yaml
+  - name: promtail-config
+    namespace: dark-tower-observability
+    options:
+      labels:
+        app: promtail
+        component: logging
+    files:
+      - promtail.yaml
 
 labels:
   - pairs:

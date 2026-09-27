@@ -102,7 +102,7 @@ impl AcceptLoopRig {
             handler_id,
             register_meeting_timeout,
             max_connections,
-            // Deployed values (infra/services/mh-service/configmap.yaml). The
+            // Deployed values (infra/services/mh-service/config.env). The
             // rig drives the REAL `bind()`, so these are the transport
             // parameters the test endpoint actually negotiates with.
             mh_service::config::QuicTransportParams {

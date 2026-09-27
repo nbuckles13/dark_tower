@@ -14,14 +14,15 @@
 #   - AC (8443) + GC (8444) host ports answer                 [HARD FAIL]
 #   - MC/MH WebTransport cert fingerprints present            [HARD FAIL]
 #   - MC/MH WebTransport ports have a right-family listener   [HARD FAIL]
-#   - ...including when that check CANNOT RUN. All FOUR causes are  [HARD FAIL]
+#   - ...including when that check CANNOT RUN. All FIVE causes are  [HARD FAIL]
 #     hard fails: `ss` missing, `ss` failed, no advertise address,
-#     no resolver (getent). Enumerative, not illustrative — the
+#     no resolver (getent), no per-instance config sources.
+#     Enumerative, not illustrative — the
 #     runbook cites this block as the severity SSoT, so it must not
 #     under-list. See the contract below.
 #   - client N (VITE_DT_RECEIVE_SLOTS) is an integer >= 1     [HARD FAIL]
 #     and <= the MC server cap MC_MAX_RECEIVE_SLOTS, read
-#     from infra/services/mc-service/configmap.yaml. N above
+#     from infra/services/mc-service/config.env. N above
 #     the cap is one silent participant per browser.
 #   - ...including when the cap CANNOT BE READ. All THREE causes  [HARD FAIL]
 #     are hard fails and are diagnosed separately: cap file absent,
@@ -82,7 +83,7 @@
 #      getUserMedia and WebTransport are both unavailable there (SECURE CONTEXT
 #      above; the runbook section it cites).
 #   2. The advertise addresses are loopback literals (127.0.0.1): every
-#      infra/services/{mc,mh}-service/{mc,mh}-{0,1}-configmap.yaml advertises a
+#      infra/services/{mc,mh}-service/{mc,mh}-{0,1}-config.env advertises a
 #      https://127.0.0.1:<port> URL. GC hands those to the browser, so a second
 #      machine's browser dials ITS OWN loopback and reaches nothing. (The ports
 #      are deliberately not restated here — they are in those files and in this
@@ -373,8 +374,9 @@ fi
 
 # ─── MC / MH WebTransport reachability (HARD FAIL — this IS the demo) ──
 # The join step dials MC (signaling) then MH (media) over QUIC/WebTransport at
-# the addresses GC advertises to the browser — read here from the service
-# configmaps, the SSoT for those values. Two failure modes this catches that the
+# the addresses GC advertises to the browser — read here from the per-instance
+# ConfigMap generator sources (infra/services/m[ch]-service/m[ch]-N-config.env),
+# the SSoT for those values. Two failure modes this catches that the
 # AC/GC TCP probes above cannot: nothing published on the MC/MH WT port, and an
 # IPv4/IPv6 loopback family mismatch.
 #
@@ -390,20 +392,22 @@ fi
 # this script is the fast path, the runbook is the source of prose/diagnosis.
 #
 # KNOWN FALSE POSITIVE, accepted with a named diagnosis rather than softened:
-# the advertise addresses are read from the committed configmap files on disk,
+# the advertise addresses are read from the committed config files on disk,
 # which is correct for the static host topology this script targets. On a
-# devloop cluster the live ConfigMap is patched and the on-disk value is stale,
+# devloop cluster the live ConfigMap is rendered with the host-gateway address
+# (setup.sh:apply_env_root) and the on-disk value is the host default,
 # so this check can go RED against a perfectly healthy cluster — and now that is
 # a blocker, not a misleading green. Every listener failure below therefore
 # prints the ground-truth `kubectl` command for the live value. The honest fix
 # if this ever bites in practice is to read the live ConfigMap, not to soften
 # the check; that is recorded in docs/TODO.md. See runbook §1 and F8.
-WT_CONFIGMAPS=(
-    infra/services/mc-service/mc-0-configmap.yaml
-    infra/services/mc-service/mc-1-configmap.yaml
-    infra/services/mh-service/mh-0-configmap.yaml
-    infra/services/mh-service/mh-1-configmap.yaml
-)
+#
+# The instance set is DERIVED from the per-instance generator sources — the same
+# glob infra/kind/scripts/setup.sh:advertise_instances() uses — never a
+# hand-kept list, so a new instance is checked without editing this script.
+shopt -s nullglob
+WT_CONFIGMAPS=(infra/services/m[ch]-service/m[ch]-[0-9]*-config.env)
+shopt -u nullglob
 
 # Snapshot UDP listeners once; note whether "localhost" prefers IPv6 (mirrored).
 # WT_SS_OK distinguishes "ss ran and found no listener" from "ss failed to run".
@@ -450,16 +454,21 @@ wt_listener_on() {
 # label so the operator never hand-edits it at 3am.
 #
 # The key is SERVICE-PREFIXED (`MH_WEBTRANSPORT_ADVERTISE_ADDRESS` /
-# `MC_WEBTRANSPORT_ADVERTISE_ADDRESS`, see the configmap files). An unprefixed
+# `MC_WEBTRANSPORT_ADVERTISE_ADDRESS`, see the config files). An unprefixed
 # jsonpath does not error — it returns EMPTY, which reads as "the live
 # ConfigMap has no advertise address either" and manufactures exactly the false
 # conclusion this remedy exists to prevent. A remedy command that fails
 # silently is worse than no remedy.
+#
+# The live ConfigMap's NAME carries a content hash (ADR-0038 §2:
+# `mc-0-config-<hash>`), so the command resolves it through the name the
+# instance's Deployment actually references rather than guessing a literal.
 wt_live_value_cmd() {
-    local label="$1" prefix
+    local label="$1" prefix svc
     prefix="$(printf '%s' "${label%%-*}" | tr '[:lower:]' '[:upper:]')"
-    printf "kubectl get cm %s-config -n dark-tower -o jsonpath='{.data.%s_WEBTRANSPORT_ADVERTISE_ADDRESS}'" \
-        "$label" "$prefix"
+    svc="${label%%-*}-service"
+    printf "kubectl get cm -n dark-tower -o jsonpath='{.data.%s_WEBTRANSPORT_ADVERTISE_ADDRESS}' \"\$(kubectl get deployment/%s -n dark-tower -o jsonpath='{.spec.template.spec.containers[?(@.name==\"%s\")].env[?(@.name==\"%s_WEBTRANSPORT_ADVERTISE_ADDRESS\")].valueFrom.configMapKeyRef.name}')\"" \
+        "$prefix" "$label" "$svc" "$prefix"
 }
 
 # Shared remedy block for "nothing is listening". Printed by every listener
@@ -471,7 +480,7 @@ wt_listener_remedy() {
     echo "      Check it really is up:  kubectl get pods -n dark-tower"
     echo "      On a DEVLOOP cluster this check reads a stale on-disk value — confirm against the live one:"
     echo "        $(wt_live_value_cmd "$label")"
-    echo "      If that disagrees with the configmap file, the preflight is reporting stale data and"
+    echo "      If that disagrees with the config file, the preflight is reporting stale data and"
     echo "      the cluster may be healthy (runbook §1, F8). This script targets the static host topology."
 }
 
@@ -491,11 +500,11 @@ check_wt_endpoint() {
     if [[ -z "$url" ]]; then
         # DIFFERENT LANE from every other failure here, and it must say so.
         # Everything else means "your machine or your cluster is wrong" and is
-        # operator-fixable. This means the configmap or this script's grep
+        # operator-fixable. This means the config file or this script's grep
         # pattern drifted — there is nothing to fix locally, and a reader who
         # gets the generic message spends an hour restarting a healthy cluster.
         fail "${label}: CANNOT VERIFY — no WEBTRANSPORT_ADVERTISE_ADDRESS found in ${file}."
-        echo "      This is REPO/CONFIG DRIFT (the configmap key, or this script's parse), not your"
+        echo "      This is REPO/CONFIG DRIFT (the config key, or this script's parse), not your"
         echo "      environment. Nothing to fix locally: report it. Not starting the dev server,"
         echo "      because a check that did not run must never read as a check that passed."
         return
@@ -568,8 +577,14 @@ check_wt_endpoint() {
     esac
 }
 
+if (( ${#WT_CONFIGMAPS[@]} == 0 )); then
+    # Same lane as the no-advertise-address case: the tree drifted from this
+    # script's glob. Zero instances checked must never read as all-clear.
+    fail "MC/MH: CANNOT VERIFY — no per-instance config sources match infra/services/m[ch]-service/m[ch]-N-config.env."
+    echo "      This is REPO/CONFIG DRIFT, not your environment. Nothing to fix locally: report it."
+fi
 for cm in "${WT_CONFIGMAPS[@]}"; do
-    label="${cm##*/}"; label="${label%-configmap.yaml}"
+    label="${cm##*/}"; label="${label%-config.env}"
     check_wt_endpoint "$cm" "$label"
 done
 
@@ -607,7 +622,7 @@ done
 # "dev-web.sh's WebTransport preflight reads the on-disk ConfigMap"): on a
 # devloop cluster the live value can differ, so every cap message prints the
 # live command, and the in-cluster AUTHORITY is MC's own counter.
-MC_SHARED_CONFIGMAP="infra/services/mc-service/configmap.yaml"
+MC_SHARED_CONFIGMAP="infra/services/mc-service/config.env"
 DEMO_RECEIVE_SLOTS=3
 if [[ -n "${VITE_DT_RECEIVE_SLOTS+x}" ]]; then
     N_SOURCE="set by you"
@@ -620,9 +635,11 @@ export VITE_DT_RECEIVE_SLOTS
 cap_live_value_cmd() {
     # SHARED ConfigMap (consumed by mc-0 AND mc-1), namespace spelled out: without
     # -n the command returns NotFound in another namespace, which reads as "the
-    # cluster has no cap either". Deliberately NOT wt_live_value_cmd, which
-    # derives PER-INSTANCE names.
-    printf "kubectl get cm mc-service-config -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}'"
+    # cluster has no cap either". Its NAME carries a content hash (ADR-0038 §2:
+    # `mc-service-config-<hash>`), so it is resolved through the name mc-0's
+    # Deployment actually references — the same move as wt_live_value_cmd, which
+    # this deliberately does not reuse because that derives PER-INSTANCE names.
+    printf "kubectl get cm -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}' \"\$(kubectl get deployment/mc-0 -n dark-tower -o jsonpath='{.spec.template.spec.containers[?(@.name==\"mc-service\")].env[?(@.name==\"MC_MAX_RECEIVE_SLOTS\")].valueFrom.configMapKeyRef.name}')\""
 }
 
 # The authority framing, printed on EVERY branch that names a cap — including
@@ -655,7 +672,7 @@ check_receive_slots() {
     fi
     # `|| true`: grep's no-match exit must reach the CANNOT VERIFY branch below,
     # not kill the preflight via pipefail + set -e (see check_wt_endpoint).
-    cap_line="$(grep -E '^[[:space:]]+MC_MAX_RECEIVE_SLOTS:[[:space:]]*' "$MC_SHARED_CONFIGMAP" 2>/dev/null | head -1 || true)"
+    cap_line="$(grep -E '^MC_MAX_RECEIVE_SLOTS=' "$MC_SHARED_CONFIGMAP" 2>/dev/null | head -1 || true)"
     # THREE CAUSES, THREE BRANCHES — deliberately not one message with the value
     # interpolated. Each has a different first move: the file is gone (deploy),
     # the key is gone or this script's anchored match drifted (repo), the value
@@ -665,14 +682,14 @@ check_receive_slots() {
         fail "receive slots: CANNOT VERIFY — ${MC_SHARED_CONFIGMAP} exists but declares no MC_MAX_RECEIVE_SLOTS data key, so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap."
         echo "      This is REPO/CONFIG DRIFT — the key was removed or renamed, or this script's"
         echo "      anchored match drifted from the file's shape. NOT your environment, and note"
-        echo "      the match is anchored on the indented data line, so a comment mentioning the"
+        echo "      the match is anchored on a line-start KEY= entry, so a comment mentioning the"
         echo "      key never satisfies it. Nothing to fix locally: report it."
         echo "      The live value discriminates: present live but not on disk means the file"
         echo "      drifted; absent in both means the key really is gone:"
         echo "        $(cap_live_value_cmd)"
         return
     fi
-    cap="$(printf '%s' "$cap_line" | sed -E 's/^[[:space:]]+MC_MAX_RECEIVE_SLOTS:[[:space:]]*"?([^"[:space:]]*)"?.*$/\1/')"
+    cap="${cap_line#MC_MAX_RECEIVE_SLOTS=}"
     if [[ ! "$cap" =~ ^[1-9][0-9]*$ ]]; then
         fail "receive slots: CANNOT VERIFY — MC_MAX_RECEIVE_SLOTS in ${MC_SHARED_CONFIGMAP} is not an integer >= 1 (got '${cap}'), so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap."
         echo "      This is REPO/CONFIG DRIFT — the KEY IS PRESENT and its VALUE is malformed (MC"

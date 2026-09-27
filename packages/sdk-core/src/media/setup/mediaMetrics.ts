@@ -106,7 +106,7 @@ const KEY_CUSTODY = 'operator';
  * RESERVED SENTINEL: `invalid` must never become a real token in this or any
  * neighbouring media vocabulary. The OTel collector rewrites any value failing
  * its charset check to exactly that string
- * (`infra/services/otel-collector/configmap.yaml`), so a real token spelled
+ * (`infra/services/otel-collector/collector.yaml`), so a real token spelled
  * `invalid` would be indistinguishable from a rewritten junk value from a
  * patched client. `dt-guard client-metrics-export` (G6) fails the build if it
  * ever appears here or in MH's `MediaDropReason`.

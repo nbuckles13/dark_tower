@@ -544,15 +544,19 @@ sqlx migrate run --source migrations
 
 ### Grafana Not Showing Dashboards
 
+Dashboards are content-addressed ConfigMaps mounted into the Grafana pod
+(`docs/observability/dashboards.md` §Kubernetes), so applying the environment root
+rolls Grafana whenever a dashboard changes. A restart is never the fix.
+
 ```bash
-# Check ConfigMaps
-kubectl get configmap -n dark-tower-observability
+# Is every dashboard file mounted? Compare against infra/grafana/dashboards/*.json
+kubectl exec -n dark-tower-observability deploy/grafana -- ls /var/lib/grafana/dashboards
 
-# Check Grafana logs
+# Is the running pod on the current render? (Should print nothing.)
+kubectl diff -k infra/kubernetes/overlays/kind/observability/
+
+# Check Grafana logs (provisioning errors name the offending file)
 kubectl logs -n dark-tower-observability -l app=grafana
-
-# Restart Grafana
-kubectl rollout restart deployment/grafana -n dark-tower-observability
 ```
 
 ### Container Runtime Issues

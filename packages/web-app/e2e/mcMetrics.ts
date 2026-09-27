@@ -43,7 +43,7 @@
 // Prometheus's default `instance` = `__address__` = pod IP:port is the per-pod
 // identity, fresh on every rollover. Two traps this depends on:
 //   1. A `pod` target_label exists ONLY in
-//      `infra/kubernetes/observability/promtail-config.yaml` (logs/Loki) — NEVER
+//      `infra/kubernetes/observability/promtail.yaml` (logs/Loki) — NEVER
 //      the metrics path. For metrics the identity is `instance`.
 //   2. The mc/mh Deployments carry a STABLE pod metadata label `instance: mc-0`
 //      that is NOT propagated into series today (no `labelmap` in the mc/mh

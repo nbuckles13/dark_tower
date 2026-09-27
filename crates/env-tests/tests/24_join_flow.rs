@@ -70,7 +70,7 @@ async fn cluster() -> &'static ClusterConnection {
 /// The budget is the DEPLOYED limit, not AC's compiled default. The dev cluster
 /// sets `AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"` /
 /// `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES: "1"`
-/// (`infra/services/ac-service/configmap.yaml:14-15`), so the per-IP ceiling here is
+/// (`AC_REGISTRATION_RATE_LIMIT_*` in `infra/services/ac-service/config.env`), so the per-IP ceiling here is
 /// 100/minute — not the 5/hour default in `crates/ac-service/src/config.rs:50,57` that
 /// applies only when those keys are absent. The limit is counted in Postgres
 /// (`user_service.rs:80`), so it is the one AC budget that survives a pod rollout;

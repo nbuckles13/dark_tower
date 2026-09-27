@@ -322,9 +322,10 @@ kubectl get pods -n dark-tower -l app=mc-service
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Expected recovery time: NONE from scaling -- it is not an available lever.
-# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
-# plus a roll: minutes, and it takes effect only on restart (no content hash --
-# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a config.env edit
+# plus an apply of the environment root: minutes. The ConfigMap is
+# content-addressed, so the apply itself rolls both MC pods (see
+# docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
 # instance is a manifest change (ConfigMap + Deployment + Service + Kind port
 # mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
@@ -454,9 +455,10 @@ kubectl logs -n dark-tower -l app=mc-service --tail=100 | grep -i "reject\|capac
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Expected recovery time: NONE from scaling -- it is not an available lever.
-# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
-# plus a roll: minutes, and it takes effect only on restart (no content hash --
-# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a config.env edit
+# plus an apply of the environment root: minutes. The ConfigMap is
+# content-addressed, so the apply itself rolls both MC pods (see
+# docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
 # instance is a manifest change (ConfigMap + Deployment + Service + Kind port
 # mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
@@ -602,8 +604,8 @@ kubectl rollout history deployment/gc-service -n dark-tower
    - Fix: Restore secret
 
 4. **Missing ConfigMap**: Required ConfigMap deleted
-   - Check: `kubectl get configmap -n dark-tower gc-service-config`
-   - Fix: Restore ConfigMap
+   - Check: `kubectl describe pod -n dark-tower -l app=gc-service` (the pod shows `CreateContainerConfigError` naming the missing ConfigMap). The ConfigMap's name is content-hash-suffixed (`gc-service-config-<hash>`), so `kubectl get configmap -n dark-tower -l app=gc-service` lists every generation.
+   - Fix: re-apply the environment root, which re-creates the exact generation the pod template references. Or run `kubectl rollout undo deployment/gc-service -n dark-tower` if the reference itself is the regression.
 
 5. **ImagePullBackOff**: Cannot pull container image
    - Check: Pod events show image pull errors
@@ -1554,11 +1556,12 @@ sum by(result, failure_reason) (rate(gc_jwt_validations_total[15m]))
 
 2. **CORS misconfiguration**: allowed-origins list regressed; browsers blocked at preflight. NOTE: the allowlist is fail-closed — an EMPTY `CORS_ALLOWED_ORIGINS` blocks ALL cross-origin browser requests, which is exactly the misconfig shape that produces total telemetry silence
    - Check: step 2 denied/403 spike; then the knob itself:
-     `kubectl get configmap gc-service -n dark-tower -o yaml | grep CORS`
+     `kubectl get configmap -n dark-tower -o yaml "$(kubectl get deployment/gc-service -n dark-tower -o jsonpath='{.spec.template.spec.containers[?(@.name=="gc-service")].env[?(@.name=="CORS_ALLOWED_ORIGINS")].valueFrom.configMapKeyRef.name}')" | grep CORS`
+     (the ConfigMap name is content-hash-suffixed; this resolves the one the pods actually use)
      (`CORS_ALLOWED_ORIGINS`, comma-separated explicit origins, never `*` —
-     set in `infra/services/gc-service/configmap.yaml` + env overlays, read by
+     set in `infra/services/gc-service/config.env` + env overlays, read by
      `crates/gc-service/src/config.rs`)
-   - Fix: correct `CORS_ALLOWED_ORIGINS` in the gc-service ConfigMap and restart; expected recovery 2-3 minutes
+   - Fix: correct `CORS_ALLOWED_ORIGINS` in `infra/services/gc-service/config.env` and apply the environment root. The content-addressed ConfigMap rolls GC on apply. Expected recovery 2-3 minutes
 
 3. **Auth regression on the telemetry route**: clients getting 401s pre-handler
    - Check: step 4
@@ -1580,7 +1583,7 @@ sum by(result, failure_reason) (rate(gc_jwt_validations_total[15m]))
 
 ```bash
 # Option 1: Fix CORS origin allowlist — edit CORS_ALLOWED_ORIGINS in the
-# gc-service ConfigMap (infra/services/gc-service/configmap.yaml / env overlay;
+# gc-service ConfigMap (infra/services/gc-service/config.env / env overlay;
 # comma-separated explicit origins, never "*"; empty = fail-closed, ALL
 # cross-origin browser requests blocked), then:
 kubectl rollout restart deployment/gc-service -n dark-tower
@@ -1627,8 +1630,12 @@ A `denied`/`403` climb while `allowed` drops right after a deploy signals a CORS
 #    logs carry the structured requested_origin field (never string-interpolated).
 kubectl logs -n dark-tower -l app=gc-service --tail=500 | grep -i "CORS preflight denied"
 
-# 2. Inspect the live allowlist knob.
-kubectl get configmap gc-service -n dark-tower -o yaml | grep CORS_ALLOWED_ORIGINS
+# 2. Inspect the live allowlist knob. The ConfigMap name is content-hash-suffixed
+#    (ADR-0038); resolve the one the running pod template references.
+kubectl get configmap -n dark-tower -o yaml \
+  "$(kubectl get deployment/gc-service -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="gc-service")].env[?(@.name=="CORS_ALLOWED_ORIGINS")].valueFrom.configMapKeyRef.name}')" \
+  | grep CORS_ALLOWED_ORIGINS
 #   Empty value            -> fail-closed: ALL cross-origin browser requests blocked
 #   Missing the real origin -> that origin specifically blocked
 #   Value "*"               -> does NOT widen: config keeps "*" verbatim, and "*" parses
@@ -1640,7 +1647,7 @@ kubectl get configmap gc-service -n dark-tower -o yaml | grep CORS_ALLOWED_ORIGI
 
 # 3. Diff against last-good to pinpoint the regression. The ConfigMap + overlay are
 #    the single source; crates/gc-service/src/config.rs parses CORS_ALLOWED_ORIGINS.
-git log -p --oneline -- infra/services/gc-service/configmap.yaml \
+git log -p --oneline -- infra/services/gc-service/config.env \
   infra/kubernetes/overlays/*/services/gc-service/ | head -80
 ```
 
@@ -1665,8 +1672,9 @@ For the shared `gc_cors_preflight_total` allowlist query and the fail-closed sem
 # explicit, NEVER "*" and never allow-all (the layer is fail-closed by design and
 # runs with allow_credentials(false); a "*" entry does NOT allow-all — it panics
 # AllowOrigin::list and crashes gc-service at startup).
-# Edit infra/services/gc-service/configmap.yaml (or the env overlay), then:
-kubectl rollout restart deployment/gc-service -n dark-tower
+# Edit infra/services/gc-service/config.env (or the env overlay), then apply the
+# environment root (Kind: ./infra/kind/scripts/setup.sh --skip-build --only gc).
+# The content-addressed ConfigMap rolls GC on apply; no restart step:
 kubectl rollout status deployment/gc-service -n dark-tower
 
 # Alternatively, if the regression came from a specific deploy, roll that back:
@@ -1705,7 +1713,10 @@ First confirm collector-pod health per **Scenario 10 step 5** (`kubectl get pods
 # Path check — DNS + reachability + config from a GC pod to the configured endpoint.
 # OTEL_COLLECTOR_ENDPOINT is the BARE base (scheme+host+port, no path); GC appends
 # /v1/metrics|/v1/traces itself (crates/gc-service/src/config.rs).
-kubectl get configmap gc-service -n dark-tower -o yaml | grep OTEL_COLLECTOR_ENDPOINT
+kubectl get configmap -n dark-tower -o yaml \
+  "$(kubectl get deployment/gc-service -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="gc-service")].env[?(@.name=="OTEL_COLLECTOR_ENDPOINT")].valueFrom.configMapKeyRef.name}')" \
+  | grep OTEL_COLLECTOR_ENDPOINT
 kubectl exec -n dark-tower deployment/gc-service -- \
   sh -c 'getent hosts otel-collector.dark-tower.svc.cluster.local'
 # Confirm no NetworkPolicy blocks GC egress -> collector

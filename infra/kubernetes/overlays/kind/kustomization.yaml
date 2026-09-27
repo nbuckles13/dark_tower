@@ -1,3 +1,16 @@
+# The Kind ENVIRONMENT ROOT (ADR-0038 §2): composes every service, the OTel
+# collector and the observability stack. `infra/kind/scripts/setup.sh`
+# (apply_env_root) is what applies it, and every ConfigMap a pod template
+# consumes is content-addressed, so an apply rolls exactly the workloads whose
+# configuration changed.
+#
+# DEVLOOP CLUSTERS MUST APPLY THROUGH `setup.sh:apply_env_root`, NOT a plain
+# `kubectl apply -k` of this directory. A devloop cluster advertises its MC/MH
+# WebTransport endpoints on the host-gateway IP and per-slug ports; apply_env_root
+# layers those onto this root as a rendered wrapper. A plain apply of this
+# directory silently puts mc-{0,1}/mh-{0,1} back on the 127.0.0.1 defaults —
+# no error at apply time, broken media in Layer 7. On the static host topology
+# (no DT_HOST_GATEWAY_IP) the plain root IS the correct render.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

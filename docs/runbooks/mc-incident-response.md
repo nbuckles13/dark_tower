@@ -244,9 +244,10 @@ curl http://localhost:8080/metrics | grep mc_messages_dropped_total
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Expected recovery time: NONE from scaling -- it is not an available lever.
-# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
-# plus a roll: minutes, and it takes effect only on restart (no content hash --
-# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a config.env edit
+# plus an apply of the environment root: minutes. The ConfigMap is
+# content-addressed, so the apply itself rolls both MC pods (see
+# docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
 # instance is a manifest change (ConfigMap + Deployment + Service + Kind port
 # mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
@@ -532,8 +533,8 @@ kubectl rollout history deployment/mc-0 -n dark-tower
    - Fix: Restore secret
 
 5. **Missing ConfigMap**: Required ConfigMap deleted
-   - Check: `kubectl get configmap -n dark-tower mc-service-config`
-   - Fix: Restore ConfigMap
+   - Check: `kubectl describe pod -n dark-tower -l app=mc-service` (`CreateContainerConfigError` names the missing ConfigMap). ConfigMap names are content-hash-suffixed (`mc-service-config-<hash>`, ADR-0038), so `kubectl get configmap -n dark-tower -l app=mc-service` lists every generation.
+   - Fix: re-apply the environment root, which re-creates the exact generation the pod template references
 
 6. **Actor System Initialization Failure**: Actor system cannot start
    - Check: Logs for actor initialization errors
@@ -556,8 +557,12 @@ kubectl delete pods -n dark-tower -l app=mc-service
 
 # Option 3: Check and restore missing secrets/configmaps
 kubectl get secret -n dark-tower mc-service-secrets
-kubectl get configmap -n dark-tower mc-service-config
-# If missing, recreate from secure backup
+# ConfigMap names are content-hash-suffixed; resolve the one mc-0 references:
+kubectl get configmap -n dark-tower \
+  "$(kubectl get deployment/mc-0 -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="mc-service")].env[?(@.name=="GC_GRPC_URL")].valueFrom.configMapKeyRef.name}')"
+# Secret missing: recreate from secure backup. ConfigMap missing: re-apply the
+# environment root, which re-creates it from infra/services/mc-service/*.env.
 
 # Option 4: Increase resource limits (if OOMKilled)
 kubectl patch deployment/mc-0 -n dark-tower -p '{"spec":{"template":{"spec":{"containers":[{"name":"mc-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
@@ -671,9 +676,10 @@ kubectl patch deployment/mc-1 -n dark-tower -p '{"spec":{"template":{"spec":{"co
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Expected recovery time: NONE from scaling -- it is not an available lever.
-# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
-# plus a roll: minutes, and it takes effect only on restart (no content hash --
-# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a config.env edit
+# plus an apply of the environment root: minutes. The ConfigMap is
+# content-addressed, so the apply itself rolls both MC pods (see
+# docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
 # instance is a manifest change (ConfigMap + Deployment + Service + Kind port
 # mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
@@ -911,9 +917,10 @@ curl http://localhost:8080/metrics | grep mc_actor_mailbox_depth
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Expected recovery time: NONE from scaling -- it is not an available lever.
-# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
-# plus a roll: minutes, and it takes effect only on restart (no content hash --
-# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a config.env edit
+# plus an apply of the environment root: minutes. The ConfigMap is
+# content-addressed, so the apply itself rolls both MC pods (see
+# docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
 # instance is a manifest change (ConfigMap + Deployment + Service + Kind port
 # mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
@@ -1174,9 +1181,10 @@ kubectl exec -it deployment/redis -n dark-tower -- redis-cli ping
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Expected recovery time: NONE from scaling -- it is not an available lever.
-# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
-# plus a roll: minutes, and it takes effect only on restart (no content hash --
-# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a config.env edit
+# plus an apply of the environment root: minutes. The ConfigMap is
+# content-addressed, so the apply itself rolls both MC pods (see
+# docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
 # instance is a manifest change (ConfigMap + Deployment + Service + Kind port
 # mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
@@ -1345,9 +1353,10 @@ kubectl edit networkpolicy mc-service -n dark-tower
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
 # Expected recovery time: NONE from scaling -- it is not an available lever.
-# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a ConfigMap edit
-# plus a roll: minutes, and it takes effect only on restart (no content hash --
-# see docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
+# Capping admission (MC_MAX_MEETINGS / MC_MAX_PARTICIPANTS) is a config.env edit
+# plus an apply of the environment root: minutes. The ConfigMap is
+# content-addressed, so the apply itself rolls both MC pods (see
+# docs/runbooks/mc-deployment.md §Config-failure triage). Adding an mc-2
 # instance is a manifest change (ConfigMap + Deployment + Service + Kind port
 # mapping) and a deploy -- plan it, do not attempt it mid-incident.
 
@@ -2509,7 +2518,7 @@ or a sender's own rotation push is landing late (check that sender side against 
 **At the shipped default, raising W does NOT help — read this before touching it.** Retention is
 `min(W/2, ceiling)`, and the client ceiling `KEK_RETENTION_CEILING_MS` (30s, in
 `packages/sdk-core/src/config/clientConfig.ts`) is the binding parameter: at the default
-`MC_KEK_ROTATION_DEBOUNCE_SECONDS=60` (`infra/services/mc-service/configmap.yaml`), W/2 equals that
+`MC_KEK_ROTATION_DEBOUNCE_SECONDS=60` (`infra/services/mc-service/config.env`), W/2 equals that
 ceiling EXACTLY, so retention is **already at its design maximum**. Raising W to 90, 120 or 300
 yields the identical 30s — and flips `ceiling_clamped` to permanently non-zero fleet-wide, a second
 signal manufactured by a change that cannot help. If you have already raised W and see

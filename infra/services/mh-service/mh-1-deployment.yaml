@@ -118,7 +118,7 @@ spec:
               name: mh-service-config
               key: MH_MAX_CONNECTIONS
         # Story-2 egress-budget chain (R-19, R-23). Rationale for every value
-        # is in configmap.yaml, which is its single home. HARD references, NOT
+        # is in config.env, which is its single home. HARD references, NOT
         # `optional:` — all six are required reads (four since story 2 task 8,
         # the other two when tasks 10/11 land), so a key
         # missing here must be a loud CreateContainerConfigError, never a pod

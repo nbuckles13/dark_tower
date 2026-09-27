@@ -2,10 +2,38 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - configmap.yaml
   - deployment.yaml
   - service.yaml
   - network-policy.yaml
+
+# Content-addressed configuration (ADR-0038 §2): generated, so kustomize
+# appends a hash of the data to the name and rewrites the volume reference;
+# editing the config file changes the pod template and rolls the pod.
+# `namespace:` is load-bearing -- see
+# infra/kubernetes/observability/kustomization.yaml.
+#
+# OpenTelemetry Collector configuration for local Kind development (R-59).
+#
+# TWO SIGNALS, TWO FATES. Traces are a dev sink: OTLP-gRPC from AC/GC/MC (R-55)
+# and OTLP-HTTP from GC's /api/v1/telemetry proxy (R-2) are written to the
+# collector log via `debug`. NO production trace exporter (Tempo / Honeycomb /
+# etc.) — that matches ADR-0036's recorded trace-export decision.
+#
+# METRICS are a real pipeline as of R-27: browser `dt_client_*` series are
+# filtered, label-bounded, accumulated across browsers, and exposed on :8889
+# for Prometheus to PULL. That pipeline is what makes `MCMediaMissingKeyMaterial`
+# able to fire at all. See `docs/observability/metrics/client.md` for the
+# stored-label shape (the ONE home for what a client series looks like in
+# Prometheus — do not restate it here).
+configMapGenerator:
+  - name: otel-collector-config
+    namespace: dark-tower
+    files:
+      - config.yaml=collector.yaml
+    options:
+      labels:
+        app: otel-collector
+        component: observability
 
 labels:
   - pairs:

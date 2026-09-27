@@ -35,7 +35,7 @@
 - Runner, hermetic suite, preflight, stop hook -> `scripts/workflow/run-story.sh`, `scripts/workflow/run-story.test.sh`, `scripts/workflow/preflight-story.sh`, `scripts/workflow/devloop-stop-hook.sh`. Manifest producers/consumers, one home each -> `.claude/skills/user-story/SKILL.md`, `.claude/skills/close-story/SKILL.md`, `scripts/guards/simple/validate-story-manifest.sh`, `docs/user-stories/_template.md`
 
 ## JWT Validation
-- Shared logic -> `crates/common/src/jwt.rs`, `crates/common/src/meeting_token.rs`; thin wrappers -> `crates/gc-service/src/auth/jwt.rs`, `crates/mc-service/src/auth/mod.rs`; MH JWKS config -> `infra/services/mh-service/configmap.yaml`. Display-name join carrier -> `crates/ac-service/src/handlers/internal_tokens.rs` + `crates/common/src/jwt.rs` (GSA); the AC serialize-only copy lockstep -> `docs/TODO.md`
+- Shared logic -> `crates/common/src/jwt.rs`, `crates/common/src/meeting_token.rs`; thin wrappers -> `crates/gc-service/src/auth/jwt.rs`, `crates/mc-service/src/auth/mod.rs`; MH JWKS config -> `infra/services/mh-service/config.env`. Display-name join carrier -> `crates/ac-service/src/handlers/internal_tokens.rs` + `crates/common/src/jwt.rs` (GSA); the AC serialize-only copy lockstep -> `docs/TODO.md`
 
 ## Observability
 - Per-service metrics -> `crates/mc-service/src/observability/metrics.rs` and siblings (per-service, not duplication); **cross-service label vocabulary has one home** -> `crates/common/src/observability/labels.rs` — check here before declaring a label const in a service crate. Health endpoints -> `crates/mc-service/src/observability/health.rs`, `crates/mh-service/src/observability/health.rs` (duplicated, see `docs/TODO.md`), `crates/gc-service/src/routes/mod.rs`

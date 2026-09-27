@@ -636,7 +636,7 @@ export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean
      bounds), plus MH_MAX_REGISTERED_MEETINGS and
      MH_MAX_MUTED_SOURCES_PER_MEETING, which story 2 tasks 11 and 10 make
      required (harmless to set before then). VALUES mirror
-     infra/services/mh-service/configmap.yaml (the budget mirrors the Kind
+     infra/services/mh-service/config.env (the budget mirrors the Kind
      overlay's, so a local run is not starved); that file is the single home —
      if they disagree, it wins. MH_MAX_STREAMS is deliberately absent: it is
      retired and no longer read. -->

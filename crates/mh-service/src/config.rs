@@ -73,7 +73,7 @@ pub const MAX_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 300;
 // different remedy.
 //
 // All four are REQUIRED reads (story 2 R-22) with no code default: their
-// ConfigMap entries in `infra/services/mh-service/configmap.yaml` are the single
+// ConfigMap entries in `infra/services/mh-service/config.env` are the single
 // home for the numbers, and a required read is what gives `dt-guard env-config`
 // rule-1 coverage (it keys on `ConfigError::MissingEnvVar` literals, which a
 // defaulted read never emits). Each also has a hard code-level CEILING, because
@@ -105,7 +105,7 @@ pub const MAX_EGRESS_STREAMS_PER_MEETING_CEILING: usize = 8_192;
 /// deployed relation is `MH_MAX_MUTED_SOURCES_PER_MEETING >=
 /// MH_MAX_EGRESS_STREAMS_PER_MEETING` (a legitimate per-handler muted set can
 /// never name more senders than the streams they source there — see
-/// `infra/services/mh-service/configmap.yaml`). A muted ceiling BELOW the egress
+/// `infra/services/mh-service/config.env`). A muted ceiling BELOW the egress
 /// ceiling would make some egress value MH accepts impossible to pair with a
 /// legal muted value; boot would then refuse on
 /// [`ConfigError::MutedSourceBoundBelowEgressBound`] for a configuration no
@@ -134,7 +134,7 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 ///
 /// This docstring is the surviving home of the reasoning that previously sat on
 /// the deleted `DEFAULT_MAX_TOTAL_EGRESS_EDGES` (moved intact when the read
-/// became required, story 2 task 8); `infra/services/mh-service/configmap.yaml`
+/// became required, story 2 task 8); `infra/services/mh-service/config.env`
 /// and `docs/TODO.md` §Media Path Obligations cite it.
 ///
 /// It also bounds the derived egress stream ceiling from above: MH refuses to
@@ -242,7 +242,7 @@ pub const MAX_REGISTERED_MEETINGS_CEILING: usize = 65_536;
 /// nudge fires on the deployed placeholder by design, whereas this one fires
 /// only when someone has lowered a value deployed at 8192 — the cap is
 /// cumulative across uptime until reclamation is fenced (see
-/// `infra/services/mh-service/configmap.yaml`), so a low value is a
+/// `infra/services/mh-service/config.env`), so a low value is a
 /// registration outage waiting for uptime.
 pub const REGISTERED_MEETINGS_ADVISORY_MIN: usize = 100;
 
@@ -358,7 +358,7 @@ const _: () = assert!(
 // which one they are in:
 //
 //   1. ENV-DRIVEN, REQUIRED  — parsed in `from_vars`, supplied by
-//      `infra/services/mh-service/configmap.yaml` (or, for the termination
+//      `infra/services/mh-service/config.env` (or, for the termination
 //      grace, by the kustomize `replacements:` block writing each instance's
 //      own pod spec into its own env). Change the manifest; no release needed.
 //   2. COMPILE-TIME CONSTANT — everything in THIS section. Changing one is a
@@ -561,7 +561,7 @@ pub const NOMINAL_AUDIO_FRAME_BYTES: usize = NOMINAL_OPUS_PAYLOAD_BYTES
 ///
 /// A compile-time constant rather than an env var: no manifest supplies it, and
 /// a newly-required variable with no manifest is a deploy-time `CrashLoop`.
-/// `infra/services/mh-service/configmap.yaml` documents this value to operators
+/// `infra/services/mh-service/config.env` documents this value to operators
 /// as the bound `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` must sit strictly above.
 ///
 /// The queue itself lands with the forward path (story task 16). This value is
@@ -683,7 +683,7 @@ pub const QUINN_DEFAULT_MAX_CONCURRENT_UNI_STREAMS: u32 = 100;
 /// ADR-0036 §1 requires this bound be declared because "a bound has to be
 /// declared to be assertable and the default being adequate is not the same as
 /// the default being chosen", and
-/// `infra/services/mh-service/configmap.yaml` justifies the deployed `64` as
+/// `infra/services/mh-service/config.env` justifies the deployed `64` as
 /// "sitting below quinn's unchosen default of 100, so the ceiling is
 /// demonstrably ours".
 ///
@@ -724,7 +724,7 @@ pub const MAX_IDLE_TIMEOUT_SECONDS: u64 = 30;
 /// **sends both pods into `CrashLoopBackOff` immediately**, with no warning band and no
 /// intermediate degraded state, because the deployed keepalive is already at
 /// the limit. Either edit must move `MH_KEEPALIVE_INTERVAL_MS` in
-/// `infra/services/mh-service/configmap.yaml` in the same change.
+/// `infra/services/mh-service/config.env` in the same change.
 ///
 /// Recorded because the arithmetic is invisible from either constant alone:
 /// nothing here or in `MAX_IDLE_TIMEOUT_SECONDS` hints that a third value,
@@ -748,7 +748,7 @@ pub const MIN_KEEPALIVE_TO_IDLE_RATIO: u64 = 3;
 /// so an undeclared receive window voids the drain window derived in this same
 /// file under exactly the adversarial condition where it would matter most.
 ///
-/// # Corrected arithmetic — THIS SUPERSEDES `infra/services/mh-service/configmap.yaml:174`
+/// # Corrected arithmetic — THIS SUPERSEDES the `MH_MAX_CONNECTIONS` memory comment in `infra/services/mh-service/config.env`
 ///
 /// That comment states the declared receive side drops the ceiling to
 /// "~263 KB". It has **two independent defects, pointing in opposite
@@ -781,7 +781,7 @@ pub const MIN_KEEPALIVE_TO_IDLE_RATIO: u64 = 3;
 /// can change: a ledger that omits the only tunable term cannot show whoever
 /// inherits it (story 2's egress-budget work) the effect of the one value they
 /// are able to move. That is the same defect this docstring exists to correct in
-/// `configmap.yaml` — an incomplete base someone else re-derives from — and
+/// `config.env` — an incomplete base someone else re-derives from — and
 /// omitting it here while correcting it there would be the narrower version of
 /// the same mistake. Bounded above by
 /// [`MAX_DATAGRAM_BUFFER_AUDIO_FRAMES_CEILING`], so its worst case is
@@ -1139,7 +1139,7 @@ fn parse_unit_ratio(key: &str, raw: &str, consequence: &str) -> Result<f64, Conf
     if !(0.0..=1.0).contains(&parsed) {
         return Err(ConfigError::InvalidValue(format!(
             "{key} must be in 0.0..=1.0, got {parsed} — {consequence}. Remediation: set {key} \
-             in infra/services/mh-service/configmap.yaml to a value in 0.0..=1.0"
+             in infra/services/mh-service/config.env to a value in 0.0..=1.0"
         )));
     }
     Ok(parsed)
@@ -1305,7 +1305,7 @@ fn reject_zero(key: &str, value: u64, consequence: &str) -> Result<(), ConfigErr
     if value == 0 {
         return Err(ConfigError::InvalidValue(format!(
             "{key} must be greater than 0, got 0 — {consequence}. Remediation: set {key} in \
-             infra/services/mh-service/configmap.yaml"
+             infra/services/mh-service/config.env"
         )));
     }
     Ok(())
@@ -1322,7 +1322,7 @@ fn reject_above(key: &str, value: u64, ceiling: u64, consequence: &str) -> Resul
     if value > ceiling {
         return Err(ConfigError::InvalidValue(format!(
             "{key} must be at most {ceiling}, got {value} — {consequence}. Remediation: lower \
-             {key} in infra/services/mh-service/configmap.yaml to {ceiling} or less"
+             {key} in infra/services/mh-service/config.env to {ceiling} or less"
         )));
     }
     Ok(())
@@ -1593,7 +1593,7 @@ pub enum ConfigError {
          than the application egress queue bound ({egress_queue_frames} frames): ADR-0036 §1 \
          requires MH's own queue to trip FIRST so back-pressure is countable in MH's code rather \
          than silently discarded inside quinn. Remediation: raise \
-         MH_DATAGRAM_BUFFER_AUDIO_FRAMES in infra/services/mh-service/configmap.yaml above \
+         MH_DATAGRAM_BUFFER_AUDIO_FRAMES in infra/services/mh-service/config.env above \
          {egress_queue_frames}"
     )]
     EgressQueueDoesNotBindFirst {
@@ -1630,7 +1630,7 @@ pub enum ConfigError {
          ({budget_bps} bit/s) / max(MH_STREAM_COST_AUDIO_BPS, MH_STREAM_COST_VIDEO_BPS) \
          ({max_stream_cost_bps} bit/s), converted to bytes and floored. A handler this small \
          would boot, be placed by GC, and then reject nearly every stream. Remediation: RAISE \
-         MH_EGRESS_BUDGET_BPS in infra/services/mh-service/configmap.yaml. NEVER lower the \
+         MH_EGRESS_BUDGET_BPS in infra/services/mh-service/config.env. NEVER lower the \
          floor (a code constant) to quiet this refusal"
     )]
     EgressStreamCeilingBelowFloor {
@@ -1651,7 +1651,7 @@ pub enum ConfigError {
          ({max_total_egress_edges}). The resource-exhaustion guard must sit at or above the \
          capacity it backstops: otherwise GC is advertised a capacity MH refuses at the \
          resource guard. Remediation: raise MH_MAX_TOTAL_EGRESS_EDGES to at least {ceiling}, or \
-         lower MH_EGRESS_BUDGET_BPS, in infra/services/mh-service/configmap.yaml"
+         lower MH_EGRESS_BUDGET_BPS, in infra/services/mh-service/config.env"
     )]
     EgressStreamCeilingExceedsEdgeBound {
         /// The derived ceiling.
@@ -1674,7 +1674,7 @@ pub enum ConfigError {
          registration naming more muted senders than it admits is rejected whole and the \
          meeting loses all its edges. Remediation: raise MH_MAX_MUTED_SOURCES_PER_MEETING to at \
          least {egress}, or lower MH_MAX_EGRESS_STREAMS_PER_MEETING, in \
-         infra/services/mh-service/configmap.yaml"
+         infra/services/mh-service/config.env"
     )]
     MutedSourceBoundBelowEgressBound {
         /// The configured `MH_MAX_MUTED_SOURCES_PER_MEETING`.
@@ -1696,7 +1696,7 @@ pub enum ConfigError {
         "MH_KEEPALIVE_INTERVAL_MS={keepalive_ms} is too large: keepalive must be at most \
          max_idle_timeout / {min_ratio} = {max_allowed_ms}ms (idle timeout {idle_timeout_ms}ms), \
          so a single lost keepalive still leaves margin before the peer times out. Remediation: \
-         lower MH_KEEPALIVE_INTERVAL_MS in infra/services/mh-service/configmap.yaml to \
+         lower MH_KEEPALIVE_INTERVAL_MS in infra/services/mh-service/config.env to \
          {max_allowed_ms} or less"
     )]
     KeepaliveTooLarge {
@@ -2307,7 +2307,7 @@ mod tests {
                 "http://localhost:8082/.well-known/jwks.json".to_string(),
             ),
             // ADR-0036 §1 transport parameters, all REQUIRED. Values are the
-            // DEPLOYED ones from `infra/services/mh-service/configmap.yaml`, so
+            // DEPLOYED ones from `infra/services/mh-service/config.env`, so
             // a manifest/code divergence shows up here rather than only in a
             // cluster: a test fixture that invented its own numbers would keep
             // passing while production CrashLooped.
@@ -2645,7 +2645,7 @@ mod tests {
             Err(ConfigError::InvalidValue(msg)) => {
                 assert!(msg.contains("MH_MAX_CONCURRENT_UNI_STREAMS"), "{msg}");
                 assert!(
-                    msg.contains("configmap.yaml"),
+                    msg.contains("infra/services/mh-service/config.env"),
                     "must name where to fix it: {msg}"
                 );
             }
@@ -2822,7 +2822,7 @@ mod tests {
 
     #[test]
     fn the_deployed_keepalive_satisfies_the_ratio_the_configmap_asserts() {
-        // `configmap.yaml` states 10000 ms is a chosen 1:3 against a 30 s idle
+        // `config.env` states 10000 ms is a chosen 1:3 against a 30 s idle
         // timeout. Pinned here so the ConfigMap's claim is checked rather than
         // narrated.
         let config = Config::from_vars(&base_vars()).expect("deployed values must load");
@@ -2837,7 +2837,7 @@ mod tests {
              against a {}ms idle timeout. A failure means a CONSTANT moved the boundary under the \
              deployed value — either MIN_KEEPALIVE_TO_IDLE_RATIO went up or MAX_IDLE_TIMEOUT_SECONDS \
              went down. Both pods would refuse to start. Fix by lowering \
-             MH_KEEPALIVE_INTERVAL_MS in infra/services/mh-service/configmap.yaml in the SAME \
+             MH_KEEPALIVE_INTERVAL_MS in infra/services/mh-service/config.env in the SAME \
              change; do not relax the ratio to make this pass.",
             config.quic_transport.keepalive_interval_ms,
             config.quic_transport.keepalive_interval_ms,
@@ -3786,5 +3786,35 @@ mod tests {
             config.otel_config().is_none(),
             "endpoint present but disabled must NOT enable OTel (no presence-gating)"
         );
+    }
+
+    #[test]
+    fn every_infra_path_this_file_cites_resolves() {
+        // The operator-facing remediation strings above name the file to edit.
+        // Nothing else checks that it exists: when the ConfigMap moved to a
+        // generator source (ADR-0038) every one of them went stale at once.
+        // Scan this file's own text so a new remediation string is covered
+        // without being registered anywhere (docs/TODO.md entry, 2026-09-02).
+        let src = include_str!("config.rs");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut cited = 0;
+        for (i, _) in src.match_indices("infra/services/") {
+            let path: String = src[i..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, '`' | '"' | '\\' | ')' | ','))
+                .collect();
+            let path = path.trim_end_matches('.');
+            // A brace/star glob (`mh-{{0,1}}-deployment.yaml`) names a family,
+            // not a file; the concrete members are cited elsewhere.
+            if path.contains(['{', '*']) {
+                continue;
+            }
+            assert!(
+                root.join(path).exists(),
+                "config.rs cites {path}, which does not exist"
+            );
+            cited += 1;
+        }
+        assert!(cited > 0, "expected at least one cited infra path");
     }
 }

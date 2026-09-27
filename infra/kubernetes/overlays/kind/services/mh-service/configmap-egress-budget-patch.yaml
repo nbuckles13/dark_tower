@@ -1,6 +1,6 @@
 # Kind dev-cluster egress budget (story 2 R-19), strategic-merge patch.
 #
-# The prod base (infra/services/mh-service/configmap.yaml) ships
+# The prod base (infra/services/mh-service/config.env) ships
 # MH_EGRESS_BUDGET_BPS as a deliberately-unsized placeholder. That placeholder
 # admits fewer streams than the suite needs, so the Kind cluster must override
 # it. This patch changes that ONE value and nothing else; every other base key

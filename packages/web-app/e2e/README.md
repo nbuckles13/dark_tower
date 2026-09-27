@@ -268,7 +268,7 @@ counterpart). MC/MH endpoints come exclusively from the join response's
 
   The rate-limit **SSoT is the AC config the target cluster actually runs**: the
   Kind cluster this suite targets ships
-  `infra/services/ac-service/configmap.yaml`
+  `infra/services/ac-service/config.env`
   (`AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"` per 1-minute window,
   relaxed for dev/test), so consecutive runs and the Layer-7 retry are safe. A
   **prod-configured AC** target instead gets the production default of 5 per

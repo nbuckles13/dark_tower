@@ -96,6 +96,16 @@ jobs:
         # Mirrors ci-client.yml's equivalent step.
         run: cargo build --release -p dt-guard -p dt-story --locked
 
+      - name: Assert kubectl is present (kustomize R-21 renders the environment root)
+        # `dt-guard kustomize` R-21 (ADR-0038 content-addressed ConfigMaps) FAILS
+        # when no kustomize tool resolves, instead of degrading to a WARN. It is
+        # the invariant's only enforcement. GitHub's ubuntu runner images ship
+        # kubectl; this step makes that premise explicit and loud, so a runner
+        # image change surfaces here and not as a confusing guard failure. The
+        # devloop image pins kubectl in infra/devloop/Dockerfile (KUBECTL_VERSION).
+        # See docs/TODO.md "validate-kustomize maps 'I did not check this'...".
+        run: kubectl version --client && kubectl kustomize --help >/dev/null
+
       - name: Install Playwright Chromium
         # INTERIM PATCH (see TODO: run CI in the devloop image). Layer 4
         # (scripts/lang/ts/test.sh → nx test:component) runs vitest browser-mode

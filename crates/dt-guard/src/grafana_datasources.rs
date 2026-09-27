@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 
 const DASHBOARDS_SUBDIR: &str = "infra/grafana/dashboards";
 const DATASOURCES_CONFIG: &str = "infra/grafana/provisioning/datasources/datasources.yaml";
-const PROMTAIL_CONFIG: &str = "infra/kubernetes/observability/promtail-config.yaml";
+/// The Promtail server config itself — the source of the `promtail-config`
+/// ConfigMap generator in `infra/kubernetes/observability/kustomization.yaml`.
+const PROMTAIL_CONFIG: &str = "infra/kubernetes/observability/promtail.yaml";
 
 pub const UNDEFINED_DATASOURCE_UID_RULE_ID: &str = "undefined_datasource_uid";
 pub const INVALID_LOKI_LABEL_RULE_ID: &str = "invalid_loki_label";
@@ -137,64 +139,60 @@ fn collect_datasource_uids(v: &Value, out: &mut HashSet<String>) {
 // Promtail Loki-label extraction.
 // -----------------------------------------------------------------------------
 
-fn extract_valid_loki_labels(repo_root: &Path) -> Option<HashSet<String>> {
+/// REASON token when the valid-label set cannot be derived. Its own token, and
+/// a FAIL: this used to be `Option` + `if let Some`, so a moved or unparseable
+/// promtail config silently skipped the whole Loki-label rule.
+pub const PROMTAIL_LABELS_UNAVAILABLE_TOKEN: &str =
+    "grafana-datasources-promtail-labels-unavailable";
+
+/// Derive the valid Loki label set from the Promtail server config.
+///
+/// Fails closed: a missing or unparseable file, a file with no
+/// `scrape_configs`, or an EMPTY resulting label set is an error. An empty set
+/// is never a pass — it would either flag every dashboard label (noise) or,
+/// under a softer rule, check nothing (silence); both mean the extraction no
+/// longer matches the file's shape.
+fn extract_valid_loki_labels(repo_root: &Path) -> Result<HashSet<String>> {
     let cfg_path = repo_root.join(PROMTAIL_CONFIG);
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let raw = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("reading Promtail config {PROMTAIL_CONFIG}"))?;
+    let promtail: Value = serde_norway::from_str(&raw)
+        .with_context(|| format!("parsing Promtail config {PROMTAIL_CONFIG}"))?;
+    let scrape_configs = promtail
+        .get("scrape_configs")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{PROMTAIL_CONFIG} has no `scrape_configs` list"))?;
     let mut labels = HashSet::new();
-    for doc in serde_norway::Deserializer::from_str(&raw) {
-        let value: Value = match serde::Deserialize::deserialize(doc) {
-            Ok(v) => v,
-            Err(e) => {
-                warn_skip("promtail YAML doc deserialize", &cfg_path, &e);
-                continue;
-            }
-        };
-        if value.get("kind").and_then(Value::as_str) != Some("ConfigMap") {
-            continue;
-        }
-        let Some(prom_yml) = value
-            .get("data")
-            .and_then(|d| d.get("promtail.yaml"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let promtail: Value = match serde_norway::from_str(prom_yml) {
-            Ok(p) => p,
-            Err(e) => {
-                warn_skip("promtail.yaml inner parse", &cfg_path, &e);
-                continue;
-            }
-        };
-        let Some(scrape_configs) = promtail.get("scrape_configs").and_then(Value::as_array) else {
-            continue;
-        };
-        for sc in scrape_configs {
-            if let Some(relabels) = sc.get("relabel_configs").and_then(Value::as_array) {
-                for r in relabels {
-                    let action = r.get("action").and_then(Value::as_str).unwrap_or("replace");
-                    if action != "replace" {
-                        continue;
-                    }
-                    if let Some(target) = r.get("target_label").and_then(Value::as_str) {
-                        if !target.starts_with("__") && !target.is_empty() {
-                            labels.insert(target.to_string());
-                        }
+    for sc in scrape_configs {
+        if let Some(relabels) = sc.get("relabel_configs").and_then(Value::as_array) {
+            for r in relabels {
+                let action = r.get("action").and_then(Value::as_str).unwrap_or("replace");
+                if action != "replace" {
+                    continue;
+                }
+                if let Some(target) = r.get("target_label").and_then(Value::as_str) {
+                    if !target.starts_with("__") && !target.is_empty() {
+                        labels.insert(target.to_string());
                     }
                 }
             }
-            if let Some(stages) = sc.get("pipeline_stages").and_then(Value::as_array) {
-                for stage in stages {
-                    if let Some(label_map) = stage.get("labels").and_then(Value::as_object) {
-                        for k in label_map.keys() {
-                            labels.insert(k.clone());
-                        }
+        }
+        if let Some(stages) = sc.get("pipeline_stages").and_then(Value::as_array) {
+            for stage in stages {
+                if let Some(label_map) = stage.get("labels").and_then(Value::as_object) {
+                    for k in label_map.keys() {
+                        labels.insert(k.clone());
                     }
                 }
             }
         }
     }
-    Some(labels)
+    if labels.is_empty() {
+        anyhow::bail!(
+            "{PROMTAIL_CONFIG} yielded no Loki labels (no replace-action relabel target_label, no pipeline labels stage)"
+        );
+    }
+    Ok(labels)
 }
 
 // -----------------------------------------------------------------------------
@@ -315,8 +313,13 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         }
     }
 
-    // Rule 2: Loki label consistency.
-    if let Some(valid_loki_labels) = extract_valid_loki_labels(repo_root) {
+    // Rule 2: Loki label consistency. Fails closed if the label set cannot be
+    // derived — see `extract_valid_loki_labels`.
+    let valid_loki_labels = extract_valid_loki_labels(repo_root).map_err(|e| {
+        eprintln!("ERROR: {e:#}");
+        anyhow::anyhow!("{PROMTAIL_LABELS_UNAVAILABLE_TOKEN}")
+    })?;
+    {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&dashboards_dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .collect();
@@ -358,7 +361,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
                             rule_id: INVALID_LOKI_LABEL_RULE_ID,
                             message: format!(
                                 "panel [{panel_title}] uses invalid Loki label {label:?} \
-                                 (not defined in promtail-config.yaml relabel_configs \
+                                 (not defined in promtail.yaml relabel_configs \
                                  or pipeline_stages.labels)"
                             ),
                         });
@@ -380,6 +383,58 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn real_promtail_config_yields_known_labels() {
+        // Positive control on the in-tree file: `app` and `namespace` are
+        // relabel `target_label`s in infra/kubernetes/observability/promtail.yaml.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let labels = super::extract_valid_loki_labels(&root).expect("real promtail config");
+        for known in ["app", "namespace"] {
+            assert!(labels.contains(known), "{known} missing from {labels:?}");
+        }
+    }
+
+    #[test]
+    fn run_fails_with_its_own_token_when_promtail_config_is_missing() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(td.path().join(super::DASHBOARDS_SUBDIR)).expect("mkdir");
+        let ds = td.path().join(super::DATASOURCES_CONFIG);
+        std::fs::create_dir_all(ds.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&ds, "datasources: []\n").expect("write");
+        let err = super::run(td.path(), false).expect_err("must fail closed");
+        assert_eq!(
+            crate::common::status::reason_token(&err),
+            super::PROMTAIL_LABELS_UNAVAILABLE_TOKEN
+        );
+    }
+
+    #[test]
+    fn missing_unparseable_or_empty_promtail_config_fails_closed() {
+        let td = tempfile::tempdir().expect("tempdir");
+        assert!(
+            super::extract_valid_loki_labels(td.path()).is_err(),
+            "missing file"
+        );
+        let dir = td.path().join("infra/kubernetes/observability");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cfg = dir.join("promtail.yaml");
+        std::fs::write(&cfg, "scrape_configs: [unterminated\n").expect("write");
+        assert!(
+            super::extract_valid_loki_labels(td.path()).is_err(),
+            "unparseable"
+        );
+        std::fs::write(&cfg, "server: {}\n").expect("write");
+        assert!(
+            super::extract_valid_loki_labels(td.path()).is_err(),
+            "no scrape_configs"
+        );
+        std::fs::write(&cfg, "scrape_configs:\n  - job_name: x\n").expect("write");
+        assert!(
+            super::extract_valid_loki_labels(td.path()).is_err(),
+            "empty label set"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -68,11 +68,11 @@ unset __path_dirs __d __f __n
 # ---------------------------------------------------------------------------
 
 # Build a temp root. $1 = "with-fingerprints" | "without-fingerprints".
-# $2 = advertise address to write into every configmap ("" = omit the key).
-# $3 = the shared MC ConfigMap's MC_MAX_RECEIVE_SLOTS value (default "8");
+# $2 = advertise address to write into every per-instance config.env ("" = omit the key).
+# $3 = the shared MC config.env's MC_MAX_RECEIVE_SLOTS value (default "8");
 #      "__omit_key__" writes the file without the key, "__no_file__" writes no
 #      file at all. Every root carries a COMMENT decoy naming the key with a
-#      different value, so a reader that is not anchored on the data line reads
+#      different value, so a reader that is not anchored on the KEY= line reads
 #      the decoy and the cap assertions below go red.
 make_root() {
   local fingerprints="$1" advertise="${2-}" cap="${3-8}"
@@ -99,20 +99,19 @@ JSON
     local key
     key="$(printf '%s' "${svc%%-*}" | tr '[:lower:]' '[:upper:]')_WEBTRANSPORT_ADVERTISE_ADDRESS"
     if [[ -n "$advertise" ]]; then
-      printf 'data:\n  %s: "%s"\n' "$key" "$advertise" >"$dir/${svc}-configmap.yaml"
+      printf '%s=%s\n' "$key" "$advertise" >"$dir/${svc}-config.env"
     else
-      printf 'data:\n  SOMETHING_ELSE: "x"\n' >"$dir/${svc}-configmap.yaml"
+      printf 'SOMETHING_ELSE=x\n' >"$dir/${svc}-config.env"
     fi
   done
   if [[ "$cap" != "__no_file__" ]]; then
     {
-      printf 'data:\n'
-      printf '  # Prose decoy — MC_MAX_RECEIVE_SLOTS: "99" must never be read from a comment.\n'
+      printf '# Prose decoy — MC_MAX_RECEIVE_SLOTS=99 must never be read from a comment.\n'
       if [[ "$cap" != "__omit_key__" ]]; then
-        printf '  MC_MAX_RECEIVE_SLOTS: "%s"\n' "$cap"
+        printf 'MC_MAX_RECEIVE_SLOTS=%s\n' "$cap"
       fi
-      printf '  MC_AUDIO_CODEC: "opus"\n'
-    } >"$root/infra/services/mc-service/configmap.yaml"
+      printf 'MC_AUDIO_CODEC=opus\n'
+    } >"$root/infra/services/mc-service/config.env"
   fi
   printf '%s' "$root"
 }
@@ -248,6 +247,17 @@ assert_absent "listener-present-no-failure"  "nothing listening" "$out"
 # ===========================================================================
 # (3) CANNOT VERIFY branches are HARD FAIL, in two distinct owner lanes.
 # ===========================================================================
+# (3-derived) No per-instance config sources at all — the instance set is derived
+#      from a glob, so zero matches must be a loud REPO/CONFIG DRIFT, never a
+#      silent "nothing to check".
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+rm -f "$root"/infra/services/m?-service/m?-*-config.env
+stubs="$(make_stubs ss-present 'udp   UNCONN  0  0   127.0.0.1:4434   0.0.0.0:*')"
+run_check "$root" "$stubs"
+out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "no-instance-sources-cannot-verify" "no per-instance config sources" "$out"
+assert_status "no-instance-sources-says-drift" "REPO/CONFIG DRIFT" "$out"
+
 # (3a) `ss` absent — the operator's machine. A missing package must not
 #      reproduce the silent no-audio failure this escalation closes.
 root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
@@ -612,7 +622,7 @@ assert_absent "ss-broken-does-not-blame-cluster" "nothing listening" "$out"
 #     branch therefore reds here until its phrase is added to the header and to
 #     this array — which is the forcing function, not the enumeration itself.
 CANNOT_RUN_CAUSES=("\`ss\` missing" "\`ss\` failed" "no advertise address" "no resolver" \
-                   "cap file absent" "key absent" "value not an integer")
+                   "no per-instance config sources" "cap file absent" "key absent" "value not an integer")
 
 for cause in "${CANNOT_RUN_CAUSES[@]}"; do
     assert_status "header-enumerates-cannot-run-cause" "$cause" "$header_block"
@@ -678,8 +688,11 @@ assert_absent "slots-default-not-over-cap" "$OVER_CAP_TEXT" "$out"
 assert_absent "slots-default-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
 # The comment decoy's value must never surface as the cap.
 assert_absent "slots-decoy-not-read" "MC_MAX_RECEIVE_SLOTS=99" "$out"
+# The live name is hash-suffixed (ADR-0038 §2), so the command resolves it via mc-0's ref.
 assert_status "slots-echo-prints-live-cmd" \
-  "kubectl get cm mc-service-config -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}'" "$out"
+  "kubectl get cm -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}'" "$out"
+assert_status "slots-echo-live-cmd-resolves-hashed-name" \
+  "kubectl get deployment/mc-0 -n dark-tower" "$out"
 # THE AUTHORITY FRAMING ON THE **PASS** BRANCH. The demo-breaking case is an
 # on-disk cap of 8 against a live cap of 2: the operator stands on a GREEN line
 # holding a number the cluster does not enforce, so "this is an on-disk read,
@@ -737,7 +750,7 @@ for cap_case in __omit_key__ eight; do
   assert_status "slots-cap-unreadable-lane-[${cap_case}]" "REPO/CONFIG DRIFT" "$out"
   assert_absent "slots-cap-unreadable-no-pass-[${cap_case}]" "✓ receive slots" "$out"
   assert_status "slots-cap-unreadable-live-cmd-[${cap_case}]" \
-    "kubectl get cm mc-service-config -n dark-tower" "$out"
+    "kubectl get deployment/mc-0 -n dark-tower" "$out"
   # ...and must NOT claim the file is missing when it is present.
   assert_absent "slots-cap-unreadable-not-file-absent-[${cap_case}]" "DOES NOT EXIST" "$out"
 done
@@ -767,16 +780,16 @@ assert_hard_fail_branch "slots-cap-file-absent" "receive slots: CANNOT VERIFY" "
 assert_status "slots-cap-file-absent-says-so"      "DOES NOT EXIST" "$out"
 assert_status "slots-cap-file-absent-not-key"      "NOT a missing key inside it" "$out"
 assert_status "slots-cap-file-absent-lane"         "REPO/CONFIG DRIFT" "$out"
-assert_status "slots-cap-file-absent-live-cmd"     "kubectl get cm mc-service-config -n dark-tower" "$out"
+assert_status "slots-cap-file-absent-live-cmd"     "kubectl get deployment/mc-0 -n dark-tower" "$out"
 assert_absent "slots-cap-file-absent-no-pass"      "✓ receive slots" "$out"
 
 # (10g) REAL-FILE control (@operations condition 2). The fixture shape is ours;
 #       the committed ConfigMap's shape is not. Run the extraction against the
-#       real infra/services/mc-service/configmap.yaml and assert it produced a
+#       real infra/services/mc-service/config.env and assert it produced a
 #       non-empty integer >= 1 — no literal value, so raising the cap never reds
 #       this for the wrong reason.
 root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
-cp "$REPO_ROOT/infra/services/mc-service/configmap.yaml" "$root/infra/services/mc-service/configmap.yaml"
+cp "$REPO_ROOT/infra/services/mc-service/config.env" "$root/infra/services/mc-service/config.env"
 run_check "$root" "$stubs" 1
 out="$(plain "$RUN_OUT")"
 real_cap="$(printf '%s\n' "$out" | grep -oE 'server cap MC_MAX_RECEIVE_SLOTS=[0-9]+' | head -1 | cut -d= -f2 || true)"
@@ -784,7 +797,7 @@ if [[ "$real_cap" =~ ^[1-9][0-9]*$ ]]; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))
-  FAILURES+=("[slots-real-configmap-cap-extracted] the cap extraction produced '${real_cap}' from the REAL infra/services/mc-service/configmap.yaml — the reader no longer matches the committed file's shape (not a cap-value problem)")
+  FAILURES+=("[slots-real-configmap-cap-extracted] the cap extraction produced '${real_cap}' from the REAL infra/services/mc-service/config.env — the reader no longer matches the committed file's shape (not a cap-value problem)")
 fi
 assert_absent "slots-real-configmap-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
 
@@ -814,11 +827,14 @@ assert_status "help-second-machine-certs-cited" "scripts/generate-dev-certs.sh" 
 
 # (10j) The cited facts must still be TRUE of the tree, or the header is the
 #       fail-open document read just before someone types a flag.
-for cm_file in "$REPO_ROOT"/infra/services/mc-service/mc-{0,1}-configmap.yaml \
-               "$REPO_ROOT"/infra/services/mh-service/mh-{0,1}-configmap.yaml; do
-  adv="$(grep -oE 'WEBTRANSPORT_ADVERTISE_ADDRESS: "https://[^"]+"' "$cm_file" || true)"
+# Same derived instance set dev-web.sh uses (the per-instance generator sources).
+fact_files=0
+for cm_file in "$REPO_ROOT"/infra/services/m[ch]-service/m[ch]-[0-9]*-config.env; do
+  fact_files=$((fact_files + 1))
+  adv="$(grep -oE '^[A-Z]+_WEBTRANSPORT_ADVERTISE_ADDRESS=https://[^[:space:]]+' "$cm_file" || true)"
   assert_status "fact-loopback-advertise-[${cm_file##*/}]" 'https://127.0.0.1:443' "$adv"
 done
+assert_rc "fact-loopback-nonvacuous" 0 "$([[ "$fact_files" -ge 4 ]] && echo 0 || echo "1 (${fact_files} files)")"
 san_line="$(grep -E 'printf "(DNS|IP):%s"' "$REPO_ROOT/scripts/generate-dev-certs.sh" || true)"
 assert_status "fact-sans-dns-emitted" 'DNS:%s' "$san_line"
 assert_absent "fact-sans-no-ip-emitted" 'IP:%s' "$san_line"

@@ -1,29 +1,9 @@
+# Grafana's ServiceAccount carries NO Role. Dashboards are mounted from
+# content-addressed ConfigMaps (infra/grafana/deployment.yaml, projected volume)
+# rather than listed from the API by a sidecar, so Grafana needs no Kubernetes
+# API access, and the pod does not automount this account's token.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: grafana
   namespace: dark-tower-observability
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: grafana-sidecar
-  namespace: dark-tower-observability
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: grafana-sidecar
-  namespace: dark-tower-observability
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: grafana-sidecar
-subjects:
-  - kind: ServiceAccount
-    name: grafana
-    namespace: dark-tower-observability

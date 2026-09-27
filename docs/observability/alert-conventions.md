@@ -316,7 +316,7 @@ bump, rather than passing as "no findings".
    guarantees every sample of the previously-exposed series has aged out before the
    accumulator can forget, so no window can span both values.
 
-The values live in `infra/services/otel-collector/configmap.yaml`; the windows live
+The values live in `infra/services/otel-collector/collector.yaml`; the windows live
 in the rule files. **Neither number is restated here and the configmap must not
 restate the derivation** — the reasoning is the durable part, the numbers are not.
 

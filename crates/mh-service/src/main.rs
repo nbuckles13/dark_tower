@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mh_service::config::EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
             "Configure me: the egress stream ceiling is below the recommended minimum (one \
              full all-hear-all meeting at the demo size). Set MH_EGRESS_BUDGET_BPS in \
-             infra/services/mh-service/configmap.yaml to this deployment's expected peak \
+             infra/services/mh-service/config.env to this deployment's expected peak \
              egress. This handler boots and serves as configured."
         );
     }
@@ -249,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "MH_MAX_REGISTERED_MEETINGS is implausibly low: new meetings are refused once \
              this many are registered, and a meeting whose MC never sends EndMeeting stays \
              registered until restart. Check the value in \
-             infra/services/mh-service/configmap.yaml"
+             infra/services/mh-service/config.env"
         );
     }
 

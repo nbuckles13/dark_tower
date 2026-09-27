@@ -36,6 +36,15 @@
 //! filename convention to drift from, and it makes an unrecognised manifest a
 //! loud failure rather than an invisible omission.
 //!
+//! **ConfigMaps are generated** (ADR-0038 §2): a service's ConfigMaps are
+//! `configMapGenerator` entries in its `kustomization.yaml`, read through the
+//! shared `common::kustomize_generators` parser into the same name-scoped
+//! model as a `kind: ConfigMap` document (keyed by the generator name, which is
+//! what every base `configMapKeyRef` uses before kustomize hash-suffixes it).
+//! An unreadable generator or source is a hard error, and the OK line carries
+//! the ConfigMap count, so a guard that stopped seeing generators cannot report
+//! a vacuous check 3 as clean.
+//!
 //! # Scope boundary — read this before trusting the status line
 //!
 //! This guard covers `infra/services/<svc>/` **only**. It does NOT cover
@@ -47,12 +56,16 @@
 //! declares and no workload references. Extending coverage to overlays needs a
 //! patch-semantics resolution model rather than this declaration-semantics one;
 //! it is tracked in `docs/TODO.md` § Infrastructure Validation in Devloops.
-//! `env-config-clean-<S>-services-<W>-workloads` therefore means "the base
+//! `env-config-clean-<S>-services-<W>-workloads-<C>-configmaps` therefore means "the base
 //! service manifests are consistent", not "MH's ConfigMap surface is checked".
 //! Coverage that is stated can be audited; coverage that is assumed cannot.
 
 use crate::common::explain::{print_finding, Finding};
+use crate::common::kustomize_generators::{config_map_generators, generator_keys};
 use crate::common::path_safety::resolve_cited_path;
+use crate::common::pod_spec::{
+    container_configmap_refs, containers, env_from_is_list, pod_spec, ConfigMapRefKind,
+};
 use crate::common::status::emit_ok;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
@@ -213,7 +226,6 @@ const NO_POD_SPEC_KINDS: &[&str] = &[
     "PodDisruptionBudget",
     "ServiceMonitor",
     "Secret",
-    "Kustomization",
     "PersistentVolumeClaim",
     "ServiceAccount",
     "Role",
@@ -223,6 +235,7 @@ const NO_POD_SPEC_KINDS: &[&str] = &[
 ];
 
 const CONFIGMAP_KIND: &str = "ConfigMap";
+const KUSTOMIZATION_KIND: &str = "Kustomization";
 
 #[expect(
     clippy::disallowed_methods,
@@ -276,6 +289,9 @@ pub(crate) struct Hit {
 pub(crate) struct Report {
     pub(crate) checked_services: usize,
     pub(crate) checked_workloads: usize,
+    /// ConfigMaps (plain or generated) resolved across checked services — the
+    /// positive control that generator-sourced maps were actually seen.
+    pub(crate) checked_configmaps: usize,
     pub(crate) hits: Vec<Hit>,
 }
 
@@ -343,29 +359,6 @@ fn extract_required_env_vars(content: &str) -> Vec<String> {
     out
 }
 
-/// Locate a workload's pod spec. One path, no per-kind branching — see
-/// [`WORKLOAD_KINDS_WITH_POD_SPEC`] on why `CronJob`'s deeper nesting is out.
-fn pod_spec(doc: &Value) -> Option<&Value> {
-    doc.get("spec")?.get("template")?.get("spec")
-}
-
-/// All containers in a pod spec, regular and init.
-///
-/// `initContainers` is included deliberately: it is one more field on the same
-/// pod spec rather than a separate code path, and omitting it is not neutral —
-/// a required env var declared only on an init container would produce a false
-/// `missing_in_manifest`, and its ConfigMap key a false orphan. A guard that
-/// invents findings is worse than one that misses them.
-fn containers(pod: &Value) -> Vec<&Value> {
-    let mut out: Vec<&Value> = Vec::new();
-    for field in ["containers", "initContainers"] {
-        if let Some(seq) = pod.get(field).and_then(Value::as_sequence) {
-            out.extend(seq.iter());
-        }
-    }
-    out
-}
-
 /// Read `metadata.name`, if present.
 fn metadata_name(doc: &Value) -> Option<&str> {
     doc.get("metadata")?.get("name")?.as_str()
@@ -413,105 +406,95 @@ fn parse_workload(doc: &Value, rel_path: &Path, dir: &str) -> (Option<Workload>,
     let mut uses_env_from = false;
 
     for container in conts {
-        if let Some(env_from) = container.get("envFrom") {
+        let cname = container
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>");
+        if container.get("envFrom").is_some() {
             uses_env_from = true;
             hits.push(Hit {
                 rule_id: UNSUPPORTED_ENV_SOURCE_RULE_ID,
                 detail: format!(
-                    "{dir}: container {c} uses envFrom; this guard checks per-key configMapKeyRef only and will not claim coverage over bulk env injection",
-                    c = container.get("name").and_then(Value::as_str).unwrap_or("<unnamed>"),
+                    "{dir}: container {cname} uses envFrom; this guard checks per-key configMapKeyRef only and will not claim coverage over bulk env injection"
                 ),
                 file: rel_path.to_path_buf(),
             });
-            // A bulk `configMapRef` import means every key of the named
-            // ConfigMap might be consumed — suppress orphan checks for THAT map
-            // only (below), not the whole service. A `secretRef`-only envFrom
-            // names no ConfigMap and suppresses none. A `configMapRef` whose
-            // `name` cannot be read is unknowable: emit a malformed hit and fall
-            // back to the conservative service-wide suppression, never a silent
-            // widening.
-            match env_from.as_sequence() {
-                Some(seq) => {
-                    for src in seq {
-                        let Some(cm_ref) = src.get("configMapRef") else {
-                            continue; // secretRef or other source: no ConfigMap
-                        };
-                        match cm_ref.get("name").and_then(Value::as_str) {
-                            Some(cm_name) => {
-                                ambiguous_cm_names.insert(cm_name.to_string());
-                            }
-                            None => {
-                                imports_unnamed_configmap = true;
-                                hits.push(Hit {
-                                    rule_id: MALFORMED_ENV_REFERENCE_RULE_ID,
-                                    detail: format!(
-                                        "{dir}: an envFrom configMapRef has no readable `name`; the imported ConfigMap is unknowable"
-                                    ),
-                                    file: rel_path.to_path_buf(),
-                                });
-                            }
-                        }
+            // envFrom present but not a list — e.g. written as a mapping, one
+            // of the commonest YAML mistakes. Its imports are unreadable, so
+            // suppress orphan checks conservatively (service-wide), but SAY
+            // SO. An unexplained service-wide suppression is the silent
+            // widening the per-ConfigMap handling below rules out.
+            if !env_from_is_list(container) {
+                imports_unnamed_configmap = true;
+                hits.push(Hit {
+                    rule_id: MALFORMED_ENV_REFERENCE_RULE_ID,
+                    detail: format!(
+                        "{dir}: envFrom is not a list (expected a sequence of sources); its imports are unreadable, so orphan checks are suppressed for this service"
+                    ),
+                    file: rel_path.to_path_buf(),
+                });
+            }
+        }
+        if let Some(env) = container.get("env").and_then(Value::as_sequence) {
+            for entry in env {
+                match entry.get("name").and_then(Value::as_str) {
+                    Some(name) => {
+                        env_names.insert(name.to_string());
                     }
+                    None => hits.push(Hit {
+                        rule_id: MALFORMED_ENV_REFERENCE_RULE_ID,
+                        detail: format!("{dir}: an env entry has no `name` field"),
+                        file: rel_path.to_path_buf(),
+                    }),
                 }
-                // envFrom present but not a list — e.g. written as a mapping,
-                // one of the commonest YAML mistakes. Same treatment as an
-                // unreadable `name`: suppress conservatively, but SAY SO. An
-                // unexplained service-wide suppression is the silent widening
-                // the comment above rules out.
-                None => {
+            }
+        }
+        // The walk is shared (`common::pod_spec`); the policy is this guard's.
+        // Volume references are out of scope here: this guard checks env
+        // wiring (R-21 in `kustomize` covers every reference shape).
+        for r in container_configmap_refs(container) {
+            match (r.kind, r.name, r.key) {
+                // A bulk `configMapRef` import means every key of the named
+                // ConfigMap might be consumed — suppress orphan checks for THAT
+                // map only (below), not the whole service. A `configMapRef`
+                // whose `name` cannot be read is unknowable: emit a malformed
+                // hit and fall back to the conservative service-wide
+                // suppression, never a silent widening.
+                (ConfigMapRefKind::EnvFrom, Some(cm_name), _) => {
+                    ambiguous_cm_names.insert(cm_name.to_string());
+                }
+                (ConfigMapRefKind::EnvFrom, None, _) => {
                     imports_unnamed_configmap = true;
                     hits.push(Hit {
                         rule_id: MALFORMED_ENV_REFERENCE_RULE_ID,
                         detail: format!(
-                            "{dir}: envFrom is not a list (expected a sequence of sources); its imports are unreadable, so orphan checks are suppressed for this service"
+                            "{dir}: an envFrom configMapRef has no readable `name`; the imported ConfigMap is unknowable"
                         ),
                         file: rel_path.to_path_buf(),
                     });
                 }
-            }
-        }
-        let Some(env) = container.get("env").and_then(Value::as_sequence) else {
-            continue;
-        };
-        for entry in env {
-            let Some(name) = entry.get("name").and_then(Value::as_str) else {
-                hits.push(Hit {
-                    rule_id: MALFORMED_ENV_REFERENCE_RULE_ID,
-                    detail: format!("{dir}: an env entry has no `name` field"),
-                    file: rel_path.to_path_buf(),
-                });
-                continue;
-            };
-            env_names.insert(name.to_string());
-            let Some(cm_ref) = entry
-                .get("valueFrom")
-                .and_then(|v| v.get("configMapKeyRef"))
-            else {
-                continue;
-            };
-            let cm_name = cm_ref.get("name").and_then(Value::as_str);
-            let cm_key = cm_ref.get("key").and_then(Value::as_str);
-            match (cm_name, cm_key) {
-                (Some(cm_name), Some(cm_key)) => {
+                (ConfigMapRefKind::KeyRef, Some(cm_name), Some(cm_key)) => {
                     // Check 4. Recorded IN ADDITION to the ref, never instead of
                     // it: the crossed ref is still a real reference to `cm_key`,
                     // and dropping it would misreport that key as an orphan.
-                    if cm_key != name {
-                        hits.push(Hit {
-                            rule_id: CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
-                            detail: format!(
-                                "{dir}: workload {w} env {name} reads key {cm_key} from ConfigMap {cm_name}; the key must equal the env var name (a crossed ref starts the pod on another variable's value)",
-                                w = metadata_name(doc).unwrap_or("<unnamed>"),
-                            ),
-                            file: rel_path.to_path_buf(),
-                        });
+                    if let Some(name) = r.env_name {
+                        if cm_key != name {
+                            hits.push(Hit {
+                                rule_id: CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
+                                detail: format!(
+                                    "{dir}: workload {w} env {name} reads key {cm_key} from ConfigMap {cm_name}; the key must equal the env var name (a crossed ref starts the pod on another variable's value)",
+                                    w = metadata_name(doc).unwrap_or("<unnamed>"),
+                                ),
+                                file: rel_path.to_path_buf(),
+                            });
+                        }
                     }
                     key_refs.insert((cm_name.to_string(), cm_key.to_string()));
                 }
                 // Missing `name` and/or `key`. Dropping this silently would let
                 // the key it *should* have named surface as an orphan — a
                 // wrong-direction remediation carrying the guard's authority.
-                _ => {
+                (ConfigMapRefKind::KeyRef, cm_name, cm_key) => {
                     if let Some(cm_name) = cm_name {
                         // We know the ConfigMap but not the key — suppress
                         // orphan checks for it below.
@@ -521,12 +504,14 @@ fn parse_workload(doc: &Value, rel_path: &Path, dir: &str) -> (Option<Workload>,
                         rule_id: MALFORMED_ENV_REFERENCE_RULE_ID,
                         detail: format!(
                             "{dir}: env {name} has a configMapKeyRef missing its `name` and/or `key` (name: {has_n}, key: {has_k})",
+                            name = r.env_name.unwrap_or("<unnamed>"),
                             has_n = cm_name.is_some(),
                             has_k = cm_key.is_some(),
                         ),
                         file: rel_path.to_path_buf(),
                     });
                 }
+                (ConfigMapRefKind::Volume | ConfigMapRefKind::Projected, _, _) => {}
             }
         }
     }
@@ -647,6 +632,37 @@ fn discover_manifests(repo_root: &Path, infra_dir: &Path, dir: &str) -> Result<D
                     name: name.to_string(),
                     keys: configmap_keys(&doc),
                 });
+            } else if kind == KUSTOMIZATION_KIND {
+                // ADR-0038 §2: service ConfigMaps are `configMapGenerator`
+                // entries, not `kind: ConfigMap` documents. They enter the SAME
+                // name-scoped model, keyed by the generator name (the pre-hash
+                // name every base `configMapKeyRef` uses); findings point at
+                // the source file. The shared parser makes an unreadable
+                // generator or source a hard error — a generator this guard
+                // cannot read would otherwise be a ConfigMap it silently
+                // cannot see, turning check 3 vacuous.
+                let entries = config_map_generators(&doc)
+                    .with_context(|| format!("reading configMapGenerator in {}", rel.display()))?;
+                for entry in entries {
+                    if entry.behavior.as_deref().is_some_and(|b| b != "create") {
+                        anyhow::bail!(
+                            "{}: configMapGenerator {:?} uses behavior {:?}; a service base must CREATE its ConfigMaps (merge/replace belong in overlays, which this guard does not cover)",
+                            rel.display(),
+                            entry.name,
+                            entry.behavior
+                        );
+                    }
+                    let keys = generator_keys(infra_dir, &entry)?;
+                    let src = entry
+                        .source_paths()
+                        .next()
+                        .map_or_else(|| rel.clone(), |p| rel.with_file_name(p));
+                    out.configmaps.push(ConfigMapDoc {
+                        path: src,
+                        name: entry.name,
+                        keys,
+                    });
+                }
             } else if !NO_POD_SPEC_KINDS.contains(&kind) {
                 out.hits.push(Hit {
                     rule_id: UNCLASSIFIED_MANIFEST_KIND_RULE_ID,
@@ -706,6 +722,7 @@ pub(crate) fn analyze(repo_root: &Path) -> Result<Report> {
 
         report.checked_services += 1;
         report.checked_workloads += discovered.workloads.len();
+        report.checked_configmaps += discovered.configmaps.len();
 
         let config_content = std::fs::read_to_string(&config_rs)
             .with_context(|| format!("reading {}", config_rs.display()))?;
@@ -900,8 +917,8 @@ fn clean_outcome(report: &Report) -> Result<String> {
         anyhow::bail!("env-config-no-services-checked");
     }
     Ok(format!(
-        "env-config-clean-{}-services-{}-workloads",
-        report.checked_services, report.checked_workloads
+        "env-config-clean-{}-services-{}-workloads-{}-configmaps",
+        report.checked_services, report.checked_workloads, report.checked_configmaps
     ))
 }
 
@@ -2107,14 +2124,161 @@ spec:
     }
 
     #[test]
-    fn clean_outcome_reports_both_counts_when_services_were_checked() {
+    fn clean_outcome_reports_every_count_when_services_were_checked() {
         let measured = Report {
             checked_services: 4,
             checked_workloads: 6,
+            checked_configmaps: 8,
             hits: Vec::new(),
         };
         let token = clean_outcome(&measured).expect("clean run yields a token");
-        assert_eq!(token, "env-config-clean-4-services-6-workloads");
+        assert_eq!(
+            token,
+            "env-config-clean-4-services-6-workloads-8-configmaps"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // configMapGenerator sources (ADR-0038 §2). Service ConfigMaps are
+    // generated, so these are the controls that check 2 and check 3 still SEE
+    // them — without them a guard that stopped reading generators would lose
+    // check 3 silently (no ConfigMaps -> no orphans) while check 2 went red
+    // for a misleading reason.
+    // -------------------------------------------------------------------------
+
+    fn generator_kustomization(entries: &str) -> String {
+        format!(
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - deployment.yaml\nconfigMapGenerator:\n{entries}"
+        )
+    }
+
+    #[test]
+    fn generator_env_source_resolves_and_is_counted() {
+        let kust = generator_kustomization("  - name: gen\n    envs: [config.env]\n");
+        let dep = deployment_ref("svc", "gen", "K");
+        let td = fixture(&[(
+            "gc-service",
+            "",
+            &[
+                ("kustomization.yaml", &kust),
+                ("deployment.yaml", &dep),
+                ("config.env", "# comment\nK=v\n"),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "unexpected hits: {:?}", report.hits);
+        assert_eq!(report.checked_configmaps, 1);
+    }
+
+    #[test]
+    fn generator_env_source_orphan_key_fires() {
+        let kust = generator_kustomization("  - name: gen\n    envs: [config.env]\n");
+        let dep = deployment_ref("svc", "gen", "K");
+        let td = fixture(&[(
+            "gc-service",
+            "",
+            &[
+                ("kustomization.yaml", &kust),
+                ("deployment.yaml", &dep),
+                ("config.env", "K=v\nORPHAN=x\n"),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        let orphans = hits_for(&report, ORPHAN_CONFIGMAP_KEY_RULE_ID);
+        assert_eq!(orphans.len(), 1, "{:?}", report.hits);
+        assert!(orphans[0].detail.contains("ORPHAN"));
+        // The finding points at the source a human edits, not the kustomization.
+        assert!(
+            orphans[0].file.ends_with("config.env"),
+            "{:?}",
+            orphans[0].file
+        );
+    }
+
+    #[test]
+    fn generator_env_source_missing_key_fires() {
+        let kust = generator_kustomization("  - name: gen\n    envs: [config.env]\n");
+        let dep = deployment_ref("svc", "gen", "WANTED");
+        let td = fixture(&[(
+            "gc-service",
+            "",
+            &[
+                ("kustomization.yaml", &kust),
+                ("deployment.yaml", &dep),
+                ("config.env", "OTHER=x\n"),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        assert_eq!(hits_for(&report, KEY_NOT_IN_CONFIGMAP_RULE_ID).len(), 1);
+    }
+
+    #[test]
+    fn generator_literals_and_files_supply_keys() {
+        let kust = generator_kustomization(
+            "  - name: gen\n    literals: [LIT=1]\n    files: [FILEKEY=f.txt]\n",
+        );
+        let dep = format!(
+            "{}        - name: FILEKEY\n          valueFrom:\n            configMapKeyRef:\n              name: gen\n              key: FILEKEY\n",
+            deployment_ref("svc", "gen", "LIT")
+        );
+        let td = fixture(&[(
+            "gc-service",
+            "",
+            &[
+                ("kustomization.yaml", &kust),
+                ("deployment.yaml", &dep),
+                ("f.txt", "x"),
+            ],
+        )]);
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "unexpected hits: {:?}", report.hits);
+        assert_eq!(report.checked_configmaps, 1);
+    }
+
+    #[test]
+    fn generator_unreadable_or_quoted_source_is_a_hard_error() {
+        let kust = generator_kustomization("  - name: gen\n    envs: [config.env]\n");
+        let dep = deployment_ref("svc", "gen", "K");
+        let missing = fixture(&[(
+            "gc-service",
+            "",
+            &[("kustomization.yaml", &kust), ("deployment.yaml", &dep)],
+        )]);
+        assert!(analyze(missing.path()).is_err());
+        // `K=""` would ship the 2-char value `""` (kustomize reads env files
+        // literally) — e.g. a non-empty CORS allowlist in a fail-closed base.
+        let quoted = fixture(&[(
+            "gc-service",
+            "",
+            &[
+                ("kustomization.yaml", &kust),
+                ("deployment.yaml", &dep),
+                ("config.env", "K=\"\"\n"),
+            ],
+        )]);
+        let err = analyze(quoted.path()).expect_err("quoted value must fail");
+        assert!(format!("{err:#}").contains("quote-wrapped"), "{err:#}");
+    }
+
+    #[test]
+    fn real_tree_resolves_generator_configmaps_for_every_service() {
+        // Positive control on the actual repository: every canonical service's
+        // ConfigMaps are generator-sourced today, so a run that resolved none
+        // (or any configmap_not_found) means the guard stopped seeing them.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let report = analyze(&root).expect("analyze real tree");
+        assert!(
+            hits_for(&report, CONFIGMAP_NOT_FOUND_RULE_ID).is_empty(),
+            "{:?}",
+            report.hits
+        );
+        // ac, gc, mc (+ mc-0, mc-1), mh (+ mh-0, mh-1) -- at least one per service.
+        assert!(
+            report.checked_configmaps >= report.checked_services && report.checked_services == 4,
+            "services {} configmaps {}",
+            report.checked_services,
+            report.checked_configmaps
+        );
     }
 
     // -------------------------------------------------------------------------

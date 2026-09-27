@@ -202,9 +202,8 @@ JSON-escaped text in the `last-applied-configuration` annotation, which Kubernet
 262,144 bytes. By story 2 task 12, `mc-overview.json` alone escaped to 99.7% of that, and the
 shared MC ConfigMap failed cluster setup outright. Moving the media-path rows out, into a ConfigMap
 of their own, gives both files real headroom. `dt-guard kustomize` now fails Layer 3 when any
-dashboard ConfigMap passes its headroom threshold, and when any generator in the Grafana kustomization
-that ships dashboard JSON — whatever the group is named — omits the `grafana_dashboard: "1"` label
-(which would make its dashboard silently invisible in Grafana).
+dashboard ConfigMap passes its headroom threshold, and (R-21) when a generated dashboard ConfigMap is
+not a source of Grafana's projected `dashboards` volume (which would make it silently invisible).
 
 **Default Time Range**: Last 6 hours
 **Refresh**: 1 minute
@@ -416,58 +415,40 @@ services:
 
 ### Kubernetes (Staging/Production)
 
-Dashboards are loaded via **label-selected ConfigMap discovery** using `kiwigrid/k8s-sidecar`:
+Dashboards are **content-addressed ConfigMaps mounted into the Grafana pod** (ADR-0038 §2):
 
-**How it works** (corrected — the previous version of this block described
-auto-discovery that does not exist, and following it turned Layer 3 red):
+**How it works:**
 1. `infra/grafana/kustomization.yaml` holds a **static** `configMapGenerator` list
    (`grafana-dashboards-ac`, `-gc`, `-mc`, `-mc-media`, `-mh`, `-client`, `-errors`).
    Nothing is auto-discovered. **Grouping is size-bounded, not prefix-bound**: dashboards
    are grouped by service prefix only while the group's ConfigMap fits the annotation cap
    (see the comment above the groups in `kustomization.yaml`); `-mc-media` is MC's media
    path split out of `-mc` for that reason.
-2. Each group carries `options.labels.grafana_dashboard: "1"`.
-3. `generatorOptions.disableNameSuffixHash: true` keeps the generated ConfigMap names
-   stable, so **changing a group's contents does not roll the Grafana pod.**
-4. A `kiwigrid/k8s-sidecar` **initContainer** with `METHOD: LIST` lists labeled ConfigMaps
-   **once at pod start**, writes them into a shared `emptyDir` at
-   `/var/lib/grafana/dashboards`, and exits. **It does not watch.**
+2. Each generated ConfigMap carries a **content hash in its name**. Kustomize rewrites the
+   Grafana Deployment's references, so editing any dashboard changes the pod template:
+   **applying the environment root rolls Grafana, with no manual restart step.**
+3. `infra/grafana/deployment.yaml` mounts every group into `/var/lib/grafana/dashboards`
+   through **one `projected` volume**. The file provider in
+   `infra/grafana/provisioning/dashboards/dashboards.yaml` reads that path. The sources are
+   not `optional:`, so a group missing at runtime fails pod start loudly. There is no sidecar,
+   no label selection and no Kubernetes API access. Grafana does not automount a
+   ServiceAccount token.
 
-**Adding a new dashboard** — four steps; step 4 is the one with no guard behind it:
+**Adding a new dashboard:**
 
-1. Add the JSON to `infra/grafana/dashboards/`, named `{prefix}-{name}.json`.
+1. Add the JSON to `infra/grafana/dashboards/`, named `{prefix}-{name}.json` (the filename
+   must be unique across groups, since all groups mount into one directory).
 2. Register the basename in `infra/grafana/kustomization.yaml` under the matching
-   `grafana-dashboards-{prefix}` group, **creating the group if it does not exist**.
-   `dt-guard kustomize` R-20 enforces this bidirectionally: an unregistered dashboard and
-   a registered-but-absent file both turn Layer 3 red.
-3. **If you created a group, it MUST carry:**
-   ```yaml
-       options:
-         labels:
-           grafana_dashboard: "1"
-   ```
-   R-20 itself checks basenames only, but `dt-guard kustomize`'s `dashboard_configmap_label`
-   rule (`crates/dt-guard/src/kustomize_configmaps.rs`) fails Layer 3 when any generator in
-   the Grafana kustomization that ships dashboard JSON — whatever it is named — omits the
-   label the sidecar selects on (read from the sidecar's own `LABEL` / `LABEL_VALUE`). Without
-   it the group would be invisible to the sidecar forever.
-4. **Deploying to a running cluster takes two actions, not one.** Because the ConfigMap
-   names are stable and the sidecar only lists at pod start, `apply` alone leaves you with
-   a correct ConfigMap that Grafana never reads:
-   ```bash
-   kubectl apply -k infra/kubernetes/overlays/kind/observability/
-   kubectl rollout restart deployment/grafana -n dark-tower-observability
-   kubectl rollout status  deployment/grafana -n dark-tower-observability --timeout=300s
-   ```
-   The `rollout status` is a readiness wait on the restart, not a third action — it is
-   there so the step fails loudly instead of returning before Grafana is back. See
-   `docs/LOCAL_DEVELOPMENT.md` §"Grafana Not Showing Dashboards". `deploy_observability()`
-   in `infra/kind/scripts/setup.sh` escapes the restart only because a full setup builds
-   the pod fresh.
-
-**The missing labels block and the missing restart are the same failure with two causes**:
-a dashboard that is registered, guarded, committed — and invisible in Grafana. R-20 covers
-neither, which is why they are spelled out here rather than left to the guard.
+   `grafana-dashboards-{prefix}` group. `dt-guard kustomize` R-20 enforces this
+   bidirectionally: an unregistered dashboard and a registered-but-absent file both turn
+   Layer 3 red.
+3. **If you created a new group**, add it as a source of the `dashboards` projected volume
+   in `infra/grafana/deployment.yaml`. `dt-guard kustomize` R-21 fails the build on a
+   generated ConfigMap that no pod template references, so forgetting this step is red,
+   not silent.
+4. Deploy by applying the environment root (Kind: `./infra/kind/scripts/setup.sh --skip-build
+   --only otel`, which applies the whole root and waits for every workload). The new hash
+   rolls Grafana.
 
 ---
 

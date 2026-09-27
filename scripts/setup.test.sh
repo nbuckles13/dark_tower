@@ -575,7 +575,206 @@ assert_rc "only-bogus-rejected-rc" 1 "$only_rc"
 assert_status "only-bogus-lists-otel" "Valid: ac, gc, mc, mh, otel" "$only_out"
 assert_no_marker "only-bogus-never-reaches-kind" "$MARK" 'ran.kind'
 
-# === (D) the cargo parallelism cap reaches every cargo invocation, incl. the IMAGE builds =======
+# =============================================================================================
+# === (D) The environment root + content-addressed ConfigMaps (ADR-0038 devloop 1) =============
+# =============================================================================================
+# These cases RENDER with the REAL kubectl (its embedded kustomize), never a stub: a stubbed
+# render would pass vacuously. kubectl is guaranteed in the devloop image
+# (infra/devloop/Dockerfile) and on CI runners; absent, the render cases FAIL loudly here.
+REAL_KUBECTL="$(command -v kubectl || true)"
+if [[ -z "$REAL_KUBECTL" ]]; then
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[render-kubectl-present] kubectl not on PATH — the (D) render cases cannot run; this is a FAIL, not a skip")
+fi
+ROOT_DIR="${REPO_ROOT}/infra/kubernetes/overlays/kind"
+RWORK="${WORK}/render"
+mkdir -p "$RWORK"
+
+# render <dir> <out-dir>: kustomize-render <dir> into <out-dir>.yaml and split it into one file
+# per document (on the `---` separator kustomize emits), so documents compare byte-for-byte.
+render() {
+  local src="$1" out="$2"
+  rm -rf "$out"; mkdir -p "$out"
+  "$REAL_KUBECTL" kustomize "$src" > "${out}.yaml" || return 1
+  awk -v d="$out" 'BEGIN{n=0; f=sprintf("%s/%04d", d, n)} /^---$/{close(f); n++; f=sprintf("%s/%04d", d, n); next} {print > f}' "${out}.yaml"
+}
+# doc_sums <split-dir>: sha256 of every document, sorted.
+doc_sums() { local f; for f in "$1"/*; do [[ -f "$f" ]] && sha256sum < "$f" | cut -d' ' -f1; done | sort; }
+# cm_names <split-dir>: ConfigMap metadata.name values, sorted.
+cm_names() {
+  local f
+  for f in "$1"/*; do
+    grep -q '^kind: ConfigMap$' "$f" && awk '/^metadata:/{m=1;next} /^[^ ]/{m=0} m&&/^  name: /{print $2}' "$f"
+  done | sort
+}
+# kind_docs <split-dir> <kind>: concatenated documents of one kind (for identity checks).
+kind_docs() { local f; for f in "$1"/*; do grep -q "^kind: $2\$" "$f" && cat "$f"; done; }
+
+if [[ -n "$REAL_KUBECTL" ]]; then
+  render "$ROOT_DIR" "${RWORK}/root"; root_rc=$?
+  assert_rc "root-renders" 0 "$root_rc"
+  assert_status "root-render-has-deployments" "kind: Deployment" "$(cat "${RWORK}/root.yaml")"
+  root_sums="$(doc_sums "${RWORK}/root")"
+
+  # --- (D1) Pre-applied sub-overlays are byte-identical SUBSETS of the root render ------------
+  # setup.sh applies postgres/redis/otel-collector ahead of the root for ordering only; if their
+  # render ever differed from the root's, the root apply would flip those objects back and forth.
+  # Non-empty + expected kind first, so "every doc of an empty set is in root" cannot pass.
+  for pair in "postgres:StatefulSet" "redis:StatefulSet" "otel-collector:Deployment"; do
+    sub="${pair%%:*}"; want_kind="${pair#*:}"
+    render "${ROOT_DIR}/services/${sub}" "${RWORK}/sub-${sub}"; sub_rc=$?
+    assert_rc "subset-${sub}-renders" 0 "$sub_rc"
+    assert_status "subset-${sub}-nonempty-has-${want_kind}" "kind: ${want_kind}" "$(cat "${RWORK}/sub-${sub}.yaml")"
+    missing="$(comm -23 <(doc_sums "${RWORK}/sub-${sub}") <(printf '%s\n' "$root_sums"))"
+    if [[ -z "$missing" ]]; then PASS=$((PASS + 1)); else
+      FAIL=$((FAIL + 1)); FAILURES+=("[subset-${sub}-in-root] a document of overlays/kind/services/${sub} is not byte-identical in the root render — the root apply would flip it"); fi
+  done
+
+  # --- (D2) The devloop wrapper: advertise values land, and ONLY those four ConfigMaps change --
+  RUN_RENDER='sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; render_env_overlay "$out"'
+  WRAP="${RWORK}/wrap"; mkdir -p "$WRAP"
+  DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=24435 \
+    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 bash -c "$RUN_RENDER" _ "$SETUP" "$WRAP" >/dev/null 2>&1
+  assert_rc "wrapper-renders" 0 $?
+  render "$WRAP" "${RWORK}/wrapped"; assert_rc "wrapper-kustomize-builds" 0 $?
+  wrapped="$(cat "${RWORK}/wrapped.yaml")"
+  assert_status "wrapper-mc-0-advertise" "MC_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24433" "$wrapped"
+  assert_status "wrapper-mc-1-advertise" "MC_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24435" "$wrapped"
+  assert_status "wrapper-mh-0-advertise" "MH_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24434" "$wrapped"
+  assert_status "wrapper-mh-1-advertise" "MH_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24436" "$wrapped"
+  # Exactly the four per-instance ConfigMap names change (their hash); every other ConfigMap
+  # name, e.g. ac-service-config's, is unchanged, which is "rolls exactly those pods".
+  changed="$(comm -3 <(cm_names "${RWORK}/root") <(cm_names "${RWORK}/wrapped") | tr -d '\t' \
+    | sed -E 's/-[^-]+$//' | sort -u | tr '\n' ' ')"
+  assert_rc "wrapper-changes-exactly-the-four-instance-configmaps" 0 \
+    "$([[ "$changed" == "mc-0-config mc-1-config mh-0-config mh-1-config " ]] && echo 0 || echo "1 (changed: ${changed})")"
+  ac_root="$(cm_names "${RWORK}/root" | grep '^ac-service-config-')"
+  assert_rc "wrapper-ac-config-present" 0 "$([[ -n "$ac_root" ]] && echo 0 || echo 1)"
+  assert_status "wrapper-ac-config-hash-unchanged" "$ac_root" "$(cm_names "${RWORK}/wrapped")"
+  # Security 2c: the wrapper must not touch Secrets.
+  assert_rc "wrapper-secrets-identical" 0 \
+    "$([[ "$(kind_docs "${RWORK}/root" Secret)" == "$(kind_docs "${RWORK}/wrapped" Secret)" ]] && echo 0 || echo 1)"
+  # DRY N1: the wrapper's instance set is DERIVED; it must equal the per-instance generators
+  # the root actually renders, so a new instance can never miss its override silently.
+  inst_wrapper="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; advertise_instances' _ "$SETUP" | tr '\n' ' ')"
+  inst_root="$(cm_names "${RWORK}/root" | grep -E '^m[ch]-[0-9]+-config-' | sed -E 's/-config-[^-]+$//' | sort | tr '\n' ' ')"
+  assert_rc "wrapper-instances-equal-root-generators" 0 \
+    "$([[ -n "$inst_root" && "$inst_wrapper" == "$inst_root" ]] && echo 0 || echo "1 (wrapper='${inst_wrapper}' root='${inst_root}')")"
+  # Invalid inputs fail the render (the caller then refuses to apply anything).
+  bad="$(DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=70000 \
+    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 bash -c "$RUN_RENDER" _ "$SETUP" "$WRAP" 2>&1)"; bad_rc=$?
+  assert_rc "wrapper-bad-port-rejected" 1 "$bad_rc"
+  assert_status "wrapper-bad-port-named" "MC_1_WEBTRANSPORT_PORT" "$bad"
+  DT_HOST_GATEWAY_IP=10.1.2.3 bash -c "$RUN_RENDER" _ "$SETUP" "$WRAP" >/dev/null 2>&1
+  assert_rc "wrapper-missing-port-rejected" 1 $?
+
+  # --- (D3) A data change changes ONLY its consumer's pod template ----------------------------
+  # Copy infra/ (the root references bases by relative path), change one key in mc-0's
+  # generator source, re-render: the only workload whose document differs must be mc-0.
+  CP="${RWORK}/copy"; mkdir -p "$CP"; cp -r "${REPO_ROOT}/infra" "$CP/"
+  sed -i -E 's#^(MC_WEBTRANSPORT_ADVERTISE_ADDRESS=).*#\1https://127.0.0.1:1#' "$CP/infra/services/mc-service/mc-0-config.env"
+  render "$CP/infra/kubernetes/overlays/kind" "${RWORK}/mutated"; assert_rc "mutated-renders" 0 $?
+  wl_changed=""
+  for f in "${RWORK}/mutated"/*; do
+    grep -qE '^kind: (Deployment|StatefulSet|DaemonSet)$' "$f" || continue
+    if ! grep -qxF "$(sha256sum < "$f" | cut -d' ' -f1)" <<< "$root_sums"; then
+      wl_changed+="$(awk '/^metadata:/{m=1;next} /^[^ ]/{m=0} m&&/^  name: /{print $2}' "$f") "
+    fi
+  done
+  assert_rc "one-key-change-rolls-only-its-consumer" 0 \
+    "$([[ "$wl_changed" == "mc-0 " ]] && echo 0 || echo "1 (changed workloads: '${wl_changed}')")"
+fi
+
+# --- (D4) apply_env_root: ONE apply path; the wrapper choice lives inside it ------------------
+# A PATH-stubbed kubectl records every `apply -k` target and snapshots the kustomization it was
+# handed; `kustomize` passes through to the REAL kubectl (env_root_workloads renders).
+D4_BIN="${WORK}/d4bin"; mkdir -p "$D4_BIN"
+cat > "${D4_BIN}/kubectl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${MARK}/kubectl.calls"
+args=("\$@")
+for ((i=0; i<\${#args[@]}; i++)); do
+  case "\${args[i]}" in
+    kustomize) exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]:i}" ;;
+    apply)
+      if [[ "\${args[i+1]:-}" == "-k" ]]; then
+        d="\${args[i+2]}"; printf '%s\n' "\$d" >> "${MARK}/applied"
+        [[ -f "\$d/kustomization.yaml" ]] && cp "\$d/kustomization.yaml" "${MARK}/applied.kustomization.yaml"
+        exit 0
+      fi ;;
+    delete) printf '%s\n' "\$*" >> "${MARK}/deleted"; exit 0 ;;
+    rollout)
+      case "\${args[i+1]:-}" in
+        restart) printf '%s\n' "\${args[i+2]}" >> "${MARK}/restarted"; exit 0 ;;
+        status)  exit 0 ;;
+      esac ;;
+  esac
+done
+echo "kubectl stub (D4): unmodelled invocation: \$*" >&2
+exit 91
+EOF
+for tool in kind docker podman; do
+  cat > "${D4_BIN}/${tool}" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${MARK}/${tool}.calls"
+if [[ "${tool}" == kind && "\$1 \$2" == "get clusters" ]]; then echo "d4cluster"; fi
+exit 0
+EOF
+done
+chmod +x "${D4_BIN}/kubectl" "${D4_BIN}/kind" "${D4_BIN}/docker" "${D4_BIN}/podman"
+RUN_APPLY='sp="$1"; set --; source "$sp" >/dev/null 2>&1; apply_env_root'
+
+reset_marks
+PATH="${D4_BIN}:${PATH}" env -u DT_HOST_GATEWAY_IP bash -c "$RUN_APPLY" _ "$SETUP" >/dev/null 2>&1
+assert_rc "apply-root-plain-rc" 0 $?
+assert_status "apply-root-plain-applies-the-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
+# Retired resources are converged away without --prune (security: the retired
+# grafana-sidecar RoleBinding is a live privilege until deleted).
+assert_status "apply-root-deletes-retired-grafana-rbac" "rolebinding/grafana-sidecar role/grafana-sidecar" "$(cat "${MARK}/deleted" 2>/dev/null)"
+assert_status "apply-root-retired-delete-is-idempotent" "--ignore-not-found" "$(cat "${MARK}/deleted" 2>/dev/null)"
+
+reset_marks
+PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 \
+  MC_1_WEBTRANSPORT_PORT=24435 MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 \
+  bash -c "$RUN_APPLY" _ "$SETUP" >/dev/null 2>&1
+assert_rc "apply-root-gateway-rc" 0 $?
+assert_absent "apply-root-gateway-not-the-plain-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
+assert_status "apply-root-gateway-applied-the-wrapper" "behavior: merge" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_status "apply-root-gateway-deletes-retired-grafana-rbac" "rolebinding/grafana-sidecar" "$(cat "${MARK}/deleted" 2>/dev/null)"
+assert_rc "apply-root-gateway-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
+
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 \
+  bash -c "$RUN_APPLY" _ "$SETUP" 2>&1)"; rc=$?
+assert_rc "apply-root-render-failure-aborts" 1 "$rc"
+assert_no_marker "apply-root-render-failure-applies-nothing" "$MARK" "applied"
+assert_status "apply-root-render-failure-says-no-fallback" "NOT applying" "$out"
+assert_rc "apply-root-failure-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
+
+# --- (D5) --only: converge the whole root; restart ONLY what a rebuilt image affects ----------
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 env -u DT_HOST_GATEWAY_IP \
+  bash "$SETUP" --only gc 2>&1)"; rc=$?
+assert_rc "only-gc-build-rc" 0 "$rc"
+assert_status "only-gc-applies-the-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
+assert_status "only-gc-restarts-gc" "deployment/gc-service" "$(cat "${MARK}/restarted" 2>/dev/null)"
+assert_absent "only-gc-restarts-nothing-else" "mc-0" "$(cat "${MARK}/restarted" 2>/dev/null)"
+assert_status "only-gc-waits-for-every-root-workload" "statefulset/redis" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
+
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster env -u DT_HOST_GATEWAY_IP \
+  bash "$SETUP" --skip-build --only gc 2>&1)"; rc=$?
+assert_rc "only-gc-skip-build-rc" 0 "$rc"
+assert_status "only-gc-skip-build-applies-the-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
+assert_no_marker "only-gc-skip-build-restarts-nothing" "$MARK" "restarted"
+
+# Static: the imperative ConfigMap patch and apply --prune (which could delete the
+# imperatively-created Secrets) must not come back.
+setup_code="$(grep -vE '^[[:space:]]*#' "$SETUP")"
+assert_absent "setup-has-no-configmap-patch" "patch configmap" "$setup_code"
+assert_absent "setup-has-no-prune" "--prune" "$setup_code"
+
+# === (E) the cargo parallelism cap reaches every cargo invocation, incl. the IMAGE builds =======
 # The image builds' release dependency cook + service build are the heaviest builds on the box
 # and ran uncapped (nproc=32 jobs each) while the pipeline was capped — two devloops building
 # images at once exhausted the 16GB WSL VM (2026-09-27). The cap now lives ONLY in
@@ -606,31 +805,6 @@ done
 # Positive control: the loop must have checked the four service Dockerfiles, not zero.
 if [ "$df_count" -ge 4 ]; then PASS=$((PASS + 1)); else
   FAIL=$((FAIL + 1)); FAILURES+=("[dockerfile-cap-nonvacuous] expected >=4 service Dockerfiles, found ${df_count}"); fi
-
-# === apply_reports_configmap_changed: restart only on an IN-PLACE ConfigMap change ==========
-# `kubectl apply` never restarts pods consuming a ConfigMap via configMapKeyRef, so the deploy
-# functions restart on `configured`. These pin the decision table: a false negative leaves
-# pods on stale values (the MH env-test's staleness check then reds); a false positive churns
-# every pod on a fresh bring-up or an idempotent re-run.
-RUN_ARCM='sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; apply_reports_configmap_changed "$out"'
-arcm() { bash -c "$RUN_ARCM" _ "$SETUP" "$1"; }
-
-arcm $'deployment.apps/mh-0 configured\nconfigmap/mh-service-config configured\nservice/mh-0 unchanged'
-assert_rc "arcm-configmap-configured-restarts"   0 $?
-arcm $'configmap/mh-service-config configured (server dry run)'
-assert_rc "arcm-dry-run-suffix-tolerated"        0 $?
-arcm $'configmap/mh-service-config created\ndeployment.apps/mh-0 created'
-assert_rc "arcm-created-no-restart"              1 $?
-arcm $'configmap/mh-service-config unchanged\ndeployment.apps/mh-0 unchanged'
-assert_rc "arcm-unchanged-no-restart"            1 $?
-# A Deployment changing is NOT a reason to restart here: `apply` rolls it out by itself.
-arcm $'configmap/mh-service-config unchanged\ndeployment.apps/mh-0 configured'
-assert_rc "arcm-only-deployment-configured"      1 $?
-# Anchored on the kind: a Secret or a name merely containing "configmap" must not match.
-arcm $'secret/configmap-backup configured'
-assert_rc "arcm-other-kind-no-restart"           1 $?
-arcm ''
-assert_rc "arcm-empty-output-no-restart"         1 $?
 
 # ---- extract_manifest_images: a comment must never become an image ----------------
 # Regression for Gate 2 attempt 1: a ConfigMap-literal comment "# image: without this"

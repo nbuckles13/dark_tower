@@ -9,7 +9,7 @@
 //!
 //! # Verification of the PII filter (the crux — see devloop-output main.md §R1)
 //! The dev OTel collector's debug exporter runs at `verbosity: normal`
-//! (`infra/services/otel-collector/configmap.yaml`), which logs metric/span
+//! (`infra/services/otel-collector/collector.yaml`), which logs metric/span
 //! names+counts only — never attribute keys/values (a deliberate @security
 //! control so PII never lands in the collector pod log). So we CANNOT read back
 //! the forwarded attributes from the collector. Instead the filter is verified
@@ -24,7 +24,7 @@
 //! - Kind cluster with AC + GC deployed; AC `devtest` org seeded.
 //! - GC telemetry config = compiled defaults (the ConfigMap does NOT override
 //!   them): max payload 256 KiB, per-user rate limit 60/min (per-pod, in-memory).
-//!   See the reverse cross-ref comment in `infra/services/gc-service/configmap.yaml`.
+//!   See the reverse cross-ref comment in `infra/services/gc-service/config.env`.
 
 #![cfg(feature = "flows")]
 
@@ -547,7 +547,7 @@ async fn test_metrics_rate_limit_returns_429() {
 
     // M=130 > replicas(2) × telemetry burst(60) = 120 ⇒ ≥1 pod exceeds burst ⇒ ≥1 429 guaranteed.
     // COUPLED to: gc-service replicas (deployment.yaml:10) AND TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE
-    // (compiled default 60; NOT set in gc-service/configmap.yaml today — if a ConfigMap later sets
+    // (compiled default 60; NOT set in gc-service/config.env today — if a ConfigMap later sets
     // it, burst changes too). Recompute M > replicas × burst if either moves (3 replicas ⇒ M ≥ 181).
     const M: usize = 130;
 

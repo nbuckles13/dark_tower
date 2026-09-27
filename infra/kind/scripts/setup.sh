@@ -6,6 +6,8 @@
 # - Calico CNI for NetworkPolicy enforcement
 # - PostgreSQL and Redis
 # - Full observability stack (Prometheus, Grafana, Loki)
+# - Everything above applied as ONE environment root:
+#   infra/kubernetes/overlays/kind/ (ADR-0038; see apply_env_root)
 # - Database migrations
 # - Port-forwarding
 #
@@ -35,10 +37,14 @@
 #
 # Options:
 #   --yes                    Auto-answer yes to all interactive prompts
-#   --only <svc>             Only rebuild+redeploy one service (ac, gc, mc, mh), or
-#                            re-apply the OTel collector (otel; restarts it if its
-#                            ConfigMap changed)
-#   --skip-build             Skip image builds, only apply manifests
+#   --only <svc>             Rebuild one service image (ac, gc, mc, mh; none for
+#                            otel), then apply the whole environment root
+#                            (infra/kubernetes/overlays/kind/) and wait for every
+#                            workload in it. Content-addressed ConfigMaps roll
+#                            exactly the workloads whose config changed; the
+#                            rebuilt service is restarted to pick up its image
+#   --skip-build             Skip image builds, only apply manifests (with --only,
+#                            nothing is restarted unless its config changed)
 #   --provision-org <sub>    Create one fresh organization and exit. Requires
 #                            DT_CLUSTER_NAME. Container-runnable (see EXECUTION
 #                            CONTEXT above); rejected in combination with --only
@@ -657,77 +663,30 @@ deploy_redis() {
     log_info "Redis deployed successfully."
 }
 
-# Deploy observability stack (Prometheus, Loki, Promtail, kube-state-metrics, node-exporter, Grafana)
-deploy_observability() {
-    log_step "Deploying observability stack..."
-
-    # Clean up legacy monolithic ConfigMap from older versions of this script
-    ${KUBECTL} delete configmap grafana-dashboards -n dark-tower-observability --ignore-not-found
-
-    # Apply entire observability stack via Kustomize overlay
-    # (includes Grafana RBAC, deployment, service, and dashboard ConfigMaps via configMapGenerator)
-    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/observability/"
-
-    log_info "Waiting for kube-state-metrics to be ready..."
-    ${KUBECTL} wait --for=condition=available --timeout=120s \
-        deployment/kube-state-metrics -n dark-tower-observability
-
-    log_info "Waiting for node-exporter to be ready..."
-    ${KUBECTL} rollout status daemonset/node-exporter -n dark-tower-observability --timeout=60s
-
-    log_info "Waiting for Prometheus to be ready..."
-    ${KUBECTL} wait --for=condition=Ready pod -l app=prometheus -n dark-tower-observability --timeout=120s
-
-    log_info "Waiting for Loki to be ready..."
-    ${KUBECTL} wait --for=condition=Ready pod -l app=loki -n dark-tower-observability --timeout=120s
-
-    log_info "Waiting for Promtail to be ready..."
-    ${KUBECTL} wait --for=condition=Ready pod -l app=promtail -n dark-tower-observability --timeout=120s
-
-    # Grafana reads dashboard ConfigMaps ONCE, at pod start (k8s-sidecar initContainer,
-    # METHOD: LIST), and disableNameSuffixHash keeps their names stable, so on an
-    # EXISTING cluster an apply alone leaves Grafana serving the old dashboards.
-    # Restart and wait (same two commands as scripts/layer7.sh and
-    # docs/observability/dashboards.md §Kubernetes); on a fresh cluster the restart is
-    # a no-op-equivalent second rollout.
-    log_info "Restarting Grafana so it lists the current dashboard ConfigMaps..."
-    ${KUBECTL} rollout restart deployment/grafana -n dark-tower-observability
-    ${KUBECTL} rollout status deployment/grafana -n dark-tower-observability --timeout=300s
-
-    log_info "Observability stack deployed successfully."
-}
-
 # Deploy the dev OTel collector (R-59)
 #
-# Ordered AFTER deploy_observability/deploy_redis and BEFORE the AC/GC/MC/MH
-# services. THE READINESS GATE IS LOAD-BEARING NOW, NOT EVENTUALLY: AC, GC and MC
-# all set OTEL_ENABLED=true in the Kind overlay and probe this collector during
+# Ordered BEFORE the environment-root apply that starts the AC/GC/MC/MH
+# services (the collector is also part of that root; this pre-apply is a subset
+# of it and exists for ordering). THE READINESS GATE IS LOAD-BEARING: AC, GC and
+# MC all set OTEL_ENABLED=true in the Kind overlay and probe this collector during
 # init, and under R-54 fail-hard-at-init a service started before the collector
 # is Ready fails init and CrashLoopBackoffs. The gate is the `rollout status`
 # below; do not shorten, skip, or collapse it back to a label-selector
-# `wait --for=condition=Ready` (see the comment at the site for why). A
-# ConfigMap the pinned collector image rejects now STALLS whole-cluster bring-up
-# loudly at this gate rather than being silently ignored by an already-running
-# pod - that is the intended trade, not a regression.
+# `wait --for=condition=Ready` (see the comment at the site for why). A config
+# the pinned collector image rejects STALLS whole-cluster bring-up loudly at
+# this gate rather than being silently ignored by an already-running pod — that
+# is the intended trade, not a regression.
 # (MH is the exception and deliberately so: it has no OTEL_ENABLED and no 4317
 # egress rule, so it never probes. Enabling it needs the egress rule first.)
 # See the collector-upgrade-discipline section in docs/runbooks/gc-deployment.md.
 deploy_otel_collector() {
     log_step "Deploying OTel collector..."
 
-    # The ConfigMap is not content-hashed and the pod template carries no
-    # checksum annotation, so a config-only apply changes nothing in the pod
-    # spec, and otelcol reads `--config` once at startup with no file watcher.
-    # Without the conditional restart the running pod keeps the OLD filter
-    # list while the committed file (and every file-reading guard) is correct.
-    # Scope and fail-open limits of the detector: see apply_reports_configmap_changed.
-    local apply_out
-    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/otel-collector/")
-    printf '%s\n' "${apply_out}"
-    if apply_reports_configmap_changed "${apply_out}"; then
-        log_info "OTel collector ConfigMap changed in place; restarting so the pod loads the new config..."
-        ${KUBECTL} rollout restart deployment/otel-collector -n dark-tower
-    fi
+    # otelcol reads `--config` once at startup with no file watcher, so a config
+    # edit must roll the pod. It does, with no restart here: the config is a
+    # content-addressed generator (ADR-0038 §2), so an edit changes the
+    # ConfigMap's name, hence the pod template, hence a rollout.
+    ${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/otel-collector/"
 
     # `rollout status`, NOT `wait --for=condition=Ready pod -l app=otel-collector`.
     # deployment.yaml has `replicas: 1` and no `strategy:` block, so the default
@@ -736,11 +695,213 @@ deploy_otel_collector() {
     # wait would match that old pod and report success over a rejected config.
     # BUDGET: this timeout must exceed the single-pod readiness budget (120s, the
     # figure the replaced wait used) PLUS terminationGracePeriodSeconds (30s,
-    # deployment.yaml) - after a restart it covers a new pod becoming Ready AND
-    # the old one terminating, serialized. Do not "tidy" it down to 120s.
+    # deployment.yaml) - after a config change it covers a new pod becoming Ready
+    # AND the old one terminating, serialized. Do not "tidy" it down to 120s.
     log_info "Waiting for OTel collector rollout to complete..."
     ${KUBECTL} rollout status deployment/otel-collector -n dark-tower --timeout=180s
     log_info "OTel collector deployed successfully."
+}
+
+# --- The environment root (ADR-0038 §2) ------------------------------------
+#
+# `infra/kubernetes/overlays/kind/` composes every service, the OTel collector
+# and the observability stack. apply_env_root() is the ONE place that applies
+# it. Every ConfigMap a pod template consumes is generated with a content hash
+# in its name, so applying the root rolls exactly the workloads whose
+# configuration changed and nothing else — no unconditional restart.
+ENV_ROOT_REL="infra/kubernetes/overlays/kind"
+ENV_ROOT="${PROJECT_ROOT}/${ENV_ROOT_REL}"
+
+# The per-instance MC/MH ConfigMaps whose advertise address a devloop cluster
+# overrides, DERIVED from the per-instance generator sources on disk (not a
+# hand-kept list): adding mc-2 means adding mc-2-config.env, and the override
+# follows. Prints `mc-0`, `mc-1`, … one per line, sorted.
+advertise_instances() {
+    local f base
+    for f in "${PROJECT_ROOT}"/infra/services/m[ch]-service/m[ch]-[0-9]*-config.env; do
+        [[ -e "$f" ]] || continue
+        base="${f##*/}"
+        printf '%s\n' "${base%-config.env}"
+    done | sort
+}
+
+# Render the devloop wrapper kustomization into directory $1. PURE: it writes
+# only $1/kustomization.yaml and touches no cluster (setup.test.sh renders it).
+#
+# Why a wrapper: the advertise address of each MC/MH pod is a per-cluster value
+# (host-gateway IP + the helper's per-slug port). It used to be `kubectl
+# patch`ed onto the live ConfigMap after apply, which (a) addresses a literal
+# ConfigMap name that no longer exists once names are content-addressed and
+# (b) sits outside the render, so the next apply reverts it and it never enters
+# a hash. Here it is a render INPUT instead: a `behavior: merge` generator over
+# the root's own per-instance generator, so the value is part of the hash and a
+# gateway/port change rolls exactly those pods. Devloop 3's `deploy` render
+# absorbs this step (the ports are the blueprint's port allocation).
+#
+# Returns non-zero, with a diagnostic, on any invalid input — the caller must
+# not fall back to the plain root (that would silently advertise localhost).
+render_env_overlay() {
+    local dir="$1" rel inst svc idx svc_uc port_var port instances
+    if [[ ! "${DT_HOST_GATEWAY_IP:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "${DT_HOST_GATEWAY_IP}" == "0.0.0.0" ]]; then
+        log_error "render_env_overlay: DT_HOST_GATEWAY_IP is unset or invalid: '${DT_HOST_GATEWAY_IP:-}'"
+        return 1
+    fi
+    instances="$(advertise_instances)"
+    if [[ -z "${instances}" ]]; then
+        log_error "render_env_overlay: no per-instance generator sources (infra/services/m[ch]-service/m[ch]-N-config.env) found"
+        return 1
+    fi
+    # kustomize rejects an absolute path in `resources:`; the default load
+    # restrictor allows a relative path to a kustomization directory.
+    rel="$(realpath --relative-to="${dir}" "${ENV_ROOT}")" || return 1
+    {
+        echo "# GENERATED by infra/kind/scripts/setup.sh:render_env_overlay — do not edit."
+        echo "apiVersion: kustomize.config.k8s.io/v1beta1"
+        echo "kind: Kustomization"
+        echo "resources:"
+        echo "  - ${rel}"
+        echo "configMapGenerator:"
+    } > "${dir}/kustomization.yaml"
+    while IFS= read -r inst; do
+        svc="${inst%%-*}"
+        idx="${inst#*-}"
+        svc_uc="${svc^^}"
+        port_var="${svc_uc}_${idx}_WEBTRANSPORT_PORT"
+        port="${!port_var:-}"
+        if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            log_error "render_env_overlay: ${port_var} is unset or not a port (1..65535): '${port}' (expected from DT_PORT_MAP)"
+            return 1
+        fi
+        {
+            echo "  - name: ${inst}-config"
+            echo "    namespace: dark-tower"
+            echo "    behavior: merge"
+            echo "    literals:"
+            echo "      - \"${svc_uc}_WEBTRANSPORT_ADVERTISE_ADDRESS=https://${DT_HOST_GATEWAY_IP}:${port}\""
+        } >> "${dir}/kustomization.yaml"
+    done <<< "${instances}"
+}
+
+# Apply the environment root. With DT_HOST_GATEWAY_IP set (a devloop cluster)
+# the wrapper rendered above is applied instead — chosen HERE and nowhere else,
+# so no caller can apply the plain root to a devloop cluster and silently revert
+# its advertise addresses. A render failure aborts; there is no fallback.
+# The body is a subshell so the temp dir's EXIT trap fires on every exit path.
+apply_env_root() (
+    set -euo pipefail
+    if [[ -z "${DT_HOST_GATEWAY_IP:-}" ]]; then
+        log_step "Applying environment root ${ENV_ROOT_REL}..."
+        ${KUBECTL} apply -k "${ENV_ROOT}"
+        delete_retired_resources
+        exit 0
+    fi
+    wrap="$(mktemp -d "${TMPDIR:-/tmp}/dt-env-root.XXXXXX")"
+    trap 'rm -rf "${wrap}"' EXIT
+    if ! render_env_overlay "${wrap}"; then
+        log_error "Could not render the devloop environment overlay; NOT applying (the plain root would advertise localhost to clients)."
+        exit 1
+    fi
+    log_step "Applying environment root ${ENV_ROOT_REL} (devloop advertise addresses via ${DT_HOST_GATEWAY_IP})..."
+    ${KUBECTL} apply -k "${wrap}"
+    delete_retired_resources
+)
+
+# Removed-resource convergence without `apply --prune` (which could delete the
+# Secrets this script creates imperatively). Objects the tree no longer declares
+# are deleted by name here, idempotently. REMOVE an entry once every cluster has
+# been rebuilt from a tree without it (ADR-0038 devloop 3's `provision` rebuilds
+# them all):
+#   - grafana-sidecar Role/RoleBinding: retired with the dashboard LIST sidecar.
+#     Left in place, the RoleBinding keeps granting the `grafana` ServiceAccount
+#     configmaps get/list/watch, so it is a live privilege, not inert litter.
+delete_retired_resources() {
+    ${KUBECTL} delete rolebinding/grafana-sidecar role/grafana-sidecar \
+        -n dark-tower-observability --ignore-not-found
+}
+
+# Workloads the environment root owns, DERIVED from its render (so a new
+# workload is waited on without editing a list): `<namespace> <kind>/<name>`,
+# one per line. With $1 set, only workloads whose pod template runs the image
+# `localhost/$1-service:` (the ones a rebuild of that service's image affects).
+env_root_workloads() {
+    local image_filter="${1:-}"
+    kubectl kustomize "${ENV_ROOT}" | awk -v img="${image_filter:+localhost/${image_filter}-service:}" '
+        function emit() {
+            if (k ~ /^(Deployment|StatefulSet|DaemonSet)$/ && (img == "" || has_img)) print ns " " tolower(k) "/" n
+            k = ""; n = ""; ns = ""; has_img = 0; m = 0
+        }
+        /^---/ { emit(); next }
+        /^kind: / { k = $2 }
+        /^metadata:/ { m = 1; next }
+        /^[^ ]/ { m = 0 }
+        m && /^  name: / { n = $2 }
+        m && /^  namespace: / { ns = $2 }
+        img != "" && index($0, "image: " img) { has_img = 1 }
+        END { emit() }'
+}
+
+# Print what the rollout-status line cannot: the pod phase and events that
+# distinguish CreateContainerConfigError (missing ConfigMap key), FailedMount
+# (missing Secret/ConfigMap volume) and CrashLoopBackOff — see
+# docs/runbooks/mc-deployment.md §Config-failure triage.
+dump_workload_diagnostics() {
+    local ns="$1" res="$2" sel
+    sel="$(${KUBECTL} get "${res}" -n "${ns}" \
+        -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' 2>/dev/null || true)"
+    sel="${sel%,}"
+    log_error "--- ${ns}/${res}: pods ---"
+    ${KUBECTL} get pods -n "${ns}" -o wide ${sel:+-l "${sel}"} || true
+    log_error "--- ${ns}/${res}: describe (tail) ---"
+    ${KUBECTL} describe pods -n "${ns}" ${sel:+-l "${sel}"} 2>&1 | tail -n 60 || true
+    log_error "--- ${ns}: recent events ---"
+    ${KUBECTL} get events -n "${ns}" --sort-by=.lastTimestamp 2>&1 | tail -n 25 || true
+}
+
+# Wait for EVERY workload the root owns — never only the one a caller asked
+# about: applying the root can roll any workload whose config changed, and one
+# that crashloops on a new required key must fail this step, not pass green.
+# Reports every failing workload (with diagnostics) before failing.
+wait_for_env_root() {
+    log_step "Waiting for every workload in ${ENV_ROOT_REL} to roll out..."
+    local workloads ns res failed=()
+    workloads="$(env_root_workloads)"
+    if [[ -z "${workloads}" ]]; then
+        log_error "Rendered ${ENV_ROOT_REL} contains no workloads — refusing to report a vacuous success."
+        return 1
+    fi
+    while read -r ns res; do
+        if ! ${KUBECTL} rollout status "${res}" -n "${ns}" --timeout=300s; then
+            log_error "Rollout did not complete: ${ns}/${res}"
+            dump_workload_diagnostics "${ns}" "${res}"
+            failed+=("${ns}/${res}")
+        fi
+    done <<< "${workloads}"
+    if (( ${#failed[@]} > 0 )); then
+        log_error "Workloads not ready: ${failed[*]}"
+        return 1
+    fi
+    log_info "All $(wc -l <<< "${workloads}") workloads rolled out."
+}
+
+# Build one Dark Tower service image and load it into Kind.
+# $1 = service short name (ac, gc, mc, mh).
+build_service_image() {
+    local svc="$1"
+    log_step "Building ${svc}-service container image..."
+    build_image "localhost/${svc}-service:latest" "infra/docker/${svc}-service/Dockerfile" "${PROJECT_ROOT}"
+    log_step "Loading ${svc}-service image into kind cluster..."
+    load_image_to_kind "localhost/${svc}-service:latest"
+}
+
+build_service_images() {
+    if [[ "${SKIP_BUILD}" == "true" ]]; then
+        log_warn "Skipping service image builds (--skip-build). Ensure images are already loaded."
+        return 0
+    fi
+    local svc
+    for svc in ac gc mc mh; do
+        build_service_image "${svc}"
+    done
 }
 
 # Run database migrations
@@ -1187,130 +1348,6 @@ create_ac_secrets() {
     log_info "AC service secrets created."
 }
 
-# Build and deploy AC service
-# Did `kubectl apply` change a ConfigMap IN PLACE? Returns 0 iff so.
-#
-# WHY THIS EXISTS: `kubectl apply` updates a ConfigMap but NEVER restarts the
-# pods that consume it through `configMapKeyRef` — env is resolved once, at
-# container start. So re-running this script after a value-only ConfigMap
-# change used to leave every pod running the OLD value while every manifest
-# check passed. For MH that includes the Kind egress budget, where a stale
-# value presents as "some receivers are missing some senders"; the MH env-test
-# (crates/env-tests/tests/01_mh_deployment_config.rs) fails on exactly that
-# staleness, and its precondition is this restart.
-#
-# Only `configured` needs a restart: `created` means the pods are new and
-# already carry the value, and `unchanged` means there is nothing to pick up.
-# Restarting only on `configured` keeps a fresh bring-up and an idempotent
-# re-run free of pod churn. Matches kubectl's `<kind>/<name> <verb>` line
-# (verified against real output; a dry run appends a parenthetical, which the
-# pattern tolerates).
-#
-# IT NARROWS THE STALENESS WINDOW; IT DOES NOT CLOSE IT. This script is ONE
-# deploy path. A human running `kubectl apply -k` against the Kind overlay
-# bypasses it entirely, and that is supported — docs/runbooks/mh-deployment.md
-# tells operators to do exactly that. The fail-closed backstop is the env-test
-# staleness branch (crates/env-tests/tests/01_mh_deployment_config.rs), which
-# covers every path this script does not own.
-#
-# THIS DETECTOR IS FAIL-OPEN, and that is only acceptable because of the above.
-# A missed detection is a SILENTLY stale value — for MH's egress budget that
-# presents as "some receivers are missing some senders", indistinguishable by
-# symptom from a routing bug. So: do NOT delete the env-test staleness branch
-# on the grounds that this script handles it, and do NOT weaken this on the
-# grounds that the env-test catches it. Each is the other's justification; drop
-# either and both halves become useless at once.
-#
-# SCOPE IS THE FOUR APPLICATION SERVICES (AC, GC, MC, MH) PLUS THE OTEL
-# COLLECTOR. The collector qualifies because it is stateless (no connection
-# pool or migration to race) and reads `--config` once at startup with no file
-# watcher, so without a restart a config edit never takes effect. Deliberately
-# NOT postgres or redis: those carry state and connection pools, and a restart
-# mid-setup can race whatever is migrating or seeding against them.
-#
-# DO NOT PORT THIS TO A PRODUCTION DEPLOY PATH UNCHANGED. In Kind a restart is
-# cheap. On a real deployment restarting MH drops every live WebTransport
-# session that pod is carrying, so a ConfigMap value edit would silently become
-# a media outage for that pod's meetings. The COLLECTOR is worse, not cheaper,
-# wherever `OTEL_ENABLED=true`: it is a SINGLETON, and under R-54
-# fail-hard-at-init any AC/GC/MC pod that restarts inside its restart gap fails
-# init rather than starting degraded — a fleet-wide init hazard, not a telemetry
-# gap. Production runs `OTEL_ENABLED=false` today (see the AC deployment runbook:
-# "until the collector has an availability SLO"), and that default is the ONLY
-# thing keeping this latent. Outside Kind this must be an explicit
-# operator action with that consequence stated, never an implicit consequence
-# of `apply -k`.
-#
-# KNOWN LIMITS — both fail SILENT, which is why they are written here:
-#   - This depends on kubectl's own output wording. If kubectl ever rewords
-#     `configured`, this stops restarting and nothing reports it. MH has a
-#     backstop (the env-test staleness check reds); AC, GC, MC and the OTel
-#     collector do not. The collector's silent-stale symptom is the worst of
-#     them: an allowlisted metric name absent from Prometheus reads identically
-#     to "no browser is running".
-#   - A run that dies between the apply and the restart leaves stale pods, and
-#     the next run sees `unchanged` and does not restart either.
-# Neither is a regression: before this helper there was no restart at all on
-# the host path.
-apply_reports_configmap_changed() {
-    grep -Eq '^configmap/[^[:space:]]+ configured( |$)' <<<"$1"
-}
-
-deploy_ac_service() {
-    if [[ "${SKIP_BUILD}" != "true" ]]; then
-        log_step "Building AC service container image..."
-        build_image localhost/ac-service:latest infra/docker/ac-service/Dockerfile "${PROJECT_ROOT}"
-
-        log_step "Loading image into kind cluster..."
-        load_image_to_kind localhost/ac-service:latest
-    else
-        log_warn "Skipping AC image build (--skip-build). Ensure image is already loaded."
-    fi
-
-    log_step "Deploying AC service to cluster..."
-    # Captured, then printed: declared separately so a failing apply still
-    # aborts under `set -e` (`local x=$(...)` would mask its exit status).
-    local apply_out
-    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/ac-service/")
-    printf '%s\n' "${apply_out}"
-    if apply_reports_configmap_changed "${apply_out}"; then
-        log_info "AC ConfigMap changed in place; restarting so the pod picks up the new values..."
-        ${KUBECTL} rollout restart statefulset/ac-service -n dark-tower
-    fi
-
-    log_info "Waiting for AC service to be ready..."
-    ${KUBECTL} rollout status statefulset/ac-service -n dark-tower --timeout=180s
-
-    log_info "AC service deployed successfully."
-}
-
-# Build and deploy Global Controller service
-deploy_gc_service() {
-    if [[ "${SKIP_BUILD}" != "true" ]]; then
-        log_step "Building Global Controller container image..."
-        build_image localhost/gc-service:latest infra/docker/gc-service/Dockerfile "${PROJECT_ROOT}"
-
-        log_step "Loading image into kind cluster..."
-        load_image_to_kind localhost/gc-service:latest
-    else
-        log_warn "Skipping GC image build (--skip-build). Ensure image is already loaded."
-    fi
-
-    log_step "Deploying Global Controller to cluster..."
-    local apply_out
-    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/gc-service/")
-    printf '%s\n' "${apply_out}"
-    if apply_reports_configmap_changed "${apply_out}"; then
-        log_info "GC ConfigMap changed in place; restarting so the pod picks up the new values..."
-        ${KUBECTL} rollout restart deployment/gc-service -n dark-tower
-    fi
-
-    log_info "Waiting for Global Controller to be ready..."
-    ${KUBECTL} rollout status deployment/gc-service -n dark-tower --timeout=180s
-
-    log_info "Global Controller deployed successfully."
-}
-
 # Generate TLS certificates and create MC TLS secret
 create_mc_tls_secret() {
     log_step "Generating TLS certificates for MC WebTransport..."
@@ -1328,66 +1365,6 @@ create_mc_tls_secret() {
     log_info "MC TLS secret created successfully."
 }
 
-# Build and deploy Meeting Controller service
-deploy_mc_service() {
-    if [[ "${SKIP_BUILD}" != "true" ]]; then
-        log_step "Building Meeting Controller container image..."
-        build_image localhost/mc-service:latest infra/docker/mc-service/Dockerfile "${PROJECT_ROOT}"
-
-        log_step "Loading image into kind cluster..."
-        load_image_to_kind localhost/mc-service:latest
-    else
-        log_warn "Skipping MC image build (--skip-build). Ensure image is already loaded."
-    fi
-
-    log_step "Deploying Meeting Controller to cluster..."
-    local apply_out
-    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mc-service/")
-    printf '%s\n' "${apply_out}"
-    # ONE restart decision for both reasons below, so the devloop path still
-    # restarts exactly once. The host path (no gateway IP) previously never
-    # restarted, leaving a value-only ConfigMap change unapplied.
-    local restart_needed=false
-    if apply_reports_configmap_changed "${apply_out}"; then
-        restart_needed=true
-    fi
-
-    # Devloop mode: patch MC advertise addresses to use host-gateway IP + dynamic ports.
-    # Static ConfigMaps default to localhost:4433/4435 which are unreachable from the
-    # devloop container. The gateway IP is reachable from both container and host.
-    # TLS SAN coverage is not required — dev-mode clients use cert validation bypass.
-    if [[ -n "${DT_HOST_GATEWAY_IP:-}" ]]; then
-        log_info "Patching MC-0 advertise address: https://${DT_HOST_GATEWAY_IP}:${MC_0_WEBTRANSPORT_PORT}"
-        ${KUBECTL} patch configmap mc-0-config -n dark-tower \
-            --type merge -p "{\"data\":{\"MC_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MC_0_WEBTRANSPORT_PORT}\"}}"
-        log_info "Patching MC-1 advertise address: https://${DT_HOST_GATEWAY_IP}:${MC_1_WEBTRANSPORT_PORT}"
-        ${KUBECTL} patch configmap mc-1-config -n dark-tower \
-            --type merge -p "{\"data\":{\"MC_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MC_1_WEBTRANSPORT_PORT}\"}}"
-        restart_needed=true
-    fi
-    if [[ "${restart_needed}" == "true" ]]; then
-        ${KUBECTL} rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower
-    fi
-
-    log_info "Waiting for Meeting Controller to be ready..."
-    ${KUBECTL} rollout status deployment/mc-0 -n dark-tower --timeout=180s
-    ${KUBECTL} rollout status deployment/mc-1 -n dark-tower --timeout=180s
-
-    log_info "Meeting Controller deployed successfully."
-}
-
-# Create MH service secrets
-create_mh_secrets() {
-    log_step "Creating MH service secrets..."
-
-    ${KUBECTL} create secret generic mh-service-secrets \
-        --from-literal=MH_CLIENT_SECRET="media-handler-secret-dev-003" \
-        -n dark-tower \
-        --dry-run=client -o yaml | ${KUBECTL} apply -f -
-
-    log_info "MH service secrets created."
-}
-
 # Generate TLS certificates and create MH TLS secret
 create_mh_tls_secret() {
     log_step "Generating TLS certificates for MH WebTransport..."
@@ -1403,50 +1380,6 @@ create_mh_tls_secret() {
         --dry-run=client -o yaml | ${KUBECTL} apply -f -
 
     log_info "MH TLS secret created successfully."
-}
-
-# Build and deploy Media Handler service
-deploy_mh_service() {
-    if [[ "${SKIP_BUILD}" != "true" ]]; then
-        log_step "Building Media Handler container image..."
-        build_image localhost/mh-service:latest infra/docker/mh-service/Dockerfile "${PROJECT_ROOT}"
-
-        log_step "Loading image into kind cluster..."
-        load_image_to_kind localhost/mh-service:latest
-    else
-        log_warn "Skipping MH image build (--skip-build). Ensure image is already loaded."
-    fi
-
-    log_step "Deploying Media Handler to cluster..."
-    local apply_out
-    apply_out=$(${KUBECTL} apply -k "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mh-service/")
-    printf '%s\n' "${apply_out}"
-    # ONE restart decision for both reasons below (see deploy_mc_service). This
-    # is also what makes the MH env-test's staleness check hold on the host path.
-    local restart_needed=false
-    if apply_reports_configmap_changed "${apply_out}"; then
-        restart_needed=true
-    fi
-
-    # Devloop mode: patch MH advertise addresses (same pattern as MC above).
-    if [[ -n "${DT_HOST_GATEWAY_IP:-}" ]]; then
-        log_info "Patching MH-0 advertise address: https://${DT_HOST_GATEWAY_IP}:${MH_0_WEBTRANSPORT_PORT}"
-        ${KUBECTL} patch configmap mh-0-config -n dark-tower \
-            --type merge -p "{\"data\":{\"MH_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MH_0_WEBTRANSPORT_PORT}\"}}"
-        log_info "Patching MH-1 advertise address: https://${DT_HOST_GATEWAY_IP}:${MH_1_WEBTRANSPORT_PORT}"
-        ${KUBECTL} patch configmap mh-1-config -n dark-tower \
-            --type merge -p "{\"data\":{\"MH_WEBTRANSPORT_ADVERTISE_ADDRESS\":\"https://${DT_HOST_GATEWAY_IP}:${MH_1_WEBTRANSPORT_PORT}\"}}"
-        restart_needed=true
-    fi
-    if [[ "${restart_needed}" == "true" ]]; then
-        ${KUBECTL} rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower
-    fi
-
-    log_info "Waiting for Media Handler to be ready..."
-    ${KUBECTL} rollout status deployment/mh-0 -n dark-tower --timeout=180s
-    ${KUBECTL} rollout status deployment/mh-1 -n dark-tower --timeout=180s
-
-    log_info "Media Handler deployed successfully."
 }
 
 # Install Telepresence traffic-manager (optional)
@@ -1607,9 +1540,18 @@ print_access_info() {
     echo ""
 }
 
-# Deploy a single service (used by --only flag)
+# --only <svc>: rebuild ONE service image, then converge the whole tree.
+#
+# It applies the environment root, not a per-service overlay: the root is the
+# single source of what is deployed, and a per-service apply could leave a
+# sibling's changed configuration undeployed. Content-addressed ConfigMaps mean
+# the apply rolls only what changed. Image tags are still `:latest` (content
+# tags are ADR-0038 devloop 2), so a rebuilt image is picked up by restarting
+# the workloads that run it — ONLY when an image was actually built:
+# `--skip-build --only <svc>` (the helper's `deploy`) restarts nothing.
+# The wait covers every workload in the root, for the same reason as the apply.
 deploy_only_service() {
-    local svc="$1"
+    local svc="$1" built=false res ns
 
     # Verify cluster exists
     if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
@@ -1620,30 +1562,36 @@ deploy_only_service() {
     check_prerequisites
 
     case "$svc" in
-        ac)
-            create_ac_secrets
-            deploy_ac_service
-            ;;
-        gc)
-            deploy_gc_service
-            ;;
-        mc)
-            create_mc_tls_secret
-            deploy_mc_service
-            ;;
-        mh)
-            create_mh_secrets
-            create_mh_tls_secret
-            deploy_mh_service
-            ;;
-        otel)
-            deploy_otel_collector
-            ;;
+        ac) create_ac_secrets ;;
+        mc) create_mc_tls_secret ;;
+        mh) create_mh_tls_secret ;;
+        gc|otel) ;;
         *)
             log_error "Unknown service '${svc}'"
             exit 1
             ;;
     esac
+
+    if [[ "$svc" != "otel" ]]; then
+        if [[ "${SKIP_BUILD}" != "true" ]]; then
+            build_service_image "$svc"
+            built=true
+        else
+            log_warn "Skipping ${svc} image build (--skip-build). Ensure image is already loaded."
+        fi
+    fi
+
+    apply_env_root
+
+    if [[ "${built}" == "true" ]]; then
+        while read -r ns res; do
+            [[ -n "${res}" ]] || continue
+            log_info "Restarting ${ns}/${res} to pick up the rebuilt ${svc}-service image..."
+            ${KUBECTL} rollout restart "${res}" -n "${ns}"
+        done <<< "$(env_root_workloads "$svc")"
+    fi
+
+    wait_for_env_root
 
     log_info "Service '${svc}' deployed successfully."
 }
@@ -1681,21 +1629,24 @@ main() {
     install_calico
     create_namespaces
     preload_third_party_images
+    build_service_images
+    # Pre-applied ahead of the root for ORDERING only (each is a byte-identical
+    # subset of the root render — scripts/setup.test.sh pins that — so the root
+    # apply below is a no-op on them): migrations need PostgreSQL, and R-54
+    # fail-hard OTel init needs the collector Ready before any service starts.
     deploy_postgres
     deploy_redis
-    deploy_observability
-    deploy_otel_collector
     run_migrations
     seed_test_data
     seed_demo_org
+    # Imperative Secrets/TLS (moved to `provision` in ADR-0038 devloop 3); they
+    # must exist before the root apply creates the pods that mount them.
     create_ac_secrets
-    deploy_ac_service
-    deploy_gc_service
     create_mc_tls_secret
-    deploy_mc_service
-    create_mh_secrets
     create_mh_tls_secret
-    deploy_mh_service
+    deploy_otel_collector
+    apply_env_root
+    wait_for_env_root
     install_telepresence
     setup_port_forwards
     print_access_info

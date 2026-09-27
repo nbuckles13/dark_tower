@@ -163,7 +163,7 @@ function guardModeFor(env: TelemetryEnv): GuardMode {
  * With DELTA, each export carries only that interval's increment, so the
  * collector's `delta_to_cumulative` processor SUMS them into one correct
  * cumulative series with no per-browser label
- * (`infra/services/otel-collector/configmap.yaml`). That is the entire reason
+ * (`infra/services/otel-collector/collector.yaml`). That is the entire reason
  * the fleet can be counted without identifying anyone.
  *
  * ---------------------------------------------------------------------------

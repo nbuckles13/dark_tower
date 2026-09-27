@@ -9,9 +9,20 @@ resources:
   - deployment.yaml
   - service.yaml
 
-generatorOptions:
-  disableNameSuffixHash: true
-
+# EVERY ConfigMap here is content-addressed (ADR-0038 §2): generated WITH the
+# hash suffix, and consumed by the Grafana pod template by name, so editing a
+# datasource, the provider config or any dashboard changes the pod template and
+# applying the environment root rolls Grafana. Grafana reads all of them only at
+# startup, which is exactly why a stable name would leave it serving stale
+# config until someone remembered a manual restart.
+#
+# Dashboards are mounted by `infra/grafana/deployment.yaml` through ONE
+# `projected` volume listing every `grafana-dashboards-<prefix>` group below.
+# ADDING A GROUP therefore means adding it in two places: here, and as a source
+# of that projected volume. Forget the second and `dt-guard kustomize` R-21
+# fails the build (a generated ConfigMap no pod template references). The
+# sources are not `optional:`, so a group missing at runtime fails pod start
+# loudly rather than silently dropping dashboards.
 configMapGenerator:
   - name: grafana-datasources
     files:
@@ -20,25 +31,16 @@ configMapGenerator:
     files:
       - dashboards.yaml=provisioning/dashboards/dashboards.yaml
   - name: grafana-dashboards-ac
-    options:
-      labels:
-        grafana_dashboard: "1"
     files:
       - ac-logs.json=dashboards/ac-logs.json
       - ac-overview.json=dashboards/ac-overview.json
       - ac-slos.json=dashboards/ac-slos.json
   - name: grafana-dashboards-gc
-    options:
-      labels:
-        grafana_dashboard: "1"
     files:
       - gc-logs.json=dashboards/gc-logs.json
       - gc-overview.json=dashboards/gc-overview.json
       - gc-slos.json=dashboards/gc-slos.json
   - name: grafana-dashboards-mc
-    options:
-      labels:
-        grafana_dashboard: "1"
     files:
       - mc-logs.json=dashboards/mc-logs.json
       - mc-overview.json=dashboards/mc-overview.json
@@ -51,15 +53,9 @@ configMapGenerator:
   # single MC ConfigMap failed cluster setup. `dt-guard kustomize` now fails
   # Layer 3 on any dashboard ConfigMap past its headroom threshold.
   - name: grafana-dashboards-mc-media
-    options:
-      labels:
-        grafana_dashboard: "1"
     files:
       - mc-media.json=dashboards/mc-media.json
   - name: grafana-dashboards-mh
-    options:
-      labels:
-        grafana_dashboard: "1"
     files:
       - mh-logs.json=dashboards/mh-logs.json
       - mh-media.json=dashboards/mh-media.json
@@ -75,26 +71,14 @@ configMapGenerator:
   # `dt-guard kustomize` (`configmap_annotation_size`, in
   # `crates/dt-guard/src/kustomize_configmaps.rs`) fails Layer 3 at 80% of the
   # cap, and its message says to split a file out, as MC's media path was.
+  # A NEW group must also be added as a source of the `dashboards` projected
+  # volume in deployment.yaml (R-21 fails the build otherwise).
   #
   # `client` is not a Rust service, but it follows the same grouping, so
   # future `client-*.json` dashboards land here too — subject to the same cap.
-  #
-  # The `options.labels` block below is LOAD-BEARING. The Grafana k8s-sidecar
-  # mounts only ConfigMaps carrying `grafana_dashboard: "1"`. `dt-guard
-  # kustomize` R-20 checks dashboard BASENAMES only, but its
-  # `dashboard_configmap_label` rule (`crates/dt-guard/src/kustomize_configmaps.rs`)
-  # fails Layer 3 when any generator here that ships dashboard JSON, whatever
-  # it is named, omits the label the sidecar selects on. Every other group
-  # here carries it; so must any new one.
   - name: grafana-dashboards-client
-    options:
-      labels:
-        grafana_dashboard: "1"
     files:
       - client-media.json=dashboards/client-media.json
   - name: grafana-dashboards-errors
-    options:
-      labels:
-        grafana_dashboard: "1"
     files:
       - errors-overview.json=dashboards/errors-overview.json
