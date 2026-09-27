@@ -6,7 +6,7 @@ Multi-stage Dockerfile for the Dark Tower Authentication Controller service foll
 
 ### Production (Default)
 ```bash
-docker build --build-arg CARGO_BUILD_JOBS=default -t dark-tower/ac-service:latest .
+docker build -t dark-tower/ac-service:latest .
 ```
 
 **Characteristics:**
@@ -20,7 +20,7 @@ docker build --build-arg CARGO_BUILD_JOBS=default -t dark-tower/ac-service:lates
 
 ### Debug (With HEALTHCHECK)
 ```bash
-docker build --build-arg CARGO_BUILD_JOBS=default -t dark-tower/ac-service:debug --target runtime-with-healthcheck .
+docker build -t dark-tower/ac-service:debug --target runtime-with-healthcheck .
 ```
 
 **Characteristics:**
@@ -38,7 +38,7 @@ docker build --build-arg CARGO_BUILD_JOBS=default -t dark-tower/ac-service:debug
 Build from repository root:
 ```bash
 cd /path/to/dark_tower
-docker build --build-arg CARGO_BUILD_JOBS=default -f infra/docker/ac-service/Dockerfile -t ac-service:latest .
+docker build -f infra/docker/ac-service/Dockerfile -t ac-service:latest .
 ```
 
 ### Required Files
@@ -229,7 +229,7 @@ docker logs ac-service
 ### Build fails
 ```bash
 # Check Docker context
-docker build --build-arg CARGO_BUILD_JOBS=default -f infra/docker/ac-service/Dockerfile .
+docker build -f infra/docker/ac-service/Dockerfile .
 
 # Common issues:
 # 1. Building from wrong directory (must be repo root)

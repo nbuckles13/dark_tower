@@ -379,10 +379,7 @@ launch_helper() {
     # REPO_ROOT (see build_helper above) — that pin is what protects the
     # binary from container tampering. See ADR-0030 §"Build-context
     # trichotomy" for the full security model.
-    # Cargo parallelism cap for the helper's service image builds. Same default as
-    # scripts/lang/_common.sh, which carries the rationale; scripts/setup.test.sh pins the
-    # defaults equal. An operator's exported CARGO_BUILD_JOBS overrides it.
-    local helper_args=("$TASK_SLUG" --project-root "$CLONE_DIR" --cargo-build-jobs "${CARGO_BUILD_JOBS:-6}")
+    local helper_args=("$TASK_SLUG" --project-root "$CLONE_DIR")
     if [ -n "${HOST_GATEWAY_IP:-}" ]; then
         helper_args+=(--host-gateway-ip "$HOST_GATEWAY_IP")
     fi

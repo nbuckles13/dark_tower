@@ -234,10 +234,6 @@ pub struct Context {
     /// Host-gateway IP for Kind NodePort listenAddress (ADR-0030).
     /// Detected by devloop.sh and passed via --host-gateway-ip.
     pub host_gateway_ip: Option<String>,
-    /// Cargo parallelism cap passed to every service image build as
-    /// `--build-arg CARGO_BUILD_JOBS` (validated at startup; forwarded by devloop.sh with
-    /// the pipeline default, see scripts/lang/_common.sh).
-    pub cargo_build_jobs: String,
     /// Shutdown flag — set by signal handler, checked during long-running commands.
     pub shutdown: Arc<AtomicBool>,
     /// Shared write-mutex state — `None` when idle, `Some(InFlightOp)` when a
@@ -1810,8 +1806,6 @@ fn cmd_rebuild(
     run_command_streaming(
         Command::new(ctx.container_runtime.as_str())
             .arg("build")
-            .arg("--build-arg")
-            .arg(format!("CARGO_BUILD_JOBS={}", ctx.cargo_build_jobs))
             .arg("-t")
             .arg(svc.image_tag())
             .arg("-f")
@@ -2660,7 +2654,6 @@ mod tests {
             registry_path: dir.path().join("port-registry.json"),
             container_runtime: ContainerRuntime::Podman,
             host_gateway_ip: None,
-            cargo_build_jobs: "6".to_string(),
             shutdown: Arc::new(AtomicBool::new(false)),
             write_state: Arc::new(Mutex::new(WriteState::new())),
             recreate_bound: AtomicBool::new(false),
@@ -3349,7 +3342,6 @@ current-context: kind-devloop-test
             registry_path: dir.join("port-registry.json"),
             container_runtime: ContainerRuntime::Podman,
             host_gateway_ip: None,
-            cargo_build_jobs: "6".to_string(),
             shutdown: Arc::new(AtomicBool::new(false)),
             write_state: Arc::new(Mutex::new(WriteState::new())),
             recreate_bound: AtomicBool::new(false),
