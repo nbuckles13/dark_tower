@@ -76,7 +76,7 @@ fi
 
 say()  { echo "==> $*"; }
 warn() { echo "WARN: $*" >&2; }
-fail() { echo "ERROR: $*" >&2; exit "${2:-2}"; }
+fail() { echo "ERROR: $1" >&2; exit "${2:-2}"; }
 
 # ─── Preflight ──────────────────────────────────────────────────
 
