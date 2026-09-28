@@ -39,6 +39,14 @@
 #
 # See: docs/decisions/adr-0025-containerized-devloop.md
 
+# Parse the WHOLE script before running any of it. Bash reads a script from disk
+# as it executes. Git checkouts replace the file (new inode, so a running bash keeps
+# the old bytes), but an IN-PLACE write (an editor, a tool's file write) changes
+# the bytes under bash's read offset: it resumes mid-statement in the new content,
+# which is a syntax error or, worse, the wrong command. The braces force one parse
+# up front; the `exit` before the closing brace keeps bash from reading past it.
+# Checked by scripts/parse-whole-script.test.sh.
+{
 set -euo pipefail
 
 # ─── Node pin (SSoT = repo-root .nvmrc) ─────────────────────────
@@ -965,3 +973,5 @@ else
     echo ""
     menu_reenter_or_cleanup
 fi
+exit
+}
