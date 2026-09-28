@@ -433,9 +433,31 @@ fn longest_dt_client_window(alerts_dir: &Path) -> Result<(u64, usize)> {
 pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     let catalog_path = repo_root.join(CATALOG);
     let config_path = repo_root.join(COLLECTOR_CONFIG);
-    if !catalog_path.is_file() || !config_path.is_file() {
-        emit_ok("client-metrics-export-no-artifacts");
-        return Ok(());
+    match (catalog_path.is_file(), config_path.is_file()) {
+        // Neither artifact exists (a tree without the client-metrics surface):
+        // nothing to compare, and saying so is the honest result.
+        (false, false) => {
+            emit_ok("client-metrics-export-no-artifacts");
+            return Ok(());
+        }
+        // ONE side missing is a moved or deleted file, not an absent surface.
+        // Treating it as "no artifacts" made this guard go quiet the moment the
+        // collector config moved (ADR-0038 renamed configmap.yaml): fail loudly.
+        (true, false) | (false, true) => {
+            let (missing, present) = if catalog_path.is_file() {
+                (COLLECTOR_CONFIG, CATALOG)
+            } else {
+                (CATALOG, COLLECTOR_CONFIG)
+            };
+            return report(
+                vec![empty_input(
+                    missing,
+                    &format!("file at all (it is missing while {present} exists)"),
+                )],
+                explain,
+            );
+        }
+        (true, true) => {}
     }
 
     let catalog =
@@ -983,5 +1005,33 @@ impl MediaDropReason {
             "30m is not on a dt_client_ selector; 99h is a template"
         );
         assert_eq!(files, 1);
+    }
+
+    /// One artifact present and the other missing is a moved/deleted file, not
+    /// an absent surface, so it must be red, never `no-artifacts`.
+    #[test]
+    fn one_missing_artifact_fails_instead_of_reporting_no_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let catalog = root.join(CATALOG);
+        std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        std::fs::write(&catalog, "### `dt_client_x`\n").unwrap();
+        assert!(
+            run(root, false).is_err(),
+            "catalog without collector config"
+        );
+        std::fs::remove_file(&catalog).unwrap();
+        let cfg = root.join(COLLECTOR_CONFIG);
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, CFG).unwrap();
+        assert!(
+            run(root, false).is_err(),
+            "collector config without catalog"
+        );
+        std::fs::remove_file(&cfg).unwrap();
+        assert!(
+            run(root, false).is_ok(),
+            "neither present is still no-artifacts"
+        );
     }
 }
