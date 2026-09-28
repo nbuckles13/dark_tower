@@ -76,6 +76,8 @@ layer_lifecycle_begin 3
   # Long-running entry scripts (devloop.sh, run-story.sh) are wrapped `{ ... exit; }` so an
   # edit landing mid-run cannot shift bash's read offset. Static; no cluster.
   run_and_emit "parse-whole-script-test" "${__here}/parse-whole-script.test.sh" || true
+  # The devloop model's single home is .claude/settings.json (no agent/skill/script pins).
+  run_and_emit "model-single-home-test" "${__here}/model-single-home.test.sh" || true
   # Absorb self-test: absorb-devloop.sh's interrupted-absorb resume contract (refuses an
   # incomplete resolution, a foreign paused pick or an unrelated merge; otherwise finishes
   # the paused commit and absorbs the rest, recording origins so a resolved commit is never

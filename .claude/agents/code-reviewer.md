@@ -1,7 +1,6 @@
 ---
 name: code-reviewer
 description: Code quality reviewer - Rust idioms, ADR compliance
-model: claude-opus-4-8[1m]
 ---
 
 # Code Quality Reviewer

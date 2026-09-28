@@ -74,7 +74,12 @@ DESTROY=false
 # Model for the interactive session, which is the Lead when /devloop runs.
 # Teammates take their model from .claude/agents/*.md; the Lead has no agent
 # file, so this is the only place its model can be set.
-DEVLOOP_LEAD_MODEL="${DEVLOOP_LEAD_MODEL:-claude-opus-4-8[1m]}"
+# The model's single home is "model" in .claude/settings.json, which the in-container
+# session reads from the clone; every teammate inherits it. DEVLOOP_LEAD_MODEL is an
+# optional one-off override (passed as --model only when set), not a second default.
+DEVLOOP_LEAD_MODEL="${DEVLOOP_LEAD_MODEL:-}"
+LEAD_MODEL_ARGS=()
+[[ -n "$DEVLOOP_LEAD_MODEL" ]] && LEAD_MODEL_ARGS=(--model "$DEVLOOP_LEAD_MODEL")
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --rebuild) REBUILD_IMAGE=true; shift ;;
@@ -890,7 +895,7 @@ if [ ${#EXEC_CMD[@]} -gt 0 ]; then
     exit "$EXEC_RC"
 fi
 
-podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions --model "$DEVLOOP_LEAD_MODEL" --remote-control "$TASK_SLUG" || true
+podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions "${LEAD_MODEL_ARGS[@]}" --remote-control "$TASK_SLUG" || true
 
 # ─── Phase 3: Post-session ──────────────────────────────────────
 

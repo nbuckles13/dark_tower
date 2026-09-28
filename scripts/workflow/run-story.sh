@@ -721,18 +721,18 @@ TASK_TIMEOUT="${STORY_TASK_TIMEOUT:-14400}"
 # Session-limit waits per task before falling through to escalation.
 SESSION_LIMIT_RETRIES="${STORY_SESSION_LIMIT_RETRIES:-2}"
 
-# Model for devloop sessions (Lead + teammates inherit). Default Opus: the
-# ~200-devloop baseline ran on Opus-class models (comparability), the gate
-# structure catches implementation mistakes regardless, and quota windows —
-# not model capability — are the binding constraint on story throughput.
-#
-# The default is the ALIAS `opus`, never a generation-pinned id. A pinned id
-# rots in two directions the runner cannot detect: it silently executes a
-# weaker model than intended across a whole unattended story, or it hard-fails
-# every task once the id is retired. Same form as the canary's `--model haiku`
-# below. Per-seat tiering (ADR-0035 §F) is a separate decision and needs a
-# per-teammate override in the devloop skill, not a change to this default.
-STORY_MODEL="${STORY_MODEL:-opus}"
+# Model for devloop sessions (Lead + teammates inherit). Its single home is
+# "model" in .claude/settings.json, which every claude session in the repo reads
+# (headless included) — so the runner passes NO --model by default and cannot
+# drift from the interactive devloop. The pin there is deliberate (a
+# generation-specific id, chosen over the `opus` alias after issues seen when the
+# alias resolved to Opus 5): changing models is a one-line edit in one file.
+# STORY_MODEL is an optional one-off override, passed as --model only when set.
+# Per-seat tiering (ADR-0035 §F) is a separate decision and needs a per-teammate
+# override in the devloop skill, not a change here.
+STORY_MODEL="${STORY_MODEL:-}"
+STORY_MODEL_ARGS=()
+[ -n "$STORY_MODEL" ] && STORY_MODEL_ARGS=(--model "$STORY_MODEL")
 
 scripts/workflow/preflight-story.sh "$STORY_FILE"
 
@@ -2314,7 +2314,7 @@ while :; do
     # runner's trap for the spawn (default disposition: bash continues when the
     # foreground child handles the signal) and restore it after.
     trap - INT
-    env -u DEVLOOP_HEADLESS claude "$interactive_prompt" --model "$STORY_MODEL"
+    env -u DEVLOOP_HEADLESS claude "$interactive_prompt" "${STORY_MODEL_ARGS[@]}"
     claude_rc=$?
     trap on_sigint INT
     set -e
@@ -2338,7 +2338,7 @@ while :; do
       DEVLOOP_STOP_COUNT_FILE="$stop_count_file" \
       DEVLOOP_COMMIT_INTENT_FILE="$RUN_DIR/task-${id}.commit-intent.json" \
       timeout "$TASK_TIMEOUT" claude -p "$task_prompt" \
-      --model "$STORY_MODEL" \
+      "${STORY_MODEL_ARGS[@]}" \
       --output-format stream-json --verbose \
       --dangerously-skip-permissions
     claude_rc=$?
