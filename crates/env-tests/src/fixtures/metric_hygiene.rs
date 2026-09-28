@@ -128,7 +128,7 @@ const CLIENT_METRIC_PREFIX: &str = "dt_client_";
 /// are now examined by this module.
 ///
 /// The conclusion survives on a stronger premise. The collector's metric-NAME
-/// allowlist (`infra/services/otel-collector/configmap.yaml`) admits exactly the
+/// allowlist (`infra/services/otel-collector/collector.yaml`) admits exactly the
 /// media set and EXCLUDES all five grandfathered join-flow metrics, so no
 /// `meeting_id_hash`-carrying series is exported at all. The exception therefore
 /// still has **zero members**, now by curation rather than by accident. Had the

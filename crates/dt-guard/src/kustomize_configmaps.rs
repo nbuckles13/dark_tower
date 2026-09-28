@@ -1,11 +1,15 @@
-//! Two local checks over kustomize-GENERATED ConfigMaps, run by the
-//! `kustomize` subcommand alongside R-16 and R-20.
+//! A local check over kustomize-GENERATED ConfigMaps, run by the `kustomize`
+//! subcommand alongside R-16 and R-20.
 //!
 //! * **`configmap_annotation_size`** — every `configMapGenerator` entry under
 //!   `infra/` must stay under [`ANNOTATION_HEADROOM_PERCENT`] of Kubernetes'
 //!   annotation cap once client-side apply serialises it.
-//! * **`dashboard_configmap_label`** — every Grafana generator that ships
-//!   dashboard JSON must carry the label the Grafana sidecar selects on.
+//!
+//! (A second rule, `dashboard_configmap_label`, checked Grafana dashboard
+//! generators for the label a k8s-sidecar selected on. ADR-0038 §2 replaced the
+//! sidecar with one projected volume that names every group, so the label no
+//! longer selects anything; a group left off that volume is now caught by R-21
+//! (`kustomize_content_addressing`: a generated ConfigMap no pod references).)
 //!
 //! # SCOPE: GENERATED ConfigMaps ONLY — not every ConfigMap that is applied
 //!
@@ -18,7 +22,7 @@
 //! YAML parse of `data:` block scalars, which is out of keeping with this
 //! subcommand's line-oriented parsers, or a new dependency. The one
 //! non-trivial literal ConfigMap in the tree when this was written is
-//! `otel-collector-config` (`infra/services/otel-collector/configmap.yaml`):
+//! `otel-collector-config` (`infra/services/otel-collector/collector.yaml`):
 //! **30,084 bytes, 11.5% of the cap** (kubectl-measured), about 7x headroom.
 //! Tracked in `docs/TODO.md`, "The ConfigMap-size guard covers generated
 //! ConfigMaps only".
@@ -80,10 +84,7 @@
 //!
 //! # Ownership
 //!
-//! Machinery (`infrastructure`), per CLAUDE.md's guard-ownership split. The
-//! label rule's CONTENT — which label, which value — is not restated here: it is
-//! read from the sidecar's own `LABEL` / `LABEL_VALUE` in the Grafana
-//! deployment, the single source of truth for what the sidecar selects.
+//! Machinery (`infrastructure`), per CLAUDE.md's guard-ownership split.
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -97,7 +98,6 @@ use crate::common::scan::warn_skip;
 use crate::kustomize::strip_inline_comment;
 
 pub const CONFIGMAP_ANNOTATION_SIZE_RULE_ID: &str = "configmap_annotation_size";
-pub const DASHBOARD_CONFIGMAP_LABEL_RULE_ID: &str = "dashboard_configmap_label";
 
 /// Kubernetes' cap on the total size of an object's annotations
 /// (`TotalAnnotationSizeLimitB` in `k8s.io/apimachinery`'s object-meta
@@ -142,9 +142,6 @@ pub const METADATA_ALLOWANCE_BYTES: usize = 1_024;
 pub const fn headroom_threshold_bytes() -> usize {
     ANNOTATION_SIZE_LIMIT_BYTES * ANNOTATION_HEADROOM_PERCENT / 100
 }
-
-const GRAFANA_KUSTOMIZATION: &str = "infra/grafana/kustomization.yaml";
-const GRAFANA_DEPLOYMENT: &str = "infra/grafana/deployment.yaml";
 
 /// One finding, in the shape `kustomize::run` reports.
 #[derive(Debug, PartialEq, Eq)]
@@ -551,69 +548,6 @@ pub(crate) fn judge_size(name: &str, measured: usize, file: &Path) -> Option<Con
     })
 }
 
-/// Read the sidecar's `LABEL` / `LABEL_VALUE` env from the Grafana deployment.
-pub(crate) fn sidecar_label(deployment: &str) -> Option<(String, String)> {
-    let mut label = None;
-    let mut value = None;
-    let mut pending: Option<&str> = None;
-    for raw in deployment.lines() {
-        let line = strip_inline_comment(raw);
-        if let Some(name) = line.strip_prefix("- name:") {
-            pending = match unquote(name.trim()) {
-                "LABEL" => Some("LABEL"),
-                "LABEL_VALUE" => Some("LABEL_VALUE"),
-                _ => None,
-            };
-            continue;
-        }
-        if let (Some(which), Some(v)) = (pending, line.strip_prefix("value:")) {
-            let v = unquote(v.trim()).to_string();
-            if which == "LABEL" {
-                label = Some(v);
-            } else {
-                value = Some(v);
-            }
-            pending = None;
-        }
-    }
-    Some((label?, value?))
-}
-
-/// Judge the label on one Grafana generator. Only generators that ship
-/// dashboard JSON are in scope: `grafana-dashboards-config` ships the
-/// provisioning YAML and must NOT be picked up by the sidecar as a dashboard.
-pub(crate) fn judge_label(
-    gen: &Generator,
-    expected: &(String, String),
-    file: &Path,
-) -> Option<ConfigMapFinding> {
-    let ships_json = gen.sources.iter().any(|s| match s {
-        Source::File { key, .. } => key.ends_with(".json"),
-        _ => false,
-    });
-    if !ships_json {
-        return None;
-    }
-    let carries = gen
-        .labels
-        .iter()
-        .any(|(k, v)| k == &expected.0 && v == &expected.1);
-    if carries {
-        return None;
-    }
-    Some(ConfigMapFinding {
-        rule_id: DASHBOARD_CONFIGMAP_LABEL_RULE_ID,
-        detail: format!(
-            "configMapGenerator `{}` ships dashboard JSON but does not carry the label \
-             `{}: \"{}\"` that the Grafana sidecar selects on (its LABEL / LABEL_VALUE in \
-             {GRAFANA_DEPLOYMENT}). Without it the dashboard exists, is registered, passes \
-             the dashboard coverage check, and is NEVER loaded by Grafana.",
-            gen.name, expected.0, expected.1
-        ),
-        file: file.to_path_buf(),
-    })
-}
-
 /// Find every `kustomization.yaml` under `infra/`.
 fn kustomizations(infra: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -744,61 +678,6 @@ pub(crate) fn check(repo_root: &Path) -> Result<Vec<ConfigMapFinding>> {
         });
     }
 
-    // Label: Grafana dashboard generators, against the sidecar's own selector.
-    let grafana_kust = repo_root.join(GRAFANA_KUSTOMIZATION);
-    if grafana_kust.is_file() {
-        let deployment_path = repo_root.join(GRAFANA_DEPLOYMENT);
-        // Same rule as above: an unreadable deployment is a finding, not an
-        // abort. Without the selector the check cannot be performed, and a
-        // silent skip would read as a pass.
-        let deployment = match std::fs::read_to_string(&deployment_path) {
-            Ok(d) => d,
-            Err(e) => {
-                findings.push(ConfigMapFinding {
-                    rule_id: DASHBOARD_CONFIGMAP_LABEL_RULE_ID,
-                    detail: format!(
-                        "cannot read {GRAFANA_DEPLOYMENT} ({e}), which is the single source of \
-                         truth for the label the Grafana sidecar selects on, so dashboard \
-                         ConfigMap labels cannot be checked"
-                    ),
-                    file: PathBuf::from(GRAFANA_DEPLOYMENT),
-                });
-                return Ok(findings);
-            }
-        };
-        let Some(expected) = sidecar_label(&deployment) else {
-            // Fail LOUD: without the selector, "every generator is labelled" can
-            // be neither confirmed nor denied, and skipping would read as a pass.
-            findings.push(ConfigMapFinding {
-                rule_id: DASHBOARD_CONFIGMAP_LABEL_RULE_ID,
-                detail: format!(
-                    "cannot find the Grafana sidecar's LABEL and LABEL_VALUE env in \
-                     {GRAFANA_DEPLOYMENT}, so dashboard ConfigMap labels cannot be checked"
-                ),
-                file: PathBuf::from(GRAFANA_DEPLOYMENT),
-            });
-            return Ok(findings);
-        };
-        let content = match std::fs::read_to_string(&grafana_kust) {
-            Ok(c) => c,
-            Err(e) => {
-                findings.push(ConfigMapFinding {
-                    rule_id: DASHBOARD_CONFIGMAP_LABEL_RULE_ID,
-                    detail: format!(
-                        "cannot read {GRAFANA_KUSTOMIZATION} ({e}), so dashboard ConfigMap labels \
-                         cannot be checked"
-                    ),
-                    file: PathBuf::from(GRAFANA_KUSTOMIZATION),
-                });
-                return Ok(findings);
-            }
-        };
-        for gen in parse_generators(&content) {
-            if let Some(f) = judge_label(&gen, &expected, Path::new(GRAFANA_KUSTOMIZATION)) {
-                findings.push(f);
-            }
-        }
-    }
     Ok(findings)
 }
 
@@ -967,56 +846,11 @@ generatorOptions:
     }
 
     #[test]
-    fn a_dashboard_generator_without_the_sidecar_label_is_a_finding() {
-        let g = parse_generators(GRAFANA);
-        let expected = ("grafana_dashboard".to_string(), "1".to_string());
-        let p = Path::new(GRAFANA_KUSTOMIZATION);
-        assert_eq!(
-            judge_label(&g[0], &expected, p),
-            None,
-            "provisioning YAML is not a dashboard"
-        );
-        assert_eq!(judge_label(&g[1], &expected, p), None, "labelled");
-        let f = judge_label(&g[2], &expected, p).unwrap();
-        assert_eq!(f.rule_id, DASHBOARD_CONFIGMAP_LABEL_RULE_ID);
-        assert!(f.detail.contains("grafana-dashboards-unlabelled"));
-        let wrong = ("grafana_dashboard".to_string(), "2".to_string());
-        assert!(
-            judge_label(&g[1], &wrong, p).is_some(),
-            "a wrong VALUE is not the label"
-        );
-    }
-
-    #[test]
-    fn the_expected_label_is_read_from_the_sidecar_not_restated() {
-        let deployment = r#"      containers:
-        - name: k8s-sidecar
-          env:
-            - name: LABEL
-              value: grafana_dashboard
-            - name: LABEL_VALUE
-              value: "1"
-            - name: FOLDER
-              value: /tmp/dashboards
-"#;
-        assert_eq!(
-            sidecar_label(deployment),
-            Some(("grafana_dashboard".to_string(), "1".to_string()))
-        );
-        assert_eq!(sidecar_label("containers: []\n"), None);
-    }
-
-    #[test]
     fn check_runs_end_to_end_on_a_temp_tree() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let g = root.join("infra/grafana");
         std::fs::create_dir_all(g.join("dashboards")).unwrap();
-        std::fs::write(
-            g.join("deployment.yaml"),
-            "- name: LABEL\n  value: grafana_dashboard\n- name: LABEL_VALUE\n  value: \"1\"\n",
-        )
-        .unwrap();
         std::fs::write(
             g.join("kustomization.yaml"),
             "configMapGenerator:\n  - name: big\n    options:\n      labels:\n        grafana_dashboard: \"1\"\n    files:\n      - big.json=dashboards/big.json\n  - name: small\n    files:\n      - small.json=dashboards/small.json\n",
@@ -1038,11 +872,8 @@ generatorOptions:
             .collect();
         assert_eq!(
             rules,
-            vec![
-                (CONFIGMAP_ANNOTATION_SIZE_RULE_ID, true),
-                (DASHBOARD_CONFIGMAP_LABEL_RULE_ID, true)
-            ],
-            "big is too large though its file is 40 KB; small ships JSON unlabelled"
+            vec![(CONFIGMAP_ANNOTATION_SIZE_RULE_ID, true)],
+            "big is too large though its file is 40 KB; small is fine"
         );
     }
 
@@ -1391,32 +1222,6 @@ generatorOptions:
         std::fs::write(k.join("small.json"), "{}").unwrap();
         let dotted = dir.path().join(".");
         assert_eq!(check(&dotted).unwrap(), Vec::new());
-    }
-
-    /// The label rule's own source of truth being unreadable must not abort the
-    /// whole `kustomize` run — that would take R-16/R-18/R-19 findings down
-    /// with it — and must not pass quietly either.
-    #[test]
-    fn an_unreadable_grafana_deployment_is_a_label_finding_not_an_aborted_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let g = dir.path().join("infra/grafana");
-        std::fs::create_dir_all(&g).unwrap();
-        std::fs::write(
-            g.join("kustomization.yaml"),
-            "configMapGenerator:\n  - name: d\n    literals:\n      - K=V\n",
-        )
-        .unwrap();
-        // No deployment.yaml at all.
-        let findings = check(dir.path()).expect("a read failure must be a finding, not an Err");
-        assert_eq!(findings.len(), 1, "{findings:#?}");
-        assert_eq!(findings[0].rule_id, DASHBOARD_CONFIGMAP_LABEL_RULE_ID);
-        assert!(
-            findings[0]
-                .detail
-                .contains("cannot read infra/grafana/deployment.yaml"),
-            "{}",
-            findings[0].detail
-        );
     }
 
     #[test]

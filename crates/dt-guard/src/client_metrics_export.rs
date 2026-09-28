@@ -55,7 +55,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 const CATALOG: &str = "docs/observability/metrics/client.md";
-const COLLECTOR_CONFIG: &str = "infra/services/otel-collector/configmap.yaml";
+const COLLECTOR_CONFIG: &str = "infra/services/otel-collector/collector.yaml";
 const GC_FILTER: &str = "crates/gc-service/src/services/telemetry_filter.rs";
 const MEDIA_METRICS_TS: &str = "packages/sdk-core/src/media/setup/mediaMetrics.ts";
 const REJECT_REASON_TS: &str = "packages/sdk-core/src/media/frame/rejectReason.ts";

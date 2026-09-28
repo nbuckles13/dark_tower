@@ -67,7 +67,7 @@ pub const ALLOWLIST: [&str; 12] = [
     // Retained on the TRACE path on purpose: it is what makes a single session
     // traceable. It never reaches a stored metric series — the collector's
     // metrics-path `keep_keys` omits it
-    // (`infra/services/otel-collector/configmap.yaml`). That asymmetry is
+    // (`infra/services/otel-collector/collector.yaml`). That asymmetry is
     // deliberate; see the three-lists comment there before "unifying" anything.
     "meeting_id_hash",
     // Value is SERVER-STAMPED from the authenticated claims (see
