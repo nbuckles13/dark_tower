@@ -158,6 +158,17 @@ Three devloops, in order; each leaves Layer 7 correct:
    datasources); `infra/kubernetes/overlays/kind/` becomes the applied root.
 2. **Migration Job + content-tagged images**: a migrations image and Job; image tags
    derived from image content and wired into the root; the host `sqlx` path retired.
+   Step-1 follow-ups carried here (they surfaced when story 2 was absorbed on top of
+   step 1):
+   - **One `configMapGenerator` parser.** Step 1 added the shared parser
+     (`crates/dt-guard/src/common/kustomize_generators.rs`); story 2 task 12 brought a
+     second one (`parse_generators` in `crates/dt-guard/src/kustomize_configmaps.rs`,
+     behind the annotation-size rule). Consolidate onto the shared one, keeping both
+     callers' tests green.
+   - **Observability confirms the retired `dashboard_configmap_label` rule.** The absorb
+     retired it (commit `2abbd05d`): it checked the label a Grafana k8s-sidecar selected
+     on, and step 1 replaced the sidecar with a projected volume, which R-21 guards.
+     This is a review ask, not new work.
 3. **`provision` / `deploy` verbs + Layer 7 switch-over**: a deterministic blueprint render
    shared by build and check, its hash recorded in the cluster; helper allowlist reduced to the verbs; `layer7.sh` becomes
    `provision && deploy && tests`; `rebuild-all` and the diff-based infra trigger retired;
@@ -176,6 +187,17 @@ Three devloops, in order; each leaves Layer 7 correct:
    an accepted interim exception, not a precedent. `deploy` (helper-side, applying the
    one environment root that already composes observability) replaces it, and no new
    container-side cluster write may be added in the meantime.
+
+   `deploy` is also the in-container route for OTel collector changes, so this step
+   closes the two collector entries in `docs/TODO.md` ("No collector deploy route from
+   inside the devloop container", "Collector config-staleness window"). It also rewrites
+   the collector change procedures in `docs/runbooks/gc-deployment.md`, which a status
+   banner marks as pre-ADR-0038 (TODO: "gc-deployment.md's OTel-collector change
+   procedures"). **That rewrite carries an operations decision:** a config-only collector
+   change now renames the ConfigMap and restarts the singleton collector on apply. Under
+   R-54 fail-hard-at-init that is the same hazard as an image change, so whether the
+   runbook's config-only exemption from the separate-change-window rule still holds is
+   for operations to decide in this step, not to inherit.
 
 Until then, today's behaviour (a full rebuild on every gate) stays: slow but correct.
 
