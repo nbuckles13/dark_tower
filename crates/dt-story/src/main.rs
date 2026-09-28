@@ -191,9 +191,9 @@ enum Command {
 /// 3. **Never project a reference whose referent can be invalidated without
 ///    this artifact being rewritten** — unless it is admitted on the
 ///    revalidate-at-use branch, and says so. `escalation` holds a `$RUN_DIR`
-///    path that vanishes with the container; `commit` holds a sha that the
-///    runner's post-completion `git commit --amend` invalidates by
-///    construction (`run-story.sh` says so where it declines to set it).
+///    path that vanishes with the container; `commit` holds a sha that absorbing
+///    or cherry-picking the story branch rewrites (`run-story.sh` says so
+///    where it declines to set it).
 ///    Different mechanisms, same hazard — and neither argument finds the
 ///    other's instance, so test the property, not the shape: both are
 ///    `Option<String>`, so references are invisible to the type system.

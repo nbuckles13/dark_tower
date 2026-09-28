@@ -218,8 +218,8 @@ pub struct Task {
     ///
     /// * `commit` is FIRST-writer-wins (a differing value warns and is not
     ///   overwritten) because the runner declines to supply it at all — the
-    ///   post-completion `git commit --amend` changes the sha, so any sha
-    ///   recordable there is stale by construction. A `commit` value present
+    ///   story branch is absorbed/cherry-picked into the main tree, which
+    ///   rewrites the sha, so any sha recordable there goes stale. A `commit` value present
     ///   is therefore a human annotation, and overwriting it with a value
     ///   the runner itself calls unreliable would be a regression.
     /// * `slug` is LAST-writer-wins because the runner IS its authoritative
