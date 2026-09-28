@@ -161,7 +161,21 @@ Three devloops, in order; each leaves Layer 7 correct:
 3. **`provision` / `deploy` verbs + Layer 7 switch-over**: a deterministic blueprint render
    shared by build and check, its hash recorded in the cluster; helper allowlist reduced to the verbs; `layer7.sh` becomes
    `provision && deploy && tests`; `rebuild-all` and the diff-based infra trigger retired;
-   the 2026-09-03 TODO entry resolved.
+   the 2026-09-03 TODO entry resolved. This step also retires the two interim diff-based
+   Layer 7 arms that story 2 task 10 adds (they reach this tree when story 2 is absorbed,
+   so this step runs after that absorb):
+   - `dev-cluster deploy <svc>` when the diff touches a service's manifests, and
+   - a container-side `kubectl apply -k infra/kubernetes/overlays/kind/observability/`
+     (plus a Prometheus rollout wait) when the diff touches the observability config.
+
+   Both decide what to apply from `merge-base(origin/main, HEAD)`, the history-dependent
+   rule this ADR rejects. Today they are masked: any branch that touched `infra/kind/`
+   gets a full rebuild on every gate. Once that rebuild stops firing, they become the
+   only deploy path. **Security note:** the observability apply is a cluster write
+   from inside the devloop container, outside the helper allowlist (ADR-0030). It is
+   an accepted interim exception, not a precedent. `deploy` (helper-side, applying the
+   one environment root that already composes observability) replaces it, and no new
+   container-side cluster write may be added in the meantime.
 
 Until then, today's behaviour (a full rebuild on every gate) stays: slow but correct.
 
