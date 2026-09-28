@@ -541,10 +541,11 @@ data:
   # Where an operator sees it: `mh_media_registered_meetings` against
   # `mh_media_registered_meetings_limit`, and that rejection outcome. READ THE
   # GAUGE AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an
-  # `EndMeeting` releases a meeting, so a meeting whose MC never calls it (any
-  # MC before story 2 task 12; an MC that crashed) stays counted until the pod
-  # restarts — reading it as concurrency understates exhaustion in the
-  # direction that hides it.
+  # `EndMeeting` releases a meeting, so a meeting whose MC never COMPLETES it
+  # (an MC crashed or killed before or during teardown; retries exhausted or an
+  # MH predating the RPC; a rollback to an MC build without teardown) stays
+  # counted until the pod restarts — reading it as concurrency understates
+  # exhaustion in the direction that hides it.
   MH_MAX_REGISTERED_MEETINGS: "8192"
 
   # Resource-exhaustion guard, §8-guard family: the maximum size of
@@ -734,8 +735,9 @@ data:
   #
   # MH implements the R-20 teardown path (`EndMeeting` reclaims an ended
   # meeting's edges), but that makes this an ordinary resource guard only for
-  # meetings whose MC CALLS it: MC begins calling it in story 2 task 12, and a
-  # meeting whose MC dies without calling it still holds its edges until the
+  # meetings whose MC COMPLETES it: MC calls it for every meeting it ends as of
+  # story 2 task 12, and a meeting whose MC never completes it (crash, kill
+  # mid-teardown, exhausted retries, rollback) still holds its edges until the
   # pod restarts. See the citations above.
   # Code-side home: the hard-ceiling constant for
   # `MH_MAX_TOTAL_EGRESS_EDGES` in `crates/mh-service/src/config.rs`.

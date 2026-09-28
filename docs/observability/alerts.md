@@ -635,7 +635,9 @@ histogram_quantile(0.95,
 
 Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`, `MCMediaGenerationDivergence`, `MCKekRotationOverdue`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
 
-**That list is complete; the entries below it are not.** Only `MCMediaGenerationDivergence` has a full inventory entry — it landed with its alert, so byte-identical PromQL was applied at authoring time. The other five are **named here and uninventoried** (`MCKekRotationOverdue`'s entry, with the two KEK warnings and the info rule that replaced `MCSenderIdSpaceExhausted`, is story 2 task 16's), exactly as in §Media Handler Alerts. The `inventory_expr_drift` guard checks byte-identity for what is inventoried; it does not require that every rule have an entry, so nothing mechanical will report this section incomplete.
+**That list is complete; the entries below it are not.** Only `MCMediaGenerationDivergence` has a full inventory entry — it landed with its alert, so byte-identical PromQL was applied at authoring time. The other five are **named here and uninventoried** (`MCKekRotationOverdue`'s entry, with the two KEK warnings and the info rule that replaced `MCSenderIdSpaceExhausted`, is story 2 task 16's), exactly as in §Media Handler Alerts.
+
+**Task 16's inventory backlog is larger than the clause above, which was written before story 2 task 12 (updated 2026-09-27 by @observability at Gate 3 of `docs/devloop-outputs/2026-09-27-mc-server-mute-teardown/`).** Six further `severity: warning` MC rules now exist with no inventory entry: `MCEndMeetingOwnershipRejected`, `MCEndMeetingFailureRate`, `MCPushQuiesceTimeouts`, `MCTeardownFenceBackstop`, `MCNotifyMeetingEndedFailing` and `MCMeetingEndedNotificationsDropped` (all in `mc-alerts.yaml`, all with runbook links and full rule comments — what they lack is the byte-identical PromQL copy an inventory entry carries). **Named rather than counted, deliberately**: the clause above says "the other five", and a count is what went stale here when the rule set grew — the same sub-kind as the enumeration failure recorded in `docs/TODO.md` under the runbook-commands entry. So task 16 owes ten entries, not four, and this list is the hand-off. **The page-severity list above is unaffected and remains complete** — every one of the six is `warning`. The `inventory_expr_drift` guard checks byte-identity for what is inventoried; it does not require that every rule have an entry, so nothing mechanical will report this section incomplete.
 
 #### MCMediaGenerationDivergence
 
@@ -654,7 +656,7 @@ sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[
 1. **Any structural change re-pushes; force one only if the meeting is quiescent.** Of ADR-0036 §8's four re-fire triggers only *structural change* is implemented, but since story 2 it fires on every join, leave, capability declaration and mute, and a push that failed stays unconfirmed so the next roster event of any kind re-sends it. A meeting with churn therefore often clears by itself — check whether the counter has stopped moving before acting. There is still no periodic re-assert (story 4), so a quiescent meeting stays dark until something changes. An MC restart against a live handler is **not counted here at all**: MC adopts MH's generation as a floor, re-pushes above it, and records that on `mc_media_policy_generation_adoptions_total` instead, so this page does not fire on MC rollouts. A `generation_mismatch` with `applied > sent` that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the `u64::MAX` ratchet wedge) — not rollout noise.
 2. Split on the `outcome` label first — the values have different first moves. **The MC-restart arm is under NO `outcome` label by design**: read `mc_media_policy_generation_adoptions_total` and the adoption WARN at `mc.register_meeting.trigger` (carrying `sent_generation`, `applied_generation`, `adopted_generation`) alongside the split, so a clean breakdown after an MC restart is not mistaken for "nothing happened". `generation_mismatch` means MH's apply ran and did not take effect (open MH, read `mh_media_policy_applies_total{outcome}`); `no_applied_generation` means MH echoed nothing (confirm the MH image first — a rollout skew is the cheap explanation and it clears itself); `transport_mode_mismatch` is ADR-0036 §8's separate two-ends-must-agree echo failing, a different remedy reached from the same runbook.
 3. Read `mc_media_generation_divergence` for the magnitude **second, never first**: it is last-write-wins at pod level, so a healthy push for an unrelated meeting erases a diverged reading, and a value of 0 is not evidence that nothing diverged.
-4. If the meeting is quiescent, force a structural change — any participant leaving and rejoining, declaring or toggling mute makes MC re-publish and re-send the unconfirmed push.
+4. **If the meeting is quiescent, force a structural change — prefer a capability re-declaration or a mute toggle.** Either makes MC re-publish, and the unconfirmed push is re-sent. **Do not reach for leave-and-rejoin in a meeting with one participant**: as of story 2 task 12 the last participant leaving *ends* the meeting — MC releases the handler and notifies GC — so the rejoin lands on a re-created meeting rather than re-publishing to the diverged one. The divergence clears, but you have replaced the meeting instead of repairing it, and the evidence goes with it. A mute toggle is the cheapest safe trigger and costs the participant nothing.
 5. **Do not restart MH.** It sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence.
 
 > **The selector is NEGATED, and that is the design, not a shorthand.** It reads "everything that is not a confirmed match and not the known-noisy diagnostic". `PolicyPushOutcome::ALL` is compile-checked in Rust, but **that compile error does not reach PromQL** — so under the negated form a sixth outcome added later pages and gets classified deliberately, while under a positive `outcome=~"a|b"` it would fall silently outside the alert. For a page alert whose subject is *a partial blackhole reporting healthy*, silence is the failure mode to defend against.
@@ -721,7 +723,7 @@ sum(rate(mc_session_joins_total[5m])) > 0
 `for: 5m`
 
 **Response**:
-1. Check "Join Failures by Error Type" panel in MC Overview dashboard
+1. Check "Session Join Failures by Type" panel in MC Overview dashboard
 2. If `jwt_validation` errors dominate -> check AC service health and JWKS endpoint
 3. If `meeting_not_found` errors -> check GC-MC meeting state synchronization
 4. If `mc_capacity_exceeded` errors -> scale MC horizontally
@@ -778,7 +780,7 @@ sum(rate(mc_jwt_validations_total[5m])) > 0
 
 **Response**:
 1. Check AC service health and JWKS endpoint availability
-2. Check "JWT Validations by Result" panel in MC Overview dashboard
+2. Check "JWT Validations by Result & Type" panel in MC Overview dashboard
 3. If JWKS fetch failures -> check network connectivity to AC
 4. If token expiry issues -> check clock skew between services
 5. If sudden spike -> check for recent AC key rotation or config changes
@@ -804,7 +806,7 @@ histogram_quantile(0.95,
 `for: 5m`
 
 **Response**:
-1. Check "Session Join Latency P50/P95/P99" panel in MC Overview dashboard
+1. Check "Session Join Latency (P50/P95/P99)" panel in MC Overview dashboard
 2. Check JWT validation latency (may be slow JWKS fetch)
 3. Check actor mailbox depth (may be backpressure)
 4. Check WebTransport session setup time

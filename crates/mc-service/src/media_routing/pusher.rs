@@ -91,7 +91,8 @@ use tracing::{debug, error, info, warn, Instrument};
 const MAX_REGISTER_ATTEMPTS: u32 = 3;
 
 /// Backoff between attempts (one fewer entry than attempts).
-const REGISTER_BACKOFF_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+pub(crate) const REGISTER_BACKOFF_DELAYS: [Duration; 2] =
+    [Duration::from_secs(1), Duration::from_secs(2)];
 
 /// One snapshot for one handler, and the generation the actor took for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,9 +120,25 @@ pub struct PushTarget {
 }
 
 /// Handle to one (meeting, handler) push worker.
+///
+/// # Two ways to stop, and they are NOT interchangeable
+///
+/// - **Dropped** (`Drop`): the task is ABORTED. An in-flight `RegisterMeeting`
+///   is abandoned mid-RPC. That is right only for an UNCLEAN end — a meeting
+///   actor that panicked, or an MC process that is exiting — where nothing will
+///   call `EndMeeting` afterwards anyway.
+/// - **Drained** ([`Self::into_task`] after cancelling the worker's token): the
+///   caller awaits the returned handle, so every attempt already issued has
+///   RETURNED. This is the ONLY stop a meeting teardown may use.
+///   `EndMeetingRequest` (`internal.proto`) makes it a MUST: once MH's handler
+///   has enqueued a policy and upserted the registration, a dropped client
+///   future does not undo it, so an aborted attempt can land AFTER the release
+///   and re-create the ended meeting.
 pub struct HandlerPusher {
     jobs: watch::Sender<Option<PushJob>>,
-    task: JoinHandle<()>,
+    /// `Some` until [`Self::into_task`] takes it; `Drop` aborts only what is
+    /// still here, which is what makes a drained worker un-abortable.
+    task: Option<JoinHandle<()>>,
 }
 
 impl HandlerPusher {
@@ -136,7 +153,10 @@ impl HandlerPusher {
             mh_grpc_endpoint = %target.handler.grpc_endpoint,
         );
         let task = tokio::spawn(run(target, rx, cancel).instrument(span));
-        Self { jobs, task }
+        Self {
+            jobs,
+            task: Some(task),
+        }
     }
 
     /// Publish the latest snapshot. Always wakes the worker, even when the
@@ -148,13 +168,31 @@ impl HandlerPusher {
     /// Has the worker exited?
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Give up this handle's right to abort the worker, returning its task for
+    /// the caller to AWAIT.
+    ///
+    /// The teardown path's half of the drain. It does not stop anything by
+    /// itself: the caller cancels the worker's token first (the worker honours
+    /// cancel at attempt start, in backoff and while idle — never mid-RPC), then
+    /// awaits this handle, so the one attempt that may be in flight RETURNS
+    /// rather than being dropped. Dropping the returned handle detaches the
+    /// task; it never aborts it.
+    #[must_use]
+    pub fn into_task(mut self) -> Option<JoinHandle<()>> {
+        self.task.take()
     }
 }
 
 impl Drop for HandlerPusher {
+    /// The UNCLEAN stop — see the type doc. A drained worker has already had its
+    /// task taken, so there is nothing here to abort.
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -525,6 +563,24 @@ mod tests {
                 result
             })
         }
+
+        /// Not exercised by the pusher's own tests (the pusher never releases);
+        /// the teardown's tests cover `EndMeeting`. Records nothing because
+        /// nothing here calls it — an assertion that relied on it would be
+        /// written against `teardown`'s double instead.
+        fn end_meeting<'a>(
+            &'a self,
+            _call: &'a crate::media_routing::teardown::EndMeetingCall,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::media_routing::teardown::EndMeetingFailure>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn target(mh: Arc<ScriptedMh>, generations: Arc<PolicyGenerations>) -> PushTarget {
@@ -769,6 +825,7 @@ mod tests {
                 supersede_on_independent_frame: false,
                 transport_mode: TransportMode::Datagram,
             }],
+            server_muted_sources: std::collections::BTreeSet::new(),
         }
     }
 

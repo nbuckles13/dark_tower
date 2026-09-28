@@ -249,7 +249,7 @@ panel then renders bits while claiming bytes. Put the equivalence in prose where
 
 - **Datagram send buffer** (story 1) — **live as of story task 9**, as
   `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` in `infra/services/mh-service/configmap.yaml`; the frames→bytes
-  conversion lands with task 12. ADR-0036 §1 requires this be expressed and documented **in
+  conversion landed with story 1's MH transport-configuration task (`crates/mh-service/src/config.rs`). ADR-0036 §1 requires this be expressed and documented **in
   frames of audio**, not bytes, because quinn's 1 MiB default is ≈93 seconds of queued audio and
   "1 MiB" does not make that visible while "93 seconds" does. quinn's API takes bytes, so the
   conversion happens once at config load.

@@ -181,10 +181,13 @@ impl GcClient {
     /// `current_streams < max_streams` always true. Now it is real, so a handler
     /// at its ceiling drops out of GC placement.
     ///
-    /// Streams are released when a meeting's MC calls `EndMeeting` (story 2
-    /// R-20; MC begins calling it in story 2 task 12). A meeting whose MC never
-    /// calls it (an MC crash, or any MC before task 12) keeps its streams, so
-    /// this can sit at the ceiling with no live meeting behind it. When every
+    /// Streams are released when a meeting's MC calls `EndMeeting` on meeting
+    /// end (story 2 R-20). A meeting whose MC never COMPLETES it (an MC that
+    /// crashes or is killed mid-teardown, whose `EndMeeting` exhausts its
+    /// retries or reaches an MH predating the RPC, or that is rolled back to a
+    /// build predating teardown; `docs/TODO.md`, "A meeting whose MC never
+    /// sends `EndMeeting` is never reclaimed") keeps its streams, so this can
+    /// sit at the ceiling with no live meeting behind it. When every
     /// handler is there, the first join to a NEW meeting fails at GC (503). The
     /// recovery is under "The ratchet" in `docs/observability/metrics/mh-service.md`
     /// (pointed at, not restated: deployment names are infra topology);

@@ -213,7 +213,9 @@ ports.json, so a pipeline run needs none of the manual env knobs below —
 
 **`E2E_ORG_SUBDOMAIN` is required on purpose.** Layer 7 provisions a fresh
 organization per run (`scripts/layer7.sh` Phase 1h) because no production code
-marks a meeting ended, so an org's live-meeting count only climbs toward
+marks a meeting ROW ended (MC's meeting-end notify, story 2 task 12, ends only
+GC's MC-assignment row, never `meetings.status`, which is what the cap counts),
+so an org's live-meeting count only climbs toward
 `max_concurrent_meetings` — this suite creates ~7 meetings per run, and a second
 run against a cap of 10 used to fail partway with a 403 the pipeline blamed on
 the diff. A default here would silently restore that: green on the first run of

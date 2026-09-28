@@ -650,6 +650,162 @@ groups:
           impact: "Affected participants hear nothing while every server-side signal reads healthy - MH never opens a frame and structurally cannot observe any of the three conditions. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-16-missing-key-material"
 
+      # ------------------------------------------------------------------
+      # ADR-0031 block — meeting teardown on the media handlers
+      # (story 2 task 12, R-20). A failed or skipped release leaves MH holding
+      # the meeting's registration, routes and edge budget; since R-21 that
+      # consumes the ENFORCED MH_MAX_REGISTERED_MEETINGS, so the cost is
+      # progressive denial of NEW meetings on the handler, with no
+      # client-visible cause until then. These rules see only teardowns MC
+      # ATTEMPTED; a teardown that never happens (an MC crash) is an ABSENT
+      # event and belongs to story-2 task 18's MH rule (mh-alerts.yaml).
+      # ------------------------------------------------------------------
+      # DELIBERATELY NO ALERT on mc_media_server_mute_requests_total,
+      # mc_media_unmute_requests_total or mc_media_refusal_replies_suppressed_total
+      # (story 2 task 12). A non-zero mute rate is healthy moderation, and the
+      # refusal-side values (not_permitted, not_server_muted, suppressed replies)
+      # are CLIENT-INFLATABLE by construction - one connection can drive them at
+      # line rate. Recorded here so the absence reads as a decision, not an
+      # omission; MH's server_muted drop reason records the same decision.
+      - alert: MCEndMeetingOwnershipRejected
+        # Fleet-contract-reads-zero-forever: MC only ever sends its own mc_id,
+        # and releases only after GC can no longer re-assign the meeting id, so
+        # a mismatch can only mean MC sent the wrong id. Present at zero from
+        # process start, so a `> 0` rule is never silently inert.
+        # The graceful-shutdown population (a successor already re-registered
+        # the meeting) is its own value, superseded_by_successor, and is NOT
+        # selected here: it is routine on rolling deploys. Do not widen this
+        # selector to it.
+        expr: |
+          sum(increase(mc_media_end_meeting_total{outcome="rejected_ownership"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-teardown
+        annotations:
+          summary: "MC released a meeting on a handler that says another MC owns it"
+          description: "mc_media_end_meeting_total{outcome=\"rejected_ownership\"} rose: a handler answered EndMeeting with FAILED_PRECONDITION, i.e. the mc_id MC sent is not the one recorded for the meeting, on a teardown for a meeting that ENDED (the graceful-shutdown case is counted separately as superseded_by_successor). MC sends only its own id, so this is an MC defect, not an MH one. The mc.teardown ERROR line names the meeting and the handler."
+          impact: "The handler keeps that meeting's registration, routes and edge budget until it restarts (the release was refused and is never retried)."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
+      - alert: MCEndMeetingFailureRate
+        # Non-zero-denominator guard per docs/observability/alert-conventions.md.
+        # THRESHOLD PROVENANCE: 5% is this task's figure, not SLO-derived; there
+        # is no observed baseline (every release is new in story 2 task 12).
+        #
+        # BOTH SELECTORS ARE POSITIVE (`outcome=~`), NOT NEGATED, and that is
+        # the catalog's standing rule for this family, not a style choice:
+        # `docs/observability/metrics/mc-service.md` records that a negated
+        # predicate is correct only where the SUCCESS set is closed and small,
+        # and instructs that any harmonisation pass move predicates TO the
+        # positive form. This metric's success set is demonstrably not closed —
+        # it grew from {released} to {released, superseded_by_successor} inside
+        # one devloop (story 2 task 12, O-24), and under a negated predicate
+        # that new benign value would have silently joined the failure set and
+        # paged on every rolling deploy. So an eighth outcome added later
+        # defaults to NOT a failure and has to be classified deliberately.
+        # THE CLASSIFICATION OBLIGATION LIVES AT THE ENUM: `EndMeetingOutcome`
+        # in `crates/mc-service/src/media_routing/teardown.rs` names this rule
+        # so a new variant is classified where it is added.
+        #
+        # `unimplemented` IS a failure here on purpose: it is an expected,
+        # non-fatal rollout-order outcome, but it still leaks the meeting on
+        # that handler, which is what this rule is about.
+        #
+        # `superseded_by_successor` is in NEITHER the numerator nor the
+        # denominator. It leaks nothing (the successor MC owns the meeting), and
+        # it arrives in BURSTS on every rolling deploy — left in the
+        # denominator it would dilute the ratio exactly when deploys are
+        # happening, which is the fail-quiet direction and would mask a real
+        # failure during a rollout. So the rule reads: of the releases that were
+        # ours to make, what fraction failed.
+        expr: |
+          (
+            sum(rate(mc_media_end_meeting_total{outcome=~"rejected_ownership|unimplemented|unavailable_exhausted|invalid_argument|error"}[15m]))
+            /
+            sum(rate(mc_media_end_meeting_total{outcome=~"released|rejected_ownership|unimplemented|unavailable_exhausted|invalid_argument|error"}[15m]))
+          ) > 0.05
+          and
+          sum(rate(mc_media_end_meeting_total{outcome=~"released|rejected_ownership|unimplemented|unavailable_exhausted|invalid_argument|error"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-teardown
+        annotations:
+          summary: "MC meeting releases failing on media handlers ({{ $value | humanizePercentage }})"
+          description: "More than 5% of the EndMeeting calls that were MC's to make (one per meeting per handler; superseded_by_successor is excluded from both numerator and denominator) did not release, for 15 minutes. Split on the outcome label: unimplemented (MH predates the RPC - rollout order was reversed; MH rolls forward first, MC rolls back first), unavailable_exhausted (MH unreachable - fix MH reachability), rejected_ownership (MC defect - see MCEndMeetingOwnershipRejected)."
+          impact: "Each failed release leaves that meeting's registration and edge budget on the handler until it restarts; MH_MAX_REGISTERED_MEETINGS then ratchets toward refusing new meetings on that pod."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
+      - alert: MCPushQuiesceTimeouts
+        # The leading indicator of the same ratchet: a teardown released
+        # without confirming its pushes had drained. Clean denominator (both
+        # outcomes are server-driven); `> 0` on the timeout cell, which is
+        # zero-initialised so the rule is never silently inert.
+        expr: |
+          sum(increase(mc_media_push_quiesce_total{outcome="timed_out"}[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-teardown
+        annotations:
+          summary: "A meeting teardown released without its policy pushes draining"
+          description: "mc_media_push_quiesce_total{outcome=\"timed_out\"} rose: a push worker was still mid-RegisterMeeting past push_quiesce_bound_seconds (MC's startup line), MC waited one more attempt window, then released anyway. A queued late apply is refused MH-side (mh_media_released_meeting_apply_refusals_total); a registration still in flight is only ORDERED by that wait, which fails open - confirm against the handler's mh_media_registered_meetings rather than assuming either outcome."
+          impact: "Possibly one meeting's registration and edge budget re-created on a handler after its release, held until that handler restarts."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
+      - alert: MCTeardownFenceBackstop
+        # Expected-empty; zero-initialised. Completion is reported from a Drop
+        # guard on every exit of the teardown task, so this fires only for a
+        # task that HUNG or vanished without unwinding. NOT mutually exclusive
+        # with MCPushQuiesceTimeouts: a backstop WITHOUT a matching timeout is
+        # a different fault (hung outside the drain).
+        expr: |
+          sum(increase(mc_media_teardown_fence_backstop_total[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: meeting-teardown
+        annotations:
+          summary: "A meeting teardown never reported completion; its fence was lifted by deadline"
+          description: "mc_media_teardown_fence_backstop_total rose: a meeting's teardown task hung or died without unwinding, and the controller's fence for that meeting id expired so creates could proceed. A still-running release may land on the re-created meeting. For a meeting that ended (not a shutdown), GC is still told it ended on this path, so the id is re-assignable. Escalate on a repeat: every firing is also a meeting whose EndMeeting may never have gone out."
+          impact: "Rejoins of that meeting were held until the deadline; one handler may hold a leaked registration."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
+      - alert: MCNotifyMeetingEndedFailing
+        # A GC-coordination failure with a user-visible cost: GC keeps reusing
+        # an ended meeting's assignment, and joins to it fail until MC restarts.
+        expr: |
+          sum(increase(mc_gc_notify_meeting_ended_total{status="error"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: gc-coordination
+        annotations:
+          summary: "MC could not tell GC that a meeting ended"
+          description: "mc_gc_notify_meeting_ended_total{status=\"error\"} rose. The notify is sent at most once for anything GC may have processed, so an error is final: GC keeps the ended meeting's assignment live, reuses it for the next join, and MC answers meeting_not_found. The mc.grpc.gc_client ERROR line names the meeting."
+          impact: "Joins to the affected meeting id fail with meeting_not_found until MC restarts or is marked unhealthy."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
+      - alert: MCMeetingEndedNotificationsDropped
+        expr: |
+          sum(increase(mc_gc_meeting_ended_notifications_dropped_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: gc-coordination
+        annotations:
+          summary: "MC dropped meeting-ended notifications before sending them"
+          description: "mc_gc_meeting_ended_notifications_dropped_total rose: MC's notify queue was full, so a meeting's end was never reported to GC. Expected-empty (the queue is sized far above any burst): this is MC losing events, not GC being down."
+          impact: "GC keeps each affected meeting's assignment live; joins to those meeting ids fail until MC restarts."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
   - name: mc-service-info
     interval: 60s
     rules:

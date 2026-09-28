@@ -38,10 +38,11 @@ use mh_service::routing::{MeetingKey, MeetingPolicy, RoutingTable};
 use mh_service::session::{ApplyOutcome, LocalSubscribers, SessionManagerHandle};
 use mh_test_utils::admission::{fixture_policy_limits, with_ceiling};
 use mh_test_utils::media_policy::{egress, register_request, register_request_muted};
+use mh_test_utils::session::apply_registered;
 use proto_gen::dark_tower::internal::v1::EgressStream;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const MEETING: &str = "meeting-server-mute";
 
@@ -220,7 +221,6 @@ async fn a_muted_senders_malformed_frame_is_server_muted_not_a_codec_reject() {
 async fn a_mute_survives_reassert_and_an_unmute_takes_effect_in_one_generation() {
     let sm = SessionManagerHandle::new(with_ceiling(64));
     let limits = fixture_policy_limits();
-    let timeout = Duration::from_millis(limits.policy_apply_timeout_ms);
     let apply = |generation: u64, muted: &'static [u32]| {
         let request = register_request_muted(
             MEETING,
@@ -230,10 +230,9 @@ async fn a_mute_survives_reassert_and_an_unmute_takes_effect_in_one_generation()
         );
         let policy = MeetingPolicy::from_request(&request, &limits).unwrap();
         let sm = sm.clone();
-        async move {
-            sm.apply_policy(policy, limits.max_total_egress_edges, timeout)
-                .await
-        }
+        // Register, then apply: the production order (see
+        // `mh_test_utils::session`).
+        async move { apply_registered(&sm, policy).await }
     };
 
     let routing = sm.routing_table();

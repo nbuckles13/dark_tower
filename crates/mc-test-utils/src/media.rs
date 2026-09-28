@@ -116,7 +116,7 @@ pub fn meeting_assignment_for(
     }
 
     table
-        .render([&handler])
+        .render([&handler], &std::collections::BTreeSet::new())
         .expect("fixture assignment must render")
         .for_handler(&handler)
         .cloned()

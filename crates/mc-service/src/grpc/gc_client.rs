@@ -27,7 +27,7 @@ use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::global_controller_service_client::GlobalControllerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
     ComprehensiveHeartbeatRequest, ControllerCapacity, FastHeartbeatRequest, HealthStatus,
-    RegisterMcRequest,
+    NotifyMeetingEndedRequest, RegisterMcRequest,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -64,6 +64,40 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 /// Maximum backoff delay.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Attempts to deliver one meeting-ended notification. Only an attempt that
+/// provably never reached GC ([`is_provably_unsent`]: the connect phase failed)
+/// is followed by another; any other failure ends the loop (see
+/// [`GcClient::notify_meeting_ended`]). With the registration backoff
+/// (`BACKOFF_BASE` doubling: 1+2+4+8+16 s between the six attempts) this rides
+/// out roughly half a minute of GC refusing connections, which covers a GC pod
+/// restart.
+pub const MAX_NOTIFY_ATTEMPTS: u32 = 6;
+
+/// Whether a failed GC call provably never reached GC: its error chain
+/// contains tonic's [`tonic::ConnectError`], i.e. the TCP/HTTP2 connect phase
+/// failed, so no request bytes were written.
+///
+/// This is decided from the RETURNED `Status`, never from a readiness probe
+/// beforehand. After the first successful connect tonic's reconnecting channel
+/// reports ready even when a reconnect fails: it parks the connect error and
+/// returns it from `call()` (tonic 0.12 `transport/channel/service/reconnect.rs`,
+/// the `has_been_connected || is_lazy` branch). A readiness pre-check therefore
+/// never sees a GC restart and would leave the retry unreachable.
+/// `Status::try_from_error` keeps the
+/// transport error as the status's `source`, and that chain carries the
+/// `ConnectError`.
+#[must_use]
+pub fn is_provably_unsent(status: &tonic::Status) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(status);
+    while let Some(err) = source {
+        if err.is::<tonic::ConnectError>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
 
 /// GC client with connection management.
 ///
@@ -144,7 +178,17 @@ impl GcClient {
                 McError::Grpc(format!("Failed to connect to GC: {e}"))
             })?;
 
-        Ok(Self {
+        Ok(Self::with_channel(channel, token_rx, config))
+    }
+
+    /// Build a client over an existing channel (the constructor seam; `new`
+    /// is this plus the eager connect). A lazily-connected channel takes the
+    /// SAME tonic reconnect branch as an eagerly-connected one whose peer has
+    /// since gone away, so tests use it to drive an unreachable GC
+    /// deterministically.
+    #[must_use]
+    pub fn with_channel(channel: Channel, token_rx: TokenReceiver, config: Config) -> Self {
+        Self {
             channel,
             token_rx,
             config,
@@ -155,7 +199,7 @@ impl GcClient {
             comprehensive_heartbeat_interval_ms: AtomicU64::new(
                 DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL.as_millis() as u64,
             ),
-        })
+        }
     }
 
     /// Add authorization header to a request.
@@ -177,6 +221,104 @@ impl GcClient {
                 })?,
         );
         Ok(grpc_request)
+    }
+
+    /// Tell GC a meeting has ended, so it stops reusing the meeting's assignment
+    /// (ADR-0010 §3: "last participant leaves, MC notifies GC").
+    ///
+    /// # At-most-once for anything GC may have processed
+    ///
+    /// `NotifyMeetingEndedRequest` carries only `(meeting_id, region)` and GC
+    /// ends whatever assignment row is ACTIVE for it. A duplicate that landed
+    /// after the meeting's NEXT incarnation was assigned would end that live
+    /// row and split the meeting. So a retry happens ONLY where the request
+    /// provably never reached GC: the call failed in its connect phase
+    /// ([`is_provably_unsent`]), before anything was sent. Every other failure is
+    /// ambiguous — GC may have committed it — and is NOT retried; it is counted,
+    /// and the meeting id then reads `MeetingNotFound` until MC restarts
+    /// (`MCNotifyMeetingEndedFailing`). An exhausted connect-failure budget is
+    /// counted the same way, once. The incarnation-safe fix is tracked in
+    /// `docs/TODO.md`, "`NotifyMeetingEnded` is not incarnation-safe".
+    ///
+    /// Called only after the meeting's handlers are released, by the controller.
+    pub async fn notify_meeting_ended(&self, meeting_id: &str) {
+        let mut backoff = BACKOFF_BASE;
+        for attempt in 1..=MAX_NOTIFY_ATTEMPTS {
+            let request = match self.add_auth(NotifyMeetingEndedRequest {
+                meeting_id: meeting_id.to_string(),
+                region: self.config.region.clone(),
+            }) {
+                Ok(request) => request,
+                Err(e) => {
+                    crate::observability::metrics::record_gc_notify_meeting_ended("error");
+                    error!(
+                        target: "mc.grpc.gc_client",
+                        meeting_id = %meeting_id,
+                        error = %e,
+                        "Could not build NotifyMeetingEnded"
+                    );
+                    return;
+                }
+            };
+            let mut client = GlobalControllerServiceClient::with_interceptor(
+                self.channel.clone(),
+                common::observability::otel_grpc::client_interceptor(),
+            );
+            match client.notify_meeting_ended(request).await {
+                Ok(_) => {
+                    crate::observability::metrics::record_gc_notify_meeting_ended("success");
+                    info!(
+                        target: "mc.grpc.gc_client",
+                        meeting_id = %meeting_id,
+                        attempts = attempt,
+                        "GC notified that the meeting ended"
+                    );
+                }
+                Err(status) if is_provably_unsent(&status) => {
+                    // Connect phase failed: nothing reached GC, so a retry
+                    // cannot duplicate a processed notification.
+                    if attempt == MAX_NOTIFY_ATTEMPTS {
+                        crate::observability::metrics::record_gc_notify_meeting_ended("error");
+                        error!(
+                            target: "mc.grpc.gc_client",
+                            meeting_id = %meeting_id,
+                            attempts = attempt,
+                            code = ?status.code(),
+                            error = %status.message(),
+                            "Could not reach GC to report a meeting ended; GC keeps reusing its \
+                             assignment, and joins to this meeting id fail until MC restarts"
+                        );
+                        return;
+                    }
+                    warn!(
+                        target: "mc.grpc.gc_client",
+                        meeting_id = %meeting_id,
+                        attempt,
+                        code = ?status.code(),
+                        error = %status.message(),
+                        "GC not reachable for NotifyMeetingEnded; retrying (the request was not sent)"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                    continue;
+                }
+                Err(status) => {
+                    // Possibly sent: GC may have committed it. Never retried.
+                    crate::observability::metrics::record_gc_notify_meeting_ended("error");
+                    error!(
+                        target: "mc.grpc.gc_client",
+                        meeting_id = %meeting_id,
+                        code = ?status.code(),
+                        error = %status.message(),
+                        "NotifyMeetingEnded failed after it may have been sent; not retried (GC \
+                         may have processed it, and a duplicate could end a later incarnation's \
+                         live assignment). If GC did not commit it, joins to this meeting id fail \
+                         until MC restarts."
+                    );
+                }
+            }
+            return;
+        }
     }
 
     /// Register with the Global Controller.
@@ -819,6 +961,115 @@ mod tests {
         assert_eq!(
             delay, BACKOFF_MAX,
             "Backoff should cap at BACKOFF_MAX after many iterations"
+        );
+    }
+}
+
+/// Queue depth for meeting-ended notifications to GC.
+///
+/// Sized far above any realistic burst (it would take this many meetings ending
+/// within one GC round trip to fill it), so a full queue is a defect signal
+/// rather than load: a drop is counted on its own series and logged at ERROR,
+/// never silent.
+pub const MEETING_ENDED_QUEUE_CAPACITY: usize = 1024;
+
+/// The production `MeetingEndedNotifier`: queue the meeting id for
+/// [`drain_meeting_ended`]. `try_send`, because the controller's loop must
+/// never block on GC.
+#[derive(Debug)]
+pub struct MeetingEndedQueue {
+    tx: tokio::sync::mpsc::Sender<String>,
+}
+
+impl MeetingEndedQueue {
+    /// A queue of `capacity`, and the receiving end [`drain_meeting_ended`]
+    /// consumes.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> (Self, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        (Self { tx }, rx)
+    }
+}
+
+impl crate::actors::controller::MeetingEndedNotifier for MeetingEndedQueue {
+    fn meeting_ended(&self, meeting_id: &str) {
+        if let Err(e) = self.tx.try_send(meeting_id.to_string()) {
+            crate::observability::metrics::record_gc_meeting_ended_notification_dropped();
+            error!(
+                target: "mc.grpc.gc_client",
+                meeting_id = %meeting_id,
+                error = %e,
+                "Meeting-ended notification DROPPED before it was sent (queue full or closed); \
+                 GC keeps reusing this meeting's assignment and joins to it fail until MC restarts"
+            );
+        }
+    }
+}
+
+/// Drain meeting-ended notifications to GC, one at a time, until `cancel`.
+///
+/// Sequential on purpose: while GC is unreachable every notification would
+/// fail the same way, and a burst of parallel connect attempts helps nobody.
+///
+/// # Shutdown: FLUSH what is queued, then count only what does not fit
+///
+/// `cancel` fires AFTER the shutdown release window, because a meeting whose
+/// teardown completes inside that window produces its notification at that
+/// moment — so cancelling with the shutdown token would guarantee the loss of
+/// exactly the notifications the release window exists to produce. On `cancel`
+/// the queue is closed to new entries and what is already in it is SENT, until
+/// [`teardown::SHUTDOWN_NOTIFY_FLUSH_BUDGET`] expires. Only the remainder is
+/// counted as DROPPED, with the same ERROR as a full queue — never lost
+/// silently. A notification produced after the close finds the queue closed and
+/// is counted by [`MeetingEndedQueue`] the same way.
+pub async fn drain_meeting_ended(
+    gc_client: std::sync::Arc<GcClient>,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            // Cancel first: once the flush window opens, take no new work into
+            // the unbounded path — the flush below is the bounded one.
+            biased;
+            () = cancel.cancelled() => break,
+            next = rx.recv() => match next {
+                Some(meeting_id) => gc_client.notify_meeting_ended(&meeting_id).await,
+                None => return,
+            },
+        }
+    }
+
+    // Closed first, so the set to flush is fixed and cannot grow under us.
+    rx.close();
+    let flush_deadline =
+        tokio::time::Instant::now() + crate::media_routing::teardown::SHUTDOWN_NOTIFY_FLUSH_BUDGET;
+    while let Ok(meeting_id) = rx.try_recv() {
+        // Each send is bounded by the SAME deadline, so one unreachable-GC
+        // notification cannot consume the whole flush. A send cut off here is
+        // AMBIGUOUS — it may have been committed — so it is not counted as
+        // dropped and, per the at-most-once policy, never retried; the ERROR
+        // below names the remainder that was provably never sent.
+        if tokio::time::timeout_at(flush_deadline, gc_client.notify_meeting_ended(&meeting_id))
+            .await
+            .is_err()
+        {
+            error!(
+                target: "mc.grpc.gc_client",
+                meeting_id = %meeting_id,
+                "Meeting-ended notification was still in flight when the shutdown flush window \
+                 expired; whether GC committed it is UNKNOWN and it is not retried"
+            );
+            break;
+        }
+    }
+    while let Ok(meeting_id) = rx.try_recv() {
+        crate::observability::metrics::record_gc_meeting_ended_notification_dropped();
+        error!(
+            target: "mc.grpc.gc_client",
+            meeting_id = %meeting_id,
+            "Meeting-ended notification DROPPED at shutdown before it was sent; GC keeps reusing \
+             this meeting's assignment and joins to it fail until MC restarts"
         );
     }
 }

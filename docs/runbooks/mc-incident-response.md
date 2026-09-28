@@ -82,6 +82,8 @@ container name, so `kubectl ... deployment/mc-service` fails with
    - [Scenario 17: KEK Rotation Storm / Flapping Participant](#scenario-17-kek-rotation-storm--flapping-participant)
    - [Scenario 18: A Participant Hears Only Part of the Roster](#scenario-18-a-participant-hears-only-part-of-the-roster)
    - [Scenario 19: KEK Rotation Stalled](#scenario-19-kek-rotation-stalled)
+   - [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+   - [Scenario 21: Server Mute Not Enforced](#scenario-21-server-mute-not-enforced)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1824,7 +1826,7 @@ Expected recovery time: branch-dependent. Operational drift self-heals over 5-15
 
 **Related Alerts**: `MCActorPanic`, MH-side `MHCallerTypeRejected`; MH-side [Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures) (the sender-side view of the same RPC pair).
 
-**Dashboards**: MC Overview → Media Connectivity row ("MH Notifications Unapplied by Reason", "Notifications Without Connection Id") and MH Coordination row ("MH Notifications by Event").
+**Dashboards**: MC Media Path → Media Connectivity row ("MH Notifications Unapplied by Reason", "Notifications Without Connection Id"), and MC Overview → MH Coordination row ("MH Notifications by Event"). The two are separate dashboards since story 2 task 12; each links to the other.
 
 ---
 
@@ -1933,9 +1935,9 @@ than waiting for one to fire.
 participant who joined successfully and is silent, with `mc_session_joins_total`
 showing success and no WebTransport rejection.
 
-**Five questions, in the order worth asking them.** Each has a primary counter;
-three further metrics appear below as companions or escalation pointers, so the
-five headings are **not** a complete list of the metrics named here. **Scope
+**Questions, in the order worth asking them.** Each has a primary counter;
+further metrics appear below as companions or escalation pointers, so the
+headings are **not** a complete list of the metrics named here. **Scope
 boundary**: this section covers the client-facing signalling path only. The
 MC->MH control plane (`mc_media_policy_pushes_total`,
 `mc_media_generation_divergence`) is cited below only to route you, and is
@@ -1945,7 +1947,7 @@ meeting, participant or stream identity.
 
 ```bash
 kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
-curl -s http://localhost:8080/metrics | grep -E 'mc_media_(receive_capability_declarations|send_directives|slot_states|slot_view_emissions|unreachable_senders|mute_requests)_total|mc_media_receive_slot_cap|mc_participant_outbound_messages_dropped_total'
+curl -s http://localhost:8080/metrics | grep -E 'mc_media_(receive_capability_declarations|send_directives|slot_states|slot_view_emissions|unreachable_senders|mute_requests|server_mute_requests|unmute_requests)_total|mc_media_receive_slot_cap|mc_participant_outbound_messages_dropped_total'
 kill %1
 # Repeat for mc-1 -- a symptom on one instance says nothing about the other.
 ```
@@ -2098,9 +2100,10 @@ is **the completeness caveat on counter 2**.
 
 ```promql
 sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[5m]))
-# payload_kind ∈ {signaling_raw, participant_update_joined, participant_update_left, meeting_kek_update}
-# (participant_update split into _joined/_left in story 2 task 9; payload_kind=~"participant_update.*"
-#  recovers the old merged series)
+# payload_kind ∈ {signaling_raw, participant_update_joined, participant_update_left,
+#                 participant_update_muted, meeting_kek_update}
+# (participant_update split into _joined/_left in story 2 task 9 and _muted in task 12;
+#  payload_kind=~"participant_update.*" recovers the old merged series)
 ```
 
 **`emitted` does not mean the client was told.** `record_send_directive` fires
@@ -2130,6 +2133,18 @@ counter is the complete record of repeat occurrences.
 any `composition_failed`; `client` for the capability rejection tokens and for a
 sustained `rate_limited` (a repeat loop in the SDK's mute path). For "I can hear
 some people but not others", go to Scenario 18 first.
+
+**6. `mc_media_server_mute_requests_total{action,outcome}` and
+`mc_media_unmute_requests_total{outcome}` — did a host's server mute (or a
+participant's request to be unmuted) land?** Both are client-facing signalling:
+the first counts a host's `ServerMuteRequest` dispositions, the second a muted
+participant's `UnmuteRequest` relays to the host. An unmute REQUEST never lifts
+a mute — only a host's server-unmute does — so `relayed` rising with the
+participant still muted is correct behaviour, not a fault. A
+`participant_update_muted` drop on counter 5 is the one drop here with no
+re-sync path: that client shows a wrong mute indicator until the next mute
+change on that participant. For "a host muted someone and they are still
+heard", go to Scenario 21.
 
 ---
 
@@ -2286,11 +2301,16 @@ in the response path, not the apply path.
 > `transport_mode_mismatch` see its row above — a rejoin re-sends the same disagreeing declaration
 > and will not clear it.
 
-1. **If the meeting is quiescent, force a structural change** — any participant leaving and
-   rejoining (or declaring, or toggling mute) makes MC re-publish, and the unconfirmed push is
-   re-sent. In a meeting with churn this usually happens by itself; confirm Step 1's counter is
-   still moving before acting.
-2. If the rejoin does not clear it, the apply is failing repeatedly rather than transiently: open MH
+1. **If the meeting is quiescent, force a structural change — prefer a capability re-declaration
+   or a mute toggle.** Either makes MC re-publish, and the unconfirmed push is re-sent. In a
+   meeting with churn this usually happens by itself; confirm Step 1's counter is still moving
+   before acting. **Do not reach for leave-and-rejoin in a meeting with one participant**: as of
+   story 2 task 12 the last participant leaving *ends* the meeting — MC releases the handler and
+   notifies GC — so the rejoin lands on a re-created meeting rather than re-publishing to the
+   diverged one. The divergence clears, but you have replaced the meeting instead of repairing it,
+   and the evidence goes with it. A mute toggle is the cheapest safe trigger and costs the
+   participant nothing.
+2. If the structural change does not clear it, the apply is failing repeatedly rather than transiently: open MH
    and read `mh_media_policy_applies_total{outcome}` and MH's logs for the session actor's mailbox
    state.
 3. If `no_applied_generation` and the images are skewed, let the rollout complete; the condition
@@ -2702,7 +2722,7 @@ sum by(trigger) (rate(mc_meeting_kek_generated_total{trigger!="meeting_created"}
 - **`participant_left` (`MCKekRotationStorm`)** — leave-triggered rotation is **bounded at one per
   meeting per W** by the debounce, measured from the oldest un-rotated departure. A rate per active
   meeting above 1/W is not reachable while the debounce works: **suspect the debounce, not the churn.**
-  Many departures in a busy meeting do NOT raise this — they coalesce (MC Overview → KEK Departures
+  Many departures in a busy meeting do NOT raise this — they coalesce (MC Media Path → KEK Departures
   Coalesced per Rotation).
 - **`sender_space_exhausted` (`MCKekEpochResetOnSenderIdExhaustion`)** — immediate and exempt from W,
   self-limited to once per 65,536 admissions in one meeting. **Human churn does not reach this.** Treat it
@@ -2854,9 +2874,12 @@ directed to send to a handler it holds **no** transport for as
 than silence.** This is the discriminator: arms (a)–(d) all present as *silence*; signature
 failures mean frames ARE arriving and being REJECTED at the client. **Cause**: an MC restart
 re-issued per-meeting sender ids from 1 (`crates/mc-service/src/media_admission/sender_id.rs`,
-process memory) while MH still held the pre-restart edge table (MH's routing table is install-only
-and `EndMeeting` is not yet implemented), so MH forwards under a table that maps sender ids to the
-wrong people. **It fails closed** — the wrong audio is never played, it is rejected at the signature
+process memory) while MH still held the pre-restart edge table, so MH forwards under a table that
+maps sender ids to the wrong people. (MH's routing table is install-only, and an MC restart can leave
+it behind: as of story 2 task 12 MC releases a meeting's handlers with `EndMeeting` when the meeting
+ends or empties, and best-effort on a graceful shutdown, but a crash releases nothing, and a shutdown
+whose process exits before its teardown finishes releases only what it reached. This arm is about
+exactly that remainder, so its premise still holds on a narrower footing.) **It fails closed** — the wrong audio is never played, it is rejected at the signature
 check — so this is an **availability** event, not a confidentiality one; do not escalate it as media
 crossing.
 
@@ -2943,6 +2966,173 @@ sum by(reason) (increase(mc_meeting_kek_rotation_failures_total[15m]))
 **Not this scenario:** pushes that fail AFTER a successful rotation do not keep pending age up — it
 clears at rotation. Undelivered pushes are `MCKekPushFailureRate`
 ([Scenario 16](#scenario-16-missing-key-material)).
+
+---
+
+### Scenario 20: Meeting Teardown Failing / MH Budget Ratchet
+
+**Alerts**: `MCEndMeetingOwnershipRejected`, `MCEndMeetingFailureRate`, `MCPushQuiesceTimeouts`,
+`MCTeardownFenceBackstop`, `MCNotifyMeetingEndedFailing`, `MCMeetingEndedNotificationsDropped`
+(all warning; `infra/docker/prometheus/rules/mc-alerts.yaml`).
+
+**What changed (story 2 task 12, R-20).** A meeting now ENDS when its last roster participant is
+removed (a clean leave, or a disconnect whose grace expired). MC then, off the meeting actor's
+path: stops every policy push for the meeting and waits for each to return (the quiesce); sends
+`EndMeeting` with its own `mc_id` to every handler the meeting was programmed on; and, only after
+that, tells GC the meeting ended (`NotifyMeetingEnded`), so GC's next join for that id is a NEW
+assignment. A graceful MC shutdown releases its meetings' handlers the same way, inside a window
+derived from the pod's termination grace — read the effective value off this pod's startup line as
+`shutdown_release_budget_seconds` rather than recomputing it (`teardown::SHUTDOWN_RELEASE_BUDGET`
+= grace − pre-drain sleep − margin, drift-tested against both manifests) — but does NOT tell GC (the meeting is not over; a successor MC may take it). A shutdown
+teardown still running at that deadline — in practice an unreachable handler — is cut off by process
+exit and reported on the pod's last ERROR line as `teardowns_cut_off=<n>`; each is one more
+registration the handler keeps until its restart. While a meeting id is being
+torn down MC holds a **fence** on it: a create for that id is parked and answered when the teardown
+completes (up to `MAX_QUEUED_CREATES` parked, in `crates/mc-service/src/actors/controller.rs`; beyond that the join fails with
+`mc_session_join_failures_total{error_type="teardown_in_progress"}`).
+
+**Why it matters.** A handler that never receives `EndMeeting` keeps the meeting's registration,
+routes and edge budget until it restarts. Since R-21 that consumes the ENFORCED
+`MH_MAX_REGISTERED_MEETINGS`, so the cost is progressive denial of NEW meetings on that handler,
+with no client-visible cause until then. A notify GC never received leaves GC reusing the ended
+meeting's assignment, and joins to that id fail with `meeting_not_found`.
+
+**The bounds — read them off the pod, never compute them from this page.** MC's
+`Configuration loaded successfully` startup line carries three structured fields
+(`mc-deployment.md` §5):
+
+- `push_quiesce_bound_seconds` — how long the quiesce waits for one in-flight `RegisterMeeting`
+  attempt (`MH_CONNECT_TIMEOUT + MH_RPC_TIMEOUT + QUIESCE_SLACK`).
+- `teardown_fence_hold_max_seconds` — the worst case one teardown can take: a quiesce that times
+  out, the equal further wait after it, then every `EndMeeting` attempt at its full deadline with the
+  backoff between them. This is how long a rejoin of the same meeting id can be held.
+- `shutdown_release_budget_seconds` — how long a graceful shutdown lets its meetings' releases
+  run before process exit cuts them off, derived from the pod's `terminationGracePeriodSeconds`.
+  A teardown still running at that deadline is reported as `teardowns_cut_off=<n>` on the pod's
+  last ERROR line and leaks its registration until that handler restarts.
+
+```bash
+kubectl logs -n dark-tower deployment/mc-0 | grep "Configuration loaded successfully" | tail -1
+```
+
+**Symptom that gets reported as a join outage.** "Joins to a meeting that just emptied fail or
+hang." A rejoin DURING teardown finds GC's assignment still live (the notify is sent after
+teardown), so it reaches MC and gets `meeting_not_found`, for up to
+`teardown_fence_hold_max_seconds` in the worst case (normally milliseconds). A create that reaches
+MC by another route is parked behind the fence instead. **The remedy is MH reachability, not the
+join path**: a long teardown is a slow or unreachable handler. `mc_media_push_quiesce_total{outcome="timed_out"}`
+rising alongside `mc_session_join_failures_total{error_type="teardown_in_progress"}` IS "the fence
+is wedged".
+
+**Triage — split on the counter that moved:**
+
+```promql
+sum by (outcome) (increase(mc_media_end_meeting_total[15m]))       # one per (meeting, handler)
+sum by (outcome) (increase(mc_media_push_quiesce_total[15m]))      # one per meeting teardown
+sum(increase(mc_media_teardown_fence_backstop_total[30m]))
+sum by (status) (increase(mc_gc_notify_meeting_ended_total[15m]))
+sum(increase(mc_gc_meeting_ended_notifications_dropped_total[15m]))
+```
+
+| Moved | Meaning | First move |
+|---|---|---|
+| `mc_media_end_meeting_total{outcome="unimplemented"}` | MH predates the RPC | Rollout order was reversed: MH rolls forward first, MC rolls back first (`mc-deployment.md` §Coordination). Counted once, never retried; the meeting is held by that MH until it restarts |
+| `{outcome="unavailable_exhausted"}` | MH unreachable; the bounded retries ran out | Fix MH reachability. The meetings already lost leak exactly like the crash path |
+| `{outcome="rejected_ownership"}` | MH says another MC owns a meeting that ENDED (`FAILED_PRECONDITION`) | MC sends only its own `mc_id`, so this is an MC defect or a stale/misrouted MC. Recovery order: `mh-incident-response.md` ownership-reject arm |
+| `{outcome="superseded_by_successor"}` | the same refusal on a graceful-shutdown release | **Expected during a rolling MC deploy**: a successor already took the meeting over, and MH refused a release that would have cut it. Consistent with supersession, not proof of it — rising OUTSIDE a rollout window is worth a look. No alert. MH's `rejected_ownership` is the UNION of this value and the row above: compare against their sum, never token to token |
+| `{outcome="invalid_argument"}` or `{outcome="error"}` | MH refused the request shape, or an unclassified failure | MC defect; the `mc.teardown` ERROR line carries the gRPC code and message. Escalate to `meeting-controller` |
+| `mc_media_push_quiesce_total{outcome="timed_out"}` | a push worker was still mid-`RegisterMeeting` at the bound; MC waited one more window, then released anyway | A queued late apply is refused MH-side (`mh_media_released_meeting_apply_refusals_total`); a registration still in flight is only ORDERED by the wait, which fails open. Confirm against the handler's `mh_media_registered_meetings`, and read `mh-incident-response.md` for the two races |
+| `mc_media_teardown_fence_backstop_total` | the fence was lifted by its deadline, not by the teardown's report: the teardown task hung or died without unwinding. GC is still told a meeting that ENDED has ended (the cause is recorded at reap), so the id stays joinable; if joins to it return `meeting_not_found`, check `mc_gc_notify_meeting_ended_total{status="error"}` | Escalate on a repeat — every firing is also a meeting whose `EndMeeting` may never have gone out. **Not mutually exclusive with `timed_out`**: backstop WITHOUT a matching `timed_out` is a different fault (hung outside the drain) from the two together |
+| `mc_gc_notify_meeting_ended_total{status="error"}` | GC did not take the notify | Sent at most once for anything GC may have processed, so the error is final. GC keeps the row live; joins to that id get `meeting_not_found` until MC restarts or is marked unhealthy. Check GC health (`gc-incident-response.md`) |
+| `mc_gc_meeting_ended_notifications_dropped_total` | MC's notify queue was full; the end was never reported | Expected-empty: MC is losing events, not GC being down. Escalate to `meeting-controller` |
+
+**Logs.** `mc.teardown` carries one INFO per released meeting ("Meeting released on its media
+handlers", with `released`, `failed` and `quiesce_timed_out`) and one ERROR per failed handler
+naming the outcome and gRPC code. `mc.grpc.gc_client` carries the notify result.
+
+**What these alerts cannot see.** They fire only for teardowns MC ATTEMPTED. A meeting whose MC
+never completes `EndMeeting` — a crash, a kill mid-teardown, or a rollback to a build without
+teardown — is an ABSENT event, and its rule is story-2 task 18's (MH side), which does not exist
+yet. Until then read `mh_media_registered_meetings` against `mh_media_registered_meetings_limit` on
+each handler: rising with pod uptime while `mh_media_meeting_teardowns_total{outcome="released"}`
+stays flat is that residual (`docs/TODO.md`, "A meeting whose MC never sends `EndMeeting` is never
+reclaimed").
+
+**A mass teardown is a connection burst, not a throughput problem.** MC opens a fresh gRPC channel per MH call, so N meetings ending at once means up to N x 2 concurrent TCP/TLS handshakes (and up to twice that when quiesce times out) against at most two endpoints. Measured `nofile` on the MC pod is 1,048,576, so this is not near exhaustion — **but if a `nofile` limit is ever set low on the MC container, descriptor exhaustion would be process-global and would take the DB pool, Redis and client sessions down for healthy meetings on the same pod.** If a teardown storm coincides with unrelated MC failures, check `ulimit -n` inside the pod first:
+
+```bash
+kubectl exec -n dark-tower deployment/mc-0 -- sh -c 'ulimit -n'   # expect ~1048576
+```
+
+The named remedy is channel REUSE (one channel per endpoint, multiplexed), not a teardown concurrency cap — a cap would lengthen the fence and the rejoin hold without lowering the push-side peak (`docs/TODO.md`, "MC opens a fresh gRPC channel per MH call").
+
+**Do not** restart MC to "clear" a teardown: a crash-like exit is exactly the path that releases
+nothing. **Do not** restart MH unless the registered-meetings check says the handler is at its
+limit — it sheds every live media session on the pod.
+
+**A split meeting.** If participants of one meeting id end up on two MCs, suspect GC failover
+(`atomic_assign`'s unhealthy/stale-MC arm re-pointing the assignment to another MC on a join) racing the old MC's in-flight notify — the notify is not
+incarnation-safe (`docs/TODO.md`, "`NotifyMeetingEnded` is not incarnation-safe"). See
+`gc-incident-response.md` beside the `MCNotifyMeetingEndedFailing` triage.
+
+**Escalation**: `meeting-controller` for `rejected_ownership` (and `superseded_by_successor` outside a rollout), `invalid_argument`, `error`, the
+backstop and dropped notifications; `media-handler` for `unimplemented` (rollout order) and
+`unavailable_exhausted` (reachability); `global-controller` for notify errors that persist while GC
+is healthy.
+
+---
+
+### Scenario 21: Server Mute Not Enforced
+
+**The symptom**: "The host muted someone and we can still hear them", or the reverse, "I was
+unmuted by the host and nobody can hear me".
+
+**How server mute works (story 2 task 12, R-8..R-11).** Only a HOST (the meeting creator's
+`MeetingRole::Host` claim) may server-mute. MC records the mute, broadcasts who-muted-whom to every
+participant (including the muted one, and replays it to late joiners), and programs the muted
+participant's sender id into `server_muted_sources` on the next registration snapshot to every
+handler carrying that sender's edges — a change to the muted set alone advances
+`policy_generation`. MH drops the muted sender's frames at ingress. A participant's
+`UnmuteRequest` is only RELAYED to the host; it never lifts the mute. A server mute survives a
+reconnect within grace, and does not survive a fresh join.
+
+**Step 1 — did the host's request land?**
+
+```promql
+sum by (action, outcome) (increase(mc_media_server_mute_requests_total[15m]))
+```
+
+`applied` is the success. `unchanged` is a repeat of the current state (no push). `not_permitted`
+means the requester was not a host — refused BEFORE the target was looked at, so a non-host learns
+nothing. `unknown_target` (host only) means the named participant is not in the meeting.
+`rate_limited` is the per-connection bound. The `mc.webtransport.connection` INFO line
+"Server mute decision" names requester, target, action and outcome for each decided request —
+the meeting-scoped record.
+
+**Step 2 — does MC believe a mute is in force?** `mc_media_server_muted_sources` is the number of
+participants MC holds server-muted, summed across this pod's meetings. It is identity-free by
+design (ADR-0036 §11): it answers "is any mute in force on this MC pod", never "in THIS meeting";
+use the Step 1 log line for that.
+
+**Step 3 — is MH dropping?** `mh_media_frames_dropped_total{reason="server_muted"}` on the handlers.
+Compare **fleet-aggregate and directionally only**: `sum(mc_media_server_muted_sources)` across MC
+instances against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH
+instances. Never divide a level by a rate, and never compare per instance (MC and MH meeting sets
+do not nest). A gauge above zero with a flat drop rate is only a candidate disagreement, and only
+after excluding a muted source that is silent, disconnected, in grace or not yet on that handler —
+a drop counter reads zero for all of those.
+
+**Step 4 — did the snapshot reach MH?** A mute that landed in MC but not at MH is a push problem:
+`mc_media_policy_pushes_total{outcome}` and Scenario 12 / Scenario 15. Server mute rides the same
+snapshot as every other policy change, so a push that is failing fails for the mute too.
+
+**Not a mute problem**: a participant who muted THEMSELF (client mute, enforced at capture, ADR-0036
+§5) — `mc_media_mute_requests_total`. `slot_state="source_muted"` covers both self and server mute
+by design, so it cannot tell them apart; the `ParticipantMuteUpdate` a client receives can.
+
+**Escalation**: `meeting-controller` if Step 1 shows `applied` and Step 4 shows the push confirmed
+but MH never drops; `media-handler` if MH holds the sender in its muted set and still forwards
+(`mh-incident-response.md`, the `server_muted` drop reason in the MH catalog).
 
 ## Diagnostic Commands
 

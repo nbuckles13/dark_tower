@@ -71,4 +71,5 @@
 
 pub mod admission;
 pub mod media_policy;
+pub mod session;
 pub mod transport_shim;

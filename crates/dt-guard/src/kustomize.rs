@@ -19,6 +19,14 @@
 //! * **R-20** (local) — dashboard JSON coverage in Grafana
 //!   `configMapGenerator` (bidirectional).
 //!
+//! Plus two local checks over generated ConfigMaps, in
+//! [`crate::kustomize_configmaps`] (added at story 2 task 12; no story
+//! R-number): **`configmap_annotation_size`** (every generator under `infra/`
+//! stays under 80% of Kubernetes' 262144-byte annotation cap, measured as
+//! client-side apply actually serialises it) and **`dashboard_configmap_label`**
+//! (every Grafana generator shipping dashboard JSON carries the sidecar's
+//! selector label). Both always run; neither needs a kustomize binary.
+//!
 //! Per @operations F1 + @team-lead fix-in-loop 2026-05-22: when
 //! `kustomize`/`kubectl kustomize`/`kubeconform` are absent, each affected
 //! check degrades to WARN (devloop containers may lack kubeconform). Never
@@ -73,7 +81,13 @@ const ORPHAN_EXCLUSIONS: &[&str] = &["kustomization.yaml", "service-monitor.yaml
 /// the class is what recurs, the repair is shared by every parser that can trip
 /// on it rather than applied at the reported site. Tracked in `docs/TODO.md`
 /// §Infrastructure Validation in Devloops.
-fn strip_inline_comment(line: &str) -> &str {
+///
+/// Visible to the crate (not just this module) for exactly that reason: it is
+/// the single home for this class, so a new line-oriented parser over the same
+/// file shape — [`crate::kustomize_configmaps`]'s `configMapGenerator` parser —
+/// imports it rather than carrying its own copy, which would be a copy that can
+/// drift out of the mitigation while looking like it has it.
+pub(crate) fn strip_inline_comment(line: &str) -> &str {
     line.split_once('#')
         .map_or(line, |(before, _)| before)
         .trim()
@@ -340,9 +354,18 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
 
     let mut all_hits: Vec<Hit> = Vec::new();
 
-    // R-16 + R-20 — local checks, always run.
+    // R-16 + R-20 + generated-ConfigMap checks — local, always run.
     all_hits.extend(check_orphan_manifests(repo_root)?);
     all_hits.extend(check_dashboard_coverage(repo_root)?);
+    all_hits.extend(
+        crate::kustomize_configmaps::check(repo_root)?
+            .into_iter()
+            .map(|f| Hit {
+                rule_id: f.rule_id,
+                detail: f.detail,
+                file: f.file,
+            }),
+    );
 
     // R-15/R-17/R-18/R-19 — build-dependent. Gate on `tool`.
     if let Some(tool) = tool {
@@ -392,28 +415,63 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         }
     }
 
-    // REASON token grouped by failure-shape class: report the largest
-    // class (deterministic ordering — R-15 build > R-17 schema > R-18
-    // securityContext > R-19 empty-secret > R-16 orphan > R-20 dashboard).
+    anyhow::bail!("{}", reason_token(&all_hits))
+}
+
+/// The `REASON` token for a failing run: the largest failure-shape class and
+/// its count.
+///
+/// Pure, and separated from [`run`] so the tie-break is testable without a
+/// filesystem or a kustomize binary.
+///
+/// # Ties go to the FIRST class listed, which needs saying in code
+///
+/// The ordering below is deliberate (R-15 build > R-17 schema > R-18
+/// securityContext > R-19 empty-secret > R-16 orphan > R-20 dashboard > the
+/// generated-ConfigMap checks): a build failure means the later checks ran on
+/// nothing trustworthy, so it is the reason worth reporting. `max_by_key`
+/// alone returns the LAST maximum, so one build failure plus one
+/// annotation-size finding reported `kustomize-configmap-annotation-size` —
+/// the ordering comment was true of the list and false of the selection.
+/// `Reverse(index)` as the secondary key makes the first listed maximum win.
+fn reason_token(all_hits: &[Hit]) -> String {
     let by_kind = |id: &str| all_hits.iter().filter(|h| h.rule_id == id).count();
-    let build = by_kind(BUILD_FAILED_RULE_ID);
-    let schema = by_kind(KUBECONFORM_FAILED_RULE_ID);
-    let sec = by_kind(SECURITY_CONTEXT_RULE_ID);
-    let secrets = by_kind(EMPTY_SECRET_RULE_ID);
-    let orphan = by_kind(ORPHAN_MANIFEST_RULE_ID);
-    let dash = by_kind(DASHBOARD_ORPHAN_RULE_ID);
-    let max_class = [
-        ("kustomize-build-failed", build),
-        ("kustomize-kubeconform-failed", schema),
-        ("kustomize-security-context", sec),
-        ("kustomize-empty-secret-value", secrets),
-        ("kustomize-orphan-manifest", orphan),
-        ("kustomize-dashboard-orphan", dash),
+    let (class, count) = [
+        ("kustomize-build-failed", by_kind(BUILD_FAILED_RULE_ID)),
+        (
+            "kustomize-kubeconform-failed",
+            by_kind(KUBECONFORM_FAILED_RULE_ID),
+        ),
+        (
+            "kustomize-security-context",
+            by_kind(SECURITY_CONTEXT_RULE_ID),
+        ),
+        (
+            "kustomize-empty-secret-value",
+            by_kind(EMPTY_SECRET_RULE_ID),
+        ),
+        (
+            "kustomize-orphan-manifest",
+            by_kind(ORPHAN_MANIFEST_RULE_ID),
+        ),
+        (
+            "kustomize-dashboard-orphan",
+            by_kind(DASHBOARD_ORPHAN_RULE_ID),
+        ),
+        (
+            "kustomize-configmap-annotation-size",
+            by_kind(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
+        ),
+        (
+            "kustomize-dashboard-configmap-label",
+            by_kind(crate::kustomize_configmaps::DASHBOARD_CONFIGMAP_LABEL_RULE_ID),
+        ),
     ]
     .into_iter()
-    .max_by_key(|(_, n)| *n)
-    .unwrap_or(("kustomize-violations", 0));
-    anyhow::bail!("{}-{}", max_class.0, max_class.1)
+    .enumerate()
+    .max_by_key(|(i, (_, n))| (*n, std::cmp::Reverse(*i)))
+    .map_or(("kustomize-violations", 0), |(_, class)| class);
+    format!("{class}-{count}")
 }
 
 /// Execute R-15 → R-17 → R-18 → R-19 in sequence per build target. R-15
@@ -615,6 +673,50 @@ resources:
         assert_eq!(
             extract_declared_generator_files(kust, "-alerts.yaml"),
             vec!["mc-alerts.yaml".to_string()]
+        );
+    }
+
+    fn hit(rule_id: &'static str) -> Hit {
+        Hit {
+            rule_id,
+            detail: String::new(),
+            file: PathBuf::from("infra"),
+        }
+    }
+
+    /// On a TIE the earlier-listed class must win, because the list order is a
+    /// ranking: a build failure means the later checks saw untrustworthy input.
+    ///
+    /// Regression pin for the `max_by_key`-returns-the-LAST-maximum defect: one
+    /// build failure plus one annotation-size finding reported
+    /// `kustomize-configmap-annotation-size`, so the newest check silently
+    /// outranked R-15 and the reason token pointed a responder at a dashboard
+    /// when the build was broken.
+    #[test]
+    fn a_tie_is_broken_toward_the_earlier_class_so_build_failures_win() {
+        assert_eq!(
+            reason_token(&[
+                hit(BUILD_FAILED_RULE_ID),
+                hit(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
+            ]),
+            "kustomize-build-failed-1"
+        );
+        // Order of the hits themselves must not matter either.
+        assert_eq!(
+            reason_token(&[
+                hit(crate::kustomize_configmaps::DASHBOARD_CONFIGMAP_LABEL_RULE_ID),
+                hit(ORPHAN_MANIFEST_RULE_ID),
+            ]),
+            "kustomize-orphan-manifest-1"
+        );
+        // A genuine majority still wins over an earlier class.
+        assert_eq!(
+            reason_token(&[
+                hit(BUILD_FAILED_RULE_ID),
+                hit(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
+                hit(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
+            ]),
+            "kustomize-configmap-annotation-size-2"
         );
     }
 

@@ -281,6 +281,7 @@ mod tests {
                 supersede_on_independent_frame: false,
                 transport_mode: TransportMode::Datagram,
             }],
+            server_muted_sources: std::collections::BTreeSet::new(),
         }
     }
 
@@ -328,6 +329,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.get(), first.get() + 1);
+    }
+
+    /// A server mute changes ONLY the muted set — the same edges — and that
+    /// alone must advance the generation. Otherwise MH sees an unchanged number,
+    /// no-ops the snapshot, and a mute (or an unmute) never takes effect while
+    /// the applied echo reads `match`.
+    #[tokio::test]
+    async fn a_change_to_the_muted_set_alone_advances_the_generation() {
+        let registry = PolicyGenerations::new();
+        let unmuted = assignment(1);
+        let mut muted = assignment(1);
+        muted
+            .server_muted_sources
+            .insert(SenderId::from_nonzero(NonZeroU16::new(101).unwrap()));
+        let first = registry
+            .next_generation("m1", &handler("mh-0"), &unmuted)
+            .await
+            .unwrap();
+        let after_mute = registry
+            .next_generation("m1", &handler("mh-0"), &muted)
+            .await
+            .unwrap();
+        let after_unmute = registry
+            .next_generation("m1", &handler("mh-0"), &unmuted)
+            .await
+            .unwrap();
+        assert_eq!(after_mute.get(), first.get() + 1, "a mute advances");
+        assert_eq!(
+            after_unmute.get(),
+            after_mute.get() + 1,
+            "an unmute advances"
+        );
     }
 
     /// Advance, then go back to the original assignment: it is a *change* from

@@ -33,6 +33,12 @@ spec:
         component: signaling
         instance: mc-1
     spec:
+      # COUPLED to mc-service: SHUTDOWN_TERMINATION_GRACE_SECONDS in
+      # crates/mc-service/src/media_routing/teardown.rs must equal this (a unit
+      # test reads this file and fails on drift). It sizes the graceful-shutdown
+      # window for meeting releases: SHUTDOWN_RELEASE_BUDGET = 35 - 2 s pre-drain
+      # - 5 s margin = 28 s. Raising this lengthens that window; lowering it
+      # shortens it, and below 8 s the build fails.
       terminationGracePeriodSeconds: 35
       securityContext:
         runAsNonRoot: true

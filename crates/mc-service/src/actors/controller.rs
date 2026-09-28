@@ -19,8 +19,12 @@
 use crate::errors::McError;
 use crate::media_routing::PolicyGenerations;
 
-use super::meeting::{MeetingActor, MeetingActorHandle};
-use super::messages::{ControllerMessage, ControllerStatus, JoinResult, MeetingInfo};
+use super::meeting::{MeetingActor, MeetingActorHandle, MeetingWiring};
+use super::meeting_media::MutedSourceCensus;
+use super::messages::{
+    ControllerMessage, ControllerStatus, JoinResult, MeetingEndCause, MeetingInfo,
+    MeetingLifecycleEvent, MeetingLifecycleSink,
+};
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 
 use common::secret::{ExposeSecret, SecretBox};
@@ -35,6 +39,39 @@ use tracing::{debug, error, info, instrument, warn};
 /// Default channel buffer size for the controller mailbox.
 const CONTROLLER_CHANNEL_BUFFER: usize = 1000;
 
+/// Creates that may wait behind one meeting id's teardown. Beyond it a create
+/// is refused `MeetingTeardownInProgress` rather than queued without bound. A
+/// rejoin normally reaches MC only after the teardown (GC is notified after
+/// it), so a legitimate queue here is short; this bounds the pathological one.
+const MAX_QUEUED_CREATES: usize = 16;
+
+/// How far past the teardown's own worst case the fence's backstop deadline
+/// sits. The margin covers the teardown task being scheduled and reporting;
+/// the deadline exists ONLY for a completion report that was lost, which the
+/// `Drop`-guarded report makes a can't-happen, so it must never race a real
+/// (slow but finishing) teardown.
+const FENCE_BACKSTOP_MARGIN: Duration = Duration::from_secs(5);
+
+/// Told when a meeting has ENDED (emptied or closed) and its handlers have
+/// been released — the point at which GC may re-assign the meeting id.
+///
+/// A trait so the controller's notify path is testable without a GC; the
+/// production implementation (`main.rs`) queues the notification for the GC
+/// client, which owns the send policy.
+pub trait MeetingEndedNotifier: Send + Sync {
+    /// The meeting `meeting_id` has ended and its handlers are released.
+    fn meeting_ended(&self, meeting_id: &str);
+}
+
+/// The notifier for a controller with no GC to tell (tests that do not
+/// exercise the notify path).
+#[derive(Debug, Default)]
+pub struct NoMeetingEndedNotifier;
+
+impl MeetingEndedNotifier for NoMeetingEndedNotifier {
+    fn meeting_ended(&self, _meeting_id: &str) {}
+}
+
 /// Handle to the `MeetingControllerActor`.
 ///
 /// This is the public interface for interacting with the controller.
@@ -43,6 +80,7 @@ const CONTROLLER_CHANNEL_BUFFER: usize = 1000;
 pub struct MeetingControllerActorHandle {
     sender: mpsc::Sender<ControllerMessage>,
     cancel_token: CancellationToken,
+    teardowns: Arc<crate::media_routing::teardown::TeardownTracker>,
 }
 
 impl MeetingControllerActorHandle {
@@ -72,10 +110,33 @@ impl MeetingControllerActorHandle {
         policy_generations: Arc<PolicyGenerations>,
         kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
     ) -> Self {
+        Self::with_meeting_ended_notifier(
+            mc_id,
+            metrics,
+            controller_metrics,
+            master_secret,
+            policy_generations,
+            kek_lifecycle,
+            Arc::new(NoMeetingEndedNotifier),
+        )
+    }
+
+    /// As [`Self::new`], telling `meeting_ended` when a meeting has ended and
+    /// its handlers are released (production: the GC notification queue).
+    #[must_use]
+    pub fn with_meeting_ended_notifier(
+        mc_id: String,
+        metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
+        master_secret: SecretBox<Vec<u8>>,
+        policy_generations: Arc<PolicyGenerations>,
+        kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
+        meeting_ended: Arc<dyn MeetingEndedNotifier>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(CONTROLLER_CHANNEL_BUFFER);
         let cancel_token = CancellationToken::new();
 
-        let actor = MeetingControllerActor::new(
+        let mut actor = MeetingControllerActor::new(
             mc_id,
             receiver,
             cancel_token.clone(),
@@ -85,13 +146,24 @@ impl MeetingControllerActorHandle {
             policy_generations,
             kek_lifecycle,
         );
+        actor.meeting_ended = meeting_ended;
+        let teardowns = Arc::clone(&actor.teardowns);
 
         tokio::spawn(actor.run());
 
         Self {
             sender,
             cancel_token,
+            teardowns,
         }
+    }
+
+    /// The process's in-flight meeting-teardown count. A graceful shutdown
+    /// settles on it after [`Self::shutdown`] returns, so handed-off releases
+    /// are not dropped with the runtime.
+    #[must_use]
+    pub fn teardowns(&self) -> Arc<crate::media_routing::teardown::TeardownTracker> {
+        Arc::clone(&self.teardowns)
     }
 
     /// Create a new meeting.
@@ -218,7 +290,10 @@ impl MeetingControllerActorHandle {
         Ok(rx)
     }
 
-    /// Remove a meeting (called when all participants leave).
+    /// Remove a meeting without ENDING it: the actor is cancelled, releases
+    /// its handlers as a shutdown teardown (`TeardownReason::Shutdown`), and GC
+    /// is not told. A meeting whose participants all leave ends itself — this is
+    /// not that path.
     pub async fn remove_meeting(&self, meeting_id: String) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
@@ -245,7 +320,10 @@ impl MeetingControllerActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
-    /// Initiate graceful shutdown.
+    /// Shut the actor system down gracefully, returning once every meeting
+    /// actor has exited (so every clean-path teardown has been HANDED OFF and
+    /// counted on [`Self::teardowns`]) — not merely once shutdown has begun.
+    /// A caller that needs a bound wraps this in a timeout; `main` does.
     pub async fn shutdown(&self, deadline: Duration) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
@@ -318,6 +396,74 @@ pub struct MeetingControllerActor {
     /// rotation state for the fleet gauges. Evicted on BOTH teardown paths,
     /// beside `policy_generations`.
     kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
+    /// Meeting actors report their lifecycle here. Drained BEFORE any reap and
+    /// before any message is handled (see `drain_lifecycle`).
+    lifecycle_tx: MeetingLifecycleSink,
+    lifecycle_rx: mpsc::UnboundedReceiver<MeetingLifecycleEvent>,
+    /// Meeting ids whose previous incarnation is still being released on its
+    /// handlers. A create for one of these WAITS (see [`TeardownFence`]).
+    tearing_down: HashMap<String, TeardownFence>,
+    /// The pod's server-mute census, recomputed on every health walk.
+    muted_census: Arc<MutedSourceCensus>,
+    /// Told when a meeting has ended and its handlers are released.
+    meeting_ended: Arc<dyn MeetingEndedNotifier>,
+    /// In-flight teardowns, handed to every meeting actor's wiring.
+    teardowns: Arc<crate::media_routing::teardown::TeardownTracker>,
+    /// Answered once the drain completes (see
+    /// [`MeetingControllerActorHandle::shutdown`]).
+    shutdown_waiter: Option<tokio::sync::oneshot::Sender<Result<(), McError>>>,
+}
+
+/// Why a meeting id is fenced, and who is waiting on it.
+///
+/// # Why a fence is REQUIRED, not an optimisation
+///
+/// `EndMeeting` releases by meeting id alone, with no generation. If a meeting
+/// were re-created under this id while its previous incarnation's release was
+/// still in flight, the release would land on the NEW registration: its routes
+/// gone, MC believing it programmed, a silent dark meeting until the next
+/// structural change. So no create for this id runs until the teardown reports
+/// completion.
+///
+/// # Park, never await
+///
+/// A waiting create's responder is STORED here and answered from the
+/// completion arm of this same loop. Awaiting the completion inline would
+/// self-deadlock the whole controller — every meeting on the pod — because the
+/// completion arrives on the loop that would be blocked waiting for it.
+struct TeardownFence {
+    /// When the backstop lifts this fence if no completion ever arrives.
+    deadline: tokio::time::Instant,
+    /// Creates parked behind the teardown, answered when it lifts.
+    waiting: Vec<ParkedCreate>,
+    /// Why the meeting ended, recorded at reap so the BACKSTOP path — where no
+    /// completion report (and so no cause) ever arrives — still knows whether
+    /// GC must be told.
+    cause: MeetingEndCause,
+}
+
+/// A create parked behind a teardown fence.
+enum ParkedCreate {
+    Plain(tokio::sync::oneshot::Sender<Result<(), McError>>),
+    #[cfg(feature = "test-seams")]
+    WithSeams(
+        super::meeting_media::MeetingSeams,
+        tokio::sync::oneshot::Sender<Result<(), McError>>,
+    ),
+}
+
+impl ParkedCreate {
+    fn respond(self, result: Result<(), McError>) {
+        match self {
+            Self::Plain(respond_to) => {
+                let _ = respond_to.send(result);
+            }
+            #[cfg(feature = "test-seams")]
+            Self::WithSeams(_, respond_to) => {
+                let _ = respond_to.send(result);
+            }
+        }
+    }
 }
 
 impl MeetingControllerActor {
@@ -352,6 +498,7 @@ impl MeetingControllerActor {
         kek_lifecycle: Arc<crate::media_admission::KekLifecycle>,
     ) -> Self {
         let mailbox = MailboxMonitor::new(ActorType::Controller, &mc_id);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
 
         Self {
             mc_id,
@@ -365,6 +512,13 @@ impl MeetingControllerActor {
             master_secret,
             policy_generations,
             kek_lifecycle,
+            lifecycle_tx,
+            lifecycle_rx,
+            tearing_down: HashMap::new(),
+            muted_census: Arc::new(MutedSourceCensus::default()),
+            meeting_ended: Arc::new(NoMeetingEndedNotifier),
+            teardowns: Arc::default(),
+            shutdown_waiter: None,
         }
     }
 
@@ -378,10 +532,33 @@ impl MeetingControllerActor {
         );
 
         loop {
+            // Lifecycle events FIRST: a meeting actor sends `Ended` before its
+            // task finishes, so draining here guarantees the fence is up before
+            // the health walk could reap that actor, and before any create for
+            // the id is handled.
+            self.drain_lifecycle().await;
+
             // Check for terminated meeting actors
             self.check_meeting_health().await;
 
+            let backstop = self.tearing_down.values().map(|f| f.deadline).min();
+
             tokio::select! {
+                // A lifecycle event arrived while idle.
+                Some(event) = self.lifecycle_rx.recv() => {
+                    self.on_lifecycle(event).await;
+                }
+
+                // A fence's backstop deadline passed with no completion.
+                () = async {
+                    match backstop {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.expire_fences().await;
+                }
+
                 // Handle cancellation
                 () = self.cancel_token.cancelled() => {
                     info!(
@@ -423,6 +600,9 @@ impl MeetingControllerActor {
             messages_processed = self.mailbox.messages_processed(),
             "MeetingControllerActor stopped"
         );
+        if let Some(waiter) = self.shutdown_waiter.take() {
+            let _ = waiter.send(Ok(()));
+        }
     }
 
     /// Handle a single message.
@@ -432,8 +612,13 @@ impl MeetingControllerActor {
                 meeting_id,
                 respond_to,
             } => {
-                let result = self.create_meeting(meeting_id).await;
-                let _ = respond_to.send(result);
+                // Park, never await: see `TeardownFence`.
+                if self.tearing_down.contains_key(&meeting_id) {
+                    self.park_create(&meeting_id, ParkedCreate::Plain(respond_to));
+                } else {
+                    let result = self.create_meeting(meeting_id).await;
+                    let _ = respond_to.send(result);
+                }
             }
 
             #[cfg(feature = "test-seams")]
@@ -442,8 +627,12 @@ impl MeetingControllerActor {
                 seams,
                 respond_to,
             } => {
-                let result = self.create_meeting_with_seams(meeting_id, seams).await;
-                let _ = respond_to.send(result);
+                if self.tearing_down.contains_key(&meeting_id) {
+                    self.park_create(&meeting_id, ParkedCreate::WithSeams(seams, respond_to));
+                } else {
+                    let result = self.create_meeting_with_seams(meeting_id, seams).await;
+                    let _ = respond_to.send(result);
+                }
             }
 
             ControllerMessage::GetMeeting {
@@ -458,11 +647,7 @@ impl MeetingControllerActor {
                 meeting_id,
                 respond_to,
             } => {
-                let result = self
-                    .meetings
-                    .get(&meeting_id)
-                    .map(|managed| managed.handle.clone())
-                    .ok_or_else(|| McError::MeetingNotFound(meeting_id.clone()));
+                let result = self.get_meeting_handle(&meeting_id);
                 let _ = respond_to.send(result);
             }
 
@@ -519,10 +704,15 @@ impl MeetingControllerActor {
             ControllerMessage::Shutdown {
                 deadline,
                 respond_to,
-            } => {
-                let result = self.initiate_shutdown(deadline).await;
-                let _ = respond_to.send(result);
-            }
+            } => match self.initiate_shutdown(deadline).await {
+                // Answered after `graceful_shutdown` has drained the meeting
+                // actors, not now: the caller's next step is settling their
+                // teardowns, which must all have been handed off first.
+                Ok(()) => self.shutdown_waiter = Some(respond_to),
+                Err(e) => {
+                    let _ = respond_to.send(Err(e));
+                }
+            },
         }
     }
 
@@ -579,9 +769,14 @@ impl MeetingControllerActor {
         // Fails closed if the system CSPRNG cannot produce the meeting KEK
         // (ADR-0036 §4): no meeting is created rather than one with predictable
         // or absent key material.
+        let wiring = MeetingWiring {
+            lifecycle: self.lifecycle_tx.clone(),
+            muted_census: Arc::clone(&self.muted_census),
+            teardowns: Arc::clone(&self.teardowns),
+        };
         #[cfg(feature = "test-seams")]
         let (handle, task_handle) = match seams {
-            Some(seams) => MeetingActor::spawn_with_seams(
+            Some(seams) => MeetingActor::spawn_with_seams_wired(
                 meeting_id.clone(),
                 meeting_token,
                 Arc::clone(&self.metrics),
@@ -589,26 +784,29 @@ impl MeetingControllerActor {
                 meeting_secret,
                 Arc::clone(&self.kek_lifecycle),
                 &seams,
+                Some(wiring),
             )?,
-            None => MeetingActor::spawn(
+            None => MeetingActor::spawn_managed(
                 meeting_id.clone(),
                 meeting_token,
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.controller_metrics),
                 meeting_secret,
                 Arc::clone(&self.kek_lifecycle),
+                wiring,
             )?,
         };
         #[cfg(not(feature = "test-seams"))]
         let _ = seams;
         #[cfg(not(feature = "test-seams"))]
-        let (handle, task_handle) = MeetingActor::spawn(
+        let (handle, task_handle) = MeetingActor::spawn_managed(
             meeting_id.clone(),
             meeting_token,
             Arc::clone(&self.metrics),
             Arc::clone(&self.controller_metrics),
             meeting_secret,
             Arc::clone(&self.kek_lifecycle),
+            wiring,
         )?;
 
         let created_at = chrono::Utc::now().timestamp();
@@ -636,9 +834,17 @@ impl MeetingControllerActor {
     }
 
     /// Get a cloned handle to a meeting actor for connection handling.
+    ///
+    /// A meeting id whose previous incarnation is still being released answers
+    /// `MeetingTeardownInProgress` rather than `MeetingNotFound`: a rejoin that
+    /// lands here during a teardown is "try again in a moment", and an operator
+    /// must be able to tell that apart from a genuinely unknown meeting.
     fn get_meeting_handle(&self, meeting_id: &str) -> Result<MeetingActorHandle, McError> {
         match self.meetings.get(meeting_id) {
             Some(managed) => Ok(managed.handle.clone()),
+            None if self.tearing_down.contains_key(meeting_id) => {
+                Err(McError::MeetingTeardownInProgress)
+            }
             None => Err(McError::MeetingNotFound(meeting_id.to_string())),
         }
     }
@@ -927,6 +1133,156 @@ impl MeetingControllerActor {
                 self.kek_lifecycle.remove_meeting(&meeting_id).await;
             }
         }
+
+        // The LOAD-BEARING publish of `mc_media_server_muted_sources`: prune the
+        // census to the meetings that still exist (a panicked actor never
+        // cleared its own entry) and re-set the pod total from it. Mute changes
+        // also publish, but only for freshness — see `MutedSourceCensus`.
+        let meetings = &self.meetings;
+        self.muted_census.retain(|id| meetings.contains_key(id));
+        self.muted_census.publish();
+    }
+
+    /// Park `create` behind `meeting_id`'s teardown fence (the caller has
+    /// checked there is one); answer it at once if the fence's queue is full.
+    fn park_create(&mut self, meeting_id: &str, create: ParkedCreate) {
+        let Some(fence) = self.tearing_down.get_mut(meeting_id) else {
+            create.respond(Err(McError::Internal("no teardown fence".to_string())));
+            return;
+        };
+        if fence.waiting.len() >= MAX_QUEUED_CREATES {
+            warn!(
+                target: "mc.actor.controller",
+                mc_id = %self.mc_id,
+                meeting_id = %meeting_id,
+                "Create refused: too many creates already waiting behind this meeting's teardown"
+            );
+            create.respond(Err(McError::MeetingTeardownInProgress));
+            return;
+        }
+        debug!(
+            target: "mc.actor.controller",
+            mc_id = %self.mc_id,
+            meeting_id = %meeting_id,
+            "Create parked behind the previous incarnation's teardown"
+        );
+        fence.waiting.push(create);
+    }
+
+    /// Process every lifecycle event already queued, without waiting.
+    async fn drain_lifecycle(&mut self) {
+        while let Ok(event) = self.lifecycle_rx.try_recv() {
+            self.on_lifecycle(event).await;
+        }
+    }
+
+    async fn on_lifecycle(&mut self, event: MeetingLifecycleEvent) {
+        match event {
+            MeetingLifecycleEvent::Ended { meeting_id, cause } => {
+                self.reap_ended(&meeting_id, cause).await;
+            }
+            MeetingLifecycleEvent::TeardownComplete { meeting_id, cause } => {
+                self.teardown_complete(&meeting_id, cause, false).await;
+            }
+        }
+    }
+
+    /// A meeting actor ended through its clean exit path: reap it and FENCE
+    /// the id until its handlers are released.
+    ///
+    /// Generations are NOT evicted here: the teardown evicts them after its
+    /// drain, as `EndMeetingRequest` requires. (The panic path in
+    /// `check_meeting_health` evicts immediately — no worker survives a
+    /// dropped actor there.)
+    async fn reap_ended(&mut self, meeting_id: &str, cause: MeetingEndCause) {
+        if self.meetings.remove(meeting_id).is_some() {
+            self.metrics.meeting_removed();
+        }
+        self.kek_lifecycle.remove_meeting(meeting_id).await;
+        self.tearing_down
+            .entry(meeting_id.to_string())
+            .or_insert_with(|| TeardownFence {
+                deadline: tokio::time::Instant::now()
+                    + crate::media_routing::teardown::TEARDOWN_MAX
+                    + FENCE_BACKSTOP_MARGIN,
+                waiting: Vec::new(),
+                cause,
+            });
+        info!(
+            target: "mc.actor.controller",
+            mc_id = %self.mc_id,
+            meeting_id = %meeting_id,
+            cause = cause.label(),
+            total_meetings = self.meetings.len(),
+            "Meeting ended; releasing it on its media handlers"
+        );
+    }
+
+    /// A teardown finished (or its backstop fired): lift the fence, serve the
+    /// creates that waited on it, and tell GC — for a meeting that is actually
+    /// OVER. Told only now, after the release, so GC cannot re-assign the id
+    /// while its handlers still hold the previous incarnation (and so that a
+    /// release mismatch stays a genuine MC-defect signal).
+    async fn teardown_complete(
+        &mut self,
+        meeting_id: &str,
+        cause: MeetingEndCause,
+        backstop: bool,
+    ) {
+        let Some(fence) = self.tearing_down.remove(meeting_id) else {
+            return;
+        };
+        if backstop {
+            crate::observability::metrics::record_teardown_fence_backstop();
+            error!(
+                target: "mc.actor.controller",
+                mc_id = %self.mc_id,
+                meeting_id = %meeting_id,
+                cause = fence.cause.label(),
+                "Teardown fence lifted by its deadline, not by the teardown reporting completion \
+                 (the teardown task hung or vanished). Creates for this id proceed, and GC is \
+                 told the meeting ended if it did; if the teardown is still releasing, it may \
+                 release the new incarnation."
+            );
+        }
+        for create in fence.waiting {
+            match create {
+                ParkedCreate::Plain(respond_to) => {
+                    let result = self.create_meeting(meeting_id.to_string()).await;
+                    let _ = respond_to.send(result);
+                }
+                #[cfg(feature = "test-seams")]
+                ParkedCreate::WithSeams(seams, respond_to) => {
+                    let result = self
+                        .create_meeting_with_seams(meeting_id.to_string(), seams)
+                        .await;
+                    let _ = respond_to.send(result);
+                }
+            }
+        }
+        // The backstop notifies too. Suppressing it would leave GC reusing a
+        // live assignment row for a meeting MC no longer holds, so every join
+        // to the id gets `meeting_not_found` until MC restarts — a permanently
+        // unjoinable id, strictly worse than the release-crossing race that
+        // lifting the fence has already accepted.
+        if cause.notifies_gc() {
+            self.meeting_ended.meeting_ended(meeting_id);
+        }
+    }
+
+    /// Lift every fence whose backstop deadline has passed.
+    async fn expire_fences(&mut self) {
+        let now = tokio::time::Instant::now();
+        let expired: Vec<(String, MeetingEndCause)> = self
+            .tearing_down
+            .iter()
+            .filter(|(_, f)| f.deadline <= now)
+            .map(|(id, f)| (id.clone(), f.cause))
+            .collect();
+        for (meeting_id, cause) in expired {
+            // No report arrived, so the cause is the one recorded at reap.
+            self.teardown_complete(&meeting_id, cause, true).await;
+        }
     }
 }
 
@@ -956,6 +1312,7 @@ mod tests {
                 supersede_on_independent_frame: false,
                 transport_mode: proto_gen::dark_tower::signaling::v1::TransportMode::Datagram,
             }],
+            server_muted_sources: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1241,5 +1598,71 @@ mod tests {
 
         assert!(handle.is_cancelled());
         assert!(child.is_cancelled());
+    }
+
+    // ------------------------------------------------------------------
+    // Fence backstop (OPS-19): the cause recorded at reap decides the GC
+    // notification even though no completion report ever arrives.
+    // ------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct RecordingNotifier(std::sync::Mutex<Vec<String>>);
+
+    impl MeetingEndedNotifier for RecordingNotifier {
+        fn meeting_ended(&self, meeting_id: &str) {
+            self.0.lock().unwrap().push(meeting_id.to_string());
+        }
+    }
+
+    fn backstop_actor(notifier: Arc<RecordingNotifier>) -> MeetingControllerActor {
+        let (_tx, rx) = mpsc::channel(8);
+        let mut actor = MeetingControllerActor::new(
+            "mc-test-backstop".to_string(),
+            rx,
+            CancellationToken::new(),
+            ActorMetrics::new(),
+            ControllerMetrics::new(),
+            test_secret(),
+            test_generations(),
+            crate::media_admission::fixtures::kek_lifecycle(),
+        );
+        actor.meeting_ended = notifier;
+        actor
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backstop_lifted_fence_still_tells_gc_an_ended_meeting_ended() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let mut actor = backstop_actor(Arc::clone(&notifier));
+        actor.reap_ended("m-empty", MeetingEndCause::Empty).await;
+        actor
+            .reap_ended("m-shutdown", MeetingEndCause::Shutdown)
+            .await;
+
+        // Before the deadline nothing lifts (positive control on the timer).
+        actor.expire_fences().await;
+        assert_eq!(actor.tearing_down.len(), 2);
+        assert!(notifier.0.lock().unwrap().is_empty());
+
+        tokio::time::advance(
+            crate::media_routing::teardown::TEARDOWN_MAX
+                + FENCE_BACKSTOP_MARGIN
+                + Duration::from_millis(1),
+        )
+        .await;
+        actor.expire_fences().await;
+
+        assert!(actor.tearing_down.is_empty(), "both fences lifted");
+        assert_eq!(
+            *notifier.0.lock().unwrap(),
+            vec!["m-empty".to_string()],
+            "the ended meeting is reported to GC on the backstop path; the shutdown one never is"
+        );
+
+        // A late real completion finds no fence and does not notify twice.
+        actor
+            .teardown_complete("m-empty", MeetingEndCause::Empty, false)
+            .await;
+        assert_eq!(notifier.0.lock().unwrap().len(), 1);
     }
 }

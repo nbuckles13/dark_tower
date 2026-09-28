@@ -548,8 +548,10 @@ impl ParticipantActor {
 
     /// Handle a participant state update.
     ///
-    /// Only `ParticipantJoined` and `ParticipantLeft` are serialized to the wire.
-    /// Other variants (MuteChanged, Disconnected, Reconnected) are logged only.
+    /// `ParticipantJoined`, `ParticipantLeft` and — as of story 2 task 12 — the
+    /// SERVER-mute `ParticipantMuteUpdate` are serialized to the wire (see
+    /// `webtransport::handler::encode_participant_update`, the one encoder).
+    /// `Disconnected` and `Reconnected` are logged only.
     async fn handle_update(&mut self, update: ParticipantStateUpdate) {
         if self.is_closing {
             return;
@@ -1233,7 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_with_stream_mute_changed_not_forwarded() {
+    async fn test_spawn_with_stream_mute_changed_is_forwarded() {
         let metrics = ActorMetrics::new();
         let cancel_token = CancellationToken::new();
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
@@ -1247,24 +1249,25 @@ mod tests {
             stream_tx,
         );
 
-        // Send a MuteChanged update (should NOT be forwarded to stream)
+        // A server-mute update reaches the stream (story 2 task 12, R-11):
+        // who-muted-whom has no other carrier.
         let update = ParticipantStateUpdate::MuteChanged {
             participant_id: "part-other".to_string(),
-            audio_self_muted: true,
+            audio_self_muted: false,
             video_self_muted: false,
-            audio_server_muted: false,
+            audio_server_muted: true,
             video_server_muted: false,
+            server_muted_by: "host-1".to_string(),
         };
         handle.send_update(update).await.unwrap();
 
-        // Give the actor time to process
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Stream should be empty — MuteChanged is not serialized
-        let received = stream_rx.try_recv();
+        let bytes = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+            .await
+            .expect("the update is forwarded")
+            .expect("stream open");
         assert!(
-            received.is_err(),
-            "Expected no bytes for MuteChanged update"
+            !bytes.is_empty(),
+            "a ParticipantMuteUpdate frame was written"
         );
 
         handle.cancel();

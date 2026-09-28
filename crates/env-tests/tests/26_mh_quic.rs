@@ -45,8 +45,13 @@
 //!     — runtime edge churn (R-4) does not stall an unrelated flow.
 //!
 //! S4 and the churn test program MH DIRECTLY through the Layer-7 per-pod gRPC
-//! forwards (`env_tests::fixtures::mh_grpc`), because MC sends no server mute
-//! before story 2 task 12 — see `Injection` for the footprint and recovery.
+//! forwards (`env_tests::fixtures::mh_grpc`), each for a case no public path
+//! reaches. S4 proves survival across a re-assert at the SAME generation, and
+//! MC sends no RPC for an unchanged snapshot until story 4's §8 cadence (the
+//! host-driven server mute through MC's public API is env-test 35's S3). The
+//! churn test changes ONE edge while every participant's connectivity, and so
+//! MC's own view, stays unchanged. See `Injection` for the footprint and
+//! recovery.
 //!
 //! # Prerequisites
 //!
@@ -78,7 +83,7 @@ use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeetingResponse};
 use env_tests::fixtures::mc_session::{self, connect_wt, McSession};
 use env_tests::fixtures::media::{
-    assert_relayed_on_slot, bind_until_received, bind_until_received_each,
+    assert_relayed_on_slot, bind_until_received, bind_until_received_each, drain, read_frame,
 };
 use env_tests::fixtures::metrics::poll_until_pinned_instance;
 use env_tests::fixtures::metrics::{
@@ -86,7 +91,7 @@ use env_tests::fixtures::metrics::{
     poll_until_stable, service_job_scrape_settle, InstanceCounters,
 };
 use env_tests::fixtures::mh_grpc::{self, Handler, ReleaseOnDrop};
-use env_tests::fixtures::participant::{self, Participant};
+use env_tests::fixtures::participant::{self, open_sessions, Participant};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
@@ -422,7 +427,13 @@ async fn test_mh_url_present_in_join_response() {
 /// fire `RegisterMeeting` to every assigned MH (R-12), which is the
 /// precondition for MH-side tests that expect a registered meeting.
 ///
-/// Returns the parsed `JoinResponse`; the WebTransport connection is dropped.
+/// Returns the parsed `JoinResponse`; the WebTransport session is DROPPED on
+/// return — which, since story 2 task 12, ENDS the meeting if this was its only
+/// participant (the last participant's clean leave ends a meeting, and MC's
+/// teardown then releases it on every media handler). So this is ONLY for a
+/// caller that reads the `JoinResponse` and does nothing with the meeting
+/// afterwards. A caller that goes on to use the meeting on MH must use
+/// [`join_with_registered_mh`], which keeps the MC half alive by type.
 async fn mc_join(
     mc_url: &str,
     meeting_id: &str,
@@ -431,8 +442,7 @@ async fn mc_join(
 ) -> proto_gen::dark_tower::signaling::v1::JoinResponse {
     // Connection, framing, the `JoinRequest` field list, and the join
     // positive-control (sender_id / media_servers / handler-url present) all
-    // live in the shared `mc_session` fixture. The session is dropped when this
-    // returns, which is what the `JoinResponse`-only callers want.
+    // live in the shared `mc_session` fixture.
     let mut session = McSession::connect(mc_url).await;
     mc_session::mc_join(
         &mut session,
@@ -470,15 +480,37 @@ fn any_registered_mh_url(
         .expect("MC JoinResponse must include at least one non-empty MH URL")
 }
 
+/// A meeting registered on MH by a real GC→MC join, WITH that join's MC
+/// session held open for as long as this value lives.
+///
+/// # Why the MC session is bundled, not returned separately
+///
+/// Since story 2 task 12 the last participant's clean leave ENDS a meeting, and
+/// MC's teardown then calls `EndMeeting` on every handler — which releases the
+/// meeting there and closes its connections. A caller that dropped the MC
+/// session would have its meeting torn down underneath the MH half of its test,
+/// and the symptom would be a confusing transport error, not an assertion
+/// failure pointing here. Bundling makes that unrepresentable: a caller cannot
+/// hold `jwt`/`mh_url` without holding the session. (`#[must_use]` would not
+/// do it: `let _ = …` both drops immediately AND silences the warning.)
+struct RegisteredMeeting {
+    /// The meeting JWT (what MH authenticates with).
+    jwt: String,
+    /// One MH WebTransport URL on which the meeting is registered.
+    mh_url: String,
+    /// The MC session keeping the meeting alive. Never read; held.
+    _mc_session: McSession,
+}
+
 /// Drive the full GC→MC join so MC fires `RegisterMeeting` to all assigned MHs,
-/// then return the meeting JWT and the first MH WebTransport URL. Used by the
-/// MH-side scenarios that need a "registered meeting" precondition.
+/// and keep the meeting alive (see [`RegisteredMeeting`]). Used by the MH-side
+/// scenarios that need a "registered meeting" precondition.
 async fn join_with_registered_mh(
     cluster: &ClusterConnection,
     user_token: &str,
     display_name: &str,
     meeting_name: &str,
-) -> (String, String) {
+) -> RegisteredMeeting {
     let gc_join = gc_create_and_join(cluster, user_token, meeting_name).await;
     let mc_url = gc_join
         .mc_assignment
@@ -486,17 +518,21 @@ async fn join_with_registered_mh(
         .clone()
         .expect("MC assignment must include webtransport_endpoint");
 
-    let join_response = mc_join(
-        &mc_url,
+    let mut session = McSession::connect(&mc_url).await;
+    let join_response = mc_session::mc_join(
+        &mut session,
         &gc_join.meeting_id.to_string(),
         &gc_join.token,
+        display_name,
         display_name,
     )
     .await;
 
-    let mh_url = any_registered_mh_url(&join_response);
-
-    (gc_join.token, mh_url)
+    RegisteredMeeting {
+        jwt: gc_join.token,
+        mh_url: any_registered_mh_url(&join_response),
+        _mc_session: session,
+    }
 }
 
 /// Test: MH accepts a connection authenticated by a valid meeting JWT for a
@@ -524,13 +560,15 @@ async fn test_mh_accepts_valid_meeting_jwt() {
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) = register_test_user(&auth_client, "MH Valid JWT User").await;
 
-    let (jwt, mh_url) = join_with_registered_mh(
+    let meeting = join_with_registered_mh(
         cluster,
         &user_token,
         &display_name,
         "MH Valid JWT Test Meeting",
     )
     .await;
+    // Held for the whole test: `meeting` owns the MC session keeping it alive.
+    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
 
     let conn = connect_wt(&mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
@@ -578,13 +616,15 @@ async fn test_mh_rejects_forged_jwt() {
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) = register_test_user(&auth_client, "MH Forged JWT User").await;
 
-    let (_jwt, mh_url) = join_with_registered_mh(
+    let meeting = join_with_registered_mh(
         cluster,
         &user_token,
         &display_name,
         "MH Forged JWT Test Meeting",
     )
     .await;
+    // Held for the whole test: `meeting` owns the MC session keeping it alive.
+    let mh_url = meeting.mh_url.clone();
 
     // Structurally-valid JWT with garbage signature. Same constant as
     // `fake_token` in `24_join_flow.rs::test_mc_rejects_invalid_meeting_token`
@@ -626,13 +666,15 @@ async fn test_mh_rejects_oversized_jwt() {
     let (user_token, display_name) =
         register_test_user(&auth_client, "MH Oversized JWT User").await;
 
-    let (_jwt, mh_url) = join_with_registered_mh(
+    let meeting = join_with_registered_mh(
         cluster,
         &user_token,
         &display_name,
         "MH Oversized JWT Test Meeting",
     )
     .await;
+    // Held for the whole test: `meeting` owns the MC session keeping it alive.
+    let mh_url = meeting.mh_url.clone();
 
     // Benign filler — explicitly NOT shaped like a real JWT (no dots, no
     // base64 header) so we don't normalize logging realistic-looking tokens.
@@ -673,13 +715,15 @@ async fn test_mh_connect_increments_mc_notification_metric_connected() {
     // rollover — see the helper docs.
     let baseline = wait_for_notification_counter_stable(&prom, "connected").await;
 
-    let (jwt, mh_url) = join_with_registered_mh(
+    let meeting = join_with_registered_mh(
         cluster,
         &user_token,
         &display_name,
         "MH Connect Metric Test Meeting",
     )
     .await;
+    // Held for the whole test: `meeting` owns the MC session keeping it alive.
+    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
 
     let conn = connect_wt(&mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
@@ -718,13 +762,15 @@ async fn test_mh_disconnect_increments_mc_notification_metric_disconnected() {
     // on the leftover bump. Wait for the counter to settle before snapshotting.
     let baseline = wait_for_notification_counter_stable(&prom, "disconnected").await;
 
-    let (jwt, mh_url) = join_with_registered_mh(
+    let meeting = join_with_registered_mh(
         cluster,
         &user_token,
         &display_name,
         "MH Disconnect Metric Test Meeting",
     )
     .await;
+    // Held for the whole test: `meeting` owns the MC session keeping it alive.
+    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
 
     let conn = connect_wt(&mh_url).await;
     let (mut send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
@@ -1058,13 +1104,15 @@ async fn test_mc_programs_live_handler_with_confirmed_forwarding_policy() {
     // assigned MH. The MH WebTransport connect is not needed for the push, but
     // driving it keeps this test on the same shape as its siblings and proves
     // the meeting is genuinely usable.
-    let (jwt, mh_url) = join_with_registered_mh(
+    let meeting = join_with_registered_mh(
         cluster,
         &user_token,
         &display_name,
         "MC Policy Push Test Meeting",
     )
     .await;
+    // Held for the whole test: `meeting` owns the MC session keeping it alive.
+    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
     let conn = connect_wt(&mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
@@ -1153,17 +1201,6 @@ fn server_muted_promql() -> &'static str {
     r#"sum by (instance) (mh_media_frames_dropped_total{reason="server_muted"})"#
 }
 
-/// A marked datagram's `(marker, stream_sequence, relay slot)`.
-fn read_frame(raw: &[u8]) -> (u8, u32, u32) {
-    let view = media_protocol::codec::decode_datagram(raw)
-        .unwrap_or_else(|_| panic!("received a malformed datagram"));
-    (
-        view.payload().first().copied().unwrap_or(0),
-        view.stream_sequence(),
-        u32::from(view.stream_id()),
-    )
-}
-
 /// One MC-shaped egress stream (story 2 task 20 edge model): `source` into
 /// `subscriber`'s declared slot at `ordinal`, with MC's id packing
 /// `(subscriber << 8) | ordinal`, one candidate at stream 0, priority group 1,
@@ -1217,8 +1254,13 @@ fn mc_shaped_edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> Egre
 /// `ReleaseOnDrop` releases on success and on a panic, but not on SIGKILL or a
 /// harness kill. Then this meeting id stays wedged at the injected generation
 /// on that pod — every later MC push for it refused as stale — holding its
-/// edges and a registered-meeting slot until the pod restarts. The id is a
-/// fresh GC meeting per run, so no later run reuses it. Recovery: `EndMeeting`
+/// edges and a registered-meeting slot. From story 2 task 12 that is normally
+/// SELF-HEALING: the killed harness's MC sessions die with it, so once every
+/// participant has left and MC's reconnect grace expires, MC ends the meeting
+/// and its own `EndMeeting` releases the wedge, because the injection carries
+/// MC's own `mc_id`. It persists until the pod restarts only if MC never
+/// completes that `EndMeeting`. The id is a fresh GC meeting per run, so no
+/// later run reuses it. Manual recovery, if needed: `EndMeeting`
 /// for the id on the pod through the Layer-7 gRPC forward with the MC
 /// credential (`env_tests::fixtures::mh_grpc`), or
 /// `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`.
@@ -1384,27 +1426,6 @@ fn assert_mc_programmed_a_carrying_pod(injections: &[Injection<'_>]) {
     );
 }
 
-/// Every participant opens a session to every handler in `urls`, then declares
-/// its slots; returns sessions indexed `[participant][url]`.
-async fn open_sessions(
-    phase: &str,
-    ps: &[Participant],
-    urls: &[&String],
-) -> Vec<std::collections::HashMap<String, mc_session::MhSession>> {
-    let mut all = Vec::new();
-    for p in ps {
-        let mut mine = std::collections::HashMap::new();
-        for url in urls {
-            mine.insert(
-                (*url).clone(),
-                participant::reach(phase, p.label, url, &p.token).await,
-            );
-        }
-        all.push(mine);
-    }
-    all
-}
-
 /// Both MH pods Layer 7 exports. Every injection in this file goes to BOTH
 /// with the same policy, so no test needs to know which pod serves which
 /// WebTransport URL.
@@ -1412,17 +1433,6 @@ fn both_handlers() -> Vec<Handler> {
     let hs = mh_grpc::handlers();
     assert_eq!(hs.len(), 2, "PRECONDITION: Layer 7 exports two MH pods");
     hs
-}
-
-/// Drain whatever is queued on `conn` (non-blocking in effect: one short read
-/// per call), handing every marked frame to `each`.
-async fn drain(conn: &wtransport::Connection, mut each: impl FnMut(u8, u32, u32)) {
-    while let Ok(Ok(d)) =
-        tokio::time::timeout(Duration::from_millis(50), conn.receive_datagram()).await
-    {
-        let (marker, seq, slot) = read_frame(&d.payload());
-        each(marker, seq, slot);
-    }
 }
 
 /// S4 (story 2 R-9; ADR-0036 §7): a server-muted sender's datagrams are
@@ -1433,19 +1443,25 @@ async fn drain(conn: &wtransport::Connection, mut each: impl FnMut(u8, u32, u32)
 ///
 /// # Evidence, per the env-tests README evidence rule
 ///
-/// - DROPS: `mh_media_frames_dropped_total{reason="server_muted"}` rises past
-///   its OWN baseline on EACH pinned pod (A sends on both). No other producer
-///   of that series exists before story 2 task 12 (MC sends an empty muted set
-///   until then), so the rise is attributable to this test.
+/// - DROPS (SECONDARY): `mh_media_frames_dropped_total{reason="server_muted"}`
+///   rises past its OWN baseline on EACH pinned pod (A sends on both). NOT
+///   attributable to this test alone: from story 2 task 12 MC programs real
+///   mutes, and env-test 35's S3 produces this series on the same shared pods,
+///   in parallel (`crates/env-tests/README.md` evidence rule). It confirms the
+///   drop path ran somewhere on the pod; the NON-FORWARDING bullet below is
+///   the proof that THIS sender was dropped.
 /// - NON-FORWARDING, per receiver: B never receives an A-marked frame whose
 ///   sequence number was sent while the mute was live. This replaces the
 ///   task text's "forward counter stays flat": a POD-WIDE forward counter
 ///   staying flat proves nothing while other suites share the pods.
 /// - LIVENESS (positive control): A keeps receiving B's frames while muted.
 ///
-/// MC sends no mute before story 2 task 12, so the mute is injected directly
-/// (see [`Injection`]); "survives a re-assert" is therefore the TEST's own
-/// re-registration, at the same generation and at a new one.
+/// The mute is injected directly (see [`Injection`]) because "survives a
+/// re-assert at the SAME generation" has no public path: MC sends no RPC for
+/// an unchanged snapshot until story 4's §8 cadence. So the re-asserts here
+/// are the TEST's own re-registrations, at the same generation and at a new
+/// one. The host-driven mute through MC's public API is env-test 35's S3,
+/// which does not cover same-generation survival.
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert() {

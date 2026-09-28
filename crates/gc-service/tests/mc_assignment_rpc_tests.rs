@@ -372,7 +372,7 @@ async fn test_assign_meeting_with_mh_no_mhs(pool: PgPool) {
 /// Test existing assignment is returned without calling MC or selecting MHs.
 ///
 /// One shared mock across BOTH calls, so `call_count() == 1` proves `assign_meeting`
-/// ran exactly once for the meeting (a second mock would only prove the second call
+/// ran exactly once for the meeting incarnation (a second mock would only prove the second call
 /// made no RPC). Covers the healthy-pool reuse case; the empty-pool reuse case and
 /// its metric proof are in `test_reuse_path_skips_mh_selection_on_empty_pool`.
 #[sqlx::test(migrations = "../../migrations")]
@@ -419,7 +419,7 @@ async fn test_assign_meeting_with_mh_returns_existing(pool: PgPool) {
         "reuse path performs no MH selection"
     );
 
-    // MC notified exactly once for the meeting, by the new assignment only
+    // MC notified exactly once for the meeting incarnation, by the new assignment only
     assert_eq!(mock_client.call_count(), 1);
 }
 

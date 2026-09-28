@@ -6,7 +6,7 @@
 use super::participant::ParticipantActorHandle;
 use crate::errors::McError;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// Messages sent to `MeetingControllerActor`.
 #[derive(Debug)]
@@ -240,20 +240,47 @@ pub enum MeetingMessage {
         video_muted: bool,
     },
 
-    /// Server-mutes a participant by meeting policy (enforced at MH ingress,
-    /// ADR-0036 §5). "Host mute" is avoided as a term: it presumes a role
-    /// model this system has not defined.
+    /// Apply or lift a server mute on a participant by meeting policy
+    /// (enforced at MH ingress, ADR-0036 §5, §7). "Host mute" is avoided as a
+    /// term: it presumes a role model this system has not defined.
+    ///
+    /// `requester` is the participant id of the AUTHENTICATED CONNECTION that
+    /// sent the request — bound at the connection layer, never read from a
+    /// message field (`ServerMuteRequest` carries no requester). The actor
+    /// cannot tell a forged value from a real one; that binding is made only at
+    /// the call site.
     ServerMute {
         target_participant_id: String,
-        muted_by: String,
+        requester: String,
         audio_muted: bool,
         video_muted: bool,
-        /// Response channel for confirmation.
-        respond_to: oneshot::Sender<Result<(), McError>>,
+        /// The decision, or the refusal. Both refusals collapse to ONE wire
+        /// error at the connection; the distinction exists for the metric and
+        /// the log only.
+        respond_to: oneshot::Sender<Result<ServerMuteDecision, ServerMuteRefusal>>,
     },
 
-    /// End the meeting (called by host or system).
-    EndMeeting {
+    /// A server-muted participant asks the host(s) to lift its mute.
+    ///
+    /// NOTIFIES — never clears. This message has no write path to any
+    /// `*_server_muted` field: the single writer of server-mute state is the
+    /// `ServerMute` arm, under host authority (R-10).
+    RequestUnmute {
+        /// The AUTHENTICATED requester (the connection's own participant id).
+        participant_id: String,
+        request_audio: bool,
+        request_video: bool,
+        respond_to: oneshot::Sender<UnmuteRelay>,
+    },
+
+    /// Close the MC-side meeting (called by the system).
+    ///
+    /// NOT the MH `EndMeeting` RPC, which releases a meeting on a media
+    /// handler (`media_routing::teardown`). This was named `EndMeeting` before
+    /// story 2 task 12; it was renamed so the two concepts stop sharing a name.
+    /// Closing a meeting RUNS that release, on every handler of the meeting's
+    /// frozen set, after its push workers drain.
+    CloseMeeting {
         reason: String,
         /// Response channel for confirmation.
         respond_to: oneshot::Sender<Result<(), McError>>,
@@ -458,6 +485,17 @@ pub struct JoinResult {
     pub kek_rotation_debounce_seconds: u32,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
+    /// Who is server-muted RIGHT NOW, as `MuteChanged` values, snapshotted in the
+    /// join's own actor turn (story 2 R-11).
+    ///
+    /// The roster `Participant` message carries no mute state, so without this
+    /// a joiner could not render who-muted-whom until the next mute change. The
+    /// connection writes these through the SAME encoder as a live broadcast,
+    /// immediately after the `JoinResponse`, so replay and live cannot diverge.
+    /// Taken in the join turn, and every later change is queued to this
+    /// participant from that turn on — so it arrives snapshot-then-deltas by
+    /// construction.
+    pub server_mute_replay: Vec<ParticipantStateUpdate>,
     /// The meeting's FROZEN handler set (ADR-0036 §9). `JoinResponse.media_servers`
     /// carries every handler in it: every participant is offered the whole set
     /// and connects to all it can. The frozen value, never the Redis read this
@@ -563,6 +601,108 @@ pub struct KekPush {
     pub kek_rotation_debounce_seconds: u32,
 }
 
+/// A server-mute request the meeting actor ACTED on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerMuteDecision {
+    /// The server-mute state changed and was broadcast (and, for audio,
+    /// re-rendered and re-pushed).
+    Applied,
+    /// Already in the requested state. Nothing broadcast, nothing pushed.
+    Unchanged,
+}
+
+/// Why the meeting actor refused a server-mute request.
+///
+/// Two values for the operator (the metric label and the log); ONE for the
+/// client, which receives the same error for both. The ORDERING — authority is
+/// checked before the target is looked up — is what keeps a non-host from ever
+/// reaching [`Self::UnknownTarget`]; the single wire error is defence in depth
+/// on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerMuteRefusal {
+    /// The requester does not hold host authority.
+    NotPermitted,
+    /// An authorized requester named a participant not in this meeting.
+    /// Reachable ONLY for a host requester, by the ordering above.
+    UnknownTarget,
+}
+
+/// What became of a participant's `UnmuteRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmuteRelay {
+    /// Relayed to this many connected host(s).
+    Relayed { hosts: usize },
+    /// The requester is not server-muted in any kind it asked about; nothing
+    /// to ask for, so nothing relayed.
+    NotServerMuted,
+    /// No host is currently connected to receive it.
+    NoHostConnected,
+}
+
+/// Why a meeting actor ended. Decides whether GC is told the meeting ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingEndCause {
+    /// The last roster participant was removed (clean leave, clean close, or
+    /// grace expiry). ADR-0010 §3: "last participant leaves, MC notifies GC".
+    Empty,
+    /// Closed explicitly (`MeetingMessage::CloseMeeting`).
+    Closed,
+    /// MC is shutting down. The meeting is NOT over — a successor MC may take
+    /// it over — so GC is not told it ended; GC learns of MC loss from
+    /// heartbeats. The handlers ARE released, inside the shutdown release
+    /// window (`teardown::SHUTDOWN_RELEASE_BUDGET`; a release still running at
+    /// its deadline is cut off and counted on `main`'s shutdown log line): a
+    /// successor that already re-registered makes this release fail
+    /// `FAILED_PRECONDITION`, which can never release a taken-over meeting.
+    Shutdown,
+}
+
+impl MeetingEndCause {
+    /// Whether GC should be told the meeting ended.
+    #[must_use]
+    pub fn notifies_gc(self) -> bool {
+        matches!(self, Self::Empty | Self::Closed)
+    }
+
+    /// Bounded log form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Closed => "closed",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// A meeting actor's lifecycle, reported to the controller.
+///
+/// Carried on an UNBOUNDED channel, and bounded by construction rather than by
+/// capacity: each meeting actor sends at most one `Ended` and its teardown at
+/// most one `TeardownComplete`, so the queue is at most twice the number of
+/// meetings. A bounded channel would add a drop path to the two messages the
+/// controller's teardown fence depends on.
+#[derive(Debug)]
+pub enum MeetingLifecycleEvent {
+    /// The actor has exited through its clean exit path and handed its
+    /// MH-side teardown to a task. The controller reaps it and FENCES the id.
+    Ended {
+        meeting_id: String,
+        cause: MeetingEndCause,
+    },
+    /// That teardown has finished — sent from a `Drop` guard, so it is sent on
+    /// EVERY exit path of the teardown task, a panic included. The controller
+    /// lifts the fence, serves any queued create, and (for `Empty` / `Closed`)
+    /// tells GC the meeting ended.
+    TeardownComplete {
+        meeting_id: String,
+        cause: MeetingEndCause,
+    },
+}
+
+/// Where a managed meeting actor reports its lifecycle.
+pub type MeetingLifecycleSink = mpsc::UnboundedSender<MeetingLifecycleEvent>;
+
 /// State update for a participant (broadcast to other connections).
 #[derive(Debug, Clone)]
 pub enum ParticipantStateUpdate {
@@ -573,13 +713,23 @@ pub enum ParticipantStateUpdate {
         participant_id: String,
         reason: LeaveReason,
     },
-    /// A participant's mute status changed.
+    /// A participant's SERVER mute changed — or, on the late-joiner replay, a
+    /// participant is server-muted at the moment someone joins.
+    ///
+    /// Wire-visible as `ParticipantMuteUpdate` (story 2 R-11). Emitted only for
+    /// SERVER mute: self-mute does not fan out to the roster (security S-2's
+    /// judgment — the subscriber-visible signal is `SLOT_STATE_SOURCE_MUTED`).
+    /// So the two self-mute booleans ride along as INFORMATIONAL snapshots and
+    /// are not a self-mute source for any client.
     MuteChanged {
         participant_id: String,
         audio_self_muted: bool,
         video_self_muted: bool,
         audio_server_muted: bool,
         video_server_muted: bool,
+        /// Participant id of whoever applied the server mute; empty when
+        /// neither kind is server-muted.
+        server_muted_by: String,
     },
     /// A participant disconnected (still in grace period).
     Disconnected { participant_id: String },

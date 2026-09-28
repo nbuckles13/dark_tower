@@ -2446,7 +2446,7 @@ async fn test_join_sticky_two_users_same_mc_single_assign_rpc(pool: PgPool) -> R
     assert_eq!(
         mc_client.call_count(),
         1,
-        "assign_meeting is called once per meeting, by the first join only"
+        "assign_meeting is called once per meeting incarnation, by its first join only"
     );
 
     Ok(())

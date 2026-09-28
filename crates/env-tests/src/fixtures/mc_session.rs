@@ -55,9 +55,25 @@ pub async fn connect_wt(url: &str) -> wtransport::Connection {
 ///
 /// A description of the client-construction or connect failure.
 pub async fn try_connect_wt(url: &str) -> Result<wtransport::Connection, String> {
+    try_connect_wt_with(url, None).await
+}
+
+/// [`try_connect_wt`] with a QUIC keep-alive: while the peer is up, the
+/// session cannot end by IDLE TIMEOUT. That is what lets a test read a close
+/// on such a session as the PEER's doing (e.g. MH releasing a meeting) rather
+/// than as a quiet link timing out.
+///
+/// # Errors
+///
+/// As [`try_connect_wt`].
+pub async fn try_connect_wt_with(
+    url: &str,
+    keep_alive: Option<Duration>,
+) -> Result<wtransport::Connection, String> {
     let config = wtransport::ClientConfig::builder()
         .with_bind_default()
         .with_no_cert_validation()
+        .keep_alive_interval(keep_alive)
         .build();
     wtransport::Endpoint::client(config)
         .map_err(|e| format!("create WebTransport client: {e}"))?
@@ -345,7 +361,20 @@ pub async fn mh_connect(url: &str, jwt: &str) -> MhSession {
 ///
 /// A description of the connect, stream-open or connect-frame write failure.
 pub async fn try_mh_connect(url: &str, jwt: &str) -> Result<MhSession, String> {
-    let conn = try_connect_wt(url).await?;
+    try_mh_connect_with(url, jwt, None).await
+}
+
+/// [`try_mh_connect`] with a QUIC keep-alive (see [`try_connect_wt_with`]).
+///
+/// # Errors
+///
+/// As [`try_mh_connect`].
+pub async fn try_mh_connect_with(
+    url: &str,
+    jwt: &str,
+    keep_alive: Option<Duration>,
+) -> Result<MhSession, String> {
+    let conn = try_connect_wt_with(url, keep_alive).await?;
     let (send, recv) = try_mh_open_connect(&conn, jwt)
         .await
         .map_err(|e| format!("{e} (MH at {url})"))?;

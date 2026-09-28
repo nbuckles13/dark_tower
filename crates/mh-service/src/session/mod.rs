@@ -320,8 +320,13 @@ pub enum ApplyOutcome {
     /// install and an idempotent re-assert of an already-installed generation
     /// (which performs no swap).
     Applied,
-    /// The generation was lower than the one installed, so it was ignored.
-    /// Reordered or retried delivery must not roll policy back.
+    /// Nothing was installed because the policy is older than this handler's
+    /// state for the meeting: either its generation is below the installed
+    /// one (reordered or retried delivery must not roll policy back), or its
+    /// meeting is no longer registered here because an `EndMeeting` released
+    /// it after this apply was queued (see the released-meeting guard at the
+    /// top of `handle_config_apply`). The two share a value because they share
+    /// a remedy: none, the handler is already ahead of the policy.
     RejectedStale,
     /// Nothing was installed; the prior generation stays live.
     Failed(ApplyFailure),
@@ -467,6 +472,14 @@ impl SessionManagerActor {
             respond_to,
         } = msg;
 
+        // RELEASED-MEETING GUARD (story 2 R-20). This must be the FIRST branch:
+        // after a release the generation reads 0, so a late apply would
+        // otherwise land in the generation-advancing arm and install. See
+        // `refuse_apply_for_released_meeting`.
+        let Some(respond_to) = self.refuse_apply_for_released_meeting(&policy, respond_to) else {
+            return;
+        };
+
         let snapshot = self.routing.load();
         let installed = snapshot.generation_for(&policy.meeting);
         let projected_total_edges = snapshot.projected_total_edges(&policy);
@@ -597,10 +610,14 @@ impl SessionManagerActor {
             // `installed_meeting_count` and `installed_total_edges` are here
             // because this bound can RATCHET: a meeting's edges are released by
             // it re-asserting a smaller policy or by its MC calling `EndMeeting`
-            // (story 2 R-20), and a meeting whose MC never calls it (MC crash,
-            // or any MC before story 2 task 12) keeps them until the pod
-            // restarts. The one question an operator has on seeing this line is
-            // "is this one fat policy, or accumulated dead meetings?", and only
+            // (story 2 R-20), and a meeting whose MC never COMPLETES
+            // `EndMeeting` (an MC that crashes or is killed mid-teardown, whose
+            // `EndMeeting` exhausts its retries or reaches an MH predating the
+            // RPC, or that is rolled back to a build predating teardown) keeps
+            // them until the pod restarts (`docs/TODO.md`, "A meeting whose MC
+            // never sends `EndMeeting` is never reclaimed"). The one question an
+            // operator has on seeing this line is "is this one fat policy, or
+            // accumulated dead meetings?", and only
             // these two counts answer it. Both are bounded aggregates carrying
             // no identity.
             tracing::warn!(
@@ -633,6 +650,91 @@ impl SessionManagerActor {
         };
 
         let _ = respond_to.send(outcome);
+    }
+
+    /// The released-meeting guard (story 2 R-20). Returns `respond_to` when the
+    /// policy's meeting is registered, so the caller goes on to decide the
+    /// apply. Otherwise it refuses: installs nothing, counts, replies
+    /// `RejectedStale`, logs, and returns `None`.
+    ///
+    /// # Why it exists
+    ///
+    /// The registration upsert and the apply travel on DIFFERENT mailboxes
+    /// (lifecycle vs config-apply), and `run` selects between the two with no
+    /// ordering. So an apply that `RegisterMeeting` queued can still be waiting
+    /// when that RPC's `MH_POLICY_APPLY_TIMEOUT_MS` expires. The RPC then
+    /// returns (counted `apply_failed`, from `Failed(Timeout)`), MC counts the
+    /// attempt as returned, quiesces, and sends `EndMeeting`, and the release
+    /// can run BEFORE the queued apply. Release forgets the meeting's generation
+    /// (0), so without this check the stale apply would land in the
+    /// generation-advancing arm and install routes and edge budget for a
+    /// meeting with NO registration. Nothing could ever release that: a later
+    /// `EndMeeting` takes the unknown-meeting arm. This is the invariant
+    /// `handle_end_meeting`'s `debug_assert` states ("routes cannot exist without
+    /// a registration"), and this check is what makes it hold.
+    ///
+    /// In order it cannot fire: every apply follows its own registration's
+    /// upsert, and a foreign `mc_id`'s `EndMeeting` is refused. It fires only
+    /// when a release lands between an apply being queued and being run.
+    ///
+    /// # Coverage, stated narrowly
+    ///
+    /// This refuses an apply whose registration upsert landed BEFORE the
+    /// release (Race A). It does NOT, and cannot, refuse a registration whose
+    /// upsert lands AFTER the release (Race B): that upsert re-registers the
+    /// meeting, so its apply is indistinguishable from a live meeting's and is
+    /// correctly installed. Race B is ordered MC-side instead (MC's teardown
+    /// waits one further attempt window on a quiesce timeout before sending
+    /// `EndMeeting`). That ordering relies on tonic cancelling this handler's
+    /// server task when the client drops the request, a foreign property with
+    /// no in-tree control. So Race B is ORDERED, not closed. Nor does this reach
+    /// story 4's periodic re-assert, which is a fresh registration:
+    /// `docs/TODO.md` "`EndMeeting` has no fence against a late
+    /// `RegisterMeeting`".
+    ///
+    /// # Observability
+    ///
+    /// In the case this exists for, the refusal is NOT on
+    /// `mh_media_policy_applies_total`. That metric is recorded only by the
+    /// gRPC handler, which already returned (and counted `apply_failed`) before
+    /// this ran, so the reply goes to a dropped receiver. It is counted HERE
+    /// instead, on its own series, `mh_media_released_meeting_apply_refusals_total`, on
+    /// every refusal: a control whose firing is invisible cannot be told apart
+    /// from one never reached. It is a separate series, not a value of the
+    /// policy-apply family, because it is a second terminal event for one
+    /// registration, recorded by a different component at a different time
+    /// (see `SessionMetricHandles::record_released_meeting_apply_refusal`). The WARN
+    /// carries the correlation detail; `reply_delivered = false` identifies
+    /// Race A. When the reply IS delivered (a release inside one live RPC), the
+    /// handler ALSO counts `rejected_stale`; the two are not disjoint.
+    ///
+    /// Not an admission decision: nothing was projected, so nothing is
+    /// recorded in the admission window, the same as the stale and equal arms
+    /// of `handle_config_apply`.
+    fn refuse_apply_for_released_meeting(
+        &mut self,
+        policy: &MeetingPolicy,
+        respond_to: oneshot::Sender<ApplyOutcome>,
+    ) -> Option<oneshot::Sender<ApplyOutcome>> {
+        if self
+            .state
+            .registered_meetings
+            .contains_key(policy.meeting.as_str())
+        {
+            return Some(respond_to);
+        }
+        self.metrics.record_released_meeting_apply_refusal();
+        let reply_delivered = respond_to.send(ApplyOutcome::RejectedStale).is_ok();
+        tracing::warn!(
+            target: "mh.session.policy",
+            key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+            meeting_id = %policy.meeting.as_str(),
+            received_generation = policy.generation,
+            reply_delivered,
+            "Policy not installed: its meeting is not registered on this handler \
+             (released by EndMeeting after this apply was queued); nothing installed"
+        );
+        None
     }
 
     /// Count one admission decision, update the window, republish the ratio.
@@ -908,9 +1010,18 @@ impl SessionManagerActor {
     /// STORY-2 ASSUMPTION this rests on: MC stops every `RegisterMeeting` push
     /// for the meeting before calling `EndMeeting` (the quiesce rule stated on
     /// `EndMeetingRequest`, which is the source of truth — not restated here).
-    /// MH does not enforce it. The accepted residual: an attempt whose
-    /// client-side deadline expired can still be applied here AFTER this
-    /// release and re-create the meeting, bounded by the RPC deadline.
+    /// MH cannot enforce the quiesce itself, but it does close one half of its
+    /// deadline residual. An apply that a registration queued BEFORE this
+    /// release, and that runs after it (the RPC having already timed out), is
+    /// REFUSED at apply time: the meeting is no longer registered. See the
+    /// released-meeting guard at the top of `handle_config_apply`, counted on
+    /// `mh_media_released_meeting_apply_refusals_total`. The other half is NOT closed
+    /// here: a registration whose upsert lands AFTER this release
+    /// re-registers the meeting, and its apply is then indistinguishable from
+    /// a live meeting's. MC orders that one (its teardown waits one further
+    /// attempt window on a quiesce timeout), relying on tonic cancelling the
+    /// handler's server task on client drop. That is a foreign property with
+    /// no in-tree control, so it is ordered, not closed.
     ///
     /// STORY-4 NOTE: once the periodic §8 re-assert exists, a re-assert racing
     /// this release RESURRECTS the ended meeting's routes and edge budget on a
@@ -2528,6 +2639,118 @@ mod tests {
         actor.handle_add_connection("released".into(), conn);
         assert!(close.is_cancelled());
         assert!(!actor.state.active_connections.contains_key("released"));
+    }
+
+    /// An apply message as the gRPC handler would queue it, carrying one
+    /// A<->B pair of egress streams and A server-muted, so an install is
+    /// visible in routes, edges, generation AND the muted set.
+    fn queued_apply(
+        meeting_id: &str,
+        generation: u64,
+        respond_to: oneshot::Sender<ApplyOutcome>,
+    ) -> ConfigApplyMessage {
+        use mh_test_utils::media_policy::{egress, register_request_muted};
+        let limits = crate::config::PolicyLimits::for_tests();
+        let request = register_request_muted(
+            meeting_id,
+            generation,
+            vec![egress(1, 5, 0, 6), egress(2, 6, 0, 5)],
+            &[6],
+        );
+        ConfigApplyMessage::ApplyPolicy {
+            policy: Box::new(MeetingPolicy::from_request(&request, &limits).unwrap()),
+            max_total_egress_edges: limits.max_total_egress_edges,
+            respond_to,
+        }
+    }
+
+    /// Race A (story 2 R-20): an apply queued before `EndMeeting` released its
+    /// meeting, and run after it, installs NOTHING, and the refusal is counted.
+    ///
+    /// The positive control comes first and is what makes the refusal
+    /// meaningful: the SAME apply shape, run while the meeting is registered,
+    /// DOES install (routes, edges, generation, muted set). Without it, a
+    /// refusal assertion would also pass on a fixture that could never have
+    /// installed at all.
+    #[test]
+    fn an_apply_queued_before_a_release_and_run_after_it_installs_nothing() {
+        use common::observability::testing::MetricAssertion;
+        // Snapshot BEFORE building the actor: its counter handles bind to the
+        // recorder current at construction.
+        let snap = MetricAssertion::snapshot();
+        let mut actor = unspawned_actor();
+        let key = MeetingKey::new("m-1");
+        let a = SenderId::from_wire(6).unwrap();
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                TEST_CAP,
+            )
+            .unwrap();
+
+        // POSITIVE CONTROL: registered, so this apply installs.
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_config_apply(queued_apply("m-1", 5, tx));
+        assert_eq!(rx.try_recv().unwrap(), ApplyOutcome::Applied);
+        let installed = actor.routing.load();
+        assert_eq!(installed.total_edges(), 2, "control: the edges installed");
+        assert_eq!(installed.generation_for(&key), 5);
+        assert!(
+            installed.is_server_muted(&key, a),
+            "control: the mute installed"
+        );
+
+        // The release (the registering MC, so it releases).
+        assert_eq!(
+            actor.handle_end_meeting("m-1", "mc-1"),
+            MeetingTeardownOutcome::Released
+        );
+        let decisions_before = actor.admission_window.decisions();
+
+        // RACE A: the carrying RPC already timed out, so its receiver is gone.
+        // The generation is ABOVE the released one's forgotten 0, i.e. exactly
+        // the arm that would install without the guard.
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        actor.handle_config_apply(queued_apply("m-1", 6, tx));
+
+        let after = actor.routing.load();
+        assert!(after.routes_for(&key).is_none(), "no routes resurrected");
+        assert_eq!(after.total_edges(), 0, "no edge budget re-consumed");
+        assert_eq!(after.generation_for(&key), 0, "generation stays forgotten");
+        assert!(!after.is_server_muted(&key, a), "no muted set resurrected");
+        assert!(
+            !actor.state.registered_meetings.contains_key("m-1"),
+            "the refusal does not re-register the meeting"
+        );
+        assert_eq!(
+            actor.admission_window.decisions(),
+            decisions_before,
+            "a refusal is not an admission decision"
+        );
+        snap.counter("mh_media_released_meeting_apply_refusals_total")
+            .with_labels(&[("key_custody", "operator")])
+            .assert_delta(1);
+    }
+
+    /// A release INSIDE one live RPC (the reply is still awaited): the guard
+    /// replies `RejectedStale`, which the handler counts as usual, and ALSO
+    /// counts its own refusal. The two series are not disjoint by design.
+    #[test]
+    fn a_refusal_with_a_live_receiver_replies_rejected_stale() {
+        use common::observability::testing::MetricAssertion;
+        let snap = MetricAssertion::snapshot();
+        let mut actor = unspawned_actor();
+
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_config_apply(queued_apply("never-registered", 1, tx));
+
+        assert_eq!(rx.try_recv().unwrap(), ApplyOutcome::RejectedStale);
+        assert_eq!(actor.routing.load().total_edges(), 0);
+        snap.counter("mh_media_released_meeting_apply_refusals_total")
+            .with_labels(&[("key_custody", "operator")])
+            .assert_delta(1);
     }
 
     /// Every meeting-keyed map reclaims its entry: emptied connection entries

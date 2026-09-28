@@ -189,9 +189,11 @@ impl MeetingAssignmentsRepository {
     /// Atomically assign a meeting to an MC using ADR-0010 algorithm.
     ///
     /// This operation:
-    /// 1. Ends any unhealthy existing assignment
-    /// 2. Inserts new assignment only if no healthy assignment exists
-    /// 3. Returns the assignment (ours or the winner's if race lost)
+    /// 1. Replaces an existing assignment whose MC is unhealthy or stale
+    /// 2. Revives an ENDED assignment row — a new incarnation of the meeting
+    ///    after its MC reported it ended (`notify_meeting_ended`)
+    /// 3. Inserts a new assignment if there is no row at all
+    /// 4. Returns the assignment (ours or the winner's if race lost)
     ///
     /// # Arguments
     ///
@@ -213,10 +215,52 @@ impl MeetingAssignmentsRepository {
         // Use INSERT ... ON CONFLICT DO UPDATE to atomically handle:
         // - New assignments (no existing row)
         // - Replacing unhealthy assignments (existing row with unhealthy MC)
+        // - Reviving an ENDED row (a meeting re-joined after it ended)
         // - Race conditions (multiple GCs trying to assign simultaneously)
         //
         // Note: We use ON CONFLICT DO UPDATE (not DO NOTHING) so that we can
-        // conditionally update the row if the existing MC is unhealthy.
+        // conditionally update the row if the existing MC is unhealthy, or the
+        // row has ended.
+        //
+        // WHY AN ENDED ROW MUST BE REVIVABLE (story 2 task 12). The key is the
+        // non-partial `PRIMARY KEY (meeting_id, region)`, and an ended
+        // assignment is a SOFT delete, so it keeps occupying that key until
+        // `cleanup_old_assignments` removes it `GC_RETENTION_DAYS` later. Before
+        // MC called `notify_meeting_ended` this was unreachable; once it does,
+        // a rejoin of an ended meeting conflicts here, and without the revive
+        // arm nothing updates, the fallback lookup (which filters
+        // `ended_at IS NULL`) finds nothing, and every join to that meeting id
+        // fails until the retention cleanup. Revived in place rather than via a
+        // partial unique index, which would drop the PK that this ON CONFLICT
+        // target needs and could not be undone by rolling the image back.
+        //
+        // BOTH HALVES ARE REQUIRED. The predicate's `ended_at IS NOT NULL` arm
+        // lets an ended row be replaced; `ended_at = NULL` in the SET makes the
+        // replacement LIVE. Without the second, the ordinary MC-failover arm
+        // (unhealthy MC) would re-point an ended row at a healthy MC while it
+        // stayed ended, and lookups would keep returning nothing.
+        //
+        // CONCURRENT REVIVE: two GCs reviving the same ended row serialize on
+        // the PK row lock. The winner revives and commits; the loser re-reads a
+        // row that is now live and points at a healthy MC, so neither arm fires,
+        // nothing updates, and it falls back to the winner's assignment below.
+        // That holds when the winner assigned a HEALTHY MC; if the winner's MC
+        // is itself unhealthy or stale, the loser's unhealthy-MC arm
+        // legitimately fails it over, exactly as before this change.
+        //
+        // HAZARD THIS MAKES REACHABLE, recorded rather than closed here:
+        // `end_assignment` ends whatever row is ACTIVE for (meeting_id, region),
+        // with no controller, `assigned_at` or incarnation fence. A
+        // `notify_meeting_ended` for a PREVIOUS incarnation that lands after a
+        // revive would end the NEW incarnation's live row. MC sends that notify
+        // at most once, only after the release, so it cannot race a revive of
+        // its own. It CAN race this statement's unhealthy/stale-MC FAILOVER arm:
+        // MC-A's heartbeat goes stale, a join re-points the row to MC-B, MC-A
+        // (still alive) finishes its teardown, and its notify ends MC-B's live
+        // row — a split meeting. The incarnation-safe fix is in docs/TODO.md,
+        // "`NotifyMeetingEnded` is not incarnation-safe", and relates to the
+        // story-4 fence ("`EndMeeting` has no fence against a late
+        // `RegisterMeeting`").
         let query_result: Result<Option<AtomicAssignResult>, sqlx::Error> = sqlx::query_as(
             r#"
             INSERT INTO meeting_assignments (meeting_id, meeting_controller_id, region, assigned_by_gc_id)
@@ -224,9 +268,11 @@ impl MeetingAssignmentsRepository {
             ON CONFLICT (meeting_id, region) DO UPDATE
             SET meeting_controller_id = EXCLUDED.meeting_controller_id,
                 assigned_by_gc_id = EXCLUDED.assigned_by_gc_id,
-                assigned_at = NOW()
-            WHERE EXISTS (
-                -- Only update if current assignment's MC is unhealthy or stale
+                assigned_at = NOW(),
+                ended_at = NULL
+            WHERE meeting_assignments.ended_at IS NOT NULL
+               OR EXISTS (
+                -- Update if current assignment's MC is unhealthy or stale
                 SELECT 1 FROM meeting_controllers mc
                 WHERE mc.controller_id = meeting_assignments.meeting_controller_id
                   AND (mc.health_status != 'healthy'
@@ -438,8 +484,8 @@ impl MeetingAssignmentsRepository {
             r#"
             UPDATE meeting_assignments ma
             SET ended_at = NOW()
-            WHERE ma.meeting_id IN (
-                SELECT inner_ma.meeting_id
+            WHERE (ma.meeting_id, ma.region) IN (
+                SELECT inner_ma.meeting_id, inner_ma.region
                 FROM meeting_assignments inner_ma
                 WHERE inner_ma.ended_at IS NULL
                   AND inner_ma.assigned_at < NOW() - ($1 || ' hours')::INTERVAL
@@ -450,6 +496,21 @@ impl MeetingAssignmentsRepository {
                   )
                 LIMIT $2
             )
+              -- ALL THREE predicates re-asserted on the OUTER row, not only in
+              -- the subquery. Under READ COMMITTED the subquery's snapshot can
+              -- list a row that a concurrent `atomic_assign` then revives or
+              -- re-points before this statement locks it; such a row has
+              -- `assigned_at = NOW()`, so the inactivity re-check alone stops
+              -- it being ended, even if its new MC is itself unhealthy. Keyed
+              -- on (meeting_id, region) so a meeting's rows in OTHER regions
+              -- are never touched.
+              AND ma.ended_at IS NULL
+              AND ma.assigned_at < NOW() - ($1 || ' hours')::INTERVAL
+              AND EXISTS (
+                  SELECT 1 FROM meeting_controllers mc
+                  WHERE mc.controller_id = ma.meeting_controller_id
+                    AND mc.health_status != 'healthy'
+              )
             "#,
         )
         .bind(inactivity_hours.to_string())
@@ -502,11 +563,16 @@ impl MeetingAssignmentsRepository {
         let query_result = sqlx::query(
             r#"
             DELETE FROM meeting_assignments
-            WHERE meeting_id IN (
-                SELECT meeting_id FROM meeting_assignments
+            WHERE (meeting_id, region) IN (
+                SELECT meeting_id, region FROM meeting_assignments
                 WHERE ended_at < NOW() - ($1 || ' days')::INTERVAL
                 LIMIT $2
             )
+              -- Re-asserted on the OUTER row: a row revived by a concurrent
+              -- `atomic_assign` after the subquery's snapshot is live again and
+              -- must not be deleted. Keyed on (meeting_id, region) so a meeting's
+              -- live row in another region is never deleted with an old one.
+              AND ended_at < NOW() - ($1 || ' days')::INTERVAL
             "#,
         )
         .bind(retention_days.to_string())

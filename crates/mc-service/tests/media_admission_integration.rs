@@ -463,6 +463,21 @@ async fn sender_id_is_not_recycled_across_a_leave_and_a_later_join() {
     let server = Server::start().await;
     server.create_meeting("recycle-meeting").await;
 
+    // An ANCHOR participant held open for the whole test. Since story 2 task 12
+    // the last participant leaving ENDS the meeting, and "a later join" of an
+    // ended meeting is a new incarnation with a fresh KEK — where a reissued id
+    // would be legitimate and this test would prove nothing. Holding one
+    // participant keeps a single incarnation (one KEK) across the leave and the
+    // rejoin, which is exactly the R-35 case this test exists for.
+    let (_anchor, _as, _ar, anchor_msg) = join_keep_open(
+        &server.url(),
+        "recycle-meeting",
+        &server.token("recycle-meeting"),
+        sample_identity_public_key(),
+    )
+    .await;
+    let _ = expect_join_response(anchor_msg);
+
     let first_id = {
         let (conn, _s, _r, msg) = join_keep_open(
             &server.url(),

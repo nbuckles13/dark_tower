@@ -104,6 +104,20 @@ Complete ALL items before deploying to production:
 
 ### Coordination
 
+- [ ] **Story 2 task 12: this GC release is a PREREQUISITE of MC's, not an
+      independent change.** GC now revives an ENDED meeting assignment on the
+      next join (`atomic_assign`), so `assign_meeting` is called once per
+      meeting INCARNATION. The MC release that ships alongside it ends a meeting
+      when its last participant leaves and calls `NotifyMeetingEnded`; against a
+      GC without this fix, every later join to that meeting id fails until the
+      retention cleanup removes the row (`GC_RETENTION_DAYS`, 7 days by default).
+      **Order: forward GC → MC → MH; rollback MH → MC → GC.** GC is first
+      forward and last back. The same total order, and why MC/MH's own
+      sender_id rule wins where the two appear to conflict, is recorded in
+      `mc-deployment.md` §Coordination; a one-sided note is how the pair gets
+      separated. The change is query-only
+      (no migration), so rolling GC's image back is clean once MC is back.
+
 - [ ] **Maintenance window scheduled** (if downtime expected)
   - Dependent services notified (AC, MC, MH, Client)
   - Users notified if user-facing impact

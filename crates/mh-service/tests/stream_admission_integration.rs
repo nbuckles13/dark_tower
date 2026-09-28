@@ -24,8 +24,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
-use std::time::Duration;
-
 use common::observability::testing::MetricAssertion;
 use mh_service::config::{EgressAdmission, EGRESS_STREAM_CEILING_RECOMMENDED_MIN};
 use mh_service::observability::metrics::publish_egress_admission;
@@ -33,6 +31,7 @@ use mh_service::routing::MeetingPolicy;
 use mh_service::session::{ApplyFailure, ApplyOutcome, SessionManagerHandle};
 use mh_test_utils::admission::{fixture_policy_limits, with_ceiling};
 use mh_test_utils::media_policy::{egress, register_request};
+use mh_test_utils::session::apply_registered;
 
 const KEY_CUSTODY: (&str, &str) = ("key_custody", "operator");
 
@@ -47,14 +46,9 @@ fn policy(meeting: &str, generation: u64, streams: u32) -> MeetingPolicy {
     .unwrap()
 }
 
+/// Register, then apply: the production order (see `mh_test_utils::session`).
 async fn apply(sm: &SessionManagerHandle, policy: MeetingPolicy) -> ApplyOutcome {
-    let limits = fixture_policy_limits();
-    sm.apply_policy(
-        policy,
-        limits.max_total_egress_edges,
-        Duration::from_millis(limits.policy_apply_timeout_ms),
-    )
-    .await
+    apply_registered(sm, policy).await
 }
 
 #[tokio::test]

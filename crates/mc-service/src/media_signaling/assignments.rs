@@ -273,7 +273,14 @@ mod tests {
         }
         let declaration = declare(slots);
         table.set_demand(sender(1), declaration.audio_slot_ids());
-        (table.render(set.ids()).unwrap(), set, table, declaration)
+        (
+            table
+                .render(set.ids(), &std::collections::BTreeSet::new())
+                .unwrap(),
+            set,
+            table,
+            declaration,
+        )
     }
 
     fn compose(
@@ -457,7 +464,9 @@ mod tests {
         let composition = build_stream_assignments(
             sender(1),
             &declaration,
-            &table.render(set.ids()).unwrap(),
+            &table
+                .render(set.ids(), &std::collections::BTreeSet::new())
+                .unwrap(),
             &set,
             &SourceMuteView::default(),
             &table.unreachable_for(sender(1)),

@@ -432,6 +432,7 @@ async fn test_gc_client_load_report_carries_installed_streams_equal_to_the_gauge
     use mh_service::session::{ApplyOutcome, SessionManagerHandle};
     use mh_test_utils::admission::{fixture_policy_limits, never_binding};
     use mh_test_utils::media_policy::{egress, register_request};
+    use mh_test_utils::session::apply_registered;
 
     // Snapshot FIRST: the actor resolves its handles at construction, on this
     // (current-thread) runtime's thread.
@@ -451,13 +452,8 @@ async fn test_gc_client_load_report_carries_installed_streams_equal_to_the_gauge
         &limits,
     )
     .unwrap();
-    let outcome = session_manager
-        .apply_policy(
-            policy,
-            limits.max_total_egress_edges,
-            Duration::from_millis(limits.policy_apply_timeout_ms),
-        )
-        .await;
+    // Register, then apply: the production order (see `mh_test_utils::session`).
+    let outcome = apply_registered(&session_manager, policy).await;
     assert_eq!(outcome, ApplyOutcome::Applied);
 
     let (load_report_tx, mut load_report_rx) = mpsc::channel(1);

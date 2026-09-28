@@ -76,8 +76,10 @@ pub enum AuthClientError {
 ///
 /// # Why there is no default
 ///
-/// R-7: no production code ever marks a meeting ended, so an organization's live-meeting
-/// count only CLIMBS toward `max_concurrent_meetings`. A static organization therefore
+/// R-7: no production code ever marks a meeting ROW ended (MC's meeting-end notify, story 2
+/// task 12, ends only GC's MC-assignment row, never `meetings.status`, which is what the cap
+/// counts), so an organization's live-meeting count only CLIMBS toward
+/// `max_concurrent_meetings`. A static organization therefore
 /// makes run N's verdict a function of runs 1..N-1 — green on the first run of the day, a
 /// 403 later, attributed to the code under test. `scripts/layer7.sh` Phase 1h provisions a
 /// FRESH organization per run and exports it here.

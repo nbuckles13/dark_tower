@@ -103,8 +103,25 @@ pub struct RegisterMeetingCall {
     pub assignment: mc_service::media_routing::HandlerAssignment,
 }
 
+/// One MC→MH call, in ARRIVAL order across both RPCs — so "no
+/// `RegisterMeeting` after the first `EndMeeting`" is asserted directly
+/// rather than inferred from two independent counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MhEvent {
+    /// A `RegisterMeeting` push: (meeting, handler endpoint, generation).
+    Register {
+        meeting_id: String,
+        mh_grpc_endpoint: String,
+        policy_generation: u64,
+    },
+    /// An `EndMeeting` release.
+    End(mc_service::media_routing::teardown::EndMeetingCall),
+}
+
 pub struct MockMhRegistrationClient {
     calls: Mutex<Vec<RegisterMeetingCall>>,
+    /// Every call to either RPC, interleaved in arrival order.
+    events: Mutex<Vec<MhEvent>>,
     /// If set, `register_meeting()` returns this result.
     result: Result<(), McError>,
     /// Notified once per `register_meeting()` call, after `calls` is updated.
@@ -116,6 +133,7 @@ impl MockMhRegistrationClient {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             result: Ok(()),
             call_notify: Arc::new(Notify::new()),
         }
@@ -124,8 +142,51 @@ impl MockMhRegistrationClient {
     pub fn with_error(err: McError) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             result: Err(err),
             call_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Every call to either RPC, in arrival order.
+    pub fn events(&self) -> Vec<MhEvent> {
+        self.events
+            .lock()
+            .expect("MockMhRegistrationClient mutex poisoned")
+            .clone()
+    }
+
+    /// The `EndMeeting` calls, in arrival order.
+    pub fn end_calls(&self) -> Vec<mc_service::media_routing::teardown::EndMeetingCall> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                MhEvent::End(call) => Some(call),
+                MhEvent::Register { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Wait until at least `expected` `EndMeeting` calls have landed.
+    pub async fn wait_for_end_calls(
+        &self,
+        expected: usize,
+        timeout: Duration,
+    ) -> Vec<mc_service::media_routing::teardown::EndMeetingCall> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let ends = self.end_calls();
+            if ends.len() >= expected {
+                return ends;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "Timeout waiting for {expected} end_meeting() calls; got {} ({ends:?})",
+                    ends.len()
+                );
+            }
+            let _ = tokio::time::timeout(remaining, self.call_notify.notified()).await;
         }
     }
 
@@ -191,12 +252,39 @@ impl MhRegistrationClient for MockMhRegistrationClient {
                 egress_stream_count: programming.assignment.egress_streams.len(),
                 assignment: programming.assignment.clone(),
             });
+        self.events
+            .lock()
+            .expect("MockMhRegistrationClient mutex poisoned")
+            .push(MhEvent::Register {
+                meeting_id: programming.meeting_id.to_string(),
+                mh_grpc_endpoint: programming.mh_grpc_endpoint.to_string(),
+                policy_generation: programming.policy_generation.get(),
+            });
         self.call_notify.notify_one();
         let result = match &self.result {
             Ok(()) => Ok(()),
             Err(e) => Err(McError::Grpc(e.to_string())),
         };
         Box::pin(async move { result })
+    }
+
+    fn end_meeting<'a>(
+        &'a self,
+        call: &'a mc_service::media_routing::teardown::EndMeetingCall,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), mc_service::media_routing::teardown::EndMeetingFailure>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.events
+            .lock()
+            .expect("MockMhRegistrationClient mutex poisoned")
+            .push(MhEvent::End(call.clone()));
+        self.call_notify.notify_one();
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -228,6 +316,20 @@ pub struct TestStackHandles {
 /// fixed: 300s clock skew on the validator, zero-byte master secret,
 /// fresh `PolicyGenerations`, mc_id `"mc-test"`.
 pub async fn build_test_stack(keypair_label: &str) -> TestStackHandles {
+    build_test_stack_with_notifier(
+        keypair_label,
+        Arc::new(mc_service::actors::controller::NoMeetingEndedNotifier),
+    )
+    .await
+}
+
+/// [`build_test_stack`], telling `meeting_ended` when a meeting has ended and
+/// its handlers are released — the seam that makes MC's GC notification
+/// testable without a GC.
+pub async fn build_test_stack_with_notifier(
+    keypair_label: &str,
+    meeting_ended: Arc<dyn mc_service::actors::controller::MeetingEndedNotifier>,
+) -> TestStackHandles {
     let mock_server = MockServer::start().await;
     let keypair = TestKeypair::new(42, keypair_label);
     let jwks_url = mount_jwks_mock(&mock_server, &keypair).await;
@@ -238,13 +340,14 @@ pub async fn build_test_stack(keypair_label: &str) -> TestStackHandles {
     let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
     let metrics = ActorMetrics::new();
     let controller_metrics = ControllerMetrics::new();
-    let controller_handle = Arc::new(MeetingControllerActorHandle::new(
+    let controller_handle = Arc::new(MeetingControllerActorHandle::with_meeting_ended_notifier(
         "mc-test".to_string(),
         metrics,
         controller_metrics,
         master_secret,
         Arc::new(PolicyGenerations::new()),
         mc_test_utils::kek::kek_lifecycle(),
+        meeting_ended,
     ));
 
     let mh_store: Arc<MockMhAssignmentStore> = Arc::new(MockMhAssignmentStore::new());
@@ -484,4 +587,48 @@ pub async fn connect(url: &str) -> wtransport::Connection {
         .connect(url)
         .await
         .expect("connect")
+}
+
+/// A `MeetingEndedNotifier` that records every meeting id it is told about.
+#[derive(Default)]
+pub struct RecordingMeetingEnded {
+    ended: Mutex<Vec<String>>,
+    notify: Notify,
+}
+
+impl RecordingMeetingEnded {
+    /// Every meeting id reported, in order.
+    pub fn ended(&self) -> Vec<String> {
+        self.ended
+            .lock()
+            .expect("RecordingMeetingEnded poisoned")
+            .clone()
+    }
+
+    /// Wait until at least `expected` reports have landed.
+    pub async fn wait_for(&self, expected: usize, timeout: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let ended = self.ended();
+            if ended.len() >= expected {
+                return ended;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "Timeout waiting for {expected} meeting-ended reports; got {ended:?}"
+            );
+            let _ = tokio::time::timeout(remaining, self.notify.notified()).await;
+        }
+    }
+}
+
+impl mc_service::actors::controller::MeetingEndedNotifier for RecordingMeetingEnded {
+    fn meeting_ended(&self, meeting_id: &str) {
+        self.ended
+            .lock()
+            .expect("RecordingMeetingEnded poisoned")
+            .push(meeting_id.to_string());
+        self.notify.notify_one();
+    }
 }

@@ -75,6 +75,19 @@ pub enum McError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// A create for a meeting id whose previous incarnation is still being
+    /// released on its media handlers, refused because the queue behind that
+    /// teardown is full.
+    ///
+    /// Its own variant — so its own `error_type` label — because it is the
+    /// OPPOSITE investigation from a `Conflict`: `conflict` rising means
+    /// clients double-joining (a client defect), this rising means teardowns
+    /// are wedging and rejoins are being refused (an MC fault). The WIRE code
+    /// is deliberately the same `CONFLICT` (5), so no client changes and no new
+    /// client-visible vocabulary; only the operator-facing label splits.
+    #[error("Meeting teardown in progress")]
+    MeetingTeardownInProgress,
+
     /// JWT validation failed.
     #[error("JWT validation failed: {0}")]
     JwtValidation(String),
@@ -197,6 +210,7 @@ impl McError {
             McError::PermissionDenied(_) => 3,                           // FORBIDDEN
             McError::MeetingNotFound(_) | McError::ParticipantNotFound(_) => 4, // NOT_FOUND
             McError::Conflict(_) => 5,                                   // CONFLICT
+            McError::MeetingTeardownInProgress => 5,                     // CONFLICT (see variant)
             McError::IdentityKeyInvalid => 1,                            // INVALID_REQUEST
             McError::MeetingCapacityExceeded(_)
             | McError::McCapacityExceeded
@@ -239,6 +253,7 @@ impl McError {
             McError::Migrating { .. } => "migrating",
             McError::FencedOut(_) => "fenced_out",
             McError::Conflict(_) => "conflict",
+            McError::MeetingTeardownInProgress => "teardown_in_progress",
             McError::JwtValidation(_) => "jwt_validation",
             McError::PermissionDenied(_) => "permission_denied",
             McError::MhAssignmentMissing(_) => "mh_assignment_missing",
@@ -273,6 +288,9 @@ impl McError {
             McError::FencedOut(_) => "An internal error occurred".to_string(),
             McError::JwtValidation(_) => "Invalid or expired token".to_string(),
             McError::Conflict(msg) | McError::PermissionDenied(msg) => msg.clone(),
+            McError::MeetingTeardownInProgress => {
+                "Meeting is restarting, please try again".to_string()
+            }
             // Generic by construction: no length, no cause, nothing the caller
             // could use to probe which validation failed.
             McError::IdentityKeyInvalid => "Invalid join request".to_string(),

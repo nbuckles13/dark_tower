@@ -146,6 +146,63 @@ impl std::fmt::Debug for MediaRoutingDeps {
     }
 }
 
+/// The pod's census of server-muted participants, per meeting — the source
+/// `mc_media_server_muted_sources` is recomputed from (story 2 task 12; closes
+/// the "server mute is never observable as STATE" gap).
+///
+/// # Recompute-and-set, never delta arithmetic
+///
+/// Each meeting actor writes its own ABSOLUTE count here on every mute change.
+/// Nothing ever adds or subtracts, so there is no increment that can be
+/// doubled and no exit-path decrement that an aborted actor can skip.
+///
+/// Two callers publish the pod total, and they are NOT redundant:
+/// - the controller's `check_meeting_health` walk is the LOAD-BEARING one: it
+///   prunes entries for meetings that no longer exist (a panicked actor never
+///   reaches its own exit path) and re-sets the gauge, so any drift is erased on
+///   the next pass;
+/// - each mute change also publishes, but that is FRESHNESS ONLY.
+///
+/// Delete the second and the gauge is stale but correct. Delete the first and
+/// the drift class this design exists to prevent comes back — silently, and in
+/// the one gauge whose job is to be read against MH's `server_muted` drops.
+#[derive(Debug, Default)]
+pub struct MutedSourceCensus {
+    counts: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl MutedSourceCensus {
+    /// Record `meeting_id`'s absolute server-muted count (0 forgets it).
+    pub fn set(&self, meeting_id: &str, count: u64) {
+        let mut counts = self.lock();
+        if count == 0 {
+            counts.remove(meeting_id);
+        } else {
+            counts.insert(meeting_id.to_string(), count);
+        }
+    }
+
+    /// Forget every meeting `live` rejects.
+    pub fn retain(&self, live: impl Fn(&str) -> bool) {
+        self.lock().retain(|id, _| live(id));
+    }
+
+    /// Recompute the pod total from the census and publish it.
+    pub fn publish(&self) {
+        let total = self.lock().values().sum();
+        metrics::set_server_muted_sources(total);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+        // A poisoned census still holds valid counts (every write is a single
+        // insert or remove), so recover rather than propagate a panic into
+        // every meeting that mutes.
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// What a join carries for media routing: the server-level dependencies and
 /// the meeting's handler set as the registration (Redis) describes it at this
 /// join. The actor freezes the set at the first join.
@@ -181,6 +238,62 @@ pub struct MeetingSeams {
     pub kek_debounce_manual: bool,
 }
 
+/// Media-routing inputs for in-crate actor tests: one handler and an MH
+/// client that confirms every push. Routing behaviour itself is covered by
+/// `media_routing` unit tests and the integration suite.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn test_join_media() -> JoinMedia {
+    use crate::grpc::{MeetingProgramming, MhRegistrationClient};
+    use crate::media_routing::{HandlerEndpoint, MeetingHandlers, PolicyGenerations};
+    use crate::media_signaling::{AudioEncoding, MediaStreamPolicy};
+    use proto_gen::dark_tower::signaling::v1::Codec;
+
+    struct ConfirmingMh;
+    impl MhRegistrationClient for ConfirmingMh {
+        fn register_meeting<'a>(
+            &'a self,
+            _programming: &'a MeetingProgramming<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn end_meeting<'a>(
+            &'a self,
+            _call: &'a crate::media_routing::teardown::EndMeetingCall,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::media_routing::teardown::EndMeetingFailure>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    JoinMedia {
+        deps: Arc::new(MediaRoutingDeps {
+            mh_client: Arc::new(ConfirmingMh),
+            policy_generations: Arc::new(PolicyGenerations::new()),
+            mc_id: "mc-test".to_string(),
+            mc_grpc_endpoint: "http://mc-test:50052".to_string(),
+            stream_policy: MediaStreamPolicy::new(
+                AudioEncoding::new(Codec::Opus, 48_000, 50).unwrap(),
+            ),
+            connect_settle_window: std::time::Duration::from_millis(1500),
+        }),
+        handlers: MeetingHandlers::new([HandlerEndpoint {
+            id: crate::media_routing::HandlerId::new("mh-0"),
+            webtransport_url: "https://mh-0.test:4434".to_string(),
+            grpc_endpoint: "http://mh-0.test:50053".to_string(),
+        }])
+        .unwrap(),
+    }
+}
+
 /// Which declared participants a structural change may have affected.
 pub(super) enum Affected {
     /// Every declared participant (join, leave, declaration, reconnect).
@@ -211,9 +324,23 @@ struct View {
 /// The meeting actor's media state.
 pub(super) struct MeetingMedia {
     meeting_id: String,
-    /// The meeting's cancellation token: push workers live as long as the
-    /// MEETING, never a connection.
-    cancel: CancellationToken,
+    /// The push workers' OWN cancellation token — deliberately NOT a child of
+    /// the actor's cancel token.
+    ///
+    /// Push workers live as long as the MEETING, never a connection. But a
+    /// meeting teardown must DRAIN them (every issued `RegisterMeeting` has
+    /// RETURNED before `EndMeeting` is called — `EndMeetingRequest`'s quiesce
+    /// MUST), and a worker hanging off the actor token would be cancelled by the
+    /// very `cancel()` that ends the actor, abandoning an in-flight attempt that
+    /// can then land after the release and re-create the ended meeting. So the
+    /// actor's exit path moves this token out, together with the workers, into
+    /// the teardown ([`Self::take_teardown`]), which cancels it and then awaits
+    /// each worker.
+    ///
+    /// An actor that dies WITHOUT reaching its exit path (a panic) still stops
+    /// the workers: dropping this struct drops each `HandlerPusher`, whose
+    /// `Drop` aborts — correct there, because nothing will call `EndMeeting`.
+    pushers_cancel: CancellationToken,
     deps: Option<Arc<MediaRoutingDeps>>,
     /// Frozen at the first join.
     handlers: Option<MeetingHandlers>,
@@ -227,11 +354,11 @@ pub(super) struct MeetingMedia {
 }
 
 impl MeetingMedia {
-    pub(super) fn new(meeting_id: String, cancel: CancellationToken) -> Self {
+    pub(super) fn new(meeting_id: String) -> Self {
         Self {
             slots: SlotTable::for_meeting(&meeting_id),
             meeting_id,
-            cancel,
+            pushers_cancel: CancellationToken::new(),
             deps: None,
             handlers: None,
             pushers: BTreeMap::new(),
@@ -499,14 +626,53 @@ impl MeetingMedia {
         }
     }
 
+    /// Hand the meeting's MH-side teardown to the caller, as the actor exits.
+    ///
+    /// Moves the push workers OUT — with their own token — so that nothing left
+    /// in this struct can abort them, and returns everything the teardown needs
+    /// to drain them and then release every handler of the frozen set.
+    /// `None` if no join ever installed a handler set: no handler was ever
+    /// programmed, so there is nothing to release.
+    pub(super) fn take_teardown(
+        &mut self,
+        reason: crate::media_routing::teardown::TeardownReason,
+    ) -> Option<crate::media_routing::teardown::MediaTeardown> {
+        let (deps, handlers) = (self.deps.as_ref()?, self.handlers.as_ref()?);
+        let pusher_tasks = std::mem::take(&mut self.pushers)
+            .into_values()
+            .filter_map(HandlerPusher::into_task)
+            .collect();
+        Some(crate::media_routing::teardown::MediaTeardown {
+            meeting_id: self.meeting_id.clone(),
+            mc_id: deps.mc_id.clone(),
+            handlers: handlers.clone(),
+            pushers_cancel: self.pushers_cancel.clone(),
+            pusher_tasks,
+            mh_client: Arc::clone(&deps.mh_client),
+            policy_generations: Arc::clone(&deps.policy_generations),
+            reason,
+        })
+    }
+
     /// Is any participant waiting to be flushed?
     pub(super) fn has_dirty(&self) -> bool {
         !self.dirty.is_empty()
     }
 
     /// Re-render, re-publish to every handler, and mark `affected` dirty.
-    pub(super) async fn reconcile(&mut self, affected: Affected) {
-        self.render_and_publish().await;
+    ///
+    /// `server_muted` is REQUIRED, never defaulted: the meeting's roster is the
+    /// one home for mute state, so every reconcile must be handed the current
+    /// server-muted set. A call site that could omit it would push an EMPTY set,
+    /// which MH reads as "nobody is server-muted" — an unmute nobody asked for,
+    /// failing open. Making it a parameter lets the compiler enumerate every
+    /// call site instead of a convention doing it.
+    pub(super) async fn reconcile(
+        &mut self,
+        affected: Affected,
+        server_muted: &BTreeSet<SenderId>,
+    ) {
+        self.render_and_publish(server_muted).await;
         match affected {
             Affected::All => {
                 for (participant_id, view) in &self.views {
@@ -528,20 +694,15 @@ impl MeetingMedia {
 
     /// Render the slot table and publish each handler's snapshot.
     ///
-    /// **Note for the story-2 server-mute task (not implemented here):** each
-    /// handler's snapshot will carry `server_muted_sources`. Filter it per
-    /// handler by EDGE OWNERSHIP — the muted senders that are the SOURCE of at
-    /// least one edge this render places on that handler — never by
-    /// connectivity: a sender connected to H need not send to H, and MH
-    /// enforces mute at ingress with no cross-handler forwarding. A sender
-    /// whose edges span handlers is in each of their sets. This is also what
-    /// MH's `MH_MAX_MUTED_SOURCES_PER_MEETING` sizing derivation assumes
-    /// (`infra/services/mh-service/configmap.yaml`).
-    async fn render_and_publish(&mut self) {
+    /// Each snapshot carries that handler's `server_muted_sources`, filtered by
+    /// EDGE OWNERSHIP inside [`SlotTable::render`] — see
+    /// `HandlerAssignment::server_muted_sources` for the rule and the bound it
+    /// guarantees.
+    async fn render_and_publish(&mut self, server_muted: &BTreeSet<SenderId>) {
         let (Some(deps), Some(handlers)) = (&self.deps, &self.handlers) else {
             return;
         };
-        let assignment = match self.slots.render(handlers.ids()) {
+        let assignment = match self.slots.render(handlers.ids(), server_muted) {
             Ok(assignment) => assignment,
             Err(e) => {
                 // Fail loud: no push is better than pushing a policy MH will
@@ -590,7 +751,7 @@ impl MeetingMedia {
                         mc_grpc_endpoint: deps.mc_grpc_endpoint.clone(),
                         handler: endpoint.clone(),
                     },
-                    self.cancel.child_token(),
+                    self.pushers_cancel.child_token(),
                 )
             });
             // `send_replace` on EVERY reconcile, never behind an equality

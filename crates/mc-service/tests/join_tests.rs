@@ -1070,7 +1070,12 @@ async fn test_first_participant_triggers_register_meeting() {
     let claims = make_meeting_claims("meeting-reg");
     let token = server.sign_token(&claims);
 
-    let response = join_and_read_response(&server.url(), "meeting-reg", &token, "Alice").await;
+    // Held OPEN: since story 2 task 12 the last participant leaving ENDS the
+    // meeting, and a push not yet started when the teardown cancels the workers
+    // is (correctly) never made — so a join that dropped at once would race the
+    // push this test asserts.
+    let (_conn, _send, _recv, response) =
+        join_keep_open(&server.url(), "meeting-reg", &token, "Alice").await;
 
     // Verify join succeeded
     assert!(
@@ -1177,7 +1182,9 @@ async fn test_join_multiple_mh_handlers_offers_the_full_set_and_registers_all() 
     let claims = make_meeting_claims("meeting-multi");
     let token = server.sign_token(&claims);
 
-    let response = join_and_read_response(&server.url(), "meeting-multi", &token, "Alice").await;
+    // Held open for the same reason as `test_first_participant_triggers_register_meeting`.
+    let (_conn, _send, _recv, response) =
+        join_keep_open(&server.url(), "meeting-multi", &token, "Alice").await;
 
     // JoinResponse offers the meeting's FULL registered handler set (ADR-0036
     // §9, R-33): every participant connects to all it can, and MC routes each

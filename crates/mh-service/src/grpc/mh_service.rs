@@ -505,7 +505,7 @@ mod tests {
     // One fixture home for all three test sites that build these messages —
     // see `mh_test_utils::media_policy` for why.
     use mh_test_utils::media_policy::{egress, register_request};
-    use proto_gen::dark_tower::internal::v1::{CandidateSource, EgressStream};
+    use proto_gen::dark_tower::internal::v1::{CandidateSource, EgressStream, MutedSource};
 
     use std::sync::Arc;
 
@@ -602,9 +602,15 @@ mod tests {
         Request::new(req)
     }
 
-    /// The matching `mc_id` releases: routes gone, edges back, generation
-    /// forgotten, registration gone, acknowledged — and the teardown counter
-    /// and the method label select `released` / `end_meeting`.
+    /// The matching `mc_id` releases EVERYTHING the meeting holds: routes gone,
+    /// edges back, generation forgotten, registration gone, its server-muted
+    /// set gone with its routes, and its active connections CLOSED and removed
+    /// — acknowledged, with the teardown counter and the method label selecting
+    /// `released` / `end_meeting`.
+    ///
+    /// Each released thing is first shown to EXIST (the connection registered
+    /// and open, the mute installed), so no "gone" assertion can pass because
+    /// the setup never put it there.
     #[tokio::test]
     async fn end_meeting_from_the_registering_mc_releases_everything() {
         use common::observability::testing::MetricAssertion;
@@ -614,15 +620,39 @@ mod tests {
         // whatever the actor did.
         let snap = MetricAssertion::snapshot();
         let (svc, sm) = make_service();
-        svc.register_meeting(owned_policy_request(
+        let key = MeetingKey::new("m-1");
+        let muted = crate::routing::SenderId::from_wire(6).unwrap();
+        let mut registration = owned_policy_request(
             "m-1",
             "mc-a",
             5,
             vec![egress(1, 5, 0, 6), egress(2, 6, 0, 5)],
-        ))
-        .await
-        .unwrap();
-        assert_eq!(sm.routing_snapshot().total_edges(), 2);
+        );
+        registration.get_mut().server_muted_sources = vec![MutedSource { sender_id: 6 }];
+        svc.register_meeting(registration).await.unwrap();
+
+        // An ACTIVE connection on the meeting, whose close token we keep.
+        let close = tokio_util::sync::CancellationToken::new();
+        sm.add_connection(
+            "m-1",
+            crate::session::ConnectionEntry {
+                connection_id: "conn-1".to_string(),
+                participant_id: "user-1".to_string(),
+                connected_at: Instant::now(),
+                close: close.clone(),
+            },
+        )
+        .await;
+
+        // PRECONDITIONS: everything the release must remove is present.
+        let before = sm.routing_snapshot();
+        assert_eq!(before.total_edges(), 2);
+        assert!(
+            before.is_server_muted(&key, muted),
+            "control: mute installed"
+        );
+        assert_eq!(sm.active_connection_count().await, 1, "control: connected");
+        assert!(!close.is_cancelled(), "control: connection open");
 
         let resp = svc
             .end_meeting(end_request("m-1", "mc-a"))
@@ -633,9 +663,20 @@ mod tests {
         assert!(resp.acknowledged);
         let after = sm.routing_snapshot();
         assert_eq!(after.total_edges(), 0, "edges return to the budget");
-        assert!(after.routes_for(&MeetingKey::new("m-1")).is_none());
-        assert_eq!(after.generation_for(&MeetingKey::new("m-1")), 0);
+        assert!(after.routes_for(&key).is_none());
+        assert_eq!(after.generation_for(&key), 0);
         assert!(!sm.is_meeting_registered("m-1").await);
+        // The meeting-keyed state beyond routes (task 12 item 3).
+        assert!(
+            !after.is_server_muted(&key, muted),
+            "the muted set goes with the meeting's routes"
+        );
+        assert!(close.is_cancelled(), "the active connection is closed");
+        assert_eq!(
+            sm.active_connection_count().await,
+            0,
+            "the active-connection entry is removed"
+        );
         snap.counter("mh_media_meeting_teardowns_total")
             .with_labels(&[("outcome", "released"), ("key_custody", "operator")])
             .assert_delta(1);
