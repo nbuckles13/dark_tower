@@ -1,7 +1,6 @@
 ---
 name: infrastructure
 description: Infrastructure specialist - Kubernetes, Terraform, IaC, CI/CD
-model: claude-opus-5[1m]
 ---
 
 # Infrastructure Specialist

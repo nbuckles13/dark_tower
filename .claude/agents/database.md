@@ -1,7 +1,6 @@
 ---
 name: database
 description: Database specialist - PostgreSQL schema, migrations, query patterns
-model: claude-opus-4-8[1m]
 ---
 
 # Database Specialist

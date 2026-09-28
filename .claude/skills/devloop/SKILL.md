@@ -237,13 +237,15 @@ For security-critical implementations, the implementer should maintain a "Securi
 
 **IMPORTANT**: All teammates are spawned using the `subagent_type` parameter in the Task tool, which auto-loads their identity from `.claude/agents/{name}.md`. Do NOT manually read or inject specialist identity files — the agent system handles this.
 
+**Model**: never pass `model` when spawning a teammate, and agent definitions carry no `model:` line — every teammate inherits the Lead's model, whose single home is `"model"` in `.claude/settings.json` (enforced by `scripts/model-single-home.test.sh`). Per-seat tiering (ADR-0035 §F) would be a deliberate, documented exception to this rule, not a pin left in an agent file.
+
 **INDEX injection**: Before spawning each teammate, read `docs/specialist-knowledge/{name}/INDEX.md` and include its contents in the teammate's prompt under a `## Navigation` header. This gives each specialist a navigation map to relevant code and ADRs.
 
 **Rule 4**: Give the implementer the big-picture task. Let them decide how to break it down — don't micro-manage subtask decomposition.
 
 Use `name`/`subagent_type` per the Teammate Roster table in §Team Composition. `name` MUST match the `@` references used in teammate prompts.
 
-**For Implementer**, spawn with `name: "implementer"`, `subagent_type: "{specialist-name}"`, `model: "opus"` and this prompt:
+**For Implementer**, spawn with `name: "implementer"`, `subagent_type: "{specialist-name}"` and this prompt:
 
 ```
 You are implementing a feature for Dark Tower.
@@ -282,7 +284,7 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 - **Do NOT start implementing until @team-lead sends you "Plan approved"**
 ```
 
-**For a paired specialist** (`--paired-with`), spawn with `name: "paired-{specialist}"`, `subagent_type: "{specialist}"`, `model: "opus"`
+**For a paired specialist** (`--paired-with`), spawn with `name: "paired-{specialist}"`, `subagent_type: "{specialist}"`
 
 **For Reviewers**, spawn with `name: "{reviewer-name}"`, `subagent_type: "{reviewer-name}"` and this prompt:
 

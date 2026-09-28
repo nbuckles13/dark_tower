@@ -1,7 +1,6 @@
 ---
 name: meeting-controller
 description: Meeting Controller specialist - WebTransport signaling, sessions, participant coordination
-model: claude-opus-4-8[1m]
 ---
 
 # Meeting Controller Specialist
