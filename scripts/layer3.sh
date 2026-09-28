@@ -73,6 +73,9 @@ layer_lifecycle_begin 3
   # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
   # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.
   run_and_emit "layer-all-orchestrator-test" "${__here}/layer-all.test.sh" || true
+  # Long-running entry scripts (devloop.sh, run-story.sh) are wrapped `{ ... exit; }` so an
+  # edit landing mid-run cannot shift bash's read offset. Static; no cluster.
+  run_and_emit "parse-whole-script-test" "${__here}/parse-whole-script.test.sh" || true
   # Absorb self-test: absorb-devloop.sh's interrupted-absorb resume contract (refuses an
   # incomplete resolution, a foreign paused pick or an unrelated merge; otherwise finishes
   # the paused commit and absorbs the rest, recording origins so a resolved commit is never

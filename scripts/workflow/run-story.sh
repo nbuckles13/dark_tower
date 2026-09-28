@@ -50,6 +50,14 @@
 #       1  task escalated (escalation.json path printed) or blocked
 #       2  precondition / infra / manifest failure / retry-flag misuse
 #       130 operator abort (second Ctrl-C)
+# Parse the WHOLE script before running any of it. Bash reads a script from disk
+# as it executes. Git checkouts replace the file (new inode, so a running bash keeps
+# the old bytes), but an IN-PLACE write (an editor, a tool's file write) changes
+# the bytes under bash's read offset: it resumes mid-statement in the new content,
+# which is a syntax error or, worse, the wrong command. The braces force one parse
+# up front; the `exit` before the closing brace keeps bash from reading past it.
+# Checked by scripts/parse-whole-script.test.sh.
+{
 set -euo pipefail
 
 # Timestamped console logging (UTC). All STORY_RUN lines route through these so
@@ -2611,3 +2619,5 @@ if [ -f "$RUN_DIR/cost-ledger.jsonl" ]; then
 fi
 
 slog "STORY_RUN: ALL TASKS COMPLETE — story-close gate green. Next step: /close-story"
+exit
+}
