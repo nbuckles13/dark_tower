@@ -1593,7 +1593,7 @@ assert_status    "m6-unsafe-class-completes" "ALL TASKS COMPLETE" "$OUTPUT"
 #     NOT reach this one — `git diff A B` is TREE-TO-TREE and never consults
 #     the index, so with a garbage `.git/index` both `rev-parse HEAD` and the
 #     derivation still exit 0. Breaking the object store instead would fail the
-#     surrounding `git add` / `git commit --amend` FIRST, so the case would red
+#     surrounding `git add` / manifest `git commit` FIRST, so the case would red
 #     for a different reason than the one it names — worse than no case. Real
 #     `git` is deliberately not stubbed (the containment argument depends on
 #     it). Defensive branch; its value is that it does not fold a git fault
@@ -1719,6 +1719,26 @@ assert_status "n7-revalidate-slug-in-manifest" "slug: 2026-08-17-revalidate-devl
 # devloop's cost from its leftover session log). Assert the shape, not just kind.
 n7_zero="$(jq -r 'select(.kind=="revalidate-gate-only") | (.usd==0 and .output_tokens==0 and .turns==0)' "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo PARSE-FAILED)"
 assert_status "n7-revalidate-gate-only-zero-cost" "true" "$n7_zero"
+
+# N7c: completion NEVER rewrites the commit it finds at HEAD. --revalidate with an
+# unrelated commit on top of the prior attempt (a cherry-pick / manual fix / absorb)
+# used to amend the manifest bump INTO that commit, rewriting its sha. The bump is now
+# always its own commit: the operator's commit survives byte-identical as HEAD~1.
+run_story FAKE_LAYER3_RC=1 FAKE_DEVLOOP_MKOUT=1 \
+  FAKE_DEVLOOP_MKOUT_NAME=2026-08-17-n7c -- fixture
+assert_exit "n7c-setup-escalated-exit1" 1 "$RC"
+printf 'operator fix on top of the escalated attempt\n' > "${FIX}/operator-fix.txt"
+git -C "$FIX" add operator-fix.txt >/dev/null 2>&1
+git -C "$FIX" commit -q -m "operator: unrelated fix" >/dev/null 2>&1
+n7c_sha="$(git -C "$FIX" rev-parse HEAD)"
+REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit   "n7c-revalidate-green-exit0" 0 "$RC"
+if [ "$(git -C "$FIX" rev-parse HEAD~1 2>/dev/null)" = "$n7c_sha" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n7c-operator-commit-untouched] the operator's commit ${n7c_sha} is no longer HEAD~1 — completion rewrote it"); fi
+assert_status "n7c-manifest-own-commit" "chore(story): task #1 complete" "$(git -C "$FIX" log -1 --format=%s 2>/dev/null || true)"
+if [ "$(git -C "$FIX" show --name-only --format= HEAD 2>/dev/null)" = "docs/user-stories/2026-08-13-fixture.md" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); FAILURES+=("[n7c-manifest-commit-only-manifest] the manifest commit carries more than the story file"); fi
 
 # N7b: (S-8, ADR-0037 §D7) --revalidate re-attests the tree AFTER the gate. Set up the same committed-
 # escalated prior attempt as N7, then --revalidate with the gate GREEN (FAKE_LAYER3_RC=0) but a gate LAYER
@@ -2315,11 +2335,12 @@ Specialist: infrastructure"
 REUSE_FIXTURE=1 run_story FAKE_LAYER_ALL_RC=0 -- fixture --finish
 unset REUSE_FIXTURE
 assert_exit "o16-green-exit0" 0 "$RC"
-o16_msg="$(git -C "$FIX" log -1 --format=%B 2>/dev/null || true)"
+# HEAD is the runner's separate manifest commit; the task's commit is HEAD~1.
+o16_msg="$(git -C "$FIX" log -1 --format=%B HEAD~1 2>/dev/null || true)"
 assert_status "o16-committed-recorded-subject" "o16 recorded subject" "$o16_msg"
 assert_status "o16-committed-recorded-specialist" "Specialist: infrastructure" "$o16_msg"
 # The committed changeset (HEAD's added output doc) is the intent's file.
-o16_files="$(git -C "$FIX" show --name-only --format= HEAD 2>/dev/null || true)"
+o16_files="$(git -C "$FIX" show --name-only --format= HEAD~1 2>/dev/null || true)"
 assert_status "o16-committed-file" "docs/devloop-outputs/2026-08-17-o16/main.md" "$o16_files"
 o16_zero="$(jq -r 'select(.kind=="finish") | (.usd==0 and .measured==true and .output_tokens==0)' "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo PARSE-FAILED)"
 assert_status "o16-finish-zero-cost" "true" "$o16_zero"

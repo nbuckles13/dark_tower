@@ -1124,7 +1124,7 @@ canary_probe() {
   # rather than discarded: when a canary is unclassifiable that stderr is the
   # only evidence of why, so 2>/dev/null would make the infra lane less
   # debuggable than the bug it replaces. $RUN_DIR is under DEVLOOP_TMP, outside
-  # the work tree, so `git add` and the amend below cannot sweep it.
+  # the work tree, so `git add` and the manifest commit below cannot sweep it.
   #
   # --allowedTools "" MUST STAY LAST: the option is variadic
   # (`--allowedTools <tools...>`), so a flag appended after it in the natural
@@ -1526,7 +1526,7 @@ run_full_gate() {
 # complete_task <id> <baseline-head> [cost_mode] — slug resolution + dt-story
 # complete + manifest bump + cleanup + suppression-visibility note. Factored so
 # every completion path shares ONE implementation of the closed-set slug derivation
-# and the amend-or-chore commit; the differences are the commit-range baseline (the
+# and the manifest commit; the differences are the commit-range baseline (the
 # devloop's head_before on the normal, --interactive AND --finish paths; only
 # --revalidate reads the prior attempt's persisted `task-N.head-before` sidecar) and
 # the cost_mode. cost_mode selects
@@ -1589,9 +1589,13 @@ complete_task() {
     task_slug=""; slug_src=""
   fi
 
-  # Fold the manifest bump into the devloop's own commit. No --commit sha in the
-  # manifest: amending changes the sha. Fall back to a separate chore commit if
-  # the amend is rejected (e.g. a hook that pins devloop-commit trees).
+  # The manifest bump is ALWAYS its own commit on top of the task's work — never an
+  # amend. HEAD is not necessarily the task's commit: after --revalidate (or any
+  # cherry-pick / absorb / manual commit on top) an amend would fold the bookkeeping
+  # into an unrelated commit and rewrite its sha. No --commit sha in the manifest:
+  # the story branch is absorbed/cherry-picked, which rewrites shas anyway.
+  local task_tip
+  task_tip="$(git rev-parse --short HEAD)"
   if [ -n "$task_slug" ]; then
     "$DT_STORY" complete "$STORY_FILE" "$id" --slug "$task_slug"
   else
@@ -1613,11 +1617,9 @@ complete_task() {
     "$DT_STORY" complete "$STORY_FILE" "$id"
   fi
   git add "$STORY_FILE"
-  if ! git commit --quiet --amend --no-edit; then
-    git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
-  fi
+  git commit --quiet -m "chore(story): task #${id} complete (run-story manifest bump)"
   rm -f "$slug_file" "$start_marker" "$stop_count_file"
-  slog "STORY_RUN: COMPLETE task=${id} commit=$(git rev-parse --short HEAD) slug=${task_slug:-none} src=${slug_src:-none} cause=${slug_cause:-none}"
+  slog "STORY_RUN: COMPLETE task=${id} commit=${task_tip} manifest_commit=$(git rev-parse --short HEAD) slug=${task_slug:-none} src=${slug_src:-none} cause=${slug_cause:-none}"
 
   # Cost ledger. A gate-only (--revalidate), finish, or interactive completion spawned
   # no devloop session for THIS attempt, so report_task_cost would find nothing or
@@ -1630,11 +1632,12 @@ complete_task() {
     *)           report_task_cost "$id" ;;
   esac
 
-  # Suppression-visibility monitor: if this task's commit ADDED audit-suppression
+  # Suppression-visibility monitor: if this task's work ADDED audit-suppression
   # entries, surface it — a cleared advisory via suppression (vs a real fix) is a
   # governed but deliberate choice that should be loud, not buried in a diff.
-  if git show HEAD --format= --name-only 2>/dev/null | grep -q '^audit-suppressions\.toml$'; then
-    added="$(git show HEAD -- audit-suppressions.toml 2>/dev/null | grep -cE '^\+[[:space:]]*id[[:space:]]*=' || true)"
+  # Range baseline..task_tip: HEAD is now the manifest commit, not the task's work.
+  if git diff --name-only "$baseline" "$task_tip" 2>/dev/null | grep -q '^audit-suppressions\.toml$'; then
+    added="$(git diff "$baseline" "$task_tip" -- audit-suppressions.toml 2>/dev/null | grep -cE '^\+[[:space:]]*id[[:space:]]*=' || true)"
     if [ "${added:-0}" -gt 0 ]; then
       slog "STORY_RUN: NOTE task=${id} added ${added} audit suppression(s) — verify security-reviewed with exposure analysis + expiry"
     fi
@@ -1815,7 +1818,7 @@ finish_lane() {
     exit 2
   fi
   # Commit with the recorded message via -F (S-9: never argv/eval). complete_task
-  # then amends the manifest bump onto it (index-vs-HEAD; only $STORY_FILE staged, so
+  # then commits the manifest bump on top of it (only $STORY_FILE staged, so
   # gate2_is_devloop_mainmd rejects it and the pre-commit hook no-ops — verified).
   local msg_file="$RUN_DIR/task-${id}.finish-message"
   printf '%s\n' "$i_msg" >"$msg_file"
