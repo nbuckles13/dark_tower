@@ -73,6 +73,11 @@ layer_lifecycle_begin 3
   # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
   # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.
   run_and_emit "layer-all-orchestrator-test" "${__here}/layer-all.test.sh" || true
+  # Absorb self-test: absorb-devloop.sh's interrupted-absorb resume contract (refuses an
+  # incomplete resolution, a foreign paused pick or an unrelated merge; otherwise finishes
+  # the paused commit and absorbs the rest, recording origins so a resolved commit is never
+  # picked twice). Hermetic — throwaway repos, real git. No cluster.
+  run_and_emit "absorb-devloop-selftest" "${__here}/../infra/devloop/absorb-devloop.test.sh" || true
   # Story-runner self-test (ADR-0035 §12): the runner drives unattended
   # skip-permissions sessions and reaches `git reset --hard` + `git clean -fdq`
   # from a classification decision, with zero tests before this file. Hermetic —
