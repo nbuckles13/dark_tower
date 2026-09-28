@@ -118,13 +118,23 @@ git add docs/specialist-knowledge/*/INDEX.md
 
 **Source code and other files:** Read the conflicting hunks, understand both sides, and resolve the merge. Most conflicts will be straightforward (e.g., adjacent additions in the same file).
 
-After resolving:
+After resolving and `git add`-ing the files: if the absorb was started with
+`infra/devloop/absorb-devloop.sh`, **rerun the same command** instead of
+`git cherry-pick --continue`. It refuses an incomplete resolution (unmerged paths,
+unstaged edits, staged conflict markers), finishes the paused commit, and absorbs
+whatever the devloop branch still has, including commits added since the stop.
+Otherwise:
 
 ```bash
 git cherry-pick --continue --no-edit
 ```
 
 Repeat for each conflicting commit in the sequence.
+
+Finishing a conflict-resolved commit runs the pre-commit hook, unlike a clean
+pick. For a commit that completes a devloop (it stages a Phase=complete
+`main.md`), the Gate-2 check then requires a verdict for the resolved tree:
+run `./scripts/layer-all.sh`, then continue.
 
 ### Step 6: Verify
 
