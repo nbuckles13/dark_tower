@@ -76,9 +76,12 @@
 //!
 //! Directly, as the meeting-controller service principal: Layer 7
 //! (`scripts/layer7.sh`, step (i)) forwards each MH POD's gRPC port and exports
-//! `ENV_TEST_MH_{0,1}_GRPC_URL` plus `ENV_TEST_MH_{0,1}_POD_IP`. MC does not call
-//! `EndMeeting` until story 2 task 12, and a mismatched `mc_id` is unreachable
-//! through MC at all (MC always sends its own), so both arms need a direct call.
+//! `ENV_TEST_MH_{0,1}_GRPC_URL` plus `ENV_TEST_MH_{0,1}_POD_IP`. MC's own
+//! `EndMeeting` is proved end to end through public APIs by env-test 35. This
+//! suite drives the arms MC can never produce: a mismatched `mc_id` is
+//! unreachable through MC at all (MC always sends its own), and the release is
+//! observed at a generation this test controls, on a long-running pod. So both
+//! arms need a direct call.
 //! The token comes from AC's client-credentials endpoint for the Kind dev
 //! `meeting-controller` client — never minted locally — narrowed to
 //! `service.write.mh`. It is used only against MH and never printed.
@@ -130,10 +133,6 @@ use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHand
 use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
 use tonic::transport::Channel;
 use tonic::Code;
-
-/// Never dialled (see the module docs). Syntactically valid so it passes MH's
-/// scheme check; `.invalid` is reserved, so it cannot resolve by accident.
-const NEVER_DIALLED_MC_ENDPOINT: &str = "http://env-test-mc.invalid:50052";
 
 /// Scrape-convergence bound for one metric wait (same bound as test 28).
 const METRIC_BOUND: Duration = Duration::from_secs(120);
@@ -505,17 +504,8 @@ async fn assert_stale(
     );
 }
 
+/// Test 29's probe: the shared fixture (see `probe_registration` for the
+/// empty-edges and never-generation-0 decisions this test documents).
 fn register(meeting_id: &str, mc_id: &str, generation: u64) -> RegisterMeetingRequest {
-    RegisterMeetingRequest {
-        meeting_id: meeting_id.to_string(),
-        mc_id: mc_id.to_string(),
-        mc_grpc_endpoint: NEVER_DIALLED_MC_ENDPOINT.to_string(),
-        // EMPTY ON PURPOSE — see "This test registers NO edges" in the module docs.
-        egress_streams: Vec::new(),
-        selection_rules: None,
-        // 1 or HELD_GENERATION only, never 0 (a gen-0 registration installs
-        // nothing and proves nothing) — see "Containment" in the module docs.
-        policy_generation: generation,
-        server_muted_sources: Vec::new(),
-    }
+    env_tests::fixtures::mh_grpc::probe_registration(meeting_id, mc_id, generation)
 }

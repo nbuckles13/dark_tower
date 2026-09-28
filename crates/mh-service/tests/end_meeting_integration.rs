@@ -320,6 +320,61 @@ async fn a_released_meeting_reregisters_at_generation_one_as_on_a_fresh_pod() {
     );
 }
 
+/// Race A over the real spawned actor: register and release over real gRPC,
+/// then an apply for the released meeting reaches the actor late. It installs
+/// NOTHING, and the refusal is counted on the guard's own series.
+///
+/// The late apply is handed to the session handle directly, because no public
+/// path can produce it: a `RegisterMeeting` always upserts its registration
+/// before it queues its apply, so over gRPC the meeting would simply be
+/// registered again. That is exactly what makes the real race a deadline race
+/// (the apply was queued by an RPC that had already timed out), which a
+/// deterministic test cannot stage over the wire.
+///
+/// `rejected_stale` does not appear here as evidence: the handle's reply is
+/// delivered in this test, but in the production race it is not, and the
+/// guard's counter is the series that moves in both.
+#[tokio::test]
+async fn an_apply_for_a_released_meeting_installs_nothing_and_is_counted() {
+    let snap = MetricAssertion::snapshot();
+    let mut rig = Rig::start(fixture_policy_limits()).await;
+    assert_eq!(
+        rig.register("m-late", "mc-a", 4, vec![egress(1, 5, 0, 6)])
+            .await
+            .unwrap(),
+        4,
+        "control: the registration installed"
+    );
+    assert!(rig.end("m-late", "mc-a").await.unwrap(), "released");
+
+    let limits = fixture_policy_limits();
+    let late = mh_service::routing::MeetingPolicy::from_request(
+        &register_request("m-late", 5, vec![egress(1, 5, 0, 6)]),
+        &limits,
+    )
+    .unwrap();
+    let outcome = rig
+        .session_manager
+        .apply_policy(
+            late,
+            limits.max_total_egress_edges,
+            Duration::from_millis(limits.policy_apply_timeout_ms),
+        )
+        .await;
+
+    assert_eq!(outcome, mh_service::session::ApplyOutcome::RejectedStale);
+    let after = rig.session_manager.routing_snapshot();
+    assert!(after.routes_for(&MeetingKey::new("m-late")).is_none());
+    assert_eq!(after.total_edges(), 0, "no edge budget re-consumed");
+    assert!(
+        !rig.session_manager.is_meeting_registered("m-late").await,
+        "the refusal does not re-register the meeting"
+    );
+    snap.counter("mh_media_released_meeting_apply_refusals_total")
+        .with_labels(&[KEY_CUSTODY])
+        .assert_delta(1);
+}
+
 // ---------------------------------------------------------------------------
 // Ownership reject
 // ---------------------------------------------------------------------------

@@ -501,7 +501,12 @@ mod tests {
             table.admit_on(sender(s), &set, &["mh-0"]);
             table.set_demand(sender(s), vec![0]);
         }
-        (table.render(set.ids()).unwrap(), set)
+        (
+            table
+                .render(set.ids(), &std::collections::BTreeSet::new())
+                .unwrap(),
+            set,
+        )
     }
 
     #[test]
@@ -653,6 +658,7 @@ mod tests {
                     supersede_on_independent_frame: false,
                     transport_mode,
                 }],
+                server_muted_sources: std::collections::BTreeSet::new(),
             },
         );
         MeetingAssignment { per_handler }
@@ -802,7 +808,9 @@ mod tests {
         table.set_demand(sender(1), vec![0]);
         let (directive, outcome) = build_send_directive(
             sender(1),
-            &table.render(set.ids()).unwrap(),
+            &table
+                .render(set.ids(), &std::collections::BTreeSet::new())
+                .unwrap(),
             &set,
             &MediaStreamPolicy::new(encoding()),
         )
@@ -880,7 +888,9 @@ mod tests {
         }
         let (directive, outcome) = build_send_directive(
             sender(1),
-            &table.render(set.ids()).unwrap(),
+            &table
+                .render(set.ids(), &std::collections::BTreeSet::new())
+                .unwrap(),
             &set,
             &MediaStreamPolicy::new(encoding()),
         )

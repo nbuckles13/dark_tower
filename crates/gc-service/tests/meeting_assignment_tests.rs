@@ -447,6 +447,308 @@ async fn test_cleanup_old_assignments(pool: PgPool) -> Result<(), anyhow::Error>
 }
 
 // ============================================================================
+// Reviving an ENDED assignment (story 2 task 12)
+//
+// Once MC reports a meeting ended (`notify_meeting_ended`), a rejoin of that
+// meeting id must be assignable again. The row is soft-deleted and keeps the
+// (meeting_id, region) key, so `atomic_assign` must REVIVE it in place. These
+// tests read `ended_at` straight from the table: gc-service's queries are
+// runtime strings, so nothing checks their `ended_at` semantics at compile
+// time and these are the only guard.
+// ============================================================================
+
+fn candidate(id: &str) -> McCandidate {
+    McCandidate {
+        controller_id: id.to_string(),
+        grpc_endpoint: format!("https://{id}.example.com:50051"),
+        webtransport_endpoint: None,
+        load_ratio: 0.1,
+    }
+}
+
+async fn ended_at_is_null(
+    pool: &PgPool,
+    meeting_id: &str,
+    region: &str,
+) -> Result<bool, anyhow::Error> {
+    let (null,): (bool,) = sqlx::query_as(
+        "SELECT ended_at IS NULL FROM meeting_assignments WHERE meeting_id = $1 AND region = $2",
+    )
+    .bind(meeting_id)
+    .bind(region)
+    .fetch_one(pool)
+    .await?;
+    Ok(null)
+}
+
+/// An ended row with a HEALTHY MC is revived: the new MC is returned, the row
+/// is live again, and a lookup finds it. Before the fix this path answered
+/// `ServiceUnavailable` until the retention cleanup.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_atomic_assign_revives_an_ended_assignment(pool: PgPool) -> Result<(), anyhow::Error> {
+    register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
+    register_healthy_mc(&pool, "mc-2", "us-east-1", 10, 100).await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-revive",
+        "us-east-1",
+        &candidate("mc-1"),
+        "gc-1",
+    )
+    .await?;
+    MeetingAssignmentsRepository::end_assignment(&pool, "m-revive", Some("us-east-1")).await?;
+    assert!(
+        !ended_at_is_null(&pool, "m-revive", "us-east-1").await?,
+        "precondition: ended"
+    );
+
+    let revived = MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-revive",
+        "us-east-1",
+        &candidate("mc-2"),
+        "gc-2",
+    )
+    .await?;
+    assert_eq!(
+        revived.mc_id, "mc-2",
+        "the new incarnation's MC wins the revive"
+    );
+    assert!(
+        ended_at_is_null(&pool, "m-revive", "us-east-1").await?,
+        "the row is live again"
+    );
+    assert!(
+        MeetingAssignmentsRepository::get_healthy_assignment(&pool, "m-revive", "us-east-1")
+            .await?
+            .is_some(),
+        "and a lookup finds it"
+    );
+    Ok(())
+}
+
+/// The FAILOVER half: an ended row pointing at an UNHEALTHY MC. The old
+/// unhealthy-MC arm already fired here — the discriminating assertion is that
+/// the row is also made LIVE (`ended_at` cleared), which a predicate-only fix
+/// would miss.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_atomic_assign_failover_of_an_ended_row_clears_ended_at(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
+    register_healthy_mc(&pool, "mc-2", "us-east-1", 10, 100).await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-fail",
+        "us-east-1",
+        &candidate("mc-1"),
+        "gc-1",
+    )
+    .await?;
+    MeetingAssignmentsRepository::end_assignment(&pool, "m-fail", Some("us-east-1")).await?;
+    MeetingControllersRepository::update_heartbeat(&pool, "mc-1", 10, 100, HealthStatus::Unhealthy)
+        .await?;
+
+    let revived = MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-fail",
+        "us-east-1",
+        &candidate("mc-2"),
+        "gc-2",
+    )
+    .await?;
+    assert_eq!(revived.mc_id, "mc-2");
+    assert!(
+        ended_at_is_null(&pool, "m-fail", "us-east-1").await?,
+        "a failover of an ended row must also clear ended_at, or lookups keep returning nothing"
+    );
+    Ok(())
+}
+
+/// No steal after a revive: once revived onto a healthy MC, another GC's
+/// assign for the same id returns the revived winner and does NOT overwrite
+/// it. Guards the `OR`'s parenthesisation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_a_revived_assignment_is_not_stolen(pool: PgPool) -> Result<(), anyhow::Error> {
+    register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
+    register_healthy_mc(&pool, "mc-2", "us-east-1", 10, 100).await?;
+    register_healthy_mc(&pool, "mc-3", "us-east-1", 10, 100).await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-steal",
+        "us-east-1",
+        &candidate("mc-1"),
+        "gc-1",
+    )
+    .await?;
+    MeetingAssignmentsRepository::end_assignment(&pool, "m-steal", Some("us-east-1")).await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-steal",
+        "us-east-1",
+        &candidate("mc-2"),
+        "gc-2",
+    )
+    .await?;
+
+    let loser = MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-steal",
+        "us-east-1",
+        &candidate("mc-3"),
+        "gc-3",
+    )
+    .await?;
+    assert_eq!(
+        loser.mc_id, "mc-2",
+        "the live, healthy revived assignment is kept"
+    );
+    Ok(())
+}
+
+/// Cleanup is keyed on (meeting_id, region): an old ENDED row in one region
+/// is deleted, and a LIVE row of the same meeting id in another region is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_cleanup_never_deletes_a_live_row_in_another_region(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    register_healthy_mc(&pool, "mc-a", "us-east-1", 10, 100).await?;
+    register_healthy_mc(&pool, "mc-b", "eu-west-1", 10, 100).await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-2r",
+        "us-east-1",
+        &candidate("mc-a"),
+        "gc-1",
+    )
+    .await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-2r",
+        "eu-west-1",
+        &candidate("mc-b"),
+        "gc-1",
+    )
+    .await?;
+    MeetingAssignmentsRepository::end_assignment(&pool, "m-2r", Some("us-east-1")).await?;
+    sqlx::query(
+        "UPDATE meeting_assignments SET ended_at = NOW() - INTERVAL '10 days' \
+         WHERE meeting_id = $1 AND region = 'us-east-1'",
+    )
+    .bind("m-2r")
+    .execute(&pool)
+    .await?;
+
+    let cleaned = MeetingAssignmentsRepository::cleanup_old_assignments(&pool, 7, None).await?;
+    assert_eq!(cleaned, 1, "only the old ended row");
+    assert!(
+        ended_at_is_null(&pool, "m-2r", "eu-west-1").await?,
+        "the live row in the other region survives"
+    );
+    Ok(())
+}
+
+/// Stale-ending is keyed on (meeting_id, region) and re-checks the MC on the
+/// row it ends: a stale row with an unhealthy MC in one region is ended, and
+/// a healthy live row of the same meeting id in another region is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_end_stale_never_ends_a_healthy_row_in_another_region(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    register_healthy_mc(&pool, "mc-a", "us-east-1", 10, 100).await?;
+    register_healthy_mc(&pool, "mc-b", "eu-west-1", 10, 100).await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-stale",
+        "us-east-1",
+        &candidate("mc-a"),
+        "gc-1",
+    )
+    .await?;
+    MeetingAssignmentsRepository::atomic_assign(
+        &pool,
+        "m-stale",
+        "eu-west-1",
+        &candidate("mc-b"),
+        "gc-1",
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE meeting_assignments SET assigned_at = NOW() - INTERVAL '48 hours' WHERE meeting_id = $1",
+    )
+    .bind("m-stale")
+    .execute(&pool)
+    .await?;
+    MeetingControllersRepository::update_heartbeat(&pool, "mc-a", 10, 100, HealthStatus::Unhealthy)
+        .await?;
+
+    let ended = MeetingAssignmentsRepository::end_stale_assignments(&pool, 24, None).await?;
+    assert_eq!(ended, 1, "only the stale row whose MC is unhealthy");
+    assert!(!ended_at_is_null(&pool, "m-stale", "us-east-1").await?);
+    assert!(
+        ended_at_is_null(&pool, "m-stale", "eu-west-1").await?,
+        "the healthy row in the other region is untouched"
+    );
+    Ok(())
+}
+
+/// Service level: a meeting that ended is re-assigned as a NEW incarnation —
+/// a fresh MH selection and one more `assign_meeting` to MC — and the call
+/// after that reuses it (one `assign_meeting` per incarnation).
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_service_reassigns_an_ended_meeting_as_a_new_incarnation(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    register_healthy_mc(&pool, "mc-1", "us-east-1", 10, 100).await?;
+    register_healthy_mhs_for_region(&pool, "us-east-1").await?;
+    let mc_client = Arc::new(MockMcClient::accepting());
+
+    let first = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client.clone(),
+        "m-incarnation",
+        "us-east-1",
+        "gc-1",
+    )
+    .await?;
+    assert!(first.mh_selection.is_some());
+    McAssignmentService::end_assignment(&pool, "m-incarnation", Some("us-east-1")).await?;
+
+    let second = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client.clone(),
+        "m-incarnation",
+        "us-east-1",
+        "gc-1",
+    )
+    .await?;
+    assert!(
+        second.mh_selection.is_some(),
+        "an ended meeting gets a NEW selection"
+    );
+    assert_eq!(
+        mc_client.call_count(),
+        2,
+        "and a second assign_meeting to MC"
+    );
+
+    let third = McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client.clone(),
+        "m-incarnation",
+        "us-east-1",
+        "gc-1",
+    )
+    .await?;
+    assert!(
+        third.mh_selection.is_none(),
+        "within an incarnation, the assignment is reused"
+    );
+    assert_eq!(mc_client.call_count(), 2);
+    Ok(())
+}
+
+// ============================================================================
 // Service Tests (using assign_meeting_with_mh with MockMcClient)
 // ============================================================================
 

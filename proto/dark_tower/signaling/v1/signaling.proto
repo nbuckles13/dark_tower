@@ -646,9 +646,29 @@ message ServerMuteRequest {
 }
 
 // Participant request to unmute after being server-muted.
+//
+// Dual-use: sent client->MC as `ClientMessage.unmute_request`, and relayed
+// MC->host as `ServerMessage.unmute_request`. Receiving it does NOT lift a
+// server mute (R-10); see `participant_id`.
 message UnmuteRequest {
   bool request_audio = 1;
   bool request_video = 2;
+
+  // Server-stamped on the MC->host relay: MC sets this to the requester's
+  // participant id from the authenticated connection and OVERWRITES any value
+  // a client sent. Ignored on the client->MC receive path. UnmuteRequest
+  // crosses the trust boundary in BOTH directions (client->MC request, MC->host
+  // relay), so participant_id is authoritative in neither direction on the
+  // wire; only the MC-stamped relay value is trustworthy. Identity relayed to
+  // the host: truncate before logging (256-byte bound, as
+  // `MhConnectionStatus.mh_url`), never log unbounded (same register as
+  // `ParticipantMuteUpdate.server_muted_by`). Receiving this does NOT lift a
+  // server mute; only the host's ServerMuteRequest with audio_muted=false does
+  // (R-10).
+  //
+  // Tag 3, not 1 as `participant_id` is on most messages in this file, because
+  // 1 and 2 were taken when it was added. Deliberate; do not renumber.
+  string participant_id = 3;
 }
 
 // Response to an unmute request from a participant with mute authority.

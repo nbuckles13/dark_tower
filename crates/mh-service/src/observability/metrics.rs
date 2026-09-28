@@ -276,8 +276,18 @@ pub enum PolicyApplyOutcome {
     /// counting it as a rejection would drive that series monotonically upward
     /// in the steady state and make any alert on it dead on arrival.
     Applied,
-    /// A generation strictly lower than the installed one was ignored.
-    /// Reordered or retried delivery on the MC→MH path; abnormal.
+    /// Nothing installed because the handler is already ahead of the policy:
+    /// a generation strictly lower than the installed one (reordered or
+    /// retried delivery on the MC→MH path; abnormal), or a policy whose meeting
+    /// an `EndMeeting` released between the apply being queued and being run.
+    ///
+    /// The second cause lands HERE only when the carrying RPC was still
+    /// waiting for the reply, i.e. a release inside one live RPC, which MC's
+    /// quiesce prevents. In the case the released-meeting guard exists for,
+    /// the RPC had already timed out (counted `apply_failed`) and the refusal
+    /// is NOT on this metric: it is on `mh_media_released_meeting_apply_refusals_total`,
+    /// recorded by the session actor. Do not read a flat `rejected_stale` as
+    /// "no late apply was refused".
     RejectedStale,
     /// `policy_generation` was 0 — MC named no generation.
     ///
@@ -545,6 +555,9 @@ pub struct SessionMetricHandles {
     registered_meetings: Gauge,
     /// Indexed by [`MeetingTeardownOutcome::ALL`] order.
     teardowns: [Counter; 3],
+    /// `mh_media_released_meeting_apply_refusals_total`: see
+    /// [`SessionMetricHandles::record_released_meeting_apply_refusal`].
+    released_meeting_apply_refusals: Counter,
 }
 
 impl SessionMetricHandles {
@@ -565,6 +578,46 @@ impl SessionMetricHandles {
             MeetingTeardownOutcome::UnknownMeeting => unknown.increment(1),
             MeetingTeardownOutcome::RejectedOwnership => rejected.increment(1),
         }
+    }
+
+    /// Count one policy the session actor's released-meeting guard refused:
+    /// an apply queued before an `EndMeeting` released its meeting, run after.
+    ///
+    /// Metric: `mh_media_released_meeting_apply_refusals_total`
+    /// Labels: `key_custody` (single value `operator`)
+    /// Cardinality: 1. No meeting, MC, handler or generation identity
+    /// (ADR-0036 §11); those are on the guard's WARN.
+    ///
+    /// # A SEPARATE series, never a value of `mh_media_policy_applies_total`
+    ///
+    /// That metric counts REGISTRATIONS, exactly once each, in the gRPC
+    /// handler. The case this counts produces a SECOND terminal event for one
+    /// registration: the handler already recorded `apply_failed` when the RPC
+    /// timed out, and this refusal happens later, in a different component.
+    /// Folding it into that partition would make the sum stop counting
+    /// registrations. So the two are NOT disjoint: one registration can appear
+    /// on both. Never sum them and never build a ratio across them.
+    ///
+    /// Counted on EVERY guard refusal, whether or not the reply was delivered,
+    /// so this series is the guard's own firing count. A delivered reply is
+    /// also counted `rejected_stale` by the handler (the same event on two
+    /// counters with different denominators; do not sum).
+    ///
+    /// Present at zero from process start. Non-zero is NOT a fault: it is the
+    /// guard doing its job on the proto's deadline race (fate A on
+    /// `EndMeetingRequest`). No alert.
+    ///
+    /// # This counter can NEVER detect story 4's fence failing
+    ///
+    /// Its meaning does not change when story 4's re-assert fence lands. A
+    /// fence failure is a periodic re-assert resurrecting a released meeting,
+    /// and a re-assert is a fresh `RegisterMeeting` whose upsert RE-REGISTERS
+    /// the meeting, so the guard passes it by construction and this series
+    /// stays flat (the proto's fate A/C orthogonality). The deadline race it
+    /// does count survives story 4 unchanged. Story 4 must bring its own signal
+    /// for its fence; never alert on this series for that purpose.
+    pub fn record_released_meeting_apply_refusal(&self) {
+        self.released_meeting_apply_refusals.increment(1);
     }
 
     /// Publish the windowed rejection ratio (never NaN; see
@@ -629,6 +682,30 @@ pub fn resolve_session_handles() -> SessionMetricHandles {
                 KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
             )
         }),
+        // ANCHOR (DRY): `mh_media_released_meeting_apply_refusals_total` — prose
+        // consumers that must hold this exact string, none of them guard-covered
+        // (no guard reads metric names out of proto comments, Rust doc-comments,
+        // `docs/TODO.md` or runbook prose), so a rename here must sweep them:
+        //   - `proto/dark_tower/internal/v1/internal.proto`, `EndMeetingRequest`'s
+        //     residual paragraph, fate (A);
+        //   - `session/mod.rs`, BOTH `handle_end_meeting`'s doc and
+        //     `refuse_apply_for_released_meeting`'s doc;
+        //   - `PolicyApplyOutcome::RejectedStale`'s doc in this file, which points
+        //     a reader of a flat `rejected_stale` at where the late refusal went;
+        //   - `docs/TODO.md`, the `EndMeeting`-fence entry;
+        //   - `docs/runbooks/mh-incident-response.md`, the quiesce-`timed_out` row;
+        //   - `docs/runbooks/mc-incident-response.md`, Scenario 20's
+        //     `mc_media_push_quiesce_total{outcome="timed_out"}` row;
+        //   - `infra/docker/prometheus/rules/mc-alerts.yaml`, the
+        //     `MCPushQuiesceTimeouts` description (prose, not its `expr`).
+        // A renamed pointer names a series that returns no data, which is
+        // INDISTINGUISHABLE from the series existing and being flat — the same
+        // ambiguity this counter exists to remove. The name deliberately shares
+        // no word with `rejected_stale`, which it does NOT count.
+        released_meeting_apply_refusals: counter!(
+            "mh_media_released_meeting_apply_refusals_total",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        ),
     }
 }
 
@@ -1304,8 +1381,10 @@ pub enum MediaDropReason {
     /// is healthy moderation. Its whole diagnostic value is reading it — zero
     /// or not — against whether a mute was intended, which is why it is in
     /// [`Self::ALL`] and present at zero from process start (absent and zero
-    /// must not look alike). Meaning of a deployed zero, and the task-12
-    /// boundary before which it is zero by construction: see the catalog.
+    /// must not look alike). MC programs the muted set from story 2 task 12,
+    /// so a deployed zero is informative only when read against whether a host
+    /// mute was intended; what a zero does and does not prove is in the
+    /// catalog.
     ///
     /// MH-local by the same rule as `no_policy`: it is NOT in the cross-language
     /// `reject_reasons` vocabulary, because no client can observe it (the
@@ -1709,6 +1788,11 @@ pub fn zero_initialize_counters() {
     for o in MeetingTeardownOutcome::ALL {
         counter!("mh_media_meeting_teardowns_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    // Released-meeting guard: expected-empty and rare, which is exactly why it
+    // must be present at zero. Absent must mean "not scraped", never "the guard
+    // has not fired".
+    counter!("mh_media_released_meeting_apply_refusals_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+        .increment(0);
     for o in MediaSessionStartOutcome::ALL {
         counter!("mh_media_session_starts_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
@@ -1825,6 +1909,11 @@ mod tests {
         }
         present_at_zero(
             r#"mh_media_policy_applies_total{outcome="rejected_meeting_cap",key_custody="operator"}"#,
+        );
+        // The released-meeting guard's own counter: expected-empty, so absent
+        // and zero must not look alike.
+        present_at_zero(
+            r#"mh_media_released_meeting_apply_refusals_total{key_custody="operator"}"#,
         );
 
         // Series-count ceiling (security): a future enum variant can't silently

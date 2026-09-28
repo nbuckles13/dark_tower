@@ -6,7 +6,9 @@
 //! 3. Runs the bridge loop forwarding `ParticipantUpdate` messages to the client
 //! 4. Notifies the meeting when the connection drops (via `MeetingActorHandle`)
 
-use crate::actors::messages::{DisconnectCause, JoinResult};
+use crate::actors::messages::{
+    DisconnectCause, JoinResult, ServerMuteDecision, ServerMuteRefusal, UnmuteRelay,
+};
 use crate::actors::{
     BoundedMhStatus, MeetingActorHandle, MeetingControllerActorHandle, MhState,
     ParticipantActorHandle,
@@ -17,6 +19,7 @@ use crate::errors::McError;
 use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
     CapabilityOutcome, DirectiveOutcome, MuteOutcome, ReceiveCapabilityDeclaration,
+    RefusalReplySurface, ServerMuteAction, ServerMuteOutcome, UnmuteRequestOutcome,
 };
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
@@ -653,12 +656,34 @@ pub async fn handle_connection(
         "JoinResponse sent"
     );
 
+    // Step 8b (story 2 R-11): replay who is server-muted RIGHT NOW, written
+    // directly after the JoinResponse and before the bridge loop starts
+    // forwarding queued updates — the snapshot was taken in the join's own actor
+    // turn, and every later change is queued behind it, so the joiner sees
+    // snapshot-then-deltas. Through the SAME encoder as a live broadcast.
+    for update in &join_result.server_mute_replay {
+        let Some(encoded) = crate::webtransport::handler::encode_participant_update(update) else {
+            continue;
+        };
+        if let Err(e) = write_framed_message(&mut send_stream, &encoded.server_message).await {
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                error = %e,
+                "Failed to replay server-mute state to the joiner"
+            );
+            return Err(e);
+        }
+    }
+
     // Step 9: The per-connection media-signalling context (ADR-0036 §5, §6):
     // the live meeting handle plus the per-connection bounds. The MH push and
     // every client view are the MEETING ACTOR's work; this connection only
     // validates, bounds and forwards what its client says.
+    // `is_host` is threaded from the ONE derivation above (`claims.role`), never
+    // re-derived from a message or a roster lookup at this layer.
     let mut media_context =
-        media_signaling_context(meeting_handle, &join_result, client_media_config);
+        media_signaling_context(meeting_handle, &join_result, client_media_config, is_host);
 
     // Step 10: Run bridge loop — forward ParticipantActor updates to client
     // outbound_tx was passed through the join flow and is now owned by ParticipantActor.
@@ -832,8 +857,13 @@ async fn run_bridge_loop(
 ///   holding this source. **Never touches the send directive** — that
 ///   invariant is enforced by the module boundary in
 ///   `media_signaling::directive`, which has no path to mute state at all.
-/// - All other messages, INCLUDING `ServerMuteRequest` (no dispatch arm exists
-///   yet; host-only server mute is story-2 task 12): ignored, logged at debug.
+/// - `ServerMuteRequest` (ADR-0036 §5, §7; story 2 R-8): host-only server
+///   mute — see [`handle_server_mute_request`] for the order of checks.
+/// - `UnmuteRequest` (R-10): a server-muted participant asks the host(s);
+///   NOTIFIES, never clears — see [`handle_unmute_request`].
+/// - All other messages, INCLUDING `UnmuteResponse` (the host lifts a mute
+///   with a `ServerMuteRequest`, so there is one lift path under one authority):
+///   ignored, logged at debug.
 ///
 /// # A client that never declares is never told to send
 ///
@@ -884,6 +914,12 @@ async fn handle_client_message(
         }
         Some(client_message::Message::MuteRequest(request)) => {
             handle_mute_request(&request, connection_id, media).await;
+        }
+        Some(client_message::Message::ServerMuteRequest(request)) => {
+            handle_server_mute_request(&request, connection_id, participant_handle, media).await;
+        }
+        Some(client_message::Message::UnmuteRequest(request)) => {
+            handle_unmute_request(&request, connection_id, media).await;
         }
         Some(_) => {
             debug!(
@@ -1006,28 +1042,72 @@ const CAPABILITY_REJECTION_REFILL_INTERVAL_MS: u64 = 1_000;
 /// below what a client can send on an idle QUIC connection.
 const MUTE_WORK_REFILL_INTERVAL_MS: u64 = 250;
 
+/// Server-mute work tokens a fresh connection may spend immediately.
+///
+/// DERIVED from the client-mute bucket rather than restated, and asserted below
+/// to be no looser: R-8 requires server mute to be rate-bounded "at least as
+/// tightly as" client mute, and a second independent number would drift.
+/// Spent only by a HOST (authority is checked first), so this bounds the one
+/// principal who may drive a roster-wide broadcast from one connection.
+const SERVER_MUTE_WORK_BURST: u32 = MUTE_WORK_BURST;
+
+/// Milliseconds per refilled server-mute work token. See
+/// [`SERVER_MUTE_WORK_BURST`].
+const SERVER_MUTE_WORK_REFILL_INTERVAL_MS: u64 = MUTE_WORK_REFILL_INTERVAL_MS;
+
+// R-8: server mute bounded at least as tightly as client mute. Fails the build,
+// not a test, if either bucket is later loosened past the other.
+const _: () = {
+    assert!(SERVER_MUTE_WORK_BURST <= MUTE_WORK_BURST);
+    assert!(SERVER_MUTE_WORK_REFILL_INTERVAL_MS >= MUTE_WORK_REFILL_INTERVAL_MS);
+};
+
+/// Server-mute REFUSAL replies a fresh connection may be sent immediately.
+///
+/// Its own bucket, NOT the capability path's `rejection_reply_limiter`: that
+/// bucket's rationale is "a correction that converges", which an authorization
+/// probe is not, and sharing it would let a client driving refusals here
+/// silence the error replies another path needs. Refusals stay fully counted
+/// however fast they arrive; only the reply is rationed.
+const SERVER_MUTE_REFUSAL_REPLY_BURST: u32 = 4;
+
+/// Milliseconds per refilled server-mute refusal-reply token — 1 s.
+const SERVER_MUTE_REFUSAL_REPLY_REFILL_INTERVAL_MS: u64 = 1_000;
+
+/// `UnmuteRequest`s a fresh connection may send immediately.
+///
+/// Tighter than mute, because each one is relayed into ANOTHER participant's
+/// mailbox and onto a human host's screen: asking a couple of times is
+/// legitimate, a stream of asks is harassment of the host.
+const UNMUTE_REQUEST_BURST: u32 = 2;
+
+/// Milliseconds per refilled unmute-request token — 5 s.
+const UNMUTE_REQUEST_REFILL_INTERVAL_MS: u64 = 5_000;
+
 /// Per-connection token bucket bounding a repeatable client-driven action.
 ///
 /// # Why a rate limit and NOT a budget
 ///
 /// The receive-capability path takes a cumulative budget for ACCEPTED
 /// declarations because re-declaring is rare and a client that stops
-/// re-declaring loses nothing. The two actions bounded here are the opposite:
-/// repeatable steady-state paths that must keep working for the life of the
-/// session. A cumulative budget would spend out and then permanently deny —
-/// freezing `audio_self_muted` on the roster so every other participant renders
-/// a live speaker as muted, or silencing the error a client needs in order to
-/// correct its declaration.
+/// re-declaring loses nothing. Every action bounded here is the opposite: a
+/// repeatable steady-state path that must keep working for the life of the
+/// session. A cumulative budget would spend out and then permanently deny — for
+/// instance freezing `audio_self_muted` on the roster so every other
+/// participant renders a live speaker as muted, or silencing the error a client
+/// needs in order to correct its declaration.
 ///
 /// A rate limit bounds work per unit time and never permanently denies. See
 /// `media_signaling`'s module doc for the criterion in general form.
 ///
-/// # Two instances, deliberately not one shared bucket
+/// # One instance per bounded path, deliberately never a shared bucket
 ///
-/// [`MediaSignalingContext`] holds a separate bucket per bounded path, so a
-/// client flooding malformed declarations cannot also suppress its own mute
-/// reports (or the reverse). One shared bucket would make each path a denial
-/// vector against the other, which is the amplification problem one level down.
+/// [`MediaSignalingContext`] holds a separate bucket for every bounded path —
+/// client mute, capability rejection replies, server mute, server-mute refusal
+/// replies, unmute requests — so that flooding ANY one of them cannot suppress
+/// any other on the same connection. A shared bucket would make each path a
+/// denial vector against the rest, which is the amplification problem one
+/// level down.
 #[derive(Debug)]
 struct ClientWorkLimiter {
     tokens: u32,
@@ -1166,6 +1246,27 @@ struct MediaSignalingContext {
 
     /// One-shot bound on the rejection-reply-suppressed WARN.
     rejection_reply_suppressed_logged: bool,
+
+    /// Whether this connection's token carries `MeetingRole::Host`.
+    ///
+    /// Taken from the ONE derivation at accept (`claims.role`); never
+    /// re-derived here from a message or a roster lookup. The meeting actor
+    /// repeats the check against its roster entry — the two are AND-composed.
+    is_host: bool,
+    /// Bounds a host's server-mute work (see [`SERVER_MUTE_WORK_BURST`]).
+    server_mute_limiter: ClientWorkLimiter,
+    /// Bounds the REPLIES to refused server-mute requests (never the counting).
+    server_mute_refusal_reply_limiter: ClientWorkLimiter,
+    /// Bounds `UnmuteRequest`s relayed to the host(s).
+    unmute_request_limiter: ClientWorkLimiter,
+    /// One-shot bound on the server-mute refusal WARN (refusals always counted).
+    server_mute_refusal_logged: bool,
+    /// One-shot bound on the server-mute rate-limit WARN.
+    server_mute_rate_limit_logged: bool,
+    /// One-shot bound on the server-mute refusal-reply-suppressed WARN.
+    server_mute_refusal_reply_suppressed_logged: bool,
+    /// One-shot bound on the unmute-request rate-limit WARN.
+    unmute_rate_limit_logged: bool,
 }
 
 impl MediaSignalingContext {
@@ -1295,6 +1396,7 @@ async fn reject_capability(
     // counter, before the send — so a suppressed rejection is counted, not
     // silent.
     if !media.rejection_reply_limiter.try_spend(Instant::now()) {
+        metrics::record_refusal_reply_suppressed(RefusalReplySurface::Capability);
         if !media.rejection_reply_suppressed_logged {
             media.rejection_reply_suppressed_logged = true;
             warn!(
@@ -1451,6 +1553,246 @@ async fn handle_mute_request(
     metrics::record_mute_request(MuteOutcome::Applied);
 }
 
+/// `message_kind` for the server-mute refusal `ErrorMessage`.
+const SIGNALING_KIND_SERVER_MUTE_REFUSAL: &str = "server_mute_refusal";
+
+/// The ONE client-visible refusal for a server-mute request, whatever the
+/// reason. A bounded `&'static str`; no client value is ever echoed back.
+const SERVER_MUTE_REFUSED_MESSAGE: &str = "Server mute request refused";
+
+/// Handle a post-join `ServerMuteRequest` (ADR-0036 §5, §7; story 2 R-8..R-11).
+///
+/// # The order of checks is the security property
+///
+/// 1. **Authority, before `request.participant_id` is read at all.** A
+///    non-host is refused here, before any actor hop, so it never reaches the
+///    shared meeting actor and learns nothing about who is in the meeting —
+///    every request it sends gets the same refusal, whatever it names. The
+///    ordering is the control; the single wire error below is defence in depth
+///    on top of it (it collapses the one case where this layer and the actor
+///    read different vintages of the role).
+/// 2. **Rate limit** — a host's work only, from a bucket no looser than client
+///    mute's ([`SERVER_MUTE_WORK_BURST`]).
+/// 3. **The actor**, which re-checks authority against its roster (AND-composed)
+///    and then resolves the target.
+///
+/// The requester is `media.participant_id` — the AUTHENTICATED connection's own
+/// id. `ServerMuteRequest` carries no requester field, and the actor cannot tell
+/// a forged `requester` from a real one, so this call site is the only place
+/// that binding is made.
+///
+/// `reason` (client-controlled, echoed to another participant per the proto)
+/// is deliberately neither forwarded nor logged.
+async fn handle_server_mute_request(
+    request: &v1::ServerMuteRequest,
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
+) {
+    let action = ServerMuteAction::from_request(request.audio_muted, request.video_muted);
+
+    // 1. Authority.
+    if !media.is_host {
+        refuse_server_mute(
+            ServerMuteRefusal::NotPermitted,
+            action,
+            None,
+            connection_id,
+            participant_handle,
+            media,
+        )
+        .await;
+        return;
+    }
+
+    // 2. Rate limit (host work only).
+    if !media.server_mute_limiter.try_spend(Instant::now()) {
+        metrics::record_server_mute_request(action, ServerMuteOutcome::RateLimited);
+        if !media.server_mute_rate_limit_logged {
+            media.server_mute_rate_limit_logged = true;
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                requester_participant_id = %media.participant_id,
+                "Server-mute requests on this connection exceeded the sustained rate limit and \
+                 are being dropped. Further occurrences on this connection are counted, not logged."
+            );
+        }
+        return;
+    }
+
+    // 3. The actor. The target id is client-supplied, so it is length-bounded
+    // at this trust boundary before it enters the actor or a log line.
+    let target = truncate_utf8(&request.participant_id, MAX_CLIENT_STRING_BYTES);
+    match media
+        .meeting_handle
+        .server_mute(
+            target.clone(),
+            media.participant_id.clone(),
+            request.audio_muted,
+            request.video_muted,
+        )
+        .await
+    {
+        Err(e) => {
+            metrics::record_server_mute_request(action, ServerMuteOutcome::ActorUnavailable);
+            debug!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                error = %e,
+                "Meeting actor unavailable for a server-mute request"
+            );
+        }
+        Ok(Ok(decision)) => {
+            let outcome = match decision {
+                ServerMuteDecision::Applied => ServerMuteOutcome::Applied,
+                ServerMuteDecision::Unchanged => ServerMuteOutcome::Unchanged,
+            };
+            metrics::record_server_mute_request(action, outcome);
+            // The decision, with who asked and about whom, on the signalling
+            // path where identity is legitimate. Participant ids only — never a
+            // sender id, user id or display name.
+            info!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                requester_participant_id = %media.participant_id,
+                target_participant_id = %target,
+                action = action.label(),
+                outcome = outcome.label(),
+                audio_muted = request.audio_muted,
+                video_muted = request.video_muted,
+                "Server mute decision"
+            );
+        }
+        Ok(Err(refusal)) => {
+            refuse_server_mute(
+                refusal,
+                action,
+                Some(&target),
+                connection_id,
+                participant_handle,
+                media,
+            )
+            .await;
+        }
+    }
+}
+
+/// Count, bound-log and answer a refused server-mute request.
+///
+/// ONE client-visible error for every refusal — same code, same static text —
+/// so nothing about the refusal's reason reaches the client. The reason
+/// survives only in the metric label and this log, which are operator-visible.
+/// The counter always fires; the WARN fires once per connection; the REPLY is
+/// rationed by its own bucket, and a withheld reply is itself counted.
+async fn refuse_server_mute(
+    refusal: ServerMuteRefusal,
+    action: ServerMuteAction,
+    target: Option<&str>,
+    connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
+) {
+    let outcome = match refusal {
+        ServerMuteRefusal::NotPermitted => ServerMuteOutcome::NotPermitted,
+        ServerMuteRefusal::UnknownTarget => ServerMuteOutcome::UnknownTarget,
+    };
+    metrics::record_server_mute_request(action, outcome);
+
+    if !media.server_mute_refusal_logged {
+        media.server_mute_refusal_logged = true;
+        // The target is logged only when the requester was authorized: a
+        // non-host's request is refused before its target is looked at.
+        warn!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            requester_participant_id = %media.participant_id,
+            target_participant_id = target.unwrap_or(""),
+            action = action.label(),
+            outcome = outcome.label(),
+            "Server-mute request refused. Further refusals on this connection are counted, not \
+             logged."
+        );
+    }
+
+    if !media
+        .server_mute_refusal_reply_limiter
+        .try_spend(Instant::now())
+    {
+        metrics::record_refusal_reply_suppressed(RefusalReplySurface::ServerMute);
+        if !media.server_mute_refusal_reply_suppressed_logged {
+            media.server_mute_refusal_reply_suppressed_logged = true;
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                "Server-mute refusal replies on this connection exceeded their rate limit and are \
+                 being suppressed. Refusals are still counted on \
+                 mc_media_server_mute_requests_total and suppressions on \
+                 mc_media_refusal_replies_suppressed_total."
+            );
+        }
+        return;
+    }
+
+    send_signaling(
+        participant_handle,
+        connection_id,
+        SIGNALING_KIND_SERVER_MUTE_REFUSAL,
+        &ServerMessage {
+            message: Some(server_message::Message::Error(ErrorMessage {
+                code: v1::ErrorCode::Forbidden as i32,
+                message: SERVER_MUTE_REFUSED_MESSAGE.to_string(),
+                details: Default::default(),
+            })),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        },
+    )
+    .await;
+}
+
+/// Handle a post-join `UnmuteRequest` (R-10): a server-muted participant asks
+/// the host(s) to lift its mute.
+///
+/// NOTIFIES — never clears. The actor relays a FRESH `UnmuteRequest` whose
+/// `participant_id` is this connection's authenticated id, so the
+/// `participant_id` a client put in its own request is never read and can never
+/// be forwarded. There is no write path to server-mute state from here.
+async fn handle_unmute_request(
+    request: &v1::UnmuteRequest,
+    connection_id: &str,
+    media: &mut MediaSignalingContext,
+) {
+    if !media.unmute_request_limiter.try_spend(Instant::now()) {
+        metrics::record_unmute_request(UnmuteRequestOutcome::RateLimited);
+        if !media.unmute_rate_limit_logged {
+            media.unmute_rate_limit_logged = true;
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                "Unmute requests on this connection exceeded their rate limit and are being \
+                 dropped. Further occurrences on this connection are counted, not logged."
+            );
+        }
+        return;
+    }
+    let outcome = match media
+        .meeting_handle
+        .request_unmute(
+            media.participant_id.clone(),
+            request.request_audio,
+            request.request_video,
+        )
+        .await
+    {
+        Ok(UnmuteRelay::Relayed { .. }) => UnmuteRequestOutcome::Relayed,
+        Ok(UnmuteRelay::NotServerMuted) => UnmuteRequestOutcome::NotServerMuted,
+        Ok(UnmuteRelay::NoHostConnected) => UnmuteRequestOutcome::NoHostConnected,
+        Err(_) => UnmuteRequestOutcome::ActorUnavailable,
+    };
+    metrics::record_unmute_request(outcome);
+}
+
 /// Send a `ServerMessage` to the client through the participant actor.
 ///
 /// Routed through the actor's outbound channel rather than written straight to
@@ -1477,7 +1819,8 @@ async fn send_signaling(
     {
         // WARN, not DEBUG. `ParticipantActorHandle::send` is an awaited mpsc
         // send, so an `Err` means the mailbox is CLOSED — the participant actor
-        // is gone. The only thing this path sends is a capability rejection
+        // is gone. This path sends only rejections and refusals — a capability
+        // rejection or a server-mute refusal, named by `message_kind` —
         // (directives and slot assignments are the meeting actor's, which
         // counts its own delivery failures on
         // `mc_media_slot_view_emissions_total{outcome="delivery_failed"}`).
@@ -1487,9 +1830,10 @@ async fn send_signaling(
             error = %e,
             // `message_kind`, NOT `payload_kind`: the `payload_kind` label on
             // `mc_participant_outbound_messages_dropped_total` is a DISJOINT
-            // domain ({signaling_raw, participant_update}) on a later hop.
+            // domain on a later hop (its values are enumerated in that
+            // metric's catalog row, deliberately not restated here).
             message_kind = message_kind,
-            "Failed to deliver a capability rejection to the participant actor"
+            "Failed to deliver a rejection or refusal to the participant actor"
         );
     }
 }
@@ -1500,31 +1844,70 @@ fn media_signaling_context(
     meeting_handle: MeetingActorHandle,
     join_result: &JoinResult,
     config: crate::media_signaling::ClientMediaConfig,
+    is_host: bool,
 ) -> MediaSignalingContext {
-    // One clock reading for both buckets: they start together at join, so a
-    // skew between them would be meaningless state.
-    let limiter_start = Instant::now();
-
-    MediaSignalingContext {
+    MediaSignalingContext::new(
         meeting_handle,
-        participant_id: join_result.participant_id.clone(),
-        max_receive_slots: config.max_receive_slots,
-        declaration_budget: config.max_receive_capability_declarations,
-        declaration: None,
-        last_reported_mute: None,
-        mute_limiter: ClientWorkLimiter::new(
-            limiter_start,
-            MUTE_WORK_BURST,
-            MUTE_WORK_REFILL_INTERVAL_MS,
-        ),
-        rejection_reply_limiter: ClientWorkLimiter::new(
-            limiter_start,
-            CAPABILITY_REJECTION_BURST,
-            CAPABILITY_REJECTION_REFILL_INTERVAL_MS,
-        ),
-        mute_rate_limit_logged: false,
-        rejection_logged: false,
-        rejection_reply_suppressed_logged: false,
+        join_result.participant_id.clone(),
+        &config,
+        is_host,
+    )
+}
+
+impl MediaSignalingContext {
+    /// The ONE constructor, shared by the join path and the unit tests, so a
+    /// test cannot drift from the limiters production actually installs.
+    fn new(
+        meeting_handle: MeetingActorHandle,
+        participant_id: String,
+        config: &crate::media_signaling::ClientMediaConfig,
+        is_host: bool,
+    ) -> Self {
+        // One clock reading for every bucket: they start together at join, so a
+        // skew between them would be meaningless state.
+        let limiter_start = Instant::now();
+
+        Self {
+            meeting_handle,
+            participant_id,
+            max_receive_slots: config.max_receive_slots,
+            declaration_budget: config.max_receive_capability_declarations,
+            declaration: None,
+            last_reported_mute: None,
+            mute_limiter: ClientWorkLimiter::new(
+                limiter_start,
+                MUTE_WORK_BURST,
+                MUTE_WORK_REFILL_INTERVAL_MS,
+            ),
+            rejection_reply_limiter: ClientWorkLimiter::new(
+                limiter_start,
+                CAPABILITY_REJECTION_BURST,
+                CAPABILITY_REJECTION_REFILL_INTERVAL_MS,
+            ),
+            mute_rate_limit_logged: false,
+            rejection_logged: false,
+            rejection_reply_suppressed_logged: false,
+            is_host,
+            server_mute_limiter: ClientWorkLimiter::new(
+                limiter_start,
+                SERVER_MUTE_WORK_BURST,
+                SERVER_MUTE_WORK_REFILL_INTERVAL_MS,
+            ),
+            server_mute_refusal_reply_limiter: ClientWorkLimiter::new(
+                limiter_start,
+                SERVER_MUTE_REFUSAL_REPLY_BURST,
+                SERVER_MUTE_REFUSAL_REPLY_REFILL_INTERVAL_MS,
+            ),
+            unmute_request_limiter: ClientWorkLimiter::new(
+                limiter_start,
+                UNMUTE_REQUEST_BURST,
+                UNMUTE_REQUEST_REFILL_INTERVAL_MS,
+            ),
+            server_mute_refusal_logged: false,
+            server_mute_rate_limit_logged: false,
+            server_mute_refusal_reply_suppressed_logged: false,
+            unmute_rate_limit_logged: false,
+        }
     }
 }
 
@@ -1742,6 +2125,7 @@ fn build_join_response(result: &JoinResult) -> JoinResponse {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::observability::metrics::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
 
     // Full R-60 behavioral coverage (all-CONNECTED / partial / all-FAILED state
     // recording + metric + truncation + cap) lives in
@@ -1851,8 +2235,16 @@ mod tests {
         )
     }
 
-    /// A live media-signalling context over a throwaway meeting actor.
+    /// A live media-signalling context over a throwaway meeting actor, for a
+    /// NON-host connection.
     fn test_media_context() -> (MediaSignalingContext, tokio::task::JoinHandle<()>) {
+        test_media_context_as(false)
+    }
+
+    /// As [`test_media_context`], choosing the connection's host authority.
+    fn test_media_context_as(
+        is_host: bool,
+    ) -> (MediaSignalingContext, tokio::task::JoinHandle<()>) {
         use crate::actors::{ActorMetrics, ControllerMetrics, MeetingActor};
         let (meeting, task) = MeetingActor::spawn(
             "test-meeting".to_string(),
@@ -1870,29 +2262,8 @@ mod tests {
                 .expect("in band"),
             connect_settle_window: std::time::Duration::from_millis(1500),
         };
-        let limiter_start = Instant::now();
         (
-            MediaSignalingContext {
-                meeting_handle: meeting,
-                participant_id: "test-part".to_string(),
-                max_receive_slots: config.max_receive_slots,
-                declaration_budget: config.max_receive_capability_declarations,
-                declaration: None,
-                last_reported_mute: None,
-                mute_limiter: ClientWorkLimiter::new(
-                    limiter_start,
-                    MUTE_WORK_BURST,
-                    MUTE_WORK_REFILL_INTERVAL_MS,
-                ),
-                rejection_reply_limiter: ClientWorkLimiter::new(
-                    limiter_start,
-                    CAPABILITY_REJECTION_BURST,
-                    CAPABILITY_REJECTION_REFILL_INTERVAL_MS,
-                ),
-                mute_rate_limit_logged: false,
-                rejection_logged: false,
-                rejection_reply_suppressed_logged: false,
-            },
+            MediaSignalingContext::new(meeting, "test-part".to_string(), &config, is_host),
             task,
         )
     }
@@ -1901,17 +2272,336 @@ mod tests {
     async fn test_handle_client_message_unhandled_type() {
         let (handle, _task) = test_participant_handle();
         let (mut media, _meeting) = test_media_context();
-        // `ServerMuteRequest` has no dispatch arm yet (story-2 task 12); it
-        // must fall through to the ignored branch without panicking.
+        // `UnmuteResponse` has no dispatch arm by design (the host lifts a mute
+        // with a `ServerMuteRequest`); it must fall through to the ignored
+        // branch without panicking.
         let msg = ClientMessage {
-            message: Some(client_message::Message::ServerMuteRequest(
-                v1::ServerMuteRequest::default(),
+            message: Some(client_message::Message::UnmuteResponse(
+                v1::UnmuteResponse::default(),
             )),
             trace_parent: String::new(),
             trace_state: String::new(),
         };
         let data = msg.encode_to_vec();
         handle_client_message(&data, "test-conn-3", &handle, &mut media).await;
+    }
+
+    // ------------------------------------------------------------------
+    // Server mute and unmute requests at the dispatch boundary (R-8, R-10)
+    // ------------------------------------------------------------------
+
+    /// A participant actor whose outbound stream the test can read.
+    fn streamed_participant(
+        participant_id: &str,
+    ) -> (
+        ParticipantActorHandle,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) {
+        use crate::actors::{ActorMetrics, ParticipantActor};
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (handle, _task) = ParticipantActor::spawn_with_stream(
+            format!("conn-{participant_id}"),
+            participant_id.to_string(),
+            "test-meeting".to_string(),
+            CancellationToken::new(),
+            ActorMetrics::new(),
+            tx,
+        );
+        (handle, rx)
+    }
+
+    fn server_mute_msg(target: &str) -> Vec<u8> {
+        ClientMessage {
+            message: Some(client_message::Message::ServerMuteRequest(
+                v1::ServerMuteRequest {
+                    participant_id: target.to_string(),
+                    audio_muted: true,
+                    video_muted: false,
+                    reason: String::new(),
+                },
+            )),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        }
+        .encode_to_vec()
+    }
+
+    /// The next `ErrorMessage` written to a participant's stream.
+    async fn next_error(rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> ErrorMessage {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a reply is written")
+            .expect("stream open");
+        match ServerMessage::decode(&bytes[..]).unwrap().message {
+            Some(server_message::Message::Error(e)) => e,
+            other => unreachable!("expected an ErrorMessage, got {other:?}"),
+        }
+    }
+
+    /// R-8: a NON-HOST is refused at dispatch, before any actor hop. Proven by
+    /// making the hop impossible: the meeting actor is stopped first, so a
+    /// request that reached it would be `actor_unavailable`, never
+    /// `not_permitted`.
+    #[tokio::test]
+    async fn a_non_host_server_mute_is_refused_at_dispatch_without_an_actor_hop() {
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        let (participant, mut rx) = streamed_participant("test-part");
+        let (mut media, meeting_task) = test_media_context_as(false);
+        media.meeting_handle.cancel();
+        let _ = meeting_task.await;
+
+        handle_client_message(&server_mute_msg("anyone"), "c", &participant, &mut media).await;
+
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "not_permitted"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "actor_unavailable"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(0);
+        let error = next_error(&mut rx).await;
+        assert_eq!(error.code, v1::ErrorCode::Forbidden as i32);
+        assert_eq!(error.message, SERVER_MUTE_REFUSED_MESSAGE);
+    }
+
+    /// R-8, the ORDERING invariant at the metric: after driving the non-host
+    /// path, the `unknown_target` cell is PRESENT-and-still-ZERO — never merely
+    /// absent, which would pass on a process that never recorded anything. A
+    /// non-host can never reach target resolution; if someone reorders the
+    /// checks and reintroduces the existence oracle, this goes red.
+    #[tokio::test]
+    async fn a_non_host_never_reaches_unknown_target() {
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        crate::observability::metrics::zero_initialize_counters();
+        let (participant, _rx) = streamed_participant("test-part");
+        let (mut media, _meeting) = test_media_context_as(false);
+
+        handle_client_message(
+            &server_mute_msg("no-such-id"),
+            "c",
+            &participant,
+            &mut media,
+        )
+        .await;
+
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "unknown_target"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(0);
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "not_permitted"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+    }
+
+    /// The two refusals are ONE wire error — byte-identical — so the client
+    /// learns nothing about which one it was. Only the metric distinguishes.
+    #[tokio::test]
+    async fn not_permitted_and_unknown_target_are_byte_identical_on_the_wire() {
+        // Non-host: refused at dispatch.
+        let (participant, mut rx) = streamed_participant("test-part");
+        let (mut media, _m1) = test_media_context_as(false);
+        handle_client_message(&server_mute_msg("x"), "c", &participant, &mut media).await;
+        let not_permitted = next_error(&mut rx).await;
+
+        // A host on the roster naming an absent participant: the ACTOR refuses
+        // with `UnknownTarget`.
+        let (host, mut host_rx) = streamed_participant("test-part");
+        let (mut host_media, _m2) = test_media_context_as(true);
+        host_media
+            .meeting_handle
+            .connection_join(
+                "conn-h".to_string(),
+                "user-h".to_string(),
+                "test-part".to_string(),
+                String::new(),
+                true,
+                crate::media_admission::fixtures::sample_identity_key(),
+                None,
+                crate::actors::meeting_media::test_join_media(),
+            )
+            .await
+            .unwrap();
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        handle_client_message(&server_mute_msg("ghost"), "c", &host, &mut host_media).await;
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "unknown_target"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+        let unknown_target = next_error(&mut host_rx).await;
+
+        assert_eq!(
+            not_permitted.encode_to_vec(),
+            unknown_target.encode_to_vec(),
+            "the two refusals must be indistinguishable to the client"
+        );
+    }
+
+    /// R-8 rate bound: a host's server-mute work is bounded by a bucket no
+    /// looser than client mute's (also a compile-time assertion); past the
+    /// burst, requests are counted `rate_limited` and do no work.
+    #[tokio::test]
+    async fn a_host_is_rate_limited_after_the_server_mute_burst() {
+        let (participant, _rx) = streamed_participant("test-part");
+        let (mut media, _meeting) = test_media_context_as(true);
+        for _ in 0..SERVER_MUTE_WORK_BURST {
+            handle_client_message(&server_mute_msg("x"), "c", &participant, &mut media).await;
+        }
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        handle_client_message(&server_mute_msg("x"), "c", &participant, &mut media).await;
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "rate_limited"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+    }
+
+    /// Refusals are ALWAYS counted; past the reply burst the REPLY is withheld
+    /// and that suppression is itself counted — and `not_permitted` keeps
+    /// counting every refusal (the partition is intact).
+    #[tokio::test]
+    async fn suppressed_refusal_replies_are_counted_and_refusals_still_are() {
+        let (participant, _rx) = streamed_participant("test-part");
+        let (mut media, _meeting) = test_media_context_as(false);
+        for _ in 0..SERVER_MUTE_REFUSAL_REPLY_BURST {
+            handle_client_message(&server_mute_msg("x"), "c", &participant, &mut media).await;
+        }
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        handle_client_message(&server_mute_msg("x"), "c", &participant, &mut media).await;
+        snap.counter("mc_media_refusal_replies_suppressed_total")
+            .with_labels(&[
+                ("surface", "server_mute"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "not_permitted"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+    }
+
+    /// R-10: the relayed `UnmuteRequest` carries the AUTHENTICATED requester's
+    /// id, never the one the client wrote. Asserted POSITIVELY, on a path where
+    /// the relay actually happens (the requester is genuinely server-muted and
+    /// a host is connected) — a "forged value absent" check alone would pass
+    /// vacuously on the no-relay path.
+    #[tokio::test]
+    async fn a_forged_participant_id_in_an_unmute_request_is_never_relayed() {
+        let (_participant, _rx) = streamed_participant("test-part");
+        let (mut media, _meeting) = test_media_context_as(false);
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::channel(64);
+        let meeting = media.meeting_handle.clone();
+        let join = |id: &str, host: bool, tx| {
+            let meeting = meeting.clone();
+            let id = id.to_string();
+            async move {
+                meeting
+                    .connection_join(
+                        format!("conn-{id}"),
+                        format!("user-{id}"),
+                        id,
+                        String::new(),
+                        host,
+                        crate::media_admission::fixtures::sample_identity_key(),
+                        tx,
+                        crate::actors::meeting_media::test_join_media(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        join("host", true, Some(host_tx)).await;
+        join("test-part", false, None).await;
+        meeting
+            .server_mute("test-part".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        let forged = ClientMessage {
+            message: Some(client_message::Message::UnmuteRequest(v1::UnmuteRequest {
+                request_audio: true,
+                request_video: false,
+                participant_id: "forged-victim".to_string(),
+            })),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        }
+        .encode_to_vec();
+        handle_client_message(&forged, "c", &_participant, &mut media).await;
+
+        snap.counter("mc_media_unmute_requests_total")
+            .with_labels(&[
+                ("outcome", "relayed"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+        let relayed = loop {
+            let bytes = tokio::time::timeout(Duration::from_secs(5), host_rx.recv())
+                .await
+                .expect("the relay reached the host")
+                .expect("stream open");
+            if let Some(server_message::Message::UnmuteRequest(r)) =
+                ServerMessage::decode(&bytes[..]).unwrap().message
+            {
+                break r;
+            }
+        };
+        assert_eq!(
+            relayed.participant_id, "test-part",
+            "the relay names the AUTHENTICATED requester, whatever the client wrote"
+        );
+    }
+
+    /// The unmute-request bucket is its own, and tighter than mute's.
+    #[tokio::test]
+    async fn unmute_requests_are_rate_limited_after_their_burst() {
+        let (participant, _rx) = streamed_participant("test-part");
+        let (mut media, _meeting) = test_media_context_as(false);
+        let msg = ClientMessage {
+            message: Some(client_message::Message::UnmuteRequest(v1::UnmuteRequest {
+                request_audio: true,
+                request_video: false,
+                participant_id: String::new(),
+            })),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        }
+        .encode_to_vec();
+        for _ in 0..UNMUTE_REQUEST_BURST {
+            handle_client_message(&msg, "c", &participant, &mut media).await;
+        }
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        handle_client_message(&msg, "c", &participant, &mut media).await;
+        snap.counter("mc_media_unmute_requests_total")
+            .with_labels(&[
+                ("outcome", "rate_limited"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+        const { assert!(UNMUTE_REQUEST_BURST < MUTE_WORK_BURST) };
     }
 
     #[tokio::test]

@@ -163,9 +163,11 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 /// policy — the per-meeting subtraction makes 5 edges shrinking to 4 install
 /// and drop the total by one.
 ///
-/// So the floor still ratchets for every meeting whose MC NEVER calls
-/// `EndMeeting`: every meeting before MC begins calling it (story 2 task 12),
-/// and permanently for any meeting whose MC dies without calling it. That
+/// So the floor still ratchets for every meeting whose MC never COMPLETES
+/// `EndMeeting`: an MC that crashes or is killed mid-teardown, whose
+/// `EndMeeting` exhausts its retries or reaches an MH predating the RPC, or
+/// that is rolled back to a build predating teardown (`docs/TODO.md`, "A
+/// meeting whose MC never sends `EndMeeting` is never reclaimed"). That
 /// portion is unreclaimable until the pod restarts and rises at the rate such
 /// meetings end. "Reaching this means a bug, a leak, or a hostile MC, never
 /// growth" was false as first written and is still false for those meetings:

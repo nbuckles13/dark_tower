@@ -132,6 +132,8 @@ pub struct Session {
     pub media_servers: Vec<String>,
     /// The token `sub` this session joined as (what MH reports).
     pub user: String,
+    /// MC's participant id for this session, read off the `JoinResponse`.
+    pub participant_id: String,
     /// The meeting joined.
     pub meeting_id: String,
 }
@@ -189,6 +191,31 @@ impl Session {
         tokio::time::timeout(QUIET, read_server_message(&mut self.recv))
             .await
             .ok()
+    }
+
+    /// The next server message of ANY kind (roster traffic included), or
+    /// `None` if none arrives within the quiet bound.
+    pub async fn next_server_message(&mut self) -> Option<ServerMessage> {
+        self.next_raw().await
+    }
+
+    /// Read until a `ParticipantMuteUpdate` about `participant_id` arrives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if none arrives within the quiet bound.
+    pub async fn expect_mute_update_for(
+        &mut self,
+        participant_id: &str,
+    ) -> proto_gen::dark_tower::signaling::v1::ParticipantMuteUpdate {
+        while let Some(msg) = self.next_raw().await {
+            if let Some(server_message::Message::ParticipantMuteUpdate(u)) = msg.message {
+                if u.participant_id == participant_id {
+                    return u;
+                }
+            }
+        }
+        panic!("no ParticipantMuteUpdate for {participant_id} arrived");
     }
 
     /// The next media-signalling message, skipping roster traffic, or `None`
@@ -426,6 +453,31 @@ pub async fn join_as_on(
     session
 }
 
+/// [`join_as`], but as the meeting's HOST (the token carries
+/// `MeetingRole::Host`, as GC stamps it for the meeting's creator).
+///
+/// # Panics
+///
+/// As [`join_as`].
+pub async fn join_as_host(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+) -> Session {
+    let session = match try_join_with_role(rig, stack, meeting_id, user, true).await {
+        Ok(session) => session,
+        Err(e) => panic!("expected JoinResponse, got {e}"),
+    };
+    for handler in registered_handlers(stack, meeting_id).await {
+        let answered = session
+            .connect_to(stack, &handler, &connection_id_for(user, &handler))
+            .await;
+        assert_eq!(answered, session.sender_id);
+    }
+    session
+}
+
 /// [`join_as`], returning MC's error text instead of panicking on a refusal.
 pub async fn try_join_as(
     rig: &AcceptLoopRig,
@@ -433,8 +485,22 @@ pub async fn try_join_as(
     meeting_id: &str,
     user: &str,
 ) -> Result<Session, String> {
+    try_join_with_role(rig, stack, meeting_id, user, false).await
+}
+
+/// The one join path behind [`try_join_as`] and [`join_as_host`].
+async fn try_join_with_role(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+    host: bool,
+) -> Result<Session, String> {
     let mut claims = make_meeting_claims(meeting_id);
     claims.sub = user.to_string();
+    if host {
+        claims.role = ::common::jwt::MeetingRole::Host;
+    }
     let token = stack.keypair.sign_token(&claims);
 
     let conn = connect(&rig.url).await;
@@ -459,8 +525,9 @@ pub async fn try_join_as(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (sender_id, media_servers) = match resp.message {
+    let (participant_id, sender_id, media_servers) = match resp.message {
         Some(server_message::Message::JoinResponse(r)) => (
+            r.participant_id.clone(),
             r.sender_id.expect("MC allocates a sender id at join"),
             r.media_servers
                 .into_iter()
@@ -477,6 +544,40 @@ pub async fn try_join_as(
         sender_id,
         media_servers,
         user: user.to_string(),
+        participant_id,
         meeting_id: meeting_id.to_string(),
+    })
+}
+
+/// A framed `ServerMuteRequest` naming `target`.
+pub fn server_mute_frame(target: &str, audio_muted: bool) -> bytes::BytesMut {
+    encode_framed(&ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
+        message: Some(client_message::Message::ServerMuteRequest(
+            proto_gen::dark_tower::signaling::v1::ServerMuteRequest {
+                participant_id: target.to_string(),
+                audio_muted,
+                video_muted: false,
+                reason: String::new(),
+            },
+        )),
+    })
+}
+
+/// A framed `UnmuteRequest` for audio. `claimed_participant_id` is what the
+/// CLIENT writes into the field MC overwrites on relay — pass another
+/// participant's id to exercise the forgery path.
+pub fn unmute_request_frame(claimed_participant_id: &str) -> bytes::BytesMut {
+    encode_framed(&ClientMessage {
+        trace_parent: String::new(),
+        trace_state: String::new(),
+        message: Some(client_message::Message::UnmuteRequest(
+            proto_gen::dark_tower::signaling::v1::UnmuteRequest {
+                request_audio: true,
+                request_video: false,
+                participant_id: claimed_participant_id.to_string(),
+            },
+        )),
     })
 }

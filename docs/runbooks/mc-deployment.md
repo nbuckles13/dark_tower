@@ -236,6 +236,40 @@ Complete ALL items before deploying to production:
     `error_type=identity_key_invalid` on `mc_session_join_failures_total` means a
     client sent a **wrongly-encoded** key (PEM/JWK/base64 rather than the raw 32
     bytes), never that a client has not implemented the field.
+  - **Story 2 task 12 (server mute + meeting teardown) orders the rollout
+    across THREE services as ONE total order: forward GC → MC → MH; rollback
+    MH → MC → GC.** It composes with the standing MC/MH rule in
+    `mh-deployment.md` §"Cross-service ordering: MC and MH are coupled by the
+    sender_id binding contract" (forward MC first, back MH first), and **that
+    rule wins wherever the two appear to conflict** — its skew is a total media
+    blackout, this one's is a counted degradation. The two reasons:
+    - **GC before MC** — a meeting now ENDS when its last participant leaves,
+      and MC tells GC (`NotifyMeetingEnded`). A GC without the task-12
+      assignment fix cannot re-assign an ended meeting id: every later join to
+      that id fails until the retention cleanup removes the row
+      (`GC_RETENTION_DAYS`, 7 days by default). A cross-service rolling deploy
+      IS that skew window, so GC must be fully rolled before any MC pod runs
+      this image, and MC must be rolled back before GC is.
+    - **MH after MC is safe, not merely tolerated** — every MH since story 2
+      task 11 serves `EndMeeting`; this task's only MH-side change is the
+      apply-time refusal for a released meeting. While MH lags, an MC release
+      that races a late apply is not refused MH-side (Race A in
+      `EndMeetingRequest`, `internal.proto`), which leaves at most that one
+      registration until the handler restarts — and rolling MH restarts it.
+      An MH that predated the RPC entirely would answer `UNIMPLEMENTED`,
+      counted on `mc_media_end_meeting_total{outcome="unimplemented"}` and
+      never retried: a degradation, not an outage.
+  - **Mid-roll, the two MC pods legitimately disagree about meeting counts.**
+    A new mc-0 ends empty meetings, releases their handlers and ends their GC
+    assignments; an old mc-1 does not. Per-instance active-meeting counts, MH
+    registered-meeting counts and GC assignment counts diverge for the duration
+    of the roll — expected, not a defect. §1 Pre-Deployment Verification gates
+    on the active-meeting count per instance; read it with this in mind.
+  - **What operators see differently after this release**: a meeting whose last
+    participant leaves is gone (a rejoin creates a new meeting — same meeting
+    id, fresh sender ids and KEK); `mc_media_end_meeting_total{outcome="released"}`
+    and `mc_gc_notify_meeting_ended_total{status="success"}` move on ordinary
+    turnover. Teardown triage: `mc-incident-response.md` Scenario 20.
 
 
 - [ ] **Maintenance window scheduled** (if downtime expected)
@@ -469,8 +503,39 @@ kubectl logs deployment/mc-1 -n dark-tower | grep "Configuration loaded successf
 - [ ] **mc-0 and mc-1 report identical values.** They read one shared ConfigMap,
       so a difference means one Deployment's `configMapKeyRef` block is stale —
       the guard-green split-brain the ConfigMap banner warns about.
+- [ ] **`mc_id` is the ONE field that must DIFFER between the two pods — and must
+      differ from what the same pod reported before this roll.** Every other
+      field on this line is shared by design; `mc_id` is the opposite, and it is
+      the field MH's ownership check compares when a departing MC releases its
+      meetings on graceful shutdown (story 2 task 12). Two pods reporting the
+      same `mc_id`, or a pod reporting the same value across a restart, means
+      `MC_ID` has been pinned — see the DO-NOT-PIN warning in §Configuration
+      Reference for why that turns a rolling deploy into a meeting outage. This
+      check is the only thing that detects a pinned `MC_ID` before it costs a
+      meeting: MC cannot detect it itself, because no pod can see another pod's
+      id.
+
+      ```bash
+      # Must print two DIFFERENT ids. One id printed twice is the footgun.
+      for p in mc-0 mc-1; do
+        kubectl logs -n dark-tower "deployment/$p" \
+          | grep -o 'mc_id="[^"]*"' | tail -1
+      done
+      ```
 - [ ] No `audio frame rate other than 20 ms frames` WARN, unless you set one
       deliberately
+- [ ] `push_quiesce_bound_seconds`, `teardown_fence_hold_max_seconds` and
+      `shutdown_release_budget_seconds` are present (story 2 task 12). They are
+      derived from compiled constants rather than from config, so they are identical
+      on every pod of one image — with one exception worth knowing: the inputs to
+      `shutdown_release_budget_seconds` include this pod's
+      `terminationGracePeriodSeconds`, restated in Rust as
+      `SHUTDOWN_TERMINATION_GRACE_SECONDS`. A unit test fails the build on drift
+      between the two, so a mismatch cannot ship; the field is here because the
+      startup line is still the only per-pod record of the budget the process
+      actually computed. `teardown_fence_hold_max_seconds` is the worst case a
+      rejoin of a just-ended meeting can be held; `shutdown_release_budget_seconds`
+      decides whether a shutdown release happens at all.
 
 > **That WARN will not appear in the error grep above.** §Logs review greps
 > `error|panic|fatal`; this one is a `WARN`. `mc-service` emits it whenever
@@ -580,6 +645,11 @@ kill %1
 - Critical changes: 24 hours with on-call monitoring
 
 ### How to Rollback
+
+> **Cross-service order for the story-2 task-12 release: roll back MH → MC →
+> GC** (MC before GC, or ended meeting ids become unjoinable). The full
+> reasoning, and why the MC/MH sender_id rule in `mh-deployment.md` wins where
+> the two appear to conflict, is in §Coordination above.
 
 > **What is in the coupled set, and what may NOT be reverted alone.**
 > Since the ADR-0036 keys landed, MC's config is a hard startup dependency:
@@ -733,7 +803,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `MC_WEBTRANSPORT_BIND_ADDRESS` | No | WebTransport (QUIC/UDP) bind address. | `0.0.0.0:4433` | `0.0.0.0:4433` |
 | `MC_GRPC_BIND_ADDRESS` | No | gRPC bind address for GC communication. | `0.0.0.0:50052` | `0.0.0.0:50052` |
 | `MC_HEALTH_BIND_ADDRESS` | No | Health/metrics bind address. | `0.0.0.0:8081` | `0.0.0.0:8081` |
-| `MC_ID` | No | Instance identifier. Auto-generated when unset. | `mc-$HOSTNAME-<uuid8>` | `mc-0` |
+| `MC_ID` | No | Instance identifier. **MUST be unique per process incarnation — leave it unset.** See the warning below. | `mc-$HOSTNAME-<uuid8>` | *(unset — use the default)* |
 | `MC_MAX_MEETINGS` | No | Maximum concurrent meetings. | `1000` | `1000` |
 | `MC_MAX_PARTICIPANTS` | No | Maximum participants across all meetings. | `10000` | `10000` |
 | `MC_BINDING_TOKEN_TTL_SECONDS` | No | Binding token TTL (ADR-0023). | `30` | `30` |
@@ -746,6 +816,24 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `OTEL_SAMPLE_RATE` | No | Head-sampling ratio in `[0.0, 1.0]`; `init_otel` validates. | `1.0` | `1.0` |
 | `DEPLOYMENT_ENVIRONMENT` | No | `deployment.environment` resource attribute (ADR-0011). | `development` | `production` |
 | `RUST_LOG` | No | Logging level. Set as a literal in the Deployment, not via ConfigMap. | `info` | `info,mc_service=debug` |
+
+> **DO NOT PIN `MC_ID` PER POD — a stable value turns a rolling deploy into a
+> meeting outage (story 2 task 12).** Setting `MC_ID=mc-0` is the tempting
+> choice: it matches the pod names, matches every `deployment/mc-0` command in
+> this runbook, and reads tidier than a generated string. It is unsafe. MC now
+> releases its meetings' handlers on graceful shutdown (`EndMeeting`), and the
+> **only** thing preventing a departing pod from releasing meetings its
+> successor has already taken over is MH's ownership check — which compares
+> `mc_id`. Under the Deployments' RollingUpdate surge the old and new pods run
+> concurrently; if they share an `MC_ID`, the departing pod's release **passes**
+> that check and drops the successor's live meeting, closing every participant's
+> MH connection at once, with no client-visible cause. Leave `MC_ID` unset: the
+> default (`mc-$HOSTNAME-<uuid8>`, regenerated on every process start) is unique
+> per incarnation, which is the property the safety argument rests on. Nothing
+> in `infra/services/mc-service/**` sets it today, and nothing should.
+> Cross-check: a departing pod whose release is correctly refused counts
+> `mc_media_end_meeting_total{outcome="superseded_by_successor"}`, which is
+> expected during a roll — see `mc-incident-response.md` Scenario 20.
 
 **The seventeen Required rows are the CrashLoop list.** Each is loaded via
 `ConfigError::MissingEnvVar` in `crates/mc-service/src/config.rs`, so absence
@@ -1416,10 +1504,11 @@ sum(rate(mc_gc_heartbeats_total{status="success"}[5m])) / sum(rate(mc_gc_heartbe
 ### Grafana Dashboards
 
 **Recommended dashboards:**
-- **MC Overview** - Active meetings, connections, mailbox depth, panics, join flow
+- **MC Overview** - Active meetings, connections, mailbox depth, panics, join flow, MH coordination (incl. teardown)
+- **MC Media Path** - ADR-0036 media rows: media routing, client media signalling (incl. server mute), media connectivity, KEK lifecycle
 - **MC SLOs** - Session join duration, Redis latency, drop rate, error budget
 
-See `infra/grafana/dashboards/mc-overview.json`.
+See `infra/grafana/dashboards/mc-overview.json` and `infra/grafana/dashboards/mc-media.json`.
 
 ### Alerting Rules
 

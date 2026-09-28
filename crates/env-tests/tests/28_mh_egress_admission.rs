@@ -71,15 +71,18 @@
 //! is not aligned with the ratio's window buckets, so a transient ratio value
 //! can be invisible.
 //!
-//! # Cleanup — the ratchet, until MC calls `EndMeeting` (story 2 task 12)
+//! # Cleanup — the ratchet, for meetings nobody ends
 //!
 //! MH releases a meeting's streams when its MC calls `EndMeeting` (story 2
-//! task 11), but MC begins calling it only in task 12. Until then, streams of a
-//! meeting that ends ABNORMALLY are never released, and a handler at its
-//! ceiling drops out of GC placement. So
-//! the test ends by closing every MC session cleanly: MC's single removal
-//! choke point re-pushes shrinking policies, and each handler returns to zero
-//! streams for this meeting. If the FIRST join fails with 503, the handlers
+//! R-20). Streams of a meeting whose MC never COMPLETES `EndMeeting` are never
+//! released (`docs/TODO.md`, "A meeting whose MC never sends `EndMeeting` is
+//! never reclaimed"), and a handler at its ceiling drops out of GC placement.
+//! So the test ends by closing every MC session cleanly: each close but the
+//! last re-pushes a shrinking policy, and the last ends the meeting, whose
+//! `EndMeeting` releases it on every handler. A panic before cleanup drops the
+//! sessions instead; MC ends the meeting when their reconnect grace expires and
+//! releases it the same way. Only a meeting whose MC never COMPLETES
+//! `EndMeeting` keeps its streams. If the FIRST join fails with 503, the handlers
 //! were already full before the test started — a distinct PRECONDITION
 //! message, not a GC bug.
 
@@ -370,7 +373,7 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         );
     }
 
-    // ---- CLEANUP: clean closes, so MC re-pushes shrinking policies ----------
+    // ---- CLEANUP: clean closes; the last one ends the meeting and MC releases it on every handler ----
     for p in ps.into_iter().rev() {
         p.session
             .connection()

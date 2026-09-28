@@ -281,6 +281,208 @@ impl MuteOutcome {
     }
 }
 
+/// The verb a server-mute request asked for (`mc_media_server_mute_requests_total{action}`).
+///
+/// The label names WHAT WAS ASKED FOR, never its result (that is `outcome`).
+/// `mute` if the request asks for either kind to be server-muted, `unmute` if
+/// it asks for neither — a request carries the complete target state.
+///
+/// NOT A JOIN KEY with `dt_client_media_mute_transitions_total{action}`, whose
+/// value set is byte-identical: that series is the local user's own
+/// capture-side toggle; this one is a host's moderation decision about
+/// someone else. Different decider, different enforcement point (client
+/// capture, ADR-0036 §5, versus MH ingress, §7), different remedy. Summing
+/// `by(action)` across the two metric names means nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerMuteAction {
+    /// Apply a server mute (either kind).
+    Mute,
+    /// Lift it (neither kind).
+    Unmute,
+}
+
+impl ServerMuteAction {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 2] = [Self::Mute, Self::Unmute];
+
+    /// The action a request's target state asks for.
+    #[must_use]
+    pub fn from_request(audio_muted: bool, video_muted: bool) -> Self {
+        if audio_muted || video_muted {
+            Self::Mute
+        } else {
+            Self::Unmute
+        }
+    }
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mute => "mute",
+            Self::Unmute => "unmute",
+        }
+    }
+}
+
+/// Disposition of one `ServerMuteRequest` (`mc_media_server_mute_requests_total{outcome}`).
+///
+/// # Deliberately NOT folded into [`MuteOutcome`]
+///
+/// Overlapping member names (`applied`, `unchanged`, `rate_limited`,
+/// `actor_unavailable`) are not a duplication to consolidate. Client mute and
+/// server mute differ in decider (the participant about themselves versus a
+/// host about someone else), enforcement point (client capture versus MH
+/// ingress) and remedy, and a merged series would make every existing client
+/// mute query silently count moderation events.
+///
+/// # It PARTITIONS requests
+///
+/// Exactly one value per request, so `sum()` is requests received.
+///
+/// # Failure predicate, stated positively on purpose
+///
+/// `outcome=~"rate_limited|actor_unavailable"`. A variant added later then
+/// defaults to NOT-a-failure and has to be classified deliberately. Do not
+/// harmonise this to `outcome!="applied"`: `unchanged`, `not_permitted` and
+/// `unknown_target` are not MC failures.
+///
+/// # The metric distinguishes two refusals the client never can
+///
+/// [`Self::NotPermitted`] and [`Self::UnknownTarget`] reach the client as ONE
+/// identical error; the split exists only here and in the log, which are
+/// operator-visible. That asymmetry is deliberate — do not "harmonise" it in
+/// either direction. Because authority is checked BEFORE the target is looked
+/// up, `unknown_target` is reachable ONLY for a host requester: a non-host
+/// asking about a participant who does not exist is `not_permitted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerMuteOutcome {
+    /// The server-mute state changed.
+    Applied,
+    /// Already in the requested state.
+    Unchanged,
+    /// The requester does not hold host authority.
+    ///
+    /// **Client-inflatable, like `unchanged` on the client-mute counter and
+    /// `accepted_unchanged` on the declarations counter**: the check is cheap
+    /// and precedes any actor hop, so a non-host can drive this at line rate.
+    /// Never put it in a ratio denominator, and never alert on its raw rate
+    /// without per-connection normalisation.
+    NotPermitted,
+    /// A host named a participant not in this meeting. Host-only (see type doc).
+    UnknownTarget,
+    /// The connection's server-mute rate limit was exhausted (host requests only).
+    RateLimited,
+    /// The meeting actor could not be reached.
+    ActorUnavailable,
+}
+
+impl ServerMuteOutcome {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 6] = [
+        Self::Applied,
+        Self::Unchanged,
+        Self::NotPermitted,
+        Self::UnknownTarget,
+        Self::RateLimited,
+        Self::ActorUnavailable,
+    ];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Unchanged => "unchanged",
+            Self::NotPermitted => "not_permitted",
+            Self::UnknownTarget => "unknown_target",
+            Self::RateLimited => "rate_limited",
+            Self::ActorUnavailable => "actor_unavailable",
+        }
+    }
+}
+
+/// Disposition of one participant `UnmuteRequest` (`mc_media_unmute_requests_total{outcome}`).
+///
+/// A separate family from [`ServerMuteOutcome`], and not merely because the
+/// decider differs: merged, `action="unmute"` would name a host LIFTING a mute
+/// and a participant ASKING to be lifted in one series — two operations by two
+/// principals behind one selector.
+///
+/// One increment per REQUEST, never per host it is relayed to. A per-host
+/// delivery failure is the later hop, counted by the outbound path — disjoint
+/// from this series, so alert on at most one of them.
+///
+/// Failure predicate, positive: `outcome=~"rate_limited|actor_unavailable"`.
+/// `not_server_muted` and `no_host_connected` are ROUTINE (the latter is
+/// normal once the host has left a meeting that carries on); `not_server_muted`
+/// is client-driven, so keep it out of every ratio denominator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmuteRequestOutcome {
+    /// Relayed to at least one connected host.
+    Relayed,
+    /// The requester is not server-muted in any kind it asked about.
+    NotServerMuted,
+    /// No host is connected to receive it.
+    NoHostConnected,
+    /// The connection's unmute-request rate limit was exhausted.
+    RateLimited,
+    /// The meeting actor could not be reached.
+    ActorUnavailable,
+}
+
+impl UnmuteRequestOutcome {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 5] = [
+        Self::Relayed,
+        Self::NotServerMuted,
+        Self::NoHostConnected,
+        Self::RateLimited,
+        Self::ActorUnavailable,
+    ];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Relayed => "relayed",
+            Self::NotServerMuted => "not_server_muted",
+            Self::NoHostConnected => "no_host_connected",
+            Self::RateLimited => "rate_limited",
+            Self::ActorUnavailable => "actor_unavailable",
+        }
+    }
+}
+
+/// Which client-driven path had a REFUSAL REPLY suppressed by its reply limit
+/// (`mc_media_refusal_replies_suppressed_total{surface}`).
+///
+/// A suppressed reply is NOT a separate refusal: the refusal is still counted,
+/// once, on its own path's counter (`not_permitted`, or a capability rejection
+/// outcome). This series counts the REPLY that was withheld, so the two are
+/// deliberately disjoint views of one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReplySurface {
+    /// A `ServerMuteRequest` refusal.
+    ServerMute,
+    /// A `ReceiveCapability` rejection.
+    Capability,
+}
+
+impl RefusalReplySurface {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 2] = [Self::ServerMute, Self::Capability];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ServerMute => "server_mute",
+            Self::Capability => "capability",
+        }
+    }
+}
+
 /// Disposition of one dirty participant in one slot-view flush turn
 /// (ADR-0036 §5/§6; story 2's server-driven re-emit).
 ///

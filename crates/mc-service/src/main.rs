@@ -48,6 +48,7 @@ use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActor
 use mc_service::auth::McJwtValidator;
 use mc_service::config::Config;
 use mc_service::errors::McError;
+use mc_service::grpc::gc_client::{MeetingEndedQueue, MEETING_ENDED_QUEUE_CAPACITY};
 use mc_service::grpc::{
     GcClient, McAssignmentService, McAuthLayer, McMediaCoordinationService, MhClient,
     MhRegistrationClient,
@@ -145,6 +146,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_codec = ?config.audio_encoding.codec(),
         audio_max_bitrate_bps = config.audio_encoding.max_bitrate_bps(),
         audio_frame_rate_hz = config.audio_encoding.frame_rate_hz(),
+        // DERIVED teardown bounds (story 2 task 12), logged so the runbook names
+        // a field instead of restating arithmetic over four constants in two
+        // files. Named for what each bounds, not for its formula.
+        push_quiesce_bound_seconds =
+            mc_service::media_routing::teardown::PUSH_QUIESCE_BOUND.as_secs(),
+        teardown_fence_hold_max_seconds =
+            mc_service::media_routing::teardown::TEARDOWN_MAX.as_secs(),
+        // The third derived bound, and the only one whose inputs include a value
+        // copied from the pod manifest — so the only one that can go wrong from
+        // OUTSIDE this crate. It decides whether a release happens at all, where
+        // the two above shape one teardown's duration. Logged HERE rather than
+        // only at shutdown because the shutdown line carrying it is the
+        // cut-off branch: a healthy exit would never print it.
+        shutdown_release_budget_seconds =
+            mc_service::media_routing::teardown::SHUTDOWN_RELEASE_BUDGET.as_secs(),
         "Configuration loaded successfully"
     );
 
@@ -310,13 +326,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kek_lifecycle = Arc::new(config.kek_lifecycle());
     kek_lifecycle.publish_config_gauges();
 
-    let controller_handle = Arc::new(MeetingControllerActorHandle::new(
+    // Meeting-ended notifications to GC (ADR-0010 §3). The controller queues
+    // one per meeting that ended AND whose handlers are released; the GC task
+    // below drains them once the GC client exists. See `MeetingEndedQueue`.
+    let (meeting_ended_queue, meeting_ended_rx) =
+        MeetingEndedQueue::with_capacity(MEETING_ENDED_QUEUE_CAPACITY);
+    let controller_handle = Arc::new(MeetingControllerActorHandle::with_meeting_ended_notifier(
         config.mc_id.clone(),
         Arc::clone(&actor_metrics),
         Arc::clone(&controller_metrics),
         master_secret,
         Arc::clone(&policy_generations),
         Arc::clone(&kek_lifecycle),
+        Arc::new(meeting_ended_queue),
     ));
     info!("Actor system initialized");
 
@@ -468,6 +490,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     info!("Connected to Global Controller");
 
+    // The GC client is shared by the heartbeat task and the meeting-ended drain.
+    let gc_client = Arc::new(gc_client);
+    let notify_client = Arc::clone(&gc_client);
+    // NOT a child of the shutdown token, deliberately. A meeting whose teardown
+    // completes inside the shutdown release window calls `meeting_ended` at that
+    // moment, so its notification is produced AFTER the shutdown token fires. A
+    // child token would end this drain at t=0 and guarantee the loss of exactly
+    // those notifications — a stale GC assignment row, i.e. the failure the
+    // revive fix exists to prevent, reached through the release window itself.
+    // Cancelled below, after the releases have settled.
+    let notify_token = tokio_util::sync::CancellationToken::new();
+    let notify_drain_token = notify_token.clone();
+    let notify_drain = tokio::spawn(async move {
+        mc_service::grpc::gc_client::drain_meeting_ended(
+            notify_client,
+            meeting_ended_rx,
+            notify_drain_token,
+        )
+        .await;
+    });
+
     // Spawn unified GC task (registration + dual heartbeats)
     let gc_task_token = shutdown_token.child_token();
     let gc_task_metrics = Arc::clone(&controller_metrics);
@@ -531,11 +574,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown_token.cancel();
 
     // Give tasks time to shut down
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(
+        mc_service::media_routing::teardown::SHUTDOWN_PRE_DRAIN_SECONDS,
+    ))
+    .await;
 
-    // Shutdown actor system (also cancels via its token)
-    if let Err(e) = controller_handle.shutdown(Duration::from_secs(30)).await {
-        warn!(error = %e, "Actor system shutdown error");
+    // Drain the actor system, then let the meetings' MH releases finish — both
+    // under ONE deadline derived from the pod's termination grace, so this can
+    // never hold the pod into SIGKILL. `shutdown` returns only once every
+    // meeting actor has exited, i.e. once every teardown has been handed off
+    // and counted; settling before that could observe zero and exit early.
+    let release_budget = mc_service::media_routing::teardown::SHUTDOWN_RELEASE_BUDGET;
+    let release_deadline = tokio::time::Instant::now() + release_budget;
+    match tokio::time::timeout_at(release_deadline, controller_handle.shutdown(release_budget))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "Actor system shutdown error"),
+        Err(_) => warn!(
+            release_budget_seconds = release_budget.as_secs(),
+            "Actor system drain did not finish inside the shutdown release budget"
+        ),
+    }
+    let teardowns = controller_handle.teardowns();
+    let cut_off = teardowns.settle_until(release_deadline).await;
+    if cut_off == 0 {
+        info!("Meeting teardowns settled before exit");
+    } else {
+        // Logged, not counted: a counter incremented this close to exit is
+        // never scraped. Each cut-off meeting keeps its MH registration until
+        // that handler restarts (docs/TODO.md, "A meeting whose MC never sends
+        // `EndMeeting` is never reclaimed").
+        error!(
+            teardowns_cut_off = cut_off,
+            release_budget_seconds = release_budget.as_secs(),
+            "Meeting teardowns still running at the shutdown deadline were cut off; \
+             their handlers keep those registrations until they restart"
+        );
+    }
+
+    // Only now: every release that will complete has completed, so every
+    // meeting-ended notification that will be produced has been queued. The
+    // drain flushes what is queued within its own reserved slice of the pod
+    // grace; awaiting it here is what makes the flush actually run rather than
+    // being dropped with the runtime, and BOTH sides are bounded (the drain by
+    // its flush deadline, this await by the same budget) so neither can hold
+    // the pod into SIGKILL.
+    notify_token.cancel();
+    if tokio::time::timeout(
+        mc_service::media_routing::teardown::SHUTDOWN_NOTIFY_FLUSH_BUDGET,
+        notify_drain,
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            notify_flush_budget_seconds =
+                mc_service::media_routing::teardown::SHUTDOWN_NOTIFY_FLUSH_BUDGET.as_secs(),
+            "GC meeting-ended flush did not finish inside its budget; any notification still \
+             queued is reported on its own ERROR line"
+        );
     }
 
     // Abort TokenManager background task (ADR-0010)
@@ -548,7 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Unified GC task: registration + dual heartbeat loop.
 ///
-/// This task owns `gc_client` directly (no Arc needed).
+/// Shares `gc_client` with the meeting-ended drain.
 /// It never exits on GC connectivity issues - keeps retrying to protect active meetings.
 ///
 /// Operational model:
@@ -557,7 +655,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// - Re-registration: Detect `NOT_FOUND` from heartbeat, automatically re-register
 /// - Never exit: Protects active meetings during GC outages/restarts
 async fn run_gc_task(
-    gc_client: GcClient,
+    gc_client: Arc<GcClient>,
     metrics: Arc<ControllerMetrics>,
     health_state: Arc<HealthState>,
     cancel_token: CancellationToken,

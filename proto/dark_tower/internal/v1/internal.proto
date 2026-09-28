@@ -798,11 +798,41 @@ message RegisterMeetingResponse {
 // before. Enforcement owner: the MC teardown task (per-meeting cancellation
 // plus a tracker of issued attempts, awaited before the call).
 //
-// RESIDUAL, ACCEPTED IN STORY 2: an attempt whose client-side deadline expired
-// has returned an error to MC but may still be applied by MH afterwards,
-// re-creating the meeting. The window is bounded by the RPC deadline. Once
-// story 4 adds a periodic re-assert the same race becomes routine; the fence
-// that closes both is recorded in docs/TODO.md §Media Path Obligations.
+// THREE RACES, THREE DIFFERENT FATES. This paragraph once stated them as one
+// accepted residual; story 2 task 12 closed the first and ordered the second,
+// so stating them together would now overstate the coverage in one direction
+// and understate the remaining obligation in the other.
+//
+//   (A) An attempt whose client-side deadline expired returned an error to MC,
+//       but its policy is still QUEUED on MH's config mailbox behind this
+//       release. CLOSED: MH refuses to install policy for a meeting that is not
+//       registered at apply time. The registration was removed by this release,
+//       so the queued apply finds nothing to install. Enforced in mh-service
+//       and unit-tested; the refusal is observable via MH's
+//       `mh_media_released_meeting_apply_refusals_total` counter. This check
+//       refuses APPLIES for an UNREGISTERED meeting and has no window: it is
+//       orthogonal to both fence options for (C), since a re-assert
+//       re-registers the meeting and passes it by design.
+//
+//   (B) An attempt still genuinely IN FLIGHT when MC's quiesce bound expires,
+//       whose upsert lands AFTER this release and re-registers the meeting.
+//       (A)'s check cannot catch it and must not try: at apply time the meeting
+//       IS registered, and a re-registered meeting is indistinguishable from a
+//       live one. ORDERED, NOT CLOSED: on the quiesce-timeout path MC waits one
+//       full attempt window before calling this RPC, so an in-flight attempt
+//       has had its deadline expire and its server handler cancelled first.
+//       That ordering rests on the RPC layer cancelling the server handler when
+//       the client drops the request -- a property of the transport library,
+//       not of this contract -- so it FAILS OPEN: if it ever changed, nothing in
+//       this tree would go red, and nothing observes it. Do not read (B) as
+//       closed.
+//
+//   (C) Story 4's periodic re-assert. STILL OPEN, and the fence is still
+//       REQUIRED: a re-assert is a fresh RegisterMeeting whose upsert
+//       re-registers the meeting, so (A)'s check passes it by construction and
+//       (B)'s ordering does not apply -- nothing is racing a deadline, the
+//       re-assert is simply due. Recorded in docs/TODO.md,
+//       "`EndMeeting` has no fence against a late `RegisterMeeting`".
 //
 // SEMANTICS (enforced by `MhMediaService::end_meeting` and the session actor's
 // release in crates/mh-service):
@@ -892,7 +922,19 @@ service MeetingControllerService {
   rpc AssignMeetingWithMh(AssignMeetingWithMhRequest) returns (AssignMeetingWithMhResponse);
 }
 
-// Request to notify GC that a meeting has ended
+// Request to notify GC that a meeting has ended.
+//
+// NOT INCARNATION-SAFE, and MC compensates by how it sends it. GC ends whatever
+// assignment row is ACTIVE for (meeting_id, region), so a notify for one
+// incarnation of a meeting that arrived after the NEXT incarnation was assigned
+// would end the next incarnation's live row. MC therefore sends this only after
+// the meeting's handlers are released, and retries it only where the request
+// provably was not processed (a pre-send connect failure, or a definitive error
+// status), never on an ambiguous failure -- so a processed notify is never
+// delivered twice. What that does NOT cover: GC failover re-pointing a row to
+// another MC while a notify is in flight. The fix is a controller id and an
+// incarnation token on this message (tag 3 is free); docs/TODO.md,
+// "`NotifyMeetingEnded` is not incarnation-safe".
 message NotifyMeetingEndedRequest {
   string meeting_id = 1; // Meeting that ended
   string region = 2; // Region where the meeting was hosted

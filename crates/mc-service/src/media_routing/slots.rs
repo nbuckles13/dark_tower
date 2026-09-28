@@ -654,6 +654,22 @@ impl SlotTable {
     /// that handler, so a handler owning no edges must still be registered or
     /// its connectivity could never be observed.
     ///
+    /// # The server-muted set, per handler
+    ///
+    /// `server_muted` is the meeting's SERVER-muted senders (never self-muted:
+    /// see [`HandlerAssignment::server_muted_sources`]). Each handler's snapshot
+    /// carries the members that are the SOURCE of at least one edge this
+    /// render places on it — edge ownership, never connectivity. A sender
+    /// connected to H need not send to H, and MH enforces mute at ingress with
+    /// no cross-handler forwarding, so a sender whose edges span two handlers
+    /// is in BOTH sets and a muted sender with no edge anywhere is in none.
+    ///
+    /// A required parameter rather than table state, deliberately: the meeting
+    /// actor's roster is the one home for mute, and making every render supply
+    /// the set means a caller cannot render without it. A render that silently
+    /// defaulted to an empty set would tell MH "nobody is muted" — an unmute
+    /// nobody asked for.
+    ///
     /// # Errors
     ///
     /// [`AssignmentError::EgressOrdinalOverflow`] if an ordinal does not fit
@@ -661,6 +677,7 @@ impl SlotTable {
     pub fn render<'a>(
         &self,
         handlers: impl IntoIterator<Item = &'a HandlerId>,
+        server_muted: &BTreeSet<SenderId>,
     ) -> Result<MeetingAssignment, AssignmentError> {
         let mut per_handler: BTreeMap<HandlerId, HandlerAssignment> = handlers
             .into_iter()
@@ -677,6 +694,9 @@ impl SlotTable {
                     egress_stream_id: egress_stream_id(member.sender, ordinal)?,
                     subscriber: member.sender,
                     slot_id: *slot_id,
+                    // Exactly one candidate: the muted-set bound on
+                    // `HandlerAssignment::server_muted_sources` rests on it.
+                    // Adding a candidate here voids that bound; re-derive it.
                     candidate_sources: vec![edge.source],
                     stream_number: MAIN_AUDIO_STREAM_NUMBER,
                     priority_group: AUDIO_PRIORITY_GROUP,
@@ -698,6 +718,15 @@ impl SlotTable {
             assignment
                 .egress_streams
                 .sort_by_key(|s| s.egress_stream_id);
+            // Edge ownership: a muted sender is on THIS handler's set iff it
+            // sources one of THIS handler's egress streams. Built as a set, so
+            // a sender sourcing several of this handler's streams appears once.
+            assignment.server_muted_sources = assignment
+                .egress_streams
+                .iter()
+                .flat_map(|plan| plan.candidate_sources.iter().copied())
+                .filter(|source| server_muted.contains(source))
+                .collect();
         }
         Ok(MeetingAssignment { per_handler })
     }
@@ -1099,6 +1128,85 @@ mod tests {
         );
     }
 
+    /// The render's per-handler server-muted set, by EDGE OWNERSHIP.
+    ///
+    /// A is on both handlers, B only on mh-0, C only on mh-1. B and C each hear
+    /// A; A hears B and C. So A sources an edge on EACH handler, B only on mh-0
+    /// (its only shared handler with A) and C only on mh-1.
+    fn split_meeting() -> (SlotTable, MeetingHandlers) {
+        let set = handler_set();
+        let mut t = SlotTable::new();
+        t.admit_on(sender(1), &set, &["mh-0", "mh-1"]);
+        t.admit_on(sender(2), &set, &["mh-0"]);
+        t.admit_on(sender(3), &set, &["mh-1"]);
+        t.set_demand(sender(1), vec![0, 1]);
+        t.set_demand(sender(2), vec![0]);
+        t.set_demand(sender(3), vec![0]);
+        (t, set)
+    }
+
+    fn muted_on(render: &MeetingAssignment, handler: &str) -> Vec<u16> {
+        render
+            .for_handler(&h(handler))
+            .unwrap()
+            .server_muted_sources
+            .iter()
+            .map(|s| s.get().get())
+            .collect()
+    }
+
+    #[test]
+    fn a_muted_sender_whose_edges_span_both_handlers_is_in_both_sets() {
+        let (t, set) = split_meeting();
+        let render = t.render(set.ids(), &BTreeSet::from([sender(1)])).unwrap();
+        assert_eq!(muted_on(&render, "mh-0"), vec![1]);
+        assert_eq!(muted_on(&render, "mh-1"), vec![1]);
+    }
+
+    #[test]
+    fn a_muted_sender_is_only_on_the_handlers_carrying_its_edges() {
+        let (t, set) = split_meeting();
+        let render = t.render(set.ids(), &BTreeSet::from([sender(2)])).unwrap();
+        assert_eq!(
+            muted_on(&render, "mh-0"),
+            vec![2],
+            "B's one edge is on mh-0"
+        );
+        assert!(
+            muted_on(&render, "mh-1").is_empty(),
+            "B sources nothing on mh-1, and connectivity alone never puts it there"
+        );
+    }
+
+    #[test]
+    fn a_muted_sender_with_no_edge_is_in_no_set_and_nobody_muted_is_empty() {
+        let (mut t, set) = split_meeting();
+        t.admit_on(sender(4), &set, &[]); // admitted, connected to nothing
+        let render = t.render(set.ids(), &BTreeSet::from([sender(4)])).unwrap();
+        assert!(muted_on(&render, "mh-0").is_empty());
+        assert!(muted_on(&render, "mh-1").is_empty());
+
+        let unmuted = t.render(set.ids(), &BTreeSet::new()).unwrap();
+        assert!(muted_on(&unmuted, "mh-0").is_empty());
+        assert!(muted_on(&unmuted, "mh-1").is_empty());
+    }
+
+    /// The bound MH relies on: each handler's set is no larger than its egress
+    /// streams, even with EVERY participant muted.
+    #[test]
+    fn a_handlers_muted_set_never_exceeds_its_egress_streams() {
+        let (t, set) = split_meeting();
+        let everyone = BTreeSet::from([sender(1), sender(2), sender(3)]);
+        let render = t.render(set.ids(), &everyone).unwrap();
+        for handler in ["mh-0", "mh-1"] {
+            let policy = render.for_handler(&h(handler)).unwrap();
+            assert!(
+                policy.server_muted_sources.len() <= policy.egress_streams.len(),
+                "{handler}: |muted| <= |egress_streams|"
+            );
+        }
+    }
+
     #[test]
     fn a_middle_leave_changes_only_the_leavers_slot() {
         let mut t = SlotTable::new();
@@ -1139,7 +1247,9 @@ mod tests {
         assert_eq!(sources(&t, 1), vec![Some(2), Some(3), Some(4)]);
         t.set_demand(sender(1), vec![9, 8, 7]);
         assert_eq!(sources(&t, 1), vec![Some(2), Some(3), Some(4)]);
-        let render = t.render(handler_set().ids()).unwrap();
+        let render = t
+            .render(handler_set().ids(), &std::collections::BTreeSet::new())
+            .unwrap();
         let ids: Vec<u16> = render
             .per_handler
             .values()
@@ -1175,7 +1285,9 @@ mod tests {
         t.set_demand(sender(7), vec![0, 1]);
         connect_all(&mut t, &[7]);
         assert_eq!(sources(&t, 7), vec![None, None]);
-        let render = t.render(handler_set().ids()).unwrap();
+        let render = t
+            .render(handler_set().ids(), &std::collections::BTreeSet::new())
+            .unwrap();
         assert!(render
             .per_handler
             .values()
@@ -1196,7 +1308,7 @@ mod tests {
         }
         connect_all(&mut t, &[1, 2]);
         let find = |t: &SlotTable| {
-            t.render(handler_set().ids())
+            t.render(handler_set().ids(), &std::collections::BTreeSet::new())
                 .unwrap()
                 .per_handler
                 .iter()
@@ -1343,7 +1455,9 @@ mod tests {
         }
         assert_properties(t); // invariants 6 and 7
 
-        let render = t.render(handler_set().ids()).unwrap();
+        let render = t
+            .render(handler_set().ids(), &std::collections::BTreeSet::new())
+            .unwrap();
         assert_eq!(render.per_handler.len(), 2, "one entry per handler, always");
         let mut ids = HashSet::new();
         let mut streams = 0usize;
@@ -1358,7 +1472,12 @@ mod tests {
             for plan in &policy.egress_streams {
                 streams += 1;
                 assert!(ids.insert(plan.egress_stream_id), "unique egress_stream_id");
-                assert_eq!(plan.candidate_sources.len(), 1);
+                assert_eq!(
+                    plan.candidate_sources.len(),
+                    1,
+                    "one candidate per stream is the premise of the muted-set bound \
+                     (`HandlerAssignment::server_muted_sources`: |set| <= |egress_streams|)"
+                );
                 let sub = t.member(plan.subscriber).unwrap();
                 let ordinal =
                     crate::media_routing::assignment::egress_ordinal(plan.egress_stream_id);

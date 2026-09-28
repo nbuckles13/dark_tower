@@ -392,6 +392,14 @@ fail-closed, which is correct, but it also makes it **total** rather than partia
   for the skew window, not a degradation.
 - **Backward: MH FIRST, then MC.** The reverse order, for the same reason.
 
+This pair sits inside a three-service order since story 2 task 12: **forward
+GC → MC → MH; rollback MH → MC → GC** (`mc-deployment.md` §Coordination). GC
+goes before MC because an MC that ends meetings needs GC's revive of an ended
+assignment. Where any other ordering note appears to conflict with this
+section — including the `EndMeeting` rollout-order note below, written for the
+release that introduced the RPC — **this section wins**: its skew is a total
+blackout, theirs a counted degradation.
+
 > **DO NOT roll MC back alone after this contract has landed.** `kubectl rollout
 > undo deployment/mc-0` returns MC to a binary that never sets `sender_id`, so a
 > still-new MH declines **everything**. Rolling MC back is a **total media

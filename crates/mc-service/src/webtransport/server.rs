@@ -102,6 +102,10 @@ impl WebTransportServer {
         // declaration against — so the published cap and the enforced cap are
         // one value, not a config read and a parallel constant.
         metrics::set_receive_slot_cap(client_media_config.max_receive_slots);
+        // Present at zero from process start (O-13): absent must mean "not up
+        // or not scraped", never "nobody is muted". The controller's health walk
+        // then keeps it recomputed from live state.
+        metrics::set_server_muted_sources(0);
         // Same discipline: the published settle window is the enforced one.
         metrics::set_connect_settle_window(client_media_config.connect_settle_window);
 

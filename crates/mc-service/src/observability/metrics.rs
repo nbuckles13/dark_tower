@@ -15,11 +15,13 @@
 //! Maximum 1,000 unique label combinations per metric.
 
 use crate::media_admission::SenderBindingOutcome;
+use crate::media_routing::teardown::{EndMeetingOutcome, QuiesceOutcome};
 use crate::media_routing::{
     divergence_magnitude, FloorAdoption, PolicyPushOutcome, SettleOutcome, Unapplied,
 };
 use crate::media_signaling::{
-    slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome, SlotViewEmission,
+    slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome, RefusalReplySurface,
+    ServerMuteAction, ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -992,7 +994,7 @@ pub fn set_receive_slot_cap(cap: usize) {
 ///
 /// **It is NOT a meeting-wide contention signal.** It was documented as one
 /// while `handle_self_mute` still drove an O(N) awaited `broadcast_update`;
-/// security's S-2 removed that fan-out (`MuteChanged` had no consumer), so what
+/// security's S-2 removed that fan-out on the judgment that no consumer needed it, so what
 /// remains on the SHARED meeting actor is one `GetState` roster snapshot per
 /// composition — a queue slot, not head-of-line blocking. Do not route a
 /// meeting-wide latency investigation here.
@@ -1003,6 +1005,183 @@ pub fn record_mute_request(outcome: MuteOutcome) {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
+}
+
+// ============================================================================
+// Server mute and meeting teardown (story 2 task 12; R-8..R-11, R-20)
+// ============================================================================
+
+/// Record the disposition of one `ServerMuteRequest`.
+///
+/// Metric: `mc_media_server_mute_requests_total`
+/// Labels: `action` (`ServerMuteAction::ALL`), `outcome` (`ServerMuteOutcome::ALL`), `key_custody`
+/// Cardinality: 12 (2 x 6), zero-initialised as the FULL cross product
+///
+/// Counted SEPARATELY from `mc_media_mute_requests_total` — see
+/// `ServerMuteOutcome`'s type doc for the decider/enforcement/remedy split, the
+/// partition, the positive failure predicate, and why `not_permitted` never
+/// belongs in a denominator. No meeting, participant or sender identity: those
+/// are in the `mc.webtransport.connection` decision log, where identity is
+/// legitimate.
+pub fn record_server_mute_request(action: ServerMuteAction, outcome: ServerMuteOutcome) {
+    counter!(
+        "mc_media_server_mute_requests_total",
+        "action" => action.label(),
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record the disposition of one participant `UnmuteRequest`.
+///
+/// Metric: `mc_media_unmute_requests_total`
+/// Labels: `outcome` (`UnmuteRequestOutcome::ALL`), `key_custody`
+/// Cardinality: 5
+///
+/// One increment per REQUEST, never per host relayed to.
+pub fn record_unmute_request(outcome: UnmuteRequestOutcome) {
+    counter!(
+        "mc_media_unmute_requests_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record a refusal REPLY withheld by its path's reply limiter.
+///
+/// Metric: `mc_media_refusal_replies_suppressed_total`
+/// Labels: `surface` (`RefusalReplySurface::ALL`), `key_custody`
+/// Cardinality: 2
+///
+/// EVERY SUPPRESSED REPLY IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER
+/// CONNECTION. A single WARN does not mean a single suppression — the one-shot
+/// WARN is only safe BECAUSE this counter exists. Not a refusal count: the
+/// refusal itself is counted once on its own path, so these are disjoint views
+/// of one request. Expected-empty (a legitimate client never reaches the
+/// burst); client-inflatable, so no alert.
+pub fn record_refusal_reply_suppressed(surface: RefusalReplySurface) {
+    counter!(
+        "mc_media_refusal_replies_suppressed_total",
+        "surface" => surface.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Publish how many participants MC believes are SERVER-muted right now,
+/// summed across this pod's meetings.
+///
+/// Metric: `mc_media_server_muted_sources`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// A STATE level, not an event rate: a mute applied yesterday is still here.
+/// Recomputed and `set` from live state (the meeting-actor census), never
+/// delta-maintained, so it cannot drift after an actor dies without running its
+/// exit path. Present at zero from process start. Pod-level and identity-free
+/// by design (ADR-0036 §11): it answers "is any mute in force on this MC pod",
+/// NOT "in this meeting".
+pub fn set_server_muted_sources(total: u64) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a participant count; exact in f64 far beyond any roster cap"
+    )]
+    let value = total as f64;
+    gauge!(
+        "mc_media_server_muted_sources",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(value);
+}
+
+/// Record the outcome of releasing one meeting on one handler.
+///
+/// Metric: `mc_media_end_meeting_total`
+/// Labels: `outcome` (`EndMeetingOutcome::ALL`), `key_custody`
+/// Cardinality: 7
+///
+/// ONE INCREMENT PER (MEETING, HANDLER), never per meeting: a handler missed
+/// from the release would otherwise be invisible. No handler label — the
+/// handler id is a per-incarnation token and belongs in the `mc.teardown` log
+/// line, as for the policy-push pair.
+pub fn record_end_meeting(outcome: EndMeetingOutcome) {
+    counter!(
+        "mc_media_end_meeting_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record how one meeting teardown's push drain ended.
+///
+/// Metric: `mc_media_push_quiesce_total`
+/// Labels: `outcome` (`QuiesceOutcome::ALL`), `key_custody`
+/// Cardinality: 2
+///
+/// ONE INCREMENT PER MEETING TEARDOWN (contrast `mc_media_end_meeting_total`,
+/// per (meeting, handler)). Both values are server-driven, so unlike most of
+/// this family `timed_out / (quiesced + timed_out)` IS a clean ratio.
+pub fn record_push_quiesce(outcome: QuiesceOutcome) {
+    counter!(
+        "mc_media_push_quiesce_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record a teardown fence lifted by its DEADLINE rather than by the teardown
+/// reporting completion.
+///
+/// Metric: `mc_media_teardown_fence_backstop_total`
+/// Labels: `key_custody` (1)
+/// Cardinality: 1
+///
+/// Expected-empty. Completion is reported from a `Drop` guard on every exit
+/// of the teardown task, so this fires only if that task hung or vanished
+/// without unwinding. NOT mutually exclusive with
+/// `mc_media_push_quiesce_total{outcome="timed_out"}`: a wedged teardown can
+/// record both, and a backstop WITHOUT a matching timeout is a different fault
+/// (the task hung somewhere other than the drain).
+pub fn record_teardown_fence_backstop() {
+    counter!(
+        "mc_media_teardown_fence_backstop_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record the result of one `NotifyMeetingEnded` call to GC.
+///
+/// Metric: `mc_gc_notify_meeting_ended_total`
+/// Labels: `status` (success, error)
+/// Cardinality: 2
+///
+/// A GC-coordination metric, like its `mc_gc_heartbeats_total` sibling — not a
+/// media-path one — so it carries no `key_custody`. Coarse `status`, because a
+/// fire-and-forget notification's remedies do not differ by failure mode. A
+/// sustained `error` leaves GC holding a live assignment for an ended meeting,
+/// and joins to that id then get `MeetingNotFound` until MC restarts.
+pub fn record_gc_notify_meeting_ended(status: &'static str) {
+    counter!("mc_gc_notify_meeting_ended_total", "status" => status).increment(1);
+}
+
+/// Record a meeting-ended notification DROPPED before it was attempted,
+/// because the notify queue was full.
+///
+/// Metric: `mc_gc_meeting_ended_notifications_dropped_total`
+/// Labels: none
+/// Cardinality: 1
+///
+/// Its OWN series, not a `status` value on the RPC counter: a pre-attempt loss
+/// ("MC is losing events") and an RPC failure ("GC is down") are opposite
+/// investigations. Expected-empty; any non-zero is a stale GC assignment with
+/// no other detector.
+pub fn record_gc_meeting_ended_notification_dropped() {
+    counter!("mc_gc_meeting_ended_notifications_dropped_total").increment(1);
 }
 
 // ============================================================================
@@ -1681,6 +1860,7 @@ const JOIN_FAILURE_ERROR_TYPES: &[&str] = &[
     "identity_key_invalid",
     "session_binding",
     "conflict",
+    "teardown_in_progress",
     "draining",
 ];
 /// `mc_jwt_validations_total{result, token_type, failure_reason}` — token types.
@@ -1789,6 +1969,33 @@ pub fn zero_initialize_counters() {
     for o in MuteOutcome::ALL {
         counter!("mc_media_mute_requests_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    // The FULL action x outcome cross product, unreachable cells included (a
+    // non-host never reaches `unknown_target`, and that cell staying at zero is
+    // what the R-8 ordering test reads — absent would prove nothing).
+    for a in ServerMuteAction::ALL {
+        for o in ServerMuteOutcome::ALL {
+            counter!("mc_media_server_mute_requests_total", "action" => a.label(), "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
+    }
+    for o in UnmuteRequestOutcome::ALL {
+        counter!("mc_media_unmute_requests_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for s in RefusalReplySurface::ALL {
+        counter!("mc_media_refusal_replies_suppressed_total", "surface" => s.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in EndMeetingOutcome::ALL {
+        counter!("mc_media_end_meeting_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in QuiesceOutcome::ALL {
+        counter!("mc_media_push_quiesce_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    counter!("mc_media_teardown_fence_backstop_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
+        .increment(0);
+    // GC-coordination, no key_custody (see `record_gc_notify_meeting_ended`).
+    for status in STATUS_SUCCESS_ERROR {
+        counter!("mc_gc_notify_meeting_ended_total", "status" => *status).increment(0);
+    }
+    counter!("mc_gc_meeting_ended_notifications_dropped_total").increment(0);
     for o in FloorAdoption::ALL {
         counter!("mc_media_policy_generation_adoptions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
@@ -2026,9 +2233,17 @@ mod tests {
     ///  * labels are read from `error_type_label()` (the single source), so a
     ///    renamed label flows through and a stale const is caught.
     ///
-    /// (The `all` array is the one hand-maintained surface; a variant added to the
-    /// enum but forgotten here is caught by `join_reachable`'s exhaustiveness the
-    /// moment this fn is compiled.)
+    /// RESIDUAL — the `all` array is hand-maintained, and exhaustiveness does
+    /// NOT cover it: the compiler forces a new variant to be CLASSIFIED in
+    /// `join_reachable`, not LISTED in `all`, and a variant absent from `all`
+    /// enters neither side of the assertion, so it passes silently. (That is how
+    /// `MeetingTeardownInProgress` went un-zero-initialised.) The mitigation is
+    /// `MCERROR_VARIANT_COUNT`, pinned beside the match: the author discharging
+    /// the compile error sees it, and `all.len()` must equal it. It narrows the
+    /// gap to "bumped the count without listing the variant", which the length
+    /// assertion catches; a variant listed twice is caught by the
+    /// distinct-discriminant check. What remains is an author who adds the
+    /// match arm and neither bumps nor lists — the count then reds.
     #[test]
     fn join_failure_error_types_tracks_mcerror_enum() {
         use crate::errors::{McError, SessionBindingError};
@@ -2051,6 +2266,7 @@ mod tests {
             },
             McError::FencedOut(String::new()),
             McError::Conflict(String::new()),
+            McError::MeetingTeardownInProgress,
             McError::JwtValidation(String::new()),
             McError::PermissionDenied(String::new()),
             McError::MhAssignmentMissing(String::new()),
@@ -2066,6 +2282,21 @@ mod tests {
 
         // WILDCARD-FREE: adding an `McError` variant breaks compilation here until
         // it is classified. Do NOT add a `_ =>` arm — that reopens the drift gap.
+        // When you classify a new variant here, ALSO list it in `all` above and
+        // bump this count; `all` is otherwise invisible to the assertion below.
+        const MCERROR_VARIANT_COUNT: usize = 23;
+        assert_eq!(
+            all.len(),
+            MCERROR_VARIANT_COUNT,
+            "every McError variant must be listed in `all` (one instance each)"
+        );
+        let distinct: std::collections::HashSet<_> =
+            all.iter().map(std::mem::discriminant).collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "a variant is listed twice in `all`"
+        );
         fn join_reachable(e: &McError) -> bool {
             match e {
                 McError::JwtValidation(_)
@@ -2076,6 +2307,7 @@ mod tests {
                 | McError::IdentityKeyInvalid
                 | McError::SessionBinding(_)
                 | McError::Conflict(_)
+                | McError::MeetingTeardownInProgress
                 | McError::Draining => true,
                 McError::Redis(_)
                 | McError::Grpc(_)
@@ -2508,6 +2740,127 @@ mod tests {
                 .with_labels(&[("status", "success"), ("rejection_reason", "none")])
                 .assert_delta(0);
         }
+    }
+
+    /// `mc_media_server_mute_requests_total`: every (action, outcome) cell
+    /// records under its own labels and no other.
+    #[test]
+    fn record_server_mute_request_covers_every_action_and_outcome() {
+        for action in ServerMuteAction::ALL {
+            for outcome in ServerMuteOutcome::ALL {
+                let snap = MetricAssertion::snapshot();
+                record_server_mute_request(action, outcome);
+                snap.counter("mc_media_server_mute_requests_total")
+                    .with_labels(&[
+                        ("action", action.label()),
+                        ("outcome", outcome.label()),
+                        (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                    ])
+                    .assert_delta(1);
+            }
+        }
+    }
+
+    /// `mc_media_unmute_requests_total`.
+    #[test]
+    fn record_unmute_request_covers_every_outcome() {
+        for outcome in UnmuteRequestOutcome::ALL {
+            let snap = MetricAssertion::snapshot();
+            record_unmute_request(outcome);
+            snap.counter("mc_media_unmute_requests_total")
+                .with_labels(&[
+                    ("outcome", outcome.label()),
+                    (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                ])
+                .assert_delta(1);
+        }
+    }
+
+    /// `mc_media_refusal_replies_suppressed_total`.
+    #[test]
+    fn record_refusal_reply_suppressed_covers_every_surface() {
+        for surface in RefusalReplySurface::ALL {
+            let snap = MetricAssertion::snapshot();
+            record_refusal_reply_suppressed(surface);
+            snap.counter("mc_media_refusal_replies_suppressed_total")
+                .with_labels(&[
+                    ("surface", surface.label()),
+                    (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                ])
+                .assert_delta(1);
+        }
+    }
+
+    /// `mc_media_server_muted_sources` is SET (a level), not incremented.
+    #[test]
+    fn set_server_muted_sources_publishes_the_level() {
+        let snap = MetricAssertion::snapshot();
+        set_server_muted_sources(3);
+        snap.gauge("mc_media_server_muted_sources")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_value(3.0);
+    }
+
+    /// `mc_media_end_meeting_total`.
+    #[test]
+    fn record_end_meeting_covers_every_outcome() {
+        for outcome in EndMeetingOutcome::ALL {
+            let snap = MetricAssertion::snapshot();
+            record_end_meeting(outcome);
+            snap.counter("mc_media_end_meeting_total")
+                .with_labels(&[
+                    ("outcome", outcome.label()),
+                    (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                ])
+                .assert_delta(1);
+        }
+    }
+
+    /// `mc_media_push_quiesce_total`.
+    #[test]
+    fn record_push_quiesce_covers_every_outcome() {
+        for outcome in QuiesceOutcome::ALL {
+            let snap = MetricAssertion::snapshot();
+            record_push_quiesce(outcome);
+            snap.counter("mc_media_push_quiesce_total")
+                .with_labels(&[
+                    ("outcome", outcome.label()),
+                    (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                ])
+                .assert_delta(1);
+        }
+    }
+
+    /// `mc_media_teardown_fence_backstop_total`.
+    #[test]
+    fn record_teardown_fence_backstop_increments() {
+        let snap = MetricAssertion::snapshot();
+        record_teardown_fence_backstop();
+        snap.counter("mc_media_teardown_fence_backstop_total")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_delta(1);
+    }
+
+    /// `mc_gc_notify_meeting_ended_total` — both statuses, no `key_custody`
+    /// (a GC-coordination metric, like its heartbeat sibling).
+    #[test]
+    fn record_gc_notify_meeting_ended_covers_both_statuses() {
+        for status in STATUS_SUCCESS_ERROR.iter().copied() {
+            let snap = MetricAssertion::snapshot();
+            record_gc_notify_meeting_ended(status);
+            snap.counter("mc_gc_notify_meeting_ended_total")
+                .with_labels(&[("status", status)])
+                .assert_delta(1);
+        }
+    }
+
+    /// `mc_gc_meeting_ended_notifications_dropped_total`.
+    #[test]
+    fn record_gc_meeting_ended_notification_dropped_increments() {
+        let snap = MetricAssertion::snapshot();
+        record_gc_meeting_ended_notification_dropped();
+        snap.counter("mc_gc_meeting_ended_notifications_dropped_total")
+            .assert_delta(1);
     }
 
     #[test]

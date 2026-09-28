@@ -192,6 +192,27 @@ pub async fn reach(phase: &str, who: &str, url: &str, token: &str) -> mc_session
         })
 }
 
+/// Open one media session per participant per url (`result[i][url]`), each
+/// failing as an ENVIRONMENT fact via [`reach`].
+///
+/// Hoisted from `tests/26_mh_quic.rs` at story 2 task 12, when
+/// `tests/35_mc_server_mute_teardown.rs` became its second consumer.
+pub async fn open_sessions(
+    phase: &str,
+    ps: &[Participant],
+    urls: &[&String],
+) -> Vec<std::collections::HashMap<String, mc_session::MhSession>> {
+    let mut all = Vec::new();
+    for p in ps {
+        let mut mine = std::collections::HashMap::new();
+        for url in urls {
+            mine.insert((*url).clone(), reach(phase, p.label, url, &p.token).await);
+        }
+        all.push(mine);
+    }
+    all
+}
+
 /// MC's enforced connect settle window, read from the gauge it publishes.
 pub async fn settle_window(cluster: &ClusterConnection) -> Duration {
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);

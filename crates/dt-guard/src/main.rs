@@ -341,7 +341,8 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
-    /// Kustomize infrastructure validation (R-15..R-20).
+    /// Kustomize infrastructure validation (R-15..R-20), plus generated-ConfigMap
+    /// annotation size and Grafana dashboard sidecar-label checks.
     Kustomize {
         /// Repository root for path resolution.
         #[arg(long)]

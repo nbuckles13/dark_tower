@@ -4,7 +4,8 @@ use crate::actors::messages::{LeaveReason, ParticipantStateUpdate};
 use crate::webtransport::trace::inject_current_context;
 
 use proto_gen::dark_tower::signaling::v1::{
-    self, server_message, Participant, ParticipantJoined, ParticipantLeft, ServerMessage,
+    self, server_message, Participant, ParticipantJoined, ParticipantLeft, ParticipantMuteUpdate,
+    ServerMessage,
 };
 use tracing::debug;
 
@@ -36,10 +37,26 @@ pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_JOINED: &str = "participant_update_joi
 /// since this counter is fleet-wide.
 pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT: &str = "participant_update_left";
 
+/// `payload_kind` for a dropped `ParticipantMuteUpdate` (story 2 task 12).
+///
+/// A separate value by DEMONSTRATED CONSUMER NEED, not message-type taxonomy
+/// (the same rule that keeps `signaling_raw` one value): a dropped mute update
+/// has no re-sync path. Join/leave state is rebuilt from the roster, but
+/// who-muted-whom is delivered ONLY by the live broadcast and the late-joiner
+/// replay, so a drop leaves that client rendering a wrong indicator until the
+/// next mute change on that participant — which may never come. Past
+/// participle, matching `_joined` / `_left`, so `participant_update.*` still
+/// recovers the merged series.
+pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED: &str = "participant_update_muted";
+
 /// Encode a `ParticipantStateUpdate` for the wire.
 ///
-/// Only `ParticipantJoined` and `ParticipantLeft` are serialized to the wire.
-/// Other variants are logged but return `None`.
+/// `ParticipantJoined`, `ParticipantLeft` and `ParticipantMuteUpdate` are
+/// serialized. Other variants are logged but return `None`.
+///
+/// THE ONE SERIALIZER for `MuteChanged`: the live server-mute broadcast and the
+/// late-joiner replay both reach the wire through this function, so a mute
+/// applied before you join and one applied after cannot be encoded two ways.
 pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<EncodedUpdate> {
     match update {
         ParticipantStateUpdate::Joined(info) => {
@@ -111,13 +128,36 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Enco
                 },
             })
         }
-        ParticipantStateUpdate::MuteChanged { participant_id, .. } => {
-            debug!(
-                target: "mc.webtransport.handler",
-                participant_id = %participant_id,
-                "MuteChanged not serialized (out of scope)"
-            );
-            None
+        ParticipantStateUpdate::MuteChanged {
+            participant_id,
+            audio_self_muted,
+            video_self_muted,
+            audio_server_muted,
+            video_server_muted,
+            server_muted_by,
+        } => {
+            // `server_muted_by` is MC's OWN value — the requester's participant
+            // id from the authenticated connection, never parsed off the wire —
+            // so there is no emit-side truncation here. The proto's "truncate
+            // before logging" obligation is the RECEIVER's.
+            let (trace_parent, trace_state) = inject_current_context();
+            Some(EncodedUpdate {
+                payload_kind: PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED,
+                server_message: ServerMessage {
+                    message: Some(server_message::Message::ParticipantMuteUpdate(
+                        ParticipantMuteUpdate {
+                            participant_id: participant_id.clone(),
+                            audio_self_muted: *audio_self_muted,
+                            video_self_muted: *video_self_muted,
+                            audio_server_muted: *audio_server_muted,
+                            video_server_muted: *video_server_muted,
+                            server_muted_by: server_muted_by.clone(),
+                        },
+                    )),
+                    trace_parent,
+                    trace_state,
+                },
+            })
         }
         ParticipantStateUpdate::Disconnected { participant_id } => {
             debug!(
@@ -269,15 +309,46 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_mute_changed_returns_none() {
+    fn test_encode_mute_changed_is_a_participant_mute_update() {
         let update = ParticipantStateUpdate::MuteChanged {
             participant_id: "part-1".to_string(),
             audio_self_muted: true,
             video_self_muted: false,
-            audio_server_muted: false,
+            audio_server_muted: true,
             video_server_muted: false,
+            server_muted_by: "host-1".to_string(),
         };
-        assert!(encode_participant_update(&update).is_none());
+        let encoded = encode_participant_update(&update).expect("MuteChanged is wire-visible");
+        assert_eq!(encoded.payload_kind, PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED);
+        let Some(server_message::Message::ParticipantMuteUpdate(m)) =
+            encoded.server_message.message
+        else {
+            panic!("expected a ParticipantMuteUpdate");
+        };
+        assert_eq!(
+            m,
+            ParticipantMuteUpdate {
+                participant_id: "part-1".to_string(),
+                audio_self_muted: true,
+                video_self_muted: false,
+                audio_server_muted: true,
+                video_server_muted: false,
+                server_muted_by: "host-1".to_string(),
+            },
+            "every field reaches the wire, who-muted-whom included"
+        );
+    }
+
+    #[test]
+    fn payload_kinds_are_distinct_and_share_the_update_prefix() {
+        let kinds = [
+            PAYLOAD_KIND_PARTICIPANT_UPDATE_JOINED,
+            PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT,
+            PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED,
+        ];
+        let unique: std::collections::HashSet<_> = kinds.iter().collect();
+        assert_eq!(unique.len(), kinds.len());
+        assert!(kinds.iter().all(|k| k.starts_with("participant_update_")));
     }
 
     #[test]

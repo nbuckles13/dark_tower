@@ -1,0 +1,3380 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "MC Overview",
+      "tooltip": "Joins, security events, GC/Redis, and MH Coordination incl. meeting teardown (EndMeeting outcomes, push quiesce, fence backstop).",
+      "type": "link",
+      "url": "/d/mc-overview"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 55,
+      "panels": [],
+      "title": "Media Routing (ADR-0036 \u00a78)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Forwarding-policy pushes to an MH, by what the handler's reply proved (ADR-0036 \u00a78). THIS IS THE DETECTION SIGNAL for a meeting whose policy MC could not confirm as live; the divergence stat beside it is only the magnitude a responder reads next. Counts response evaluations, NOT meetings: a retried push contributes one sample per attempt. handler_id_mismatch is a DIAGNOSTIC, not an alerting signal, until MH_HANDLER_ID is stable per deployment - the id is a per-incarnation token, so an ordinary MH pod restart produces that outcome by construction. Alert expressions must read outcome!~\"match|handler_id_mismatch\"; the alert rule, the metrics catalog and mc-deployment.md's post-deploy checklist hold one expression with one revert trigger (2026-09-02-mh-stable-handler-id). No meeting identifier, sender id or generation number appears as a label. COLOUR: red is the three Err outcomes only; handler_id_mismatch is YELLOW because it is expected by construction on any MH restart and is excluded from the alert expression - visible, expected, not your incident. The red regexp is anchored so a sixth outcome whose name contains \"mismatch\" cannot silently join the red set.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "match"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(generation_mismatch|transport_mode_mismatch|no_applied_generation)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "handler_id_mismatch"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "id": 56,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_policy_pushes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media Policy Pushes by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Last-observed MAGNITUDE |sent - applied| by which a handler's live forwarding policy differed from the one MC pushed - an unsigned magnitude, never a signed difference, computed from the APPLIED value in the response. Any non-zero value means the live policy is not the one MC pushed, in either direction. AN ABSENT SERIES RENDERS AS ZERO here (noValue: 0), so this panel cannot distinguish \"never pushed\" from \"recorder regressed\" - read liveness from the Media Policy Pushes panel beside it, which is also the detection signal; this one is only the magnitude. Last-write-wins per pod: a healthy push overwrites a diverged reading, and MC inherits the global scrape_interval config key, which is coarse relative to a one-shot-per-registration write, so a divergence can be overwritten before it is ever scraped. WRITTEN ONLY ON A REGISTRATION PUSH: with the ADR-0036 section 8 re-assert cadence deferred, this does NOT observe a handler restart - a handler can lose all forwarding policy while this holds its last healthy value. COLOUR: orange at >= 1, not red - any non-zero means the live policy is not the one MC pushed, but this gauge is not page-worthy on its own (the counter is the detection signal). Green covers only 0, which with noValue: 0 also covers never-pushed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "id": 57,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_generation_divergence)",
+          "legendFormat": "divergence magnitude",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media Generation Divergence (magnitude)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Whether MC could resolve a participant's sender_id for the Media Handler that asked, and if not why (ADR-0036 \u00a72, \u00a74; R-15). Increments once per NotifyParticipantConnected RESPONSE MC emits. READ THIS BEFORE COMPARING WITH MH: MH sees only sender_id==0 and structurally cannot tell the three unresolved outcomes apart - its declined_no_sender_binding is the UNION of all three. This panel is the only place the split exists, and the outcomes triage differently: meeting_unknown is a routing/registration fault whose remedy is in the MC-MH registration path; participant_unknown is an expected low-rate race between MH's connect notification and MC's join completing; registry_full is RETIRED (story 2 task 20: the connection registry and its cap are gone; MC never declines a binding for capacity) - a non-zero value can only come from an MC image predating the retirement during a rolling deploy, version skew, NOT a capacity signal; user_ambiguous is one user with two roster entries for one sub, which NEVER self-clears and which RECONNECTING CAUSES - so the participant_unknown remedy (reconnect) is actively HARMFUL here and there is no operator remedy (full triage in mh-incident-response.md Scenario 15 Step 2). connection_id does NOT resolve it: it tells MH connections apart, not MC joins (docs/TODO.md, 'user_ambiguous has no operator remedy'). THE sender_id VALUE IS NEVER A LABEL (ADR-0036 \u00a711): outcome carries the triage signal as a bounded token instead of 65535 values. No meeting id, participant id or sender id appears as a label. DENOMINATOR NOTE: sum() over this metric equals mc_mh_notifications_received_total{event_type=\"connected\"} by construction - same path, same gate - so do not alert on both as if they were independent.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 63,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(mc_media_sender_binding_responses_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sender Binding Responses by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MC-restart generation floors (mc_media_policy_generation_adoptions_total): a restarted MC's FIRST push to a live handler was answered with a higher applied generation (the pre-restart MC's number), and MC adopted it as a floor and re-pushed above it. SPLIT BY outcome: adopted is the recovery event, EXPECTED during an MC rollout at most one per live (meeting, handler); superseded is routine coalescing (a restart-floor reply discarded for a newer render, no adoption, no per-pair bound). A rising adopted count a rise with NO MC restart is not - investigate as a second MC programming the same meeting (MC runbook Scenario 15). Recorded HERE INSTEAD of Media Policy Pushes{outcome=generation_mismatch}, so this arm is deliberately invisible under every outcome label and MCMediaGenerationDivergence does not page on rollouts; a FAILED adoption, or any higher echo after a confirm, is still recorded as generation_mismatch and pages. Total evaluated replies = pushes + adoptions. Zero is healthy; an ABSENT series is NOT a zero - it means the metrics pipeline is broken.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 162,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(mc_media_policy_generation_adoptions_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Policy Generation Floor Adoptions",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "id": 157,
+      "panels": [],
+      "title": "Client Media Signalling (ADR-0036 \u00a75, \u00a76)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Client receive-capability declarations by disposition (ADR-0036 \u00a76). This metric PARTITIONS declarations: every one lands in exactly one bucket. THE SUCCESS SET IS {accepted, accepted_unchanged}, so the complete rejection count is outcome!~\"accepted|accepted_unchanged\". DO NOT USE outcome!=\"accepted\": that counts a success as a rejection, and the success it counts is the one value a client can inflate for free. USE accepted ALONE AS ANY RATIO DENOMINATOR - accepted_unchanged is an identical re-declaration that MC does no work for, so it is client-inflatable at near-zero server cost and a ratio computed over it is an evadable alert. Rejection is always WHOLE-DECLARATION - MC never accepts a prefix, never applies last-write-wins to a duplicate, never clamps an out-of-range id. COLOUR, and read it carefully: GREEN is accepted; DARK GREEN is accepted_unchanged (also a success, but NOT the denominator); RED is the five CLIENT DEFECTS (duplicate_slot_id, slot_count_over_cap, slot_id_out_of_range, pinned_sender_id_zero, pinned_sender_id_out_of_range). YELLOW is media_kind_unspecified, whose likeliest producer is a VERSION-SKEWED client whose AUDIO=0 decodes as unspecified - correlate with a client rollout, not with a forgotten field. ORANGE is declaration_budget_exhausted - a client re-declaring past MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS on one connection; any occurrence is a client bug or an attack (since story 2 an accepted distinct declaration is a meeting-wide structural change, which is why the budget exists). slot_count_over_cap is R-1's loud over-cap rejection: read it beside the Receive Slot Cap stat - a cap below the clients' configured N is a configuration mismatch, not a client bug. (slot_id_not_planned is retired in story 2: declared slots are now the assignment's input.) No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "accepted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "accepted_unchanged"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "semi-dark-green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(duplicate_slot_id|slot_count_over_cap|slot_id_out_of_range|pinned_sender_id_zero|pinned_sender_id_out_of_range)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "media_kind_unspecified"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "declaration_budget_exhausted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "id": 58,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_receive_capability_declarations_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Capability Declarations by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Send-directive compositions by disposition (ADR-0036 \u00a75), recorded by the MEETING ACTOR on every composition - including those triggered by a peer's join, leave, declaration or mute - and only when the directive CHANGED. EMITTED MEANS COMPOSED, NOT DELIVERED: two hops follow it, each on its own series - participant mailbox CLOSED is Slot View Emissions outcome=delivery_failed, stream channel FULL is Dropped Outbound Messages payload_kind=signaling_raw. THE SUCCESS SET IS {emitted, emitted_empty_targets}, NOT {emitted}. \u00a75 makes an empty target set a SPECIFIED success (\"that means send nothing\"), and it is ROUTINE: a solo participant, anyone nobody holds in a slot, and anyone not yet connected to a handler (or inside the connect settle window) is directed to send nothing, then re-sent a non-empty directive the moment someone holds it. 'Holds' means SHARES A CONNECTED HANDLER WITH (story 2 task 20) - not 'placed on the same handler', task 6's retired meaning. Under round-robin this was routine in every split two-person meeting; under the edge model an all-connected meeting co-locates, so the expected magnitude dropped. A directive may now carry several targets (every handler owning one of the sender's edges; Mean Send Targets per Directive). Both are GREEN and any failure predicate must read outcome!~\"emitted|emitted_empty_targets\" - PERMANENT, grounded in \u00a75, unlike the temporary carve-out on Media Policy Pushes. RED is the three MC DEFECTS (any non-zero value is a bug): unknown_stream_number, transport_mode_unspecified and handler_url_unresolved (every url comes from one frozen handler set, and an edge's owning handler is only ever a member of it; fails CLOSED - nothing is sent). ORANGE is the two ENVIRONMENTAL values: meeting_state_unavailable and assignment_failed. The failure values are disjoint by construction: composition is sequential stages and the first failing stage returns its own value.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(emitted|emitted_empty_targets)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(unknown_stream_number|transport_mode_unspecified|handler_url_unresolved)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(meeting_state_unavailable|assignment_failed)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "id": 59,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_send_directives_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Send Directives by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Slot states MC conveys to subscribers (ADR-0036 \u00a76), one increment per declared slot per StreamAssignments the actor actually SENDS. The bucketed slot-state signal \u00a711 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (all eight SlotState variants, not the three reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. EMISSIONS ARE CLIENT- AND SERVER-DRIVEN since story 2: the actor re-emits on a PEER's join, leave, declaration or audio-mute change, so the distribution is weighted by meeting churn as well as by any one client - normalise before building a ratio. fewer_sources_than_slots is every declared-but-unfilled slot - a solo participant (loopback removed, R-3), any meeting smaller than N, and every slot of a participant not yet connected to a handler; it is the healthy steady state of a small meeting. source_muted covers client AND server mute (one wire state). source_unreachable stays UNEMITTED under the story-2 edge model: a participant the subscriber shares NO connected handler with is named in unreachable_sender_ids instead (the state is reserved for a PINNED source with no shared handler, which static fill cannot produce) (see Unreachable Senders Named); a non-zero red line here is therefore an MC defect, as is unspecified. zero_requested may be unemittable in principle (open protocol question, docs/TODO.md); withheld_by_congestion arrives with the MH slot-state notification and switch_pending with \u00a77 switching.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "active"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "source_muted"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(fewer_sources_than_slots|zero_requested)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(source_unreachable|unspecified)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "withheld_by_congestion"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "switch_pending"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "purple",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "id": 60,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (slot_state) (rate(mc_media_slot_states_total[$__rate_interval]))",
+          "legendFormat": "{{slot_state}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Slot States",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - emitted means COMPOSED, not delivered, and this panel is the stream-channel-FULL half of what happened next. The participant-mailbox-CLOSED half is Slot View Emissions outcome=delivery_failed - an EARLIER hop, disjoint from this one. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard. (mc_media_unmatched_plan_slots_total, formerly the other half of this panel, is RETIRED in story 2: plans are derived from declared slots, so it was identically zero.) Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "id": 61,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[$__rate_interval]))",
+          "legendFormat": "dropped: {{payload_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dropped Outbound Messages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Client MuteRequest dispositions (ADR-0036 \u00a75). This metric PARTITIONS mute reports: every post-join MuteRequest lands in exactly one bucket. THE SUCCESS SET IS {applied, applied_no_recompose} - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count two routine states as failures. GREEN applied: the audio flag moved on a declared connection and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. DARK GREEN applied_no_recompose: reported, with nothing to re-convey - either no receive capability has been declared yet, or ONLY video_muted changed, and the slot view reads only audio mute, so no subscriber's view changes. Expect applied_no_recompose to be the largest bucket once clients wire camera buttons; it is what an ordinary camera toggle produces. BLUE unchanged: identical to the report already in force - MC correctly did nothing, not a failure. USE applied + applied_no_recompose AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate for a tuple compare, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (burst 8, sustained 4/s per connection). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's audio_self_muted once spent, leaving every other client rendering a live speaker as muted for the rest of the session. Dropping a report is safe because \u00a75 enforces client mute at CAPTURE on the client, so the audio genuinely stops and only the indicator is stale. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied_no_recompose"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "semi-dark-green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unchanged"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rate_limited"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "actor_unavailable"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 34
+      },
+      "id": 62,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_mute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mute Requests by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Dispositions of dirty participants in the meeting actor's server-driven slot-view flush (ADR-0036 \u00a75/\u00a76; story 2): after a join, leave, declaration or mute the actor re-emits each affected declared participant's changed SendDirective and StreamAssignments, at most SLOT_VIEW_FLUSH_BATCH per actor turn. THIS DOES NOT PARTITION EMISSIONS - a participant deferred on three turns and sent on the fourth counts four times. SUCCESS SET {sent, deferred}: GREEN sent, BLUE deferred - deferred is the ROUTINE shape of the bound under load (the view is carried, coalesced and never dropped), NOT a failure. FAILURE PREDICATE, stated positively on purpose: outcome=~\"delivery_failed|composition_failed\" - a later value defaults to not-a-failure. RED composition_failed is an MC DEFECT (any non-zero is a bug; the stage is on Send Directives, which is the alerting home - do not alert on both). ORANGE delivery_failed is environmental: the participant actor was gone. No meeting, participant, slot or sender identity is a label.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sent"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "deferred"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "composition_failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "delivery_failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "id": 159,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_slot_view_emissions_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Slot View Emissions by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The configured MC_MAX_RECEIVE_SLOTS, published from the SAME ClientMediaConfig field every connection's capability parse enforces. A CONFIG ECHO, NOT A UTILISATION GAUGE - there is no numerator; do not build a 'slots used / cap' ratio. Read beside Receive Capability Declarations: a rising slot_count_over_cap with a cap below the clients' configured N is a configuration mismatch (R-1), not a client bug.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "id": 158,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_receive_slot_cap)",
+          "instant": true,
+          "legendFormat": "slot cap",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Slot Cap",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Joins whose Redis handler assignment differed from the meeting's handler set frozen at first join. EXPECTED EMPTY: the frozen set is the meeting's authority, so MC kept it and moved no edge - but any non-zero value is an MC-internal invariant violation (Redis and the actor disagree). Capture and escalate to meeting-controller (MC runbook Scenario 18 arm f); restarting nothing fixes it. Zero is healthy; an ABSENT series is NOT a zero - it means the metrics pipeline is broken.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "id": 161,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(mc_media_handler_set_divergence_total[$__rate_interval]))",
+          "legendFormat": "divergent joins",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Handler Set Divergence",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Roster participants named in StreamAssignments.unreachable_sender_ids - a routable participant whose CONNECTED handler set is disjoint from the subscriber's (ADR-0036 \u00a79, story 2 R-33, task 20), summed over emitted views. A NON-ZERO RATE IS A CONNECTIVITY-DEGRADATION SIGNAL: every client is offered every handler and an all-connected meeting co-locates, so a healthy meeting emits zero here. EMISSION-WEIGHTED, NOT A POPULATION: it does NOT count who cannot reach whom (use the connectivity INFO lines and Connect Settles window_elapsed, MC runbook Scenario 18). Mean per emitted view = this / Slot View Emissions outcome=sent. Permanently zero on a single-handler deployment, by construction - because every ROUTABLE participant is on that handler and a not-yet-connected participant is never unreachable (see Not-Yet-Connected Senders). The field is a wire contract the client must render, not optional. No sender, meeting or handler identity.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "id": 160,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_media_unreachable_senders_total[$__rate_interval]))",
+          "legendFormat": "unreachable senders named",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Unreachable Senders Named",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "ServerMuteRequest dispositions by action (the verb ASKED for: mute | unmute, never its result) and outcome (story 2 task 12; ADR-0036 \u00a75, \u00a77). Counted SEPARATELY from client mute (Mute Requests by Outcome): different decider, enforcement point (MH ingress, not client capture) and remedy. PARTITIONS requests. The failure predicate is POSITIVE: outcome=~\"rate_limited|actor_unavailable\" - do not harmonise it to outcome!=\"applied\". not_permitted vs unknown_target: the metric distinguishes two refusals the CLIENT never can (one byte-identical wire error) - deliberate, do not harmonise. unknown_target is reachable ONLY for a host requester, because authority is checked before the target is looked up. not_permitted is CLIENT-INFLATABLE (the check precedes any actor hop) - NEVER use it in a ratio denominator and never alert on its raw rate. No alert on this panel by decision: non-zero mute is healthy moderation. Not a join key with the client's dt_client_media_mute_transitions_total{action} despite identical values.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "id": 178,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (action, outcome) (increase(mc_media_server_mute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{action}}/{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Server Mute Requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Participant UnmuteRequest dispositions: a server-muted participant asking the host(s) to lift its mute. NOTIFIES ONLY - it never clears a mute (the single writer is the host's ServerMuteRequest). ONE increment per request, never per host relayed to; a per-host delivery failure is the later hop (Dropped Outbound Messages, signaling_raw), disjoint from this panel. Failure predicate, positive: outcome=~\"rate_limited|actor_unavailable\". not_server_muted and no_host_connected are ROUTINE (no_host_connected is normal once the host has left). not_server_muted is client-driven: keep it out of any ratio denominator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "id": 179,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mc_media_unmute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Unmute Requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Refusal REPLIES withheld by a path's reply limiter, by surface (server_mute | capability). EXPECTED EMPTY - a legitimate client never reaches a reply burst, so zero is healthy and the series is present at zero from process start (absent = pipeline fault, not calm). NOT a refusal count: every refusal is counted on its own path (Server Mute Requests outcome=not_permitted|unknown_target, or a Receive Capability rejection) whether or not the reply went out. EVERY suppressed reply is counted here; only the FIRST is logged per connection, so a single WARN does not mean a single suppression. Non-zero: some connection is looping refused requests (an SDK bug, or a probe). No alert: client-inflatable by construction.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 62
+      },
+      "id": 180,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (surface) (increase(mc_media_refusal_replies_suppressed_total[$__rate_interval]))",
+          "legendFormat": "{{surface}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Suppressed Refusal Replies",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "How many participants MC believes are SERVER-muted (audio) right now, summed across each MC instance's meetings (one series per instance) - a STATE level, not an event rate: a mute applied yesterday is still here while Server Mute Requests stays flat. Present at zero from process start. Recomputed from live state on the controller's health walk, so it cannot drift after an actor dies. Read it against MH's server_muted drops at FLEET level only (sum across MC pods vs sum of mh_media_frames_dropped_total{reason=\"server_muted\"} rate across MH pods) and DIRECTIONALLY - never divided, never per instance (MC and MH meeting sets do not nest). Gauge > 0 with a flat fleet drop rate is only a candidate disagreement: a muted participant who is silent, disconnected or in grace drops nothing. It does not answer whether ONE meeting has a mute in force.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 62
+      },
+      "id": 181,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance) (mc_media_server_muted_sources)",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Server-Muted Sources",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "id": 163,
+      "panels": [],
+      "title": "Media Connectivity (ADR-0036 \u00a79)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MH connect/disconnect notifications that did NOT become (or change) participant connectivity, by reason (story 2 task 20). Connectivity decides who hears whom, so every way a notification fails to become routing input is counted. READ PER REASON, NEVER AS ONE RATE: unknown_connection is ROUTINE (every declined connection's Disconnected); participant_unknown is a low-rate join race; user_ambiguous and meeting_unknown are faults; a SUSTAINED handler_not_in_set means an MH restarted under a new id and story-4 re-registration has not happened (stale connectivity does not self-clear, MC runbook Scenario 18); connection_bound_refused is EXPECTED-EMPTY (red); retired_connection is a Connected delivered after its own Disconnected, refused by MC's tombstone. No meeting, participant, handler or connection identity.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unknown_connection"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "participant_unknown"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(handler_not_in_set|retired_connection)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(connection_bound_refused|user_ambiguous|meeting_unknown)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 71
+      },
+      "id": 164,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(mc_mh_notifications_unapplied_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MH Notifications Unapplied by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Participants' connectivity episodes settling (story 2 task 20). PER EPISODE, so it IS a population: window_elapsed counts participants that did NOT reach every handler of their meeting within MC_MEDIA_CONNECT_SETTLE_MS - Scenario 18 Step 0's count of 'who failed to connect everywhere'. complete = reached every handler (settles at its last connect, no added latency). The window withholds routing while a participant establishes (no edges, not unreachable); window_elapsed is the visible edge of that mask. Read against Connect Settle Window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "complete"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "window_elapsed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 71
+      },
+      "id": 165,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mc_media_connect_settles_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Connect Settles by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Roster members NOT routable (not yet connected to any handler, inside their settle window, or re-establishing) counted per emitted StreamAssignments, the subscriber ITSELF INCLUDED (so a subscriber's own all-fewer_sources view, identical to a small meeting's, is not invisible). The partner of Unreachable Senders Named: that one is silence because connected sets are disjoint, this one is silence because someone is not connected yet. NOT EXPECTED-EMPTY - every join passes through it; PERSISTENCE, not rate, is the fault. Emission-weighted: normalise by Slot View Emissions outcome=sent. Mixes the subscriber's own contribution (at most 1) with its peers'.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 79
+      },
+      "id": 166,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_media_not_yet_connected_senders_total[$__rate_interval]))",
+          "legendFormat": "not-yet-connected senders",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Not-Yet-Connected Senders",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Send targets per emitted SendDirective (story 2 task 20): a sender sends to every handler owning one of its edges, and MC's edge policy co-locates to minimise that. ~1 when participants reach every handler; above 1 only with genuinely partial connectivity. A sustained rise with healthy connectivity means co-location degraded - visible otherwise only as client uplink cost. Changed directives only (the emitted boundary).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 79
+      },
+      "id": 167,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_media_send_targets_total[$__rate_interval])) / sum(rate(mc_media_send_directives_total{outcome=\"emitted\"}[$__rate_interval]))",
+          "legendFormat": "targets per directive",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mean Send Targets per Directive",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Publisher->subscriber edges that changed handler between two renders (story 2 task 20). connectivity_change is routine: the edge's handler left one party's connected set and the edge moved, keeping its slot and sender. unexpected is EXPECTED-EMPTY and RED: an edge moved while both parties were still on its old handler - an edge-stability invariant violation; capture and escalate (ERROR at mc.actor.meeting names both handlers). Detected by diffing consecutive renders, independently of the code it checks.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "connectivity_change"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unexpected"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 87
+      },
+      "id": 168,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(mc_media_edge_moves_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Edge Moves by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MH notifications with an EMPTY connection_id - an MH image predating the field (story 2 task 20). The degraded legacy path: one implicit key per (participant, handler), i.e. the stale-disconnect hazard connection_id closes. Non-zero means an old MH is still in the fleet (rolling deploy or stuck pod). Retirement condition: once flat for a full MH rollout, MC's legacy branch is deleted.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 87
+      },
+      "id": 169,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mc_mh_notifications_without_connection_id_total[$__rate_interval]))",
+          "legendFormat": "legacy notifications",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Notifications Without Connection Id",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The connect settle window this MC enforces (MC_MEDIA_CONNECT_SETTLE_MS), published from the SAME field the meeting actors enforce. A CONFIG ECHO. Cost it names: time-to-first-audio for a participant that does not reach every handler is delayed by up to this; it never appears in join latency (which stops at the JoinResponse). Read Connect Settles window_elapsed against it.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 95
+      },
+      "id": 170,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_connect_settle_window_seconds)",
+          "instant": true,
+          "legendFormat": "settle window",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Connect Settle Window",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 99
+      },
+      "id": 171,
+      "panels": [],
+      "title": "KEK Lifecycle (ADR-0036 \u00a74 Rotation)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Age of the OLDEST un-rotated departure across live meetings (a MAXIMUM, sampled every 5s from times the meeting actors recorded, so a wedged actor still ages), beside the overdue threshold (W x 2) and W itself. MCKekRotationOverdue pages when pending age exceeds the threshold for 2m. Healthy: a sawtooth that climbs to about W and drops to 0 at each rotation, never reaching the threshold. While pending age is above zero, a departed participant still holds a working KEK: this is a confidentiality exposure window, not a media-quality one. Pending age is cleared AT ROTATION, not when every push succeeds - undelivered pushes are the KEK Push Outcomes panel.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 100
+      },
+      "id": 172,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_kek_rotation_pending_age_seconds)",
+          "legendFormat": "pending age (oldest)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_kek_rotation_overdue_threshold_seconds)",
+          "legendFormat": "overdue threshold",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_kek_rotation_window_seconds)",
+          "legendFormat": "W",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "KEK Rotation Pending Age vs Overdue Threshold",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "One MeetingKekUpdate outcome per rostered recipient per rotation (ADR-0036 Sec 4). delivered = handed to the connection's outbound stream (not a client ack). participant_gone = rostered but no live connection (reconnect grace) - BENIGN, it gets the current KEK on return. dropped_outbound = outbound channel full or closed. actor_unavailable = participant actor exited or its mailbox closed (MCActorPanic territory). timed_out = no answer within 2s (read mc_actor_mailbox_depth; MCHighMailboxDepthCritical territory). Every non-delivered, non-gone push is a security residual: that member never rotates its own transmit keys, so a departed participant keeps opening THAT member's media past W. MCKekPushFailureRate fires on outcome!~\"delivered|participant_gone\" above 1% for 10m.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 100
+      },
+      "id": 173,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(mc_meeting_kek_pushes_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KEK Push Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Time from the rotation decision to the LAST per-recipient push outcome - the window in which some members hold the new key and others do not. Bounded above by the 2s outcome timeout, which the top bucket covers. The p99 tail matters most: it is the portion that can overlap the next rotation.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 108
+      },
+      "id": 174,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_meeting_kek_rotation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_meeting_kek_rotation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(mc_meeting_kek_rotation_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "KEK Rotation Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "How many roster removals each leave-triggered rotation covered. The debounce is measured from the OLDEST un-rotated departure and never reset by a later one, so a busy meeting coalesces several departures into one rotation per W. Observed for participant_left rotations only.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 108
+      },
+      "id": 175,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(mc_meeting_kek_rotation_coalesced_leaves_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(mc_meeting_kek_rotation_coalesced_leaves_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "KEK Departures Coalesced per Rotation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Rotations that could not be performed; the KEK was left UNCHANGED. Zero is healthy. While this is non-zero every departed participant keeps a working KEK (the W bound is SUSPENDED, not delayed) and MCKekRotationOverdue pages. rng is the live arm (CSPRNG failure, retried after W). generation_exhausted is permanent for the meeting (u16 KEK generation at its ceiling, ~22.7 days of uninterrupted rotation at the W floor) and the page will not clear until the meeting ends.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 116
+      },
+      "id": 176,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(reason) (increase(mc_meeting_kek_rotation_failures_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KEK Rotation Failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The highest sender_id namespace consumption across live meetings, in the CURRENT epoch - cursor consumption including ids skipped by an epoch reset's exclusion snapshot, so NOT a count of admissions and not comparable to a join count. Resets at each epoch. At 65535 MC rotates the KEK and reissues from a fresh namespace (sender_space_exhausted on the issuance panel); the meeting keeps admitting. A high value means a flapping client or a scripted join loop: flapper eviction does not ship, and this is its visibility. Deliberately no alert.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 116
+      },
+      "id": 177,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_meeting_sender_ids_issued_max)",
+          "instant": true,
+          "legendFormat": "max consumed",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Sender ID Namespace Consumption (max)",
+      "type": "stat"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "mc-service",
+    "media"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Meeting Controller - Media Path",
+  "uid": "mc-media",
+  "version": 1,
+  "weekStart": ""
+}

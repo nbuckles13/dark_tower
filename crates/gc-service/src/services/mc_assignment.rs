@@ -8,7 +8,9 @@
 //! This service orchestrates the assignment flow:
 //! 1. Check for existing healthy assignment. If one exists, return it as-is:
 //!    no MH selection, no MC notification (R-6 join stickiness — the meeting's
-//!    handler set was programmed into MC once, at first join, and MC owns it)
+//!    handler set was programmed into MC once per meeting INCARNATION, at its
+//!    first join, and MC owns it; an ENDED assignment is not "existing", so a
+//!    rejoin after the meeting ended starts a new incarnation below)
 //! 2. Otherwise select MHs for the meeting via weighted load balancing
 //! 3. Select a candidate MC via load balancing
 //! 4. Call MC via gRPC to notify of assignment (ADR-0010 Section 4a)
@@ -66,9 +68,11 @@ pub struct AssignmentWithMh {
     pub mc_assignment: McAssignment,
     /// MH selection (active/active peers). `Some` iff this call made a NEW
     /// assignment — it is exactly the selection sent to MC in the
-    /// once-per-meeting `assign_meeting` RPC. `None` on the reuse path: the
-    /// meeting's handler set was frozen at first join and is owned by MC, so GC
-    /// neither re-selects nor re-reads it.
+    /// once-per-meeting-INCARNATION `assign_meeting` RPC. `None` on the reuse
+    /// path: the meeting's handler set was frozen at the incarnation's first
+    /// join and is owned by MC, so GC neither re-selects nor re-reads it. A
+    /// rejoin after the meeting ENDED (MC's `notify_meeting_ended`) is a new
+    /// incarnation, and takes the new-assignment path again.
     ///
     /// `None` is the only spelling of "no selection": a `Some` is never empty
     /// (`select_mhs_for_meeting` guarantees at least one handler), which is the

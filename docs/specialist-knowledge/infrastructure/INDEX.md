@@ -34,7 +34,7 @@
 ## Guard Pipeline (ADR-0034)
 - Binary + wrapper shape (subcommand-per-policy, clap dispatcher, STATUS line per ADR-0033 §6; wrappers source the shared prelude per ADR-0034 §3) -> `crates/dt-guard/`, `scripts/guards/simple/*.sh`; canonical-home `Lazy<Regex>` convention -> `clippy.toml`
 - Canonical `{ac,gc,mc,mh}` service enumeration SSoT; Bash mirror -> `crates/dt-guard/src/common/services.rs`, `scripts/guards/common.sh`
-- Kustomize policy (build, orphan manifests, kubeconform, securityContext) -> `crates/dt-guard/src/kustomize.rs`, `kustomize_tools.rs`
+- Kustomize policy (build, orphan manifests, kubeconform, securityContext) -> `crates/dt-guard/src/kustomize.rs`, `kustomize_tools.rs`; ConfigMap annotation-size cap + Grafana dashboard sidecar label -> `kustomize_configmaps.rs`
 - Env-config policy (per-workload env-var coverage, `configMapKeyRef` resolution, key==env-name) -> `crates/dt-guard/src/env_config.rs`; live-cluster twin for MH -> `crates/env-tests/tests/01_mh_deployment_config.rs`
 - Observability policy modules -> `crates/dt-guard/src/alert_rules.rs`, `dashboard_panels.rs`, `infrastructure_metrics.rs`, `metric_labels.rs`, `metric_coverage.rs`
 - Release-artifact premise for the ADR-0036 §11 compile gate -> `crates/dt-guard/src/release_build_profile.rs`; real-build demo `scripts/release-feature-gate.test.sh`

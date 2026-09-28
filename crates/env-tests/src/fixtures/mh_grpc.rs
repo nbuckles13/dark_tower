@@ -33,7 +33,7 @@ use crate::fixtures::auth_client::TokenRequest;
 use crate::fixtures::kube::{deployment_env_value, secret_key};
 use crate::fixtures::AuthClient;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::dark_tower::internal::v1::EndMeetingRequest;
+use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
@@ -133,6 +133,51 @@ pub async fn connect(handler: &Handler) -> MediaHandlerServiceClient<Channel> {
             )
         });
     MediaHandlerServiceClient::new(channel)
+}
+
+/// An MC gRPC endpoint that is never dialled. Syntactically valid so it passes
+/// MH's scheme check; `.invalid` is reserved, so it cannot resolve by accident.
+/// A probe registration names it because MH only calls MC back for a
+/// participant's connection, and a probe has no participants.
+pub const NEVER_DIALLED_MC_ENDPOINT: &str = "http://env-test-mc.invalid:50052";
+
+/// A PROBE registration: `meeting_id` at `generation` as `mc_id`, with NO
+/// edges and NO muted set.
+///
+/// Hoisted at its second consumer (tests 29 and 35) so both probes are the
+/// same decision under the same policy:
+///
+/// - **Empty `egress_streams`, deliberately.** Edges would make the probe
+///   depend on FREE SHARED CAPACITY: MH's egress admission refuses a
+///   registration whole when the projected installed streams exceed the pod's
+///   ceiling, and suites share these pods. With no edges the projection is
+///   unchanged by the probe, so the ceiling can never refuse it. Do not
+///   "strengthen" a probe by giving it edges.
+/// - **Never generation 0.** A gen-0 registration installs nothing and proves
+///   nothing.
+/// - **A probe TAKES OWNERSHIP of the meeting** (MH rebinds `mc_id` on any
+///   validation-passing registration, by design, for failover). Never probe a
+///   meeting some real MC is still using, and always release the probe under
+///   its own `mc_id` (see [`ReleaseOnDrop`]).
+#[must_use]
+pub fn probe_registration(
+    meeting_id: &str,
+    mc_id: &str,
+    generation: u64,
+) -> RegisterMeetingRequest {
+    assert_ne!(
+        generation, 0,
+        "a gen-0 probe installs nothing and proves nothing"
+    );
+    RegisterMeetingRequest {
+        meeting_id: meeting_id.to_string(),
+        mc_id: mc_id.to_string(),
+        mc_grpc_endpoint: NEVER_DIALLED_MC_ENDPOINT.to_string(),
+        egress_streams: Vec::new(),
+        selection_rules: None,
+        policy_generation: generation,
+        server_muted_sources: Vec::new(),
+    }
 }
 
 /// A meeting this test registered: where, and under which `mc_id`.

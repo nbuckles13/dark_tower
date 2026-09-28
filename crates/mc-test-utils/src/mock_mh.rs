@@ -73,6 +73,37 @@ pub enum AppliedGenerationBehaviour {
     EchoUpTo(u64),
 }
 
+/// One call the stub served, in ARRIVAL order across both RPCs.
+///
+/// A single interleaved log rather than one list per RPC, so "no
+/// `RegisterMeeting` after the first `EndMeeting`" — and "every push had
+/// RETURNED before the release arrived" — are assertable directly instead of
+/// being inferred from two independent counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StubEvent {
+    /// A `RegisterMeeting` arrived.
+    RegisterArrived {
+        /// The meeting it registers.
+        meeting_id: String,
+        /// Its `policy_generation`.
+        policy_generation: u64,
+    },
+    /// That `RegisterMeeting` RETURNED its reply (after any configured delay).
+    RegisterReturned {
+        /// The meeting it registered.
+        meeting_id: String,
+        /// Its `policy_generation`.
+        policy_generation: u64,
+    },
+    /// An `EndMeeting` arrived.
+    EndMeeting {
+        /// The meeting to release.
+        meeting_id: String,
+        /// The `mc_id` it carried.
+        mc_id: String,
+    },
+}
+
 /// A configurable tonic `MediaHandlerService` for MC component tests.
 ///
 /// Build with [`MediaHandlerStub::builder`], then [`MediaHandlerStubBuilder::spawn`]
@@ -92,6 +123,13 @@ pub struct MediaHandlerStub {
     last_request: Arc<Mutex<Option<RegisterMeetingRequest>>>,
     /// Every `EndMeeting` request served, in order.
     end_meeting_requests: Arc<Mutex<Vec<EndMeetingRequest>>>,
+    /// Every call to either RPC, interleaved in arrival order.
+    events: Arc<Mutex<Vec<StubEvent>>>,
+    /// How long each `RegisterMeeting` holds before replying — an attempt "in
+    /// flight" for the length of the delay.
+    register_delay: Duration,
+    /// If set, `EndMeeting` answers this status instead of acknowledging.
+    end_meeting_status: Option<tonic::Code>,
     /// Per meeting, the transport mode of the LAST snapshot the stub applied —
     /// what a real MH echoes, since it reads the mode off its live snapshot.
     live_modes: Mutex<HashMap<String, TransportMode>>,
@@ -114,9 +152,19 @@ pub struct MediaHandlerStubHandle {
     call_count: Arc<AtomicU64>,
     last_request: Arc<Mutex<Option<RegisterMeetingRequest>>>,
     end_meeting_requests: Arc<Mutex<Vec<EndMeetingRequest>>>,
+    events: Arc<Mutex<Vec<StubEvent>>>,
 }
 
 impl MediaHandlerStubHandle {
+    /// Every call to either RPC, interleaved in arrival order.
+    #[must_use]
+    pub fn events(&self) -> Vec<StubEvent> {
+        self.events
+            .lock()
+            .expect("MediaHandlerStub mutex poisoned")
+            .clone()
+    }
+
     /// `http://<addr>`, ready to hand to `MhClient`.
     #[must_use]
     pub fn endpoint(&self) -> String {
@@ -167,6 +215,8 @@ pub struct MediaHandlerStubBuilder {
     handler_id: String,
     transport_mode: TransportMode,
     process_start_epoch_ms: u64,
+    register_delay: Duration,
+    end_meeting_status: Option<tonic::Code>,
 }
 
 impl Default for MediaHandlerStubBuilder {
@@ -179,6 +229,8 @@ impl Default for MediaHandlerStubBuilder {
             handler_id: String::new(),
             transport_mode: TransportMode::Unspecified,
             process_start_epoch_ms: 0,
+            register_delay: Duration::ZERO,
+            end_meeting_status: None,
         }
     }
 }
@@ -222,6 +274,23 @@ impl MediaHandlerStubBuilder {
         self
     }
 
+    /// Hold every `RegisterMeeting` this long before replying, so an attempt is
+    /// genuinely IN FLIGHT for that window (the teardown-quiesce tests).
+    #[must_use]
+    pub fn register_delay(mut self, delay: Duration) -> Self {
+        self.register_delay = delay;
+        self
+    }
+
+    /// Answer `EndMeeting` with `code` instead of acknowledging — e.g.
+    /// `FailedPrecondition` for another MC's `mc_id`, `Unimplemented` for an MH
+    /// that predates the RPC.
+    #[must_use]
+    pub fn end_meeting_status(mut self, code: tonic::Code) -> Self {
+        self.end_meeting_status = Some(code);
+        self
+    }
+
     /// Convenience: a handler that genuinely programs what MC sends.
     ///
     /// Echoes the sent generation, asserts `handler_id`, and echoes datagram —
@@ -252,6 +321,9 @@ impl MediaHandlerStubBuilder {
             call_count: Arc::new(AtomicU64::new(0)),
             last_request: Arc::new(Mutex::new(None)),
             end_meeting_requests: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(Vec::new())),
+            register_delay: self.register_delay,
+            end_meeting_status: self.end_meeting_status,
             live_modes: Mutex::new(HashMap::new()),
         }
     }
@@ -271,6 +343,7 @@ impl MediaHandlerStubBuilder {
         let call_count = Arc::new(AtomicU64::new(0));
         let last_request = Arc::new(Mutex::new(None));
         let end_meeting_requests = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
 
         let stub = MediaHandlerStub {
             accept: self.accept,
@@ -282,6 +355,9 @@ impl MediaHandlerStubBuilder {
             call_count: Arc::clone(&call_count),
             last_request: Arc::clone(&last_request),
             end_meeting_requests: Arc::clone(&end_meeting_requests),
+            events: Arc::clone(&events),
+            register_delay: self.register_delay,
+            end_meeting_status: self.end_meeting_status,
             live_modes: Mutex::new(HashMap::new()),
         };
 
@@ -307,6 +383,7 @@ impl MediaHandlerStubBuilder {
             call_count,
             last_request,
             end_meeting_requests,
+            events,
         }
     }
 }
@@ -321,6 +398,16 @@ impl MediaHandlerService for MediaHandlerStub {
         let sent = req.policy_generation;
         let req_is_empty = req.egress_streams.is_empty();
         let meeting_id = req.meeting_id.clone();
+        self.events
+            .lock()
+            .expect("MediaHandlerStub mutex poisoned")
+            .push(StubEvent::RegisterArrived {
+                meeting_id: meeting_id.clone(),
+                policy_generation: sent,
+            });
+        if !self.register_delay.is_zero() {
+            tokio::time::sleep(self.register_delay).await;
+        }
 
         self.received_generations
             .lock()
@@ -356,6 +443,7 @@ impl MediaHandlerService for MediaHandlerStub {
             self.transport_mode
         };
         let applied_now = self.accept && sent != 0 && applied_generation == sent;
+        let meeting_id_for_log = meeting_id.clone();
         let transport_mode = {
             let mut live = self
                 .live_modes
@@ -371,6 +459,13 @@ impl MediaHandlerService for MediaHandlerStub {
             }
         };
 
+        self.events
+            .lock()
+            .expect("MediaHandlerStub mutex poisoned")
+            .push(StubEvent::RegisterReturned {
+                meeting_id: meeting_id_for_log,
+                policy_generation: sent,
+            });
         Ok(Response::new(RegisterMeetingResponse {
             accepted: self.accept,
             applied_generation,
@@ -380,20 +475,31 @@ impl MediaHandlerService for MediaHandlerStub {
         }))
     }
 
-    /// Records the request and acknowledges it.
+    /// Records the request and acknowledges it — or, with
+    /// [`MediaHandlerStubBuilder::end_meeting_status`], answers that status
+    /// (e.g. the `mc_id`-mismatch `FAILED_PRECONDITION`).
     ///
-    /// Always `acknowledged: true`: the stub models the release and the
-    /// unknown-meeting no-op, which the contract answers identically. It does
-    /// NOT model the `mc_id`-mismatch rejection; a test needing that should add
-    /// a builder knob rather than rely on this default.
+    /// By default `acknowledged: true`: the stub models the release and the
+    /// unknown-meeting no-op, which the contract answers identically.
     async fn end_meeting(
         &self,
         request: Request<EndMeetingRequest>,
     ) -> Result<Response<EndMeetingResponse>, Status> {
+        let req = request.into_inner();
+        self.events
+            .lock()
+            .expect("MediaHandlerStub mutex poisoned")
+            .push(StubEvent::EndMeeting {
+                meeting_id: req.meeting_id.clone(),
+                mc_id: req.mc_id.clone(),
+            });
         self.end_meeting_requests
             .lock()
             .expect("MediaHandlerStub mutex poisoned")
-            .push(request.into_inner());
+            .push(req);
+        if let Some(code) = self.end_meeting_status {
+            return Err(Status::new(code, "stub-configured EndMeeting status"));
+        }
         Ok(Response::new(EndMeetingResponse { acknowledged: true }))
     }
 }

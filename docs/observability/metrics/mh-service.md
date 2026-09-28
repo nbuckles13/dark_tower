@@ -275,7 +275,7 @@ because story task 21's media metrics need a section to extend.
 | `outcome` | Condition | What a responder does |
 |---|---|---|
 | `applied` | The live forward path reflects the generation MC sent — a fresh install, **or** an idempotent re-assert of an already-installed generation (no snapshot swap). | Nothing. This is health. |
-| `rejected_stale` | A generation strictly lower than the installed one was ignored. | Investigate reordering or retry on the MC→MH path. Policy is not rolled back. |
+| `rejected_stale` | Nothing installed because MH is already ahead: (1) a generation strictly lower than the installed one was ignored; or (2, rare) an `EndMeeting` released the meeting between the apply being queued and run, while the carrying RPC was still waiting (MC's quiesce prevents this). | (1) Investigate reordering or retry on the MC→MH path. Policy is not rolled back. (2) No remedy on MH; cross-check `mc_media_push_quiesce_total{outcome="timed_out"}` on MC. |
 | `no_generation` | `policy_generation` was 0 — MC named no generation. | **See the window note below.** Today: nothing. |
 | `rejected_invalid` | The policy failed structural validation (duplicate `egress_stream_id`, duplicate subscriber slot, malformed identifier, count bound, unspecified or heterogeneous transport mode). | MC sent bad policy; the remedy is upstream in MC's assignment computation. |
 | `apply_failed` | MH could not install it: config-apply mailbox full, apply timed out, session actor gone, or the aggregate egress-edge bound. **The prior generation stays live.** | MH-side. Read the `reason` field on the accompanying `mh.session.policy` WARN log line to tell the causes apart — it is deliberately not a label. |
@@ -326,9 +326,26 @@ Story 2 R-19, R-23; ADR-0036 §11 "Admission control is keyed on egress bandwidt
 
 **Identity with `mh_media_policy_applies_total`.** One admission decision is made per **generation-advancing** policy apply the session actor processes. So `sum(mh_media_stream_admission_total)` is the generation-advancing, actor-processed subset of `sum(mh_media_policy_applies_total)`. The difference is: stale applies (`rejected_stale` only), equal-generation re-asserts (`applied` only), `no_generation`, `rejected_invalid`, `rejected_meeting_cap` (the registration cap is checked on the REGISTER path, before config-apply admission ever runs, so a cap refusal is a policy outcome with no admission decision), and failures before the actor saw the policy (mailbox full, actor gone). An apply-timeout can count an admission decision AND `apply_failed`. A ceiling rejection increments `rejected_stream_ceiling` on **both** counters — the same event under different denominators. **Do not sum them.**
 
-**The ratchet — now only for meetings nobody ends.** Ordinary departures re-push shrinking policies and release streams, and a meeting whose MC calls `EndMeeting` (story 2 R-20) releases all of its streams and its registration (`mh_media_meeting_teardowns_total{outcome="released"}`, with `mh_media_egress_edges` and `mh_media_registered_meetings` falling). MC begins calling `EndMeeting` in story 2 task 12. Until then, and permanently for any meeting whose MC dies without calling it, the meeting keeps its streams until the pod restarts. `current_streams` in MH's GC load report is the same value — so a handler at its ceiling drops out of GC placement, and when every handler is there the first join to a NEW meeting fails with 503. `mh_media_egress_edges` sitting at the ceiling with no live meeting behind it, and rising with pod uptime rather than with load, is that state. Recovery: `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`; healthy meetings reinstall on their MC's next push.
+**The ratchet — now only for meetings nobody ends.** Ordinary departures re-push shrinking policies and release streams, and a meeting whose MC calls `EndMeeting` (story 2 R-20) releases all of its streams and its registration (`mh_media_meeting_teardowns_total{outcome="released"}`, with `mh_media_egress_edges` and `mh_media_registered_meetings` falling). MC calls `EndMeeting` for every meeting it ends as of story 2 task 12. What remains is a meeting whose MC never COMPLETES `EndMeeting` — (i) an MC crashed or killed before or during teardown, (ii) retries exhausted (`mc_media_end_meeting_total{outcome="unavailable_exhausted"}`) or an MH predating the RPC (`unimplemented`), (iii) a rollback to an MC build without teardown — and such a meeting keeps its streams until the pod restarts (`docs/TODO.md`, "A meeting whose MC never sends `EndMeeting` is never reclaimed"). `current_streams` in MH's GC load report is the same value — so a handler at its ceiling drops out of GC placement, and when every handler is there the first join to a NEW meeting fails with 503. `mh_media_egress_edges` sitting at the ceiling with no live meeting behind it, and rising with pod uptime rather than with load, is that state. Recovery: `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`; healthy meetings reinstall on their MC's next push.
 
 Every series below carries `key_custody=operator` and NO meeting, participant or stream identity (ADR-0036 §11). All are present from process start: the counter is zero-initialised per outcome, the six static gauges (four admission-chain values plus the two resource-guard `_limit`s) are published right after the recorder installs, and the ratio, installed-streams and registered-meetings gauges are published when the session actor is built.
+
+### `mh_media_released_meeting_apply_refusals_total`
+- **Expected-empty**: yes — a healthy teardown ordering produces none, so this reads zero when healthy
+- **Type**: Counter
+- **Description**: Queued forwarding-policy applies the session actor refused because the meeting was no longer registered (released between the apply being queued and the actor reaching it — ADR-0036 §8; the `EndMeetingRequest` accepted-residual race)
+- **Labels**: `key_custody`: single value `operator`
+- **Cardinality**: 1
+- **Present at zero from process start**, so **absent is NOT zero**: an absent series means MH is not up or not scraped, never "no late apply arrived".
+- **THIS IS THE ONLY SIGNAL THAT THE GUARD WORKS, AND THAT IS WHY IT EXISTS.** `mh_media_policy_applies_total` is recorded **only in the gRPC handler**, which in this race has already timed out, recorded `apply_failed` and returned before the queued apply runs; the actor's refusal replies to a dropped channel and reaches the handler's `ApplyOutcome` → `PolicyApplyOutcome` conversion never. Without this counter an operator **cannot distinguish "the guard refused a late apply" from "no late apply arrived"** — and `mh_media_registered_meetings` staying flat is not evidence either, because flat is also exactly what "nothing arrived" looks like. **A guard that silently stopped working would look identical to a guard with nothing to do.** There is no log-based alerting path in this stack (every rule in `infra/docker/prometheus/rules/` is PromQL over metrics), so the actor-side WARN can *confirm* for someone already suspicious and can never *notify*.
+- **NOT `rejected_stale`, and a flat `rejected_stale` says nothing about this.** That value means a generation strictly lower than the installed one was ignored — a different decision at a different layer — or, rarely, the same released-meeting refusal when its reply WAS delivered (a release inside one live RPC, which MC's quiesce prevents); in the race this counter exists for, the reply is not delivered and `rejected_stale` does not move. The two were conflated repeatedly during this task's planning; the name deliberately shares no word with it.
+- **NOT disjoint from `mh_media_policy_applies_total{outcome="apply_failed"}`.** One registration can increment both — `apply_failed` in the handler at deadline expiry, this counter in the actor later. **Different denominators; do not sum**, and do not build a ratio across them. (Same relationship, and the same rule, as `rejected_stream_ceiling` and `mh_media_stream_admission_total`.)
+- **`apply_failed` is a NEGATIVE discriminator for this race, not a positive one.** It also covers a full mailbox, an apply timeout, a dead actor and the aggregate egress-edge bound — four causes with four different remedies, and it feeds the `docs/runbooks/mh-deployment.md` bake gate. If this counter is flat, an `apply_failed` near a teardown is one of those other causes; do not read it as a race.
+- **No alert — and this counter can NEVER detect story 4's fence failing, so its meaning does not change when that fence lands.** A non-zero value is the `EndMeetingRequest` accepted deadline residual (fate A) *occurring* and the guard *working*; alerting would page on a design decision deliberately taken. Story 4's fence guards against a different race (fate C): a periodic re-assert is a fresh `RegisterMeeting` whose upsert **re-registers** the released meeting, so this guard passes it by construction and this series stays flat while the fence fails. The deadline race this series counts is unaffected by the fence and persists after it. **Story 4 must bring its own signal for its fence; never repurpose this series to alert on it.** (Stated as a prohibition because the opposite reading — "non-zero means the fence failed" — was proposed during this task's review and landed at five sites before the orthogonality recorded on `EndMeetingRequest` caught it.)
+- **Race B is NOT covered by this counter and has no signal at all.** MC's ordered wait relies on a dropped client request cancelling MH's server-side handler — a foreign-library property that **fails open** — and "the wait was performed" is a different fact from "the late registration did not land", only the first being in MC's reach. An MC-side counter would look like coverage while measuring the wrong event. Detection is the `docs/TODO.md` ratchet signature ("A meeting whose MC never sends `EndMeeting` is never reclaimed"); the rule is story-2 task 18's.
+- **Usage**: Did MH catch a late apply for a released meeting, rather than installing routes nobody will release?
+- **Recorded in**: `session/mod.rs::refuse_apply_for_released_meeting` via `observability/metrics.rs::SessionMetricHandles::record_released_meeting_apply_refusal`
+- **Dashboard**: MH Media - Late Applies Refused (Released Meeting)
 
 ### `mh_media_stream_admission_total`
 - **Type**: Counter
@@ -410,7 +427,7 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Description**: Meetings this handler holds registered — the size of the session actor's registration map, set from its length at every mutation (register, release), never incremented or decremented.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: Occupancy against `mh_media_registered_meetings_limit`. READ IT AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an `EndMeeting` releases a meeting, so a meeting whose MC never calls `EndMeeting` (any MC before story 2 task 12; an MC that crashed) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with concurrent load is that residual. Many meetings here against a flat `mh_media_egress_edges` is the empty-meeting shape the cap exists for. Published as 0 when the session actor is built.
+- **Usage**: Occupancy against `mh_media_registered_meetings_limit`. READ IT AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an `EndMeeting` releases a meeting, so a meeting whose MC never COMPLETES `EndMeeting` (an MC crashed or killed before or during teardown; retries exhausted or an MH predating the RPC; a rollback to an MC build without teardown) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with concurrent load is that residual. Many meetings here against a flat `mh_media_egress_edges` is the empty-meeting shape the cap exists for. Published as 0 when the session actor is built.
 
 ### `mh_media_registered_meetings_limit`
 - **Type**: Gauge
@@ -438,6 +455,8 @@ Story 2 R-20. `MediaHandlerService.EndMeeting` releases a meeting's handler reso
 | `released` | The registering MC ended the meeting: registration and routes removed (its applied generation forgotten, so a same-id re-create installs fresh), edges returned to the budget, active connections closed. Pending connections are left to the registration timeout. | None — the healthy path. Its rate should track meeting ends. |
 | `unknown_meeting` | No registration held for that meeting id; acknowledged as an idempotent no-op. | Usually none: MC calls every handler in the meeting's assigned set, including ones it never registered with. Climbing well above `released` is an MC-side signal (double sends, or ending meetings this handler never held). |
 | `rejected_ownership` | A different `mc_id` than the registering one asked to end the meeting; refused with `FAILED_PRECONDITION`, nothing released. | A misrouted or stale MC, or a `service.write.mh` holder acting on a meeting it does not own. The WARN line carries `registered_mc_id` and `caller_mc_id`. The recovery order when the wrong MC holds a meeting is in `docs/runbooks/mh-incident-response.md` (ownership-reject arm). |
+
+**`rejected_ownership` is a UNION of MC's two rejection values — do not compare the like-named tokens.** MH cannot tell why an MC was tearing down, so this value counts both MC populations: MC's `mc_media_end_meeting_total{outcome="rejected_ownership"}` (a meeting that ENDED — an MC defect) **plus** `{outcome="superseded_by_successor"}` (a graceful-shutdown release refused because a successor already took the meeting over — routine on rolling deploys). Compare this value against the SUM of those two, for COMPARISON only, never a sum or a ratio across the hop: the denominators differ (MH counts per request received, including MC's retries; MC per (meeting, handler) terminal outcome). Comparing token to token shows a gap that grows on every rolling deploy and looks exactly like lost messages between MC and MH. (`docs/observability/metrics/mc-service.md`, `mc_media_end_meeting_total`.)
 
 **Not label material**: `meeting_id` and `mc_id` (raw or hashed) are unbounded and meeting-identifying; both belong in the log line (ADR-0036 §11).
 
@@ -995,26 +1014,39 @@ The series is **present at zero from process start** (pre-registered by
 NOT zero**: an absent `server_muted` series means MH is not up or not scraped,
 never "nobody is muted".
 
-**What a deployed zero means depends on a task boundary.**
+**What a deployed zero means.**
 
 1. **Enforcement is live at MH as of story 2 task 10.** The drop path and this
    counter are real and tested end to end (env-test S4 in
    `crates/env-tests/tests/26_mh_quic.rs`). This is NOT a
    `stream_rate_limited`- or `partial_frame_discard`-style token with no
    enforcement behind it.
-2. **No production producer sets the muted set until story 2 task 12.** MC
-   sends `server_muted_sources` empty unconditionally today
-   (`crates/mc-service/src/grpc/mh_client.rs`). So **in a deployed cluster
-   this series is zero BY CONSTRUCTION until task 12 lands, and reading that
-   zero proves nothing about whether mutes are honoured.** After task 12 the
-   same zero becomes informative.
-3. **MC-side signal.** As of task 10 MC exposes no server-mute-specific
-   metric, and the one wire state (`slot_state="source_muted"`) covers client
-   AND server mute, so this counter is the only fleet evidence that a server
-   mute is in force. `mc_media_server_mute_requests_total{action,outcome}` is
-   specified and owned by story 2 task 12. A residual survives even that — a
-   request-EVENT count cannot say whether a mute is in force NOW — and is
-   tracked in `docs/TODO.md` §Media Path Obligations (trigger: task 12).
+2. **MC programs the muted set as of story 2 task 12**: a host's server mute
+   puts the muted participant's sender id into `server_muted_sources` on every
+   registration snapshot MC pushes to a handler carrying that sender's edges
+   (`crates/mc-service/src/media_routing/slots.rs`). This is a DROP counter, so
+   **a zero has two causes**: no mute is in force, OR a mute is in force over a
+   source that is silent, disconnected, in grace, or not yet on this handler.
+   So a zero means no mute is being **enforced against an actively sending
+   source** — not that no mute is in force. MC's
+   `mc_media_server_muted_sources` gauge is what separates the two causes.
+3. **MC-side signals, and how to compare them with this counter.**
+   `mc_media_server_mute_requests_total{action,outcome}` counts host mute
+   EVENTS; `mc_media_server_muted_sources` is the STATE (participants MC holds
+   server-muted, summed per MC pod — see `docs/observability/metrics/mc-service.md`).
+   The comparison is **fleet-aggregate and directional only**:
+   `sum(mc_media_server_muted_sources)` across MC instances against
+   `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across
+   MH instances. Per instance it is not a signal at all, because MC and MH
+   meeting sets do not nest. A level and a counter are **never divided**: a
+   gauge above zero while the fleet drop rate is flat is only a CANDIDATE
+   disagreement, and only after item 2's silent-source cause is excluded. It is
+   the same class as `mc_media_generation_divergence` and the env-tests README
+   rule against reading shared pod-level values as per-entity evidence — a
+   known shape, not a quirk of this metric. The pod-level gauge answers "is any
+   mute in force on this MC pod", never "in THIS meeting" (ADR-0036 §11 bars
+   that dimension); the meeting-scoped question is answered by MC's decision
+   log (target `mc.webtransport.connection`, one INFO line per decided server-mute request, naming requester, target, action and outcome).
 
 **Sender-scoped, and per-stream ingress mute is foreclosed.** MH binds the
 sender per connection and never reads the stream number (inside the opaque

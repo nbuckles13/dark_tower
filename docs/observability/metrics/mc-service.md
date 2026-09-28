@@ -75,6 +75,33 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (2 statuses x 2 types = 4 series)
 - **Usage**: Monitor GC registration health, detect connectivity issues
 
+### `mc_gc_notify_meeting_ended_total`
+- **Type**: Counter
+- **Description**: `NotifyMeetingEnded` calls to GC — MC telling GC a meeting ENDED (emptied or closed) after its handlers were released (ADR-0010 §3)
+- **Labels**:
+  - `status`: `success`, `error`
+- **Cardinality**: 2; zero-initialised
+- **A GC-coordination metric, like its `mc_gc_heartbeats_total` sibling — no `key_custody`.** Coarse `status`, because a fire-and-forget notification's remedies do not differ by failure mode.
+- **Send policy: AT MOST ONCE for anything GC may have processed.** Retried (with backoff, up to `MAX_NOTIFY_ATTEMPTS`, ~31 s) only when the request provably never left MC (the call failed in its connect phase, e.g. GC restarting); never after it may have been sent, because a duplicate landing after the meeting's NEXT incarnation was assigned would end that live assignment. So `error` is final for that meeting.
+- **What a sustained `error` costs, user-visibly**: GC keeps reusing the ended meeting's assignment, and every join to that meeting id gets `meeting_not_found` from MC until MC restarts. There is no other detector.
+- **Alert**: `MCNotifyMeetingEndedFailing`
+- **Recorded in**: `grpc/gc_client.rs::notify_meeting_ended` via `observability/metrics.rs::record_gc_notify_meeting_ended`
+- **Dashboard**: MC Overview - GC Meeting-Ended Notifications (Fencing & Heartbeat Latency row)
+
+### `mc_gc_meeting_ended_notifications_dropped_total`
+- **Expected-empty**: yes
+- **Type**: Counter
+- **Description**: A meeting-ended notification DROPPED before it was attempted — the notify queue was full, or it was produced after the queue closed at shutdown, or it was still queued when the shutdown flush budget expired
+- **Labels**: none
+- **Cardinality**: 1; zero-initialised
+- **Its own series, not a `status` value on `mc_gc_notify_meeting_ended_total`**: a pre-attempt loss ("MC is losing events") and an RPC failure ("GC is down") are opposite investigations.
+- **Any non-zero is a stale GC assignment with no other detector** — joins to that meeting id fail until MC restarts.
+- **Alert**: `MCMeetingEndedNotificationsDropped` (warning, `> 0`)
+- **Two arms, and only one of them is reliably scraped.** The queue-full arm is ordinary runtime and is a dependable detector. The shutdown arms increment within seconds of process exit, so by this diff's own argument (a counter incremented that close to exit is never scraped) the counter there is BEST-EFFORT and the ERROR log line is the load-bearing evidence. Do not read a flat counter after a restart as proof nothing was dropped at shutdown; read the pod's last log lines.
+- **A mid-send cut-off at the shutdown deadline is deliberately NOT counted here**: whether GC committed it is unknown, and `NotifyMeetingEnded` is at-most-once, so it is never retried and is reported on its own ERROR line instead. This counter is only the provably-never-sent remainder.
+- **Recorded in**: `grpc/gc_client.rs::MeetingEndedQueue::meeting_ended` (queue full or closed) and `grpc/gc_client.rs::drain_meeting_ended` (the remainder past the shutdown flush budget), both via `observability/metrics.rs::record_gc_meeting_ended_notification_dropped`
+- **Dashboard**: MC Overview - GC Meeting-Ended Notifications Dropped (Fencing & Heartbeat Latency row)
+
 ### `mc_gc_heartbeat_latency_seconds`
 - **Type**: Histogram
 - **Description**: GC heartbeat round-trip latency
@@ -146,7 +173,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Usage**: Monitor authentication health, detect token validation failures, diagnose failure causes
 - **Recorded in**: `connection.rs` after JWT validation, `grpc/auth_interceptor.rs` for service tokens
 - **Alert**: `MCHighJwtValidationFailures` (warning, failure rate >10% for 5m)
-- **Dashboard**: MC Overview - JWT Validations by Result (Join Flow row)
+- **Dashboard**: MC Overview - JWT Validations by Result & Type (Join Flow row)
 
 ### `mc_session_joins_total`
 - **Type**: Counter
@@ -156,7 +183,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Cardinality**: Low (2 status values)
 - **Usage**: Monitor join success rate, overall join volume
 - **Alert**: `MCHighJoinFailureRate` (warning, failure rate >5% for 5m)
-- **Dashboard**: MC Overview - Session Join Rate by Status (Join Flow row)
+- **Dashboard**: MC Overview - Session Joins by Status (Join Flow row)
 
 ### `mc_session_join_duration_seconds`
 - **Type**: Histogram
@@ -166,9 +193,10 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Buckets**: [0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000]
 - **Cardinality**: Low (2 status values)
 - **Usage**: Monitor join latency, identify slow joins. Extended to 5s because join includes actor processing.
+- **Mixes two populations since story 2 task 12.** A join whose meeting id is still being torn down on its media handlers can be PARKED behind the controller's teardown fence and served when the teardown completes: up to `teardown_fence_hold_max_seconds` later (MC's startup line), far past the top bucket, so those observations land in `+Inf`. A p99 excursion here is therefore either "MC is slow" or "one meeting's teardown wedged and its rejoins were parked". Separate them with `mc_media_push_quiesce_total{outcome="timed_out"}`, `mc_media_teardown_fence_backstop_total` and `mc_session_join_failures_total{error_type="teardown_in_progress"}` (the parked-queue overflow), all of which move only in the second case. The buckets are deliberately unchanged: this histogram backs the MC session-join SLO (`docs/observability/slos.md`), and re-bucketing would break burn-rate comparability. The parked population is bounded and rare (a rejoin during teardown normally reaches GC's live row and fails `meeting_not_found` instead), so it cannot move a 30-day p99 objective.
 - **Recorded in**: `connection.rs` measuring full join flow
 - **Alert**: `MCHighJoinLatency` (info, p95 >2s for 5m, success only)
-- **Dashboard**: MC Overview - Session Join Latency P50/P95/P99 (Join Flow row)
+- **Dashboard**: MC Overview - Session Join Latency (P50/P95/P99) (Join Flow row)
 
 ### `mc_session_join_failures_total`
 - **Expected-empty**: yes — every series is a join failure, so a healthy join path reads zero
@@ -188,6 +216,15 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
     0 is admitted (the contract's NO KEY PUBLISHED state) and lands on
     `mc_join_identity_key_presence_total{presence="absent"}` below. So this value means a client sent
     a wrongly-encoded key, never that a client has not implemented the field.
+  - `teardown_in_progress` (story 2 task 12) — the join named a meeting whose PREVIOUS incarnation
+    MC is still releasing on its media handlers (the last participant left moments ago and MC's
+    teardown has not finished). **The OPPOSITE investigation from `conflict`**: `conflict` rising
+    means clients double-joining (a client defect, no server action); this rising means teardowns
+    are slow or wedging and rejoins are being turned away (an MC or MH fault). Normally a window of
+    milliseconds; the worst case is MC's `teardown_fence_hold_max_seconds` startup-line field.
+    Rising together with `mc_media_push_quiesce_total{outcome="timed_out"}` is the signature of a
+    wedged teardown (see the EndMeeting scenario in `docs/runbooks/mc-incident-response.md`). The
+    WIRE code is the same `CONFLICT` as `conflict` — only this operator-facing label splits them.
   - **`sender_id_space_exhausted` is RETIRED (story 2 task 9, R-16) and is never emitted.** It meant
     MC refused a joiner because the meeting's 65535 `sender_id`s were used up. MC now performs an
     immediate KEK-epoch reset instead — a new KEK plus a fresh namespace that excludes every id
@@ -198,7 +235,7 @@ All MC service metrics follow ADR-0011 naming conventions with the `mc_` prefix.
 - **Usage**: Diagnose join failure root causes, alert on specific failure patterns
 - **Recorded in**: `connection.rs` on join failure only
 - **Alert**: Used indirectly via `MCHighJoinFailureRate` (this metric provides error type breakdown for diagnosis)
-- **Dashboard**: MC Overview - Join Failures by Error Type (Join Flow row)
+- **Dashboard**: MC Overview - Session Join Failures by Type (Join Flow row)
 
 ---
 
@@ -375,7 +412,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **The security residual this is the only control for:** a member whose push is not delivered never rotates its own transmit keys, so a departed participant keeps opening THAT member's media past W.
 - **Recorded in**: `media_admission/rotation.rs::collect_push_outcomes` via `observability/metrics.rs::record_kek_push`
 - **Alert**: `MCKekPushFailureRate` (warning, `outcome!~"delivered|participant_gone"` > 1% for 10m — negated so a value added later fails CLOSED into the alert)
-- **Dashboard**: MC Overview - KEK Push Outcomes (KEK Lifecycle row)
+- **Dashboard**: MC Media - KEK Push Outcomes (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_failures_total`
 - **Expected-empty**: yes — a healthy rotation path fails nothing, so this reads zero when healthy
@@ -388,7 +425,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **The two reasons have OPPOSITE remedies** — the point of the label. `rng` (CSPRNG failure) is overwhelmingly the live arm and is retried after W. `generation_exhausted` (the `u16` KEK generation at its ceiling) is permanent for that meeting and `MCKekRotationOverdue` will not clear until it ends; at the W floor it takes ~22.7 days of uninterrupted rotation in one meeting, so it is effectively unreachable.
 - **While either persists, the W bound is SUSPENDED, not delayed**: every departed participant keeps a KEK that opens all current media.
 - **Recorded in**: `actors/meeting.rs::rotation_failed` and the epoch reset in `handle_join` via `observability/metrics.rs::record_kek_rotation_failure`
-- **Dashboard**: MC Overview - KEK Rotation Failures (KEK Lifecycle row)
+- **Dashboard**: MC Media - KEK Rotation Failures (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_coalesced_leaves`
 - **Type**: Histogram
@@ -399,7 +436,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Unit-last spelling (`_leaves`)** deliberately: the tree's first unitless histogram, and `_count` would collide with the histogram's own `_count` series.
 - The debounce is measured from the OLDEST un-rotated departure and never reset by a later one, so a busy meeting folds several departures into one rotation per W.
 - **Recorded in**: `actors/meeting.rs::rotate_due` (`participant_left` only)
-- **Dashboard**: MC Overview - KEK Departures Coalesced per Rotation (KEK Lifecycle row)
+- **Dashboard**: MC Media - KEK Departures Coalesced per Rotation (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_duration_seconds`
 - **Type**: Histogram
@@ -409,7 +446,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Buckets**: 0.0005 … 2.5 s (its own full-name matcher). The top bucket covers the 2 s outcome timeout, so a fully timed-out rotation lands in a real bucket rather than `+Inf`.
 - Measures the window in which some members already hold the new key and others do not — the operationally meaningful quantity, not CSPRNG cost. Emitted even when recipients time out.
 - **Recorded in**: `media_admission/rotation.rs::collect_push_outcomes`
-- **Dashboard**: MC Overview - KEK Rotation Duration (KEK Lifecycle row)
+- **Dashboard**: MC Media - KEK Rotation Duration (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_pending_age_seconds`
 - **Type**: Gauge
@@ -423,7 +460,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Label set MUST stay identical to the overdue threshold's**, or `MCKekRotationOverdue`'s bare `a > b` matches nothing and the page silently never fires.
 - **Recorded in**: `media_admission/rotation.rs::KekLifecycle::publish_fleet_gauges` (sampler task in `main.rs`)
 - **Alert**: `MCKekRotationOverdue` (page)
-- **Dashboard**: MC Overview - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
+- **Dashboard**: MC Media - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_window_seconds`
 - **Type**: Gauge
@@ -434,7 +471,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **A CONFIG ECHO**, set once at boot from the SAME value the debounce timer and the `kek_rotation_debounce_seconds` wire field use (`Config::kek_lifecycle`), so the three cannot drift. It should equal the ConfigMap value on every MC pod; a mismatch is a stale ConfigMap or a pod that did not roll — for W a **security** fact, since W is the exposure bound on a departed participant.
 - **No retention gauge exists, deliberately**: clients derive retention as `min(W/2, ceiling)`, so it would always be a function of this one.
 - **Recorded in**: `main.rs` via `KekLifecycle::publish_config_gauges`
-- **Dashboard**: MC Overview - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
+- **Dashboard**: MC Media - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_overdue_threshold_seconds`
 - **Type**: Gauge
@@ -444,7 +481,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Cardinality**: 1
 - **Exists so the page compares two gauges with no arithmetic**, keeping W out of PromQL. The multiplier is a named Rust constant (`KEK_ROTATION_OVERDUE_MULTIPLIER`, compile-time asserted ≥ 2): at 1, healthy pending age reaches the threshold just before every rotation.
 - **Recorded in**: `main.rs` via `KekLifecycle::publish_config_gauges`
-- **Dashboard**: MC Overview - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
+- **Dashboard**: MC Media - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
 
 ### `mc_meeting_sender_ids_issued_max`
 - **Type**: Gauge
@@ -456,7 +493,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **A maximum, not a sum**, so one meeting near a reset is not hidden behind fleet noise.
 - **Flapper visibility, deliberately without an alert.** Flapper eviction does not ship; nothing bounds a flapping client's join-path cost, and this is how it is seen. Exhaustion self-repairs into an epoch reset, so a threshold alert here would fire on a healthy condition.
 - **Recorded in**: `media_admission/rotation.rs::KekLifecycle::publish_fleet_gauges`
-- **Dashboard**: MC Overview - Sender ID Namespace Consumption (max) (KEK Lifecycle row)
+- **Dashboard**: MC Media - Sender ID Namespace Consumption (max) (KEK Lifecycle row)
 
 ---
 
@@ -480,7 +517,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Cardinality**: 1 (no labels)
 - **Usage**: Monitor MC→MH RPC latency, detect MH performance degradation
 - **Recorded in**: `mh_client.rs` measuring full RPC round-trip
-- **Dashboard**: MC Overview - RegisterMeeting RPC Latency P50/P95/P99 (MH Coordination row)
+- **Dashboard**: MC Overview - RegisterMeeting RPC Latency (P50/P95/P99) (MH Coordination row)
 
 ## Media-Routing Control Plane Metrics (ADR-0036 §8, §11)
 
@@ -509,7 +546,7 @@ which does carry `handler_id`. The label may return once
 - **Label key is `outcome`, not `status`**, matching MH's `mh_media_policy_applies_total{outcome,key_custody}` so both ends of one handshake sit side by side in a query.
 - **Usage**: Detect a meeting whose forwarding policy MC could not confirm as live
 - **Recorded in**: `grpc/mh_client.rs::confirm` via `observability/metrics.rs::record_media_policy_push` (and `media_routing/pusher.rs` for a FAILED restart-floor adoption, as `generation_mismatch`)
-- **Dashboard**: MC Overview - Media Policy Pushes by Outcome (Media Routing row)
+- **Dashboard**: MC Media - Media Policy Pushes by Outcome (Media Routing row)
 
 ### `mc_media_policy_generation_adoptions_total`
 - **Type**: Counter
@@ -526,7 +563,7 @@ which does carry `handler_id`. The label may return once
 - **Denominator**: total evaluated replies = `sum(mc_media_policy_pushes_total) + sum(mc_media_policy_generation_adoptions_total)` — summing **both** label values, which is what keeps the reconstruction exact.
 - **Triage surface**: the WARN at `mc.register_meeting.trigger` ("Handler holds a newer policy generation than this MC issued ... adopting it as a floor"), carrying `sent_generation`, `applied_generation` and `adopted_generation`. A rise here during an MC rollout is expected, one per live (meeting, handler); a rise with NO MC restart is not — investigate as a second MC programming the same meeting.
 - **Recorded in**: `media_routing/pusher.rs::push_until_settled` via `observability/metrics.rs::record_policy_generation_adoption`; zero-initialised at boot
-- **Dashboard**: MC Overview - Policy Generation Floor Adoptions (Media Routing row)
+- **Dashboard**: MC Media - Policy Generation Floor Adoptions (Media Routing row)
 
 ### `mc_media_sender_binding_responses_total`
 - **Type**: Counter
@@ -546,7 +583,7 @@ which does carry `handler_id`. The label may return once
 - **Label key is `outcome`, not `status`**, matching the sibling `mc_media_policy_pushes_total` and MH's counterpart so both ends of one handshake sit side by side in a query.
 - **Usage**: Detect a participant MC cannot bind for MH — and distinguish a routing fault from a join race, which MH alone cannot
 - **Recorded in**: `grpc/media_coordination.rs::notify_participant_connected` via `observability/metrics.rs::record_sender_binding_response`
-- **Dashboard**: MC Overview - Sender Binding Responses by Outcome (Media Routing row)
+- **Dashboard**: MC Media - Sender Binding Responses by Outcome (Media Routing row)
 
 ### `mc_media_generation_divergence`
 - **Type**: Gauge
@@ -560,7 +597,7 @@ which does carry `handler_id`. The label may return once
 - **An MC restart against a live handler is now self-correcting.** A restarted MC re-derives generations from 1 while MH still holds K; the push worker adopts MH's truthfully echoed K as a floor and re-pushes at K+1 (`PolicyGenerations::adopt_floor`), and it is recorded on `mc_media_policy_generation_adoptions_total`, NOT here: a successful adoption never writes this gauge. Only a FAILED adoption (recorded as `generation_mismatch`) writes a magnitude.
 - **Usage**: Read the magnitude after `mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}` has fired; never page on it
 - **Recorded in**: `grpc/mh_client.rs::confirm` via `observability/metrics.rs::record_media_policy_push` (and `media_routing/pusher.rs` for a FAILED restart-floor adoption, as `generation_mismatch`)
-- **Dashboard**: MC Overview - Media Generation Divergence (Media Routing row)
+- **Dashboard**: MC Media - Media Generation Divergence (magnitude) (Media Routing row)
 
 ## Client-Facing Media Signalling Metrics (ADR-0036 §5, §6, §11)
 
@@ -613,7 +650,7 @@ span would record as attributes, on a surface no guard covers.
 - **Logging**: every rejection increments this counter; the WARN fires **once per connection**, carries the outcome token, and never carries the offending `slot_id`/`pinned_sender_id` value.
 - **Usage**: Are clients' capability declarations landing, and if not, whose bug is it?
 - **Recorded in**: `webtransport/connection.rs::handle_receive_capability` via `observability/metrics.rs::record_receive_capability`. Only `accepted` declarations reach the meeting actor (`MeetingActorHandle::register_receive_capability`); every rejection is decided connection-side.
-- **Dashboard**: MC Overview - Receive Capability Declarations by Outcome (Client Media Signalling row)
+- **Dashboard**: MC Media - Receive Capability Declarations by Outcome (Client Media Signalling row)
 
 ### `mc_media_send_directives_total`
 - **Type**: Counter
@@ -635,7 +672,7 @@ span would record as attributes, on a surface no guard covers.
 - **Only CHANGED directives are emitted.** The actor retains each declared participant's last directive and sends a new one only when it differs, so the `emitted` rate tracks target-set changes (someone starts or stops holding this participant), not structural churn.
 - **Usage**: Is MC actually directing clients to send, and when it silently is not, why?
 - **Recorded in**: `actors/meeting_media.rs::flush_one` (every failed composition; every CHANGED successful one) and `webtransport/connection.rs::handle_receive_capability` (`meeting_state_unavailable` when the actor cannot register a declaration), both via `observability/metrics.rs::record_send_directive`
-- **Dashboard**: MC Overview - Send Directives by Outcome (Client Media Signalling row)
+- **Dashboard**: MC Media - Send Directives by Outcome (Client Media Signalling row)
 
 ### `mc_media_slot_states_total`
 - **Type**: Counter
@@ -652,7 +689,7 @@ span would record as attributes, on a surface no guard covers.
   - The client-driven share is bounded: mute-driven re-emits are rate-limited per connection (`mc_media_mute_requests_total{outcome="rate_limited"}`), a video-only toggle re-emits nothing, and each re-emit reaches only the subscribers HOLDING the muted source. The server-driven share is bounded per meeting by the actor's per-turn flush bound (`mc_media_slot_view_emissions_total{outcome="deferred"}`).
 - **Usage**: How many slots are filled versus dark, and in what way
 - **Recorded in**: `actors/meeting_media.rs::flush_one` via `observability/metrics.rs::record_slot_state`
-- **Dashboard**: MC Overview - Slot States (Client Media Signalling row)
+- **Dashboard**: MC Media - Slot States (Client Media Signalling row)
 
 ### `mc_media_mute_requests_total`
 - **Type**: Counter
@@ -670,14 +707,81 @@ span would record as attributes, on a surface no guard covers.
 - **`unchanged` IS CLIENT-INFLATABLE AT NEAR-ZERO SERVER COST, and must not appear in a ratio denominator.** Same property as `accepted_unchanged` on the capability counter, and the same rule: **the denominator is `applied` + `applied_no_recompose`**. The short-circuit fires before any actor hop, roster read or recomposition, so a client repeating one state drives this value at line rate for a tuple compare and a counter increment. "What fraction of mute reports are being applied", computed over `unchanged`, is a number one participant can drive to zero.
 - **`unchanged` is exempt from the rate limiter ON PURPOSE — do not "fix" the ordering.** The no-op check runs *before* the token is spent, so identical repeats do not drain the bucket. Reversing that would let a client spamming a steady state exhaust its own budget on messages that do no work and thereby suppress its next **genuine** toggle, while the metric reported `rate_limited` for an expensive path that was never approached.
 - **`rate_limited` is the visible edge of the mute-work bound, and is NOT by itself an incident.** Client mute is the only repeatable client-driven path that puts work on the **shared meeting actor's mailbox** — one actor hop plus a re-emit to the source's holders. A per-connection token bucket (burst 8, sustained 4/s) bounds it; the resulting fan-out is bounded per meeting by the actor's flush bound.
-  - **This is NOT a meeting-wide contention signal.** The roster `broadcast_update` the bound was first sized against was removed (security's S-2: `MuteChanged` has no consumer). The meeting-wide cost of a mute is its re-emit to the source's holders, which the actor bounds per turn; do not route a meeting-wide latency investigation here.
+  - **This is NOT a meeting-wide contention signal.** The roster `broadcast_update` the bound was first sized against was removed on security's S-2 judgment that no consumer needed a SELF-mute fan-out. (`MuteChanged` IS wire-serialized since story 2 task 12 — for SERVER mute only; a self-mute still does not fan out, by that judgment, not because the encoder cannot.) The meeting-wide cost of a mute is its re-emit to the source's holders, which the actor bounds per turn; do not route a meeting-wide latency investigation here.
   - **A human never reaches the limiter.** A sustained non-zero rate means one connection is toggling far above human rates: a client-side repeat loop or a reactive-state bug first, an abusive peer second. It is bounded to that connection either way.
   - **Why a rate limit and not a budget.** A cumulative budget would permanently deny a repeatable steady-state user action: once spent, that participant's `audio_self_muted` freezes and every other client renders a live speaker as muted for the rest of the session. That is a correctness failure strictly worse than the amplification it would prevent. See `media_signaling`'s module doc for the criterion in general form.
   - **Dropping a report is safe, and here is why it is safe even for a merely broken client.** ADR-0036 §5 enforces client mute at **capture on the client**, so a suppressed report means the audio genuinely stopped and only the indicator other participants see is stale. There is no window in which someone believes they have stopped transmitting and has not. A suppressed report deliberately does not update MC's cache of the last reported pair, so the client's next toggle re-attempts rather than being swallowed — the staleness is bounded by that next action, not by the session.
 - **`actor_unavailable` is environmental and terminal**: the meeting actor's mailbox is closed, so the connection is already going away.
 - **Usage**: Is client mute being applied, and when it is not, why? Is any connection driving mute recomposition hard enough to be clamped? (Per-connection cost, not meeting-wide — see the `rate_limited` bullet.)
 - **Recorded in**: `webtransport/connection.rs::handle_mute_request` via `observability/metrics.rs::record_mute_request`
-- **Dashboard**: MC Overview - Mute Requests by Outcome (Client Media Signalling row)
+- **Dashboard**: MC Media - Mute Requests by Outcome (Client Media Signalling row)
+
+### `mc_media_server_mute_requests_total`
+- **Type**: Counter
+- **Description**: `ServerMuteRequest` dispositions — a host's server mute of another participant (ADR-0036 §5, §7; story 2 R-8, R-9)
+- **Labels**:
+  - `action`: `mute`, `unmute` — the verb the request ASKED for (`mute` if either kind is requested muted, `unmute` if neither), never its result
+  - `outcome`: `applied`, `unchanged`, `not_permitted`, `unknown_target`, `rate_limited`, `actor_unavailable`
+  - `key_custody`: single value `operator`
+- **Cardinality**: 12 (2 x 6), bounded at the type level by `ServerMuteAction::ALL` x `ServerMuteOutcome::ALL`, and **zero-initialised as the FULL cross product, unreachable cells included** — so an absent series means "not up or not scraped", never zero
+- **Deliberately SEPARATE from `mc_media_mute_requests_total`, and not merely because the names overlap.** Client mute and server mute differ in decider (the participant about itself versus a host about someone else), enforcement point (client capture, ADR-0036 §5, versus MH ingress, §7) and remedy. A merged series would make every existing client-mute query silently count moderation events.
+- **`action` is NOT A JOIN KEY with `dt_client_media_mute_transitions_total{action}`**, whose value set is byte-identical: that series is a local user's capture-side toggle, this one a host's moderation decision. Summing `by(action)` across the two metric names means nothing (`docs/observability/label-taxonomy.md`, the `action` row).
+- **It PARTITIONS requests**: one increment per `ServerMuteRequest`, in exactly one `outcome`. `sum()` is requests received.
+- **THE FAILURE PREDICATE IS STATED POSITIVELY: `outcome=~"rate_limited|actor_unavailable"`.** `unchanged`, `not_permitted` and `unknown_target` are not MC failures. Positive for the same reason as `mc_media_mute_requests_total`: a variant added later defaults to NOT being a failure. Do not harmonise it to `outcome!="applied"`.
+- **The metric distinguishes two refusals the CLIENT never can — deliberately.** `not_permitted` and `unknown_target` reach the client as ONE byte-identical error; the split exists only here and in the `mc.webtransport.connection` WARN, which are operator-visible. Do not "harmonise" that asymmetry in either direction.
+- **`unknown_target` is reachable ONLY for a host requester.** Authority is checked BEFORE the target is looked up, so a non-host naming a participant who does not exist is `not_permitted`. That ORDERING is the security control (a non-host learns nothing about who is in the meeting); the single wire error is defence in depth on top of it. The `{action="mute",outcome="unknown_target"}` cell staying at zero while a non-host is refused is what the ordering test reads.
+  - `applied` — the requested state differed and was recorded; for an audio change, MC re-rendered (the muted sender rides the next registration snapshot of every handler carrying one of its edges, advancing that handler's generation) and re-emitted `SOURCE_MUTED` to the source's holders.
+  - `unchanged` — already in the requested state; nothing broadcast or pushed.
+  - `not_permitted` — the requester's token does not carry `MeetingRole::Host` (refused at the connection, before any actor hop) or its roster entry is not a host (refused again in the actor; the two are AND-composed). **CLIENT-INFLATABLE, exactly like `unchanged` on the client-mute counter and `accepted_unchanged` on the declarations counter**: the check is cheap and precedes any actor hop, so one non-host drives it at line rate. **Never put it in a ratio denominator, and never alert on its raw rate without per-connection normalisation.**
+  - `unknown_target` — an authorized host named a participant not in this meeting.
+  - `rate_limited` — a host's server-mute work exceeded its per-connection bucket (no looser than client mute's: burst 8, 4/s sustained; a compile-time assertion keeps it so). Host requests only: a non-host is refused before the bucket.
+  - `actor_unavailable` — the meeting actor's mailbox is closed; environmental. Not reachable through the public test path; a stays-at-zero cell in the unit suite.
+- **No alert, by decision.** A non-zero mute rate is healthy moderation, and `not_permitted` is client-inflatable; MH's `server_muted` drop reason records the same no-alert decision for the enforcement side.
+- **Usage**: Is moderation working, and when a mute seems not to take, did MC even apply it? (Then read the state gauge below and MH's `server_muted` drops.)
+- **Recorded in**: `webtransport/connection.rs::handle_server_mute_request` / `refuse_server_mute` via `observability/metrics.rs::record_server_mute_request`
+- **Dashboard**: MC Media - Server Mute Requests (Client Media Signalling row)
+
+### `mc_media_unmute_requests_total`
+- **Type**: Counter
+- **Description**: Participant `UnmuteRequest` dispositions — a server-muted participant asking the host(s) to lift its mute (story 2 R-10). NOTIFIES only; never clears a mute.
+- **Labels**:
+  - `outcome`: `relayed`, `not_server_muted`, `no_host_connected`, `rate_limited`, `actor_unavailable`
+  - `key_custody`: single value `operator`
+- **Cardinality**: 5, bounded by `UnmuteRequestOutcome::ALL`; zero-initialised
+- **A separate family from `mc_media_server_mute_requests_total`, with the sharper reason recorded:** merged, `action="unmute"` would name a host LIFTING a mute and a participant ASKING to be lifted in one series — two operations by two principals behind one selector. No `action` label here: the request has one direction.
+- **Counting unit: ONE INCREMENT PER REQUEST, never per host it is relayed to.** A per-host delivery failure is the LATER hop, counted by the outbound path (`mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`) — disjoint from this series, so alert on at most one of them.
+- **Failure predicate, positive: `outcome=~"rate_limited|actor_unavailable"`.** `relayed` is success; `not_server_muted` and `no_host_connected` are ROUTINE (`no_host_connected` is normal once the host has left a meeting that carries on). `not_server_muted` is client-driven: keep it out of every ratio denominator.
+- **Usage**: Are muted participants' requests reaching a host?
+- **Recorded in**: `webtransport/connection.rs::handle_unmute_request` via `observability/metrics.rs::record_unmute_request`
+- **Dashboard**: MC Media - Unmute Requests (Client Media Signalling row)
+
+### `mc_media_refusal_replies_suppressed_total`
+- **Expected-empty**: yes — a legitimate client never reaches a reply burst, so this reads zero when healthy
+- **Type**: Counter
+- **Description**: A REFUSAL reply withheld by its path's reply-rate limiter
+- **Labels**:
+  - `surface`: `server_mute`, `capability`
+  - `key_custody`: single value `operator`
+- **Cardinality**: 2, bounded by `RefusalReplySurface::ALL`; zero-initialised
+- **NOT A REFUSAL COUNT.** The refusal itself is counted once, on its own path — `mc_media_server_mute_requests_total{outcome="not_permitted"|"unknown_target"}` or a `mc_media_receive_capability_declarations_total` rejection outcome — whether or not a reply went out. These are deliberately DISJOINT views of one request: the refusal is about the request, the suppression about the reply. Suppression is therefore never an `outcome` value, which would break those counters' partition and under-count refusals exactly when a probe is most active.
+- **EVERY SUPPRESSED REPLY IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER CONNECTION. A SINGLE WARN DOES NOT MEAN A SINGLE SUPPRESSION.** The one-shot WARN only became safe *because* this counter exists; before story 2 task 12 the capability path's suppressed replies had a latched WARN and NO counter.
+- **No alert, by decision**: client-inflatable by construction.
+- **Usage**: Is some connection looping refused requests (an SDK bug, or a probe)?
+- **Recorded in**: `webtransport/connection.rs::refuse_server_mute` and `reject_capability` via `observability/metrics.rs::record_refusal_reply_suppressed`
+- **Dashboard**: MC Media - Suppressed Refusal Replies (Client Media Signalling row)
+
+### `mc_media_server_muted_sources`
+- **Type**: Gauge
+- **Description**: How many participants MC believes are SERVER-muted (audio) right now, SUMMED across this pod's meetings
+- **Labels**: `key_custody` (single value `operator`)
+- **Cardinality**: 1
+- **A STATE level, not an event rate.** Counting unit: server-muted participants in force on this MC pod — NOT mute events. A mute applied yesterday is still counted here; `mc_media_server_mute_requests_total` stays flat for it.
+- **Present at zero from process start**, so ABSENT means "not up or not scraped", never "nobody is muted".
+- **Recomputed and `set` from live state, never delta-maintained.** Each meeting actor writes its ABSOLUTE count into a census; the controller's health walk prunes meetings that no longer exist and re-sets the pod total (the load-bearing publish), and every mute change also publishes (freshness only). So an actor that dies without running its exit path cannot leave a phantom count behind.
+- **Read it against MH's enforcement — at FLEET level, and directionally.** `sum(mc_media_server_muted_sources)` across MC instances against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH instances. Per instance the comparison means nothing: MC and MH meeting sets do not nest (a meeting on mc-0 has edges on mh-0 and/or mh-1, and each handler serves both MCs). A level and a counter are NEVER divided. Gauge > 0 while the fleet drop rate is flat is only a CANDIDATE disagreement — first exclude the benign cause: a muted participant who is silent, disconnected, in grace or not yet on a handler drops nothing. Same class of caveat as `mc_media_generation_divergence`.
+- **What it does NOT answer**: whether a mute is in force in ONE meeting. ADR-0036 §11 bars a per-meeting dimension; the meeting-scoped question is MC's state and the `mc.webtransport.connection` "Server mute decision" log.
+- **Recorded in**: `actors/meeting_media.rs::MutedSourceCensus::publish` via `observability/metrics.rs::set_server_muted_sources`; boot zero in `webtransport/server.rs`
+- **Dashboard**: MC Media - Server-Muted Sources (Client Media Signalling row)
 
 ### `mc_media_slot_view_emissions_total`
 - **Type**: Counter
@@ -696,7 +800,7 @@ span would record as attributes, on a surface no guard covers.
 - **Shared denominator, recorded so it is not alerted on twice.** A composition failure increments BOTH this series (`composition_failed`) and `mc_media_send_directives_total{outcome=<stage>}`. `mc_media_send_directives_total` carries the STAGE dimension and is the alerting and triage home; `composition_failed` exists here only so the flush-turn disposition set is complete. Do not alert on both.
 - **Usage**: Is the meeting actor's server-driven re-emit keeping every declared participant's view current, and is the per-meeting bound engaging?
 - **Recorded in**: `actors/meeting_media.rs::flush` / `flush_one` via `observability/metrics.rs::record_slot_view_emission`
-- **Dashboard**: MC Overview - Slot View Emissions by Outcome (Client Media Signalling row)
+- **Dashboard**: MC Media - Slot View Emissions by Outcome (Client Media Signalling row)
 
 ### `mc_media_unreachable_senders_total`
 - **Type**: Counter
@@ -711,7 +815,7 @@ span would record as attributes, on a surface no guard covers.
 - **This field is a wire contract, not a courtesy.** `signaling.proto` requires the client to mark these roster entries distinctly; client consumption lands with story 2 task 20 (SDK) and the rendering with task 15 (UI). Its rarity is not a reason for a client to ignore it: an unreachable peer is otherwise wholly silent.
 - **Usage**: How often participants are told part of the roster is unreachable — read as degraded media connectivity
 - **Recorded in**: `actors/meeting_media.rs::flush_one` via `observability/metrics.rs::record_unreachable_senders`
-- **Dashboard**: MC Overview - Unreachable Senders Named (Client Media Signalling row)
+- **Dashboard**: MC Media - Unreachable Senders Named (Client Media Signalling row)
 
 ### `mc_media_not_yet_connected_senders_total`
 - **Type**: Counter
@@ -725,7 +829,7 @@ span would record as attributes, on a surface no guard covers.
 - **Emission-weighted**: normalise by `mc_media_slot_view_emissions_total{outcome="sent"}`.
 - **Usage**: Is MC silent toward participants because their media connectivity has not been observed?
 - **Recorded in**: `actors/meeting_media.rs::flush_one` via `observability/metrics.rs::record_not_yet_connected_senders`
-- **Dashboard**: MC Overview - Not-Yet-Connected Senders (Media Connectivity row)
+- **Dashboard**: MC Media - Not-Yet-Connected Senders (Media Connectivity row)
 
 ### `mc_media_send_targets_total`
 - **Type**: Counter
@@ -737,7 +841,7 @@ span would record as attributes, on a surface no guard covers.
 - **Only CHANGED directives are recorded** (same boundary as `emitted`), so this is emission-weighted too.
 - **Usage**: Are senders being spread across handlers more than connectivity requires?
 - **Recorded in**: `actors/meeting_media.rs::flush_one` via `observability/metrics.rs::record_send_targets`
-- **Dashboard**: MC Overview - Mean Send Targets per Directive (Media Connectivity row)
+- **Dashboard**: MC Media - Mean Send Targets per Directive (Media Connectivity row)
 
 ### `mc_media_edge_moves_total`
 - **Type**: Counter
@@ -750,7 +854,7 @@ span would record as attributes, on a surface no guard covers.
 - **Detected independently of the code it checks**: a diff of consecutive renders in `reconcile`, not a counter inside the slot table's mutation path, so a regression there cannot also hide its own evidence.
 - **Usage**: Edge churn from connectivity changes; any `unexpected` is an MC defect to capture and escalate
 - **Recorded in**: `actors/meeting_media.rs::record_edge_moves` via `observability/metrics.rs::record_edge_move`
-- **Dashboard**: MC Overview - Edge Moves by Reason (Media Connectivity row; `unexpected` red)
+- **Dashboard**: MC Media - Edge Moves by Reason (Media Connectivity row; `unexpected` red)
 
 ### `mc_media_connect_settles_total`
 - **Type**: Counter
@@ -763,7 +867,7 @@ span would record as attributes, on a surface no guard covers.
 - **The window is a masking mechanism, so it is counted.** While a participant is establishing, MC withholds routing (no edges, not unreachable) rather than act on a partial set; without the window, staggered connects would pin every edge involving the participant to its first handler permanently (see `media_routing/connectivity.rs`). `window_elapsed` is the visible edge of that mask.
 - **Usage**: Scenario 18 Step 0's population signal; a rising `window_elapsed` share is participants that cannot reach every handler
 - **Recorded in**: `actors/meeting_media.rs::sync_routing` via `observability/metrics.rs::record_connect_settle`
-- **Dashboard**: MC Overview - Connect Settles by Outcome (Media Connectivity row)
+- **Dashboard**: MC Media - Connect Settles by Outcome (Media Connectivity row)
 
 ### `mc_media_connect_settle_window_seconds`
 - **Type**: Gauge
@@ -774,7 +878,7 @@ span would record as attributes, on a surface no guard covers.
 - **A CONFIG ECHO**, set once at boot from the same `ClientMediaConfig::connect_settle_window` the meeting actors enforce, so the published and enforced windows cannot drift (the `mc_media_receive_slot_cap` pattern). Env-test `27_mc_slot_placement.rs` derives its settle wait from this value.
 - **Cost it names**: time-to-first-audio for a participant that does not reach every handler is delayed by up to this window; it never appears in `mc_session_join_duration_seconds` (which stops at the JoinResponse).
 - **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_connect_settle_window`
-- **Dashboard**: MC Overview - Connect Settle Window (Media Connectivity row, stat panel)
+- **Dashboard**: MC Media - Connect Settle Window (Media Connectivity row, stat panel)
 
 ### `mc_media_handler_set_divergence_total`
 - **Expected-empty**: yes — any non-zero value is an MC-internal invariant violation
@@ -785,7 +889,7 @@ span would record as attributes, on a surface no guard covers.
 - **Cardinality**: 1
 - **The frozen set is the meeting's authority.** The actor keeps it: no later join and no changed Redis entry can widen a live meeting's handler set or move anyone's edges. A non-zero value means Redis and the actor disagree — capture and escalate as an MC defect; restarting nothing fixes it. The ERROR line at `mc.actor.meeting` says the same.
 - **Recorded in**: `actors/meeting_media.rs::install` via `observability/metrics.rs::record_handler_set_divergence`
-- **Dashboard**: MC Overview - Handler Set Divergence (Client Media Signalling row)
+- **Dashboard**: MC Media - Handler Set Divergence (Client Media Signalling row)
 
 ### `mc_media_receive_slot_cap`
 - **Type**: Gauge
@@ -796,7 +900,7 @@ span would record as attributes, on a surface no guard covers.
 - **A CONFIG ECHO, NOT A UTILISATION GAUGE.** Set once, when the WebTransport server is built, from the very `ClientMediaConfig::max_receive_slots` every connection's capability parse compares a declaration against — so the published cap and the enforced cap are one value. There is no numerator: do not build a "slots used / cap" ratio on it.
 - **Usage**: Read beside `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}` — a rising over-cap rate with a cap below the client's configured N is a configuration mismatch, not a client bug (R-1)
 - **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_receive_slot_cap`
-- **Dashboard**: MC Overview - Receive Slot Cap (Client Media Signalling row, stat panel)
+- **Dashboard**: MC Media - Receive Slot Cap (Client Media Signalling row, stat panel)
 
 ### `mc_media_unmatched_plan_slots_total` — RETIRED (story 2)
 Retired rather than left as a permanent zero. It counted egress plans for a slot the subscriber never declared; since story 2 plans are DERIVED from the declared slots, so the count is identically zero on every path — a detector that structurally cannot observe anything, and a flat panel that reads as coverage. The invariant it guarded now lives in `media_routing::slots`' exhaustive model check, which fails the build instead. Its story-1 twin, `slot_id_not_planned`, retired with it. **Re-add condition**: if story 5's MH-selects shape returns and the forwarding plan decouples from the declaration again, re-derive the counter from that decoupling — not from this entry's old rationale.
@@ -810,9 +914,10 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **Type**: Counter
 - **Description**: Server messages dropped because a participant's outbound channel was full or closed
 - **Labels**:
-  - `payload_kind`: `signaling_raw`, `participant_update_joined`, `participant_update_left`, `meeting_kek_update`
+  - `payload_kind`: `signaling_raw`, `participant_update_joined`, `participant_update_left`, `participant_update_muted`, `meeting_kek_update`
 - **Cardinality**: bounded by one constant per `try_send` site in `actors/participant.rs` plus the roster-update labels `webtransport/handler.rs::encode_participant_update` returns with each wire-visible update (no restated count: it would be the third value of this line in one story)
 - **`participant_update` was SPLIT into `_joined` / `_left`** (story 2 task 9). The rule applied is **demonstrated consumer need, not message-type taxonomy**: a named consumer — the client's R-18 rebind correlation — cannot do its job with the two merged, because a dropped LEAVE has a consequence a dropped join does not (the client keeps a stale roster entry and later counts a legitimate `sender_id` reissue as a rebind, `dt_client_media_roster_key_rebinds_total{outcome="rebind"}`). Non-zero `participant_update_left` over a window makes that explanation **supported** — not confirmed for any single rebind increment, since this counter is fleet-wide. `signaling_raw` also spans several message types and **stays merged**: that is the same rule returning the other answer, not an unfinished half of this split. The shared stem means `payload_kind=~"participant_update.*"` still recovers the old merged series.
+- **`participant_update_muted` was split out at story 2 task 12, on the same DEMONSTRATED-CONSUMER-NEED rule.** A dropped `ParticipantMuteUpdate` has no re-sync path: join/leave state is rebuilt from the roster, but who-muted-whom is delivered ONLY by the live server-mute broadcast and the late-joiner replay, so a drop leaves that client rendering a wrong mute indicator until the next mute change on that participant — which may never come. Distinct consequence, distinct remedy. Past participle, matching `_joined` / `_left`, so `payload_kind=~"participant_update.*"` still recovers the merged series.
 - **`meeting_kek_update`** is the third `try_send` site: a KEK push the outbound channel dropped. The same event is also `mc_meeting_kek_pushes_total{outcome="dropped_outbound"}` — two angles on one event, one as outbound loss, one as a rotation that did not reach a member.
 - **The client did not receive something MC decided to send.**
 - **EVERY DROP IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER CONNECTION. A SINGLE WARN DOES NOT MEAN A SINGLE DROP.** The WARN at `mc.actor.participant` fires once per participant actor and is deliberately not repeated — a per-message log on a client-drivable path is a log-amplification vector, and a wedged outbound channel drops one message per roster broadcast, i.e. O(participants x events) from one bad connection. **So log-line volume understates drop volume by orders of magnitude, and this counter is the only complete record.** Triaging by `grep` first — which is what people actually do — shows one line and reads as an isolated blip; the truth is the opposite. Take the magnitude from here, never from the log.
@@ -822,7 +927,7 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **RECIPROCAL WITH `mc_media_send_directives_total`.** That counter's `emitted` means a directive was **composed**, not delivered — it fires before the send. `payload_kind="signaling_raw"` is the stream-channel-FULL half of the evidence for what happened next; the participant-mailbox-CLOSED half is `mc_media_slot_view_emissions_total{outcome="delivery_failed"}` (a different, earlier hop — the two are disjoint). **A non-zero `signaling_raw` rate against a healthy `emitted` rate is the specific shape of "MC composed a send directive the client never received".**
 - **Usage**: Detect a slow or wedged client connection losing server messages
 - **Recorded in**: `actors/participant.rs::handle_send`, `handle_update` and `handle_kek_update` via `observability/metrics.rs::record_participant_outbound_dropped`
-- **Dashboard**: MC Overview - Dropped Outbound Messages (Client Media Signalling row)
+- **Dashboard**: MC Media - Dropped Outbound Messages (Client Media Signalling row)
 
 ---
 
@@ -857,7 +962,7 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **No meeting, participant, handler or connection identity.** `connection_id` is unbounded (one per MH session) and appears in the INFO line at `mc.grpc.media_coordination` as a correlation field only.
 - **Usage**: Every way MH-reported connectivity failed to become routing input
 - **Recorded in**: `grpc/media_coordination.rs` via `observability/metrics.rs::record_notification_unapplied`
-- **Dashboard**: MC Overview - MH Notifications Unapplied by Reason (Media Connectivity row; per-reason colours)
+- **Dashboard**: MC Media - MH Notifications Unapplied by Reason (Media Connectivity row; per-reason colours)
 
 ### `mc_mh_notifications_without_connection_id_total`
 - **Type**: Counter
@@ -868,7 +973,58 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **The degraded legacy path, counted so it is not silent.** An empty id maps to one implicit key per (participant, handler) — exactly the pre-field semantics, including the stale-disconnect hazard `connection_id` exists to close. Non-zero means an old MH is still in the fleet (a rolling deploy, or a stuck pod). **Retirement condition**: once this has been flat for a full MH rollout, the legacy branch in `media_routing/connectivity.rs` is deleted.
 - **Usage**: Is any MH still running without `connection_id`?
 - **Recorded in**: `grpc/media_coordination.rs` via `observability/metrics.rs::record_notification_without_connection_id`
-- **Dashboard**: MC Overview - Notifications Without Connection Id (Media Connectivity row)
+- **Dashboard**: MC Media - Notifications Without Connection Id (Media Connectivity row)
+
+---
+
+### `mc_media_end_meeting_total`
+- **Type**: Counter
+- **Description**: Outcome of releasing a meeting on ONE media handler (`EndMeeting`, story 2 R-20) — when the meeting ENDED, and best-effort on graceful MC shutdown
+- **Labels**:
+  - `outcome`: `released`, `rejected_ownership`, `superseded_by_successor`, `unimplemented`, `unavailable_exhausted`, `invalid_argument`, `error`
+  - `key_custody`: single value `operator`
+- **Cardinality**: 7, bounded by `EndMeetingOutcome::ALL`; zero-initialised over the full set
+- **COUNTING UNIT: ONE INCREMENT PER (MEETING, HANDLER)**, never per meeting — a handler missed from the release would otherwise be invisible. Every handler of the meeting's frozen set is released, including one never pushed to.
+- **No handler label** — the handler id is a per-incarnation token (see this section's intro); the `mc.teardown` log line carries `mh_id` for the one-handler-vs-all question.
+  - `released` — acknowledged: released, OR the meeting was unknown on that handler (one outcome by design; MC's action is identical).
+  - `rejected_ownership` — `FAILED_PRECONDITION` on a teardown for a meeting that ENDED (emptied or closed): another MC's `mc_id` holds the meeting. **An MC defect: any non-zero value is a bug** — MC only sends its own id, and a release is sent only after the meeting's handlers are no longer being re-assigned (GC is told the meeting ended AFTER the release). Terminal; never retried. **The shutdown population was split out into `superseded_by_successor` on purpose** (story 2 task 12, O-24): folded in here it would fire this value's alert on every rolling deploy, get silenced, and hide the defect. Do not merge them back.
+  - `superseded_by_successor` — `FAILED_PRECONDITION` on a GRACEFUL-SHUTDOWN teardown. The expected cause is a successor MC that already re-registered the meeting during a rollout: MH's ownership check refusing a release that would have cut a live meeting. **Consistent with supersession, not proof of it**: a wrong `mc_id` sent during shutdown lands on this value too and is indistinguishable at the recording site. Decided from MC's own teardown reason, never inferred from MH's reply. Expected non-zero after deploys; rising OUTSIDE a rollout window is worth a look (confirm mixed MC images as `mh-incident-response.md` does for `no_generation`). **No alert**, recorded: alerting would page on every deploy. Zero-initialised, so a flat baseline is distinguishable from an absent series.
+  - `unimplemented` — the handler predates the RPC: a rollout in the wrong order (MH rolls forward first, MC rolls back first). Non-fatal, never retried; that handler keeps the meeting until it restarts.
+  - `unavailable_exhausted` — transport, `UNAVAILABLE` or `DEADLINE_EXCEEDED` on every attempt (a release is idempotent, so these are retried, bounded). The meeting leaks on that handler exactly like a crash.
+  - `invalid_argument`, `error` — terminal; not expected from MC's own values.
+- **Cross-hop counterpart — for COMPARISON only, never a sum or a ratio**: `mh_media_meeting_teardowns_total{outcome="rejected_ownership"}` (`docs/observability/metrics/mh-service.md`). **The correspondence is ASYMMETRIC**: MH cannot tell why an MC was tearing down, so MH's `rejected_ownership` corresponds to MC's `rejected_ownership` **plus** `superseded_by_successor`, not to the like-named MC value alone. Comparing token to token shows a gap that grows on every rolling deploy and looks exactly like lost MC→MH messages. And the denominators differ even for the union — MC counts per (meeting, handler) terminal outcome, MH per request received (including retries of retryable failures) — so different denominators; do not sum, and do not build a ratio across them.
+- **Usage**: Are ended meetings being released on their handlers? A sustained rate of failure outcomes (anything but `released` and `superseded_by_successor`) means MH edge budget and `MH_MAX_REGISTERED_MEETINGS` slots are leaking.
+- **THE FAILURE PREDICATE IS STATED POSITIVELY**: `outcome=~"rejected_ownership|unimplemented|unavailable_exhausted|invalid_argument|error"`, **not** `outcome!~"released|superseded_by_successor"`. This section's standing rule (see `mc_media_mute_requests_total`) is that a negated predicate is correct only where the SUCCESS set is closed and small. **This metric's success set is demonstrably not closed** — it grew from `{released}` to `{released, superseded_by_successor}` inside one devloop, and under a negated predicate that new benign value would have joined the failure set silently and paged on every rolling deploy. So an eighth value defaults to NOT a failure and must be classified deliberately. **The classification obligation is recorded at `EndMeetingOutcome` in `media_routing/teardown.rs`**, because that is where a variant is added and nothing in Rust connects it to a PromQL rule.
+- **`superseded_by_successor` is in NEITHER the numerator NOR the denominator** of `MCEndMeetingFailureRate`. **The denominator is `released` + the five failure values** — the releases that were MC's to make. It leaks nothing, and it arrives in bursts on every rolling deploy: left in the denominator it would dilute the ratio exactly while deploys are happening, the fail-quiet direction, masking a real failure during a rollout. (`released` stays in, as the non-zero-denominator guard requires.)
+- **Alerts**: `MCEndMeetingOwnershipRejected` (`> 0`, `rejected_ownership` only), `MCEndMeetingFailureRate` (positive predicate, above). `superseded_by_successor` has **no alert**, recorded.
+- **Recorded in**: `media_routing/teardown.rs::run` via `observability/metrics.rs::record_end_meeting`
+- **Dashboard**: MC Overview - EndMeeting Outcomes (MH Coordination row)
+
+### `mc_media_push_quiesce_total`
+- **Type**: Counter
+- **Description**: How one meeting teardown's DRAIN of its push workers ended — every in-flight `RegisterMeeting` must have RETURNED before `EndMeeting` goes out (`EndMeetingRequest`'s quiesce MUST)
+- **Labels**:
+  - `outcome`: `quiesced`, `timed_out`
+  - `key_custody`: single value `operator`
+- **Cardinality**: 2, bounded by `QuiesceOutcome::ALL`; zero-initialised
+- **COUNTING UNIT: ONE INCREMENT PER MEETING TEARDOWN** (contrast `mc_media_end_meeting_total`, per (meeting, handler)). That is why the two are separate metrics: "the drain timed out" and "released on every handler" are routinely both true.
+- **Unlike most of this family, this IS a clean denominator**: both values are server-driven and neither is client-inflatable, so `timed_out / (quiesced + timed_out)` is a legitimate ratio.
+- **`timed_out` is the LEADING indicator of the edge-budget ratchet.** The drain waited `push_quiesce_bound_seconds` (MC's startup line), then waited once more before releasing (so an in-flight registration's deadline expires first), and still released. A late apply that was already queued at MH is refused there; a registration still in flight is only ORDERED by that wait — a property of the RPC layer that fails open. See the EndMeeting scenario in `docs/runbooks/mc-incident-response.md`.
+- **Alert**: `MCPushQuiesceTimeouts` (warning, `> 0`)
+- **Recorded in**: `media_routing/teardown.rs::quiesce` via `observability/metrics.rs::record_push_quiesce`
+- **Dashboard**: MC Overview - Push Quiesce Outcomes (MH Coordination row)
+
+### `mc_media_teardown_fence_backstop_total`
+- **Expected-empty**: yes — reads zero forever on a healthy MC
+- **Type**: Counter
+- **Description**: A teardown fence lifted by its DEADLINE rather than by the teardown reporting completion
+- **Labels**: `key_custody` (single value `operator`)
+- **Cardinality**: 1; zero-initialised
+- The controller FENCES a meeting id while its previous incarnation is being released (a create for it waits), because `EndMeeting` releases by meeting id alone and would otherwise release a re-created meeting. Completion is reported from a `Drop` guard on EVERY exit of the teardown task, a panic included — so this fires only if that task HUNG or vanished without unwinding. When it fires, creates for that id proceed, a still-running release may land on the new incarnation, and — for a meeting that ENDED rather than one removed at shutdown — GC is told it ended (the cause is recorded when the fence is raised), so the id stays re-assignable rather than stuck on `meeting_not_found`.
+- **NOT mutually exclusive with `mc_media_push_quiesce_total{outcome="timed_out"}`**: a wedged teardown can record both. A backstop WITHOUT a matching timeout is a different fault — the task hung somewhere other than the drain.
+- **Alert**: `MCTeardownFenceBackstop` (warning, `> 0`)
+- **Recorded in**: `actors/controller.rs::teardown_complete` via `observability/metrics.rs::record_teardown_fence_backstop`
+- **Dashboard**: MC Overview - Teardown Fence Backstops (MH Coordination row)
 
 ---
 
@@ -974,7 +1130,9 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
   involuntary departures (network issues / crashes) — see the disconnect-reason runbook
   section.
 - **Recorded in**: `actors/meeting.rs::remove_and_broadcast_left` (voluntary/timeout/removed)
-  and `actors/meeting.rs::handle_end_meeting` (meeting_ended)
+  and `actors/meeting.rs::handle_close_meeting` (meeting_ended — the MC-side meeting
+  lifecycle close, renamed from `handle_end_meeting` in story 2 task 12 so that
+  `EndMeeting` names only the MC→MH release RPC, which records no leave reason)
 
 ### `mc_join_display_name_resolved_total`
 - **Type**: Counter
@@ -1049,7 +1207,7 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
 - **Alert**: ANY non-zero value indicates a bug or misconfiguration
 - **Usage**: Detect service-to-service routing errors, misconfigured tokens
 - **Recorded in**: `grpc/auth_interceptor.rs` on Layer 2 rejection
-- **Dashboard**: MC Overview - Caller Type Rejections
+- **Dashboard**: MC Overview - Caller Type Rejections (ADR-0003 Layer 2)
 
 ---
 
@@ -1097,7 +1255,16 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
 
 ## Error Metrics
 
-### `mc_errors_total`
+### `mc_errors_total` — NOT EMITTED (no recording site exists)
+
+> **This metric does not exist.** Nothing in `crates/` records it; `McError::error_type_label()`'s doc
+> (`crates/mc-service/src/errors.rs`) only reserves the name for a future global error counter. Any
+> query against it returns no data, which is indistinguishable from "healthy and flat" — so the
+> example below is marked NON-FUNCTIONAL rather than deleted, and the row is kept so a grep for
+> the name lands here. What to read instead today: `mc_session_join_failures_total{error_type}` for
+> join-path errors (present at zero over its join-reachable values) and `mc_actor_panics_total` for
+> actor faults. The fields below describe the reserved design, not a live series.
+
 - **Type**: Counter
 - **Description**: Total errors by operation and type
 - **Labels**:
@@ -1108,8 +1275,8 @@ client-controlled string, `mh_url`, participant-id, or raw close-reason text.
   - `status_code`: Signaling error code as string (2, 3, 4, 5, 6, 7)
 - **Cardinality**: Medium (~90 combinations, bounded by operations and error types)
 - **Usage**: Track error rates by type, identify patterns in failures
-- **Example**:
-  ```promql
+- **Example** (NON-FUNCTIONAL — the series does not exist; see the note above):
+  ```text
   sum(rate(mc_errors_total{job="mc-service"}[5m])) by (operation, error_type)
   ```
 

@@ -10,6 +10,7 @@
 //! | [`generation`] | a **change-detector** that numbers those snapshots, plus floor adoption after an MC restart |
 //! | [`confirm`] | a **total classifier** of the handler's reply into one bounded outcome |
 //! | [`pusher`] | one **push worker per (meeting, handler)**: serialized, latest-wins, meeting-scoped |
+//! | [`teardown`] | releasing an ended meeting on EVERY handler of its frozen set, only after its push workers have DRAINED (the `Quiesced` witness) |
 //! | (`grpc::mh_client`) | the programming call that carries a snapshot and confirms the echo |
 //!
 //! Loopback is gone (story 2 R-3): visibility is non-reflexive, so a solo
@@ -44,6 +45,7 @@ pub mod generation;
 pub mod placement;
 pub mod pusher;
 pub mod slots;
+pub mod teardown;
 
 pub use assignment::{
     AssignmentError, EgressStreamPlan, HandlerAssignment, HandlerId, MeetingAssignment,

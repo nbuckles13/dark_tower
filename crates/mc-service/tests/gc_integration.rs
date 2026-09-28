@@ -71,6 +71,14 @@ struct MockGcServer {
     fast_heartbeat_tx: Option<mpsc::Sender<FastHeartbeatRequest>>,
     /// Channel to notify when comprehensive heartbeat received.
     comprehensive_heartbeat_tx: Option<mpsc::Sender<ComprehensiveHeartbeatRequest>>,
+    /// `NotifyMeetingEnded` requests received (shared so the test can read it
+    /// after the server owns the mock).
+    notify_meeting_ended_calls: Arc<AtomicU32>,
+    /// When set, `NotifyMeetingEnded` answers with this status instead of acking.
+    notify_meeting_ended_failure: Option<tonic::Code>,
+    /// When set, `NotifyMeetingEnded` sleeps this long before answering, so a
+    /// caller's own deadline can be made to expire deterministically.
+    notify_meeting_ended_delay: Option<Duration>,
 }
 
 impl MockGcServer {
@@ -85,7 +93,20 @@ impl MockGcServer {
             registration_tx: None,
             fast_heartbeat_tx: None,
             comprehensive_heartbeat_tx: None,
+            notify_meeting_ended_calls: Arc::new(AtomicU32::new(0)),
+            notify_meeting_ended_failure: None,
+            notify_meeting_ended_delay: None,
         }
+    }
+
+    fn with_notify_meeting_ended_failure(mut self, code: tonic::Code) -> Self {
+        self.notify_meeting_ended_failure = Some(code);
+        self
+    }
+
+    fn with_notify_meeting_ended_delay(mut self, delay: Duration) -> Self {
+        self.notify_meeting_ended_delay = Some(delay);
+        self
     }
 
     fn new_with_behavior(behavior: MockBehavior) -> Self {
@@ -237,6 +258,14 @@ impl GlobalControllerService for MockGcServer {
         &self,
         _request: Request<NotifyMeetingEndedRequest>,
     ) -> Result<Response<NotifyMeetingEndedResponse>, Status> {
+        self.notify_meeting_ended_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if let Some(delay) = self.notify_meeting_ended_delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(code) = self.notify_meeting_ended_failure {
+            return Err(Status::new(code, "mock NotifyMeetingEnded failure"));
+        }
         Ok(Response::new(NotifyMeetingEndedResponse {
             acknowledged: true,
         }))
@@ -869,4 +898,335 @@ async fn gc_comprehensive_heartbeat_error_records_status_error_type_comprehensiv
     snap.counter("mc_gc_heartbeats_total")
         .with_labels(&[("status", "error"), ("heartbeat_type", "fast")])
         .assert_delta(0);
+}
+
+// ============================================================================
+// Meeting-ended notification to GC: `mc_gc_notify_meeting_ended_total{status}`
+// and `mc_gc_meeting_ended_notifications_dropped_total`.
+//
+// `current_thread` for the same reason as the heartbeat block above: the
+// notify future runs on the test's task, so the thread-local recorder sees it.
+// ============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_meeting_ended_notification_reaches_gc_once_and_counts_success() {
+    use ::common::observability::testing::MetricAssertion;
+
+    let mock_gc = MockGcServer::accepting();
+    let calls = Arc::clone(&mock_gc.notify_meeting_ended_calls);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let gc_client = GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
+        .await
+        .unwrap();
+
+    let snap = MetricAssertion::snapshot();
+    gc_client.notify_meeting_ended("meeting-ended-ok").await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one request reaches GC"
+    );
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(0);
+
+    cancel_token.cancel();
+}
+
+/// A request GC received and answered with an error may have been committed, so
+/// it is never re-sent: a duplicate could end a later incarnation's live
+/// assignment. One call, one `error`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_meeting_ended_notification_gc_rejected_is_counted_and_never_resent() {
+    use ::common::observability::testing::MetricAssertion;
+
+    let mock_gc =
+        MockGcServer::accepting().with_notify_meeting_ended_failure(tonic::Code::Internal);
+    let calls = Arc::clone(&mock_gc.notify_meeting_ended_calls);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let gc_client = GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
+        .await
+        .unwrap();
+
+    let snap = MetricAssertion::snapshot();
+    gc_client
+        .notify_meeting_ended("meeting-ended-rejected")
+        .await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a sent-and-failed notification must not be retried"
+    );
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(0);
+
+    cancel_token.cancel();
+}
+
+/// A full queue drops the notification on its own counter, never silently and
+/// never blocking the caller (the controller loop).
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_meeting_ended_queue_counts_the_drop_and_keeps_what_it_holds() {
+    use ::common::observability::testing::MetricAssertion;
+    use mc_service::actors::controller::MeetingEndedNotifier;
+    use mc_service::grpc::gc_client::MeetingEndedQueue;
+
+    let (queue, mut rx) = MeetingEndedQueue::with_capacity(1);
+
+    let snap = MetricAssertion::snapshot();
+    queue.meeting_ended("first");
+    snap.counter("mc_gc_meeting_ended_notifications_dropped_total")
+        .assert_delta(0);
+
+    let snap = MetricAssertion::snapshot();
+    queue.meeting_ended("second");
+    snap.counter("mc_gc_meeting_ended_notifications_dropped_total")
+        .assert_delta(1);
+
+    assert_eq!(rx.recv().await.as_deref(), Some("first"));
+    assert!(rx.try_recv().is_err(), "the dropped id must not be queued");
+}
+
+/// A GC address that refuses connections: bind an ephemeral port, then release
+/// it. The adverse input is real (a kernel connection refusal), not a
+/// hand-built `Status`.
+fn refused_gc_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// A lazily-connected channel takes the same tonic reconnect branch
+/// (`has_been_connected || is_lazy`) as `GcClient::new`'s eagerly-connected
+/// channel after GC went away: readiness reports `Ok`, and the connect error
+/// surfaces from the call. So this reproduces a GC restart deterministically.
+fn lazy_channel(url: &str) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(url.to_string())
+        .unwrap()
+        .connect_lazy()
+}
+
+/// The classifier's positive AND negative control, both on statuses a real
+/// call produced: a refused connect is provably unsent (so the downcast cannot
+/// silently go green-by-never-matching), and an error GC's handler returned is
+/// not (so it cannot go green-by-always-matching).
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_connect_failure_classifies_as_provably_unsent() {
+    use mc_service::grpc::gc_client::is_provably_unsent;
+    use proto_gen::dark_tower::internal::v1::global_controller_service_client::GlobalControllerServiceClient;
+
+    let request = || NotifyMeetingEndedRequest {
+        meeting_id: "classify".to_string(),
+        region: "us-east-1".to_string(),
+    };
+
+    let refused = GlobalControllerServiceClient::new(lazy_channel(&refused_gc_url()))
+        .notify_meeting_ended(request())
+        .await
+        .expect_err("nothing listens on the refused port");
+    assert_eq!(refused.code(), tonic::Code::Unavailable);
+    assert!(
+        is_provably_unsent(&refused),
+        "a refused connect must classify as unsent; got {refused:?}"
+    );
+
+    let mock_gc =
+        MockGcServer::accepting().with_notify_meeting_ended_failure(tonic::Code::Unavailable);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let handler_error = GlobalControllerServiceClient::new(lazy_channel(&format!("http://{addr}")))
+        .notify_meeting_ended(request())
+        .await
+        .expect_err("the mock's handler answers with an error");
+    // Same code as the refused connect, so only the source chain can tell them apart.
+    assert_eq!(handler_error.code(), tonic::Code::Unavailable);
+    assert!(
+        !is_provably_unsent(&handler_error),
+        "a status GC's handler returned was sent and must never classify as unsent"
+    );
+    // Ambiguous outcomes (GC may have committed) fail CLOSED: no source chain,
+    // no ConnectError, never retried.
+    for ambiguous in [
+        tonic::Status::deadline_exceeded("ambiguous"),
+        tonic::Status::unknown("ambiguous"),
+        tonic::Status::cancelled("ambiguous"),
+    ] {
+        assert!(
+            !is_provably_unsent(&ambiguous),
+            "{:?} must not classify as unsent",
+            ambiguous.code()
+        );
+    }
+    cancel_token.cancel();
+}
+
+/// GC unreachable (a GC pod restart): the notification is retried with backoff
+/// until the attempt budget is spent, then counted `error` exactly once. The
+/// paused clock makes the backoff free; the elapsed virtual time is the
+/// evidence that every retry actually ran (1+2+4+8+16 s between the attempts),
+/// which a loop that gave up after the first failure would not accumulate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_unreachable_gc_is_retried_then_counted_error_once() {
+    use ::common::observability::testing::MetricAssertion;
+    use mc_service::grpc::gc_client::MAX_NOTIFY_ATTEMPTS;
+
+    let url = refused_gc_url();
+    let gc_client =
+        GcClient::with_channel(lazy_channel(&url), test_token_receiver(), test_config(&url));
+
+    let snap = MetricAssertion::snapshot();
+    let started = tokio::time::Instant::now();
+    gc_client
+        .notify_meeting_ended("meeting-ended-gc-down")
+        .await;
+    let elapsed = started.elapsed();
+
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(0);
+    assert_eq!(
+        MAX_NOTIFY_ATTEMPTS, 6,
+        "the backoff sum below is for six attempts"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(1 + 2 + 4 + 8 + 16),
+        "all {MAX_NOTIFY_ATTEMPTS} attempts must run with backoff between them; elapsed {elapsed:?}"
+    );
+}
+
+/// Shutdown never loses a notification silently, and the two arms are
+/// different: what is ALREADY QUEUED is flushed (the test below), while a
+/// notification produced AFTER the queue is closed is counted as dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn a_notification_produced_after_the_shutdown_close_is_counted_as_dropped() {
+    use ::common::observability::testing::MetricAssertion;
+    use mc_service::actors::controller::MeetingEndedNotifier;
+    use mc_service::grpc::gc_client::{drain_meeting_ended, MeetingEndedQueue};
+
+    // Never dialled: nothing is queued, so the drain closes and returns at once.
+    let url = refused_gc_url();
+    let gc_client = Arc::new(GcClient::with_channel(
+        lazy_channel(&url),
+        test_token_receiver(),
+        test_config(&url),
+    ));
+    let (queue, rx) = MeetingEndedQueue::with_capacity(4);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    drain_meeting_ended(gc_client, rx, cancel).await;
+
+    let snap = MetricAssertion::snapshot();
+    queue.meeting_ended("after-close");
+    snap.counter("mc_gc_meeting_ended_notifications_dropped_total")
+        .assert_delta(1);
+}
+
+/// The counted-remainder arm: when the flush budget expires mid-flush, the
+/// notification in flight is AMBIGUOUS (it may have been committed, so it is
+/// deliberately not counted as dropped and never retried) and everything still
+/// queued behind it IS counted as dropped. Driven by a GC that answers slower
+/// than the flush budget, so the deadline expiry is real rather than simulated.
+#[tokio::test(flavor = "current_thread")]
+async fn the_remainder_past_the_shutdown_flush_budget_is_counted_as_dropped() {
+    use ::common::observability::testing::MetricAssertion;
+    use mc_service::actors::controller::MeetingEndedNotifier;
+    use mc_service::grpc::gc_client::{drain_meeting_ended, MeetingEndedQueue};
+    use mc_service::media_routing::teardown::SHUTDOWN_NOTIFY_FLUSH_BUDGET;
+
+    let mock_gc =
+        MockGcServer::accepting().with_notify_meeting_ended_delay(SHUTDOWN_NOTIFY_FLUSH_BUDGET * 3);
+    let calls = Arc::clone(&mock_gc.notify_meeting_ended_calls);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let gc_client = Arc::new(
+        GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
+            .await
+            .unwrap(),
+    );
+    let (queue, rx) = MeetingEndedQueue::with_capacity(4);
+    queue.meeting_ended("slow-1");
+    queue.meeting_ended("stranded-2");
+    queue.meeting_ended("stranded-3");
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let snap = MetricAssertion::snapshot();
+    drain_meeting_ended(gc_client, rx, cancel).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the flush stops at its deadline instead of working through the queue"
+    );
+    snap.counter("mc_gc_meeting_ended_notifications_dropped_total")
+        .assert_delta(2);
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(0);
+
+    cancel_token.cancel();
+}
+
+/// OPS-26: a notification produced AFTER shutdown begins — the ordinary case,
+/// since a teardown completing inside the shutdown release window calls
+/// `meeting_ended` at that moment — is SENT, not dropped. The drain's token is
+/// cancelled only once the releases have settled, so `cancel` opens a bounded
+/// flush rather than ending the drain.
+#[tokio::test(flavor = "current_thread")]
+async fn a_notification_queued_during_the_release_window_is_flushed_not_dropped() {
+    use ::common::observability::testing::MetricAssertion;
+    use mc_service::actors::controller::MeetingEndedNotifier;
+    use mc_service::grpc::gc_client::{drain_meeting_ended, MeetingEndedQueue};
+
+    let mock_gc = MockGcServer::accepting();
+    let calls = Arc::clone(&mock_gc.notify_meeting_ended_calls);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let gc_client = Arc::new(
+        GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
+            .await
+            .unwrap(),
+    );
+    let (queue, rx) = MeetingEndedQueue::with_capacity(4);
+
+    // The release window: teardowns complete and queue their notifications
+    // while the drain is still live.
+    let notify_token = CancellationToken::new();
+    let drain = tokio::spawn(drain_meeting_ended(
+        Arc::clone(&gc_client),
+        rx,
+        notify_token.clone(),
+    ));
+    queue.meeting_ended("settled-during-window");
+
+    let snap = MetricAssertion::snapshot();
+    notify_token.cancel();
+    drain.await.unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the notification produced during the release window must reach GC"
+    );
+    snap.counter("mc_gc_notify_meeting_ended_total")
+        .with_labels(&[("status", "success")])
+        .assert_delta(1);
+    snap.counter("mc_gc_meeting_ended_notifications_dropped_total")
+        .assert_delta(0);
+
+    cancel_token.cancel();
 }

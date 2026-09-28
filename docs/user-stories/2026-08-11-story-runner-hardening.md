@@ -43,7 +43,7 @@ Planning produced 23 requirements across 8 tasks. That was disproportionate to t
 
   **This depends on R-2's fifth defect being fixed first**: hand-written prompts are safe because a human avoids stray quotes, and machine-generated ones are not. *(operations, protocol)*
 
-- **R-7 — Layer 7's Nth consecutive run against the same dev cluster reaches the same verdict as its first**, for both suites. It does not today: no production code ever marks a meeting ended, so each organization's count of live meetings only ever climbs toward its cap. The browser suite creates ~7 meetings per run against a cap of 10, so a second run fails partway with a 403 the pipeline attributes to the code under test. This bites *within* a single devloop, which iterates until the gates are green, and it makes a story uncloseable, since rerunning is the documented recovery for several lanes. *(database, test, client)*
+- **R-7 — Layer 7's Nth consecutive run against the same dev cluster reaches the same verdict as its first**, for both suites. It does not today: no production code ever marks a meeting ROW ended (MC's meeting-end notify, story 2 task 12 of the hear-each-other story, ends only GC's MC-assignment row, never `meetings.status`, which is what the cap counts), so each organization's count of live meetings only ever climbs toward its cap. The browser suite creates ~7 meetings per run against a cap of 10, so a second run fails partway with a 403 the pipeline attributes to the code under test. This bites *within* a single devloop, which iterates until the gates are green, and it makes a story uncloseable, since rerunning is the documented recovery for several lanes. *(database, test, client)*
 
 ## Implementation Plan
 

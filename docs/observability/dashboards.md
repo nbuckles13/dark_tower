@@ -157,8 +157,10 @@ All dashboard JSON files are stored in `infra/grafana/dashboards/` and auto-load
 **Purpose**: Primary operational dashboard for Meeting Controller service.
 
 **Rows**: Traffic Summary, Security Events, Redis & Recovery, Fencing & Heartbeat Latency, Join Flow,
-MH Coordination, Media Routing (ADR-0036 §8), Client Media Signalling (ADR-0036 §5, §6), Media
-Connectivity (ADR-0036 §9).
+MH Coordination. The MH Coordination row carries meeting teardown (EndMeeting outcomes, push
+quiesce, teardown fence backstop) beside RegisterMeeting, which is where a responder triaging MC to
+MH already looks. MC's ADR-0036 media-path rows live in **MC Media Path** below; the two dashboards
+link to each other.
 
 **Panels and their metrics**: read them from the JSON — it is the source of truth (ADR-0031). This
 page deliberately carries no per-panel list: a hand-maintained copy drifted several rows behind the
@@ -174,6 +176,53 @@ JSON before it was removed (O-21, `docs/TODO.md`).
 - `MCHighJwtValidationFailures` (fires when JWT failure rate >10%)
 
 **When to Use**: Day-to-day MC operations, investigating join failures, WebTransport issues, capacity planning
+
+### MC Media Path
+
+**File**: `infra/grafana/dashboards/mc-media.json`
+**UID**: `mc-media`
+**Tags**: `mc-service`, `media`
+**ConfigMap**: `grafana-dashboards-mc-media` (its own; see *Why it is a separate file* below)
+
+**Purpose**: MC's side of the ADR-0036 media path — the counterpart of **MH Media Path**.
+
+**Rows**: Media Routing (ADR-0036 §8), Client Media Signalling (ADR-0036 §5, §6), Media Connectivity
+(ADR-0036 §9), KEK Lifecycle (ADR-0036 §4 Rotation).
+
+**Panels and their metrics**: read them from the JSON, as for MC Overview (ADR-0031).
+
+**Why KEK Lifecycle is here, when there is no KEK row on MH Media Path.** Do not read this dashboard
+as a row-for-row mirror of MH's: MH never holds media keys, by ADR-0036 §4's design, so MH has no
+key-custody row at all. KEK Lifecycle is here because §4 key custody is the key half of the media
+path. **A responder asking "why can't this participant decrypt?" opens this dashboard, not MC
+Overview.**
+
+**Why it is a separate file, and in its own ConfigMap.** Client-side apply stores each ConfigMap as
+JSON-escaped text in the `last-applied-configuration` annotation, which Kubernetes caps at
+262,144 bytes. By story 2 task 12, `mc-overview.json` alone escaped to 99.7% of that, and the
+shared MC ConfigMap failed cluster setup outright. Moving the media-path rows out, into a ConfigMap
+of their own, gives both files real headroom. `dt-guard kustomize` now fails Layer 3 when any
+dashboard ConfigMap passes its headroom threshold, and when any generator in the Grafana kustomization
+that ships dashboard JSON — whatever the group is named — omits the `grafana_dashboard: "1"` label
+(which would make its dashboard silently invisible in Grafana).
+
+**Default Time Range**: Last 6 hours
+**Refresh**: 1 minute
+
+**Related Alerts**: `MCMediaGenerationDivergence`, `MCMediaMissingKeyMaterial`,
+`MCKekRotationOverdue`, `MCKekPushFailureRate`, `MCKekRotationStorm` (for the last two named on
+key issuance, and for `MCMediaMissingKeyMaterial`, issuance itself is read on MC Overview; see below).
+
+**Cross-dashboard reads.** Meeting teardown stays on MC Overview (MH Coordination) while policy
+generations are here (Media Routing), so a wedged teardown reads both. `mc_media_server_muted_sources`
+(Client Media Signalling) is read against MH's `server_muted` drops on **MH Media Path**. KEY
+ISSUANCE is on MC Overview, not here: **Meeting KEK Issuance by Trigger**
+(`mc_meeting_kek_generated_total{trigger}`, Join Flow row) is a join-time event, so step 1 of "why
+can't this participant decrypt?" — did the meeting ever get a key? — is read there before this
+dashboard's KEK Lifecycle row.
+
+**When to Use**: "I can't hear anyone", one-way audio, a participant who cannot decrypt, server mute
+not taking effect, key rotation stalls.
 
 ---
 
@@ -371,9 +420,12 @@ Dashboards are loaded via **label-selected ConfigMap discovery** using `kiwigrid
 
 **How it works** (corrected — the previous version of this block described
 auto-discovery that does not exist, and following it turned Layer 3 red):
-1. `infra/grafana/kustomization.yaml` holds a **static** `configMapGenerator` list, one
-   group per prefix (`grafana-dashboards-ac`, `-gc`, `-mc`, `-mh`, `-client`, `-errors`).
-   Nothing is auto-discovered.
+1. `infra/grafana/kustomization.yaml` holds a **static** `configMapGenerator` list
+   (`grafana-dashboards-ac`, `-gc`, `-mc`, `-mc-media`, `-mh`, `-client`, `-errors`).
+   Nothing is auto-discovered. **Grouping is size-bounded, not prefix-bound**: dashboards
+   are grouped by service prefix only while the group's ConfigMap fits the annotation cap
+   (see the comment above the groups in `kustomization.yaml`); `-mc-media` is MC's media
+   path split out of `-mc` for that reason.
 2. Each group carries `options.labels.grafana_dashboard: "1"`.
 3. `generatorOptions.disableNameSuffixHash: true` keeps the generated ConfigMap names
    stable, so **changing a group's contents does not roll the Grafana pod.**
@@ -381,8 +433,7 @@ auto-discovery that does not exist, and following it turned Layer 3 red):
    **once at pod start**, writes them into a shared `emptyDir` at
    `/var/lib/grafana/dashboards`, and exits. **It does not watch.**
 
-**Adding a new dashboard** — four steps, and steps 3 and 4 are the ones with no guard
-behind them:
+**Adding a new dashboard** — four steps; step 4 is the one with no guard behind it:
 
 1. Add the JSON to `infra/grafana/dashboards/`, named `{prefix}-{name}.json`.
 2. Register the basename in `infra/grafana/kustomization.yaml` under the matching
@@ -395,9 +446,11 @@ behind them:
          labels:
            grafana_dashboard: "1"
    ```
-   **R-20 checks basenames only and never inspects `options.labels`.** A group that lists
-   its files and omits this block passes CI green, lands in the repo, and is invisible to
-   the sidecar forever. No guard will tell you.
+   R-20 itself checks basenames only, but `dt-guard kustomize`'s `dashboard_configmap_label`
+   rule (`crates/dt-guard/src/kustomize_configmaps.rs`) fails Layer 3 when any generator in
+   the Grafana kustomization that ships dashboard JSON — whatever it is named — omits the
+   label the sidecar selects on (read from the sidecar's own `LABEL` / `LABEL_VALUE`). Without
+   it the group would be invisible to the sidecar forever.
 4. **Deploying to a running cluster takes two actions, not one.** Because the ConfigMap
    names are stable and the sidecar only lists at pod start, `apply` alone leaves you with
    a correct ConfigMap that Grafana never reads:
@@ -468,6 +521,7 @@ To request a new dashboard:
 | GC SLOs | Observability | Operations | 2026-02-05 |
 | AC Overview | Observability | AC Team | TBD |
 | MC Overview | Observability | MC Team | 2026-03-27 |
+| MC Media Path | Observability | MC Team | 2026-09-27 |
 | MH Overview | Observability | MH Team | TBD |
 | MH Media Path | MH Team (ADR-0031) | Observability | 2026-09-09 |
 | Client SDK Media Path | Client Team (ADR-0031) | Observability | 2026-09-09 |

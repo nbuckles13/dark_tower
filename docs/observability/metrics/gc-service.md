@@ -115,6 +115,10 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   numerator with no matching `gc_mc_assignments_total{status="success"}`, so this
   **under-reports** the reuse rate (the safe direction for a stickiness SLI). The reuse-path debug
   log is off at production log levels, so this is the production answer to "are joins sticky?".
+  **A rejoin after the meeting ENDED is a new assignment, not a reuse** (story 2 task 12): MC
+  tells GC when a meeting's last participant leaves, GC ends the assignment row, and the next join
+  revives it on the new-assignment branch — a fresh MH selection. So stickiness here means "within
+  one meeting incarnation"; ordinary meeting turnover lowers this rate by design.
 
 ### `gc_mc_assignment_duration_seconds`
 - **Type**: Histogram

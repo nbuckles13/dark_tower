@@ -82,7 +82,10 @@ pub use directive::{
     AUDIO_BITRATE_MAX_BPS, AUDIO_BITRATE_MIN_BPS, AUDIO_FRAME_RATE_MAX_HZ,
     AUDIO_FRAME_RATE_MH_SIZING_HZ, AUDIO_FRAME_RATE_MIN_HZ,
 };
-pub use outcome::{CapabilityOutcome, DirectiveOutcome, MuteOutcome, SlotViewEmission};
+pub use outcome::{
+    CapabilityOutcome, DirectiveOutcome, MuteOutcome, RefusalReplySurface, ServerMuteAction,
+    ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome,
+};
 
 /// The configured inputs to client-facing media signalling, as one value.
 ///

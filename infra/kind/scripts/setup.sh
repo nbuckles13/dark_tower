@@ -295,7 +295,9 @@ dt_psql() {
 # is looking at a deliberate exclusion, not an unfinished refactor.
 #
 # The schema default of 10 is the R-7 bug: no production code marks a meeting
-# ended, so an org's live-meeting count only climbs, and the browser suite's ~7
+# ROW ended (MC's meeting-end notify, story 2 task 12, ends only GC's
+# MC-assignment row, never `meetings.status`, which is what the cap counts),
+# so an org's live-meeting count only climbs, and the browser suite's ~7
 # meetings/run exhausts a cap of 10 on the second run against the same cluster.
 # Config over hardcoding (CLAUDE.md), and the knob is what makes the validator below a LIVE
 # check rather than a vacuous one (@code-reviewer F3): with a bare literal, `1000` can never
@@ -682,8 +684,15 @@ deploy_observability() {
     log_info "Waiting for Promtail to be ready..."
     ${KUBECTL} wait --for=condition=Ready pod -l app=promtail -n dark-tower-observability --timeout=120s
 
-    log_info "Waiting for Grafana to be ready..."
-    ${KUBECTL} wait --for=condition=Ready pod -l app=grafana -n dark-tower-observability --timeout=300s
+    # Grafana reads dashboard ConfigMaps ONCE, at pod start (k8s-sidecar initContainer,
+    # METHOD: LIST), and disableNameSuffixHash keeps their names stable, so on an
+    # EXISTING cluster an apply alone leaves Grafana serving the old dashboards.
+    # Restart and wait (same two commands as scripts/layer7.sh and
+    # docs/observability/dashboards.md §Kubernetes); on a fresh cluster the restart is
+    # a no-op-equivalent second rollout.
+    log_info "Restarting Grafana so it lists the current dashboard ConfigMaps..."
+    ${KUBECTL} rollout restart deployment/grafana -n dark-tower-observability
+    ${KUBECTL} rollout status deployment/grafana -n dark-tower-observability --timeout=300s
 
     log_info "Observability stack deployed successfully."
 }
@@ -874,9 +883,11 @@ ON CONFLICT (subdomain) DO NOTHING;
 # Creates ONE freshly generated organization per layer-7 run, so the Nth
 # consecutive run against the same dev cluster reaches the same verdict as the
 # first. Without it every run's meetings accumulate against a single org's
-# max_concurrent_meetings — nothing in production code marks a meeting ended —
-# and the browser suite's ~7 meetings/run exhaust the seeded cap on the second
-# run, reported as a failure of the code under test.
+# max_concurrent_meetings — nothing in production code marks a meeting ROW
+# ended (MC's meeting-end notify, story 2 task 12, ends only GC's MC-assignment
+# row, never `meetings.status`, which is what the cap counts) — and the browser
+# suite's ~7 meetings/run exhaust the seeded cap on the second run, reported as
+# a failure of the code under test.
 #
 # THE CONNECTION ROUTE IS LOAD-BEARING. This goes through the cluster's Postgres
 # (dt_psql), never the container's $DATABASE_URL, which points at the devloop's

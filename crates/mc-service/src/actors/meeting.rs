@@ -22,11 +22,12 @@ use crate::media_admission::{
     KekPushOutcome, KekRotationDebounce, RotationTrigger, SenderId,
 };
 
-use super::meeting_media::{Affected, JoinMedia, MeetingMedia, RosterEntry};
+use super::meeting_media::{Affected, JoinMedia, MeetingMedia, MutedSourceCensus, RosterEntry};
 use super::messages::{
-    DisconnectCause, JoinResult, KekPush, LeaveReason, MeetingMessage, MeetingState,
-    ParticipantInfo, ParticipantStateUpdate, ParticipantStatus, ReconnectResult, SenderLookup,
-    SignalingPayload,
+    DisconnectCause, JoinResult, KekPush, LeaveReason, MeetingEndCause, MeetingLifecycleEvent,
+    MeetingLifecycleSink, MeetingMessage, MeetingState, ParticipantInfo, ParticipantStateUpdate,
+    ParticipantStatus, ReconnectResult, SenderLookup, ServerMuteDecision, ServerMuteRefusal,
+    SignalingPayload, UnmuteRelay,
 };
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
@@ -35,7 +36,7 @@ use crate::media_routing::{ConnectionKey, Unapplied};
 use crate::media_signaling::ReceiveCapabilityDeclaration;
 
 use common::secret::SecretBox;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -330,21 +331,29 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
-    /// Server-mutes a participant by meeting policy (enforced at MH ingress,
-    /// ADR-0036 §5). "Host mute" is avoided as a term: it presumes a role
+    /// Apply or lift a server mute by meeting policy (enforced at MH ingress,
+    /// ADR-0036 §5, §7). "Host mute" is avoided as a term: it presumes a role
     /// model this system has not defined.
+    ///
+    /// `requester` MUST be the participant id of the authenticated connection
+    /// making the request — see `MeetingMessage::ServerMute`.
+    ///
+    /// # Errors
+    ///
+    /// The outer [`McError`] means the actor could not be reached; the inner
+    /// result is the actor's decision.
     pub async fn server_mute(
         &self,
         target_participant_id: String,
-        muted_by: String,
+        requester: String,
         audio_muted: bool,
         video_muted: bool,
-    ) -> Result<(), McError> {
+    ) -> Result<Result<ServerMuteDecision, ServerMuteRefusal>, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(MeetingMessage::ServerMute {
                 target_participant_id,
-                muted_by,
+                requester,
                 audio_muted,
                 video_muted,
                 respond_to: tx,
@@ -353,14 +362,42 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
 
         rx.await
-            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
-    /// End the meeting.
-    pub async fn end_meeting(&self, reason: String) -> Result<(), McError> {
+    /// A server-muted participant asks the host(s) to lift its mute. NOTIFIES;
+    /// never clears. `participant_id` MUST be the authenticated connection's.
+    ///
+    /// # Errors
+    ///
+    /// [`McError::Internal`] if the actor could not be reached.
+    pub async fn request_unmute(
+        &self,
+        participant_id: String,
+        request_audio: bool,
+        request_video: bool,
+    ) -> Result<UnmuteRelay, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
-            .send(MeetingMessage::EndMeeting {
+            .send(MeetingMessage::RequestUnmute {
+                participant_id,
+                request_audio,
+                request_video,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
+    }
+
+    /// Close the MC-side meeting. Runs the MH-side release (`EndMeeting` on
+    /// every handler of the frozen set, after its pushes drain) as the actor
+    /// exits. NOT the MH `EndMeeting` RPC itself.
+    pub async fn close_meeting(&self, reason: String) -> Result<(), McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::CloseMeeting {
                 reason,
                 respond_to: tx,
             })
@@ -414,6 +451,16 @@ struct Participant {
     audio_server_muted: bool,
     /// Video server-mute (enforced, ADR-0036 §5).
     video_server_muted: bool,
+    /// Who applied the server mute (a participant id), while either kind is
+    /// server-muted. Written ONLY by `handle_server_mute`, beside the two flags
+    /// it qualifies, and cleared in lockstep with them — so the requester and
+    /// the state it describes cannot come apart. No side map.
+    ///
+    /// MC PRODUCES this value (the requester's id from its authenticated
+    /// connection); it is never parsed off the wire, so nothing validates or
+    /// truncates it on the way out. Truncation-before-logging is the
+    /// receiver's obligation (`ParticipantMuteUpdate.server_muted_by`).
+    server_muted_by: Option<String>,
     /// Whether this participant has host privileges.
     is_host: bool,
     /// Per-meeting sender id, allocated once at admission (ADR-0036 §2, §4).
@@ -516,8 +563,50 @@ pub struct MeetingActor {
     #[cfg(feature = "test-seams")]
     kek_debounce_manual: bool,
     /// Join-order slots and shared-handler edges, observed connectivity, push workers and per-participant
-    /// views (ADR-0036 §5/§6/§8/§9). Dropped with the actor.
+    /// views (ADR-0036 §5/§6/§8/§9). Its push workers are HANDED OFF to the
+    /// teardown on a clean exit and aborted with it on an unclean one.
     media: MeetingMedia,
+    /// Set when the meeting has ended and the actor should leave its loop
+    /// through the clean exit path (which releases the handlers).
+    end_cause: Option<MeetingEndCause>,
+    /// Where this actor reports its lifecycle; `None` for an actor spawned
+    /// outside a controller (tests), which still tears down, unobserved.
+    wiring: Option<MeetingWiring>,
+}
+
+/// What a controller-managed meeting actor is wired to.
+#[derive(Debug, Clone)]
+pub struct MeetingWiring {
+    /// The controller's lifecycle channel (`Ended`, `TeardownComplete`).
+    pub lifecycle: MeetingLifecycleSink,
+    /// The pod's server-mute census.
+    pub muted_census: Arc<MutedSourceCensus>,
+    /// The process's in-flight teardown count, which a graceful shutdown
+    /// waits on so a handed-off release is not dropped with the runtime.
+    pub teardowns: Arc<crate::media_routing::teardown::TeardownTracker>,
+}
+
+/// Reports `TeardownComplete` when dropped — so it is sent on EVERY exit of the
+/// teardown task, a panic included. The controller's fence depends on this
+/// message; a completion sent only on the happy path would make one panicked
+/// teardown a permanently unjoinable meeting id.
+struct TeardownDone {
+    lifecycle: Option<MeetingLifecycleSink>,
+    meeting_id: String,
+    cause: MeetingEndCause,
+}
+
+impl Drop for TeardownDone {
+    fn drop(&mut self) {
+        if let Some(lifecycle) = &self.lifecycle {
+            // The controller being gone (MC exiting) is the only way this
+            // fails, and then there is no fence to lift.
+            let _ = lifecycle.send(MeetingLifecycleEvent::TeardownComplete {
+                meeting_id: std::mem::take(&mut self.meeting_id),
+                cause: self.cause,
+            });
+        }
+    }
 }
 
 impl MeetingActor {
@@ -558,6 +647,33 @@ impl MeetingActor {
             kek_lifecycle,
             AdmissionEpoch::generate,
             |_| {},
+        )
+    }
+
+    /// Spawn a CONTROLLER-MANAGED meeting actor: as [`Self::spawn`], plus the
+    /// lifecycle channel and the server-mute census.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spawn`].
+    pub(crate) fn spawn_managed(
+        meeting_id: String,
+        cancel_token: CancellationToken,
+        metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
+        master_secret: SecretBox<Vec<u8>>,
+        kek_lifecycle: Arc<KekLifecycle>,
+        wiring: MeetingWiring,
+    ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
+        Self::spawn_inner(
+            meeting_id,
+            cancel_token,
+            metrics,
+            controller_metrics,
+            master_secret,
+            kek_lifecycle,
+            AdmissionEpoch::generate,
+            move |actor| actor.wiring = Some(wiring),
         )
     }
 
@@ -619,7 +735,7 @@ impl MeetingActor {
             "Meeting key material provisioned"
         );
 
-        let media = MeetingMedia::new(meeting_id.clone(), cancel_token.clone());
+        let media = MeetingMedia::new(meeting_id.clone());
         let kek_debounce = KekRotationDebounce::new(kek_lifecycle.window());
 
         let mut actor = Self {
@@ -646,6 +762,8 @@ impl MeetingActor {
             #[cfg(feature = "test-seams")]
             kek_debounce_manual: false,
             media,
+            end_cause: None,
+            wiring: None,
         };
         configure(&mut actor);
 
@@ -682,6 +800,35 @@ impl MeetingActor {
         kek_lifecycle: Arc<KekLifecycle>,
         seams: &super::meeting_media::MeetingSeams,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
+        Self::spawn_with_seams_wired(
+            meeting_id,
+            cancel_token,
+            metrics,
+            controller_metrics,
+            master_secret,
+            kek_lifecycle,
+            seams,
+            None,
+        )
+    }
+
+    /// [`Self::spawn_with_seams`] for a controller-managed actor. **Test builds
+    /// only.**
+    #[cfg(feature = "test-seams")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "spawn_with_seams' tuple plus the controller wiring; one body keeps the seam path identical to production"
+    )]
+    pub(crate) fn spawn_with_seams_wired(
+        meeting_id: String,
+        cancel_token: CancellationToken,
+        metrics: Arc<ActorMetrics>,
+        controller_metrics: Arc<ControllerMetrics>,
+        master_secret: SecretBox<Vec<u8>>,
+        kek_lifecycle: Arc<KekLifecycle>,
+        seams: &super::meeting_media::MeetingSeams,
+        wiring: Option<MeetingWiring>,
+    ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         let sender_ids = match seams.sender_id_cursor {
             Some(cursor) => crate::media_admission::SenderIdAllocator::resuming_from(
                 cursor,
@@ -702,6 +849,7 @@ impl MeetingActor {
             |actor| {
                 actor.media.apply_seams(seams);
                 actor.kek_debounce_manual = manual;
+                actor.wiring = wiring;
             },
         )
     }
@@ -719,6 +867,14 @@ impl MeetingActor {
         let mut grace_check = tokio::time::interval(Duration::from_secs(5));
 
         loop {
+            // The meeting ended during the previous turn (emptied, or closed):
+            // leave through the clean exit path below, which releases the
+            // handlers. Checked BEFORE any other work, so nothing is admitted
+            // after the ending turn — a join already queued sees `Draining`.
+            if self.end_cause.is_some() {
+                break;
+            }
+
             // Check for terminated connection actors
             self.check_connection_health().await;
             let settle_wake = self.media.next_settle_wake();
@@ -732,6 +888,7 @@ impl MeetingActor {
                         meeting_id = %self.meeting_id,
                         "MeetingActor received cancellation signal"
                     );
+                    self.end_cause.get_or_insert(MeetingEndCause::Shutdown);
                     self.graceful_shutdown().await;
                     break;
                 }
@@ -799,6 +956,14 @@ impl MeetingActor {
                 }
             }
         }
+
+        // A meeting that ended by emptying or closing has not yet drained its
+        // connection actors (the shutdown path above already did).
+        let cause = self.end_cause.unwrap_or(MeetingEndCause::Shutdown);
+        if cause != MeetingEndCause::Shutdown {
+            self.graceful_shutdown().await;
+        }
+        self.hand_off_teardown(cause);
 
         // One of the two teardown evictions (the controller's `remove_meeting`
         // is the other, for an actor that panicked before reaching here), so a
@@ -943,19 +1108,36 @@ impl MeetingActor {
 
             MeetingMessage::ServerMute {
                 target_participant_id,
-                muted_by,
+                requester,
                 audio_muted,
                 video_muted,
                 respond_to,
             } => {
                 let result = self
-                    .handle_server_mute(&target_participant_id, &muted_by, audio_muted, video_muted)
+                    .handle_server_mute(
+                        &target_participant_id,
+                        &requester,
+                        audio_muted,
+                        video_muted,
+                    )
                     .await;
                 let _ = respond_to.send(result);
             }
 
-            MeetingMessage::EndMeeting { reason, respond_to } => {
-                let result = self.handle_end_meeting(&reason).await;
+            MeetingMessage::RequestUnmute {
+                participant_id,
+                request_audio,
+                request_video,
+                respond_to,
+            } => {
+                let relay = self
+                    .handle_request_unmute(&participant_id, request_audio, request_video)
+                    .await;
+                let _ = respond_to.send(relay);
+            }
+
+            MeetingMessage::CloseMeeting { reason, respond_to } => {
+                let result = self.handle_close_meeting(&reason).await;
                 let _ = respond_to.send(result);
             }
 
@@ -1193,8 +1375,12 @@ impl MeetingActor {
             disconnected_at: None,
             audio_self_muted: false,
             video_self_muted: false,
+            // A fresh JOIN starts unmuted — this is what makes a server mute not
+            // survive a rejoin. A RECONNECT reuses this roster entry and keeps
+            // it. No side table is needed for either (R-10).
             audio_server_muted: false,
             video_server_muted: false,
+            server_muted_by: None,
             is_host,
             sender_id,
             identity_public_key,
@@ -1235,9 +1421,10 @@ impl MeetingActor {
         // registers every handler, possibly with an empty snapshot), and
         // re-emit changed views to existing declared subscribers. The joiner
         // itself has not declared, so it is sent nothing yet.
-        self.media.reconcile(Affected::All).await;
+        self.reconcile_media(Affected::All).await;
         self.flush_views().await;
 
+        let server_mute_replay = self.server_mute_replay(&participant_id);
         Ok(JoinResult {
             participant_id,
             correlation_id,
@@ -1251,6 +1438,10 @@ impl MeetingActor {
             kek_generation: self.admission.keys().generation(),
             kek_rotation_debounce_seconds: self.kek_lifecycle.window_seconds(),
             participant_handle: conn_handle_for_result,
+            // Taken in this turn: every later mute change is broadcast to the
+            // joiner (now on the roster) from this turn on, so the joiner
+            // receives snapshot-then-deltas, never a gap or a reorder.
+            server_mute_replay,
             media_handlers,
         })
     }
@@ -1409,7 +1600,7 @@ impl MeetingActor {
         // (explicit leave, clean close, grace expiry): free only the leaver's
         // slots, refill earliest-first, re-push, re-emit.
         self.media.remove(participant_id);
-        self.media.reconcile(Affected::All).await;
+        self.reconcile_media(Affected::All).await;
         self.flush_views().await;
 
         // KEK rotation on leave (ADR-0036 §4; story 2 R-12), scheduled on the
@@ -1422,6 +1613,31 @@ impl MeetingActor {
         self.kek_lifecycle
             .set_pending(&self.meeting_id, self.kek_debounce.pending_since())
             .await;
+
+        // The mute census follows the roster: a removed server-muted
+        // participant is no longer counted.
+        self.publish_mute_census();
+
+        // The last participant is gone: the meeting has ENDED (ADR-0010 §3,
+        // "last participant leaves, MC notifies GC"). On THIS choke point, so
+        // every removal path ends it identically — an explicit leave, a clean
+        // close, a grace expiry. A participant still in its grace window is on
+        // the roster, so a reconnect inside the window never reaches here.
+        //
+        // No new admission from this turn on (`Draining`), and the loop leaves
+        // through the clean exit path, which drains the push workers and
+        // releases every handler (`media_routing::teardown`). The pending KEK
+        // rotation just recorded is dropped with the actor, which is sound: the
+        // KEK dies with it, so the end of the actor is itself a rotation.
+        if self.participants.is_empty() && self.end_cause.is_none() {
+            info!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                "Last participant left; ending the meeting"
+            );
+            self.is_shutting_down = true;
+            self.end_cause = Some(MeetingEndCause::Empty);
+        }
     }
 
     /// Perform the leave-debounced rotation if it is due. Returns whether a
@@ -1779,11 +1995,14 @@ impl MeetingActor {
     ///
     /// # No roster `broadcast_update`, and why the slot-view fan-out is different
     ///
-    /// `MuteChanged` has no consumer: `webtransport::handler::encode_participant_update`
-    /// returns `None` for it and the roster `Participant` proto carries no mute
-    /// field, so a roster broadcast would deliver zero bytes to zero clients
-    /// while cloning the update N times and awaiting N sends on this task.
-    /// It stays removed.
+    /// Self-mute does not fan out to the roster, and as of story 2 task 12 that
+    /// is a JUDGMENT, not a consequence of the encoder. `encode_participant_update`
+    /// now has a real `MuteChanged` arm, so a roster broadcast here WOULD reach
+    /// clients — security's S-2 concluded that nothing needs it: the
+    /// subscriber-visible signal is `SLOT_STATE_SOURCE_MUTED`, and a self-mute is
+    /// the participant's own state, which its own client already knows. Server
+    /// mute is different and does fan out, because who-muted-whom has no other
+    /// carrier (`ParticipantMuteUpdate.server_muted_by`).
     ///
     /// The subscriber-visible mute signal is `SLOT_STATE_SOURCE_MUTED`, and since
     /// story 2 the ACTOR composes it: an audio-flag change marks dirty only the
@@ -1816,7 +2035,7 @@ impl MeetingActor {
         let sender = participant.sender_id;
 
         if audio_changed {
-            self.media.reconcile(Affected::HoldersOf(sender)).await;
+            self.reconcile_media(Affected::HoldersOf(sender)).await;
             self.flush_views().await;
         }
     }
@@ -1835,7 +2054,7 @@ impl MeetingActor {
             ));
         }
         self.media.declare(participant_id, declaration)?;
-        self.media.reconcile(Affected::All).await;
+        self.reconcile_media(Affected::All).await;
         self.flush_views().await;
         Ok(())
     }
@@ -1895,7 +2114,7 @@ impl MeetingActor {
         );
         let unapplied = match applied {
             Ok(true) => {
-                self.media.reconcile(Affected::All).await;
+                self.reconcile_media(Affected::All).await;
                 self.flush_views().await;
                 None
             }
@@ -1932,7 +2151,7 @@ impl MeetingActor {
             now,
         ) {
             Ok(true) => {
-                self.media.reconcile(Affected::All).await;
+                self.reconcile_media(Affected::All).await;
                 self.flush_views().await;
                 None
             }
@@ -1944,7 +2163,7 @@ impl MeetingActor {
     /// Settle every establishing participant whose window is due.
     async fn settle_due(&mut self) {
         if self.media.settle_due(tokio::time::Instant::now()) {
-            self.media.reconcile(Affected::All).await;
+            self.reconcile_media(Affected::All).await;
             self.flush_views().await;
         }
     }
@@ -1968,88 +2187,203 @@ impl MeetingActor {
         self.media.flush(&roster).await;
     }
 
-    /// Handle a server-mute request (enforced, ADR-0036 §5).
+    /// Apply or lift a server mute (enforced at MH ingress, ADR-0036 §5, §7;
+    /// story 2 R-8..R-11).
     ///
-    /// Only participants with host privileges can mute other participants.
+    /// # The order is the security property
+    ///
+    /// 1. **Authority first, fail closed** — the requester must be on the roster
+    ///    AND hold host authority. Checked BEFORE the target is looked up, so a
+    ///    non-host learns nothing about who is in the meeting: every request it
+    ///    sends is `NotPermitted`, whatever it names. That ORDERING is the
+    ///    control. The connection layer refuses non-hosts before any actor hop
+    ///    and this check repeats it; the two are AND-composed, which is what
+    ///    makes them fail closed when they read different vintages of the role
+    ///    (`handle_reconnect` deliberately keeps the roster entry's `is_host`
+    ///    rather than refreshing it from the reconnecting token).
+    /// 2. **Then the target.** `UnknownTarget` is reachable only here, after
+    ///    authority — i.e. only for a host, who inherently learns whether an id
+    ///    is in their own meeting by the refusal-versus-success difference. The
+    ///    connection returns the SAME wire error for both refusals, which is
+    ///    defence in depth on top of the ordering, not what the ordering
+    ///    depends on.
+    ///
+    /// # What a change does
+    ///
+    /// The single writer of `*_server_muted` and `server_muted_by`. Self-mute
+    /// fields are never touched here, and `handle_self_mute` never touches these,
+    /// so the two compose: clearing one never clears the other.
+    ///
+    /// Broadcast to EVERY participant — the target included, so the muted
+    /// participant learns it cannot clear the mute itself (R-10, R-11). An
+    /// audio change is a structural change: re-render (the muted set rides each
+    /// handler's snapshot, so the generation advances where it changed),
+    /// re-push, confirm the echo, and re-emit `StreamAssignments` to the
+    /// holders of this source (`SOURCE_MUTED`).
+    ///
+    /// # Fan-out cost, and what the argument rests on
+    ///
+    /// The broadcast is O(roster) awaited sends on this actor. That is the SAME
+    /// amplification class this actor already accepts, unbounded, for every
+    /// `Joined`, `Disconnected`, `Left` and `Reconnected` (all through
+    /// `broadcast_update`, none behind a limiter, `Reconnected` reachable on
+    /// transport churn). A server mute is strictly cheaper: host-only authority,
+    /// and a per-connection rate bound no looser than client mute's. Each send
+    /// lands in a per-participant BOUNDED mailbox that counts its own drops. If
+    /// the membership fan-out is ever bounded, this argument's comparator
+    /// changes and it must be revisited.
     #[instrument(skip_all, fields(meeting_id = %self.meeting_id))]
     async fn handle_server_mute(
         &mut self,
         target_participant_id: &str,
-        muted_by: &str,
+        requester: &str,
         audio_muted: bool,
         video_muted: bool,
-    ) -> Result<(), McError> {
-        // MAJOR-002 fix: Verify muted_by has host privileges
-        let is_host = self
-            .participants
-            .get(muted_by)
-            .map(|p| p.is_host)
-            .unwrap_or(false);
-
+    ) -> Result<ServerMuteDecision, ServerMuteRefusal> {
+        // 1. Authority, before anything about the target is read.
+        let is_host = self.participants.get(requester).is_some_and(|p| p.is_host);
         if !is_host {
-            warn!(
-                target: "mc.actor.meeting",
-                "Non-host attempted server-mute operation"
-            );
-            return Err(McError::PermissionDenied(
-                "Only hosts can mute other participants".to_string(),
-            ));
+            return Err(ServerMuteRefusal::NotPermitted);
         }
 
-        // Update mute state and extract values for broadcast
-        let mut audio_changed_for = None;
-        let update = if let Some(participant) = self.participants.get_mut(target_participant_id) {
-            if participant.audio_server_muted != audio_muted {
-                audio_changed_for = Some(participant.sender_id);
-            }
-            participant.audio_server_muted = audio_muted;
-            participant.video_server_muted = video_muted;
-
-            info!(
-                target: "mc.actor.meeting",
-                audio_muted = audio_muted,
-                video_muted = video_muted,
-                "Server mute applied"
-            );
-
-            Some(ParticipantStateUpdate::MuteChanged {
-                participant_id: target_participant_id.to_string(),
-                audio_self_muted: participant.audio_self_muted,
-                video_self_muted: participant.video_self_muted,
-                audio_server_muted: participant.audio_server_muted,
-                video_server_muted: participant.video_server_muted,
-            })
-        } else {
-            None
+        // 2. The target.
+        let Some(participant) = self.participants.get_mut(target_participant_id) else {
+            return Err(ServerMuteRefusal::UnknownTarget);
         };
+        if participant.audio_server_muted == audio_muted
+            && participant.video_server_muted == video_muted
+        {
+            return Ok(ServerMuteDecision::Unchanged);
+        }
 
-        // Broadcast mute change after releasing the mutable borrow
-        if let Some(update) = update {
-            self.broadcast_update(target_participant_id, update).await;
-            // Subscribers holding this source see `SOURCE_MUTED` (one wire
-            // state for both causes). Enforcement at MH ingress — the muted set
-            // on the snapshot — is story-2 task 12.
-            if let Some(sender) = audio_changed_for {
-                self.media.reconcile(Affected::HoldersOf(sender)).await;
-                self.flush_views().await;
+        let audio_changed = participant.audio_server_muted != audio_muted;
+        participant.audio_server_muted = audio_muted;
+        participant.video_server_muted = video_muted;
+        // Cleared in lockstep with the flags it qualifies.
+        participant.server_muted_by = (audio_muted || video_muted).then(|| requester.to_string());
+        let sender = participant.sender_id;
+        let update = Self::mute_changed(participant);
+
+        // Everyone, the target included.
+        for p in self.participants.values() {
+            if let Some(conn) = &p.connection {
+                let _ = conn.send_update(update.clone()).await;
             }
-            Ok(())
-        } else {
-            // MINOR-002 fix: Don't include participant ID in error message
-            Err(McError::ParticipantNotFound(
-                "Target participant not found".to_string(),
-            ))
+        }
+
+        // Story 2 is audio-only, and MH mute is SENDER-scoped (it drops every
+        // stream of the sender), so only the audio flag feeds MH. Per-kind mute
+        // moves to MC's egress edge set when video lands (story 3); a
+        // video-only server mute is recorded and broadcast but changes nothing
+        // MH enforces.
+        if audio_changed {
+            self.publish_mute_census();
+            self.reconcile_media(Affected::HoldersOf(sender)).await;
+            self.flush_views().await;
+        }
+        Ok(ServerMuteDecision::Applied)
+    }
+
+    /// A participant's current mute state as the wire update, the ONE shape
+    /// both the live broadcast and the late-joiner replay use.
+    fn mute_changed(participant: &Participant) -> ParticipantStateUpdate {
+        ParticipantStateUpdate::MuteChanged {
+            participant_id: participant.participant_id.clone(),
+            audio_self_muted: participant.audio_self_muted,
+            video_self_muted: participant.video_self_muted,
+            audio_server_muted: participant.audio_server_muted,
+            video_server_muted: participant.video_server_muted,
+            server_muted_by: participant.server_muted_by.clone().unwrap_or_default(),
         }
     }
 
-    /// Handle meeting end.
-    async fn handle_end_meeting(&mut self, reason: &str) -> Result<(), McError> {
+    /// Every OTHER participant currently server-muted, as the updates a joiner
+    /// must replay to render who-muted-whom at once (R-11). The roster
+    /// `Participant` message carries no mute state, so this is the only way a
+    /// joiner learns of a mute applied before it arrived.
+    fn server_mute_replay(&self, joiner: &str) -> Vec<ParticipantStateUpdate> {
+        self.participants
+            .values()
+            .filter(|p| p.participant_id != joiner)
+            .filter(|p| p.audio_server_muted || p.video_server_muted)
+            .map(Self::mute_changed)
+            .collect()
+    }
+
+    /// A participant asks the host(s) to lift its server mute (R-10).
+    ///
+    /// NOTIFIES ONLY. There is no write to any `*_server_muted` field on this
+    /// path — the single writer is `handle_server_mute`, under host authority —
+    /// so a participant can never clear its own server mute, however it asks.
+    ///
+    /// The relay is a FRESH `UnmuteRequest` whose `participant_id` is the
+    /// authenticated requester's (passed in from the connection), so a value a
+    /// client put in its own request can never be forwarded. Relayed only when
+    /// the requester is actually server-muted in a kind it asked about.
+    async fn handle_request_unmute(
+        &mut self,
+        participant_id: &str,
+        request_audio: bool,
+        request_video: bool,
+    ) -> UnmuteRelay {
+        let asks_for_something = self.participants.get(participant_id).is_some_and(|p| {
+            (request_audio && p.audio_server_muted) || (request_video && p.video_server_muted)
+        });
+        if !asks_for_something {
+            return UnmuteRelay::NotServerMuted;
+        }
+        let relay = proto_gen::dark_tower::signaling::v1::ServerMessage {
+            message: Some(
+                proto_gen::dark_tower::signaling::v1::server_message::Message::UnmuteRequest(
+                    proto_gen::dark_tower::signaling::v1::UnmuteRequest {
+                        request_audio,
+                        request_video,
+                        participant_id: participant_id.to_string(),
+                    },
+                ),
+            ),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        };
+        let mut hosts = 0usize;
+        for p in self.participants.values() {
+            if !p.is_host || p.participant_id == participant_id {
+                continue;
+            }
+            if let Some(conn) = &p.connection {
+                let (trace_parent, trace_state) =
+                    crate::webtransport::trace::inject_current_context();
+                let mut message = relay.clone();
+                message.trace_parent = trace_parent;
+                message.trace_state = trace_state;
+                if conn
+                    .send(SignalingPayload::server_message(&message))
+                    .await
+                    .is_ok()
+                {
+                    hosts += 1;
+                }
+            }
+        }
+        if hosts == 0 {
+            UnmuteRelay::NoHostConnected
+        } else {
+            UnmuteRelay::Relayed { hosts }
+        }
+    }
+
+    /// Close the MC-side meeting (called by the system).
+    ///
+    /// Tells every participant the meeting ended, stops admitting, and leaves
+    /// the loop through the clean exit path, which releases every handler. NOT
+    /// the MH `EndMeeting` RPC; this RUNS it.
+    async fn handle_close_meeting(&mut self, reason: &str) -> Result<(), McError> {
         info!(
             target: "mc.actor.meeting",
             meeting_id = %self.meeting_id,
             reason = %reason,
             participants = self.participants.len(),
-            "Ending meeting"
+            "Closing meeting"
         );
 
         self.is_shutting_down = true;
@@ -2077,10 +2411,118 @@ impl MeetingActor {
             managed.handle.cancel();
         }
 
-        // Cancel self (will trigger graceful shutdown)
-        self.cancel_token.cancel();
+        // Leave through the CLEAN exit path — deliberately NOT by cancelling
+        // this actor's token, which is the process-shutdown path.
+        self.end_cause.get_or_insert(MeetingEndCause::Closed);
 
         Ok(())
+    }
+
+    /// Re-render and re-publish with the CURRENT server-muted set — the one
+    /// place it is computed, from the roster (the one home for mute state).
+    /// Every reconcile goes through here; `MeetingMedia::reconcile` takes the
+    /// set as a required argument so no path can render without it.
+    async fn reconcile_media(&mut self, affected: Affected) {
+        let server_muted: BTreeSet<SenderId> = self
+            .participants
+            .values()
+            .filter(|p| p.audio_server_muted)
+            .map(|p| p.sender_id)
+            .collect();
+        self.media.reconcile(affected, &server_muted).await;
+    }
+
+    /// Write this meeting's ABSOLUTE server-muted count into the pod census and
+    /// publish (freshness only — see `MutedSourceCensus` for the load-bearing
+    /// caller). Counts the audio flag, which is what MH enforces.
+    fn publish_mute_census(&self) {
+        if let Some(wiring) = &self.wiring {
+            let count = self
+                .participants
+                .values()
+                .filter(|p| p.audio_server_muted)
+                .count();
+            wiring
+                .muted_census
+                .set(&self.meeting_id, u64::try_from(count).unwrap_or(u64::MAX));
+            wiring.muted_census.publish();
+        }
+    }
+
+    /// Hand this meeting's MH-side teardown to a task, as the actor exits
+    /// through its clean path, and report the end to the controller.
+    ///
+    /// `Ended` is sent BEFORE the teardown task exists, on the same channel
+    /// its completion will use, so the controller always sees `Ended` (and
+    /// fences the id) before `TeardownComplete` (and lifts it).
+    ///
+    /// The task is detached rather than awaited, so a slow or unreachable
+    /// handler never holds this actor — or a rejoin of this meeting id — for
+    /// the teardown's full duration; the controller's fence covers ordering
+    /// instead. There is no queue, so nothing to drop.
+    ///
+    /// **Concurrency, in numbers, for the correlated case** (every meeting
+    /// ending at once against an unreachable handler — in practice a graceful
+    /// shutdown). One teardown holds at most one outbound MH connection per
+    /// handler of its frozen set (≤ 2, GC's selection), opened AFTER its push
+    /// workers — one per handler, each able to be mid-connect — have drained,
+    /// or, on the quiesce-timeout path, after one further bound during which a
+    /// still-running worker may overlap its release. So the peak is the
+    /// steady-state push-worker bound (`MC_MAX_MEETINGS` × 2 = 2,000 at the
+    /// default) and at most twice that on the timeout path, each connection
+    /// bounded by `MH_CONNECT_TIMEOUT` and each teardown by
+    /// `teardown::TEARDOWN_MAX`. A cap here would lengthen the fence and the
+    /// rejoin hold for every queued meeting without lowering the push-side
+    /// peak, which exists whether or not a meeting is ending.
+    ///
+    /// **At graceful shutdown these tasks are WAITED FOR, up to a derived
+    /// deadline.** Each is counted on the wiring's `TeardownTracker` from
+    /// before its spawn until it ends; `main` drains the actor system and then
+    /// settles the tracker, both inside `teardown::SHUTDOWN_RELEASE_BUDGET`,
+    /// which is derived from the pod's `terminationGracePeriodSeconds` so the
+    /// wait cannot hold the pod into SIGKILL. A healthy release fits with room
+    /// to spare. A teardown still running at the deadline (an unreachable
+    /// handler) is cut off by process exit, counted in `main`'s shutdown log
+    /// line, and releases only the handlers it reached — the crash residual in
+    /// `docs/TODO.md` ("A meeting whose MC never sends `EndMeeting` is never
+    /// reclaimed").
+    fn hand_off_teardown(&mut self, cause: MeetingEndCause) {
+        let lifecycle = self.wiring.as_ref().map(|w| w.lifecycle.clone());
+        if let Some(wiring) = &self.wiring {
+            wiring.muted_census.set(&self.meeting_id, 0);
+            wiring.muted_census.publish();
+            let _ = wiring.lifecycle.send(MeetingLifecycleEvent::Ended {
+                meeting_id: self.meeting_id.clone(),
+                cause,
+            });
+        }
+        let done = TeardownDone {
+            lifecycle,
+            meeting_id: self.meeting_id.clone(),
+            cause,
+        };
+        let reason = match cause {
+            MeetingEndCause::Empty | MeetingEndCause::Closed => {
+                crate::media_routing::teardown::TeardownReason::MeetingEnded
+            }
+            MeetingEndCause::Shutdown => crate::media_routing::teardown::TeardownReason::Shutdown,
+        };
+        match self.media.take_teardown(reason) {
+            Some(teardown) => {
+                // Counted BEFORE the spawn, so a shutdown settle can never
+                // observe zero while this release is handed off but unstarted.
+                let in_flight = self.wiring.as_ref().map(|w| w.teardowns.begin());
+                tokio::spawn(async move {
+                    // Both dropped when this task ends, on every path.
+                    let _done = done;
+                    let _in_flight = in_flight;
+                    crate::media_routing::teardown::run(teardown).await;
+                });
+            }
+            // No handler was ever programmed: nothing to release, and the
+            // teardown is complete now (`done` drops here).
+            None => drop(done),
+        }
     }
 
     /// Check for disconnect timeouts.
@@ -2273,44 +2715,9 @@ mod tests {
         crate::media_admission::fixtures::sample_identity_key()
     }
 
-    /// Media-routing inputs for in-crate actor tests: one handler and an MH
-    /// client that confirms every push. Routing behaviour itself is covered by
-    /// `media_routing` unit tests and the integration suite.
+    /// Media-routing inputs for in-crate actor tests — the shared fixture.
     fn test_media() -> JoinMedia {
-        use crate::grpc::{MeetingProgramming, MhRegistrationClient};
-        use crate::media_routing::{HandlerEndpoint, MeetingHandlers, PolicyGenerations};
-        use crate::media_signaling::{AudioEncoding, MediaStreamPolicy};
-        use proto_gen::dark_tower::signaling::v1::Codec;
-
-        struct ConfirmingMh;
-        impl MhRegistrationClient for ConfirmingMh {
-            fn register_meeting<'a>(
-                &'a self,
-                _programming: &'a MeetingProgramming<'a>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>>
-            {
-                Box::pin(async { Ok(()) })
-            }
-        }
-
-        JoinMedia {
-            deps: Arc::new(super::super::meeting_media::MediaRoutingDeps {
-                mh_client: Arc::new(ConfirmingMh),
-                policy_generations: Arc::new(PolicyGenerations::new()),
-                mc_id: "mc-test".to_string(),
-                mc_grpc_endpoint: "http://mc-test:50052".to_string(),
-                stream_policy: MediaStreamPolicy::new(
-                    AudioEncoding::new(Codec::Opus, 48_000, 50).unwrap(),
-                ),
-                connect_settle_window: std::time::Duration::from_millis(1500),
-            }),
-            handlers: MeetingHandlers::new([HandlerEndpoint {
-                id: crate::media_routing::HandlerId::new("mh-0"),
-                webtransport_url: "https://mh-0.test:4434".to_string(),
-                grpc_endpoint: "http://mh-0.test:50053".to_string(),
-            }])
-            .unwrap(),
-        }
+        super::super::meeting_media::test_join_media()
     }
 
     #[tokio::test]
@@ -2567,7 +2974,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = must_spawn(
+        let (handle, task) = must_spawn(
             "meeting-leave-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -2593,11 +3000,16 @@ mod tests {
         let result = handle.participant_leave("part-1".to_string()).await;
         assert!(result.is_ok());
 
-        // Verify empty
-        let state = handle.get_state().await.unwrap();
-        assert_eq!(state.participants.len(), 0);
-
-        handle.cancel();
+        // The only participant is gone, so the meeting has ENDED (story 2 task
+        // 12; ADR-0010 §3). A real observable: the actor's task completes
+        // through its clean exit path — which it does only because the roster
+        // emptied, i.e. only because the removal above happened. Not "the
+        // roster is no longer readable", which would pass for any reason the
+        // actor stopped answering.
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the meeting ends when its last participant leaves")
+            .expect("the meeting actor exits cleanly, not by panic");
     }
 
     /// `sender_id` continuity across an ADR-0023 reconnect.
@@ -2802,9 +3214,8 @@ mod tests {
     ///
     /// # Why this is asserted through the actor message counter
     ///
-    /// `MuteChanged` is not wire-serialized
-    /// (`webtransport::handler::encode_participant_update` returns `None` for
-    /// it), so there is no outbound frame to watch for. What is being pinned is
+    /// The absence of a frame proves little on its own (a participant with no
+    /// declared view receives few frames anyway), so what is being pinned is
     /// the absence of the O(N) `broadcast_update` — one message DELIVERED to
     /// every other participant's actor — and that is exactly what
     /// `ActorMetrics::total_messages_processed` counts. A dedicated
@@ -2880,9 +3291,11 @@ mod tests {
              and it is the cheapest client-driven O(N) fan-out in MC"
         );
 
-        // A REAL transition must not fan out either: `MuteChanged` has no
-        // consumer, so the broadcast would deliver zero bytes to zero clients
-        // while awaiting N sends on the shared meeting-actor task.
+        // A REAL transition must not fan out either. MuteChanged IS
+        // wire-serialized as of task 12, so this would now deliver real bytes to
+        // real clients — S-2's judgment is that none of them need it, and the
+        // cost is one awaited send per participant on the shared meeting-actor
+        // task.
         handle
             .update_self_mute("part-a".to_string(), true, false)
             .await
@@ -2891,9 +3304,14 @@ mod tests {
         assert_eq!(
             metrics.total_messages_processed.load(Ordering::Relaxed) - base,
             2,
-            "a real mute transition must reach the meeting actor and STOP there: \
-             `MuteChanged` is not wire-serialized, so a fan-out here delivers nothing \
-             to anyone while awaiting one send per participant on the shared actor task"
+            "a real SELF-mute transition must reach the meeting actor and STOP there. \
+             `MuteChanged` IS wire-serialized as of task 12, so this is no longer a \
+             zero-byte fan-out — it is one S-2 deliberately does not perform: a self-mute \
+             is the participant's own state and the subscriber-visible signal is \
+             SLOT_STATE_SOURCE_MUTED, so a roster broadcast would cost one awaited send \
+             per participant on the shared actor task and tell no one anything new. If \
+             this goes red, the question is whether S-2's judgment changed, not whether \
+             the encoder did"
         );
 
         // POSITIVE CONTROL — the transition actually landed. Without this the
@@ -2967,112 +3385,451 @@ mod tests {
         handle.cancel();
     }
 
-    #[tokio::test]
-    async fn test_meeting_actor_server_mute() {
-        let metrics = ActorMetrics::new();
-        let controller_metrics = ControllerMetrics::new();
-        let cancel_token = CancellationToken::new();
-
-        let (handle, _task) = must_spawn(
-            "meeting-server-mute-test".to_string(),
-            cancel_token.clone(),
-            metrics,
-            controller_metrics,
+    /// A meeting with a HOST (`host`, with an outbound stream) and a non-host
+    /// (`part-2`, with its own stream) — the shape every server-mute test needs.
+    /// Returns the handle, the actor task, and each participant's outbound
+    /// stream.
+    async fn host_meeting(
+        meeting_id: &str,
+    ) -> (
+        MeetingActorHandle,
+        JoinHandle<()>,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) {
+        let (handle, task) = must_spawn(
+            meeting_id.to_string(),
+            CancellationToken::new(),
+            ActorMetrics::new(),
+            ControllerMetrics::new(),
             test_secret(),
         );
-
-        // Join host (part-1) and non-host (part-2)
-        let _ = handle
+        let (host_tx, host_rx) = tokio::sync::mpsc::channel(64);
+        let (p2_tx, p2_rx) = tokio::sync::mpsc::channel(64);
+        handle
             .connection_join(
-                "conn-1".to_string(),
-                "user-1".to_string(),
-                "part-1".to_string(),
+                "conn-host".to_string(),
+                "user-host".to_string(),
+                "host".to_string(),
                 String::new(),
-                true, // host
+                true,
                 test_identity_key(),
-                None,
+                Some(host_tx),
                 test_media(),
             )
-            .await;
-        let _ = handle
+            .await
+            .unwrap();
+        handle
             .connection_join(
                 "conn-2".to_string(),
                 "user-2".to_string(),
                 "part-2".to_string(),
                 String::new(),
-                false, // not host
+                false,
                 test_identity_key(),
-                None,
+                Some(p2_tx),
                 test_media(),
             )
-            .await;
-
-        // Host-privileged participant server-mutes part-2
-        let result = handle
-            .server_mute("part-2".to_string(), "part-1".to_string(), true, false)
-            .await;
-        assert!(result.is_ok());
-
-        // Check state
-        let state = handle.get_state().await.unwrap();
-        let participant = state
-            .participants
-            .iter()
-            .find(|p| p.participant_id == "part-2")
+            .await
             .unwrap();
-        assert!(participant.audio_server_muted);
-        assert!(!participant.video_server_muted);
+        (handle, task, host_rx, p2_rx)
+    }
 
-        handle.cancel();
+    /// Read `ServerMessage`s off a participant's outbound stream until one
+    /// matches, or panic after a bound.
+    async fn next_matching(
+        rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        want: impl Fn(&proto_gen::dark_tower::signaling::v1::server_message::Message) -> bool,
+    ) -> proto_gen::dark_tower::signaling::v1::server_message::Message {
+        use prost::Message as _;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let bytes = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("the expected message arrives")
+                .expect("stream open");
+            // The participant actor's outbound channel carries the encoded
+            // `ServerMessage`; the length prefix is added later, by the bridge.
+            let msg = proto_gen::dark_tower::signaling::v1::ServerMessage::decode(&bytes[..])
+                .expect("a framed ServerMessage");
+            if let Some(m) = msg.message {
+                if want(&m) {
+                    return m;
+                }
+            }
+        }
+    }
+
+    async fn state_of(handle: &MeetingActorHandle, participant_id: &str) -> ParticipantInfo {
+        handle
+            .get_state()
+            .await
+            .unwrap()
+            .participants
+            .into_iter()
+            .find(|p| p.participant_id == participant_id)
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn test_meeting_actor_server_mute_denied_for_non_host() {
-        let metrics = ActorMetrics::new();
-        let controller_metrics = ControllerMetrics::new();
-        let cancel_token = CancellationToken::new();
+    async fn a_host_server_mute_applies_and_a_repeat_is_unchanged() {
+        let (handle, _task, _h, _p) = host_meeting("sm-apply").await;
 
-        let (handle, _task) = must_spawn(
-            "meeting-server-mute-denied".to_string(),
-            cancel_token.clone(),
-            metrics,
-            controller_metrics,
-            test_secret(),
+        let result = handle
+            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(result, Ok(ServerMuteDecision::Applied));
+        let p2 = state_of(&handle, "part-2").await;
+        assert!(p2.audio_server_muted);
+        assert!(!p2.video_server_muted);
+
+        let again = handle
+            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(again, Ok(ServerMuteDecision::Unchanged));
+    }
+
+    /// R-8, the ORDERING invariant: authority is checked BEFORE the target is
+    /// looked up. A non-host naming a participant who does NOT exist gets
+    /// `NotPermitted` — never `UnknownTarget` — so a non-host learns nothing
+    /// about who is in the meeting. If the checks were ever reordered, this goes
+    /// red.
+    #[tokio::test]
+    async fn a_non_host_is_refused_before_the_target_is_looked_at() {
+        let (handle, _task, _h, _p) = host_meeting("sm-order").await;
+
+        let nonexistent = handle
+            .server_mute("ghost".to_string(), "part-2".to_string(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            nonexistent,
+            Err(ServerMuteRefusal::NotPermitted),
+            "a non-host naming a NON-EXISTENT participant must be NotPermitted, not UnknownTarget"
+        );
+        let existing = handle
+            .server_mute("host".to_string(), "part-2".to_string(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(existing, Err(ServerMuteRefusal::NotPermitted));
+        assert!(
+            !state_of(&handle, "host").await.audio_server_muted,
+            "a refused request changes nothing"
+        );
+    }
+
+    /// A requester that is not on the roster at all fails CLOSED.
+    #[tokio::test]
+    async fn an_unknown_requester_is_not_permitted() {
+        let (handle, _task, _h, _p) = host_meeting("sm-unknown-requester").await;
+        let result = handle
+            .server_mute("part-2".to_string(), "nobody".to_string(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(result, Err(ServerMuteRefusal::NotPermitted));
+    }
+
+    /// `UnknownTarget` is reachable only by an authorized requester.
+    #[tokio::test]
+    async fn a_host_naming_an_absent_participant_is_unknown_target() {
+        let (handle, _task, _h, _p) = host_meeting("sm-unknown-target").await;
+        let result = handle
+            .server_mute("ghost".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(result, Err(ServerMuteRefusal::UnknownTarget));
+    }
+
+    /// R-10 compose rule, BOTH directions: client mute and server mute have
+    /// separate writers, so clearing one never clears the other.
+    #[tokio::test]
+    async fn self_mute_and_server_mute_compose_in_both_directions() {
+        let (handle, _task, _h, _p) = host_meeting("sm-compose").await;
+
+        // Direction 1: self-muted AND server-muted; lifting the server mute
+        // leaves the self mute in place.
+        handle
+            .update_self_mute("part-2".to_string(), true, false)
+            .await
+            .unwrap();
+        handle
+            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .server_mute("part-2".to_string(), "host".to_string(), false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let p2 = state_of(&handle, "part-2").await;
+        assert!(!p2.audio_server_muted, "the server mute was lifted");
+        assert!(
+            p2.audio_self_muted,
+            "lifting the server mute left the SELF mute alone"
         );
 
-        // Join two non-host participants
-        let _ = handle
+        // Direction 2: server-muted again; the participant unmuting ITSELF
+        // leaves the server mute in place.
+        handle
+            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .update_self_mute("part-2".to_string(), false, false)
+            .await
+            .unwrap();
+        let p2 = state_of(&handle, "part-2").await;
+        assert!(!p2.audio_self_muted, "the self mute was lifted");
+        assert!(
+            p2.audio_server_muted,
+            "a self-unmute did NOT clear the server mute"
+        );
+    }
+
+    /// R-10: `UnmuteRequest` NOTIFIES the host and NEVER clears the mute. The
+    /// relay carries the requester's id as the actor was given it (the
+    /// connection's authenticated id) — asserted POSITIVELY, on a path where the
+    /// relay actually happened.
+    #[tokio::test]
+    async fn an_unmute_request_is_relayed_to_the_host_and_never_clears_the_mute() {
+        use proto_gen::dark_tower::signaling::v1::server_message::Message as M;
+        let (handle, _task, mut host_rx, _p) = host_meeting("sm-unmute-request").await;
+        handle
+            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let relay = handle
+            .request_unmute("part-2".to_string(), true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            relay,
+            UnmuteRelay::Relayed { hosts: 1 },
+            "the relay happened"
+        );
+
+        let M::UnmuteRequest(relayed) =
+            next_matching(&mut host_rx, |m| matches!(m, M::UnmuteRequest(_))).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(relayed.participant_id, "part-2");
+        assert!(relayed.request_audio);
+
+        assert!(
+            state_of(&handle, "part-2").await.audio_server_muted,
+            "asking to be unmuted did NOT unmute"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmute_request_from_a_participant_not_server_muted_is_not_relayed() {
+        let (handle, _task, _h, _p) = host_meeting("sm-unmute-not-muted").await;
+        let relay = handle
+            .request_unmute("part-2".to_string(), true, true)
+            .await
+            .unwrap();
+        assert_eq!(relay, UnmuteRelay::NotServerMuted);
+    }
+
+    /// R-11: the broadcast reaches EVERY participant — the target included, so
+    /// it can render that it cannot clear the mute itself — carrying who muted
+    /// whom.
+    #[tokio::test]
+    async fn a_server_mute_is_broadcast_to_the_target_itself_with_who_muted_whom() {
+        use proto_gen::dark_tower::signaling::v1::server_message::Message as M;
+        let (handle, _task, _h, mut p2_rx) = host_meeting("sm-broadcast").await;
+        handle
+            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let M::ParticipantMuteUpdate(update) =
+            next_matching(&mut p2_rx, |m| matches!(m, M::ParticipantMuteUpdate(_))).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(update.participant_id, "part-2");
+        assert!(update.audio_server_muted);
+        assert_eq!(update.server_muted_by, "host");
+    }
+
+    /// R-11 late joiner: the join result carries a replay of who is
+    /// server-muted NOW, with who muted them; lifting clears `server_muted_by`
+    /// in lockstep, so a later joiner replays nothing.
+    #[tokio::test]
+    async fn a_late_joiner_is_handed_the_current_server_mutes_to_replay() {
+        let (handle, _task, _h, _p) = host_meeting("sm-replay").await;
+        handle
+            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let joined = handle
             .connection_join(
-                "conn-1".to_string(),
-                "user-1".to_string(),
-                "part-1".to_string(),
+                "conn-3".to_string(),
+                "user-3".to_string(),
+                "part-3".to_string(),
                 String::new(),
-                false, // not host
+                false,
                 test_identity_key(),
                 None,
                 test_media(),
             )
-            .await;
-        let _ = handle
+            .await
+            .unwrap();
+        assert_eq!(joined.server_mute_replay.len(), 1);
+        let ParticipantStateUpdate::MuteChanged {
+            participant_id,
+            audio_server_muted,
+            server_muted_by,
+            ..
+        } = &joined.server_mute_replay[0]
+        else {
+            unreachable!("the replay is MuteChanged");
+        };
+        assert_eq!(participant_id, "part-2");
+        assert!(*audio_server_muted);
+        assert_eq!(server_muted_by, "host");
+
+        handle
+            .server_mute("part-2".to_string(), "host".to_string(), false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let later = handle
             .connection_join(
+                "conn-4".to_string(),
+                "user-4".to_string(),
+                "part-4".to_string(),
+                String::new(),
+                false,
+                test_identity_key(),
+                None,
+                test_media(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            later.server_mute_replay.is_empty(),
+            "a lifted mute is not replayed (server_muted_by cleared with the flags)"
+        );
+    }
+
+    /// R-10: a server mute survives a RECONNECT within grace (the roster entry
+    /// is reused) and does NOT survive a fresh JOIN (a new roster entry starts
+    /// unmuted). No side table is involved in either.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_mute_survives_reconnect_but_not_a_fresh_join() {
+        let (handle, _task, _h, _p) = host_meeting("sm-reconnect").await;
+        let joined = handle
+            .connection_join(
+                "conn-3".to_string(),
+                "user-3".to_string(),
+                "part-3".to_string(),
+                String::new(),
+                false,
+                test_identity_key(),
+                None,
+                test_media(),
+            )
+            .await
+            .unwrap();
+        handle
+            .server_mute("part-3".to_string(), "host".to_string(), true, false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Reconnect within grace: the SAME roster entry, still muted.
+        let _ = handle
+            .connection_disconnected(
+                "conn-3".to_string(),
+                "part-3".to_string(),
+                DisconnectCause::ConnectionLost,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let reconnected = handle
+            .connection_reconnect(
+                "conn-3b".to_string(),
+                joined.correlation_id.clone(),
+                joined.binding_token.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconnected.participant_id, "part-3");
+        assert!(
+            state_of(&handle, "part-3").await.audio_server_muted,
+            "the mute survives a reconnect within grace"
+        );
+
+        // A fresh join by the same user: a NEW roster entry, unmuted.
+        let rejoined = handle
+            .connection_join(
+                "conn-3c".to_string(),
+                "user-3".to_string(),
+                "part-3-new".to_string(),
+                String::new(),
+                false,
+                test_identity_key(),
+                None,
+                test_media(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !state_of(&handle, &rejoined.participant_id)
+                .await
+                .audio_server_muted,
+            "a fresh join starts unmuted"
+        );
+    }
+
+    /// A participant in its grace window is still on the roster, so another
+    /// participant's departure does NOT end the meeting — the reconnect path
+    /// stays open.
+    #[tokio::test(start_paused = true)]
+    async fn a_participant_in_grace_keeps_the_meeting_alive() {
+        let (handle, task, _h, _p) = host_meeting("grace-keeps-alive").await;
+        let _ = handle
+            .connection_disconnected(
                 "conn-2".to_string(),
-                "user-2".to_string(),
                 "part-2".to_string(),
-                String::new(),
-                false, // not host
-                test_identity_key(),
-                None,
-                test_media(),
+                DisconnectCause::ConnectionLost,
             )
             .await;
+        handle.participant_leave("host".to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "a grace member keeps the meeting alive"
+        );
+        assert_eq!(handle.get_state().await.unwrap().participants.len(), 1);
+    }
 
-        // Non-host tries to mute part-2 - should fail
-        let result = handle
-            .server_mute("part-2".to_string(), "part-1".to_string(), true, false)
-            .await;
-        assert!(matches!(result, Err(McError::PermissionDenied(_))));
-
-        handle.cancel();
+    /// Closing a meeting leaves through the clean exit path (not the
+    /// process-shutdown cancel), so its handlers are released.
+    #[tokio::test]
+    async fn closing_a_meeting_ends_the_actor_through_the_clean_path() {
+        let (handle, task, _h, _p) = host_meeting("close").await;
+        handle.close_meeting("test".to_string()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a closed meeting's actor exits")
+            .expect("cleanly");
+        assert!(
+            !handle.is_cancelled(),
+            "closing does not use the process-shutdown cancel"
+        );
     }
 
     #[tokio::test]
@@ -3108,7 +3865,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = must_spawn(
+        let (handle, task) = must_spawn(
             "meeting-grace-period-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -3177,15 +3934,16 @@ mod tests {
         // Wait for the grace check interval (every 5 seconds) to process
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Verify participant has been removed
-        let state = handle.get_state().await.unwrap();
-        assert_eq!(
-            state.participants.len(),
-            0,
-            "Participant should be removed after grace period expires"
-        );
-
-        handle.cancel();
+        // The only participant is gone, so the meeting has ENDED (story 2 task
+        // 12; ADR-0010 §3). A real observable: the actor's task completes
+        // through its clean exit path — which it does only because the roster
+        // emptied, i.e. only because the removal above happened. Not "the
+        // roster is no longer readable", which would pass for any reason the
+        // actor stopped answering.
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("grace expiry of the last participant ends the meeting")
+            .expect("the meeting actor exits cleanly, not by panic");
     }
 
     /// Test that reconnection within grace period preserves participant.
@@ -3264,7 +4022,7 @@ mod tests {
         let controller_metrics = ControllerMetrics::new();
         let cancel_token = CancellationToken::new();
 
-        let (handle, _task) = must_spawn(
+        let (handle, task) = must_spawn(
             "meeting-clean-close-test".to_string(),
             cancel_token.clone(),
             metrics,
@@ -3304,15 +4062,22 @@ mod tests {
         // mailbox processing under start_paused.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Participant is GONE already (grace skipped) — not merely Disconnected.
-        let state = handle.get_state().await.unwrap();
-        assert_eq!(
-            state.participants.len(),
-            0,
-            "clean close must remove the participant immediately, skipping grace"
-        );
-
-        handle.cancel();
+        // The only participant is gone, so the meeting has ENDED (story 2 task
+        // 12; ADR-0010 §3). A real observable: the actor's task completes
+        // through its clean exit path — which it does only because the roster
+        // emptied, i.e. only because the removal above happened. Not "the
+        // roster is no longer readable", which would pass for any reason the
+        // actor stopped answering.
+        // ONE virtual second, far inside the 30 s grace window: under
+        // `start_paused` a longer bound would let tokio auto-advance past grace,
+        // and the meeting would then end by grace expiry — passing this test
+        // for the wrong reason.
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect(
+                "a clean close of the last participant ends the meeting WITHOUT waiting out grace",
+            )
+            .expect("the meeting actor exits cleanly, not by panic");
     }
 
     /// Task #64: an ABRUPT loss (`DisconnectCause::ConnectionLost`) must PRESERVE

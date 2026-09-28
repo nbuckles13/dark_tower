@@ -285,6 +285,19 @@ __apply_observability_overlay() {
     || precondition_fail observability-apply-failed \
       "the Prometheus Deployment did not finish rolling onto the new config within ${budget}s" \
       "kubectl -n dark-tower-observability get pods -l app=prometheus; kubectl -n dark-tower-observability logs deploy/prometheus (a config Prometheus rejects crash-loops the new pod)"
+  # Grafana reads dashboard ConfigMaps ONCE, at pod start (k8s-sidecar initContainer,
+  # METHOD: LIST), and disableNameSuffixHash keeps their names stable, so an apply
+  # alone leaves a correct ConfigMap Grafana never reads. Restart and WAIT, as
+  # docs/observability/dashboards.md §Kubernetes prescribes; a timeout fails loudly.
+  "$KUBECTL_BIN" --context "$context" -n dark-tower-observability rollout restart deployment/grafana >&2 \
+    || precondition_fail observability-apply-failed \
+      "kubectl rollout restart deployment/grafana failed against ${context}" \
+      "kubectl -n dark-tower-observability get deploy grafana"
+  "$KUBECTL_BIN" --context "$context" -n dark-tower-observability rollout status deployment/grafana \
+    --timeout="${budget}s" >&2 \
+    || precondition_fail observability-apply-failed \
+      "the Grafana Deployment did not finish restarting onto the new dashboard ConfigMaps within ${budget}s" \
+      "kubectl -n dark-tower-observability get pods -l app=grafana; kubectl -n dark-tower-observability logs deploy/grafana -c k8s-sidecar (the dashboard-listing initContainer)"
 }
 
 # Wait (bounded) for the cluster to become healthy. `dev-cluster rebuild-all` issues
@@ -1118,7 +1131,9 @@ __layer7_main() {
   fi
   emit_step_duration observability-ready "$t_step"
 
-  # (h) Per-run organization (R-7). No production code ever marks a meeting ended, so an org's
+  # (h) Per-run organization (R-7). No production code ever marks a meeting ROW ended (MC's
+  #     meeting-end notify, story 2 task 12, ends only GC's MC-assignment row, never
+  #     meetings.status, which is what the cap counts), so an org's
   #     count of live meetings only CLIMBS toward max_concurrent_meetings: the browser suite
   #     creates ~7 meetings/run against demo's cap of 10, so a second run against the same
   #     cluster failed partway with a 403 the pipeline attributed to the code under test.

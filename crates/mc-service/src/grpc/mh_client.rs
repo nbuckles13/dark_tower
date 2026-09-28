@@ -3,12 +3,33 @@
 //! Provides a client for MC->MH communication:
 //! - `RegisterMeeting` - Program an MH with a meeting's forwarding policy
 //!   (ADR-0036 §7, §8)
+//! - `EndMeeting` - Release an ended meeting on an MH (story 2 R-20). Ordering
+//!   (drain every push first) is the caller's obligation; see
+//!   `media_routing::teardown`.
 //!
 //! # Security
 //!
 //! - OAuth 2.0 tokens authenticate MC to MH (via TokenReceiver)
 //! - Tokens are automatically refreshed by TokenManager background task
-//! - Each call creates a new Channel (MH endpoints vary per meeting)
+//! - Each call creates a new Channel (MH endpoints vary per meeting). **This is
+//!   pre-existing and its cost is recorded rather than defended**: a `Channel`
+//!   per call means one fresh TCP connection and TLS handshake per RPC, against
+//!   a set of distinct endpoints that is the handler FLEET (2), not the meeting
+//!   count — so the stated reason is weaker than it reads. The peak is
+//!   `MC_MAX_MEETINGS` x handlers-per-meeting (2), and up to twice that while a
+//!   teardown's quiesce has timed out and a push worker overlaps its release:
+//!   ~4,000 concurrent connects at the default cap. Measured headroom on the
+//!   deployed pod is `nofile` = 1,048,576 (containerd default; no limit is set
+//!   in `infra/services/mc-service/**`), so exhaustion is not reachable — which
+//!   is why this is recorded, not fixed here. **Teardown concurrency is
+//!   CORRELATED, unlike push concurrency**: pushes follow independent roster
+//!   events, whereas one unreachable handler or one drain ends many meetings
+//!   into the same window, so the same arithmetic peak is far likelier to be
+//!   approached. **The remedy is channel REUSE, not a concurrency cap** — one
+//!   `Channel` per endpoint, multiplexed over HTTP/2, lowers both peaks and
+//!   lengthens nothing, where a semaphore lowers one and lengthens the teardown
+//!   fence (and so the rejoin hold) for every queued meeting. Spun out with the
+//!   numbers in `docs/TODO.md` ("MC opens a fresh gRPC channel per MH call").
 //! - **No key material of any kind is read, logged, or placed on the request.**
 //!   The request carries meeting/MC identity, edges, per-egress behaviours and a
 //!   generation — never a KEK, an identity key or a nonce (ADR-0036 §4, §11).
@@ -19,6 +40,7 @@
 //! because different meetings may be assigned to different MH instances.
 
 use crate::errors::McError;
+use crate::media_routing::teardown::{EndMeetingCall, EndMeetingFailure, EndMeetingFailureKind};
 use crate::media_routing::{
     self, EgressStreamPlan, HandlerAssignment, PolicyPushOutcome, PushDisposition, PushExpectation,
 };
@@ -28,21 +50,29 @@ use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, RegisterMeetingRequest, RegisterMeetingResponse, SubscriberSlot,
+    CandidateSource, EgressStream, EndMeetingRequest, MutedSource, RegisterMeetingRequest,
+    RegisterMeetingResponse, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
+use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use tonic::Request;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Default timeout for MH RPC calls.
-const MH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// `pub(crate)` because the teardown's quiesce bound is DERIVED from it
+/// (`media_routing::teardown::PUSH_QUIESCE_BOUND`): one in-flight attempt is
+/// bounded by this plus [`MH_CONNECT_TIMEOUT`], so changing either moves the
+/// bound with it instead of leaving a stale copy.
+pub(crate) const MH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default connect timeout for MH.
-const MH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default connect timeout for MH. See [`MH_RPC_TIMEOUT`] for why it is
+/// crate-visible.
+pub(crate) const MH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Everything one `RegisterMeeting` push carries.
 ///
@@ -109,6 +139,35 @@ pub trait MhRegistrationClient: Send + Sync {
         &'a self,
         programming: &'a MeetingProgramming<'a>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>>;
+
+    /// Release an ended meeting on one MH instance.
+    ///
+    /// REQUIRED, with no default body: a defaulted `Ok(())` would let a test
+    /// double silently skip recording the call, and the "no `EndMeeting` before
+    /// pushes stop" assertions would then hold over an empty set.
+    ///
+    /// `Ok(())` means ACKNOWLEDGED — released, or unknown there (one outcome by
+    /// design). Every failure is classified; see [`EndMeetingFailureKind`].
+    fn end_meeting<'a>(
+        &'a self,
+        call: &'a EndMeetingCall,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), EndMeetingFailure>> + Send + 'a>>;
+}
+
+/// Map a gRPC status from `EndMeeting` to its contract class
+/// (`EndMeetingRequest` in `internal.proto`).
+#[must_use]
+pub fn classify_end_meeting_status(status: &tonic::Status) -> EndMeetingFailureKind {
+    match status.code() {
+        tonic::Code::FailedPrecondition => EndMeetingFailureKind::RejectedOwnership,
+        tonic::Code::Unimplemented => EndMeetingFailureKind::Unimplemented,
+        tonic::Code::InvalidArgument => EndMeetingFailureKind::InvalidArgument,
+        // "Nothing released on this attempt" — and a release is idempotent.
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+            EndMeetingFailureKind::Retryable
+        }
+        _ => EndMeetingFailureKind::Other,
+    }
 }
 
 /// Build the wire `EgressStream` messages for one handler's policy.
@@ -237,30 +296,7 @@ impl MhClient {
         programming: &MeetingProgramming<'_>,
     ) -> Result<(), McError> {
         let meeting_id = programming.meeting_id;
-
-        // Create channel to the specific MH endpoint
-        let channel = Endpoint::from_shared(programming.mh_grpc_endpoint.to_string())
-            .map_err(|e| {
-                error!(
-                    target: "mc.grpc.mh_client",
-                    error = %e,
-                    "Invalid MH endpoint"
-                );
-                McError::Config(format!("Invalid MH endpoint: {e}"))
-            })?
-            .connect_timeout(MH_CONNECT_TIMEOUT)
-            .timeout(MH_RPC_TIMEOUT)
-            .connect()
-            .await
-            .map_err(|e| {
-                warn!(
-                    target: "mc.grpc.mh_client",
-                    error = %e,
-                    meeting_id = %meeting_id,
-                    "Failed to connect to MH"
-                );
-                McError::Grpc(format!("Failed to connect to MH: {e}"))
-            })?;
+        let channel = connect_handler(programming.mh_grpc_endpoint, meeting_id).await?;
 
         // R-56: inject the active W3C trace context into outbound MH metadata.
         let mut client = MediaHandlerServiceClient::with_interceptor(
@@ -281,12 +317,12 @@ impl MhClient {
             // — so `None` is the accurate statement, not a stub left unfilled.
             selection_rules: None,
             policy_generation: programming.policy_generation.get(),
-            // Empty is the TRUTHFUL value today, not a placeholder: MC does not
-            // yet program server mute into MH. Story-2 task 12 (MC server mute
-            // into MH policy) populates it, and must advance `policy_generation`
-            // whenever the set changes. An empty set is byte-identical to the
-            // pre-R-9 wire.
-            server_muted_sources: Vec::new(),
+            // This handler's server-muted senders, filtered by edge ownership in
+            // the render (`HandlerAssignment::server_muted_sources`). A set
+            // upstream, so the wire list is duplicate-free and canonically
+            // ordered; a change to it changed the assignment, so the generation
+            // above already advanced for it.
+            server_muted_sources: build_muted_sources(programming.assignment),
         };
 
         let grpc_request = self.add_auth(request)?;
@@ -470,12 +506,106 @@ impl MhClient {
     }
 }
 
+impl MhClient {
+    /// Release an ended meeting on one MH (story 2 R-20).
+    ///
+    /// Classifies every failure for the caller's retry decision; logs nothing
+    /// itself (the teardown logs each terminal outcome once, with its cause).
+    ///
+    /// # Errors
+    ///
+    /// [`EndMeetingFailure`] — see [`EndMeetingFailureKind`] for the classes.
+    #[instrument(skip_all, fields(meeting_id = %call.meeting_id), target = "mc.grpc.mh_client")]
+    pub async fn end_meeting(&self, call: &EndMeetingCall) -> Result<(), EndMeetingFailure> {
+        // A connect failure provably released nothing, so it is retryable.
+        let channel = connect_handler(&call.mh_grpc_endpoint, &call.meeting_id)
+            .await
+            .map_err(|e| EndMeetingFailure {
+                kind: EndMeetingFailureKind::Retryable,
+                detail: e.to_string(),
+            })?;
+        let mut client = MediaHandlerServiceClient::with_interceptor(
+            channel,
+            common::observability::otel_grpc::client_interceptor(),
+        );
+        let request = self
+            .add_auth(EndMeetingRequest {
+                meeting_id: call.meeting_id.clone(),
+                mc_id: call.mc_id.clone(),
+            })
+            .map_err(|e| EndMeetingFailure {
+                kind: EndMeetingFailureKind::Other,
+                detail: e.to_string(),
+            })?;
+        match client.end_meeting(request).await {
+            Ok(response) if response.get_ref().acknowledged => Ok(()),
+            // `false` is the proto3 default of an empty reply, so it must never
+            // read as success (`EndMeetingResponse`).
+            Ok(_) => Err(EndMeetingFailure {
+                kind: EndMeetingFailureKind::Other,
+                detail: "EndMeeting returned acknowledged=false".to_string(),
+            }),
+            Err(status) => Err(EndMeetingFailure {
+                kind: classify_end_meeting_status(&status),
+                detail: format!("{:?}: {}", status.code(), status.message()),
+            }),
+        }
+    }
+}
+
+/// Open a channel to one MH — the ONE dial path both RPCs share, so the
+/// timeouts that the teardown's quiesce bound is derived from cannot diverge
+/// between them.
+async fn connect_handler(mh_grpc_endpoint: &str, meeting_id: &str) -> Result<Channel, McError> {
+    Endpoint::from_shared(mh_grpc_endpoint.to_string())
+        .map_err(|e| {
+            error!(
+                target: "mc.grpc.mh_client",
+                error = %e,
+                "Invalid MH endpoint"
+            );
+            McError::Config(format!("Invalid MH endpoint: {e}"))
+        })?
+        .connect_timeout(MH_CONNECT_TIMEOUT)
+        .timeout(MH_RPC_TIMEOUT)
+        .connect()
+        .await
+        .map_err(|e| {
+            warn!(
+                target: "mc.grpc.mh_client",
+                error = %e,
+                meeting_id = %meeting_id,
+                "Failed to connect to MH"
+            );
+            McError::Grpc(format!("Failed to connect to MH: {e}"))
+        })
+}
+
+/// The wire form of one handler's server-muted set. The set is already
+/// deduplicated and ordered upstream; this is a pure mapping.
+fn build_muted_sources(assignment: &HandlerAssignment) -> Vec<MutedSource> {
+    assignment
+        .server_muted_sources
+        .iter()
+        .map(|sender| MutedSource {
+            sender_id: u32::from(sender.get().get()),
+        })
+        .collect()
+}
+
 impl MhRegistrationClient for MhClient {
     fn register_meeting<'a>(
         &'a self,
         programming: &'a MeetingProgramming<'a>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), McError>> + Send + 'a>> {
         Box::pin(self.register_meeting(programming))
+    }
+
+    fn end_meeting<'a>(
+        &'a self,
+        call: &'a EndMeetingCall,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), EndMeetingFailure>> + Send + 'a>> {
+        Box::pin(MhClient::end_meeting(self, call))
     }
 }
 
@@ -522,7 +652,7 @@ mod tests {
             table.set_demand(sender, vec![0]);
         }
         table
-            .render([&handler])
+            .render([&handler], &std::collections::BTreeSet::new())
             .unwrap()
             .for_handler(&handler)
             .cloned()

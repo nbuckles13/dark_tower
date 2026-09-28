@@ -217,3 +217,35 @@ pub fn assert_relayed_on_slot(
         "{phase}: the signature is untouched"
     );
 }
+
+/// A marked datagram's `(marker, stream_sequence, relay slot)`.
+///
+/// Hoisted from `tests/26_mh_quic.rs` at story 2 task 12, when
+/// `tests/35_mc_server_mute_teardown.rs` became its second consumer.
+///
+/// # Panics
+///
+/// Panics on a malformed datagram.
+#[must_use]
+pub fn read_frame(raw: &[u8]) -> (u8, u32, u32) {
+    let view = media_protocol::codec::decode_datagram(raw)
+        .unwrap_or_else(|_| panic!("received a malformed datagram"));
+    (
+        view.payload().first().copied().unwrap_or(0),
+        view.stream_sequence(),
+        u32::from(view.stream_id()),
+    )
+}
+
+/// Drain whatever is queued on `conn` (non-blocking in effect: one short read
+/// per call), handing every marked frame to `each` as `(marker, seq, slot)`.
+///
+/// Hoisted with [`read_frame`].
+pub async fn drain(conn: &wtransport::Connection, mut each: impl FnMut(u8, u32, u32)) {
+    while let Ok(Ok(d)) =
+        tokio::time::timeout(Duration::from_millis(50), conn.receive_datagram()).await
+    {
+        let (marker, seq, slot) = read_frame(&d.payload());
+        each(marker, seq, slot);
+    }
+}

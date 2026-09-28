@@ -43,6 +43,19 @@ configMapGenerator:
       - mc-logs.json=dashboards/mc-logs.json
       - mc-overview.json=dashboards/mc-overview.json
       - mc-slos.json=dashboards/mc-slos.json
+  # MC's ADR-0036 media path (§4 key custody, §5/§6 client signalling, §8
+  # routing, §9 connectivity), split out of mc-overview.json at story 2 task 12
+  # and given its OWN ConfigMap. Client-side apply stores each ConfigMap as
+  # JSON-escaped text in the last-applied-configuration annotation, capped at
+  # 262144 bytes; with mc-overview.json alone escaping to 99.7% of that, a
+  # single MC ConfigMap failed cluster setup. `dt-guard kustomize` now fails
+  # Layer 3 on any dashboard ConfigMap past its headroom threshold.
+  - name: grafana-dashboards-mc-media
+    options:
+      labels:
+        grafana_dashboard: "1"
+    files:
+      - mc-media.json=dashboards/mc-media.json
   - name: grafana-dashboards-mh
     options:
       labels:
@@ -52,15 +65,27 @@ configMapGenerator:
       - mh-media.json=dashboards/mh-media.json
       - mh-overview.json=dashboards/mh-overview.json
       - mh-slos.json=dashboards/mh-slos.json
-  # `client` is not a Rust service, but it follows the same `<prefix>-*.json`
-  # grouping convention so future `client-*.json` dashboards land here too.
+  # GROUPING IS SIZE-BOUNDED, NOT PREFIX-BOUND. Dashboards are grouped by
+  # service prefix (`<prefix>-*.json`) only while the group fits: client-side
+  # apply stores each generated ConfigMap, JSON-escaped, in a
+  # last-applied-configuration annotation capped at 262144 bytes, and a group
+  # past that fails cluster setup outright (story 2 task 12: the MC group did,
+  # hence `grafana-dashboards-mc-media` above). So before adding a
+  # `<prefix>-*.json` to its service's group, check the group's headroom;
+  # `dt-guard kustomize` (`configmap_annotation_size`, in
+  # `crates/dt-guard/src/kustomize_configmaps.rs`) fails Layer 3 at 80% of the
+  # cap, and its message says to split a file out, as MC's media path was.
   #
-  # The `options.labels` block below is LOAD-BEARING AND UNGUARDED. The Grafana
-  # k8s-sidecar mounts only ConfigMaps carrying `grafana_dashboard: "1"`, and
-  # `dt-guard kustomize` R-20 checks dashboard BASENAMES in both directions
-  # while never inspecting `options.labels`. A group that lists its files and
-  # omits this block passes Layer 3 green, lands in the repo, and never appears
-  # in Grafana. Every other group here carries it; so must any new one.
+  # `client` is not a Rust service, but it follows the same grouping, so
+  # future `client-*.json` dashboards land here too — subject to the same cap.
+  #
+  # The `options.labels` block below is LOAD-BEARING. The Grafana k8s-sidecar
+  # mounts only ConfigMaps carrying `grafana_dashboard: "1"`. `dt-guard
+  # kustomize` R-20 checks dashboard BASENAMES only, but its
+  # `dashboard_configmap_label` rule (`crates/dt-guard/src/kustomize_configmaps.rs`)
+  # fails Layer 3 when any generator here that ships dashboard JSON, whatever
+  # it is named, omits the label the sidecar selects on. Every other group
+  # here carries it; so must any new one.
   - name: grafana-dashboards-client
     options:
       labels:
