@@ -16,15 +16,18 @@
 DEVLOOP_CONTAINER_MEMORY_DIR="/home/dev/.claude/projects/-work/memory"
 DEVLOOP_MEMORY_INBOX="${DEVLOOP_MEMORY_INBOX:-${HOME}/.cache/devloop/memory-inbox}"
 
-# host_memory_dir <repo-root> — the host project's memory dir. Claude Code keys a
-# project by its path with every non-alphanumeric character replaced by `-`.
+# host_memory_dir <repo-root> — the host project's memory dir, for whichever
+# machine, user and checkout path devloop.sh runs from. Claude Code keeps its
+# config in $CLAUDE_CONFIG_DIR (default ~/.claude) and keys a project by its path
+# with every non-alphanumeric character replaced by `-`.
 # DEVLOOP_MEMORY_SEED_DIR overrides it.
 host_memory_dir() {
     if [[ -n "${DEVLOOP_MEMORY_SEED_DIR:-}" ]]; then
         printf '%s' "$DEVLOOP_MEMORY_SEED_DIR"
         return
     fi
-    printf '%s/.claude/projects/%s/memory' "$HOME" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+    printf '%s/projects/%s/memory' "${CLAUDE_CONFIG_DIR:-${HOME}/.claude}" \
+        "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
 }
 
 # seed_container_memory <container> <repo-root> — copy the host memory into a new
