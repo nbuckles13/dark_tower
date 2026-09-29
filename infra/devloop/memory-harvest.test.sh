@@ -98,6 +98,11 @@ printf 'keep, edited\n' > "${FAKE}/devloop-s-dev${MEM}/k.md"
 DEVLOOP_MEMORY_SEED_DIR="$SEED" harvest_container_memory devloop-s-dev s /repo >/dev/null
 assert_status "harvest-keeps-changed-seed" "s/k.md" "$(inbox)"
 
+# The container memory dir is the project key of the image's WORKDIR (where every
+# devloop session runs), so the two cannot drift.
+workdir="$(awk '/^WORKDIR /{w=$2} END{print w}' "${__here}/Dockerfile")"
+assert_rc "container-memory-dir-matches-workdir" 0 "$([[ -n "$workdir" && "$DEVLOOP_CONTAINER_MEMORY_DIR" == "/home/dev/.claude/projects/$(printf '%s' "$workdir" | sed 's/[^A-Za-z0-9]/-/g')/memory" ]] && echo 0 || echo "1 (WORKDIR=${workdir}, dir=${DEVLOOP_CONTAINER_MEMORY_DIR})")"
+
 # Static: every removal of the dev container in devloop.sh is preceded by the gate.
 DL="${__here}/devloop.sh"
 ungated="$(awk '
