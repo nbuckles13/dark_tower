@@ -65,6 +65,9 @@ const SERVICE_BASES: &[&str] = &[
     "gc-service",
     "mc-service",
     "mh-service",
+    // The migration Job's base (ADR-0038 §2): applied ahead of the root, not
+    // part of it, so it is built, orphan-checked and schema-checked here.
+    "db-migrate",
     "otel-collector",
     "postgres",
     "redis",
@@ -95,10 +98,11 @@ const ORPHAN_EXCLUSIONS: &[&str] = &["kustomization.yaml", "service-monitor.yaml
 /// §Infrastructure Validation in Devloops.
 ///
 /// Visible to the crate (not just this module) for exactly that reason: it is
-/// the single home for this class, so a new line-oriented parser over the same
-/// file shape — [`crate::kustomize_configmaps`]'s `configMapGenerator` parser —
-/// imports it rather than carrying its own copy, which would be a copy that can
-/// drift out of the mitigation while looking like it has it.
+/// the single home for this class, so any new line-oriented parser over the
+/// same file shape imports it rather than carrying its own copy, which would be
+/// a copy that can drift out of the mitigation while looking like it has it.
+/// (`kustomize_configmaps` used to be such a parser; it now reads generators
+/// through the YAML parser in [`crate::common::kustomize_generators`].)
 pub(crate) fn strip_inline_comment(line: &str) -> &str {
     line.split_once('#')
         .map_or(line, |(before, _)| before)
@@ -929,5 +933,53 @@ resources:
     fn orphan_exclusions_skipped() {
         assert!(ORPHAN_EXCLUSIONS.contains(&"kustomization.yaml"));
         assert!(ORPHAN_EXCLUSIONS.contains(&"service-monitor.yaml"));
+    }
+
+    /// The migration Job's base is a build target (R-15/R-17/R-18/R-19) and is
+    /// orphan-checked (R-16) like every other base.
+    #[test]
+    fn service_bases_include_db_migrate() {
+        assert!(SERVICE_BASES.contains(&"db-migrate"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(
+            build_targets(&root)
+                .iter()
+                .any(|(_, label)| label == "base: infra/services/db-migrate"),
+            "db-migrate must be a build target"
+        );
+        let orphans = check_orphan_manifests(&root).expect("orphan walk");
+        assert!(
+            !orphans
+                .iter()
+                .any(|h| h.file.to_string_lossy().contains("db-migrate")),
+            "{orphans:#?}"
+        );
+    }
+
+    /// R-15 + R-18 (security's Job ruling) on the REAL db-migrate base: it
+    /// builds, and its Job satisfies every security-context invariant. Skips
+    /// VISIBLY, exactly as R-15 does, when no kustomize tool exists.
+    #[test]
+    fn real_db_migrate_base_renders_security_clean() {
+        let Some(tool) = crate::kustomize_tools::detect_kustomize_tool() else {
+            eprintln!("SKIP: real_db_migrate_base_renders_security_clean — neither `kustomize` nor `kubectl kustomize` available");
+            return;
+        };
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../infra/services/db-migrate");
+        let built = crate::kustomize_tools::run_kustomize_build(tool, &base).expect("build");
+        assert!(
+            built.success,
+            "db-migrate base failed to build:\n{}",
+            built.stderr_head
+        );
+        assert!(
+            built.stdout.contains("kind: Job"),
+            "positive control: the Job rendered"
+        );
+        let findings = crate::kustomize_tools::check_security_context(
+            &built.stdout,
+            "infra/services/db-migrate",
+        );
+        assert!(findings.is_empty(), "{findings:?}");
     }
 }

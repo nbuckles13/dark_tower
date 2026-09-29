@@ -17,8 +17,15 @@
 # Stage 1: Chef base (install cargo-chef)
 # ========================================
 ARG RUST_VERSION=1.91
-FROM docker.io/library/rust:${RUST_VERSION}-slim AS chef
+# Builder pinned to the runtime's Debian release (bookworm = distroless
+# cc-debian12): the binary links the builder's glibc, and the floating `-slim`
+# tag has moved on to trixie. setup.test.sh fails on builder/runtime drift.
+FROM docker.io/library/rust:${RUST_VERSION}-slim-bookworm AS chef
 
+# The cargo parallelism cap (build.jobs, .cargo/config.toml) applies to every
+# compile, including this one: cargo reads config from the working directory up.
+WORKDIR /build
+COPY .cargo/ .cargo/
 RUN cargo install cargo-chef
 
 # Install build dependencies

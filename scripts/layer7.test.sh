@@ -1501,4 +1501,32 @@ else
   FAILURES+=("[seam-symmetry] layer7.sh's DEVLOOP_TEST branches define DIFFERENT variable sets — a variable bound only in the test half aborts every PRODUCTION run with 'unbound variable' under set -u, with no STATUS line and no lane. Only in test half: [$(comm -23 <(printf '%s\n' "$seam_test") <(printf '%s\n' "$seam_prod") | tr '\n' ' ')] Only in prod half: [$(comm -13 <(printf '%s\n' "$seam_test") <(printf '%s\n' "$seam_prod") | tr '\n' ' ')]")
 fi
 
+# === Test runners never stop at the first failure (user ruling, ADR-0038 devloop 2) ===========
+# ONE place pins it for every layer's test runner: a run that stops at the first red hides every
+# later failure, so a fix-and-rerun loop pays one full run PER failure. (layer-all.sh's
+# cross-LAYER interactive fail-fast is a different, intentional mechanism and is not covered.)
+#   - cargo (Rust L4 + L7 env-tests): cargo test STOPS at the first failing test binary by
+#     default, so both invocations must carry --no-fail-fast.
+#   - nx run-many + vitest (TS L4) and Playwright (L7 browser): run everything by default; pin
+#     that no bail / max-failures option is introduced.
+RUST_TEST_SH="${REPO_ROOT}/scripts/lang/rust/test.sh"
+TS_TEST_SH="${REPO_ROOT}/scripts/lang/ts/test.sh"
+PW_CONFIG="${REPO_ROOT}/packages/web-app/playwright.config.ts"
+code_of() { grep -vE '^[[:space:]]*(#|//)' "$1"; }
+assert_status "no-fail-fast-rust-l4" 'cargo test --no-fail-fast' "$(code_of "$RUST_TEST_SH" | grep 'run_and_emit "cargo-test"')"
+assert_status "no-fail-fast-env-tests-l7" 'env_test_cmd=(cargo test --no-fail-fast -p env-tests' "$(code_of "$LAYER7")"
+# Non-vacuous: each file actually carries the runner being pinned.
+assert_status "runner-present-ts-l4" 'nx run-many -t test:unit' "$(code_of "$TS_TEST_SH")"
+assert_status "runner-present-pw-l7" 'defineConfig' "$(code_of "$PW_CONFIG")"
+for f in "$TS_TEST_SH" "$LAYER7"; do
+  for flag in --nxBail --nx-bail --bail --max-failures; do
+    assert_absent "no-bail-${flag#--}-${f##*/}" "$flag" "$(code_of "$f")"
+  done
+done
+for f in "$PW_CONFIG" "${REPO_ROOT}"/packages/*/vitest*.config.ts "${REPO_ROOT}"/packages/*/vitest.config.*.ts; do
+  [[ -f "$f" ]] || continue
+  assert_absent "no-maxfailures-${f#"${REPO_ROOT}"/}" "maxFailures" "$(code_of "$f")"
+  assert_absent "no-bail-config-${f#"${REPO_ROOT}"/}" "bail:" "$(code_of "$f")"
+done
+
 report_results "scripts/layer7.test.sh"

@@ -1262,8 +1262,10 @@ fn mc_shaped_edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> Egre
 /// completes that `EndMeeting`. The id is a fresh GC meeting per run, so no
 /// later run reuses it. Manual recovery, if needed: `EndMeeting`
 /// for the id on the pod through the Layer-7 gRPC forward with the MC
-/// credential (`env_tests::fixtures::mh_grpc`), or
-/// `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`.
+/// credential (`env_tests::fixtures::mh_grpc`), or a fresh cluster —
+/// `env_tests::fixtures::kube::FRESH_CLUSTER_HINT`. Not a converge
+/// (`REDEPLOY_HINT`): pods whose image/config are unchanged are not restarted,
+/// so the wedged pods would keep running.
 struct Injection<'a> {
     handler: &'a Handler,
     client: MediaHandlerServiceClient<tonic::transport::Channel>,

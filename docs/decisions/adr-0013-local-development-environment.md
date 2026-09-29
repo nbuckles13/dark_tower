@@ -200,13 +200,17 @@ cargo run --bin auth-controller
 ./infra/kind/scripts/teardown.sh
 ```
 
-**Alternative: Skaffold** (full K8s observability)
+**Alternative: in-cluster** (full K8s observability)
 
 ```bash
 # Use when you need logs in Loki or K8s-specific testing
-cd infra
-skaffold dev  # AC available at localhost:8083
+./infra/kind/scripts/setup.sh --only ac
 ```
+
+> **Superseded (ADR-0038, 2026-09-28):** the Skaffold path originally named here was
+> retired — it had drifted into a second deploy path (image names that no longer matched the
+> manifests, no MH artifact, a stale toolchain pin) that could not run the in-cluster
+> migration Job or the content-tagged image render. `setup.sh` is the one deploy path.
 
 ### Observability Matrix
 
@@ -244,7 +248,7 @@ The following files from the initial implementation are no longer needed:
 - `Makefile` - Removed (minimal value, just indirection)
 - `infra/local/kind-config.yaml` - Moved to `infra/kind/kind-config.yaml`
 - `infra/local/kind-config-ci.yaml` - Removed (single config for all envs)
-- `infra/local/skaffold.yaml` - Moved to `infra/skaffold.yaml`
+- `infra/local/skaffold.yaml` - Moved to `infra/skaffold.yaml` (itself retired by ADR-0038)
 - `infra/local/grafana/` - Moved to `infra/grafana/`
 - `docs/LOCAL_TESTING_SETUP.md` - Merged into `docs/LOCAL_DEVELOPMENT.md`
 

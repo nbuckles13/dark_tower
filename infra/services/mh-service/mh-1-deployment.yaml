@@ -38,8 +38,13 @@ spec:
         fsGroup: 65532
       containers:
       - name: mh-service
-        image: localhost/mh-service:latest
-        imagePullPolicy: IfNotPresent
+        image: localhost/mh-service:render-required
+        # Tag set at render time to the image's content tag (sha-<id>) by
+        # infra/kind/scripts/setup.sh:render_env_overlay (ADR-0038 §2). Nothing loads
+        # `:render-required`, so an apply that bypasses the render fails loudly
+        # (ErrImageNeverPull) instead of running a stale image. Never: a Kind-loaded
+        # image is never pulled; a prod overlay sets registry, tag and pull policy.
+        imagePullPolicy: Never
         ports:
         - name: health
           containerPort: 8083

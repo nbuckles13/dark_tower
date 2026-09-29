@@ -4,13 +4,17 @@
 # consumes is content-addressed, so an apply rolls exactly the workloads whose
 # configuration changed.
 #
-# DEVLOOP CLUSTERS MUST APPLY THROUGH `setup.sh:apply_env_root`, NOT a plain
-# `kubectl apply -k` of this directory. A devloop cluster advertises its MC/MH
-# WebTransport endpoints on the host-gateway IP and per-slug ports; apply_env_root
-# layers those onto this root as a rendered wrapper. A plain apply of this
-# directory silently puts mc-{0,1}/mh-{0,1} back on the 127.0.0.1 defaults —
-# no error at apply time, broken media in Layer 7. On the static host topology
-# (no DT_HOST_GATEWAY_IP) the plain root IS the correct render.
+# ALWAYS APPLY THROUGH `setup.sh:apply_env_root`, NEVER a plain `kubectl apply -k`
+# of this directory. apply_env_root layers a rendered wrapper onto this root:
+#   - every first-party image's content tag (`localhost/<name>:sha-<image id>`,
+#     setup.sh:content_tag). The bases name `:render-required`, which nothing
+#     loads, so a plain apply fails LOUDLY (ErrImageNeverPull) rather than
+#     running a stale image — by design;
+#   - on a devloop cluster, the MC/MH WebTransport advertise addresses
+#     (host-gateway IP + per-slug ports), which a plain apply would silently put
+#     back on the 127.0.0.1 defaults.
+# The migration Job (infra/services/db-migrate/) is NOT a resource here: it runs
+# to Complete before this root is applied (setup.sh:run_migration_job).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

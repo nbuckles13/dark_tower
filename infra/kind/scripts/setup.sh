@@ -8,7 +8,11 @@
 # - Full observability stack (Prometheus, Grafana, Loki)
 # - Everything above applied as ONE environment root:
 #   infra/kubernetes/overlays/kind/ (ADR-0038; see apply_env_root)
-# - Database migrations
+# - First-party images tagged by their own content (sha-<image id>; see
+#   content_tag) and loaded into Kind; the root's `:render-required` placeholders
+#   are replaced at render time, never in the tree
+# - Database migrations as an in-cluster Job (infra/services/db-migrate/),
+#   Complete BEFORE the root is applied (see run_migration_job)
 # - Port-forwarding
 #
 # Prerequisites:
@@ -24,7 +28,7 @@
 #   --provision-org path must touch nothing but ${KUBECTL}, and must return from
 #   main() BEFORE check_prerequisites(), which calls detect_container_runtime()
 #   and exits 1 when no container runtime is found. Note --only is NOT a
-#   precedent to copy: it routes through deploy_only_service(), which calls both
+#   precedent to copy: it routes through deploy_services(), which calls both
 #   `kind get clusters` and check_prerequisites().
 #
 # Environment variables:
@@ -38,13 +42,19 @@
 # Options:
 #   --yes                    Auto-answer yes to all interactive prompts
 #   --only <svc>             Rebuild one service image (ac, gc, mc, mh; none for
-#                            otel), then apply the whole environment root
+#                            otel) and the migrations image, run the migration
+#                            Job, then apply the whole environment root
 #                            (infra/kubernetes/overlays/kind/) and wait for every
-#                            workload in it. Content-addressed ConfigMaps roll
-#                            exactly the workloads whose config changed; the
-#                            rebuilt service is restarted to pick up its image
-#   --skip-build             Skip image builds, only apply manifests (with --only,
-#                            nothing is restarted unless its config changed)
+#                            workload in it. Content-tagged images and
+#                            content-addressed ConfigMaps roll exactly the
+#                            workloads whose image or config changed; nothing is
+#                            restarted
+#   --rebuild-all            Like --only, for every first-party image (the
+#                            helper's `rebuild-all`; ADR-0038 step 3 folds it
+#                            into `deploy`)
+#   --skip-build             Skip image builds: deploy the content-tagged images
+#                            the cluster already runs (fails loudly, naming the
+#                            fix, when it runs none — REASON=image-unresolved)
 #   --provision-org <sub>    Create one fresh organization and exit. Requires
 #                            DT_CLUSTER_NAME. Container-runnable (see EXECUTION
 #                            CONTEXT above); rejected in combination with --only
@@ -62,6 +72,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+# shellcheck source=../../lib/cargo-lock-version.sh
+source "${PROJECT_ROOT}/infra/lib/cargo-lock-version.sh"
 CLUSTER_NAME="${DT_CLUSTER_NAME:-dark-tower}"
 KIND_CONFIG="${PROJECT_ROOT}/infra/kind/kind-config.yaml"
 CALICO_VERSION="v3.27.0"
@@ -143,6 +155,7 @@ KUBECTL="kubectl --context ${KUBE_CONTEXT}"
 # --- Argument parsing ---
 AUTO_YES=false
 ONLY_SERVICE=""
+REBUILD_ALL=false
 SKIP_BUILD=false
 PROVISION_ORG_SUB=""
 
@@ -174,6 +187,10 @@ while [[ $# -gt 0 ]]; do
                     ;;
             esac
             shift 2
+            ;;
+        --rebuild-all)
+            REBUILD_ALL=true
+            shift
             ;;
         --skip-build)
             SKIP_BUILD=true
@@ -209,8 +226,14 @@ done
 # exits without touching the cluster. Combining it with flags that only mean
 # something on the full host-side setup path can only express a misunderstanding,
 # so reject the combination rather than silently ignoring the other flag.
-if [[ -n "${PROVISION_ORG_SUB}" ]] && { [[ -n "${ONLY_SERVICE}" ]] || [[ "${SKIP_BUILD}" == true ]]; }; then
-    echo "ERROR: --provision-org cannot be combined with --only or --skip-build" >&2
+if [[ -n "${PROVISION_ORG_SUB}" ]] && { [[ -n "${ONLY_SERVICE}" ]] || [[ "${SKIP_BUILD}" == true ]] || [[ "${REBUILD_ALL}" == true ]]; }; then
+    echo "ERROR: --provision-org cannot be combined with --only, --rebuild-all or --skip-build" >&2
+    exit 1
+fi
+# --rebuild-all means "build everything": with --skip-build it would mean
+# nothing, and with --only it would contradict itself.
+if [[ "${REBUILD_ALL}" == true ]] && { [[ -n "${ONLY_SERVICE}" ]] || [[ "${SKIP_BUILD}" == true ]]; }; then
+    echo "ERROR: --rebuild-all cannot be combined with --only or --skip-build" >&2
     exit 1
 fi
 
@@ -227,12 +250,14 @@ log_info() {
     echo -e "${GREEN}[$(_ts) INFO]${NC} $1"
 }
 
+# Diagnostics go to STDERR, so a function called inside `$(...)` can never
+# swallow its own error message (the capture would take stdout only).
 log_warn() {
-    echo -e "${YELLOW}[$(_ts) WARN]${NC} $1"
+    echo -e "${YELLOW}[$(_ts) WARN]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[$(_ts) ERROR]${NC} $1"
+    echo -e "${RED}[$(_ts) ERROR]${NC} $1" >&2
 }
 
 log_step() {
@@ -513,11 +538,11 @@ create_namespaces() {
 
 # Fail fast BEFORE the first cold image build if the host container-storage filesystem
 # lacks headroom for a 4-service release build — rather than dying mid-COPY with "no space
-# left on device" after several minutes. Run-once (the first build_image call guards them
-# all); naturally skipped under --skip-build (build_image isn't called).
+# left on device" after several minutes. Run-once (the first build_content_tagged_image call guards them
+# all); naturally skipped under --skip-build (no image is built).
 #
-# $1 = the resolved container runtime (build_image's $CONTAINER_CMD). MUST be passed, NOT
-# re-derived: build_image defaults to `docker` when KIND_EXPERIMENTAL_PROVIDER is unset, so
+# $1 = the resolved container runtime (container_cmd). MUST be passed, NOT
+# re-derived: container_cmd defaults to `docker` when KIND_EXPERIMENTAL_PROVIDER is unset, so
 # a re-derived `podman` default here would `df` the WRONG runtime's graphroot on an
 # unset-provider host — measuring the wrong filesystem exactly when the guard matters.
 #
@@ -559,25 +584,105 @@ check_build_disk_space() {
     fi
 }
 
-# Build a container image, removing the old image if it was replaced.
-# Usage: build_image <tag> <dockerfile> <context-dir>
-build_image() {
-    local TAG="$1" DOCKERFILE="$2" CONTEXT="$3"
-    local CONTAINER_CMD
+# The container runtime CLI, from the provider detect_container_runtime()
+# exported (docker when unset — the historical default of every call site here).
+container_cmd() {
     if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
-        CONTAINER_CMD="podman"
+        echo podman
     else
-        CONTAINER_CMD="docker"
+        echo docker
     fi
-    # Fast-fail on insufficient host disk before the (multi-minute) cold build. Pass the
-    # resolved runtime so the guard measures the SAME runtime's graphroot (see fn header).
-    check_build_disk_space "$CONTAINER_CMD"
-    local OLD_IMAGE_ID
-    OLD_IMAGE_ID=$(${CONTAINER_CMD} images -q "$TAG" 2>/dev/null || true)
-    ${CONTAINER_CMD} build -t "$TAG" -f "$DOCKERFILE" "$CONTEXT"
-    if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(${CONTAINER_CMD} images -q "$TAG")" ]; then
-        ${CONTAINER_CMD} rmi "$OLD_IMAGE_ID" 2>/dev/null || true
+}
+
+# --- Content-derived image tags (ADR-0038 §2 step 1) ------------------------
+#
+# THE ONE place an image tag is derived. The tag is the image's own ID (its
+# content digest), so a tag can never name different bytes, and an unchanged
+# build — every layer cached — yields the same ID and so the same tag, which
+# makes the root apply a no-op for that workload. Nothing else (the helper, the
+# overlays, a hand-written manifest) derives or types a tag.
+#
+# Why the ID and not a hash of the build inputs: an input hash names DIFFERENT
+# bytes under the SAME tag whenever an input it does not hash changes (floating
+# base images, apt packages), and `kind load` would then swap the image in the
+# node with nothing rolling — stale code, green gate. The cost of the ID is one
+# extra rollout after a build-cache prune (unchanged code rebuilds to a new ID).
+#
+# Usage: content_tag <image-id>   (`sha256:<64 hex>` or bare `<64 hex>`)
+# Prints `sha-<first 16 hex>`; fails on anything that is not a sha256 image ID.
+CONTENT_TAG_LEN=16
+content_tag() {
+    local id="${1:-}"
+    id="${id#sha256:}"
+    if [[ ! "${id}" =~ ^[0-9a-f]{64}$ ]]; then
+        log_error "content_tag: not a sha256 image ID: '${1:-}'"
+        return 1
     fi
+    printf 'sha-%s\n' "${id:0:${CONTENT_TAG_LEN}}"
+}
+
+# The only tag shape a first-party image may be deployed under. Anything else —
+# `:latest` from a pre-ADR-0038 cluster, the `:render-required` placeholder —
+# is rejected, never reused.
+is_content_ref() {
+    local repo="$1" ref="$2"
+    [[ "${ref}" =~ ^${repo}:sha-[0-9a-f]{${CONTENT_TAG_LEN}}$ ]]
+}
+
+# Refs built in this run, keyed by repo (`localhost/<name>`).
+declare -A BUILT_REFS=()
+# Refs the cluster ran BEFORE this converge (the superseded ones get pruned).
+declare -A DEPLOYED_REFS=()
+# The refs this converge deploys: built, else deployed (resolve_image_refs).
+declare -A IMAGE_REFS=()
+
+# Build-args an image needs beyond its Dockerfile's defaults. Only db-migrate
+# has one: sqlx-cli pinned to the workspace's `sqlx` (the one reader:
+# infra/lib/cargo-lock-version.sh).
+image_build_args() {
+    local repo="$1" v
+    case "${repo}" in
+        "${MIGRATE_REPO}")
+            v="$(cargo_lock_version "${PROJECT_ROOT}/Cargo.lock" sqlx)" || return 1
+            printf '%s\n' "--build-arg" "SQLX_CLI_VERSION=${v}"
+            ;;
+    esac
+}
+
+# Build a first-party image, tag it by its content, load it into Kind, and
+# record it in BUILT_REFS. `localhost/<name>` is built from
+# infra/docker/<name>/Dockerfile with the repo root as context (convention —
+# first_party_repos() fails on a repo without that Dockerfile).
+# Usage: build_content_tagged_image <repo>
+build_content_tagged_image() {
+    local repo="$1" name cmd iid_file iid tag ref args=()
+    name="${repo#localhost/}"
+    cmd="$(container_cmd)"
+    # Fast-fail on insufficient host disk before the (multi-minute) cold build.
+    check_build_disk_space "${cmd}"
+    local build_args
+    build_args="$(image_build_args "${repo}")" || return 1
+    [[ -z "${build_args}" ]] || mapfile -t args <<< "${build_args}"
+    iid_file="$(mktemp "${TMPDIR:-/tmp}/dt-iid.XXXXXX")"
+    log_step "Building ${repo} container image..."
+    if ! ${cmd} build --iidfile "${iid_file}" "${args[@]}" \
+            -f "${PROJECT_ROOT}/infra/docker/${name}/Dockerfile" "${PROJECT_ROOT}"; then
+        rm -f "${iid_file}"
+        log_error "Image build failed: ${repo}"
+        return 1
+    fi
+    iid="$(cat "${iid_file}" 2>/dev/null || true)"
+    rm -f "${iid_file}"
+    if [[ -z "${iid}" ]]; then
+        log_error "Image build of ${repo} wrote no image ID (--iidfile empty); refusing to guess a tag."
+        return 1
+    fi
+    tag="$(content_tag "${iid}")" || return 1
+    ref="${repo}:${tag}"
+    ${cmd} tag "${iid}" "${ref}"
+    log_step "Loading ${ref} into kind cluster..."
+    load_image_to_kind "${ref}"
+    BUILT_REFS["${repo}"]="${ref}"
 }
 
 # Pre-load third-party images into the Kind cluster.
@@ -587,11 +692,7 @@ preload_third_party_images() {
     log_step "Pre-loading third-party images into Kind cluster..."
 
     local CONTAINER_CMD
-    if [[ "${KIND_EXPERIMENTAL_PROVIDER:-}" == "podman" ]]; then
-        CONTAINER_CMD="podman"
-    else
-        CONTAINER_CMD="docker"
-    fi
+    CONTAINER_CMD="$(container_cmd)"
 
     # Extract third-party images from rendered Kustomize manifests,
     # qualifying Docker Hub short names for podman compatibility.
@@ -712,6 +813,13 @@ deploy_otel_collector() {
 ENV_ROOT_REL="infra/kubernetes/overlays/kind"
 ENV_ROOT="${PROJECT_ROOT}/${ENV_ROOT_REL}"
 
+# The migration Job's base (ADR-0038 §2 step 3), applied AHEAD of the root by
+# run_migration_job — not one of the root's resources — and its image's repo.
+MIGRATE_BASE_REL="infra/services/db-migrate"
+MIGRATE_BASE="${PROJECT_ROOT}/${MIGRATE_BASE_REL}"
+MIGRATE_REPO="localhost/db-migrate"
+MIGRATE_NAMESPACE="dark-tower"
+
 # The per-instance MC/MH ConfigMaps whose advertise address a devloop cluster
 # overrides, DERIVED from the per-instance generator sources on disk (not a
 # hand-kept list): adding mc-2 means adding mc-2-config.env, and the override
@@ -725,30 +833,117 @@ advertise_instances() {
     done | sort
 }
 
-# Render the devloop wrapper kustomization into directory $1. PURE: it writes
-# only $1/kustomization.yaml and touches no cluster (setup.test.sh renders it).
-#
-# Why a wrapper: the advertise address of each MC/MH pod is a per-cluster value
-# (host-gateway IP + the helper's per-slug port). It used to be `kubectl
-# patch`ed onto the live ConfigMap after apply, which (a) addresses a literal
-# ConfigMap name that no longer exists once names are content-addressed and
-# (b) sits outside the render, so the next apply reverts it and it never enters
-# a hash. Here it is a render INPUT instead: a `behavior: merge` generator over
-# the root's own per-instance generator, so the value is part of the hash and a
-# gateway/port change rolls exactly those pods. Devloop 3's `deploy` render
-# absorbs this step (the ports are the blueprint's port allocation).
-#
-# Returns non-zero, with a diagnostic, on any invalid input — the caller must
-# not fall back to the plain root (that would silently advertise localhost).
-render_env_overlay() {
-    local dir="$1" rel inst svc idx svc_uc port_var port instances
-    if [[ ! "${DT_HOST_GATEWAY_IP:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "${DT_HOST_GATEWAY_IP}" == "0.0.0.0" ]]; then
-        log_error "render_env_overlay: DT_HOST_GATEWAY_IP is unset or invalid: '${DT_HOST_GATEWAY_IP:-}'"
+# First-party repos (`localhost/<name>`) the environment root runs, DERIVED
+# from its render — not a hand-kept service list. Prints one per line, sorted.
+# The first-party repos (`localhost/<name>`, tag stripped) a render of $1 names.
+first_party_repos_of() {
+    kubectl kustomize "$1" | extract_manifest_images | grep '^localhost/' \
+        | sed -E 's/:[^:/]*$//' | sort -u
+}
+
+root_repos() {
+    first_party_repos_of "${ENV_ROOT}"
+}
+
+# Every first-party repo a converge must resolve a ref for: the root's, plus
+# the migrations image (whose base is applied ahead of the root, not in it).
+# Fails when none is derived (a vacuous converge) or when a repo has no
+# infra/docker/<name>/Dockerfile to build it from.
+first_party_repos() {
+    local repos repo missing=0
+    repos="$( { root_repos; first_party_repos_of "${MIGRATE_BASE}"; } | sort -u)" || true
+    if [[ -z "${repos}" ]]; then
+        log_error "No first-party (localhost/) images derived from ${ENV_ROOT_REL} or ${MIGRATE_BASE_REL}; refusing a vacuous converge."
         return 1
     fi
-    instances="$(advertise_instances)"
-    if [[ -z "${instances}" ]]; then
-        log_error "render_env_overlay: no per-instance generator sources (infra/services/m[ch]-service/m[ch]-N-config.env) found"
+    while IFS= read -r repo; do
+        if [[ ! -f "${PROJECT_ROOT}/infra/docker/${repo#localhost/}/Dockerfile" ]]; then
+            log_error "First-party image ${repo} has no infra/docker/${repo#localhost/}/Dockerfile to build it from."
+            missing=1
+        fi
+    done <<< "${repos}"
+    (( missing == 0 )) || return 1
+    printf '%s\n' "${repos}"
+}
+
+# Every distinct image ref of <repo> the cluster runs now, one per line (may be
+# empty; may be invalid — the caller judges). The ONE deployed-ref reader, keyed
+# by repo: root workloads for service images, the Complete migration Job for
+# db-migrate. Returns non-zero when the cluster cannot be READ — that is never
+# folded into "nothing deployed".
+deployed_refs() {
+    local repo="$1" ns res out
+    if [[ "${repo}" == "${MIGRATE_REPO}" ]]; then
+        out="$(${KUBECTL} get jobs -n "${MIGRATE_NAMESPACE}" -l app=db-migrate \
+            -o jsonpath='{range .items[*]}{.status.succeeded}{" "}{.spec.template.spec.containers[0].image}{"\n"}{end}')" || return 1
+        awk '$1 == "1" { print $2 }' <<< "${out}" | sort -u
+        return 0
+    fi
+    {
+        while read -r ns res; do
+            [[ -n "${res}" ]] || continue
+            out="$(${KUBECTL} get "${res}" -n "${ns}" --ignore-not-found \
+                -o jsonpath='{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}')" || return 1
+            grep "^${repo}:" <<< "${out}" || true
+        done <<< "$(env_root_workloads "${repo}")"
+    } | sort -u
+}
+
+# Fill IMAGE_REFS (and DEPLOYED_REFS) for every first-party repo: the ref built
+# in this run, else the one content-tagged ref the cluster already runs, else
+# FAIL LOUDLY — never a guess, never `:latest`.
+resolve_image_refs() {
+    local repos repo refs n
+    repos="$(first_party_repos)" || return 1
+    while IFS= read -r repo; do
+        if ! refs="$(deployed_refs "${repo}")"; then
+            log_error "IMAGE_REF_READ_FAILED: could not read the deployed ref of ${repo} from cluster '${CLUSTER_NAME}' (kubectl failed; see above) REASON=image-ref-read-failed"
+            return 1
+        fi
+        n="$(grep -c . <<< "${refs}" || true)"
+        if (( n == 1 )) && is_content_ref "${repo}" "${refs}"; then
+            DEPLOYED_REFS["${repo}"]="${refs}"
+        fi
+        if [[ -n "${BUILT_REFS[${repo}]:-}" ]]; then
+            IMAGE_REFS["${repo}"]="${BUILT_REFS[${repo}]}"
+            continue
+        fi
+        if (( n == 1 )) && is_content_ref "${repo}" "${refs}"; then
+            IMAGE_REFS["${repo}"]="${refs}"
+            continue
+        fi
+        log_error "IMAGE_UNRESOLVED: no content-tagged image for ${repo} (deployed: $( ((n)) && tr '\n' ' ' <<< "${refs}" || echo none)); build it with 'dev-cluster rebuild-all' (or 'dev-cluster teardown' + 'dev-cluster setup'; host: setup.sh --rebuild-all) REASON=image-unresolved"
+        return 1
+    done <<< "${repos}"
+}
+
+# Render the wrapper kustomization the root is applied through into directory
+# $1. PURE given IMAGE_REFS: it writes only $1/kustomization.yaml and touches no
+# cluster (setup.test.sh renders it).
+#
+# Always rendered (ADR-0038 §2): every first-party image's tag is a per-build
+# value, set here as `images:` so the tree never carries it (the bases say
+# `:render-required`, which nothing loads). A render with any root repo lacking
+# a resolved ref fails.
+#
+# With DT_HOST_GATEWAY_IP set (a devloop cluster) it also carries the advertise
+# address of each MC/MH pod (host-gateway IP + the helper's per-slug port). That
+# used to be `kubectl patch`ed onto the live ConfigMap after apply, which (a)
+# addresses a literal ConfigMap name that no longer exists once names are
+# content-addressed and (b) sits outside the render, so the next apply reverts
+# it and it never enters a hash. Here it is a render INPUT: a `behavior: merge`
+# generator over the root's own per-instance generator, so the value is part of
+# the hash and a gateway/port change rolls exactly those pods. Devloop 3's
+# `deploy` render absorbs this (the ports are the blueprint's port allocation).
+#
+# Returns non-zero, with a diagnostic, on any invalid input — the caller must
+# not fall back to the plain root (that would run placeholder images, or
+# silently advertise localhost).
+render_env_overlay() {
+    local dir="$1" rel inst svc idx svc_uc port_var port instances repos repo ref
+    repos="$(root_repos)"
+    if [[ -z "${repos}" ]]; then
+        log_error "render_env_overlay: no first-party (localhost/) images in ${ENV_ROOT_REL}"
         return 1
     fi
     # kustomize rejects an absolute path in `resources:`; the default load
@@ -760,8 +955,31 @@ render_env_overlay() {
         echo "kind: Kustomization"
         echo "resources:"
         echo "  - ${rel}"
-        echo "configMapGenerator:"
+        echo "images:"
     } > "${dir}/kustomization.yaml"
+    while IFS= read -r repo; do
+        ref="${IMAGE_REFS[${repo}]:-}"
+        if ! is_content_ref "${repo}" "${ref}"; then
+            log_error "render_env_overlay: no content-tagged ref resolved for ${repo} (got '${ref}')"
+            return 1
+        fi
+        {
+            echo "  - name: ${repo}"
+            echo "    newTag: ${ref##*:}"
+        } >> "${dir}/kustomization.yaml"
+    done <<< "${repos}"
+
+    [[ -n "${DT_HOST_GATEWAY_IP:-}" ]] || return 0
+    if [[ ! "${DT_HOST_GATEWAY_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "${DT_HOST_GATEWAY_IP}" == "0.0.0.0" ]]; then
+        log_error "render_env_overlay: DT_HOST_GATEWAY_IP is invalid: '${DT_HOST_GATEWAY_IP}'"
+        return 1
+    fi
+    instances="$(advertise_instances)"
+    if [[ -z "${instances}" ]]; then
+        log_error "render_env_overlay: no per-instance generator sources (infra/services/m[ch]-service/m[ch]-N-config.env) found"
+        return 1
+    fi
+    echo "configMapGenerator:" >> "${dir}/kustomization.yaml"
     while IFS= read -r inst; do
         svc="${inst%%-*}"
         idx="${inst#*-}"
@@ -782,26 +1000,20 @@ render_env_overlay() {
     done <<< "${instances}"
 }
 
-# Apply the environment root. With DT_HOST_GATEWAY_IP set (a devloop cluster)
-# the wrapper rendered above is applied instead — chosen HERE and nowhere else,
-# so no caller can apply the plain root to a devloop cluster and silently revert
-# its advertise addresses. A render failure aborts; there is no fallback.
+# Apply the environment root, ALWAYS through the wrapper rendered above — chosen
+# HERE and nowhere else, so no caller can apply the plain root (placeholder
+# images; on a devloop cluster, localhost advertise addresses). A render failure
+# aborts; there is no fallback. Requires IMAGE_REFS (resolve_image_refs).
 # The body is a subshell so the temp dir's EXIT trap fires on every exit path.
 apply_env_root() (
     set -euo pipefail
-    if [[ -z "${DT_HOST_GATEWAY_IP:-}" ]]; then
-        log_step "Applying environment root ${ENV_ROOT_REL}..."
-        ${KUBECTL} apply -k "${ENV_ROOT}"
-        delete_retired_resources
-        exit 0
-    fi
     wrap="$(mktemp -d "${TMPDIR:-/tmp}/dt-env-root.XXXXXX")"
     trap 'rm -rf "${wrap}"' EXIT
     if ! render_env_overlay "${wrap}"; then
-        log_error "Could not render the devloop environment overlay; NOT applying (the plain root would advertise localhost to clients)."
+        log_error "Could not render the environment overlay; NOT applying (the plain root runs placeholder images and, on a devloop cluster, advertises localhost)."
         exit 1
     fi
-    log_step "Applying environment root ${ENV_ROOT_REL} (devloop advertise addresses via ${DT_HOST_GATEWAY_IP})..."
+    log_step "Applying environment root ${ENV_ROOT_REL} (content-tagged images${DT_HOST_GATEWAY_IP:+; devloop advertise addresses via ${DT_HOST_GATEWAY_IP}})..."
     ${KUBECTL} apply -k "${wrap}"
     delete_retired_resources
 )
@@ -821,11 +1033,11 @@ delete_retired_resources() {
 
 # Workloads the environment root owns, DERIVED from its render (so a new
 # workload is waited on without editing a list): `<namespace> <kind>/<name>`,
-# one per line. With $1 set, only workloads whose pod template runs the image
-# `localhost/$1-service:` (the ones a rebuild of that service's image affects).
+# one per line. With $1 (a repo, e.g. `localhost/mc-service`) set, only the
+# workloads whose pod template runs an image of that repo.
 env_root_workloads() {
-    local image_filter="${1:-}"
-    kubectl kustomize "${ENV_ROOT}" | awk -v img="${image_filter:+localhost/${image_filter}-service:}" '
+    local repo="${1:-}"
+    kubectl kustomize "${ENV_ROOT}" | awk -v img="${repo:+${repo}:}" '
         function emit() {
             if (k ~ /^(Deployment|StatefulSet|DaemonSet)$/ && (img == "" || has_img)) print ns " " tolower(k) "/" n
             k = ""; n = ""; ns = ""; has_img = 0; m = 0
@@ -883,54 +1095,276 @@ wait_for_env_root() {
     log_info "All $(wc -l <<< "${workloads}") workloads rolled out."
 }
 
-# Build one Dark Tower service image and load it into Kind.
-# $1 = service short name (ac, gc, mc, mh).
-build_service_image() {
-    local svc="$1"
-    log_step "Building ${svc}-service container image..."
-    build_image "localhost/${svc}-service:latest" "infra/docker/${svc}-service/Dockerfile" "${PROJECT_ROOT}"
-    log_step "Loading ${svc}-service image into kind cluster..."
-    load_image_to_kind "localhost/${svc}-service:latest"
+# --- Migrations as an in-cluster Job (ADR-0038 §2 step 3) -----------------
+#
+# Replaces the host path (port-forward + host `sqlx migrate run`, silently
+# SKIPPED when sqlx was absent). The Job runs the image built from
+# infra/docker/db-migrate/ (sqlx-cli + migrations/) and MUST reach Complete
+# before the root is applied, so no AC/GC pod on new code meets an old schema —
+# and before the seeds, which need the tables.
+#
+# Rollback in the dev cluster: there are no down-migrations. A bad or edited
+# migration is fixed by restoring the file, or by recreating the cluster
+# (`dev-cluster teardown` + `dev-cluster setup`). Never hand-edit
+# `_sqlx_migrations`.
+
+# Poll interval for the Job wait (a knob so the self-test runs instantly).
+JOB_POLL_SECONDS="${DT_JOB_POLL_SECONDS:-2}"
+# Slack on top of the Job's own activeDeadlineSeconds before setup gives up
+# polling (the Job normally goes Failed/DeadlineExceeded first). A knob only so
+# the self-test can exercise the timeout lane without waiting a minute.
+JOB_WAIT_MARGIN_SECONDS="${DT_JOB_WAIT_MARGIN_SECONDS:-60}"
+
+# Redact URL userinfo from anything printed out of the cluster: the Job's URL
+# carries none by construction, but its logs reach the Layer-7 log, so a
+# `postgres://user:pass@` from any source must never pass through.
+redact_db_urls() {
+    sed -E 's#(postgres(ql)?://)[^@/[:space:]]*@#\1<redacted>@#g'
 }
 
-build_service_images() {
-    if [[ "${SKIP_BUILD}" == "true" ]]; then
-        log_warn "Skipping service image builds (--skip-build). Ensure images are already loaded."
-        return 0
+# The Job's name: `db-migrate-<first 10 hex of sha256(rendered Job, tag set)>`.
+# The ONE place the name is derived. The render includes the image tag (so the
+# migrations, through the image ID) and the whole spec, so an unchanged set
+# re-applies as a no-op, and any change — migrations OR job.yaml — is a NEW Job
+# (a Job's pod template is immutable; reusing a name could never update it).
+# Reads the rendered YAML on stdin.
+migration_job_name() {
+    local h
+    h="$(sha256sum | cut -c1-10)"
+    printf 'db-migrate-%s\n' "${h}"
+}
+
+# Render the migration Job into directory $1 for image ref $2 and print its
+# name. PURE (local kustomize only; setup.test.sh renders it). Two passes: the
+# first sets the tag and is hashed; the second renames the Job by that hash.
+render_migration_job() {
+    local dir="$1" ref="$2" rel name
+    if ! is_content_ref "${MIGRATE_REPO}" "${ref}"; then
+        log_error "render_migration_job: not a content-tagged ${MIGRATE_REPO} ref: '${ref}'"
+        return 1
     fi
-    local svc
-    for svc in ac gc mc mh; do
-        build_service_image "${svc}"
+    rel="$(realpath --relative-to="${dir}" "${MIGRATE_BASE}")" || return 1
+    {
+        echo "# GENERATED by infra/kind/scripts/setup.sh:render_migration_job — do not edit."
+        echo "apiVersion: kustomize.config.k8s.io/v1beta1"
+        echo "kind: Kustomization"
+        echo "resources:"
+        echo "  - ${rel}"
+        echo "images:"
+        echo "  - name: ${MIGRATE_REPO}"
+        echo "    newTag: ${ref##*:}"
+    } > "${dir}/kustomization.yaml"
+    name="$(kubectl kustomize "${dir}" | migration_job_name)" || return 1
+    {
+        echo "patches:"
+        echo "  - target:"
+        echo "      kind: Job"
+        echo "      name: db-migrate"
+        echo "    patch: |-"
+        echo "      - op: replace"
+        echo "        path: /metadata/name"
+        echo "        value: ${name}"
+    } >> "${dir}/kustomization.yaml"
+    printf '%s\n' "${name}"
+}
+
+# activeDeadlineSeconds of the rendered Job on stdin — the SSoT the setup-side
+# wait is derived from. Missing is an error, never a default.
+job_active_deadline() {
+    local v
+    v="$(awk '/^kind: Job$/{j=1} j && /^  activeDeadlineSeconds: /{print $2; exit}')"
+    if [[ ! "${v}" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "The rendered migration Job has no activeDeadlineSeconds; refusing to wait without a bound."
+        return 1
+    fi
+    printf '%s\n' "${v}"
+}
+
+# The Job's terminal condition as `<Type> <reason>` (Complete / Failed), or
+# empty while it runs. Returns non-zero when the Job cannot be read.
+job_condition() {
+    ${KUBECTL} get job "$1" -n "${MIGRATE_NAMESPACE}" --ignore-not-found \
+        -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{" "}{.reason}{"\n"}{end}' \
+        | awk '$1 == "Complete" || $1 == "Failed" { print; exit }'
+}
+
+# Everything an operator needs from a failed/timed-out Job, BEFORE any cleanup:
+# logs of EVERY attempt (backoffLimit gives more than one pod), describe, events.
+# Redacted; never `get -o yaml`, never the pod env.
+dump_migration_job_diagnostics() {
+    local name="$1"
+    log_error "--- job/${name}: logs (all attempts) ---"
+    ${KUBECTL} logs -n "${MIGRATE_NAMESPACE}" -l "job-name=${name}" --all-containers --prefix --tail=-1 2>&1 \
+        | redact_db_urls || true
+    log_error "--- job/${name}: describe ---"
+    ${KUBECTL} describe job "${name}" -n "${MIGRATE_NAMESPACE}" 2>&1 | redact_db_urls | tail -n 40 || true
+    log_error "--- ${MIGRATE_NAMESPACE}: recent events ---"
+    ${KUBECTL} get events -n "${MIGRATE_NAMESPACE}" --sort-by=.lastTimestamp 2>&1 | tail -n 25 || true
+}
+
+# Run the migration Job for IMAGE_REFS[MIGRATE_REPO] and wait for it. Fails
+# LOUDLY (non-zero, a REASON= token, full diagnostics) on a Failed Job or when
+# the derived deadline passes; setup then exits non-zero before the seeds and
+# the root apply.
+run_migration_job() (
+    set -euo pipefail
+    ref="${IMAGE_REFS[${MIGRATE_REPO}]:-}"
+    wrap="$(mktemp -d "${TMPDIR:-/tmp}/dt-migrate.XXXXXX")"
+    trap 'rm -rf "${wrap}"' EXIT
+    name="$(render_migration_job "${wrap}" "${ref}")" || exit 1
+    deadline="$(kubectl kustomize "${wrap}" | job_active_deadline)" || exit 1
+    log_step "Running database migrations as job/${name} (${ref})..."
+
+    if ! cond="$(job_condition "${name}")"; then
+        log_error "Could not read job/${name} from cluster '${CLUSTER_NAME}'."
+        exit 1
+    fi
+    noop=0
+    case "${cond%% *}" in
+        Complete)
+            noop=1
+            ;;
+        Failed)
+            # A Failed Job is not a record of anything: its failure was already
+            # reported loudly by the run that saw it. Re-create = retry; a
+            # deterministic failure (checksum drift) fails loudly again.
+            log_warn "job/${name} exists and FAILED earlier (${cond#* }); deleting it to retry."
+            ${KUBECTL} delete job "${name}" -n "${MIGRATE_NAMESPACE}" --ignore-not-found --wait=true
+            ${KUBECTL} apply -k "${wrap}"
+            ;;
+        *)
+            ${KUBECTL} apply -k "${wrap}"
+            ;;
+    esac
+
+    budget=$(( deadline + JOB_WAIT_MARGIN_SECONDS ))
+    start=${SECONDS}
+    while :; do
+        if ! cond="$(job_condition "${name}")"; then
+            log_error "Could not read job/${name} while waiting for it."
+            dump_migration_job_diagnostics "${name}"
+            exit 1
+        fi
+        case "${cond%% *}" in
+            Complete) break ;;
+            Failed)
+                dump_migration_job_diagnostics "${name}"
+                # The Job's OWN deadline (activeDeadlineSeconds) ends as
+                # Failed/DeadlineExceeded — the COMMON timeout path; the
+                # setup-poll-timeout below is only a backstop. A deadline means
+                # the Job never finished (usually no sqlx output at all), so it
+                # gets the timeout token and advice, never "read sqlx's error".
+                if [[ "${cond#* }" == "DeadlineExceeded" ]]; then
+                    echo "MIGRATION_FAILURE: job/${name} did not finish within its activeDeadlineSeconds ${deadline} (reason=DeadlineExceeded) REASON=migration-timeout" >&2
+                    echo "  Usually Postgres is unreachable (NetworkPolicy, pod not Ready) or the image cannot start (ErrImageNeverPull = not loaded); see the describe/events above." >&2
+                    exit 1
+                fi
+                echo "MIGRATION_FAILURE: job/${name} failed (reason=${cond#* }) REASON=migration-failed" >&2
+                echo "  The logs above carry sqlx's error. 'previously applied but has been modified' = an applied migration file was edited: restore it, or recreate the dev cluster (no down-migrations; never hand-edit _sqlx_migrations). See docs/runbooks/devloop-validation.md." >&2
+                exit 1
+                ;;
+        esac
+        if (( SECONDS - start >= budget )); then
+            dump_migration_job_diagnostics "${name}"
+            echo "MIGRATION_FAILURE: job/${name} did not finish within ${budget}s (activeDeadlineSeconds ${deadline} + ${JOB_WAIT_MARGIN_SECONDS}s; reason=setup-poll-timeout) REASON=migration-timeout" >&2
+            echo "  Usually Postgres is unreachable (NetworkPolicy, pod not Ready) or the image cannot start (ErrImageNeverPull = not loaded)." >&2
+            exit 1
+        fi
+        sleep "${JOB_POLL_SECONDS}"
+    done
+
+    if (( noop )); then
+        # Nothing ran: the Complete Job of this name IS the record (its pod is
+        # normally already gone — removed by the converge that ran it). No log
+        # dump — it would print "No resources found" where the record belongs,
+        # or a stale run's output — and no claim that anything was applied.
+        log_info "Migrations unchanged (job/${name} already Complete); nothing applied."
+    else
+        # The record of what ran, BEFORE the interim pod delete below.
+        ${KUBECTL} logs -n "${MIGRATE_NAMESPACE}" -l "job-name=${name}" --all-containers --prefix --tail=-1 2>&1 \
+            | redact_db_urls || true
+        log_info "Migrations applied (job/${name} Complete)."
+    fi
+
+    # INTERIM (ADR-0038 step 3): delete the Succeeded pod — on the no-op path
+    # too: a converge interrupted between Complete and this delete leaves the
+    # pod behind, and the next converge sees Complete-at-entry. The devloop helper's
+    # status counted every non-Running pod in dark-tower as unhealthy, so a
+    # finished Job pod made the cluster read "Pods healthy: false" forever.
+    # The helper now exempts Job-owned Succeeded pods (parse_pod_health), but a
+    # helper is built from the HOST checkout (ADR-0030 corollary), so a helper
+    # older than that fix may still be the one running. Remove this once every
+    # running helper has the fix. Only Succeeded pods — a Failed pod is evidence
+    # and must keep reading unhealthy. A failed delete fails HERE: on an old
+    # helper it would otherwise surface later as an unexplained
+    # "cluster did not become healthy".
+    if ! ${KUBECTL} delete pods -n "${MIGRATE_NAMESPACE}" -l "job-name=${name}" \
+            --field-selector=status.phase==Succeeded --ignore-not-found; then
+        log_error "Could not delete the Succeeded pod of job/${name}; an older devloop helper would report the cluster unhealthy because of it."
+        exit 1
+    fi
+    # Older migration Jobs are history, not records (the Complete Job of THIS
+    # name is the record). Never the current one.
+    ${KUBECTL} delete jobs -n "${MIGRATE_NAMESPACE}" -l app=db-migrate \
+        --field-selector "metadata.name!=${name}" --ignore-not-found
+)
+
+# Remove the refs THIS cluster ran before this converge and no longer runs:
+# from the host store (`rmi`, never -f) and from the Kind node (`crictl rmi`).
+# Hygiene, not correctness, so a failure WARNs. Kubelet image GC is the
+# backstop for anything left in the node.
+#
+# CROSS-SLUG RACE, accepted: content tags are shared by content, so another
+# devloop that just built identical code holds the SAME ref; removing it between
+# that devloop's build and its `kind load` makes the load fail LOUDLY there —
+# never wrong code. Pruning only our own superseded refs (not every sha-*) keeps
+# that window as narrow as the old `:latest` rmi's.
+prune_superseded_images() {
+    local repo old cmd node
+    cmd="$(container_cmd)"
+    node="$(kind get nodes --name "${CLUSTER_NAME}" 2>/dev/null | head -n1 || true)"
+    for repo in "${!DEPLOYED_REFS[@]}"; do
+        old="${DEPLOYED_REFS[${repo}]}"
+        [[ -n "${old}" && "${old}" != "${IMAGE_REFS[${repo}]:-}" ]] || continue
+        log_info "Pruning superseded image ${old}..."
+        ${cmd} rmi "${old}" >/dev/null 2>&1 || log_warn "Could not remove ${old} from the host store (in use elsewhere?); leaving it."
+        if [[ -n "${node}" ]]; then
+            ${cmd} exec "${node}" crictl rmi "${old}" >/dev/null 2>&1 \
+                || log_warn "Could not remove ${old} from Kind node ${node}; kubelet image GC will reclaim it."
+        fi
     done
 }
 
-# Run database migrations
-run_migrations() {
-    log_step "Running database migrations..."
-
-    # Start port-forward in background (use dynamic port for multi-cluster support)
-    local pg_port="${POSTGRES_PORT:-5432}"
-    ${KUBECTL} port-forward -n dark-tower svc/postgres "${pg_port}:5432" &
-    PF_PID=$!
-
-    # Give it a moment to establish
-    sleep 3
-
-    export DATABASE_URL="postgresql://darktower:dev_password_change_in_production@localhost:${pg_port}/dark_tower"
-
-    # Check if sqlx is available
-    if command -v sqlx &> /dev/null; then
-        (cd "${PROJECT_ROOT}" && sqlx migrate run)
-        log_info "Migrations completed successfully."
-    else
-        log_warn "sqlx-cli not installed. Run migrations manually:"
-        log_warn "  cargo install sqlx-cli --no-default-features --features postgres"
-        log_warn "  export DATABASE_URL=\"postgresql://darktower:dev_password_change_in_production@localhost:${pg_port}/dark_tower\""
-        log_warn "  sqlx migrate run"
+# Build the given first-party repos (content-tagged, loaded into Kind), unless
+# --skip-build. With no repos given, every first-party repo.
+build_first_party_images() {
+    local repo repos=("$@")
+    if [[ "${SKIP_BUILD}" == "true" ]]; then
+        log_warn "Skipping image builds (--skip-build): deploying the content-tagged images the cluster already runs."
+        return 0
     fi
+    if (( ${#repos[@]} == 0 )); then
+        local all
+        all="$(first_party_repos)" || return 1
+        mapfile -t repos <<< "${all}"
+    fi
+    for repo in "${repos[@]}"; do
+        build_content_tagged_image "${repo}"
+    done
+}
 
-    # Kill port-forward
-    kill $PF_PID 2>/dev/null || true
+# The converge an existing cluster goes through (ADR-0038 §2), shared by
+# --only, --skip-build --only and --rebuild-all:
+#   resolve refs -> Postgres (its NetworkPolicy admits the Job) -> migration Job
+#   (Complete) -> the root, with content tags -> wait for every workload -> prune.
+# An apply rolls exactly the workloads whose image or configuration changed.
+converge_env_root() {
+    resolve_image_refs
+    deploy_postgres
+    run_migration_job
+    apply_env_root
+    wait_for_env_root
+    prune_superseded_images
 }
 
 # Seed test data (service credentials for development)
@@ -1527,7 +1961,12 @@ print_access_info() {
     echo "  - Navigate to Dashboards > AC Service"
     echo "  - Or Explore > Loki for logs"
     echo ""
-    echo "Restart In-Cluster Services:"
+    echo "Deploy Code/Config Changes (rolls only what changed):"
+    echo ""
+    echo "  ./infra/kind/scripts/setup.sh --only <ac|gc|mc|mh>   # one service"
+    echo "  ./infra/kind/scripts/setup.sh --rebuild-all          # everything"
+    echo ""
+    echo "Reset Runtime State Only (does NOT pick up new code — pods pin a content-tagged image):"
     echo ""
     echo "  kubectl ${ctx} rollout restart statefulset/ac-service -n dark-tower"
     echo "  kubectl ${ctx} rollout restart deployment/mc-0 deployment/mc-1 -n dark-tower"
@@ -1540,60 +1979,54 @@ print_access_info() {
     echo ""
 }
 
-# --only <svc>: rebuild ONE service image, then converge the whole tree.
+# --only <svc> / --rebuild-all: rebuild images, then converge the whole tree.
 #
 # It applies the environment root, not a per-service overlay: the root is the
 # single source of what is deployed, and a per-service apply could leave a
-# sibling's changed configuration undeployed. Content-addressed ConfigMaps mean
-# the apply rolls only what changed. Image tags are still `:latest` (content
-# tags are ADR-0038 devloop 2), so a rebuilt image is picked up by restarting
-# the workloads that run it — ONLY when an image was actually built:
-# `--skip-build --only <svc>` (the helper's `deploy`) restarts nothing.
-# The wait covers every workload in the root, for the same reason as the apply.
-deploy_only_service() {
-    local svc="$1" built=false res ns
+# sibling's changed configuration undeployed. Images are content-tagged, so the
+# apply rolls exactly the workloads whose image or configuration changed — there
+# is no restart here. Repos not rebuilt keep the content-tagged ref the cluster
+# already runs (resolve_image_refs), so `--skip-build --only <svc>` (the
+# helper's `deploy`) builds nothing and rolls only what its config changed.
+# The migrations image is rebuilt whenever anything is built (cached: seconds
+# unless migrations/ changed) and its Job always runs (a no-op by name when
+# unchanged). The wait covers every workload in the root, for the same reason
+# as the apply.
+# Usage: deploy_services <svc|otel|all>
+deploy_services() {
+    local target="$1" repos=()
 
     # Verify cluster exists
     if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-        log_error "Cluster '${CLUSTER_NAME}' does not exist. Run full setup first (without --only)."
+        log_error "Cluster '${CLUSTER_NAME}' does not exist. Run full setup first (without --only/--rebuild-all)."
         exit 1
     fi
 
     check_prerequisites
 
-    case "$svc" in
+    case "${target}" in
         ac) create_ac_secrets ;;
         mc) create_mc_tls_secret ;;
         mh) create_mh_tls_secret ;;
-        gc|otel) ;;
+        gc|otel|all) ;;
         *)
-            log_error "Unknown service '${svc}'"
+            log_error "Unknown service '${target}'"
             exit 1
             ;;
     esac
+    # What to build: every first-party repo for `all` (empty = build_first_party_images'
+    # default); otherwise the migrations image, plus `localhost/<svc>-service` for a
+    # service (the same `localhost/<name>` convention first_party_repos derives by).
+    case "${target}" in
+        all) repos=() ;;
+        otel) repos=("${MIGRATE_REPO}") ;;
+        *) repos=("${MIGRATE_REPO}" "localhost/${target}-service") ;;
+    esac
 
-    if [[ "$svc" != "otel" ]]; then
-        if [[ "${SKIP_BUILD}" != "true" ]]; then
-            build_service_image "$svc"
-            built=true
-        else
-            log_warn "Skipping ${svc} image build (--skip-build). Ensure image is already loaded."
-        fi
-    fi
+    build_first_party_images "${repos[@]}"
+    converge_env_root
 
-    apply_env_root
-
-    if [[ "${built}" == "true" ]]; then
-        while read -r ns res; do
-            [[ -n "${res}" ]] || continue
-            log_info "Restarting ${ns}/${res} to pick up the rebuilt ${svc}-service image..."
-            ${KUBECTL} rollout restart "${res}" -n "${ns}"
-        done <<< "$(env_root_workloads "$svc")"
-    fi
-
-    wait_for_env_root
-
-    log_info "Service '${svc}' deployed successfully."
+    log_info "Converged '${target}' successfully."
 }
 
 # Main
@@ -1607,17 +2040,23 @@ main() {
     # material into psql/kubectl arguments that would land in the layer-7 log.
     # The early return is therefore a containment control as well as a
     # correctness one. --only is NOT the precedent to copy: it routes through
-    # deploy_only_service(), which calls `kind get clusters` + check_prerequisites.
+    # deploy_services(), which calls `kind get clusters` + check_prerequisites.
     if [[ -n "${PROVISION_ORG_SUB}" ]]; then
         provision_run_org "${PROVISION_ORG_SUB}" || return 1
         return 0
     fi
 
-    # --only: targeted single-service rebuild+redeploy
+    # --only / --rebuild-all: rebuild on an existing cluster, then converge
     if [[ -n "${ONLY_SERVICE}" ]]; then
-        log_info "Rebuilding and redeploying service '${ONLY_SERVICE}'..."
+        log_info "Rebuilding '${ONLY_SERVICE}' and converging the environment root..."
         echo ""
-        deploy_only_service "${ONLY_SERVICE}"
+        deploy_services "${ONLY_SERVICE}"
+        return
+    fi
+    if [[ "${REBUILD_ALL}" == "true" ]]; then
+        log_info "Rebuilding every first-party image and converging the environment root..."
+        echo ""
+        deploy_services all
         return
     fi
 
@@ -1629,14 +2068,18 @@ main() {
     install_calico
     create_namespaces
     preload_third_party_images
-    build_service_images
+    build_first_party_images
+    resolve_image_refs
     # Pre-applied ahead of the root for ORDERING only (each is a byte-identical
     # subset of the root render — scripts/setup.test.sh pins that — so the root
-    # apply below is a no-op on them): migrations need PostgreSQL, and R-54
-    # fail-hard OTel init needs the collector Ready before any service starts.
+    # apply below is a no-op on them): the migration Job needs PostgreSQL (and
+    # its NetworkPolicy admitting the Job), and R-54 fail-hard OTel init needs
+    # the collector Ready before any service starts.
     deploy_postgres
     deploy_redis
-    run_migrations
+    # Migrations BEFORE the seeds (they need the tables) and before the root
+    # (no service pod may start against an unmigrated schema). Fails loudly.
+    run_migration_job
     seed_test_data
     seed_demo_org
     # Imperative Secrets/TLS (moved to `provision` in ADR-0038 devloop 3); they
@@ -1647,6 +2090,7 @@ main() {
     deploy_otel_collector
     apply_env_root
     wait_for_env_root
+    prune_superseded_images
     install_telepresence
     setup_port_forwards
     print_access_info

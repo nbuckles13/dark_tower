@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The migration Job (ADR-0038 §2 step 3). NOT a resource of the environment
+# root: it must reach Complete BEFORE the root applies (the pre-upgrade-hook /
+# sync-wave position), so infra/kind/scripts/setup.sh:run_migration_job applies
+# it through its own rendered wrapper, which sets the image's content tag and
+# renames the Job `db-migrate-<hash of the rendered Job>` (migration_job_name).
+# A plain `kubectl apply -k` of this directory creates a Job named `db-migrate`
+# running `localhost/db-migrate:render-required`, which nothing loads — it fails
+# with ErrImageNeverPull, by design.
+resources:
+  - job.yaml
+  - network-policy.yaml
+
+labels:
+  - pairs:
+      managed-by: dark-tower
+    includeSelectors: false

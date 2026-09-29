@@ -87,7 +87,7 @@
 // OK token says *"these enumerated inputs were checked and were clean"*, never
 // *"the release premise holds"* — and those differ exactly at the N+1th channel.
 // Its RUSTFLAGS scope is service Dockerfiles, `.github/workflows/*.yml` and
-// `.cargo/config{,.toml}`; it does NOT scan `infra/devloop/`, `infra/skaffold.yaml`,
+// `.cargo/config{,.toml}`; it does NOT scan `infra/devloop/`,
 // `infra/kind/scripts/`, `scripts/` or `crates/devloop-helper` — which is what
 // actually drives image builds on the devloop path. So the full and final
 // statement is: *the predicate is `debug_assertions`; the premise that shipped

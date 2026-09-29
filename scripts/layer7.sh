@@ -3,7 +3,7 @@
 #
 # TWO Phase-2 suites since task #19 (R-48), run SEQUENTIALLY against the same cluster
 # under the same single-attempt budget:
-#   1. Rust env-tests (`cargo test -p env-tests --features all`) — ALWAYS attempted.
+#   1. Rust env-tests (`cargo test --no-fail-fast -p env-tests --features all`) — ALWAYS attempted.
 #   2. Browser E2E (`pnpm --filter @darktower/web-app test:e2e`) — runs WHENEVER Layer 7
 #      runs (2026-08-20: the diff-trigger was retired; subject only to its Phase-1g
 #      preconditions), AFTER the Rust suite and only when it passed (an env-test FAIL skips
@@ -296,12 +296,14 @@ __apply_observability_overlay() {
       "kubectl -n dark-tower-observability get pods -l app=grafana; kubectl -n dark-tower-observability describe pod -l app=grafana (a projected-volume source that does not exist blocks pod start)"
 }
 
-# Wait (bounded) for the cluster to become healthy. `dev-cluster rebuild-all` issues
-# `kubectl rollout restart` and RETURNS BEFORE the new pods finish rolling out, so a
-# one-shot readiness check immediately after rebuild spuriously reports "not ready"
-# (observed on the first live run — STEP=rebuild then an instant cluster-unhealthy). Poll
-# every 10s up to a budget so the rollout has time to settle; only a genuinely stuck
-# cluster trips PRECONDITION_FAILURE.
+# Wait (bounded) for the cluster to become healthy. Since ADR-0038 devloop 2,
+# `dev-cluster rebuild-all` runs `setup.sh --rebuild-all`, which itself waits for every
+# root workload's rollout; this poll is the belt-and-braces check on the HELPER's view
+# (`dev-cluster status`), which can still lag a just-completed rollout (terminating old
+# pods), and it is what a helper built before that change needs — its rebuild-all
+# restarted pods and returned BEFORE they settled (observed on the first live run —
+# STEP=rebuild then an instant cluster-unhealthy). Poll every 10s up to a budget; only a
+# genuinely stuck cluster trips PRECONDITION_FAILURE.
 # Args: $1=budget-seconds (default 300)  Returns: 0 when ready, 1 on timeout.
 # Uses REAL wall-clock (layer_now) rather than counting sleeps, so the budget is
 # honoured against actual elapsed time — each __cluster_ready poll itself costs
@@ -444,8 +446,8 @@ __start_mh_grpc_forward() {
   local n="$1" context="$2" port="$3" pods pod ip pid waited=0
   local budget="${DEVLOOP_MH_FORWARD_BUDGET:-30}"
   local log="${DEVLOOP_TMP}/layer-7-mh-${n}-forward.log"
-  # Live pods only: a pod with a deletionTimestamp is terminating after rebuild-all's
-  # rollout restart and must not be chosen, so the third column must be empty. awk REPRINTS
+  # Live pods only: a pod with a deletionTimestamp is terminating after a converge rolled
+  # it (content-tagged image or config changed) and must not be chosen, so the third column must be empty. awk REPRINTS
   # the two fields rather than passing the line through: the jsonpath leaves a trailing
   # space when the timestamp is empty, and `${pods##* }` would then yield an EMPTY pod IP —
   # an instance pin that silently matches nothing.
@@ -1026,15 +1028,14 @@ __layer7_main() {
   fi
   emit_step_duration infra-change "$t_step"
 
-  # (c0) Re-apply a service's MANIFESTS when the diff touches them (story 2 task 10).
-  #      `rebuild-all` rebuilds images and restarts deployments but applies NO manifests, so
-  #      a ConfigMap edit (base under infra/services/<svc>-service/ or a Kind overlay patch
-  #      under infra/kubernetes/overlays/kind/services/<svc>-service/) would otherwise never
-  #      reach the cluster — and the env-tests that compare the LIVE ConfigMap to the tree
-  #      (01_mh_deployment_config.rs) would fail as "the cluster predates the current patch".
-  #      `dev-cluster deploy <svc>` runs setup.sh --skip-build --only <svc>, which applies the
-  #      overlay and restarts the service's pods when the apply changed its ConfigMap. Runs
-  #      BEFORE rebuild so the rebuilt pods start on the applied config.
+  # (c0) INTERIM arm (story 2 task 10; ADR-0038 step 3 retires it with the other diff-based
+  #      arms): re-apply when the diff touches a service's manifests. It was needed while
+  #      `rebuild-all` applied NO manifests; since ADR-0038 devloop 2 rebuild-all runs
+  #      `setup.sh --rebuild-all`, which applies the whole environment root itself, so on a
+  #      current helper this arm is redundant (a no-op converge). It stays for a helper built
+  #      before that change (ADR-0030 corollary). `dev-cluster deploy <svc>` runs
+  #      setup.sh --skip-build --only <svc>: it converges on the images already deployed, and
+  #      content-addressed ConfigMaps roll exactly the workloads whose config changed.
   t_step=$(layer_now)
   local svc
   for svc in ac gc mc mh; do
@@ -1066,7 +1067,8 @@ __layer7_main() {
   # (e) Wait (bounded) for the cluster to become healthy AFTER rebuild, BEFORE the suite.
   #     This is what makes Phase 2's "any non-zero == the diff's fault" sound — a green
   #     pre-check means a subsequent failure cannot be blamed on cluster bring-up. We POLL
-  #     (not one-shot) because rebuild-all returns before the rollout-restarted pods settle.
+  #     (not one-shot): see __wait_cluster_ready — the helper's status can lag a converge,
+  #     and a pre-ADR-0038-devloop-2 helper's rebuild-all returned before its pods settled.
   t_step=$(layer_now)
   # SOLE cluster-unhealthy site: on timeout, hand off to the self-heal
   # (Guard-C: scripts/layer7.sh::__self_heal_cluster). It probes the REAL cause
@@ -1077,10 +1079,13 @@ __layer7_main() {
   __wait_cluster_ready "${DEVLOOP_HEALTH_BUDGET:-300}" || __self_heal_cluster
   emit_step_duration health-confirm "$t_step"
 
-  # (e2) Re-apply the Kind OBSERVABILITY overlay when the diff touches it (story 2 task 10).
-  #      `rebuild-all` redeploys the SERVICES only, and teardown+setup fires only for an
-  #      infra/kind/ diff — so an edit to the Prometheus config (e.g. a scrape cadence) would
-  #      otherwise never reach the cluster, and the env-tests' fail-loud settle precondition
+  # (e2) INTERIM arm (story 2 task 10; ADR-0038 step 3 retires it): re-apply the Kind
+  #      OBSERVABILITY overlay when the diff touches it. A current helper's rebuild-all
+  #      already applies the whole root, observability included (this is then a no-op apply);
+  #      a helper built before ADR-0038 devloop 2 (ADR-0030 corollary) redeployed the SERVICES
+  #      only, and teardown+setup fires only for an infra/kind/ diff — so there an edit to the
+  #      Prometheus config (e.g. a scrape cadence) would otherwise never reach the cluster,
+  #      and the env-tests' fail-loud settle precondition
   #      (crates/env-tests/src/fixtures/metrics.rs::service_job_scrape_settle) would red every
   #      Prometheus-gated test against a stale config. The generated ConfigMap's content hash
   #      rolls the Prometheus Deployment; the bounded rollout wait below makes "the config on
@@ -1448,7 +1453,9 @@ __layer7_main() {
     # path to a fake suite script.
     IFS=' ' read -r -a env_test_cmd <<<"$DEVLOOP_ENV_TEST_CMD"
   else
-    env_test_cmd=(cargo test -p env-tests --features all)
+    # --no-fail-fast: one failing env-test binary must not hide the others' results
+    # (every test runner runs to completion; scripts/layer7.test.sh pins it).
+    env_test_cmd=(cargo test --no-fail-fast -p env-tests --features all)
   fi
 
   local rc

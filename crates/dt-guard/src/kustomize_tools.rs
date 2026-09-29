@@ -114,24 +114,34 @@ pub struct YamlFinding {
     pub detail: String,
 }
 
-/// Workload `kind`s subject to R-18 security-context invariants. Matches
-/// bash today (`Deployment` + `StatefulSet`). Does NOT include `DaemonSet`
-/// or `Job` (bash today doesn't check them either; preserving parity).
+/// Workload `kind`s subject to R-18 security-context invariants.
+///
+/// **Policy content, owned by `security`** (CLAUDE.md guard-ownership split:
+/// membership is content; the matcher below is machinery). It is no longer
+/// pinned to the bash guard's `{Deployment, StatefulSet}` — `validate-kustomize.sh`
+/// is a `dt-guard` wrapper (ADR-0034 §3), so there is no parity left to keep.
+/// `Job` and `CronJob` were added by security's ruling in ADR-0038 devloop 2
+/// (the `db-migrate` Job): both create pods, so leaving either out is a gap the
+/// first time one lands in a service directory.
+///
+/// `DaemonSet` stays OUT, deliberately: R-18 runs on the observability base,
+/// where `node-exporter` and `promtail` are DaemonSets that legitimately need
+/// host access; exempting them is a separate policy decision that needs
+/// `observability`.
 ///
 /// ANCHOR (DRY): `crates/dt-guard/src/env_config.rs::WORKLOAD_KINDS_WITH_POD_SPEC`
-/// is the *other* answer in this binary to "which kinds carry a pod spec", and
-/// the two deliberately differ on `DaemonSet` — that list covers every kind
-/// that can carry env configuration, this one is pinned to bash parity for
-/// R-18. Neither is the other's SSoT and they must not be folded together
-/// without an owner decision on the parity constraint.
+/// is the *other* answer in this binary to "which kinds carry a pod spec"
+/// (`{Deployment, StatefulSet, DaemonSet}`). The two differ on purpose and
+/// neither is the other's SSoT: this list is the security-context policy;
+/// that one is env-config's discovery set, which walks only the canonical
+/// service directories (where no Job lives), so Job/CronJob are moot there.
 ///
 /// **Known consequence of the divergence**: a `DaemonSet` in a service
 /// directory would have its env wiring checked by `env-config` while R-18
-/// silently skips its `runAsNonRoot` / `allowPrivilegeEscalation` /
-/// `capabilities.drop` invariants and reports green. No service directory
-/// contains one today. Whoever retires the bash-parity constraint should
-/// reconcile the two lists at that point.
-pub const SECURITY_CONTEXT_KINDS: &[&str] = &["Deployment", "StatefulSet"];
+/// skips its `runAsNonRoot` / `allowPrivilegeEscalation` / `capabilities.drop`
+/// invariants and reports green. No service directory contains one today;
+/// bringing DaemonSets under R-18 is the host-access decision above.
+pub const SECURITY_CONTEXT_KINDS: &[&str] = &["Deployment", "StatefulSet", "Job", "CronJob"];
 
 /// Workload names that bash today exempts from `readOnlyRootFilesystem: true`
 /// (substrings — match bash's `[[ "$name" != *postgres* ]]` shape).
@@ -139,7 +149,8 @@ pub const READ_ONLY_ROOT_FS_EXEMPT_SUBSTRINGS: &[&str] =
     &["postgres", "prometheus", "loki", "grafana"];
 
 /// R-18 security-context check. Walks multi-doc rendered YAML; for each
-/// `Deployment`/`StatefulSet`, asserts four required substrings appear:
+/// document whose kind is in [`SECURITY_CONTEXT_KINDS`], asserts four required
+/// substrings appear:
 /// `runAsNonRoot: true`, `allowPrivilegeEscalation: false`,
 /// `capabilities.drop: [ALL]` (loose match per bash), and
 /// `readOnlyRootFilesystem: true` (skipped for names containing
@@ -416,6 +427,41 @@ mod tests {
         let doc = "kind: StatefulSet\nmetadata:\n  name: postgres\nspec:\n  template:\n    spec:\n      securityContext:\n        runAsNonRoot: true\n      containers:\n        - name: pg\n          securityContext:\n            allowPrivilegeEscalation: false\n            capabilities:\n              drop:\n                - ALL\n";
         let findings = check_security_context(doc, "infra/services/postgres");
         assert_eq!(findings.len(), 0);
+    }
+
+    /// Positive control for security's Job ruling: a non-compliant Job is
+    /// flagged on every invariant.
+    #[test]
+    fn job_missing_security_context_is_flagged() {
+        let doc = "kind: Job\nmetadata:\n  name: db-migrate\nspec:\n  template:\n    spec:\n      containers:\n        - name: m\n          image: x\n";
+        let findings = check_security_context(doc, "infra/services/db-migrate");
+        let details: Vec<&str> = findings.iter().map(|f| f.detail.as_str()).collect();
+        assert_eq!(
+            details,
+            vec![
+                "missing runAsNonRoot: true",
+                "missing allowPrivilegeEscalation: false",
+                "missing capabilities.drop: [ALL]",
+                "missing readOnlyRootFilesystem: true",
+            ]
+        );
+        assert!(findings[0].resource.starts_with("Job/db-migrate"));
+    }
+
+    #[test]
+    fn cronjob_missing_security_context_is_flagged() {
+        let doc = "kind: CronJob\nmetadata:\n  name: nightly\nspec:\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n            - name: n\n              image: x\n";
+        let findings = check_security_context(doc, "infra/services/x");
+        assert_eq!(findings.len(), 4, "{findings:?}");
+        assert!(findings[0].resource.starts_with("CronJob/nightly"));
+    }
+
+    /// The carve-out is a decision, not an accident: a DaemonSet is not R-18's.
+    #[test]
+    fn daemonset_stays_out_of_r18() {
+        assert!(!SECURITY_CONTEXT_KINDS.contains(&"DaemonSet"));
+        let doc = "kind: DaemonSet\nmetadata:\n  name: node-exporter\n";
+        assert!(check_security_context(doc, "infra/kubernetes/observability").is_empty());
     }
 
     #[test]

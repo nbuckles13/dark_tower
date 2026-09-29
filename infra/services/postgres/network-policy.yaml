@@ -35,6 +35,19 @@ spec:
     ports:
     - protocol: TCP
       port: 5432
+  # Allow ingress from the migration Job (ADR-0038 §2; infra/services/db-migrate/).
+  # namespaceSelector + podSelector in ONE `from` element = AND; split into two
+  # elements it would be OR and admit the whole namespace.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower
+      podSelector:
+        matchLabels:
+          app: db-migrate
+    ports:
+    - protocol: TCP
+      port: 5432
   egress:
   # Allow DNS resolution
   - to:

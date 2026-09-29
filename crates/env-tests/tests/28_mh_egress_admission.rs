@@ -96,11 +96,12 @@ use env_tests::fixtures::egress_admission::{
     max_s9_feasible_ceiling, size_s9_meeting, MAX_S9_PARTICIPANTS,
 };
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
-use env_tests::fixtures::kube::{configmap_key, configmap_u64};
+use env_tests::fixtures::kube::{
+    configmap_key, configmap_name_for_all, configmap_u64, FRESH_CLUSTER_HINT, REDEPLOY_HINT,
+};
 use env_tests::fixtures::mc_session::{self, McSession, MhSession};
 use env_tests::fixtures::metrics::{gauge_by_instance_present, poll_until_any_instance_above};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
-use env_tests::NAMESPACE;
 use proto_gen::dark_tower::signaling::v1::{
     client_message, ClientMessage, MediaKind, ReceiveCapability, ReceiveSlot,
 };
@@ -178,10 +179,14 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         })
         .max()
         .expect("PRECONDITION: at least one ceiling");
-    let slot_cap = configmap_u64("mc-service-config", "MC_MAX_RECEIVE_SLOTS");
+    // Resolved ONCE per test, from EVERY instance (they must agree): the live,
+    // content-addressed generations the pods run (ADR-0038 §2).
+    let mc_config = configmap_name_for_all(&["mc-0", "mc-1"], "mc-service-config");
+    let mh_config = configmap_name_for_all(&["mh-0", "mh-1"], "mh-service-config");
+    let slot_cap = configmap_u64(&mc_config, "MC_MAX_RECEIVE_SLOTS");
     let (participants, slots) = size_meeting(ceiling, slot_cap);
 
-    let per_meeting = configmap_u64("mh-service-config", "MH_MAX_EGRESS_STREAMS_PER_MEETING");
+    let per_meeting = configmap_u64(&mh_config, "MH_MAX_EGRESS_STREAMS_PER_MEETING");
     assert!(
         per_meeting >= participants * slots,
         "PRECONDITION: MH_MAX_EGRESS_STREAMS_PER_MEETING={per_meeting} is below this meeting's \
@@ -189,11 +194,12 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
          trip instead of the stream ceiling and make this test vacuous.",
         participants * slots
     );
-    let edge_bound = configmap_u64("mh-service-config", "MH_MAX_TOTAL_EGRESS_EDGES");
+    let edge_bound = configmap_u64(&mh_config, "MH_MAX_TOTAL_EGRESS_EDGES");
     assert!(
         edge_bound >= ceiling,
         "PRECONDITION: MH_MAX_TOTAL_EGRESS_EDGES={edge_bound} is below the stream ceiling \
-         {ceiling}; MH refuses to boot in that state, so the running pods predate the ConfigMap."
+         {ceiling}; MH refuses to boot in that state, so the running pods predate the ConfigMap; \
+         {REDEPLOY_HINT}."
     );
     eprintln!(
         "S9: ceiling={ceiling} slot_cap={slot_cap} -> {participants} participants x {slots} slots"
@@ -233,8 +239,9 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
             Err(GcClientError::RequestFailed { status: 503, body }) if i == 0 => panic!(
                 "PRECONDITION: all MHs at stream ceiling before S9 started; the ratchet (streams \
                  of meetings no EndMeeting released) \
-                 (GC answered 503 to the FIRST join: no handler has headroom). Recovery: \
-                 kubectl rollout restart deployment/mh-0 deployment/mh-1 -n {NAMESPACE}. \
+                 (GC answered 503 to the FIRST join: no handler has headroom). A converge will \
+                 not clear MH's in-memory stream state — pods whose image/config are \
+                 unchanged are not restarted. Recovery: {FRESH_CLUSTER_HINT}. \
                  Body: {body}"
             ),
             Err(e) => panic!("JOIN-FANOUT: GC join for participant {i} failed: {e}"),
@@ -348,7 +355,7 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         );
     }
     let deployed_threshold: f64 = {
-        let raw = configmap_key("mh-service-config", "MH_EGRESS_REJECTION_RATIO_THRESHOLD");
+        let raw = configmap_key(&mh_config, "MH_EGRESS_REJECTION_RATIO_THRESHOLD");
         raw.parse().unwrap_or_else(|e| {
             panic!("PRECONDITION: MH_EGRESS_REJECTION_RATIO_THRESHOLD={raw:?} is not a number: {e}")
         })
@@ -369,7 +376,8 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
             (threshold - deployed_threshold).abs() < 1e-12,
             "GAUGES: {instance} publishes threshold {threshold}, but the deployed ConfigMap \
              carries MH_EGRESS_REJECTION_RATIO_THRESHOLD={deployed_threshold}: the gauge must \
-             publish the SAME field enforcement reads (or the pod predates the ConfigMap)."
+             publish the SAME field enforcement reads (or the pod predates the ConfigMap: \
+             {REDEPLOY_HINT})."
         );
     }
 

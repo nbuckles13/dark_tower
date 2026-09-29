@@ -194,19 +194,22 @@ const RULE_PRECEDENCE: &[(&str, &str)] = &[
 /// Kinds that carry a pod template at `spec.template.spec`.
 ///
 /// ANCHOR (DRY): `crates/dt-guard/src/kustomize_tools.rs::SECURITY_CONTEXT_KINDS`
-/// is the *other* answer in this binary to "which kinds carry a pod spec", and
-/// the two deliberately differ on `DaemonSet`. That list is scoped to R-18's
-/// security-context invariants and is held at `{Deployment, StatefulSet}` to
-/// preserve parity with the bash guard it replaced; this list covers every kind
-/// that can carry env configuration. Neither is the other's SSoT. Widening
-/// R-18's coverage is a behaviour change to a different check and belongs to
-/// whoever owns that bash-parity decision — do not quietly fold these together.
+/// is the *other* answer in this binary to "which kinds carry a pod spec"
+/// (`{Deployment, StatefulSet, Job, CronJob}` — security-owned R-18 policy,
+/// with `DaemonSet` held out as the host-access carve-out). This list is
+/// env-config's discovery set, `{Deployment, StatefulSet, DaemonSet}`: every
+/// kind that can carry env configuration in a canonical service directory.
+/// Neither is the other's SSoT — do not fold them together.
 ///
-/// `Job`/`CronJob` are deliberately absent: no service directory contains one,
-/// and their pod spec nests one level deeper (`spec.jobTemplate.spec.template.spec`),
-/// so supporting them speculatively would add the only per-kind branch in
-/// pod-spec location and leave it permanently untested. Their absence is safe
-/// only because an unclassified kind is a hard FAIL — see [`NO_POD_SPEC_KINDS`].
+/// `Job`/`CronJob` are absent here because this guard walks only
+/// `CANONICAL_SERVICES`, whose directories hold no Job (the `db-migrate` Job
+/// lives in `infra/services/db-migrate/`, which has no `config.rs` and is
+/// outside this rule, not a gap in it). A `Job`'s pod spec is at
+/// `spec.template.spec` — the same depth as a Deployment's; only `CronJob`
+/// nests one level deeper, under `spec.jobTemplate.spec.template.spec`.
+/// If either kind ever appears in a service directory it reds this guard as
+/// `unclassified_manifest_kind` — see [`NO_POD_SPEC_KINDS`] — and must then be
+/// added here with its pod-spec path, never silenced.
 const WORKLOAD_KINDS_WITH_POD_SPEC: &[&str] = &["Deployment", "StatefulSet", "DaemonSet"];
 
 /// Kinds that legitimately live in a service directory and **carry no pod
@@ -652,7 +655,7 @@ fn discover_manifests(repo_root: &Path, infra_dir: &Path, dir: &str) -> Result<D
                             entry.behavior
                         );
                     }
-                    let keys = generator_keys(infra_dir, &entry)?;
+                    let keys = generator_keys(repo_root, infra_dir, &entry)?;
                     let src = entry
                         .source_paths()
                         .next()
@@ -984,7 +987,13 @@ spec:
     /// test's override rather than to fixture noise.
     fn fixture(custom: &[Custom<'_>]) -> tempfile::TempDir {
         let td = tempfile::tempdir().expect("tempdir");
-        let root = td.path();
+        fixture_at(td.path(), custom);
+        td
+    }
+
+    /// [`fixture`] built at `root` (for a test that needs the repo root INSIDE
+    /// a tempdir it owns, e.g. to place a file just outside the repo).
+    fn fixture_at(root: &std::path::Path, custom: &[Custom<'_>]) {
         for (_, dir) in crate::common::services::CANONICAL_SERVICES {
             let over = custom.iter().find(|(d, _, _)| d == dir);
             let crate_dir = root.join("crates").join(dir).join("src");
@@ -1009,7 +1018,6 @@ spec:
                 }
             }
         }
-        td
     }
 
     fn hits_for<'a>(report: &'a Report, rule: &str) -> Vec<&'a Hit> {
@@ -2168,6 +2176,34 @@ spec:
         let report = analyze(td.path()).expect("analyze");
         assert!(report.hits.is_empty(), "unexpected hits: {:?}", report.hits);
         assert_eq!(report.checked_configmaps, 1);
+    }
+
+    /// Generator sources resolve through the shared containment gate
+    /// (ADR-0038 devloop 2): a source escaping the repository is a hard
+    /// error naming the escape — never a key lookup outside the tree.
+    #[test]
+    fn generator_source_escaping_repo_is_error_not_key_lookup() {
+        let kust = generator_kustomization("  - name: gen\n    envs: [../../../../outside.env]\n");
+        let dep = deployment_ref("svc", "gen", "K");
+        // One tempdir owns BOTH the repo (td/repo) and the file just outside it
+        // (td/outside.env): nothing lands in the shared system temp dir, and
+        // the tempdir's drop cleans up even if an assertion panics.
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("repo");
+        fixture_at(
+            &root,
+            &[(
+                "gc-service",
+                "",
+                &[("kustomization.yaml", &kust), ("deployment.yaml", &dep)],
+            )],
+        );
+        std::fs::write(td.path().join("outside.env"), "K=v\n").expect("write outside");
+        let err = analyze(&root).expect_err("an escaping source must fail");
+        assert!(
+            format!("{err:#}").contains("resolves outside the repository"),
+            "{err:#}"
+        );
     }
 
     #[test]

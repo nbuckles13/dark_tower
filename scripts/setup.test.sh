@@ -560,7 +560,7 @@ assert_rc     "kubeconfig-export-failure-aborts" 1 "$wk_rc"
 assert_status "kubeconfig-export-failure-loud"   "localhost:8080" "$wk_out"
 
 # === (C) --only accepts every target its dispatcher has, including otel =====================
-# deploy_only_service has had an `otel)` arm since the dev collector landed, but the argument
+# deploy_services (formerly deploy_only_service) has had an `otel)` arm since the dev collector landed, but the argument
 # parser rejected `otel`, so the documented collector-refresh step (`setup.sh --only otel`,
 # needed whenever the collector ConfigMap changes on an existing cluster) could never run.
 # Parse-level pin: the kind stub reports no clusters, so an ACCEPTED target reaches the
@@ -631,7 +631,11 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   done
 
   # --- (D2) The devloop wrapper: advertise values land, and ONLY those four ConfigMaps change --
-  RUN_RENDER='sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; render_env_overlay "$out"'
+  # Every render needs resolved content-tagged refs (ADR-0038 devloop 2); the fixture ref is
+  # a well-formed sha tag, set for exactly the repos the root runs.
+  TEST_TAG="sha-0123456789abcdef"
+  SET_REFS='for r in $(root_repos); do IMAGE_REFS[$r]="$r:'"${TEST_TAG}"'"; done'
+  RUN_RENDER='sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; '"${SET_REFS}"'; render_env_overlay "$out"'
   WRAP="${RWORK}/wrap"; mkdir -p "$WRAP"
   DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=24435 \
     MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 bash -c "$RUN_RENDER" _ "$SETUP" "$WRAP" >/dev/null 2>&1
@@ -668,6 +672,71 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   DT_HOST_GATEWAY_IP=10.1.2.3 bash -c "$RUN_RENDER" _ "$SETUP" "$WRAP" >/dev/null 2>&1
   assert_rc "wrapper-missing-port-rejected" 1 $?
 
+  # --- (D2b) Content-tagged images: the wrapper ALWAYS carries the tags (ADR-0038 §2) -------
+  STATIC="${RWORK}/static"; mkdir -p "$STATIC"
+  env -u DT_HOST_GATEWAY_IP bash -c "$RUN_RENDER" _ "$SETUP" "$STATIC" >/dev/null 2>&1
+  assert_rc "static-wrapper-renders" 0 $?
+  render "$STATIC" "${RWORK}/static-r"; assert_rc "static-wrapper-kustomize-builds" 0 $?
+  static_r="$(cat "${RWORK}/static-r.yaml")"
+  for repo in ac-service gc-service mc-service mh-service; do
+    assert_status "wrapper-every-repo-tagged-${repo}" "image: localhost/${repo}:${TEST_TAG}" "$static_r"
+  done
+  # Nothing first-party may survive untagged — neither `:latest` nor the placeholder.
+  assert_rc "wrapper-no-latest-survives" 0 "$(grep -q 'localhost/[a-z-]*:latest' <<< "$static_r" && echo 1 || echo 0)"
+  assert_absent "wrapper-no-placeholder-survives" ":render-required" "$static_r"
+  assert_rc "wrapper-no-latest-survives-gateway" 0 "$(grep -q 'localhost/[a-z-]*:latest' <<< "$wrapped" && echo 1 || echo 0)"
+  assert_absent "wrapper-no-placeholder-survives-gateway" ":render-required" "$wrapped"
+  # Advertise merges only with a gateway: the static render carries none of them.
+  assert_absent "wrapper-advertise-only-with-gateway" "behavior: merge" "$(cat "${STATIC}/kustomization.yaml")"
+  # S4a: a Kind-loaded first-party image is never pulled.
+  pull_policies="$(grep -A1 'image: localhost/' <<< "$static_r" | grep -o 'imagePullPolicy: [A-Za-z]*' | sort -u)"
+  assert_rc "wrapper-pullpolicy-never" 0 "$([[ "$pull_policies" == "imagePullPolicy: Never" ]] && echo 0 || echo "1 (${pull_policies})")"
+  # The repo set is DERIVED — exactly the four services + the migrations image.
+  repos_out="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; first_party_repos' _ "$SETUP" 2>/dev/null | tr '\n' ' ')"
+  assert_rc "repos-derived-exact-set" 0 "$([[ "$repos_out" == "localhost/ac-service localhost/db-migrate localhost/gc-service localhost/mc-service localhost/mh-service " ]] && echo 0 || echo "1 (${repos_out})")"
+  # A render with any root repo lacking a resolved ref refuses (never a placeholder apply).
+  NOREF="${RWORK}/noref"; mkdir -p "$NOREF"
+  out="$(bash -c 'sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; IMAGE_REFS[localhost/ac-service]="localhost/ac-service:sha-0123456789abcdef"; render_env_overlay "$out"' _ "$SETUP" "$NOREF" 2>&1)"
+  assert_rc "wrapper-missing-ref-refused" 1 "$?"
+  assert_status "wrapper-missing-ref-named" "no content-tagged ref resolved for localhost/gc-service" "$out"
+
+  # --- (D2c) The migration Job render (ADR-0038 §2 step 3) ------------------------------------
+  RUN_JOB='sp="$1"; out="$2"; ref="$3"; set --; source "$sp" >/dev/null 2>&1; render_migration_job "$out" "$ref"'
+  J1="${RWORK}/job1"; J2="${RWORK}/job2"; J3="${RWORK}/job3"; mkdir -p "$J1" "$J2" "$J3"
+  name1="$(bash -c "$RUN_JOB" _ "$SETUP" "$J1" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
+  name2="$(bash -c "$RUN_JOB" _ "$SETUP" "$J2" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
+  name3="$(bash -c "$RUN_JOB" _ "$SETUP" "$J3" "localhost/db-migrate:sha-fedcba9876543210" 2>/dev/null)"
+  assert_rc "job-render-named-by-hash" 0 "$([[ "$name1" =~ ^db-migrate-[0-9a-f]{10}$ ]] && echo 0 || echo "1 (${name1})")"
+  assert_rc "job-name-stable-when-unchanged" 0 "$([[ -n "$name1" && "$name1" == "$name2" ]] && echo 0 || echo 1)"
+  assert_rc "job-name-changes-with-tag" 0 "$([[ -n "$name3" && "$name1" != "$name3" ]] && echo 0 || echo 1)"
+  job_r="$("$REAL_KUBECTL" kustomize "$J1")"
+  assert_status "job-render-carries-name" "name: ${name1}" "$job_r"
+  assert_status "job-render-carries-tag" "image: localhost/db-migrate:${TEST_TAG}" "$job_r"
+  assert_absent "job-render-no-placeholder" ":render-required" "$job_r"
+  # S2: no literal credential — only secretKeyRefs into postgres-secret (positive control).
+  # The needle is READ from the artifact that owns the value, never typed from memory: a
+  # rotated password (or a new spelling) must still be what this looks for.
+  pg_password="$(awk '/^  POSTGRES_PASSWORD:/{print $2}' "${REPO_ROOT}/infra/services/postgres/secret.yaml")"
+  assert_rc "job-render-password-needle-read" 0 "$([[ -n "$pg_password" ]] && echo 0 || echo "1 (no POSTGRES_PASSWORD read from infra/services/postgres/secret.yaml)")"
+  assert_absent "job-render-no-literal-password" "${pg_password:-<unread-password-needle>}" "$job_r"
+  assert_absent "job-render-no-literal-user" "$(awk '/^  POSTGRES_USER:/{print "value: "$2}' "${REPO_ROOT}/infra/services/postgres/secret.yaml")" "$job_r"
+  assert_rc "job-render-has-secretkeyref" 0 "$(grep -A3 'name: PGPASSWORD' <<< "$job_r" | grep -q 'key: POSTGRES_PASSWORD' && grep -A4 'name: PGPASSWORD' <<< "$job_r" | grep -q 'name: postgres-secret' && echo 0 || echo 1)"
+  assert_absent "job-render-url-has-no-userinfo" "@postgres" "$(grep -A1 'name: DATABASE_URL' <<< "$job_r")"
+  assert_absent "job-render-no-sslmode" "sslmode" "$job_r"
+  # A changed Job SPEC renames it too (immutable pod template): copy the tree, edit job.yaml.
+  JCP="${RWORK}/jobcopy"; mkdir -p "$JCP"; cp -r "${REPO_ROOT}/infra" "$JCP/"; cp "${REPO_ROOT}/Cargo.lock" "$JCP/"
+  sed -i 's/backoffLimit: 1/backoffLimit: 2/' "$JCP/infra/services/db-migrate/job.yaml"
+  J4="${RWORK}/job4"; mkdir -p "$J4"
+  name4="$(bash -c "$RUN_JOB" _ "$JCP/infra/kind/scripts/setup.sh" "$J4" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
+  assert_rc "job-name-changes-with-spec" 0 "$([[ -n "$name4" && "$name1" != "$name4" ]] && echo 0 || echo "1 (${name1} vs ${name4})")"
+  # A placeholder / :latest ref never renders a Job.
+  bash -c "$RUN_JOB" _ "$SETUP" "${RWORK}/job5" "localhost/db-migrate:latest" >/dev/null 2>&1
+  assert_rc "job-render-rejects-latest" 1 $?
+  # S3: the postgres ingress rule for the Job is ONE `from` element (AND), not two (OR).
+  pg_np="$(awk '/app: db-migrate/{print NR}' "${REPO_ROOT}/infra/services/postgres/network-policy.yaml")"
+  pg_from="$(awk -v t="$pg_np" 'NR<t && /^  - from:/{f=NR} NR<t && /^    - /{last=NR} END{print f" "last}' "${REPO_ROOT}/infra/services/postgres/network-policy.yaml")"
+  assert_rc "postgres-ingress-db-migrate-single-from-element" 0 "$(sed -n "$(cut -d' ' -f1 <<< "$pg_from"),${pg_np}p" "${REPO_ROOT}/infra/services/postgres/network-policy.yaml" | grep -c '^    - ' | grep -qx 1 && echo 0 || echo 1)"
+
   # --- (D3) A data change changes ONLY its consumer's pod template ----------------------------
   # Copy infra/ (the root references bases by relative path), change one key in mc-0's
   # generator source, re-render: the only workload whose document differs must be mc-0.
@@ -685,53 +754,125 @@ if [[ -n "$REAL_KUBECTL" ]]; then
     "$([[ "$wl_changed" == "mc-0 " ]] && echo 0 || echo "1 (changed workloads: '${wl_changed}')")"
 fi
 
-# --- (D4) apply_env_root: ONE apply path; the wrapper choice lives inside it ------------------
-# A PATH-stubbed kubectl records every `apply -k` target and snapshots the kustomization it was
-# handed; `kustomize` passes through to the REAL kubectl (env_root_workloads renders).
+# --- (D4) apply_env_root: ONE apply path, ALWAYS the rendered wrapper ------------------------
+# A PATH-stubbed kubectl models the cluster reads/writes the converge makes; `kustomize` passes
+# through to the REAL kubectl (renders are never stubbed). Knobs (env):
+#   STUB_DEPLOYED_TAG        tag every first-party workload runs (default sha-aaaaaaaaaaaaaaaa)
+#   STUB_DEPLOYED_OVERRIDE   "<res>=<image>" — one workload runs <image> instead
+#   STUB_GET_FAIL=1          workload/job `get` fails (an unreadable cluster)
+#   STUB_JOBS                lines `<succeeded> <image>` for `get jobs -l app=db-migrate`
+#   STUB_JOB_COND_INITIAL    the migration Job's condition before any apply ("" = absent)
+#   STUB_JOB_COND_AFTER_APPLY  its condition once a migration wrapper is applied
+#   STUB_POD_DELETE_FAIL=1   `delete pods` fails
 D4_BIN="${WORK}/d4bin"; mkdir -p "$D4_BIN"
-cat > "${D4_BIN}/kubectl" <<EOF
+cat > "${D4_BIN}/kubectl" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "${MARK}/kubectl.calls"
 args=("\$@")
-for ((i=0; i<\${#args[@]}; i++)); do
-  case "\${args[i]}" in
-    kustomize) exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]:i}" ;;
-    apply)
-      if [[ "\${args[i+1]:-}" == "-k" ]]; then
-        d="\${args[i+2]}"; printf '%s\n' "\$d" >> "${MARK}/applied"
-        [[ -f "\$d/kustomization.yaml" ]] && cp "\$d/kustomization.yaml" "${MARK}/applied.kustomization.yaml"
-        exit 0
-      fi ;;
-    delete) printf '%s\n' "\$*" >> "${MARK}/deleted"; exit 0 ;;
-    rollout)
-      case "\${args[i+1]:-}" in
-        restart) printf '%s\n' "\${args[i+2]}" >> "${MARK}/restarted"; exit 0 ;;
-        status)  exit 0 ;;
-      esac ;;
-  esac
-done
+# Drop a leading --context <ctx>.
+if [[ "\${args[0]:-}" == "--context" ]]; then args=("\${args[@]:2}"); fi
+case "\${args[0]:-}" in
+  kustomize) exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]}" ;;
+  apply)
+    if [[ "\${args[1]:-}" == "-k" ]]; then
+      d="\${args[2]}"; printf '%s\n' "\$d" >> "${MARK}/applied"
+      if [[ -f "\$d/kustomization.yaml" ]]; then
+        if grep -q 'render_migration_job' "\$d/kustomization.yaml"; then
+          cp "\$d/kustomization.yaml" "${MARK}/applied.migration.yaml"
+          printf '%s' "\${STUB_JOB_COND_AFTER_APPLY-Complete }" > "${MARK}/jobcond"
+        elif grep -q 'render_env_overlay' "\$d/kustomization.yaml"; then
+          cp "\$d/kustomization.yaml" "${MARK}/applied.kustomization.yaml"
+        fi
+      fi
+    fi
+    exit 0 ;;
+  delete)
+    printf '%s\n' "\${args[*]}" >> "${MARK}/deleted"
+    [[ "\${args[1]:-}" == "pods" && -n "\${STUB_POD_DELETE_FAIL:-}" ]] && { echo "kubectl stub: delete pods failed" >&2; exit 1; }
+    exit 0 ;;
+  rollout)
+    case "\${args[1]:-}" in
+      restart) printf '%s\n' "\${args[2]}" >> "${MARK}/restarted"; exit 0 ;;
+      status)  exit 0 ;;
+    esac ;;
+  wait|describe|create) exit 0 ;;
+  logs) printf 'Applied 20260322000001/migrate add participant tracking (postgres://darktower:hunter2@postgres:5432/x)\n'; exit 0 ;;
+  exec) : > "${MARK}/ran.kubectl-exec"; exit 0 ;;
+  get)
+    [[ -n "\${STUB_GET_FAIL:-}" && "\${args[1]:-}" != "events" ]] && { echo "kubectl stub: get failed" >&2; exit 1; }
+    case "\${args[1]:-}" in
+      jobs) printf '%b' "\${STUB_JOBS:-}"; exit 0 ;;
+      job)
+        if [[ -f "${MARK}/jobcond" ]]; then cat "${MARK}/jobcond"; else printf '%s' "\${STUB_JOB_COND_INITIAL:-}"; fi
+        printf '\n'; exit 0 ;;
+      events) exit 0 ;;
+      pods) printf 'calico-node-x 1/1 Running\n'; exit 0 ;;
+      */*)
+        res="\${args[1]}"
+        if [[ -n "\${STUB_DEPLOYED_OVERRIDE:-}" && "\${STUB_DEPLOYED_OVERRIDE%%=*}" == "\$res" ]]; then
+          printf '%s\n' "\${STUB_DEPLOYED_OVERRIDE#*=}"; exit 0
+        fi
+        n="\${res#*/}"
+        case "\$n" in
+          ac-service|gc-service) svc="\$n" ;;
+          mc-*) svc=mc-service ;;
+          mh-*) svc=mh-service ;;
+          *) printf 'thirdparty/image:1\n'; exit 0 ;;
+        esac
+        printf 'localhost/%s:%s\n' "\$svc" "\${STUB_DEPLOYED_TAG:-sha-aaaaaaaaaaaaaaaa}"; exit 0 ;;
+    esac ;;
+esac
 echo "kubectl stub (D4): unmodelled invocation: \$*" >&2
 exit 91
-EOF
-for tool in kind docker podman; do
-  cat > "${D4_BIN}/${tool}" <<EOF
+STUB
+for tool in docker podman; do
+  cat > "${D4_BIN}/${tool}" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "${MARK}/${tool}.calls"
-if [[ "${tool}" == kind && "\$1 \$2" == "get clusters" ]]; then echo "d4cluster"; fi
+case "\$1" in
+  build)
+    shift
+    while [[ \$# -gt 0 ]]; do
+      if [[ "\$1" == "--iidfile" ]]; then printf '%s' "\${STUB_IID-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" > "\$2"; fi
+      shift
+    done ;;
+  save) for a in "\$@"; do :; done; : > "\${a}" ;;
+esac
 exit 0
-EOF
+STUB
 done
-chmod +x "${D4_BIN}/kubectl" "${D4_BIN}/kind" "${D4_BIN}/docker" "${D4_BIN}/podman"
-RUN_APPLY='sp="$1"; set --; source "$sp" >/dev/null 2>&1; apply_env_root'
+cat > "${D4_BIN}/kind" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${MARK}/kind.calls"
+case "\$1 \$2" in
+  "get clusters") echo "d4cluster" ;;
+  "get nodes") echo "d4cluster-control-plane" ;;
+esac
+exit 0
+STUB
+# The retired host path must never run: a PATH `sqlx` that records any call.
+cat > "${D4_BIN}/sqlx" <<STUB
+#!/usr/bin/env bash
+: > "${MARK}/ran.host-sqlx"
+exit 0
+STUB
+chmod +x "${D4_BIN}/kubectl" "${D4_BIN}/docker" "${D4_BIN}/podman" "${D4_BIN}/kind" "${D4_BIN}/sqlx"
+BUILT_TAG="sha-bbbbbbbbbbbbbbbb"
+DEPLOYED_TAG="sha-aaaaaaaaaaaaaaaa"
+D4_REFS='for r in $(root_repos); do IMAGE_REFS[$r]="$r:sha-0123456789abcdef"; done'
+RUN_APPLY='sp="$1"; set --; source "$sp" >/dev/null 2>&1; '"${D4_REFS}"'; apply_env_root'
 
 reset_marks
-PATH="${D4_BIN}:${PATH}" env -u DT_HOST_GATEWAY_IP bash -c "$RUN_APPLY" _ "$SETUP" >/dev/null 2>&1
+PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" env -u DT_HOST_GATEWAY_IP bash -c "$RUN_APPLY" _ "$SETUP" >/dev/null 2>&1
 assert_rc "apply-root-plain-rc" 0 $?
-assert_status "apply-root-plain-applies-the-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
+assert_absent "apply-root-plain-never-the-bare-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
+assert_status "apply-root-plain-applied-the-tagged-wrapper" "newTag: sha-" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_absent "apply-root-plain-no-advertise-merge" "behavior: merge" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
 # Retired resources are converged away without --prune (security: the retired
 # grafana-sidecar RoleBinding is a live privilege until deleted).
 assert_status "apply-root-deletes-retired-grafana-rbac" "rolebinding/grafana-sidecar role/grafana-sidecar" "$(cat "${MARK}/deleted" 2>/dev/null)"
 assert_status "apply-root-retired-delete-is-idempotent" "--ignore-not-found" "$(cat "${MARK}/deleted" 2>/dev/null)"
+assert_rc "apply-root-plain-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
 
 reset_marks
 PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 \
@@ -740,6 +881,7 @@ PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRA
 assert_rc "apply-root-gateway-rc" 0 $?
 assert_absent "apply-root-gateway-not-the-plain-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
 assert_status "apply-root-gateway-applied-the-wrapper" "behavior: merge" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_status "apply-root-gateway-wrapper-tagged" "newTag: sha-" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
 assert_status "apply-root-gateway-deletes-retired-grafana-rbac" "rolebinding/grafana-sidecar" "$(cat "${MARK}/deleted" 2>/dev/null)"
 assert_rc "apply-root-gateway-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
 
@@ -751,22 +893,198 @@ assert_no_marker "apply-root-render-failure-applies-nothing" "$MARK" "applied"
 assert_status "apply-root-render-failure-says-no-fallback" "NOT applying" "$out"
 assert_rc "apply-root-failure-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
 
-# --- (D5) --only: converge the whole root; restart ONLY what a rebuilt image affects ----------
+# --- (D5) content_tag: the ONE tag derivation (pure) -------------------------------------------
+RUN_CT='sp="$1"; id="$2"; set --; source "$sp" >/dev/null 2>&1; content_tag "$id"'
+ct() { bash -c "$RUN_CT" _ "$SETUP" "$1" 2>/dev/null; }
+hex_a="$(printf 'a%.0s' {1..64})"
+id_a="sha256:${hex_a}"; id_b="sha256:${hex_a:0:15}b${hex_a:16}"
+ta1="$(ct "$id_a")"; ta2="$(ct "$id_a")"; tb="$(ct "$id_b")"
+assert_rc "content-tag-same-id-same-tag" 0 "$([[ -n "$ta1" && "$ta1" == "$ta2" ]] && echo 0 || echo 1)"
+assert_rc "content-tag-different-id-different-tag" 0 "$([[ -n "$tb" && "$ta1" != "$tb" ]] && echo 0 || echo "1 (${ta1} ${tb})")"
+assert_rc "content-tag-shape" 0 "$([[ "$ta1" == "sha-aaaaaaaaaaaaaaaa" ]] && echo 0 || echo "1 (${ta1})")"
+assert_rc "content-tag-accepts-bare-id" 0 "$([[ "$(ct "$hex_a")" == "$ta1" ]] && echo 0 || echo 1)"
+ct "sha256:not-hex" >/dev/null; assert_rc "content-tag-rejects-non-sha256" 1 $?
+ct "" >/dev/null; assert_rc "content-tag-rejects-empty" 1 $?
+ct "sha256:abc123" >/dev/null; assert_rc "content-tag-rejects-short" 1 $?
+
+# --- (D6) Ref resolution: built > deployed > LOUD failure --------------------------------------
+RUN_RES='sp="$1"; built="$2"; set --; source "$sp" >/dev/null 2>&1; [[ -n "$built" ]] && BUILT_REFS[localhost/gc-service]="$built"; resolve_image_refs || exit 1; for r in "${!IMAGE_REFS[@]}"; do echo "$r=${IMAGE_REFS[$r]}"; done | sort'
+res() { PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster bash -c "$RUN_RES" _ "$SETUP" "$1" 2>&1; }
+JOBS_OK="1 localhost/db-migrate:${DEPLOYED_TAG}\n"
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 env -u DT_HOST_GATEWAY_IP \
-  bash "$SETUP" --only gc 2>&1)"; rc=$?
-assert_rc "only-gc-build-rc" 0 "$rc"
-assert_status "only-gc-applies-the-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
-assert_status "only-gc-restarts-gc" "deployment/gc-service" "$(cat "${MARK}/restarted" 2>/dev/null)"
-assert_absent "only-gc-restarts-nothing-else" "mc-0" "$(cat "${MARK}/restarted" 2>/dev/null)"
-assert_status "only-gc-waits-for-every-root-workload" "statefulset/redis" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
+out="$(STUB_JOBS="$JOBS_OK" res "localhost/gc-service:${BUILT_TAG}")"; rc=$?
+assert_rc "resolve-rc" 0 "$rc"
+assert_status "resolve-built-wins" "localhost/gc-service=localhost/gc-service:${BUILT_TAG}" "$out"
+assert_status "resolve-deployed-used-when-not-built" "localhost/mc-service=localhost/mc-service:${DEPLOYED_TAG}" "$out"
+assert_status "resolve-deployed-migration-job-image" "localhost/db-migrate=localhost/db-migrate:${DEPLOYED_TAG}" "$out"
+reset_marks
+out="$(STUB_JOBS="" res "")"; rc=$?
+assert_rc "resolve-none-fails-rc" 1 "$rc"
+assert_rc "resolve-none-fails-loud-names-fix" 0 "$(grep -Eq 'IMAGE_UNRESOLVED: no content-tagged image for localhost/db-migrate \(deployed: none\); build it with .dev-cluster rebuild-all.* REASON=image-unresolved' <<< "$out" && echo 0 || echo "1 (${out})")"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_DEPLOYED_TAG=latest res "")"; rc=$?
+assert_rc "resolve-deployed-latest-rejected" 1 "$rc"
+assert_status "resolve-deployed-latest-named" "(deployed: localhost/ac-service:latest" "$out"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_DEPLOYED_TAG=render-required res "")"; rc=$?
+assert_rc "resolve-deployed-render-required-rejected" 1 "$rc"
+assert_status "resolve-deployed-render-required-token" "REASON=image-unresolved" "$out"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_DEPLOYED_OVERRIDE="deployment/mc-1=localhost/mc-service:sha-cccccccccccccccc" res "")"; rc=$?
+assert_rc "resolve-two-deployed-refs-fails" 1 "$rc"
+assert_status "resolve-two-deployed-refs-lists-both" "localhost/mc-service:sha-cccccccccccccccc" "$out"
+reset_marks
+out="$(STUB_GET_FAIL=1 res "")"; rc=$?
+assert_rc "resolve-kubectl-read-failure-rc" 1 "$rc"
+assert_status "resolve-kubectl-read-failure-distinct" "REASON=image-ref-read-failed" "$out"
+assert_absent "resolve-kubectl-read-failure-not-unresolved" "image-unresolved" "$out"
+
+# --- (D7) run_migration_job: fails LOUDLY; an unchanged set is a no-op -----------------------
+RUN_MIG='sp="$1"; set --; source "$sp" >/dev/null 2>&1; IMAGE_REFS[localhost/db-migrate]="localhost/db-migrate:'"${DEPLOYED_TAG}"'"; run_migration_job'
+mig() { PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DT_JOB_POLL_SECONDS=0 bash -c "$RUN_MIG" _ "${1:-$SETUP}" 2>&1; }
+reset_marks
+out="$(mig)"; rc=$?
+assert_rc "migrate-complete-rc0" 0 "$rc"
+assert_status "migrate-applies-the-job-wrapper" "render_migration_job" "$(cat "${MARK}/applied.migration.yaml" 2>/dev/null)"
+assert_status "migrate-success-log-printed" "Applied 20260322000001" "$out"
+assert_status "migrate-success-says-applied" "Migrations applied (job/db-migrate-" "$out"
+assert_status "migrate-log-redacts-userinfo" "postgres://<redacted>@postgres" "$out"
+assert_absent "migrate-log-no-password" "hunter2" "$out"
+mig_name="$(grep -o 'value: db-migrate-[0-9a-f]*' "${MARK}/applied.migration.yaml" 2>/dev/null | cut -d' ' -f2)"
+assert_rc "migrate-name-captured" 0 "$([[ -n "$mig_name" ]] && echo 0 || echo 1)"
+assert_status "migrate-interim-deletes-succeeded-only" "--field-selector=status.phase==Succeeded" "$(grep '^delete pods' "${MARK}/deleted" 2>/dev/null)"
+assert_status "migrate-prune-excludes-current" "metadata.name!=${mig_name}" "$(grep '^delete jobs' "${MARK}/deleted" 2>/dev/null)"
+assert_rc "migrate-prune-never-current" 0 "$(grep '^delete job' "${MARK}/deleted" 2>/dev/null | grep -v "metadata.name!=" | grep -q "${mig_name:-NONE}" && echo 1 || echo 0)"
+assert_rc "migrate-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-migrate.*" >/dev/null && echo 0 || echo 1)"
 
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster env -u DT_HOST_GATEWAY_IP \
-  bash "$SETUP" --skip-build --only gc 2>&1)"; rc=$?
-assert_rc "only-gc-skip-build-rc" 0 "$rc"
-assert_status "only-gc-skip-build-applies-the-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
-assert_no_marker "only-gc-skip-build-restarts-nothing" "$MARK" "restarted"
+out="$(STUB_JOB_COND_AFTER_APPLY="Failed BackoffLimitExceeded" mig)"; rc=$?
+assert_rc "migrate-failed-rc" 1 "$rc"
+assert_rc "migrate-failed-token" 0 "$(grep -Eq '^MIGRATION_FAILURE: job/db-migrate-[0-9a-f]+ failed \(reason=BackoffLimitExceeded\) REASON=migration-failed' <<< "$out" && echo 0 || echo "1 (${out})")"
+assert_status "migrate-failed-logs-all-attempts" "--all-containers --prefix --tail=-1" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
+assert_status "migrate-failed-logs-dumped" "Applied 20260322000001" "$out"
+assert_absent "migrate-failed-log-no-password" "hunter2" "$out"
+assert_status "migrate-failed-names-checksum-remedy" "previously applied but has been modified" "$out"
+assert_no_marker "migrate-failed-no-interim-delete" "$MARK" "deleted"
+
+# The Job's OWN deadline ends as Failed/DeadlineExceeded — the common timeout path. It is a
+# timeout, not a SQL failure: timeout token + unreachable/not-loaded advice, never migration-failed.
+reset_marks
+out="$(STUB_JOB_COND_AFTER_APPLY="Failed DeadlineExceeded" mig)"; rc=$?
+assert_rc "migrate-deadline-exceeded-rc" 1 "$rc"
+assert_rc "migrate-deadline-exceeded-is-timeout" 0 "$(grep -Eq '^MIGRATION_FAILURE: .*reason=DeadlineExceeded.* REASON=migration-timeout' <<< "$out" && echo 0 || echo "1 (${out})")"
+assert_absent "migrate-deadline-exceeded-not-failed-token" "REASON=migration-failed" "$out"
+assert_absent "migrate-deadline-exceeded-not-sqlx-advice" "carry sqlx's error" "$out"
+assert_status "migrate-deadline-exceeded-hint" "ErrImageNeverPull" "$out"
+
+# The derived wait: a copy of the tree with a 1s activeDeadlineSeconds and a 0s margin.
+MCP="${RWORK}/migcopy"; rm -rf "$MCP"; mkdir -p "$MCP"; cp -r "${REPO_ROOT}/infra" "$MCP/"; cp "${REPO_ROOT}/Cargo.lock" "$MCP/"
+sed -i 's/activeDeadlineSeconds: 300/activeDeadlineSeconds: 1/' "$MCP/infra/services/db-migrate/job.yaml"
+reset_marks
+out="$(STUB_JOB_COND_AFTER_APPLY="" DT_JOB_WAIT_MARGIN_SECONDS=0 mig "$MCP/infra/kind/scripts/setup.sh")"; rc=$?
+assert_rc "migrate-timeout-rc" 1 "$rc"
+assert_rc "migrate-timeout-distinct-token" 0 "$(grep -Eq '^MIGRATION_FAILURE: .* REASON=migration-timeout' <<< "$out" && echo 0 || echo "1 (${out})")"
+assert_absent "migrate-timeout-not-the-failed-token" "REASON=migration-failed" "$out"
+assert_status "migrate-deadline-derived" "within 1s (activeDeadlineSeconds 1 + 0s" "$out"
+sed -i '/activeDeadlineSeconds/d' "$MCP/infra/services/db-migrate/job.yaml"
+reset_marks
+out="$(mig "$MCP/infra/kind/scripts/setup.sh")"; rc=$?
+assert_rc "migrate-no-deadline-fails" 1 "$rc"
+assert_status "migrate-no-deadline-says-so" "no activeDeadlineSeconds" "$out"
+assert_no_marker "migrate-no-deadline-applies-nothing" "$MARK" "applied"
+
+reset_marks
+out="$(STUB_JOB_COND_INITIAL="Failed BackoffLimitExceeded" mig)"; rc=$?
+assert_rc "migrate-existing-failed-retried-rc" 0 "$rc"
+assert_status "migrate-existing-failed-deleted" "delete job db-migrate-" "$(cat "${MARK}/deleted" 2>/dev/null)"
+assert_status "migrate-existing-failed-recreated" "render_migration_job" "$(cat "${MARK}/applied.migration.yaml" 2>/dev/null)"
+
+reset_marks
+out="$(STUB_JOB_COND_INITIAL="Complete " mig)"; rc=$?
+assert_rc "migrate-existing-complete-noop-rc" 0 "$rc"
+assert_no_marker "migrate-existing-complete-no-apply" "$MARK" "applied"
+assert_absent "migrate-existing-complete-no-job-delete" "delete job db-migrate-" "$(cat "${MARK}/deleted" 2>/dev/null)"
+assert_status "migrate-existing-complete-condition-read" "get job db-migrate-" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
+assert_status "migrate-existing-complete-says-so" "Migrations unchanged (job/db-migrate-" "$out"
+assert_absent "migrate-existing-complete-never-claims-applied" "Migrations applied" "$out"
+assert_rc "migrate-existing-complete-no-log-dump" 0 "$(grep -Eq '(^| )logs ' "${MARK}/kubectl.calls" 2>/dev/null && echo 1 || echo 0)"
+assert_status "migrate-existing-complete-still-deletes-succeeded-pod" "delete pods" "$(cat "${MARK}/deleted" 2>/dev/null)"
+assert_status "migrate-existing-complete-still-prunes-older" "metadata.name!=db-migrate-" "$(cat "${MARK}/deleted" 2>/dev/null)"
+
+reset_marks
+out="$(STUB_POD_DELETE_FAIL=1 mig)"; rc=$?
+assert_rc "migrate-interim-delete-failure-fails-setup" 1 "$rc"
+assert_status "migrate-interim-delete-failure-own-message" "Could not delete the Succeeded pod" "$out"
+
+# --- (D8) Entry points: --only / --skip-build / --rebuild-all / full setup --------------------
+builds() { grep '^build ' "${MARK}/podman.calls" 2>/dev/null | grep -o 'infra/docker/[a-z-]*/Dockerfile' | sort | tr '\n' ' '; }
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 \
+  STUB_JOBS="$JOBS_OK" env -u DT_HOST_GATEWAY_IP bash "$SETUP" --only gc 2>&1)"; rc=$?
+assert_rc "only-gc-build-rc" 0 "$rc"
+assert_rc "only-gc-builds-gc-and-db-migrate" 0 "$([[ "$(builds)" == "infra/docker/db-migrate/Dockerfile infra/docker/gc-service/Dockerfile " ]] && echo 0 || echo "1 ($(builds))")"
+assert_status "only-gc-db-migrate-gets-sqlx-version" "SQLX_CLI_VERSION=" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+assert_status "only-gc-tags-by-content" "tag sha256:bbbb" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+assert_status "only-gc-tags-gc-built" "name: localhost/gc-service"$'\n'"    newTag: ${BUILT_TAG}" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_status "only-gc-others-keep-deployed" "name: localhost/mc-service"$'\n'"    newTag: ${DEPLOYED_TAG}" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_no_marker "only-gc-restarts-nothing" "$MARK" "restarted"
+assert_status "only-gc-runs-the-migration-job" "render_migration_job" "$(cat "${MARK}/applied.migration.yaml" 2>/dev/null)"
+assert_status "only-gc-waits-for-every-root-workload" "statefulset/redis" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
+assert_status "prune-superseded-host" "rmi localhost/gc-service:${DEPLOYED_TAG}" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+assert_status "prune-superseded-node" "exec d4cluster-control-plane crictl rmi localhost/gc-service:${DEPLOYED_TAG}" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+assert_absent "prune-never-the-unchanged" "rmi localhost/mc-service" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+assert_no_marker "only-gc-host-sqlx-never-invoked" "$MARK" "ran.host-sqlx"
+
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DT_JOB_POLL_SECONDS=0 \
+  STUB_JOBS="$JOBS_OK" env -u DT_HOST_GATEWAY_IP bash "$SETUP" --skip-build --only gc 2>&1)"; rc=$?
+assert_rc "skip-build-rc" 0 "$rc"
+assert_rc "skip-build-builds-nothing" 0 "$([[ -z "$(builds)" ]] && echo 0 || echo "1 ($(builds))")"
+assert_status "skip-build-uses-deployed" "name: localhost/gc-service"$'\n'"    newTag: ${DEPLOYED_TAG}" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_no_marker "skip-build-restarts-nothing" "$MARK" "restarted"
+
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DT_JOB_POLL_SECONDS=0 \
+  STUB_JOBS="" env -u DT_HOST_GATEWAY_IP bash "$SETUP" --skip-build --only gc 2>&1)"; rc=$?
+assert_rc "skip-build-nothing-deployed-fails" 1 "$rc"
+assert_status "skip-build-nothing-deployed-token" "REASON=image-unresolved" "$out"
+assert_no_marker "skip-build-nothing-deployed-applies-nothing" "$MARK" "applied"
+
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 \
+  env -u DT_HOST_GATEWAY_IP bash "$SETUP" --rebuild-all 2>&1)"; rc=$?
+assert_rc "rebuild-all-rc" 0 "$rc"
+assert_rc "rebuild-all-builds-every-repo" 0 "$([[ "$(builds)" == "infra/docker/ac-service/Dockerfile infra/docker/db-migrate/Dockerfile infra/docker/gc-service/Dockerfile infra/docker/mc-service/Dockerfile infra/docker/mh-service/Dockerfile " ]] && echo 0 || echo "1 ($(builds))")"
+assert_no_marker "rebuild-all-restarts-nothing" "$MARK" "restarted"
+bash "$SETUP" --rebuild-all --skip-build >/dev/null 2>&1; assert_rc "rebuild-all-skip-build-rejected" 1 $?
+bash "$SETUP" --rebuild-all --only gc >/dev/null 2>&1; assert_rc "rebuild-all-only-rejected" 1 $?
+
+# The imperative Secrets/namespaces are created as `create --dry-run=client -o yaml | apply -f -`.
+# That shape is load-bearing on the NORMAL path, not a half-built-cluster workaround:
+# deploy_services re-runs create_ac_secrets / create_mc_tls_secret / create_mh_tls_secret on
+# every `--only ac|mc|mh` against a live, successfully built cluster, and a bare `create` would
+# fail there with AlreadyExists. (Reusing a HALF-built cluster is a different matter — ADR-0038
+# step 3's recorded blueprint hash closes that; nothing here makes setup reuse one.)
+for obj in "secret generic ac-service-secrets" "secret tls mc-service-tls" "secret tls mh-service-tls" "namespace dark-tower "; do
+  line="$(grep -A5 "create ${obj}" "$SETUP" | tr '\n' ' ')"
+  assert_rc "reuse-safe-create-${obj// /-}" 0 "$([[ "$line" == *"--dry-run=client -o yaml | \${KUBECTL} apply -f -"* ]] && echo 0 || echo 1)"
+done
+
+# Full setup: a FAILED migration Job stops bring-up BEFORE the seeds and the root apply, and
+# the host sqlx is never invoked (the retired host path).
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 \
+  STUB_JOB_COND_AFTER_APPLY="Failed BackoffLimitExceeded" env -u DT_HOST_GATEWAY_IP bash "$SETUP" --yes 2>&1)"; rc=$?
+assert_rc "main-migrate-failure-rc" 1 "$rc"
+assert_status "main-migrate-failure-token" "REASON=migration-failed" "$out"
+assert_status "main-migrate-failure-reached-the-job" "render_migration_job" "$(cat "${MARK}/applied.migration.yaml" 2>/dev/null)"
+assert_no_marker "main-migrate-failure-stops-before-seeds" "$MARK" "ran.kubectl-exec"
+assert_no_marker "main-migrate-failure-stops-before-root" "$MARK" "applied.kustomization.yaml"
+assert_no_marker "main-host-sqlx-never-invoked" "$MARK" "ran.host-sqlx"
+setup_code="$(grep -vE '^[[:space:]]*#' "$SETUP")"
+assert_absent "no-sqlx-cli-branch-left" "sqlx-cli not installed" "$setup_code"
+assert_absent "no-host-sqlx-migrate-left" "sqlx migrate" "$setup_code"
+assert_absent "no-port-forward-migration-left" "run_migrations()" "$setup_code"
 
 # Static: the imperative ConfigMap patch and apply --prune (which could delete the
 # imperatively-created Secrets) must not come back.
@@ -791,13 +1109,14 @@ if [ -z "$restated" ]; then PASS=$((PASS + 1)); else
 
 # Every Dockerfile STAGE that compiles copies .cargo/ in BEFORE its first cargo compile (the
 # dependency cook runs before `COPY . .`), so a new service's Dockerfile cannot build uncapped.
+# `cargo install` counts too (the db-migrate image compiles sqlx-cli; ADR-0038 devloop 2).
 df_count=0
 for df in "${REPO_ROOT}"/infra/docker/*/Dockerfile; do
   df_count=$((df_count + 1))
   bad="$(awk '
     /^FROM /                        { stage=$0; cfg=0; next }
     /^COPY (\.cargo\/? \.cargo\/?|\. \.)/ { cfg=1 }
-    /^RUN cargo (chef cook|build)/  { if (!cfg) print stage }
+    /^RUN cargo (chef cook|build|install)/  { if (!cfg) print stage }
   ' "$df" | sort -u)"
   if [ -z "$bad" ]; then PASS=$((PASS + 1)); else
     FAIL=$((FAIL + 1)); FAILURES+=("[dockerfile-cargo-config-copied] ${df#"${REPO_ROOT}"/}: a cargo compile runs in stage '${bad}' before .cargo/ is copied in, so it ignores the build.jobs cap"); fi
@@ -830,5 +1149,100 @@ emi_out=$(emi $'    # Measured on the pinned image: without this, the total read
 emi_expect "emi-midline-prose-never-matches" "" "$emi_out"
 emi_out=$(emi $'  data:\n    note: the image: field is set elsewhere\n')
 emi_expect "emi-value-text-never-matches" "" "$emi_out"
+
+# === (F) ADR-0038 devloop 2: shared pins and retired paths ======================================
+
+# --- cargo_lock_version: the ONE Cargo.lock reader (sqlx-cli pin for both images) -----------
+LIB="${REPO_ROOT}/infra/lib/cargo-lock-version.sh"
+clv() { bash -c 'source "$1"; cargo_lock_version "$2" "$3"' _ "$LIB" "$1" "$2" 2>&1; }
+LOCKS="${WORK}/locks"; mkdir -p "$LOCKS"
+printf '[[package]]\nname = "sqlx-core"\nversion = "9.9.9"\n\n[[package]]\nname = "sqlx"\nversion = "0.8.6"\n' > "$LOCKS/one.lock"
+printf '[[package]]\nname = "sqlx-core"\nversion = "0.8.6"\n' > "$LOCKS/none.lock"
+printf '[[package]]\nname = "sqlx"\nversion = "0.7.4"\n\n[[package]]\nname = "sqlx"\nversion = "0.8.6"\n' > "$LOCKS/two.lock"
+out="$(clv "$LOCKS/one.lock" sqlx)"; rc=$?
+assert_rc "cargo-lock-version-exact-match-rc" 0 "$rc"
+emi_expect "cargo-lock-version-exact-match" "0.8.6" "$out"
+emi_expect "cargo-lock-version-not-fooled-by-sqlx-core" "0.8.6" "$out"
+out="$(clv "$LOCKS/none.lock" sqlx)"; rc=$?
+assert_rc "cargo-lock-version-missing-fails" 1 "$rc"
+assert_status "cargo-lock-version-missing-says-so" "no \`sqlx\` package" "$out"
+out="$(clv "$LOCKS/two.lock" sqlx)"; rc=$?
+assert_rc "cargo-lock-version-ambiguous-fails" 1 "$rc"
+assert_status "cargo-lock-version-ambiguous-says-so" "more than one version" "$out"
+out="$(clv "${REPO_ROOT}/Cargo.lock" sqlx)"; rc=$?
+assert_rc "cargo-lock-version-real-lock" 0 "$([[ $rc -eq 0 && "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo 0 || echo "1 (${out})")"
+# Both images take the pin from that reader — never a hand-typed version.
+assert_status "devloop-sh-derives-sqlx-cli-version" 'cargo_lock_version "${script_dir}/../../Cargo.lock" sqlx' "$(cat "${REPO_ROOT}/infra/devloop/devloop.sh")"
+assert_status "devloop-dockerfile-pins-sqlx-cli" '--version "=${SQLX_CLI_VERSION}"' "$(cat "${REPO_ROOT}/infra/devloop/Dockerfile")"
+assert_status "db-migrate-dockerfile-pins-sqlx-cli" '--version "=${SQLX_CLI_VERSION}"' "$(cat "${REPO_ROOT}/infra/docker/db-migrate/Dockerfile")"
+
+# --- RUST_VERSION: one checked value across every image Dockerfile ---------------------------
+rv="$(grep -h '^ARG RUST_VERSION=' "${REPO_ROOT}"/infra/docker/*/Dockerfile | sort -u)"
+rv_n="$(grep -c . <<< "$rv")"
+assert_rc "dockerfile-rust-version-defaults-agree" 0 "$([[ "$rv_n" -eq 1 ]] && echo 0 || echo "1 (${rv//$'\n'/ | })")"
+assert_rc "dockerfile-rust-version-nonvacuous" 0 "$([[ "$(grep -l '^ARG RUST_VERSION=' "${REPO_ROOT}"/infra/docker/*/Dockerfile | wc -l)" -ge 5 ]] && echo 0 || echo 1)"
+
+# --- Builder and runtime on the SAME Debian release (glibc) ----------------------------------
+# A binary links its builder's glibc; a builder newer than the runtime fails at exec with
+# "GLIBC_2.xx not found" (ADR-0038 devloop 2 Gate 2: `rust:<v>-slim` had floated to trixie
+# while the runtime was distroless cc-debian12). Every rust builder must name its release
+# explicitly, and every distroless runtime stage must be that release.
+declare -A DEBIAN_RELEASE=([bookworm]=12 [trixie]=13)
+debian_release_mismatch() {  # prints a reason when Dockerfile $1 drifts; empty when in step
+  local df="$1" codename want got
+  codename="$(grep -oP '^FROM docker\.io/library/rust:\S*-slim-\K[a-z]+(?= AS )' "$df" | sort -u)"
+  if [[ -z "$codename" || "$(grep -c . <<< "$codename")" -ne 1 ]]; then
+    grep -q '^FROM docker\.io/library/rust:' "$df" && echo "rust builder does not pin exactly one Debian codename (-slim-<codename>): '${codename}'"
+    return 0
+  fi
+  want="${DEBIAN_RELEASE[$codename]:-}"
+  [[ -n "$want" ]] || { echo "unknown Debian codename '${codename}' (extend DEBIAN_RELEASE)"; return 0; }
+  for got in $(grep -oP '^FROM gcr\.io/distroless/cc-debian\K[0-9]+' "$df" | sort -u); do
+    [[ "$got" == "$want" ]] || echo "builder is ${codename} (debian${want}) but a runtime stage is distroless cc-debian${got}"
+  done
+}
+rel_checked=0
+for df in "${REPO_ROOT}"/infra/docker/*/Dockerfile; do
+  grep -q '^FROM docker\.io/library/rust:' "$df" || continue
+  rel_checked=$((rel_checked + 1))
+  why="$(debian_release_mismatch "$df")"
+  if [[ -z "$why" ]]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); FAILURES+=("[dockerfile-builder-runtime-same-release] ${df#"${REPO_ROOT}"/}: ${why}"); fi
+done
+assert_rc "dockerfile-builder-runtime-nonvacuous" 0 "$([[ $rel_checked -ge 5 ]] && echo 0 || echo "1 (${rel_checked})")"
+# Negative controls: the Gate-2 shape (floating -slim) and a release mismatch both trip.
+BADDF="${WORK}/bad.Dockerfile"
+printf 'FROM docker.io/library/rust:${RUST_VERSION}-slim AS builder\nFROM gcr.io/distroless/cc-debian12:nonroot AS runtime\n' > "$BADDF"
+assert_rc "dockerfile-floating-slim-trips" 0 "$([[ -n "$(debian_release_mismatch "$BADDF")" ]] && echo 0 || echo 1)"
+printf 'FROM docker.io/library/rust:${RUST_VERSION}-slim-trixie AS builder\nFROM gcr.io/distroless/cc-debian12:nonroot AS runtime\n' > "$BADDF"
+assert_rc "dockerfile-release-mismatch-trips" 0 "$([[ -n "$(debian_release_mismatch "$BADDF")" ]] && echo 0 || echo 1)"
+
+# --- Repo derivation fails loudly (zero repos / a repo with no Dockerfile) --------------------
+if [[ -n "$REAL_KUBECTL" ]]; then
+  RCP="${WORK}/repocopy"; mkdir -p "$RCP"; cp -r "${REPO_ROOT}/infra" "$RCP/"; cp "${REPO_ROOT}/Cargo.lock" "$RCP/"
+  mv "$RCP/infra/docker/gc-service" "$RCP/infra/docker/gc-service.moved"
+  out="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; first_party_repos' _ "$RCP/infra/kind/scripts/setup.sh" 2>&1)"; rc=$?
+  assert_rc "repo-without-dockerfile-fails" 1 "$rc"
+  assert_status "repo-without-dockerfile-named" "localhost/gc-service has no infra/docker/gc-service/Dockerfile" "$out"
+  mv "$RCP/infra/docker/gc-service.moved" "$RCP/infra/docker/gc-service"
+  # Zero first-party images anywhere: every localhost/ ref rewritten away.
+  grep -rl 'image: localhost/' "$RCP/infra/services" | xargs sed -i 's#image: localhost/#image: example.org/#'
+  out="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; first_party_repos' _ "$RCP/infra/kind/scripts/setup.sh" 2>&1)"; rc=$?
+  assert_rc "repos-derived-zero-fails" 1 "$rc"
+  assert_status "repos-derived-zero-says-vacuous" "refusing a vacuous converge" "$out"
+fi
+
+# --- An empty --iidfile never becomes a guessed tag ------------------------------------------
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DEVLOOP_MIN_DISK_GB=0 STUB_IID="" \
+  bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; KIND_EXPERIMENTAL_PROVIDER=podman; build_content_tagged_image localhost/gc-service' _ "$SETUP" 2>&1)"; rc=$?
+assert_rc "iidfile-empty-fails" 1 "$rc"
+assert_status "iidfile-empty-says-so" "wrote no image ID" "$out"
+assert_absent "iidfile-empty-never-tags" "tag " "$(cat "${MARK}/podman.calls" 2>/dev/null | grep -v '^build')"
+
+# --- The devloop container no longer migrates (test.sh is the one owner) ---------------------
+entry_code="$(grep -vE '^[[:space:]]*#' "${REPO_ROOT}/infra/devloop/entrypoint.sh")"
+assert_absent "entrypoint-has-no-sqlx-migrate" "sqlx migrate" "$entry_code"
+assert_absent "entrypoint-has-no-masked-migration" "may already be applied" "$entry_code"
 
 report_results "scripts/setup.test.sh"

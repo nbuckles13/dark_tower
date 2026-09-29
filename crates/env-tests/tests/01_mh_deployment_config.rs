@@ -53,13 +53,19 @@
 //!
 //! These keys arrive via `valueFrom.configMapKeyRef`, so unlike the grace value
 //! there is no literal `value` on the pod — the pod object holds only a
-//! REFERENCE. The tests therefore read three live objects and one file, and
+//! REFERENCE. The ConfigMap is content-addressed (ADR-0038 §2): its live name
+//! is `mh-service-config-<hash>`, resolved FROM THAT REFERENCE
+//! (`env_tests::fixtures::kube::configmap_name_for`), so every value checked is
+//! the generation the pod actually runs — never the bare base name (which no
+//! longer exists) and never a label selector (superseded generations are not
+//! pruned). The tests therefore read three live objects and one file, and
 //! each assertion proves something different. Keep (a) and (c) adjacent in
 //! any rewrite: they look similar and neither covers the other.
 //!
 //! - **(a) Wiring proves the REFERENCE.** For both `mh-0` and `mh-1`, every key
 //!   in [`STORY2_KEYS`] is present on the live pod as a `configMapKeyRef` to
-//!   [`SHARED_CONFIGMAP`] whose `key` equals the env var's own name. This is
+//!   the ONE [`SHARED_CONFIGMAP`] generation that pod is wired to, whose `key`
+//!   equals the env var's own name. This is
 //!   the per-workload coverage `dt-guard env-config` cannot give yet: its rule
 //!   1 only engages once the MH code task makes these reads required, and its
 //!   rule 3 is satisfied if EITHER workload references a key — so "present in
@@ -79,10 +85,13 @@
 //!   cutover is behaviour-neutral), and the current image still reads them
 //!   optional-with-default — so parity would hold even with a ref missing.
 //!   That is why (a) exists.
-//! - **(d) Staleness.** A ConfigMap value change does NOT restart pods; a pod
-//!   started before the change keeps the old value while (a) and (b) pass. For
-//!   keys (c) cannot cover, the container's start time must be at or after the
-//!   ConfigMap's last modification.
+//! - **(d) Staleness — RETIRED (ADR-0038 devloop 2).** It asserted the
+//!   container started after the ConfigMap last changed, because a value edit
+//!   used to change a ConfigMap IN PLACE without restarting pods. Content
+//!   addressing makes that failure impossible short of a hand `kubectl edit`: a
+//!   changed value is a NEW ConfigMap name, hence a new pod template, hence a
+//!   rollout, and Layer 7 waits for every rollout before this suite runs. The
+//!   check read `managedFields` times that no longer mean "config changed".
 //! - **(e) Kind sizing.** The deployed budget is the Kind overlay's value (not
 //!   the base placeholder), and the stream ceiling derived from DEPLOYED values
 //!   meets the demo requirement.
@@ -91,7 +100,7 @@
 //!
 //! For every key except the four in (c), nothing here shows the MH PROCESS
 //! observed the value — only that the deployed artifact carries it, the pod
-//! references it, and the pod started after it last changed. The strengthening
+//! references it (and, by content addressing, that it rolled onto it). The strengthening
 //! is the MH code task's published gauges (notably
 //! `mh_media_egress_stream_ceiling`): scraping the running pod's own ceiling is
 //! the fail-closed "what the pod reports" check, and it retires the ANCHOR
@@ -104,20 +113,14 @@
 //! in [`LOGGED_POLICY_BOUNDS`]. Renaming that message or those fields reds this
 //! test with a message saying so — by design, not as config drift.
 //!
-//! ## Expected red on a hand-applied value change
+//! ## Stale values after a config change
 //!
-//! `infra/kind/scripts/setup.sh` restarts both MH deployments whenever its
-//! `apply -k` changed an MH ConfigMap in place (and always on the devloop
-//! path, which re-patches the advertise addresses). That NARROWS this window;
-//! it does not close it, and (d) is not redundant with it. The script is one
-//! deploy path: a hand `kubectl apply -k` against the Kind overlay — which
-//! `docs/runbooks/mh-deployment.md` tells operators to run — bypasses it, and
-//! the script's detector is fail-open (a missed detection is a silently stale
-//! value). (d) is the fail-closed backstop for every path the script does not
-//! own. DO NOT delete it on the grounds that setup.sh handles restarts.
-//!
-//! So a red here after a hand-applied VALUE-only change is correct: the pods
-//! really are running the old value. The failure message carries the fix.
+//! A config change renames the content-addressed ConfigMap, which rolls the pods
+//! that reference it on the next converge (`infra/kind/scripts/setup.sh`
+//! applies the whole environment root and waits for every rollout). A red here
+//! that says the process is not running the deployed value therefore means the
+//! cluster was not converged to the tree — or was hand-edited; the failure
+//! message carries the fix (`REDEPLOY_HINT`).
 //!
 //! # Diagnostic output policy (PII)
 //!
@@ -142,6 +145,9 @@
 
 #![cfg(feature = "smoke")]
 
+use env_tests::fixtures::kube::{
+    configmap_name_for, configmap_name_for_all, FRESH_CLUSTER_HINT, REDEPLOY_HINT,
+};
 use env_tests::{repo_root, NAMESPACE};
 use serde_json::Value;
 use std::process::Command;
@@ -360,11 +366,26 @@ async fn test_mh_1_termination_grace_matches_pod_spec() {
 // proves and — as importantly — what it does not.
 // =============================================================================
 
-/// The ConfigMap every story-2 key is read from.
+/// The GENERATOR BASE NAME of the ConfigMap every story-2 key is read from.
+/// The live name is content-addressed (`mh-service-config-<hash>`, ADR-0038
+/// §2); resolve it from the pod spec with [`shared_configmap_for`] /
+/// [`shared_configmap`] — never use this bare name as a live object name.
 const SHARED_CONFIGMAP: &str = "mh-service-config";
 
 /// Both MH instances. Every per-instance assertion runs over this one list.
 const MH_INSTANCES: &[&str] = &["mh-0", "mh-1"];
+
+/// The live `mh-service-config` generation `instance`'s pod references.
+fn shared_configmap_for(instance: &str) -> String {
+    configmap_name_for(instance, SHARED_CONFIGMAP)
+}
+
+/// The live `mh-service-config` generation BOTH MH instances reference — for
+/// the cluster-wide assertions. The instances sharing one generation is itself
+/// asserted (by the fixture): two generations means they run different config.
+fn shared_configmap() -> String {
+    configmap_name_for_all(MH_INSTANCES, SHARED_CONFIGMAP)
+}
 
 /// How a resolved value must parse. Mirrors what the MH code task's required
 /// reads will accept, so a value that fails here would refuse to boot there.
@@ -462,21 +483,8 @@ const fn required_edges(n: u64) -> u64 {
 /// not a kustomize render — is the point: a render cannot tell you whether the
 /// overlay was applied, or whether someone edited the live object by hand.
 fn fetch_configmap(name: &str) -> Value {
-    // `--show-managed-fields` is LOAD-BEARING for the staleness check: modern
-    // kubectl strips `metadata.managedFields` from `get` output unless asked, so
-    // without it the list is empty and the ConfigMap's last-change time is
-    // unknowable. (Found by running the check against a live cluster — it
-    // failed on every run until this flag was added.)
-    let args = [
-        "get",
-        "configmap",
-        name,
-        "-n",
-        NAMESPACE,
-        "-o",
-        "json",
-        "--show-managed-fields",
-    ];
+    // `name` is the LIVE (hash-suffixed) name, resolved from the pod spec.
+    let args = ["get", "configmap", name, "-n", NAMESPACE, "-o", "json"];
     let output = Command::new("kubectl")
         .args(args)
         .output()
@@ -569,34 +577,12 @@ fn assert_parses(key: &str, raw: &str, shape: ValueShape) {
     }
 }
 
-/// Validates the one timestamp shape Kubernetes serializes `metav1.Time` in —
-/// RFC 3339, second precision, UTC: `YYYY-MM-DDTHH:MM:SSZ`. Only for that fixed
-/// shape is a lexicographic comparison a chronological one, so a timestamp in
-/// any other shape is a hard failure, never a guess.
-fn assert_k8s_timestamp(what: &str, ts: &str) {
-    let b = ts.as_bytes();
-    let shape_ok = b.len() == 20
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && b[10] == b'T'
-        && b[13] == b':'
-        && b[16] == b':'
-        && b[19] == b'Z'
-        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
-            .iter()
-            .all(|&i| b[i].is_ascii_digit());
-    assert!(
-        shape_ok,
-        "{what} {ts:?} is not in Kubernetes' RFC 3339 second-precision UTC shape \
-         (YYYY-MM-DDTHH:MM:SSZ). The staleness check orders timestamps \
-         lexicographically, which is only valid for that exact shape - refusing \
-         to compare rather than risk a wrong answer."
-    );
-}
-
 /// (a) wiring + (b) parse, for one instance.
 fn assert_story2_keys_wired(instance: &str) {
-    let cm = fetch_configmap(SHARED_CONFIGMAP);
+    // The generation THIS instance's pod references — so the values checked
+    // below are the config in effect for this pod, not a superseded one.
+    let live_cm = shared_configmap_for(instance);
+    let cm = fetch_configmap(&live_cm);
     let pod = fetch_pod(instance);
     let pod_name = pod_name_of(&pod, instance);
     let env = mh_container(&pod, &pod_name)
@@ -632,9 +618,9 @@ fn assert_story2_keys_wired(instance: &str) {
 
         assert_eq!(
             ref_name,
-            Some(SHARED_CONFIGMAP),
+            Some(live_cm.as_str()),
             "pod {pod_name}: env {key} references ConfigMap {ref_name:?}, expected \
-             {SHARED_CONFIGMAP:?}."
+             {live_cm:?} (the one {SHARED_CONFIGMAP} generation this pod is wired to)."
         );
         assert_eq!(
             ref_key,
@@ -699,82 +685,11 @@ fn assert_story2_keys_wired(instance: &str) {
     );
 }
 
-/// (d) staleness: the container started at or after the ConfigMap last changed.
-fn assert_pod_started_after_configmap_change(instance: &str) {
-    let cm = fetch_configmap(SHARED_CONFIGMAP);
-    let pod = fetch_pod(instance);
-    let pod_name = pod_name_of(&pod, instance);
-
-    let field_times: Vec<&str> = cm
-        .pointer("/metadata/managedFields")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| {
-            panic!(
-                "ConfigMap {SHARED_CONFIGMAP} has no metadata.managedFields - cannot \
-                 establish when it last changed. Unknown is NOT treated as fresh."
-            )
-        })
-        .iter()
-        .map(|f| {
-            f.get("time").and_then(Value::as_str).unwrap_or_else(|| {
-                panic!(
-                    "a managedFields entry on {SHARED_CONFIGMAP} has no readable \
-                     `time`. Unknown is NOT treated as fresh."
-                )
-            })
-        })
-        .collect();
-    assert!(
-        !field_times.is_empty(),
-        "ConfigMap {SHARED_CONFIGMAP} has an EMPTY managedFields list - cannot \
-         establish when it last changed. Unknown is NOT treated as fresh. If this \
-         fires on every run, check that fetch_configmap still passes \
-         --show-managed-fields (kubectl strips the list by default)."
-    );
-    for t in &field_times {
-        assert_k8s_timestamp("ConfigMap managedFields time", t);
-    }
-    let cm_changed = field_times
-        .iter()
-        .max()
-        .expect("field_times is non-empty, asserted above");
-
-    let started = pod
-        .pointer("/status/containerStatuses")
-        .and_then(Value::as_array)
-        .and_then(|s| {
-            s.iter()
-                .find(|c| c.get("name").and_then(Value::as_str) == Some(CONTAINER))
-        })
-        .and_then(|c| c.pointer("/state/running/startedAt"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!(
-                "pod {pod_name}: container {CONTAINER} has no state.running.startedAt \
-                 - it is not running, so no value is in effect to compare. Check \
-                 `kubectl describe pod {pod_name} -n {NAMESPACE}`."
-            )
-        });
-    assert_k8s_timestamp("container startedAt", started);
-
-    // `>=`, NOT `>`: both timestamps have one-second resolution, so a pod
-    // started in the same second the ConfigMap was written is fresh. Tightening
-    // this to `>` adds a same-second flake and catches nothing real.
-    assert!(
-        started >= *cm_changed,
-        "pod {pod_name}: container {CONTAINER} started at {started}, BEFORE \
-         ConfigMap {SHARED_CONFIGMAP} last changed at {cm_changed}. A ConfigMap \
-         change does not restart pods, so this pod is running the OLD values while \
-         every manifest check passes. Fix: \
-         kubectl rollout restart deployment/mh-0 deployment/mh-1 -n {NAMESPACE}"
-    );
-}
-
 /// (c) startup-log parity: the running process's reported §8 bounds equal the
 /// deployed ConfigMap values. Reads the log of the SAME pod the other checks
 /// read (by name, current container only — never `-l`, never `--previous`).
 fn assert_policy_bounds_match_startup_log(instance: &str) {
-    let cm = fetch_configmap(SHARED_CONFIGMAP);
+    let cm = fetch_configmap(&shared_configmap_for(instance));
     let pod = fetch_pod(instance);
     let pod_name = pod_name_of(&pod, instance);
 
@@ -831,8 +746,9 @@ fn assert_policy_bounds_match_startup_log(instance: &str) {
         "pod {pod_name}: no {CONFIG_LOADED_MESSAGE:?} event in the current \
          container's log ({json_lines} JSON lines read). Most likely the kubelet \
          rotated the container log and `kubectl logs` returns only the current \
-         file, so on a long-lived pod the startup line is gone. Fix: \
-         kubectl rollout restart deployment/{instance} -n {NAMESPACE} and re-run. \
+         file, so on a long-lived pod the startup line is gone. A converge will not \
+         fix it — the config is current, only the log rotated, and pods whose \
+         image/config are unchanged are not restarted. Fix: {FRESH_CLUSTER_HINT}. \
          Do NOT relax this test. If the pod is fresh, the startup event was \
          renamed in crates/mh-service/src/main.rs - it is a test contract."
     );
@@ -868,9 +784,9 @@ fn assert_policy_bounds_match_startup_log(instance: &str) {
         assert_eq!(
             logged, deployed,
             "pod {pod_name}: the MH process reported {field}={logged} at startup, \
-             but ConfigMap {SHARED_CONFIGMAP} carries {key}={deployed}. The process \
-             is not running the deployed value: the pod predates the ConfigMap \
-             change, or the key is not wired into this workload."
+             but its ConfigMap ({SHARED_CONFIGMAP} generation) carries {key}={deployed}. \
+             The process is not running the deployed value: the key is not wired into \
+             this workload, or the pod predates the config; {REDEPLOY_HINT}."
         );
     }
 }
@@ -879,13 +795,6 @@ fn assert_policy_bounds_match_startup_log(instance: &str) {
 async fn test_story2_keys_wired_into_every_mh_instance() {
     for instance in MH_INSTANCES {
         assert_story2_keys_wired(instance);
-    }
-}
-
-#[tokio::test]
-async fn test_mh_pods_started_after_configmap_last_changed() {
-    for instance in MH_INSTANCES {
-        assert_pod_started_after_configmap_change(instance);
     }
 }
 
@@ -929,7 +838,7 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
         "infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml";
     const BASE: &str = "infra/services/mh-service/config.env";
 
-    let cm = fetch_configmap(SHARED_CONFIGMAP);
+    let cm = fetch_configmap(&shared_configmap());
 
     // Precondition, with its own message: this sizing requirement is the Kind
     // cluster's. On any other cluster a "ceiling too low" would be the wrong
@@ -962,18 +871,17 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     assert_ne!(
         deployed, base_value,
         "deployed MH_EGRESS_BUDGET_BPS is the BASE placeholder: the Kind overlay \
-         patch ({PATCH}) did NOT apply. Deploy through the Kind overlay \
-         (`kubectl apply -k infra/kubernetes/overlays/kind/services/mh-service/`); \
-         if the base key was renamed, the strategic merge now adds a dead key and \
-         the patch must follow the rename. This is a build-path problem, not a \
-         budget-sizing one."
+         patch ({PATCH}) did NOT apply. {REDEPLOY_HINT} (never a plain `kubectl \
+         apply -k` of an overlay — the bases carry image placeholders only \
+         setup.sh renders); if the base key was renamed, the strategic merge now \
+         adds a dead key and the patch must follow the rename. This is a \
+         build-path problem, not a budget-sizing one."
     );
     assert_eq!(
         deployed, patch_value,
         "deployed MH_EGRESS_BUDGET_BPS={deployed} is neither the base placeholder \
          nor the Kind patch value ({patch_value}): the live ConfigMap was edited \
-         by hand, or the cluster predates the current patch. Redeploy through the \
-         Kind overlay."
+         by hand, or the cluster predates the current patch; {REDEPLOY_HINT}."
     );
 
     // Branch 2: the patch applied; is the value it set big enough? Computed
@@ -1018,8 +926,10 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     // participant limit. Checked here, from the live ConfigMaps, in seconds —
     // rather than discovered as a PRECONDITION panic deep in the Layer-7 flows
     // run. The limit and the pigeonhole rule have ONE home, shared with test 28.
-    let slot_cap =
-        env_tests::fixtures::kube::configmap_u64("mc-service-config", "MC_MAX_RECEIVE_SLOTS");
+    let slot_cap = env_tests::fixtures::kube::configmap_u64(
+        &configmap_name_for_all(&["mc-0", "mc-1"], "mc-service-config"),
+        "MC_MAX_RECEIVE_SLOTS",
+    );
     let feasible = env_tests::fixtures::egress_admission::max_s9_feasible_ceiling(slot_cap);
     let s9_ceiling = bits_ceiling.max(bytes_ceiling);
     assert!(
@@ -1073,7 +983,7 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
     use env_tests::fixtures::PrometheusClient;
     use std::time::Duration;
 
-    let cm = fetch_configmap(SHARED_CONFIGMAP);
+    let cm = fetch_configmap(&shared_configmap());
     let budget = parse_positive(
         "MH_EGRESS_BUDGET_BPS",
         &configmap_value(&cm, "MH_EGRESS_BUDGET_BPS"),
@@ -1107,8 +1017,8 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
             "MH instance {instance} publishes mh_media_egress_stream_ceiling={value}, but \
              the deployed ConfigMap (MH_EGRESS_BUDGET_BPS={budget}, \
              MH_STREAM_COST_AUDIO_BPS={audio}, MH_STREAM_COST_VIDEO_BPS={video}) derives \
-             {expected} under MH's documented rule. Either the pod predates a ConfigMap \
-             change (restart it) or MH's derivation diverged from its documentation."
+             {expected} under MH's documented rule. Either the pod predates the config \
+             ({REDEPLOY_HINT}) or MH's derivation diverged from its documentation."
         );
     }
 

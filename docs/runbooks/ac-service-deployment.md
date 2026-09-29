@@ -143,6 +143,13 @@ kubectl get pods -n dark-tower -l app=ac-service -o json | jq '.items[].status.c
 
 **CRITICAL:** Database migrations must complete BEFORE container deployment.
 
+> **Mechanism (ADR-0038 §2):** the dev Kind cluster runs migrations as the pre-rollout
+> `db-migrate` Job (`infra/services/db-migrate/`, image `infra/docker/db-migrate/`), which
+> `setup.sh` runs to Complete before applying the environment root — that is also the intended
+> production shape (a pre-upgrade hook / sync-wave). The operator-shell `sqlx` procedure below
+> is the manual fallback for a non-Kind environment; it is **not** how the dev cluster is
+> migrated. Dev-cluster failures: `docs/runbooks/devloop-validation.md` §6.7 (`REASON=migration-failed`).
+
 ```bash
 # Connect to database
 export DATABASE_URL="postgresql://ac_user:<password>@postgres.dark-tower.svc.cluster.local:5432/dark_tower?sslmode=verify-full"

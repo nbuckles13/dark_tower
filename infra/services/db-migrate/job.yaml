@@ -1,0 +1,80 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Renamed at render time to db-migrate-<hash> (setup.sh:migration_job_name):
+  # the hash covers the image tag (hence the migrations) and this spec, so an
+  # unchanged set re-applies as a no-op and any change is a NEW Job (a Job's
+  # pod template is immutable, so the same name could never be updated).
+  #
+  # RESIDUAL (recorded in ADR-0038 devloop 2's output): the Complete Job is the
+  # only record that "these migrations were applied". If the Postgres PVC is
+  # wiped while this Job survives, the apply is a no-op and the services fail
+  # loudly at their first query against an empty schema. Teardown recreates both.
+  name: db-migrate
+  namespace: dark-tower
+  labels:
+    app: db-migrate
+    component: migrations
+spec:
+  # One retry covers a transient connect failure; a deterministic failure
+  # (checksum drift, dirty row) fails twice and the Job goes Failed. setup.sh
+  # derives its wait from activeDeadlineSeconds — do not remove it.
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app: db-migrate
+        component: migrations
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: db-migrate
+          image: localhost/db-migrate:render-required
+          # Kind-loaded image: never pulled; it must be the one setup.sh loaded.
+          imagePullPolicy: Never
+          env:
+            # Credentials come from Postgres's own Secret, never a literal.
+            # sqlx seeds user/password/database from PG* and the URL below
+            # overrides only what it contains (sqlx-postgres 0.8.6
+            # options/parse.rs:parse_from_url), so the URL carries NO userinfo:
+            # no password can reach a URL, a log line or `kubectl describe`.
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_DB
+            # No sslmode: the in-cluster Postgres is plaintext and the image has
+            # no TLS backend; sqlx's default `prefer` connects without TLS.
+            - name: DATABASE_URL
+              value: postgres://postgres.dark-tower.svc.cluster.local:5432
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi

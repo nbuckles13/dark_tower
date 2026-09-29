@@ -47,10 +47,21 @@ RUN rustup toolchain install nightly --profile minimal
 # Additional components for stable toolchain
 RUN rustup component add llvm-tools-preview rustfmt clippy
 
-# Cargo extensions for validation pipeline
-RUN cargo install cargo-llvm-cov && \
-    cargo install sqlx-cli --no-default-features --features postgres && \
-    cargo install cargo-audit
+# Cargo extensions for validation pipeline.
+# sqlx-cli is pinned to the workspace's `sqlx` (Cargo.lock) so the CLI that
+# migrates the unit-test DB (scripts/lang/rust/test.sh) writes the
+# `_sqlx_migrations` shape the library reads. devloop.sh derives the value
+# (infra/lib/cargo-lock-version.sh — the same reader the db-migrate image uses).
+# cargo-llvm-cov and cargo-audit are pinned and `--locked` (their own lockfiles):
+# unpinned, `cargo install` resolves the newest dependencies, which can require a
+# newer rustc than the base image. Bump these here, deliberately, when needed.
+ARG SQLX_CLI_VERSION
+ARG CARGO_LLVM_COV_VERSION=0.8.7
+ARG CARGO_AUDIT_VERSION=0.22.2
+RUN : "${SQLX_CLI_VERSION:?SQLX_CLI_VERSION build-arg is required — derived from Cargo.lock; build via devloop.sh --rebuild}" && \
+    cargo install cargo-llvm-cov --locked --version "=${CARGO_LLVM_COV_VERSION}" && \
+    cargo install sqlx-cli --locked --no-default-features --features postgres --version "=${SQLX_CLI_VERSION}" && \
+    cargo install cargo-audit --locked --version "=${CARGO_AUDIT_VERSION}"
 
 # GitHub CLI (for reading PRs, issues — read-only use)
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

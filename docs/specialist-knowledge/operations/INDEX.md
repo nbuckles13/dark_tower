@@ -50,7 +50,7 @@
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; per-run org subdomain → `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`, `packages/web-app/e2e/env.ts`
 
 ## Deployment & K8s
-- Kind cluster → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_only_service()`, `dt_psql()`, `provision_run_org()`), `teardown.sh`
+- Kind cluster → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_services()`, `run_migration_job()`, `dt_psql()`, `provision_run_org()`), `teardown.sh`
 - Per-service Kustomize bases (statefulset/deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
 - Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/`; dev certs → `scripts/generate-dev-certs.sh`
 - MC/MH per-instance Deployments + ConfigMaps → `infra/services/mc-service/mc-0-config.env`, `infra/services/mh-service/mh-0-config.env`; devloop patching → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`

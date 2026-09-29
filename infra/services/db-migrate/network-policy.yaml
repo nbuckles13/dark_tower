@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-migrate
+  namespace: dark-tower
+  labels:
+    app: db-migrate
+    component: migrations
+spec:
+  podSelector:
+    matchLabels:
+      app: db-migrate
+  # Ingress listed with NO rules: default-deny — nothing talks to the Job.
+  policyTypes:
+  - Ingress
+  - Egress
+  egress:
+  # DNS resolution (postgres.dark-tower.svc.cluster.local)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  # PostgreSQL only (the postgres NetworkPolicy admits app=db-migrate on 5432)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432

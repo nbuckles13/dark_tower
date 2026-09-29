@@ -126,17 +126,10 @@ EOF
 ### Optional Tools
 
 ```bash
-# Skaffold - For automatic rebuilds and port-forwarding
-# macOS
-brew install skaffold
-
-# Linux
-curl -Lo skaffold https://storage.googleapis.com/skaffold/releases/latest/skaffold-linux-amd64
-chmod +x skaffold
-sudo mv skaffold /usr/local/bin/
-
-# sqlx-cli - For database migrations
-cargo install sqlx-cli --no-default-features --features postgres
+# sqlx-cli - only for AUTHORING migrations and the unit-test DB. The Kind
+# cluster does NOT need it: setup.sh runs migrations in-cluster (the db-migrate
+# Job, ADR-0038). Match the workspace's sqlx version (Cargo.lock):
+cargo install sqlx-cli --locked --no-default-features --features postgres --version "=$(source infra/lib/cargo-lock-version.sh && cargo_lock_version Cargo.lock sqlx)"
 
 # psql - PostgreSQL client (for direct database access)
 # macOS
@@ -163,15 +156,20 @@ psql --version
 
 This script deploys the **full local stack**:
 1. Create kind cluster with Calico CNI
-2. Deploy PostgreSQL and Redis
-3. Deploy observability stack (Prometheus, Grafana, Loki, Promtail)
-4. Run database migrations, seed test + demo organizations
+2. Build every first-party image (AC, GC, MC, MH, and the `db-migrate` migrations image),
+   tag each by its own content (`localhost/<name>:sha-<image id>`) and load it into kind
+3. Deploy PostgreSQL and Redis
+4. Run database migrations as an in-cluster Job (`db-migrate-<hash>`), then seed test + demo organizations
 5. Generate dev TLS certs and create the MC/MH TLS secrets
-6. Deploy the AC, GC, MC and MH services
+6. Apply the environment root (services, OTel collector, observability stack)
 7. Set up port-forwarding
 
+To rebuild after code changes on an existing cluster: `./infra/kind/scripts/setup.sh --only <svc>`
+(one service) or `--rebuild-all`. Only workloads whose image or configuration actually changed
+roll; nothing is restarted unconditionally.
+
 **Note**: the services ARE deployed in-cluster by setup.sh. The "Deploy AC Service" section
-below covers running AC *locally* instead (cargo or Skaffold/Telepresence) for fast iteration —
+below covers running AC *locally* instead (cargo or Telepresence) for fast iteration —
 that is an alternative to the in-cluster pod, not a required step.
 
 > Running the **browser client** against this cluster has its own runbook:
@@ -215,23 +213,11 @@ cargo run --bin auth-controller
 - Metrics appear in Grafana (Prometheus scrapes localhost:8082)
 - Logs go to stdout (standard Rust development experience)
 
-**Option B: Deploy with Skaffold** (full K8s observability)
+**Option B: Run it in the cluster** (full K8s observability)
 
-Use Skaffold when you need full observability (logs in Loki) or K8s-specific testing:
-
-```bash
-# From project root
-cd infra
-skaffold dev
-
-# Skaffold will:
-# - Build the AC service Docker image
-# - Load it into the kind cluster
-# - Deploy to the cluster (available at http://localhost:8083)
-# - Watch for code changes and rebuild automatically
-```
-
-Note: Skaffold uses port 8083 to avoid conflict with local development.
+The in-cluster AC is what setup.sh deploys. After a code change, rebuild and roll it with
+`./infra/kind/scripts/setup.sh --only ac` (logs land in Loki). (Skaffold was retired by
+ADR-0038: it was a second, drifted deploy path that could not run the migration Job.)
 
 ### 4. View Logs and Metrics
 
@@ -333,12 +319,21 @@ These credentials are automatically seeded by `setup.sh` for env-tests.
 
 #### Running Migrations
 
+The Kind cluster's database is migrated by an in-cluster Job, never from the host
+(ADR-0038 §2): every `setup.sh` run (full, `--only`, `--rebuild-all`) builds the
+`db-migrate` image from `migrations/` and runs `job/db-migrate-<hash>` to Complete BEFORE
+any service rolls. An unchanged migration set keeps the same Job name, so it is a no-op.
+
 ```bash
-# Migrations run automatically during setup.sh
-# To run manually:
-export DATABASE_URL="postgresql://darktower:dev_password_change_in_production@localhost:5432/dark_tower"
-sqlx migrate run
+# What ran (the setup output also prints it):
+kubectl get jobs -n dark-tower -l app=db-migrate
+kubectl logs -n dark-tower -l app=db-migrate --prefix --tail=-1   # while the Job's pod exists
 ```
+
+A failed Job fails setup loudly (`MIGRATION_FAILURE: … REASON=migration-failed`) with its
+logs. "previously applied but has been modified" means an applied migration file was edited:
+restore it, or recreate the cluster (`teardown.sh` + `setup.sh`) — there are no down-migrations;
+never hand-edit `_sqlx_migrations`. See `docs/runbooks/devloop-validation.md` §6.7.
 
 #### Creating Migrations
 
@@ -350,8 +345,8 @@ sqlx migrate add <name>
 sqlx migrate add add_user_sessions_table
 
 # Edit the generated file in migrations/
-# Then run:
-sqlx migrate run
+# Then apply it to the dev cluster (runs the migration Job):
+./infra/kind/scripts/setup.sh --rebuild-all
 ```
 
 #### Connecting to Database
@@ -535,11 +530,11 @@ echo $DATABASE_URL
 # Verify database is accessible
 psql $DATABASE_URL -c "SELECT 1"
 
-# Check migration status
+# Check migration status (host sqlx-cli, against a DATABASE_URL you point it at)
 sqlx migrate info
 
-# Force re-run (use with caution)
-sqlx migrate run --source migrations
+# Dev cluster: the migration Job's record
+kubectl get jobs -n dark-tower -l app=db-migrate
 ```
 
 ### Grafana Not Showing Dashboards
@@ -647,14 +642,12 @@ kubectl get svc -A                      # All services
 kubectl rollout restart statefulset/ac-service -n dark-tower  # Restart AC
 
 # === Database ===
-sqlx migrate run                        # Run migrations
 sqlx migrate add <name>                 # Create migration
+./infra/kind/scripts/setup.sh --rebuild-all   # Apply it to the dev cluster (migration Job)
 psql $DATABASE_URL                      # Connect to DB
 
 # === Development ===
-skaffold dev                            # Watch mode
-skaffold run                            # Deploy once
-skaffold delete                         # Remove deployments
+./infra/kind/scripts/setup.sh --only <svc>    # Rebuild one service, converge
 cargo test --workspace                  # Run tests
 cargo llvm-cov --workspace              # Coverage
 ```
