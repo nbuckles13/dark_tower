@@ -77,7 +77,9 @@ rm -f "${FAKE}/cp-broken"
 harvest_before_removal devloop-a-dev a >/dev/null; assert_rc "gate-passes-on-success" 0 $?
 
 # Seed: the host memory dir is copied into a new container; key derivation.
-assert_status "host-dir-key" "/.claude/projects/-home-nathan-code-dark-tower/memory" "$(DEVLOOP_MEMORY_SEED_DIR='' host_memory_dir /home/nathan/code/dark_tower)"
+assert_status "host-dir-key" "/.claude/projects/-home-nathan-code-dark-tower/memory" "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR='' host_memory_dir /home/nathan/code/dark_tower)"
+assert_status "host-dir-other-checkout" "/.claude/projects/-srv-src-my-repo-2/memory" "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR='' host_memory_dir /srv/src/my.repo_2)"
+assert_rc "host-dir-config-dir" 0 "$([[ "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR=/cfg host_memory_dir /r)" == /cfg/projects/-r/memory ]] && echo 0 || echo 1)"
 SEED="${WORK}/seed"; mkdir -p "$SEED"
 printf -- '- [k](k.md) — k\n' > "${SEED}/MEMORY.md"; printf 'keep\n' > "${SEED}/k.md"
 mkdir -p "${FAKE}/devloop-s-dev/home/dev"
