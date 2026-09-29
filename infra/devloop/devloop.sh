@@ -65,6 +65,20 @@ read_node_version() {
     printf '%s\n' "$ver"
 }
 
+# ─── sqlx-cli pin (SSoT = Cargo.lock's `sqlx`) ──────────────────
+# The devloop image's sqlx-cli migrates the unit-test DB
+# (scripts/lang/rust/test.sh). It must match the workspace's sqlx library so the
+# `_sqlx_migrations` table it writes is the one `#[sqlx::test]` reads. The
+# Dockerfile takes it as `ARG SQLX_CLI_VERSION` (no default; fails loud if
+# unset); the value comes from the ONE Cargo.lock reader, shared with
+# infra/kind/scripts/setup.sh (the db-migrate image). Fails loud, never floats.
+# shellcheck source=../lib/cargo-lock-version.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/cargo-lock-version.sh"
+read_sqlx_cli_version() {
+    local script_dir="$1"
+    cargo_lock_version "${script_dir}/../../Cargo.lock" sqlx || exit 1
+}
+
 # ─── Configuration ──────────────────────────────────────────────
 
 REBUILD_IMAGE=false
@@ -97,7 +111,9 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     echo "Building dev container image..."
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
     NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
-    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
+    SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
+    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" \
+        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi
@@ -275,12 +291,14 @@ cleanup() {
     # Reclaim the host build cruft this devloop produced — the service images and build
     # cache nothing else GCs (the multi-hundred-GB leak that exhausts container storage
     # over time; see docs/TODO.md §Devloop Container Resource Hygiene item A). CONSERVATIVE,
-    # dangling/unused-ONLY prune — NOT -af: per-slug image tagging is DEFERRED (item B), so
-    # the service images are still the shared `localhost/{ac,gc,mc,mh}-service:latest` tags.
-    # `-af` here would yank a *parallel* slug's :latest images mid-run. Dangling-only is
-    # cross-slug-safe: orphaned layers + unused build cache only, never a tagged image a
-    # concurrent devloop still references. Revisit (-> -af / per-slug filtered prune) once
-    # item B lands per-slug tags. podman-only by design — consistent with every other
+    # dangling/unused-ONLY prune — NOT -af: first-party images are tagged by CONTENT
+    # (`localhost/<name>:sha-<image id>`, ADR-0038 §2), so two slugs building identical code
+    # share a tag, and `-af` could yank an image a *parallel* slug is between building and
+    # loading. Dangling-only is cross-slug-safe: orphaned layers + unused build cache only,
+    # never a tagged image a concurrent devloop still references. setup.sh already prunes
+    # each cluster's superseded refs after every converge; the precise per-slug rmi of the
+    # LAST generation at cleanup needs a record of the deployed refs that outlives the
+    # cluster (docs/TODO.md item A). podman-only by design — consistent with every other
     # container op in this script; a docker-built host (KIND_EXPERIMENTAL_PROVIDER=docker)
     # wouldn't be reclaimed here, acceptable under the podman-primary assumption.
     if command -v podman &>/dev/null; then
@@ -570,7 +588,9 @@ if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
     echo "Building dev container image..."
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
     NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
-    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
+    SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
+    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" \
+        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi

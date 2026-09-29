@@ -164,7 +164,7 @@ Dev-loop records git state at setup for recovery:
 4. Or `git reset --hard {start_commit}` if clean revert confirmed
 5. For security-critical changes: verify no partial security state remains (no half-secured endpoints)
 6. For schema changes: rollback requires a forward migration (ALTER TABLE DROP, etc.) — `git reset` alone is insufficient if migrations were applied
-7. For infrastructure changes: rollback may require `skaffold delete` or `kubectl delete -f` if manifests were applied to a dev cluster
+7. For infrastructure changes: rollback may require `kubectl delete -f` if manifests were applied to a dev cluster
 
 **Inline security decision checkpointing**: For security-critical implementations, the implementer maintains a "Security Decisions" table in main.md, updated in real-time:
 

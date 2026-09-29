@@ -123,7 +123,7 @@
 use std::time::Duration;
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::kube::configmap_u64;
+use env_tests::fixtures::kube::{configmap_name_for_all, configmap_u64};
 use env_tests::fixtures::metrics::{gauge_by_instance_present, poll_until_pinned_instance};
 use env_tests::fixtures::mh_grpc::{
     authed, connect, handlers, mc_service_token, Handler, ReleaseOnDrop,
@@ -176,8 +176,10 @@ async fn a_long_running_mh_pod_releases_an_ended_meeting_and_admits_like_a_fresh
 
     // LIMITS — both resource-guard limits are published from the value
     // enforcement reads, i.e. equal the DEPLOYED ConfigMap (never a literal here).
-    let edge_limit = configmap_u64("mh-service-config", "MH_MAX_TOTAL_EGRESS_EDGES");
-    let meeting_limit = configmap_u64("mh-service-config", "MH_MAX_REGISTERED_MEETINGS");
+    // The live, content-addressed generation the MH pod runs (ADR-0038 §2).
+    let mh_config = configmap_name_for_all(&["mh-0", "mh-1"], "mh-service-config");
+    let edge_limit = configmap_u64(&mh_config, "MH_MAX_TOTAL_EGRESS_EDGES");
+    let meeting_limit = configmap_u64(&mh_config, "MH_MAX_REGISTERED_MEETINGS");
     for (metric, deployed) in [
         ("mh_media_egress_edges_limit", edge_limit),
         ("mh_media_registered_meetings_limit", meeting_limit),

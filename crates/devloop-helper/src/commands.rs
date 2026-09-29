@@ -980,27 +980,14 @@ fn cmd_setup(
     }
 
     // Generate DT_PORT_MAP file for setup.sh
-    let port_map_shell_path = ctx.runtime_dir.join("port-map.env");
+    let port_map_shell_path = port_map_shell_path(ctx);
     write_port_map_shell(&port_map_shell_path, &alloc)?;
 
-    // Run setup.sh
-    // DT_HOST_GATEWAY_IP enables ConfigMap patching in setup.sh for devloop clusters
-    // (advertise addresses use gateway IP + dynamic ports instead of localhost defaults).
+    // Run setup.sh — through the ONE setup.sh command builder, so full setup
+    // carries exactly the env (DT_PORT_MAP + DT_HOST_GATEWAY_IP render the
+    // devloop advertise addresses) every other setup.sh verb does.
     eprintln!("[devloop-helper] setup: running setup.sh...");
-    let mut setup_cmd = Command::new(ctx.project_root.join("infra/kind/scripts/setup.sh"));
-    setup_cmd
-        .arg("--yes")
-        .env("DT_CLUSTER_NAME", &ctx.cluster_name)
-        .env("DT_PORT_MAP", &port_map_shell_path)
-        .env("DT_HOST_GATEWAY_IP", gateway_ip)
-        .env(env_key, env_val);
-    if skip_observability {
-        // TODO: setup.sh does not yet support --skip-observability;
-        // once it does, this will suppress observability stack deployment.
-        setup_cmd.arg("--skip-observability");
-    }
-
-    run_command_streaming(&mut setup_cmd, "setup.sh", writer, signal)?;
+    run_setup_verb(ctx, SetupVerb::Setup { skip_observability }, writer, signal)?;
 
     // Generate kubeconfig for container access (ADR-0030/0031).
     // Rewrites the API server URL to the single `HOST_GATEWAY_IP:HOST_PORT_K8S_API`
@@ -1590,12 +1577,31 @@ struct PodHealthSummary {
     not_ready: Vec<PodStatus>,
 }
 
+impl PodHealthSummary {
+    /// THE health rule `status` reports: at least one counted pod, and none not
+    /// ready. (Finished Job pods are excluded from `total` by
+    /// [`parse_pod_health`], so a namespace holding only those is unhealthy.)
+    fn is_healthy(&self) -> bool {
+        self.not_ready.is_empty() && self.total > 0
+    }
+}
+
 /// Status of a single pod.
 #[derive(Debug, serde::Serialize)]
 struct PodStatus {
     name: String,
     phase: String,
     ready: bool,
+}
+
+/// Does this pod have an `ownerReferences` entry of kind `Job`?
+fn is_job_owned(pod: &serde_json::Value) -> bool {
+    pod.pointer("/metadata/ownerReferences")
+        .and_then(|v| v.as_array())
+        .is_some_and(|refs| {
+            refs.iter()
+                .any(|r| r.get("kind").and_then(|k| k.as_str()) == Some("Job"))
+        })
 }
 
 /// Parse kubectl `get pods -o json` output into a health summary.
@@ -1624,6 +1630,19 @@ fn parse_pod_health(json_str: &str) -> Result<PodHealthSummary, String> {
             .pointer("/status/phase")
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown");
+
+        // A FINISHED Job pod is not an unhealthy one: the migration Job
+        // (ADR-0038 §2) leaves a `Succeeded` pod in dark-tower, which used to
+        // read as not-ready forever. The exemption keys on BOTH the phase and
+        // Job ownership: Deployment/StatefulSet pods (restartPolicy Always)
+        // cannot reach Succeeded, but keying on ownership too keeps the
+        // exemption from ever covering anything but a completed Job. A Failed
+        // Job pod still counts — a failed migration must read unhealthy.
+        // Exempt pods are excluded from `total` (not counted as ready), so a
+        // namespace holding only finished Job pods is `total == 0`: unhealthy.
+        if phase == "Succeeded" && is_job_owned(item) {
+            continue;
+        }
 
         // A pod is ready if phase is Running AND all containers have ready=true
         let containers_ready = item
@@ -1696,7 +1715,7 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 match parse_pod_health(&stdout) {
                     Ok(summary) => {
-                        let healthy = summary.not_ready.is_empty() && summary.total > 0;
+                        let healthy = summary.is_healthy();
                         (healthy, Some(summary), None)
                     }
                     Err(e) => (false, None, Some(format!("pod health parse error: {e}"))),
@@ -1793,86 +1812,114 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
     Ok(Some(data))
 }
 
-/// Rebuild: build one service image, load into Kind, restart deployment.
+/// The setup.sh-backed verbs. A CLOSED set: each maps to fixed flags plus, at
+/// most, a validated [`Service`] — no container-supplied string reaches the
+/// setup.sh argv or env (ADR-0030 trust boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupVerb {
+    /// Full bring-up of a cluster `cmd_setup` has just created (or reused).
+    Setup { skip_observability: bool },
+    /// Build one service image (content-tagged) + the migrations image, run the
+    /// migration Job, apply the environment root.
+    Rebuild(Service),
+    /// Build every first-party image, then the same converge.
+    RebuildAll,
+    /// Build nothing: converge on the images the cluster already runs.
+    Deploy(Service),
+}
+
+impl SetupVerb {
+    fn args(self) -> Vec<&'static str> {
+        match self {
+            // TODO: setup.sh does not yet support --skip-observability; once it
+            // does, this will suppress observability stack deployment.
+            Self::Setup {
+                skip_observability: true,
+            } => vec!["--yes", "--skip-observability"],
+            Self::Setup {
+                skip_observability: false,
+            } => vec!["--yes"],
+            Self::Rebuild(svc) => vec!["--yes", "--only", svc.as_str()],
+            Self::RebuildAll => vec!["--yes", "--rebuild-all"],
+            Self::Deploy(svc) => vec!["--yes", "--skip-build", "--only", svc.as_str()],
+        }
+    }
+}
+
+/// The shell-sourceable port map setup.sh reads (`DT_PORT_MAP`): written by
+/// `cmd_setup`, passed by [`setup_sh_command`] — one home for the path.
+fn port_map_shell_path(ctx: &Context) -> PathBuf {
+    ctx.runtime_dir.join("port-map.env")
+}
+
+/// THE one place a setup.sh invocation is built — every verb, full setup
+/// included. Image building, content
+/// tagging (`setup.sh:content_tag`), Kind loading, the migration Job and the
+/// root apply all live in setup.sh, so the helper never derives a tag. The env
+/// is identical for every verb: without DT_PORT_MAP + DT_HOST_GATEWAY_IP the
+/// root apply would revert the devloop's MC/MH advertise addresses.
+fn setup_sh_command(ctx: &Context, verb: SetupVerb) -> Result<Command, HelperError> {
+    let gateway_ip = ctx
+        .host_gateway_ip
+        .as_deref()
+        .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
+    validate_gateway_ip(gateway_ip)?;
+    let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
+    let mut cmd = Command::new(ctx.project_root.join("infra/kind/scripts/setup.sh"));
+    cmd.args(verb.args())
+        .env("DT_CLUSTER_NAME", &ctx.cluster_name)
+        .env("DT_PORT_MAP", port_map_shell_path(ctx))
+        .env("DT_HOST_GATEWAY_IP", gateway_ip)
+        .env(env_key, env_val);
+    Ok(cmd)
+}
+
+/// Run one setup.sh verb, streaming its output; a non-zero exit is an error.
+fn run_setup_verb(
+    ctx: &Context,
+    verb: SetupVerb,
+    writer: &mut dyn Write,
+    signal: &CancelSignal,
+) -> Result<(), HelperError> {
+    let mut cmd = setup_sh_command(ctx, verb)?;
+    let label = format!("setup.sh {}", verb.args().join(" "));
+    run_command_streaming(&mut cmd, &label, writer, signal)
+}
+
+/// Rebuild: `setup.sh --only <svc>` — build the service image (content-tagged),
+/// run the migration Job, apply the root. Only workloads whose image or config
+/// changed roll; nothing is restarted unconditionally.
 fn cmd_rebuild(
     ctx: &Context,
     svc: Service,
     writer: &mut dyn Write,
     signal: &CancelSignal,
 ) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] rebuild: building {}...", svc);
-
-    // Build image
-    run_command_streaming(
-        Command::new(ctx.container_runtime.as_str())
-            .arg("build")
-            .arg("-t")
-            .arg(svc.image_tag())
-            .arg("-f")
-            .arg(svc.dockerfile())
-            .arg(&ctx.project_root),
-        &format!("{} build {}", ctx.container_runtime.as_str(), svc),
-        writer,
-        signal,
-    )?;
-
-    // Load into Kind
-    load_image_to_kind(ctx, svc.image_tag(), writer, signal)?;
-
-    // Restart deployment
-    restart_deployment(ctx, svc, writer, signal)?;
-
-    Ok(())
+    eprintln!("[devloop-helper] rebuild: {svc} (setup.sh --only {svc})...");
+    run_setup_verb(ctx, SetupVerb::Rebuild(svc), writer, signal)
 }
 
-/// Rebuild all service images.
+/// Rebuild all: ONE `setup.sh --rebuild-all` (one migration Job, one apply,
+/// one wait), not a per-service loop.
 fn cmd_rebuild_all(
     ctx: &Context,
     writer: &mut dyn Write,
     signal: &CancelSignal,
 ) -> Result<(), HelperError> {
-    for svc in &Service::ALL {
-        cmd_rebuild(ctx, *svc, writer, signal)?;
-    }
-    Ok(())
+    eprintln!("[devloop-helper] rebuild-all: setup.sh --rebuild-all...");
+    run_setup_verb(ctx, SetupVerb::RebuildAll, writer, signal)
 }
 
-/// Deploy: apply manifests only via setup.sh --skip-build --only.
+/// Deploy: `setup.sh --skip-build --only <svc>` — converge on the images the
+/// cluster already runs.
 fn cmd_deploy(
     ctx: &Context,
     svc: Service,
     writer: &mut dyn Write,
     signal: &CancelSignal,
 ) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] deploy: applying manifests for {}...", svc);
-
-    let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
-
-    // Validate and pass gateway IP so setup.sh can patch ConfigMap advertise addresses.
-    let gateway_ip = ctx
-        .host_gateway_ip
-        .as_deref()
-        .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
-    validate_gateway_ip(gateway_ip)?;
-
-    let port_map_shell_path = ctx.runtime_dir.join("port-map.env");
-
-    run_command_streaming(
-        Command::new(ctx.project_root.join("infra/kind/scripts/setup.sh"))
-            .arg("--yes")
-            .arg("--skip-build")
-            .arg("--only")
-            .arg(svc.as_str())
-            .env("DT_CLUSTER_NAME", &ctx.cluster_name)
-            .env("DT_PORT_MAP", &port_map_shell_path)
-            .env("DT_HOST_GATEWAY_IP", gateway_ip)
-            .env(env_key, env_val),
-        &format!("setup.sh --skip-build --only {svc}"),
-        writer,
-        signal,
-    )?;
-
-    Ok(())
+    eprintln!("[devloop-helper] deploy: applying manifests for {svc}...");
+    run_setup_verb(ctx, SetupVerb::Deploy(svc), writer, signal)
 }
 
 /// Teardown: delete Kind cluster, clean up all state.
@@ -1925,141 +1972,6 @@ fn propagate_teardown_kind_result(result: Result<(), HelperError>) -> Result<(),
         }
         Ok(()) => Ok(()),
     }
-}
-
-/// Load a container image into the Kind cluster.
-fn load_image_to_kind(
-    ctx: &Context,
-    image_tag: &str,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
-
-    match ctx.container_runtime {
-        ContainerRuntime::Podman => {
-            // Podman requires save/load workaround
-            let tmp_path = ctx.runtime_dir.join("kind-image-load.tar");
-            run_command_streaming(
-                Command::new("podman")
-                    .arg("save")
-                    .arg(image_tag)
-                    .arg("-o")
-                    .arg(&tmp_path),
-                &format!("podman save {image_tag}"),
-                writer,
-                signal,
-            )?;
-            let result = run_command_streaming(
-                Command::new("kind")
-                    .arg("load")
-                    .arg("image-archive")
-                    .arg(&tmp_path)
-                    .arg("--name")
-                    .arg(&ctx.cluster_name)
-                    .env(env_key, env_val),
-                "kind load image-archive",
-                writer,
-                signal,
-            );
-            let _ = fs::remove_file(&tmp_path);
-            result?;
-        }
-        ContainerRuntime::Docker => {
-            run_command_streaming(
-                Command::new("kind")
-                    .arg("load")
-                    .arg("docker-image")
-                    .arg(image_tag)
-                    .arg("--name")
-                    .arg(&ctx.cluster_name)
-                    .env(env_key, env_val),
-                "kind load docker-image",
-                writer,
-                signal,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Restart the deployment(s) for a service.
-fn restart_deployment(
-    ctx: &Context,
-    svc: Service,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    let kubectl_ctx = format!("kind-{}", ctx.cluster_name);
-
-    match svc {
-        Service::Ac => {
-            run_command_streaming(
-                Command::new("kubectl")
-                    .arg("--context")
-                    .arg(&kubectl_ctx)
-                    .arg("rollout")
-                    .arg("restart")
-                    .arg("statefulset/ac-service")
-                    .arg("-n")
-                    .arg("dark-tower"),
-                "kubectl rollout restart ac-service",
-                writer,
-                signal,
-            )?;
-        }
-        Service::Gc => {
-            run_command_streaming(
-                Command::new("kubectl")
-                    .arg("--context")
-                    .arg(&kubectl_ctx)
-                    .arg("rollout")
-                    .arg("restart")
-                    .arg("deployment/gc-service")
-                    .arg("-n")
-                    .arg("dark-tower"),
-                "kubectl rollout restart gc-service",
-                writer,
-                signal,
-            )?;
-        }
-        Service::Mc => {
-            for i in 0..2 {
-                run_command_streaming(
-                    Command::new("kubectl")
-                        .arg("--context")
-                        .arg(&kubectl_ctx)
-                        .arg("rollout")
-                        .arg("restart")
-                        .arg(format!("deployment/mc-{i}"))
-                        .arg("-n")
-                        .arg("dark-tower"),
-                    &format!("kubectl rollout restart mc-{i}"),
-                    writer,
-                    signal,
-                )?;
-            }
-        }
-        Service::Mh => {
-            for i in 0..2 {
-                run_command_streaming(
-                    Command::new("kubectl")
-                        .arg("--context")
-                        .arg(&kubectl_ctx)
-                        .arg("rollout")
-                        .arg("restart")
-                        .arg(format!("deployment/mh-{i}"))
-                        .arg("-n")
-                        .arg("dark-tower"),
-                    &format!("kubectl rollout restart mh-{i}"),
-                    writer,
-                    signal,
-                )?;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Check if a Kind cluster with the given name already exists.
@@ -3330,6 +3242,383 @@ current-context: kind-devloop-test
         // Zero port ⇒ None (treated as absent).
         fs::write(dir.path().join("ports.json"), r#"{"ports":{"k8s_api":0}}"#).unwrap();
         assert_eq!(read_k8s_api_port(&ctx), None);
+    }
+
+    // --- parse_pod_health: finished Job pods (ADR-0038 migration Job) ---------
+
+    /// One pod JSON object for the health fixtures.
+    fn pod(name: &str, phase: &str, ready: Option<bool>, owner_kind: Option<&str>) -> String {
+        let owners = owner_kind
+            .map(|k| format!(r#","ownerReferences":[{{"kind":"{k}","name":"x"}}]"#))
+            .unwrap_or_default();
+        let statuses = ready
+            .map(|r| format!(r#","containerStatuses":[{{"ready":{r}}}]"#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"metadata":{{"name":"{name}"{owners}}},"status":{{"phase":"{phase}"{statuses}}}}}"#
+        )
+    }
+
+    fn pods(items: &[String]) -> String {
+        format!(r#"{{"items":[{}]}}"#, items.join(","))
+    }
+
+    #[test]
+    fn parse_pod_health_job_succeeded_pod_excluded_exact_counts() {
+        let json = pods(&[
+            pod("ac-service-0", "Running", Some(true), Some("StatefulSet")),
+            pod("db-migrate-abc-x1", "Succeeded", Some(false), Some("Job")),
+        ]);
+        let summary = parse_pod_health(&json).unwrap();
+        assert_eq!(
+            summary.total, 1,
+            "the finished Job pod is excluded from total"
+        );
+        assert_eq!(summary.ready, 1);
+        assert!(summary.not_ready.is_empty());
+        assert!(summary.is_healthy(), "cmd_status's rule: healthy");
+    }
+
+    #[test]
+    fn parse_pod_health_job_failed_pod_is_not_ready() {
+        let json = pods(&[
+            pod("ac-service-0", "Running", Some(true), Some("StatefulSet")),
+            pod("db-migrate-abc-x1", "Failed", Some(false), Some("Job")),
+        ]);
+        let summary = parse_pod_health(&json).unwrap();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.ready, 1);
+        assert_eq!(summary.not_ready.len(), 1);
+        assert_eq!(summary.not_ready[0].name, "db-migrate-abc-x1");
+        assert_eq!(summary.not_ready[0].phase, "Failed");
+    }
+
+    #[test]
+    fn parse_pod_health_succeeded_pod_without_job_owner_is_not_ready() {
+        let json = pods(&[pod("stray", "Succeeded", Some(false), None)]);
+        let summary = parse_pod_health(&json).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.ready, 0);
+        assert_eq!(summary.not_ready.len(), 1);
+        assert_eq!(summary.not_ready[0].phase, "Succeeded");
+    }
+
+    #[test]
+    fn parse_pod_health_succeeded_replicaset_owned_is_not_ready() {
+        let json = pods(&[pod(
+            "gc-service-abc",
+            "Succeeded",
+            Some(false),
+            Some("ReplicaSet"),
+        )]);
+        let summary = parse_pod_health(&json).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.not_ready.len(), 1);
+        assert_eq!(summary.not_ready[0].name, "gc-service-abc");
+    }
+
+    #[test]
+    fn parse_pod_health_mixed_running_succeeded_pending_exact() {
+        let json = pods(&[
+            pod("ac-service-0", "Running", Some(true), Some("StatefulSet")),
+            pod("gc-service-abc", "Running", Some(true), Some("ReplicaSet")),
+            pod("db-migrate-abc-x1", "Succeeded", Some(false), Some("Job")),
+            pod("mc-0-pending", "Pending", None, Some("ReplicaSet")),
+        ]);
+        let summary = parse_pod_health(&json).unwrap();
+        assert_eq!(
+            summary.total, 3,
+            "Succeeded Job pod excluded, not counted ready"
+        );
+        assert_eq!(summary.ready, 2);
+        let names: Vec<&str> = summary.not_ready.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["mc-0-pending"]);
+    }
+
+    #[test]
+    fn parse_pod_health_only_job_pods_is_not_healthy() {
+        let json = pods(&[pod(
+            "db-migrate-abc-x1",
+            "Succeeded",
+            Some(false),
+            Some("Job"),
+        )]);
+        let summary = parse_pod_health(&json).unwrap();
+        assert_eq!(summary.total, 0);
+        assert!(
+            !summary.is_healthy(),
+            "nothing running (only finished Job pods) is not healthy"
+        );
+    }
+
+    // --- setup.sh-backed verbs (rebuild / rebuild-all / deploy) --------------
+
+    fn cmd_argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn cmd_env(cmd: &Command) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        env.sort();
+        env
+    }
+
+    fn expected_env(ctx: &Context) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("DT_CLUSTER_NAME".to_string(), ctx.cluster_name.clone()),
+            (
+                "DT_HOST_GATEWAY_IP".to_string(),
+                DEFAULT_HOST_GATEWAY_IP.to_string(),
+            ),
+            (
+                "DT_PORT_MAP".to_string(),
+                ctx.runtime_dir.join("port-map.env").display().to_string(),
+            ),
+            (
+                "KIND_EXPERIMENTAL_PROVIDER".to_string(),
+                "podman".to_string(),
+            ),
+        ];
+        env.sort();
+        env
+    }
+
+    #[test]
+    fn setup_sh_command_rebuild_argv_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let cmd = setup_sh_command(&ctx, SetupVerb::Rebuild(Service::Mc)).unwrap();
+        assert_eq!(
+            cmd.get_program(),
+            ctx.project_root
+                .join("infra/kind/scripts/setup.sh")
+                .as_os_str()
+        );
+        assert_eq!(cmd_argv(&cmd), vec!["--yes", "--only", "mc"]);
+        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
+    }
+
+    #[test]
+    fn setup_sh_command_rebuild_all_argv_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let cmd = setup_sh_command(&ctx, SetupVerb::RebuildAll).unwrap();
+        assert_eq!(cmd_argv(&cmd), vec!["--yes", "--rebuild-all"]);
+        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
+    }
+
+    #[test]
+    fn setup_sh_command_deploy_argv_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let cmd = setup_sh_command(&ctx, SetupVerb::Deploy(Service::Gc)).unwrap();
+        assert_eq!(
+            cmd_argv(&cmd),
+            vec!["--yes", "--skip-build", "--only", "gc"]
+        );
+        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
+    }
+
+    /// The verbs cannot drift apart on the env that keeps a devloop cluster's
+    /// advertise addresses (DT_PORT_MAP + DT_HOST_GATEWAY_IP) intact.
+    #[test]
+    fn setup_sh_command_env_identical_across_verbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let envs: Vec<_> = [
+            SetupVerb::Setup {
+                skip_observability: false,
+            },
+            SetupVerb::Rebuild(Service::Ac),
+            SetupVerb::RebuildAll,
+            SetupVerb::Deploy(Service::Mh),
+        ]
+        .into_iter()
+        .map(|v| cmd_env(&setup_sh_command(&ctx, v).unwrap()))
+        .collect();
+        assert!(envs.windows(2).all(|w| w[0] == w[1]), "{envs:?}");
+    }
+
+    #[test]
+    fn setup_sh_command_setup_argv_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let cmd = setup_sh_command(
+            &ctx,
+            SetupVerb::Setup {
+                skip_observability: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(cmd_argv(&cmd), vec!["--yes"]);
+        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
+        let cmd = setup_sh_command(
+            &ctx,
+            SetupVerb::Setup {
+                skip_observability: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(cmd_argv(&cmd), vec!["--yes", "--skip-observability"]);
+    }
+
+    #[test]
+    fn setup_sh_command_rejects_invalid_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(dir.path());
+        ctx.host_gateway_ip = Some("0.0.0.0".to_string());
+        assert!(setup_sh_command(&ctx, SetupVerb::RebuildAll).is_err());
+    }
+
+    /// A Context whose project_root holds a stub `infra/kind/scripts/setup.sh`
+    /// with the given body (a /bin/sh script).
+    fn stub_setup_ctx(dir: &std::path::Path, body: &str) -> Context {
+        let scripts = dir.join("root/infra/kind/scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let script = scripts.join("setup.sh");
+        // Written by a CHILD process, never through an fd this test process
+        // holds: a parallel test thread forking between our write and our exec
+        // would inherit that fd and make the exec fail with ETXTBSY ("Text file
+        // busy") — a flake that reads exactly like a propagated setup failure.
+        let src = dir.join("setup.sh.src");
+        fs::write(&src, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let status = Command::new("install")
+            .arg("-m")
+            .arg("0755")
+            .arg(&src)
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(status.success(), "installing the stub setup.sh failed");
+        let mut ctx = test_ctx(dir);
+        ctx.project_root = dir.join("root");
+        ctx
+    }
+
+    fn written(output: &[u8]) -> String {
+        String::from_utf8_lossy(output).into_owned()
+    }
+
+    #[test]
+    fn cmd_rebuild_propagates_setup_failure_and_streams_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_setup_ctx(dir.path(), r#"echo "SETUP-MARKER args=$*"; exit 1"#);
+        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
+        let mut output = Vec::new();
+        let result = cmd_rebuild(&ctx, Service::Gc, &mut output, &signal);
+        assert!(result.is_err(), "a failing setup.sh must fail rebuild");
+        assert!(
+            written(&output).contains("SETUP-MARKER args=--yes --only gc"),
+            "setup.sh output must be streamed: {}",
+            written(&output)
+        );
+    }
+
+    #[test]
+    fn cmd_rebuild_ok_when_setup_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_setup_ctx(dir.path(), r#"echo "SETUP-OK args=$*"; exit 0"#);
+        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
+        let mut output = Vec::new();
+        cmd_rebuild(&ctx, Service::Mh, &mut output, &signal).unwrap();
+        assert!(written(&output).contains("SETUP-OK args=--yes --only mh"));
+    }
+
+    #[test]
+    fn cmd_rebuild_all_propagates_setup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_setup_ctx(dir.path(), r#"echo "SETUP-MARKER args=$*"; exit 3"#);
+        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
+        let mut output = Vec::new();
+        assert!(cmd_rebuild_all(&ctx, &mut output, &signal).is_err());
+        assert!(written(&output).contains("SETUP-MARKER args=--yes --rebuild-all"));
+    }
+
+    /// Is `pid` a live (non-zombie) process? `kill(pid, 0)` alone also succeeds
+    /// for a ZOMBIE — a killed orphan nothing has reaped yet (no init process to
+    /// reap reparented children) — which would read a successful kill as a
+    /// survivor. So a gone `/proc/<pid>/stat` or state `Z` also means dead.
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // Format: `pid (comm) STATE ...`; comm may contain spaces, so read
+            // the state after the LAST ')'.
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .is_some_and(|state| state != "Z"),
+            Err(_) => false,
+        }
+    }
+
+    /// A cancelled rebuild kills the setup.sh process GROUP, including a
+    /// grandchild (setup.sh's own kubectl/podman children in real use).
+    #[test]
+    fn cmd_rebuild_cancel_kills_setup_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let ctx = stub_setup_ctx(
+            dir.path(),
+            &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = CancelSignal::new(Arc::new(AtomicBool::new(false)), Arc::clone(&cancel));
+        let setter = {
+            let cancel = Arc::clone(&cancel);
+            let pidfile = pidfile.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !pidfile.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        let mut output = Vec::new();
+        let result = cmd_rebuild(&ctx, Service::Ac, &mut output, &signal);
+        setter.join().unwrap();
+        assert!(
+            matches!(result, Err(HelperError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "cancel did not stop setup.sh"
+        );
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut alive = true;
+        while Instant::now() < deadline {
+            alive = process_alive(pid);
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !alive,
+            "setup.sh's grandchild (pid {pid}) survived the cancel"
+        );
     }
 
     /// Minimal Context for the pure-fn tests that need one (`read_k8s_api_port`).

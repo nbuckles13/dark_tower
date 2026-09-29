@@ -2,6 +2,11 @@
 
 Multi-stage Dockerfile for the Dark Tower Authentication Controller service following ADR-0012 infrastructure architecture.
 
+> **Image names below are illustrative standalone builds.** In the Kind dev cluster the image is
+> built by `infra/kind/scripts/setup.sh` and tagged by its own content —
+> `localhost/ac-service:sha-<image id>` (ADR-0038 §2) — and the manifests' `:render-required`
+> placeholder is replaced at render time. Never deploy a `:latest` tag to the cluster.
+
 ## Image Variants
 
 ### Production (Default)

@@ -1,5 +1,6 @@
 //! Prometheus client fixture for querying metrics.
 
+use crate::fixtures::kube::REDEPLOY_HINT;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -664,9 +665,9 @@ pub async fn service_job_scrape_settle(prom: &PrometheusClient) -> Duration {
         "{SETTLE_NOT_ABOVE_INTERVAL}: SERVICE_JOB_SCRAPE_SETTLE ({SERVICE_JOB_SCRAPE_SETTLE:?}) \
          does not exceed the LIVE service-job scrape interval ({live:?}), so every stability \
          wait would compare two reads inside one scrape and pass having observed nothing. The \
-         cluster is most likely running a Prometheus config older than the tree: apply it with \
-         `kubectl apply -k infra/kubernetes/overlays/kind/observability/` (the generated \
-         ConfigMap hash rolls the pod). If the interval was raised on purpose, raise \
+         cluster is most likely running a Prometheus config older than the tree: \
+         {REDEPLOY_HINT} (the root composes observability; the generated ConfigMap hash \
+         rolls the pod). If the interval was raised on purpose, raise \
          SERVICE_JOB_SCRAPE_INTERVAL_SECS to match. NEVER shorten the settle to make this pass."
     );
     SERVICE_JOB_SCRAPE_SETTLE

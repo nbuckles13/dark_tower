@@ -30,11 +30,12 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# Run database migrations if sqlx-cli is available and DATABASE_URL is set
-if command -v sqlx &>/dev/null && [ -n "${DATABASE_URL:-}" ] && [ -d "/work/migrations" ]; then
-    echo "Running database migrations..."
-    sqlx migrate run --source /work/migrations || echo "WARNING: Migration failed (may already be applied)"
-fi
+# No database migration here. The unit-test DB is migrated by ONE owner,
+# scripts/lang/rust/test.sh (before every Layer 4/5 run; it fails loudly when
+# sqlx is missing or a migration fails). The block that used to run here masked
+# a failed migration as "may already be applied" and was a second copy of that
+# step; aborting container start instead would brick a devloop whose task is to
+# fix a broken migration (ADR-0038 devloop 2).
 
 # Set up user-level Claude config files if mounted by devloop.sh
 mkdir -p "${HOME}/.claude"

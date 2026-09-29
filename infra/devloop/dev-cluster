@@ -34,9 +34,9 @@ if [ $# -lt 1 ]; then
     echo "" >&2
     echo "Commands:" >&2
     echo "  setup [--skip-observability]    Create Kind cluster and deploy services" >&2
-    echo "  rebuild <service>               Rebuild one service image and restart" >&2
-    echo "  rebuild-all                     Rebuild all service images" >&2
-    echo "  deploy <service>                Apply manifests only (no rebuild)" >&2
+    echo "  rebuild <service>               Rebuild one service image (content-tagged), run migrations, apply the root" >&2
+    echo "  rebuild-all                     Rebuild every image, run migrations, apply the root (rolls only what changed)" >&2
+    echo "  deploy <service>                Apply the root with the images already deployed (no rebuild)" >&2
     echo "  teardown                        Delete Kind cluster and clean up" >&2
     echo "  recreate                        Self-heal: destroy + recreate ONLY if the host re-confirms the control plane is down" >&2
     echo "  restore-kubeconfig              Self-heal: regenerate the container kubeconfig from the live cluster (never destroys)" >&2

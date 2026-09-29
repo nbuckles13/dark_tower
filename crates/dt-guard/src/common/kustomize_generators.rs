@@ -1,11 +1,15 @@
 //! The ONE structured reader of kustomize `configMapGenerator` entries.
 //!
-//! ADR-0038 §2 makes every pod-consumed ConfigMap a generator, so three
+//! ADR-0038 §2 makes every pod-consumed ConfigMap a generator, so four
 //! policies need to know what a kustomization generates: `kustomize` R-16
 //! (a generator source is a declared file, not an orphan), R-21 (a
-//! hash-suffixed reference must name a generator that exists), and
-//! `env-config` (a `configMapKeyRef` resolves against the generator's keys).
-//! They share this parser rather than each growing its own.
+//! hash-suffixed reference must name a generator that exists), `env-config`
+//! (a `configMapKeyRef` resolves against the generator's keys), and the
+//! `configmap_annotation_size` rule in `kustomize_configmaps` (which measures
+//! the generated DATA). They share this parser, this env-file reader and this
+//! source resolver ([`generator_data`], containment-gated) rather than each
+//! growing its own — the size rule's line-oriented parser was folded in here
+//! (ADR-0038 devloop 2).
 //!
 //! It is a real YAML parse, deliberately NOT the line scanner
 //! `kustomize.rs::extract_declared_generator_files`: that scanner keeps only
@@ -26,8 +30,10 @@
 
 use anyhow::{bail, Context, Result};
 use serde_norway::Value;
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use crate::common::path_safety::resolve_cited_path;
 
 /// One source file of a `files:` entry: `key=path` or bare `path` (key =
 /// basename).
@@ -50,6 +56,18 @@ pub struct GeneratorEntry {
 }
 
 impl GeneratorEntry {
+    /// The entry's `literals:` as `(key, value)`, through the same
+    /// `KEY=VALUE` contract as env files.
+    pub fn literal_pairs(&self) -> Result<Vec<(String, String)>> {
+        self.literals
+            .iter()
+            .map(|lit| {
+                let origin = || format!("configMapGenerator {:?} literal", self.name);
+                checked_pair(lit, &origin).map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
     /// Every file this entry reads, relative to its kustomization directory.
     pub fn source_paths(&self) -> impl Iterator<Item = &str> {
         self.envs
@@ -140,8 +158,9 @@ fn is_key(s: &str) -> bool {
 }
 
 /// Validate one `KEY=VALUE` pair against the literal-value contract in the
-/// module doc; return the key.
-fn checked_pair<'a>(pair: &'a str, origin: &dyn Fn() -> String) -> Result<&'a str> {
+/// module doc; return the key and the value (split at the FIRST `=`, so a value
+/// may itself contain `=`).
+fn checked_pair<'a>(pair: &'a str, origin: &dyn Fn() -> String) -> Result<(&'a str, &'a str)> {
     let Some((key, value)) = pair.split_once('=') else {
         bail!("{}: not KEY=VALUE: {pair:?}", origin());
     };
@@ -163,53 +182,112 @@ fn checked_pair<'a>(pair: &'a str, origin: &dyn Fn() -> String) -> Result<&'a st
             origin()
         );
     }
-    Ok(key)
+    Ok((key, value))
 }
 
-/// Keys of an `envs:` file, validated per the module-doc contract.
-pub fn read_env_file_keys(content: &str, origin: &str) -> Result<Vec<String>> {
-    let mut keys = Vec::new();
+/// `(key, value)` pairs of an `envs:` file, validated per the module-doc
+/// contract. THE env-file reader: [`read_env_file_keys`] projects from it, and
+/// the annotation-size rule measures its values.
+pub fn read_env_file(content: &str, origin: &str) -> Result<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
     for (i, line) in content.lines().enumerate() {
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
         let at = || format!("{origin}:{}", i + 1);
-        keys.push(checked_pair(line, &at)?.to_string());
+        let (k, v) = checked_pair(line, &at)?;
+        pairs.push((k.to_string(), v.to_string()));
     }
-    Ok(keys)
+    Ok(pairs)
 }
 
-/// The data keys an entry generates, reading its sources from `kust_dir`.
-/// An unreadable source is an error.
-pub fn generator_keys(kust_dir: &Path, entry: &GeneratorEntry) -> Result<BTreeSet<String>> {
-    let mut keys = BTreeSet::new();
+/// Keys of an `envs:` file, validated per the module-doc contract.
+pub fn read_env_file_keys(content: &str, origin: &str) -> Result<Vec<String>> {
+    Ok(read_env_file(content, origin)?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect())
+}
+
+/// Resolve one YAML-supplied source path, relative to the kustomization's own
+/// directory, through the repository's containment gate.
+///
+/// `files:` / `envs:` entries are attacker-shaped input: `dir.join(path)` alone
+/// follows `../` out of the tree, and an ABSOLUTE entry replaces the base
+/// outright. Containment is NOT re-implemented here — the joined path is handed
+/// to [`resolve_cited_path`], the single SoT. Fail CLOSED: an escape is an
+/// error, never a skip. The two failures are reported DIFFERENTLY because the
+/// responses differ (fix a typo vs stop citing outside the repo); they are
+/// told apart by whether the joined path canonicalizes at all. Messages quote
+/// the path AS WRITTEN, never a canonicalized out-of-tree absolute path.
+///
+/// `what` qualifies the message (`""` for `files:`, `"env file "` for `envs:`).
+fn resolve_source(
+    repo_root: &Path,
+    kust_dir: &Path,
+    gen_name: &str,
+    what: &str,
+    path: &str,
+) -> Result<PathBuf> {
+    let joined = kust_dir.join(path);
+    if let Some(resolved) = resolve_cited_path(repo_root, &joined.to_string_lossy()) {
+        return Ok(resolved);
+    }
+    if std::fs::canonicalize(&joined).is_ok() {
+        bail!(
+            "configMapGenerator `{gen_name}` references {what}`{path}`, which resolves outside \
+             the repository, so it cannot be read. Generator sources must stay inside the repo \
+             (kustomize itself refuses paths outside its root)."
+        );
+    }
+    bail!("configMapGenerator `{gen_name}` references {what}`{path}` but it cannot be read")
+}
+
+/// The data an entry generates — `key -> value`, exactly as kustomize would
+/// build it — reading its sources from `kust_dir` through the containment gate.
+/// An unreadable, escaping or contract-violating source is an error.
+pub fn generator_data(
+    repo_root: &Path,
+    kust_dir: &Path,
+    entry: &GeneratorEntry,
+) -> Result<BTreeMap<String, String>> {
+    let mut data = BTreeMap::new();
     for env in &entry.envs {
-        let path = kust_dir.join(env);
+        let path = resolve_source(repo_root, kust_dir, &entry.name, "env file ", env)?;
         let content = std::fs::read_to_string(&path).with_context(|| {
             format!(
-                "configMapGenerator {:?}: reading env source {}",
-                entry.name,
-                path.display()
+                "configMapGenerator `{}` references env file `{env}` but it cannot be read",
+                entry.name
             )
         })?;
-        keys.extend(read_env_file_keys(&content, &path.display().to_string())?);
+        data.extend(read_env_file(&content, env)?);
     }
     for f in &entry.files {
-        let path = kust_dir.join(&f.path);
-        if !path.is_file() {
-            bail!(
-                "configMapGenerator {:?}: file source {} does not exist",
-                entry.name,
-                path.display()
-            );
-        }
-        keys.insert(f.key.clone());
+        let path = resolve_source(repo_root, kust_dir, &entry.name, "", &f.path)?;
+        let content = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "configMapGenerator `{}` references `{}` but it cannot be read",
+                entry.name, f.path
+            )
+        })?;
+        data.insert(f.key.clone(), content);
     }
-    for lit in &entry.literals {
-        let origin = || format!("configMapGenerator {:?} literal", entry.name);
-        keys.insert(checked_pair(lit, &origin)?.to_string());
+    for (k, v) in entry.literal_pairs()? {
+        data.insert(k, v);
     }
-    Ok(keys)
+    Ok(data)
+}
+
+/// The data keys an entry generates — a projection of [`generator_data`], so
+/// every consumer resolves sources through the same containment gate.
+pub fn generator_keys(
+    repo_root: &Path,
+    kust_dir: &Path,
+    entry: &GeneratorEntry,
+) -> Result<BTreeSet<String>> {
+    Ok(generator_data(repo_root, kust_dir, entry)?
+        .into_keys()
+        .collect())
 }
 
 #[cfg(test)]
@@ -297,6 +375,107 @@ configMapGenerator:
     }
 
     #[test]
+    fn read_env_file_value_with_equals() {
+        let p = read_env_file("URL=https://x/?a=b&c=d\n", "t").expect("read");
+        assert_eq!(
+            p,
+            vec![("URL".to_string(), "https://x/?a=b&c=d".to_string())],
+            "split at the FIRST `=`"
+        );
+    }
+
+    #[test]
+    fn read_env_file_empty_value() {
+        let p = read_env_file("EMPTY=\n", "t").expect("read");
+        assert_eq!(p, vec![("EMPTY".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn read_env_file_rejects_every_contract_violation() {
+        for bad in [
+            "NOEQUALS", "  A=1", "A=1 ", "A B=1", "=1", "A=\"x\"", "A='x'",
+        ] {
+            assert!(read_env_file(bad, "t").is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn literals_split_through_checked_pair() {
+        let e = GeneratorEntry {
+            name: "n".into(),
+            namespace: None,
+            behavior: None,
+            envs: vec![],
+            files: vec![],
+            literals: vec!["A=x=y".into(), "B=".into()],
+        };
+        assert_eq!(
+            e.literal_pairs().expect("pairs"),
+            vec![
+                ("A".to_string(), "x=y".to_string()),
+                ("B".to_string(), String::new())
+            ]
+        );
+        let bad = GeneratorEntry {
+            literals: vec!["A=\"q\"".into()],
+            ..e
+        };
+        assert!(bad.literal_pairs().is_err());
+    }
+
+    /// Containment is shared: an escaping source is an error naming the
+    /// escape, and a missing one a DIFFERENT error, for every consumer.
+    #[test]
+    fn generator_data_escaping_source_is_err() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outer.path().join("outside.env"), "A=1\n").expect("write");
+        let root = outer.path().join("repo");
+        let kdir = root.join("infra/x");
+        std::fs::create_dir_all(&kdir).expect("mkdir");
+        let e = GeneratorEntry {
+            name: "esc".into(),
+            namespace: None,
+            behavior: None,
+            envs: vec!["../../../outside.env".into()],
+            files: vec![],
+            literals: vec![],
+        };
+        let err = generator_data(&root, &kdir, &e).expect_err("escape");
+        assert!(
+            err.to_string().contains("resolves outside the repository"),
+            "{err:#}"
+        );
+        let missing = GeneratorEntry {
+            envs: vec!["nope.env".into()],
+            ..e
+        };
+        let err = generator_data(&root, &kdir, &missing).expect_err("missing");
+        assert!(err.to_string().contains("cannot be read"), "{err:#}");
+    }
+
+    #[test]
+    fn generator_data_reads_values() {
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(td.path().join("c.env"), "A=1\n").expect("write");
+        std::fs::write(td.path().join("f.yaml"), "x: 1\n").expect("write");
+        let e = GeneratorEntry {
+            name: "n".into(),
+            namespace: None,
+            behavior: None,
+            envs: vec!["c.env".into()],
+            files: vec![GeneratorFile {
+                key: "k.yaml".into(),
+                path: "f.yaml".into(),
+            }],
+            literals: vec!["L=2".into()],
+        };
+        let d = generator_data(td.path(), td.path(), &e).expect("data");
+        assert_eq!(d.get("A").map(String::as_str), Some("1"));
+        assert_eq!(d.get("k.yaml").map(String::as_str), Some("x: 1\n"));
+        assert_eq!(d.get("L").map(String::as_str), Some("2"));
+    }
+
+    #[test]
     fn generator_keys_resolves_all_sources_and_fails_on_missing() {
         let td = tempfile::tempdir().expect("tempdir");
         std::fs::write(td.path().join("c.env"), "A=1\n").expect("write");
@@ -312,7 +491,7 @@ configMapGenerator:
             }],
             literals: vec!["L=2".into()],
         };
-        let keys = generator_keys(td.path(), &e).expect("keys");
+        let keys = generator_keys(td.path(), td.path(), &e).expect("keys");
         assert_eq!(
             keys.into_iter().collect::<Vec<_>>(),
             vec!["A", "L", "k.yaml"]
@@ -321,7 +500,7 @@ configMapGenerator:
             envs: vec!["nope.env".into()],
             ..e.clone()
         };
-        assert!(generator_keys(td.path(), &missing).is_err());
+        assert!(generator_keys(td.path(), td.path(), &missing).is_err());
         let missing_file = GeneratorEntry {
             envs: vec![],
             files: vec![GeneratorFile {
@@ -330,6 +509,6 @@ configMapGenerator:
             }],
             ..e
         };
-        assert!(generator_keys(td.path(), &missing_file).is_err());
+        assert!(generator_keys(td.path(), td.path(), &missing_file).is_err());
     }
 }

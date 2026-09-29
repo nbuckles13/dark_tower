@@ -18,9 +18,9 @@
 //! applied the same way and is capped by the same annotation. Do not read a
 //! green result as "every applied ConfigMap fits".
 //!
-//! That gap is deliberate and measured. Covering literal manifests needs a real
-//! YAML parse of `data:` block scalars, which is out of keeping with this
-//! subcommand's line-oriented parsers, or a new dependency. The one
+//! That gap is deliberate and measured: covering literal manifests needs a
+//! parse of rendered `data:` block scalars, a different input from the
+//! generator sources this rule reads. The one
 //! non-trivial literal ConfigMap in the tree when this was written is
 //! `otel-collector-config` (`infra/services/otel-collector/collector.yaml`):
 //! **30,084 bytes, 11.5% of the cap** (kubectl-measured), about 7x headroom.
@@ -76,6 +76,18 @@
 //! its own. If it lands, this size rule can be retired — do not keep treating
 //! 262144 as a constraint after the apply mode that creates it is gone.
 //!
+//! # Generators are read through the ONE shared parser
+//!
+//! Entries come from [`crate::common::kustomize_generators`] (a YAML parse —
+//! key order, zero-indent block sequences and comments cannot lose or
+//! mis-attribute an entry), and their data from its [`generator_data`], which
+//! resolves every source through the repository containment gate and reads
+//! env files and literals under one `KEY=VALUE` contract. Anything that cannot
+//! be read — invalid YAML, a null/non-list section, a nameless entry, an
+//! escaping or missing source, a malformed env line — is a finding naming the
+//! file, never a skip. (Until ADR-0038 devloop 2 this module carried its own
+//! line-oriented parser; it was folded into the shared one.)
+//!
 //! # Names are measured as written, hash suffixes included by allowance
 //!
 //! Generators are read from source, so a hash-suffixed name
@@ -86,16 +98,12 @@
 //!
 //! Machinery (`infrastructure`), per CLAUDE.md's guard-ownership split.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::common::path_safety::resolve_cited_path;
+use crate::common::kustomize_generators::{generator_data, parse_config_map_generators};
 use crate::common::scan::warn_skip;
-// The single home for the inline-comment strip, by its own rustdoc: a second
-// copy here would be a copy that can drift out of the mitigation while looking
-// like it has it.
-use crate::kustomize::strip_inline_comment;
 
 pub const CONFIGMAP_ANNOTATION_SIZE_RULE_ID: &str = "configmap_annotation_size";
 
@@ -151,240 +159,6 @@ pub(crate) struct ConfigMapFinding {
     pub file: PathBuf,
 }
 
-/// Where a generated key's value comes from.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Source {
-    /// `files:` — `key=path`, or a bare `path` whose key is its basename.
-    File { key: String, path: String },
-    /// `literals:` — `KEY=VALUE`.
-    Literal { key: String, value: String },
-    /// `envs:` — a file of `KEY=VALUE` lines, each its own key.
-    Env { path: String },
-}
-
-/// One `configMapGenerator` entry.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Generator {
-    pub name: String,
-    pub labels: Vec<(String, String)>,
-    pub sources: Vec<Source>,
-}
-
-/// Where in an entry the parser is.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    None,
-    Files,
-    Literals,
-    Envs,
-    Labels,
-}
-
-/// Parse the `configMapGenerator:` section of one kustomization.
-///
-/// Line-oriented, like every other parser in the `kustomize` subcommand, and
-/// with the same two hard-won protections: inline comments are stripped before
-/// a line is interpreted, and standalone comment lines are skipped (see
-/// [`strip_inline_comment`] for why both matter — this parser imports it rather
-/// than repeating it). The section ends at the next top-level key.
-///
-/// # The entry boundary is the BULLET, not `name:`
-///
-/// A generator entry is a YAML **map**, so its keys may appear in any order:
-/// `- files:` … `name:` is as valid as `- name:` … `files:`, and kustomize
-/// accepts both. An earlier version of this parser treated `- name:` as the
-/// only entry boundary, which lost or mis-attributed every reordered entry —
-/// silently, and in the fail-OPEN direction: a reordered entry's `- files:`
-/// bullet was swallowed as a *file* of the preceding entry (so a 250 KB
-/// dashboard went unmeasured, keyed as `files:`), or, when the reordered entry
-/// came first in the section, dropped along with everything in it.
-///
-/// So the boundary is the indent of the section's first `- ` bullet: any `- `
-/// at that indent starts a new entry. Sub-list items (`- foo.json`) are
-/// necessarily indented deeper. `name:`, `files:`, `literals:`, `envs:` and
-/// `labels:` are then recognised with or without the leading dash, wherever
-/// they fall in the entry. An entry that ends with no name at all is reported
-/// by [`check`] as a finding: kustomize REQUIRES `name`, so a nameless entry
-/// means this parser lost track, and staying quiet about it would put the
-/// fail-open case straight back.
-///
-/// # Indentation of a block sequence is a STYLE, and the entry indent may be 0
-///
-/// YAML lets a block sequence sit at the same indent as the key that owns it,
-/// so all four of these are the same document, and kustomize accepts all four:
-///
-/// ```text
-/// configMapGenerator:          configMapGenerator:
-///   - name: big                - name: big
-///     files:                     files:
-///       - big.json                 - big.json
-/// ```
-///
-/// …and the two with the sub-list at its own key's indent. The zero-indent form
-/// is what `yq` emits by DEFAULT, so it arrives via any reformat. A column-0
-/// line therefore ends the section only when it is a `key:` — reading a column-0
-/// `- ` bullet as a new top-level key skipped the entire section, and skipped it
-/// fail-OPEN: an oversized dashboard went unmeasured while `measured` stayed
-/// non-zero, so the vacuity guard in [`check`] stayed quiet too. Since one
-/// reformat could silence a whole file that way, [`check`] additionally reports
-/// a kustomization that DECLARES `configMapGenerator:` and yields no entries.
-///
-/// A sub-list at its own key's indent needs no extra rule: the entry bullet is
-/// strictly shallower than the entry's own keys (YAML requires a sequence
-/// item's map keys to be indented past the `- `), so a sub-item bullet is always
-/// deeper than the entry bullet, and a bullet AT the entry indent is always the
-/// next entry — which is also the kustomize-correct reading, because such a
-/// bullet is an item of the outer `configMapGenerator` sequence.
-pub(crate) fn parse_generators(content: &str) -> Vec<Generator> {
-    let mut out: Vec<Generator> = Vec::new();
-    let mut in_section = false;
-    let mut entry_indent: Option<usize> = None;
-    let mut mode = Mode::None;
-    // Indent of the key that opened `mode`. A field line at or left of it has
-    // DEDENTED out of that block, which is what lets a `name:` after an
-    // `options: labels:` block be the generator's name while a `name:` key
-    // *inside* that block stays a label.
-    let mut mode_indent = 0usize;
-    for raw in content.lines() {
-        let indent = raw.len() - raw.trim_start().len();
-        let line = strip_inline_comment(raw);
-        if line.is_empty() {
-            continue;
-        }
-        // A column-0 line ends the section only when it is a KEY. A column-0
-        // `- ` bullet is a block sequence at its parent key's indent (see the
-        // rustdoc) and belongs to the OPEN section. A document marker is not a
-        // key, but it does end the section: what follows is another document.
-        let is_document_marker = line == "---" || line == "...";
-        if indent == 0 && (is_document_marker || !line.starts_with('-')) {
-            in_section = line == "configMapGenerator:";
-            entry_indent = None;
-            mode = Mode::None;
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        // Classify the line: a bullet at the entry indent OPENS an entry (and
-        // its remainder is still a field of that entry); a deeper bullet is a
-        // sub-list item; anything else is a field of the open entry.
-        let (field, is_item) = match line.strip_prefix("- ") {
-            Some(rest) => {
-                if entry_indent.is_none_or(|e| indent <= e) {
-                    entry_indent = Some(indent);
-                    out.push(Generator::default());
-                    mode = Mode::None;
-                    (rest.trim(), false)
-                } else {
-                    (rest.trim(), true)
-                }
-            }
-            None => (line, false),
-        };
-        let Some(current) = out.last_mut() else {
-            continue;
-        };
-        if is_item {
-            push_item(current, mode, unquote(field));
-            continue;
-        }
-        // A field at or left of the opening key's indent has left that block.
-        if mode != Mode::None && indent <= mode_indent {
-            mode = Mode::None;
-        }
-        match field {
-            "files:" | "literals:" | "envs:" | "labels:" => {
-                mode = match field {
-                    "files:" => Mode::Files,
-                    "literals:" => Mode::Literals,
-                    "envs:" => Mode::Envs,
-                    _ => Mode::Labels,
-                };
-                mode_indent = indent;
-            }
-            _ => {
-                // `name:` inside a `labels:` block is a LABEL called `name`, not
-                // the generator's name.
-                if let Some(name) = field.strip_prefix("name:").filter(|_| mode != Mode::Labels) {
-                    current.name = unquote(name.trim()).to_string();
-                    mode = Mode::None;
-                } else if let Some((key, value)) = field.split_once(':') {
-                    if mode == Mode::Labels && !value.trim().is_empty() {
-                        current
-                            .labels
-                            .push((key.trim().to_string(), unquote(value.trim()).to_string()));
-                    } else {
-                        // Any other key (`options:`, `namespace:`, `behavior:`)
-                        // closes the current list.
-                        mode = Mode::None;
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Does this kustomization DECLARE a `configMapGenerator:` section?
-///
-/// Backs a PER-FILE vacuity guard in [`check`]. The whole-tree "found ZERO
-/// generators" guard is not enough on its own: with several kustomizations in
-/// the tree, one of them losing its entire section leaves `measured` non-zero,
-/// so the run reports clean while saying nothing about that file — exactly how
-/// the zero-indent block-sequence style went unnoticed. A file that declares
-/// the section must yield at least one entry.
-///
-/// Anchored on the bare key at column 0, so the flow spelling
-/// (`configMapGenerator: []`, which legitimately has no entries) is not matched,
-/// and neither is a commented-out key.
-pub(crate) fn declares_generator_section(content: &str) -> bool {
-    content.lines().any(|raw| {
-        !raw.starts_with([' ', '\t']) && strip_inline_comment(raw) == "configMapGenerator:"
-    })
-}
-
-/// Record one sub-list item against the list the parser is currently inside.
-fn push_item(current: &mut Generator, mode: Mode, item: &str) {
-    match mode {
-        Mode::Files => current.sources.push(match item.split_once('=') {
-            Some((key, path)) => Source::File {
-                key: key.to_string(),
-                path: path.to_string(),
-            },
-            None => Source::File {
-                key: basename(item).to_string(),
-                path: item.to_string(),
-            },
-        }),
-        Mode::Literals => {
-            if let Some((key, value)) = item.split_once('=') {
-                current.sources.push(Source::Literal {
-                    key: key.to_string(),
-                    value: unquote(value).to_string(),
-                });
-            }
-        }
-        Mode::Envs => current.sources.push(Source::Env {
-            path: item.to_string(),
-        }),
-        Mode::Labels | Mode::None => {}
-    }
-}
-
-fn unquote(s: &str) -> &str {
-    let s = s.trim();
-    for q in ['"', '\''] {
-        if let Some(inner) = s.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
-            return inner;
-        }
-    }
-    s
-}
-
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 /// Bytes Go's `encoding/json` (HTML escaping on) writes for `s` as a string,
 /// quotes included.
 pub(crate) fn go_json_string_len(s: &str) -> usize {
@@ -417,106 +191,6 @@ pub(crate) fn last_applied_len(name: &str, data: &BTreeMap<String, String>) -> u
     HEAD.len() + go_json_string_len(name) + MID.len() + entries + commas + TAIL.len()
 }
 
-/// Resolve one YAML-supplied source path, relative to the kustomization's own
-/// directory, through the repository's containment gate.
-///
-/// # The path comes from a file, so it faces the gate every other cited path does
-///
-/// `files:` / `envs:` entries are attacker-shaped input in the same sense the
-/// doc-cite paths are: `dir.join(path)` alone follows `../` out of the tree, and
-/// an ABSOLUTE entry replaces the base outright (`join("/w/infra", "/etc/shadow")`
-/// is `/etc/shadow`). Containment is NOT re-implemented here — that is a reject
-/// by [`crate::common::path_safety`]'s own module doc, which is the single SoT —
-/// so the joined path is handed to [`resolve_cited_path`].
-///
-/// Fail CLOSED: an escaping path is a FINDING, never a skip. A skip would mean a
-/// generator whose size was never measured reporting as measured, which is the
-/// direction this whole guard exists to prevent.
-///
-/// The two outcomes are reported DIFFERENTLY because the responses differ — fix
-/// a path typo versus stop citing outside the repo — and `resolve_cited_path`
-/// returns `None` for both. They are told apart by asking whether the joined
-/// path canonicalizes at all (i.e. exists): if it does, the `None` was
-/// containment; if it does not, the file is missing or unreadable. Only the
-/// question is asked here; the containment DECISION stays in the gate.
-///
-/// `what` is a message qualifier ending in a space (`""` for a `files:` entry,
-/// `"env file "` for an `envs:` one), so the two source kinds stay
-/// distinguishable in a finding.
-fn resolve_source_path(
-    gen_name: &str,
-    what: &str,
-    path: &str,
-    dir: &Path,
-    repo_root: &Path,
-) -> Result<PathBuf> {
-    let joined = dir.join(path);
-    if let Some(resolved) = resolve_cited_path(repo_root, &joined.to_string_lossy()) {
-        return Ok(resolved);
-    }
-    if std::fs::canonicalize(&joined).is_ok() {
-        // It resolves, just not inside the repository. Report the path AS
-        // WRITTEN: never echo the canonicalized out-of-tree absolute path.
-        anyhow::bail!(
-            "configMapGenerator `{gen_name}` references {what}`{path}`, which resolves outside \
-             the repository, so its size cannot be measured. Generator sources must stay inside \
-             the repo (kustomize itself refuses paths outside its root)."
-        );
-    }
-    anyhow::bail!(
-        "configMapGenerator `{gen_name}` references {what}`{path}` but it cannot be read, so its \
-         size cannot be measured"
-    )
-}
-
-/// Resolve a generator's sources into the data map it produces.
-///
-/// A referenced file that cannot be read — or that escapes the repository — is
-/// an error naming the generator and the path: its size cannot be measured, and
-/// silently skipping it would under-count, the fail-open direction. [`check`]
-/// reports it as a finding.
-fn resolve_data(gen: &Generator, dir: &Path, repo_root: &Path) -> Result<BTreeMap<String, String>> {
-    let mut data = BTreeMap::new();
-    for source in &gen.sources {
-        match source {
-            Source::File { key, path } => {
-                let full = resolve_source_path(&gen.name, "", path, dir, repo_root)?;
-                let value = std::fs::read_to_string(&full).with_context(|| {
-                    format!(
-                        "configMapGenerator `{}` references `{path}` but it cannot be read, so \
-                         its size cannot be measured",
-                        gen.name
-                    )
-                })?;
-                data.insert(key.clone(), value);
-            }
-            Source::Literal { key, value } => {
-                data.insert(key.clone(), value.clone());
-            }
-            Source::Env { path } => {
-                let full = resolve_source_path(&gen.name, "env file ", path, dir, repo_root)?;
-                let text = std::fs::read_to_string(&full).with_context(|| {
-                    format!(
-                        "configMapGenerator `{}` references env file `{path}` but it cannot be \
-                         read",
-                        gen.name
-                    )
-                })?;
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    if let Some((k, v)) = line.split_once('=') {
-                        data.insert(k.trim().to_string(), v.to_string());
-                    }
-                }
-            }
-        }
-    }
-    Ok(data)
-}
-
 /// Judge one generator's measured size. Pure, so the threshold arithmetic is
 /// tested without a filesystem.
 pub(crate) fn judge_size(name: &str, measured: usize, file: &Path) -> Option<ConfigMapFinding> {
@@ -538,7 +212,8 @@ pub(crate) fn judge_size(name: &str, measured: usize, file: &Path) -> Option<Con
              JSON-escaped, in that annotation, so past the cap cluster setup fails with \
              `metadata.annotations: Too long`. Remedy: split a file out into its own \
              configMapGenerator entry (as mc-media.json was split from mc-overview.json), \
-             and carry the Grafana sidecar label on it if it is a dashboard.",
+             and, for a dashboard, add the new group to Grafana's projected dashboards \
+             volume (R-21 fails a group no pod mounts).",
             permille / 10,
             permille % 10,
             ANNOTATION_SIZE_LIMIT_BYTES,
@@ -610,41 +285,34 @@ pub(crate) fn check(repo_root: &Path) -> Result<Vec<ConfigMapFinding>> {
             }
         };
         let dir = kust.parent().unwrap_or(repo_root);
-        let generators = parse_generators(&content);
-        // PER-FILE vacuity: one file losing its whole section leaves the
-        // whole-tree `measured` counter non-zero, so that guard cannot see it.
-        if generators.is_empty() && declares_generator_section(&content) {
-            findings.push(ConfigMapFinding {
-                rule_id: CONFIGMAP_ANNOTATION_SIZE_RULE_ID,
-                detail: format!(
-                    "{} declares `configMapGenerator:` but this guard parsed ZERO entries from \
-                     it, so NOTHING in that section was measured and a clean result for this \
-                     file would be vacuous. Either the section is empty (remove the key) or \
-                     this guard's parser does not understand how it is written.",
-                    rel(repo_root, &kust).display()
-                ),
-                file: rel(repo_root, &kust),
-            });
-        }
-        for gen in generators {
-            measured += 1;
-            if gen.name.is_empty() {
-                // kustomize REQUIRES `name`, so this is the parser having lost
-                // track of an entry boundary, not a real nameless generator.
+        // The ONE generator parser (common::kustomize_generators): a real YAML
+        // parse, so key order, block-sequence indentation and comments are the
+        // YAML library's problem, not a line scanner's. Anything it cannot read
+        // — invalid YAML, a `configMapGenerator:` that is null or not a list, a
+        // nameless entry — is a FINDING naming the file, never an early `Err`
+        // (that would abort the run and hide the other checks' findings) and
+        // never a skip (that would report unmeasured generators as clean).
+        let generators = match parse_config_map_generators(&content) {
+            Ok(g) => g,
+            Err(e) => {
                 findings.push(ConfigMapFinding {
                     rule_id: CONFIGMAP_ANNOTATION_SIZE_RULE_ID,
                     detail: format!(
-                        "a configMapGenerator entry has no `name:` ({} sources parsed). \
-                         kustomize requires `name`, so either this kustomization is invalid or \
-                         this guard's entry parser lost track of an entry boundary — either way \
-                         the entry's annotation size was NOT measured.",
-                        gen.sources.len()
+                        "{}: configMapGenerator unreadable ({e:#}), so NOTHING in it was \
+                         measured and a clean result for this file would be vacuous.",
+                        rel(repo_root, &kust).display()
                     ),
                     file: rel(repo_root, &kust),
                 });
                 continue;
             }
-            match resolve_data(&gen, dir, repo_root) {
+        };
+        for gen in generators {
+            measured += 1;
+            // Sources resolve through the shared containment gate; env files
+            // and literals through the shared KEY=VALUE contract. An escaping,
+            // unreadable or contract-violating source is a finding.
+            match generator_data(repo_root, dir, &gen) {
                 Ok(data) => {
                     if let Some(f) = judge_size(
                         &gen.name,
@@ -656,7 +324,7 @@ pub(crate) fn check(repo_root: &Path) -> Result<Vec<ConfigMapFinding>> {
                 }
                 Err(e) => findings.push(ConfigMapFinding {
                     rule_id: CONFIGMAP_ANNOTATION_SIZE_RULE_ID,
-                    detail: format!("{e:#}"),
+                    detail: format!("{e:#}; its annotation size was NOT measured"),
                     file: rel(repo_root, &kust),
                 }),
             }
@@ -684,6 +352,7 @@ pub(crate) fn check(repo_root: &Path) -> Result<Vec<ConfigMapFinding>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::kustomize_generators::GeneratorFile;
 
     /// Pins the model to kubectl's real output, byte for byte, on a fixture
     /// exercising every escape class: `<`, `>`, `&`, `"`, `\`, tab, CR, LF, a
@@ -794,14 +463,17 @@ configMapGenerator:
       - x.json=dashboards/x.json
   - name: lits
     literals:
-      - KEY="quoted value"
+      - KEY=plain value
 generatorOptions:
   disableNameSuffixHash: true
 "#;
 
+    /// The comment-hardening the old line parser needed, now pinned against the
+    /// SHARED parser: inline and standalone comments never corrupt an entry, a
+    /// path, or a literal, and a bare path keys on its basename.
     #[test]
-    fn the_parser_reads_entries_labels_files_and_literals_through_comments() {
-        let g = parse_generators(GRAFANA);
+    fn the_shared_parser_reads_entries_files_and_literals_through_comments() {
+        let g = parse_config_map_generators(GRAFANA).expect("parse");
         let names: Vec<&str> = g.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(
             names,
@@ -813,17 +485,13 @@ generatorOptions:
             ]
         );
         assert_eq!(
-            g[1].labels,
-            vec![("grafana_dashboard".to_string(), "1".to_string())]
-        );
-        assert_eq!(
-            g[1].sources,
+            g[1].files,
             vec![
-                Source::File {
+                GeneratorFile {
                     key: "mc-overview.json".into(),
                     path: "dashboards/mc-overview.json".into()
                 },
-                Source::File {
+                GeneratorFile {
                     key: "mc-slos.json".into(),
                     path: "dashboards/mc-slos.json".into()
                 },
@@ -831,18 +499,30 @@ generatorOptions:
             "an inline comment must not corrupt a path, and a bare path keys on its basename"
         );
         assert_eq!(
-            g[3].sources,
-            vec![Source::Literal {
-                key: "KEY".into(),
-                value: "quoted value".into()
-            }]
+            g[3].literal_pairs().expect("literals"),
+            vec![("KEY".to_string(), "plain value".to_string())]
         );
     }
 
     #[test]
     fn a_top_level_key_ends_the_section() {
         // `generatorOptions:` follows; nothing after it may become an entry.
-        assert_eq!(parse_generators(GRAFANA).len(), 4);
+        assert_eq!(
+            parse_config_map_generators(GRAFANA).expect("parse").len(),
+            4
+        );
+    }
+
+    /// The quirk the old line parser was built around: a `name:` key INSIDE an
+    /// `options: labels:` block is a label, not the generator's name.
+    #[test]
+    fn a_label_called_name_is_not_the_generator_name() {
+        let g = parse_config_map_generators(
+            "configMapGenerator:\n  - options:\n      labels:\n        name: a-label\n    name: the-generator\n    literals:\n      - K=V\n",
+        )
+        .expect("parse");
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].name, "the-generator");
     }
 
     #[test]
@@ -932,7 +612,7 @@ generatorOptions:
     /// the preceding entry.
     #[test]
     fn entry_keys_may_come_in_any_order_because_an_entry_is_a_yaml_map() {
-        let g = parse_generators(REORDERED);
+        let g = parse_config_map_generators(REORDERED).expect("parse");
         let names: Vec<&str> = g.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(
             names,
@@ -950,42 +630,29 @@ generatorOptions:
             ]
         );
         assert_eq!(
-            g[0].sources,
-            vec![Source::File {
+            g[0].files,
+            vec![GeneratorFile {
                 key: "a.json".into(),
                 path: "dashboards/a.json".into()
             }]
         );
         assert_eq!(
-            g[0].labels,
-            vec![("grafana_dashboard".to_string(), "1".to_string())],
-            "a label block before `name:` still belongs to this entry"
-        );
-        assert_eq!(
-            g[1].sources,
-            vec![Source::File {
+            g[1].files,
+            vec![GeneratorFile {
                 key: "b.json".into(),
                 path: "dashboards/b.json".into()
             }],
             "the NEXT entry's `- literals:` bullet must not be read as a file of this one"
         );
+        assert!(g[1].literals.is_empty());
+        assert_eq!(g[2].literals, vec!["K=V"]);
+        assert!(g[2].files.is_empty());
         assert_eq!(
-            g[2].sources,
-            vec![Source::Literal {
-                key: "K".into(),
-                value: "V".into()
-            }]
-        );
-        assert_eq!(
-            g[3].sources,
-            vec![Source::File {
+            g[3].files,
+            vec![GeneratorFile {
                 key: "c.json".into(),
                 path: "dashboards/c.json".into()
             }]
-        );
-        assert!(
-            g.iter().all(|g| !g.name.is_empty()),
-            "every entry must be named, else `check` reports a lost boundary"
         );
     }
 
@@ -1027,10 +694,23 @@ generatorOptions:
             "configMapGenerator:\n  - literals:\n      - K=V\n",
         )
         .unwrap();
+        // A well-formed sibling keeps the whole-tree vacuity guard out of it.
+        let y = dir.path().join("infra/y");
+        std::fs::create_dir_all(&y).unwrap();
+        std::fs::write(
+            y.join("kustomization.yaml"),
+            "configMapGenerator:\n  - name: ok\n    literals:\n      - K=V\n",
+        )
+        .unwrap();
         let findings = check(dir.path()).unwrap();
-        assert_eq!(findings.len(), 1);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, CONFIGMAP_ANNOTATION_SIZE_RULE_ID);
-        assert!(findings[0].detail.contains("no `name:`"));
+        assert!(
+            findings[0].detail.contains("no string `name`")
+                && findings[0].detail.contains("infra/x/kustomization.yaml"),
+            "{}",
+            findings[0].detail
+        );
     }
 
     /// A YAML-supplied source path must face the repo's containment gate, and
@@ -1093,46 +773,67 @@ configMapGenerator:
   name: zero-indent-reordered
 generatorOptions:
   disableNameSuffixHash: true
+"#;
+
+    /// The old fixture's trailing shape — a `- ` bullet after `generatorOptions:`
+    /// closed the section — which the line parser had to IGNORE. It is not
+    /// YAML at all (a sequence item inside a mapping), so the shared parser
+    /// REJECTS it, and `check` reports the file rather than measuring half of it.
+    const ZERO_INDENT_WITH_STRAY_BULLET: &str = r#"configMapGenerator:
+- name: zero-indent-first
+  literals:
+  - K=V
+generatorOptions:
+  disableNameSuffixHash: true
 - name: after-the-top-level-key
 "#;
 
     #[test]
     fn a_block_sequence_at_its_parent_keys_indent_is_still_the_section() {
-        let g = parse_generators(ZERO_INDENT);
+        let g = parse_config_map_generators(ZERO_INDENT).expect("parse");
         let names: Vec<&str> = g.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(
             names,
             ["zero-indent-first", "zero-indent-reordered"],
-            "a column-0 `- ` bullet is an ENTRY, not a new top-level key; and \
-             `generatorOptions:` still closes the section, so the trailing bullet \
-             after it must NOT be read as an entry"
+            "a column-0 `- ` bullet is an ENTRY, not a new top-level key"
         );
         assert_eq!(
-            g[0].sources,
+            g[0].files,
             vec![
-                Source::File {
+                GeneratorFile {
                     key: "a.json".into(),
                     path: "dashboards/a.json".into()
                 },
-                Source::File {
+                GeneratorFile {
                     key: "b.json".into(),
                     path: "dashboards/b.json".into()
                 },
             ],
-            "a sub-list at its own `files:` key's indent is still a sub-list: its \
-             bullets are deeper than the ENTRY bullet, which is what decides"
+            "a sub-list at its own `files:` key's indent is still a sub-list"
         );
         assert_eq!(
-            g[0].labels,
-            vec![("grafana_dashboard".to_string(), "1".to_string())]
-        );
-        assert_eq!(
-            g[1].sources,
-            vec![Source::Literal {
-                key: "K".into(),
-                value: "V".into()
-            }],
+            g[1].literals,
+            vec!["K=V"],
             "the reordered zero-indent entry keeps its own literals"
+        );
+    }
+
+    #[test]
+    fn a_stray_bullet_after_the_section_is_rejected_and_reported_not_half_measured() {
+        assert!(parse_config_map_generators(ZERO_INDENT_WITH_STRAY_BULLET).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let k = dir.path().join("infra/x");
+        std::fs::create_dir_all(&k).unwrap();
+        std::fs::write(k.join("kustomization.yaml"), ZERO_INDENT_WITH_STRAY_BULLET).unwrap();
+        let findings = check(dir.path()).unwrap();
+        // The unreadable file, plus the whole-tree vacuity guard (nothing else
+        // in this tree was measured).
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detail.contains("configMapGenerator unreadable")
+                    && f.detail.contains("infra/x/kustomization.yaml")),
+            "{findings:#?}"
         );
     }
 
@@ -1162,44 +863,104 @@ generatorOptions:
     }
 
     /// The guard that makes the class self-reporting rather than silent: one
-    /// file losing its whole section is invisible to the whole-tree `measured`
-    /// counter, because the OTHER files keep it non-zero.
+    /// file declaring the section but yielding nothing measurable is invisible
+    /// to the whole-tree `measured` counter, because the OTHER files keep it
+    /// non-zero. Under the YAML parser the only such shape is a section that is
+    /// null / not a list — an error, hence a FINDING naming the file. The flow
+    /// spelling, which the line parser lost, now parses and is measured.
     #[test]
-    fn a_declared_but_unparsed_section_is_a_finding_even_when_other_files_parse() {
-        assert!(declares_generator_section(
-            "configMapGenerator:\n- name: x\n"
-        ));
-        assert!(
-            !declares_generator_section("configMapGenerator: []\n"),
-            "the flow spelling legitimately has no entries"
-        );
-        assert!(
-            !declares_generator_section("# configMapGenerator:\n"),
-            "a commented-out key declares nothing"
-        );
-
+    fn a_declared_but_null_section_is_a_finding_even_when_other_files_parse() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::create_dir_all(root.join("infra/good")).unwrap();
-        std::fs::create_dir_all(root.join("infra/lost")).unwrap();
+        for d in ["good", "flow", "lost"] {
+            std::fs::create_dir_all(root.join("infra").join(d)).unwrap();
+        }
         std::fs::write(
             root.join("infra/good/kustomization.yaml"),
             "configMapGenerator:\n  - name: ok\n    literals:\n      - K=V\n",
         )
         .unwrap();
-        // Declares the section, but every entry is written in a shape the parser
-        // does not recognise (flow maps).
+        std::fs::write(
+            root.join("infra/flow/kustomization.yaml"),
+            "configMapGenerator:\n  [{name: flow, literals: [K=V]}]\n",
+        )
+        .unwrap();
         std::fs::write(
             root.join("infra/lost/kustomization.yaml"),
-            "configMapGenerator:\n  [{name: flow, literals: [K=V]}]\n",
+            "configMapGenerator:\nresources: []\n",
         )
         .unwrap();
         let findings = check(root).unwrap();
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].rule_id, CONFIGMAP_ANNOTATION_SIZE_RULE_ID);
         assert!(
-            findings[0].detail.contains("parsed ZERO entries")
+            findings[0].detail.contains("configMapGenerator unreadable")
                 && findings[0].detail.contains("infra/lost/kustomization.yaml"),
+            "{}",
+            findings[0].detail
+        );
+    }
+
+    /// Consolidation TIGHTENS the size rule: env files and literals now go
+    /// through the shared KEY=VALUE contract, so a malformed env line or a
+    /// quote-wrapped literal is a FINDING — it used to be silently skipped or
+    /// unquoted and measured as something kustomize would not generate.
+    #[test]
+    fn a_malformed_env_file_is_now_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = dir.path().join("infra/x");
+        std::fs::create_dir_all(&k).unwrap();
+        std::fs::write(
+            k.join("kustomization.yaml"),
+            "configMapGenerator:\n  - name: env-cm\n    envs:\n      - c.env\n",
+        )
+        .unwrap();
+        std::fs::write(k.join("c.env"), "GOOD=1\nNOT A PAIR\n").unwrap();
+        let findings = check(dir.path()).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert!(
+            findings[0].detail.contains("not KEY=VALUE")
+                && findings[0].detail.contains("NOT measured"),
+            "{}",
+            findings[0].detail
+        );
+    }
+
+    #[test]
+    fn a_quote_wrapped_literal_is_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = dir.path().join("infra/x");
+        std::fs::create_dir_all(&k).unwrap();
+        std::fs::write(
+            k.join("kustomization.yaml"),
+            "configMapGenerator:\n  - name: lit\n    literals:\n      - 'KEY=\"quoted\"'\n",
+        )
+        .unwrap();
+        let findings = check(dir.path()).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert!(
+            findings[0].detail.contains("quote-wrapped"),
+            "{}",
+            findings[0].detail
+        );
+    }
+
+    /// Env values are measured, not just keys: an oversized env value fails.
+    #[test]
+    fn env_file_values_are_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = dir.path().join("infra/x");
+        std::fs::create_dir_all(&k).unwrap();
+        std::fs::write(
+            k.join("kustomization.yaml"),
+            "configMapGenerator:\n  - name: big-env\n    envs:\n      - c.env\n",
+        )
+        .unwrap();
+        std::fs::write(k.join("c.env"), format!("BIG={}\n", ">".repeat(40_000))).unwrap();
+        let findings = check(dir.path()).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert!(
+            findings[0].detail.contains("`big-env`"),
             "{}",
             findings[0].detail
         );

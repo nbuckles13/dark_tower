@@ -188,6 +188,33 @@ Three devloops, in order; each leaves Layer 7 correct:
    one environment root that already composes observability) replaces it, and no new
    container-side cluster write may be added in the meantime.
 
+   Also carried from devloop 2 (so it is not lost): **remove the interim Succeeded-pod
+   delete** in `infra/kind/scripts/setup.sh:run_migration_job`. It exists only because a
+   helper older than devloop 2 counted a finished Job pod as unhealthy; `parse_pod_health`
+   now exempts Job-owned `Succeeded` pods, so once every running helper is built from a tree
+   with that fix the delete is dead weight — and it throws away the pod's logs. `setup.sh
+   --rebuild-all` (devloop 2's internal mode behind the helper's `rebuild-all`) is absorbed
+   into `deploy` here.
+
+   The verb rename (`rebuild-all` → `deploy`; fresh cluster → `provision`) must reach ALL THREE
+   places that spell the remedy — they are in two languages and cannot share a constant:
+   `crates/env-tests/src/fixtures/kube.rs` (`REDEPLOY_HINT`, `FRESH_CLUSTER_HINT`),
+   `infra/kind/scripts/setup.sh:resolve_image_refs` (the `IMAGE_UNRESOLVED` message), and
+   `docs/runbooks/devloop-validation.md` §6.7 (the `cluster-rebuild-failed` sub-causes).
+
+   Also observed at step 2's Gate 2: a failed setup leaves a half-built cluster that the next
+   Layer 7 reuses (health check → `dev-cluster setup` reuse by name, which runs before the
+   `infra/kind/` teardown arm). `provision`'s recorded-after-success blueprint hash closes it, and
+   Layer 7's check-health-then-reuse order is retired with it.
+
+   Env-tests 01 (startup-log parity), 26 (wedged generation) and 28 (stream-ceiling ratchet)
+   assume a freshly started pod. Under `deploy`'s no-unconditional-restart rule, pods survive
+   across gates, so these will recur. Make them fresh-pod-independent (e.g. 28 reads the
+   current count as its baseline; 01 reads the in-effect config other than from the startup
+   log) instead of adding a helper restart verb. Env-tests are meant to eventually target
+   prod, which is why their fresh-pod and cluster-write assumptions must go rather than be
+   accommodated.
+
    `deploy` is also the in-container route for OTel collector changes, so this step
    closes the two collector entries in `docs/TODO.md` ("No collector deploy route from
    inside the devloop container", "Collector config-staleness window"). It also rewrites
@@ -203,11 +230,22 @@ Until then, today's behaviour (a full rebuild on every gate) stays: slow but cor
 
 ## Open questions
 
-- Local registry vs `kind load` for images (a local registry makes step 1 identical to a
-  production push; `kind load` is simpler).
-- Where the migrations image comes from (a small `sqlx-cli` image plus `migrations/`),
-  and whether the Job name carries the migrations content hash so an unchanged set is a
-  no-op rather than a re-run.
+- ~~Local registry vs `kind load` for images~~ — **Resolved (devloop 2): `kind load`.**
+  Simpler (no per-devloop registry container, port or node trust configuration), and the
+  shape is the same: a registry can later replace `load_image_to_kind` alone. The tag is the
+  image's own ID (`<repo>:sha-<first 16 hex>`, `setup.sh:content_tag`), not a hash of build
+  inputs: an input hash would name different bytes under the same tag whenever an unhashed
+  input changed (floating base images, apt packages) and nothing would roll. Cost: one extra
+  rollout after a build-cache prune. Per-service precision (a GC-only change not rolling
+  MC/MH) needs reproducible, narrowed builds — `docs/TODO.md` "Skip unchanged service image
+  builds".
+- ~~Where the migrations image comes from, and whether the Job name carries the content
+  hash~~ — **Resolved (devloop 2):** `infra/docker/db-migrate/Dockerfile` — `sqlx-cli`
+  pinned to Cargo.lock's `sqlx` plus `migrations/` as the last layer — run as
+  `infra/services/db-migrate/`'s Job, applied ahead of the root. **Yes, the name carries a
+  hash**: `db-migrate-<sha256 of the rendered Job, image tag included>`, so an unchanged set
+  re-applies as a no-op and any change (migrations or Job spec) is a new Job — which also
+  sidesteps Job-template immutability.
 - Whether platform components (Postgres, Redis, the observability stack itself) belong to
   `provision` or to the environment root; the rule of thumb is that anything a normal
   task changes belongs in the root.

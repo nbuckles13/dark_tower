@@ -69,6 +69,10 @@ layer_lifecycle_begin 3
   # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed
   # (real df, absurd DEVLOOP_MIN_DISK_GB).
   run_and_emit "setup-disk-guard-selftest" "${__here}/setup.test.sh" || true
+  # The Rust test verb (ADR-0038 devloop 2): dispatcher arg-passthrough, and the unit-test
+  # DB migration failing LOUDLY before cargo (sqlx absent / migrate run failing) with a
+  # positive control. PATH-shimmed cargo/sqlx/pg_isready; no DB, no real cargo.
+  run_and_emit "rust-test-verb-selftest" "${__here}/lang/rust/behavior-equivalence.test.sh" || true
   # Orchestrator lane-integrity (task #56): exercises layer-all's exit-code/summary/budget/
   # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
   # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.

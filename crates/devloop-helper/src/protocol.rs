@@ -27,36 +27,19 @@ pub enum Service {
 }
 
 impl Service {
-    /// All valid service variants.
+    /// All valid service variants (the round-trip test enumerates them).
+    #[cfg(test)]
     pub const ALL: [Service; 4] = [Service::Ac, Service::Gc, Service::Mc, Service::Mh];
 
-    /// Get the service name as used in container image tags and deployment names.
+    /// The service's short name, as setup.sh's `--only` takes it. Image names
+    /// and tags are NOT derived here: setup.sh tags every image by its content
+    /// (ADR-0038 §2), and the helper delegates builds to it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ac => "ac",
             Self::Gc => "gc",
             Self::Mc => "mc",
             Self::Mh => "mh",
-        }
-    }
-
-    /// Get the full crate/image name.
-    pub fn image_tag(self) -> &'static str {
-        match self {
-            Self::Ac => "localhost/ac-service:latest",
-            Self::Gc => "localhost/gc-service:latest",
-            Self::Mc => "localhost/mc-service:latest",
-            Self::Mh => "localhost/mh-service:latest",
-        }
-    }
-
-    /// Get the Dockerfile path relative to project root.
-    pub fn dockerfile(self) -> &'static str {
-        match self {
-            Self::Ac => "infra/docker/ac-service/Dockerfile",
-            Self::Gc => "infra/docker/gc-service/Dockerfile",
-            Self::Mc => "infra/docker/mc-service/Dockerfile",
-            Self::Mh => "infra/docker/mh-service/Dockerfile",
         }
     }
 }
@@ -86,9 +69,10 @@ impl fmt::Display for Service {
 pub enum HelperCommand {
     /// Allocate ports, generate kind-config, create cluster, run setup.sh.
     Setup { skip_observability: bool },
-    /// Build one service image, load into Kind, restart deployment.
+    /// Rebuild one service image (content-tagged) and converge, via
+    /// `setup.sh --only <svc>`.
     Rebuild(Service),
-    /// Rebuild all service images.
+    /// Rebuild every first-party image and converge, via `setup.sh --rebuild-all`.
     RebuildAll,
     /// Apply manifests only (no image rebuild).
     Deploy(Service),

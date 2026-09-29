@@ -106,9 +106,9 @@ The helper handles only operations that require the host's container runtime (po
 | Command | Description | Class | Why host-only |
 |---------|-------------|-------|---------------|
 | `setup` | Allocate ports, generate kind-config, create cluster, run setup.sh | write | Requires `kind create cluster`, `podman build` |
-| `rebuild <service>` | Build one service image, load into Kind, restart deployment | write | Requires `podman build`, `kind load image-archive` |
-| `rebuild-all` | Rebuild all service images | write | Same |
-| `deploy <service>` | Apply manifests only (no image rebuild) | write | Uses setup.sh which manages kind-specific operations |
+| `rebuild <service>` | `setup.sh --only <service>`: build the image (content-tagged) + the migrations image, run the migration Job, apply the environment root (ADR-0038) | write | Delegates to setup.sh; the helper derives no tag |
+| `rebuild-all` | `setup.sh --rebuild-all`: every first-party image, then the same converge | write | Same |
+| `deploy <service>` | `setup.sh --skip-build --only <service>`: converge on the images already deployed | write | Uses setup.sh which manages kind-specific operations |
 | `teardown` | Delete Kind cluster, clean up all state | write | Requires `kind delete cluster` |
 | `status` | Report cluster existence, API reachability, port allocations, readiness flag, in-flight write | read | Helper-internal state + kubectl connectivity check |
 | `cancel` | Abort the in-flight write (no-op if idle) | read | Touches only the in-flight write's cancel token |
