@@ -35,11 +35,13 @@ Report the result with `git log --oneline` for the absorbed range.
 
 ## Step 3: Triage the devloop's memories
 
-Claude inside the devloop container saves memories there; `devloop.sh` copies them to `~/.cache/devloop/memory-inbox/<slug>/` after each session and before removing the container. If the container still exists, harvest it first:
+Each new devloop container starts with a copy of your host memory. Claude inside it may add or change memories; `devloop.sh` copies those (not unchanged seeds) to `~/.cache/devloop/memory-inbox/<slug>/` after each session and before removing the container. If the container still exists, harvest it first:
 
 ```bash
-source infra/devloop/memory-harvest.sh && harvest_container_memory devloop-<slug>-dev <slug>
+source infra/devloop/memory-harvest.sh && harvest_container_memory devloop-<slug>-dev <slug> "$(git rev-parse --show-toplevel)"
 ```
+
+A file with the same name as one of your host memories is the devloop's edit of it: triage it as an update to that memory.
 
 If the inbox has no memory files (other than `MEMORY.md`), say so and stop.
 

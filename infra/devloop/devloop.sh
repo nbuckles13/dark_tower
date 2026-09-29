@@ -264,7 +264,7 @@ is_helper_process_alive() {
 }
 
 cleanup() {
-    harvest_before_removal "$DEV_CONTAINER" "$TASK_SLUG" || exit 1
+    harvest_before_removal "$DEV_CONTAINER" "$TASK_SLUG" "$REPO_ROOT" || exit 1
     echo "Destroying containers..."
     podman rm -f "$DEV_CONTAINER" 2>/dev/null || true
     podman rm -f "$DB_CONTAINER" 2>/dev/null || true
@@ -654,7 +654,7 @@ fi
 
 # --recreate: tear down containers but keep the clone
 if $RECREATE; then
-    harvest_before_removal "$DEV_CONTAINER" "$TASK_SLUG" || exit 1
+    harvest_before_removal "$DEV_CONTAINER" "$TASK_SLUG" "$REPO_ROOT" || exit 1
     echo "Recreating containers (clone preserved)..."
     podman rm -f "$DEV_CONTAINER" 2>/dev/null || true
     podman rm -f "$DB_CONTAINER" 2>/dev/null || true
@@ -667,7 +667,7 @@ if ! is_container_running "$DEV_CONTAINER"; then
     # Clone is ensured earlier (before the helper launch) — see ensure_clone().
 
     # Clean up any stopped containers from a previous run
-    harvest_before_removal "$DEV_CONTAINER" "$TASK_SLUG" || exit 1
+    harvest_before_removal "$DEV_CONTAINER" "$TASK_SLUG" "$REPO_ROOT" || exit 1
     podman rm -f "$DEV_CONTAINER" 2>/dev/null || true
     podman rm -f "$DB_CONTAINER" 2>/dev/null || true
 
@@ -770,6 +770,8 @@ if ! is_container_running "$DEV_CONTAINER"; then
     # Wait for entrypoint to complete setup
     echo "Waiting for container initialization..."
     sleep 5
+
+    seed_container_memory "$DEV_CONTAINER" "$REPO_ROOT" || exit 1
 
     echo "=== Containers ready ==="
 else
@@ -890,7 +892,7 @@ if [ ${#EXEC_CMD[@]} -gt 0 ]; then
     echo "Running in ${DEV_CONTAINER}: ${EXEC_CMD[*]}"
     podman exec -it -e "DEVLOOP_SLUG=${TASK_SLUG}" -w /work "$DEV_CONTAINER" "${EXEC_CMD[@]}"
     EXEC_RC=$?
-    harvest_container_memory "$DEV_CONTAINER" "$TASK_SLUG" || true
+    harvest_container_memory "$DEV_CONTAINER" "$TASK_SLUG" "$REPO_ROOT" || true
 
     # Report and exit HERE rather than falling through to Phase 3, which ends in
     # `read -p "Choice: "` — that would block a finished unattended run on a
@@ -925,7 +927,7 @@ fi
 
 podman exec -it "$DEV_CONTAINER" claude --dangerously-skip-permissions "${LEAD_MODEL_ARGS[@]}" --remote-control "$TASK_SLUG" || true
 # Non-destructive copy: a failure prints ERROR and the next removal refuses.
-harvest_container_memory "$DEV_CONTAINER" "$TASK_SLUG" || true
+harvest_container_memory "$DEV_CONTAINER" "$TASK_SLUG" "$REPO_ROOT" || true
 
 # ─── Phase 3: Post-session ──────────────────────────────────────
 
