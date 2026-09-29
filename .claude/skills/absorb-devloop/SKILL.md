@@ -1,179 +1,60 @@
 ---
 name: absorb-devloop
-description: Bring commits from a devloop clone back into the current branch
+description: Bring a devloop clone's commits into the current branch, then triage the Claude memories that devloop saved
 ---
 
 # Absorb Devloop
-
-Merge commits from a devloop clone (created by `devloop.sh`) back into the current branch.
-
-## When to Use
-
-After a devloop completes in a clone, use this skill to bring those commits into your working branch. Devloop clones live at `<repo_root>/../worktrees/<slug>/` and work on `feature/<slug>` branches.
-
-## Arguments
 
 ```
 /absorb-devloop <slug>
 ```
 
-- **slug** (required): The devloop task slug (e.g., `mh-quic-mh-notify`). Same slug passed to `devloop.sh`.
+`<slug>` is the devloop slug passed to `devloop.sh`; its clone is `../worktrees/<slug>/`.
 
-## Instructions
-
-### Step 1: Locate and Validate the Clone
-
-Derive the clone path and branch from the slug:
+## Step 1: Plan
 
 ```bash
-REPO_ROOT=$(git rev-parse --show-toplevel)
-SLUG="<slug>"
-CLONE_DIR="${REPO_ROOT}/../worktrees/${SLUG}"
-CLONE_BRANCH="feature/${SLUG}"
+./infra/devloop/absorb-devloop.sh --dry-run <slug>
 ```
 
-Verify the clone exists and check its state:
+Report the plan (fast-forward or cherry-pick, the commits, any skipped as already present). If the clone has uncommitted work, stop and tell the user.
+
+## Step 2: Absorb
 
 ```bash
-cd "$CLONE_DIR"
-git rev-parse --git-dir        # confirm it's a repo
-git rev-parse --abbrev-ref HEAD # confirm branch
-git status --short              # check for uncommitted work
+./infra/devloop/absorb-devloop.sh <slug>
 ```
 
-If there's uncommitted work in the clone, warn the user and stop.
+On a conflict (exit 3), resolve, `git add` the files, and rerun the same command; it finishes the paused commit and absorbs the rest.
 
-Show the clone's commits:
+- `docs/specialist-knowledge/*/INDEX.md` and `docs/devloop-outputs/**`: take the incoming side (`git checkout --theirs`).
+- Everything else: read both sides and merge. If a resolution needs a judgment call beyond combining both sides, ask the user.
+- If the pre-commit hook refuses the finished commit (e.g. a Gate-2 verdict for a devloop-completion commit), stop and ask the user. Bypassing the hook is their decision.
+
+Report the result with `git log --oneline` for the absorbed range.
+
+## Step 3: Triage the devloop's memories
+
+Claude inside the devloop container saves memories there; `devloop.sh` copies them to `~/.cache/devloop/memory-inbox/<slug>/` after each session and before removing the container. If the container still exists, harvest it first:
 
 ```bash
-git log --oneline
+source infra/devloop/memory-harvest.sh && harvest_container_memory devloop-<slug>-dev <slug>
 ```
 
-### Step 2: Add Clone as Remote and Fetch
+If the inbox has no memory files (other than `MEMORY.md`), say so and stop.
 
-From the main repo:
+For each memory file, pick one outcome:
 
-```bash
-git remote add "$SLUG" "$CLONE_DIR"
-git fetch "$SLUG"
-```
+| Outcome | When |
+|---|---|
+| **Drop** | Already stated in CLAUDE.md, a skill, an ADR, a runbook, a specialist INDEX or an existing host memory (name where); only meaningful inside that devloop's session; or wrong. |
+| **Host memory** | Durable and not derivable from the repo: the user's preferences or feedback on how to work, external references. Merge into an existing memory when one covers the topic. |
+| **Repo doc** | A rule or fact every devloop should follow that belongs in CLAUDE.md, a skill, a specialist INDEX or a runbook. Name the file and the edit. |
 
-### Step 3: Analyze Divergence
+A memory that restates existing repo guidance usually means that guidance was missed. Drop it, and note whether the existing text needs to be clearer or more prominent.
 
-Find what needs to come over:
+Present one table — file, one-line summary, recommended outcome, reason or target — and ask the user to approve or change it. Then:
 
-```bash
-# Merge base — where the clone branched from
-MERGE_BASE=$(git merge-base HEAD "$SLUG/$CLONE_BRANCH")
-
-# What we have that the clone doesn't
-git log --oneline "$MERGE_BASE..HEAD"
-
-# What the clone has that we don't
-git log --oneline "$MERGE_BASE..$SLUG/$CLONE_BRANCH"
-```
-
-Check for duplicate commits (same change independently applied to both sides):
-
-```bash
-comm -12 \
-  <(git log --format="%s" "$MERGE_BASE..HEAD" | sort) \
-  <(git log --format="%s" "$MERGE_BASE..$SLUG/$CLONE_BRANCH" | sort)
-```
-
-Report the analysis to the user before proceeding:
-- The merge base commit
-- Commit counts on each side
-- Any detected duplicates
-
-### Step 4: Cherry-Pick from Clone
-
-The default strategy is to cherry-pick the clone's commits onto the current branch. This preserves our existing history and adds the clone's work on top.
-
-```bash
-# List clone-only commits in chronological order
-git log --oneline --reverse "$MERGE_BASE..$SLUG/$CLONE_BRANCH"
-```
-
-**If duplicates were detected:** identify which clone commits are duplicates (same commit message as commits already on our branch). Confirm with the user which to skip, then cherry-pick only the non-duplicate commits.
-
-**If no duplicates:** cherry-pick all commits:
-
-```bash
-git cherry-pick <first-sha>^..<last-sha>
-```
-
-### Step 5: Resolve Conflicts
-
-If conflicts occur during cherry-pick:
-
-**Specialist INDEX files** (`docs/specialist-knowledge/*/INDEX.md`): These are updated by every devloop and always conflict in parallel work. Take the version from the cherry-picked commit (theirs):
-
-```bash
-git checkout --theirs docs/specialist-knowledge/*/INDEX.md
-git add docs/specialist-knowledge/*/INDEX.md
-```
-
-**Devloop output files** (`docs/devloop-outputs/`): Same treatment — take theirs.
-
-**Source code and other files:** Read the conflicting hunks, understand both sides, and resolve the merge. Most conflicts will be straightforward (e.g., adjacent additions in the same file).
-
-After resolving and `git add`-ing the files: if the absorb was started with
-`infra/devloop/absorb-devloop.sh`, **rerun the same command** instead of
-`git cherry-pick --continue`. It refuses an incomplete resolution (unmerged paths,
-unstaged edits, staged conflict markers), finishes the paused commit, and absorbs
-whatever the devloop branch still has, including commits added since the stop.
-Otherwise:
-
-```bash
-git cherry-pick --continue --no-edit
-```
-
-Repeat for each conflicting commit in the sequence.
-
-Finishing a conflict-resolved commit runs the pre-commit hook, unlike a clean
-pick. For a commit that completes a devloop (it stages a Phase=complete
-`main.md`), the Gate-2 check then requires a verdict for the resolved tree:
-run `./scripts/layer-all.sh`, then continue.
-
-### Step 6: Verify
-
-```bash
-cargo check 2>&1 | tail -5
-git log --oneline "$MERGE_BASE..HEAD"
-```
-
-### Step 7: Clean Up
-
-```bash
-git remote remove "$SLUG"
-```
-
-**Do NOT delete the clone directory** — the user may want to reference it or the containers may still be running.
-
-## Special Cases
-
-### Clone is a strict fast-forward (our branch has no unique commits)
-
-Skip cherry-pick entirely:
-
-```bash
-git merge --ff-only "$SLUG/$CLONE_BRANCH"
-```
-
-### Our branch has unique commits that are duplicates of clone commits
-
-If ALL our unique commits are duplicates of clone commits (same changes, different SHAs from independent creation), consider the reset approach:
-
-1. Save our unique non-duplicate commits on a temp branch
-2. Reset to the merge base
-3. Fast-forward to the clone's HEAD
-4. Cherry-pick our non-duplicate commits on top
-5. Delete the temp branch
-
-This produces a cleaner linear history since the clone's commit chain is unbroken. Only use this when confirmed with the user.
-
-## See Also
-
-- Devloop setup: `infra/devloop/devloop.sh`
-- Devloop workflow: `.claude/skills/devloop/SKILL.md`
+1. Write approved host memories (your auto-memory directory and its `MEMORY.md` index).
+2. Make approved repo edits and commit them separately.
+3. Move the triaged files to `~/.cache/devloop/memory-inbox/.triaged/<slug>-<YYYY-MM-DD>/` (kept as a record).

@@ -87,6 +87,8 @@ layer_lifecycle_begin 3
   # the paused commit and absorbs the rest, recording origins so a resolved commit is never
   # picked twice). Hermetic — throwaway repos, real git. No cluster.
   run_and_emit "absorb-devloop-selftest" "${__here}/../infra/devloop/absorb-devloop.test.sh" || true
+  # devloop.sh copies container Claude memories out before every dev-container removal.
+  run_and_emit "memory-harvest-selftest" "${__here}/../infra/devloop/memory-harvest.test.sh" || true
   # Story-runner self-test (ADR-0035 §12): the runner drives unattended
   # skip-permissions sessions and reaches `git reset --hard` + `git clean -fdq`
   # from a classification decision, with zero tests before this file. Hermetic —
