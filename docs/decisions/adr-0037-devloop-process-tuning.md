@@ -263,6 +263,30 @@ cross-owner "extra work" is now done in-loop, not deferred).
   as one complete devloop rather than several partial ones. Story 2 tests whether
   "always complete the invariant" is affordable or needs a carve-out.
 
+### D10 — Review before the full pipeline (added 2026-09-28)
+
+The Lead ran the full `layer-all.sh` (Gate 2) before review, and review almost
+always changed the tree, so a second full run was needed before commit — two
+Layer-7 bring-ups per devloop, three per task under the story runner.
+
+- **Decision**: the order is IMPLEMENTATION → FAST CHECK → REVIEW → Gate 3
+  (approval) → Gate 2 (full validation) → COMMIT.
+  - The implementer runs `./scripts/layer-fast.sh` (layers 1–6, no cluster)
+    before "Ready for review" and again after fixing review findings; the Lead
+    re-runs it as the fast check before starting review.
+  - The Lead runs `layer-all.sh` once, on the Gate-3-approved tree. Its verdict
+    is what the commit hook binds (the verdict is tree-bound, so any later
+    change forces a re-run).
+  - Any failure after implementation — fast check, a finding routed back at
+    Gate 3, or the full run — returns to implementation and repeats the whole
+    cycle. There is no special path for a Layer-7 failure found after review.
+- **What changes for reviewers**: they review a diff that passed layers 1–6;
+  env-tests have not run yet, so no review may treat them as passed.
+- **Unchanged**: gate names (Gate 2 is still the full validation whose verdict
+  file and hook carry the name), attempt limits, and the story runner's own
+  independent authority gate (ADR-0035), so a headless task goes from three full
+  runs to two.
+
 ## Deferred (not in this ADR)
 
 - **Agent-scope consolidation ("fewer agents, larger scopes").** The crux, and

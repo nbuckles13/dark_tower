@@ -104,7 +104,7 @@ The cost-of-fix-later side of the inequality includes: (a) the same fix later co
 - Introduces significant regression risk requiring its own test cycle
 - Needs cross-service coordination (e.g., common crate change affecting multiple consumers)
 
-**Suspicious deferral check** — if the finding is (a) a fix under ~5 LoC, (b) inside the PR's existing file changeset, and (c) has no design ambiguity, then deferral is almost certainly the wrong call. Sunk-cost framing makes one-line fixes feel like "going backward" at Gate 2, but the cognitive frame is the bias — fix it.
+**Suspicious deferral check** — if the finding is (a) a fix under ~5 LoC, (b) inside the PR's existing file changeset, and (c) has no design ambiguity, then deferral is almost certainly the wrong call. Sunk-cost framing makes one-line fixes feel like "going backward" at review, but the cognitive frame is the bias — fix it.
 
 ### Your response to a deferral or spin-out
 - **Accept**: The justification meets the burden-of-proof above — the cost math actually favors deferral for THIS finding. Mark as "accepted deferral" or "accepted spin-out" in your verdict. Note that even one accepted deferral makes your verdict RESOLVED-DEFERRED, not RESOLVED-FIXED.
@@ -149,7 +149,7 @@ The DRY reviewer operates on a hybrid model:
 
 The verdict is **RESOLVED-DEFERRED** if *any* finding remains in the diff after this PR — even one. A review with 9 fixes and 1 deferral is RESOLVED-DEFERRED, not RESOLVED-FIXED. This is deliberate: a single bullet under §Accepted Deferrals is a cost shift to future work, and the verdict should surface that cost without it being averaged away by the fixes.
 
-**Why the distinction matters**: a single "RESOLVED" verdict that covers both "fully fixed" and "partly deferred" lets deferral hide inside resolution. Splitting the verdict makes the deferral state visible at Gate 2 instead of weeks later in a tech-debt audit, and shifts the cognitive frame from "did we close the loop" to "did we leave anything in the diff." The latter framing is harder to satisfy with paperwork.
+**Why the distinction matters**: a single "RESOLVED" verdict that covers both "fully fixed" and "partly deferred" lets deferral hide inside resolution. Splitting the verdict makes the deferral state visible at review instead of weeks later in a tech-debt audit, and shifts the cognitive frame from "did we close the loop" to "did we leave anything in the diff." The latter framing is harder to satisfy with paperwork.
 
 ### Escalation reason (if escalated)
 [Which finding, why the deferral/spin-out justification is insufficient]

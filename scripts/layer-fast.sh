@@ -3,7 +3,7 @@
 # EXCEPT Layer 7's shared-cluster bring-up.
 #
 # This is the check an implementer runs to verify its own work before signalling
-# "Ready for validation". It is NON-DESTRUCTIVE and touches NO shared cluster, so
+# "Ready for review" (and after review fixes), and the Lead's fast check before review. It is NON-DESTRUCTIVE and touches NO shared cluster, so
 # concurrent implementer runs can never thrash the one named Layer-7 cluster the
 # Lead's Gate 2 is using (the collision this script exists to prevent).
 #

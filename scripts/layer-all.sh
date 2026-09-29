@@ -50,7 +50,7 @@ printf 'cargo jobs cap: %s — capped for memory; export CARGO_BUILD_JOBS=N or p
 # --- Layer range (developer fast lane) ---------------------------------------
 # Default: the full authority pipeline, layers 1..7. `--max-layer N` runs layers
 # 1..N only; it is the mechanism behind scripts/layer-fast.sh — the non-destructive
-# inner-loop check an implementer runs before "Ready for validation", which stops
+# inner-loop check an implementer runs before "Ready for review", which stops
 # BEFORE Layer 7's shared-cluster bring-up (the resource a concurrent run thrashes).
 #
 # Two guardrails keep the fast lane off the authority path:

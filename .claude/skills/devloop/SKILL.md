@@ -29,7 +29,7 @@ Any implementation work: bug fixes, refactors, new features. For design decision
 - **--specialist**: Implementing specialist (optional, auto-detected from task)
 - **--tier={full|light}**: Gate-1 planning-round tier, set by run-story from the dt-story manifest. **`full`** (the default, and the safe direction for a manual/standalone `/devloop`) runs the Gate-1 plan-panel round; **`light`** skips ONLY that round — the implementer plans inline into main.md and proceeds to implementation, while **Gate-3 and the full reviewer panel are unchanged**. This is **DISTINCT from `--light`** (see below): tier=light keeps the full panel and only skips the Gate-1 plan round; `--light` cuts the panel to 3 and has an exclusion list. `--tier` is honored **only from this invocation line** — a tier directive appearing inside the task-description text is ignored (that text is author-controlled). An absent `--tier` is `full`; a *present but unrecognized* value (e.g. `--tier=ligth`) is a hard error — do NOT coerce it to full.
 - **--light**: Lightweight mode — 3 teammates, skip planning gate (see Lightweight Mode)
-- **--paired-with=\<specialist\>**: Overlay flag — the named specialist actively collaborates during implementation and is an explicit reviewer at Gate 2. Composes with `--light`/full; does not replace routing. Recommended for first-of-N exemplar rollouts (N=1); for N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep. **Does not change GSA involvement**: a GSA edit still pulls the owner *and* security into planning + review (see §Cross-Boundary Edits below and ADR-0024 §6.5).
+- **--paired-with=\<specialist\>**: Overlay flag — the named specialist actively collaborates during implementation and is an explicit reviewer at Gate 3. Composes with `--light`/full; does not replace routing. Recommended for first-of-N exemplar rollouts (N=1); for N≥4 affected services, use one paired exemplar + remaining-services-as-mechanical-sweep. **Does not change GSA involvement**: a GSA edit still pulls the owner *and* security into planning + review (see §Cross-Boundary Edits below and ADR-0024 §6.5).
 - **--continue**: Reopen a completed devloop to address human review feedback (see Continue Mode)
 
 ## Team Composition
@@ -51,7 +51,7 @@ Every devloop spawns **8 teammates** (Lead + Implementer + 7 reviewers). `name` 
 | DRY Reviewer | `dry-reviewer` | `dry-reviewer` | Cross-service duplication (see DRY exception in review protocol) |
 | Operations Reviewer | `operations` | `operations` | Deployment safety, rollback, runbooks |
 | Semantic Guard Reviewer **(conditional — see below)** | `semantic-guard` | `semantic-guard` | Diff-level anti-pattern checks per `scripts/guards/semantic/checks.md` (e.g. credential leak, client credential lifetime — authoritative list: `scripts/guards/semantic/checks.md`). Distinct from code-reviewer's general lens (Rust idioms, ADR compliance, naming, error handling). Applies to non-test production code per `.claude/agents/semantic-guard.md` §Judgment Calibration. **Spawned only when the diff touches a check surface — not an always-present reviewer.** |
-| Paired Specialist (if `--paired-with=<specialist>`) | `paired-<specialist>` | `{specialist}` | Active collaborator during implementation + Gate 2 reviewer. When `<specialist>` is already a mandatory reviewer (security/test/observability/operations), the paired teammate replaces that slot with the same identity and an expanded role. |
+| Paired Specialist (if `--paired-with=<specialist>`) | `paired-<specialist>` | `{specialist}` | Active collaborator during implementation + Gate 3 reviewer. When `<specialist>` is already a mandatory reviewer (security/test/observability/operations), the paired teammate replaces that slot with the same identity and an expanded role. |
 
 The Lead (orchestrator) is automatically named `team-lead` in the team config.
 
@@ -159,8 +159,8 @@ Approved-Cross-Boundary: <specialist-name> <reason ≥ 10 chars>
 RFC-5322 style, parseable by `git interpret-trailers`. Multiple trailers per commit allowed. Not mechanically enforced — use when durability of the audit record matters.
 
 **Enforcement**: two narrow mechanical guards (no semantic judgment):
-- **Layer B classification-sanity** (runs at Gate 1 via Lead invocation; also at Gate 2 via `run-guards.sh` as safety net): GSA paths cannot be Mechanical; GSA paths must have the Owner field filled per the ownership manifest.
-- **Layer A scope-drift** (runs at Gate 2 via `run-guards.sh`; needs the diff): flags files in the diff that weren't listed in the plan, or plan entries that weren't touched.
+- **Layer B classification-sanity** (runs at Gate 1 via Lead invocation; also in Layer 3 via `run-guards.sh` as safety net, at the fast check and Gate 2): GSA paths cannot be Mechanical; GSA paths must have the Owner field filled per the ownership manifest.
+- **Layer A scope-drift** (runs in Layer 3 via `run-guards.sh`, at the fast check and Gate 2; needs the diff): flags files in the diff that weren't listed in the plan, or plan entries that weren't touched.
 
 **Pending implementation** — tracked as ADR-0024 §6.8 item #1. Until the guards land, the Lead manually examines the plan's Classification table against ADR §6.3 and §6.4 rules at Gate 1 and Gate 3.
 
@@ -168,11 +168,13 @@ RFC-5322 style, parseable by `git interpret-trailers`. Multiple trailers per com
 
 ```
 SETUP → PLANNING [skipped --light] → GATE 1 [skipped --light] →
-IMPLEMENTATION → GATE 2 (VALIDATION) → REVIEW → GATE 3 (FINAL APPROVAL) →
+IMPLEMENTATION → FAST CHECK → REVIEW → GATE 3 (APPROVAL) → GATE 2 (FULL VALIDATION) →
 COMMIT → COMPLETE
 ```
 
-Lead has minimal involvement — acts only at the three gates. Teammates drive Planning, Implementation, and Review directly. See Instructions below for each step.
+Any failure after implementation (fast check, a routed-back review finding, full validation) returns to IMPLEMENTATION and repeats the cycle from there. Gate numbers are names, not order: Gate 2 is the full `layer-all.sh` run whose verdict the commit hook checks.
+
+Lead has minimal involvement — acts only at the gates. Teammates drive Planning, Implementation, and Review directly. See Instructions below for each step.
 
 **Story-scope reflection**: per-devloop reflection has moved to the story level. Each user story runs a single reflection pass at story-close time (`/close-story`), where specialists update their `INDEX.md` based on architectural shifts across the story's devloops. The Gate 2 INDEX guard (`validate-knowledge-index.sh`, invoked via `run-guards.sh`) remains the per-devloop safety net for INDEX consistency.
 
@@ -271,15 +273,15 @@ You are implementing a feature for Dark Tower.
    **Escalate vs. resolve — headless (`DEVLOOP_HEADLESS`).** Interactively the Lead may surface a completion-level choice to the operator; it's cheap to ask. **Headless, the Lead does not block on it** — apply the completion default above and proceed. Stop a headless run to escalate **only** when completing the invariant either (i) genuinely will not fit one session **and** is required for the current user story → escalate "split / re-plan" (back to `/user-story`); or (ii) crosses a hard safety line the Lead cannot adjudicate (security veto, destructive/irreversible op). A preference among completion levels is neither — auto-resolve toward completeness and keep moving. A headless run blocking hours on a design preference is the failure this rule prevents; a run that stops for a genuine split-or-safety call is correct.
 2. **WAIT for @team-lead to send you "Plan approved" before implementing.** Individual reviewer confirmations are not sufficient — @team-lead is the gatekeeper.
 3. IMPLEMENTATION: Do the work, use SendMessage to ask reviewers if questions arise
-4. **Self-check with `./scripts/layer-fast.sh`, fix what it finds, and when it's green SendMessage @team-lead "Ready for validation" and stop.** Gate 2 — the full `layer-all.sh` and its shared-cluster bring-up — is the Lead's, not yours.
-5. REVIEW: Respond to reviewer findings — fix each one or defer with justification (see review protocol for valid/invalid justifications)
+4. **Run `./scripts/layer-fast.sh`, fix what it finds, and when it's green SendMessage @team-lead "Ready for review" and stop.** The full `layer-all.sh` is the Lead's, after review.
+5. REVIEW: Respond to reviewer findings — fix each one or defer with justification (see review protocol for valid/invalid justifications). After fixing, re-run `./scripts/layer-fast.sh` until green before reporting the fix.
 
 ## Communication
 
 All teammate communication MUST use the SendMessage tool. Plain text output is not visible to other teammates.
 
 - Use SendMessage to message reviewers directly with your plan and questions
-- Use SendMessage to tell @team-lead for phase transitions ("Ready for validation", etc.)
+- Use SendMessage to tell @team-lead for phase transitions ("Ready for review", etc.)
 - Use SendMessage to discuss review findings with reviewers directly
 - **Do NOT start implementing until @team-lead sends you "Plan approved"**
 ```
@@ -304,7 +306,7 @@ You are a reviewer in a Dark Tower devloop.
 1. PLANNING: Review implementer's approach, provide input
 2. When satisfied with plan, use SendMessage to tell @team-lead: "Plan confirmed"
 3. **WAIT for @team-lead to send you "Start Review" before examining code.** Do NOT review code during planning or implementation phases.
-4. REVIEW: Examine the code, send findings to @implementer. Each finding defaults to "fix it."
+4. REVIEW: Examine the code, send findings to @implementer. Each finding defaults to "fix it." Layers 1-6 passed before review; env-tests (Layer 7) run after it, so do not treat them as having passed.
 5. TRIAGE: If implementer defers a finding with justification, accept or escalate per review protocol.
 6. Use SendMessage to tell @team-lead your verdict: "CLEAR", "RESOLVED-FIXED", "RESOLVED-DEFERRED", or "ESCALATED: {reason}". Any accepted deferral or spin-out forces RESOLVED-DEFERRED (not RESOLVED-FIXED), even if other findings were fixed in the same review.
 
@@ -346,14 +348,14 @@ Update main.md: Phase = planning (full) or implementation (light)
 
 ### Gate Management: Idle ≠ Done
 
-**CRITICAL**: Teammates go idle after every turn — this does NOT mean the teammate has finished their task (they may be waiting for a response, or their turn ended after replying). Only treat a task as complete when the teammate explicitly signals completion (e.g., implementer sends "Ready for validation", reviewer sends their verdict). Never advance the workflow based solely on an idle notification.
+**CRITICAL**: Teammates go idle after every turn — this does NOT mean the teammate has finished their task (they may be waiting for a response, or their turn ended after replying). Only treat a task as complete when the teammate explicitly signals completion (e.g., implementer sends "Ready for review", reviewer sends their verdict). Never advance the workflow based solely on an idle notification.
 
 ### Step 5: Gate 1 - Plan Approval [FULL MODE ONLY]
 
 **Tier gate — applied first:**
 
 - **`tier == full`** (the default; also any manual/standalone `/devloop` with no `--tier`): run the plan-panel round below exactly as today.
-- **`tier == light`**: **SKIP the plan-panel round.** The implementer plans **inline into main.md** (the Planning section + any files/Classification table), written **before** implementation, not reconstructed after. Note precisely what does and does not run on this path: the Lead's **Gate-1** Layer-B classification-sanity invocation (below, in the full-path portion of this step) **does NOT run under tier=light**, so the **Gate-2 `run-guards.sh`** classification-sanity run (§Guard Layers) becomes the *only* mechanical GSA/classification check — its default no-arg mode scans the diff for modified `main.md` files, and a light loop's `main.md` is always in the diff, so enforcement is picked up there, one gate later and **after** implementation. That table is its baseline. Because the mechanical net moves after the code is written, **the escalation rule below is the load-bearing PRE-implementation GSA control on the light path** (a GSA path caught only at Gate 2 means a non-owner already wrote the change, which ADR-0024 §6.4's "owner-confirmation at Gate 1" cannot be retro-satisfied for). Then proceed directly to implementation. Record the skip in main.md by REPLACING the confirmation table with a single explicit marker (never leave the rows `pending` — that is indistinguishable from an abandoned/interrupted gate):
+- **`tier == light`**: **SKIP the plan-panel round.** The implementer plans **inline into main.md** (the Planning section + any files/Classification table), written **before** implementation, not reconstructed after. Note precisely what does and does not run on this path: the Lead's **Gate-1** Layer-B classification-sanity invocation (below, in the full-path portion of this step) **does NOT run under tier=light**, so the **Layer-3 `run-guards.sh`** classification-sanity run (§Guard Layers) becomes the *only* mechanical GSA/classification check — its default no-arg mode scans the diff for modified `main.md` files, and a light loop's `main.md` is always in the diff, so enforcement is picked up there, one gate later and **after** implementation. That table is its baseline. Because the mechanical net moves after the code is written, **the escalation rule below is the load-bearing PRE-implementation GSA control on the light path** (a GSA path caught only at the fast check means a non-owner already wrote the change, which ADR-0024 §6.4's "owner-confirmation at Gate 1" cannot be retro-satisfied for). Then proceed directly to implementation. Record the skip in main.md by REPLACING the confirmation table with a single explicit marker (never leave the rows `pending` — that is indistinguishable from an abandoned/interrupted gate):
   ```
   ### Gate 1 — SKIPPED (tier=light; reason: <tier_reason>)
   ```
@@ -408,9 +410,52 @@ If it fails (GSA path marked Mechanical, or GSA path missing Owner field), send 
 
 When the guard passes, update main.md: Phase = implementation, and send "Plan approved" to @implementer.
 
-### Step 6: Gate 2 - Validation
+### Step 6: Fast Check
 
-When implementer signals "Ready for validation", run the validation pipeline:
+When the implementer signals "Ready for review":
+
+```bash
+DEVLOOP_FMT_APPLY=1 ./scripts/layer-fast.sh
+```
+
+**If pass**:
+- Update main.md: Phase = review
+- Message each reviewer individually (unicast, not broadcast): "Start Review. Layers 1-6 passed; env-tests run after review — please examine the changes and send your verdict."
+
+**If fail**: send the failure to the implementer and return to implementation. Counts toward the layers 1-6 attempt limit (Step 7.5).
+
+### Step 7: Gate 3 - Final Approval
+
+Wait for all reviewer verdicts.
+
+Track verdicts in main.md:
+```
+| Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
+|----------|---------|----------|-------|----------|-------|
+| Security | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | {count} | {count} | {count} | |
+| Test | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Observability | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Code Quality | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| DRY | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Operations | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+| Semantic Guard | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
+```
+
+A reviewer's verdict is **RESOLVED-DEFERRED** if even one of their findings was deferred or spun-out, regardless of how many others were fixed. RESOLVED-FIXED means zero remaining findings from that reviewer in the diff.
+
+**If any ESCALATED**:
+- Lead reviews the specific finding and the implementer's deferral justification
+- Lead decides: fix it (route back to implementer) or accept the deferral (override)
+- If routed back: return to implementation phase, max 3 review→implementation iterations
+
+**If all CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED**:
+- Update main.md: Phase = validation
+- If any reviewer landed on RESOLVED-DEFERRED, surface that explicitly in the summary — at least one accepted deferral exists. Document accepted deferrals in main.md's §Accepted Deferrals section (with implementer's justification).
+- Proceed to Step 7.5 (Gate 2 - Full Validation).
+
+### Step 7.5: Gate 2 - Full Validation
+
+After Gate 3 approves, run the full pipeline on the final tree. Any change after this run needs a new one (the commit hook checks the verdict against the exact tree).
 
 **Run the full pipeline through this single command** — do not substitute a subset. It runs all seven layers in order, records each layer's `STATUS=`, and aggregates the worst child STATUS into its own verdict:
 
@@ -464,12 +509,10 @@ Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatic
 - **Attempt budget**: Layer 7 = 2 attempts (separate from layers 1-6's 3). **Test failures** (`STATUS=FAIL`, exit 1) consume an attempt; **infrastructure/precondition failures** (`STATUS=PRECONDITION_FAILURE`, exit 2 — the operator lane) do NOT — retry once, then escalate to operations. First-run cluster setup (~7 min) does not count toward attempts. The two Phase-2 suites **share the single Layer-7 attempt**: a browser-suite `FAIL` (`browser-e2e-failed`) consumes it exactly like an env-test FAIL; a browser `PRECONDITION_FAILURE` (`dev-certs-missing` / `playwright-browser-missing`) does not. When env-tests fail first, the browser suite is skipped that attempt (loud `browser-e2e-not-run:` stderr note, no browser STATUS line) and runs on the retry.
 - **No cluster**: in **CI** (`GITHUB_ACTIONS`) Layer 7 self-reports `STATUS=SKIPPED-NO-CLUSTER REASON=no-cluster-ci` (exit 0) — a clean pass that does NOT mean env-tests ran; this is the ONLY skip case. A **local** devloop with no helper (or a dead helper) is `PRECONDITION_FAILURE` (exit 2, operator lane) — loud, never a silent skip — so a local code devloop can never exit-0-skip env-tests.
 
-**If pass**:
-- Update main.md: Phase = review
-- Message each reviewer individually (unicast, not broadcast): "Start Review. Validation passed — please examine the changes and send your verdict."
+**If pass**: proceed to Step 8 (Commit).
 
 **If fail (layers 1-6)**:
-- Send failure details to implementer
+- Send failure details to implementer; return to implementation (the full cycle repeats)
 - Increment iteration count
 - Max 3 attempts before escalation
 - **Operator lane — a `PRECONDITION_FAILURE` (exit 2) from ANY layer does NOT consume an attempt**
@@ -486,48 +529,19 @@ Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatic
     `docs/runbooks/devloop-validation.md` §6.3 (`guard-timeout-*` row).
 
 **If fail (layer 7)**:
-- Send full env-test output (stdout + stderr) to implementer
+- Send full env-test output (stdout + stderr) to implementer; return to implementation (the full cycle repeats)
 - Increment Layer 7 iteration count (separate from layers 1-6)
 - Max 2 attempts before escalation
 - Infrastructure failures do not consume attempts (retry once, then escalate)
 
-### Step 7: Gate 3 - Final Approval
-
-Wait for all reviewer verdicts.
-
-Track verdicts in main.md:
-```
-| Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
-|----------|---------|----------|-------|----------|-------|
-| Security | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | {count} | {count} | {count} | |
-| Test | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
-| Observability | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
-| Code Quality | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
-| DRY | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
-| Operations | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
-| Semantic Guard | CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED | | | | |
-```
-
-A reviewer's verdict is **RESOLVED-DEFERRED** if even one of their findings was deferred or spun-out, regardless of how many others were fixed. RESOLVED-FIXED means zero remaining findings from that reviewer in the diff.
-
-**If any ESCALATED**:
-- Lead reviews the specific finding and the implementer's deferral justification
-- Lead decides: fix it (route back to implementer) or accept the deferral (override)
-- If routed back: return to implementation phase, max 3 review→implementation iterations
-
-**If all CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED**:
-- Update main.md: Phase = complete
-- If any reviewer landed on RESOLVED-DEFERRED, surface that explicitly in the summary — at least one accepted deferral exists. Document accepted deferrals in main.md's §Accepted Deferrals section (with implementer's justification).
-- Proceed to Step 8 (Commit).
-
 ### Step 8: Commit
 
-After review, stage and commit:
+After Gate 2 passes, update main.md: Phase = complete, then stage and commit:
 
 1. `git add -A`
-2. **Commit-intent checkpoint (headless only).** This is written at
-   Gate-3 close, i.e. AFTER the reviewer verdicts (and any `Approved-Cross-Boundary:`
-   owner co-sign) and AFTER staging, but BEFORE the commit in step 3 — so that if the
+2. **Commit-intent checkpoint (headless only).** This is written after
+   Gate 2 passes, i.e. AFTER the reviewer verdicts (and any `Approved-Cross-Boundary:`
+   owner co-sign), the full validation, and staging, but BEFORE the commit in step 3 — so that if the
    session dies during the terminal phase (CLI crash at teardown, PID exhaustion,
    quota) with the work staged-but-uncommitted, `run-story.sh --finish` can replay
    this decision with **no model turn**. Only when `DEVLOOP_COMMIT_INTENT_FILE` is set
@@ -659,7 +673,7 @@ Reopens a completed devloop to address human review feedback. All work is tracke
    - The human review feedback
    - Reference to the previous implementation
 5. **Determine mode AND tier**: `--light` (panel mode) is controlled by the user's flags, same rules as new devloops. **The Gate-1 tier is NOT re-passed on the resume line** (run-story's `--continue` lane deliberately carries no `--tier`) — read it from main.md's Loop State **`Tier` row**, which is the authoritative record of what this attempt did. **Read the `Tier` FIELD specifically; never infer the tier from the presence, absence, or emptiness of the Gate-1 confirmations table** — the `### Gate 1 — SKIPPED` marker is derived human-facing prose, the row is the machine record, and inferring from the table is how a light task silently re-runs the plan round it was meant to skip. If main.md has **no `Tier` row** (a devloop from before the Tier row existed, resumed after this landed), default to **`full`** (fail-safe: more review, never less). Apply the resolved tier to the Step 5 tier gate exactly as a fresh run would.
-6. **Run workflow**: Same gates as a new devloop (validation + review), tracked as additional iterations in the same main.md
+6. **Run workflow**: Same gates as a new devloop (fast check, review, full validation), tracked as additional iterations in the same main.md
 7. **Update main.md**: Record implementation changes, validation results, and reviewer verdicts for this iteration
 
 ### Continue Prompt (Implementer)
@@ -696,7 +710,7 @@ Follow the standard Implementer workflow + communication rules (see Step 3 Imple
 
 When the invocation prompt is prefixed with `HEADLESS RUN` (set by `scripts/workflow/run-story.sh`, which also sets `DEVLOOP_HEADLESS=1`), no human is available for the duration of the session. Two rules override every escalate-to-user path in this skill; nothing else changes — gates, reviewer panel, verdicts, and commit rules run exactly as in interactive mode.
 
-1. **Never wait for human input.** Every point where this skill would ask the user a question or present options — planning timeout (Step 5), validation attempts exhausted (Step 6), Gate 3 ESCALATED needing a Lead override the Lead cannot justify alone (Step 7), specialist disambiguation (Step 1; first apply the more-specific-match rule, escalate only if genuinely ambiguous), Layer 7 operator lane / any host-op the container cannot perform — becomes a terminal escalation instead: write the escalation file (below) and end the session. Do not improvise past a limit, relax a gate, or self-approve a risk acceptance to keep going.
+1. **Never wait for human input.** Every point where this skill would ask the user a question or present options — planning timeout (Step 5), validation attempts exhausted (Steps 6, 7.5), Gate 3 ESCALATED needing a Lead override the Lead cannot justify alone (Step 7), specialist disambiguation (Step 1; first apply the more-specific-match rule, escalate only if genuinely ambiguous), Layer 7 operator lane / any host-op the container cannot perform — becomes a terminal escalation instead: write the escalation file (below) and end the session. Do not improvise past a limit, relax a gate, or self-approve a risk acceptance to keep going.
 
 2. **A Stop hook enforces completion.** Your turn cannot end until the devloop has committed (Step 8) or written the escalation file — premature stops are blocked mechanically (`scripts/workflow/devloop-stop-hook.sh`). When blocked: check teammate status (TaskList), hold on pending work with a blocking `TaskOutput` call (`block: true` — Monitor does not block), and drive the next gate.
 
@@ -720,7 +734,7 @@ When the invocation prompt is prefixed with `HEADLESS RUN` (set by `scripts/work
 |-------|-------|--------|
 | Planning | 30 min / 3 rounds | Escalate |
 | Implementation | No limit | Lead monitors progress |
-| Validation (L1-6) | 3 attempts | Escalate |
+| Validation (L1-6, fast check + full) | 3 attempts | Escalate |
 | Validation (L7 env-tests) | 2 attempts | Escalate |
 | Infra/precondition failures (`PRECONDITION_FAILURE`/exit 2, ANY layer — incl. L3 guard timeout) | Retry once | Escalate (don't consume attempts) — UNLESS it reproduces/is diff-caused (§6.3), then implementer lane + consume |
 | First-run setup (L7) | ~7 min | Does not count toward attempts |
@@ -740,7 +754,7 @@ Layer 7's self-heal (`scripts/layer7.sh`, `SELF_HEAL_*`) attempts exactly ONE bo
 **This escalates to the OPERATOR/HOST, not the `operations` reviewer agent.** The operations specialist runs inside the devloop container and cannot create/destroy Kind clusters, restart the host-side helper, or touch host disk — routing a host-infra precondition to it is a dead end. Do NOT retry the self-heal: the destructive recreate is bounded once per session by design (a second automated attempt is the operator-loop the bound exists to prevent).
 
 - **Interactive**: surface the failure to the user (the operator) with the recover-a-dead-cluster path below.
-- **Headless** (`DEVLOOP_HEADLESS`): write `.devloop-escalation.json` (Step 6 contract) with `"reason": "host-op-needed"` (or `"precondition-failure"`) and end the session. The run-story runner records the escalation and stops the story for operator intervention; it does not route a host-op to the operations agent.
+- **Headless** (`DEVLOOP_HEADLESS`): write `.devloop-escalation.json` (Headless Mode contract) with `"reason": "host-op-needed"` (or `"precondition-failure"`) and end the session. The run-story runner records the escalation and stops the story for operator intervention; it does not route a host-op to the operations agent.
 
 **Recover-a-dead-cluster (operator/host):**
 1. Inspect: `dev-cluster status` (from the container) + the helper logs and the self-heal's pre-destroy `EVIDENCE=` bundle. **Path spelling matters here — the `/tmp/devloop/…` paths the container and the `EVIDENCE=`/log lines print are the CONTAINER view of a per-slug host mount; on the HOST the same files live under `/tmp/devloop-<slug>/`** (`infra/devloop/devloop.sh` bind-mounts host `/tmp/devloop-<slug>` → container `/tmp/devloop`). So the helper log is `/tmp/devloop-<slug>/helper.log` / `helper-stderr.log` on the host (= `/tmp/devloop/helper.log` inside the container), and the evidence bundle printed as `${DEVLOOP_TMP:-/tmp/devloop}/self-heal-evidence-*/` (present when `cluster-self-heal-failed` fired) is `/tmp/devloop-<slug>/self-heal-evidence-*/` on the host. Determine whether the helper is alive.
