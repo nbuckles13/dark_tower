@@ -1068,82 +1068,93 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
     - **Not** remediable MC-side: MC publishes the key to every participant on the roster, so a
       client-controlled blob of arbitrary length must never be admitted.
 
-11. **`sender_id_space_exhausted`**: The meeting consumed all 65535 per-meeting `sender_id`s and MC
-    refused the admission rather than wrapping onto a live id (invariant R-35).
+11. **`sender_id_space_exhausted` — RETIRED; never emitted.** Sender-id exhaustion no longer fails
+    a join. When a meeting's `sender_id` namespace runs out, MC performs an immediate KEK-epoch
+    reset: a new KEK, and a fresh namespace that excludes every id still bound (live and
+    grace-period roster members, plus ids a media handler may still hold). **The join succeeds and
+    the meeting repairs itself. Do NOT end the meeting.** The value is absent from the join-failure
+    vocabulary (`JOIN_FAILURE_ERROR_TYPES`, `crates/mc-service/src/observability/metrics.rs`); if
+    you see it on a dashboard, it is history from a pre-R-16 image.
 
-    > **Corrected 2026-09-26 (story 2 task 9, R-16) — sender-id exhaustion is no longer terminal.
-    > DO NOT act on the Fix below: ending the meeting destroys a session that is already
-    > recovering.** MC now performs an immediate KEK-epoch reset and reissues ids from a fresh
-    > namespace, so admission succeeds and the meeting repairs itself. This `error_type` value is
-    > never emitted any more.
-    >
-    > **Six claims below are superseded, and only these six.** (1) that MC "refused the admission" —
-    > it now admits; (2) the **Fix** ("end the meeting… the only remediation", and that the epoch
-    > reset "is deferred with all KEK rotation") — that deferral is closed; (3) "do not attempt to
-    > 'reset' the allocator" — MC now does exactly that, and **live** is the operative word: it
-    > reissues only ids whose holders have already left; (4) "the meeting is permanently broken";
-    > (5) the bare claim "**Ids are never recycled**" — ids ARE now reissued, but only after a reset
-    > that bumps the KEK generation, and **never within one KEK generation**; (6) "**LIFETIME**" in
-    > "cumulative lifetime admissions" — consumption is cumulative **since the last epoch reset**,
-    > which is what `mc_meeting_sender_ids_issued_max` reports; computing headroom over the meeting's
-    > whole life gives a number that gauge never shows. A reader trusting (2) would have
-    > **destroyed a healthy meeting and every participant's session**, and waited for
-    > `MCSenderIdSpaceExhausted`, which is retired (replacement: the info rule
-    > `MCKekEpochResetOnSenderIdExhaustion`).
-    >
-    > **Everything else below stands — including the REASON attached to claim (5).** "Because reusing
-    > one under a live KEK collides two senders on one key id… on one AES-GCM nonce" is still true,
-    > and it is exactly **why the reset is sound**: the reset installs a new KEK, so a reissued id is
-    > never under the KEK its previous holder used. "Consumed by admissions, not concurrent
-    > participants" and "`MC_MAX_PARTICIPANTS` does not bound this" still hold, per epoch.
-    >
-    > **Triage commands changed.** Start with the counter, not the log:
-    > `mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}` is the fail-closed answer to
-    > *whether this happened*. The `"sender_id space exhausted"` record below is no longer emitted,
-    > so for *which meeting* grep `"sender_id namespace"` (with `--tail`, as below), which matches
-    > both the reset — `sender_id namespace exhausted; KEK epoch reset and reissue` — and the one-shot
-    > `sender_id namespace past high watermark`. **That watermark WARN now fires before EACH reset
-    > rather than once before a permanent break**, so it is the closest thing this scenario has to a
-    > pre-event signal. Also read `mc_meeting_sender_ids_issued_max` and
-    > [Scenario 17](#scenario-17-kek-rotation-storm--flapping-participant).
-    >
-    > **The driven/accidental split below still applies**, and so does the security response: a
-    > deliberate namespace burn is still cheap (no join rate limit, no `jti` replay check —
-    > `docs/TODO.md` §Media Path Obligations). What changed is the consequence — a self-repairing
-    > rotation storm rather than a permanently broken meeting. Full rewrite: story 2 task 18.
-    - Check: `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id space exhausted"`
+    > **Corrected 2026-09-30 (story 2 task 17, R-29; supersedes the interim marker task 9 placed
+    > here on 2026-09-26).** This root cause previously said exhaustion **refused** the admission,
+    > that the meeting was **permanently broken**, that ids were **never recycled**, and that the
+    > only fix was to **end the meeting and have participants rejoin**, paged by
+    > `MCSenderIdSpaceExhausted`. After R-16 every one of those is false. A responder who trusted
+    > the old text would have **ended a meeting that was already repairing itself**, destroying every
+    > participant's session, and would have waited for an alert that is retired and can never fire.
+
+    - **Is this what happened?** Start with the counter, not the log — it is the fail-closed answer:
+      `increase(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}[15m])`. The info
+      rule `MCKekEpochResetOnSenderIdExhaustion` (`infra/docker/prometheus/rules/mc-alerts.yaml`)
+      fires when this expression is `> 0`; its triage home is
+      [Scenario 17](#scenario-17-kek-rotation-storm--flapping-participant), not this scenario.
+    - **Which meeting?** `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id namespace"`
       — **`--tail` is required**: with a label selector and no `--tail`, kubectl returns only the
-      last 10 lines per pod and this grep silently prints nothing. The JSON record carries
-      `meeting_id` (a span field under `fmt::layer().json()`, so it is in the record's span object,
-      not a top-level `meeting_id=` you can grep for), plus cumulative `admissions_total` and
-      `meeting_age_seconds`. An earlier one-shot `"sender_id namespace past high watermark"` record
-      for the same meeting tells you whether consumption was gradual or sudden. Neither carries key
-      material or a `sender_id` value.
-    - **The namespace is consumed by CUMULATIVE LIFETIME ADMISSIONS, not concurrent participants.**
-      Ids are never recycled, because reusing one under a live KEK collides two senders on one key
-      id — and since the wrap nonce derives from the key id, on one AES-GCM nonce. So
-      `MC_MAX_PARTICIPANTS` does **not** bound this: the exposure is a long-lived, high-churn
-      meeting, not a large one.
-    - Fix: **End the meeting and have participants rejoin a new one.** That is the only remediation,
-      and it is unattractive on purpose. There is no in-place lever: the KEK-epoch reset that would
-      reclaim the namespace is deferred with all KEK rotation, and a fresh meeting means a fresh
-      KEK and a fresh namespace. Do not attempt to "reset" the allocator — reissuing a live
-      `sender_id` is the exact collision the refusal exists to prevent.
-    - **Escalate if seen at all, and treat it as possibly DRIVEN until you have ruled that out.**
-      Two causes reach this state and they need different responses:
-      - *Deliberate.* Every join consumes one never-recycled id, MC has **no join rate limit and no
-        `jti` replay check** (neither is implemented — see `docs/TODO.md` §Media Path Obligations),
-        and the browser reconnect path is unwired so every reconnect is a fresh join. One valid
-        meeting token therefore permits unbounded joins until it expires. An authenticated
-        participant can burn the namespace **cheaply, quickly and permanently**, and the only
-        remedy is to destroy the meeting. The signature is the watermark record arriving *shortly*
-        before the exhaustion record — i.e. "sudden" — and a single `sub` accounting for the
+      last 10 lines per pod and this grep silently prints nothing. The stem matches the reset record
+      (`sender_id namespace exhausted; KEK epoch reset and reissue`), the one-shot-per-epoch
+      `sender_id namespace past high watermark` WARN that precedes each reset (the closest thing to a
+      pre-event signal), and the two residual refusal records below. `meeting_id` is a span field
+      under `fmt::layer().json()`, so it is in the record's span object, not a top-level
+      `meeting_id=` you can grep for. No record carries key material or a `sender_id` value. The
+      emit sites (and the reason the stem must stay contiguous) are in
+      `crates/mc-service/src/actors/meeting.rs`.
+    - **How close is the next reset?** `mc_meeting_sender_ids_issued_max` — consumption **since the
+      last epoch reset**, max across live meetings. Do not compute headroom over a meeting's whole
+      life, and do not restate the namespace size here: it is defined by the allocator,
+      `crates/mc-service/src/media_admission/sender_id.rs`. `MC_MAX_PARTICIPANTS` does **not**
+      bound consumption — ids are consumed by admissions, not concurrent participants — so the
+      exposure is a long-lived, high-churn meeting, not a large one.
+    - **Why reissuing an id is safe now, and was not before.** Reusing an id under a **live** KEK
+      collides two senders on one key id — and since the wrap nonce derives from the key id, on one
+      AES-GCM nonce. The reset installs a new KEK in the same atomic step, so a reissued id is never
+      under the KEK its previous holder used. Ids are never reissued **within** one KEK generation.
+      The atomicity argument lives in `AdmissionEpoch::admit()`,
+      `crates/mc-service/src/media_admission/epoch.rs`.
+    - **The residual join failure, and where it lands.** Two arms still refuse the joiner,
+      fail-closed, with the key state and namespace unchanged. Both surface as
+      **`error_type="internal"`** (root cause 9), so if root cause 9 is climbing, run the grep above
+      before reading it as a generic internal error. **The two arms have different remedies; the
+      ERROR message stem tells them apart** (emit sites: `crates/mc-service/src/actors/meeting.rs`):
+      - `sender_id namespace exhausted and the KEK rotation that must accompany an epoch reset
+        failed; refusing admission` — split further on the `reason` label of
+        `mc_meeting_kek_rotation_failures_total` (vocabulary and permanence: `KekRotationFailed`,
+        `crates/mc-service/src/media_admission/kek.rs`):
+        - `reason="rng"` — the system CSPRNG failed. Transient in principle: nothing changed, so
+          the next join retries the reset. **Do not end the meeting**; escalate to
+          `meeting-controller`.
+        - `reason="generation_exhausted"` — the KEK generation counter is at its ceiling and never
+          wraps. **Permanent for this meeting actor**: every join that reaches namespace exhaustion
+          is refused for the rest of the meeting. **Ending the meeting and moving people to a new
+          one IS the remedy, and nothing else clears it** (effectively unreachable; `kek.rs` says
+          why). Same remedy as [Scenario 19](#scenario-19-kek-rotation-stalled), which pages on
+          the stalled rotation.
+      - `sender_id namespace exhausted and a fresh epoch had nothing allocatable after excluding the
+        bound ids; refusing admission` — **permanent for this meeting's NEW joiners; existing
+        participants are unaffected.** This is NOT bounded by the participant cap and is not
+        near-unreachable: the exclusion set includes MC's record of ids a media handler may still
+        hold, which only grows when MH releases are lost, so operational churn over a long meeting
+        (MH crashes and restarts, lost notifications) can reach it. The argument is on
+        `AdmitFailed::NoAllocatableId`, `crates/mc-service/src/media_admission/epoch.rs`; the
+        missing reconciliation is tracked in `docs/TODO.md` §Media Path Obligations. **Moving the
+        people who still need to join into a new meeting is the only lever** — do not tell them to
+        keep retrying. Escalate to `meeting-controller`.
+    - **Treat a reset as possibly DRIVEN until you have ruled that out.** Two causes reach it and they
+      need different responses:
+      - *Deliberate.* Every join consumes one id, MC has **no join rate limit and no `jti` replay
+        check** (neither is implemented — see `docs/TODO.md` §Media Path Obligations), and the
+        browser reconnect path is unwired so every reconnect is a fresh join. One valid meeting
+        token therefore permits unbounded joins until it expires, so an authenticated participant
+        can burn the namespace cheaply and quickly. The signature is the watermark record arriving
+        *shortly* before the reset record — i.e. "sudden" — and a single `sub` accounting for the
         admissions. Check the join rate per token and per source before assuming a bug.
-      - *Accidental.* A client reconnect loop creating fresh participants. **The "~18 hours of
-        continuous churn at one admission per second" figure describes THIS case only** — it is not
-        an estimate for the driven one, which is bounded by connection rate, not by human churn.
-      In both cases the meeting is permanently broken; the difference is whether you also need a
-      security response.
+      - *Accidental.* A client reconnect loop creating fresh participants.
+
+      What changed with R-16 is the **consequence**, not the threat: a self-repairing rotation storm
+      rather than a permanently broken meeting. A driven cause still needs a security response; the
+      meeting still does not need ending. Rotation-storm triage is
+      [Scenario 17](#scenario-17-kek-rotation-storm--flapping-participant); if one sender went
+      inaudible to incumbents only after a reset, read its stale-SDK-bundle paragraph first.
 
 **Remediation**:
 
@@ -2860,7 +2871,7 @@ sum by(trigger) (rate(mc_meeting_kek_generated_total{trigger!="meeting_created"}
   Many departures in a busy meeting do NOT raise this — they coalesce (MC Media Path → KEK Departures
   Coalesced per Rotation).
 - **`sender_space_exhausted` (`MCKekEpochResetOnSenderIdExhaustion`)** — immediate and exempt from W,
-  self-limited to once per 65,536 admissions in one meeting. **Human churn does not reach this.** Treat it
+  self-limited to once per exhausted namespace in one meeting (size set by the allocator, `crates/mc-service/src/media_admission/sender_id.rs`). **Human churn does not reach this.** Treat it
   as a possibly **driven** cause — a flapping client or a scripted join loop — until ruled out; MC has no
   join rate limit and no `jti` replay check. Identify the meeting from
   `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id namespace"` (the reset and
@@ -2868,7 +2879,7 @@ sum by(trigger) (rate(mc_meeting_kek_generated_total{trigger!="meeting_created"}
 
 **Flapper eviction does not ship — a recorded decision, with this residual.** The debounce bounds
 leave-triggered rotation to one per W; exhaustion-triggered rotation is immediate but self-limited to
-once per 65,536 admissions; **nothing bounds a flapping client's join-path cost** — per cycle a roster
+once per exhausted namespace (`sender_id.rs`, above); **nothing bounds a flapping client's join-path cost** — per cycle a roster
 read, a meeting-wide assignment recompute and a control-plane push to MH: O(N) work plus a gRPC call at
 the flapper's rate, with leverage that grows with meeting size (so a two-person test shows nothing).
 **The visibility for it is `mc_meeting_sender_ids_issued_max`** (the maximum across live meetings, not a

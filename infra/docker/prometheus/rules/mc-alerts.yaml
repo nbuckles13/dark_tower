@@ -415,7 +415,9 @@ groups:
       # POSITIVE SELECTOR `trigger="participant_left"`, NOT keyed on the
       # exhaustion arm. The 2/W threshold is derived ENTIRELY from the
       # debounce; `sender_space_exhausted` is exempt from the debounce and
-      # bounded by 65,536 admissions, so it can never approach 2/W and a
+      # bounded by one exhausted sender_id namespace per reset (size: the
+      # allocator, crates/mc-service/src/media_admission/sender_id.rs), so it
+      # can never approach 2/W and a
       # per-trigger series here would read as coverage while being unable to
       # fire. Its visibility is MCKekEpochResetOnSenderIdExhaustion below.
       # PARTITION — every trigger value must be classified into exactly one:
@@ -953,8 +955,9 @@ groups:
       # is exactly why this is INFO and pages nobody. `for: 0m` satisfies the
       # guard floor via the expr window, not `for:`.
       #
-      # WHY IT EXISTS AT ALL: 65,536 admissions in one meeting is not reachable
-      # by human churn — it means a flapping client or a scripted join loop.
+      # WHY IT EXISTS AT ALL: exhausting a sender_id namespace (size: the
+      # allocator, crates/mc-service/src/media_admission/sender_id.rs) in one
+      # meeting is not reachable by human churn — it means a flapping client or a scripted join loop.
       # MC still has no join rate limit and no `jti` replay check
       # (docs/TODO.md §Media Path Obligations), so this is the trip-wire for
       # a driven cause. Read mc_meeting_sender_ids_issued_max.
@@ -974,7 +977,7 @@ groups:
           component: media-keys
         annotations:
           summary: "A meeting exhausted its sender_id namespace and MC reset its KEK epoch"
-          description: "A meeting consumed its 65,536-id sender namespace and MC performed an immediate KEK-epoch reset: a new KEK plus a fresh namespace excluding every bound id. Admission SUCCEEDED; the meeting is recovering on its own. Do NOT end the meeting. Human churn does not reach this: treat it as a possibly DRIVEN cause (a flapping client or a scripted join loop). Identify the meeting from the MC log record 'sender_id namespace exhausted; KEK epoch reset and reissue'."
+          description: "A meeting consumed its sender_id namespace (size set by the allocator, crates/mc-service/src/media_admission/sender_id.rs; progress on mc_meeting_sender_ids_issued_max) and MC performed an immediate KEK-epoch reset: a new KEK plus a fresh namespace excluding every bound id. Admission SUCCEEDED; the meeting is recovering on its own. Do NOT end the meeting. Human churn does not reach this: treat it as a possibly DRIVEN cause (a flapping client or a scripted join loop). Identify the meeting from the MC log record 'sender_id namespace exhausted; KEK epoch reset and reissue'."
           impact: "None to availability. Security-relevant as a signal: one authenticated participant can drive this cheaply because MC has no join rate limit."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-17-kek-rotation-storm--flapping-participant"
 

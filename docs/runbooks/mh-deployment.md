@@ -775,8 +775,9 @@ participant or stream dimension.
 sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
 
 # 2. Egress attempts are not dominated by queue overflow.
-#    Compare against the MHMediaEgressQueueOverflowRate threshold; see Scenario 17
-#    for why `no_subscriber` and `connection_closed` in this breakdown are not faults.
+#    Compare against the MHMediaEgressQueueOverflowRate threshold. `connection_closed`
+#    is routine; `no_subscriber` is routine only as a SHORT tail after a sender's last
+#    holder leaves -- SUSTAINED is a fault (see Scenario 17 for its two causes).
 sum by(reason) (rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
 
 # 3. Policy is applying, not merely arriving.

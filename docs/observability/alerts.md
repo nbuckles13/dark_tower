@@ -1076,7 +1076,7 @@ and
 
 **Response**:
 1. Break the drop counter down by `reason` **before** concluding back-pressure. Only `egress_queue_overflow` is what this rule measures.
-2. `connection_closed` is routine — every participant leaves every meeting. `no_subscriber` is counted **once per frame**, not once per (frame × subscriber), so in a meeting with nobody subscribed it reads as 100% of egress off a single frame. **Do not widen the selector to include either**; that is the false fire the restriction exists to prevent, and it is why this alert is named for its selector rather than for the runbook scenario.
+2. `connection_closed` is routine — every participant leaves every meeting. `no_subscriber` is counted **once per frame**, not once per (frame × subscriber); when it is routine and when sustained is a fault is read from `docs/observability/metrics/mh-service.md` §`mh_media_frames_dropped_total` (the `no_subscriber` row), not restated here. **Do not widen the selector to include either**; that is the false fire the restriction exists to prevent, and it is why this alert is named for its selector rather than for the runbook scenario.
 3. Sustained overflow means a subscriber the queue cannot drain into fast enough. There is no per-stream lever in this build — the bound is a startup-validated transport parameter. Escalate to `media-handler` with the reason breakdown and the affected pod.
 4. **Nothing may rest on `mh_media_egress_queue_depth` alone** — one process-wide, last-writer-wins gauge fed by N per-subscriber queues, with a scrape interval orders of magnitude longer than the queue's fill-and-drain time. Trend input only.
 
