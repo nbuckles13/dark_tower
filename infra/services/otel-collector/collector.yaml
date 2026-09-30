@@ -169,7 +169,7 @@ processors:
           # whichever they found first.
           #
           # `meeting_id_hash` IS ABSENT BY OMISSION, NOT BY A NAMED DELETE.
-          # That is the whole point: `MediaTransport.ts` (~417-419) spreads the
+          # That is the whole point: `MediaTransport.ts` (`#emitMetric`) spreads the
           # join label bag carrying that hash INSIDE the media directory, so an
           # already-name-allowlisted metric can ACQUIRE the identifier later. A
           # denylist would pass it; an allow-list fails closed.

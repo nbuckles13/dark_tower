@@ -511,8 +511,9 @@ can tell intentional from accidental.)*
 
 Aggregate distributions are safe **only where they actually aggregate**, and that must be asserted of
 the *observable*, not of the label set: a metric partitioned no finer than `pod` still reconstructs a
-single stream's sequence whenever the pod carries one stream — which is not a corner case but the
-loopback shape this design ships with and a routine low-occupancy production state. So the rule is:
+single stream's sequence whenever the pod carries one stream — which is not a corner case but a
+solo or two-person meeting (story 1 shipped exactly this as its loopback shape; loopback is gone since
+story 2, the low-occupancy case is not) and a routine low-occupancy production state. So the rule is:
 **no per-frame time-ordered sequence for any single stream, including where per-stream isolation
 arises from low occupancy rather than from a label.** What is prohibited is resolution that
 reconstructs a *sequence*:
@@ -567,6 +568,113 @@ Plus `key_custody=operator` (§Key custody). That is the whole set.
 > `media/__tests__/media-transport.test.ts` keeps the assertion pinning that — annotated at both
 > sites, because it and the R3 negative test assert opposite things and are both correct. See
 > §The grandfathered set below.
+
+### R4 — Every media-path series is identity-free and carries `key_custody=operator`
+
+**Story 2 (R-28) restates R1-R3 as one checkable rule.** No media-path series carries a meeting,
+participant, sender, key, slot or stream identity. Every media-path series carries
+`key_custody="operator"` (the value `crates/common/src/observability/labels.rs::KEY_CUSTODY_OPERATOR`
+publishes; §Key custody).
+
+**What "media-path series" means (defined here once; the consumers cite this).** A series whose
+metric name begins with one of these prefixes:
+
+```media-path-prefixes
+mh_media_
+mc_media_
+mc_meeting_kek_
+mc_meeting_sender_ids_
+dt_client_media_
+dt_client_time_to_first_media_frame_ms
+```
+
+The last entry is a single exported client media metric outside the `dt_client_media_` prefix. The
+hygiene kernel's `MEDIA_PATH_PREFIXES` is pinned to this block by a unit test.
+
+`mc_meeting_sender_ids_issued_max` is IN by decision: it is the ADR-0036 §2 sender-handle space. It
+observes no frame, but it is the dimension R2 exists to keep out of labels, so it stays under the
+same bar. `dt_client_mh_connection_total` and the other ADR-0028 join-flow metrics are OUT. They are
+the closed grandfathered set (§The grandfathered set), and the collector's name allowlist never
+exports them.
+
+**The identity vocabulary is ONE policy with two consumers, and this fenced block is its only home.**
+
+- `crates/dt-guard/src/client_metrics_export.rs` (`identity_key_forwarded`) applies it at build time
+  to the keys the collector keeps and the keys GC forwards.
+- `crates/env-tests/src/fixtures/metric_hygiene.rs` (`Rule::MediaPathIdentity`) applies it to the
+  stored series.
+
+`dt-guard` reads this block at RUNTIME (no copy, with a positive control), so it cannot drift. The
+kernel keeps a const copy, and its unit test parses this block and fails if the copy differs. Edit
+the block and the kernel consts together.
+
+```identity-label-policy
+containment = meeting, participant, sender, session, slot, stream
+segment = user, key, kek, id, hash
+exempt = key_custody, org_id, slot_state
+```
+
+**One case table for both matchers.** Both consumers iterate this table in their unit tests, so a
+matcher that drifts goes red in whichever crate drifted. Add a row here, never to one crate's test.
+
+```identity-label-cases
+fire = participant_id, meeting_id_hash, stream_id, key_id, kek_id, meetingId, session.id, slot_index, slot_id, x_sender_idx, user, frame_hash, user-id, key-id, sender-id, frame-hash
+pass = key_custody, org_id, slot_state, client_version, reason, outcome, action, source, mode, trigger, payload_kind, instance, job, le, otel_scope_name, otel_scope_version, valid, monkey_business, direction, status
+```
+
+**Matcher semantics.**
+
+- `containment` nouns match anywhere in the lower-cased key. Compounds like `senderIndex` or
+  `x_stream_id` are exactly what a word-boundary matcher misses (see the kernel's `contains_ci`
+  note).
+- `segment` tokens are short enough that containment would false-fire (`id` inside `valid`, `key`
+  inside `monkey`). They match only a whole segment after splitting on every non-alphanumeric character and on
+  camelCase boundaries (the same splitter as `dt-guard`'s `ts_retained_credentials::segments`) (`key_id`, `session.id`, `meetingId`).
+- `exempt` entries are **exact keys**, never segments or prefixes. So `slot_index` and `slot_id`
+  still fire while `slot_state` passes.
+
+The three exemptions:
+
+- `key_custody`: the custody declaration itself, with a single permitted value. It is not a key
+  identity.
+- `org_id`: the tenant. GC overwrites the client-sent value from the authenticated claims (R3 permits
+  it; `crates/gc-service/src/services/telemetry_filter.rs::stamp_org_id`). A tenant is not a meeting
+  or participant identity.
+- `slot_state`: the bounded eight-value state vocabulary from
+  `crates/mc-service/src/media_signaling/assignments.rs::slot_state_label`. It carries no slot index.
+
+**`meeting` overlaps `MEETING_ID_SUBSTRINGS`** in the hygiene kernel (R1). Both fire on
+`meeting_id_hash`. That is deliberate: R1 is the older, broader rule over every metric, and this
+block is R1 plus R2 restricted to the media path.
+
+**On a client series, `instance` names the collector pod, not a browser.** Client series are scraped
+from the collector under `honor_labels: false`, so `instance` and `job` are the collector's target
+labels. Grouping a `dt_client_*` expression `by (instance)` groups by collector, never by
+participant. `dt-guard client-metrics-export` flags that shape in a loaded alert rule
+(`client_alert_groups_by_instance`).
+
+**Suffix rule: `_threshold` is reserved for values that something enforces or alerts on.** A
+published advisory value takes a descriptive suffix instead. The canonical case is
+`mh_media_egress_stream_ceiling_recommended_min`, which is advisory and read by no alert. The
+reason: a `_threshold` spelling tells a responder that something automatic is watching, and an
+advisory value spelled that way reads as coverage that does not exist.
+
+**Story-2 label values** (bounded vocabularies; each is defined in code and catalogued in the
+service catalog):
+
+| Series | Label | Values (source) |
+|---|---|---|
+| `mc_meeting_kek_generated_total` | `trigger` | `crates/mc-service/src/media_admission/rotation.rs` trigger `label()` |
+| `mc_meeting_kek_pushes_total` | `outcome` | per recipient (`crates/mc-service/src/observability/metrics.rs`) |
+| `mc_participant_outbound_messages_dropped_total` | `payload_kind` | including the KEK-update kind |
+| `mh_media_frames_dropped_total` | `reason` | gains `server_muted` (`MediaDropReason`) |
+| `mh_media_stream_admission_total` | `outcome` | admission outcomes |
+| `dt_client_media_kek_updates_total` | `source` | `MEDIA_KEK_SOURCES`, including `kek_update` (two values, deliberately; see `docs/observability/metrics/client.md`) |
+| `dt_client_media_capture_source` | `mode` | the `MediaCaptureSourceMode` type (a type, not a const, so `test_tone` never reaches a production bundle; `packages/sdk-core/src/media/setup/mediaMetrics.ts`) |
+| `dt_client_media_frames_dropped_total` | `reason` | the split key-generation reasons `no_kek_for_generation` and `kek_generation_stale` |
+
+The authoritative value lists are the code enums named in each catalog entry. This table says which
+label each series gained; it is not a second copy of the values.
 
 ### No per-handler dimension on client media metrics — asked twice, answered once
 

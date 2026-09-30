@@ -489,6 +489,85 @@ groups:
           impact: "Audible loss for affected subscribers. Audio is carried one frame per QUIC datagram with no retransmission, so a dropped datagram is a dropped frame. MH readiness, handshake latency and connection-accept rate all read healthy throughout. The client-side send drop is NOT covered by this rule and cannot be - it happens in the sender and MH structurally cannot observe it; see the runbook's client-side ladder."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-17-media-datagram-drop"
 
+      # ------------------------------------------------------------------
+      # ADR-0031 block -- MHMediaEgressEdgeHeadroomLow (story 2 task 16, R-21)
+      #
+      # WHAT IT MEANS: installed egress edges on this handler are approaching
+      # the bound that BINDS FIRST. That bound is the derived egress stream
+      # ceiling (mh_media_egress_stream_ceiling, from the egress budget and
+      # per-stream costs). It is checked before MH_MAX_TOTAL_EGRESS_EDGES, and MH
+      # refuses to start unless the ceiling is at or below that edge limit
+      # (infra/services/mh-service/config.env, the MH_MAX_TOTAL_EGRESS_EDGES
+      # block), so the limit is a defence-in-depth backstop that this
+      # denominator already covers. Dividing by mh_media_egress_edges_limit
+      # instead would fire only after the ceiling was already rejecting (or
+      # never). At the ceiling, new streams are refused at admission
+      # (`rejected_stream_ceiling`; the pending MHMediaEgressBudgetExhausted is
+      # the rejection-side alert). Every new participant in any meeting on the
+      # pod then gets silence, while everyone already talking keeps talking.
+      # This alert is the EARLY warning; that one is the failure.
+      #
+      # FORK LEAK VS LOAD FIRST (the description repeats this):
+      #   LEAK -- edges climb with pod uptime while
+      #           mh_media_meeting_teardowns_total{outcome="released"} stays
+      #           flat: meetings are not being released (an MC that never
+      #           called EndMeeting, e.g. after an MC crash). A TRUE POSITIVE
+      #           for a reclamation regression on a long-lived pod. NEVER tune
+      #           the fraction up to silence it. MC runbook Scenario 20.
+      #   LOAD -- edges track concurrent meetings and participants
+      #           (mh_media_registered_meetings moves with them): real demand.
+      #           The remedy is capacity or placement, not teardown.
+      #
+      # THE ONE LITERAL, AND WHY IT IS NOT A SECOND ENCODING. 0.8 is a headroom
+      # fraction OWNED BY THIS ALERT. It has no config home, so it duplicates
+      # no configured value. That is unlike R-19's rejection threshold, which
+      # has one and is therefore read from its gauge (docs/TODO.md, the
+      # gauge-to-gauge entry for MHMediaEgressBudgetExhausted). No published
+      # headroom gauge exists, and inventing one to avoid a literal would give
+      # the alert's own policy a config key nobody tunes. The bound itself is
+      # NEVER a literal here: mh_media_egress_stream_ceiling publishes the
+      # EgressAdmission field admission reads.
+      # PROVENANCE, STATED HONESTLY: unratified. 20% headroom was chosen to
+      # leave room to act before new joins start failing silently; no join
+      # arrival rate has been measured to turn it into minutes.
+      #
+      # `for: 10m`: an edge count is a level, not a rate, and a short burst of
+      # joins legitimately approaching the bound then falling is not the
+      # signal. Ten minutes matches the story's gauge-vs-gauge warning shape.
+      #
+      # LABEL-SET IDENTITY. `a / b` matches series with equal label sets. Both
+      # gauges carry exactly key_custody plus the scrape labels, and a label
+      # added to ONE of them silently empties the division, so the alert never
+      # fires. Keep them in step (the same caveat as MCKekRotationOverdue).
+      #
+      # NON-ZERO DENOMINATOR: MH refuses to start with a stream ceiling below
+      # MIN_EGRESS_STREAM_CEILING (crates/mh-service/src/config.rs), so the
+      # ceiling gauge is never 0 on a running pod and no `> 0` guard is needed.
+      #
+      # DEMONSTRATION (ADR-0036 §11, both halves). FIRE -- lower the egress
+      # budget in the MH ConfigMap so the derived ceiling falls below the edges
+      # a demo meeting installs, and watch the ratio cross. KIND-ONLY: on a live
+      # pod, lowering the budget IS a join outage (story 2 Operations, "zero
+      # operator-reachable media levers"). PREMISE CORRECTION:
+      # the task text said "lower the edge limit", but MH refuses to start with
+      # the edge limit below the ceiling, so the budget is the lever. APPLY --
+      # confirm the selector matches a real mh container's series (both gauges
+      # present per instance with identical label sets).
+      # ------------------------------------------------------------------
+      - alert: MHMediaEgressEdgeHeadroomLow
+        expr: |
+          mh_media_egress_edges / mh_media_egress_stream_ceiling > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-egress
+        annotations:
+          summary: "MH egress edges near the handler's stream ceiling on {{ $labels.instance }} ({{ $value | humanizePercentage }})"
+          description: "mh_media_egress_edges is above the alert's headroom fraction of mh_media_egress_stream_ceiling, the admission bound that binds first (mh_media_egress_edges_limit, MH_MAX_TOTAL_EGRESS_EDGES, is a backstop at or above it). At the ceiling, new streams are refused at admission (rejected_stream_ceiling), so new participants on this handler get silence while existing ones keep talking. FORK FIRST: LEAK = edges climbing with pod uptime while mh_media_meeting_teardowns_total{outcome=\"released\"} stays flat (meetings not released; MC Scenario 20; a true positive on a long-lived pod, never tune it away). LOAD = edges tracking mh_media_registered_meetings and real demand (add capacity or rebalance placement; teardown is not the remedy)."
+          impact: "New joins on this handler will soon hear nothing while every existing participant and every liveness signal reads healthy."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
+
       - alert: MHHighMemory
         expr: |
           (

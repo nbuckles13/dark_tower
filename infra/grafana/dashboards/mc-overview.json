@@ -695,7 +695,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Actor mailbox depth by actor type. High depth indicates backpressure or slow processing. Warning at 100, critical at 500.",
+      "description": "Actor mailbox depth by actor type. High depth indicates backpressure or slow processing. Alert boundaries are owned by MCHighMailboxDepthWarning and MCHighMailboxDepthCritical (infra/docker/prometheus/rules/mc-alerts.yaml) and are not restated here; this panel's color steps mirror them.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1624,7 +1624,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "GC heartbeat latency percentiles by heartbeat type (fast/comprehensive). SLO target: p99 < 100ms.",
+      "description": "GC heartbeat latency percentiles by heartbeat type (fast/comprehensive). SLO target: the mc_gc_heartbeat_latency_seconds entry in docs/observability/metrics/mc-service.md (cited, not restated; the 'SLO target' series is a hand-copied vector() of it - re-check it against the catalog if the target changes).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1749,7 +1749,7 @@
           },
           "editorMode": "code",
           "expr": "vector(0.1)",
-          "legendFormat": "SLO (100ms)",
+          "legendFormat": "SLO target",
           "range": true,
           "refId": "B"
         }
@@ -1762,7 +1762,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Redis operation latency percentiles by operation type. SLO target: p99 < 10ms.",
+      "description": "Redis operation latency percentiles by operation type. SLO target: the mc_redis_latency_seconds entry in docs/observability/metrics/mc-service.md (cited, not restated; the 'SLO target' series is a hand-copied vector() of it - re-check it against the catalog if the target changes).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1887,7 +1887,7 @@
           },
           "editorMode": "code",
           "expr": "vector(0.01)",
-          "legendFormat": "SLO (10ms)",
+          "legendFormat": "SLO target",
           "range": true,
           "refId": "B"
         }
@@ -1913,7 +1913,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Redis operation latency percentiles (p50, p95, p99). SLO target: p99 < 10ms.",
+      "description": "Redis operation latency percentiles (p50, p95, p99). SLO target: the mc_redis_latency_seconds entry in docs/observability/metrics/mc-service.md (cited, not restated; the 'SLO target' series is a hand-copied vector() of it - re-check it against the catalog if the target changes).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2060,7 +2060,7 @@
           },
           "editorMode": "code",
           "expr": "vector(0.01)",
-          "legendFormat": "SLO (10ms)",
+          "legendFormat": "SLO target",
           "range": true,
           "refId": "D"
         }
@@ -2183,7 +2183,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "GC heartbeat latency percentiles (p50, p95, p99). SLO target: p99 < 100ms.",
+      "description": "GC heartbeat latency percentiles (p50, p95, p99). SLO target: the mc_gc_heartbeat_latency_seconds entry in docs/observability/metrics/mc-service.md (cited, not restated; the 'SLO target' series is a hand-copied vector() of it - re-check it against the catalog if the target changes).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2330,7 +2330,7 @@
           },
           "editorMode": "code",
           "expr": "vector(0.1)",
-          "legendFormat": "SLO (100ms)",
+          "legendFormat": "SLO target",
           "range": true,
           "refId": "D"
         }
@@ -3278,7 +3278,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Meeting key-encryption keys generated (ADR-0036 Sec 4), split by what caused them. meeting_created is one per meeting actor; participant_left is the leave-debounced rotation (at most one per meeting per W); sender_space_exhausted is the immediate KEK-epoch reset when a meeting's sender_id namespace runs out. Never read the three as one rate: they have different bounds and different alerts (participant_left -> MCKekRotationStorm; sender_space_exhausted -> MCKekEpochResetOnSenderIdExhaustion, info). Carries key_custody=operator: media is encrypted between clients; MH, transport and storage cannot read it; MC can. That is accepted operator custody, NOT end-to-end and NOT zero-trust. NOT a missing-key-material signal; that is the client-side MCMediaMissingKeyMaterial.",
+      "description": "Meeting key-encryption keys generated (ADR-0036 Sec 4), split by what caused them. meeting_created is one per meeting actor; participant_left is the leave-debounced rotation (at most one per meeting per W - MC_KEK_ROTATION_DEBOUNCE_SECONDS, published as mc_meeting_kek_rotation_window_seconds); sender_space_exhausted is the immediate KEK-epoch reset when a meeting's sender_id namespace runs out. Never read the three as one rate: they have different bounds and different alerts (participant_left -> MCKekRotationStorm; sender_space_exhausted -> MCKekEpochResetOnSenderIdExhaustion, info). Carries key_custody=operator: media is encrypted between clients; MH, transport and storage cannot read it; MC can. That is accepted operator custody, NOT end-to-end and NOT zero-trust. NOT a missing-key-material signal; that is the client-side MCMediaMissingKeyMaterial. The rest of the rotation lifecycle - pending age vs W vs the overdue threshold (MCKekRotationOverdue), per-recipient push outcomes, rotation duration and failures - is on the MC Media dashboard's KEK Lifecycle row, deliberately not duplicated here.",
       "fieldConfig": {
         "defaults": {
           "color": {

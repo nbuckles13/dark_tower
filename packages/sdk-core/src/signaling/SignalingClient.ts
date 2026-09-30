@@ -650,8 +650,11 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         return;
       }
       case 'meetingKekUpdate': {
-        // A rotation, or a reconnect re-issue — indistinguishable here, and
-        // deliberately counted under one `source`. The KEK goes straight into the
+        // A rotation push. `MeetingKekUpdate` is sent only by MC's rotation
+        // path (a reconnect re-issue rides the JoinResponse-shaped reconnect
+        // result, so it is `join_response`). The rotation's CAUSE is not
+        // visible here and is deliberately not a `source` value; it lives on
+        // MC's `trigger` label. The KEK goes straight into the
         // holder and the decoded field is scrubbed, exactly as for the join
         // response; the holder decides whether it demotes, is a redelivery, or
         // is refused.

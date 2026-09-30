@@ -259,7 +259,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Whether MC could resolve a participant's sender_id for the Media Handler that asked, and if not why (ADR-0036 \u00a72, \u00a74; R-15). Increments once per NotifyParticipantConnected RESPONSE MC emits. READ THIS BEFORE COMPARING WITH MH: MH sees only sender_id==0 and structurally cannot tell the three unresolved outcomes apart - its declined_no_sender_binding is the UNION of all three. This panel is the only place the split exists, and the outcomes triage differently: meeting_unknown is a routing/registration fault whose remedy is in the MC-MH registration path; participant_unknown is an expected low-rate race between MH's connect notification and MC's join completing; registry_full is RETIRED (story 2 task 20: the connection registry and its cap are gone; MC never declines a binding for capacity) - a non-zero value can only come from an MC image predating the retirement during a rolling deploy, version skew, NOT a capacity signal; user_ambiguous is one user with two roster entries for one sub, which NEVER self-clears and which RECONNECTING CAUSES - so the participant_unknown remedy (reconnect) is actively HARMFUL here and there is no operator remedy (full triage in mh-incident-response.md Scenario 15 Step 2). connection_id does NOT resolve it: it tells MH connections apart, not MC joins (docs/TODO.md, 'user_ambiguous has no operator remedy'). THE sender_id VALUE IS NEVER A LABEL (ADR-0036 \u00a711): outcome carries the triage signal as a bounded token instead of 65535 values. No meeting id, participant id or sender id appears as a label. DENOMINATOR NOTE: sum() over this metric equals mc_mh_notifications_received_total{event_type=\"connected\"} by construction - same path, same gate - so do not alert on both as if they were independent.",
+      "description": "Whether MC could resolve a participant's sender_id for the Media Handler that asked, and if not why (ADR-0036 \u00a72, \u00a74; R-15). Increments once per NotifyParticipantConnected RESPONSE MC emits. READ THIS BEFORE COMPARING WITH MH: MH sees only sender_id==0 and structurally cannot tell the three unresolved outcomes apart - its declined_no_sender_binding is the UNION of all three. This panel is the only place the split exists, and the outcomes triage differently: meeting_unknown is a routing/registration fault whose remedy is in the MC-MH registration path; participant_unknown is an expected low-rate race between MH's connect notification and MC's join completing; registry_full is RETIRED (story 2 task 20: the connection registry and its cap are gone; MC never declines a binding for capacity) - a non-zero value can only come from an MC image predating the retirement during a rolling deploy, version skew, NOT a capacity signal; user_ambiguous is one user with two roster entries for one sub, which NEVER self-clears and which RECONNECTING CAUSES - so the participant_unknown remedy (reconnect) is actively HARMFUL here and there is no operator remedy (full triage in mh-incident-response.md Scenario 15 Step 2). connection_id does NOT resolve it: it tells MH connections apart, not MC joins (docs/TODO.md, 'user_ambiguous has no operator remedy'). THE sender_id VALUE IS NEVER A LABEL (ADR-0036 \u00a711): outcome carries the triage signal as a bounded token instead of one value per sender_id in the u16 namespace. No meeting id, participant id or sender id appears as a label. DENOMINATOR NOTE: sum() over this metric equals mc_mh_notifications_received_total{event_type=\"connected\"} by construction - same path, same gate - so do not alert on both as if they were independent.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -950,7 +950,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - emitted means COMPOSED, not delivered, and this panel is the stream-channel-FULL half of what happened next. The participant-mailbox-CLOSED half is Slot View Emissions outcome=delivery_failed - an EARLIER hop, disjoint from this one. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard. (mc_media_unmatched_plan_slots_total, formerly the other half of this panel, is RETIRED in story 2: plans are derived from declared slots, so it was identically zero.) Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "NO SLOT-OCCUPANCY GAUGE EXISTS, SO THIS IS NOT 'slots used / cap' AND MUST NOT BE READ AS ONE. MC publishes no count of filled receive slots: mc_media_slot_states_total counts slot states CONVEYED (one per declared slot per StreamAssignments sent) and mc_media_receive_slot_cap is a config echo. What this panel shows instead - the honest substitute, not the requested ratio: LEFT AXIS, the share of conveyed slot states that carried a source (active or source_muted) out of all conveyed. Emission-weighted, so a meeting with churn weighs more than a quiet one (see Slot States). A low share is the healthy steady state of meetings with fewer other participants than the declared N (fewer_sources_than_slots - every solo participant included, since loopback is removed, R-3); it is not a fault. RIGHT AXIS, the published cap (mc_media_receive_slot_cap, publishing MC_MAX_RECEIVE_SLOTS from the ClientMediaConfig field every capability parse enforces): the bound every client's declared N is checked against. A cap below the clients' N shows as slot_count_over_cap on Receive Capability Declarations, never here. The pair says whether declared slots are being filled and against which configured bound clients declare; it CANNOT say how close any meeting is to the cap. That reading needs an occupancy gauge that does not exist today. Guarded: the '> 0' on the conveyed total makes a window with no emissions read as no data rather than NaN; empty is healthy when no StreamAssignments were sent. key_custody=operator. No meeting, participant, slot or sender identity is on either series.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -959,7 +959,7 @@
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "",
+            "axisLabel": "Filled share",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -996,9 +996,30 @@
               }
             ]
           },
-          "unit": "none"
+          "unit": "percentunit"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Slots"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -1006,7 +1027,7 @@
         "x": 12,
         "y": 26
       },
-      "id": 61,
+      "id": 187,
       "options": {
         "legend": {
           "calcs": [
@@ -1029,13 +1050,24 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[$__rate_interval]))",
-          "legendFormat": "dropped: {{payload_kind}}",
+          "expr": "sum(rate(mc_media_slot_states_total{slot_state=~\"active|source_muted\"}[$__rate_interval]))\n/\nsum(rate(mc_media_slot_states_total[$__rate_interval]))\nand\nsum(rate(mc_media_slot_states_total[$__rate_interval])) > 0",
+          "legendFormat": "filled share of conveyed slots",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_receive_slot_cap)",
+          "legendFormat": "slot cap (MC_MAX_RECEIVE_SLOTS)",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Dropped Outbound Messages",
+      "title": "Receive Slot Fill vs Cap",
       "type": "timeseries"
     },
     {
@@ -1043,7 +1075,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Client MuteRequest dispositions (ADR-0036 \u00a75). This metric PARTITIONS mute reports: every post-join MuteRequest lands in exactly one bucket. THE SUCCESS SET IS {applied, applied_no_recompose} - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count two routine states as failures. GREEN applied: the audio flag moved on a declared connection and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. DARK GREEN applied_no_recompose: reported, with nothing to re-convey - either no receive capability has been declared yet, or ONLY video_muted changed, and the slot view reads only audio mute, so no subscriber's view changes. Expect applied_no_recompose to be the largest bucket once clients wire camera buttons; it is what an ordinary camera toggle produces. BLUE unchanged: identical to the report already in force - MC correctly did nothing, not a failure. USE applied + applied_no_recompose AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate for a tuple compare, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (burst 8, sustained 4/s per connection). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's audio_self_muted once spent, leaving every other client rendering a live speaker as muted for the rest of the session. Dropping a report is safe because \u00a75 enforces client mute at CAPTURE on the client, so the audio genuinely stops and only the indicator is stale. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "description": "Client MuteRequest dispositions (ADR-0036 \u00a75). This metric PARTITIONS mute reports: every post-join MuteRequest lands in exactly one bucket. THE SUCCESS SET IS {applied, applied_no_recompose} - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count two routine states as failures. GREEN applied: the audio flag moved on a declared connection and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. DARK GREEN applied_no_recompose: reported, with nothing to re-convey - either no receive capability has been declared yet, or ONLY video_muted changed, and the slot view reads only audio mute, so no subscriber's view changes. Expect applied_no_recompose to be the largest bucket once clients wire camera buttons; it is what an ordinary camera toggle produces. BLUE unchanged: identical to the report already in force - MC correctly did nothing, not a failure. USE applied + applied_no_recompose AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate for a tuple compare, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (per connection; burst MUTE_WORK_BURST, one token refilled per MUTE_WORK_REFILL_INTERVAL_MS - both in crates/mc-service/src/webtransport/connection.rs, cited rather than restated). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's audio_self_muted once spent, leaving every other client rendering a live speaker as muted for the rest of the session. Dropping a report is safe because \u00a75 enforces client mute at CAPTURE on the client, so the audio genuinely stops and only the indicator is stale. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1212,6 +1244,471 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
+      "description": "ServerMuteRequest dispositions by action (the verb ASKED for: mute | unmute, never its result) and outcome (story 2 task 12; ADR-0036 \u00a75, \u00a77). Counted SEPARATELY from client mute (Mute Requests by Outcome): different decider, enforcement point (MH ingress, not client capture) and remedy. PARTITIONS requests. The failure predicate is POSITIVE: outcome=~\"rate_limited|actor_unavailable\" - do not harmonise it to outcome!=\"applied\". not_permitted vs unknown_target: the metric distinguishes two refusals the CLIENT never can (one byte-identical wire error) - deliberate, do not harmonise. unknown_target is reachable ONLY for a host requester, because authority is checked before the target is looked up. not_permitted is CLIENT-INFLATABLE (the check precedes any actor hop) - NEVER use it in a ratio denominator and never alert on its raw rate. No alert on this panel by decision: non-zero mute is healthy moderation. Not a join key with the client's dt_client_media_mute_transitions_total{action} despite identical values.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "id": 178,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (action, outcome) (increase(mc_media_server_mute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{action}}/{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Server Mute Requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Participant UnmuteRequest dispositions: a server-muted participant asking the host(s) to lift its mute. NOTIFIES ONLY - it never clears a mute (the single writer is the host's ServerMuteRequest). ONE increment per request, never per host relayed to; a per-host delivery failure is the later hop (Dropped Outbound Messages, signaling_raw), disjoint from this panel. Failure predicate, positive: outcome=~\"rate_limited|actor_unavailable\". not_server_muted and no_host_connected are ROUTINE (no_host_connected is normal once the host has left). not_server_muted is client-driven: keep it out of any ratio denominator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "id": 179,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mc_media_unmute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Unmute Requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "How many participants MC believes are SERVER-muted (audio) right now, summed across each MC instance's meetings (one series per instance) - a STATE level, not an event rate: a mute applied yesterday is still here while Server Mute Requests stays flat. Present at zero from process start. Recomputed from live state on the controller's health walk, so it cannot drift after an actor dies. Read it against MH's server_muted drops at FLEET level only (sum across MC pods vs sum of mh_media_frames_dropped_total{reason=\"server_muted\"} rate across MH pods) and DIRECTIONALLY - never divided, never per instance (MC and MH meeting sets do not nest). Gauge > 0 with a flat fleet drop rate is only a candidate disagreement: a muted participant who is silent, disconnected or in grace drops nothing. It does not answer whether ONE meeting has a mute in force.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "id": 181,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance) (mc_media_server_muted_sources)",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Server-Muted Sources",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Refusal REPLIES withheld by a path's reply limiter, by surface (server_mute | capability). EXPECTED EMPTY - a legitimate client never reaches a reply burst, so zero is healthy and the series is present at zero from process start (absent = pipeline fault, not calm). NOT a refusal count: every refusal is counted on its own path (Server Mute Requests outcome=not_permitted|unknown_target, or a Receive Capability rejection) whether or not the reply went out. EVERY suppressed reply is counted here; only the FIRST is logged per connection, so a single WARN does not mean a single suppression. Non-zero: some connection is looping refused requests (an SDK bug, or a probe). No alert: client-inflatable by construction.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "id": 180,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (surface) (increase(mc_media_refusal_replies_suppressed_total[$__rate_interval]))",
+          "legendFormat": "{{surface}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Suppressed Refusal Replies",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - emitted means COMPOSED, not delivered, and this panel is the stream-channel-FULL half of what happened next. The participant-mailbox-CLOSED half is Slot View Emissions outcome=delivery_failed - an EARLIER hop, disjoint from this one. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard. (mc_media_unmatched_plan_slots_total, formerly the other half of this panel, is RETIRED in story 2: plans are derived from declared slots, so it was identically zero.) Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "id": 61,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[$__rate_interval]))",
+          "legendFormat": "dropped: {{payload_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dropped Outbound Messages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
       "description": "Dispositions of dirty participants in the meeting actor's server-driven slot-view flush (ADR-0036 \u00a75/\u00a76; story 2): after a join, leave, declaration or mute the actor re-emits each affected declared participant's changed SendDirective and StreamAssignments, at most SLOT_VIEW_FLUSH_BATCH per actor turn. THIS DOES NOT PARTITION EMISSIONS - a participant deferred on three turns and sent on the fourth counts four times. SUCCESS SET {sent, deferred}: GREEN sent, BLUE deferred - deferred is the ROUTINE shape of the bound under load (the view is carried, coalesced and never dropped), NOT a failure. FAILURE PREDICATE, stated positively on purpose: outcome=~\"delivery_failed|composition_failed\" - a later value defaults to not-a-failure. RED composition_failed is an MC DEFECT (any non-zero is a bug; the stage is on Send Directives, which is the alerting home - do not alert on both). ORANGE delivery_failed is environmental: the participant actor was gone. No meeting, participant, slot or sender identity is a label.",
       "fieldConfig": {
         "defaults": {
@@ -1326,8 +1823,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 34
+        "x": 0,
+        "y": 58
       },
       "id": 159,
       "options": {
@@ -1360,69 +1857,6 @@
       ],
       "title": "Slot View Emissions by Outcome",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "The configured MC_MAX_RECEIVE_SLOTS, published from the SAME ClientMediaConfig field every connection's capability parse enforces. A CONFIG ECHO, NOT A UTILISATION GAUGE - there is no numerator; do not build a 'slots used / cap' ratio. Read beside Receive Capability Declarations: a rising slot_count_over_cap with a cap below the clients' configured N is a configuration mismatch (R-1), not a client bug.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 12,
-        "x": 0,
-        "y": 42
-      },
-      "id": 158,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "max(mc_media_receive_slot_cap)",
-          "instant": true,
-          "legendFormat": "slot cap",
-          "range": false,
-          "refId": "A"
-        }
-      ],
-      "title": "Receive Slot Cap",
-      "type": "stat"
     },
     {
       "datasource": {
@@ -1484,7 +1918,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 42
+        "y": 58
       },
       "id": 161,
       "options": {
@@ -1577,7 +2011,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 46
+        "y": 66
       },
       "id": 160,
       "options": {
@@ -1616,48 +2050,18 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "ServerMuteRequest dispositions by action (the verb ASKED for: mute | unmute, never its result) and outcome (story 2 task 12; ADR-0036 \u00a75, \u00a77). Counted SEPARATELY from client mute (Mute Requests by Outcome): different decider, enforcement point (MH ingress, not client capture) and remedy. PARTITIONS requests. The failure predicate is POSITIVE: outcome=~\"rate_limited|actor_unavailable\" - do not harmonise it to outcome!=\"applied\". not_permitted vs unknown_target: the metric distinguishes two refusals the CLIENT never can (one byte-identical wire error) - deliberate, do not harmonise. unknown_target is reachable ONLY for a host requester, because authority is checked before the target is looked up. not_permitted is CLIENT-INFLATABLE (the check precedes any actor hop) - NEVER use it in a ratio denominator and never alert on its raw rate. No alert on this panel by decision: non-zero mute is healthy moderation. Not a join key with the client's dt_client_media_mute_transitions_total{action} despite identical values.",
+      "description": "The configured MC_MAX_RECEIVE_SLOTS, published from the SAME ClientMediaConfig field every connection's capability parse enforces. A CONFIG ECHO, NOT A UTILISATION GAUGE - there is no numerator; do not build a 'slots used / cap' ratio. Receive Slot Fill vs Cap reads the nearest honest substitute beside it. Read beside Receive Capability Declarations: a rising slot_count_over_cap with a cap below the clients' configured N is a configuration mismatch (R-1), not a client bug.",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+            "mode": "thresholds"
           },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "blue",
                 "value": null
               }
             ]
@@ -1667,119 +2071,25 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 54
-      },
-      "id": 178,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum by (action, outcome) (increase(mc_media_server_mute_requests_total[$__rate_interval]))",
-          "legendFormat": "{{action}}/{{outcome}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Server Mute Requests",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "Participant UnmuteRequest dispositions: a server-muted participant asking the host(s) to lift its mute. NOTIFIES ONLY - it never clears a mute (the single writer is the host's ServerMuteRequest). ONE increment per request, never per host relayed to; a per-host delivery failure is the later hop (Dropped Outbound Messages, signaling_raw), disjoint from this panel. Failure predicate, positive: outcome=~\"rate_limited|actor_unavailable\". not_server_muted and no_host_connected are ROUTINE (no_host_connected is normal once the host has left). not_server_muted is client-driven: keep it out of any ratio denominator.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
+        "h": 4,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 66
       },
-      "id": 179,
+      "id": 158,
       "options": {
-        "legend": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
           "calcs": [
-            "mean",
             "lastNotNull"
           ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
+        "textMode": "auto"
       },
       "targets": [
         {
@@ -1788,200 +2098,15 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (increase(mc_media_unmute_requests_total[$__rate_interval]))",
-          "legendFormat": "{{outcome}}",
-          "range": true,
+          "expr": "max(mc_media_receive_slot_cap)",
+          "instant": true,
+          "legendFormat": "slot cap",
+          "range": false,
           "refId": "A"
         }
       ],
-      "title": "Unmute Requests",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "Refusal REPLIES withheld by a path's reply limiter, by surface (server_mute | capability). EXPECTED EMPTY - a legitimate client never reaches a reply burst, so zero is healthy and the series is present at zero from process start (absent = pipeline fault, not calm). NOT a refusal count: every refusal is counted on its own path (Server Mute Requests outcome=not_permitted|unknown_target, or a Receive Capability rejection) whether or not the reply went out. EVERY suppressed reply is counted here; only the FIRST is logged per connection, so a single WARN does not mean a single suppression. Non-zero: some connection is looping refused requests (an SDK bug, or a probe). No alert: client-inflatable by construction.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 62
-      },
-      "id": 180,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum by (surface) (increase(mc_media_refusal_replies_suppressed_total[$__rate_interval]))",
-          "legendFormat": "{{surface}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Suppressed Refusal Replies",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "How many participants MC believes are SERVER-muted (audio) right now, summed across each MC instance's meetings (one series per instance) - a STATE level, not an event rate: a mute applied yesterday is still here while Server Mute Requests stays flat. Present at zero from process start. Recomputed from live state on the controller's health walk, so it cannot drift after an actor dies. Read it against MH's server_muted drops at FLEET level only (sum across MC pods vs sum of mh_media_frames_dropped_total{reason=\"server_muted\"} rate across MH pods) and DIRECTIONALLY - never divided, never per instance (MC and MH meeting sets do not nest). Gauge > 0 with a flat fleet drop rate is only a candidate disagreement: a muted participant who is silent, disconnected or in grace drops nothing. It does not answer whether ONE meeting has a mute in force.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 62
-      },
-      "id": 181,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum by (instance) (mc_media_server_muted_sources)",
-          "legendFormat": "{{instance}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Server-Muted Sources",
-      "type": "timeseries"
+      "title": "Receive Slot Cap",
+      "type": "stat"
     },
     {
       "collapsed": false,
@@ -1989,7 +2114,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 74
       },
       "id": 163,
       "panels": [],
@@ -2116,7 +2241,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 75
       },
       "id": 164,
       "options": {
@@ -2240,7 +2365,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 75
       },
       "id": 165,
       "options": {
@@ -2333,7 +2458,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 79
+        "y": 83
       },
       "id": 166,
       "options": {
@@ -2426,7 +2551,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 79
+        "y": 83
       },
       "id": 167,
       "options": {
@@ -2550,7 +2675,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 87
+        "y": 91
       },
       "id": 168,
       "options": {
@@ -2643,7 +2768,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 87
+        "y": 91
       },
       "id": 169,
       "options": {
@@ -2706,7 +2831,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 95
+        "y": 99
       },
       "id": 170,
       "options": {
@@ -2746,7 +2871,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 99
+        "y": 103
       },
       "id": 171,
       "panels": [],
@@ -2758,7 +2883,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Age of the OLDEST un-rotated departure across live meetings (a MAXIMUM, sampled every 5s from times the meeting actors recorded, so a wedged actor still ages), beside the overdue threshold (W x 2) and W itself. MCKekRotationOverdue pages when pending age exceeds the threshold for 2m. Healthy: a sawtooth that climbs to about W and drops to 0 at each rotation, never reaching the threshold. While pending age is above zero, a departed participant still holds a working KEK: this is a confidentiality exposure window, not a media-quality one. Pending age is cleared AT ROTATION, not when every push succeeds - undelivered pushes are the KEK Push Outcomes panel.",
+      "description": "Age of the OLDEST un-rotated departure across live meetings (mc_meeting_kek_rotation_pending_age_seconds; a MAXIMUM, refreshed every KEK_GAUGE_REFRESH_INTERVAL in crates/mc-service/src/media_admission/rotation.rs from times the meeting actors recorded, so a wedged actor still ages), beside W itself (mc_meeting_kek_rotation_window_seconds, publishing MC_KEK_ROTATION_DEBOUNCE_SECONDS) and the overdue threshold (mc_meeting_kek_rotation_overdue_threshold_seconds, W x KEK_ROTATION_OVERDUE_MULTIPLIER). MCKekRotationOverdue pages when pending age exceeds the overdue-threshold GAUGE - gauge vs gauge, no literal; its `for` duration lives in the rule (infra/docker/prometheus/rules/mc-alerts.yaml). Healthy: a sawtooth that climbs to about W and drops to 0 at each rotation, never reaching the threshold. While pending age is above zero, a departed participant still holds a working KEK: this is a confidentiality exposure window, not a media-quality one. Pending age is cleared AT ROTATION, not when every push succeeds - undelivered pushes are the KEK Push Outcomes panel. Rotations by trigger are on MC Overview's Meeting KEK Issuance by Trigger panel.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2812,7 +2937,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 100
+        "y": 104
       },
       "id": 172,
       "options": {
@@ -2873,7 +2998,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "One MeetingKekUpdate outcome per rostered recipient per rotation (ADR-0036 Sec 4). delivered = handed to the connection's outbound stream (not a client ack). participant_gone = rostered but no live connection (reconnect grace) - BENIGN, it gets the current KEK on return. dropped_outbound = outbound channel full or closed. actor_unavailable = participant actor exited or its mailbox closed (MCActorPanic territory). timed_out = no answer within 2s (read mc_actor_mailbox_depth; MCHighMailboxDepthCritical territory). Every non-delivered, non-gone push is a security residual: that member never rotates its own transmit keys, so a departed participant keeps opening THAT member's media past W. MCKekPushFailureRate fires on outcome!~\"delivered|participant_gone\" above 1% for 10m.",
+      "description": "One MeetingKekUpdate outcome per rostered recipient per rotation (ADR-0036 Sec 4). delivered = handed to the connection's outbound stream (not a client ack). participant_gone = rostered but no live connection (reconnect grace) - BENIGN, it gets the current KEK on return. dropped_outbound = outbound channel full or closed. actor_unavailable = participant actor exited or its mailbox closed (MCActorPanic territory). timed_out = no answer within KEK_PUSH_OUTCOME_TIMEOUT (crates/mc-service/src/media_admission/rotation.rs; read mc_actor_mailbox_depth; MCHighMailboxDepthCritical territory). Every non-delivered, non-gone push is a security residual: that member never rotates its own transmit keys, so a departed participant keeps opening THAT member's media past W. MCKekPushFailureRate fires on the outcome!~\"delivered|participant_gone\" share; its threshold and duration live in the rule (infra/docker/prometheus/rules/mc-alerts.yaml) and are not restated here.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2927,7 +3052,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 100
+        "y": 104
       },
       "id": 173,
       "options": {
@@ -2966,7 +3091,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Time from the rotation decision to the LAST per-recipient push outcome - the window in which some members hold the new key and others do not. Bounded above by the 2s outcome timeout, which the top bucket covers. The p99 tail matters most: it is the portion that can overlap the next rotation.",
+      "description": "Time from the rotation decision to the LAST per-recipient push outcome - the window in which some members hold the new key and others do not. Bounded above by the per-push outcome timeout KEK_PUSH_OUTCOME_TIMEOUT (crates/mc-service/src/media_admission/rotation.rs), which the top bucket covers. The p99 tail matters most: it is the portion that can overlap the next rotation.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3020,7 +3145,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 108
+        "y": 112
       },
       "id": 174,
       "options": {
@@ -3135,7 +3260,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 108
+        "y": 112
       },
       "id": 175,
       "options": {
@@ -3185,7 +3310,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rotations that could not be performed; the KEK was left UNCHANGED. Zero is healthy. While this is non-zero every departed participant keeps a working KEK (the W bound is SUSPENDED, not delayed) and MCKekRotationOverdue pages. rng is the live arm (CSPRNG failure, retried after W). generation_exhausted is permanent for the meeting (u16 KEK generation at its ceiling, ~22.7 days of uninterrupted rotation at the W floor) and the page will not clear until the meeting ends.",
+      "description": "Rotations that could not be performed; the KEK was left UNCHANGED. Zero is healthy. While this is non-zero every departed participant keeps a working KEK (the W bound is SUSPENDED, not delayed) and MCKekRotationOverdue pages. rng is the live arm (CSPRNG failure, retried after W). generation_exhausted is permanent for the meeting (u16 KEK generation at its ceiling - u16 generations x the W floor MIN_KEK_ROTATION_DEBOUNCE_SECONDS in crates/mc-service/src/config.rs, i.e. weeks of uninterrupted rotation) and the page will not clear until the meeting ends.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3239,7 +3364,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 116
+        "y": 120
       },
       "id": 176,
       "options": {
@@ -3278,7 +3403,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "The highest sender_id namespace consumption across live meetings, in the CURRENT epoch - cursor consumption including ids skipped by an epoch reset's exclusion snapshot, so NOT a count of admissions and not comparable to a join count. Resets at each epoch. At 65535 MC rotates the KEK and reissues from a fresh namespace (sender_space_exhausted on the issuance panel); the meeting keeps admitting. A high value means a flapping client or a scripted join loop: flapper eviction does not ship, and this is its visibility. Deliberately no alert.",
+      "description": "The highest sender_id namespace consumption across live meetings, in the CURRENT epoch - cursor consumption including ids skipped by an epoch reset's exclusion snapshot, so NOT a count of admissions and not comparable to a join count. Resets at each epoch. When the u16 namespace is exhausted (NonZeroU16, anchored to KEY_ID_SENDER_ID_BITS in crates/mc-service/src/media_admission/sender_id.rs) MC rotates the KEK and reissues from a fresh namespace (sender_space_exhausted on the issuance panel); the meeting keeps admitting. A high value means a flapping client or a scripted join loop: flapper eviction does not ship, and this is its visibility. Deliberately no alert.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3302,7 +3427,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 116
+        "y": 120
       },
       "id": 177,
       "options": {

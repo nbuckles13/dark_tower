@@ -386,9 +386,10 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **The three values are NEVER summed into one rate.** They have different bounds and different alerts:
   - `meeting_created` — one per meeting actor. Alerted by nothing.
   - `participant_left` — the leave-debounced rotation, at most one per meeting per W. → `MCKekRotationStorm`.
-  - `sender_space_exhausted` — the immediate KEK-epoch reset when a meeting's `sender_id` namespace runs out. Exempt from the debounce, bounded by 65,536 admissions. → `MCKekEpochResetOnSenderIdExhaustion` (info).
+  - `sender_space_exhausted` — the immediate KEK-epoch reset when a meeting's `sender_id` namespace runs out. Exempt from the debounce, bounded by the `sender_id` namespace (`NonZeroU16`, pinned to `media_protocol::frame::KEY_ID_SENDER_ID_BITS` in `media_admission/sender_id.rs`). → `MCKekEpochResetOnSenderIdExhaustion` (info).
 - **Alert partition — a new `trigger` value MUST be classified into exactly one of the above.** The storm rule uses a POSITIVE selector (`trigger="participant_left"`), so an unclassified new value is **silently unalerted**. This is the one place in the KEK telemetry that trades fail-closed for semantic honesty: the storm threshold `2/W` is derived from the debounce and can never be approached by an arm the debounce does not govern, so a per-trigger storm series would read as coverage while being unable to fire.
 - **No longer identically the meeting-creation count.** It was until story 2 task 9, when rotation landed; the `meeting_created` series still is.
+- **THIS LABEL IS WHERE RECONNECT RE-ISSUE AND ROTATION ARE TOLD APART — the client cannot.** A reconnect re-issues the CURRENT KEK, generation and W without a rotation (`actors/meeting.rs`, the R-15 comment in the reconnect path), so it increments NO `trigger` here; a rotation increments `participant_left` or `sender_space_exhausted`. **They do NOT reach the client the same way** (corrected at story 2 task 16). A re-issue rides the JoinResponse-shaped reconnect result and counts as `dt_client_media_kek_updates_total{source="join_response"}`; a rotation is a `MeetingKekUpdate` push and counts as `source="kek_update"`. The client cannot tell a rotation's CAUSE, which is why this label carries it and the client keeps a DELIBERATE two-value vocabulary (`MEDIA_KEK_SOURCES` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`; recorded in `docs/observability/metrics/client.md`). Do not add a third client `source` value to split them: the client does not have the information, and the split already exists here.
 - **Still NOT a "missing key material" signal.** That condition is per-join and client-observed (`MCMediaMissingKeyMaterial`, on `dt_client_media_frames_dropped_total`).
 - **Emits no key material and no generation.** A per-meeting generation series would be a membership-change trace. *Which* meeting is answered by the meeting actor's span.
 - **Recorded in**: `actors/meeting.rs` at meeting-actor creation, `rotate_due` and the epoch reset in `handle_join`, via `observability/metrics.rs::record_meeting_kek_generated`
@@ -407,11 +408,12 @@ zero-trust measure: MC generates and holds every KEK it issues.
   - `dropped_outbound` — the outbound stream channel was full or closed. Also on `mc_participant_outbound_messages_dropped_total{payload_kind="meeting_kek_update"}`.
   - `participant_gone` — rostered but no live connection (inside the reconnect grace period). **Benign**: a returning participant receives the current KEK, on reconnect re-issue or a fresh join.
   - `actor_unavailable` — the participant actor exited or its mailbox closed. `MCActorPanic` territory.
-  - `timed_out` — handed to the mailbox and no answer within 2 s. **Names the observable, not an inferred cause**: MC cannot tell a wedged actor from a lost reply or a slow turn. Read `mc_actor_mailbox_depth`; `MCHighMailboxDepthCritical` territory. Distinct from `actor_unavailable` because the remedy is.
+  - `timed_out` — handed to the mailbox and no answer within `KEK_PUSH_OUTCOME_TIMEOUT` (`media_admission/rotation.rs`). **Names the observable, not an inferred cause**: MC cannot tell a wedged actor from a lost reply or a slow turn. Read `mc_actor_mailbox_depth`; `MCHighMailboxDepthCritical` territory. Distinct from `actor_unavailable` because the remedy is.
 - **Exactly one increment per recipient, including a silent one.** A recipient that never answers is recorded as `timed_out` rather than dropped from the tally — otherwise it would leave BOTH the numerator and the denominator of the failure ratio, and `MCKekPushFailureRate` would get *quieter* as more actors wedged.
 - **The security residual this is the only control for:** a member whose push is not delivered never rotates its own transmit keys, so a departed participant keeps opening THAT member's media past W.
+- **PER RECIPIENT, SO THIS IS THE SMALL-DENOMINATOR DETECTOR.** `MCMediaMissingKeyMaterial` is a FLEET-WIDE client ratio (`dt_client_media_frames_dropped_total` over `dt_client_media_frames_received_total`): one client in a hundred whose pushes always fail reads about 1% there forever and never crosses its threshold. This counter sees that one recipient's failed push directly, which is why the `MCMediaMissingKeyMaterial` rule comment in `infra/docker/prometheus/rules/mc-alerts.yaml` names it (with `MCClientKekConflictingKey` for the unwrap split) as that alert's compensating control. The client-side symptom of a failed push is `no_kek_for_generation`.
 - **Recorded in**: `media_admission/rotation.rs::collect_push_outcomes` via `observability/metrics.rs::record_kek_push`
-- **Alert**: `MCKekPushFailureRate` (warning, `outcome!~"delivered|participant_gone"` > 1% for 10m — negated so a value added later fails CLOSED into the alert)
+- **Alert**: `MCKekPushFailureRate` (warning; selects `outcome!~"delivered|participant_gone"` — negated so a value added later fails CLOSED into the alert; threshold and `for:` live in the rule, `infra/docker/prometheus/rules/mc-alerts.yaml`, and its `alerts.md` entry)
 - **Dashboard**: MC Media - KEK Push Outcomes (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_failures_total`
@@ -424,6 +426,7 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Cardinality**: 2
 - **The two reasons have OPPOSITE remedies** — the point of the label. `rng` (CSPRNG failure) is overwhelmingly the live arm and is retried after W. `generation_exhausted` (the `u16` KEK generation at its ceiling) is permanent for that meeting and `MCKekRotationOverdue` will not clear until it ends; at the W floor it takes ~22.7 days of uninterrupted rotation in one meeting, so it is effectively unreachable.
 - **While either persists, the W bound is SUSPENDED, not delayed**: every departed participant keeps a KEK that opens all current media.
+- **No alert of its own**: `MCKekRotationOverdue` is the page for a rotation that is not happening, and its description forks on this counter's `reason` FIRST.
 - **Recorded in**: `actors/meeting.rs::rotation_failed` and the epoch reset in `handle_join` via `observability/metrics.rs::record_kek_rotation_failure`
 - **Dashboard**: MC Media - KEK Rotation Failures (KEK Lifecycle row)
 
@@ -443,8 +446,9 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Description**: From the rotation decision to the LAST per-recipient push outcome
 - **Labels**:
   - `key_custody`: `operator`
-- **Buckets**: 0.0005 … 2.5 s (its own full-name matcher). The top bucket covers the 2 s outcome timeout, so a fully timed-out rotation lands in a real bucket rather than `+Inf`.
+- **Buckets**: its own full-name matcher in `observability/metrics.rs` (the bucket list lives there). The top bucket covers `KEK_PUSH_OUTCOME_TIMEOUT`, so a fully timed-out rotation lands in a real bucket rather than `+Inf`.
 - Measures the window in which some members already hold the new key and others do not — the operationally meaningful quantity, not CSPRNG cost. Emitted even when recipients time out.
+- **No alert and no SLO**: rotation latency is explicitly OPEN in `docs/observability/slos.md` (no number ratified; story 8).
 - **Recorded in**: `media_admission/rotation.rs::collect_push_outcomes`
 - **Dashboard**: MC Media - KEK Rotation Duration (KEK Lifecycle row)
 
@@ -454,10 +458,11 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Labels**:
   - `key_custody`: `operator`
 - **Cardinality**: 1
-- **A maximum, sampled — not written by the actors.** A 5 s timer samples the times the meeting actors recorded. Last-writer-wins would let a healthy meeting's 0 erase an overdue meeting's age; event-driven writes would go stale; and sampling what the actors wrote means a WEDGED actor still ages. Zero at boot.
+- **A maximum, sampled — not written by the actors.** A timer (`KEK_GAUGE_REFRESH_INTERVAL`, `media_admission/rotation.rs`) samples the times the meeting actors recorded. Last-writer-wins would let a healthy meeting's 0 erase an overdue meeting's age; event-driven writes would go stale; and sampling what the actors wrote means a WEDGED actor still ages. Zero at boot.
 - **Cleared at rotation**, not when every push succeeds — one wedged recipient must not pin it (that is the push counter's job).
 - While above zero, a departed participant still holds a working KEK: a **confidentiality** window, not a media-quality one.
-- **Label set MUST stay identical to the overdue threshold's**, or `MCKekRotationOverdue`'s bare `a > b` matches nothing and the page silently never fires.
+- **`MCKekRotationOverdue` compares this gauge against `mc_meeting_kek_rotation_overdue_threshold_seconds` BARE** (`pending_age > overdue_threshold`, no `on()`, no arithmetic, no literal), so W never appears in PromQL.
+- **LABEL-SET IDENTITY CAVEAT: the label set MUST stay identical to the overdue threshold's.** A bare binary operator matches series by their FULL label set, so a label added to one gauge and not the other (a new target label, a `key_custody` change on one side) makes `a > b` match nothing and the page silently never fires — absence, which reads as health. Both are emitted from `observability/metrics.rs` with the same `key_custody` pair and nothing else; change them together.
 - **Recorded in**: `media_admission/rotation.rs::KekLifecycle::publish_fleet_gauges` (sampler task in `main.rs`)
 - **Alert**: `MCKekRotationOverdue` (page)
 - **Dashboard**: MC Media - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
@@ -469,18 +474,21 @@ zero-trust measure: MC generates and holds every KEK it issues.
   - `key_custody`: `operator`
 - **Cardinality**: 1
 - **A CONFIG ECHO**, set once at boot from the SAME value the debounce timer and the `kek_rotation_debounce_seconds` wire field use (`Config::kek_lifecycle`), so the three cannot drift. It should equal the ConfigMap value on every MC pod; a mismatch is a stale ConfigMap or a pod that did not roll — for W a **security** fact, since W is the exposure bound on a departed participant.
-- **No retention gauge exists, deliberately**: clients derive retention as `min(W/2, ceiling)`, so it would always be a function of this one.
+- **IN SECONDS, like every other form of W — no unit conversion anywhere on the MC side.** The config key `MC_KEK_ROTATION_DEBOUNCE_SECONDS` parses to `Config::kek_rotation_debounce_seconds: u32` (`config.rs`, bounded by `MIN_KEK_ROTATION_DEBOUNCE_SECONDS`..=`MAX_KEK_ROTATION_DEBOUNCE_SECONDS`); `KekLifecycle` stores that `u32` as-is (`media_admission/rotation.rs`); the wire field `kek_rotation_debounce_seconds` (`uint32`, `signaling.proto`) is `KekLifecycle::window_seconds()`, the stored value itself; and this gauge is `window().as_secs_f64()`, a widening of the same seconds. The only unit change in the whole chain is inside the client's `deriveKekRetention`, which turns W/2 into milliseconds at the one place retention is computed.
+- **No retention gauge exists, deliberately**: clients derive retention as `min(W/2, KEK_RETENTION_CEILING_MS)` with `KEK_RETENTION_FLOOR_MS` substituted when W is absent or zero (`packages/sdk-core/src/config/clientConfig.ts::deriveKekRetention`), so it would always be a function of this one. See `docs/observability/metrics/client.md` §No retention gauge.
 - **Recorded in**: `main.rs` via `KekLifecycle::publish_config_gauges`
 - **Dashboard**: MC Media - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
 
 ### `mc_meeting_kek_rotation_overdue_threshold_seconds`
 - **Type**: Gauge
-- **Description**: W × 2 — the pending age above which `MCKekRotationOverdue` pages
+- **Description**: W × `KEK_ROTATION_OVERDUE_MULTIPLIER` — the pending age above which `MCKekRotationOverdue` pages
 - **Labels**:
   - `key_custody`: `operator`
 - **Cardinality**: 1
-- **Exists so the page compares two gauges with no arithmetic**, keeping W out of PromQL. The multiplier is a named Rust constant (`KEK_ROTATION_OVERDUE_MULTIPLIER`, compile-time asserted ≥ 2): at 1, healthy pending age reaches the threshold just before every rotation.
+- **Exists so the page compares two gauges with no arithmetic**, keeping W out of PromQL. The multiplier is a named Rust constant (`KEK_ROTATION_OVERDUE_MULTIPLIER` in `media_admission/rotation.rs`, compile-time asserted ≥ 2): at 1, healthy pending age reaches the threshold just before every rotation.
+- **In seconds**, derived from the same stored W as the window gauge (`KekLifecycle::overdue_threshold`). Label-set identity with pending age is load-bearing — see the caveat on `mc_meeting_kek_rotation_pending_age_seconds`.
 - **Recorded in**: `main.rs` via `KekLifecycle::publish_config_gauges`
+- **Alert**: `MCKekRotationOverdue` (page) — the right-hand side of its bare comparison
 - **Dashboard**: MC Media - KEK Rotation Pending Age vs Overdue Threshold (KEK Lifecycle row)
 
 ### `mc_meeting_sender_ids_issued_max`
@@ -491,7 +499,8 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Cardinality**: 1
 - **Cursor consumption, NOT admissions.** After an epoch reset the allocator's cursor runs past ids excluded by the reset's snapshot without issuing them, and counts them. That is the right quantity for namespace pressure — an excluded id genuinely is not available — but it is **not comparable to a join count**, and it resets at each epoch.
 - **A maximum, not a sum**, so one meeting near a reset is not hidden behind fleet noise.
-- **Flapper visibility, deliberately without an alert.** Flapper eviction does not ship; nothing bounds a flapping client's join-path cost, and this is how it is seen. Exhaustion self-repairs into an epoch reset, so a threshold alert here would fire on a healthy condition.
+- **Flapper visibility, deliberately without an alert.** Flapper eviction does not ship; nothing bounds a flapping client's join-path cost, and this is how it is seen. Exhaustion self-repairs into an epoch reset, so a threshold alert here would fire on a healthy condition. The retired `MCSenderIdSpaceExhausted` is replaced by the info rule `MCKekEpochResetOnSenderIdExhaustion` on `mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}`, whose description points here (retirement recorded in `docs/observability/alerts.md`).
+- **A media-path series by decision** (`docs/observability/label-taxonomy.md` §R4): it observes no frame, but it is the ADR-0036 §2 sender-handle space, so it carries `key_custody` and no identity.
 - **Recorded in**: `media_admission/rotation.rs::KekLifecycle::publish_fleet_gauges`
 - **Dashboard**: MC Media - Sender ID Namespace Consumption (max) (KEK Lifecycle row)
 
@@ -736,7 +745,7 @@ span would record as attributes, on a surface no guard covers.
   - `unknown_target` — an authorized host named a participant not in this meeting.
   - `rate_limited` — a host's server-mute work exceeded its per-connection bucket (no looser than client mute's: burst 8, 4/s sustained; a compile-time assertion keeps it so). Host requests only: a non-host is refused before the bucket.
   - `actor_unavailable` — the meeting actor's mailbox is closed; environmental. Not reachable through the public test path; a stays-at-zero cell in the unit suite.
-- **No alert, by decision.** A non-zero mute rate is healthy moderation, and `not_permitted` is client-inflatable; MH's `server_muted` drop reason records the same no-alert decision for the enforcement side.
+- **No alert, by decision.** A non-zero mute rate is healthy moderation, and `not_permitted` is client-inflatable; MH's `server_muted` drop reason records the same no-alert decision for the enforcement side. The decision's home is the `DELIBERATELY NO ALERT` comment directly above `MCEndMeetingOwnershipRejected` in `infra/docker/prometheus/rules/mc-alerts.yaml` (covering this counter, `mc_media_unmute_requests_total` and `mc_media_refusal_replies_suppressed_total`), inventoried as a deliberate absence in `docs/observability/alerts.md`. The inverse condition (a mute that did not take) needs a per-meeting correlation ADR-0036 §11 bars; it is covered by the browser env-test S3 (`packages/web-app/e2e/server-mute.spec.ts`), MC runbook Scenario 21 and MH runbook Scenario 19 once story 2 task 18 writes it — not by an alert.
 - **Usage**: Is moderation working, and when a mute seems not to take, did MC even apply it? (Then read the state gauge below and MH's `server_muted` drops.)
 - **Recorded in**: `webtransport/connection.rs::handle_server_mute_request` / `refuse_server_mute` via `observability/metrics.rs::record_server_mute_request`
 - **Dashboard**: MC Media - Server Mute Requests (Client Media Signalling row)
@@ -751,6 +760,7 @@ span would record as attributes, on a surface no guard covers.
 - **A separate family from `mc_media_server_mute_requests_total`, with the sharper reason recorded:** merged, `action="unmute"` would name a host LIFTING a mute and a participant ASKING to be lifted in one series — two operations by two principals behind one selector. No `action` label here: the request has one direction.
 - **Counting unit: ONE INCREMENT PER REQUEST, never per host it is relayed to.** A per-host delivery failure is the LATER hop, counted by the outbound path (`mc_participant_outbound_messages_dropped_total{payload_kind="signaling_raw"}`) — disjoint from this series, so alert on at most one of them.
 - **Failure predicate, positive: `outcome=~"rate_limited|actor_unavailable"`.** `relayed` is success; `not_server_muted` and `no_host_connected` are ROUTINE (`no_host_connected` is normal once the host has left a meeting that carries on). `not_server_muted` is client-driven: keep it out of every ratio denominator.
+- **No alert, by decision** — the same `DELIBERATELY NO ALERT` comment above `MCEndMeetingOwnershipRejected` in `infra/docker/prometheus/rules/mc-alerts.yaml`.
 - **Usage**: Are muted participants' requests reaching a host?
 - **Recorded in**: `webtransport/connection.rs::handle_unmute_request` via `observability/metrics.rs::record_unmute_request`
 - **Dashboard**: MC Media - Unmute Requests (Client Media Signalling row)
@@ -765,7 +775,7 @@ span would record as attributes, on a surface no guard covers.
 - **Cardinality**: 2, bounded by `RefusalReplySurface::ALL`; zero-initialised
 - **NOT A REFUSAL COUNT.** The refusal itself is counted once, on its own path — `mc_media_server_mute_requests_total{outcome="not_permitted"|"unknown_target"}` or a `mc_media_receive_capability_declarations_total` rejection outcome — whether or not a reply went out. These are deliberately DISJOINT views of one request: the refusal is about the request, the suppression about the reply. Suppression is therefore never an `outcome` value, which would break those counters' partition and under-count refusals exactly when a probe is most active.
 - **EVERY SUPPRESSED REPLY IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER CONNECTION. A SINGLE WARN DOES NOT MEAN A SINGLE SUPPRESSION.** The one-shot WARN only became safe *because* this counter exists; before story 2 task 12 the capability path's suppressed replies had a latched WARN and NO counter.
-- **No alert, by decision**: client-inflatable by construction.
+- **No alert, by decision**: client-inflatable by construction. Recorded in the `DELIBERATELY NO ALERT` comment above `MCEndMeetingOwnershipRejected` in `infra/docker/prometheus/rules/mc-alerts.yaml`.
 - **Usage**: Is some connection looping refused requests (an SDK bug, or a probe)?
 - **Recorded in**: `webtransport/connection.rs::refuse_server_mute` and `reject_capability` via `observability/metrics.rs::record_refusal_reply_suppressed`
 - **Dashboard**: MC Media - Suppressed Refusal Replies (Client Media Signalling row)
@@ -914,11 +924,12 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **Type**: Counter
 - **Description**: Server messages dropped because a participant's outbound channel was full or closed
 - **Labels**:
-  - `payload_kind`: `signaling_raw`, `participant_update_joined`, `participant_update_left`, `participant_update_muted`, `meeting_kek_update`
+  - `payload_kind`: `signaling_raw`, `participant_update_joined`, `participant_update_left`, `participant_update_muted`, `meeting_kek_update`. All five are zero-initialised from `OUTBOUND_PAYLOAD_KINDS` in `observability/metrics.rs`. `participant_update_muted` was missing from that list until story 2 task 16, so its series was absent until its first drop; it is emitted from `webtransport/handler.rs::PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED`
 - **Cardinality**: bounded by one constant per `try_send` site in `actors/participant.rs` plus the roster-update labels `webtransport/handler.rs::encode_participant_update` returns with each wire-visible update (no restated count: it would be the third value of this line in one story)
 - **`participant_update` was SPLIT into `_joined` / `_left`** (story 2 task 9). The rule applied is **demonstrated consumer need, not message-type taxonomy**: a named consumer — the client's R-18 rebind correlation — cannot do its job with the two merged, because a dropped LEAVE has a consequence a dropped join does not (the client keeps a stale roster entry and later counts a legitimate `sender_id` reissue as a rebind, `dt_client_media_roster_key_rebinds_total{outcome="rebind"}`). Non-zero `participant_update_left` over a window makes that explanation **supported** — not confirmed for any single rebind increment, since this counter is fleet-wide. `signaling_raw` also spans several message types and **stays merged**: that is the same rule returning the other answer, not an unfinished half of this split. The shared stem means `payload_kind=~"participant_update.*"` still recovers the old merged series.
 - **`participant_update_muted` was split out at story 2 task 12, on the same DEMONSTRATED-CONSUMER-NEED rule.** A dropped `ParticipantMuteUpdate` has no re-sync path: join/leave state is rebuilt from the roster, but who-muted-whom is delivered ONLY by the live server-mute broadcast and the late-joiner replay, so a drop leaves that client rendering a wrong mute indicator until the next mute change on that participant — which may never come. Distinct consequence, distinct remedy. Past participle, matching `_joined` / `_left`, so `payload_kind=~"participant_update.*"` still recovers the merged series.
-- **`meeting_kek_update`** is the third `try_send` site: a KEK push the outbound channel dropped. The same event is also `mc_meeting_kek_pushes_total{outcome="dropped_outbound"}` — two angles on one event, one as outbound loss, one as a rotation that did not reach a member.
+- **`meeting_kek_update`** is the KEK-update kind, a `try_send` site of its own (`OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE`, `actors/participant.rs`): a KEK push the outbound channel dropped. The same event is also `mc_meeting_kek_pushes_total{outcome="dropped_outbound"}` — two angles on one event, one as outbound loss, one as a rotation that did not reach a member. Alert on the push counter (`MCKekPushFailureRate`), not here.
+- **`participant_update_left` is the named CORRELATOR for the `MCClientRosterKeyRebind` tripwire** (`infra/docker/prometheus/rules/mc-alerts.yaml`). That rule's known cause 3 is a lost `ParticipantLeft` followed by an R-16 `sender_id` reissue. That cause REQUIRES a sender-id-exhaustion epoch reset in the meeting (`mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}`; `media_admission/epoch.rs`), and no reset rules it out. That is the decisive check. `participant_update_left` read over MC's process lifetime only SUPPORTS it. A short-window zero rules nothing out, because the lost Left can precede the reissue by hours. Being fleet-wide, it never CONFIRMS any single rebind increment. It is a correlator, never an alert input.
 - **The client did not receive something MC decided to send.**
 - **EVERY DROP IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER CONNECTION. A SINGLE WARN DOES NOT MEAN A SINGLE DROP.** The WARN at `mc.actor.participant` fires once per participant actor and is deliberately not repeated — a per-message log on a client-drivable path is a log-amplification vector, and a wedged outbound channel drops one message per roster broadcast, i.e. O(participants x events) from one bad connection. **So log-line volume understates drop volume by orders of magnitude, and this counter is the only complete record.** Triaging by `grep` first — which is what people actually do — shows one line and reads as an isolated blip; the truth is the opposite. Take the magnitude from here, never from the log.
 - The one-shot WARN only became safe *because* this counter exists: before it, the repeated line **was** the record.

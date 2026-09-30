@@ -174,9 +174,11 @@ export type MediaMuteAction = (typeof MEDIA_MUTE_ACTIONS)[keyof typeof MEDIA_MUT
 /**
  * Bounded `source` vocabulary for `dt_client_media_kek_updates_total`.
  *
- * TWO values, and the merge inside `kek_update` is deliberate: a reconnect
- * re-issue and a rotation arrive in the same `MeetingKekUpdate` message and are
- * not distinguishable at the client.
+ * TWO values, deliberately: `join_response` (a first join, AND a reconnect
+ * re-issue, whose response is JoinResponse-shaped) and `kek_update` (a
+ * rotation push; `MeetingKekUpdate` is sent only by MC's rotation path). The
+ * client cannot see a rotation's cause; that split lives on MC's `trigger`
+ * label on `mc_meeting_kek_generated_total`, never as a third value here.
  *
  * The ONE home of this vocabulary. `kekSource.ts`'s arrival type is DERIVED from
  * it, never retyped, so an addition cannot land in one copy only.

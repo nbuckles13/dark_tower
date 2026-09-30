@@ -128,7 +128,7 @@ describe('the meeting KEK never survives the decode boundary', () => {
   });
 
   it('routes a KEK-push message through the holder, as the push source', async () => {
-    // A rotation (or reconnect re-issue) lands in the SAME holder the join
+    // A rotation push lands in the SAME holder the join
     // response fed, through the same scrubbing intake.
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     rig.deliver(framedMeetingKekUpdate(new Uint8Array(MEETING_KEK_BYTES).fill(0x22), 9));

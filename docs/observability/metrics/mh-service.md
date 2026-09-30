@@ -355,6 +355,9 @@ Every series below carries `key_custody=operator` and NO meeting, participant or
   - `key_custody`: `operator` (single value)
 - **Cardinality**: 2
 - **Usage**: The exhaustion signal's raw counts. Prefer `increase()` on panels — a single rejection must be visible.
+- **Alert**: none on the counter. The exhaustion alert reads the windowed ratio gauge below, never this counter.
+- **Recorded in**: the session actor, via `observability/metrics.rs::SessionMetricHandles::record`; zero-initialised per outcome by `resolve_session_handles`
+- **Dashboard**: MH Media - Egress Stream Admission Decisions by Outcome
 
 | `outcome` | Condition | What a responder does |
 |---|---|---|
@@ -371,6 +374,8 @@ sum by(outcome) (increase(mh_media_stream_admission_total[$__rate_interval]))
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: The left-hand side of the egress-exhaustion alert, compared bare against `mh_media_stream_admission_rejection_ratio_threshold`.
+- **Alert**: `MHMediaEgressBudgetExhausted` — **PENDING**, story 2 task 18 (runbook MH Scenario 18). It compares this gauge against `mh_media_stream_admission_rejection_ratio_threshold` gauge-versus-gauge (`warning`, `for: 10m`, no arithmetic, no literal). Until the rule lands there is no alert on egress exhaustion; the binding constraints are in `docs/observability/alerts.md` §Pending (not yet a rule). The same label-set identity caveat as `MHMediaEgressEdgeHeadroomLow` applies: both gauges carry exactly `key_custody` plus the scrape labels, and a label added to one silently empties the comparison.
+- **Dashboard**: MH Media - Admission Rejection Ratio vs Threshold
 
 Defined values: **no decisions in the window publishes 0.0** (never NaN, never 1.0 — the alert must be silent on an idle handler); **zero admitted with any rejected publishes 1.0** (never 0.0 — the alert must not be quietest when exhaustion is total).
 
@@ -383,14 +388,17 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Description**: `MH_EGRESS_REJECTION_RATIO_THRESHOLD`, published from the SAME configuration field the session actor's threshold log reads.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: The right-hand side of the exhaustion alert, so the alert is a bare gauge-to-gauge comparison with no PromQL literal. The number lives only in the ConfigMap.
+- **Usage**: The right-hand side of the exhaustion alert (`MHMediaEgressBudgetExhausted`, pending, story 2 task 18), so the alert is a bare gauge-to-gauge comparison with no PromQL literal. The number lives only in the ConfigMap.
+- **`_threshold` is correct here** because something reads it as one: the session actor's threshold WARN today, the pending alert next. Contrast `mh_media_egress_stream_ceiling_recommended_min` (`docs/observability/label-taxonomy.md` §R4 suffix rule).
 
 ### `mh_media_egress_budget_bytes_per_second`
 - **Type**: Gauge
 - **Description**: The configured egress budget in **bytes** per second (`MH_EGRESS_BUDGET_BPS / 8`, floored — converted once at load).
 - **Labels**: `basis`: `unmeasured` (single value today); `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: What the ceiling is derived from.
+- **Usage**: What the ceiling is derived from. No alert (a configuration value; the pending exhaustion alert reads the rejection ratio instead).
+- **Recorded in**: `observability/metrics.rs::publish_egress_admission`, once at startup
+- **Dashboard**: MH Media - Egress Budget (bytes/s) and Stream Ceiling
 
 `basis="unmeasured"` records ADR-0036's open item that the budget has no measurement behind it; the value changes when that item closes. **No panel or alert may select on `basis`** — reference the gauge bare. A `{basis="unmeasured"}` selector goes silently empty on exactly the day the measurement lands.
 
@@ -399,14 +407,16 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Description**: The derived egress **stream** ceiling: `budget_bytes / max(cost_audio_bytes, cost_video_bytes)`. The worst-case cost keeps MH type-blind (ADR-0036 §7).
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: The same field enforced at admission and advertised to GC as `max_streams`, so it explains a GC placement decision directly. MH refuses to start when it is below 2 (two participants hearing each other) or above `MH_MAX_TOTAL_EGRESS_EDGES`. `crates/env-tests/tests/01_mh_deployment_config.rs` asserts that the running pods publish the value the deployed ConfigMap derives.
+- **Usage**: The same field enforced at admission and advertised to GC as `max_streams`, so it explains a GC placement decision directly. MH refuses to start when it is below `MIN_EGRESS_STREAM_CEILING` (`crates/mh-service/src/config.rs`; two participants hearing each other) or above `MH_MAX_TOTAL_EGRESS_EDGES`. `crates/env-tests/tests/01_mh_deployment_config.rs` asserts that the running pods publish the value the deployed ConfigMap derives.
 
 ### `mh_media_egress_stream_ceiling_recommended_min`
 - **Type**: Gauge
-- **Description**: The ADVISORY recommended minimum for the ceiling: one full all-hear-all meeting at the story-2 demo size (N+1 = 6 participants each hearing N = 5).
+- **Description**: The ADVISORY recommended minimum for the ceiling: one full all-hear-all meeting at the story-2 demo size — `EGRESS_STREAM_CEILING_RECOMMENDED_MIN` = `all_hear_all_streams(RECOMMENDED_MIN_DEMO_PEERS)` in `crates/mh-service/src/config.rs` (the value is published here; this entry does not restate it).
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: The dashboard comparison and the first triage step: is the ceiling below this because the budget is still the unsized placeholder? **Advisory only — never an alert input.** The suffix is deliberately descriptive and not `_threshold`; do not promote it into an alert expression. A deployment below it boots, serves, and logs an INFO "configure me" nudge naming `MH_EGRESS_BUDGET_BPS` at startup. It is a code constant that must never merge with the refuse-boot floor of 2. The same requirement sizes the Kind budget (`infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`), and `01_mh_deployment_config.rs` checks the published value against that requirement.
+- **Usage**: The dashboard comparison and the first triage step: is the ceiling below this because the budget is still the unsized placeholder? **Advisory only — never an alert input.** A deployment below it boots, serves, and logs an INFO "configure me" nudge naming `MH_EGRESS_BUDGET_BPS` at startup. It is a code constant that must never merge with the refuse-boot floor `MIN_EGRESS_STREAM_CEILING` (a compile-time assertion in `config.rs` keeps them apart).
+- **NO ALERT, BY DESIGN — the fourth deliberate-absence entry** in `docs/observability/alerts.md` §Deliberate absences (MH). A placeholder budget is a configuration state, not an incident. Do not promote it into an alert expression.
+- **Why the suffix is `_recommended_min` and not `_threshold` — the taxonomy suffix rule** (`docs/observability/label-taxonomy.md` §R4): `_threshold` is reserved for values that something enforces or alerts on; an advisory value takes a descriptive suffix. A `_threshold` spelling tells a responder that something automatic is watching, and an advisory value spelled that way reads as coverage that does not exist. This gauge is the canonical case; `mh_media_stream_admission_rejection_ratio_threshold` is the contrasting one. The same requirement sizes the Kind budget (`infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`), and `01_mh_deployment_config.rs` checks the published value against that requirement.
 
 ### `mh_media_egress_edges`
 - **Type**: Gauge
@@ -414,13 +424,17 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: Saturation against `mh_media_egress_stream_ceiling` (same unit). Published as 0 at startup and then on every install and every release. It falls when a live meeting re-asserts a smaller policy and when `EndMeeting` releases a meeting; it stays high after a meeting that ends with no `EndMeeting` — truthfully, because those streams really are still held (the ratchet above). **Compare each pod against ITS OWN ceiling, never against the fleet.** MC co-locates each meeting's edges onto ONE handler, choosing it by a per-meeting rotation, so pods should be roughly balanced across many meetings but a single large meeting's egress is never split — and the idle sibling is not headroom for a meeting refused on the busy one (edges do not move once placed). Until capacity-aware spreading lands (`docs/TODO.md` §Media Path Obligations, item 1) a few large meetings can therefore skew the pods; sustained severe skew is worth investigating rather than expected. The name is fixed by the story.
+- **Alert**: `MHMediaEgressEdgeHeadroomLow` (warning, `mh-alerts.yaml`) — `mh_media_egress_edges / mh_media_egress_stream_ceiling` above a headroom fraction the ALERT owns. The denominator is the ceiling because it binds first; `mh_media_egress_edges_limit` is a backstop MH refuses to start below it (it has no config home, so it duplicates no configured value; provenance in the rule's ADR-0031 block). **Fork LEAK vs LOAD first**: LEAK = edges climbing with pod uptime while `mh_media_meeting_teardowns_total{outcome="released"}` stays flat (meetings not released; a true positive on a long-lived pod — never tune the fraction up to silence it; MC runbook Scenario 20); LOAD = edges tracking `mh_media_registered_meetings` and real demand (capacity or placement, not teardown). **Label-set identity**: `a / b` matches equal label sets, so a label added to ONE of the two gauges silently empties the division and the alert never fires; keep them in step.
+- **Recorded in**: `observability/metrics.rs::SessionMetricHandles::publish_egress_edges` (at every install and release)
+- **Dashboard**: MH Media - Installed Egress Streams vs Stream Ceiling (the alert's comparison); Egress Edges vs Edge-Limit Backstop
 
 ### `mh_media_egress_edges_limit`
 - **Type**: Gauge
 - **Description**: The configured `MH_MAX_TOTAL_EGRESS_EDGES` — the aggregate egress-edge resource guard, read from the same `PolicyLimits` field the session actor enforces (never a second literal).
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: The backstop's headroom, beside `mh_media_egress_edges` on the installed-streams panel. **Not a saturation denominator**: config load refuses a stream ceiling above this bound, so the ceiling always binds first and a refusal here is the labelled backstop (`apply_failed`). Static; published once at startup.
+- **Usage**: The backstop's headroom, beside `mh_media_egress_edges` on the installed-streams panel. **Not a saturation denominator** for CAPACITY: config load refuses a stream ceiling above this bound, so the ceiling always binds first and a refusal here is the labelled backstop (`apply_failed`). Static; published once at startup.
+- **It is NOT the denominator of `MHMediaEgressEdgeHeadroomLow`** (corrected within story 2 task 16). That alert divides by `mh_media_egress_stream_ceiling`, which binds first: MH refuses to start with the ceiling above this limit, so against this limit the alert would fire only after admission was already rejecting, or never. A LEAK (edges held by meetings nobody released) approaches the ceiling first and is caught there. This gauge is plotted beside it as the backstop. Edges reaching it means the ceiling check did not bind, which shows as `mh_media_policy_applies_total{outcome="apply_failed"}`.
 
 ### `mh_media_registered_meetings`
 - **Type**: Gauge
@@ -428,6 +442,10 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: Occupancy against `mh_media_registered_meetings_limit`. READ IT AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an `EndMeeting` releases a meeting, so a meeting whose MC never COMPLETES `EndMeeting` (an MC crashed or killed before or during teardown; retries exhausted or an MH predating the RPC; a rollback to an MC build without teardown) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with concurrent load is that residual. Many meetings here against a flat `mh_media_egress_edges` is the empty-meeting shape the cap exists for. Published as 0 when the session actor is built.
+- **Teardown proof is the PAIR, not either half.** A released meeting shows as `mh_media_meeting_teardowns_total{outcome="released"}` incrementing AND this gauge FALLING in the same window. The counter alone proves MH decided; only the fall proves the registration left the map. This is the ADR-0036 §11 demonstration for teardown: end a meeting and watch this gauge fall.
+- **No alert of its own yet**: the teardown-never-arrives rule is story 2 task 18's (`mh-alerts.yaml` header). It is the LOAD-side correlator in `MHMediaEgressEdgeHeadroomLow`'s LEAK-vs-LOAD fork.
+- **Recorded in**: `observability/metrics.rs::SessionMetricHandles::publish_registered_meetings` (the map's length, at every register and release)
+- **Dashboard**: MH Media - Registered Meetings vs Registration Cap
 
 ### `mh_media_registered_meetings_limit`
 - **Type**: Gauge
@@ -435,6 +453,7 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: The denominator for registration occupancy, so no alert or panel needs the number as a PromQL literal. A resource guard, never capacity and never advertised to GC. Static; published once at startup.
+- **Dashboard**: MH Media - Registered Meetings vs Registration Cap
 
 **Configuration reflections (ADR-0038 step 3).**
 
@@ -504,7 +523,12 @@ Story 2 R-20. `MediaHandlerService.EndMeeting` releases a meeting's handler reso
 
 **`rejected_ownership` is a UNION of MC's two rejection values — do not compare the like-named tokens.** MH cannot tell why an MC was tearing down, so this value counts both MC populations: MC's `mc_media_end_meeting_total{outcome="rejected_ownership"}` (a meeting that ENDED — an MC defect) **plus** `{outcome="superseded_by_successor"}` (a graceful-shutdown release refused because a successor already took the meeting over — routine on rolling deploys). Compare this value against the SUM of those two, for COMPARISON only, never a sum or a ratio across the hop: the denominators differ (MH counts per request received, including MC's retries; MC per (meeting, handler) terminal outcome). Comparing token to token shows a gap that grows on every rolling deploy and looks exactly like lost messages between MC and MH. (`docs/observability/metrics/mc-service.md`, `mc_media_end_meeting_total`.)
 
+**Teardown proof is the PAIR.** A `released` increment says the session actor decided to release; `mh_media_registered_meetings` FALLING in the same window says the registration actually left the map (and `mh_media_egress_edges` falls with it when the meeting held edges). Read the two together — the counter alone is not proof of reclamation. A flat `released` rate while edges climb with uptime is the LEAK arm of `MHMediaEgressEdgeHeadroomLow`.
+
 **Not label material**: `meeting_id` and `mc_id` (raw or hashed) are unbounded and meeting-identifying; both belong in the log line (ADR-0036 §11).
+
+- **Recorded in**: `observability/metrics.rs::SessionMetricHandles::record_teardown`; zero-initialised per outcome by `resolve_session_handles`
+- **Alert**: none directly (the teardown-never-arrives rule is story 2 task 18's); read by `MHMediaEgressEdgeHeadroomLow`'s LEAK fork
 
 **PromQL example** (per ADR-0029 — low-rate lifecycle counter, prefer `increase`):
 ```promql
@@ -819,6 +843,22 @@ attempts sum whole — every datagram received is either an ingress drop or an
 ingress forward — while attributing the failure to the egress-side cause it
 actually has.
 
+**N-WAY FAN-OUT ACCOUNTING IDENTITY (story 2 R-28) — stated once, here.** One accepted
+ingress frame becomes **E egress attempts**, one per egress edge naming its sender
+(E = that sender's subscriber count on this handler). So `forwarded{direction="egress"}`
+is **not comparable** to `forwarded{direction="ingress"}`: with loopback gone and N-way
+fan-out live, egress forwards exceed ingress forwards on every healthy multi-party
+meeting, and an "egress / ingress" delivery ratio reads ABOVE 1 when healthy. Every
+ratio is therefore built within ONE direction:
+
+- **Egress delivery is egress-internal**: `forwarded{egress} / (forwarded{egress} + dropped{egress})`
+  — the MH Media "Egress Delivery Ratio (per-edge, egress-internal)" panel, redefined in story 2.
+- **Egress over ingress is a FAN-OUT measure, not a delivery measure**: the MH Media
+  "Mean Fan-out (egress forwards per ingress forward)" panel, whose expected value is the
+  mean subscriber count per forwarded frame (denominator guarded `> 0`).
+- The ingress identity is unchanged: every datagram received is an ingress drop or an
+  ingress forward.
+
 **EVERY egress series is counted per EDGE except one.** `forwarded{direction="egress"}`
 and every `direction=egress` drop reason — `egress_queue_overflow`,
 `connection_closed`, `transport_send_refused`, `no_local_subscriber`,
@@ -832,7 +872,7 @@ defensible and neither is inferable from the series names, which is why they are
 stated here.
 
 ### `mh_media_frames_dropped_total`
-- **Expected-empty**: yes — frame drops are the media-path fault signal, zero on a healthy idle/loopback path
+- **Expected-empty**: yes — every fault reason reads zero on a healthy path; the two exceptions are named, not hidden: `no_subscriber` shows a short in-flight tail when a sender's last subscriber leaves, and `server_muted` is non-zero during healthy moderation (both below)
 - **Type**: Counter
 - **Description**: Frames MH did not forward, by reason.
 - **Labels**:
@@ -841,6 +881,8 @@ stated here.
   - `key_custody`: `operator` (single value)
 - **Cardinality**: Low — bounded at the type level by the compile-checked `MediaDropReason::ALL` plus `media_protocol`’s `ALL_REJECT_REASONS`, × one `key_custody` value. **Deliberately no restated integer**: the two vocabularies below are the operator-facing artifact, and a second encoding of their combined length only rots — `mc-service.md` §`mc_media_sender_binding_responses_total` records one drifting four times inside a single devloop. The codec half is not merely tedious to restate but **unrestatable in principle**: `resolve_media_handles` builds it by iterating `ALL_REJECT_REASONS`, so a ninth codec token added upstream gets an MH series with no MH edit. (The written-out lengths in `MediaDropReason::ALL` and in the handle array stay: those are compile-checked, and they are the guard.)
 - **Usage**: The primary "why is there no audio" signal. Read it with the forwarded counter, never alone.
+- **Fan-out units**: see the N-way fan-out accounting identity under `mh_media_frames_forwarded_total` — egress drops are per edge (except `no_subscriber`, per frame), so they are comparable only with egress forwards.
+- **A SOLO PARTICIPANT PUTS NO FRAMES ON THIS COUNTER AT ALL, AND THAT IS HEALTHY** (story 2 task 16, verified against code; this corrects the task text's premise that a solo participant produces a climbing `no_subscriber` series). Story 1's loopback (the sender forwarded back to itself) is removed. A publisher nobody holds is sent an EMPTY target set by MC (`DirectiveOutcome::EmittedEmptyTargets`, `crates/mc-service/src/media_signaling/directive.rs`: "empty. That means send nothing."), and the SDK builds and sends nothing on an empty set (`packages/sdk-core/src/media/pipeline/egress.ts`, `submit()`). So a one-person meeting reads flat on ingress AND on every drop reason. `no_subscriber` is healthy only as a short in-flight tail: frames already sent when the last holder leaves, before the empty directive lands. **A SUSTAINED `no_subscriber` is a fault**: a client is sending while MH has no edge naming it, so MC's send directive and MH's installed policy disagree. That is MC's assignment and push path (Scenario 15's divergence family), not a quiet meeting.
 
 **`reason` is ONE layered label space, not two vocabularies.**
 `media-protocol`'s `reject_reasons!` macro documents its eight tokens as "the
@@ -888,7 +930,7 @@ sender; none is a bug on its own.
 | `oversize_datagram` | ingress | The received datagram's byte length exceeded the wire-format frame maximum, rejected before any parse. | A sender build defect or a hostile peer. **Not** the codec's `payload_length_exceeds_max`, which is the declared *field* exceeding the max during header validation — same constant, two checks, two tokens, and the distinction tells you whether anything was parsed at all. |
 | `stream_rate_limited` | ingress | A connection exceeded its per-connection stream creation-rate cap. | **UNREACHABLE UNTIL UNI-STREAM/VIDEO — this token cannot fire today and is not a live detector.** MH opens no unidirectional-stream accept loop and audio is one frame per datagram, so there is no stream-creation event to limit. The token is defined now so the author of the accept path inherits the spelling rather than inventing a second one; a fixed-window limiter was built for it at task 16 and **removed at review** as unreachable enforcement machinery. Same posture as `partial_frame_discard`. |
 | `no_policy` | ingress | No forwarding policy is installed for this meeting. | **The remedy is the control plane, not this handler.** Read `mh_media_policy_applies_total` and MC's `mc_media_policy_pushes_total`. |
-| `no_subscriber` | egress | A policy is installed but no egress edge names this sender. | MC's assignment. The publisher is connected and nobody is subscribed to it. |
+| `no_subscriber` | egress | A policy is installed but no egress edge names this sender. | A short in-flight tail after a sender's last subscriber leaves is healthy. **Sustained** means the client is sending against an empty edge set, i.e. MC's directive and MH's policy disagree (MC's assignment and push path). A solo participant produces NONE: MC directs it to send nothing (see above). |
 | `no_local_subscriber` | egress | An edge names a subscriber with no connection on this handler. | Ordinary under multi-handler assignment (§9), where a meeting's participants are spread across handlers. Sustained and unexpected means a stale assignment. |
 | `transport_receive_dropped` | ingress | Datagrams the QUIC connection received that **no MH reader ever saw**. Computed exactly at connection teardown as quinn's `frame_rx.datagram` minus the count the ingress loop actually read. | **The client fleet or MH session-start latency — not MH's forward path.** Read the three limitations in the blockquote below this table BEFORE acting on it: it is forensic rather than live, it is an upper bound, and it is client-influenceable. Its ordinary contributor is a client publishing before its `SendDirective` arrives, or reconnecting into a handler it already holds a directive for and racing the new connection's setup. |
 | `no_media_session` | ingress | **Not redundant with the row above — see the note beneath this table.** Datagrams received on a connection whose media session MH **declined**, so no ingress loop was ever spawned and every one was discarded. Exact in the sense that matters — there is no reader to overlap with, so the whole received count IS the loss and no differencing is needed. **"Exact" qualifies the no-reader property, not a race with the wire**: the sample is taken *after* the connection closes (deliberately — the MC-unavailable arm sleeps a jittered interval before closing, and a publishing client sends throughout, so sampling earlier would under-count by exactly the window the slowest decline arm holds open), which leaves one residue — a datagram already in flight when the close frame goes out is discarded uncounted. Bounded by one RTT, per connection, once. | **Diagnostic only; do not alert on it.** It is fully explained one entry up by `mh_media_session_starts_total{outcome="declined_*"}`, which names the cause; this token only says how much media the declined connections were carrying. A large value during an MC outage is expected, not additional signal: MH's MC-client retry budget keeps each declined publisher transmitting for tens of seconds before its close lands. |
@@ -1115,7 +1157,13 @@ counter. Unsupported and untooled.
 **No alert**, recorded: a non-zero rate is healthy moderation, and the inverse
 ("a mute that should be dropping is not") needs a per-meeting correlation
 ADR-0036 §11 bars. Not added to the invariant-violations stat panel. The
-`sum by(reason)` ingress-drop panels break it out automatically.
+`sum by(reason)` ingress-drop panels break it out automatically. The decision's
+home is the `DELIBERATELY NO ALERT` comment above `MCEndMeetingOwnershipRejected`
+in `infra/docker/prometheus/rules/mc-alerts.yaml`, inventoried in
+`docs/observability/alerts.md` §Deliberate absences (MC); coverage is env-test S3
+and MH runbook Scenario 19 once story 2 task 18 writes it. The ADR-0031
+demonstration is to apply a mute and watch THIS reason move, not only MC's
+`mc_media_server_mute_requests_total`.
 
 **Interaction with `MHIngressDatagramsNeverRead`.** A muted frame is a real
 ingress attempt, so `server_muted` enters that rule's ingress denominator

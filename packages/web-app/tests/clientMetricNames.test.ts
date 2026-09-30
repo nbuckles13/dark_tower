@@ -1,10 +1,13 @@
 // File: packages/web-app/tests/clientMetricNames.test.ts
 //
 // Fail-closed drift guard for `e2e/clientMetricNames.ts` (story 2 R-27; owned
-// with observability). Nothing else links the alert's names to the emitter:
-// `dt-guard application-metrics` cannot see `dt_client_*`, and the
-// client-metrics-export guard does not check alert -> emitter. The live
-// read-back in the multi-party spec then proves the LOADED rule agrees.
+// with observability). What this file adds is the link to the SHARED ASSERTED
+// NAMES in `e2e/clientMetricNames.ts`. Since story 2 task 16,
+// `dt-guard client-metrics-export` also checks the alert side (rule 2: every
+// `dt_client_*` name in a loaded rule is exported and every selected or grouped
+// label is kept; G7: the reason alternation partitions the vectors' dropping
+// tokens), but it knows nothing of this constant. The live read-back in the
+// multi-party spec then proves the LOADED rule agrees.
 //
 // The rule is read STRUCTURALLY (the `- alert:` list item, then its `expr:` key
 // and block scalar by indentation) rather than by a regex over the whole file, so

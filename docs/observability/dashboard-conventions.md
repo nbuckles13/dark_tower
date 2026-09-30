@@ -354,6 +354,22 @@ silently — and the MC/GC rows above are a divergence now, **deliberate and doc
 - **Read the sample-ratio gauge before reading a rate off a sampled histogram's `_count`.**
   `mh_media_forward_latency_seconds_count` is 1/N of `mh_media_frames_forwarded_total`; dividing the
   two directly measures the sample ratio, not the media path.
+- **One rule: publish the value enforcement reads, then cite it; never restate it** (story 2 task 16).
+  "Publish the value enforcement reads" and "cite, don't restate" are two halves of ONE rule, written
+  up once here. (1) A limit, cap, window or threshold that code enforces is published as a gauge
+  read from the SAME field enforcement reads (the bullet above). (2) Every panel title, description
+  and annotation, and every **alert annotation** (`summary`/`description`/`impact`) on a media rule,
+  names that gauge or config key instead of writing its number: "edges vs `mh_media_egress_edges_limit`",
+  not "edges vs 65536"; "retention ceiling `KEK_RETENTION_CEILING_MS`", not "30 s". A literal is a
+  second encoding of the value, and it goes stale silently the first time an operator retunes. The
+  only way to put the limit on a panel is to plot its gauge.
+  **Carve-out, stated so the boundary exists once**: provenance and derivation comments (rule-file
+  `THRESHOLD PROVENANCE` blocks, catalog derivations) may show a number **only when it names its
+  source** const, gauge or config key alongside, because the arithmetic cannot be followed without
+  it. An alert's own threshold that has no config home (for example
+  `MHMediaEgressEdgeHeadroomLow`'s headroom fraction) is the alert's policy, not a second encoding;
+  it lives in the expr, and prose cites the rule rather than repeating the number. Units, bucket
+  boundaries and pure arithmetic facts are not limits and are not covered.
 - **Do not tune a scrape interval to fix a dashboard.** A panel that needs finer resolution than the
   scrape provides is a cadence decision (cost, owner: operations), not a panel decision.
 

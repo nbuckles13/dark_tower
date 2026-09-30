@@ -521,119 +521,133 @@ groups:
       # MCMediaMissingKeyMaterial - client-side counter, MC-side remedy
       # ====================================================================
       #
-      # THIS ALERT CAN NOW FIRE. It could not before 2026-09-23, and the
-      # previous version of this comment said so at length. The export path was
-      # built and PROVEN end to end: the full expression below was evaluated
-      # against live data emitted by sdk-core's own built bundle through GC into
-      # Prometheus and returned 0.286 -- non-empty, for the first time ever.
+      # THIS ALERT CAN FIRE. The client export path was proven end to end on
+      # 2026-09-23: the full expression below, evaluated against live data
+      # from sdk-core's built bundle through GC into Prometheus, returned
+      # 0.286.
       #
-      # WHAT THAT MEANS, PRECISELY: the premise that the series does not exist
-      # has cleared. NOTHING ELSE IN THIS COMMENT HAS CLEARED. The typo gap, the
-      # for:/rate() shape, the threshold provenance and the denominator argument
-      # below are all unchanged by the export landing, and the typo gap matters
-      # MORE now, not less, because a green CI over a believed-live alert is
-      # more misleading than a green CI over an admittedly-dead one.
-      #
-      # THE FOUR PREMISES THIS ALERT NOW RESTS ON, so the next reader can
+      # THE FOUR PREMISES THIS ALERT RESTS ON, so the next reader can
       # re-falsify them instead of trusting that someone once checked:
       #   1. The collector SUMS same-identity delta datapoints from N browsers.
-      #      VERSION-DEPENDENT: it is `delta_to_cumulative` on
-      #      otel/opentelemetry-collector-contrib:0.161.0. The previously pinned
-      #      0.103.1 did NOT ship that processor and silently failed to sum.
-      #      The image tag and the collector ConfigMap are one atomic rollback
-      #      unit -- see docs/runbooks/gc-deployment.md §Rollback.
-      #   2. GC's telemetry filter PASSES the `reason` key. This numerator
-      #      selects on it; GC stripped it until 2026-09-23, which alone would
-      #      have zeroed this alert even with a perfect collector.
-      #      (crates/gc-service/src/services/telemetry_filter.rs)
+      #      VERSION-DEPENDENT: that is `delta_to_cumulative`, which the
+      #      previously pinned collector did not ship. The image tag and the
+      #      collector ConfigMap are one atomic rollback unit -- see
+      #      docs/runbooks/gc-deployment.md §Rollback.
+      #   2. GC's telemetry filter PASSES the `reason` key
+      #      (crates/gc-service/src/services/telemetry_filter.rs).
       #   3. A Prometheus job scrapes the collector
       #      (`otel-collector` in infra/kubernetes/observability/prometheus.yml).
       #   4. `add_metric_suffixes: false` on the prometheus exporter, so the
-      #      names below pass through VERBATIM as authored in TypeScript. With
-      #      suffixing on, `dt_client_time_to_first_media_frame_ms` acquires a
-      #      unit suffix and silently stops matching anything.
-      # Break any one of those four and this alert goes quiet rather than red.
+      #      names below pass through VERBATIM as authored in TypeScript.
+      # Premises 2 and 4 are now MECHANICALLY checked, not just narrated:
+      # `dt-guard client-metrics-export` (rule 2, story 2 task 16) fails the
+      # build if any dt_client_* name in a loaded rule is not exported by the
+      # collector, or if any label this rule selects or groups on is not in the
+      # collector's keep_keys. Rule 1 does the same for the labels the SDK
+      # attaches. That replaces the old warning here that "nothing covers a
+      # typo in this expression": a misspelled name now fails as
+      # `dead_alert_reference`. Premises 1 and 3 are covered by the live
+      # R-27 read-back (a real browser's series read back out of Prometheus
+      # by the names in packages/web-app/e2e/clientMetricNames.ts).
       #
-      # ABSENCE OF THIS ALERT IS STILL NOT PROOF OF HEALTH, FOR A NEW REASON.
-      # The series can vanish without the alert firing: five controls on the
-      # collector's metrics path drop client data BY DESIGN and all five look
-      # identical to "no browser is running", and there is no per-browser `up`
-      # signal and structurally cannot be one (ADR-0036 §11 bars a per-session
+      # ABSENCE OF THIS ALERT IS NOT PROOF OF HEALTH. The series can vanish
+      # without the alert firing: several controls on the collector's metrics
+      # path drop client data BY DESIGN and all of them look identical to "no
+      # browser is running", and there is no per-browser `up` signal and
+      # structurally cannot be one (ADR-0036 §11 bars a per-session
       # service.instance.id). Triage ladder for a quiet series:
       # docs/runbooks/gc-deployment.md §When the client series go quiet.
       #
-      # NOTHING ELSE COVERS A TYPO IN THIS EXPRESSION. `dt-guard
-      # application-metrics` extracts alert metric references with a regex
-      # built from the four service prefixes in
-      # crates/dt-guard/src/common/services.rs -- \b((?:ac|gc|mc|mh)_[a-z][a-z0-9_]*).
-      # Underscore is a word character, so `dt_client_media_frames_dropped_total`
-      # matches nothing and a misspelling here passes CI green while the alert
-      # never fires. THIS GAP IS UNCHANGED BY THE EXPORT LANDING and is now the
-      # ONLY thing between a typo here and a silently dead alert. The "does it
-      # apply" step (the counter arriving in Prometheus from a real browser
-      # through the SDK OTLP sink and the GC telemetry proxy) is this rule's
-      # SOLE coverage, not belt-and-braces. That step reads the metric name back
-      # OUT of Prometheus by the exact string used here -- OTLP->Prometheus
-      # normalisation is not guaranteed to preserve the `_total` suffix written
-      # in TypeScript, which is why `add_metric_suffixes: false` is premise 4
-      # above rather than a detail.
-      #
       # DENOMINATOR IS `received`, AND THAT IS THE ATTEMPTS SUM.
       # `received = accepted + sum(drops by reason)` is an accounting identity
-      # held at the crypto/parse boundary, so `received` IS the total and the
-      # guard on it matches the ratio's own denominator. Denominating or
-      # guarding on `accepted` would be the attempts-denominator inversion in
-      # its exact form: in a TOTAL key-delivery outage `accepted` goes to
-      # zero, the guard evaluates false, and the alert goes silent at the
-      # moment the failure is complete.
+      # held at the crypto/parse boundary, per client, and it survives N
+      # senders unchanged with no sender split. So `received` IS the total and
+      # the guard on it matches the ratio's own denominator. Denominating or
+      # guarding on `accepted` would be the attempts-denominator inversion: in
+      # a TOTAL key-delivery outage `accepted` goes to zero and the alert goes
+      # silent at the moment the failure is complete.
       #
-      # `for: 15m` AGAINST A rate(...[5m]) WINDOW IS DELIBERATE AND IS A
+      # `for: 15m` AGAINST A rate(...[5m]) WINDOW IS DELIBERATE, and it is a
       # DOCUMENTED ANTI-SHAPE. alert-conventions.md says to match `for:` to
-      # the rate() window. DO NOT "FIX" THIS TO 5m. All three reasons are EXPECTED
-      # transients at join and after a KEK rotation (ADR-0036 §11); the
-      # sustained case is the signal, so the `for:` window must outlast the
-      # transients and is doing the discriminating work that the threshold is
-      # not.
+      # the rate() window. DO NOT "FIX" THIS TO 5m. Three of the four reasons
+      # are EXPECTED transients at join and after every KEK rotation (ADR-0036
+      # §11), so the `for:` window must outlast them; it does the
+      # discriminating work that the threshold does not.
       #
-      # THRESHOLD PROVENANCE, STATED HONESTLY: 5% is not SLO-derived and there
-      # is no observed baseline. At 20 ms/frame (50 frames/s) a 1-2 second
-      # join transient is well under 1% of a 5-minute window, while a
-      # sustained delivery failure sits near 100%. Do not cite it as ratified.
+      # THE SELECTOR (story 2 task 16) -- every client drop reason meaning "could
+      # not open because of key delivery":
+      #   no_kek_for_generation  newer generation than held: MC's push has not
+      #                          arrived;
+      #   kek_generation_stale   older than this client still retains;
+      #   no_roster_entry        no usable identity key for the sender;
+      #   unwrap_failed          JOINED IN TASK 16, BY DECISION. It is an
+      #                          AUTHENTICATED frame (the signature covers the
+      #                          wrap block and runs before unwrap, so transit
+      #                          corruption is `signature_invalid`, never this)
+      #                          whose KEK unwrap failed. Its causes are (a) sender
+      #                          and receiver holding DIFFERENT KEK bytes under one
+      #                          generation, which is a key-DISTRIBUTION split, (b) a
+      #                          sender wrap/key-schedule bug, or (c) an
+      #                          authenticated member emitting bad wraps. (a) is
+      #                          this alert's subject. (b) and (c) produce the same
+      #                          user symptom, and no other rule selects them, so
+      #                          excluding the token would leave a receive-path
+      #                          crypto failure that nothing watches.
+      # Membership is a DECISION, never a pattern. `layer` names the processing
+      # stage, not the remedy owner: unwrap_failed is layer=crypto and still
+      # belongs here. The partition is MECHANICAL: dt-guard
+      # client-metrics-export (G7) requires every `drops_frame: true` token in
+      # proto/test-vectors/frame-v2.vectors.json to sit in EXACTLY ONE of this
+      # alternation or its `NOT_KEY_DELIVERY` list
+      # (crates/dt-guard/src/client_metrics_export.rs, which carries the
+      # per-token reason, including sender_not_assigned = misrouting). A new
+      # token therefore fails the build until someone classifies it. Do not
+      # restate the exclusion reasons here; the const is their home.
       #
-      # AGGREGATED NUMERATOR, NOT `sum by(reason)`: all three reasons share
-      # one runbook scenario, and a per-reason instance would need
-      # `/ on() group_left()` broadcasting for the denominator - machinery for
-      # no triage gain. The reason fork lives in Scenario 16, which is where
-      # the three remedies diverge.
+      # THRESHOLD, RE-DERIVED OVER THE FOUR-TOKEN SET AGAINST W (task 16):
+      # 5% and `for: 15m` stand. The healthy steady state is a DUTY CYCLE:
+      #   - no_kek_for_generation costs the KEK push SKEW between members on
+      #     each rotation. Rotations are at most one per W per meeting, and W
+      #     is at least MIN_KEK_ROTATION_DEBOUNCE_SECONDS
+      #     (crates/mc-service/src/config.rs).
+      #   - kek_generation_stale is ~0 while client retention (at least
+      #     KEK_RETENTION_FLOOR_MS, packages/sdk-core/src/config/clientConfig.ts)
+      #     far exceeds that skew.
+      #   - no_roster_entry is join-only.
+      #   - unwrap_failed has NO healthy transient: with a usable cached key
+      #     the same mismatch is the non-dropping `wrap_key_id_mismatch`.
+      # So the healthy ratio is about skew / W. Holding 5% for 15 minutes at
+      # the W floor needs a skew of 5% of W on EVERY rotation, with a leave
+      # every W for the whole window (that churn is MCKekRotationStorm's
+      # subject). The story's "~25x margin" holds iff per-rotation push skew is
+      # under 1/25 of that, i.e. 0.2% of W. THE SKEW IS UNMEASURED. Treat this
+      # as a stated assumption, not a ratified number; if a deployment measures
+      # a larger skew, re-derive here. Before the widening, the same argument
+      # ran over two tokens. Widening a NUMERATOR over an unchanged denominator
+      # only moves the ratio UP, and the added token contributes ~0 when
+      # healthy, so the re-derivation leaves the number where it was.
       #
-      # THE SELECTOR IS AN EXPLICIT TOKEN ENUMERATION, NOT A LAYER OR PREFIX
-      # PATTERN. Nothing about a token's `layer` field or spelling puts it in
-      # this alert (`layer` names the processing STAGE, not the remedy owner -
-      # docs/observability/label-taxonomy.md). A future key-delivery token must
-      # be added here DELIBERATELY; no pattern would have caught
-      # `kek_generation_stale`, and none will catch the next one.
-      # `sender_not_assigned` is DELIBERATELY EXCLUDED: it is misrouting (a
-      # verified frame from a sender outside the client's MC-stated slot
-      # assignment), whose remedy is MC placement / MH forwarding, not KEK or
-      # roster delivery. The 5% threshold above was set over two tokens;
-      # re-deriving it over the widened three-token set is story 2 task 16's
-      # work, not re-derived here. WHICH WAY IT LEANS UNTIL THEN (@operations'
-      # derivation — falsify it rather than re-deriving from scratch):
-      #   (1) widening a NUMERATOR over an unchanged denominator can only move
-      #       the ratio UP, so an un-re-derived 0.05 is more sensitive, never
-      #       less. The risk task 16 inherits is a false page, not a miss — the
-      #       safe side, which is what makes shipping the widening ahead of the
-      #       derivation correct rather than merely convenient;
-      #   (2) the selected population is roughly UNCHANGED at the split: with no
-      #       retention before this change, every older-than-retained frame
-      #       already landed on no_kek_for_generation. After it, those frames
-      #       split to kek_generation_stale (still selected) LESS the ones
-      #       retention now rescues into accepted — so the existing threshold is,
-      #       if anything, conservative.
+      # BLIND SPOT, AND ITS NAMED COMPENSATING CONTROL. This is a FLEET-WIDE
+      # ratio: one client in a hundred whose KEK push always fails reads 1%
+      # forever and never fires. The small-denominator detectors are MC's
+      # per-recipient push counter (mc_meeting_kek_pushes_total{outcome},
+      # alerted by MCKekPushFailureRate) and, for the unwrap split, the
+      # client's conflicting_key refusal (MCClientKekConflictingKey below).
+      #
+      # AGGREGATED NUMERATOR, NOT `sum by(reason)`: the reasons share one
+      # runbook scenario, and a per-reason instance would need
+      # `/ on() group_left()` broadcasting for the denominator -- machinery
+      # for no triage gain. The reason fork lives in Scenario 16.
+      #
+      # DEMONSTRATION (ADR-0036 §11, both halves): FIRE -- guard rule 2 proves
+      # every name and label this expression reads survives the pipe. APPLY
+      # -- a client series name read back out of Prometheus by a real browser
+      # (the R-27 read-back, packages/web-app/e2e/multi-party-hear.spec.ts,
+      # names from packages/web-app/e2e/clientMetricNames.ts).
       - alert: MCMediaMissingKeyMaterial
         expr: |
           (
-            sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"}[5m]))
+            sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
             /
             sum(rate(dt_client_media_frames_received_total[5m]))
           ) > 0.05
@@ -646,9 +660,118 @@ groups:
           component: media-keys
         annotations:
           summary: "Clients sustained-dropping media frames for missing key material ({{ $value | humanizePercentage }})"
-          description: "Receiving clients cannot open frames because of missing key material, in three arms: the carried KEK generation is NEWER than any held (no_kek_for_generation - MC's KEK push has not arrived); the carried generation is OLDER than this client retains (kek_generation_stale - the frame predates the client's retention window, which derives from MC's rotation debounce; remedy MC_KEK_ROTATION_DEBOUNCE_SECONDS); or there is no usable identity key for the sender (no_roster_entry). All are EXPECTED transiently at join and after a KEK rotation; 15 minutes sustained is the signal, and ADR-0036 §11 makes it the only signal for a join or rotation path that has silently stopped delivering keys. Split on the reason label FIRST - the three arms have different remedies and are not equally instrumented. Fires on a client counter but lives here because the remedy is in MC's KEK-and-roster delivery path."
-          impact: "Affected participants hear nothing while every server-side signal reads healthy - MH never opens a frame and structurally cannot observe any of the three conditions. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
+          description: "Receiving clients cannot open frames because of key delivery, in four arms. no_kek_for_generation: the carried KEK generation is NEWER than any held, so MC's KEK push has not arrived. kek_generation_stale: the carried generation is OLDER than this client retains; retention derives from MC's rotation debounce, see Scenario 16 Arm 3 before touching MC_KEK_ROTATION_DEBOUNCE_SECONDS. no_roster_entry: there is no usable identity key for the sender. unwrap_failed: an authenticated frame whose KEK unwrap failed, i.e. a KEK-bytes split between sender and receiver, or a sender wrap bug. The first three are EXPECTED transiently at join and after a KEK rotation; unwrap_failed never is. 15 minutes sustained is the signal, and ADR-0036 §11 makes it the only signal for a join or rotation path that has silently stopped delivering keys. Split on the reason label FIRST: the arms have different remedies. This is a fleet-wide ratio and cannot see one client whose pushes fail; read mc_meeting_kek_pushes_total{outcome} for that. It fires on a client counter but lives here because the remedy is MC's KEK-and-roster delivery path."
+          impact: "Affected participants hear nothing while every server-side signal reads healthy. MH never opens a frame and structurally cannot observe any of the four conditions. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-16-missing-key-material"
+
+      # ====================================================================
+      # Client key-lifecycle TRIPWIRES (story 2 task 16) -- MC-side remedy
+      # ====================================================================
+      #
+      # Two client TRIPWIRE arms (near-zero, alerted on first occurrence; the
+      # rebind arm is NOT zero-forever, see its causes) whose remedy is MC's KEK and roster
+      # delivery path, so they live here, like MCMediaMissingKeyMaterial. The
+      # third tripwire (retention violation) is an SDK regression and lives in
+      # client-alerts.yaml. The `MCClient` prefix is the naming convention:
+      # a client-origin series, an MC remedy (docs/observability/alert-conventions.md).
+      #
+      # SHAPE: PRESENCE, NOT increase(). The SDK exports a counter only in an
+      # interval where it was recorded (DELTA temporality; OTel sdk-metrics'
+      # DeltaMetricProcessor starts each collection from an empty map), so the
+      # series is ABSENT until the first increment and first appears in
+      # Prometheus already at >= 1. increase()/rate() need a prior sample and
+      # never see that first event, and for a tripwire arm the first
+      # event is the only one that matters. dt-guard client-metrics-export
+      # (`tripwire_rate_wrapped`) fails the build if these names are ever
+      # wrapped in increase()/rate(). That is a SHAPE guard. The claim that
+      # "appears at 1, so sum > 0 fires" is UNVERIFIED BY EXECUTION, because no
+      # PromQL-evaluating lane exists. The live demonstration is to trip the
+      # counter once in a browser and watch the alert go pending.
+      #
+      # CLEARING: the alert clears on its own when the collector's prometheus
+      # exporter drops the idle series after its `metric_expiration`
+      # (infra/services/otel-collector/collector.yaml). Idle tabs do not hold
+      # it up (they export nothing for an unrecorded arm). So "still firing"
+      # is not "still happening", and a SECOND occurrence while firing is
+      # invisible in the alert state; read the raw counter, which rises.
+      # Silence proves nothing about the pipe (up{job="otel-collector"}).
+      #
+      # `for: 1m`, not 0m: validate_for_field accepts < 30s only with an
+      # increase() window, which this shape deliberately lacks. It costs a
+      # minute of latency and nothing else.
+      #
+      # EVERY KNOWN REASON THE COUNTER CAN BE NON-ZERO is listed per rule.
+      # A newly observed legitimate cause is ADDED to that list. The rule is
+      # never retired or silenced for it: the first legitimate-looking
+      # increment is the exact event that tempts someone to retire a tripwire.
+      #
+      # DEMONSTRATION (ADR-0036 §11, both halves): FIRE -- the shape guard
+      # plus the documented one-increment browser demo. APPLY -- guard rule 2
+      # proves the name is exported and `outcome` is in keep_keys; the R-27
+      # read-back proves the pipe carries client series.
+      - alert: MCClientKekConflictingKey
+        # Known non-zero causes (kekSource.ts, the `conflicting_key` arm):
+        #   1. an MC defect delivering DIFFERENT bytes under a generation the
+        #      client already holds, on a live connection;
+        #   2. a compromised or misbehaving MC;
+        #   3. a FUTURE SDK change adding reconnect that swaps keys on a live
+        #      holder instead of starting a new session with a new holder.
+        #      This is the most likely first legitimate-looking increment, and
+        #      the fix is the SDK; never relax the refusal.
+        # NOT causes: a stale tab or a reconnect race (the SDK has no
+        # reconnect; one holder per session), or an equal-bytes redelivery
+        # (`MeetingKekHolder.install` returns `already_held`, which is not a
+        # refusal and is never counted). It is the SOLE observable witness of
+        # its arm: the receive-side twin is unwrap_failed on peers, diluted
+        # inside MCMediaMissingKeyMaterial's fleet ratio.
+        expr: |
+          sum(dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-keys
+        annotations:
+          summary: "A client refused conflicting KEK bytes under a generation it already held"
+          description: "dt_client_media_kek_install_refusals_total{outcome=\"conflicting_key\"} is present: a client was handed different KEK bytes under a KEK generation it already holds, and kept the held key. Peers holding the other bytes drop that sender's frames as unwrap_failed. Causes: an MC KEK-issuance defect, a compromised MC, or an SDK change that reuses a key holder across sessions. The alert clears when the collector expires the idle series (metric_expiration), not when the condition stops. A second occurrence while firing shows only in the raw counter."
+          impact: "Part of a meeting may be unable to open another member's media, with no server-side signal. Security-relevant: a same-generation key swap is exactly what the refusal exists to catch."
+          runbook_url: "docs/runbooks/mc-incident-response.md#tripwire-conflicting-kek"
+
+      - alert: MCClientRosterKeyRebind
+        # Known non-zero causes (mediaMetrics.ts MEDIA_ROSTER_KEY_CHANGES, rosterKeys.ts):
+        #   1. an MC defect in roster publication;
+        #   2. a cache-poisoning attempt (route to security);
+        #   3. a LOST ParticipantLeft (MC's roster try_send dropped under
+        #      outbound backpressure) followed by an R-16 sender-id reissue,
+        #      which reaches the client as a rebind.
+        # Cause 3 has a NECESSARY condition: a sender-id-space-exhaustion KEK
+        # epoch reset in that meeting, because an id is reissued ONLY under a
+        # later generation (crates/mc-service/src/media_admission/epoch.rs,
+        # "The invariant, stated once"). CHECK THAT FIRST:
+        # the RAW counter sum(mc_meeting_kek_generated_total{trigger=
+        # "sender_space_exhausted"}) > 0, with no range window (it covers MC's
+        # process lifetime, which bounds every meeting). It is fleet-wide with no
+        # meeting label: non-zero SUPPORTS cause 3, and only a fleet-wide zero
+        # RULES IT OUT, leaving causes 1 and 2.
+        # mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}
+        # is SUPPORTING evidence only, read as the raw counter over MC's process
+        # lifetime. The lost Left can precede the reissue by hours, so a
+        # short-window zero rules NOTHING out. It is fleet-wide, so it never
+        # confirms a single increment either.
+        # Only the `rebind` arm is selected: `downgrade` is expected non-zero
+        # and is panel-only (client-media.json).
+        expr: |
+          sum(dt_client_media_roster_key_rebinds_total{outcome="rebind"}) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-keys
+        annotations:
+          summary: "A client saw a sender id rebound to a different identity key"
+          description: "dt_client_media_roster_key_rebinds_total{outcome=\"rebind\"} is present: a sender id the client had bound to one identity key arrived bound to a different one. Causes: an MC roster-publication defect, a cache-poisoning attempt, or a lost ParticipantLeft followed by a sender-id reissue. Check that third cause FIRST: it needs a sender-id-exhaustion epoch reset in that meeting (mc_meeting_kek_generated_total{trigger=\"sender_space_exhausted\"} or MCKekEpochResetOnSenderIdExhaustion). No reset rules it out. mc_participant_outbound_messages_dropped_total{payload_kind=\"participant_update_left\"} over MC's lifetime only supports it; a short-window zero proves nothing. The alert clears when the collector expires the idle series (metric_expiration), not when the condition stops. A second occurrence while firing shows only in the raw counter."
+          impact: "Frames from the rebound sender may be attributed to the wrong identity or refused. Sender attribution is the property ADR-0036 §3 signatures exist to provide."
+          runbook_url: "docs/runbooks/mc-incident-response.md#tripwire-roster-key-rebind"
 
       # ------------------------------------------------------------------
       # ADR-0031 block — meeting teardown on the media handlers

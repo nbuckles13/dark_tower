@@ -1893,11 +1893,16 @@ const ASSIGNMENT_REJECTION_REASONS: &[&str] = &[
 /// `mc_participant_outbound_messages_dropped_total{payload_kind}` — the bound
 /// is stated in the "Participant outbound delivery" section header. Emit sites
 /// pass `&'static str` constants, never a runtime value.
+///
+/// Built FROM those constants, never restated as literals: a literal list is
+/// how `participant_update_muted` (story 2 task 12) went un-zero-initialised
+/// until story 2 task 16. A new `payload_kind` const must be added here.
 const OUTBOUND_PAYLOAD_KINDS: &[&str] = &[
-    "signaling_raw",
-    "participant_update_joined",
-    "participant_update_left",
-    "meeting_kek_update",
+    crate::actors::participant::OUTBOUND_PAYLOAD_SIGNALING_RAW,
+    crate::webtransport::handler::PAYLOAD_KIND_PARTICIPANT_UPDATE_JOINED,
+    crate::webtransport::handler::PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT,
+    crate::webtransport::handler::PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED,
+    crate::actors::participant::OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE,
 ];
 /// `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` —
 /// the Layer-2 (ADR-0003) rejection combinations. `grpc_service`/`expected_type`
@@ -2157,6 +2162,15 @@ mod tests {
 
         // Demo-symptom Join Flow counters that read 0/No-Data on the story-1 demo.
         present_at_zero(r#"mc_session_joins_total{status="success"}"#);
+        // Every payload kind, so the next kind added without zero-init reds here.
+        for kind in OUTBOUND_PAYLOAD_KINDS {
+            present_at_zero(&format!(
+                r#"mc_participant_outbound_messages_dropped_total{{payload_kind="{kind}"}}"#
+            ));
+        }
+        present_at_zero(
+            r#"mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_muted"}"#,
+        );
         present_at_zero(r#"mc_session_joins_total{status="failure"}"#);
         present_at_zero(r#"mc_webtransport_connections_total{status="rejected"}"#);
         present_at_zero(r#"mc_actor_panics_total{actor_type="controller"}"#);
