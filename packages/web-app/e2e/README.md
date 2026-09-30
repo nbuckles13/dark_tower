@@ -154,8 +154,9 @@ sender), `receiveAnalysis` (layer 3, the decoded tone, through the pure
 series are fleet aggregates (the collector is their `instance`, and they carry no
 participant label), so they prove only the pipe, the exported NAME and the
 alert's applicability. Every "flat"/"zero" claim is sampled together with a
-probe that must ADVANCE in the same window, over a ≥ 4-sample floor
-(`receiveEvidence.ts:observeWindow`). Every multi-party test takes the MH
+probe that must ADVANCE in the same window ON THE SAME PAGE (a stalled page
+sampler repeats a stale snapshot; its own mover is what catches that), over a
+≥ 4-sample floor (`receiveEvidence.ts:observeWindow`). Every multi-party test takes the MH
 admission baseline BEFORE its joins, so a missing sender is diagnosed (budget
 rejection / misrouting / unobservable) automatically.
 
@@ -190,7 +191,13 @@ to CI artifacts or attached to issues.
 **Timing constants** live at the top of `fixtures.ts`'s media section: a 750 ms
 post-mute settle (frames already queued at the instant of mute may still drain —
 §5 stops *capture* within one frame, which is not the same as un-queueing), a
-2 500 ms observation window, and a 4-sample floor.
+2 500 ms observation window, and a 4-sample floor. Both windows —
+`observeWindow` and `expectCountersFlatOverWindow` — stop only when the window has
+elapsed AND the floor is met; slow reads or a slipping in-page sampler under load
+extend them up to `FLAT_WINDOW_MAX_OBSERVE_FACTOR` × the span, where they fail as
+a `HARNESS:` error — the floor is never lowered (stop rule:
+`e2e/windowSampling.ts:windowStep`). `observeWindow` also races each read against
+that bound, so a hung read fails there too.
 
 **Registration cost (solo spec): 0.** Both tests sign in as the shared user V and
 create their meeting Node-side. The multi-party specs spend one sign-in per

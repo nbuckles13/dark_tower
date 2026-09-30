@@ -55,6 +55,7 @@ async function clickServerMute(actor: JoinedMember, target: JoinedMember): Promi
 function mutedSlotProbe(receiver: JoinedMember, sender: JoinedMember): Probe {
   return {
     label: `${receiver.label}.slot(${sender.label}).isSourceMuted`,
+    observer: receiver.label,
     expect: 'zero',
     read: async () =>
       (await latestAssignments(receiver)).some(
@@ -212,6 +213,8 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
           acceptedProbe(host, b, 'flat'),
           acceptedProbe(c, b, 'flat'),
           acceptedProbe(c, host, 'advance'),
+          // The host's own mover, so its flat-on-B is read from a live sampler.
+          acceptedProbe(host, c, 'advance'),
         ],
         'compose: B unmuted itself but is still server-muted',
       );

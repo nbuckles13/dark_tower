@@ -98,6 +98,9 @@ test.describe('story 2 S2: under-fill and over-subscription', () => {
           // nothing verifies (L2).
           keyedProbe(r, s3, 'zero'),
           acceptedProbe(r, s3, 'zero'),
+          // R's own mover: R keeps receiving a sender it holds, so R's zeros are
+          // read from a live sampler, not a stale snapshot.
+          acceptedProbe(r, s1, 'advance'),
           sentProbe(s3, 'advance'),
           acceptedProbe(s1, s3, 'advance'),
         ],

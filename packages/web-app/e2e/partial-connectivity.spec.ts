@@ -57,6 +57,7 @@ async function connectedSet(member: JoinedMember): Promise<string[]> {
 function connectedCountProbe(member: JoinedMember): Probe {
   return {
     label: `${member.label}.connectedHandlers`,
+    observer: member.label,
     expect: 'flat',
     read: async () => (await connectedSet(member)).length,
   };
@@ -66,6 +67,7 @@ function connectedCountProbe(member: JoinedMember): Probe {
 function unreachableMarkLostProbe(receiver: JoinedMember, subject: JoinedMember): Probe {
   return {
     label: `${receiver.label}.roster(${subject.label}).unreachableMarkLost`,
+    observer: receiver.label,
     expect: 'zero',
     read: async () =>
       (await receiver.page

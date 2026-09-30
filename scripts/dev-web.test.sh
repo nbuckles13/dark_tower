@@ -168,7 +168,12 @@ run_check() {
   if [[ -n "${RUN_CHECK_TONE:-}" ]]; then tone_env=(); fi
   local -a tone_set=()
   if [[ -n "${RUN_CHECK_TONE:-}" ]]; then tone_set=("DT_TEST_TONE=${RUN_CHECK_TONE}"); fi
-  RUN_OUT="$(cd "$root" && env "${tone_env[@]}" "${n_env[@]}" "${tone_set[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
+  # Same for the test-levers opt-in (RUN_CHECK_LEVERS).
+  local -a levers_env=(-u DT_TEST_LEVERS)
+  if [[ -n "${RUN_CHECK_LEVERS:-}" ]]; then levers_env=(); fi
+  local -a levers_set=()
+  if [[ -n "${RUN_CHECK_LEVERS:-}" ]]; then levers_set=("DT_TEST_LEVERS=${RUN_CHECK_LEVERS}"); fi
+  RUN_OUT="$(cd "$root" && env "${tone_env[@]}" "${levers_env[@]}" "${n_env[@]}" "${tone_set[@]}" "${levers_set[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
     bash "$root/scripts/dev-web.sh" --check 2>&1 || true)"
 }
 
@@ -699,6 +704,13 @@ RUN_CHECK_TONE=1 run_check "$root" "$stubs"
 out_tone="$(plain "$RUN_OUT")"
 assert_status "tone-state-on-when-set" "test tone: ON requested (DT_TEST_TONE=1;" "$out_tone"
 assert_absent "tone-state-not-off-when-set" "test tone: OFF" "$out_tone"
+# The sibling test-levers define is echoed the same way (@operations OPS-1, task 19).
+assert_status "levers-state-off-when-unset" "test levers: OFF (DT_TEST_LEVERS unset)" "$out"
+assert_absent "levers-state-not-on-when-unset" "test levers: ON" "$out"
+RUN_CHECK_LEVERS=1 run_check "$root" "$stubs"
+out_levers="$(plain "$RUN_OUT")"
+assert_status "levers-state-on-when-set" "test levers: ON requested (DT_TEST_LEVERS=1;" "$out_levers"
+assert_absent "levers-state-not-off-when-set" "test levers: OFF" "$out_levers"
 assert_absent "slots-default-not-over-cap" "$OVER_CAP_TEXT" "$out"
 assert_absent "slots-default-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
 # The comment decoy's value must never surface as the cap.

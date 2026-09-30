@@ -1526,8 +1526,10 @@ starts on a join is F15's join path, and a silence present from the start is §4
 **Fix.** The remedy lives in one place, the rotation arm of
 [`mc-incident-response.md` Scenario 16](mc-incident-response.md#rotation-arm--silence-after-someone-left)
 (per-recipient push outcomes, the retention-expiry rung, and why raising W usually does not help).
-**Do not duplicate it here.** The immediate unblock for you is a **page reload**. That is a fresh
-join, and it carries the current KEK. MC never re-sends a KEK push that was dropped.
+**Do not duplicate it here.** The immediate unblock for you is a **rejoin**. Click the **Create**
+nav, then **Join**, and enter the same code. That is a fresh join, and it carries the current KEK.
+A page reload also works, but it drops the in-memory sign-in (`App.svelte`), so you then have to sign
+in again. MC never re-sends a KEK push that was dropped.
 
 ### F17 — "I can hear some people but not all"
 
@@ -1761,3 +1763,4 @@ yourself updating the same fact in two of these files, one of them is wrong.
 | 2026-09-30 | client (story 2 task 13) | Added **F18** (receive-slot count N over the MC cap: loud refusal, `dt_client_media_receive_slots_rejected_total`, the bus/console discriminators, fix by agreement never by clamping) and **F19** (rising `dt_client_media_receive_source_deficit_total`: an MC-claimed-active source decoding nothing, triage ladder into MH Scenarios 15-17 and MC routing). F16/F17 left for story 2's runbook task. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |
 | 2026-09-30 | operations (story 2 task 17) | Corrected triage prose falsified by loopback removal (R-3), each with a recorded-correction note: **F13** no longer reads `received` flat as a failed round trip — it forks first on `dt_client_media_receive_source_deficit_total` + `data-slot-state` (nobody sent to you is correct), and only "MC says active, nothing arrives" proceeds to the NAT-binding / stale-policy fork; **F12** gains the healthy "nobody holds you" case (a solo participant sends nothing: `EmittedEmptyTargets`); **F14** gains the N-sender note (`accepted` rising can mean one sender works and another does not); §4.5 rung 1, the rung-2 fork table and the rung-6 `no_subscriber` comment (sustained is a fault, not routine) updated to match; stale "no media plane" text in §4.3 and §7 corrected. |
 | 2026-09-30 | operations (story 2 task 18) | Added **F16** (silence after a leave: the KEK-rotation signature, discriminated by leave correlation; rung 1 is the client pipe's presence, because a dead pipe leaves `MCMediaMissingKeyMaterial` green; the retained-generations counter against `kek_update`; remedy in MC Scenario 16's rotation arm) and **F17** (static fill: late joiners inaudible until someone leaves; effective N from the slot grid, the server cap, no debugger until story 5). Removed F18's reservation note. |
+| 2026-09-30 | test (story 2 task 19) | F16's immediate unblock corrected from "page reload" to a rejoin via the Create then Join navs: a reload drops the in-memory sign-in. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |
