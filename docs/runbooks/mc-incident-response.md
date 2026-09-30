@@ -2352,9 +2352,17 @@ in the response path, not the apply path.
 
 ### Scenario 16: Missing Key Material
 
-**Alert**: `MCMediaMissingKeyMaterial`, `MCKekPushFailureRate`
+**Alert**: `MCMediaMissingKeyMaterial`, `MCKekPushFailureRate`; tripwires `MCClientKekConflictingKey`, `MCClientRosterKeyRebind`, `ClientKekRetentionViolation`
 **Severity**: Warning
 **Runbook Section**: `#scenario-16-missing-key-material`
+
+> **This scenario also hosts the client key-lifecycle TRIPWIRES** (story 2 task 16). These are
+> three client tripwire arms, each alerted on its first occurrence. Each has its own rung
+> below: [conflicting KEK](#tripwire-conflicting-kek),
+> [roster key rebind](#tripwire-roster-key-rebind) and
+> [KEK retention violation](#tripwire-kek-retention-violation). They are here because two of the
+> three remedies are MC's key-and-roster delivery path. The third is an SDK regression and is
+> hosted here only because there is no client incident runbook.
 
 > **`MCKekPushFailureRate` routes here too** (story 2 task 9). A KEK push that did not reach a member
 > IS missing key material at that client, one hop earlier: the server-side cause of the
@@ -2379,14 +2387,15 @@ in the response path, not the apply path.
 
 **What this is.** A receiving client is dropping frames because it does not have the key material
 needed to open them. The counter is **client-side**, by design: MH never opens a frame and
-**structurally cannot observe any of the three conditions** (ADR-0036 §4, §11).
+**structurally cannot observe any of the four conditions** (ADR-0036 §4, §11).
 
 ```promql
-sum by(reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"}[5m]))
+sum by(reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
 ```
 
-**All three reasons are expected as transients** at join and immediately after a KEK rotation. **The
-sustained case is the signal**, and ADR-0036 §11 states it is the *only* signal for a join or
+**The three key-generation and roster reasons are expected as transients** at join and immediately
+after a KEK rotation. `unwrap_failed` has **no** healthy transient (Arm 4). **The sustained case is
+the signal**, and ADR-0036 §11 states it is the *only* signal for a join or
 rotation path that has silently stopped delivering keys. That is why the alert's `for:` window is
 long rather than its threshold being high — see the comment on the rule.
 
@@ -2426,7 +2435,7 @@ long rather than its threshold being high — see the comment on the rule.
 > same batch and compress together — which is why it is ratio-shaped and why an absolute-rate alert
 > on a `dt_client_*` series would fire on the artefact alone.)
 
-**Triage splits on the `reason` label first, because the three arms have different remedies — and
+**Triage splits on the `reason` label first, because the four arms have different remedies — and
 because they are not equally instrumented.**
 
 #### Arm 1 — `no_roster_entry`
@@ -2556,11 +2565,124 @@ honouring the W it was sent:
 
 This arm has no server-side counter either (same gap as Arm 2).
 
+#### Arm 4 — `unwrap_failed`
+
+**It joined this alert's selector in story 2 task 16.** Before that it was selected by no alert
+rule. The frame is **authenticated**: the signature covers the wrapped-key block and verification
+runs before unwrap, so transit corruption lands on `signature_invalid`, never here. What remains is
+a KEK-unwrap tag mismatch on a frame a roster member really sent. Its reachable causes are:
+
+1. **The sender and this receiver hold DIFFERENT KEK bytes under the same generation.** This is a
+   KEK-distribution split, and the reason the arm belongs to MC's delivery path. Its per-client
+   witness is the [conflicting KEK tripwire](#tripwire-conflicting-kek): a client refusing to
+   overwrite a held generation with different bytes. That tripwire is the small-denominator
+   detector the fleet-wide ratio cannot be.
+2. **A sender-side wrap or key-schedule bug.** Route to `client`.
+3. **An authenticated roster member emitting bad wraps**, whether misbehaving or compromised. Route
+   to `security`.
+
+A drop lands here only when the unwrap failed **and** no usable transmit key for the frame's key id
+was already cached. With a usable cached key the same mismatch is the non-dropping
+`wrap_key_id_mismatch`. That is why this arm has no healthy transient: a sustained rate is always
+signal.
+
+#### Tripwires — client key-lifecycle counters that should never move
+
+Three client tripwire arms are **expected to stay at or near zero** (retention violation and conflicting KEK have no known benign cause; rebind has one, below), and each is alerted on its first occurrence.
+Read these properties before triaging any of them:
+
+- **The alert is presence-shaped**: `sum(X) > 0`, not `increase()`. The SDK exports a counter only
+  when it is recorded, so the series does not exist until the first increment and first appears
+  already at ≥ 1. `increase()` would never see that first event.
+- **"Still firing" does not mean "still happening".** The alert clears on its own when the
+  collector's prometheus exporter drops the idle series, after its `metric_expiration`
+  (`infra/services/otel-collector/collector.yaml`). An idle open tab does not hold it up, because
+  the SDK exports only the attribute sets recorded in each interval. No one has to ack it.
+- **A second occurrence while the alert is firing is invisible in the alert state.** Read the raw
+  counter (`sum by(outcome)(X)`): it rises.
+- **Silence proves nothing about the pipe.** The alert cannot fire while the client pipe is dead.
+  Liveness is `up{job="otel-collector"}` plus the quiet-series ladder in `gc-deployment.md`.
+- **A new legitimate cause is added to the rule comment.** The rule is never retired or silenced for
+  it. The first legitimate-looking increment is exactly the event that tempts someone to retire a
+  tripwire.
+
+#### Tripwire: conflicting KEK
+
+**Alert**: `MCClientKekConflictingKey`, on `dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}`.
+
+A client was handed **different KEK bytes under a generation it already holds**, and refused them.
+The SDK has no reconnect: one KEK holder lives per meeting session and dies with its signaling
+connection, and a rejoin gets a new holder. So neither a stale tab nor a reconnect race reaches
+this arm. An equal-bytes redelivery returns `already_held` from `MeetingKekHolder.install`, which is not a refusal and is never counted. The known causes are:
+
+1. An MC defect that delivers different bytes under a held generation on a live connection.
+2. A compromised or misbehaving MC.
+3. A future SDK change that adds reconnect and swaps keys instead of starting a new session with a
+   new holder. The fix is in the SDK; the refusal must not be relaxed.
+
+The paired receive-side symptom is Arm 4 (`unwrap_failed`) on peers holding the other bytes. Route
+to `meeting-controller` (KEK issuance and delivery), with `security` required.
+
+#### Tripwire: roster key rebind
+
+**Alert**: `MCClientRosterKeyRebind`, on `dt_client_media_roster_key_rebinds_total{outcome="rebind"}`.
+
+A client saw a sender id it already had bound to one identity key arrive bound to a **different**
+identity. `downgrade` is a separate, expected-non-zero arm and is not alerted. The known causes are:
+
+1. An MC defect in roster publication.
+2. A cache-poisoning attempt. Route to `security`.
+3. **A lost `ParticipantLeft`** (MC's roster push dropped under outbound backpressure), followed by
+   an R-16 sender-id reissue. The client never learned that the old binding ended.
+
+**Check cause 3's necessary condition FIRST.** A sender id is reissued only under a later KEK
+generation, and an epoch reset always bumps it (`crates/mc-service/src/media_admission/epoch.rs`,
+"The invariant, stated once"). So cause 3 requires a sender-id-space-exhaustion epoch reset in that
+meeting:
+
+```promql
+sum(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}) > 0
+```
+
+Read it as the **raw counter**, with no range window. It covers MC's process lifetime, and a meeting
+cannot outlive its MC process. A `[24h]`-style window would wrongly rule the cause out for an older
+meeting. The counter is **fleet-wide, with no meeting label**: non-zero **supports** cause 3 but does not rule it in for THIS meeting, and only
+a fleet-wide zero **rules it OUT**, which leaves causes 1 and 2 (`meeting-controller` and
+`security`). `MCKekEpochResetOnSenderIdExhaustion` having fired is corroboration.
+
+If there was a reset, `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`
+read as the **raw counter over MC's process lifetime** is supporting evidence. **Never use a
+short-window zero on it as a rule-out**: the lost Left can precede the reissue by hours, because
+the reissue comes only at the next exhaustion. The counter is fleet-wide, so it never confirms any
+single increment either. Route to `meeting-controller`.
+
+#### Tripwire: KEK retention violation
+
+**Alert**: `ClientKekRetentionViolation` (`infra/docker/prometheus/rules/client-alerts.yaml`), on
+`dt_client_media_kek_retention_violations_total`.
+
+**This is a client SDK regression, and an operator cannot remediate it.** An SDK install path tried to make a client hold more than the current KEK generation plus ONE
+previous (`MAX_HELD_GENERATIONS`). `RetentionGuard` **fails safe**: it zeroizes and drops the excess
+in the same call, so no superseded key was kept past that install. This is a COUNT bound, not the
+time bound `min(W/2, ceiling)`, which this counter does not observe. What is broken is the
+key-lifetime code that should have made the guard unnecessary, so a further regression could take the
+fail-safe with it, and that is why it alerts. The bound it protects is ADR-0036 §4's key
+minimisation in a browser. The invariant is held by a unit test (`RetentionGuard` in
+`packages/sdk-core/src/media/setup/kekSource.ts`), so there is no known legitimate cause. The
+counter exists to catch a future refactor that breaks it.
+
+It is a warning rather than a page only because it is zero-forever and unit-test-held. **Action**:
+
+1. Roll back the web-app/SDK release that introduced it.
+2. File a `client` bug with the release version (`client_version` on the series).
+3. Involve `security`.
+
+There is no MC-side remedy, and changing W does not help.
+
 #### Neighbouring reasons that are NOT this scenario
 
 | `reason` | What it actually is | Route to |
 |---|---|---|
-| `unwrap_failed` | The **KEK unwrap** failed — key **distribution** | `meeting-controller` |
 | `decrypt_failed` | The **SFrame payload** decrypt failed — the key schedule or the sender | `client` |
 | `no_transmit_key` | A frame with neither a cached key nor a usable wrap — a **protocol violation**, not a fourth key reason | `protocol` / `client` |
 | `sender_not_assigned` | A verified frame from a sender outside the client's MC-stated slot assignment — **misrouting**, not key delivery; deliberately excluded from this alert | `meeting-controller` (placement) / `media-handler` (forwarding) |
@@ -2568,7 +2690,7 @@ This arm has no server-side counter either (same gap as Arm 2).
 `unwrap_failed` and `decrypt_failed` are both AES-GCM failures on one receive path that route to
 opposite teams. Read the label, not the symptom.
 
-**Escalation**: `meeting-controller` owns all three remedies (roster publication, KEK delivery,
+**Escalation**: `meeting-controller` owns the Arm 1–3 remedies and Arm 4 cause 1 (roster publication, KEK delivery,
 rotation debounce).
 `security` is a required reviewer on any change to KEK handling.
 
@@ -2989,7 +3111,21 @@ clears at rotation. Undelivered pushes are `MCKekPushFailureRate`
 
 **Alerts**: `MCEndMeetingOwnershipRejected`, `MCEndMeetingFailureRate`, `MCPushQuiesceTimeouts`,
 `MCTeardownFenceBackstop`, `MCNotifyMeetingEndedFailing`, `MCMeetingEndedNotificationsDropped`
-(all warning; `infra/docker/prometheus/rules/mc-alerts.yaml`).
+(all warning; `infra/docker/prometheus/rules/mc-alerts.yaml`); `MHMediaEgressEdgeHeadroomLow`
+(warning; `infra/docker/prometheus/rules/mh-alerts.yaml`).
+
+> **Arriving from `MHMediaEgressEdgeHeadroomLow`? Fork LEAK vs LOAD first** (story 2 task 16). The
+> alert reads installed edges against `mh_media_egress_stream_ceiling`, the admission bound that binds
+> first.
+>
+> - **LEAK** is this scenario: `mh_media_egress_edges` climbs with the handler's uptime while
+>   `mh_media_meeting_teardowns_total{outcome="released"}` stays flat, so ended meetings are not
+>   being released. That includes the residual that no MC-side alert can see, an MC that never
+>   called `EndMeeting` (for example after an MC crash). On a long-lived pod this is a true
+>   positive. Do not tune the alert's fraction up to silence it.
+> - **LOAD** is not this scenario: the edges track `mh_media_registered_meetings` and real demand.
+>   Teardown is healthy and the remedy is capacity or placement (more handlers, or rebalancing),
+>   not anything below.
 
 **What changed (story 2 task 12, R-20).** A meeting now ENDS when its last roster participant is
 removed (a clean leave, or a disconnect whose grace expired). MC then, off the meeting actor's

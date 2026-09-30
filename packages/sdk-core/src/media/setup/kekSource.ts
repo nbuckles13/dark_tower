@@ -437,9 +437,12 @@ export class MeetingKekHolder implements MeetingKekSource, KekWrapSource {
       //  (b) this is the arm that fails SILENTLY. An older generation partitions
       //      the meeting visibly (`no_kek_for_generation` / `kek_generation_stale`,
       //      both alerted); a same-generation mismatch holds the generation and
-      //      fails at the unwrap tag, surfacing only as `unwrap_failed`, which no
-      //      alert or panel selects. The refusal counter is the sole witness.
-      //  Tracked in `docs/TODO.md` §Media Path Obligations.
+      //      fails at the unwrap tag, surfacing as `unwrap_failed` (in
+      //      `MCMediaMissingKeyMaterial`'s selector since story 2 task 16, but that
+      //      is a fleet-wide ratio). The refusal counter is the per-client witness
+      //      and is itself alerted: `MCClientKekConflictingKey`
+      //      (`infra/docker/prometheus/rules/mc-alerts.yaml`). The reconnect
+      //      hazard stays tracked in `docs/TODO.md` §Media Path Obligations.
       this.#observer?.installRefused('conflicting_key');
       this.#observer?.warn(
         'the meeting controller delivered a different key under the KEK generation already held; ' +

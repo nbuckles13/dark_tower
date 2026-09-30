@@ -152,7 +152,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames the receive path could not open, by frozen reject reason. THE SIGNAL THIS BOARD EXISTS FOR: the three key-material reasons no_kek_for_generation (KEK generation newer than held - MC's push has not arrived), kek_generation_stale (generation older than this client retains) and no_roster_entry are, per ADR-0036 §11, the only signal for a join or rotation path that has silently stopped delivering keys - all are expected transiently at join and after a KEK rotation, and sustained is the fault. Split on reason FIRST; the three arms have different remedies and are not equally instrumented. EMPTY HERE IS NOT A STATEMENT ABOUT DROPS AT ALL. Today it means the export hop is unwired (see the banner), and it would look exactly the same whether or not frames were being dropped. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where the drop panels read a flat ZERO when healthy (those counters are present-at-zero from startup; an ABSENT series there is a fault). Do not carry that reading across to this board; once the exporter lands, an empty panel here will mean what it means there, and not before. The discriminator, once both states are possible: count(dt_client_media_frames_received_total) returning no data (series absent, pipeline unwired) versus returning a number (series present, counters genuinely at zero). No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on.",
+      "description": "Frames the receive path could not open, by frozen reject reason. THE SIGNAL THIS BOARD EXISTS FOR: the FOUR key-material reasons MCMediaMissingKeyMaterial selects - no_kek_for_generation (KEK generation newer than held - MC's push has not arrived), kek_generation_stale (generation older than this client retains), no_roster_entry (no usable identity key for the sender) and unwrap_failed (an authenticated frame whose KEK unwrap failed: a KEK-bytes split between sender and receiver under one generation, or a sender wrap bug; transit corruption lands on signature_invalid instead, because the signature covers the wrap block) - are, per ADR-0036 §11, the only signal for a join or rotation path that has silently stopped delivering keys. The first three are expected transiently at join and after a KEK rotation, and sustained is the fault; unwrap_failed has NO healthy transient. Split on reason FIRST; the four arms have different remedies (docs/runbooks/mc-incident-response.md Scenario 16) and are not equally instrumented - the conflicting-KEK tripwire panel below is the small-denominator witness for the unwrap_failed split. The alert's ratio, threshold and duration live in the rule (infra/docker/prometheus/rules/mc-alerts.yaml) and are not restated here. AN EMPTY PANEL HERE IS AMBIGUOUS. The export pipeline is LIVE, so empty can mean no drops occurred, no browser has reported within the collector's metric_expiration, or the pipeline broke - run the three-step discriminator in the READ FIRST panel before concluding anything from absence. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where the drop panels read a flat ZERO when healthy (those counters are present-at-zero from startup; an ABSENT series there is a fault). Client series are created lazily on first emission, so here absence and zero are different states; do not carry the MH reading across. No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -639,7 +639,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames the send path discarded, by a bounded send-drop vocabulary that is DISTINCT from the receive reject taxonomy. Every spelling EXCEPT `not_connected` deliberately matches MH's MediaDropReason, so `sum by(reason)` compares across the two ends of one hop; `not_connected` is client-only, because MH never initiates. The roster's one home is `MEDIA_SEND_DROP_REASONS` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`, which a `toEqual` test pins - the correspondence is stated here by naming the exception, never by a count, so it cannot go stale on a sixth token. transport_send_refused and not_connected should both READ ZERO FOREVER. EMPTY HERE IS NOT A STATEMENT ABOUT DROPS AT ALL. Today it means the export hop is unwired (see the banner), and it would look exactly the same whether or not frames were being dropped. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where the drop panels read a flat ZERO when healthy (those counters are present-at-zero from startup; an ABSENT series there is a fault). Do not carry that reading across to this board; once the exporter lands, an empty panel here will mean what it means there, and not before. The discriminator, once both states are possible: count(dt_client_media_frames_received_total) returning no data (series absent, pipeline unwired) versus returning a number (series present, counters genuinely at zero). No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on.",
+      "description": "Frames the send path discarded, by a bounded send-drop vocabulary that is DISTINCT from the receive reject taxonomy. Every spelling EXCEPT `not_connected` deliberately matches MH's MediaDropReason, so `sum by(reason)` compares across the two ends of one hop; `not_connected` is client-only, because MH never initiates. The roster's one home is `MEDIA_SEND_DROP_REASONS` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`, which a `toEqual` test pins - the correspondence is stated here by naming the exception, never by a count, so it cannot go stale on a sixth token. transport_send_refused and not_connected should both READ ZERO FOREVER. AN EMPTY PANEL HERE IS AMBIGUOUS. The export pipeline is LIVE, so empty can mean no drops occurred, no browser has reported within the collector's metric_expiration, or the pipeline broke - run the three-step discriminator in the READ FIRST panel before concluding anything from absence. THIS IS THE OPPOSITE OF THE MH MEDIA-PATH BOARD, where the drop panels read a flat ZERO when healthy (those counters are present-at-zero from startup; an ABSENT series there is a fault). Client series are created lazily on first emission, so here absence and zero are different states; do not carry the MH reading across. No client reject reason is video-gated - every token that can appear on this counter is reachable in this story. Stated explicitly because the equivalent MH drop panels DO name two reasons that cannot fire until video, and silence here would be indistinguishable from having forgotten to check. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -732,7 +732,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Depth of the DEEPEST of the sender's bounded egress lanes (one per target handler, each bounded independently), in frames. A full gauge with healthy frames_sent means ONE lane (one handler's path) is stalled, not the sender. Read against the configured bound - `media.egress.maxQueueFrames` and `media.audio.frameDurationMs` in `packages/sdk-core/src/config/clientConfig.ts` (10 frames x 20 ms = 200 ms at the defaults in force at time of writing; cited rather than restated so the figure cannot silently drift from the config). The application bound trips BEFORE the transport high-water mark - asserted at setup - so a rising depth here is back-pressure we can count rather than loss inside the user agent. NOT an egress budget, capacity or ceiling: no such gauge exists in this story. AN EMPTY PANEL HERE IS AMBIGUOUS - it does not by itself mean zero drops. Run the three-step discriminator in the READ FIRST panel before concluding anything from absence. ",
+      "description": "Depth of the DEEPEST of the sender's bounded egress lanes (one per target handler, each bounded independently), in frames. A full gauge with healthy frames_sent means ONE lane (one handler's path) is stalled, not the sender. Read against the configured bound - `media.egress.maxQueueFrames` and `media.audio.frameDurationMs` in `packages/sdk-core/src/config/clientConfig.ts` - their product is the lane's bound in time. Read the keys, not a figure copied here: a number on a board outlives the config it was copied from. The application bound trips BEFORE the transport high-water mark - asserted at setup - so a rising depth here is back-pressure we can count rather than loss inside the user agent. NOT an egress budget, capacity or ceiling: no such gauge exists in this story. AN EMPTY PANEL HERE IS AMBIGUOUS - it does not by itself mean zero drops. Run the three-step discriminator in the READ FIRST panel before concluding anything from absence. ",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1033,7 +1033,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "dt_client_media_capture_source{mode}: what feeds each client's send path, as a presence gauge (value 1 for the ACTIVE mode only; a microphone build never writes a test_tone series). A test_tone series in any environment other than dev/test means a test-tone build (the Vite build-time define __DT_TEST_TONE__, story 2 R-7) is serving real users whose microphones are not being sent at all. Presence is judged over the lookback window, not per scrape: the SDK re-sets the gauge once per export interval on its own timer. No alert, deliberately - dev and test legitimately carry test_tone and the environment is not on the series. See docs/observability/metrics/client.md.",
+      "description": "dt_client_media_capture_source{mode}: what feeds each client's send path, as a presence gauge (value 1 for the ACTIVE mode only; a microphone build never writes a test_tone series). THE VALUE IS NOT A BROWSER COUNT. Every browser sets 1 for its mode with no per-browser label (a per-session identity is barred by ADR-0036 §11), so all browsers in a mode write ONE series and the collector's view is last-writer-wins: sum by(mode) reads 1 whether one browser or a thousand carry that mode. Never read a level, a rise or a fall off this panel. THE ONLY SIGNAL IS THE PRESENCE OF THE mode=\"test_tone\" SERIES (count(dt_client_media_capture_source{mode=\"test_tone\"}) > 0). A test_tone series in any environment other than dev/test means a test-tone build (the Vite build-time define __DT_TEST_TONE__, story 2 R-7) is serving real users whose microphones are not being sent at all. Presence is judged over the lookback window, not per scrape: the SDK re-sets the gauge once per export interval on its own timer. No alert, deliberately - dev and test legitimately carry test_tone and the environment is not on the series. See docs/observability/metrics/client.md.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1305,6 +1305,679 @@
         }
       ],
       "title": "Receive Path - Receive-Slot Refusals (N over MC cap)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_kek_retention_violations_total - ALERTED by ClientKekRetentionViolation (infra/docker/prometheus/rules/client-alerts.yaml). A ZERO-FOREVER TRIPWIRE AGAINST A FUTURE REFACTOR, not a detector for a live condition: the retention invariant is held by a unit test, and the only known cause of a non-zero value is an SDK regression that retains more than one previous KEK generation (a COUNT bound, current plus ONE previous generation, not the W-derived time bound). RetentionGuard FAILS SAFE: it zeroizes and drops the excess in the same call, so no superseded key was kept. What is broken is the key-lifetime code that should have made the guard unnecessary. Remedy: roll back the web-app/SDK release; nothing MC-side helps, and changing MC_KEK_ROTATION_DEBOUNCE_SECONDS does not. SERIES-ABSENT SEMANTICS: this counter is created lazily - the SDK exports DELTA and a counter only in an interval where it was recorded, so the series is ABSENT until the first increment and first appears in Prometheus already at >= 1. PRESENTED AS THE RAW SUMMED VALUE, NOT increase(): increase()/rate() need a prior sample and never see that first event, and for a tripwire the first event is the only one that matters - the alert reads the same presence form. No series is the healthy reading, but empty is equally what a broken pipeline looks like, so run the READ FIRST discriminator before trusting it. The value is the collector's accumulated count, and the series vanishes when the collector's metric_expiration (infra/services/otel-collector/collector.yaml) drops it idle - a vanished series is not a resolved one, and the alert clears then, not when the condition stops. Triage: docs/runbooks/mc-incident-response.md#tripwire-kek-retention-violation. # guard:ignore(lazy delta client tripwire counter first appears already at one so increase never sees the first event)",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 57
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(dt_client_media_kek_retention_violations_total)",
+          "legendFormat": "retention violations (accumulated)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Key Tripwire - KEK Retention Violations (ALERTED)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_kek_install_refusals_total{outcome=\"conflicting_key\"} - ALERTED by MCClientKekConflictingKey (infra/docker/prometheus/rules/mc-alerts.yaml). A client was handed DIFFERENT KEK bytes under a generation it already holds, and kept the held key. THIS IS THE SOLE OBSERVABLE WITNESS OF THAT ARM: the receive-side twin is unwrap_failed on peers, diluted inside MCMediaMissingKeyMaterial's fleet-wide ratio, so a small population is visible only here. Causes and what is NOT a cause are listed on the rule. The other two refusal arms are panel-only, on KEK Install Refusals below. SERIES-ABSENT SEMANTICS: this counter is created lazily - the SDK exports DELTA and a counter only in an interval where it was recorded, so the series is ABSENT until the first increment and first appears in Prometheus already at >= 1. PRESENTED AS THE RAW SUMMED VALUE, NOT increase(): increase()/rate() need a prior sample and never see that first event, and for a tripwire the first event is the only one that matters - the alert reads the same presence form. No series is the healthy reading, but empty is equally what a broken pipeline looks like, so run the READ FIRST discriminator before trusting it. The value is the collector's accumulated count, and the series vanishes when the collector's metric_expiration (infra/services/otel-collector/collector.yaml) drops it idle - a vanished series is not a resolved one, and the alert clears then, not when the condition stops. Triage: docs/runbooks/mc-incident-response.md#tripwire-conflicting-kek. # guard:ignore(lazy delta client tripwire counter first appears already at one so increase never sees the first event)",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(dt_client_media_kek_install_refusals_total{outcome=\"conflicting_key\"})",
+          "legendFormat": "conflicting_key refusals (accumulated)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Key Tripwire - Conflicting KEK Refusals (ALERTED)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_roster_key_rebinds_total. Target A is the rebind arm as its raw summed value (presence, the same form its alert reads); target B is the downgrade arm with increase() per ADR-0029, because downgrade is expected non-zero and its raw value is a collector-memory-bound accumulation that resets on expiry or restart. ONLY THE rebind ARM ALERTS, via MCClientRosterKeyRebind (infra/docker/prometheus/rules/mc-alerts.yaml): a live sender id bound to DIFFERENT, well-formed key bytes. Near-zero, NOT zero-forever - three causes: an MC roster-publication defect, a cache-poisoning attempt, or a lost ParticipantLeft followed by a sender-id reissue (that cause REQUIRES a sender-id-exhaustion epoch reset in the meeting - mc_meeting_kek_generated_total{trigger=\"sender_space_exhausted\"} - and no reset rules it out; mc_participant_outbound_messages_dropped_total{payload_kind=\"participant_update_left\"} over MC's lifetime only supports it, and a short-window zero rules nothing out). downgrade IS EXPECTED NON-ZERO and is never an alert input: MC publishing an empty key is a documented occurrence (see no_roster_entry). One increment per EVENT, not per purged key; no sender dimension. SERIES-ABSENT SEMANTICS: this counter is created lazily - the SDK exports DELTA and a counter only in an interval where it was recorded, so the series is ABSENT until the first increment and first appears in Prometheus already at >= 1. THE rebind ARM IS PRESENTED AS THE RAW SUMMED VALUE, NOT increase(): increase()/rate() need a prior sample and never see that first event, and for a tripwire the first event is the only one that matters - the alert reads the same presence form. No series is the healthy reading, but empty is equally what a broken pipeline looks like, so run the READ FIRST discriminator before trusting it. The value is the collector's accumulated count, and the series vanishes when the collector's metric_expiration (infra/services/otel-collector/collector.yaml) drops it idle - a vanished series is not a resolved one, and the alert clears then, not when the condition stops. Triage: docs/runbooks/mc-incident-response.md#tripwire-roster-key-rebind. # guard:ignore(lazy delta client tripwire counter first appears already at one so increase never sees the first event)",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(dt_client_media_roster_key_rebinds_total{outcome=\"rebind\"})",
+          "legendFormat": "rebind (presence, accumulated; ALERTED)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_roster_key_rebinds_total{outcome=\"downgrade\"}[$__rate_interval]))",
+          "legendFormat": "downgrade (increase; expected non-zero)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Roster Key Changes by Outcome (rebind ALERTED)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_kek_retention_anomalies_total by outcome: a KEK message's W (the kek_rotation_debounce_seconds wire field, MC_KEK_ROTATION_DEBOUNCE_SECONDS, published by MC as mc_meeting_kek_rotation_window_seconds) produced a non-nominal retention window, min(W/2, KEK_RETENTION_CEILING_MS) derived by deriveKekRetention in packages/sdk-core/src/config/clientConfig.ts. One per KEK message; the denominator is dt_client_media_kek_updates_total. PANEL ONLY. floor_substituted AND ceiling_clamped ARE EXPECTED-NON-ZERO CONFIGURATION / ROLLBACK STATES AND ARE NEVER ALERT INPUTS. floor_substituted: W was zero or absent, i.e. an MC older than the kek_rotation_debounce_seconds field, so the client used KEK_RETENTION_FLOOR_MS - expected, fleet-wide, during a deliberate one-version MC rollback (the supported path, not an incident; do not roll further back). It is the fleet's only cluster-visible rollback detector. ceiling_clamped: W/2 exceeded KEK_RETENTION_CEILING_MS and retention was clamped. The shipped default W ALREADY sits at that ceiling, so raising MC_KEK_ROTATION_DEBOUNCE_SECONDS at all flips the whole fleet to a permanently climbing ceiling_clamped that changes retention by nothing and is NOT a fault - it is where an operator meets the fact that W is no longer the binding parameter. below_rewrap_latency: the derived retention does not exceed the client's transmit-key re-wrap latency, so frames wrapped under the previous generation can outlive it at the receiver; the client validates its floor at startup, so this fires only when MC's W/2 is too small - the remedy is in MC (raise MC_KEK_ROTATION_DEBOUNCE_SECONDS), never client-side. SERIES-ABSENT SEMANTICS: this counter is created lazily - the SDK exports DELTA and a counter only in an interval where it was recorded, so the series is ABSENT until the first increment and first appears in Prometheus already at >= 1. Plotted with increase() per ADR-0029, so the FIRST increment of each series is invisible here (no prior sample); a series that exists at all has seen at least one event - check its presence in Explore if a single occurrence matters. Empty is ambiguous: run the READ FIRST discriminator. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(dt_client_media_kek_retention_anomalies_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KEK Retention Anomalies by Outcome (never alerted)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_kek_install_refusals_total, the two arms that do NOT alert: older_generation (a generation below the current; the holder never rolls back) and malformed (wrong width, all-zero, or a generation outside the wire's u16 range; refused and scrubbed). conflicting_key is excluded here - it alerts, and has its own tripwire panel above. Every refusal leaves the held state unchanged and working. Both arms read zero from an honest MC today (the client has no reconnect, so no holder outlives the KEK epoch it was given); an increment is a defect - an MC bug, or a client holding one KEK holder across two sessions - not a delivery hiccup. See docs/observability/metrics/client.md. (already_held is not a refusal: it is a wrap outcome, deliberately uncounted.) SERIES-ABSENT SEMANTICS: this counter is created lazily - the SDK exports DELTA and a counter only in an interval where it was recorded, so the series is ABSENT until the first increment and first appears in Prometheus already at >= 1. Plotted with increase() per ADR-0029, so the FIRST increment of each series is invisible here (no prior sample); a series that exists at all has seen at least one event - check its presence in Explore if a single occurrence matters. Empty is ambiguous: run the READ FIRST discriminator. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 73
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(dt_client_media_kek_install_refusals_total{outcome=~\"older_generation|malformed\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "KEK Install Refusals - older_generation / malformed (panel only)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_decode_queue_dropped_total: frames evicted from a per-sender decode lane's bounded pending queue while that lane's decoder is being created or replaced (overflow drops the oldest); one increment per evicted frame. PANEL ONLY. POST-ACCEPT: every frame counted here was already counted on dt_client_media_frames_accepted_total, so it sits DOWNSTREAM of received = accepted + sum(drops by reason), in the accepted-to-audible segment. It is NEVER a frames_dropped_total reason and is NEVER subtracted in that identity - folding it in would put one frame on both sides and break the identity silently, in aggregate. It exists because a queue eviction fires no decoder error callback, so Downlink Continuity and Decode's decoder-errors series does not see this loss. SERIES-ABSENT SEMANTICS: this counter is created lazily - the SDK exports DELTA and a counter only in an interval where it was recorded, so the series is ABSENT until the first increment and first appears in Prometheus already at >= 1. Plotted with increase() per ADR-0029, so the FIRST increment of each series is invisible here (no prior sample); a series that exists at all has seen at least one event - check its presence in Explore if a single occurrence matters. Empty is ambiguous: run the READ FIRST discriminator. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 81
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_decode_queue_dropped_total[$__rate_interval]))",
+          "legendFormat": "decode-queue evictions",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Path - Decode Queue Drops (post-accept)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "increase(dt_client_media_kek_generations_retained_total) read AGAINST increase(dt_client_media_kek_updates_total{source=\"kek_update\"}). PANEL ONLY. KEK UPDATES RISING WHILE RETENTIONS STAY FLAT IS THE SIGNAL: rotations are arriving and no install is keeping the previous generation, so every rotation costs an audio gap (the opposite failure from the retention-violation tripwire, which watches for retaining too MANY). NEITHER SERIES ALONE SAYS ANYTHING. kek_update is rotation pushes only (a reconnect re-issue rides the JoinResponse-shaped reconnect result and counts as join_response), and each push delivers a newer generation and demotes the current one, so the HEALTHY EXPECTATION IS ROUGHLY ONE-TO-ONE, less refusals (KEK Install Refusals and the conflicting-KEK tripwire panels). The divergence is the signal; flat retentions with flat updates is simply no rotation. Both count per browser. SERIES-ABSENT SEMANTICS: this counter is created lazily - the SDK exports DELTA and a counter only in an interval where it was recorded, so the series is ABSENT until the first increment and first appears in Prometheus already at >= 1. Plotted with increase() per ADR-0029, so the FIRST increment of each series is invisible here (no prior sample); a series that exists at all has seen at least one event - check its presence in Explore if a single occurrence matters. Empty is ambiguous: run the READ FIRST discriminator. ",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 81
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_kek_updates_total{source=\"kek_update\"}[$__rate_interval]))",
+          "legendFormat": "kek_update arrivals",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_kek_generations_retained_total[$__rate_interval]))",
+          "legendFormat": "generations retained",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "KEK Rotations vs Generations Retained",
       "type": "timeseries"
     }
   ],

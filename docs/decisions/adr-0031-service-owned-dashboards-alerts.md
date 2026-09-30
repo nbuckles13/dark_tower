@@ -57,6 +57,8 @@ On every service-owned metrics/dashboard/alert PR, the following cross-cutting s
 
 **Review gate timing**: plan approval (not post-hoc). Thresholds, panel classifications, and alert shapes are agreed as part of the plan artifact before implementation, so review is collaborative rather than gatekeeping.
 
+**Named review obligation — retired-behaviour prose sweep** (amendment, 2026-09-30, story 2 task 16). This is a REVIEW obligation, not a guard. **When a requirement retires a behaviour, the plan must grep runbooks, dashboard JSON (titles, descriptions, annotations) and alert-rule comments and annotations for text asserting that behaviour, and fix every hit in the same change.** Reviewers check that the sweep ran and that the plan lists what it found. The reason is that nothing mechanical catches prose: story 2 falsified five pieces of triage text that way. Examples are the loopback-era "flat zero is THE EXPECTED HEALTHY STATE" panel descriptions, the "`unwrap_failed` is selected by no alert or panel" source comment, and the "nothing covers a typo in this expression" rule comment, each still asserting a behaviour its own story had removed. A guard cannot tell a sentence that describes retired behaviour from one that describes current behaviour; a reviewer holding the retired requirement can.
+
 ### Plan-template artifact
 
 Plans for devloops that add or modify metrics/alerts MUST include a structured Alert Thresholds block reviewable at plan approval:

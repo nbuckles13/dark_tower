@@ -19,6 +19,7 @@
 //!
 //! Template files (`_template-*.yaml`) are skipped entirely.
 
+use crate::common::alert_rule_files::loadable_rules_files;
 use crate::common::duration::parse_prometheus_duration;
 use crate::common::path_safety::{resolve_cited_path, to_repo_relative};
 use crate::common::status::emit_ok;
@@ -462,59 +463,6 @@ impl Finding {
 //
 // "Sets differ" would be true and useless. Which side is short determines who
 // is called.
-
-/// **The** predicate for *which files in the rules directory Prometheus loads*.
-///
-/// Returns bare filenames, sorted. Two exclusions, both deliberate:
-///
-/// * **not `_`-prefixed** — `_template-service-alerts.yaml` is a starter of
-///   `<svc>` placeholders. Its exprs are not parseable PromQL, and Prometheus
-///   validates rule files at config load and **exits non-zero**, which
-///   in-cluster is CrashLoopBackOff and takes whole-cluster bring-up with it.
-///   It is additionally guard-*exempt* by design, so loading it would evaluate
-///   and publish annotation text nothing has ever scanned.
-/// * **`-alerts.yaml` suffix** — a recording-rules file would want a different
-///   glob and a different review; nothing has needed one yet, and admitting it
-///   silently is how the set stops meaning anything.
-///
-/// This is intentionally **narrower** than the set [`run`] lints, which is
-/// every `*.yaml`/`*.yml` minus `_template-`. The gap is real and it is
-/// reported: [`check_rule_file_loading`] compares the **linted** set against
-/// this one and flags every file that falls in between — `Foo-alerts.yaml`,
-/// `mc-recording-rules.yaml`, `mh-media-alerts.yml`. Each of those is a file
-/// full of live alert rules that this guard lints, passes clean, and Prometheus
-/// never loads: the "alive, never applied" defect, occurring inside the guard
-/// built to close it.
-///
-/// **An earlier version of this comment claimed that asymmetry was reported
-/// when only half of it was.** `Foo-alerts.yaml` was caught (an uppercase name
-/// is outside the glob *and* outside this predicate, so the glob-coverage loop
-/// saw it); `mc-recording-rules.yaml` was not, because a file that is not in
-/// this predicate is not in `expected` and was therefore never asked about.
-/// The comment named the uncaught example. Found at review, and it is the same
-/// class as every other overclaim in this changeset — a sentence asserting a
-/// protection that did not exist.
-fn loadable_rules_files(alerts_dir: &Path) -> Result<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
-    if !alerts_dir.is_dir() {
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(alerts_dir).context("read alerts dir for loading coverage")? {
-        let entry = entry.context("read alerts dir entry")?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if name.starts_with('_') {
-            continue;
-        }
-        if !name.ends_with("-alerts.yaml") {
-            continue;
-        }
-        out.push(name);
-    }
-    out.sort();
-    Ok(out)
-}
 
 /// Expand one Prometheus `rule_files` glob against the rules directory.
 ///

@@ -635,9 +635,7 @@ histogram_quantile(0.95,
 
 Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`, `MCMediaGenerationDivergence`, `MCKekRotationOverdue`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
 
-**That list is complete; the entries below it are not.** Only `MCMediaGenerationDivergence` has a full inventory entry — it landed with its alert, so byte-identical PromQL was applied at authoring time. The other five are **named here and uninventoried** (`MCKekRotationOverdue`'s entry, with the two KEK warnings and the info rule that replaced `MCSenderIdSpaceExhausted`, is story 2 task 16's), exactly as in §Media Handler Alerts.
-
-**Task 16's inventory backlog is larger than the clause above, which was written before story 2 task 12 (updated 2026-09-27 by @observability at Gate 3 of `docs/devloop-outputs/2026-09-27-mc-server-mute-teardown/`).** Six further `severity: warning` MC rules now exist with no inventory entry: `MCEndMeetingOwnershipRejected`, `MCEndMeetingFailureRate`, `MCPushQuiesceTimeouts`, `MCTeardownFenceBackstop`, `MCNotifyMeetingEndedFailing` and `MCMeetingEndedNotificationsDropped` (all in `mc-alerts.yaml`, all with runbook links and full rule comments — what they lack is the byte-identical PromQL copy an inventory entry carries). **Named rather than counted, deliberately**: the clause above says "the other five", and a count is what went stale here when the rule set grew — the same sub-kind as the enumeration failure recorded in `docs/TODO.md` under the runbook-commands entry. So task 16 owes ten entries, not four, and this list is the hand-off. **The page-severity list above is unaffected and remains complete** — every one of the six is `warning`. The `inventory_expr_drift` guard checks byte-identity for what is inventoried; it does not require that every rule have an entry, so nothing mechanical will report this section incomplete.
+**Every MC rule is inventoried as of story 2 task 16**, except the pre-story-2 ones this section never covered: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed` and the join-flow warnings not listed below. Read `mc-alerts.yaml` rather than inferring absence from this file. The ten entries task 16 owed are the two KEK warnings, the page, the sender-id info rule and the six task-12 teardown warnings, all below by name. The `inventory_expr_drift` guard holds byte-identity for every inventoried entry. It does **not** require that every rule have one, so nothing mechanical reports this file incomplete.
 
 #### MCMediaGenerationDivergence
 
@@ -663,13 +661,28 @@ sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[
 >
 > `handler_id_mismatch` is the one exclusion beyond `match`: `MH_HANDLER_ID` is per-incarnation, so an ordinary MH restart produces it by construction and a bare `outcome != "match"` would page on every rollout. That exclusion is held at three sites — this rule, `docs/observability/metrics/mc-service.md`'s catalog entry, and `mc-deployment.md`'s post-deploy checklist — as **one decision with one revert trigger**, `2026-09-02-mh-stable-handler-id`; remove it in all three places together.
 
+#### MCKekRotationOverdue
+
+**Severity**: Page
+**Condition**: The oldest un-rotated departure in some meeting is older than the published overdue threshold, with no arithmetic: `mc_meeting_kek_rotation_pending_age_seconds` is compared bare against `mc_meeting_kek_rotation_overdue_threshold_seconds` (W times a compile-time multiplier, published by MC from the value its timer enforces). The condition must hold for 2 minutes.
+**Impact**: **Confidentiality, not media quality.** A departed participant still holds a KEK that opens every current participant's media in that meeting. When this fires, W has already been exceeded by roughly the multiplier; it is not a leading indicator.
+**Runbook**: [Scenario 19: KEK Rotation Stalled](../runbooks/mc-incident-response.md#scenario-19-kek-rotation-stalled)
+
+**PromQL**:
+```promql
+mc_meeting_kek_rotation_pending_age_seconds > mc_meeting_kek_rotation_overdue_threshold_seconds
+```
+`for: 2m`
+
+**Label-set identity is load-bearing**: `a > b` matches equal label sets, so a label added to only one of the two gauges silently empties the comparison. **Demonstration** (ADR-0036 §11): stall the rotation timer and watch pending age cross the threshold gauge. Fork first on `mc_meeting_kek_rotation_failures_total{reason}`; if neither reason moves, suspect a wedged meeting actor (`mc_actor_mailbox_depth`).
+
 ### Warning Alerts (Join Flow)
 
 #### MCMediaMissingKeyMaterial
 
 **Severity**: Warning
-**Condition**: >5% of received media frames dropped for missing key material, sustained 15 minutes
-**Impact**: Affected participants hear nothing while every server-side signal reads healthy — MH never opens a frame and structurally cannot observe either condition.
+**Condition**: >5% of received media frames dropped for missing key material (four reasons: `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `unwrap_failed`), sustained 15 minutes
+**Impact**: Affected participants hear nothing while every server-side signal reads healthy — MH never opens a frame and structurally cannot observe any of the four conditions.
 **Runbook**: [Scenario 16: Missing Key Material](../runbooks/mc-incident-response.md#scenario-16-missing-key-material)
 
 > **THIS ALERT CAN NOW FIRE, AND HAS BEEN PROVEN TO MATCH.** It previously carried a notice that it was structurally incapable of matching, because `dt_client_*` metrics reached no Prometheus. That is fixed: the collector's `prometheus` exporter, the `otel-collector` scrape job and the GC telemetry-filter widening landed together, and the expression below returned `0.286` against live data driven by sdk-core's own built bundle through the GC proxy. Recorded as an event rather than deleted, because "this alert has never fired" means something different before and after that date, and a responder reading history needs to know which side of it they are on.
@@ -682,7 +695,7 @@ sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[
 **PromQL**:
 ```promql
 (
-  sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry"}[5m]))
+  sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
   /
   sum(rate(dt_client_media_frames_received_total[5m]))
 ) > 0.05
@@ -691,17 +704,22 @@ sum(rate(dt_client_media_frames_received_total[5m])) > 0
 ```
 `for: 15m`
 
-**The selector is an EXPLICIT TOKEN ENUMERATION, not a pattern over `layer` or a name prefix** — a future key-delivery token joins it only by being added here deliberately (and in `mc-alerts.yaml`). `layer` does no selector work: classify by `docs/observability/label-taxonomy.md` §The discriminator, never by `layer`. **`sender_not_assigned` is EXCLUDED by decision**: it is a frame from a sender outside the client's MC slot-assignment set, so its remedy lives in MH/MC placement, not in KEK or roster delivery, and it is not alerted anywhere this story (the alert inventory is story 2 task 16's). Re-deriving the threshold for the widened three-token selector is also task 16's. Until then it leans SAFE (@operations' derivation, recorded in full at the rule): widening a numerator over an unchanged denominator only moves the ratio up, so the un-re-derived 5% can over-page but never under-page; and the selected population is roughly today's minus the frames retention now rescues into `accepted`.
+**The selector is an EXPLICIT TOKEN ENUMERATION, and its partition is MECHANICAL** (story 2 task 16). `dt-guard client-metrics-export` (G7) requires every `drops_frame: true` token in `proto/test-vectors/frame-v2.vectors.json` to be in **exactly one** of this alternation or the guard's `NOT_KEY_DELIVERY` list, which carries each excluded token's reason; `sender_not_assigned` (misrouting) is one of them. So a new reject token fails the build until someone classifies it. **Deriving membership from `layer` was considered and rejected**: `layer` names the processing stage, not the remedy owner, and `unwrap_failed` (layer `crypto`) belongs here. **`unwrap_failed` joined by decision**: it is an authenticated frame whose KEK unwrap failed. Its main cause is a KEK-bytes split between sender and receiver, which is key distribution; the others are sender wrap bugs, whose user symptom is identical and which nothing else selects. It has no healthy transient.
+
+**Threshold, re-derived against W over the four-token set (task 16)**: 5% and `for: 15m` stand. The healthy ratio is a duty cycle of about (per-rotation KEK push skew) / W. Rotations happen at most once per W per meeting, W ≥ `MIN_KEK_ROTATION_DEBOUNCE_SECONDS`, retention far exceeds the skew so `kek_generation_stale` is ~0, `no_roster_entry` is join-only, and `unwrap_failed` has no transient. Holding 5% for 15 minutes at the W floor needs a skew of 5% of W on every rotation, with a leave every W. The story's ~25x margin holds iff skew is under 0.2% of W. **The skew is unmeasured**: this is a stated assumption, not a ratified number. The full derivation is in the rule comment.
+
+**Blind spot and its named compensating control**: this is a fleet-wide ratio, so one client in a hundred with a failing push reads 1% forever. `MCKekPushFailureRate` (MC's per-recipient push counter) and `MCClientKekConflictingKey` are the small-denominator detectors.
 
 **Response**:
-1. **Split on the `reason` label first** — the three arms have different remedies and are not equally instrumented.
+1. **Split on the `reason` label first** — the four arms have different remedies and are not equally instrumented.
 2. `no_roster_entry`: no usable identity key for the sender, including the case where MC published an empty key. Signature verification cannot run, so attribution is failing and not merely decryption. Corroborate server-side with `mc_join_identity_key_presence_total{presence}` — a rising `absent` ratio answers "are clients publishing keys?" directly. A *malformed* key is a different condition and lands on `mc_session_join_failures_total{error_type="identity_key_invalid"}`.
 3. `no_kek_for_generation`: the frame's wrap announces a KEK generation NEWER than any this receiver holds — **MC's KEK push has not arrived** (MC delivery path). **This arm has no server-side counter and cannot have one** — `mc_meeting_kek_generated_total` increments unconditionally and its catalog entry states the inference is not computable even in principle. Absence of a signal here is not evidence the KEK is present.
 4. `kek_generation_stale`: the frame's wrap announces a generation OLDER than this receiver still retains (it keeps the current generation plus at most one previous, for `min(W/2, ceiling)` where W is MC's `kek_rotation_debounce_seconds`). At the shipped default W, client retention is **already at its ceiling** (`KEK_RETENTION_CEILING_MS`, 30 s), so raising `MC_KEK_ROTATION_DEBOUNCE_SECONDS` does **not** lengthen it — it only flips the fleet to `ceiling_clamped`. The only lever that lengthens retention past 30 s is the client ceiling itself, an SDK constant requiring a release **and** a deliberate key-lifetime bound (ADR-0036 §4) — a security decision, not a remedy an operator applies. Lowering W *shortens* retention and makes this worse. A sustained `kek_generation_stale` at default configuration therefore points at **sender-side rotation skew**, not at MC's debounce. Read `dt_client_media_kek_retention_anomalies_total{outcome}` for why retention was what it was (`floor_substituted` = an MC older than the field, expected during a deliberate MC rollback; `below_rewrap_latency` = W/2 under the client's re-wrap latency) and `dt_client_media_kek_install_refusals_total{outcome}` for KEK messages the client refused. Both KEK arms fire only when no usable transmit key for the frame's key id is already cached.
 5. Check the non-dump path first and completely: the per-join response-side condition (`meeting_kek` not exactly 32 bytes) and `dt_client_media_kek_updates_total{source=~"join_response|kek_update"}` — the join response is no longer the only KEK source. Then read the runbook's dump gate before going further.
-6. All three reasons are **expected transiently** at join and after a KEK rotation. The `for: 15m` window, not the threshold, is what separates the transient from the signal.
+6. `unwrap_failed`: an authenticated frame whose KEK unwrap failed. It has **no** healthy transient, so a sustained rate is always signal. The main cause is a KEK-bytes split between sender and receiver; check `MCClientKekConflictingKey` / `dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}`. The others are a sender wrap or key-schedule bug (`client`) and a misbehaving authenticated member (`security`). Runbook Scenario 16 Arm 4.
+7. The first three reasons are **expected transiently** at join and after every KEK rotation. The `for: 15m` window, not the threshold, is what separates the transient from the signal.
 
-**Threshold provenance**: 5% is not SLO-derived and there is no observed baseline. At 20 ms/frame (50 frames/s) a 1–2 second join transient is well under 1% of a 5-minute window while a sustained delivery failure sits near 100%.
+**Threshold provenance**: 5% is not SLO-derived and there is no observed baseline. The re-derivation against W is above and in the rule comment.
 
 #### MCHighJoinFailureRate
 
@@ -787,6 +805,174 @@ sum(rate(mc_jwt_validations_total[5m])) > 0
 
 ---
 
+### Warning Alerts (Media Keys)
+
+#### MCKekPushFailureRate
+
+**Severity**: Warning
+**Condition**: More than 1% of per-recipient `MeetingKekUpdate` pushes neither delivered nor to a benign grace-period member (`participant_gone`), for 10 minutes, with a non-zero-denominator guard.
+**Impact**: Members that miss a push cannot open frames under the new generation and do not rotate their own transmit keys. There is no re-push, so in a quiet meeting this does not clear on its own.
+**Runbook**: [Scenario 16: Missing Key Material](../runbooks/mc-incident-response.md#scenario-16-missing-key-material)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mc_meeting_kek_pushes_total{outcome!~"delivered|participant_gone"}[10m]))
+  /
+  sum(rate(mc_meeting_kek_pushes_total[10m]))
+) > 0.01
+and
+sum(rate(mc_meeting_kek_pushes_total[10m])) > 0
+```
+`for: 10m`
+
+**This is the small-denominator detector** that `MCMediaMissingKeyMaterial`'s fleet-wide client ratio cannot be: one client in a hundred whose pushes always fail reads 1% there forever. Split on `outcome` first: `dropped_outbound`, `actor_unavailable`, `timed_out`.
+
+#### MCKekRotationStorm
+
+**Severity**: Warning
+**Condition**: Leave-triggered rotations (`mc_meeting_kek_generated_total{trigger="participant_left"}`) per active meeting exceed twice 1/W, with W read from `mc_meeting_kek_rotation_window_seconds`, averaged over 10 minutes.
+**Impact**: Every rotation pushes a new KEK to every member and makes every sender rotate its transmit keys. A storm multiplies control-plane and client key work across the fleet.
+**Runbook**: [Scenario 17: KEK Rotation Storm / Flapping Participant](../runbooks/mc-incident-response.md#scenario-17-kek-rotation-storm--flapping-participant)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mc_meeting_kek_generated_total{trigger="participant_left"}[10m]))
+  /
+  sum(avg_over_time(mc_meetings_active[10m]))
+) > 2 / scalar(max(mc_meeting_kek_rotation_window_seconds))
+and
+sum(avg_over_time(mc_meetings_active[10m])) > 0
+and on()
+sum(mc_meetings_active) > 0
+```
+`for: 10m`
+
+The debounce limits each meeting to one leave rotation per W, so this is **not reachable while the debounce works**: suspect the debounce, not the churn. Fork on the `trigger` label first.
+
+#### MCClientKekConflictingKey
+
+**Severity**: Warning
+**Condition**: Any client has counted `dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}`: it was handed different KEK bytes under a generation it already holds, and refused them.
+**Impact**: Part of a meeting may be unable to open another member's media (peers see `unwrap_failed`) with no server-side signal. It is security-relevant, because a same-generation key swap is what the refusal exists to catch.
+**Runbook**: [Tripwire: conflicting KEK](../runbooks/mc-incident-response.md#tripwire-conflicting-kek)
+
+**PromQL**:
+```promql
+sum(dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}) > 0
+```
+`for: 1m`
+
+**Presence-shaped, not `increase()`**: the counter is absent until the first increment and appears already at ≥ 1, so `increase()` would never see the one event that matters. `dt-guard client-metrics-export` (`tripwire_rate_wrapped`) fails the build on an `increase()`/`rate()` wrapping; that is a shape guard, and the appear-at-1 firing claim is unverified by execution. **It clears when the collector's exporter drops the idle series** (`metric_expiration`, `infra/services/otel-collector/collector.yaml`), not when the condition stops. A second occurrence while firing shows only in the raw counter. Idle tabs do not hold it up. **Every known non-zero cause is listed at the rule**. A new legitimate cause is added there; the rule is never retired or silenced for it.
+
+**Sole observable witness** of its arm, and the small-denominator detector for `MCMediaMissingKeyMaterial`'s `unwrap_failed` arm.
+
+#### MCClientRosterKeyRebind
+
+**Severity**: Warning
+**Condition**: Any client has counted `dt_client_media_roster_key_rebinds_total{outcome="rebind"}`: a sender id arrived bound to a different identity key. The `downgrade` arm is expected non-zero and is panel-only.
+**Impact**: Frames from the rebound sender may be attributed to the wrong identity or refused. Sender attribution is what ADR-0036 §3 signatures exist to provide.
+**Runbook**: [Tripwire: roster key rebind](../runbooks/mc-incident-response.md#tripwire-roster-key-rebind)
+
+**PromQL**:
+```promql
+sum(dt_client_media_roster_key_rebinds_total{outcome="rebind"}) > 0
+```
+`for: 1m`
+
+**Presence-shaped, not `increase()`**: the counter is absent until the first increment and appears already at ≥ 1, so `increase()` would never see the one event that matters. `dt-guard client-metrics-export` (`tripwire_rate_wrapped`) fails the build on an `increase()`/`rate()` wrapping; that is a shape guard, and the appear-at-1 firing claim is unverified by execution. **It clears when the collector's exporter drops the idle series** (`metric_expiration`, `infra/services/otel-collector/collector.yaml`), not when the condition stops. A second occurrence while firing shows only in the raw counter. Idle tabs do not hold it up. **Every known non-zero cause is listed at the rule**. A new legitimate cause is added there; the rule is never retired or silenced for it.
+
+**Not zero-forever** (paired-client correction at task 16): a lost `ParticipantLeft` followed by a sender-id reissue reaches it. That cause has a **necessary condition**: a sender-id-exhaustion epoch reset in the meeting (`mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}` / `MCKekEpochResetOnSenderIdExhaustion`; ids are reissued only under a later generation, `media_admission/epoch.rs`). Check it first, as the raw counter with no range window (it covers MC's process lifetime). It is fleet-wide with no meeting label, so only a fleet-wide zero rules the cause out. `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`, read over MC's lifetime, only supports it. A short-window zero rules nothing out, because the lost Left can precede the reissue by hours.
+
+### Warning Alerts (Meeting Teardown)
+
+#### MCEndMeetingOwnershipRejected
+
+**Severity**: Warning
+**Condition**: Any `mc_media_end_meeting_total{outcome="rejected_ownership"}` in 15 minutes: a handler answered `EndMeeting` with FAILED_PRECONDITION because the `mc_id` MC sent is not the one recorded for the meeting.
+**Impact**: The handler keeps that meeting's registration, routes and edge budget until it restarts. The release is refused and never retried.
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+sum(increase(mc_media_end_meeting_total{outcome="rejected_ownership"}[15m])) > 0
+```
+`for: 0m`
+
+Fleet-contract-reads-zero-forever and present at zero from process start, so `> 0` is never inert. The graceful-shutdown population (`superseded_by_successor`) is deliberately not selected, because it is routine on rolling deploys.
+
+#### MCEndMeetingFailureRate
+
+**Severity**: Warning
+**Condition**: More than 5% of meeting releases to handlers fail, over 15 minutes. Both selectors are positive enumerations, and there is a non-zero-denominator guard.
+**Impact**: Handlers keep ended meetings' registrations and edge budget, which consumes `MH_MAX_REGISTERED_MEETINGS` and denies new meetings on that handler.
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mc_media_end_meeting_total{outcome=~"rejected_ownership|unimplemented|unavailable_exhausted|invalid_argument|error"}[15m]))
+  /
+  sum(rate(mc_media_end_meeting_total{outcome=~"released|rejected_ownership|unimplemented|unavailable_exhausted|invalid_argument|error"}[15m]))
+) > 0.05
+and
+sum(rate(mc_media_end_meeting_total{outcome=~"released|rejected_ownership|unimplemented|unavailable_exhausted|invalid_argument|error"}[15m])) > 0
+```
+`for: 15m`
+
+#### MCPushQuiesceTimeouts
+
+**Severity**: Warning
+**Condition**: Any `mc_media_push_quiesce_total{outcome="timed_out"}` in 30 minutes: a teardown released without its policy pushes draining.
+**Impact**: Possibly one meeting's registration and edge budget re-created on a handler after its release, held until that handler restarts.
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+sum(increase(mc_media_push_quiesce_total{outcome="timed_out"}[30m])) > 0
+```
+`for: 0m`
+
+#### MCTeardownFenceBackstop
+
+**Severity**: Warning
+**Condition**: Any `mc_media_teardown_fence_backstop_total` in 30 minutes: a teardown task hung or died, and the controller's per-meeting fence was lifted by deadline.
+**Impact**: Rejoins of that meeting were held until the deadline, and one handler may hold a leaked registration.
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+sum(increase(mc_media_teardown_fence_backstop_total[30m])) > 0
+```
+`for: 0m`
+
+#### MCNotifyMeetingEndedFailing
+
+**Severity**: Warning
+**Condition**: Any `mc_gc_notify_meeting_ended_total{status="error"}` in 15 minutes. The notify is at-most-once, so an error is final.
+**Impact**: Joins to the affected meeting id fail with `meeting_not_found` until MC restarts or is marked unhealthy.
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+sum(increase(mc_gc_notify_meeting_ended_total{status="error"}[15m])) > 0
+```
+`for: 0m`
+
+#### MCMeetingEndedNotificationsDropped
+
+**Severity**: Warning
+**Condition**: Any `mc_gc_meeting_ended_notifications_dropped_total` in 15 minutes: MC's notify queue was full.
+**Impact**: GC keeps each affected meeting's assignment live, and joins to those meeting ids fail until MC restarts.
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+sum(increase(mc_gc_meeting_ended_notifications_dropped_total[15m])) > 0
+```
+`for: 0m`
+
 ### Info Alerts (Join Flow)
 
 #### MCHighJoinLatency
@@ -812,6 +998,27 @@ histogram_quantile(0.95,
 4. Check WebTransport session setup time
 5. Check MC pod resource utilization (CPU, memory)
 
+### Info Alerts (Media Keys)
+
+#### MCKekEpochResetOnSenderIdExhaustion
+
+**Severity**: Info
+**Condition**: A meeting exhausted its sender-id namespace and MC performed an immediate KEK-epoch reset (`trigger="sender_space_exhausted"`), any occurrence in 15 minutes.
+**Impact**: None to availability: admission succeeded and the meeting is recovering on its own. It is a security-relevant signal, because one authenticated participant can drive it cheaply.
+**Runbook**: [Scenario 17: KEK Rotation Storm / Flapping Participant](../runbooks/mc-incident-response.md#scenario-17-kek-rotation-storm--flapping-participant)
+
+**PromQL**:
+```promql
+increase(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}[15m]) > 0
+```
+`for: 0m`
+
+**This REPLACES the retired `MCSenderIdSpaceExhausted`.** A responder who remembers the old warning ("NOT SELF-CLEARING") will want to end the meeting. **Do not.** Exhaustion now triggers a new KEK and a fresh namespace, and the join succeeds. The old rule's `sender_id_space_exhausted` join-failure label is never emitted again, so that rule would be permanently silent. **Deploy coupling**: rule files self-roll with the Prometheus ConfigMap and the MC image does not. The retirement must land with or after the task-9 MC image and be restored with or before any image rollback (`docs/runbooks/mc-deployment.md` §Coordination).
+
+### Deliberate absences (MC)
+
+- **Server mute has no alert, by decision** (story 2 task 12). A non-zero mute rate is healthy moderation, and the refusal-side values are client-inflatable. The inverse condition, "a mute was applied but the muted sender is still heard", would need a per-meeting correlation that ADR-0036 §11 bars. Coverage is the browser env-test S3 (`packages/web-app/e2e/server-mute.spec.ts`), MC runbook Scenario 21 (Server Mute Not Enforced), and MH runbook Scenario 19 once story 2 task 18 writes it, and the ADR-0031 demonstration is to apply a mute and watch **MH's** `mh_media_frames_dropped_total{reason="server_muted"}` move, not only MC's counter. The decision is recorded at `mc-alerts.yaml` above `MCEndMeetingOwnershipRejected`; it is cited here, not restated.
+
 ---
 
 ## Media Handler Alerts
@@ -819,8 +1026,8 @@ histogram_quantile(0.95,
 **Status**: ✅ Exists — **partially inventoried here**
 **File**: `infra/docker/prometheus/rules/mh-alerts.yaml`
 
-**This section inventories exactly one of that file's alerts — `MHMediaEgressQueueOverflowRate`,
-below. Every other alert in `mh-alerts.yaml` ships uninventoried.** Read the rules file directly, and
+**This section inventories two of that file's alerts, `MHMediaEgressQueueOverflowRate` and
+`MHMediaEgressEdgeHeadroomLow`, below. Every other alert in `mh-alerts.yaml` ships uninventoried.** Read the rules file directly, and
 **do not treat the absence of an entry below as the absence of an alert** — that is the inference a
 reader naturally makes here, and it is wrong.
 
@@ -829,7 +1036,7 @@ Inventoried alerts are **named, never counted.** A count would be a second encod
 two struck entries from that failure. A name degrades differently: an alert name that stops existing
 is greppable, a count that stops being right is invisible.
 
-The one entry is inventoried because it **landed with its alert** (ADR-0036 story 1), so the
+The entries are inventoried because they **landed with their alerts** (ADR-0036 story 1; story 2 task 16), so the
 byte-identical-PromQL discipline was applied at authoring time rather than reconstructed. The rest
 are deliberately **not retro-filled** — backfilling is tracked in `docs/TODO.md`. Note what the
 `inventory_expr_drift` guard does and does not cover: it holds byte-identity for whatever *is*
@@ -877,6 +1084,39 @@ and
 >
 > **The client-side send drop is not covered by this rule and cannot be** — it happens in the sender, and MH structurally cannot observe it (ADR-0036 §11). A flat counter here is not evidence that frames are arriving. See the runbook's client-side ladder.
 
+#### MHMediaEgressEdgeHeadroomLow
+
+**Severity**: Warning
+**Condition**: `mh_media_egress_edges` above an alert-owned headroom fraction of `mh_media_egress_stream_ceiling`, for 10 minutes. The ceiling is the admission bound that binds first. `mh_media_egress_edges_limit` (`MH_MAX_TOTAL_EGRESS_EDGES`) is a backstop that MH refuses to start below the ceiling, so this denominator covers both. No bound is ever a literal.
+**Impact**: New participants on the handler will soon be refused at admission and get silence, while everyone already talking keeps talking and every liveness signal reads healthy.
+**Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+
+**PromQL**:
+```promql
+mh_media_egress_edges / mh_media_egress_stream_ceiling > 0.8
+```
+`for: 10m`
+
+**Fork LEAK vs LOAD first.** LEAK means edges climb with uptime while `mh_media_meeting_teardowns_total{outcome="released"}` stays flat. That is a reclamation regression, a true positive on a long-lived pod: never tune the fraction up to silence it. LOAD means edges track `mh_media_registered_meetings` and demand, and the remedy is capacity or placement. This is the **early warning**; the pending `MHMediaEgressBudgetExhausted` is the rejection-side failure. The fraction is **alert-owned and unratified**: it has no config home, so it duplicates no configured value (the derivation is in the rule's ADR-0031 block). **Demonstration**: lower the egress budget so the derived ceiling falls below a demo meeting's edges, and watch the ratio cross (lowering the edge limit instead makes MH refuse to start); confirm both gauges are present per instance with identical label sets.
+
+### Pending (not yet a rule): `MHMediaEgressBudgetExhausted`
+
+**No rule exists yet, and this is deliberately NOT a `####` inventory heading.** A `####` heading for a rule that does not exist fails `inventory_expr_drift`, and PromQL written here first would pressure the author to match it. The rule is story 2 task 18's (operations), with runbook MH Scenario 18. Its binding constraints, carried from the story:
+- `severity: warning`, `for: 10m`;
+- gauge-versus-gauge with **no arithmetic and no literal**: `mh_media_stream_admission_rejection_ratio` against `mh_media_stream_admission_rejection_ratio_threshold` (the ConfigMap's `MH_EGRESS_REJECTION_RATIO_THRESHOLD` reaches PromQL only through that gauge; `docs/TODO.md`, the gauge-to-gauge entry);
+- sustained rejection while placement keeps targeting the pod is a triage step, not a second alert.
+- **What its leading indicator is, precisely**: `MHMediaEgressEdgeHeadroomLow` reads installed edges over the **same** `mh_media_egress_stream_ceiling` that the stream-ceiling rejection arm hits. So it LEADS admission reaching the ceiling through edge occupancy (genuine exhaustion, and the unreclaimed-edge floor). It does **not** lead congestion or measured bandwidth: the budget's basis is `unmeasured`, and nothing measures bandwidth until story 5. It does not lead the empty-meeting-growth arm, which binds on `mh_media_registered_meetings_limit`, not on edges. MH Scenario 18's "no leading indicator" must be scoped accordingly (story file, task 18's prompt, correction note of 2026-09-30).
+
+Promote to a `####` entry in the same commit that lands the rule.
+
+### Deliberate absences (MH)
+
+These are recorded so that the absence reads as a decision, not an omission:
+1. No burn-rate pair (gated on the unratified MH SLO target; `docs/observability/slos.md`).
+2. No RegisterMeeting-apply alert (same gate).
+3. No teardown-never-arrives rule yet (story 2 task 18's; see the `mh-alerts.yaml` header).
+4. **`mh_media_egress_stream_ceiling_recommended_min` has no alert, by design** (story 2 task 16). It is ADVISORY: the ceiling a demo of the configured size needs, published so an operator can compare it with `mh_media_egress_stream_ceiling`. Nothing enforces it, which is exactly why it is spelled `_recommended_min` and not `_threshold` (`docs/observability/label-taxonomy.md` §R4 suffix rule: a threshold spelling tells a responder that something automatic is watching).
+
 **Remaining unbuilt candidates** (aspirational — thresholds are unratified):
 - `MHHighPacketLoss` - Packet loss >1%
 - `MHForwardingQueueBacklog` - Queue depth high
@@ -901,6 +1141,41 @@ and
 >   number is **not ratified against the current SLI**. The alert is legitimate future work, but it
 >   cannot carry a number until story 8 ratifies one; see `docs/observability/slos.md`. Left out of
 >   the candidate list above rather than restated with a stale threshold.
+
+---
+
+## Client SDK Alerts
+
+**File**: `infra/docker/prometheus/rules/client-alerts.yaml` (new in story 2 task 16; ADR-0031 owner `client`)
+
+The placement rule: a client-origin series whose **remedy is the SDK** lives here. A client-origin series whose remedy is a server lives in that server's file, with the `MCClient` prefix (`MCMediaMissingKeyMaterial`, `MCClientKekConflictingKey`, `MCClientRosterKeyRebind`). See `alert-conventions.md` §Alert naming.
+
+#### ClientKekRetentionViolation
+
+**Severity**: Warning
+**Condition**: Any client has counted `dt_client_media_kek_retention_violations_total`: an SDK install path tried to hold more than the current KEK generation plus one previous (a COUNT bound, not the W-derived time bound). `RetentionGuard` failed safe, zeroizing and dropping the excess in the same call.
+**Impact**: An SDK regression in key-lifetime code. The fail-safe held, so no superseded key was retained past the install, but the path that should have prevented the over-retention is broken, and a further regression could remove the fail-safe with it.
+**Runbook**: [Tripwire: KEK retention violation](../runbooks/mc-incident-response.md#tripwire-kek-retention-violation)
+
+**PromQL**:
+```promql
+sum(dt_client_media_kek_retention_violations_total) > 0
+```
+`for: 1m`
+
+**Presence-shaped, not `increase()`**: the counter is absent until the first increment and appears already at ≥ 1, so `increase()` would never see the one event that matters. `dt-guard client-metrics-export` (`tripwire_rate_wrapped`) fails the build on an `increase()`/`rate()` wrapping; that is a shape guard, and the appear-at-1 firing claim is unverified by execution. **It clears when the collector's exporter drops the idle series** (`metric_expiration`, `infra/services/otel-collector/collector.yaml`), not when the condition stops. A second occurrence while firing shows only in the raw counter. Idle tabs do not hold it up. **Every known non-zero cause is listed at the rule**. A new legitimate cause is added there; the rule is never retired or silenced for it.
+
+**A zero-forever tripwire against a future SDK refactor, not a live-condition detector.** The invariant is unit-tested, and there is no known legitimate cause. The remedy is an SDK rollback, not an operator action.
+
+### Deliberate absences (client receive path)
+
+`MCMediaMissingKeyMaterial` covers four key-delivery reject reasons. `unwrap_failed` joined it in story 2 task 16, partly because nothing else watched it. That same argument applies to the other receive-path drop reasons, so their absence is recorded here as a decision rather than inherited. Each is visible on **client-media panel 3** (Frame Drops by Reason), and none is alerted:
+
+- **`signature_invalid`, `decrypt_failed`, `replay_detected`** (receive-path crypto). Any authenticated roster member can drive each of them at every receiver by authoring the frames, and transit corruption also lands on `signature_invalid`. A fleet-ratio threshold on them would be attacker-controllable. No baseline exists to set one, and a per-sender split, the dimension that would make them actionable, is barred by ADR-0036 §11. Their triage owners differ, as recorded in the guard's `NOT_KEY_DELIVERY` reasons: `security` for forgery, `client` for sender key-schedule defects.
+- **The eight codec structural rejects and `no_transmit_key`.** These are byte-determined, so a malformed or non-conforming sender produces them, and so can anyone authoring frames. A codec regression shows as a step on panel 3 at a release boundary. `no_transmit_key` is a protocol violation, and the `protocol`/`client` code owns it.
+- **`sender_not_assigned`** is misrouting, whose remedy is MC placement and MH forwarding. It is covered on the server side by MC's slot and send-target metrics, not by a client alert.
+
+**Whether any of these should alert is an open decision, not a closed one.** It is tracked in `docs/TODO.md` §Observability Debt ("Receive-path crypto drop reasons have no alert"), with the trigger being the first observed baseline.
 
 ---
 

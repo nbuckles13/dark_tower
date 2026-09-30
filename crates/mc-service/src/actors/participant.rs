@@ -41,14 +41,14 @@ const PARTICIPANT_CHANNEL_BUFFER: usize = 200;
 /// `webtransport::handler::encode_participant_update` returns WITH each
 /// wire-visible update. A new `try_send` site must add a constant here, never
 /// pass a literal.
-const OUTBOUND_PAYLOAD_SIGNALING_RAW: &str = "signaling_raw";
+pub(crate) const OUTBOUND_PAYLOAD_SIGNALING_RAW: &str = "signaling_raw";
 
 /// `payload_kind` label for a `MeetingKekUpdate` dropped on the outbound
 /// channel. Also recorded as `mc_meeting_kek_pushes_total{outcome=
 /// "dropped_outbound"}` — the two count the same event from two angles: this
 /// one as a delivery failure among all outbound traffic, that one as a
 /// rotation that did not reach a member.
-const OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE: &str = "meeting_kek_update";
+pub(crate) const OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE: &str = "meeting_kek_update";
 
 /// Maximum distinct MH statuses recorded per participant (R-60 security cap).
 ///

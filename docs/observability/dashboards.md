@@ -209,7 +209,8 @@ not a source of Grafana's projected `dashboards` volume (which would make it sil
 **Refresh**: 1 minute
 
 **Related Alerts**: `MCMediaGenerationDivergence`, `MCMediaMissingKeyMaterial`,
-`MCKekRotationOverdue`, `MCKekPushFailureRate`, `MCKekRotationStorm` (for the last two named on
+`MCKekRotationOverdue`, `MCKekPushFailureRate`, `MCKekRotationStorm`, `MCClientKekConflictingKey`
+and `MCClientRosterKeyRebind` (both client-origin tripwires, panelled on **Client SDK Media Path**) (for the last two named on
 key issuance, and for `MCMediaMissingKeyMaterial`, issuance itself is read on MC Overview; see below).
 
 **Cross-dashboard reads.** Meeting teardown stays on MC Overview (MH Coordination) while policy
@@ -268,13 +269,15 @@ The media-path **triage** board: where an operator goes to answer *why*, after
 | Media Forward Latency by Phase (p95 / p99) | Which of three phases is slow — receive-buffer, processing, or transmit-buffer |
 | Ingress / Egress Drops by Reason | Which condition dropped frames, on which side |
 | Zero-Forever Invariant Drops | Whether an invariant that should never fire has fired |
-| Egress Delivery Ratio | What fraction of egress attempts the transport accepted |
+| Egress Delivery Ratio (per-edge, egress-internal) | What fraction of per-edge egress attempts were forwarded: egress forwards over egress forwards plus per-edge egress drops. Egress-internal since story 2 (R-28): one accepted ingress frame becomes E egress attempts, so egress is never compared with ingress here. `no_subscriber` counts per FRAME, so it is excluded from the per-edge denominator |
+| Mean Fan-out (egress forwards per ingress forward) | Egress over ingress forwards, with the denominator guarded. Its expected value is the mean subscriber count per forwarded ingress frame. This is where egress and ingress ARE compared, as a ratio of units rather than a delivery rate |
 | Egress Stream Admission Decisions by Outcome | Is MH refusing new streams for capacity, and how often (story 2 R-19) |
-| Stream Admission Rejection Ratio vs Threshold | Is the windowed refusal share above the configured threshold — the same bare gauge-to-gauge comparison the exhaustion alert makes |
-| Installed Egress Streams vs Stream Ceiling | How close each handler is to its stream ceiling, and whether that ceiling is still the unsized placeholder (below the advisory recommended minimum). The edge-limit backstop is plotted beside them for headroom only: saturation is against the ceiling, never the limit. Streams are released when a meeting's MC calls `EndMeeting` (MC calls it from story 2 task 12); installed streams rising with pod uptime rather than load are meetings nobody ended — recovery under "The ratchet" in `docs/observability/metrics/mh-service.md` |
+| Admission Rejection Ratio vs Threshold | Is the windowed refusal share above the configured threshold — the same bare gauge-to-gauge comparison the exhaustion alert makes |
+| Installed Egress Streams vs Stream Ceiling | How close each handler is to its stream ceiling (the comparison `MHMediaEgressEdgeHeadroomLow` reads; fork LEAK vs LOAD first), and whether that ceiling is still the unsized placeholder (below the advisory recommended minimum). Saturation is against the ceiling, never the limit. Streams are released when a meeting's MC calls `EndMeeting` (MC calls it from story 2 task 12); installed streams rising with pod uptime rather than load are meetings nobody ended — recovery under "The ratchet" in `docs/observability/metrics/mh-service.md` |
+| Egress Edges vs Edge-Limit Backstop | The `MH_MAX_TOTAL_EGRESS_EDGES` backstop per pod. It is not the saturation denominator: the ceiling binds first, and MH refuses to start otherwise |
 | Registered Meetings vs Registration Cap | How many meetings each handler holds registered against `MH_MAX_REGISTERED_MEETINGS` (story 2 R-21) — registrations held, not meetings in progress |
 | Meeting Teardowns by Outcome | Are meetings being released, is MC ending meetings this handler never held, and is any MC ending a meeting it does not own (story 2 R-20) |
-| Egress Budget (bytes/s) | What budget the ceiling is derived from, in bytes (the key is in bits) |
+| Egress Budget (bytes/s) and Stream Ceiling | What budget the ceiling is derived from, in bytes (the key is in bits) |
 | Late Applies Refused (Released Meeting) | Is the released-meeting guard working — how many queued policy applies MH's session actor refused because `EndMeeting` had already released the meeting (the only signal for that guard; a flat 0 is healthy, an ABSENT series is a broken pipeline) |
 | Registration Policy Bounds | What per-registration pre-allocation bounds the running process loaded (config reflection; a step means a pod started on different config) |
 | Policy Apply Timeout | What config-apply reply timeout the running process loaded, in seconds (config reflection; a step means a pod started on different config) |
@@ -330,6 +333,22 @@ accounting identity `received = accepted + sum(drops by reason)`.
 > startup and they exist at zero whether or not anything flows. Here, client series are
 > created lazily on first emission, so absence and zero are genuinely different states.
 > Do not copy wording between the two boards in either direction.
+
+**Story 2 task 16 decided an operator surface for every counter task 7 exported**, because a panel nobody browses is not a surface for a counter whose whole value is that something watches it:
+
+- **Group A, alert plus panel.** The rows are marked ALERTED in their titles, and the rules are presence-shaped:
+  - `dt_client_media_kek_retention_violations_total` → `ClientKekRetentionViolation`, in `client-alerts.yaml`;
+  - `dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}` → `MCClientKekConflictingKey`;
+  - `dt_client_media_roster_key_rebinds_total{outcome="rebind"}` → `MCClientRosterKeyRebind`.
+
+  These panels plot the raw summed value, not `increase()`, because the series appears already at ≥ 1.
+- **Group B, panel only:**
+  - `kek_retention_anomalies_total` (`floor_substituted` and `ceiling_clamped` are expected-non-zero configuration and rollback states, NEVER alert inputs);
+  - the other two install-refusal arms;
+  - `decode_queue_dropped_total` (post-accept, never part of the accounting identity);
+  - **KEK Rotations vs Generations Retained**, which reads `kek_generations_retained_total` AGAINST `kek_updates_total{source="kek_update"}`. Rotations rising while retentions stay flat is the signal, and neither series alone says anything.
+
+The capture-source panel's value is not a browser count: the only signal is the presence of `mode="test_tone"`. The panel list itself is in the JSON.
 
 ## Platform Dashboards
 

@@ -58,6 +58,10 @@ Anchor examples:
 - `MCCapacityWarning` — 80% of active-meeting cap; scale out before hitting limit.
 - `MCPodRestartingFrequently` — service instability signal; not yet outage.
 
+**"Ticket tier" is `warning`.** Story and task text sometimes says "ticket-tier alert" (for example
+the story-2 client tripwires). No `ticket` severity exists, and the guard rejects one: ticket tier
+means `severity: warning` (Slack, business hours). Do not invent `severity: ticket`.
+
 ### `info` — **awareness / trend / leading indicator** `[guard-enforced value]`
 
 Fires when the system exhibits a condition worth tracking but requiring no
@@ -73,6 +77,25 @@ Anchor examples:
   `page` alert covers SLO at 200ms; this surfaces join-path degradation for
   observability.
 - `MCHighJoinLatency` — analogous leading indicator for MC session joins.
+
+### Alert naming for client-origin series `[reviewer-only]`
+
+Rules live in the file of the service whose **remedy** they route to (ADR-0031), so a
+`dt_client_*` series can be alerted from more than one file. The name prefix says which case it is:
+
+- **`MC…` / `MH…` / `GC…`** — the series is server-side, or it is the long-standing client-counter
+  rule `MCMediaMissingKeyMaterial` (it predates this convention and is not renamed).
+- **`MCClient…` (or `MHClient…`)** — a **client-origin series whose remedy is that server**, in that
+  server's rule file (`MCClientKekConflictingKey`, `MCClientRosterKeyRebind`).
+- **`Client…`** — a client-origin series whose remedy is the **SDK itself**, in
+  `infra/docker/prometheus/rules/client-alerts.yaml` (`ClientKekRetentionViolation`).
+
+**Lazily created client counters alert on PRESENCE, not `increase()`.** The SDK exports a counter
+only in an interval where it was recorded, so a lazily created client counter (every arm) first appears in
+Prometheus already at ≥ 1, and `increase()` never sees that first event. Use `sum(X{…}) > 0` with
+`for: 1m`, and state the clearing behaviour (the collector's `metric_expiration`) in the rule
+comment. `dt-guard client-metrics-export` (`tripwire_rate_wrapped`) enforces the shape for the
+enumerated tripwire counters.
 
 ### Severity classification decision tree
 

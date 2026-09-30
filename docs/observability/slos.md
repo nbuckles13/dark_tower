@@ -395,5 +395,6 @@ forward-path gates, Tier 2 regression deltas, Tier 3 non-gating objective).
 | `MCRegisterMeetingFailureRate` re-assert-failure alert | The MH target, then the handler-restart story | meeting-controller (rule), media-handler + observability + operations (reviewers) |
 | GC availability numerator counts client-attributable 4xx | Own scoping — moves a shipped baseline | observability |
 | No SLO for the MC→MH control plane's applied-generation echo | Handler-restart story | observability + operations |
+| KEK **rotation latency** (departure → every remaining member holding the new generation) — **explicitly OPEN, no number ratified** (story 2 task 16). Instruments exist: `mc_meeting_kek_rotation_duration_seconds` and the pending-age gauge against the published W and overdue-threshold gauges. The only rule is `MCKekRotationOverdue`, a confidentiality page on a W multiple, not a latency objective. Do not read that page's threshold as the objective | Story 8 (performance) | observability + meeting-controller + security |
 
 Debt and rationale for each: `docs/TODO.md` §Observability Debt.

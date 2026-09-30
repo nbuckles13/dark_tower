@@ -27,7 +27,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "GC heartbeat success rate. Green = >99%, Yellow = 95-99%, Red = <95%. Critical for MC-GC integration health.",
+      "description": "GC heartbeat success rate. Color steps live in this panel's fieldConfig thresholds and are not restated here. Critical for MC-GC integration health.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -98,7 +98,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Token refresh success rate. Green = >99.9%, Yellow = 99-99.9%, Red = <99%. Critical for AC authentication.",
+      "description": "Token refresh success rate. Color steps live in this panel's fieldConfig thresholds and are not restated here. Critical for AC authentication.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -169,7 +169,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Current token refresh p99 latency. Monitors AC token acquisition performance against 5s threshold.",
+      "description": "Current token refresh p99 latency. Monitors AC token acquisition performance against the histogram's top bucket (the red step in this panel's fieldConfig thresholds).",
       "fieldConfig": {
         "defaults": {
           "color": {

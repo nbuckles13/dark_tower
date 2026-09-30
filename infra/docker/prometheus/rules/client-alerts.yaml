@@ -1,0 +1,88 @@
+# Prometheus alerting rules whose REMEDY is the browser client SDK
+# (packages/sdk-core, packages/web-app).
+#
+# Severity levels (per docs/observability/alert-conventions.md):
+# - page: User-visible impact now or SLO burn; pages oncall immediately
+# - warning: Degraded but contained, or approaching limits; Slack notify
+# - info: Awareness/trend/leading indicator; no notification, dashboards only
+#
+# OWNERSHIP (ADR-0031 §Ownership split): the `client` specialist authors this
+# file; operations reviews severity routing and runbook linkage; observability
+# reviews thresholds, PromQL and cardinality.
+#
+# PLACEMENT RULE: a client-origin series whose remedy is the SDK lives HERE. A
+# client-origin series whose remedy is a server lives in that server's file
+# (MCMediaMissingKeyMaterial, MCClientKekConflictingKey and
+# MCClientRosterKeyRebind are in mc-alerts.yaml). The `Client` alert-name prefix
+# marks a client-origin series with a client remedy
+# (docs/observability/alert-conventions.md §Alert naming).
+#
+# LOADING: this file is in the `prometheus-rules` configMapGenerator
+# (infra/docker/prometheus/kustomization.yaml) and matches both `rule_files`
+# globs. `dt-guard alert-rules-policy` fails if those sets diverge, and
+# crates/env-tests/tests/33_alert_rules_loaded.rs fails if Prometheus did not
+# load it.
+
+groups:
+  - name: client-sdk-warning
+    interval: 60s
+    rules:
+      # ------------------------------------------------------------------
+      # ADR-0031 block -- ClientKekRetentionViolation (story 2 task 16)
+      #
+      # WHAT IT MEANS: an install path tried to make a client HOLD more than
+      # the current KEK generation plus ONE previous (`MAX_HELD_GENERATIONS`,
+      # `RetentionGuard` in packages/sdk-core/src/media/setup/kekSource.ts). The
+      # guard FAILS SAFE: it zeroizes and drops the excess generations in the
+      # same call, so no superseded key was retained past that install. What is
+      # broken is the key-lifetime code path that should have made the guard
+      # unnecessary. This is a COUNT bound, NOT the time bound
+      # min(W/2, ceiling) (`expiresAtMs`), which this counter does not observe.
+      #
+      # A ZERO-FOREVER TRIPWIRE AGAINST A FUTURE REFACTOR, NOT A DETECTOR FOR
+      # A LIVE CONDITION. The invariant is held by a unit test (`RetentionGuard`
+      # in packages/sdk-core/src/media/setup/kekSource.ts), so there is NO
+      # known legitimate non-zero cause. The only cause is an SDK regression
+      # that breaks the bound. If a legitimate cause is ever found, ADD it
+      # here. Never retire or silence the rule for it.
+      #
+      # WARNING, NOT PAGE: it is zero-forever and unit-test-held, and the
+      # remedy (roll back the SDK release) is not an operator action at 3am.
+      #
+      # SHAPE: PRESENCE, NOT increase(). The SDK exports a counter only in an
+      # interval where it was recorded (DELTA temporality; OTel sdk-metrics'
+      # DeltaMetricProcessor starts each collection from an empty map), so the
+      # series is ABSENT until the first increment and first appears already
+      # at >= 1. increase() would never see it. `dt-guard
+      # client-metrics-export` (`tripwire_rate_wrapped`) fails the build if the
+      # name is wrapped in increase()/rate(). That is a shape guard; the
+      # appear-at-1 firing claim is UNVERIFIED BY EXECUTION (no PromQL lane).
+      #
+      # CLEARING: the alert clears when the collector's prometheus exporter
+      # drops the idle series after its `metric_expiration`
+      # (infra/services/otel-collector/collector.yaml). Idle tabs export
+      # nothing and do not hold it up. "Still firing" is not "still
+      # happening", and a second occurrence while firing shows only in the raw
+      # counter.
+      #
+      # `for: 1m`: validate_for_field accepts < 30s only with an increase()
+      # window, which this shape deliberately lacks.
+      #
+      # DEMONSTRATION (ADR-0036 §11, both halves): FIRE -- the shape guard,
+      # plus the unit test that drives RetentionGuard's violation callback.
+      # APPLY -- guard rule 2 proves the name is exported, and the R-27
+      # read-back proves the pipe carries client series.
+      # ------------------------------------------------------------------
+      - alert: ClientKekRetentionViolation
+        expr: |
+          sum(dt_client_media_kek_retention_violations_total) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: client
+          component: media-keys
+        annotations:
+          summary: "A browser client tried to hold more than one previous KEK generation (fail-safe zeroized the excess)"
+          description: "dt_client_media_kek_retention_violations_total is present: an SDK install path tried to make some client hold more than the current KEK generation plus one previous. The RetentionGuard fail-safe zeroized and dropped the excess in the same call, so no superseded key was kept, but the key-lifetime code that should have made the guard unnecessary is broken. The invariant is unit-tested and has no known legitimate cause. No operator or MC-side remedy exists, and changing MC_KEK_ROTATION_DEBOUNCE_SECONDS does not help. Roll back the web-app/SDK release (client_version on the series names it) and file a client bug with security. The alert clears when the collector expires the idle series (metric_expiration), not when the condition stops."
+          impact: "An SDK regression in key-lifetime code. The fail-safe held, so no superseded meeting key was retained past the install, but the path that should have prevented the over-retention is broken, and a further regression could remove the fail-safe with it."
+          runbook_url: "docs/runbooks/mc-incident-response.md#tripwire-kek-retention-violation"

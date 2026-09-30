@@ -25,8 +25,11 @@
 //!
 //! Derived from `docs/observability/label-taxonomy.md`, never restated here:
 //! §Media-path identity R1 (no meeting identifier, raw or hashed, on any
-//! metric) and §Key custody (no end-to-end or zero-trust boolean anywhere,
-//! because the default deployment is neither). `observability` owns that file;
+//! metric), §Key custody (no end-to-end or zero-trust boolean anywhere,
+//! because the default deployment is neither), and §R4 (every media-path series
+//! is identity-free and carries `key_custody="operator"`; its identity vocabulary
+//! is a fenced block there, pinned against this module's consts by a unit test).
+//! `observability` owns that file;
 //! this module owns only the mechanics of checking it.
 
 use std::collections::BTreeMap;
@@ -49,7 +52,7 @@ pub struct Series {
     pub labels: BTreeMap<String, String>,
 }
 
-/// Which rule a violation breached. Separate variants because the two have
+/// Which rule a violation breached. Separate variants because the rules have
 /// different owners, different runbook entries and different fixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
@@ -58,6 +61,12 @@ pub enum Rule {
     /// §Key custody — an end-to-end / zero-trust claim in a name, label key or
     /// label value.
     OverclaimToken,
+    /// R4 — a meeting, participant, sender, key, slot or stream identity (or any
+    /// other token of the identity vocabulary) in a label KEY of a media-path
+    /// series.
+    MediaPathIdentity,
+    /// R4 — a media-path series without `key_custody="operator"`.
+    MissingKeyCustody,
 }
 
 /// One breach, carrying enough context for a runbook entry to be actionable.
@@ -104,6 +113,59 @@ const MEETING_ID_SUBSTRINGS: &[&str] = &["meeting_id", "meetingid"];
 const OVERCLAIM_SUBSTRINGS: &[&str] =
     &["e2ee", "end_to_end", "endtoend", "zero_trust", "zerotrust"];
 
+/// Metric-name prefixes that make a series a MEDIA-PATH series.
+///
+/// Defined ONCE, in the ```media-path-prefixes fenced block of
+/// `docs/observability/label-taxonomy.md` §R4; this copy is pinned to it by
+/// [`tests::media_path_prefixes_match_the_taxonomy_block`]. It is a prefix list rather than a name list
+/// on purpose: a new `mh_media_*` series is in scope the day it lands, with no
+/// edit here. `dt_client_time_to_first_media_frame_ms` is listed whole because it
+/// is the one exported client media metric outside `dt_client_media_`.
+pub const MEDIA_PATH_PREFIXES: &[&str] = &[
+    "mh_media_",
+    "mc_media_",
+    "mc_meeting_kek_",
+    "mc_meeting_sender_ids_",
+    "dt_client_media_",
+    "dt_client_time_to_first_media_frame_ms",
+];
+
+/// The single permitted `key_custody` value. Mirrors
+/// `crates/common/src/observability/labels.rs::KEY_CUSTODY_OPERATOR`; this crate
+/// does not depend on `common`, so the value is restated here and pinned by
+/// [`tests::key_custody_value_matches_common`], which reads that file.
+pub const KEY_CUSTODY_KEY: &str = "key_custody";
+/// See [`KEY_CUSTODY_KEY`].
+pub const KEY_CUSTODY_OPERATOR: &str = "operator";
+
+/// R4 identity vocabulary, CONTAINMENT half: nouns long enough to match as a
+/// substring of the lower-cased key (`senderIndex`, `x_stream_id`).
+///
+/// **One policy, two consumers.** The only home of this vocabulary is the
+/// fenced ```identity-label-policy block in `docs/observability/label-taxonomy.md`
+/// §R4; `dt-guard client-metrics-export` reads that block at runtime to police
+/// the collector's `keep_keys` and GC's forwarded keys, and this kernel applies
+/// the same vocabulary to STORED series.
+/// [`tests::identity_vocabulary_matches_the_taxonomy_block`] parses the block and
+/// fails if these consts differ from it. `meeting` overlaps
+/// [`MEETING_ID_SUBSTRINGS`] by design: R1 covers every metric, R4 only the
+/// media path.
+pub const IDENTITY_CONTAINMENT: &[&str] = &[
+    "meeting",
+    "participant",
+    "sender",
+    "session",
+    "slot",
+    "stream",
+];
+/// R4 identity vocabulary, SEGMENT half: tokens short enough that containment
+/// would false-fire (`id` in `valid`, `key` in `monkey`), so they match only a
+/// whole segment after splitting on non-alphanumerics and camelCase boundaries.
+pub const IDENTITY_SEGMENTS: &[&str] = &["user", "key", "kek", "id", "hash"];
+/// R4 exemptions — EXACT keys, never segments or prefixes (so `slot_id` still
+/// fires while `slot_state` passes). Reasons live with the taxonomy block.
+pub const IDENTITY_EXEMPT: &[&str] = &["key_custody", "org_id", "slot_state"];
+
 /// The client SDK's reserved metric-name namespace.
 ///
 /// Enforced for the client by `R26_NAME_RE` in
@@ -114,7 +176,62 @@ const OVERCLAIM_SUBSTRINGS: &[&str] =
 /// subject of a non-reachability premise pin.
 const CLIENT_METRIC_PREFIX: &str = "dt_client_";
 
-/// Evaluate both rules over a series set.
+/// Whether `name` is a media-path series under [`MEDIA_PATH_PREFIXES`].
+#[must_use]
+pub fn is_media_path_series(name: &str) -> bool {
+    MEDIA_PATH_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Split a label key into lower-cased segments on every non-alphanumeric
+/// character and on lower-to-upper camelCase boundaries (`meetingId` ->
+/// `meeting`, `id`; `user-id` -> `user`, `id`).
+///
+/// MUST match `dt-guard`'s splitter (`ts_retained_credentials::segments`) and the
+/// "Matcher semantics" paragraph of `docs/observability/label-taxonomy.md` §R4.
+/// Both crates run the shared ```identity-label-cases table from that section,
+/// so a divergence goes red in whichever crate drifted.
+fn key_segments(key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in key.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        cur.push(c.to_ascii_lowercase());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The R4 identity token a label key matches, if any. Exempt keys never match.
+#[must_use]
+pub fn identity_token_in_key(key: &str) -> Option<&'static str> {
+    if IDENTITY_EXEMPT.contains(&key) {
+        return None;
+    }
+    let lk = key.to_ascii_lowercase();
+    if let Some(n) = IDENTITY_CONTAINMENT.iter().find(|n| lk.contains(**n)) {
+        return Some(n);
+    }
+    let segs = key_segments(key);
+    IDENTITY_SEGMENTS
+        .iter()
+        .find(|t| segs.iter().any(|s| s == **t))
+        .copied()
+}
+
+/// Evaluate every rule over a series set.
 ///
 /// **No allowlist, and the empty allowlist is still the point — but the reason
 /// changed, and the old reason is now false.** ADR-0036 §11 grandfathers exactly
@@ -156,8 +273,36 @@ pub fn check_series(series: &[Series]) -> Vec<Violation> {
             }
         }
 
+        // R4 — media-path series only. `key_custody` must be PRESENT with the
+        // single permitted value; absence and a wrong value are one violation
+        // each, reported with the value seen.
+        let media = is_media_path_series(&s.name);
+        if media {
+            match s.labels.get(KEY_CUSTODY_KEY).map(String::as_str) {
+                Some(KEY_CUSTODY_OPERATOR) => {}
+                other => out.push(Violation {
+                    rule: Rule::MissingKeyCustody,
+                    series: s.name.clone(),
+                    detail: format!(
+                        "media-path series must carry `{KEY_CUSTODY_KEY}=\"{KEY_CUSTODY_OPERATOR}\"`, \
+                         saw {other:?}"
+                    ),
+                }),
+            }
+        }
+
         for (k, v) in &s.labels {
             let lk = k.to_ascii_lowercase();
+
+            if media {
+                if let Some(token) = identity_token_in_key(k) {
+                    out.push(Violation {
+                        rule: Rule::MediaPathIdentity,
+                        series: s.name.clone(),
+                        detail: format!("label KEY `{k}` matches identity token `{token}`"),
+                    });
+                }
+            }
 
             // KEYS ONLY, and deliberately — do NOT "fix" this into symmetry with
             // the overclaim loop below, which checks keys AND values.
@@ -546,8 +691,11 @@ mod tests {
             "mh_media_frames_forwarded_total",
             &[("meeting_id_hash", "abc123"), ("key_custody", "operator")],
         )]);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].rule, Rule::MeetingIdentifier);
+        // R1 AND R4 both fire on a media-path series: R1 bars it on every
+        // metric, R4's `meeting` noun on the media path. Count per rule.
+        assert_eq!(count(&v, Rule::MeetingIdentifier), 1);
+        assert_eq!(count(&v, Rule::MediaPathIdentity), 1);
+        assert_eq!(v.len(), 2);
     }
 
     /// The case the Rust source guard documents as uncovered: `starts_with`
@@ -558,15 +706,17 @@ mod tests {
     fn fires_on_trailing_compound_meeting_identifier() {
         let v = check_series(&[s(
             "mh_media_forward_latency_seconds",
-            &[("x_meeting_id", "m-1")],
+            &[("x_meeting_id", "m-1"), ("key_custody", "operator")],
         )]);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].rule, Rule::MeetingIdentifier);
+        assert_eq!(count(&v, Rule::MeetingIdentifier), 1);
     }
 
     #[test]
     fn fires_on_overclaim_label_key() {
-        let v = check_series(&[s("mh_media_frames_forwarded_total", &[("e2ee", "true")])]);
+        let v = check_series(&[s(
+            "mh_media_frames_forwarded_total",
+            &[("e2ee", "true"), ("key_custody", "operator")],
+        )]);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, Rule::OverclaimToken);
     }
@@ -575,14 +725,20 @@ mod tests {
     /// and not only keys.
     #[test]
     fn fires_on_overclaim_label_value() {
-        let v = check_series(&[s("mc_media_policy_pushes_total", &[("mode", "zero_trust")])]);
+        let v = check_series(&[s(
+            "mc_media_policy_pushes_total",
+            &[("mode", "zero_trust"), ("key_custody", "operator")],
+        )]);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, Rule::OverclaimToken);
     }
 
     #[test]
     fn fires_on_overclaim_in_metric_name() {
-        let v = check_series(&[s("mh_media_e2ee_frames_total", &[])]);
+        let v = check_series(&[s(
+            "mh_media_e2ee_frames_total",
+            &[("key_custody", "operator")],
+        )]);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rule, Rule::OverclaimToken);
     }
@@ -593,9 +749,258 @@ mod tests {
     fn fires_on_camel_case_overclaim_value() {
         let v = check_series(&[s(
             "mh_media_frames_forwarded_total",
-            &[("mode", "ZeroTrust")],
+            &[("mode", "ZeroTrust"), ("key_custody", "operator")],
         )]);
         assert_eq!(v.len(), 1);
+    }
+
+    fn count(v: &[Violation], rule: Rule) -> usize {
+        v.iter().filter(|x| x.rule == rule).count()
+    }
+
+    // ------------------------------------------------------------------
+    // R4 — media-path identity and key custody (story 2 task 16)
+    // ------------------------------------------------------------------
+
+    /// The clean control for R4, over REAL story-2 label shapes. Without it the
+    /// FIRE fixtures below could pass because the predicate flags everything —
+    /// and with `id` in the segment set, the scrape-added and bounded-vocabulary
+    /// keys here are exactly where a false positive would appear.
+    #[test]
+    fn r4_real_story2_series_produce_nothing() {
+        let ko = ("key_custody", "operator");
+        let series = vec![
+            s(
+                "mc_meeting_kek_pushes_total",
+                &[("outcome", "delivered"), ko],
+            ),
+            s(
+                "mc_meeting_kek_generated_total",
+                &[("trigger", "participant_left"), ko],
+            ),
+            s("mc_meeting_kek_rotation_pending_age_seconds", &[ko]),
+            s(
+                "mc_meeting_kek_rotation_coalesced_leaves_bucket",
+                &[("le", "4"), ko],
+            ),
+            s("mc_meeting_sender_ids_issued_max", &[ko]),
+            s(
+                "mc_media_slot_states_total",
+                &[("slot_state", "active"), ko],
+            ),
+            s(
+                "mc_media_server_mute_requests_total",
+                &[("outcome", "applied"), ko],
+            ),
+            s(
+                "mh_media_egress_edges",
+                &[ko, ("instance", "10.0.0.1:8081"), ("job", "mh-service")],
+            ),
+            s(
+                "mh_media_stream_admission_total",
+                &[("outcome", "admitted"), ko],
+            ),
+            s(
+                "mh_media_frames_dropped_total",
+                &[("reason", "server_muted"), ("direction", "ingress"), ko],
+            ),
+            s(
+                "dt_client_media_capture_source",
+                &[
+                    ("mode", "test_tone"),
+                    ("client_version", "0.1.0"),
+                    ("org_id", "acme"),
+                    ko,
+                    ("otel_scope_name", "dt"),
+                    ("otel_scope_version", "1"),
+                    ("instance", "otel-collector:8889"),
+                    ("job", "otel-collector"),
+                ],
+            ),
+            s(
+                "dt_client_media_kek_updates_total",
+                &[("source", "kek_update"), ("action", "x"), ko],
+            ),
+            s(
+                "dt_client_time_to_first_media_frame_ms_bucket",
+                &[("le", "100"), ko],
+            ),
+        ];
+        let v = check_series(&series);
+        assert!(
+            v.is_empty(),
+            "unexpected R4 violations on real shapes: {v:?}"
+        );
+    }
+
+    /// The fenced block `name` from label-taxonomy.md, as text (without fences).
+    fn taxonomy_block(name: &str) -> String {
+        let md = repo_file("docs/observability/label-taxonomy.md");
+        let fence = format!("```{name}\n");
+        let start = md
+            .find(&fence)
+            .unwrap_or_else(|| panic!("label-taxonomy.md must carry the ```{name} block (§R4)"))
+            + fence.len();
+        let end = md[start..]
+            .find("```")
+            .unwrap_or_else(|| panic!("unterminated ```{name} block"));
+        md[start..start + end].to_string()
+    }
+
+    /// The SHARED matcher table (```identity-label-cases, §R4), which dt-guard's
+    /// matcher also runs. Positive control: both halves parsed non-empty and the
+    /// `-`-separated case is present, so an empty parse cannot pass.
+    #[test]
+    fn r4_matcher_runs_the_shared_case_table() {
+        let block = taxonomy_block("identity-label-cases");
+        let fire = policy_line(&block, "fire");
+        let pass = policy_line(&block, "pass");
+        assert!(
+            !fire.is_empty() && !pass.is_empty() && fire.iter().any(|k| k == "user-id"),
+            "positive control: the case table parsed empty or lost `user-id`"
+        );
+        for key in &fire {
+            let v = check_series(&[s(
+                "mh_media_frames_forwarded_total",
+                &[(key.as_str(), "v"), ("key_custody", "operator")],
+            )]);
+            assert_eq!(
+                count(&v, Rule::MediaPathIdentity),
+                1,
+                "`{key}` must fire R4: {v:?}"
+            );
+        }
+        for key in &pass {
+            assert_eq!(identity_token_in_key(key), None, "`{key}` must NOT fire R4");
+        }
+    }
+
+    /// Exemptions are EXACT keys, not segment or prefix holes.
+    #[test]
+    fn r4_exemptions_are_exact() {
+        assert_eq!(identity_token_in_key("slot_state_id"), Some("slot"));
+        assert_eq!(identity_token_in_key("org_id_hash"), Some("id"));
+    }
+
+    /// DRIFT PIN for the media-path definition (```media-path-prefixes, §R4).
+    #[test]
+    fn media_path_prefixes_match_the_taxonomy_block() {
+        let block = taxonomy_block("media-path-prefixes");
+        let parsed: Vec<String> = block
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert!(
+            parsed.iter().any(|p| p == "mh_media_"),
+            "positive control: the prefix block parsed empty or lost `mh_media_`"
+        );
+        let want: Vec<String> = MEDIA_PATH_PREFIXES
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect();
+        assert_eq!(
+            parsed, want,
+            "MEDIA_PATH_PREFIXES drifted from label-taxonomy.md §R4"
+        );
+    }
+
+    /// Scope: R4 applies to media-path series only. The same key on a
+    /// control-plane series is not R4's business (R1 still covers `meeting_id`).
+    #[test]
+    fn r4_is_scoped_to_media_path_series() {
+        let v = check_series(&[s("mc_session_joins_total", &[("participant_id", "p")])]);
+        assert_eq!(count(&v, Rule::MediaPathIdentity), 0);
+        assert_eq!(count(&v, Rule::MissingKeyCustody), 0);
+    }
+
+    /// FIRE: a media-path series with key_custody absent, or with a wrong value.
+    #[test]
+    fn r4_fires_on_missing_or_wrong_key_custody() {
+        let v = check_series(&[s("mh_media_egress_edges", &[])]);
+        assert_eq!(count(&v, Rule::MissingKeyCustody), 1);
+        let v = check_series(&[s(
+            "dt_client_media_frames_sent_total",
+            &[("key_custody", "participant")],
+        )]);
+        assert_eq!(count(&v, Rule::MissingKeyCustody), 1);
+        // mc_meeting_sender_ids_ is IN the media-path set by decision.
+        let v = check_series(&[s("mc_meeting_sender_ids_issued_max", &[])]);
+        assert_eq!(count(&v, Rule::MissingKeyCustody), 1);
+    }
+
+    /// Parse one `name = a, b, c` line out of the taxonomy's fenced block.
+    fn policy_line(block: &str, name: &str) -> Vec<String> {
+        block
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix(name)
+                    .and_then(|r| r.trim_start().strip_prefix('='))
+            })
+            .map(|r| {
+                r.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn repo_file(rel: &str) -> String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e} — the drift pin cannot run without it"))
+    }
+
+    /// DRIFT PIN: the consts above must equal the ONE home of the vocabulary,
+    /// the fenced ```identity-label-policy block in label-taxonomy.md §R4. The
+    /// positive control (non-empty, contains `participant`) keeps an empty parse
+    /// from comparing equal to nothing.
+    #[test]
+    fn identity_vocabulary_matches_the_taxonomy_block() {
+        let block = taxonomy_block("identity-label-policy");
+        let block = block.as_str();
+        let containment = policy_line(block, "containment");
+        let segment = policy_line(block, "segment");
+        let exempt = policy_line(block, "exempt");
+        assert!(
+            containment.iter().any(|t| t == "participant") && !segment.is_empty() && !exempt.is_empty(),
+            "positive control: the policy block parsed empty or lost `participant` — extraction failure, not a clean result"
+        );
+        let as_vec = |c: &[&str]| c.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            containment,
+            as_vec(IDENTITY_CONTAINMENT),
+            "containment drifted from label-taxonomy.md §R4"
+        );
+        assert_eq!(
+            segment,
+            as_vec(IDENTITY_SEGMENTS),
+            "segment drifted from label-taxonomy.md §R4"
+        );
+        assert_eq!(
+            exempt,
+            as_vec(IDENTITY_EXEMPT),
+            "exempt drifted from label-taxonomy.md §R4"
+        );
+    }
+
+    /// The restated `operator` value must equal common's constant.
+    #[test]
+    fn key_custody_value_matches_common() {
+        let src = repo_file("crates/common/src/observability/labels.rs");
+        let want = format!("KEY_CUSTODY_OPERATOR: &str = \"{KEY_CUSTODY_OPERATOR}\"");
+        let want_key = format!("KEY_CUSTODY_LABEL: &str = \"{KEY_CUSTODY_KEY}\"");
+        assert!(
+            src.contains(&want),
+            "common's KEY_CUSTODY_OPERATOR no longer equals {KEY_CUSTODY_OPERATOR:?}"
+        );
+        assert!(
+            src.contains(&want_key),
+            "common's KEY_CUSTODY_LABEL no longer equals {KEY_CUSTODY_KEY:?}"
+        );
     }
 
     #[test]

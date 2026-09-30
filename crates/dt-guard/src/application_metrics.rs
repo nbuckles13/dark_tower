@@ -15,6 +15,7 @@
 //! (services / metric_catalog / grafana). This module consumes them
 //! read-only; no duplicate `Lazy<Regex>` re-inlines remain.
 
+use crate::common::alert_rule_files::{rule_exprs, yaml_value_to_json};
 use crate::common::metric_catalog::CATALOG_HEAD_RE;
 use crate::common::scan::warn_skip;
 use crate::common::services::{CANONICAL_SERVICES, SERVICE_METRIC_PREFIX_RE};
@@ -209,66 +210,16 @@ fn extract_alert_expr_metric_refs(repo_root: &Path) -> Vec<(String, HashSet<Stri
         };
         let json = yaml_value_to_json(doc);
         let mut metrics = HashSet::new();
-        let groups = json.get("groups").and_then(|v| v.as_array());
-        if let Some(groups) = groups {
-            for g in groups {
-                let Some(rules) = g.get("rules").and_then(|v| v.as_array()) else {
-                    continue;
-                };
-                for r in rules {
-                    if let Some(expr) = r.get("expr").and_then(|v| v.as_str()) {
-                        for caps in SERVICE_METRIC_PREFIX_RE.captures_iter(expr) {
-                            if let Some(m) = caps.get(1) {
-                                metrics.insert(m.as_str().to_string());
-                            }
-                        }
-                    }
+        for r in rule_exprs(&json) {
+            for caps in SERVICE_METRIC_PREFIX_RE.captures_iter(&r.expr) {
+                if let Some(m) = caps.get(1) {
+                    metrics.insert(m.as_str().to_string());
                 }
             }
         }
         out.push((name.to_string(), metrics));
     }
     out
-}
-
-/// Convert serde_norway::Value → serde_json::Value (shallow, lossy for tags/aliases).
-fn yaml_value_to_json(v: serde_norway::Value) -> Value {
-    match v {
-        serde_norway::Value::Null => Value::Null,
-        serde_norway::Value::Bool(b) => Value::Bool(b),
-        serde_norway::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Number(i.into())
-            } else if let Some(u) = n.as_u64() {
-                Value::Number(u.into())
-            } else if let Some(f) = n.as_f64() {
-                serde_json::Number::from_f64(f)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            }
-        }
-        serde_norway::Value::String(s) => Value::String(s),
-        serde_norway::Value::Sequence(seq) => {
-            Value::Array(seq.into_iter().map(yaml_value_to_json).collect())
-        }
-        serde_norway::Value::Mapping(map) => {
-            let mut o = serde_json::Map::new();
-            for (k, val) in map {
-                let key = match k {
-                    serde_norway::Value::String(s) => s,
-                    other => match serde_norway::to_string(&other) {
-                        Ok(s) => s.trim().to_string(),
-                        Err(_) => continue,
-                    },
-                };
-                o.insert(key, yaml_value_to_json(val));
-            }
-            Value::Object(o)
-        }
-        serde_norway::Value::Tagged(_) => Value::Null,
-    }
 }
 
 // -----------------------------------------------------------------------------

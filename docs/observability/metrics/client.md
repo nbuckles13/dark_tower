@@ -46,6 +46,18 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 > warns about below, reached by a different route. **So this marker means
 > *catalogued as exported*, not *observed in Prometheus*.**
 >
+> **What else the same guard checks (story 2 task 16).** The export decision is
+> forced for EVERY `dt_client_*` literal in non-test `packages/sdk-core/src`, not
+> just `mediaMetrics.ts` — rule 4 walks the whole tree, so a name emitted from
+> `media/MediaTransport.ts` or `session/MeetingSession.ts` without a heading and an
+> `Exported:` marker here is a red build. Rule 2 (`dead_alert_reference`) fails the
+> build if a loaded alert rule references a `dt_client_*` name that is not
+> `Exported: yes`, or selects or groups on a label the collector's `keep_keys` does
+> not keep — the exact way `MCMediaMissingKeyMaterial` once sat dead. Rule 1
+> (`label_key_not_forwarded`) fails it if an `Exported: yes` name is emitted with a
+> label key that GC does not forward or the collector does not keep. None of these
+> ties the green to the RUNNING collector (above).
+>
 > **The 23 media-path metrics ARE queryable.** The original 14 were verified end
 > to end on the Kind stack from sdk-core's own built bundle through the GC proxy —
 > not a synthetic payload. The six KEK-custody and decode-lane counters added by
@@ -153,7 +165,7 @@ down, then polls is reliable where "join, then query" flakes.
   - **Join-flow metrics** carry `client_version`, `meeting_id_hash`, `org_id`. This set is the **closed, enumerated ADR-0036 §11 exception**: it is grandfathered *as a set*, it is not extended, and nothing joins it.
   - **Media-path metrics** (`dt_client_media_*` and `dt_client_time_to_first_media_frame_ms`) carry `client_version`, `org_id`, `key_custody=operator` — **and never a meeting, participant, or stream dimension, hashed or otherwise.** They are built by allow-list in `media/setup/mediaMetrics.ts`, never by spreading and pruning the join set.
   - **No metric, log field, span attribute, or sentence in this file may carry an end-to-end or zero-trust boolean** (ADR-0036 §11: the default deployment is neither).
-  - **Nothing mechanical enforces this in TypeScript.** `dt-guard`'s media-path deny is Rust-only, its metric-label scanner reads `crates/`, and `ts_pii.rs` scans only `console.*`/`logger.*` call sites. The rules and their enforcement status are in `docs/observability/label-taxonomy.md` R1/R2/R3 — **read them before adding a label here**; they are not restated in this file, because a second home drifts.
+  - **Enforcement in TypeScript is PARTIAL, and it is on the pipe, not at the call site.** `dt-guard client-metrics-export` (story 2 task 16) extracts the label keys of every emission of an `Exported: yes` name across non-test sdk-core and fails if a key is not forwarded by GC (`ALLOWLIST` ∪ `MEDIA_DATAPOINT_EXTRA`) and kept by the collector (`label_key_not_forwarded`), and fails if any forwarded or kept key is identity-shaped per the `identity-label-policy` block in `docs/observability/label-taxonomy.md` §R4 (`identity_key_forwarded`). So an identity key cannot reach STORAGE silently. What stays unenforced: a non-exported name's labels (the name filter drops the whole series, so the rule does not apply to it), and the SDK-side shape itself — `dt-guard`'s media-path deny is Rust-only and `ts_pii.rs` scans only `console.*`/`logger.*` call sites. The rules are in `docs/observability/label-taxonomy.md` R1-R4 — **read them before adding a label here**; they are not restated in this file, because a second home drifts.
 
   **The grandfathered set is FROZEN, and these are its members.** A category with
   no roster opens by analogy — the next author decides their metric is
@@ -219,6 +231,18 @@ down, then polls is reliable where "join, then query" flakes.
 ---
 
 ## Join-flow metrics (R-25)
+
+**Pre-existing label-key mismatch — harmless today, and why it will not stay silent.**
+The SDK emits these metrics with BARE label keys — `status`, `failure_stage`,
+`close_reason` (`session/MeetingSession.ts`) and `mh_index_bucket`
+(`media/MediaTransport.ts`) — while GC's telemetry filter `ALLOWLIST`
+(`crates/gc-service/src/services/telemetry_filter.rs`) carries only the `dt.`-dotted
+spellings (`dt.failure_stage`, `dt.close_reason`, `dt.mh_index_bucket`) and no
+`status` at all. So GC strips all four today. That is harmless ONLY because every
+metric here is `Exported: no`: the collector's name allowlist drops the whole series
+anyway. The day any of them is exported, `dt-guard client-metrics-export` rule 1
+(`label_key_not_forwarded`) fires on the stripped key. Fix the spelling on one side
+then, deliberately; do not widen `keep_keys` to make the finding go away.
 
 ### `dt_client_join_attempts_total`
 - **Exported**: no — deliberately NOT exported. ADR-0036 §11 grandfathers `meeting_id_hash` on this metric AS EMITTED (browser-console log↔metric correlation); it does not grandfather exporting a per-meeting identifier into stored Prometheus series, which `docs/observability/label-taxonomy.md` R1 bars. Stripping the hash and exporting anyway would publish a series whose shape does not match this entry — a silently different metric.
@@ -441,9 +465,11 @@ block must not be cited as precedent for adding one here.
 ## Media-path metrics (ADR-0036 §11)
 
 Emitted from `packages/sdk-core/src/media/setup/mediaMetrics.ts`, which is the
-ONLY file under `packages/sdk-core/src/media/**` permitted to name a metric —
-asserted by `media/__tests__/hotPathLayout.test.ts`, since nothing mechanical
-enforces the media-path telemetry rules in TypeScript.
+ONLY file under `packages/sdk-core/src/media/**` permitted to name a media-path
+metric — asserted by `media/__tests__/hotPathLayout.test.ts`. That test is the
+call-site control; `dt-guard client-metrics-export` covers the pipe (label keys of
+exported names, identity-shaped keys, and the export decision for every
+`dt_client_*` literal in non-test sdk-core — see the block at the top of this file).
 
 **Every metric in this section carries `client_version`, `org_id` and
 `key_custody=operator`, and nothing else beyond its own bounded discriminator.**
@@ -476,6 +502,17 @@ partially, by `dt_client_media_decoder_errors_total` and
 ever become a `frames_dropped_total` reason; extending the identity to
 the playback boundary would require playback-side drop reasons — a vocabulary
 extension needing its own planning, not a word swap.
+
+**Per client, and unchanged by N senders (story 2 R-28).** The identity is written
+per receiving client and holds for a client receiving from N senders exactly as it
+did for one: every datagram, from whichever sender, leaves through exactly one term.
+There is **no sender split** on either side and none is needed — adding a sender
+label to make it "per sender" would be the identity dimension ADR-0036 §11 bars, and
+the identity does not require it. `dt_client_media_decode_queue_dropped_total` is
+POST-ACCEPT and never enters it (see its entry). The server-side fan-out identity
+(one MH ingress frame becomes E egress attempts) is a different identity with a
+different unit, stated in `docs/observability/metrics/mh-service.md`
+§`mh_media_frames_forwarded_total`.
 
 **Counting-point migration (video story).** When several frames share one
 stream, `dt_client_media_frames_received_total` must move from the TRANSPORT
@@ -582,6 +619,20 @@ the comment's reader.
   (`unknown_version` staying individually visible is how a version-skewed
   rollback is detected — rollback for this feature is redeploy-only with no
   finer-grained control) and breaks `sum by(reason)` comparability with MH.
+- **The KEK generation split — two reasons, not one.** A frame whose wrap names a
+  KEK generation this receiver cannot open is counted by DIRECTION:
+  `no_kek_for_generation` (newer than any held) or `kek_generation_stale` (older
+  than retained). They point at different causes (a push that has not arrived,
+  versus sender skew past retention), which is why they are split.
+- **The four KEY-DELIVERY reasons — exactly `MCMediaMissingKeyMaterial`'s selector**
+  (`infra/docker/prometheus/rules/mc-alerts.yaml`) — are the three key-material
+  reasons below plus `unwrap_failed` (next bullets). `unwrap_failed` joined the
+  selector at story 2 task 16; before that it was in no alert and no panel.
+  Membership is held by a PARTITION check, not by this list: every
+  `drops_frame: true` token in `proto/test-vectors/frame-v2.vectors.json` must sit in
+  exactly one of that alternation or the `NOT_KEY_DELIVERY` const in
+  `crates/dt-guard/src/client_metrics_export.rs` (which carries each exclusion's
+  reason), so a new token fails the build until classified.
 - **The three key-material reasons** are `no_kek_for_generation` (the frame's
   wrap announces a KEK generation NEWER than the newest this receiver holds — MC's
   push has not arrived), `kek_generation_stale` (the wrap announces a generation
@@ -595,7 +646,7 @@ the comment's reader.
   `kek_generation_not_held` instead, from either direction. All three are expected
   transients at join and after a KEK rotation; **the sustained case is the
   signal**, and it is the only signal for a join or rotation path that has
-  silently stopped delivering keys. For a sustained `kek_generation_stale`: At the shipped default W, client retention is **already at its ceiling** (`KEK_RETENTION_CEILING_MS`, 30 s), so raising `MC_KEK_ROTATION_DEBOUNCE_SECONDS` does **not** lengthen it — it only flips the fleet to `ceiling_clamped`. The only lever that lengthens retention past 30 s is the client ceiling itself, an SDK constant requiring a release **and** a deliberate key-lifetime bound (ADR-0036 §4) — a security decision, not a remedy an operator applies. Lowering W *shortens* retention and makes this worse. A sustained `kek_generation_stale` at default configuration therefore points at **sender-side rotation skew**, not at MC's debounce.
+  silently stopped delivering keys. For a sustained `kek_generation_stale`: At the shipped default W (`MC_KEK_ROTATION_DEBOUNCE_SECONDS` in `infra/services/mc-service/config.env`), client retention is **already at its ceiling** (`KEK_RETENTION_CEILING_MS`), so raising `MC_KEK_ROTATION_DEBOUNCE_SECONDS` does **not** lengthen it — it only flips the fleet to `ceiling_clamped`. The only lever that lengthens retention past `KEK_RETENTION_CEILING_MS` is the client ceiling itself, an SDK constant requiring a release **and** a deliberate key-lifetime bound (ADR-0036 §4) — a security decision, not a remedy an operator applies. Lowering W *shortens* retention and makes this worse. A sustained `kek_generation_stale` at default configuration therefore points at **sender-side rotation skew**, not at MC's debounce.
   See `dt_client_media_kek_retention_anomalies_total` for why retention was what
   it was.
 - **`sender_not_assigned`** (layer `assignment`) is a frame that parsed and
@@ -605,14 +656,28 @@ the comment's reader.
   not a key-material reason. **A sustained non-zero rate means a media handler
   forwarded a frame from a sender this client holds no slot for** — MH
   misrouting, or a compromised handler — or a lagging assignment at a remap edge
-  when brief. It is **deliberately NOT alerted** in this story (the alert
-  inventory is task 16's) and **deliberately EXCLUDED from
-  `MCMediaMissingKeyMaterial`**: its remedy lives in MH/MC placement, not in KEK
-  or roster delivery.
+  when brief. It is **deliberately NOT alerted** (decided at story 2 task 16) and
+  **deliberately EXCLUDED from `MCMediaMissingKeyMaterial`**: its remedy lives in
+  MH/MC placement, not in KEK or roster delivery. The exclusion is recorded as a
+  `NOT_KEY_DELIVERY` entry (misrouting) in `crates/dt-guard/src/client_metrics_export.rs`.
 - **`unwrap_failed` versus `decrypt_failed`** are two AES-GCM failures on one
   receive path routing to opposite teams: `unwrap_failed` is the KEK unwrap, so
   it is key DISTRIBUTION; `decrypt_failed` is the SFrame payload, so it is the
   key schedule or the sender.
+- **`unwrap_failed` is INSIDE `MCMediaMissingKeyMaterial`'s selector** (story 2
+  task 16), consistent with its key-DISTRIBUTION classification — the selector
+  used to exclude it, which contradicted this entry. **It is an AUTHENTICATED-frame
+  failure, never transit corruption**: the §3 signature covers the publisher
+  region, which includes the wrapped-key block, and `verifyFrame` runs BEFORE any
+  unwrap (`packages/sdk-core/src/media/frame/receivePath.ts`, verify-before-decrypt
+  is structural). A frame corrupted in transit therefore fails as
+  `signature_invalid` and never reaches the unwrap. What remains is (a) a KEK-bytes
+  split under one generation between sender and receiver (key distribution —
+  `dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}` is its
+  per-client witness), (b) a sender wrap or key-schedule bug, or (c) an
+  authenticated member emitting bad wraps. It has **no healthy transient**: with a
+  usable cached key the same tag mismatch is the non-dropping
+  `wrap_key_id_mismatch` wrap outcome instead.
 - **`no_transmit_key`** is a frame with neither a cached key nor a usable wrap: a
   protocol violation, not a third key reason and not a decode reject.
 
@@ -795,6 +860,7 @@ the comment's reader.
   on **both** sides of the identity, breaking it silently and only in aggregate:
   the same failure `wrap_key_id_mismatch`'s `drops_frame: false` exists to
   prevent. It must never become a reason.
+- **Panel only, no alert** (Group B, §Operator surface for the task-7 counters).
 - **Why it exists**: a queue eviction fires no decoder error callback, so
   `dt_client_media_decoder_errors_total` does not see this loss. It mirrors the
   send-side precedent: the bounded egress queue counts its evictions because the
@@ -819,6 +885,23 @@ the comment's reader.
   indistinguishable on this label — deliberately**: the discriminator would be
   the generation, which is barred below. This counter is the denominator for
   `dt_client_media_kek_retention_anomalies_total`.
+- **THE TWO-VALUE `source` VOCABULARY IS DELIBERATE — do not "fix" it with a third
+  value.** `MEDIA_KEK_SOURCES` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`
+  is exactly `join_response` and `kek_update`. **Corrected at story 2 task 16
+  (paired-client, verified against code):** an earlier version of this paragraph
+  said a reconnect re-issue arrives as a `MeetingKekUpdate`. It does not. The
+  reconnect response is JoinResponse-shaped
+  (`proto/dark_tower/signaling/v1/signaling.proto`), and MC's R-15 re-issue is a
+  field on the reconnect result (`crates/mc-service/src/actors/meeting.rs`), so a
+  re-issue counts as `join_response`, merged with a first join. `MeetingKekUpdate`
+  is sent only by the rotation path. The two values stay deliberate for the correct
+  reason: **the client cannot tell a rotation's CAUSE** (`participant_left` vs
+  `sender_space_exhausted`), and the only discriminator on the message, the
+  generation, is barred as a label (below). **The split exists, on the server: MC's
+  `trigger` label on `mc_meeting_kek_generated_total`.** A rotation increments its
+  trigger; a reconnect re-issue increments nothing
+  (`docs/observability/metrics/mc-service.md`). Ask MC which it was; do not ask the
+  client.
 - **Usage**: the KEK arriving through the KEK-source seam. **Never the key
   itself, and never its generation** — the generation is monotonic over the
   meeting's life, so as a label its cardinality is unbounded over TIME rather
@@ -834,7 +917,31 @@ the comment's reader.
 - **Labels**: base only.
 - **Fleet contract: reads zero forever; alertable at `> 0`** — the same contract
   form as `dt_client_media_send_dropped_total{reason="transport_send_refused"}`.
-  No alert selects it today; the inventory decision is story 2 task 16's.
+- **A ZERO-FOREVER TRIPWIRE AGAINST A FUTURE REFACTOR — NOT A DETECTOR FOR A LIVE
+  CONDITION.** The retention bound is an invariant the SDK holds by construction and
+  a unit test verifies: `RetentionGuard` in
+  `packages/sdk-core/src/media/setup/kekSource.ts` runs after every install, and
+  `media/setup/__tests__/kekSource.test.ts` drives it with a fabricated
+  over-retained list and proves the check runs on every live install. There is no
+  known legitimate non-zero cause and no operator remedy; a non-zero value means an
+  SDK regression broke the bound, and the remedy is to roll back the SDK release
+  (`client_version` on the series names it).
+- **Alert**: `ClientKekRetentionViolation` (warning,
+  `infra/docker/prometheus/rules/client-alerts.yaml`), **presence-shaped**:
+  `sum(dt_client_media_kek_retention_violations_total) > 0`, never `increase()` or
+  `rate()` — the series is absent until the first increment and appears already at
+  1, so a rate would never see the only event that matters. It clears when the
+  collector's exporter expires the idle series (`metric_expiration`,
+  `infra/services/otel-collector/collector.yaml`), not when the condition stops.
+  Group A (see §Operator surface for the task-7 counters).
+- **A COUNTER, NOT A GAUGE — and why that is an ADR-0036 §11 corollary.** N browsers
+  with identical label sets (no per-browser label: §11 bars one) write one stream
+  identity, so a gauge would be last-writer-wins at the collector: one healthy
+  browser's `0` would erase a violating browser's `1`. A counter's deltas SUM in the
+  collector instead. The collision did not show §11 was wrong; **it showed the
+  metric was shaped wrong** — a per-client state published as a gauge. The same
+  corollary shaped `dt_client_media_receive_source_deficit_total` and
+  `dt_client_media_kek_generations_retained_total`.
 
 ### `dt_client_media_kek_retention_anomalies_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -853,16 +960,20 @@ the comment's reader.
     during a deliberate one-version MC rollback, which is the SUPPORTED path and
     not an incident** — rolling MC below the field flips every live client to the
     floor and this climbs fleet-wide; do not page on it and do not roll further
-    back. It is the fleet's rollback detector: the client also logs a WARN, but a
+    back. **An expected-non-zero configuration/rollback state: NEVER an alert
+    input.** It is the fleet's rollback detector: the client also logs a WARN, but a
     browser console reaches no operator, so **this counter is the only
     cluster-visible evidence**.
   - `ceiling_clamped` — W/2 exceeded the client ceiling and retention was clamped.
     **A CONFIGURATION STATE, not an incident**: if
     `MC_KEK_ROTATION_DEBOUNCE_SECONDS` is raised so W/2 exceeds the ceiling, this
     is permanently non-zero on a correctly configured fleet. It reads zero at
-    today's W — but only just: at the default W=60, W/2 EQUALS the ceiling, so
-    **ANY increase to W makes this permanently non-zero while changing retention
-    by exactly zero**. It is where an operator meets the fact that W is no longer
+    today's W — but only just: **the shipped default W already sits at the
+    ceiling** (at `MC_KEK_ROTATION_DEBOUNCE_SECONDS`' default in
+    `infra/services/mc-service/config.env`, W/2 EQUALS `KEK_RETENTION_CEILING_MS`;
+    `clientConfig.ts` records the same fact), so **ANY increase to W makes this
+    permanently non-zero while changing retention by exactly zero** — a first
+    operator who raises W must not read the climbing counter as a fault. It is where an operator meets the fact that W is no longer
     the binding parameter. **Never an alert input.**
   - `below_rewrap_latency` — the derived retention does not exceed the client's
     transmit-key re-wrap latency T (the frames already queued for egress when the
@@ -875,6 +986,9 @@ the comment's reader.
   `dt_client_media_kek_updates_total`, and any ratio needs the non-zero-denominator
   guard (no KEK messages in the window must read as no data, not as 0% or NaN
   noise).
+- **Panel only, no alert** (Group B, §Operator surface for the task-7 counters).
+  `floor_substituted` and `ceiling_clamped` are expected-non-zero configuration or
+  rollback states and are NEVER alert inputs.
 
 ### `dt_client_media_kek_install_refusals_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -891,6 +1005,14 @@ the comment's reader.
     never rolls back.
   - `malformed` — wrong width, all-zero, or a generation outside `0..65535`.
     Refused and scrubbed, on both arrival paths.
+- **Alert on ONE arm**: `MCClientKekConflictingKey` (warning,
+  `infra/docker/prometheus/rules/mc-alerts.yaml`), presence-shaped on
+  `outcome="conflicting_key"` only — Group A. The justification is that it is the
+  **SOLE OBSERVABLE witness of its arm**: a same-generation KEK-bytes split shows
+  elsewhere only as `unwrap_failed` on peers, diluted inside
+  `MCMediaMissingKeyMaterial`'s fleet-wide ratio, and that holds however client
+  reconnect eventually lands. The rule comment lists every known non-zero cause.
+  `older_generation` and `malformed` are panel-only (Group B).
 - **Usage**: every refusal leaves the held state unchanged and working. **Both
   `conflicting_key` and `older_generation` are UNREACHABLE in an honest
   deployment today, and that is what makes this counter a tripwire rather than a
@@ -922,7 +1044,9 @@ the comment's reader.
 - **Labels**: base only.
 - **Fleet signal is the PAIR**: `dt_client_media_kek_updates_total{source="kek_update"}`
   rising while this stays flat means rotations are happening and nothing is
-  being retained — an audio gap at every rotation. It watches the opposite
+  being retained — an audio gap at every rotation. **Neither series alone says
+  anything**, so the panel reads this AGAINST that one on one panel (Group B, panel
+  only); a panel of this counter by itself would not be a surface for it. It watches the opposite
   failure from `dt_client_media_kek_retention_violations_total` (retaining too
   few, rather than too many).
 - **A counter, not a gauge — deliberately.** The story originally planned a
@@ -947,10 +1071,14 @@ the comment's reader.
     injected roster update, or a `ParticipantLeft` MC dropped under outbound
     backpressure (roster updates are sent with `try_send`), so this client saw
     the reissued id bound to a new key with no prior removal.
-    `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`
-    non-zero over the same window makes the third cause **supported**; zero
-    **rules it out**. That counter is fleet-wide and per-mailbox, so it never
-    confirms that any individual increment here was a lost leave. The delivery
+    The third cause REQUIRES a sender-id-exhaustion epoch reset in that meeting
+    (`mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}`; ids are
+    reissued only under a later generation, `media_admission/epoch.rs`). No
+    reset rules it OUT. `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`,
+    read over MC's process lifetime, only **supports** it; a short-window zero
+    rules nothing out, because the lost Left can precede the reissue by hours.
+    That counter is fleet-wide and per-mailbox, so it never confirms that any
+    individual increment here was a lost leave. The delivery
     gap behind the third cause is filed in `docs/TODO.md` (roster removals are
     droppable). Key hygiene holds on all three: the purge below runs either
     way.
@@ -959,6 +1087,14 @@ the comment's reader.
     occurrence (see `no_roster_entry` under `dt_client_media_frames_dropped_total`),
     which is exactly why it is split out — a merged counter could carry no
     alert contract without firing on a known condition.
+- **Alert on ONE arm**: `MCClientRosterKeyRebind` (warning,
+  `infra/docker/prometheus/rules/mc-alerts.yaml`), presence-shaped on
+  `outcome="rebind"` — Group A. `rebind` is **near-zero, NOT zero-forever**: the rule
+  comment lists all three causes, including the lost-`ParticipantLeft`-plus-reissue
+  path, with `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`
+  as supporting evidence only. The decisive check is its necessary condition: a
+  sender-id-exhaustion epoch reset (`trigger="sender_space_exhausted"`); none rules it out. `downgrade` is expected
+  non-zero and is panel-only.
 - **Effect**: the sender's cached unwrapped transmit keys are purged (zeroized),
   and the entry is known-keyless until the new key imports, so its frames drop
   as `no_roster_entry` in that window. The purge spans **every** KEK-generation
@@ -987,7 +1123,11 @@ the comment's reader.
   test-tone build is EMITTING the tone, not merely that a build is test-tone: an
   injected factory in a `__DT_TEST_TONE__` build still reports `microphone`
   (`session/mediaSelection.ts:selectCaptureSource`).
-- **Only the active mode's series is emitted.** A microphone build never
+- **THE SIGNAL IS THE PRESENCE OF THE `mode="test_tone"` SERIES, NOT ITS VALUE.**
+  The value is always `1` and, because every browser writes one stream identity
+  (no per-browser label, §11), the stored value is last-writer-wins: **it is not a
+  count of browsers** and `sum()` over it is not "how many browsers run the tone".
+  Only the active mode's series is emitted. A microphone build never
   writes a `test_tone` series at `0`: the signal is the series' PRESENCE, and a
   zero-valued series would make presence lie. Read it as
   `count(dt_client_media_capture_source{mode="test_tone"}) > 0`, or
@@ -1029,8 +1169,12 @@ the comment's reader.
   (`lifecycle/muteState.ts`), so a live, unmuted sender always produces frames
   and zero decoded frames is a real fault, not silence.
 - **Labels**: base only. **No sender, slot or mode label** — ever.
-- **A counter, not a gauge — deliberately.** N browsers at one stream identity
-  make a gauge last-writer-wins; a counter sums them in the collector.
+- **A counter, not a gauge — deliberately.** N browsers with identical label sets
+  (no per-browser label, ADR-0036 §11) write one stream identity, so a gauge is
+  last-writer-wins at the collector: one healthy browser's `0` would erase a
+  starving browser's deficit. A counter's deltas sum in the collector instead. **The
+  §11 corollary: the collision revealed the metric was shaped wrong, not that §11
+  was wrong** — see `dt_client_media_kek_retention_violations_total`.
   Initialised with `add(0)` at pipeline start, so `rate()` has a series before
   the first deficit.
 - **Blind spot**: a declaration MC rejects whole produces ZERO active
@@ -1092,6 +1236,62 @@ the comment's reader.
   dashboard on its own, and on its own it means only *datagrams are reaching
   us*. See §The receive-path accounting identity above for the three terms that
   together say whether media is actually working.
+
+### No retention gauge — retention is derived, and W is in seconds end to end
+
+**No gauge publishes client KEK retention, deliberately.** Retention is derived at
+the client, in exactly one function, `deriveKekRetention` in
+`packages/sdk-core/src/config/clientConfig.ts`: `min(W/2, KEK_RETENTION_CEILING_MS)`,
+with `KEK_RETENTION_FLOOR_MS` substituted when W is absent or zero (the
+`floor_substituted` outcome). A gauge would always be a function of W, and a
+per-client gauge would be last-writer-wins (the §11 corollary above). Why a
+retention was what it was is `dt_client_media_kek_retention_anomalies_total{outcome}`.
+
+**W's chain, verified against code — all SECONDS, no conversion anywhere between them:**
+
+| Home | Name | Unit |
+|---|---|---|
+| MC config | `MC_KEK_ROTATION_DEBOUNCE_SECONDS` → `Config::kek_rotation_debounce_seconds: u32` (`crates/mc-service/src/config.rs`) | seconds |
+| MC runtime | `KekLifecycle::window_seconds` (`crates/mc-service/src/media_admission/rotation.rs`), the stored `u32` itself | seconds |
+| Wire | `kek_rotation_debounce_seconds` (`uint32`, `JoinResponse` and `MeetingKekUpdate`, `proto/dark_tower/signaling/v1/signaling.proto`) | seconds |
+| Metric | `mc_meeting_kek_rotation_window_seconds` (`window().as_secs_f64()`, a widening of the same seconds) | seconds |
+
+The ONLY unit change in the whole path is inside `deriveKekRetention`, which turns
+W/2 into the milliseconds its return value is expressed in. Nothing between MC's
+config and the client's derivation converts.
+
+### Operator surface for the task-7 counters — Group A / Group B (story 2 task 16)
+
+Story 2 task 7 shipped six exported client counters and scheduled an operator surface
+for one. All six are decided here; a panel nobody browses is not a surface for a
+counter whose whole value is that something watches it.
+
+**Group A — warning-tier ALERT plus panel** (`severity: warning` is the ticket tier):
+
+| Counter (arm) | Alert | Why it is alerted |
+|---|---|---|
+| `dt_client_media_kek_retention_violations_total` | `ClientKekRetentionViolation` (`client-alerts.yaml`) | zero-forever tripwire against an SDK regression |
+| `dt_client_media_kek_install_refusals_total{outcome="conflicting_key"}` | `MCClientKekConflictingKey` (`mc-alerts.yaml`) | the SOLE-OBSERVABLE witness of its arm |
+| `dt_client_media_roster_key_rebinds_total{outcome="rebind"}` | `MCClientRosterKeyRebind` (`mc-alerts.yaml`) | near-zero, NOT zero-forever: a lost `ParticipantLeft` plus a reissue reaches it (correlator `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_left"}`) |
+
+**Group A rules are PRESENCE-shaped, `sum(X{sel}) > 0`** — never `increase()`/`rate()`.
+These are lazy DELTA series: absent until the first increment, first stored already
+at 1, so a rate never sees the first event, which for a tripwire is the only one that
+matters. `dt-guard client-metrics-export` (`tripwire_rate_wrapped`) enforces the shape.
+Each rule comment names every known non-zero cause, and a newly found legitimate cause
+is ADDED there — the rule is never retired or silenced for it.
+
+**Group B — panel only** (`infra/grafana/dashboards/client-media.json`):
+
+- `dt_client_media_kek_retention_anomalies_total` — `floor_substituted` and
+  `ceiling_clamped` are expected-non-zero configuration/rollback states and are NEVER
+  alert inputs (the shipped default W already sits at the ceiling).
+- `dt_client_media_kek_install_refusals_total`'s other two arms, `older_generation`
+  and `malformed`.
+- `dt_client_media_decode_queue_dropped_total`.
+- `dt_client_media_kek_generations_retained_total`, read AGAINST
+  `dt_client_media_kek_updates_total{source="kek_update"}` on one panel: rotations
+  rising while retentions stay flat is the signal; neither series alone says anything.
 
 ---
 

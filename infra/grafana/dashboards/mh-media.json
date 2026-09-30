@@ -14,7 +14,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "THE THREE PHASES ARE PLOTTED SEPARATELY AND MUST NEVER BE AGGREGATED HERE. A single total series is the cheapest thing to build and would foreclose the phase-triage runbook scenario operations writes in story 8: ADR-0036 \u00a711 decomposes the forward path into three phases precisely because they have DIFFERENT REMEDIES, and an undifferentiated total does not tell an operator which to pursue. The story-8 latency alert gets a scenario of its own and is never folded into egress exhaustion. Per-phase remedies are NOT restated here - see docs/observability/metrics/mh-service.md \u00a7Media Forward Path, and the Media Forward Latency by Phase panel on the Media Handler - SLOs dashboard. THE 'total' PHASE IS DELIBERATELY EXCLUDED from this panel by selector. It exists to carry the ADR-0011 objective, because quantiles do not sum and the SLO number needs its own observation; an operator who reads the total first cannot tell which of three remedies to pursue. AND THERE IS NO SERIES MEASURING THE SLI-ELIGIBLE SPAN TODAY. The eligible subset is receive_buffer + processing (MH-internal, not client-influenceable); 'total' is wider and IS client-influenced, because it includes transmit_buffer, which is slow-subscriber time. But the eligible subset is VISIBLE here, not AVAILABLE: p95(receive_buffer + processing) cannot be constructed from p95(receive_buffer) and p95(processing), by the same quantiles-do-not-sum property that justifies 'total' existing at all. So do NOT ratify an objective off these two series - the quantity cannot be computed from what is plotted. A series for the eligible span would only exist if a LATER story narrows the Total phase's recording to end at egress-enqueue; that is an MH hot-path change and this story does not make it. See docs/observability/slos.md \u00a7Open: the target. SAMPLED ONE-IN-N: read the sample-ratio panel on the SLOs dashboard before reading any rate off _count. This panel is the phase-triage substrate; the SLOs dashboard carries the objective view.",
+      "description": "THE THREE PHASES ARE PLOTTED SEPARATELY AND MUST NEVER BE AGGREGATED HERE. A single total series is the cheapest thing to build and would foreclose the phase-triage runbook scenario operations writes in story 8: ADR-0036 §11 decomposes the forward path into three phases precisely because they have DIFFERENT REMEDIES, and an undifferentiated total does not tell an operator which to pursue. The story-8 latency alert gets a scenario of its own and is never folded into egress exhaustion. Per-phase remedies are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path, and the Media Forward Latency by Phase panel on the Media Handler - SLOs dashboard. THE 'total' PHASE IS DELIBERATELY EXCLUDED from this panel by selector. It exists to carry the ADR-0011 objective, because quantiles do not sum and the SLO number needs its own observation; an operator who reads the total first cannot tell which of three remedies to pursue. AND THERE IS NO SERIES MEASURING THE SLI-ELIGIBLE SPAN TODAY. The eligible subset is receive_buffer + processing (MH-internal, not client-influenceable); 'total' is wider and IS client-influenced, because it includes transmit_buffer, which is slow-subscriber time. But the eligible subset is VISIBLE here, not AVAILABLE: p95(receive_buffer + processing) cannot be constructed from p95(receive_buffer) and p95(processing), by the same quantiles-do-not-sum property that justifies 'total' existing at all. So do NOT ratify an objective off these two series - the quantity cannot be computed from what is plotted. A series for the eligible span would only exist if a LATER story narrows the Total phase's recording to end at egress-enqueue; that is an MH hot-path change and this story does not make it. See docs/observability/slos.md §Open: the target. SAMPLED ONE-IN-N: read the sample-ratio panel on the SLOs dashboard before reading any rate off _count. This panel is the phase-triage substrate; the SLOs dashboard carries the objective view.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -107,7 +107,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "THE THREE PHASES ARE PLOTTED SEPARATELY AND MUST NEVER BE AGGREGATED HERE. A single total series is the cheapest thing to build and would foreclose the phase-triage runbook scenario operations writes in story 8: ADR-0036 \u00a711 decomposes the forward path into three phases precisely because they have DIFFERENT REMEDIES, and an undifferentiated total does not tell an operator which to pursue. The story-8 latency alert gets a scenario of its own and is never folded into egress exhaustion. Per-phase remedies are NOT restated here - see docs/observability/metrics/mh-service.md \u00a7Media Forward Path, and the Media Forward Latency by Phase panel on the Media Handler - SLOs dashboard. THE 'total' PHASE IS DELIBERATELY EXCLUDED from this panel by selector. It exists to carry the ADR-0011 objective, because quantiles do not sum and the SLO number needs its own observation; an operator who reads the total first cannot tell which of three remedies to pursue. WHY 'total' IS NOT THE SLI, AND WHY NO SERIES MEASURES THE ELIGIBLE SPAN: stated once on the p95 panel beside this one - it is the single most likely sentence in this tree to change (story 8 settles it), so it lives in one place. SAMPLED ONE-IN-N: read the sample-ratio panel on the SLOs dashboard before reading any rate off _count. p99 companion to the p95 panel beside it; read both before attributing a phase.",
+      "description": "THE THREE PHASES ARE PLOTTED SEPARATELY AND MUST NEVER BE AGGREGATED HERE. A single total series is the cheapest thing to build and would foreclose the phase-triage runbook scenario operations writes in story 8: ADR-0036 §11 decomposes the forward path into three phases precisely because they have DIFFERENT REMEDIES, and an undifferentiated total does not tell an operator which to pursue. The story-8 latency alert gets a scenario of its own and is never folded into egress exhaustion. Per-phase remedies are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path, and the Media Forward Latency by Phase panel on the Media Handler - SLOs dashboard. THE 'total' PHASE IS DELIBERATELY EXCLUDED from this panel by selector. It exists to carry the ADR-0011 objective, because quantiles do not sum and the SLO number needs its own observation; an operator who reads the total first cannot tell which of three remedies to pursue. WHY 'total' IS NOT THE SLI, AND WHY NO SERIES MEASURES THE ELIGIBLE SPAN: stated once on the p95 panel beside this one - it is the single most likely sentence in this tree to change (story 8 settles it), so it lives in one place. SAMPLED ONE-IN-N: read the sample-ratio panel on the SLOs dashboard before reading any rate off _count. p99 companion to the p95 panel beside it; read both before attributing a phase.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -200,7 +200,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames MH discarded on the publisher-to-relay side, broken out by reason - the WHY behind the Media Frame Drops by Direction panel on the Media Handler - Overview dashboard, which answers only WHETHER and on which side. A FLAT LINE AT ZERO MEANS NO DROPS OCCURRED, AND THAT IS THE EXPECTED HEALTHY STATE OF THE LOOPBACK. Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md \u00a7Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "Frames MH discarded on the publisher-to-relay side, broken out by reason - the WHY behind the Media Frame Drops by Direction panel on the Media Handler - Overview dashboard, which answers only WHETHER and on which side. A FLAT LINE AT ZERO ON A REASON MEANS NO DROPS OF THAT REASON OCCURRED - and since loopback was removed (story 2 R-3) a flat panel no longer stands for any special healthy-loopback state. A solo participant is directed to send nothing (mc_media_send_directives_total{outcome=\"emitted_empty_targets\"}), so a solo meeting puts no frame on this panel at all. Some ingress reasons are legitimately NON-ZERO in a healthy fleet: server_muted tracks a server-muted sender's full frame rate while a host mute is in force (healthy moderation - read it against whether a mute was intended), and transport_receive_dropped has a legitimately non-zero tail. Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -293,7 +293,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames MH discarded on the relay-to-subscriber side, broken out by reason. Counted per edge for every reason here EXCEPT `no_subscriber`, which counts once per FRAME because the frame reached zero edges and there is no per-edge event to count (docs/observability/metrics/mh-service.md \u00a7Media Forward Path). A responder must not scale the `no_subscriber` series as an edge count. A FLAT LINE AT ZERO MEANS NO DROPS OCCURRED, AND THAT IS THE EXPECTED HEALTHY STATE OF THE LOOPBACK. Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md \u00a7Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "Frames MH discarded on the relay-to-subscriber side, broken out by reason. Counted per edge for every reason here EXCEPT `no_subscriber`, which counts once per FRAME because the frame reached zero edges and there is no per-edge event to count (docs/observability/metrics/mh-service.md §Media Forward Path). A responder must not scale the `no_subscriber` series as an edge count. LOOPBACK WAS REMOVED IN STORY 2 (R-3), SO A FLAT ZERO NO LONGER MEANS ANYTHING SPECIAL, and two reasons are routinely NON-ZERO in a healthy meeting: connection_closed (a subscriber left underneath a send) and no_subscriber (MH received a frame from a sender whose installed policy names no egress edge for it - ordinarily the in-flight tail when a sender's last holder leaves, before the sender's updated, empty send directive takes effect). Neither is a fault at that level; do not read a non-zero no_subscriber as MH failing. A solo participant does NOT feed no_subscriber: MC directs it to send nothing (mc_media_send_directives_total{outcome=\"emitted_empty_targets\"}), so it produces no frames here at all. SUSTAINED no_subscriber is the catalog's reading - a publisher connected and sending while nobody is subscribed to it, remedy MC's assignment (docs/observability/metrics/mh-service.md §Media Forward Path). Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -386,7 +386,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Drops on the two reasons whose contract is that they READ ZERO FOREVER: transport_send_refused (the transport seam refused a datagram it should have accepted) and relay_rewrite_failed (rewrite failed on a frame that had already decoded cleanly - an MH bug, never a sender fault). Any non-zero value is an invariant violation, not load shedding. This panel reads 0 rather than 'No data' when no violation has been counted because both reasons are pre-registered at zero at process start (resolve_media_handles), so increase() runs over a present-but-flat series and sums to 0. A noValue:0 override was removed from this panel and must not be reinstated: it never fired (the query returns 0, never an empty result), and now that the series is pre-registered an ABSENT series here would mean the metrics pipeline is broken - recorder not installed, scrape failing, pod down, or wrong job label - which must surface as 'No data' rather than be painted as zero violations. Zero-init is what makes a healthy panel read 0; noValue would only have hidden the faults. Nor are the by-reason breakdown panels empty when healthy - they read present-and-flat-at-zero for exactly the same reason this one does; earlier wording here contrasted this panel against them on that basis and was simply wrong about both. Deliberately NOT the shape of the alert rule that watches this family: this is increase() over the dashboard range, not a rate over a fixed window. Do not copy it into a rule or a rule into it. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "Drops on the two reasons whose contract is that they READ ZERO FOREVER: transport_send_refused (the transport seam refused a datagram it should have accepted) and relay_rewrite_failed (rewrite failed on a frame that had already decoded cleanly - an MH bug, never a sender fault). Any non-zero value is an invariant violation, not load shedding. This panel reads 0 rather than 'No data' when no violation has been counted because both reasons are pre-registered at zero at process start (resolve_media_handles), so increase() runs over a present-but-flat series and sums to 0. A noValue:0 override was removed from this panel and must not be reinstated: it never fired (the query returns 0, never an empty result), and now that the series is pre-registered an ABSENT series here would mean the metrics pipeline is broken - recorder not installed, scrape failing, pod down, or wrong job label - which must surface as 'No data' rather than be painted as zero violations. Zero-init is what makes a healthy panel read 0; noValue would only have hidden the faults. Nor are the by-reason breakdown panels empty when healthy - they read present-and-flat-at-zero for exactly the same reason this one does; earlier wording here contrasted this panel against them on that basis and was simply wrong about both. Deliberately NOT the shape of the alert rule that watches this family: this is increase() over the dashboard range, not a rate over a fixed window. Do not copy it into a rule or a rule into it. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -453,7 +453,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "The fraction of egress attempts the transport accepted, built on the ATTEMPTS SUM (forwarded + dropped) rather than on one addend - a frame count cannot be denominated by anything else, and building on forwarded alone silently rises when drops rise. Expression source: docs/observability/metrics/mh-service.md \u00a7Media Forward Path, which is where it is derived and explained; it is reproduced rather than re-derived here. Reads empty in a healthy idle loopback when there are no egress attempts (a legitimate 0/0 ratio). Note the drop panels themselves now read a flat ZERO, not empty (present-at-zero); this ratio can still legitimately read empty on a 0/0. That is not a delivery failure. key_custody=operator: MH cannot read the media it forwards; MC can. A keyless relay working correctly - drops at zero, delivery ratio at 1 - is NOT end-to-end and NOT zero-trust (ADR-0036 \u00a74). Because this is a ratio, an empty panel is a legitimate 0/0 (no egress attempts) and is healthy - do NOT read absence here as a broken pipeline, unlike the by-reason drop panels which are present-at-zero. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "Of the per-EDGE egress attempts MH made, the fraction the transport accepted: forwarded{direction=\"egress\"} / (forwarded{direction=\"egress\"} + dropped{direction=\"egress\", reason!=\"no_subscriber\"}). EGRESS-INTERNAL BY DESIGN - IT NO LONGER COMPARES EGRESS TO INGRESS. Under N-way fan-out one accepted ingress frame becomes E egress attempts, one per subscriber edge (the R-28 frame accounting identity, docs/observability/metrics/mh-service.md §Media Forward Path), so egress forwards are not comparable to ingress forwards: an egress/ingress quotient measures the mean fan-out, not delivery, and reads above 1 in any healthy meeting of three or more. That quotient is the Mean Fan-out panel beside this one. no_subscriber IS EXCLUDED FROM THE DENOMINATOR, deliberately: it counts once per FRAME that reached ZERO edges, so no egress attempt exists for it; keeping it would mix per-frame and per-edge units and make a meeting with nobody subscribed read as 0% delivery off frames nobody was meant to receive. Read it on Egress Drops by Reason. This therefore DIFFERS from the catalog's egress drop-rate expression, which keeps no_subscriber in the attempts sum and states the unit mix instead; do not 'fix' either to match the other without reading both. Built on the ATTEMPTS SUM, never on one addend - building on forwarded alone silently rises when drops rise. The trailing '> 0' guard on the attempts sum makes a window with no egress attempts read as no data rather than NaN. Empty is healthy here when nothing is being sent - including every solo meeting, whose participant MC directs to send nothing - so do NOT read absence on this panel as a broken pipeline, unlike the by-reason drop panels, which are present-at-zero. key_custody=operator: MH cannot read the media it forwards; MC can. A keyless relay working correctly - delivery ratio at 1 - is NOT end-to-end and NOT zero-trust (ADR-0036 §4). This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and a sustained fall below 1 warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -505,7 +505,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 18,
+        "w": 9,
         "x": 6,
         "y": 16
       },
@@ -532,13 +532,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"}[$__rate_interval]))\n  /\n(\n    sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"}[$__rate_interval]))\n  + sum(rate(mh_media_frames_dropped_total{direction=\"egress\"}[$__rate_interval]))\n)",
-          "legendFormat": "egress delivery ratio",
+          "expr": "sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"}[$__rate_interval]))\n/\n(\n    sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"}[$__rate_interval]))\n  + sum(rate(mh_media_frames_dropped_total{direction=\"egress\", reason!=\"no_subscriber\"}[$__rate_interval]))\n)\nand\n(\n    sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"}[$__rate_interval]))\n  + sum(rate(mh_media_frames_dropped_total{direction=\"egress\", reason!=\"no_subscriber\"}[$__rate_interval]))\n) > 0",
+          "legendFormat": "per-edge egress delivery ratio",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Egress Delivery Ratio",
+      "title": "Egress Delivery Ratio (per-edge, egress-internal)",
       "type": "timeseries"
     },
     {
@@ -546,7 +546,100 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Egress stream admission decisions (story 2 R-19): one per generation-advancing policy apply, admitted or rejected_stream_ceiling. increase(), NOT rate(): a single discrete rejection under rate() renders as a near-zero rate at any realistic scrape cadence and reads identical to healthy, and a single capacity rejection is exactly what this panel exists to show. Both outcomes are pre-registered at zero at process start, so the healthy reading is a flat zero rejected series, NOT 'No data'. A rejection is a CAPACITY refusal: compare the stream ceiling with the recommended minimum (unsized placeholder budget?) and installed streams with the ceiling (ratchet?) on the panels beside this one. key_custody=operator.",
+      "description": "sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"})) / sum(rate(mh_media_frames_forwarded_total{direction=\"ingress\"})): EXPECTED VALUE IS THE MEAN SUBSCRIBER COUNT PER ACCEPTED INGRESS FRAME. It exists because egress forwards are NOT comparable to ingress forwards (the R-28 frame accounting identity, docs/observability/metrics/mh-service.md §Media Forward Path): one accepted ingress frame becomes E egress attempts, one per subscriber edge, so this quotient is a fan-out, never a delivery ratio - delivery is the egress-internal Egress Delivery Ratio beside it. Reading it: in a meeting of M participants where everyone holds everyone else in a slot, each sender fans out to M-1 edges, so expect roughly the fleet's mean holder count per sender; a fall with no change in meeting sizes means egress attempts are being dropped (read Egress Drops by Reason) or edges were withdrawn. It is a MEAN over every ingress frame, including frames that reached no edge (no_subscriber counts on forwarded{direction=\"ingress\"} too), and its numerator counts only egress the transport ACCEPTED, so egress drops pull it down. It is a fleet-wide mean, never a per-meeting value: no meeting identity exists on these series by design (ADR-0036 §11). Guarded: the 'and ... > 0' on the ingress denominator makes a window with no ingress forwards read as no data rather than NaN or +Inf; empty is healthy when no media is flowing (a solo participant is directed to send nothing). key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Egress forwards per ingress forward",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 16
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"}[$__rate_interval]))\n/\nsum(rate(mh_media_frames_forwarded_total{direction=\"ingress\"}[$__rate_interval]))\nand\nsum(rate(mh_media_frames_forwarded_total{direction=\"ingress\"}[$__rate_interval])) > 0",
+          "legendFormat": "mean fan-out",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mean Fan-out (egress forwards per ingress forward)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Egress stream admission decisions (story 2 R-19): one per generation-advancing policy apply, admitted or rejected_stream_ceiling. increase(), NOT rate(): a single discrete rejection under rate() renders as a near-zero rate at any realistic scrape cadence and reads identical to healthy, and a single capacity rejection is exactly what this panel exists to show. Both outcomes are pre-registered at zero at process start, so the healthy reading is a flat zero rejected series, NOT 'No data'. A rejection is a CAPACITY refusal: compare the stream ceiling with the ADVISORY recommended minimum (unsized placeholder budget?) on Egress Budget, and installed streams with the ceiling (ratchet?) on Installed Egress Streams vs Stream Ceiling. The windowed share of rejections, and the threshold the pending MHMediaEgressBudgetExhausted warning will compare it with, is the panel beside this one. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -639,7 +732,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Windowed (5-minute sliding) share of admission decisions refused, against the configured threshold - the same bare gauge-to-gauge comparison the egress-exhaustion alert makes, with no PromQL literal. The ratio gauge is authoritative; a rate()-based ratio over the counter uses a different window and WILL differ. 0 decisions in the window reads 0 (idle is silent); all-rejected reads 1. An excursion shorter than a few scrape intervals (the mh-service job's scrape_interval) can be invisible. key_custody=operator.",
+      "description": "Windowed share of admission decisions refused (mh_media_stream_admission_rejection_ratio) against the configured threshold (mh_media_stream_admission_rejection_ratio_threshold, publishing the same EgressAdmission field admission reads). THIS PAIR IS WHAT THE PENDING MHMediaEgressBudgetExhausted WARNING (story 2 task 18) WILL COMPARE - GAUGE VS GAUGE, bare, with no PromQL literal and no restated threshold; until that rule lands in mh-alerts.yaml nothing alerts on it, and this panel is the only place the comparison is read. The window is ADMISSION_WINDOW_BUCKETS x ADMISSION_WINDOW_BUCKET in crates/mh-service/src/session/admission.rs (a sliding window, never a lifetime ratio - one early rejection must not latch it); read the constants, not a number copied here. The ratio gauge is authoritative; a rate()-based ratio over mh_media_stream_admission_total uses a different window and WILL differ. 0 decisions in the window reads 0 (idle is silent); all-rejected reads 1. An excursion shorter than a few scrape intervals (the mh-service job's scrape_interval) can be invisible. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -735,7 +828,7 @@
           "refId": "B"
         }
       ],
-      "title": "Stream Admission Rejection Ratio vs Threshold",
+      "title": "Admission Rejection Ratio vs Threshold",
       "type": "timeseries"
     },
     {
@@ -743,7 +836,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Installed egress streams on each handler (mh_media_egress_edges) against its derived egress STREAM ceiling, the ADVISORY recommended minimum, and the edge-limit backstop (mh_media_egress_edges_limit) - all four in one unit, aggregate installed egress streams on the pod. Saturation is edges against the CEILING (capacity; remedy: raise MH_EGRESS_BUDGET_BPS), NEVER against the edge limit: that is a resource guard, and MH refuses to boot with a ceiling above it, so the ceiling always binds first - the limit line is plotted only to show the backstop's headroom. A ceiling below the recommended minimum means the budget is still the unsized placeholder - a configuration state, not an incident; the recommended minimum is never an alert input. Streams are released when a meeting's MC calls EndMeeting (story 2 R-20; MC calls it for every meeting it ends as of story 2 task 12); a meeting whose MC never COMPLETES EndMeeting (an MC crashed or killed before or during teardown; retries exhausted or an MH predating the RPC; a rollback to an MC build without teardown) keeps its streams until the pod restarts (the ratchet), and GC stops placing on a handler at its ceiling - installed streams rising with pod uptime rather than load is that state; recovery is a rollout restart of mh-0/mh-1. Read each pod against ITS OWN ceiling, never against the fleet: MC co-locates each meeting's edges onto ONE handler (chosen by a per-meeting rotation, so pods are roughly balanced across many meetings), but one large meeting's egress is never split and the idle sibling is not headroom for a meeting refused on the busy one. Until capacity-aware spreading lands, a few large meetings can skew the pods; sustained severe skew is worth investigating. key_custody=operator.",
+      "description": "Installed egress streams on each handler (mh_media_egress_edges) against its derived egress STREAM ceiling and the ADVISORY recommended minimum - all three in one unit, aggregate installed egress streams on the pod. THIS is the comparison MHMediaEgressEdgeHeadroomLow reads: edges / mh_media_egress_stream_ceiling against an ALERT-OWNED headroom fraction (the fraction lives in infra/docker/prometheus/rules/mh-alerts.yaml and is deliberately not restated here). FORK LEAK VS LOAD FIRST: installed streams climbing with pod uptime while mh_media_meeting_teardowns_total{outcome=\"released\"} stays flat (Meeting Teardowns by Outcome) is a RECLAMATION LEAK (docs/runbooks/mc-incident-response.md Scenario 20) and a true positive on a long-lived pod, never tuned away; streams tracking mh_media_registered_meetings and real demand is LOAD, a capacity or placement question. The edge-limit backstop (mh_media_egress_edges_limit) is on Egress Edges vs Edge-Limit Backstop beside this panel. Saturation is edges against the CEILING (capacity; remedy: raise MH_EGRESS_BUDGET_BPS), NEVER against the edge limit: that is a resource guard, and MH refuses to boot with a ceiling above it, so the ceiling always binds first - so the ceiling, not the limit, is the headroom denominator. A ceiling below the recommended minimum means the budget is still the unsized placeholder - a configuration state, not an incident; the recommended minimum is never an alert input. Streams are released when a meeting's MC calls EndMeeting (story 2 R-20; MC calls it for every meeting it ends as of story 2 task 12); a meeting whose MC never COMPLETES EndMeeting (an MC crashed or killed before or during teardown; retries exhausted or an MH predating the RPC; a rollback to an MC build without teardown) keeps its streams until the pod restarts (the ratchet), and GC stops placing on a handler at its ceiling - installed streams rising with pod uptime rather than load is that state; recovery is a rollout restart of mh-0/mh-1. Read each pod against ITS OWN ceiling, never against the fleet: MC co-locates each meeting's edges onto ONE handler (chosen by a per-meeting rotation, so pods are roughly balanced across many meetings), but one large meeting's egress is never split and the idle sibling is not headroom for a meeting refused on the busy one. Until capacity-aware spreading lands, a few large meetings can skew the pods; sustained severe skew is worth investigating. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -848,17 +941,6 @@
           "legendFormat": "recommended min (advisory)",
           "range": true,
           "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "max by (instance) (mh_media_egress_edges_limit)",
-          "legendFormat": "edge limit (backstop) {{instance}}",
-          "range": true,
-          "refId": "D"
         }
       ],
       "title": "Installed Egress Streams vs Stream Ceiling",
@@ -869,7 +951,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "The configured egress budget in BYTES per second - the key MH_EGRESS_BUDGET_BPS is in BITS; MH converts once at load, so a factor of 8 between the two is correct. basis=unmeasured records that the budget has no measurement behind it (ADR-0036 open item); this panel deliberately does not select on basis, because that label is designed to change. key_custody=operator.",
+      "description": "Installed egress edges per handler (mh_media_egress_edges) against the aggregate edge bound (mh_media_egress_edges_limit, publishing PolicyLimits::max_total_egress_edges from MH_MAX_TOTAL_EGRESS_EDGES - the same field enforcement reads), one pair per pod. The limit is a DEFENSE-IN-DEPTH BACKSTOP, not the saturation denominator: MH refuses to start with a stream ceiling above it and admission rejects at the ceiling first, so MHMediaEgressEdgeHeadroomLow and the LEAK-vs-LOAD fork read Installed Egress Streams vs Stream Ceiling, beside this. Edges reaching THIS line would mean the ceiling check did not bind - it surfaces as mh_media_policy_applies_total{outcome=\"apply_failed\"}. Read each pod against ITS OWN limit, never the fleet. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -878,7 +960,7 @@
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Budget",
+            "axisLabel": "Egress edges",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -915,7 +997,7 @@
               }
             ]
           },
-          "unit": "Bps"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -925,7 +1007,7 @@
         "x": 12,
         "y": 32
       },
-      "id": 11,
+      "id": 18,
       "options": {
         "legend": {
           "calcs": [
@@ -948,13 +1030,24 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "max by (instance) (mh_media_egress_budget_bytes_per_second)",
-          "legendFormat": "budget {{instance}}",
+          "expr": "max by (instance) (mh_media_egress_edges)",
+          "legendFormat": "edges {{instance}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_egress_edges_limit)",
+          "legendFormat": "limit {{instance}}",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Egress Budget (bytes/s)",
+      "title": "Egress Edges vs Edge-Limit Backstop",
       "type": "timeseries"
     },
     {
@@ -962,7 +1055,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Meetings each handler holds registered (mh_media_registered_meetings) against MH_MAX_REGISTERED_MEETINGS (mh_media_registered_meetings_limit), story 2 R-21. A RESOURCE GUARD, never capacity and never advertised to GC. Read the gauge as REGISTRATIONS HELD, not meetings in progress: it falls only when an EndMeeting releases a meeting, so a meeting whose MC never COMPLETES EndMeeting (an MC crashed or killed before or during teardown, retries exhausted or an MH predating the RPC, or a rollback to an MC build without teardown) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with load is that residual; many meetings against flat installed streams is the empty-meeting shape the cap exists for. At the limit, NEW meetings are refused (mh_media_policy_applies_total{outcome=\"rejected_meeting_cap\"}) while held ones keep re-asserting. key_custody=operator.",
+      "description": "Meetings each handler holds registered (mh_media_registered_meetings) against MH_MAX_REGISTERED_MEETINGS (mh_media_registered_meetings_limit), story 2 R-21. A RESOURCE GUARD, never capacity and never advertised to GC. Read the gauge as REGISTRATIONS HELD, not meetings in progress: it falls only when an EndMeeting releases a meeting, so a meeting whose MC never COMPLETES EndMeeting (an MC crashed or killed before or during teardown, retries exhausted or an MH predating the RPC, or a rollback to an MC build without teardown) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with load is that residual; many meetings against flat installed streams is the empty-meeting shape the cap exists for. AT MEETING END THE GAUGE MUST FALL: a released increment on mh_media_meeting_teardowns_total (Meeting Teardowns by Outcome) without this gauge falling in the same window is THE failure - a teardown acknowledged and not reclaimed - never a lag to wait out. At the limit, NEW meetings are refused (mh_media_policy_applies_total{outcome=\"rejected_meeting_cap\"}) while held ones keep re-asserting. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1226,6 +1319,266 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
+      "description": "The configured egress budget in BYTES per second (mh_media_egress_budget_bytes_per_second, left axis) - the key MH_EGRESS_BUDGET_BPS is in BITS; MH converts once at load, so a factor of 8 between the two is correct. basis=unmeasured records that the budget has no measurement behind it (ADR-0036 open item); this panel deliberately does not select on basis, because that label is designed to change. Right axis, in STREAMS: the derived egress stream ceiling (mh_media_egress_stream_ceiling - the budget divided by the heavier per-stream cost, the same field admission enforces and gc_client advertises to GC as max_streams) and mh_media_egress_stream_ceiling_recommended_min. THE RECOMMENDED MINIMUM IS ADVISORY - NOTHING ALERTS ON IT, by decision (it takes a descriptive suffix, not _threshold, precisely because nothing automatic watches it). A ceiling below it means the budget is still the unsized placeholder: a configuration state, not an incident. Per-stream costs are on their own panel. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Budget",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Egress streams"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Egress streams"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_egress_budget_bytes_per_second)",
+          "legendFormat": "budget {{instance}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_egress_stream_ceiling)",
+          "legendFormat": "stream ceiling {{instance}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mh_media_egress_stream_ceiling_recommended_min)",
+          "legendFormat": "recommended min (ADVISORY)",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Egress Budget (bytes/s) and Stream Ceiling",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The ENFORCED per-stream costs in BYTES per second (MH_STREAM_COST_AUDIO_BPS / MH_STREAM_COST_VIDEO_BPS are bits, converted once at load with div_ceil(8)): mh_media_stream_cost_audio_bytes_per_second and mh_media_stream_cost_video_bytes_per_second. The heavier one divides the budget into mh_media_egress_stream_ceiling. Deliberately NOT on the Egress Budget panel. A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Bytes/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_stream_cost_audio_bytes_per_second)",
+          "legendFormat": "audio {{instance}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_stream_cost_video_bytes_per_second)",
+          "legendFormat": "video {{instance}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Per-Stream Egress Costs (bytes/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
       "description": "The ADR-0036 section 8 pre-allocation bounds on ONE registration: MH_MAX_EGRESS_STREAMS_PER_MEETING (mh_media_egress_streams_per_meeting_limit), MH_MAX_CANDIDATE_SOURCES_PER_EGRESS (mh_media_candidate_sources_per_egress_limit) and MH_MAX_MUTED_SOURCES_PER_MEETING (mh_media_muted_sources_per_meeting_limit). A registration exceeding one is refused whole (mh_media_policy_applies_total{outcome=\"rejected_invalid\"}). A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
@@ -1278,9 +1631,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 12,
         "x": 0,
-        "y": 48
+        "y": 56
       },
       "id": 15,
       "options": {
@@ -1393,9 +1746,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 48
+        "w": 12,
+        "x": 12,
+        "y": 56
       },
       "id": 16,
       "options": {
@@ -1427,110 +1780,6 @@
         }
       ],
       "title": "Policy Apply Timeout",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "The ENFORCED per-stream costs in BYTES per second (MH_STREAM_COST_AUDIO_BPS / MH_STREAM_COST_VIDEO_BPS are bits, converted once at load with div_ceil(8)): mh_media_stream_cost_audio_bytes_per_second and mh_media_stream_cost_video_bytes_per_second. The heavier one divides the budget into mh_media_egress_stream_ceiling. Deliberately NOT on the Egress Budget panel. A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "Bytes/s",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "Bps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 48
-      },
-      "id": 17,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "max by (instance) (mh_media_stream_cost_audio_bytes_per_second)",
-          "legendFormat": "audio {{instance}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "max by (instance) (mh_media_stream_cost_video_bytes_per_second)",
-          "legendFormat": "video {{instance}}",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "Per-Stream Egress Costs (bytes/s)",
       "type": "timeseries"
     }
   ],
