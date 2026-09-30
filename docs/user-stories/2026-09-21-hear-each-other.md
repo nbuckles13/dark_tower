@@ -541,7 +541,7 @@ tasks:
   tier: light
   tier_reason: 'harness-only: provisioning helper, detector, diagnostic; no contract'
 - id: 15
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 3
@@ -561,6 +561,7 @@ tasks:
     CORRECTION (2026-09-24, revised after the shared-handler visibility task was added as id 20): (1) Visibility follows observed connectivity: every client connects to every handler and MC routes each pair through a handler both share, so an all-connected Kind meeting has everyone hearing everyone — S1/S2/S3/S6 need no placement setup, and nothing may assume which handler carries a pair. (2) The MC `test-seams` placement lever is absent from the release Kind image (a `--release` build) and is no longer needed: partial connectivity (S10a) is produced by which handlers a test context connects to. (3) Task 6 converts story 1's browser loopback spec to a solo-hears-nothing check, which removes the only browser-tier proof of client STRUCTURAL mute (egress flat while muted); this task OWNS restoring that coverage in its multi-context tests. (4) Task 6 already landed the sdk-core read-loop start from `StreamAssignment.media_handler_url` and (slot, sender)-keyed hop-sequence tracking.
 
     Env-tests follow the evidence rule in `crates/env-tests/README.md` (drive public APIs; assert per-entity evidence; never the value of a shared pod-level gauge).
+  slug: 2026-09-30-multi-participant-ui-browser-env-tests
   tag: story-2026-09-21-hear-each-other-task-15
 - id: 16
   status: pending
