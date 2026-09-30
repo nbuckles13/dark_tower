@@ -108,11 +108,11 @@ config's own header comment says so), and the browser demo works with exactly on
 
 | | **Static — the demo path** | **Devloop helper — the agent path** |
 |---|---|---|
-| Brought up by | `./infra/kind/scripts/setup.sh` | `infra/devloop/dev-cluster setup` |
+| Brought up by | `./infra/kind/scripts/setup.sh` | `dev-cluster provision && dev-cluster deploy` (`infra/devloop/dev-cluster`) |
 | Config | `infra/kind/kind-config.yaml` (committed) | rendered from `infra/kind/kind-config.yaml.tmpl` |
 | Host ports | the fixed `hostPort` values in that file | allocated per-clone, 20000–29999 |
 | Published on | `127.0.0.1` (loopback, per R-37) | the podman host-gateway IP |
-| MC/MH advertise | the committed IPv4 literals in the per-instance `*-config.env` files | rendered to the gateway IP at deploy time (`setup.sh:apply_env_root`) |
+| MC/MH advertise | the committed IPv4 literals in the per-instance `*-config.env` files | rendered to the gateway IP at deploy time (`infra/kind/scripts/deploy.sh:apply_env_root`) |
 
 **Use the static path.** `scripts/dev-web.sh` defaults to the static host ports, and reads the
 MC/MH advertise addresses from the **committed configmap files on disk** — both of which are only
@@ -122,10 +122,11 @@ true under the static topology.
 devloop helper over a unix socket at `/tmp/devloop/helper.sock`, which exists only inside a running
 devloop container. From a plain WSL2 shell it will fail at the socket check.
 
-> **You will see `dev-cluster setup` elsewhere in the repo and it is correct there.**
-> `scripts/layer7.sh`, `infra/devloop/devloop.sh`, ADR-0030 and several `docs/TODO.md` entries all
-> use it correctly. The rule is not the string, it is **the audience**: a human on the WSL2 host
-> gets `./infra/kind/scripts/setup.sh`; the devloop container gets `dev-cluster setup`.
+> **You will see `dev-cluster provision` / `dev-cluster deploy` elsewhere in the repo and they are
+> correct there.** `scripts/layer7.sh`, `infra/devloop/devloop.sh` and ADR-0030 use them correctly.
+> The rule is not the string, it is **the audience**: a human on the WSL2 host gets
+> `./infra/kind/scripts/setup.sh` (which runs provision.sh, then deploy.sh, then the host
+> port-forwards); the devloop container gets `dev-cluster provision && dev-cluster deploy`.
 
 > **Two different bind policies, both deliberate — do not "fix" the second one.**
 > The browser-flow ports (AC, GC, MC, MH) bind `listenAddress: 127.0.0.1` per R-37, so a laptop on
@@ -449,7 +450,7 @@ and the join will fail in a way that looks exactly like F1. See F8.
 
 | It did | Verify |
 |---|---|
-| Seeded the `demo` org (`infra/kind/scripts/setup.sh::seed_demo_org`, idempotent) | `kubectl exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "select subdomain from organizations"` |
+| Seeded the `demo` org (`infra/kind/scripts/deploy.sh::seed_demo_org`, idempotent) | `kubectl exec -n dark-tower postgres-0 -- psql -U darktower -d dark_tower -c "select subdomain from organizations"` |
 | Generated dev certs + fingerprints, via `scripts/generate-dev-certs.sh` | `ls infra/docker/certs/fingerprints.json` |
 | Created the `mc-service-tls` / `mh-service-tls` secrets | `kubectl describe secret mc-service-tls -n dark-tower` |
 | Ran migrations, deployed AC/GC/MC/MH, started port-forwards | `kubectl get pods -n dark-tower` |
@@ -1085,23 +1086,22 @@ unlikely on a laptop, and **not** a cert problem.)
 file is missing, because the leaf rotated, or because the dev server is still holding a stale value
 in memory.
 
-**Fix — four steps, in this order.** Regenerating certs alone is not enough, and neither is
-restarting Vite: on a running cluster, `kubectl apply` is a no-op on an unchanged Deployment spec,
-so recreating the TLS secret does **not** restart the pods still serving the old leaf. This is the
-sequence `scripts/generate-dev-certs.sh` itself prints when a leaf is near expiry:
+**Fix — two steps, in this order.** Regenerating certs alone is not enough, and neither is
+restarting Vite. This is the sequence `scripts/generate-dev-certs.sh` itself prints when a leaf is
+near expiry:
 
 ```bash
 # --- WSL2 ---
 ./infra/kind/scripts/setup.sh
-#   regenerates expiring leaves, recreates the mc/mh-service-tls Secrets, redeploys
-kubectl rollout restart deployment/mc-0 deployment/mc-1 deployment/mh-0 deployment/mh-1 -n dark-tower
-#   'apply' alone does not restart pods on a secret-only change
+#   provision renews an expiring leaf and hashes the PUBLIC certs into its blueprint (ADR-0038),
+#   so a renewed leaf REBUILDS the cluster: fresh mc/mh-service-tls Secrets, fresh MC/MH pods
+#   (no rollout-restart step); deploy then converges the application onto it
 # then restart the dev server:
 scripts/dev-web.sh
 #   the browser-side fingerprints are read at Vite CONFIG time — a running server never re-reads them
 ```
 
-**Not a browser setting.** The remedy is the four-step sequence above. A browser setting that turns
+**Not a browser setting.** The remedy is the sequence above. A browser setting that turns
 off certificate validation is never the fix here: MC/MH trust in dev flows entirely through
 `serverCertificateHashes` pinning, so disabling validation does not restore the media path — it
 leaves a demo that appears to work while the property the pinning exists to prove is gone. This is
@@ -1122,9 +1122,10 @@ a `serverCertificateHashes`-pinned certificate whose validity window exceeds 14 
 is external and must not be "helpfully" lengthened. Expiry is therefore a routine event roughly
 every other week, not a first-run-only problem.
 
-> Automating the rollout-restart inside `setup.sh` is tracked in `docs/TODO.md` under
-> "Port Constant Scattering". It is **not** done, and this runbook does not do it — this runbook
-> documents the manual sequence.
+> Since ADR-0038 step 3 no manual rollout-restart is needed: a renewed leaf changes provision's
+> blueprint, so the next `setup.sh` (host) or `dev-cluster provision` (devloop) rebuilds the
+> cluster with the new Secrets. Expect that rebuild (~6 min) roughly every 13 days on a
+> long-lived cluster.
 
 ---
 
@@ -1143,12 +1144,12 @@ kubectl get configmap -n dark-tower -o jsonpath='{.data.MC_WEBTRANSPORT_ADVERTIS
 ```
 
 If the variable prints anything, or the live value is a gateway IP rather than the IPv4 loopback
-literal committed in `infra/services/mc-service/mc-0-config.env`, this is F8. `setup.sh` also
+literal committed in `infra/services/mc-service/mc-0-config.env`, this is F8. `deploy.sh` also
 logs it when it applies (`Applying environment root … (devloop advertise addresses via <ip>)`), so
 the setup output is a second confirming signal.
 
-**Cause.** `DT_HOST_GATEWAY_IP` was still exported from a previous devloop session. `setup.sh`
-treats it as "you are building a devloop cluster" and renders all four MC/MH advertise addresses
+**Cause.** `DT_HOST_GATEWAY_IP` was still exported from a previous devloop session. `deploy.sh`
+(via `setup.sh`) treats it as "you are building a devloop cluster" and renders all four MC/MH advertise addresses
 with that IP — which the Windows browser cannot dial.
 
 **Fix.**

@@ -62,8 +62,8 @@ privileged/cluster parts for you:
 echo '127.0.0.1  demo.localhost' | sudo tee -a /etc/hosts  # see the runbook — this is the WSL2-side file
 ```
 
-Use `./infra/kind/scripts/setup.sh`, **not** `infra/devloop/dev-cluster setup`.
-The latter is the ADR-0030 in-container helper: it needs the devloop helper
+Use `./infra/kind/scripts/setup.sh`, **not** `dev-cluster provision` / `dev-cluster deploy`.
+Those are the ADR-0030 in-container helper's verbs: it needs the devloop helper
 socket (which only exists inside a running devloop container) and it allocates
 dynamic ports bound to the podman host-gateway IP, so the fixed loopback ports
 this demo assumes would not be there.

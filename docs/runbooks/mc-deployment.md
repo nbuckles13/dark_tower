@@ -88,7 +88,7 @@ infra/
 - **Kind overlay** (`infra/kubernetes/overlays/kind/services/mc-service/`): References the base and adds Kind-specific labels.
 - Deploy with: `kubectl apply -k infra/kubernetes/overlays/kind/services/mc-service/`
 
-> **Note:** The MC WebTransport TLS secret (`mc-service-tls`) is created imperatively by `setup.sh` (via `create_mc_tls_secret()`), not managed by Kustomize. Ensure TLS secrets are provisioned before deploying MC. See [Common Deployment Issues](#common-deployment-issues) for TLS troubleshooting.
+> **Note:** The MC WebTransport TLS secret (`mc-service-tls`) is created imperatively by `infra/kind/scripts/provision.sh` (via `create_tls_secret()`) when the platform is provisioned, not managed by Kustomize. Ensure TLS secrets are provisioned before deploying MC. See [Common Deployment Issues](#common-deployment-issues) for TLS troubleshooting.
 
 ---
 
@@ -926,13 +926,13 @@ kubectl logs -n dark-tower deployment/mc-0 --previous | head -5
 #    infra/kubernetes/overlays/kind/services/mc-service/configmap-otel-patch.yaml)
 #    and silently turns MC's span export OFF at the moment you most need it.
 #    On a devloop cluster, applying even the plain overlay root reverts the
-#    per-cluster advertise addresses. Go through setup.sh, which chooses the
-#    right render (infra/kind/scripts/setup.sh:apply_env_root):
+#    per-cluster advertise addresses. Go through deploy.sh, which chooses the
+#    right render (infra/kind/scripts/deploy.sh:apply_env_root):
 #
 # 2a. Devloop / Kind cluster:
-./infra/kind/scripts/setup.sh --skip-build --only mc
-#     (equivalently: dev-cluster deploy mc). This applies the whole environment
-#     root and waits for EVERY workload in it, not just MC.
+./infra/kind/scripts/deploy.sh
+#     (from the devloop container: dev-cluster deploy). This applies the whole
+#     environment root and waits for EVERY workload in it, not just MC.
 
 # 3. Confirm the roll (the apply already started it).
 kubectl rollout status deployment/mc-0 -n dark-tower
@@ -948,24 +948,22 @@ ControllerRevisions**, or this lever breaks (`CreateContainerConfigError` /
 `FailedMount` on undo). This runbook deliberately publishes no cleanup
 command. The durable fix is still to change the tree and re-apply.
 
-**On a devloop cluster, a rebuild does NOT apply manifests.** `dev-cluster
-rebuild` / `rebuild-all` build the image, load it and `rollout restart`
-(`crates/devloop-helper/src/commands.rs`); they never `kubectl apply`. Layer 7's
-infra-change detector watches `infra/kind/` only (`scripts/layer7.sh`), never
-`infra/services/`. So a diff that changes `infra/services/mc-service/**` and the
-image together produces the new image against the **old** ConfigMap and pod
-template by default — the CrashLoop above is the guaranteed outcome, not bad
-luck. Run `dev-cluster deploy mc` (`setup.sh --skip-build --only mc`, which
-applies the whole environment root; content-addressed ConfigMaps then roll only
-what changed) after any change under `infra/services/`.
+**On a devloop cluster, `deploy` applies the manifests and the image together.**
+`dev-cluster deploy` (`infra/kind/scripts/deploy.sh`) builds every image, runs the
+migration Job and applies the whole environment root on every run, and Layer 7
+runs it on every gate (ADR-0038) — so a change under `infra/services/mc-service/**`
+reaches the cluster with the image that needs it; content-addressed ConfigMaps roll
+only what changed. (Before ADR-0038 the image was rebuilt without applying the
+manifests, which made the CrashLoop above the guaranteed outcome.) If you see it
+now, the cluster was not converged — run `dev-cluster deploy`.
 
 **The symptom may not look like a config problem at all.** In the 2026-09-03
-occurrence the first error surfaced was a Layer 7 `PRECONDITION_FAILURE` on
-`port 24500 (prometheus) is already in use`. That was downstream noise: cluster
-`setup` re-ran *because* mc-0 and mc-1 were unhealthy, and the re-run collided
-with ports the existing cluster still held. Chasing the port would have been an
-hour spent nowhere. **If cluster setup re-runs unexpectedly, check MC pod health
-before believing any port or resource-conflict message it produces.**
+occurrence (pre-ADR-0038) the first error surfaced was a Layer 7
+`PRECONDITION_FAILURE` on `port 24500 (prometheus) is already in use`. That was
+downstream noise: cluster setup re-ran *because* mc-0 and mc-1 were unhealthy, and
+the re-run collided with ports the existing cluster still held. **If a cluster-level
+step fails with a port or resource-conflict message, check MC pod health before
+believing it.**
 
 ### Kubernetes Secrets
 
@@ -993,8 +991,8 @@ env vars. Keys are `tls.crt` and `tls.key`; `MC_TLS_CERT_PATH` /
 > **It is NOT in the kustomization and `apply -k` will not create it.**
 > `infra/services/mc-service/kustomization.yaml` lists `secret.yaml`, which
 > defines only `mc-service-secrets`. `mc-service-tls` is created *imperatively*
-> by `infra/kind/scripts/setup.sh::create_mc_tls_secret` — which runs
-> `scripts/generate-dev-certs.sh`, then `kubectl create secret tls` — so it is
+> by `infra/kind/scripts/provision.sh::create_tls_secret` (provision materializes the
+> certs with `scripts/generate-dev-certs.sh`, then `kubectl create secret tls`) — so it is
 > outside the ConfigMap + Deployments + image coupled set and survives every
 > `apply -k`. **On a fresh namespace it must be created before the pods start.**
 >
@@ -1094,8 +1092,8 @@ boot without OTel:
 1. Set `OTEL_ENABLED=false` in `infra/services/mc-service/config.env` (or, in
    Kind, drop the `configmap-otel-patch.yaml` from the overlay
    `kustomization.yaml`).
-2. Apply the environment root (Kind: `./infra/kind/scripts/setup.sh --skip-build
-   --only mc`). `mc-service-config` is content-addressed, so the apply changes
+2. Apply the environment root (Kind: `./infra/kind/scripts/deploy.sh`, or
+   `dev-cluster deploy`). `mc-service-config` is content-addressed, so the apply changes
    **both** MC pod templates (`mc-0`, `mc-1`) and rolls them. There is no
    separate restart step:
    ```bash

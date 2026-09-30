@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  # Renamed at render time to db-migrate-<hash> (setup.sh:migration_job_name):
+  # Renamed at render time to db-migrate-<hash> (deploy.sh:migration_job_name):
   # the hash covers the image tag (hence the migrations) and this spec, so an
   # unchanged set re-applies as a no-op and any change is a NEW Job (a Job's
   # pod template is immutable, so the same name could never be updated).
@@ -17,7 +17,7 @@ metadata:
     component: migrations
 spec:
   # One retry covers a transient connect failure; a deterministic failure
-  # (checksum drift, dirty row) fails twice and the Job goes Failed. setup.sh
+  # (checksum drift, dirty row) fails twice and the Job goes Failed. deploy.sh
   # derives its wait from activeDeadlineSeconds — do not remove it.
   backoffLimit: 1
   activeDeadlineSeconds: 300
@@ -38,7 +38,7 @@ spec:
       containers:
         - name: db-migrate
           image: localhost/db-migrate:render-required
-          # Kind-loaded image: never pulled; it must be the one setup.sh loaded.
+          # Kind-loaded image: never pulled; it must be the one deploy.sh loaded.
           imagePullPolicy: Never
           env:
             # Credentials come from Postgres's own Secret, never a literal.

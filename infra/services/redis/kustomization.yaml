@@ -4,7 +4,6 @@ kind: Kustomization
 resources:
   - statefulset.yaml
   - service.yaml
-  - secret.yaml
   - network-policy.yaml
 
 # Content-addressed configuration (ADR-0038 §2): generated, so kustomize
@@ -12,6 +11,24 @@ resources:
 # editing the config file changes the pod template and rolls the pod.
 # `namespace:` is load-bearing -- see
 # infra/kubernetes/observability/kustomization.yaml.
+# The Redis password is a GENERATED Secret for the same reason: its name carries a
+# hash of its data, so a password change renames it, which changes the pod
+# templates that reference it (redis, and MC's composed REDIS_URL) and rolls them.
+# A plain Secret would change in place and roll nothing. It is the ONE owner of
+# the password: MC composes its REDIS_URL from this key (mc-{0,1}-deployment.yaml).
+# The value must be URL-safe (it is embedded unencoded). Development password —
+# override in production via external-secrets or sealed-secrets.
+secretGenerator:
+  - name: redis-secrets
+    namespace: dark-tower
+    type: Opaque
+    literals:
+      - REDIS_PASSWORD=dev_password_change_in_production
+    options:
+      labels:
+        app: redis
+        component: cache
+
 configMapGenerator:
   - name: redis-config
     namespace: dark-tower

@@ -823,6 +823,48 @@ pub async fn poll_until_stable(
     }
 }
 
+/// THE baseline rule for every "rose past / did not rise from its baseline"
+/// check: a per-instance counter snapshot that has STOPPED MOVING across one
+/// service-job scrape ([`service_job_scrape_settle`], which fails closed if the
+/// settle does not exceed the live scrape interval). An unsettled read lets an
+/// earlier or concurrent test's increment, still being scraped, satisfy a later
+/// "rose" check with nothing from the caller (a false pass) or trip a "did not
+/// rise" check (a false fail). Pods persist across Layer-7 runs (ADR-0038), so
+/// the hazard is the common case, not an edge.
+///
+/// The RETURNED map is the baseline; callers never re-read. `bound` is the
+/// caller's failure-only ceiling; `context` names what is NOT at fault in the
+/// timeout message (e.g. "the admission assertion under test").
+///
+/// # Panics
+///
+/// When the snapshot does not stabilise within `bound` — a PRECONDITION
+/// (environment/scrape) failure, worded so it never reads as the check itself.
+#[must_use = "the returned map IS the settled baseline; re-reading yields an unsettled one"]
+pub async fn settled_baseline(
+    prom: &PrometheusClient,
+    promql: &str,
+    bound: Duration,
+    context: &str,
+) -> InstanceCounters {
+    poll_until_stable(
+        prom,
+        promql,
+        service_job_scrape_settle(prom).await,
+        bound,
+        |v1, v2| {
+            format!(
+                "PRECONDITION: baseline did not stabilise for `{promql}` within {bound:?} \
+                 (two reads a scrape apart: v1={}, v2={}). An environment/scrape condition \
+                 (other traffic still moving the counter), not {context}.",
+                format_instance_map(v1),
+                format_instance_map(v2),
+            )
+        },
+    )
+    .await
+}
+
 /// Read an EAGERLY-REGISTERED gauge per `instance`, polling until the series is
 /// present on at least `min_instances` instances or `timeout` elapses.
 ///

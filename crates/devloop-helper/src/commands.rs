@@ -10,8 +10,8 @@ use crate::fs_atomic::atomic_write_secret;
 use crate::logging::now_rfc3339;
 use crate::ports::{self, PortAllocation, PortOffsets};
 use crate::protocol::{
-    CommandOutcome, CommandResult, CommandStarted, HelperCommand, Service, StreamKind, StreamLine,
-    StreamMsg, MAX_LINE_LEN,
+    CommandOutcome, CommandResult, CommandStarted, HelperCommand, StreamKind, StreamLine,
+    StreamMsg, WriteDecisions, MAX_LINE_LEN,
 };
 use serde::Serialize;
 use std::fs;
@@ -48,14 +48,15 @@ const DEFAULT_HOST_GATEWAY_IP: &str = "10.255.255.254";
 
 /// Graceful-shutdown window between SIGTERM and SIGKILL on cancel
 /// (per security S5). The 2 s window is for the cooperative shell/kubectl
-/// tree spawned by writer commands — `setup.sh` running `kubectl wait`,
+/// tree spawned by writer commands — `provision.sh`/`deploy.sh` running `kubectl wait`,
 /// `kubectl apply`, `kind create cluster`, etc. — all of which respond
 /// promptly to SIGTERM. We do NOT signal the Kind cluster's
 /// containerd/kubelet/etcd: those run inside Kind's container as detached
 /// components managed by the cluster's PID 1, not as descendants of
-/// setup.sh — they were never in our process group. Partial-Kind state
-/// from a cancelled `setup` is recovered by setup.sh's "cluster exists,
-/// reusing" branch on the next setup. Process-wide shutdown stays
+/// the scripts — they were never in our process group. Partial-Kind state
+/// from a cancelled `provision` carries no blueprint record, so the next
+/// `provision` tears it down and rebuilds it (ADR-0038 §1; a half-built
+/// cluster is never reused). Process-wide shutdown stays
 /// SIGKILL-immediate; see the `IMPORTANT:` comment in
 /// `run_command_streaming`.
 pub const CANCEL_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -121,18 +122,32 @@ fn signal_process_group(child: &Child, sig: libc::c_int) -> Result<(), HelperErr
     Ok(())
 }
 
-/// Per-write cancellation signal. Wraps the helper's process-wide shutdown
-/// flag and a per-write cancel token; either being set cancels the in-flight
-/// child (per CR3).
+/// Per-write handle every child of the write is run with. Wraps the helper's
+/// process-wide shutdown flag and a per-write cancel token — either being set
+/// cancels the in-flight child (per CR3) — and the write's decision-line sink
+/// ([`WriteDecisions`]): `run_command_streaming` records the provision/deploy
+/// decision lines it relays, and `run_with_write_slot` hands them to the audit
+/// log. Scoped to ONE write, like the cancel token, so a line can never be
+/// attributed to another write.
 #[derive(Clone)]
 pub struct CancelSignal {
     pub shutdown: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
+    pub decisions: Arc<Mutex<WriteDecisions>>,
 }
 
 impl CancelSignal {
     pub fn new(shutdown: Arc<AtomicBool>, cancel: Arc<AtomicBool>) -> Self {
-        Self { shutdown, cancel }
+        Self {
+            shutdown,
+            cancel,
+            decisions: Arc::new(Mutex::new(WriteDecisions::default())),
+        }
+    }
+
+    /// The decision lines recorded so far for this write.
+    pub fn decisions(&self) -> WriteDecisions {
+        lock_recovered(&self.decisions).clone()
     }
 
     /// True if either shutdown OR per-write cancel is set. Available for
@@ -155,10 +170,7 @@ impl CancelSignal {
     /// `run_with_write_slot`.
     #[allow(dead_code)]
     pub fn shutdown_only(shutdown: Arc<AtomicBool>) -> Self {
-        Self {
-            shutdown,
-            cancel: Arc::new(AtomicBool::new(false)),
-        }
+        Self::new(shutdown, Arc::new(AtomicBool::new(false)))
     }
 }
 
@@ -355,8 +367,11 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
         eprintln!("[devloop-helper] failed to send started message: {e}");
     }
 
+    let mut decisions = WriteDecisions::default();
     let result = if cmd.is_write() {
-        run_with_write_slot(cmd, ctx, writer)
+        let (result, recorded) = run_with_write_slot(cmd, ctx, writer);
+        decisions = recorded;
+        result
     } else {
         // Reads + control commands bypass the write mutex.
         match cmd {
@@ -379,6 +394,7 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
             error: None,
             error_kind: None,
             data,
+            decisions,
         },
         Err(e) => {
             // For Busy errors, also surface the structured op/args via data
@@ -398,6 +414,7 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
                 error: Some(e.to_string()),
                 error_kind: Some(e.kind().to_string()),
                 data,
+                decisions,
             }
         }
     }
@@ -407,22 +424,30 @@ pub fn execute(cmd: &HelperCommand, ctx: &Context, writer: &mut dyn Write) -> Co
 /// `WriteSlotGuard` on any exit path. Returns `HelperError::Busy` if another
 /// write is already in flight (per Security S1 + Obs O1 collision-pair).
 /// Returns `HelperError::Cancelled` if the per-write cancel token was set
-/// during execution.
+/// during execution. Also returns the decision lines the write's scripts
+/// printed ([`WriteDecisions`]; empty for a rejected or script-less write), for
+/// the audit log.
 fn run_with_write_slot(
     cmd: &HelperCommand,
     ctx: &Context,
     writer: &mut dyn Write,
-) -> Result<Option<serde_json::Value>, HelperError> {
+) -> (
+    Result<Option<serde_json::Value>, HelperError>,
+    WriteDecisions,
+) {
     let cancel_token = Arc::new(AtomicBool::new(false));
 
     // Try to claim the slot.
     {
         let mut g = lock_recovered(&ctx.write_state);
         if let Some(in_flight) = g.in_flight.as_ref() {
-            return Err(HelperError::Busy {
-                op: in_flight.op.clone(),
-                args: in_flight.args.clone(),
-            });
+            return (
+                Err(HelperError::Busy {
+                    op: in_flight.op.clone(),
+                    args: in_flight.args.clone(),
+                }),
+                WriteDecisions::default(),
+            );
         }
         g.in_flight = Some(InFlightOp {
             op: cmd.name().to_string(),
@@ -439,12 +464,8 @@ fn run_with_write_slot(
     let signal = CancelSignal::new(Arc::clone(&ctx.shutdown), Arc::clone(&cancel_token));
 
     let result = match cmd {
-        HelperCommand::Setup { skip_observability } => {
-            cmd_setup(ctx, *skip_observability, writer, &signal)
-        }
-        HelperCommand::Rebuild(svc) => cmd_rebuild(ctx, *svc, writer, &signal).map(|()| None),
-        HelperCommand::RebuildAll => cmd_rebuild_all(ctx, writer, &signal).map(|()| None),
-        HelperCommand::Deploy(svc) => cmd_deploy(ctx, *svc, writer, &signal).map(|()| None),
+        HelperCommand::Provision => cmd_provision(ctx, writer, &signal),
+        HelperCommand::Deploy => cmd_deploy(ctx, writer, &signal).map(|()| None),
         HelperCommand::Teardown => cmd_teardown(ctx, writer, &signal).map(|()| None),
         HelperCommand::Recreate => cmd_recreate(ctx, writer, &signal),
         HelperCommand::RestoreKubeconfig => cmd_restore_kubeconfig(ctx, writer, &signal),
@@ -474,7 +495,8 @@ fn run_with_write_slot(
     // Map command-failed errors to HelperError::Cancelled when the per-write
     // cancel token was set during execution. Process-shutdown does NOT remap
     // (we're going down; the helper's exit path swallows it).
-    result.map_err(|e| {
+    let decisions = signal.decisions();
+    let result = result.map_err(|e| {
         if signal.cancel_set() {
             // The escalation flag will be set by run_command_streaming when
             // SIGKILL was needed. Default to false here; the streaming path
@@ -489,7 +511,8 @@ fn run_with_write_slot(
         } else {
             e
         }
-    })
+    });
+    (result, decisions)
 }
 
 /// Test-only: run `sleep N` via run_command_streaming so the concurrency
@@ -726,7 +749,7 @@ fn reachability_from_signals(
 }
 
 /// Read the live apiserver port from the persisted port map (`ports.json`
-/// `.ports.k8s_api`) — the SAME value setup wrote (S4-convergent). Returns
+/// `.ports.k8s_api`) — the SAME value provision wrote (S4-convergent). Returns
 /// `None` if the file is missing/unparseable or the port is absent/zero.
 ///
 /// This is also `restore-kubeconfig`'s port source (S4): NEVER a fresh
@@ -738,22 +761,6 @@ fn read_k8s_api_port(ctx: &Context) -> Option<u16> {
     let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
     let port = value.pointer("/ports/k8s_api").and_then(|v| v.as_u64())?;
     u16::try_from(port).ok().filter(|&p| p != 0)
-}
-
-/// Read the persisted `observability_deployed` SSoT from the live `ports.json`
-/// (written from `!skip_observability` by setup). A cluster brought up with
-/// `--skip-observability` must be RECREATED without observability too — else the
-/// self-heal silently restores a stack the operator explicitly opted out of
-/// (@code-reviewer, config-over-hardcoding). Defaults to `true` (full stack) when
-/// the file is missing/unparseable — there is then no SSoT to honour, and that
-/// matches the pre-existing behaviour.
-fn read_observability_deployed(ctx: &Context) -> bool {
-    let ports_path = ctx.runtime_dir.join("ports.json");
-    fs::read_to_string(&ports_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|v| v.get("observability_deployed").and_then(|b| b.as_bool()))
-        .unwrap_or(true)
 }
 
 /// `<runtime> inspect -f '{{.State.Running}}' <cluster>-control-plane`, bounded
@@ -890,28 +897,39 @@ fn self_heal_data(
     }))
 }
 
-/// Setup: allocate ports, generate kind-config, create cluster, run setup.sh.
-fn cmd_setup(
+/// Provision: allocate ports, render kind-config, write the port maps, run
+/// `infra/kind/scripts/provision.sh` — which compares the blueprint recorded in
+/// the cluster with the one this render produces and destroys + rebuilds the
+/// cluster only when they differ or no record exists (ADR-0038 §1). The helper
+/// never runs `kind create` itself: provision.sh creates the cluster from the
+/// SAME rendered kind-config it hashed.
+fn cmd_provision(
     ctx: &Context,
-    skip_observability: bool,
     writer: &mut dyn Write,
     signal: &CancelSignal,
 ) -> Result<Option<serde_json::Value>, HelperError> {
-    eprintln!("[devloop-helper] setup: allocating ports...");
+    eprintln!("[devloop-helper] provision: allocating ports...");
     let alloc = ports::allocate_ports(&ctx.slug, &ctx.registry_path)?;
 
     eprintln!(
-        "[devloop-helper] setup: allocated base port {} (slot {})",
+        "[devloop-helper] provision: allocated base port {} (slot {})",
         alloc.base_port, alloc.slot_index
     );
 
-    // Verify critical ports are available
-    ports::verify_ports_available(&alloc)?;
+    // Verify critical ports only when there is no cluster yet. An existing
+    // cluster holds its OWN ports (the per-slug allocation is stable), so the
+    // check would always fail against it; if provision.sh then rebuilds that
+    // cluster, `kind create` fails LOUDLY on a foreign holder ("port is already
+    // allocated") after the old cluster is gone — accepted, never silent.
+    if !cluster_already_exists(&ctx.cluster_name)? {
+        ports::verify_ports_available(&alloc)?;
+    }
 
-    // Generate kind-config from template
+    // Render kind-config from the template — a blueprint input (provision.sh
+    // hashes this exact file and creates the cluster from it).
     let template_path = ctx.project_root.join("infra/kind/kind-config.yaml.tmpl");
     let template = fs::read_to_string(&template_path).map_err(|e| HelperError::CommandFailed {
-        cmd: "setup".to_string(),
+        cmd: "provision".to_string(),
         detail: format!("failed to read kind-config template: {e}"),
     })?;
 
@@ -924,7 +942,6 @@ fn cmd_setup(
     vars.insert("CLUSTER_NAME".to_string(), ctx.cluster_name.clone());
 
     let config_content = ports::substitute_template(&template, &vars);
-    let config_path = ctx.runtime_dir.join("kind-config.yaml");
     {
         // not secret-bearing (port mappings + gateway IP) — ordinary write; the
         // atomic-secret-write helper (`fs_atomic`) is for credential files only.
@@ -933,7 +950,7 @@ fn cmd_setup(
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&config_path)?;
+            .open(kind_config_path(ctx))?;
         file.write_all(config_content.as_bytes())?;
         file.flush()?;
     }
@@ -941,53 +958,15 @@ fn cmd_setup(
     // Generate port map
     let host = CONTAINER_HOST;
     let host_fallback = "172.17.0.1";
-    let port_map = ports::generate_port_map(
-        &alloc,
-        &ctx.cluster_name,
-        host,
-        host_fallback,
-        !skip_observability,
-    );
+    let port_map = ports::generate_port_map(&alloc, &ctx.cluster_name, host, host_fallback);
     let port_map_path = ctx.runtime_dir.join("ports.json");
     ports::write_port_map(&port_map_path, &port_map)?;
 
-    // Create Kind cluster (skip if it already exists for idempotent setup)
-    let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
-    let cluster_exists = cluster_already_exists(&ctx.cluster_name)?;
-    if cluster_exists {
-        eprintln!(
-            "[devloop-helper] setup: Kind cluster '{}' already exists, reusing",
-            ctx.cluster_name
-        );
-    } else {
-        eprintln!(
-            "[devloop-helper] setup: creating Kind cluster '{}'...",
-            ctx.cluster_name
-        );
-        run_command_streaming(
-            Command::new("kind")
-                .arg("create")
-                .arg("cluster")
-                .arg("--config")
-                .arg(&config_path)
-                .arg("--name")
-                .arg(&ctx.cluster_name)
-                .env(env_key, env_val),
-            "kind create cluster",
-            writer,
-            signal,
-        )?;
-    }
+    // DT_PORT_MAP file for the scripts (deploy renders the advertise ports).
+    write_port_map_shell(&port_map_shell_path(ctx), &alloc)?;
 
-    // Generate DT_PORT_MAP file for setup.sh
-    let port_map_shell_path = port_map_shell_path(ctx);
-    write_port_map_shell(&port_map_shell_path, &alloc)?;
-
-    // Run setup.sh — through the ONE setup.sh command builder, so full setup
-    // carries exactly the env (DT_PORT_MAP + DT_HOST_GATEWAY_IP render the
-    // devloop advertise addresses) every other setup.sh verb does.
-    eprintln!("[devloop-helper] setup: running setup.sh...");
-    run_setup_verb(ctx, SetupVerb::Setup { skip_observability }, writer, signal)?;
+    eprintln!("[devloop-helper] provision: running provision.sh...");
+    run_script(ctx, Script::Provision, writer, signal)?;
 
     // Generate kubeconfig for container access (ADR-0030/0031).
     // Rewrites the API server URL to the single `HOST_GATEWAY_IP:HOST_PORT_K8S_API`
@@ -996,14 +975,14 @@ fn cmd_setup(
 
     // Return port map as data
     let data = serde_json::to_value(&port_map).map_err(|e| HelperError::CommandFailed {
-        cmd: "setup".to_string(),
+        cmd: "provision".to_string(),
         detail: format!("failed to serialize port map: {e}"),
     })?;
 
     Ok(Some(data))
 }
 
-/// Write a shell-sourceable port map file for setup.sh.
+/// Write a shell-sourceable port map file (`DT_PORT_MAP`) for the scripts.
 fn write_port_map_shell(path: &Path, alloc: &PortAllocation) -> Result<(), HelperError> {
     // not secret-bearing (port numbers) — ordinary write; the atomic-secret-write
     // helper (`fs_atomic`) is for credential files only.
@@ -1101,18 +1080,18 @@ fn rewrite_kubeconfig_server(
 /// HOST_PORT_K8S_API` binding — so the container reaches the Kind cluster's K8s
 /// API through the host-gateway binding.
 ///
-/// Takes the k8s_api port as a `u16` so setup + `restore-kubeconfig` share ONE
-/// impl (@dry-reviewer): setup passes `alloc.port(PortOffsets::K8S_API)`;
+/// Takes the k8s_api port as a `u16` so provision + `restore-kubeconfig` share ONE
+/// impl (@dry-reviewer): provision passes `alloc.port(PortOffsets::K8S_API)`;
 /// `cmd_restore_kubeconfig` passes the port read from the LIVE `ports.json` (S4 —
 /// never a fresh `allocate_ports`).
 ///
 /// NOTE: this is the CONTAINER kubeconfig (`runtime_dir/kubeconfig`), distinct
-/// from (a)'s host `$KUBECONFIG` written by `infra/kind/scripts/setup.sh`'s
-/// `write_kubeconfig()` (:393-397). Host kubeconfig vs container kubeconfig — do
+/// from (a)'s host `$KUBECONFIG` written by `infra/kind/scripts/provision.sh`'s
+/// `write_kubeconfig()`. Host kubeconfig vs container kubeconfig — do
 /// NOT collapse the two writers; they target different files for different
 /// consumers.
 fn generate_container_kubeconfig(ctx: &Context, k8s_api_port: u16) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] setup: generating container kubeconfig...");
+    eprintln!("[devloop-helper] provision: generating container kubeconfig...");
 
     let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
     let output = Command::new("kind")
@@ -1154,7 +1133,7 @@ fn generate_container_kubeconfig(ctx: &Context, k8s_api_port: u16) -> Result<(),
     atomic_write_secret(&kubeconfig_path, kubeconfig.as_bytes())?;
 
     eprintln!(
-        "[devloop-helper] setup: kubeconfig written to {}",
+        "[devloop-helper] provision: kubeconfig written to {}",
         kubeconfig_path.display()
     );
 
@@ -1419,17 +1398,18 @@ fn decide_recreate(
 /// with the shell's probe. The shell classifies; the host RE-VERIFIES against an
 /// observation the container cannot forge. Removing it collapses the safety
 /// argument. Containment invariant: destroys ONLY `ctx.cluster_name` — there is
-/// no client-supplied target arg (see `protocol::Request::reject_all_args`), so
+/// no client-supplied target arg (the wire request carries no argument field at
+/// all — `protocol::Request`), so
 /// the worst case is "one devloop destroys its OWN cluster" (the blast radius
 /// devloop.sh:577-582 already accepts). The container's *assertion* is never the
 /// authority; this gate + the containment invariant are.
 ///
-/// NON-COLLAPSE (Finding-5 RECIPROCAL with `scripts/layer7.sh`'s infra-change
-/// branch): that branch does an UNCONDITIONAL `teardown`+`setup` and MUST destroy
-/// a HEALTHY cluster (the `infra/kind/` blueprint changed, so the running cluster
-/// is stale by definition). This verb is its INVERSE — it MUST REFUSE to destroy
-/// a healthy cluster. Two semantically-opposite operations; do NOT let a DRY pass
-/// merge them (the forward half of this note lives at that shell branch).
+/// NON-COLLAPSE (Finding-5 RECIPROCAL with `infra/kind/scripts/provision.sh`):
+/// provision MUST destroy a HEALTHY cluster whose recorded blueprint differs
+/// from the tree's (the platform is stale by definition, ADR-0038 §1). This verb
+/// is its INVERSE — it MUST REFUSE to destroy a healthy cluster. Two
+/// semantically-opposite operations; do NOT let a DRY pass merge them (the
+/// forward half of this note lives in provision.sh).
 fn cmd_recreate(
     ctx: &Context,
     writer: &mut dyn Write,
@@ -1478,24 +1458,22 @@ fn cmd_recreate(
 
     // --- Evidence BEFORE the destroy -------------------------------------------
     let evidence_leaf = capture_evidence_bundle(ctx);
-    // Honour the persisted observability-deploy SSoT BEFORE teardown wipes
-    // ports.json (@code-reviewer): recreate the cluster with the SAME
-    // observability choice it was originally brought up with, not a hardcoded
-    // full stack.
-    let skip_observability = !read_observability_deployed(ctx);
     eprintln!(
         "[devloop-helper] recreate: control plane confirmed down; evidence={evidence_leaf}; \
-         recreating {} (skip_observability={skip_observability})",
+         recreating {} (teardown, provision, deploy)",
         ctx.cluster_name
     );
 
-    // --- Destroy + recreate (reuse cmd_teardown/cmd_setup) ---------------------
+    // --- Destroy + recreate (reuse cmd_teardown/cmd_provision/cmd_deploy) ------
     // Called DIRECTLY (not via the dispatcher): they run inside the write slot
     // this command already holds; routing through `execute`/`run_with_write_slot`
     // would self-`Busy`. cmd_teardown swallows non-cancel kind errors internally,
     // so its `?` only propagates a genuine `Cancelled`.
     cmd_teardown(ctx, writer, signal)?;
-    match cmd_setup(ctx, skip_observability, writer, signal) {
+    // The teardown removed the cluster (and its blueprint record), so provision
+    // rebuilds; deploy then brings the application back, as the cluster had it.
+    let rebuilt = cmd_provision(ctx, writer, signal).and_then(|_| cmd_deploy(ctx, writer, signal));
+    match rebuilt {
         Ok(_) => Ok(self_heal_data(
             SelfHealOutcome::Recreated,
             1,
@@ -1503,7 +1481,7 @@ fn cmd_recreate(
         )),
         Err(e @ HelperError::Cancelled { .. }) => Err(e),
         Err(e) => {
-            eprintln!("[devloop-helper] recreate: setup after teardown failed: {e}");
+            eprintln!("[devloop-helper] recreate: provision/deploy after teardown failed: {e}");
             Ok(self_heal_data(
                 SelfHealOutcome::RecreateFailed,
                 1,
@@ -1677,6 +1655,20 @@ fn parse_pod_health(json_str: &str) -> Result<PodHealthSummary, String> {
     })
 }
 
+/// The write ops that change the cluster, for status's
+/// `cluster_write_in_progress` — what `scripts/layer7.sh`'s busy-retry waits out
+/// (`Cluster write in progress:`). Matched by literal op name (the reads bypass
+/// the write mutex, so status observes the op the writer registered).
+///
+/// `teardown` and `recreate` are in the set on purpose: mid-write, `Cluster
+/// exists: false` + `Cluster write in progress: false` would be the self-heal's
+/// dispatch row 1 (`apiserver-unreachable` → destroy). Every verb that creates,
+/// rebuilds, converges or deletes the cluster must be here; only
+/// `restore-kubeconfig` (a container-side file rewrite) is not.
+fn is_cluster_write(op: &str) -> bool {
+    matches!(op, "provision" | "deploy" | "recreate" | "teardown")
+}
+
 /// Status: read-only health check — cluster exists, pods healthy, ports.json.
 ///
 /// Snapshots `WriteState` at request time (per Security S4) so the busy hint
@@ -1746,23 +1738,10 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
         None
     };
 
-    // 4. Setup-in-progress is true iff a setup write is currently holding the
-    // mutex. Sourcing from the mutex (instead of the legacy `setup.pid` heuristic
-    // owned by devloop.sh's eager-setup wrapper) means the field reflects what
-    // the helper actually sees in flight — including manual `dev-cluster setup`
-    // invocations that never wrote a setup.pid. The `setup.pid` file still
-    // exists and is still maintained by devloop.sh for its own wrapper-lifecycle
-    // tracking; cmd_status simply doesn't consult it any more.
-    // Vocabulary matched by literal op name. `recreate` calls `cmd_setup`
-    // INTERNALLY, so a status served mid-`recreate` (reads bypass the write
-    // mutex) would otherwise report `setup_in_progress=false` while a genuine
-    // setup runs inside it — and `Cluster exists: false` + `Setup in progress:
-    // false` is dispatch row 1 (`apiserver-unreachable`), i.e. it fails toward a
-    // destroy. Both write ops that run setup must be in this set; adding a THIRD
-    // verb that runs setup requires revisiting this matcher.
-    let setup_in_progress = busy
-        .as_ref()
-        .is_some_and(|b| matches!(b.op.as_str(), "setup" | "recreate"));
+    // 4. `cluster_write_in_progress` is true iff a cluster-changing write is
+    // holding the mutex (sourced from the mutex, not devloop.sh's `setup.pid`
+    // wrapper-lifecycle file). See `is_cluster_write` for the vocabulary.
+    let cluster_write_in_progress = busy.as_ref().is_some_and(|b| is_cluster_write(&b.op));
 
     // Build response data — construct fully to avoid indexing (clippy::indexing_slicing)
     let pod_summary_val = pod_summary.map(|summary| {
@@ -1799,7 +1778,7 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
         "cluster_exists": cluster_exists,
         "pods_healthy": pods_healthy,
         "apiserver_reachable": apiserver_reachable,
-        "setup_in_progress": setup_in_progress,
+        "cluster_write_in_progress": cluster_write_in_progress,
         "checked_at": now_rfc3339(),
         "pod_summary": pod_summary_val,
         "pod_error": pod_error,
@@ -1812,114 +1791,96 @@ fn cmd_status(ctx: &Context) -> Result<Option<serde_json::Value>, HelperError> {
     Ok(Some(data))
 }
 
-/// The setup.sh-backed verbs. A CLOSED set: each maps to fixed flags plus, at
-/// most, a validated [`Service`] — no container-supplied string reaches the
-/// setup.sh argv or env (ADR-0030 trust boundary).
+/// The two cluster-building scripts (ADR-0038 §1/§2). A CLOSED set: each maps
+/// to a fixed path and fixed argv — no container-supplied string reaches a
+/// script's argv or env (ADR-0030 trust boundary; the wire request carries no
+/// argument at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SetupVerb {
-    /// Full bring-up of a cluster `cmd_setup` has just created (or reused).
-    Setup { skip_observability: bool },
-    /// Build one service image (content-tagged) + the migrations image, run the
-    /// migration Job, apply the environment root.
-    Rebuild(Service),
-    /// Build every first-party image, then the same converge.
-    RebuildAll,
-    /// Build nothing: converge on the images the cluster already runs.
-    Deploy(Service),
+enum Script {
+    /// `provision.sh`: the platform, rebuilt only when its blueprint changed.
+    Provision,
+    /// `deploy.sh`: the application, converged on every run.
+    Deploy,
 }
 
-impl SetupVerb {
-    fn args(self) -> Vec<&'static str> {
+impl Script {
+    fn rel_path(self) -> &'static str {
         match self {
-            // TODO: setup.sh does not yet support --skip-observability; once it
-            // does, this will suppress observability stack deployment.
-            Self::Setup {
-                skip_observability: true,
-            } => vec!["--yes", "--skip-observability"],
-            Self::Setup {
-                skip_observability: false,
-            } => vec!["--yes"],
-            Self::Rebuild(svc) => vec!["--yes", "--only", svc.as_str()],
-            Self::RebuildAll => vec!["--yes", "--rebuild-all"],
-            Self::Deploy(svc) => vec!["--yes", "--skip-build", "--only", svc.as_str()],
+            Self::Provision => "infra/kind/scripts/provision.sh",
+            Self::Deploy => "infra/kind/scripts/deploy.sh",
         }
     }
 }
 
-/// The shell-sourceable port map setup.sh reads (`DT_PORT_MAP`): written by
-/// `cmd_setup`, passed by [`setup_sh_command`] — one home for the path.
+/// The shell-sourceable port map the scripts read (`DT_PORT_MAP`): written by
+/// `cmd_provision`, passed by [`script_command`] — one home for the path.
 fn port_map_shell_path(ctx: &Context) -> PathBuf {
     ctx.runtime_dir.join("port-map.env")
 }
 
-/// THE one place a setup.sh invocation is built — every verb, full setup
-/// included. Image building, content
-/// tagging (`setup.sh:content_tag`), Kind loading, the migration Job and the
-/// root apply all live in setup.sh, so the helper never derives a tag. The env
-/// is identical for every verb: without DT_PORT_MAP + DT_HOST_GATEWAY_IP the
-/// root apply would revert the devloop's MC/MH advertise addresses.
-fn setup_sh_command(ctx: &Context, verb: SetupVerb) -> Result<Command, HelperError> {
+/// The rendered per-slug kind-config (`DT_KIND_CONFIG`): written by
+/// `cmd_provision`, hashed into the blueprint and consumed by `kind create` in
+/// provision.sh, and re-rendered by deploy.sh's blueprint check.
+fn kind_config_path(ctx: &Context) -> PathBuf {
+    ctx.runtime_dir.join("kind-config.yaml")
+}
+
+/// The fixed argv every script runs with — the ONE encoding [`script_command`]
+/// passes and [`script_label`] names.
+const SCRIPT_ARGS: &[&str] = &["--yes"];
+
+/// The log/stream label of a script invocation, derived from the same argv
+/// [`script_command`] passes, so the label cannot drift from what is exec'd.
+fn script_label(script: Script) -> String {
+    std::iter::once(script.rel_path())
+        .chain(SCRIPT_ARGS.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// THE one place a provision/deploy invocation is built. The argv is the fixed
+/// [`SCRIPT_ARGS`] and the env is identical for both scripts: cluster name, the port
+/// map (deploy renders the MC/MH advertise addresses from it), the validated
+/// host-gateway IP, the rendered kind-config (both scripts render the same
+/// blueprint from it) and the Kind provider.
+fn script_command(ctx: &Context, script: Script) -> Result<Command, HelperError> {
     let gateway_ip = ctx
         .host_gateway_ip
         .as_deref()
         .unwrap_or(DEFAULT_HOST_GATEWAY_IP);
     validate_gateway_ip(gateway_ip)?;
     let (env_key, env_val) = ctx.container_runtime.kind_provider_env();
-    let mut cmd = Command::new(ctx.project_root.join("infra/kind/scripts/setup.sh"));
-    cmd.args(verb.args())
+    let mut cmd = Command::new(ctx.project_root.join(script.rel_path()));
+    cmd.args(SCRIPT_ARGS)
         .env("DT_CLUSTER_NAME", &ctx.cluster_name)
         .env("DT_PORT_MAP", port_map_shell_path(ctx))
         .env("DT_HOST_GATEWAY_IP", gateway_ip)
+        .env("DT_KIND_CONFIG", kind_config_path(ctx))
         .env(env_key, env_val);
     Ok(cmd)
 }
 
-/// Run one setup.sh verb, streaming its output; a non-zero exit is an error.
-fn run_setup_verb(
+/// Run one script, streaming its output; a non-zero exit is an error.
+fn run_script(
     ctx: &Context,
-    verb: SetupVerb,
+    script: Script,
     writer: &mut dyn Write,
     signal: &CancelSignal,
 ) -> Result<(), HelperError> {
-    let mut cmd = setup_sh_command(ctx, verb)?;
-    let label = format!("setup.sh {}", verb.args().join(" "));
-    run_command_streaming(&mut cmd, &label, writer, signal)
+    let mut cmd = script_command(ctx, script)?;
+    run_command_streaming(&mut cmd, &script_label(script), writer, signal)
 }
 
-/// Rebuild: `setup.sh --only <svc>` — build the service image (content-tagged),
-/// run the migration Job, apply the root. Only workloads whose image or config
-/// changed roll; nothing is restarted unconditionally.
-fn cmd_rebuild(
-    ctx: &Context,
-    svc: Service,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] rebuild: {svc} (setup.sh --only {svc})...");
-    run_setup_verb(ctx, SetupVerb::Rebuild(svc), writer, signal)
-}
-
-/// Rebuild all: ONE `setup.sh --rebuild-all` (one migration Job, one apply,
-/// one wait), not a per-service loop.
-fn cmd_rebuild_all(
-    ctx: &Context,
-    writer: &mut dyn Write,
-    signal: &CancelSignal,
-) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] rebuild-all: setup.sh --rebuild-all...");
-    run_setup_verb(ctx, SetupVerb::RebuildAll, writer, signal)
-}
-
-/// Deploy: `setup.sh --skip-build --only <svc>` — converge on the images the
-/// cluster already runs.
+/// Deploy: `deploy.sh --yes` — build every image (content-tagged), run the
+/// migration Job, apply the environment root and wait. Only workloads whose
+/// image or config changed roll; nothing is restarted unconditionally.
 fn cmd_deploy(
     ctx: &Context,
-    svc: Service,
     writer: &mut dyn Write,
     signal: &CancelSignal,
 ) -> Result<(), HelperError> {
-    eprintln!("[devloop-helper] deploy: applying manifests for {svc}...");
-    run_setup_verb(ctx, SetupVerb::Deploy(svc), writer, signal)
+    eprintln!("[devloop-helper] deploy: running deploy.sh...");
+    run_script(ctx, Script::Deploy, writer, signal)
 }
 
 /// Teardown: delete Kind cluster, clean up all state.
@@ -2041,7 +2002,7 @@ fn pipe_reader(
 ///
 /// Cancel/shutdown send signals to the child's *process group* (negative-pgid
 /// `libc::kill`) so they reach grandchildren that inherited stdout/stderr —
-/// e.g. `kubectl wait` spawned by `setup.sh`. Without this, an immediate-child
+/// e.g. `kubectl wait` spawned by `provision.sh`/`deploy.sh`. Without this, an immediate-child
 /// SIGKILL would leave grandchildren holding the pipes open, blocking the
 /// reader threads on `read()` until the orphan exited (~60 s in practice).
 /// The child is spawned with `Command::process_group(0)` so it becomes the
@@ -2049,8 +2010,9 @@ fn pipe_reader(
 /// unaffected.
 ///
 /// SAFETY: Child processes must not receive the auth token in their environment.
-/// Only DT_CLUSTER_NAME, DT_PORT_MAP (file path), and KIND_EXPERIMENTAL_PROVIDER
-/// are passed. The auth token stays in the helper process only.
+/// Only the env [`script_command`] sets (DT_CLUSTER_NAME, DT_PORT_MAP and
+/// DT_KIND_CONFIG file paths, DT_HOST_GATEWAY_IP, KIND_EXPERIMENTAL_PROVIDER) is
+/// added. The auth token stays in the helper process only.
 fn run_command_streaming(
     cmd: &mut Command,
     description: &str,
@@ -2114,6 +2076,9 @@ fn run_command_streaming(
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(StreamMsg::Line(stream_line)) => {
+                // Record the two decision-line shapes for the audit log (and
+                // nothing else) whether or not the client is still listening.
+                lock_recovered(&signal.decisions).observe(&stream_line.line);
                 if !write_failed {
                     if let Err(e) = send_json_line(writer, &stream_line) {
                         eprintln!("[devloop-helper] stream write failed: {e}");
@@ -2150,10 +2115,10 @@ fn run_command_streaming(
         // IMPORTANT: cancel/shutdown kill semantics (per CR12 + Security S5).
         //
         // 1. WHAT GETS KILLED: the whole process group of the write child —
-        //    `setup.sh` plus its kubectl/kind/shell descendants. We do NOT
+        //    `provision.sh`/`deploy.sh` plus their kubectl/kind/shell descendants. We do NOT
         //    reach the Kind cluster's containerd/kubelet/etcd: those run
         //    inside Kind's container as detached components managed by the
-        //    cluster's PID 1, not as descendants of setup.sh, and were
+        //    cluster's PID 1, not as descendants of those scripts, and were
         //    never in our process group. (Iter-1's framing claimed they
         //    were children of setup.sh — that was wrong; iter-2 corrects
         //    the model and the 2 s grace window's justification.)
@@ -2173,8 +2138,9 @@ fn run_command_streaming(
         //      the group, CANCEL_GRACEFUL_TIMEOUT (2 s) grace, then
         //      escalate to SIGKILL of the group. The 2 s window matches
         //      the cooperative shell/kubectl tree's typical SIGTERM
-        //      response. Partial-Kind state is recovered via setup.sh's
-        //      "cluster exists, reusing" branch on the next setup.
+        //      response. A cancelled provision leaves no blueprint record,
+        //      so the next provision tears the partial cluster down and
+        //      rebuilds it (ADR-0038 §1).
         //    - Process-shutdown (helper-wide, set by SIGTERM/SIGINT to
         //      the helper): SIGKILL of the group immediately. We're going
         //      down; no time for a 2 s grace window.
@@ -2739,7 +2705,7 @@ current-context: kind-devloop-test
             );
         }
 
-        // Verify every non-comment, non-empty line matches setup.sh validation regex
+        // Verify every non-comment, non-empty line matches the scripts' DT_PORT_MAP validation regex
         #[expect(
             clippy::disallowed_methods,
             reason = "test-only static-literal Regex; pattern compiles or test panics — outside dt-guard canonical-home discipline since this is a one-off test assertion, not a guard kernel. ADR-0034 §6 + ADR-0002"
@@ -2751,7 +2717,7 @@ current-context: kind-devloop-test
             }
             assert!(
                 re.is_match(line),
-                "line does not match setup.sh validation regex: '{line}'"
+                "line does not match the scripts' DT_PORT_MAP validation regex: '{line}'"
             );
         }
     }
@@ -3351,7 +3317,7 @@ current-context: kind-devloop-test
         );
     }
 
-    // --- setup.sh-backed verbs (rebuild / rebuild-all / deploy) --------------
+    // --- provision.sh / deploy.sh (the two cluster-building scripts) ---------
 
     fn cmd_argv(cmd: &Command) -> Vec<String> {
         cmd.get_args()
@@ -3382,6 +3348,13 @@ current-context: kind-devloop-test
                 DEFAULT_HOST_GATEWAY_IP.to_string(),
             ),
             (
+                "DT_KIND_CONFIG".to_string(),
+                ctx.runtime_dir
+                    .join("kind-config.yaml")
+                    .display()
+                    .to_string(),
+            ),
+            (
                 "DT_PORT_MAP".to_string(),
                 ctx.runtime_dir.join("port-map.env").display().to_string(),
             ),
@@ -3395,112 +3368,96 @@ current-context: kind-devloop-test
     }
 
     #[test]
-    fn setup_sh_command_rebuild_argv_env() {
+    fn script_command_provision_argv_env() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(dir.path());
-        let cmd = setup_sh_command(&ctx, SetupVerb::Rebuild(Service::Mc)).unwrap();
+        let cmd = script_command(&ctx, Script::Provision).unwrap();
         assert_eq!(
             cmd.get_program(),
             ctx.project_root
-                .join("infra/kind/scripts/setup.sh")
+                .join("infra/kind/scripts/provision.sh")
                 .as_os_str()
         );
-        assert_eq!(cmd_argv(&cmd), vec!["--yes", "--only", "mc"]);
-        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
-    }
-
-    #[test]
-    fn setup_sh_command_rebuild_all_argv_env() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
-        let cmd = setup_sh_command(&ctx, SetupVerb::RebuildAll).unwrap();
-        assert_eq!(cmd_argv(&cmd), vec!["--yes", "--rebuild-all"]);
-        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
-    }
-
-    #[test]
-    fn setup_sh_command_deploy_argv_env() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
-        let cmd = setup_sh_command(&ctx, SetupVerb::Deploy(Service::Gc)).unwrap();
-        assert_eq!(
-            cmd_argv(&cmd),
-            vec!["--yes", "--skip-build", "--only", "gc"]
-        );
-        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
-    }
-
-    /// The verbs cannot drift apart on the env that keeps a devloop cluster's
-    /// advertise addresses (DT_PORT_MAP + DT_HOST_GATEWAY_IP) intact.
-    #[test]
-    fn setup_sh_command_env_identical_across_verbs() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
-        let envs: Vec<_> = [
-            SetupVerb::Setup {
-                skip_observability: false,
-            },
-            SetupVerb::Rebuild(Service::Ac),
-            SetupVerb::RebuildAll,
-            SetupVerb::Deploy(Service::Mh),
-        ]
-        .into_iter()
-        .map(|v| cmd_env(&setup_sh_command(&ctx, v).unwrap()))
-        .collect();
-        assert!(envs.windows(2).all(|w| w[0] == w[1]), "{envs:?}");
-    }
-
-    #[test]
-    fn setup_sh_command_setup_argv_env() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(dir.path());
-        let cmd = setup_sh_command(
-            &ctx,
-            SetupVerb::Setup {
-                skip_observability: false,
-            },
-        )
-        .unwrap();
         assert_eq!(cmd_argv(&cmd), vec!["--yes"]);
         assert_eq!(cmd_env(&cmd), expected_env(&ctx));
-        let cmd = setup_sh_command(
-            &ctx,
-            SetupVerb::Setup {
-                skip_observability: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(cmd_argv(&cmd), vec!["--yes", "--skip-observability"]);
     }
 
     #[test]
-    fn setup_sh_command_rejects_invalid_gateway() {
+    fn script_command_deploy_argv_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let cmd = script_command(&ctx, Script::Deploy).unwrap();
+        assert_eq!(
+            cmd.get_program(),
+            ctx.project_root
+                .join("infra/kind/scripts/deploy.sh")
+                .as_os_str()
+        );
+        assert_eq!(cmd_argv(&cmd), vec!["--yes"]);
+        assert_eq!(cmd_env(&cmd), expected_env(&ctx));
+    }
+
+    /// The two scripts cannot drift apart on argv or env — only the path
+    /// differs (both render the same blueprint from DT_KIND_CONFIG).
+    #[test]
+    fn script_command_identical_except_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let p = script_command(&ctx, Script::Provision).unwrap();
+        let d = script_command(&ctx, Script::Deploy).unwrap();
+        assert_eq!(cmd_argv(&p), cmd_argv(&d));
+        assert_eq!(cmd_env(&p), cmd_env(&d));
+        assert_ne!(p.get_program(), d.get_program());
+    }
+
+    #[test]
+    fn script_command_rejects_invalid_gateway() {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(dir.path());
         ctx.host_gateway_ip = Some("0.0.0.0".to_string());
-        assert!(setup_sh_command(&ctx, SetupVerb::RebuildAll).is_err());
+        assert!(script_command(&ctx, Script::Provision).is_err());
+        assert!(script_command(&ctx, Script::Deploy).is_err());
     }
 
-    /// A Context whose project_root holds a stub `infra/kind/scripts/setup.sh`
+    /// `cluster_write_in_progress` covers every op that creates, rebuilds,
+    /// converges or deletes the cluster — and nothing else.
+    #[test]
+    fn is_cluster_write_exact_set() {
+        for op in ["provision", "deploy", "recreate", "teardown"] {
+            assert!(is_cluster_write(op), "{op} must count as a cluster write");
+        }
+        for op in [
+            "restore-kubeconfig",
+            "status",
+            "cancel",
+            "test-sleep",
+            "setup",
+            "rebuild-all",
+            "",
+        ] {
+            assert!(!is_cluster_write(op), "{op} must not count");
+        }
+    }
+
+    /// A Context whose project_root holds a stub `infra/kind/scripts/<name>`
     /// with the given body (a /bin/sh script).
-    fn stub_setup_ctx(dir: &std::path::Path, body: &str) -> Context {
-        let scripts = dir.join("root/infra/kind/scripts");
-        fs::create_dir_all(&scripts).unwrap();
-        let script = scripts.join("setup.sh");
+    fn stub_script_ctx(dir: &std::path::Path, script: Script, body: &str) -> Context {
+        let path = dir.join("root").join(script.rel_path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Written by a CHILD process, never through an fd this test process
         // holds: a parallel test thread forking between our write and our exec
         // would inherit that fd and make the exec fail with ETXTBSY ("Text file
-        // busy") — a flake that reads exactly like a propagated setup failure.
-        let src = dir.join("setup.sh.src");
+        // busy") — a flake that reads exactly like a propagated script failure.
+        let src = dir.join("script.src");
         fs::write(&src, format!("#!/bin/sh\n{body}\n")).unwrap();
         let status = Command::new("install")
             .arg("-m")
             .arg("0755")
             .arg(&src)
-            .arg(&script)
+            .arg(&path)
             .status()
             .unwrap();
-        assert!(status.success(), "installing the stub setup.sh failed");
+        assert!(status.success(), "installing the stub script failed");
         let mut ctx = test_ctx(dir);
         ctx.project_root = dir.join("root");
         ctx
@@ -3511,38 +3468,86 @@ current-context: kind-devloop-test
     }
 
     #[test]
-    fn cmd_rebuild_propagates_setup_failure_and_streams_marker() {
+    fn cmd_deploy_propagates_script_failure_and_streams_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = stub_setup_ctx(dir.path(), r#"echo "SETUP-MARKER args=$*"; exit 1"#);
-        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
-        let mut output = Vec::new();
-        let result = cmd_rebuild(&ctx, Service::Gc, &mut output, &signal);
-        assert!(result.is_err(), "a failing setup.sh must fail rebuild");
-        assert!(
-            written(&output).contains("SETUP-MARKER args=--yes --only gc"),
-            "setup.sh output must be streamed: {}",
-            written(&output)
+        let ctx = stub_script_ctx(
+            dir.path(),
+            Script::Deploy,
+            r#"echo "DEPLOY-MARKER args=$* kind=$DT_KIND_CONFIG"; exit 1"#,
         );
+        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
+        let mut output = Vec::new();
+        let result = cmd_deploy(&ctx, &mut output, &signal);
+        assert!(result.is_err(), "a failing deploy.sh must fail deploy");
+        let out = written(&output);
+        assert!(out.contains("DEPLOY-MARKER args=--yes kind="), "{out}");
+        assert!(out.contains("kind-config.yaml"), "{out}");
     }
 
     #[test]
-    fn cmd_rebuild_ok_when_setup_succeeds() {
+    fn cmd_deploy_ok_when_script_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = stub_setup_ctx(dir.path(), r#"echo "SETUP-OK args=$*"; exit 0"#);
+        let ctx = stub_script_ctx(
+            dir.path(),
+            Script::Deploy,
+            r#"echo "DEPLOY-OK args=$*"; exit 0"#,
+        );
         let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
         let mut output = Vec::new();
-        cmd_rebuild(&ctx, Service::Mh, &mut output, &signal).unwrap();
-        assert!(written(&output).contains("SETUP-OK args=--yes --only mh"));
+        cmd_deploy(&ctx, &mut output, &signal).unwrap();
+        assert!(written(&output).contains("DEPLOY-OK args=--yes"));
+    }
+
+    /// F8: the streamed label is derived from the argv script_command passes.
+    #[test]
+    fn script_label_is_derived_from_the_exec_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        for script in [Script::Provision, Script::Deploy] {
+            let cmd = script_command(&ctx, script).unwrap();
+            let expected = std::iter::once(script.rel_path().to_string())
+                .chain(cmd_argv(&cmd))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(script_label(script), expected);
+        }
+    }
+
+    /// The streaming path records a write's decision lines on its signal
+    /// (what run_with_write_slot hands the audit log) — and nothing else.
+    #[test]
+    fn run_script_records_decision_lines_on_the_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = stub_script_ctx(
+            dir.path(),
+            Script::Provision,
+            "echo 'noise'; echo 'BLUEPRINT ACTION=rebuild REASON=changed RECORDED=a CURRENT=b CHANGED=kind-config'; exit 0",
+        );
+        let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
+        let mut output = Vec::new();
+        run_script(&ctx, Script::Provision, &mut output, &signal).unwrap();
+        let d = signal.decisions();
+        assert_eq!(
+            d.blueprint.as_deref(),
+            Some(
+                "BLUEPRINT ACTION=rebuild REASON=changed RECORDED=a CURRENT=b CHANGED=kind-config"
+            )
+        );
+        assert!(d.deploy_failed.is_none());
     }
 
     #[test]
-    fn cmd_rebuild_all_propagates_setup_failure() {
+    fn run_script_provision_propagates_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = stub_setup_ctx(dir.path(), r#"echo "SETUP-MARKER args=$*"; exit 3"#);
+        let ctx = stub_script_ctx(
+            dir.path(),
+            Script::Provision,
+            r#"echo "PROVISION-MARKER args=$*"; exit 3"#,
+        );
         let signal = CancelSignal::shutdown_only(Arc::new(AtomicBool::new(false)));
         let mut output = Vec::new();
-        assert!(cmd_rebuild_all(&ctx, &mut output, &signal).is_err());
-        assert!(written(&output).contains("SETUP-MARKER args=--yes --rebuild-all"));
+        assert!(run_script(&ctx, Script::Provision, &mut output, &signal).is_err());
+        assert!(written(&output).contains("PROVISION-MARKER args=--yes"));
     }
 
     /// Is `pid` a live (non-zombie) process? `kill(pid, 0)` alone also succeeds
@@ -3565,14 +3570,15 @@ current-context: kind-devloop-test
         }
     }
 
-    /// A cancelled rebuild kills the setup.sh process GROUP, including a
-    /// grandchild (setup.sh's own kubectl/podman children in real use).
+    /// A cancelled deploy kills the deploy.sh process GROUP, including a
+    /// grandchild (the script's own kubectl/podman children in real use).
     #[test]
-    fn cmd_rebuild_cancel_kills_setup_child() {
+    fn cmd_deploy_cancel_kills_script_child() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("child.pid");
-        let ctx = stub_setup_ctx(
+        let ctx = stub_script_ctx(
             dir.path(),
+            Script::Deploy,
             &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
         );
         let cancel = Arc::new(AtomicBool::new(false));
@@ -3591,7 +3597,7 @@ current-context: kind-devloop-test
         };
         let started = Instant::now();
         let mut output = Vec::new();
-        let result = cmd_rebuild(&ctx, Service::Ac, &mut output, &signal);
+        let result = cmd_deploy(&ctx, &mut output, &signal);
         setter.join().unwrap();
         assert!(
             matches!(result, Err(HelperError::Cancelled { .. })),
@@ -3599,7 +3605,7 @@ current-context: kind-devloop-test
         );
         assert!(
             started.elapsed() < Duration::from_secs(20),
-            "cancel did not stop setup.sh"
+            "cancel did not stop deploy.sh"
         );
         let pid: i32 = fs::read_to_string(&pidfile)
             .unwrap()
@@ -3617,7 +3623,7 @@ current-context: kind-devloop-test
         }
         assert!(
             !alive,
-            "setup.sh's grandchild (pid {pid}) survived the cancel"
+            "deploy.sh's grandchild (pid {pid}) survived the cancel"
         );
     }
 

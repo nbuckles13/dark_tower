@@ -77,14 +77,21 @@
 //! - **(b) Parse** proves every resolved value is loadable under the MH code
 //!   task's required-read image BEFORE that image ships — the point of landing
 //!   manifests first.
-//! - **(c) Startup-log parity proves the READING.** For the four §8 keys the
-//!   current image already reads and logs, the value the MH PROCESS reported
-//!   in its startup event equals the deployed ConfigMap value. This is the only
-//!   assertion here about what the running process observed. It CANNOT prove
-//!   wiring on its own: those four values equal their code defaults (so
-//!   cutover is behaviour-neutral), and the current image still reads them
-//!   optional-with-default — so parity would hold even with a ref missing.
-//!   That is why (a) exists.
+//! - **(c) Published-gauge parity proves the READING.** For every
+//!   configuration value in [`CONFIG_GAUGES`], the value the running MH
+//!   PROCESS publishes (a static gauge `publish_egress_admission` sets at
+//!   startup from the field enforcement reads) equals the deployed ConfigMap
+//!   value of THAT instance's generation, under MH's own conversion (bits →
+//!   bytes, ms → s). It is the assertion here about what the running process
+//!   observed. It reads gauges, not the startup log line: a log line is lost
+//!   to kubelet log rotation on a long-lived pod, and pods survive across
+//!   Layer-7 runs (ADR-0038: nothing restarts an unchanged workload). A
+//!   gauge is per-process and static for its lifetime, and a changed value is
+//!   a new pod (content addressing), so the gauge always reflects the process
+//!   that is running. It CANNOT prove wiring on its own: every one of these
+//!   reads is REQUIRED (no default — a missing key refuses boot), but a literal
+//!   `value:` on the workload equal to the ConfigMap's value would also match.
+//!   (a) is what proves the `configMapKeyRef`, which is why it exists.
 //! - **(d) Staleness — RETIRED (ADR-0038 devloop 2).** It asserted the
 //!   container started after the ConfigMap last changed, because a value edit
 //!   used to change a ConfigMap IN PLACE without restarting pods. Content
@@ -98,25 +105,16 @@
 //!
 //! ## What this does NOT prove — read before citing it
 //!
-//! For every key except the four in (c), nothing here shows the MH PROCESS
-//! observed the value — only that the deployed artifact carries it, the pod
-//! references it (and, by content addressing, that it rolled onto it). The strengthening
-//! is the MH code task's published gauges (notably
-//! `mh_media_egress_stream_ceiling`): scraping the running pod's own ceiling is
-//! the fail-closed "what the pod reports" check, and it retires the ANCHOR
-//! (DRY) formula in (e). Tracked in `docs/TODO.md` §Observability Debt.
-//!
-//! ## The startup log line is a TEST CONTRACT
-//!
-//! (c) depends on `crates/mh-service/src/main.rs` emitting exactly one
-//! JSON event with message [`CONFIG_LOADED_MESSAGE`] carrying the field names
-//! in [`LOGGED_POLICY_BOUNDS`]. Renaming that message or those fields reds this
-//! test with a message saying so — by design, not as config drift.
+//! (c) shows the process LOADED each value; it does not show every code path
+//! reads the field the gauge reflects. That is pinned on the MH side:
+//! `crates/mh-service/tests/stream_admission_integration.rs` asserts each gauge
+//! is `.set()` from the one field enforcement reads. The retired-key refs and
+//! the ratio threshold are outside (c) (the latter: `28_mh_egress_admission.rs`).
 //!
 //! ## Stale values after a config change
 //!
 //! A config change renames the content-addressed ConfigMap, which rolls the pods
-//! that reference it on the next converge (`infra/kind/scripts/setup.sh`
+//! that reference it on the next `deploy` (`infra/kind/scripts/deploy.sh`
 //! applies the whole environment root and waits for every rollout). A red here
 //! that says the process is not running the deployed value therefore means the
 //! cluster was not converged to the tree — or was hand-edited; the failure
@@ -129,10 +127,8 @@
 //! value, `.spec.terminationGracePeriodSeconds`, the scalar VALUES of the named
 //! story-2 keys (none is a credential), timestamps, and counts. Never the
 //! parsed `serde_json::Value`, never the env array itself, never a ConfigMap's
-//! `data` map, never raw `kubectl` stdout, and NEVER A LOG LINE — not even the
-//! one being searched for, and not in a no-match branch. The startup event
-//! carries bind and advertise addresses and other configuration; (c) extracts
-//! the named numeric fields from it by JSON key and prints only those. It never
+//! `data` map, never raw `kubectl` stdout, and never a log line. (c) prints
+//! only the named gauge's scalar and the key's deployed scalar. It never
 //! scrapes a `Debug` render of a config struct, which would inherit
 //! `SecretString` redaction as an assumption rather than checking it.
 //!
@@ -141,13 +137,12 @@
 //! a value, and `mh-service-config` holds no secrets — one future
 //! literal-valued env var or secret-bearing ConfigMap key would turn a
 //! diagnostic dump into a credential leak in CI logs. Extract the scalars
-//! first, then format. The ConfigMap and log reads are in scope of this policy.
+//! first, then format. The ConfigMap and gauge reads are in scope of this policy.
 
 #![cfg(feature = "smoke")]
 
-use env_tests::fixtures::kube::{
-    configmap_name_for, configmap_name_for_all, FRESH_CLUSTER_HINT, REDEPLOY_HINT,
-};
+use env_tests::fixtures::kube::{configmap_name_for, configmap_name_for_all, REDEPLOY_HINT};
+use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 use env_tests::{repo_root, NAMESPACE};
 use serde_json::Value;
 use std::process::Command;
@@ -430,39 +425,63 @@ const STORY2_KEYS: &[(&str, ValueShape)] = &[
     ("MH_MAX_STREAMS", ValueShape::PositiveInteger),
 ];
 
-/// The message of MH's single startup configuration event, emitted by
-/// `crates/mh-service/src/main.rs`. A TEST CONTRACT — see the module doc.
-const CONFIG_LOADED_MESSAGE: &str = "Configuration loaded successfully";
+/// How long a MH gauge series may take to appear for a pod (its first scrape
+/// after process start). ONE bound for every presence poll in this file.
+const GAUGE_PRESENT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `(ConfigMap key, startup-event field)` for every integer value the running
-/// MH process reports verbatim. ONE table. The egress-chain rows (budget and
-/// both costs, logged in BITS exactly as configured) were appended by the MH
-/// egress-budget code task (story 2 task 8), the registered-meeting cap by
-/// the MH teardown task (story 2 task 11), and the muted-source bound by the
-/// MH server-mute task (story 2 task 10). The derived stream ceiling is not
-/// a ConfigMap key, so its parity is checked against the published gauge in
-/// [`test_running_mh_publishes_the_deployed_stream_ceiling`] rather than here;
-/// the ratio threshold is a float and is checked against its gauge by
-/// `28_mh_egress_admission.rs`.
-const LOGGED_POLICY_BOUNDS: &[(&str, &str)] = &[
+/// `(ConfigMap key, published gauge, Conversion)` for every configuration value
+/// the running MH process loaded. ONE table, and the gauges are published by
+/// `crates/mh-service/src/observability/metrics.rs:publish_egress_admission`
+/// from the ONE field enforcement reads. The derived stream ceiling is not a
+/// ConfigMap key (its parity is
+/// [`test_running_mh_publishes_the_deployed_stream_ceiling`]); the ratio
+/// threshold is a float, checked against its gauge by `28_mh_egress_admission.rs`.
+const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
     (
         "MH_MAX_EGRESS_STREAMS_PER_MEETING",
-        "max_egress_streams_per_meeting",
+        "mh_media_egress_streams_per_meeting_limit",
+        Conversion::Identity,
     ),
     (
         "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
-        "max_candidate_sources_per_egress",
+        "mh_media_candidate_sources_per_egress_limit",
+        Conversion::Identity,
     ),
-    ("MH_MAX_TOTAL_EGRESS_EDGES", "max_total_egress_edges"),
-    ("MH_POLICY_APPLY_TIMEOUT_MS", "policy_apply_timeout_ms"),
-    ("MH_MAX_REGISTERED_MEETINGS", "max_registered_meetings"),
+    (
+        "MH_MAX_TOTAL_EGRESS_EDGES",
+        "mh_media_egress_edges_limit",
+        Conversion::Identity,
+    ),
+    (
+        "MH_POLICY_APPLY_TIMEOUT_MS",
+        "mh_media_policy_apply_timeout_seconds",
+        Conversion::MsToSeconds,
+    ),
+    (
+        "MH_MAX_REGISTERED_MEETINGS",
+        "mh_media_registered_meetings_limit",
+        Conversion::Identity,
+    ),
     (
         "MH_MAX_MUTED_SOURCES_PER_MEETING",
-        "max_muted_sources_per_meeting",
+        "mh_media_muted_sources_per_meeting_limit",
+        Conversion::Identity,
     ),
-    ("MH_EGRESS_BUDGET_BPS", "egress_budget_bps"),
-    ("MH_STREAM_COST_AUDIO_BPS", "stream_cost_audio_bps"),
-    ("MH_STREAM_COST_VIDEO_BPS", "stream_cost_video_bps"),
+    (
+        "MH_EGRESS_BUDGET_BPS",
+        "mh_media_egress_budget_bytes_per_second",
+        Conversion::BitsToBytesFloor,
+    ),
+    (
+        "MH_STREAM_COST_AUDIO_BPS",
+        "mh_media_stream_cost_audio_bytes_per_second",
+        Conversion::BitsToBytesCeil,
+    ),
+    (
+        "MH_STREAM_COST_VIDEO_BPS",
+        "mh_media_stream_cost_video_bytes_per_second",
+        Conversion::BitsToBytesCeil,
+    ),
 ];
 
 /// The demo requirement the Kind budget is sized against: N+1 participants
@@ -685,112 +704,6 @@ fn assert_story2_keys_wired(instance: &str) {
     );
 }
 
-/// (c) startup-log parity: the running process's reported §8 bounds equal the
-/// deployed ConfigMap values. Reads the log of the SAME pod the other checks
-/// read (by name, current container only — never `-l`, never `--previous`).
-fn assert_policy_bounds_match_startup_log(instance: &str) {
-    let cm = fetch_configmap(&shared_configmap_for(instance));
-    let pod = fetch_pod(instance);
-    let pod_name = pod_name_of(&pod, instance);
-
-    let args = ["logs", pod_name.as_str(), "-n", NAMESPACE, "-c", CONTAINER];
-    let output = Command::new("kubectl")
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("kubectl not available - cannot read {pod_name} logs: {e}"));
-    assert!(
-        output.status.success(),
-        "`kubectl {}` failed (exit status {}): {}",
-        args.join(" "),
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Parse every line; keep ONLY the matching events, never a line. Lines that
-    // are not JSON (a panic message, say) are counted, not printed.
-    //
-    // Tolerating an individual non-JSON line cannot make this pass vacuously:
-    // passing REQUIRES exactly one parsed JSON config event whose four fields
-    // equal the deployed values (asserted below). A stream that is entirely
-    // non-JSON gets its own branch; a config event rendered in some non-JSON
-    // shape is simply absent, and absence fails loudly.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let non_empty: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
-    let parsed: Vec<Value> = non_empty
-        .iter()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .collect();
-    let json_lines = parsed.len();
-    let other_lines = non_empty.len() - json_lines;
-    let events: Vec<Value> = parsed
-        .into_iter()
-        .filter(|v| {
-            v.pointer("/fields/message").and_then(Value::as_str) == Some(CONFIG_LOADED_MESSAGE)
-        })
-        .collect();
-
-    // Branch: the stream is not JSON at all. Distinct from "event missing" so
-    // an empty or garbage stream is not triaged as log rotation.
-    assert!(
-        json_lines > 0,
-        "pod {pod_name}: container {CONTAINER}'s log has NO JSON lines \
-         ({other_lines} non-empty non-JSON lines). MH logs JSON \
-         (tracing_subscriber `fmt::layer().json()` in crates/mh-service/src/main.rs); \
-         either the logger changed shape or the stream is empty. This is not a \
-         config-value mismatch."
-    );
-
-    // Branch: zero matching events.
-    assert!(
-        !events.is_empty(),
-        "pod {pod_name}: no {CONFIG_LOADED_MESSAGE:?} event in the current \
-         container's log ({json_lines} JSON lines read). Most likely the kubelet \
-         rotated the container log and `kubectl logs` returns only the current \
-         file, so on a long-lived pod the startup line is gone. A converge will not \
-         fix it — the config is current, only the log rotated, and pods whose \
-         image/config are unchanged are not restarted. Fix: {FRESH_CLUSTER_HINT}. \
-         Do NOT relax this test. If the pod is fresh, the startup event was \
-         renamed in crates/mh-service/src/main.rs - it is a test contract."
-    );
-
-    // Branch: more than one — impossible in one container's life; taking the
-    // first or last would hide whatever made it happen.
-    assert_eq!(
-        events.len(),
-        1,
-        "pod {pod_name}: {} {CONFIG_LOADED_MESSAGE:?} events in ONE container's \
-         log, expected exactly one. Something re-ran MH's startup path; do not \
-         pick one.",
-        events.len()
-    );
-    let event = &events[0];
-
-    for &(key, field) in LOGGED_POLICY_BOUNDS {
-        // Branch: the field is absent or not an unsigned integer.
-        let logged = event
-            .pointer(&format!("/fields/{field}"))
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| {
-                panic!(
-                    "pod {pod_name}: the {CONFIG_LOADED_MESSAGE:?} event has no \
-                     unsigned-integer field {field:?}. The logger shape or the field \
-                     name drifted in crates/mh-service/src/main.rs - that event is a \
-                     test contract (update LOGGED_POLICY_BOUNDS with the rename)."
-                )
-            });
-        let deployed = parse_positive(key, &configmap_value(&cm, key));
-
-        // Branch: both present, values disagree.
-        assert_eq!(
-            logged, deployed,
-            "pod {pod_name}: the MH process reported {field}={logged} at startup, \
-             but its ConfigMap ({SHARED_CONFIGMAP} generation) carries {key}={deployed}. \
-             The process is not running the deployed value: the key is not wired into \
-             this workload, or the pod predates the config; {REDEPLOY_HINT}."
-        );
-    }
-}
-
 #[tokio::test]
 async fn test_story2_keys_wired_into_every_mh_instance() {
     for instance in MH_INSTANCES {
@@ -798,10 +711,86 @@ async fn test_story2_keys_wired_into_every_mh_instance() {
     }
 }
 
+/// (c) What the RUNNING process loaded equals the deployed ConfigMap, for every
+/// row of [`CONFIG_GAUGES`], per MH instance against ITS OWN ConfigMap
+/// generation. Read from the static gauges MH publishes at startup — not the
+/// startup log line, which log rotation loses on a long-lived pod. Three
+/// distinct outcomes per row: no data (the gauge is absent for this pod), shape
+/// (the publisher changed what it publishes), mismatch (the process runs a value
+/// other than the deployed one).
 #[tokio::test]
 async fn test_policy_bounds_reported_by_running_mh_match_configmap() {
-    for instance in MH_INSTANCES {
-        assert_policy_bounds_match_startup_log(instance);
+    use env_tests::cluster::ClusterConnection;
+    use env_tests::fixtures::metrics::poll_until_pinned_instance;
+    use env_tests::fixtures::PrometheusClient;
+    use std::time::Duration;
+
+    let cluster = ClusterConnection::new()
+        .await
+        .expect("Failed to connect to cluster - ensure port-forwards are running");
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+
+    // Per instance: its own generation and its own pod IP (the Prometheus
+    // `instance` label is pod IP:port).
+    let pods: Vec<(&str, String, String, Value)> = MH_INSTANCES
+        .iter()
+        .map(|&instance| {
+            let pod = fetch_pod(instance);
+            let pod_name = pod_name_of(&pod, instance);
+            let pod_ip = pod
+                .pointer("/status/podIP")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("pod {pod_name} has no status.podIP"))
+                .to_string();
+            let cm = fetch_configmap(&shared_configmap_for(instance));
+            (instance, pod_name, pod_ip, cm)
+        })
+        .collect();
+
+    for &(key, gauge, conversion) in CONFIG_GAUGES {
+        for (instance, pod_name, pod_ip, cm) in &pods {
+            let deployed = parse_positive(key, &configmap_value(cm, key));
+            // Branch: no data for THIS pod. Polled PER POD, pinned to its IP: right after
+            // a deploy rolls MH, the terminating predecessor is still a scrape target for
+            // its drain window, so "enough instances have the series" can be satisfied
+            // before the NEW pod's first scrape. The poll's timeout panic is the no-data
+            // branch (its phase/expectation carry the explanation).
+            let promql = format!("max by (instance) ({gauge})");
+            let value = poll_until_pinned_instance(
+                &prom,
+                &promql,
+                pod_ip,
+                GAUGE_PRESENT_BOUND,
+                Duration::from_secs(2),
+                &format!(
+                    "PRESENCE ({instance}, pod {pod_name}): MH publishes {gauge} at process \
+                     start, so absence is a scrape/startup problem (the pod is not scraped, \
+                     or the publish ran before the recorder) — NOT a configuration mismatch"
+                ),
+                "present",
+                |_| true,
+            )
+            .await;
+            let series = format!("instance at {pod_ip}");
+            match gauge_verdict(conversion, deployed, value) {
+                GaugeVerdict::Match => {}
+                // Branch: the publisher's shape changed.
+                GaugeVerdict::Shape => panic!(
+                    "gauge {gauge} on {instance} ({series}) is not a value its {conversion:?} \
+                     conversion can produce ({value}): the publisher's shape changed in \
+                     crates/mh-service/src/observability/metrics.rs — update CONFIG_GAUGES \
+                     with it. This is not a configuration mismatch."
+                ),
+                // Branch: the running process holds another value.
+                GaugeVerdict::Mismatch(expected) => panic!(
+                    "{instance} (pod {pod_name}) runs {gauge}={value}, but its ConfigMap \
+                     ({SHARED_CONFIGMAP} generation) carries {key}={deployed}, which MH's \
+                     {conversion:?} conversion makes {expected}. The process is not running \
+                     the deployed value: the key is not wired into this workload, or the pod \
+                     predates the config; {REDEPLOY_HINT}."
+                ),
+            }
+        }
     }
 }
 
@@ -873,7 +862,7 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
         "deployed MH_EGRESS_BUDGET_BPS is the BASE placeholder: the Kind overlay \
          patch ({PATCH}) did NOT apply. {REDEPLOY_HINT} (never a plain `kubectl \
          apply -k` of an overlay — the bases carry image placeholders only \
-         setup.sh renders); if the base key was renamed, the strategic merge now \
+         deploy.sh renders); if the base key was renamed, the strategic merge now \
          adds a dead key and the patch must follow the rename. This is a \
          build-path problem, not a budget-sizing one."
     );
@@ -981,7 +970,6 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
     use env_tests::cluster::ClusterConnection;
     use env_tests::fixtures::metrics::gauge_by_instance_present;
     use env_tests::fixtures::PrometheusClient;
-    use std::time::Duration;
 
     let cm = fetch_configmap(&shared_configmap());
     let budget = parse_positive(
@@ -1008,7 +996,7 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         &prom,
         "mh_media_egress_stream_ceiling",
         instances,
-        Duration::from_secs(60),
+        GAUGE_PRESENT_BOUND,
     )
     .await;
     for (instance, value) in &ceilings {
@@ -1026,7 +1014,7 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         &prom,
         "mh_media_egress_stream_ceiling_recommended_min",
         instances,
-        Duration::from_secs(60),
+        GAUGE_PRESENT_BOUND,
     )
     .await;
     let required = required_edges(DEMO_N);

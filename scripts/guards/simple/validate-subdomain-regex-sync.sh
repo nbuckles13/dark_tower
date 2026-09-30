@@ -56,19 +56,10 @@ IFS=$'\n\t'
 __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # scripts/guards/simple
 __real_root="$(cd "${__here}/../../.." && pwd)"
 
-# Scan-root seam, DEVLOOP_TEST-gated — same trust boundary as scripts/layer7.sh's seams and
-# for the same reason. Redirecting the root at a tree with no violations is a
-# SILENT-VALIDATION-DISABLE lever: the guard would report OK having examined nothing this
-# repo cares about. So it is honored ONLY under the test sentinel, which
-# `assert_no_ci_sentinel_leak` (run at the top of layer3.sh and layer-all.sh) independently
-# reds if it ever leaks into CI. The self-test needs it because the guard's FAILURE branches
-# can only be driven against a synthetic tree — driving them against the real one would mean
-# breaking the repo to test the guard.
-if [[ "${DEVLOOP_TEST:-}" == "1" ]]; then
-  REPO_ROOT="${SUBDOMAIN_GUARD_ROOT:-$__real_root}"
-else
-  REPO_ROOT="$__real_root"
-fi
+# shellcheck source=../common.sh
+source "${__here}/../common.sh"
+# Scan-root seam (SUBDOMAIN_GUARD_ROOT), DEVLOOP_TEST-gated — rationale on guard_seam_root.
+REPO_ROOT="$(guard_seam_root SUBDOMAIN_GUARD_ROOT "$__real_root")"
 
 # The canonical literal, byte for byte. Sourced from the migration's CHECK.
 readonly CANONICAL='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'

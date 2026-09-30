@@ -38,7 +38,7 @@ use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeeting
 use env_tests::fixtures::mc_session::{self, McSession};
 use env_tests::fixtures::metrics::{
     format_instance_map, gauge_by_instance_present, poll_until_any_instance_above,
-    poll_until_stable, service_job_scrape_settle, InstanceCounters, PrometheusClient,
+    settled_baseline, PrometheusClient,
 };
 use env_tests::fixtures::AuthClient;
 use proto_gen::dark_tower::signaling::v1::{server_message, JoinResponse, MeetingKekUpdate};
@@ -98,18 +98,6 @@ async fn rotation_window(prom: &PrometheusClient) -> Duration {
     Duration::from_secs_f64(seconds)
 }
 
-async fn settled_baseline(prom: &PrometheusClient, promql: &'static str) -> InstanceCounters {
-    let settle = service_job_scrape_settle(prom).await;
-    poll_until_stable(prom, promql, settle, COUNTER_BUDGET, |v1, v2| {
-        format!(
-            "{promql} did not settle within {COUNTER_BUDGET:?} (last reads: v1={}, v2={})",
-            format_instance_map(v1),
-            format_instance_map(v2),
-        )
-    })
-    .await
-}
-
 async fn join(
     gc: &JoinMeetingResponse,
     display_name: &str,
@@ -154,8 +142,20 @@ async fn a_departure_rotates_the_meeting_kek_for_the_remaining_member() {
 
     // Baselines FIRST, settled, so a later rise is attributable to this run's
     // action rather than to a pre-existing instance missing from a single read.
-    let rotations_before = settled_baseline(&prom, ROTATIONS_PROMQL).await;
-    let delivered_before = settled_baseline(&prom, DELIVERED_PROMQL).await;
+    let rotations_before = settled_baseline(
+        &prom,
+        ROTATIONS_PROMQL,
+        COUNTER_BUDGET,
+        "the KEK-rotation assertion under test",
+    )
+    .await;
+    let delivered_before = settled_baseline(
+        &prom,
+        DELIVERED_PROMQL,
+        COUNTER_BUDGET,
+        "the KEK-rotation assertion under test",
+    )
+    .await;
 
     let mut users = Vec::new();
     for label in ["kek-a", "kek-b"] {

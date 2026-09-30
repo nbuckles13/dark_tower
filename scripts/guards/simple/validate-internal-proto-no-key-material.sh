@@ -54,8 +54,9 @@
 #
 # Why bash+grep and not a dt-guard subcommand: this is a grep-shaped anchor guard over two
 # fixed files (same class as validate-ts-fmt-proto-excluded / validate-frame-vectors) — no
-# parser, no cargo, hermetic in Layer 3. Deliberately does NOT source ../common.sh: it would
-# use none of it (validate-frame-vectors.sh records why a dead `source` is worse than none).
+# parser, no cargo, hermetic in Layer 3. Sources ../common.sh for ONE helper only
+# (guard_seam_root, the shared root seam); common.sh's top level only defines functions,
+# colour strings and two arrays, so it changes neither set -euo/IFS nor stdout/STATUS.
 #
 # Emits NO `STATUS=` line: run-guards.sh owns STATUS emission. Exit 0 = clean, 1 = any
 # violation or vacuity. Messages go to stderr. Self-test:
@@ -66,16 +67,12 @@ IFS=$'\n\t'
 __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # scripts/guards/simple
 __real_root="$(cd "${__here}/../../.." && pwd)"
 
-# Root seam, DEVLOOP_TEST-gated (same trust boundary as validate-subdomain-regex-sync.sh):
-# redirecting the root at a clean tree would be a silent-disable lever, so it is honoured
-# only under the test sentinel that layer3.sh / layer-all.sh independently red on in CI.
+# shellcheck source=../common.sh
+source "${__here}/../common.sh"
+# Root seam (INTERNAL_PROTO_GUARD_ROOT), DEVLOOP_TEST-gated — rationale on guard_seam_root.
 # ONE root, both paths derived from it: two file seams would let a self-test redirect one
 # file and silently keep the real other. run-guards.sh's `$1` search path is ignored.
-if [[ "${DEVLOOP_TEST:-}" == "1" ]]; then
-  ROOT="${INTERNAL_PROTO_GUARD_ROOT:-$__real_root}"
-else
-  ROOT="$__real_root"
-fi
+ROOT="$(guard_seam_root INTERNAL_PROTO_GUARD_ROOT "$__real_root")"
 
 INTERNAL="${ROOT}/proto/dark_tower/internal/v1/internal.proto"
 SIGNALING="${ROOT}/proto/dark_tower/signaling/v1/signaling.proto"

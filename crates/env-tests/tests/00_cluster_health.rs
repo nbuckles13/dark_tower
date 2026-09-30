@@ -224,7 +224,7 @@ async fn test_secrets_not_in_logs() {
 /// The dev OTel collector (R-59) must be Ready. This asserts the cluster-setup
 /// readiness gate is correct: the `app=otel-collector` selector here MUST match
 /// (1) the Deployment pod-template label and (2) the `kubectl wait` selector in
-/// `deploy_otel_collector()` (infra/kind/scripts/setup.sh). The three-way match
+/// `deploy_otel_collector()` (infra/kind/scripts/deploy.sh). The three-way match
 /// is the invariant — if any one is typo'd/renamed, this test fails rather than
 /// the gate silently passing on zero pods and the breakage surfacing later as
 /// CrashLooping services once R-55 makes the four services depend on the
@@ -236,7 +236,7 @@ async fn test_secrets_not_in_logs() {
 /// governs how long an EXISTING matched pod is given to reach Ready — a small
 /// tolerance matching this suite's other health checks (cluster.rs uses 5-10s
 /// probe timeouts), so a brief readiness blip when smoke tests start doesn't
-/// false-fail even though setup.sh has already Ready-gated the collector.
+/// false-fail even though deploy.sh has already Ready-gated the collector.
 ///
 /// Namespace is `dark-tower` (where the collector actually runs) — NOT `default`.
 #[tokio::test]

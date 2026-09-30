@@ -8,7 +8,7 @@ resources:
   # mc-service-secrets ONLY
   - secret.yaml
   # mc-service-tls NOT listed — created imperatively by
-  # infra/kind/scripts/setup.sh:create_mc_tls_secret() from the certs
+  # infra/kind/scripts/provision.sh:create_tls_secret() from the certs
   # scripts/generate-dev-certs.sh generates, because listing it would commit
   # TLS key material to git. Consequence: `kubectl apply -k` alone does NOT
   # produce startable pods on a fresh namespace — both mc-{0,1} mount it as
@@ -27,7 +27,8 @@ resources:
   # misleading for all three, which is the generalisation worth carrying; pod
   # phase alone tells them apart before you read anything.
   #
-  # setup.sh is the only supported bootstrap today; making this declarative is
+  # infra/kind/scripts/provision.sh (the dev stand-in for a secret manager,
+  # ADR-0038 §1) is the only supported bootstrap today; making this declarative is
   # tracked in docs/TODO.md §Infrastructure Validation in Devloops.
   - pdb.yaml
   - network-policy.yaml

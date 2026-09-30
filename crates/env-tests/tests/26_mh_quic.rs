@@ -57,7 +57,7 @@
 //!
 //! - Kind cluster with AC, GC, MC, MH-0, MH-1 deployed; port-forwards active.
 //! - MH WebTransport endpoints reachable on the host via Kind NodePort
-//!   (see `infra/kind/scripts/setup.sh`'s ConfigMap patching of
+//!   (see `infra/kind/scripts/deploy.sh:render_env_overlay`'s render of
 //!   `MH_WEBTRANSPORT_ADVERTISE_ADDRESS`).
 //! - Test data seeded (`devtest` organization).
 //!
@@ -87,8 +87,8 @@ use env_tests::fixtures::media::{
 };
 use env_tests::fixtures::metrics::poll_until_pinned_instance;
 use env_tests::fixtures::metrics::{
-    any_instance_exceeds_baseline, format_instance_map, poll_until_any_instance_above,
-    poll_until_stable, service_job_scrape_settle, InstanceCounters,
+    any_instance_exceeds_baseline, format_instance_map, gauge_by_instance_present,
+    instance_for_pod_ip, poll_until_any_instance_above, settled_baseline, InstanceCounters,
 };
 use env_tests::fixtures::mh_grpc::{self, Handler, ReleaseOnDrop};
 use env_tests::fixtures::participant::{self, open_sessions, Participant};
@@ -266,6 +266,11 @@ fn notification_promql(event_type: &str) -> String {
     )
 }
 
+/// Bound on a baseline read settling (two reads a scrape apart agreeing). Under
+/// cluster load the MC/MH notification and push chains converge in several
+/// non-equal rounds of the settle; this is a failure-only ceiling.
+const BASELINE_SETTLE_BOUND: Duration = Duration::from_secs(90);
+
 /// Wait for the PER-INSTANCE `mc_mh_notifications_received_total{event_type=...}`
 /// snapshot to stabilize: two consecutive reads (a Prometheus scrape interval
 /// apart) returning the SAME per-instance map. Closes the cross-test race where
@@ -273,8 +278,9 @@ fn notification_promql(event_type: &str) -> String {
 /// might still be in flight to Prometheus when the next test snapshots its
 /// baseline. After this returns, baseline-reads are safe.
 ///
-/// The loop is the shared [`poll_until_stable`]; the two numbers below are this
-/// caller's own decisions, argued here. **Read that helper's doc before changing
+/// The loop is the shared `settled_baseline` (over `poll_until_stable`, both in
+/// `env_tests::fixtures::metrics`); the two numbers below — its settle and
+/// [`BASELINE_SETTLE_BOUND`] — are argued here. **Read that helper's doc before changing
 /// either** — the settle interval in particular is a correctness precondition,
 /// not a budget, and shortening it makes the stabilize vacuous rather than fast.
 ///
@@ -284,7 +290,7 @@ fn notification_promql(event_type: &str) -> String {
 /// any outstanding scrape lands between the two reads. Both waits in this
 /// binary read MC counters (`mc-service` job), so both use
 /// `SERVICE_JOB_SCRAPE_SETTLE`, obtained through
-/// [`service_job_scrape_settle`], which fails loudly if the LIVE per-job
+/// `service_job_scrape_settle`, which fails loudly if the LIVE per-job
 /// `scrape_interval` (`infra/kubernetes/observability/prometheus.yml`) no
 /// longer sits below it. This is **not a local decision**: it is the same
 /// decision `wait_for_policy_push_counter_stable` makes, which references this
@@ -310,20 +316,11 @@ async fn wait_for_notification_counter_stable(
     prom: &PrometheusClient,
     event_type: &str,
 ) -> InstanceCounters {
-    let settle = service_job_scrape_settle(prom).await;
-    poll_until_stable(
+    settled_baseline(
         prom,
         &notification_promql(event_type),
-        settle,
-        Duration::from_secs(90),
-        |v1, v2| {
-            format!(
-                "mc_mh_notifications_received_total{{event_type=\"{event_type}\"}} per-instance \
-                 snapshot did not stabilize within 90s (last reads: v1={}, v2={})",
-                format_instance_map(v1),
-                format_instance_map(v2),
-            )
-        },
+        BASELINE_SETTLE_BOUND,
+        "the assertion under test",
     )
     .await
 }
@@ -371,8 +368,8 @@ async fn assert_notification_counter_increases_past(
 ///
 /// Ground truth: `crates/mc-service/src/webtransport/connection.rs:712-718`
 /// populates `media_servers` from `MhAssignmentData.handlers`. In Kind,
-/// `infra/kind/scripts/setup.sh:651-655` patches MH ConfigMaps to advertise
-/// host-reachable URLs, so the URLs returned here are reachable from the test.
+/// `infra/kind/scripts/deploy.sh:render_env_overlay` renders the MH advertise
+/// addresses as host-reachable URLs, so the URLs returned here are reachable from the test.
 ///
 /// On-call: if this fails after a deploy, suspect MH ConfigMap advertise
 /// address misconfiguration (`MH_WEBTRANSPORT_ADVERTISE_ADDRESS`) or Redis
@@ -796,20 +793,6 @@ fn participant_mh_status_promql(state: &str) -> String {
     format!(r#"sum by (instance) (mc_participant_mh_status_total{{state="{state}"}})"#)
 }
 
-/// Read a PER-INSTANCE snapshot of `mc_participant_mh_status_total` for a
-/// specific `state` label, via `sum by (instance)(...)`. Mirrors
-/// [`notification_promql`]; see [`InstanceCounters`] for the `instance`
-/// grouping rationale + the two traps. FAILS LOUDLY on a Prometheus query
-/// error; an empty result (state not yet observed) is a legitimate empty map
-/// (per-pod zero), distinct from a failed query.
-async fn mc_participant_mh_status_counter(
-    prom: &PrometheusClient,
-    state: &str,
-) -> InstanceCounters {
-    prom.instance_counter_map(&participant_mh_status_promql(state))
-        .await
-}
-
 /// Poll until SOME currently-present instance's
 /// `mc_participant_mh_status_total{state=...}` value exceeds its OWN `baseline`
 /// value — robust to a pod rollover, via the shared
@@ -868,7 +851,13 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) = register_test_user(&auth_client, "MC MediaUpdate User").await;
 
-    let baseline = mc_participant_mh_status_counter(&prom, "connected").await;
+    let baseline = settled_baseline(
+        &prom,
+        &participant_mh_status_promql("connected"),
+        BASELINE_SETTLE_BOUND,
+        "the assertion under test",
+    )
+    .await;
 
     // Real GC→MC join, but keep the session OPEN so we can send a follow-up
     // MediaConnectionUpdate on it (the `mc_join` wrapper drops its session).
@@ -993,7 +982,7 @@ async fn policy_push_counter(prom: &PrometheusClient, outcome_selector: &str) ->
 /// either helper, **a third stability-wait**, or a change to the Prometheus
 /// scrape SLA". Story task 25 added the third stability-wait (the media-forward
 /// path's baseline-freshness precondition), so the loop is now
-/// [`poll_until_stable`] in `env_tests::fixtures::metrics` and **every**
+/// `poll_until_stable` in `env_tests::fixtures::metrics` and **every**
 /// caller uses it — which is exactly the condition the deferral was waiting on.
 ///
 /// # The settle and 90s budget here are the SAME decision as the notification
@@ -1008,25 +997,16 @@ async fn policy_push_counter(prom: &PrometheusClient, outcome_selector: &str) ->
 /// clone comment existed to prevent.
 ///
 /// The settle is the shared, explicitly-named `SERVICE_JOB_SCRAPE_SETTLE`
-/// (via [`service_job_scrape_settle`]) — a value both sites NAME, never a
+/// (via `service_job_scrape_settle`) — a value both sites NAME, never a
 /// default `poll_until_stable` supplies.
 /// Returns the STABILISED `outcome="match"` snapshot for the caller to baseline
 /// on, for the same reason as [`wait_for_notification_counter_stable`].
 async fn wait_for_policy_push_counter_stable(prom: &PrometheusClient) -> InstanceCounters {
-    let settle = service_job_scrape_settle(prom).await;
-    poll_until_stable(
+    settled_baseline(
         prom,
         &policy_push_promql(r#"outcome="match""#),
-        settle,
-        Duration::from_secs(90),
-        |v1, v2| {
-            format!(
-                "mc_media_policy_pushes_total{{outcome=\"match\"}} per-instance snapshot did \
-                 not stabilize within 90s (last reads: v1={}, v2={})",
-                format_instance_map(v1),
-                format_instance_map(v2),
-            )
-        },
+        BASELINE_SETTLE_BOUND,
+        "the assertion under test",
     )
     .await
 }
@@ -1097,7 +1077,13 @@ async fn test_mc_programs_live_handler_with_confirmed_forwarding_policy() {
 
     let match_baseline = wait_for_policy_push_counter_stable(&prom).await;
     let non_match_selector = r#"outcome!="match""#;
-    let non_match_baseline = policy_push_counter(&prom, non_match_selector).await;
+    let non_match_baseline = settled_baseline(
+        &prom,
+        &policy_push_promql(non_match_selector),
+        BASELINE_SETTLE_BOUND,
+        "the assertion under test",
+    )
+    .await;
 
     // A real join: GC creates and assigns, MC admits the participant and — as
     // the first participant — computes the assignment and programs every
@@ -1262,10 +1248,11 @@ fn mc_shaped_edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> Egre
 /// completes that `EndMeeting`. The id is a fresh GC meeting per run, so no
 /// later run reuses it. Manual recovery, if needed: `EndMeeting`
 /// for the id on the pod through the Layer-7 gRPC forward with the MC
-/// credential (`env_tests::fixtures::mh_grpc`), or a fresh cluster —
-/// `env_tests::fixtures::kube::FRESH_CLUSTER_HINT`. Not a converge
+/// credential (`env_tests::fixtures::mh_grpc`). Not a converge
 /// (`REDEPLOY_HINT`): pods whose image/config are unchanged are not restarted,
-/// so the wedged pods would keep running.
+/// so a converge leaves the wedge in place. A later run is not blocked by it —
+/// its meeting id is fresh — unless leaked registrations reach the cap, which
+/// [`injectable_handlers`] reports as a named PRECONDITION.
 struct Injection<'a> {
     handler: &'a Handler,
     client: MediaHandlerServiceClient<tonic::transport::Channel>,
@@ -1437,6 +1424,55 @@ fn both_handlers() -> Vec<Handler> {
     hs
 }
 
+/// [`both_handlers`], after a PRECONDITION that each pod can register one more
+/// meeting: an injection registers a NEW meeting id on BOTH pods. Pods persist
+/// across runs (ADR-0038: nothing restarts an unchanged MH), so a pod can hold
+/// registrations a killed harness never released (see [`Injection`]'s "If
+/// cleanup is skipped"). At the cap, the injection would be refused as
+/// `rejected_meeting_cap` — a confusing registration refusal rather than the
+/// named leak it is. Read from the published gauges, per pinned pod.
+async fn injectable_handlers(prom: &PrometheusClient) -> Vec<Handler> {
+    let handlers = both_handlers();
+    let registered = gauge_by_instance_present(
+        prom,
+        "mh_media_registered_meetings",
+        handlers.len(),
+        BASELINE_SETTLE_BOUND,
+    )
+    .await;
+    let limits = gauge_by_instance_present(
+        prom,
+        "mh_media_registered_meetings_limit",
+        handlers.len(),
+        BASELINE_SETTLE_BOUND,
+    )
+    .await;
+    for h in &handlers {
+        let held = instance_for_pod_ip(&registered, &h.pod_ip).map(|(_, v)| v);
+        let limit = instance_for_pod_ip(&limits, &h.pod_ip).map(|(_, v)| v);
+        let (Some(held), Some(limit)) = (held, limit) else {
+            panic!(
+                "PRECONDITION: {} (pod IP {}) publishes no mh_media_registered_meetings / \
+                 _limit series (registered: {}, limit: {}) — a scrape/startup condition.",
+                h.name,
+                h.pod_ip,
+                format_instance_map(&registered),
+                format_instance_map(&limits),
+            );
+        };
+        assert!(
+            held + 1.0 <= limit,
+            "PRECONDITION: {} holds {held}/{limit} registered meetings, so the injection's new \
+             meeting id would be refused at the registration cap. Registrations nothing \
+             releases: a meeting's MC never completed EndMeeting (a killed harness, see \
+             Injection's recovery note; compare mh_media_registered_meetings with pod uptime). \
+             An environment/leak condition, not the behaviour under test.",
+            h.name
+        );
+    }
+    handlers
+}
+
 /// S4 (story 2 R-9; ADR-0036 §7): a server-muted sender's datagrams are
 /// dropped at MH ingress under `server_muted`; the mute is SOURCE-only (the
 /// muted participant still hears its peer); it survives a re-assert at the
@@ -1505,7 +1541,7 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
     assert_relayed_on_slot("S4 PRE", &pre[&MARK_A], b_slot, MARK_A, "A");
 
     // INJECT on both pods: the same A <-> B edges MC would program, plus A muted.
-    let handlers = both_handlers();
+    let handlers = injectable_handlers(&prom).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let edges = || {
@@ -1519,7 +1555,13 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
         injections.push(Injection::open(handler, &token, &cleanup, &ps[0]).await);
     }
     assert_mc_programmed_a_carrying_pod(&injections);
-    let baselines = prom.instance_counter_map(server_muted_promql()).await;
+    let baselines = settled_baseline(
+        &prom,
+        server_muted_promql(),
+        BASELINE_SETTLE_BOUND,
+        "the assertion under test",
+    )
+    .await;
     for injection in &mut injections {
         let g = injection.generation(0);
         injection.install(g, edges(), &[a]).await;
@@ -1589,8 +1631,7 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
     // DROPS counted on EACH pod, past its own baseline.
     let mut after_first = Vec::new();
     for handler in &handlers {
-        let base = env_tests::fixtures::metrics::instance_for_pod_ip(&baselines, &handler.pod_ip)
-            .map_or(0.0, |(_, v)| v);
+        let base = instance_for_pod_ip(&baselines, &handler.pod_ip).map_or(0.0, |(_, v)| v);
         after_first.push(
             poll_until_pinned_instance(
                 &prom,
@@ -1775,7 +1816,8 @@ async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
         })
         .await;
 
-    let handlers = both_handlers();
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let handlers = injectable_handlers(&prom).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let mut injections = Vec::new();

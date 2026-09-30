@@ -47,7 +47,7 @@ spec:
         # confirmed present by running `otelcol-contrib components` from THAT digest
         # — not read from release notes. 0.103.1 is the proof that matters: it
         # loads this same config far enough to CrashLoop on a missing processor.
-        # The reference below is by TAG, not `tag@sha256`, because `setup.sh`'s
+        # The reference below is by TAG, not `tag@sha256`, because `deploy.sh`'s
         # preload path (`kustomize | grep image:` -> `podman save` ->
         # `kind load image-archive`) is unproven with a digest reference and a
         # broken preload breaks whole-cluster bring-up — a worse failure than the

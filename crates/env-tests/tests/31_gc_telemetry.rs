@@ -48,7 +48,11 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 // across the 2 GC replicas — only needed under the `observability` feature
 // (flows-only ⇒ the (g)/(h)/(t-c) tests degrade to 202-only).
 #[cfg(feature = "observability")]
-use env_tests::eventual::{assert_eventually, ConsistencyCategory};
+use env_tests::eventual::ConsistencyCategory;
+#[cfg(feature = "observability")]
+use env_tests::fixtures::metrics::{
+    poll_until_any_instance_above, settled_baseline, InstanceCounters,
+};
 #[cfg(feature = "observability")]
 use env_tests::fixtures::PrometheusClient;
 
@@ -131,7 +135,7 @@ async fn ratelimit_user_token(cluster: &ClusterConnection) -> &'static str {
 }
 
 /// A service (client-credentials) token — NOT a user token. The seeded
-/// `test-client` credential (`infra/kind/scripts/setup.sh`) is the same one
+/// `test-client` credential (`infra/kind/scripts/deploy.sh:seed_test_data`) is the same one
 /// `24_join_flow.rs` uses for its service-token rejection test.
 async fn service_token(cluster: &ClusterConnection) -> String {
     let auth = AuthClient::new(&cluster.ac_base_url);
@@ -300,51 +304,66 @@ fn traces_payload_pii_span() -> Vec<u8> {
 }
 
 // ============================================================================
-// PII-filter verification helper (C2′ — ratified). Reads GC's drop counter via
-// PromQL, SUMMED across the 2 GC replicas (each pod is a separate target), so the
-// assertion is correct regardless of which pod served the POST. Absent/empty
-// vector ⇒ 0 (R2). Only compiled under the `observability` feature.
+// PII-filter verification helper (C2′ — ratified). Reads GC's drop counter PER
+// INSTANCE (`sum by (instance)`, one per GC pod), so the assertion is correct
+// regardless of which pod served the POST, and robust to a pod rollover (each
+// pod is compared with its OWN baseline; a pod absent from the baseline counts
+// from 0). Only compiled under the `observability` feature.
 // ============================================================================
 
-/// Summed value of `gc_telemetry_pii_attributes_dropped_total{kind=…}` across all
-/// GC pods. Returns 0.0 when the series does not exist yet (R2 absent ⇒ 0).
+/// Bound on the drop-counter baseline settling. The three PII tests run
+/// concurrently, and GC pods persist across runs (ADR-0038), so an increment
+/// still being scraped would otherwise satisfy a later "rose" check with
+/// nothing from this test (a false pass). A failure-only ceiling.
 #[cfg(feature = "observability")]
-async fn pii_dropped_sum(cluster: &ClusterConnection, kind: &str) -> f64 {
-    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
-    let query = format!("sum(gc_telemetry_pii_attributes_dropped_total{{kind=\"{kind}\"}})");
-    let resp = prom
-        .query_promql(&query)
-        .await
-        .expect("Prometheus drop-counter query should succeed");
-    resp.data
-        .result
-        .first()
-        .and_then(|r| r.value.as_ref())
-        .and_then(|(_, v)| v.parse::<f64>().ok())
-        .unwrap_or(0.0)
+const BASELINE_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(90);
+
+#[cfg(feature = "observability")]
+fn pii_dropped_promql(kind: &str) -> String {
+    format!("sum by (instance) (gc_telemetry_pii_attributes_dropped_total{{kind=\"{kind}\"}})")
 }
 
-/// Assert the summed `{kind}` drop counter rises by at least `expected` relative
-/// to `before`, polling within the `MetricsScrape` budget (scrape lag). `≥`
-/// tolerates concurrent increments; R7 keeps one writer per `{kind}` sum-series.
+/// The SETTLED per-instance baseline of `gc_telemetry_pii_attributes_dropped_total{kind}`:
+/// two reads a GC scrape apart agree. The returned map IS the baseline; never re-read.
+#[cfg(feature = "observability")]
+async fn pii_dropped_baseline(cluster: &ClusterConnection, kind: &str) -> InstanceCounters {
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    settled_baseline(
+        &prom,
+        &pii_dropped_promql(kind),
+        BASELINE_SETTLE_BOUND,
+        "the PII-filter assertion under test",
+    )
+    .await
+}
+
+/// Assert the `{kind}` drop counter rose past its OWN baseline on some GC pod
+/// (the one that served the POST), polling within the `MetricsScrape` budget
+/// (scrape lag). Counters are whole numbers, so "rose" is `>= +1`, the one
+/// attribute each test plants.
 #[cfg(feature = "observability")]
 async fn assert_drop_counter_increased(
     cluster: &'static ClusterConnection,
     kind: &'static str,
-    before: f64,
-    expected: f64,
+    before: InstanceCounters,
 ) {
-    assert_eventually(ConsistencyCategory::MetricsScrape, || async move {
-        pii_dropped_sum(cluster, kind).await >= before + expected
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "sum(gc_telemetry_pii_attributes_dropped_total{{kind=\"{kind}\"}}) did not rise by \
-             >= {expected} within the MetricsScrape budget (before = {before}); the deployed PII \
-             filter may not have dropped the planted attribute"
-        )
-    });
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let budget = ConsistencyCategory::MetricsScrape.timeout();
+    poll_until_any_instance_above(
+        &prom,
+        &pii_dropped_promql(kind),
+        &before,
+        budget,
+        std::time::Duration::from_secs(2),
+        |current| {
+            format!(
+                "gc_telemetry_pii_attributes_dropped_total{{kind=\"{kind}\"}} did not rise past \
+                 its baseline on any GC pod within {budget:?} (baseline {before:?}, now \
+                 {current:?}); the deployed PII filter may not have dropped the planted attribute"
+            )
+        },
+    )
+    .await;
 }
 
 // ============================================================================
@@ -609,7 +628,7 @@ async fn test_metrics_pii_nonallowlisted_key_filtered() {
     let gc = GcClient::new(&cluster.gc_base_url);
 
     #[cfg(feature = "observability")]
-    let before = pii_dropped_sum(cluster, "resource").await;
+    let before = pii_dropped_baseline(cluster, "resource").await;
 
     let resp = gc
         .raw_ingest_telemetry(
@@ -628,7 +647,7 @@ async fn test_metrics_pii_nonallowlisted_key_filtered() {
     );
 
     #[cfg(feature = "observability")]
-    assert_drop_counter_increased(cluster, "resource", before, 1.0).await;
+    assert_drop_counter_increased(cluster, "resource", before).await;
 }
 
 /// (h) Non-scalar value on an ALLOWLISTED key (DATAPOINT level) → 202 + the
@@ -640,7 +659,7 @@ async fn test_metrics_pii_nonscalar_value_dropped() {
     let gc = GcClient::new(&cluster.gc_base_url);
 
     #[cfg(feature = "observability")]
-    let before = pii_dropped_sum(cluster, "datapoint").await;
+    let before = pii_dropped_baseline(cluster, "datapoint").await;
 
     let resp = gc
         .raw_ingest_telemetry(
@@ -659,7 +678,7 @@ async fn test_metrics_pii_nonscalar_value_dropped() {
     );
 
     #[cfg(feature = "observability")]
-    assert_drop_counter_increased(cluster, "datapoint", before, 1.0).await;
+    assert_drop_counter_increased(cluster, "datapoint", before).await;
 }
 
 /// (t-c) Non-allowlisted SPAN attribute → 202 + the `{kind="span"}` drop counter
@@ -671,7 +690,7 @@ async fn test_traces_pii_nonallowlisted_span_attr_filtered() {
     let gc = GcClient::new(&cluster.gc_base_url);
 
     #[cfg(feature = "observability")]
-    let before = pii_dropped_sum(cluster, "span").await;
+    let before = pii_dropped_baseline(cluster, "span").await;
 
     let resp = gc
         .raw_ingest_telemetry(
@@ -690,5 +709,5 @@ async fn test_traces_pii_nonallowlisted_span_attr_filtered() {
     );
 
     #[cfg(feature = "observability")]
-    assert_drop_counter_increased(cluster, "span", before, 1.0).await;
+    assert_drop_counter_increased(cluster, "span", before).await;
 }

@@ -116,7 +116,9 @@ scripts/
 > `scripts/lang/_changed_helpers.sh`'s `diff_touches_path` / `diff_touches_glob` /
 > `diff_touches_root_files` primitives, which the surviving diff-aware consumers use
 > directly: the Layer-6 audit **dep-manifest** gate (`_audit_gate.sh`, §3 task-#47
-> amendment) and Layer-7's `infra/kind/` rebuild check. `_changed_helpers.sh` and its
+> amendment). (Layer 7's `infra/kind/` rebuild check was a second consumer until ADR-0038
+> step 3 made Layer 7 `provision && deploy && tests` with no diff inspection at all — every
+> run compares the tree with what the cluster records.) `_changed_helpers.sh` and its
 > self-test stay. The original decentralized-classifier design is preserved below for the
 > record; it describes a mechanism the tree no longer contains.
 
@@ -150,7 +152,7 @@ Default: run everything, every language, every run.
 | 4     | Test     | rust, ts — always (proto has no `test.sh` — N/A placeholder)                     |
 | 5     | Lint     | rust, ts, proto — always                                                         |
 | 6     | Audit    | cargo audit, pnpm audit, buf breaking — always dispatched; the cargo/pnpm audit wrappers then apply a dep-manifest gate internally (task-#47 amendment) |
-| 7     | Env-tests| dev-cluster + Rust env-tests + browser E2E — always                             |
+| 7     | Env-tests| dev-cluster `provision` + `deploy` (ADR-0038; no diff inspection) + Rust env-tests + browser E2E — always |
 
 **The classifying principle (retained for future toolchains):**
 
@@ -275,7 +277,7 @@ global worst-wins aggregation ladder (`_common.sh::__status_rank` / `status_to_e
   `no-cluster-ci`. **Reachable ONLY in CI** — a LOCAL run with no/dead helper is the loud
   `PRECONDITION_FAILURE` below, never a silent skip (the silent-skip-hole closer).
 - **`PRECONDITION_FAILURE`** (exit 2, ranked ABOVE `FAIL`, BELOW `FAIL-MISSING-VERB`): the OPERATOR
-  lane — a Phase-1 pre-suite step (helper liveness / cluster bring-up / rebuild / health /
+  lane — a Phase-1 pre-suite step (helper liveness / provision / deploy / health /
   observability readiness) failed, OR a local run with no/dead helper. Above `FAIL` (an infra
   precondition dominates a sibling test FAIL) but below `FAIL-MISSING-VERB` (a persistent wiring
   fault outranks a transient/operational cluster-down). Mapped to **exit 2** — the same

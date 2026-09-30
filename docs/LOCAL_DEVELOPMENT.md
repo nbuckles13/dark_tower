@@ -127,7 +127,7 @@ EOF
 
 ```bash
 # sqlx-cli - only for AUTHORING migrations and the unit-test DB. The Kind
-# cluster does NOT need it: setup.sh runs migrations in-cluster (the db-migrate
+# cluster does NOT need it: deploy.sh runs migrations in-cluster (the db-migrate
 # Job, ADR-0038). Match the workspace's sqlx version (Cargo.lock):
 cargo install sqlx-cli --locked --no-default-features --features postgres --version "=$(source infra/lib/cargo-lock-version.sh && cargo_lock_version Cargo.lock sqlx)"
 
@@ -150,25 +150,35 @@ psql --version
 ### 1. Create the Cluster
 
 ```bash
-# Run the setup script (creates cluster, deploys infrastructure)
+# Bring the cluster up to date (provision, then deploy, then port-forwards)
 ./infra/kind/scripts/setup.sh
 ```
 
-This script deploys the **full local stack**:
-1. Create kind cluster with Calico CNI
-2. Build every first-party image (AC, GC, MC, MH, and the `db-migrate` migrations image),
-   tag each by its own content (`localhost/<name>:sha-<image id>`) and load it into kind
-3. Deploy PostgreSQL and Redis
-4. Run database migrations as an in-cluster Job (`db-migrate-<hash>`), then seed test + demo organizations
-5. Generate dev TLS certs and create the MC/MH TLS secrets
-6. Apply the environment root (services, OTel collector, observability stack)
-7. Set up port-forwarding
+The dev cluster has two layers with different lifecycles (ADR-0038), and `setup.sh` runs both:
 
-To rebuild after code changes on an existing cluster: `./infra/kind/scripts/setup.sh --only <svc>`
-(one service) or `--rebuild-all`. Only workloads whose image or configuration actually changed
-roll; nothing is restarted unconditionally.
+1. **Provision** (`./infra/kind/scripts/provision.sh`) — the PLATFORM: the kind cluster
+   (Calico CNI, namespaces) and its Secret/TLS material (dev certs, the AC and MC/MH TLS
+   Secrets). It is rebuilt ONLY when its **blueprint** changed — a content hash of the kind
+   config, the kind version, the provisioning scripts and the public TLS leaf certs, recorded
+   in the cluster (`kube-system/configmap/devloop-blueprint`) after a successful build. Every
+   run prints one `BLUEPRINT ACTION=… REASON=…` line; `./infra/kind/scripts/provision.sh
+   --blueprint` prints the render itself. A renewed 14-day WebTransport leaf changes the
+   blueprint, so a long-lived cluster rebuilds about every 13 days.
+2. **Deploy** (`./infra/kind/scripts/deploy.sh`) — the APPLICATION, converged on every run:
+   build every first-party image (AC, GC, MC, MH and the `db-migrate` migrations image), tag
+   each by its own content (`localhost/<name>:sha-<image id>`) and load it into kind when the
+   node lacks it; PostgreSQL and Redis; database migrations as an in-cluster Job
+   (`db-migrate-<hash>`); seed the test + demo organizations; the OTel collector; the ONE
+   environment root (services, collector, observability stack); wait for every rollout.
+3. Port-forwarding, Telepresence and the access summary (host conveniences).
 
-**Note**: the services ARE deployed in-cluster by setup.sh. The "Deploy AC Service" section
+**To deploy code or config changes: `./infra/kind/scripts/deploy.sh`** (from the devloop
+container: `dev-cluster deploy`). Only workloads whose image or configuration actually changed
+roll; nothing is restarted unconditionally. `deploy.sh` refuses a cluster whose platform is
+missing, half-built or stale, naming `provision.sh`. Out-of-band `kubectl` edits are
+overwritten by the next deploy — the tree is the source of truth.
+
+**Note**: the services ARE deployed in-cluster by deploy.sh. The "Deploy AC Service" section
 below covers running AC *locally* instead (cargo or Telepresence) for fast iteration —
 that is an alternative to the in-cluster pod, not a required step.
 
@@ -215,8 +225,8 @@ cargo run --bin auth-controller
 
 **Option B: Run it in the cluster** (full K8s observability)
 
-The in-cluster AC is what setup.sh deploys. After a code change, rebuild and roll it with
-`./infra/kind/scripts/setup.sh --only ac` (logs land in Loki). (Skaffold was retired by
+The in-cluster AC is what deploy.sh deploys. After a code change, roll it with
+`./infra/kind/scripts/deploy.sh` (logs land in Loki). (Skaffold was retired by
 ADR-0038: it was a second, drifted deploy path that could not run the migration Job.)
 
 ### 4. View Logs and Metrics
@@ -308,7 +318,7 @@ cargo test -p env-tests --features all          # Everything
 - Client Secret: `test-client-secret-dev-999`
 - Scope: `test:all`
 
-These credentials are automatically seeded by `setup.sh` for env-tests.
+These credentials are automatically seeded by `deploy.sh` for env-tests.
 
 **Why separate test database?**
 - Different port (5433 vs 5432) avoids conflicts with dev cluster
@@ -320,19 +330,19 @@ These credentials are automatically seeded by `setup.sh` for env-tests.
 #### Running Migrations
 
 The Kind cluster's database is migrated by an in-cluster Job, never from the host
-(ADR-0038 §2): every `setup.sh` run (full, `--only`, `--rebuild-all`) builds the
+(ADR-0038 §2): every `deploy.sh` run builds the
 `db-migrate` image from `migrations/` and runs `job/db-migrate-<hash>` to Complete BEFORE
 any service rolls. An unchanged migration set keeps the same Job name, so it is a no-op.
 
 ```bash
-# What ran (the setup output also prints it):
+# What ran (the deploy output also prints it):
 kubectl get jobs -n dark-tower -l app=db-migrate
-kubectl logs -n dark-tower -l app=db-migrate --prefix --tail=-1   # while the Job's pod exists
+kubectl logs -n dark-tower -l app=db-migrate --prefix --tail=-1   # the Job's pod stays until a newer Job replaces it
 ```
 
-A failed Job fails setup loudly (`MIGRATION_FAILURE: … REASON=migration-failed`) with its
+A failed Job fails deploy loudly (`MIGRATION_FAILURE: … REASON=migration-failed`) with its
 logs. "previously applied but has been modified" means an applied migration file was edited:
-restore it, or recreate the cluster (`teardown.sh` + `setup.sh`) — there are no down-migrations;
+restore it, or recreate the cluster (`teardown.sh`, then `setup.sh`) — there are no down-migrations;
 never hand-edit `_sqlx_migrations`. See `docs/runbooks/devloop-validation.md` §6.7.
 
 #### Creating Migrations
@@ -346,7 +356,7 @@ sqlx migrate add add_user_sessions_table
 
 # Edit the generated file in migrations/
 # Then apply it to the dev cluster (runs the migration Job):
-./infra/kind/scripts/setup.sh --rebuild-all
+./infra/kind/scripts/deploy.sh
 ```
 
 #### Connecting to Database
@@ -625,7 +635,9 @@ perf report
 
 ```bash
 # === Cluster Management ===
-./infra/kind/scripts/setup.sh          # Create cluster
+./infra/kind/scripts/setup.sh          # Provision + deploy (+ port-forwards)
+./infra/kind/scripts/provision.sh      # Platform only (rebuilds only on a blueprint change)
+./infra/kind/scripts/deploy.sh         # Application only (converge to the tree)
 ./infra/kind/scripts/teardown.sh       # Delete cluster
 kind get clusters                       # List clusters
 kubectl cluster-info                    # Cluster info
@@ -639,15 +651,15 @@ kubectl delete pod -n dark-tower <pod>  # Delete pod
 
 # === Service Management ===
 kubectl get svc -A                      # All services
-kubectl rollout restart statefulset/ac-service -n dark-tower  # Restart AC
+kubectl rollout restart statefulset/ac-service -n dark-tower  # Reset AC's runtime state (does NOT pick up new code)
 
 # === Database ===
 sqlx migrate add <name>                 # Create migration
-./infra/kind/scripts/setup.sh --rebuild-all   # Apply it to the dev cluster (migration Job)
+./infra/kind/scripts/deploy.sh         # Apply it to the dev cluster (migration Job)
 psql $DATABASE_URL                      # Connect to DB
 
 # === Development ===
-./infra/kind/scripts/setup.sh --only <svc>    # Rebuild one service, converge
+./infra/kind/scripts/deploy.sh         # Build + converge (rolls only what changed)
 cargo test --workspace                  # Run tests
 cargo llvm-cov --workspace              # Coverage
 ```

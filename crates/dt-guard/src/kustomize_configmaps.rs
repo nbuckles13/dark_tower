@@ -69,8 +69,8 @@
 //! object into `kubectl.kubernetes.io/last-applied-configuration`. **Server-side
 //! apply (`kubectl apply --server-side`) writes no such annotation**, so it
 //! would remove this failure mode entirely from
-//! `infra/kind/scripts/setup.sh::deploy_observability` and
-//! `scripts/layer7.sh::__apply_observability_overlay`. It was deliberately NOT
+//! `infra/kind/scripts/deploy.sh::apply_env_root` (the one environment-root
+//! apply, ADR-0038). It was deliberately NOT
 //! adopted with this guard: switching carries field-manager and ownership
 //! migration consequences for every existing object, which makes it a task of
 //! its own. If it lands, this size rule can be retired — do not keep treating

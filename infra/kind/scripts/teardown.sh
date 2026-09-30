@@ -11,45 +11,33 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Logging only (lib/common.sh is definitions-only). NOT its validate_cluster_name
+# or dt_init_cluster_env: teardown's validation is deliberately different (below).
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
+
 CLUSTER_NAME="${DT_CLUSTER_NAME:-dark-tower}"
 
 # --- Cluster name validation (#1 charset only — DELIBERATELY no length cap) ---
-# INVERSE PRECONDITION vs setup.sh (@paired-operations / @security, the (b) Finding-5
-# pattern): setup.sh MUST reject a >49-char name (it can't CREATE the 63-char DNS-label
+# INVERSE PRECONDITION vs provision (lib/common.sh:validate_cluster_name; @paired-operations /
+# @security, the (b) Finding-5 pattern): provision MUST reject a >49-char name (it can't CREATE the 63-char DNS-label
 # node), but teardown MUST NOT — a partially-created orphan cluster from before the
 # length cap existed (unbounded slugs) can carry a 50-63 char name, and teardown's whole
 # job is to DELETE whatever exists. A length cap here would strand that orphan (exit
 # before `kind delete`) AND misdirect ("shorten it" is useless advice for a name you're
 # deleting). So teardown validates CHARSET/FORMAT only — which is what protects the
 # `kind delete`/`pkill` command sites; length contributes nothing to injection safety.
-# The CHARSET regex below is kept in sync with setup.sh's by a check in
+# The CHARSET regex below is kept in sync with lib/common.sh's by a check in
 # scripts/setup.test.sh; the length-cap divergence is intentional — DO NOT unify them.
-validate_cluster_name() {
+validate_cluster_name_charset() {
     local name="$1"
     if [[ ! "${name}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
         echo "ERROR: Invalid cluster name '${name}': must be lowercase alphanumeric/hyphens, start and end with alphanumeric" >&2
         exit 1
     fi
 }
-validate_cluster_name "${CLUSTER_NAME}"
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+validate_cluster_name_charset "${CLUSTER_NAME}"
 
 # Main
 main() {

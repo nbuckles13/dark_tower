@@ -40,6 +40,13 @@
 #
 #   --force-ca   Regenerate the dev CA (implies regenerating all leaves).
 #   --force      Regenerate all leaf certs even if still valid.
+#   --check-renewal
+#                READ-ONLY: exit 10 if a normal run WOULD (re)generate the CA
+#                or any leaf (missing, expiring within 24h, over-long window),
+#                0 if it would reuse everything. Writes nothing. Uses the SAME
+#                reuse predicate as a normal run (leaf_reusable), so "due" and
+#                "renewed" cannot disagree. infra/kind/scripts/provision.sh
+#                uses it to report a due renewal (CHANGED=tls-renewal-due).
 #
 set -euo pipefail
 
@@ -59,20 +66,56 @@ FORCE_CA=false
 FORCE_LEAF=false
 CA_REGENERATED=false   # set true when the CA is (re)generated this run; forces leaf regen
 
+CHECK_RENEWAL=false
+RENEWAL_DUE_RC=10
 for arg in "$@"; do
   case "$arg" in
     --force-ca) FORCE_CA=true ;;
     --force) FORCE_LEAF=true ;;
+    --check-renewal) CHECK_RENEWAL=true ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
 done
+
+# The leaves this script mints: "<name> <days>". ONE list for the normal run
+# and --check-renewal.
+LEAVES=(
+  "auth-localhost ${DAYS_CERT}"
+  "mc-webtransport ${DAYS_WT_CERT}"
+  "mh-webtransport ${DAYS_WT_CERT}"
+)
+
+# The CA is reused iff both files exist and --force-ca was not passed.
+ca_reusable() {
+  [ -f "$CA_KEY" ] && [ -f "$CA_CERT" ] && [ "$FORCE_CA" = false ]
+}
+
+# THE reuse predicate for a leaf (see the comment block in
+# generate_service_cert for why each clause exists). Args: <name> <days>.
+leaf_reusable() {
+  local name="$1" days="$2"
+  local key_file="${CERT_DIR}/${name}.key" cert_file="${CERT_DIR}/${name}.crt"
+  [ "$FORCE_LEAF" = false ] && [ "$CA_REGENERATED" = false ] \
+    && [ -f "$cert_file" ] && [ -f "$key_file" ] \
+    && openssl x509 -checkend 86400 -noout -in "$cert_file" >/dev/null 2>&1 \
+    && ! openssl x509 -checkend $(( days * 86400 )) -noout -in "$cert_file" >/dev/null 2>&1
+}
+
+if [ "$CHECK_RENEWAL" = true ]; then
+  ca_reusable || exit "$RENEWAL_DUE_RC"
+  for leaf in "${LEAVES[@]}"; do
+    # shellcheck disable=SC2086  # "<name> <days>" splits into the two args
+    leaf_reusable $leaf || exit "$RENEWAL_DUE_RC"
+  done
+  exit 0
+fi
 
 mkdir -p "$CERT_DIR"
 
 # ---------------------------------------------------------------------------
 # 1. Self-signed CA
 # ---------------------------------------------------------------------------
-if [ -f "$CA_KEY" ] && [ -f "$CA_CERT" ] && [ "$FORCE_CA" = false ]; then
+if ca_reusable; then
   echo "CA already exists, reusing (pass --force-ca to regenerate)"
 else
   echo "Generating self-signed CA (ECDSA P-256)..."
@@ -117,6 +160,17 @@ generate_service_cert() {
   local cert_file="${CERT_DIR}/${name}.crt"
   local ext_file="${CERT_DIR}/${name}.ext"
 
+  # Every minted leaf must be in LEAVES with the same window, or
+  # --check-renewal would silently not consider it.
+  local listed=false leaf
+  for leaf in "${LEAVES[@]}"; do
+    [ "$leaf" = "${name} ${days}" ] && listed=true
+  done
+  if [ "$listed" = false ]; then
+    echo "ERROR: leaf '${name} ${days}' is not in LEAVES; add it so --check-renewal covers it." >&2
+    exit 1
+  fi
+
   # Reuse path: present, key present, NOT expiring within 24h (86400s), AND
   # remaining validity below the intended window length (`days`) — a PROXY for
   # the validity-window cap, not the window itself (see the NOTE at the end of
@@ -145,11 +199,9 @@ generate_service_cert() {
   # deliberately avoid exact notAfter-notBefore date math (GNU-vs-BSD `date -d`
   # fragility) for an edge case that can't bite in practice — proxy is the right
   # altitude for a dev script.
-  # Both `-checkend` calls are guarded probes (set-e-safe).
-  if [ "$FORCE_LEAF" = false ] && [ "$CA_REGENERATED" = false ] \
-     && [ -f "$cert_file" ] && [ -f "$key_file" ] \
-     && openssl x509 -checkend 86400 -noout -in "$cert_file" >/dev/null 2>&1 \
-     && ! openssl x509 -checkend $(( days * 86400 )) -noout -in "$cert_file" >/dev/null 2>&1; then
+  # Both `-checkend` calls are guarded probes (set-e-safe). The predicate itself
+  # is leaf_reusable (above), shared with --check-renewal.
+  if leaf_reusable "$name" "$days"; then
     echo ""
     echo "Reusing existing ${name} certificate (present, valid, within its ${days}-day window)."
     echo "  Cert: ${cert_file}"
@@ -362,12 +414,9 @@ echo "  mh-webtransport: notAfter=${MH_EXPIRES_AT}"
 echo ""
 echo "If the browser later refuses the MC/MH WebTransport handshake, the leaf may have"
 echo "expired (routine given the 14-day window) or the deployed cert/fingerprint may be"
-echo "stale. Full recovery on a RUNNING cluster (re-running this script alone only rewrites"
-echo "the PEMs — it does not update the in-cluster Secret or restart the pods):"
-echo "  1) ./infra/kind/scripts/setup.sh"
-echo "     # regenerates expiring leaves, recreates mc/mh-service-tls Secrets, redeploys"
-echo "  2) kubectl rollout restart deployment/mc-0 deployment/mc-1 deployment/mh-0 deployment/mh-1 -n dark-tower"
-echo "     # 'apply' alone does not restart pods on a secret-only change"
-echo "     # (why: docs/runbooks/client-dev-local.md F7; automating it is tracked in docs/TODO.md)"
-echo "  3) restart 'pnpm dev'"
+echo "stale. Re-running this script alone only rewrites the PEMs. To get them into the cluster:"
+echo "  1) dev-cluster provision   (devloop container)  or  ./infra/kind/scripts/setup.sh  (host)"
+echo "     # the provision blueprint hashes these public certs, so a renewed leaf rebuilds the"
+echo "     # cluster with fresh TLS Secrets (and fresh MC/MH pods)"
+echo "  2) restart 'pnpm dev'"
 echo "     # reloads the browser-side fingerprint from fingerprints.json"

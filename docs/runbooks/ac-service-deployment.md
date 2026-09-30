@@ -145,7 +145,7 @@ kubectl get pods -n dark-tower -l app=ac-service -o json | jq '.items[].status.c
 
 > **Mechanism (ADR-0038 §2):** the dev Kind cluster runs migrations as the pre-rollout
 > `db-migrate` Job (`infra/services/db-migrate/`, image `infra/docker/db-migrate/`), which
-> `setup.sh` runs to Complete before applying the environment root — that is also the intended
+> `infra/kind/scripts/deploy.sh` (the `dev-cluster deploy` verb) runs to Complete before applying the environment root — that is also the intended
 > production shape (a pre-upgrade hook / sync-wave). The operator-shell `sqlx` procedure below
 > is the manual fallback for a non-Kind environment; it is **not** how the dev cluster is
 > migrated. Dev-cluster failures: `docs/runbooks/devloop-validation.md` §6.7 (`REASON=migration-failed`).
@@ -564,8 +564,9 @@ Do not `kubectl edit` the live ConfigMap. Its name is hash-suffixed, and nothing
 references the edited object after the next apply, which overwrites it anyway.
 
 ```bash
-# Kind / devloop cluster: apply the whole environment root, then wait for every workload.
-./infra/kind/scripts/setup.sh --skip-build --only ac
+# Kind / devloop cluster: apply the whole environment root, then wait for every workload
+# (from the devloop container: dev-cluster deploy).
+./infra/kind/scripts/deploy.sh
 
 # Read the live value through the name the pod template actually references:
 kubectl get configmap -n dark-tower -o yaml \

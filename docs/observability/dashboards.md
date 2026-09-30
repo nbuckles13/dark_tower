@@ -275,6 +275,10 @@ The media-path **triage** board: where an operator goes to answer *why*, after
 | Registered Meetings vs Registration Cap | How many meetings each handler holds registered against `MH_MAX_REGISTERED_MEETINGS` (story 2 R-21) — registrations held, not meetings in progress |
 | Meeting Teardowns by Outcome | Are meetings being released, is MC ending meetings this handler never held, and is any MC ending a meeting it does not own (story 2 R-20) |
 | Egress Budget (bytes/s) | What budget the ceiling is derived from, in bytes (the key is in bits) |
+| Late Applies Refused (Released Meeting) | Is the released-meeting guard working — how many queued policy applies MH's session actor refused because `EndMeeting` had already released the meeting (the only signal for that guard; a flat 0 is healthy, an ABSENT series is a broken pipeline) |
+| Registration Policy Bounds | What per-registration pre-allocation bounds the running process loaded (config reflection; a step means a pod started on different config) |
+| Policy Apply Timeout | What config-apply reply timeout the running process loaded, in seconds (config reflection; a step means a pod started on different config) |
+| Per-Stream Egress Costs (bytes/s) | What enforced per-stream audio and video costs the running process loaded, in bytes (config reflection; a step means a pod started on different config) |
 
 Two conventions this board depends on, both easy to break by well-meaning edit:
 
@@ -446,9 +450,9 @@ Dashboards are **content-addressed ConfigMaps mounted into the Grafana pod** (AD
    in `infra/grafana/deployment.yaml`. `dt-guard kustomize` R-21 fails the build on a
    generated ConfigMap that no pod template references, so forgetting this step is red,
    not silent.
-4. Deploy by applying the environment root (Kind: `./infra/kind/scripts/setup.sh --skip-build
-   --only otel`, which applies the whole root and waits for every workload). The new hash
-   rolls Grafana.
+4. Deploy by applying the environment root (Kind: `./infra/kind/scripts/deploy.sh`, or
+   `dev-cluster deploy` from the devloop container — it applies the whole root and waits for
+   every workload). The new hash rolls Grafana.
 
 ---
 

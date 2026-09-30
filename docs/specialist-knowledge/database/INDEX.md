@@ -44,9 +44,9 @@
 
 ## Cluster Data Provisioning
 - Per-run organization row → `infra/kind/scripts/setup.sh:provision_run_org()` (`--provision-org` mode)
-- psql invocation wrapper → `infra/kind/scripts/setup.sh:dt_psql()`
-- Baseline `devtest` seed → `infra/kind/scripts/setup.sh:seed_test_data()`
-- Concurrent-meeting cap constant → `infra/kind/scripts/setup.sh` (`ORG_MAX_CONCURRENT_MEETINGS`)
+- psql invocation wrapper → `infra/kind/scripts/lib/cluster-db.sh:dt_psql()`
+- Baseline `devtest` seed → `infra/kind/scripts/deploy.sh:seed_test_data()`
+- Concurrent-meeting cap constant → `infra/kind/scripts/lib/cluster-db.sh` (`ORG_MAX_CONCURRENT_MEETINGS`)
 - Layer-7 provisioning call site (Phase 1h) → `scripts/layer7.sh:__generate_org_subdomain()`
 - Org-subdomain pattern drift guard (7 encodings incl. `docs/DATABASE_SCHEMA.md`) → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
 

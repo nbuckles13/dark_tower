@@ -185,7 +185,10 @@ assert_status "vacuous-not-evidence" "it is not evidence that the sites are in s
 # this branch exists to catch: a number changed without the row that justifies it. Comparing
 # the table to its own length would be circular and could never catch this.
 T="$(new_tree)"
-SKEWED="${WORK}/guard-skewed.sh"
+# The copy sits in a `simple/` dir beside a copy of ../common.sh, because the guard sources
+# its shared seam helper by relative path.
+mkdir -p "${WORK}/skew/simple"; cp "$(dirname "$GUARD")/../common.sh" "${WORK}/skew/common.sh"
+SKEWED="${WORK}/skew/simple/guard-skewed.sh"
 sed 's/^readonly EXPECTED_SITE_COUNT=7$/readonly EXPECTED_SITE_COUNT=8/' "$GUARD" > "$SKEWED"
 # Prove the injection actually took, or this case tests the unmodified guard and passes for
 # the wrong reason.

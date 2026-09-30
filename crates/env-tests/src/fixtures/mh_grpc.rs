@@ -40,7 +40,7 @@ use tonic::Request;
 
 /// Where MC's own AC client credentials are deployed. The test READS them from
 /// the cluster rather than restating them: the Secret is the single source (it
-/// matches what `infra/kind/scripts/setup.sh` seeds into AC), and a copy here
+/// matches what `infra/kind/scripts/deploy.sh:seed_test_data` seeds into AC), and a copy here
 /// would drift on rotation and then fail as an apparent environment fault.
 const MC_DEPLOYMENT: &str = "mc-0";
 const MC_CLIENT_ID_ENV: &str = "MC_CLIENT_ID";

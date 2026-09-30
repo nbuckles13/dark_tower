@@ -49,7 +49,7 @@ spec:
       - name: mc-service
         image: localhost/mc-service:render-required
         # Tag set at render time to the image's content tag (sha-<id>) by
-        # infra/kind/scripts/setup.sh:render_env_overlay (ADR-0038 §2). Nothing loads
+        # infra/kind/scripts/deploy.sh:render_env_overlay (ADR-0038 §2). Nothing loads
         # `:render-required`, so an apply that bypasses the render fails loudly
         # (ErrImageNeverPull) instead of running a stale image. Never: a Kind-loaded
         # image is never pulled; a prod overlay sets registry, tag and pull policy.
@@ -95,11 +95,18 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: AC_JWKS_URL
-        - name: REDIS_URL
+        # REDIS_URL is COMPOSED from the password's one owner, redis-secrets
+        # (infra/services/redis/kustomization.yaml's secretGenerator; content-addressed, so a
+        # password change rolls MC) — never a second literal copy. Dependent env
+        # vars: REDIS_PASSWORD MUST be declared before REDIS_URL. The owner's value must be
+        # URL-safe (it is embedded unencoded).
+        - name: REDIS_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: mc-service-secrets
-              key: REDIS_URL
+              name: redis-secrets
+              key: REDIS_PASSWORD
+        - name: REDIS_URL
+          value: "redis://:$(REDIS_PASSWORD)@redis.dark-tower:6379"
         - name: MC_BINDING_TOKEN_SECRET
           valueFrom:
             secretKeyRef:

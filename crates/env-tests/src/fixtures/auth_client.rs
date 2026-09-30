@@ -87,7 +87,7 @@ pub enum AuthClientError {
 /// A `unwrap_or("devtest")` fallback would be that same defect wearing a default: the
 /// suite would go green while the fix sat inert. So unset AND blank both fail loudly.
 /// `devtest` remains reachable only through the EXPLICIT manual invocation named in the
-/// error message below (and seeded by `infra/kind/scripts/setup.sh:seed_test_data`, which
+/// error message below (and seeded by `infra/kind/scripts/deploy.sh:seed_test_data`, which
 /// carries the matching half of this cross-reference).
 ///
 /// Follows `crates/env-tests/src/cluster.rs::read_env_url`'s conventions — empty string

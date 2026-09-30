@@ -61,8 +61,8 @@ Host
 **Concurrency model** (added 2026-05-03 after R-35 surfaced `status` hangs while `setup` was in flight):
 
 - Read-only commands (`status`, `ports`, `version`) ALWAYS run concurrently with whatever else is in flight. They take no shared lock and snapshot the busy state for inclusion in their response.
-- Write commands (`setup`, `deploy`, `rebuild`, `rebuild-all`, `teardown`) acquire a single per-helper write slot. A second write while one is in flight is rejected with a typed `busy` error carrying the in-flight `op` + `args` so the client can render `helper busy with <op>; run dev-cluster cancel to abort it`.
-- `cancel` flips a per-write `Arc<AtomicBool>` cancel token. The in-flight write thread observes the token in `run_command_streaming`, sends `SIGTERM` to its child's *process group* (the child was spawned with `Command::process_group(0)` so it is the leader of a fresh group with `pgid == child.id()`), waits up to 2 s, then escalates to `SIGKILL` of the same group. The process-group signal is what reaches grandchildren — `kubectl wait`, `kubectl apply`, etc., spawned by `setup.sh` — that inherited stdout/stderr; without it, an immediate-child kill would leave grandchildren holding the pipes open and stretch cancel latency to ~60 s. `cancel` is idempotent: when no write is in flight it is a no-op (audit-logged with `outcome="no-op"`).
+- Write commands (`provision`, `deploy`, `teardown`, `recreate`, `restore-kubeconfig`) acquire a single per-helper write slot. A second write while one is in flight is rejected with a typed `busy` error carrying the in-flight `op` + `args` so the client can render `helper busy with <op>; run dev-cluster cancel to abort it`.
+- `cancel` flips a per-write `Arc<AtomicBool>` cancel token. The in-flight write thread observes the token in `run_command_streaming`, sends `SIGTERM` to its child's *process group* (the child was spawned with `Command::process_group(0)` so it is the leader of a fresh group with `pgid == child.id()`), waits up to 2 s, then escalates to `SIGKILL` of the same group. The process-group signal is what reaches grandchildren — `kubectl wait`, `kubectl apply`, etc., spawned by `provision.sh`/`deploy.sh` — that inherited stdout/stderr; without it, an immediate-child kill would leave grandchildren holding the pipes open and stretch cancel latency to ~60 s. `cancel` is idempotent: when no write is in flight it is a no-op (audit-logged with `outcome="no-op"`).
 - The accept loop is bounded at 32 concurrent client connections; over-cap connections are refused with a typed error and the rejection is rate-limited in the audit log to one entry per second to prevent log spam under burst.
 - The writer thread is the sole signaller of its child: it holds the `Child` on its own stack and signals before any `wait()` so PID-recycle TOCTOU is structurally impossible. `cancel` only sets the atomic; it never holds a PID across threads.
 
@@ -79,7 +79,7 @@ Host
 | Layer | Path | Purpose |
 |---|---|---|
 | Helper *binary source* | `REPO_ROOT` | Security: container cannot tamper. Used by `build_helper()` (`cargo build --manifest-path $REPO_ROOT/Cargo.toml`). |
-| Helper *runtime project-root* | `CLONE_DIR` | Function: service builds, kind-config, setup.sh must reflect the devloop's branch state. Passed as `--project-root` arg to the helper at launch; consumed as `ctx.project_root` in `cmd_setup` / `cmd_rebuild` / `cmd_deploy`. |
+| Helper *runtime project-root* | `CLONE_DIR` | Function: service builds, kind-config, setup.sh must reflect the devloop's branch state. Passed as `--project-root` arg to the helper at launch; consumed as `ctx.project_root` in `cmd_provision` / `cmd_deploy`. |
 | Pod runtime | container fs | Sandboxed; no host access. |
 
 The runtime project-root determines where `podman build` looks for source, where `setup.sh` reads manifests from, and where the kind-config template is read from. Setting it to `REPO_ROOT` (the original implementation, fixed 2026-05-01) caused service rebuilds to silently produce stale images: `/work` inside the dev container is mounted from `CLONE_DIR`, so edits made by Claude landed there — but `podman build` ran against `REPO_ROOT` and saw whatever was last committed to the user's main checkout. Builds full-cache-hit and looked successful in <3s; the rebuilt image was byte-identical to whatever was last built. The fix is `--project-root "$CLONE_DIR"` in `devloop.sh`'s helper launch, with the clone-creation step hoisted to run before `launch_helper` so `CLONE_DIR` always exists when the helper starts.
@@ -105,13 +105,15 @@ The helper handles only operations that require the host's container runtime (po
 
 | Command | Description | Class | Why host-only |
 |---------|-------------|-------|---------------|
-| `setup` | Allocate ports, generate kind-config, create cluster, run setup.sh | write | Requires `kind create cluster`, `podman build` |
-| `rebuild <service>` | `setup.sh --only <service>`: build the image (content-tagged) + the migrations image, run the migration Job, apply the environment root (ADR-0038) | write | Delegates to setup.sh; the helper derives no tag |
-| `rebuild-all` | `setup.sh --rebuild-all`: every first-party image, then the same converge | write | Same |
-| `deploy <service>` | `setup.sh --skip-build --only <service>`: converge on the images already deployed | write | Uses setup.sh which manages kind-specific operations |
+| `provision` | Allocate ports, render kind-config, write the port map, run `infra/kind/scripts/provision.sh`: rebuild the platform (cluster, CNI, namespaces, Secret/TLS material) ONLY when its recorded blueprint differs or is missing (ADR-0038 §1), then write the container kubeconfig | write | Requires `kind create/delete cluster` |
+| `deploy` | Run `infra/kind/scripts/deploy.sh`: build every first-party image (content-tagged), `kind load`, the migration Job, the ONE environment root, wait for every rollout (ADR-0038 §2) | write | Requires `podman build`, `kind load`; the helper derives no tag |
 | `teardown` | Delete Kind cluster, clean up all state | write | Requires `kind delete cluster` |
+| `recreate` | Self-heal: teardown + provision + deploy, ONLY after the host re-confirms the control plane is dead; bounded to once per helper lifetime | write | Requires `kind delete/create cluster` |
+| `restore-kubeconfig` | Self-heal: regenerate only the container kubeconfig from the live cluster (never destroys) | write | Reads the host kubeconfig |
 | `status` | Report cluster existence, API reachability, port allocations, readiness flag, in-flight write | read | Helper-internal state + kubectl connectivity check |
 | `cancel` | Abort the in-flight write (no-op if idle) | read | Touches only the in-flight write's cancel token |
+
+**Every verb takes NO argument** (ADR-0038 step 3): the request is exactly `{token, command}` with unknown fields denied at deserialization, so no container-supplied string can reach a script's argv or env; the allowlist is `VERBS` in `crates/devloop-helper/src/protocol.rs` (pinned against `parse_command` by a unit test, and against the `dev-cluster` client's copy by `scripts/guards/simple/validate-dev-cluster-verbs.sh`). The per-service `rebuild <svc>` / `rebuild-all` / `deploy <svc>` surface and `setup` were retired with it: `provision` is the one destructive build verb (it MUST destroy a healthy cluster whose blueprint changed — the inverse of `recreate`, which MUST refuse to), and it destroys only the helper-owned `ctx.cluster_name`.
 
 The `class` column drives the concurrency model described in §"Helper Process". Read-class commands never block on the write slot; write-class commands acquire it and are rejected with `busy` if it is held.
 
@@ -129,13 +131,13 @@ A second write while a write is in flight returns `Response::err` with `error_ki
 
 While the cancel is in flight (between the cancel-token store and the writer's `Drop` of `WriteSlotGuard`), `status` returns `cancel_pending: true` in its top-level data. The flag is sourced from the in-flight op's `cancel_token` under the same mutex acquisition that snapshots `busy`/`in_flight`, so the view is consistent. Operators see `[busy, cancelling] write in flight: <op>` in the `dev-cluster status` banner during this window; once the writer releases the slot, the banner is omitted entirely (`busy=false`, `cancel_pending=false`, `in_flight=null`).
 
-Cancelling a write — `setup`, `deploy`, `rebuild`, `rebuild-all`, OR `teardown` — abandons the operation immediately and may leave host-side state (Kind cluster fragments, containerd/etcd processes inside leaked Kind containers, port allocations) requiring manual recovery. Recovery is uniform across both abandonment paths: re-running `dev-cluster setup` reconciles partial Kind state via the "cluster exists, reusing" branch (`cmd_setup` at `commands.rs:237-243`); re-running `dev-cluster teardown` is idempotent against straggling state. If the Kind container itself wedges, `podman/docker rm -f kind-control-plane-<cluster-name>` is the manual recovery. The helper does not pretend cancel partial-restores; the user has chosen to abandon, and the cancel mechanism is symmetric for that reason — there is no per-command cancel policy and no `is_cancellable()` carve-out.
+Cancelling a write — `provision`, `deploy`, `teardown`, `recreate` OR `restore-kubeconfig` — abandons the operation immediately and may leave host-side state (Kind cluster fragments, containerd/etcd processes inside leaked Kind containers, port allocations) requiring manual recovery. Recovery is uniform across both abandonment paths: re-running `dev-cluster provision` rebuilds a partially built cluster (a cancelled build records no blueprint, so it reads as missing and is torn down and rebuilt — never reused); re-running `dev-cluster teardown` is idempotent against straggling state. If the Kind container itself wedges, `podman/docker rm -f kind-control-plane-<cluster-name>` is the manual recovery. The helper does not pretend cancel partial-restores; the user has chosen to abandon, and the cancel mechanism is symmetric for that reason — there is no per-command cancel policy and no `is_cancellable()` carve-out.
 
 #### 4. Connection cap
 
 The accept loop bounds concurrent client connections at 32 (`MAX_CONCURRENT_CONNECTIONS`). This protects against pathological client-side fan-out (e.g., a script polling `status` in a tight loop while `setup` runs) without affecting normal devloop usage. Over-cap connections are immediately refused; the rejection is logged but rate-limited to one audit entry per second (`REJECT_LOG_DEDUP_SECS`) so a flood of refused connections cannot evict useful audit entries.
 
-**Input validation**: All arguments validated via Rust enums/match. Service names: `ac`, `gc`, `mc`, `mh` (exhaustive enum match). No shell interpolation — all commands use `Command::new().arg()`.
+**Input validation**: No verb takes an argument; the command name is matched against a closed enum. No shell interpolation — all commands use `Command::new().arg()` with fixed literals.
 
 **Socket authentication**: Helper generates a random 32-byte hex token at startup, writes to `/tmp/devloop-{slug}/auth-token` (chmod 0600). The `dev-cluster` client reads the token from the bind-mounted file. Every socket request must include the token; helper rejects invalid/missing tokens. Token rotates on helper restart.
 
@@ -337,9 +339,9 @@ networking:
 
 **Dual-port K8s API pattern**: `apiServerAddress: "127.0.0.1"` keeps host kubectl working via `localhost:${HOST_PORT_K8S_API}`. A separate `extraPortMappings` entry for port 6443 on `${HOST_GATEWAY_IP}:${HOST_PORT_K8S_API_GATEWAY}` makes the API reachable from containers. The container kubeconfig points to `host.containers.internal:${HOST_PORT_K8S_API_GATEWAY}`.
 
-**Static file preserved**: Existing `kind-config.yaml` kept for manual `setup.sh` usage with default ports.
+**Static file preserved**: Existing `kind-config.yaml` kept for manual host usage with default ports (`provision.sh`'s default when `DT_KIND_CONFIG` is unset).
 
-### setup.sh Parameterization
+### Kind script parameterization (setup.sh / provision.sh / deploy.sh)
 
 ```bash
 CLUSTER_NAME="${DT_CLUSTER_NAME:-dark-tower}"
@@ -351,9 +353,9 @@ PORT_MAP_FILE="${DT_PORT_MAP:-}"
 - All `kubectl` commands use `--context kind-${CLUSTER_NAME}`
 - Interactive prompts skippable via `--yes` flag for automated use
 - Interactive prompts auto-skipped when stdin is not a TTY (`[[ -t 0 ]]`), so automated callers don't need `--yes`
-- `--only <service>`: Rebuild + redeploy single service (~30-60s with cargo-chef cache)
-- `--skip-build`: Apply manifests only (~15-20s)
-- `--provision-org <subdomain>`: Create one fresh `organizations` row and exit, printing `PROVISIONED_ORG org_id=<uuid> subdomain=<sub>`. **The only mode of this script that is CONTAINER-runnable** (story R-7): it dispatches from `main()` before `check_prerequisites`, so it never touches `kind`/`podman`/`docker` — none of which exist in the devloop container — and reaches the cluster solely through `kubectl exec` + the container kubeconfig this ADR already grants under *Container-Side Test Execution*. `DT_CLUSTER_NAME` is **required with no fallback** on this path (the global `dark-tower` default would silently resolve to a manually created workstation cluster and write the row into the wrong database), and the context is asserted to resolve before any write. Invoked by `scripts/layer7.sh` Phase 1h; rejected in combination with `--only`/`--skip-build`.
+- `DT_KIND_CONFIG` (provision.sh): the rendered kind config to build from — the helper's per-slug render; it is part of the provision blueprint
+- *(ADR-0038 step 3)* setup.sh's `--only <service>`, `--skip-build` and `--rebuild-all` flags were retired with the per-service helper verbs: `provision.sh` builds the platform only when its blueprint changed, `deploy.sh` converges the application (every image, one root) on every run, and host `setup.sh` runs both
+- `--provision-org <subdomain>`: Create one fresh `organizations` row and exit, printing `PROVISIONED_ORG org_id=<uuid> subdomain=<sub>`. **The only mode of this script that is CONTAINER-runnable** (story R-7): it dispatches from `main()` before `check_prerequisites`, so it never touches `kind`/`podman`/`docker` — none of which exist in the devloop container — and reaches the cluster solely through `kubectl exec` + the container kubeconfig this ADR already grants under *Container-Side Test Execution*. `DT_CLUSTER_NAME` is **required with no fallback** on this path (the global `dark-tower` default would silently resolve to a manually created workstation cluster and write the row into the wrong database), and the context is asserted to resolve before any write. Invoked by `scripts/layer7.sh` Phase 1h.
 - `DT_ORG_MAX_CONCURRENT_MEETINGS` (default 1000): `max_concurrent_meetings` for the orgs the test suites drive — `seed_test_data`'s `devtest` org and `--provision-org`. Deliberately not applied to `seed_demo_org`, which takes the schema default.
 
 The helper does **not** gain a verb for org provisioning, and that is a consequence of the build-context trichotomy corollary above rather than a preference: a new socket verb cannot be exercised by the devloop that adds it. Provisioning therefore goes through this script, which the helper's *runtime* project-root already resolves to `CLONE_DIR`.
@@ -390,7 +392,7 @@ The purpose of integrating Kind and env-tests into the devloop is to **catch int
 
 **Execution**: smoke first (~30s gate), then all remaining features. **All env-test features run by default** when the cluster has the corresponding stack deployed. Do not skip observability or resilience tests — the whole point is preventing bug escapes at integration boundaries. If tests are flaky, fix the tests rather than excluding them.
 
-- If `--skip-observability` was used at setup (no Prometheus/Grafana/Loki deployed), observability tests are automatically skipped.
+- *(ADR-0038 step 3: `--skip-observability` was retired — the one environment root always composes the observability stack.)*
 - If the observability stack is deployed but unhealthy, the devloop agent should report this as an infrastructure failure (retry once, then escalate) rather than silently skipping tests.
 
 **Attempt budgets**: 3 unit/clippy/semantic + 2 integration. Infrastructure failures don't consume attempts. First-run setup (~7 min) doesn't consume attempts.
@@ -410,9 +412,8 @@ The purpose of integrating Kind and env-tests into the devloop is to **catch int
 | Devloop without cluster | 4-8 GB | Any machine |
 | Single devloop with cluster | 6-10 GB | **16 GB minimum** |
 | 2 concurrent devloops | 12-20 GB | **32 GB recommended** |
-| With `--skip-observability` | Saves ~1.5 GB per cluster | Resource-constrained option |
 
-**Optional**: `--skip-observability` flag skips Prometheus/Grafana/Loki/Promtail deployment, saving ~1.5 GB per cluster. Observability env-tests automatically skipped when stack not deployed.
+*(Historical: a `--skip-observability` option was specified here; it never reached setup.sh and was retired by ADR-0038 step 3 — `deploy` applies one root that always includes observability.)*
 
 ### System Limits (inotify)
 
@@ -475,7 +476,7 @@ Observability endpoint access (Prometheus, Grafana, Loki) from inside the contai
 - Grafana dashboard validation
 - Loki log searches for failure diagnosis
 
-The `--skip-observability` flag remains supported — when the observability stack isn't deployed, those ports aren't mapped and observability tests are auto-skipped.
+*(The `--skip-observability` flag was retired by ADR-0038 step 3; the observability ports are always mapped.)*
 
 ### Orphan Cleanup
 
@@ -526,7 +527,7 @@ On `devloop.sh` startup:
 - **Infrastructure** (97%): Host-native helper, envsubst templating, registry-based port allocation. Verified named podman network + `--userns=keep-id` compatibility, container DNS, and `host.containers.internal` routing. Confirmed Kind passes `listenAddress` to podman `-p` flag.
 - **Security** (95%): Compiled Rust binary eliminates injection class. All ADR-0025 isolation preserved. `--network=host` and podman socket access explicitly prohibited. Container can reach Kind ports but not arbitrary localhost services.
 - **Test** (95%): `ClusterPorts::from_env()` only test code change. Zero test code changes for networking. Same feedback loop as running on host. Exit code classification for attempt budgets.
-- **Observability** (93%): Flat JSON port map, `host.containers.internal`, `--skip-observability` for resource-constrained. Prometheus/Grafana/Loki directly reachable. Observability access documented as a requirement.
+- **Observability** (93%): Flat JSON port map, `host.containers.internal`, `--skip-observability` for resource-constrained (retired by ADR-0038 step 3). Prometheus/Grafana/Loki directly reachable. Observability access documented as a requirement.
 - **Operations** (95%): PID file lifecycle, multi-layer orphan cleanup, 200-stride port allocation. Gateway-IP binding is operationally clean. Dynamic detection, orphan cleanup with PID file and state directory scanning.
 
 ## Debate Reference

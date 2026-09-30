@@ -112,7 +112,7 @@ fn run() -> Result<(), HelperError> {
     // Set socket timeout so we can check the shutdown flag periodically
     listener.set_nonblocking(false)?;
 
-    // Log startup (base_port is not yet known — allocation happens in cmd_setup)
+    // Log startup (base_port is not yet known — allocation happens in cmd_provision)
     audit_log.log_startup(&cluster_name, &socket_path.to_string_lossy(), process::id());
 
     eprintln!(
@@ -382,7 +382,7 @@ fn handle_connection(
     // Audit log per Obs schema:
     // - Busy errors → "rejected_busy" entry with collision pair in args (option A).
     // - Cancel command → "cancel" entry with target=<op> in args.
-    // - Cancelled writes → keep cmd_name (e.g. "setup"), error prefix "cancelled".
+    // - Cancelled writes → keep cmd_name (e.g. "deploy"), error prefix "cancelled".
     // - Everything else → standard cmd entry with appropriate outcome.
     let exit_code = result.exit_code.unwrap_or(-1);
     let error_str = result.error.as_deref();
@@ -447,13 +447,14 @@ fn handle_connection(
         } else {
             Some(logging::OUTCOME_ERROR)
         };
-        audit_log.log_command(
+        audit_log.log_command_with_decisions(
             &cmd_name,
             &cmd_args,
             result.duration_ms,
             exit_code,
             error_str,
             outcome,
+            &result.decisions,
         );
     }
 
@@ -795,46 +796,128 @@ mod tests {
         (token, lines)
     }
 
+    /// O2 (ADR-0038 step 3): a provision/deploy write's decision lines reach the
+    /// PERSISTENT audit log (helper.log) — and nothing else the script printed.
     #[test]
-    fn test_socket_shell_metacharacters_in_service() {
-        let resp = socket_roundtrip_with_token(
-            r#"{"token":"TOKEN_PLACEHOLDER","command":"rebuild","service":"; rm -rf /"}"#,
+    fn test_write_decision_lines_reach_the_audit_log_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let token = auth::generate_token().unwrap();
+        let mut ctx = build_test_context(dir.path());
+        let root = dir.path().join("root");
+        let script = root.join("infra/kind/scripts/deploy.sh");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        // Installed by a child process (never an fd this test holds), so a
+        // parallel fork cannot make the exec fail with ETXTBSY.
+        let src = dir.path().join("deploy.src");
+        fs::write(
+            &src,
+            "#!/bin/sh\n\
+             echo 'building images (secret=hunter2)'\n\
+             echo 'BLUEPRINT ACTION=check REASON=match RECORDED=aaaaaaaaaaaa CURRENT=aaaaaaaaaaaa CHANGED=-'\n\
+             echo 'DEPLOY_FAILED REASON=rollout-failed WORKLOADS=dark-tower/deployment/mc-0' >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+        assert!(std::process::Command::new("install")
+            .arg("-m")
+            .arg("0755")
+            .arg(&src)
+            .arg(&script)
+            .status()
+            .unwrap()
+            .success());
+        ctx.project_root = root;
+        let log_path = dir.path().join("helper.log");
+        let audit_log = logging::AuditLog::new(&log_path).unwrap();
+        let token_clone = token.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            let _ = handle_connection(stream, &token_clone, &ctx, &audit_log);
+        });
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        writeln!(client, r#"{{"token":"{token}","command":"deploy"}}"#).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let _ = read_all_ndjson(&mut BufReader::new(&client));
+        handle.join().unwrap();
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        let entry: serde_json::Value = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["cmd"] == "deploy")
+            .expect("a deploy audit entry");
+        assert_eq!(
+            entry["deploy_failed"],
+            "DEPLOY_FAILED REASON=rollout-failed WORKLOADS=dark-tower/deployment/mc-0"
         );
-        assert!(!resp.success);
-        assert_eq!(resp.error_kind.as_deref(), Some("invalid_service"));
+        assert_eq!(
+            entry["blueprint"],
+            "BLUEPRINT ACTION=check REASON=match RECORDED=aaaaaaaaaaaa CURRENT=aaaaaaaaaaaa CHANGED=-"
+        );
+        // Negative: arbitrary script output never reaches the audit log.
+        assert!(!log.contains("hunter2"), "{log}");
+        assert!(!log.contains("building images"), "{log}");
     }
 
+    /// The retired `service` argument field is rejected at deserialization —
+    /// before auth-gated parse, before any exec — whatever it carries.
     #[test]
-    fn test_socket_command_substitution_in_service() {
-        let resp = socket_roundtrip_with_token(
-            r#"{"token":"TOKEN_PLACEHOLDER","command":"rebuild","service":"$(whoami)"}"#,
-        );
-        assert!(!resp.success);
-        assert_eq!(resp.error_kind.as_deref(), Some("invalid_service"));
+    fn test_socket_service_field_rejected_whatever_its_value() {
+        for value in [
+            "; rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "ac | cat /etc/passwd",
+            "gc",
+        ] {
+            let json = format!(
+                r#"{{"token":"TOKEN_PLACEHOLDER","command":"deploy","service":{}}}"#,
+                serde_json::Value::String(value.to_string())
+            );
+            let resp = socket_roundtrip_with_token(&json);
+            assert!(!resp.success, "{value}");
+            assert_eq!(
+                resp.error_kind.as_deref(),
+                Some("invalid_request"),
+                "{value}"
+            );
+        }
     }
 
+    /// Injection shapes in the ONLY string the wire carries besides the token.
     #[test]
-    fn test_socket_backtick_injection_in_service() {
-        let resp = socket_roundtrip_with_token(
-            r#"{"token":"TOKEN_PLACEHOLDER","command":"rebuild","service":"`id`"}"#,
-        );
-        assert!(!resp.success);
-        assert_eq!(resp.error_kind.as_deref(), Some("invalid_service"));
-    }
-
-    #[test]
-    fn test_socket_pipe_in_service() {
-        let resp = socket_roundtrip_with_token(
-            r#"{"token":"TOKEN_PLACEHOLDER","command":"rebuild","service":"ac | cat /etc/passwd"}"#,
-        );
-        assert!(!resp.success);
-        assert_eq!(resp.error_kind.as_deref(), Some("invalid_service"));
+    fn test_socket_command_injection_shapes_rejected() {
+        for command in [
+            "deploy mc",
+            "provision ",
+            "deploy; rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "provision | cat /etc/passwd",
+            "rebuild-all",
+            "setup",
+        ] {
+            let json = format!(
+                r#"{{"token":"TOKEN_PLACEHOLDER","command":{}}}"#,
+                serde_json::Value::String(command.to_string())
+            );
+            let resp = socket_roundtrip_with_token(&json);
+            assert!(!resp.success, "{command:?}");
+            assert_eq!(
+                resp.error_kind.as_deref(),
+                Some("invalid_command"),
+                "{command:?}"
+            );
+        }
     }
 
     #[test]
     fn test_socket_null_bytes_in_command() {
         // Null byte in the middle of a command
-        let mut request = br#"{"token":"fake","command":"setup"#.to_vec();
+        let mut request = br#"{"token":"fake","command":"provision"#.to_vec();
         request.push(0x00);
         request.extend_from_slice(br#"extra"}"#);
         request.push(b'\n');
@@ -843,16 +926,16 @@ mod tests {
     }
 
     #[test]
-    fn test_socket_newline_in_service_field() {
+    fn test_socket_newline_in_command_field() {
         let resp = socket_roundtrip_with_token(
-            "{\"token\":\"TOKEN_PLACEHOLDER\",\"command\":\"rebuild\",\"service\":\"ac\\nmalicious\"}",
+            "{\"token\":\"TOKEN_PLACEHOLDER\",\"command\":\"deploy\\nteardown\"}",
         );
         assert!(!resp.success);
     }
 
     #[test]
     fn test_socket_invalid_auth_token() {
-        let request = br#"{"token":"wrong_token_definitely_not_valid","command":"setup"}"#;
+        let request = br#"{"token":"wrong_token_definitely_not_valid","command":"provision"}"#;
         let mut full = request.to_vec();
         full.push(b'\n');
         let resp = socket_roundtrip(&full);
@@ -862,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_socket_missing_token_field() {
-        let request = b"{\"command\":\"setup\"}\n";
+        let request = b"{\"command\":\"provision\"}\n";
         let resp = socket_roundtrip(request);
         assert!(!resp.success);
         // Missing required field should cause JSON parse error
@@ -896,7 +979,7 @@ mod tests {
     #[test]
     fn test_socket_unknown_fields_rejected() {
         let resp = socket_roundtrip_with_token(
-            r#"{"token":"TOKEN_PLACEHOLDER","command":"setup","evil_field":"payload"}"#,
+            r#"{"token":"TOKEN_PLACEHOLDER","command":"provision","evil_field":"payload"}"#,
         );
         assert!(!resp.success);
         // deny_unknown_fields should reject this at JSON parse time
@@ -928,7 +1011,7 @@ mod tests {
     fn test_socket_oversized_valid_json() {
         // Construct a >1MB valid JSON object with padding
         let padding = "a".repeat(1_200_000);
-        let json = format!(r#"{{"token":"fake","command":"setup","padding":"{padding}"}}"#);
+        let json = format!(r#"{{"token":"fake","command":"provision","padding":"{padding}"}}"#);
         let mut payload = json.into_bytes();
         payload.push(b'\n');
         let (_token, lines) = socket_roundtrip_raw(&payload);
@@ -1239,12 +1322,9 @@ mod concurrency_tests {
         }
         assert!(h.ctx.snapshot_busy().is_some());
 
-        // Try a real wire write (rebuild ac).
-        let rebuild_json = format!(
-            r#"{{"token":"{}","command":"rebuild","service":"ac"}}"#,
-            h.helper.token
-        );
-        let lines = h.helper.request(&rebuild_json);
+        // Try a real wire write (deploy).
+        let deploy_json = format!(r#"{{"token":"{}","command":"deploy"}}"#, h.helper.token);
+        let lines = h.helper.request(&deploy_json);
         let result = TestHelperWithCtx::parse_result(&lines);
         assert_eq!(result.error_kind.as_deref(), Some("busy"));
         let data = result.data.expect("busy data missing");
@@ -1359,19 +1439,20 @@ mod concurrency_tests {
         assert_eq!(data["busy"], serde_json::Value::Bool(false), "got: {data}");
         // Per CR11: in_flight is literally null (not absent) when idle.
         assert_eq!(data["in_flight"], serde_json::Value::Null, "got: {data}");
-        // setup_in_progress is sourced from the mutex; idle => false.
+        // cluster_write_in_progress is sourced from the mutex; idle => false.
         assert_eq!(
-            data["setup_in_progress"],
+            data["cluster_write_in_progress"],
             serde_json::Value::Bool(false),
             "got: {data}"
         );
     }
 
-    /// `setup_in_progress` must reflect the mutex view, not the legacy
-    /// `setup.pid` heuristic. Asserts that a non-setup write in flight
-    /// (TestSleep) leaves `setup_in_progress=false` while `busy=true`.
+    /// `cluster_write_in_progress` must reflect the mutex view, not the legacy
+    /// `setup.pid` heuristic. Asserts that a write that is NOT a cluster write
+    /// (TestSleep) leaves it false while `busy=true`; the positive set is
+    /// pinned by `commands::tests::is_cluster_write_exact_set`.
     #[test]
-    fn test_status_setup_in_progress_only_for_setup_op() {
+    fn test_status_cluster_write_in_progress_only_for_cluster_writes() {
         let h = TestHelperWithCtx::start();
         let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 5);
         for _ in 0..50 {
@@ -1387,9 +1468,9 @@ mod concurrency_tests {
         let data = result.data.expect("status data missing");
         assert_eq!(data["busy"], serde_json::Value::Bool(true), "got: {data}");
         assert_eq!(
-            data["setup_in_progress"],
+            data["cluster_write_in_progress"],
             serde_json::Value::Bool(false),
-            "non-setup write in flight should not show setup_in_progress=true: {data}",
+            "a non-cluster write in flight must not show cluster_write_in_progress=true: {data}",
         );
 
         // Cancel and reap.
@@ -1409,11 +1490,8 @@ mod concurrency_tests {
         }
         assert!(h.ctx.snapshot_busy().is_some());
 
-        let rebuild_json = format!(
-            r#"{{"token":"{}","command":"rebuild","service":"ac"}}"#,
-            h.helper.token
-        );
-        let _ = h.helper.request(&rebuild_json);
+        let deploy_json = format!(r#"{{"token":"{}","command":"deploy"}}"#, h.helper.token);
+        let _ = h.helper.request(&deploy_json);
 
         // Give the audit log a moment to flush.
         std::thread::sleep(Duration::from_millis(100));
@@ -1437,10 +1515,10 @@ mod concurrency_tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(
-            args.iter().any(|a| a.starts_with("rejected=rebuild")),
+            args.iter().any(|a| a.starts_with("rejected=deploy")),
             "got: {args:?}"
         );
-        assert!(args.contains(&"rejected_args=ac"), "got: {args:?}");
+        assert!(args.contains(&"rejected_args="), "got: {args:?}");
         assert!(
             args.iter().any(|a| a.starts_with("in_flight=test-sleep")),
             "got: {args:?}"

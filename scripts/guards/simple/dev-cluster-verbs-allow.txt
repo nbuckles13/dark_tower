@@ -1,0 +1,23 @@
+# Retired-spelling allowlist for scripts/guards/simple/validate-dev-cluster-verbs.sh (rule 5).
+# One entry per line: path|token|context|reason — the hit's path and token must match exactly and
+# its line must contain `context`. An entry that matches no line fails the guard (stale), so this
+# list can only shrink with the tree. Admit ONLY text that must name a retired spelling
+# (rejection tests, a retirement record, the predicate's own home) — never live advice.
+crates/devloop-helper/src/protocol.rs|rebuild-all|for retired in|the rejection test names the retired verbs
+crates/devloop-helper/src/protocol.rs|rebuild-all|verb like `rebuild-all`|the invalid_command message's comment names a retired verb
+crates/devloop-helper/src/main.rs|rebuild-all|"rebuild-all",|socket test: a retired verb is rejected before exec
+crates/devloop-helper/src/commands.rs|rebuild-all|"rebuild-all",|is_cluster_write test: a retired verb is not a cluster write
+docs/decisions/adr-0030-host-side-cluster-helper.md|rebuild-all|retired|the allowlist's retirement record
+docs/decisions/adr-0030-host-side-cluster-helper.md|--skip-build|retired|the allowlist's retirement record
+docs/decisions/adr-0030-host-side-cluster-helper.md|skip-observability|retired|the allowlist's retirement record
+scripts/lang/_changed_helpers.sh|diff_touches_path|diff_touches_path|the predicate's own home (Layer-6 audit gate consumer)
+scripts/lang/_audit_gate.sh|diff_touches_path|diff_touches_path|the audit gate's history of its own predicate
+docs/runbooks/devloop-validation.md|diff_touches_path|**`diff_touches_path <prefix>`**|the _changed_helpers reference section
+scripts/layer7.test.sh|diff_touches_path|for needle in|the static no-retired-machinery check
+scripts/layer7.test.sh|rebuild-all|for needle in|the static no-retired-machinery check
+scripts/layer7.test.sh|observability-apply-failed|for needle in|the static no-retired-machinery check
+scripts/setup.test.sh|--skip-build|retired|asserts the retired flag is rejected
+scripts/setup.test.sh|--skip-build|"e2e-0123456789abcdef" --skip-build|asserts the retired flag is rejected
+scripts/setup.test.sh|--skip-build|Unknown option '--skip-build'|asserts the retired flag is rejected
+scripts/setup.test.sh|--skip-build|for f in --only --skip-build --rebuild-all|asserts the retired flags are rejected
+scripts/setup.test.sh|rebuild-all|for f in --only --skip-build --rebuild-all|asserts the retired flags are rejected

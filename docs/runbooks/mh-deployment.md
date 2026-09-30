@@ -420,9 +420,9 @@ MC (an MC image predating the contract does not export that series at all). See
 Step 2.
 
 **In a devloop Kind cluster, a stale image on either side is the single most likely
-cause** of a `declined_no_sender_binding` spike — `dev-cluster rebuild-all` rebuilds
-and redeploys both, which is why the Layer-7 precondition uses it rather than
-patching one service.
+cause** of a `declined_no_sender_binding` spike — `dev-cluster deploy` rebuilds
+every image and converges both from the one environment root, which is why Layer 7
+runs it on every gate rather than patching one service.
 
 #### MH's media path now depends on MC's gRPC availability, and the wait is ~48s
 

@@ -149,7 +149,8 @@ meeting Node-side.
 
 1. **Kind cluster with AC+GC+MC+MH _and_ the observability stack**:
    `infra/kind/scripts/setup.sh`. Prometheus is **required** (assertion (d));
-   do **not** use `--skip-observability`.
+   the environment root always deploys it, so if it is missing the stack is
+   not up or not Ready yet.
 2. **Dev WebTransport certs**: `scripts/generate-dev-certs.sh` (writes
    `infra/docker/certs/fingerprints.json` + `fingerprints.env`; the canonical
    keys are `MC_CERT_SHA256` / `MH_CERT_SHA256`). The harness reads

@@ -9,6 +9,7 @@ pub mod mc_session;
 pub mod media;
 pub mod metric_hygiene;
 pub mod metrics;
+pub mod mh_config;
 pub mod mh_grpc;
 pub mod participant;
 

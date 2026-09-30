@@ -1220,6 +1220,318 @@
       ],
       "title": "Late Applies Refused (Released Meeting)",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The ADR-0036 section 8 pre-allocation bounds on ONE registration: MH_MAX_EGRESS_STREAMS_PER_MEETING (mh_media_egress_streams_per_meeting_limit), MH_MAX_CANDIDATE_SOURCES_PER_EGRESS (mh_media_candidate_sources_per_egress_limit) and MH_MAX_MUTED_SOURCES_PER_MEETING (mh_media_muted_sources_per_meeting_limit). A registration exceeding one is refused whole (mh_media_policy_applies_total{outcome=\"rejected_invalid\"}). A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 48
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_egress_streams_per_meeting_limit)",
+          "legendFormat": "streams/meeting {{instance}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_candidate_sources_per_egress_limit)",
+          "legendFormat": "candidates/egress {{instance}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_muted_sources_per_meeting_limit)",
+          "legendFormat": "muted/meeting {{instance}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Registration Policy Bounds",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MH_POLICY_APPLY_TIMEOUT_MS in SECONDS (mh_media_policy_apply_timeout_seconds): the bound on awaiting the session actor's config-apply (and EndMeeting release) reply. A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Seconds",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 48
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_policy_apply_timeout_seconds)",
+          "legendFormat": "timeout {{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Policy Apply Timeout",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The ENFORCED per-stream costs in BYTES per second (MH_STREAM_COST_AUDIO_BPS / MH_STREAM_COST_VIDEO_BPS are bits, converted once at load with div_ceil(8)): mh_media_stream_cost_audio_bytes_per_second and mh_media_stream_cost_video_bytes_per_second. The heavier one divides the budget into mh_media_egress_stream_ceiling. Deliberately NOT on the Egress Budget panel. A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Bytes/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 48
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_stream_cost_audio_bytes_per_second)",
+          "legendFormat": "audio {{instance}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_stream_cost_video_bytes_per_second)",
+          "legendFormat": "video {{instance}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Per-Stream Egress Costs (bytes/s)",
+      "type": "timeseries"
     }
   ],
   "refresh": "1m",

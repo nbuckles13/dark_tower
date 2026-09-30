@@ -365,7 +365,7 @@ curl http://ac-service:9090/metrics | grep ac_token_issuance_total
 ```bash
 # Option 1: Temporarily increase rate limits (config change; the apply rolls AC)
 # Edit the AC_RATE_LIMIT_* values in infra/services/ac-service/config.env, then
-# apply the environment root (Kind: ./infra/kind/scripts/setup.sh --skip-build --only ac).
+# apply the environment root (Kind: ./infra/kind/scripts/deploy.sh, or `dev-cluster deploy`).
 # The ConfigMap is content-addressed (ADR-0038), so the apply itself rolls the
 # StatefulSet. Do not `kubectl edit` the live ConfigMap: its name is
 # hash-suffixed and the next apply overwrites the edit.

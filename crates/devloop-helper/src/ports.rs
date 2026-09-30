@@ -299,7 +299,6 @@ pub struct PortMap {
     pub cluster_name: String,
     pub host: String,
     pub host_fallback: String,
-    pub observability_deployed: bool,
     pub ports: PortEntries,
     pub container_urls: HashMap<String, String>,
     pub host_urls: HashMap<String, String>,
@@ -337,7 +336,6 @@ pub fn generate_port_map(
     cluster_name: &str,
     host: &str,
     host_fallback: &str,
-    observability_deployed: bool,
 ) -> PortMap {
     let ports = PortEntries {
         ac_http: alloc.port(PortOffsets::AC_HTTP),
@@ -356,38 +354,24 @@ pub fn generate_port_map(
         mh_1_grpc: alloc.port(PortOffsets::MH_1_GRPC),
         mh_1_webtransport: alloc.port(PortOffsets::MH_1_WEBTRANSPORT),
         postgres: alloc.port(PortOffsets::POSTGRES),
-        prometheus: if observability_deployed {
-            alloc.port(PortOffsets::PROMETHEUS)
-        } else {
-            0
-        },
-        grafana: if observability_deployed {
-            alloc.port(PortOffsets::GRAFANA)
-        } else {
-            0
-        },
-        loki: if observability_deployed {
-            alloc.port(PortOffsets::LOKI)
-        } else {
-            0
-        },
+        prometheus: alloc.port(PortOffsets::PROMETHEUS),
+        grafana: alloc.port(PortOffsets::GRAFANA),
+        loki: alloc.port(PortOffsets::LOKI),
         k8s_api: alloc.port(PortOffsets::K8S_API),
     };
 
     let mut container_urls = HashMap::new();
     container_urls.insert("ac".to_string(), format!("http://{host}:{}", ports.ac_http));
     container_urls.insert("gc".to_string(), format!("http://{host}:{}", ports.gc_http));
-    if observability_deployed {
-        container_urls.insert(
-            "prometheus".to_string(),
-            format!("http://{host}:{}", ports.prometheus),
-        );
-        container_urls.insert(
-            "grafana".to_string(),
-            format!("http://{host}:{}", ports.grafana),
-        );
-        container_urls.insert("loki".to_string(), format!("http://{host}:{}", ports.loki));
-    }
+    container_urls.insert(
+        "prometheus".to_string(),
+        format!("http://{host}:{}", ports.prometheus),
+    );
+    container_urls.insert(
+        "grafana".to_string(),
+        format!("http://{host}:{}", ports.grafana),
+    );
+    container_urls.insert("loki".to_string(), format!("http://{host}:{}", ports.loki));
 
     let mut host_urls = HashMap::new();
     host_urls.insert(
@@ -398,26 +382,23 @@ pub fn generate_port_map(
         "gc".to_string(),
         format!("http://localhost:{}", ports.gc_http),
     );
-    if observability_deployed {
-        host_urls.insert(
-            "prometheus".to_string(),
-            format!("http://localhost:{}", ports.prometheus),
-        );
-        host_urls.insert(
-            "grafana".to_string(),
-            format!("http://localhost:{}", ports.grafana),
-        );
-        host_urls.insert(
-            "loki".to_string(),
-            format!("http://localhost:{}", ports.loki),
-        );
-    }
+    host_urls.insert(
+        "prometheus".to_string(),
+        format!("http://localhost:{}", ports.prometheus),
+    );
+    host_urls.insert(
+        "grafana".to_string(),
+        format!("http://localhost:{}", ports.grafana),
+    );
+    host_urls.insert(
+        "loki".to_string(),
+        format!("http://localhost:{}", ports.loki),
+    );
 
     PortMap {
         cluster_name: cluster_name.to_string(),
         host: host.to_string(),
         host_fallback: host_fallback.to_string(),
-        observability_deployed,
         ports,
         container_urls,
         host_urls,
@@ -742,12 +723,10 @@ mod tests {
             "devloop-td-42",
             "host.containers.internal",
             "172.17.0.1",
-            true,
         );
 
         assert_eq!(port_map.cluster_name, "devloop-td-42");
         assert_eq!(port_map.host, "host.containers.internal");
-        assert!(port_map.observability_deployed);
         assert_eq!(port_map.ports.ac_http, 24200);
         assert_eq!(port_map.ports.gc_http, 24201);
         assert_eq!(port_map.ports.prometheus, 24300);
@@ -764,23 +743,6 @@ mod tests {
         assert!(port_map.host_urls.contains_key("prometheus"));
         assert!(port_map.host_urls.contains_key("grafana"));
         assert!(port_map.host_urls.contains_key("loki"));
-    }
-
-    #[test]
-    fn test_generate_port_map_no_observability() {
-        let alloc = PortAllocation {
-            base_port: 24200,
-            slot_index: 21,
-        };
-        let port_map = generate_port_map(&alloc, "devloop-test", "localhost", "localhost", false);
-
-        assert!(!port_map.observability_deployed);
-        assert_eq!(port_map.ports.prometheus, 0);
-        assert_eq!(port_map.ports.grafana, 0);
-        assert_eq!(port_map.ports.loki, 0);
-        // Observability URLs should not be present
-        assert!(!port_map.container_urls.contains_key("prometheus"));
-        assert!(!port_map.host_urls.contains_key("grafana"));
     }
 
     #[test]
@@ -855,7 +817,6 @@ mod tests {
             "devloop-test",
             "host.containers.internal",
             "172.17.0.1",
-            true,
         );
         write_port_map(&path, &port_map).unwrap();
 
