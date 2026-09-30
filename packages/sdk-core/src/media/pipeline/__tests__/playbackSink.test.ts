@@ -29,6 +29,9 @@ function fakeContext(): {
       return now;
     },
     destination,
+    createGain() {
+      return { connect(): void {}, disconnect(): void {} } as unknown as GainNode;
+    },
     createBuffer(channels: number, frames: number, sampleRate: number) {
       const data = new Float32Array(frames);
       return {
@@ -80,7 +83,7 @@ describe('scheduled playback sink', () => {
     // the platform would play them simultaneously — audible as a burst, not as
     // speech.
     const { context, started } = fakeContext();
-    const lane = createScheduledPlaybackSink(context, 1).openLane();
+    const lane = createScheduledPlaybackSink(context, 1).openLane(1);
     lane.enqueue(frame() as never);
     lane.enqueue(frame() as never);
     lane.enqueue(frame() as never);
@@ -99,8 +102,8 @@ describe('scheduled playback sink', () => {
     // sums what starts together.
     const { context, started } = fakeContext();
     const sink = createScheduledPlaybackSink(context, 1);
-    const a = sink.openLane();
-    const b = sink.openLane();
+    const a = sink.openLane(1);
+    const b = sink.openLane(1);
     for (let i = 0; i < 5; i += 1) {
       a.enqueue(frame() as never);
       b.enqueue(frame() as never);
@@ -120,7 +123,7 @@ describe('scheduled playback sink', () => {
     // platform plays immediately and all at once. Re-seating turns a gap into
     // silence followed by resumed audio, which is what a listener expects.
     const { context, started, advance } = fakeContext();
-    const lane = createScheduledPlaybackSink(context, 1).openLane();
+    const lane = createScheduledPlaybackSink(context, 1).openLane(1);
     lane.enqueue(frame() as never);
     advance(5);
     lane.enqueue(frame() as never);
@@ -132,8 +135,8 @@ describe('scheduled playback sink', () => {
     // our schedule. At 50 frames a second a leak is a real resource fault.
     const { context } = fakeContext();
     const sink = createScheduledPlaybackSink(context, 1);
-    const a = sink.openLane();
-    const b = sink.openLane();
+    const a = sink.openLane(1);
+    const b = sink.openLane(1);
     let closed = 0;
     a.enqueue(frame(() => (closed += 1)) as never);
     a.close();
@@ -146,8 +149,8 @@ describe('scheduled playback sink', () => {
   it('closing one lane leaves the other lanes playing', () => {
     const { context, started } = fakeContext();
     const sink = createScheduledPlaybackSink(context, 1);
-    const a = sink.openLane();
-    const b = sink.openLane();
+    const a = sink.openLane(1);
+    const b = sink.openLane(1);
     a.close();
     b.enqueue(frame() as never);
     expect(started).toHaveLength(1);
@@ -155,7 +158,7 @@ describe('scheduled playback sink', () => {
 
   it('releases the frame even when the copy throws', () => {
     const { context } = fakeContext();
-    const lane = createScheduledPlaybackSink(context, 1).openLane();
+    const lane = createScheduledPlaybackSink(context, 1).openLane(1);
     let closed = 0;
     const hostile = {
       ...frame(() => (closed += 1)),
@@ -170,9 +173,9 @@ describe('scheduled playback sink', () => {
   it('stops scheduling after the sink closes, including on a lane opened afterwards', () => {
     const { context, started } = fakeContext();
     const sink = createScheduledPlaybackSink(context, 1);
-    const before = sink.openLane();
+    const before = sink.openLane(1);
     sink.close();
-    const after = sink.openLane();
+    const after = sink.openLane(1);
     before.enqueue(frame() as never);
     after.enqueue(frame() as never);
     expect(started).toEqual([]);

@@ -565,6 +565,44 @@ message JoinResponse {
   // redacting `Debug`. OBSERVABILITY: bounded by configuration, but a value
   // rather than a category -- the log line, not a label.
   uint32 kek_rotation_debounce_seconds = 11;
+
+  // MC's cap on the TOTAL number of slots one `ReceiveCapability` declaration
+  // may carry, across all media kinds -- `MC_MAX_RECEIVE_SLOTS`. THE canonical
+  // statement of this field's rules. It is the same
+  // `ClientMediaConfig::max_receive_slots` value MC checks every declaration
+  // against and publishes as `mc_media_receive_slot_cap`. Its legal range is
+  // MC's configuration bound, not restated here:
+  // `crates/mc-service/src/config.rs::MIN_RECEIVE_SLOTS` / `MAX_RECEIVE_SLOTS`.
+  // Never 0 from a conforming MC.
+  //
+  // ADVISORY, NOT AUTHORITY. MC remains the enforcement point: a declaration
+  // exceeding the cap is rejected WHOLE, never clamped and never accepted as a
+  // prefix. A client's local check against this value is a user-experience
+  // pre-check that fails loudly before sending. It MUST NOT replace MC's check,
+  // and a client MUST NOT compute, clamp or shrink its declaration from it --
+  // refuse, never degrade to fewer slots.
+  //
+  // TWO QUANTITIES, NOT A DUPLICATE. The client's declared slot count N is a
+  // REQUEST; this is the bound on it. Same shape as
+  // `EncodingParameters.max_bitrate_bps` versus the client's default bitrate.
+  //
+  // PER SESSION. The value describes the MC instance that served THIS join.
+  // Instances can differ during a configuration rollout, and an ADR-0023
+  // recovery reconnect receives a fresh `JoinResponse`, so a client uses the
+  // latest value it received and never caches one across joins.
+  //
+  // PRESENCE. MC always sets this field, so ABSENT means an older MC (the
+  // supported rollback): the cap is UNKNOWN, and the client declares and relies
+  // on MC's rejection. A client MUST NOT infer a cap and MUST NOT parse the
+  // rejection's message text. A PRESENT 0 is a contract violation, not
+  // absence: a client MUST surface it loudly (log the value, mark it distinct
+  // from "unknown" on its diagnostic surface) and MAY then proceed as if the
+  // cap were unknown. It MUST NOT refuse every declaration locally on it.
+  //
+  // NOT IDENTITY OR KEY MATERIAL. A bounded configuration value: safe to log,
+  // shown in the clear by the redacting `Debug`. OBSERVABILITY: a log value,
+  // never a metric label -- MC already publishes it as a gauge.
+  optional uint32 max_receive_slots = 12;
 }
 
 // Reason for participant leaving.
@@ -803,8 +841,9 @@ message ReceiveCapability {
   // The declared slots.
   //
   // Unbounded on this wire; the proto does not enforce a cap. Slot count is
-  // capped by server-side configuration (ADR-0036 §6), and MC rejects a
-  // declaration exceeding it. Enforcement owner: story task 14.
+  // capped by server-side configuration (ADR-0036 §6): MC rejects a
+  // declaration exceeding it, and the cap is advertised on
+  // `JoinResponse.max_receive_slots`.
   repeated ReceiveSlot slots = 1;
 }
 

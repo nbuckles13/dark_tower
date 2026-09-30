@@ -17,11 +17,14 @@
 //     (the R-23 non-secret allowlist), never a raw Error / `.cause` / `.stack`.
 
 import type {
+  CaptureSourceInfo,
   MediaFrameCounts,
   MeetingSessionEventMap,
+  ReceiveSlotsDiagnostics,
   RosterParticipant,
   SdkError,
 } from '@darktower/sdk-core';
+import type { E2EInstrumentation } from './e2eAnalysis.js';
 
 /** The minimal surface installE2EHooks needs: subscribe to typed session events. */
 export interface SessionEvents {
@@ -38,11 +41,17 @@ export interface SessionEvents {
  * path under ADR-0036 §11, whose per-frame invariant is zero allocation and zero
  * registry lookup — a `bus.emit()` per frame is exactly the shape that rule
  * exists to stop, and it would put a test-only channel on the production forward
- * path. `MeetingSession` satisfies this structurally, so nothing was added to
- * the SDK for the bus's benefit.
+ * path. `MeetingSession` satisfies this structurally. The per-(slot, sender)
+ * receive counters (story 2 R-30) keep the same rule from the other side: an
+ * INJECTED recorder (`e2eAnalysis.ts`) the ingress calls only when present, and
+ * which only a test build injects.
  */
 export interface SessionMediaCounters {
   readonly media: { readonly frameCounts: MediaFrameCounts } | undefined;
+  /** Effective N, its source and the server cap (story 2 R-23). Plain values. */
+  readonly receiveSlots: ReceiveSlotsDiagnostics;
+  /** What feeds the send path, once media has started (story 2 R-7). */
+  readonly captureSource: CaptureSourceInfo | undefined;
 }
 
 /** The surface {@link installE2EHooks} consumes. */
@@ -74,7 +83,10 @@ interface InternalBus {
  * @returns a disposer that stops the frame-count sampler. Callers must invoke it
  * on unmount; in production it is an already-inert no-op.
  */
-export function installE2EHooks(session: E2ESessionHandle): () => void {
+export function installE2EHooks(
+  session: E2ESessionHandle,
+  instrumentation?: E2EInstrumentation,
+): () => void {
   if (__E2E_HOOKS__) {
     const roster = (p: RosterParticipant): Record<string, string> => ({
       participantId: p.participantId,
@@ -141,6 +153,42 @@ export function installE2EHooks(session: E2ESessionHandle): () => void {
       }),
     );
     session.on('mediaConnected', (url) => bus.emit({ type: 'mediaConnected', mhUrl: url }));
+
+    // ------------------------------------------------------------------
+    // STORY 2 R-1 / R-7 / R-23 / R-30 — N, the capture source, the expected
+    // sender per slot, and the three receive-verification layers
+    // ------------------------------------------------------------------
+    //
+    // Same rules as below: whitelist projections of plain values, sender ids
+    // STRINGIFIED (the `joined` convention), never a session or media object on
+    // the bus, and nothing here reaches `MetricsSink`.
+
+    // Effective N and the server cap, readable at runtime — the suite's check
+    // that the build declares the N it was configured with (browser knobs are
+    // outside `dt-guard env-config`). Emitted once the join has told us the cap.
+    session.on('joined', () => {
+      const slots = session.receiveSlots;
+      bus.emit({
+        type: 'receiveSlots',
+        declared: slots.declared,
+        source: slots.source,
+        serverCapState: slots.serverCap.state,
+        ...(slots.serverCap.state !== 'unknown' ? { serverCap: slots.serverCap.value } : {}),
+      });
+    });
+
+    // The EXPECTED sender per slot, from MC's latest assignment. Replace, never
+    // merge — each event is the complete current view.
+    session.on('streamAssignments', (event) =>
+      bus.emit({
+        type: 'slotAssignments',
+        assignments: event.assignments.map((a) => ({
+          slotId: a.slotId,
+          ...(a.senderId !== undefined ? { senderId: a.senderId.toString() } : {}),
+          slotState: a.slotState,
+        })),
+      }),
+    );
     session.on('error', (err) => bus.emit({ type: 'error', ...projectError(err) }));
 
     // ------------------------------------------------------------------
@@ -159,6 +207,15 @@ export function installE2EHooks(session: E2ESessionHandle): () => void {
     // the voice-activity trace), microphone labels, `deviceId`s, participant
     // names, the meeting code, and any token. `mediaFault` is also absent: it is
     // a DOM-rendered operator signal, not a test observable.
+    //
+    // THE ONE ANALYSED-AUDIO EXCEPTION (story 2 R-30, @security): `receiveAnalysis`
+    // carries a per-lane, band-limited (`E2E_ANALYSIS_BAND_*_HZ`, at most
+    // `E2E_ANALYSIS_MAX_BINS` bins — `e2eAnalysis.ts`) dB MAGNITUDE
+    // spectrum plus a level, sampled on this tick — no phase, no time-domain
+    // samples, no PCM. With a real microphone that is a coarse view of speech
+    // content; its only readers are scripts already in the page, which could tap
+    // the played-back AudioContext directly, so it adds no capability. It never
+    // leaves the bus.
 
     // The latency §10 says is OBSERVED, NEVER GATED. This event carries the
     // number; nothing in the suite compares it against a threshold, and a
@@ -176,7 +233,60 @@ export function installE2EHooks(session: E2ESessionHandle): () => void {
     // ("egress stays flat while muted") needs a handful of reads across a
     // window, not a stream — and a stream would cost a bus event per frame at
     // 50 frames a second on the production hot path.
+    // The capture source is announced ONCE, when media starts: the harness
+    // ASSERTS tone mode from it rather than assuming the dev server was started
+    // with `DT_TEST_TONE=1` (Playwright may reuse an existing server).
+    let captureAnnounced = false;
     const sampler = setInterval(() => {
+      const source = session.captureSource;
+      if (!captureAnnounced && source !== undefined) {
+        captureAnnounced = true;
+        bus.emit({
+          type: 'captureSource',
+          mode: source.mode,
+          ...(source.toneHz !== undefined ? { toneHz: source.toneHz } : {}),
+        });
+      }
+      // Receive layers 1/2 (+ drops) and layer 3, SAMPLED on the same tick.
+      // Cumulative snapshots, never per frame.
+      if (instrumentation !== undefined && session.media !== undefined) {
+        const verification = instrumentation.verification();
+        bus.emit({
+          type: 'receiveLayers',
+          layers: verification.layers.map((l) => ({
+            slot: l.slot,
+            senderId: l.senderId.toString(),
+            keyed: l.keyed,
+            verified: l.verified,
+          })),
+          drops: verification.drops.map((d) => ({
+            slot: d.slot,
+            senderId: d.senderId === null ? null : d.senderId.toString(),
+            reason: d.reason,
+            count: d.count,
+          })),
+          overflow: verification.overflow,
+          atMs: Date.now(),
+        });
+        bus.emit({
+          type: 'receiveAnalysis',
+          // Keyed by the lane's sender; the harness joins it to the slot via
+          // the latest `slotAssignments`.
+          lanes: instrumentation.analysis().map((a) => ({
+            senderId: a.senderId.toString(),
+            levelDbfs: a.levelDbfs,
+            ready: a.ready,
+            sampleRateHz: a.sampleRateHz,
+            fftSize: a.fftSize,
+            smoothingTimeConstant: a.smoothingTimeConstant,
+            binHz: a.binHz,
+            bandStartHz: a.bandStartHz,
+            bandEndHz: a.bandEndHz,
+            spectrumDb: [...a.spectrumDb],
+          })),
+          atMs: Date.now(),
+        });
+      }
       const counts = session.media?.frameCounts;
       // Only while a pipeline exists. Emitting zeroes before `startMedia()`
       // would put samples inside a window where "flat" means nothing.

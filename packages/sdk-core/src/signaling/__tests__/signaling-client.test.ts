@@ -189,6 +189,31 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
     client.close();
   });
 
+  it.each([
+    ['present', 8, 8],
+    ['absent (older MC)', undefined, undefined],
+    ['a present 0 (contract violation), kept as 0', 0, 0],
+  ] as const)(
+    'passes JoinResponse.max_receive_slots through verbatim when %s',
+    async (_label, onWire, expected) => {
+      const wt = new MockWebTransport();
+      const { client, joinPromise } = startJoin(wt);
+      wt.simulateReady();
+      await waitFor(() => wt.getOpenedBidiStreams().length > 0);
+      wt.simulateServerMessage(
+        0,
+        framedJoinResponse({
+          participantId: 'p-self',
+          senderId: 1,
+          ...(onWire !== undefined ? { maxReceiveSlots: onWire } : {}),
+        }),
+      );
+      const joined = (await joinPromise) as Awaited<ReturnType<SignalingClient['join']>>;
+      expect(joined.maxReceiveSlots).toBe(expected);
+      client.close();
+    },
+  );
+
   it('never projects the meeting KEK into the joined event', async () => {
     // events.ts guarantees JoinedEvent carries no key material. Rust has three
     // Debug-redaction tests; this is the TS-side enforcement of the same

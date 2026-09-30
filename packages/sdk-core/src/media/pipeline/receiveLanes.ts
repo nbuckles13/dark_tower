@@ -64,6 +64,19 @@ export interface DecodeLane {
   decode(frame: EncodedAudioFrame): void;
 }
 
+/**
+ * One lane's decode ACTIVITY, for the receive-source deficit (story 2 R-28).
+ *
+ * `epoch` identifies the lane INSTANCE: a sender that leaves and re-enters the
+ * assignment set gets a new lane whose `decoded` restarts at 0, and a new epoch,
+ * so a caller comparing two samples never reads a restart as "decoded nothing".
+ */
+export interface LaneActivity {
+  readonly epoch: number;
+  /** Frames this lane's decoders have OUTPUT (post-decode), monotone per epoch. */
+  readonly decoded: number;
+}
+
 /** Construction options for {@link ReceiveLanes}. */
 export interface ReceiveLanesOptions {
   readonly metrics: MediaMetrics;
@@ -101,6 +114,8 @@ export class ReceiveLanes {
    */
   readonly #lanes = new Map<number, Lane>();
   #closed = false;
+  /** Serial for lane instances; see {@link LaneActivity.epoch}. */
+  #nextEpoch = 0;
 
   constructor(options: ReceiveLanesOptions) {
     this.#options = options;
@@ -131,7 +146,7 @@ export class ReceiveLanes {
     }
     for (const senderId of assigned) {
       if (this.#lanes.has(senderId) || this.#lanes.size >= this.#options.maxLanes) continue;
-      this.#lanes.set(senderId, new Lane(this.#options));
+      this.#lanes.set(senderId, new Lane(this.#options, senderId, (this.#nextEpoch += 1)));
     }
   }
 
@@ -149,6 +164,15 @@ export class ReceiveLanes {
   /** Senders currently assigned and decodable. For assertion and sampling only. */
   get assignedSenders(): readonly number[] {
     return [...this.#lanes.keys()];
+  }
+
+  /**
+   * `senderId`'s lane activity, or `undefined` if it has no lane. Sampled once
+   * per export interval by the pipeline, never per frame.
+   */
+  activityFor(senderId: number): LaneActivity | undefined {
+    const lane = this.#lanes.get(senderId);
+    return lane ? { epoch: lane.epoch, decoded: lane.decodedCount } : undefined;
   }
 
   /** Frames waiting on a lane's decoder. For the per-lane accounting identity. */
@@ -178,10 +202,14 @@ class Lane implements DecodeLane {
   #lastFaultAtMs: number | undefined;
   readonly #pending: EncodedAudioFrame[] = [];
   #closed = false;
+  /** Decoder OUTPUTS on this lane (post-decode). One increment per output. */
+  #decoded = 0;
+  readonly epoch: number;
 
-  constructor(options: ReceiveLanesOptions) {
+  constructor(options: ReceiveLanesOptions, senderId: number, epoch: number) {
     this.#options = options;
-    this.#playback = options.playback.openLane();
+    this.epoch = epoch;
+    this.#playback = options.playback.openLane(senderId);
     // Created EAGERLY at assignment, so it is usually ready before MH forwards
     // the sender's first frame.
     this.#ensureDecoder();
@@ -189,6 +217,10 @@ class Lane implements DecodeLane {
 
   get pendingCount(): number {
     return this.#pending.length;
+  }
+
+  get decodedCount(): number {
+    return this.#decoded;
   }
 
   decode(frame: EncodedAudioFrame): void {
@@ -239,8 +271,10 @@ class Lane implements DecodeLane {
         sampleRateHz: this.#options.sampleRateHz,
         channels: this.#options.channels,
         onOutput: (data) => {
-          if (instance === this.#instance) this.#playback.enqueue(data);
-          else data.close();
+          if (instance === this.#instance) {
+            this.#decoded += 1;
+            this.#playback.enqueue(data);
+          } else data.close();
         },
         onError: () => this.#onFault(instance),
       })

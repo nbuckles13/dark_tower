@@ -120,9 +120,13 @@
 #   Audio: one microphone feeding N participants feeds back. The answer is the
 #   test-tone send mode (R-7) — a constant per-participant tone in place of the
 #   microphone, enabled by the Vite BUILD-TIME define __DT_TEST_TONE__ (owned by
-#   the client; never a runtime setting, never in a production bundle). This
-#   script does not switch it on. Headphones are for the separate one-microphone
-#   human-audibility pass, not the answer to N-way feedback.
+#   the client; never a runtime setting, never in a production bundle). It is
+#   OPT-IN: run `DT_TEST_TONE=1 scripts/dev-web.sh` — this script passes the
+#   environment through to the dev server, whose vite.config reads it
+#   (packages/web-app/vite/testTone.ts accepts only unset or exactly 1). Each
+#   participant's tone is derived from its per-meeting sender id. Headphones
+#   are for the separate one-microphone human-audibility pass, not the answer
+#   to N-way feedback.
 #   N: VITE_DT_RECEIVE_SLOTS, the client's audio receive-slot count — each
 #   participant hears at most N others. Exported by this script (default 3) and
 #   echoed in the preflight beside the MC cap. ONE value per dev server: every
@@ -721,6 +725,19 @@ check_receive_slots() {
 }
 check_receive_slots
 
+# ─── Test-tone state (INFORMATIONAL, never validated here) ───
+# The other opt-in knob in this workflow, printed beside N so it is visible
+# before anyone has to listen for it. NOT re-validated in bash: the one predicate
+# is packages/web-app/vite/testTone.ts, which throws on any value but unset or
+# exactly 1 — a bash copy would drift from it. A reused dev server started with
+# a different setting keeps ITS value; the E2E bus `captureSource` event is the
+# runtime truth.
+if [[ -n "${DT_TEST_TONE:-}" ]]; then
+    echo "  test tone: ON requested (DT_TEST_TONE=${DT_TEST_TONE}; vite.config.ts accepts only 1 and fails the launch otherwise)"
+else
+    echo "  test tone: OFF (DT_TEST_TONE unset) — every participant sends its microphone"
+fi
+
 # ─── demo.localhost resolution (WARN — WSL2-side tooling only) ───
 # This checks THIS machine's resolver (/etc/hosts + glibc). It is NOT the browser's:
 # a host browser reads its own hosts file, and Chromium resolves *.localhost to
@@ -774,7 +791,7 @@ echo "   Open Chrome at: http://${DEMO_HOST}:5173"
 echo "   N+1 participants (N=${VITE_DT_RECEIVE_SLOTS}, ${N_SOURCE}): open $((VITE_DT_RECEIVE_SLOTS + 1)) browsing contexts on"
 echo "   THIS machine — demo Chrome profiles recommended, one per participant — each signed"
 echo "   in as a DISTINCT registered account, all joining the same meeting code."
-echo "   Audio for N-way: the test-tone build (__DT_TEST_TONE__, see --help), not one shared mic."
+echo "   Audio for N-way: the test-tone build (DT_TEST_TONE=1 -> __DT_TEST_TONE__, see --help), not one shared mic."
 echo
 # Launch through the Nx `dev` target, NOT `pnpm --filter … dev`. The web-app
 # `dev` target declares `dependsOn: proto-gen:codegen`, so Nx generates the

@@ -238,6 +238,8 @@ export class FakeAudioCodecs {
 
 /** One lane's record, in lane-open order on `RecordingPlaybackSink.lanes`. */
 export interface RecordingPlaybackLane {
+  /** The sender the SDK opened this lane for (`PlaybackSink.openLane`). */
+  readonly senderId: number;
   /** What THIS lane played, in order. */
   readonly played: Uint8Array[];
   readonly closed: boolean;
@@ -260,8 +262,8 @@ export class RecordingPlaybackSink {
   leaked = 0;
   closeCount = 0;
 
-  openLane(): { enqueue(data: never): void; close(): void } {
-    const lane = { played: [] as Uint8Array[], closed: false };
+  openLane(senderId: number): { enqueue(data: never): void; close(): void } {
+    const lane = { senderId, played: [] as Uint8Array[], closed: false };
     this.lanes.push(lane);
     return {
       enqueue: (data: never) => {
@@ -287,7 +289,7 @@ export class RecordingPlaybackSink {
   }
 
   factory = async (): Promise<{
-    openLane(): { enqueue(data: never): void; close(): void };
+    openLane(senderId: number): { enqueue(data: never): void; close(): void };
     close(): void;
   }> => this;
 }

@@ -7,7 +7,13 @@
 import type { SdkError } from '../errors/SdkError.js';
 import type { FetchLike } from '../http/types.js';
 import type { MetricsSink } from '../telemetry/MetricsSink.js';
-import type { MediaConfig } from '../config/clientConfig.js';
+import type {
+  MediaConfig,
+  ParsedReceiveSlots,
+  ReceiveSlotsSource,
+} from '../config/clientConfig.js';
+import type { MediaCaptureSourceMode } from '../media/setup/mediaMetrics.js';
+import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
 import type {
   AudioDecoderFactory,
   AudioEncoderFactory,
@@ -175,21 +181,52 @@ export interface MeetingSessionEventMap {
 
 /** Construction options for {@link MeetingSession}. */
 
-/**
- * The receive slot this client declares by default.
- *
- * ADR-0036 §6: a slot id is SUBSCRIBER-SCOPED, not globally unique, so choosing
- * a constant is safe — two subscribers both choosing 0 do not collide, because a
- * media handler's routing table is keyed on (subscriber, slot_id).
- */
-export const DEFAULT_AUDIO_SLOT_ID = 0;
-
 /** Options for `MeetingSession.startMedia`. */
 export interface StartMediaOptions {
   /** `MediaDeviceInfo.deviceId` of the chosen microphone; the default when absent. */
   readonly deviceId?: string;
-  /** The slot id to declare. Defaults to {@link DEFAULT_AUDIO_SLOT_ID}. */
-  readonly slotId?: number;
+}
+
+/**
+ * MC's receive-slot cap as this session learned it from `JoinResponse`
+ * (`max_receive_slots`; see its proto comment, the canonical statement).
+ *
+ *   * `known` — MC advertised a cap. The declaration is checked against it.
+ *   * `unknown` — the field was absent: an older MC (the supported rollback), or
+ *     no join yet. The SDK declares and MC's whole-declaration rejection is the
+ *     enforcer; nothing is inferred.
+ *   * `invalid` — MC sent a PRESENT 0, a contract violation. Surfaced (here and
+ *     as a console WARN) and then treated like `unknown`, never as "refuse
+ *     everything".
+ */
+export type ReceiveSlotCap =
+  | { readonly state: 'known'; readonly value: number }
+  | { readonly state: 'unknown' }
+  | { readonly state: 'invalid'; readonly value: number };
+
+/**
+ * The effective receive-slot configuration, readable at runtime (story 2 R-23):
+ * "why can't I hear the sixth person" is answered by these two numbers.
+ * Numbers and a bounded source token only.
+ */
+export interface ReceiveSlotsDiagnostics {
+  /** N: the audio receive slots this client declares (slot ids `0..N-1`). */
+  readonly declared: number;
+  /** Whether N was configured by the embedder or is the SDK default. */
+  readonly source: ReceiveSlotsSource;
+  /** The server cap, as the latest join advertised it. */
+  readonly serverCap: ReceiveSlotCap;
+}
+
+/**
+ * What feeds this session's send path, once `startMedia()` has chosen it.
+ * `toneHz` is present only in a test-tone build (`__DT_TEST_TONE__`): the
+ * frequency derived from this participant's meeting-scoped sender id, so a test
+ * harness reads expected tones rather than restating the derivation.
+ */
+export interface CaptureSourceInfo {
+  readonly mode: MediaCaptureSourceMode;
+  readonly toneHz?: number;
 }
 
 export interface MeetingSessionOptions {
@@ -226,4 +263,18 @@ export interface MeetingSessionOptions {
   readonly decoderFactory?: AudioDecoderFactory;
   /** Playback sink factory. Defaults to `AudioContext`; injected for tests. */
   readonly playbackFactory?: PlaybackSinkFactory;
+  /**
+   * N, as parsed by `parseReceiveSlots` (e.g. from `VITE_DT_RECEIVE_SLOTS`), with
+   * its source. When present it sets `mediaConfig.receive.audioSlots`; when
+   * absent N is whatever `mediaConfig` says (the SDK default unless the embedder
+   * supplied a media config). See `ReceiveConfig.audioSlots`: N is a REQUEST
+   * bounded by MC's `MC_MAX_RECEIVE_SLOTS`, rejected whole above it.
+   */
+  readonly receiveSlots?: ParsedReceiveSlots;
+  /**
+   * TEST-ONLY receive verification (story 2 R-30). Absent in production: the web
+   * app injects one only inside `if (__E2E_HOOKS__)`. See
+   * `media/pipeline/receiveVerification.ts`.
+   */
+  readonly receiveVerification?: ReceiveVerificationRecorder;
 }

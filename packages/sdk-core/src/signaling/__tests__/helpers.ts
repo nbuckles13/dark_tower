@@ -71,6 +71,8 @@ export interface JoinResponseInit {
   // Present so a test can construct the leak scenario: the meeting KEK is on the
   // wire but must never be projected into `JoinedEvent` (events.ts guarantee).
   meetingKek?: Uint8Array;
+  /** `JoinResponse.max_receive_slots`; omitted = absent on the wire. */
+  maxReceiveSlots?: number;
 }
 
 export function buildJoinResponse(init: JoinResponseInit = {}) {
@@ -92,6 +94,7 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
     correlationId: init.correlationId ?? '',
     bindingToken: init.bindingToken ?? '',
     meetingKek: init.meetingKek ?? new Uint8Array(),
+    ...(init.maxReceiveSlots !== undefined ? { maxReceiveSlots: init.maxReceiveSlots } : {}),
   });
 }
 

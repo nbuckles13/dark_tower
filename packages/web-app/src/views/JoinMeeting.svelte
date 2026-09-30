@@ -14,6 +14,7 @@
   import { MeetingSessionState } from '@darktower/sdk-core';
   import { buildMeetingSession } from '../lib/session.js';
   import { installE2EHooks } from '../lib/e2eBus.js';
+  import { createE2EInstrumentation } from '../lib/e2eAnalysis.js';
   import { errorText, isSessionRejection } from '../lib/errorText.js';
   import InMeeting from './InMeeting.svelte';
 
@@ -33,11 +34,15 @@
     onSessionInvalid: () => void;
   } = $props();
 
+  // Story 2 R-30: the receive-side instrumentation for the E2E bus — `undefined`
+  // in production, where it is eliminated with the bus. Built BEFORE the session
+  // so it can be injected into it.
+  const e2e = createE2EInstrumentation();
   // svelte-ignore state_referenced_locally
-  const session = buildMeetingSession(config);
+  const session = buildMeetingSession(config, e2e);
   // Returns a disposer because the bus now runs a sampling timer in test builds
   // (a no-op function in production, where the whole bus is eliminated).
-  const disposeE2EHooks = installE2EHooks(session);
+  const disposeE2EHooks = installE2EHooks(session, e2e);
   const store = bindMeetingSession(session);
   onDestroy(() => {
     disposeE2EHooks();

@@ -88,6 +88,9 @@ processors:
           - dt_client_media_roster_key_rebinds_total
           - dt_client_media_kek_generations_retained_total
           - dt_client_media_decode_queue_dropped_total
+          - dt_client_media_capture_source
+          - dt_client_media_receive_source_deficit_total
+          - dt_client_media_receive_slots_rejected_total
           - dt_client_time_to_first_media_frame_ms
 
   # ---------------------------------------------------------------------
@@ -146,7 +149,7 @@ processors:
     metric_statements:
       - context: datapoint
         statements:
-          # --- (b) keep_keys: exactly seven keys, in two owned groups ---
+          # --- (b) keep_keys, in two owned groups ---
           #
           # GROUP 1 — the ADR-0036 §11 media contract label set (observability's).
           #   client_version, org_id, key_custody
@@ -154,10 +157,14 @@ processors:
           # and restated in `docs/observability/label-taxonomy.md` R3.
           #
           # GROUP 2 — the per-metric discriminators (global-controller's + security's),
-          # the same five-key widening applied to GC's datapoint tier minus
-          # key_custody: reason, outcome, action, source.
+          # the same widening applied to GC's datapoint tier
+          # (`MEDIA_DATAPOINT_EXTRA`) minus key_custody: reason, outcome,
+          # action, source, mode. `mode` (story 2 task 13) is carried only by
+          # `dt_client_media_capture_source` — `microphone` | `test_tone`, a
+          # build-time property; its presence under `test_tone` outside dev IS
+          # the signal.
           #
-          # Two groups rather than a flat seven because the next editor must
+          # Two groups rather than a flat list because the next editor must
           # know WHICH owner to consult for a given key; flattened, they edit
           # whichever they found first.
           #
@@ -192,7 +199,7 @@ processors:
           # go dark. NO MERGED LIST IS CORRECT FOR BOTH QUESTIONS.
           # `dt-guard client-metrics-export` (G4) asserts this list is a SUBSET
           # of GC's two, so the two encodings cannot drift apart silently.
-          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source"])
+          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source", "mode"])
 
           # --- key_custody: asserted here, not accepted from a browser ---
           #
@@ -225,7 +232,7 @@ processors:
           # control. The length cap bounds BYTES PER SERIES, **not** the number
           # of distinct series: a patched client sending a million distinct
           # 8-character values defeats it entirely. Nothing here bounds
-          # distinct-value COUNT for these four keys, and no comment may claim
+          # distinct-value COUNT for these keys, and no comment may claim
           # it does. The accepted exposure is series-count inflation, which is
           # visible in series count, in `memory_limiter`, and in
           # `delta_to_cumulative`'s `max_streams`.
@@ -273,6 +280,7 @@ processors:
           - set(attributes["outcome"], "invalid") where attributes["outcome"] != nil and (not IsString(attributes["outcome"]) or not IsMatch(attributes["outcome"], "^[a-z_]{1,64}$"))
           - set(attributes["action"], "invalid") where attributes["action"] != nil and (not IsString(attributes["action"]) or not IsMatch(attributes["action"], "^[a-z_]{1,64}$"))
           - set(attributes["source"], "invalid") where attributes["source"] != nil and (not IsString(attributes["source"]) or not IsMatch(attributes["source"], "^[a-z_]{1,64}$"))
+          - set(attributes["mode"], "invalid") where attributes["mode"] != nil and (not IsString(attributes["mode"]) or not IsMatch(attributes["mode"], "^[a-z_]{1,64}$"))
 
   # ---------------------------------------------------------------------
   # COLLECTOR-CLOCK RESTAMP — the ordering authority at the trust boundary.
@@ -370,9 +378,14 @@ processors:
   # WORST-CASE FIGURE, WITH ITS DENOMINATOR: per per-run `org_id` (with
   # `client_version` and `key_custody` fixed), counting a histogram as ONE
   # stream and assuming every reject reason is observed, the allowlist above
-  # is 20 names / 47 streams (was 14 names / 34 streams before story 2's six
-  # KEK/roster/decode-queue counters, +38%). Against `max_streams: 500` that
-  # is ~10 concurrent runs of headroom (was ~14). Realistic counts are well
+  # is 23 names / 51 streams. Arithmetic: 20 names / 47 streams before story 2
+  # task 13 (was 14 names / 34 streams before story 2's six
+  # KEK/roster/decode-queue counters, +38%); task 13 adds
+  # `dt_client_media_capture_source` x 2 `mode` values = 2,
+  # `dt_client_media_receive_source_deficit_total` = 1 and
+  # `dt_client_media_receive_slots_rejected_total` = 1, so 47 + 4 = 51 (+9%).
+  # Against `max_streams: 500` that is ~9.8 concurrent runs of headroom
+  # (was ~10.6). Realistic counts are well
   # below worst case, since most reject reasons never fire in a run.
   # Recompute this figure whenever a name or a label value set is added.
   delta_to_cumulative:

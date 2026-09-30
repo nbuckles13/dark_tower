@@ -17,6 +17,7 @@ import {
 } from '@darktower/sdk-core';
 import type { WebTransportConnectFn } from '@darktower/sdk-core';
 import type { DemoConfig } from './config.js';
+import type { E2EInstrumentation } from './e2eAnalysis.js';
 
 /** A `connect` that pins the dev MC/MH cert fingerprints (dev only). */
 function makeConnect(config: DemoConfig): WebTransportConnectFn {
@@ -34,12 +35,21 @@ export function buildMeetingClient(config: DemoConfig): MeetingApiClient {
   return new MeetingApiClient({ gcBaseUrl: config.gcBaseUrl });
 }
 
-/** Construct a fresh single-use {@link MeetingSession} (meeting-join view). */
-export function buildMeetingSession(config: DemoConfig): MeetingSession {
+/**
+ * Construct a fresh single-use {@link MeetingSession} (meeting-join view).
+ *
+ * `receiveSlots` is N from `VITE_DT_RECEIVE_SLOTS` (see `config.ts`). `e2e` is
+ * the test build's receive-side instrumentation (`e2eAnalysis.ts`); it is
+ * `undefined` in production, so neither the verification recorder nor the
+ * analysing playback wrapper is ever injected there.
+ */
+export function buildMeetingSession(config: DemoConfig, e2e?: E2EInstrumentation): MeetingSession {
   return new MeetingSession({
     acOriginTemplate: config.acOriginTemplate,
     gcBaseUrl: config.gcBaseUrl,
     connect: makeConnect(config),
+    receiveSlots: config.receiveSlots,
+    ...(e2e ? { receiveVerification: e2e.recorder, playbackFactory: e2e.playbackFactory } : {}),
   });
 }
 

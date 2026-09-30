@@ -13,8 +13,10 @@
 
 import { MeetingSessionState, TypedEventEmitter } from '@darktower/sdk-core';
 import type {
+  CaptureSourceInfo,
   JoinedEvent,
   MediaFrameCounts,
+  ReceiveSlotsDiagnostics,
   MeetingSessionEventMap,
   MuteSnapshot,
 } from '@darktower/sdk-core';
@@ -86,6 +88,15 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
     this.disconnectCalls += 1;
   }
 
+  /** Effective N / source / server cap, as the real facade reports it. Mutable. */
+  receiveSlots: ReceiveSlotsDiagnostics = {
+    declared: 1,
+    source: 'default',
+    serverCap: { state: 'unknown' },
+  };
+  /** Set by `startMedia()` to the microphone, as the real facade's default. */
+  captureSource: CaptureSourceInfo | undefined;
+
   /** The running pipeline, or `undefined` before `startMedia()` — as the real facade. */
   media: FakeAudioPipeline | undefined;
   /** Device ids `startMedia` was called with, in order. */
@@ -103,6 +114,7 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
     if (existing) return existing;
     const pipeline = new FakeAudioPipeline((snapshot) => this.fire('muteChanged', snapshot));
     this.media = pipeline;
+    this.captureSource ??= { mode: 'microphone' };
     return pipeline;
   }
 

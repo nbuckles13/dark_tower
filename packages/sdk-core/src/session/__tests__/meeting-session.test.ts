@@ -22,6 +22,20 @@ import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
 import { MeetingSessionState } from '../events.js';
 import type { JoinCredentials, MeetingSessionOptions } from '../events.js';
 import { MediaConnectionError } from '../../errors/MediaConnectionError.js';
+import { SignalingError, SignalingErrorCode } from '../../errors/SignalingError.js';
+import type { SdkError } from '../../errors/SdkError.js';
+import {
+  ClientConfigError,
+  DEFAULT_CLIENT_CONFIG,
+  DEFAULT_RECEIVE_AUDIO_SLOTS,
+} from '../../config/clientConfig.js';
+import { selectCaptureSource } from '../mediaSelection.js';
+import { createMicrophoneCapture } from '../../media/setup/capture.js';
+import {
+  JOIN_BAG_MARKER,
+  joinBagViolations,
+  readGrandfatheredRoster,
+} from '../../__tests__/joinLabelRoster.js';
 import { MeetingUnauthorizedError } from '../../errors/MeetingError.js';
 import { ConnectionState, SlotState } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { FetchLike } from '../../http/types.js';
@@ -1324,7 +1338,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     // left in flight to wait for.
     await waitFor(() => applied.mock.calls.length === 1);
     expect(applied.mock.calls[0]?.[0]).toEqual([
-      { slotId: 0, senderId: undefined, mediaHandlerUrl: '' },
+      { slotId: 0, senderId: undefined, mediaHandlerUrl: '', active: false },
     ]);
     expect(pipeline.assignedSenders).toEqual([]);
 
@@ -1523,5 +1537,333 @@ describe('MeetingSession — media absence-signals (ADR-0036 §5/§6/§10)', () 
     ).toEqual(expect.arrayContaining(['muteChanged', 'firstMediaFrame', 'fault']));
 
     session.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 2 task 13: receive-slot count N, the advertised server cap, and the
+// capture-source selection (R-1, R-7, R-23)
+// ---------------------------------------------------------------------------
+
+describe('MeetingSession — receive slots N and the server cap (story 2 R-1, R-23)', () => {
+  const KEK = new Uint8Array(32).fill(0x11);
+
+  async function joinedWith(opts: {
+    readonly receiveSlots?: { count: number; source: 'configured' | 'default' };
+    readonly maxReceiveSlots?: number;
+    readonly injectCapture?: boolean;
+  }): Promise<{
+    session: MeetingSession;
+    mocks: Map<string, MockWebTransport>;
+    sink: InMemoryMetricsSink;
+  }> {
+    const mocks = new Map<string, MockWebTransport>();
+    const capture = new FakeCaptureSource();
+    const codecs = new FakeAudioCodecs();
+    const playback = new RecordingPlaybackSink();
+    const sink = new InMemoryMetricsSink();
+    const session = makeSession(mocks, {
+      metricsSink: sink,
+      ...(opts.injectCapture === false ? {} : { captureFactory: async () => capture as never }),
+      encoderFactory: codecs.encoderFactory as never,
+      decoderFactory: codecs.decoderFactory as never,
+      playbackFactory: playback.factory as never,
+      ...(opts.receiveSlots ? { receiveSlots: opts.receiveSlots } : {}),
+    });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await waitFor(() => mocks.has(MC_ENDPOINT));
+    const mc = mocks.get(MC_ENDPOINT)!;
+    mc.simulateReady();
+    await waitFor(() => mc.getOpenedBidiStreams().length > 0);
+    mc.simulateServerMessage(
+      0,
+      framedJoinResponse({
+        mediaServers: MEDIA_SERVERS,
+        senderId: 258,
+        meetingKek: KEK,
+        kekGeneration: 0,
+        ...(opts.maxReceiveSlots !== undefined ? { maxReceiveSlots: opts.maxReceiveSlots } : {}),
+      }),
+    );
+    await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
+    for (const url of MEDIA_SERVERS) mocks.get(url)!.simulateReady();
+    await joining;
+    return { session, mocks, sink };
+  }
+
+  function declaredSlots(mocks: Map<string, MockWebTransport>): number[] | undefined {
+    const capability = decodeOutboundClientMessages(
+      mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0),
+    ).find((m) => m.message.case === 'receiveCapability');
+    if (capability?.message.case !== 'receiveCapability') return undefined;
+    return capability.message.value.slots.map((s) => s.slotId);
+  }
+
+  function rejectedCount(sink: InMemoryMetricsSink): number {
+    return sink
+      .getRecordedMetrics()
+      .filter((m) => m.name === 'dt_client_media_receive_slots_rejected_total')
+      .reduce((sum, m) => sum + m.value, 0);
+  }
+
+  it('declares slots 0..N-1 for the configured N, within the advertised cap', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      receiveSlots: { count: 3, source: 'configured' },
+      maxReceiveSlots: 8,
+    });
+    await rig.session.startMedia();
+    expect(declaredSlots(rig.mocks)).toEqual([0, 1, 2]);
+    expect(rig.session.receiveSlots).toEqual({
+      declared: 3,
+      source: 'configured',
+      serverCap: { state: 'known', value: 8 },
+    });
+    // Zero-initialised, never incremented.
+    expect(rejectedCount(rig.sink)).toBe(0);
+    expect(
+      rig.sink
+        .getRecordedMetrics()
+        .some((m) => m.name === 'dt_client_media_receive_slots_rejected_total'),
+    ).toBe(true);
+    rig.session.disconnect();
+  });
+
+  it('an N above the client ceiling fails at CONSTRUCTION with the typed error, before any use', () => {
+    const mocks = new Map<string, MockWebTransport>();
+    const ceiling = DEFAULT_CLIENT_CONFIG.media.ingress.maxDecodeLanes;
+    expect(() =>
+      makeSession(mocks, { receiveSlots: { count: ceiling + 1, source: 'configured' } }),
+    ).toThrow(ClientConfigError);
+    // Nothing was dialled, so nothing could have been declared.
+    expect(mocks.size).toBe(0);
+  });
+
+  it('accepts N exactly at the cap', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      receiveSlots: { count: 4, source: 'configured' },
+      maxReceiveSlots: 4,
+    });
+    await rig.session.startMedia();
+    expect(declaredSlots(rig.mocks)).toEqual([0, 1, 2, 3]);
+    rig.session.disconnect();
+  });
+
+  it('refuses N above the cap LOUDLY — typed, counted, nothing declared, never shrunk', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      receiveSlots: { count: 5, source: 'configured' },
+      maxReceiveSlots: 4,
+    });
+    const err = await rig.session.startMedia().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SignalingError);
+    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.ReceiveSlotsOverCap);
+    // Both quantities in the message, numbers only.
+    expect((err as SignalingError).message).toContain('5');
+    expect((err as SignalingError).message).toContain('4');
+    // The redaction allowlist carries no cause and no payload.
+    expect(Object.keys((err as SignalingError).toJSON()).sort()).not.toContain('cause');
+    expect(rejectedCount(rig.sink)).toBe(1);
+    // NO declaration at all — never a prefix, never one silent slot.
+    expect(declaredSlots(rig.mocks)).toBeUndefined();
+    expect(rig.session.media).toBeUndefined();
+    rig.session.disconnect();
+  });
+
+  it('declares when the cap is ABSENT (older MC): cap unknown, MC is the backstop', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({ receiveSlots: { count: 5, source: 'configured' } });
+    await rig.session.startMedia();
+    expect(declaredSlots(rig.mocks)).toEqual([0, 1, 2, 3, 4]);
+    expect(rig.session.receiveSlots.serverCap).toEqual({ state: 'unknown' });
+    expect(rejectedCount(rig.sink)).toBe(0);
+
+    // THE BACKSTOP IS LOUD TOO (R-1): MC rejects the whole declaration with an
+    // ErrorMessage, which surfaces as a session `error` carrying the server code
+    // — never parsed for its text, never a silent single slot.
+    const errors: SdkError[] = [];
+    rig.session.on('error', (e) => errors.push(e));
+    rig.mocks
+      .get(MC_ENDPOINT)!
+      .simulateServerMessage(
+        0,
+        framedError(ErrorCode.INVALID_REQUEST, 'receive capability rejected: too many slots'),
+      );
+    await waitFor(() => errors.length === 1);
+    expect(errors[0]?.toJSON().serverCode).toBe('INVALID_REQUEST');
+    expect(rig.session.media?.assignedSenders).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  it('surfaces a PRESENT 0 cap loudly and distinctly, then proceeds as unknown', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rig = await joinedWith({
+      receiveSlots: { count: 2, source: 'configured' },
+      maxReceiveSlots: 0,
+    });
+    expect(rig.session.receiveSlots.serverCap).toEqual({ state: 'invalid', value: 0 });
+    await rig.session.startMedia();
+    // Not "refuse everything": the declaration goes out.
+    expect(declaredSlots(rig.mocks)).toEqual([0, 1]);
+    const warned = warn.mock.calls.map((c) => c.join(' '));
+    expect(warned.some((line) => line.includes('[dt-media-slots]') && line.includes('0'))).toBe(
+      true,
+    );
+    rig.session.disconnect();
+  });
+
+  it('reports the SDK default N with source "default" when nothing is configured', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({ maxReceiveSlots: 8 });
+    await rig.session.startMedia();
+    expect(rig.session.receiveSlots.declared).toBe(DEFAULT_RECEIVE_AUDIO_SLOTS);
+    expect(rig.session.receiveSlots.source).toBe('default');
+    expect(declaredSlots(rig.mocks)).toEqual([0]);
+    rig.session.disconnect();
+  });
+
+  it('logs N with its source and the cap as numbers only', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      receiveSlots: { count: 2, source: 'configured' },
+      maxReceiveSlots: 8,
+    });
+    await rig.session.startMedia();
+    const line = info.mock.calls.map((c) => c.join(' ')).find((l) => l.includes('dt-media-slots'));
+    expect(line).toBe('[dt-media-slots] declaring N=2 receive slots (configured); server cap 8');
+    rig.session.disconnect();
+  });
+});
+
+describe('MeetingSession — capture source (story 2 R-7)', () => {
+  it('the DEFAULT capture is the microphone when __DT_TEST_TONE__ is off (@security A3)', async () => {
+    // The flag is `false` under every vitest config, so this run is the
+    // production branch: a default-on tone would fail here.
+    expect(__DT_TEST_TONE__).toBe(false);
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, {
+      encoderFactory: new FakeAudioCodecs().encoderFactory as never,
+    });
+    // Before startMedia there is no source.
+    expect(session.captureSource).toBeUndefined();
+    // Structural: the selection's default branch names the microphone factory
+    // and the tone synthesis is reachable only inside the gate.
+    const { readFileSync } = await import('node:fs');
+    const source = readFileSync(new URL('../mediaSelection.ts', import.meta.url), 'utf8');
+    const gate = source.indexOf('if (__DT_TEST_TONE__) {');
+    expect(gate).toBeGreaterThan(0);
+    expect(source.indexOf('createTestToneCapture({')).toBeGreaterThan(gate);
+    expect(source.indexOf("'test_tone'")).toBeGreaterThan(gate);
+    // Behavioural: with the flag off, no injected factory -> the microphone.
+    const chosen = selectCaptureSource(undefined, 258);
+    expect(chosen.info).toEqual({ mode: 'microphone' });
+    expect(chosen.factory).toBe(createMicrophoneCapture);
+    // An injected factory is respected and reported as the microphone.
+    const injected = async () => new FakeCaptureSource() as never;
+    expect(selectCaptureSource(injected, 258).factory).toBe(injected);
+  });
+
+  it('reports the microphone mode on the gauge and the session after startMedia', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const mocks = new Map<string, MockWebTransport>();
+    const capture = new FakeCaptureSource();
+    const codecs = new FakeAudioCodecs();
+    const playback = new RecordingPlaybackSink();
+    const sink = new InMemoryMetricsSink();
+    const session = makeSession(mocks, {
+      metricsSink: sink,
+      captureFactory: async () => capture as never,
+      encoderFactory: codecs.encoderFactory as never,
+      decoderFactory: codecs.decoderFactory as never,
+      playbackFactory: playback.factory as never,
+    });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all', { senderId: 258, meetingKek: new Uint8Array(32).fill(1) });
+    await joining;
+    await session.startMedia();
+    expect(session.captureSource).toEqual({ mode: 'microphone' });
+    const gauges = sink
+      .getRecordedMetrics()
+      .filter((m) => m.name === 'dt_client_media_capture_source');
+    expect(gauges.length).toBeGreaterThan(0);
+    expect(gauges.every((g) => g.labels.mode === 'microphone' && g.value === 1)).toBe(true);
+    session.disconnect();
+  });
+});
+
+describe('join label bag — PRIMARY, behavioural (ADR-0036 §11; story 2 task 13)', () => {
+  // Every emission that carries the join bag (`meeting_id_hash`) must be a metric
+  // on the frozen grandfathered roster READ from client.md. Driven through the
+  // real join -> startMedia -> leave flow with a recording sink, so a name that
+  // reaches the spreading helper by any route is seen.
+  it('only grandfathered metrics carry meeting_id_hash across join, startMedia and leave', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const roster = readGrandfatheredRoster();
+    expect(
+      roster.length,
+      'EXTRACTION FAILURE: empty grandfathered roster parsed from client.md',
+    ).toBeGreaterThan(0);
+
+    const mocks = new Map<string, MockWebTransport>();
+    const sink = new InMemoryMetricsSink();
+    const codecs = new FakeAudioCodecs();
+    const session = makeSession(mocks, {
+      metricsSink: sink,
+      captureFactory: async () => new FakeCaptureSource() as never,
+      encoderFactory: codecs.encoderFactory as never,
+      decoderFactory: codecs.decoderFactory as never,
+      playbackFactory: new RecordingPlaybackSink().factory as never,
+      receiveSlots: { count: 2, source: 'configured' },
+    });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'partial', {
+      senderId: 258,
+      meetingKek: new Uint8Array(32).fill(1),
+      maxReceiveSlots: 8,
+    });
+    await joining;
+    await session.startMedia();
+    session.disconnect();
+
+    const emissions = sink.getRecordedMetrics();
+    // The bag was LIVE: without this, a flow that emitted nothing would pass.
+    expect(emissions.some((e) => JOIN_BAG_MARKER in e.labels)).toBe(true);
+    // And the media side ran too, so its emissions were actually checked.
+    expect(emissions.some((e) => e.name === 'dt_client_media_capture_source')).toBe(true);
+    expect(
+      joinBagViolations(emissions, roster),
+      'VIOLATION: join bag on a non-roster metric',
+    ).toEqual([]);
+  });
+
+  it('NEGATIVE CONTROL: a non-roster emission carrying the bag is a violation, for the right reason', () => {
+    const roster = readGrandfatheredRoster();
+    expect(roster.length).toBeGreaterThan(0);
+    const violations = joinBagViolations(
+      [
+        { name: 'dt_client_join_attempts_total', labels: { meeting_id_hash: 'h', status: 'ok' } },
+        { name: 'dt_client_media_new_thing_total', labels: { meeting_id_hash: 'h' } },
+        { name: 'dt_client_media_frames_sent_total', labels: { org_id: 'o' } },
+      ],
+      roster,
+    );
+    expect(violations).toEqual(['dt_client_media_new_thing_total']);
   });
 });

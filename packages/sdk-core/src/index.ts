@@ -252,6 +252,8 @@ export type { RejectReason, RejectLayer, RejectDetail } from './media/frame/reje
 export {
   DEFAULT_CLIENT_CONFIG,
   DEFAULT_METRIC_EXPORT_INTERVAL_MS,
+  DEFAULT_RECEIVE_AUDIO_SLOTS,
+  parseReceiveSlots,
   MIN_AUDIO_ROTATION_PERIOD_MS,
   KEK_RETENTION_CEILING_MS,
   KEK_RETENTION_FLOOR_MS,
@@ -271,6 +273,9 @@ export type {
   MediaConfig,
   OpusApplication,
   OpusSignal,
+  ParsedReceiveSlots,
+  ReceiveConfig,
+  ReceiveSlotsSource,
   ReceiverStateConfig,
   TelemetryCadenceConfig,
 } from './config/clientConfig.js';
@@ -302,6 +307,7 @@ export type {
   MediaKekInstallRefusal,
   MediaKekRetentionAnomaly,
   MediaKekSource,
+  MediaCaptureSourceMode,
   MediaMetricIdentity,
   MediaMuteAction,
   MediaSendDropReason,
@@ -330,7 +336,14 @@ export type {
 } from './media/setup/rosterKeys.js';
 export { CaptureFailure, MediaCaptureError, listMicrophones } from './media/setup/capture.js';
 export { AudioCodecUnsupportedError } from './media/setup/opus.js';
-export { MediaPlaybackError, PlaybackFailure } from './media/setup/audioPlayback.js';
+export {
+  MediaPlaybackError,
+  PlaybackFailure,
+  // The SDK's default playback sink, exported so an embedder can WRAP it (the
+  // E2E build attaches a per-lane analyser to `PlaybackLane.output`) rather than
+  // re-implement it.
+  createAudioContextPlaybackSink,
+} from './media/setup/audioPlayback.js';
 export type {
   AudioDecoderFactory,
   AudioDecoderSeam,
@@ -358,8 +371,28 @@ export { sframeObjectLength } from './media/frame/sframe.js';
 export { buildPublisherRegion, writeHopSequence } from './media/frame/frameCodec.js';
 export type { PublisherRegionInput } from './media/frame/frameCodec.js';
 
-export { DEFAULT_AUDIO_SLOT_ID } from './session/events.js';
-export type { StartMediaOptions } from './session/events.js';
+export type {
+  CaptureSourceInfo,
+  ReceiveSlotCap,
+  ReceiveSlotsDiagnostics,
+  StartMediaOptions,
+} from './session/events.js';
+
+// Story 2 R-30: the TEST-ONLY receive-verification recorder. Not a door into the
+// hot path: it only RECEIVES counts from an ingress an embedder cannot build,
+// and changes no decision. The web app constructs it only inside
+// `if (__E2E_HOOKS__)`, so production bundles tree-shake it.
+export {
+  BoundedReceiveVerificationRecorder,
+  RECEIVE_VERIFICATION_MAX_KEYS,
+} from './media/pipeline/receiveVerification.js';
+export type {
+  ObservedSlot,
+  ReceiveVerificationDrop,
+  ReceiveVerificationLayers,
+  ReceiveVerificationRecorder,
+  ReceiveVerificationSnapshot,
+} from './media/pipeline/receiveVerification.js';
 export type {
   ReceiveSlotDeclaration,
   SendDirectiveEvent,

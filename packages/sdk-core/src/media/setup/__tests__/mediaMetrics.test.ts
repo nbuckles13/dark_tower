@@ -251,6 +251,10 @@ describe('the story-2 counters carry EXACTLY their stated label sets', () => {
     ],
     ['dt_client_media_kek_generations_retained_total', (m) => m.kekGenerationRetained(), null],
     ['dt_client_media_decode_queue_dropped_total', (m) => m.decodeQueueDropped(), null],
+    // Story 2 task 13.
+    ['dt_client_media_capture_source', (m) => m.captureSource('microphone'), 'mode'],
+    ['dt_client_media_receive_source_deficit_total', (m) => m.receiveSourceDeficit(2), null],
+    ['dt_client_media_receive_slots_rejected_total', (m) => m.receiveSlotsRejected(), null],
   ];
 
   it.each(cases)('%s', (name, emit, discriminator) => {
@@ -286,5 +290,24 @@ describe('the story-2 counters carry EXACTLY their stated label sets', () => {
       'join_response',
       'kek_update',
     ]);
+  });
+});
+
+describe('story 2 task 13 media metrics', () => {
+  it('capture_source is a presence gauge: value 1, the active mode only', () => {
+    const sink = new InMemoryMetricsSink();
+    new MediaMetrics(IDENTITY, sink).captureSource('microphone');
+    const records = sink.getRecordedMetrics();
+    expect(records).toHaveLength(1);
+    expect(records[0]?.value).toBe(1);
+    expect(records[0]?.labels.mode).toBe('microphone');
+  });
+
+  it('the deficit counter adds the COUNT, and 0 is a legal zero-initialisation', () => {
+    const sink = new InMemoryMetricsSink();
+    const m = new MediaMetrics(IDENTITY, sink);
+    m.receiveSourceDeficit(0);
+    m.receiveSourceDeficit(3);
+    expect(sink.getRecordedMetrics().map((r) => r.value)).toEqual([0, 3]);
   });
 });

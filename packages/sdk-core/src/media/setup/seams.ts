@@ -65,6 +65,17 @@ export interface PlaybackLane {
   enqueue(data: AudioData): void;
   /** Release this lane only. Idempotent; other lanes keep playing. */
   close(): void;
+  /**
+   * This lane's own output node, PRE-mix and post-decode — where its audio
+   * enters the shared output. Present on the `AudioContext` sink; absent on
+   * implementations with no audio graph (test doubles).
+   *
+   * An OBSERVATION point only: an embedder may attach an analyser to it (the
+   * E2E build's per-slot tone analysis, `packages/web-app/src/lib/e2eAnalysis.ts`)
+   * but nothing in the SDK reads it, and connecting it anywhere else would
+   * duplicate the lane's audio.
+   */
+  readonly output?: AudioNode;
 }
 
 /**
@@ -79,8 +90,14 @@ export interface PlaybackLane {
  * which is the mix.
  */
 export interface PlaybackSink {
-  /** Open a new lane on this output. One per actively decoded sender. */
-  openLane(): PlaybackLane;
+  /**
+   * Open a new lane on this output. One per actively decoded sender.
+   *
+   * `senderId` is the lane's verified key-id sender. The SDK's own sink ignores
+   * it; it exists so an embedder-wrapped sink can tell lanes apart (the E2E
+   * build keys its per-slot analysis by it). Never a metric label, never logged.
+   */
+  openLane(senderId: number): PlaybackLane;
   /** Release the sink and every lane on it. Idempotent. */
   close(): void;
 }

@@ -25,7 +25,9 @@
 import {
   DEFAULT_CLIENT_CONFIG,
   transmitRewrapLatencyMs,
+  validateMediaConfig,
   type MediaConfig,
+  type ReceiveSlotsSource,
 } from '../config/clientConfig.js';
 import { AuthApiClient } from '../http/AuthApiClient.js';
 import { bytesToHex } from '../media/frame/hex.js';
@@ -36,16 +38,13 @@ import type { JoinedEvent } from '../signaling/events.js';
 import { MediaTransport } from '../media/MediaTransport.js';
 import type { MediaTransportOptions } from '../media/events.js';
 import { MeetingIdentity } from '../media/setup/identity.js';
-import {
-  AudioPipeline,
-  type AudioPipelineOptions,
-  type AudioSendDirective,
-} from '../media/lifecycle/AudioPipeline.js';
+import { AudioPipeline, type AudioPipelineOptions } from '../media/lifecycle/AudioPipeline.js';
 import { MeetingKekHolder } from '../media/setup/kekSource.js';
-import { kekObserver, rosterInvalidationListener } from './mediaWiring.js';
+import { kekObserver, rosterInvalidationListener, sendDirectiveListener } from './mediaWiring.js';
+import { classifySlotCap, receiveSlotIdsToDeclare, selectCaptureSource } from './mediaSelection.js';
 import { MediaMetrics } from '../media/setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
-import { createMicrophoneCapture } from '../media/setup/capture.js';
+import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
 import { createAudioDecoder, createAudioEncoder } from '../media/setup/opus.js';
 import { createAudioContextPlaybackSink } from '../media/setup/audioPlayback.js';
 import type {
@@ -59,18 +58,24 @@ import { validateUserToken } from '../validation/limits.js';
 import { SignalingError, SignalingErrorCode } from '../errors/SignalingError.js';
 import { MeetingUnauthorizedError } from '../errors/MeetingError.js';
 import { CloseReason, normalizeCloseReason } from '../telemetry/closeReason.js';
-import { configureTelemetry, flushMetrics, getMetricsSink } from '../telemetry/telemetryConfig.js';
+import {
+  configureTelemetry,
+  flushMetrics,
+  getMetricExportIntervalMs,
+  getMetricsSink,
+} from '../telemetry/telemetryConfig.js';
 import type { TelemetryConfig } from '../telemetry/telemetryConfig.js';
 import type { MetricLabels, MetricsSink } from '../telemetry/MetricsSink.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 
 import {
-  DEFAULT_AUDIO_SLOT_ID,
   MeetingSessionState,
+  type CaptureSourceInfo,
   type JoinCredentials,
   type JoinOptions,
   type MeetingSessionEventMap,
   type MeetingSessionOptions,
+  type ReceiveSlotsDiagnostics,
   type StartMediaOptions,
 } from './events.js';
 
@@ -295,7 +300,17 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   #pipeline: AudioPipeline | undefined;
   #senderId: number | undefined;
   #orgId = '';
-  readonly #captureFactory: CaptureSourceFactory;
+  /** The embedder's capture factory, if it injected one. See {@link #selectCaptureSource}. */
+  readonly #injectedCaptureFactory: CaptureSourceFactory | undefined;
+  readonly #receiveSlotsSource: ReceiveSlotsSource;
+  readonly #receiveVerification: ReceiveVerificationRecorder | undefined;
+  /**
+   * `JoinResponse.max_receive_slots` from THIS session's join, verbatim
+   * (`undefined` = absent). Per session by construction: a `MeetingSession` is
+   * single-use per join, so nothing is carried across joins.
+   */
+  #advertisedSlotCap: number | undefined;
+  #captureSource: CaptureSourceInfo | undefined;
   readonly #encoderFactory: AudioEncoderFactory;
   readonly #decoderFactory: AudioDecoderFactory;
   readonly #playbackFactory: PlaybackSinkFactory;
@@ -315,12 +330,20 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     this.#connectTimeoutMs = options.connectTimeoutMs;
     this.#joinTimeoutMs = options.joinTimeoutMs;
     this.#metricsSink = options.metricsSink ?? getMetricsSink();
-    this.#mediaConfig = options.mediaConfig ?? DEFAULT_CLIENT_CONFIG.media;
+    const baseMedia = options.mediaConfig ?? DEFAULT_CLIENT_CONFIG.media;
+    this.#mediaConfig = options.receiveSlots
+      ? { ...baseMedia, receive: { ...baseMedia.receive, audioSlots: options.receiveSlots.count } }
+      : baseMedia;
+    // At the boundary, BEFORE N is used: an out-of-ceiling N throws typed, here.
+    validateMediaConfig(this.#mediaConfig);
+    this.#receiveSlotsSource =
+      options.receiveSlots?.source ?? (options.mediaConfig ? 'configured' : 'default');
+    this.#receiveVerification = options.receiveVerification;
     this.#kekSource = new MeetingKekHolder({
       rewrapLatencyMs: transmitRewrapLatencyMs(this.#mediaConfig),
       clock: this.#clock,
     });
-    this.#captureFactory = options.captureFactory ?? createMicrophoneCapture;
+    this.#injectedCaptureFactory = options.captureFactory;
     this.#encoderFactory = options.encoderFactory ?? createAudioEncoder;
     this.#decoderFactory = options.decoderFactory ?? createAudioDecoder;
     this.#playbackFactory = options.playbackFactory ?? createAudioContextPlaybackSink;
@@ -434,6 +457,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
 
       // --- joined ---
       this.#senderId = joined.senderId;
+      this.#advertisedSlotCap = joined.maxReceiveSlots;
       // OUR OWN key goes into the roster resolver, and this is NOT a self-trust
       // branch.
       //
@@ -520,7 +544,15 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       this.#mediaMetrics ??
       new MediaMetrics({ clientVersion: __SDK_VERSION__, orgId: this.#orgId }, this.#metricsSink);
 
-    const slotId = options.slotId ?? DEFAULT_AUDIO_SLOT_ID;
+    // Zero-initialised, so `rate()` has a series before the first refusal.
+    metrics.receiveSlotsRejected(0);
+    const slotIds = receiveSlotIdsToDeclare({
+      count: this.#mediaConfig.receive.audioSlots,
+      source: this.#receiveSlotsSource,
+      cap: classifySlotCap(this.#advertisedSlotCap),
+      metrics,
+    });
+    const capture = selectCaptureSource(this.#injectedCaptureFactory, senderId);
     const media = this.#media;
     const pipelineOptions: AudioPipelineOptions = {
       config: this.#mediaConfig,
@@ -530,7 +562,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         this.#rosterKeys ?? new RosterIdentityKeys(this.#mediaConfig.ingress.maxCachedIdentityKeys),
       senderId,
       identity,
-      declaredSlotIds: [slotId],
+      declaredSlotIds: slotIds,
       senderFor: (url) => media?.getDatagramChannel(url),
       readableFor: (url) => media?.getDatagramChannel(url)?.readable,
       reportMute: (audioMuted) => {
@@ -541,14 +573,18 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
           // Nothing actionable, and nothing safe to log about a mute report.
         });
       },
-      captureFactory: this.#captureFactory,
+      captureFactory: capture.factory,
+      captureSource: capture.info.mode,
+      metricExportIntervalMs: getMetricExportIntervalMs(),
       encoderFactory: this.#encoderFactory,
       decoderFactory: this.#decoderFactory,
       playbackFactory: this.#playbackFactory,
+      ...(this.#receiveVerification ? { verification: this.#receiveVerification } : {}),
       clock: this.#clock,
     };
     const pipeline = new AudioPipeline(pipelineOptions);
     this.#pipeline = pipeline;
+    this.#captureSource = capture.info;
 
     // The remaining three absence-signals (§5/§10), forwarded verbatim — see
     // `session/events.ts`. Subscribed immediately after construction and before
@@ -563,52 +599,12 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     pipeline.on('firstMediaFrame', (elapsedMs) => this.emit('firstMediaFrame', elapsedMs));
     pipeline.on('fault', (fault) => this.emit('mediaFault', fault));
 
-    // The last audio instruction MC gave, so a withdrawal can be applied to it.
-    let lastAudio: AudioSendDirective | undefined;
-    signaling.on('sendDirective', (directive) => {
-      const audio = directive.streams.find((s) => s.mediaKind === 'audio');
-      if (!audio) {
-        // A directive with NO audio stream is MC directing this client to
-        // produce no audio (`SendDirective`: "What MC directs this client to
-        // produce"). MC sends exactly this — `streams: []` — to a publisher
-        // nobody holds: a solo participant, or one whose last holder left.
-        //
-        // It must NOT be ignored, and the reason is FORWARD SECRECY, not tidy
-        // bookkeeping — do not "simplify" this back to an early return.
-        //
-        // Ignoring it kept the STALE instruction, so the pipeline's target set
-        // never reached zero. `AudioPipeline.setSendDirective` rotates the
-        // transmit key on the empty -> non-empty EDGE, and resume-from-empty is
-        // one of only four `rotate()` call sites (see `lifecycle/transmitKeys.ts`,
-        // "the bound is the interval between two consecutive rotations from any
-        // trigger"). Never seeing "empty" made that call site unreachable on this
-        // path. So a publisher whose last holder left, then picked up by a NEW
-        // holder, resumed under the SAME transmit key generation — which the
-        // DEPARTED holder still has, and can therefore decrypt the resumed media
-        // with. That is the window ADR-0036 §4 rotation exists to close.
-        //
-        // Applied as an empty target set, which is exactly §5's "send nothing" —
-        // so MC's two spellings of it (`streams: []`, and a stream with empty
-        // targets) land identically and both arm the resume rotation. A reader
-        // must not have to know which spelling MC happens to emit.
-        //
-        // With no earlier instruction there is nothing to withdraw: egress was
-        // never started, and no placeholder stream number or bitrate is invented.
-        if (lastAudio && lastAudio.targets.length > 0) {
-          lastAudio = { ...lastAudio, targets: [] };
-          pipeline.setSendDirective(lastAudio);
-        }
-        return;
-      }
-      lastAudio = {
-        streamNumber: audio.streamNumber,
-        // MC's directed value when present; the configured DEFAULT otherwise.
-        // Never a local ceiling applied on top — see `clientConfig.ts`.
-        bitrateBps: audio.maxBitrateBps ?? this.#mediaConfig.audio.defaultBitrateBps,
-        targets: audio.targets,
-      };
-      pipeline.setSendDirective(lastAudio);
-    });
+    // What MC directs this client to SEND. The listener carries the load-bearing
+    // empty-directive rule (forward secrecy) — see `mediaWiring.ts`.
+    signaling.on(
+      'sendDirective',
+      sendDirectiveListener(pipeline, this.#mediaConfig.audio.defaultBitrateBps),
+    );
     // RECEIVING comes from the slot assignments, independently of the send
     // directive: a participant nobody holds gets an empty target set and must
     // still hear the slots it holds. Subscribed before the declaration below,
@@ -621,11 +617,14 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
           slotId: a.slotId,
           senderId: a.senderId,
           mediaHandlerUrl: a.mediaHandlerUrl,
+          active: a.slotState === 'active',
         })),
       );
     });
 
-    await signaling.sendReceiveCapability([{ slotId, mediaKind: 'audio' }]);
+    await signaling.sendReceiveCapability(
+      slotIds.map((slotId) => ({ slotId, mediaKind: 'audio' as const })),
+    );
     await pipeline.start(options.deviceId !== undefined ? { deviceId: options.deviceId } : {});
     return pipeline;
   }
@@ -662,6 +661,27 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // that, so there is nothing to seed and nothing to report here.
     if (senderId === undefined || !publicKey) return;
     await this.#rosterKeys?.upsert({ senderId, identityPublicKey: publicKey });
+  }
+
+  /**
+   * The effective receive-slot configuration and the server cap (story 2 R-23),
+   * readable at runtime. Numbers and a bounded source token only.
+   */
+  get receiveSlots(): ReceiveSlotsDiagnostics {
+    return {
+      declared: this.#mediaConfig.receive.audioSlots,
+      source: this.#receiveSlotsSource,
+      serverCap: classifySlotCap(this.#advertisedSlotCap),
+    };
+  }
+
+  /**
+   * What feeds the send path — `undefined` before `startMedia()`. `toneHz` only
+   * in a test-tone build. For the E2E bus and diagnostics; never a metric label
+   * beyond the bounded `mode`.
+   */
+  get captureSource(): CaptureSourceInfo | undefined {
+    return this.#captureSource;
   }
 
   /** The running media pipeline, or `undefined` before `startMedia()`. */

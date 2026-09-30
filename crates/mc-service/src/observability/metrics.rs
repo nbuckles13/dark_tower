@@ -953,13 +953,9 @@ pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
 /// `ClientMediaConfig::max_receive_slots`, the SAME field the capability parse
 /// compares a declaration against, so the published value cannot drift from the
 /// enforced one. There is no numerator to divide it by.
-pub fn set_receive_slot_cap(cap: usize) {
-    // Bounded at 64 at config load; the conversion is total.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "cap is bounded to 1..=64 at config load; exact in f64"
-    )]
-    let value = cap as f64;
+pub fn set_receive_slot_cap(cap: u8) {
+    // `u8` by type, so the conversion is total and exact.
+    let value = f64::from(cap);
     gauge!(
         "mc_media_receive_slot_cap",
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR

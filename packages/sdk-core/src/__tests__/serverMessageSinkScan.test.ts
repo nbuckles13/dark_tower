@@ -42,9 +42,14 @@
 // allow-list label constructor (nothing to label); this is the supplement, not
 // the thing standing between a key and a log line.
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { stripComments } from './stripComments.js';
+import { sourceFiles } from './sourceFiles.js';
+
+// Generated protobuf code is not hand-written and contains no sinks; test
+// sources legitimately construct and inspect these types. `.d.ts` IS scanned.
+const SCAN_SCOPE = { skipDirs: ['__tests__', 'proto'], includeDts: true } as const;
 
 const SRC_ROOT = new URL('..', import.meta.url).pathname;
 
@@ -137,36 +142,6 @@ function blankLiteralText(line: string): string {
   return out;
 }
 
-function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const path = join(dir, entry);
-    if (statSync(path).isDirectory()) {
-      // Generated protobuf code is not hand-written and contains no sinks; test
-      // sources legitimately construct and inspect these types.
-      if (entry === '__tests__' || entry === 'proto') continue;
-      out.push(...sourceFiles(path));
-      continue;
-    }
-    if (entry.endsWith('.ts')) out.push(path);
-  }
-  return out;
-}
-
-/**
- * Blank out comments while PRESERVING LINE NUMBERS.
- *
- * A block comment is replaced by its own newlines rather than deleted, so a
- * reported `file:line` points at the real source. A scan that names the wrong
- * line sends its reader to innocent code and gets dismissed as a false positive
- * — which is how a true finding is lost.
- */
-function stripComments(source: string): string {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ' '))
-    .replace(/(^|[^:])\/\/.*$/gm, '$1');
-}
-
 /**
  * Every `(sink, subject)` hit in one source text.
  *
@@ -202,12 +177,12 @@ describe('no key-bearing value reaches a serialising or persisting sink', () => 
     // A scan that silently covers nothing is worse than no scan: it reports
     // clean while the offending line ships, which ADR-0036 §11 names as strictly
     // worse than an absent control, because an absence gets noticed.
-    expect(sourceFiles(SRC_ROOT).length).toBeGreaterThan(20);
+    expect(sourceFiles(SRC_ROOT, SCAN_SCOPE).length).toBeGreaterThan(20);
   });
 
   it('never passes a key-bearing subject to a sink on the same line', () => {
     const findings: string[] = [];
-    for (const file of sourceFiles(SRC_ROOT)) {
+    for (const file of sourceFiles(SRC_ROOT, SCAN_SCOPE)) {
       findings.push(...scan(file, readFileSync(file, 'utf8')));
     }
     expect(findings, findings.join('\n')).toEqual([]);
@@ -254,7 +229,7 @@ describe('no key-bearing value reaches a serialising or persisting sink', () => 
     // who have the least identity assurance to begin with." So the property is
     // not confidentiality — the public half is public — it is that no storage
     // API is touched at all on this path.
-    for (const file of sourceFiles(SRC_ROOT)) {
+    for (const file of sourceFiles(SRC_ROOT, SCAN_SCOPE)) {
       const source = stripComments(readFileSync(file, 'utf8'));
       for (const api of ['localStorage', 'sessionStorage', 'indexedDB']) {
         expect(source, `${file}: the SDK persists nothing; ${api} must not appear`).not.toContain(

@@ -85,6 +85,8 @@ async function makePipeline(opts: Options = {}): Promise<{
     senderId: SENDER_ID,
     identity,
     declaredSlotIds: [0],
+    captureSource: 'microphone',
+    metricExportIntervalMs: 10_000,
     senderFor: (url) => (opts.senders ? opts.senders[url] : opts.sender),
     readableFor: (url) => (opts.readables ? opts.readables[url] : opts.readable),
     reportMute: () => {},

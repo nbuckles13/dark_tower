@@ -8,6 +8,10 @@ import { resolve } from 'node:path';
 // watch / inner loop.
 export default defineConfig({
   define: {
+    // Story 2 R-7: the test-tone build define is FALSE under every test runner,
+    // so the default suite runs the microphone path and an accidentally
+    // default-on tone cannot hide in it (@security A3).
+    __DT_TEST_TONE__: JSON.stringify(false),
     // Unit tests exercise the dev branch; mirror the non-prod Vite define so
     // `__DEV_TRUST_FINGERPRINT__` resolves under Vitest's transform.
     __DEV_TRUST_FINGERPRINT__: JSON.stringify(true),

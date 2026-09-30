@@ -81,6 +81,7 @@ import type { MediaMetrics } from '../setup/mediaMetrics.js';
 import type { DecodeLane } from './receiveLanes.js';
 import type { FirstMediaObserver } from '../setup/measurement.js';
 import type { HopSequenceMonitor } from './hopSequenceMonitor.js';
+import type { ObservedSlot, ReceiveVerificationRecorder } from './receiveVerification.js';
 
 /** Resolves a verification key from a frame's own `key_id.sender_id`. */
 export interface IdentityKeyResolver {
@@ -113,6 +114,12 @@ export interface IngressPipelineOptions {
   readonly firstMedia: FirstMediaObserver;
   /** Called for every accepted frame, before the decoder is fed. */
   readonly onAccepted?: (frame: AcceptedFrame) => void;
+  /**
+   * Test-only receive verification (story 2 R-30). ABSENT in production: the
+   * web app injects one only inside `if (__E2E_HOOKS__)`. See
+   * `receiveVerification.ts`.
+   */
+  readonly verification?: ReceiveVerificationRecorder;
 }
 
 /**
@@ -132,6 +139,7 @@ export class IngressPipeline {
   readonly #replay: ReplayWindow;
   readonly #firstMedia: FirstMediaObserver;
   readonly #onAccepted: ((frame: AcceptedFrame) => void) | undefined;
+  readonly #verify: ReceiveVerificationRecorder | undefined;
 
   /**
    * Frames that completed the receive path, since construction. Monotone.
@@ -179,6 +187,7 @@ export class IngressPipeline {
     this.#replay = options.replay;
     this.#firstMedia = options.firstMedia;
     this.#onAccepted = options.onAccepted;
+    this.#verify = options.verification;
   }
 
   /**
@@ -250,6 +259,12 @@ export class IngressPipeline {
     this.#framesReceived += 1;
     this.#firstMedia.onFrameReceived();
 
+    // Test-only verification keys (R-30): where this frame was OBSERVED, and
+    // which sender its key id names. Recorded, never decided on. Advanced as the
+    // parse progresses so a drop at any stage carries what was known by then.
+    let observedSlot: ObservedSlot = 'unparsed';
+    let observedSender: number | undefined;
+
     try {
       // `decodeFrame` bounds `payload_length` against the wire maximum BEFORE
       // slicing and returns slices rather than copies, so a reject costs no more
@@ -287,9 +302,13 @@ export class IngressPipeline {
       if (hop.undeclaredStreamId) this.#metrics.undeclaredStreamId();
       if (hop.missing > 0) this.#metrics.downlinkGapFrames(hop.missing);
       if (hop.reordered) this.#metrics.downlinkReorder();
+      observedSlot = hop.undeclaredStreamId ? 'undeclared' : decoded.streamId;
 
       if ('error' in keyed) throw keyed.error;
       const { senderId } = keyed;
+      observedSender = senderId;
+      // Layer 1: the key id names this sender on this slot. Pre-verify.
+      this.#verify?.keyed(observedSlot, senderId);
 
       const identityKey = this.#roster.identityKeyFor(senderId);
       if (!identityKey) {
@@ -306,6 +325,7 @@ export class IngressPipeline {
         this.#metrics.frameDropped('no_roster_entry');
         this.#framesDropped += 1;
         this.#lastDropReason = 'no_roster_entry';
+        this.#verify?.dropped(observedSlot, senderId, 'no_roster_entry');
         return;
       }
 
@@ -369,6 +389,8 @@ export class IngressPipeline {
       // and turns both this getter and the production counter into that trace.
       this.#metrics.frameAccepted();
       this.#framesAccepted += 1;
+      // Layer 2: verified under this sender's roster key AND decrypted.
+      this.#verify?.verified(observedSlot, senderId);
       this.#onAccepted?.({ senderId: Number(opened.senderId), plaintext: opened.plaintext });
       lane.decode({ data: opened.plaintext, timestampUs: 0 });
     } catch (err) {
@@ -382,6 +404,7 @@ export class IngressPipeline {
         // The verbatim token, from the vectors file's closed set. No mapping
         // table here either — see the comment above this catch.
         this.#lastDropReason = err.rejectReason;
+        this.#verify?.dropped(observedSlot, observedSender, err.rejectReason);
         return;
       }
       // Anything else is a defect rather than a wire condition, and it must not

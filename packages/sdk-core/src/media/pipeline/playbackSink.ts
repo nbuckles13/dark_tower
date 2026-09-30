@@ -55,6 +55,8 @@ export function createScheduledPlaybackSink(
 
   return {
     openLane(): PlaybackLane {
+      // `senderId` is deliberately unused here: this sink needs no identity to
+      // mix. See `PlaybackSink.openLane`.
       const lane = createLane(
         context,
         channels,
@@ -81,8 +83,16 @@ function createLane(
 ): PlaybackLane {
   let playheadSeconds = 0;
   let closed = false;
+  // The lane's own unity-gain bus: every scheduled source connects HERE, and the
+  // bus connects to the shared destination, which sums the lanes (the mix). One
+  // node per LANE, created once — not per frame — and the observation point
+  // `PlaybackLane.output` exposes.
+  const output = context.createGain();
+  output.connect(context.destination);
 
   return {
+    output,
+
     enqueue(data: AudioData): void {
       if (closed || isSinkClosed()) {
         // Ownership was transferred to this lane, so a late frame must still be
@@ -103,7 +113,7 @@ function createLane(
 
         const source = context.createBufferSource();
         source.buffer = buffer;
-        source.connect(context.destination);
+        source.connect(output);
 
         const frameSeconds = data.numberOfFrames / data.sampleRate;
         const lead = frameSeconds * LEAD_FRAMES;
@@ -125,6 +135,9 @@ function createLane(
       if (closed) return;
       closed = true;
       playheadSeconds = 0;
+      // Sources already scheduled finish into a disconnected bus: silence, which
+      // is what closing a lane means.
+      output.disconnect();
       onClose();
     },
   };

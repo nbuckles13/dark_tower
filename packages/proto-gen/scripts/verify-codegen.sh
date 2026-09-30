@@ -158,6 +158,12 @@ for symbol in kekRotationDebounceSeconds unreachableSenderIds; do
   assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
 done
 
+# Story 2 task 13 (R-1, R-23) — MC's receive-slot cap advertised on the join
+# response, so the SDK can expose it and refuse an over-cap declaration locally.
+for symbol in maxReceiveSlots; do
+  assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
+done
+
 # ADR-0036 signalling contract — the superseded shapes must be GONE.
 # `StreamAssignment` is deliberately absent from this list: the name is reused
 # by the new shape, so an absence assert on it would contradict the presence

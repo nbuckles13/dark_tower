@@ -26,11 +26,11 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 `OtelMetricsSink`) and exported OTLP-HTTP/proto to the GC telemetry proxy
 (`POST /api/v1/telemetry/v1/metrics`).
 
-> ## WHICH METRICS IN THIS CATALOG ARE QUERYABLE — 20 OF 25, AND THE SPLIT IS DELIBERATE
+> ## WHICH METRICS IN THIS CATALOG ARE QUERYABLE — 23 OF 28, AND THE SPLIT IS DELIBERATE
 >
 > This block **replaces** a "not one metric here is queryable" notice. It was not
 > deleted when the exporter landed, because deleting it would have left a catalog
-> of 25 metrics under a header implying all 25 are queryable — the same
+> of 28 metrics under a header implying all 28 are queryable — the same
 > overclaim-by-omission the original was written to prevent, inverted. Read the
 > per-metric **`Exported:`** marker; it is authoritative and machine-checked
 > **against the committed collector config** (`dt-guard client-metrics-export`
@@ -46,11 +46,12 @@ prefix (ADR-0028 §9). They are emitted via the OTel JS `Meter` (production
 > warns about below, reached by a different route. **So this marker means
 > *catalogued as exported*, not *observed in Prometheus*.**
 >
-> **The 20 media-path metrics ARE queryable.** The original 14 were verified end
+> **The 23 media-path metrics ARE queryable.** The original 14 were verified end
 > to end on the Kind stack from sdk-core's own built bundle through the GC proxy —
 > not a synthetic payload. The six KEK-custody and decode-lane counters added by
-> ADR-0036 story 2 task 7 are exported by the same allowlist; that end-to-end
-> read-back predates them. `MCMediaMissingKeyMaterial`'s full expression returned `0.286` against
+> ADR-0036 story 2 task 7, and the capture-source gauge and the two receive-slot
+> counters added by story 2 task 13, are exported by the same allowlist; that
+> end-to-end read-back predates them. `MCMediaMissingKeyMaterial`'s full expression returned `0.286` against
 > live data; it had never been able to match before.
 >
 > **The 5 ADR-0028 join-flow metrics are deliberately NOT exported.** They are the
@@ -965,6 +966,100 @@ the comment's reader.
   state is retained** — no roster path touches it, in any scope. Roster-held identity keys are **trust-on-first-use**; this
   counter records a change of binding, it says nothing about which binding is
   authentic.
+
+### `dt_client_media_capture_source`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Gauge, value `1`.
+- **Description**: What feeds this client's send path. A **SAFETY OBSERVABLE**:
+  a `test_tone` series outside a dev environment means a test-tone build
+  (story 2 R-7, Vite build-time define `__DT_TEST_TONE__`) is serving real
+  users, whose microphones are then not being sent at all.
+- **Labels**: base + `mode` — `microphone` | `test_tone`, a closed, bounded,
+  identity-free vocabulary (`MediaCaptureSourceMode` in
+  `packages/sdk-core/src/media/setup/mediaMetrics.ts`). The value is a
+  **build-time** property of the bundle, not per user. The `test_tone` token
+  exists in the bundle only inside the define's gate, so a production bundle
+  cannot emit it (asserted by `packages/web-app/tests/bundle-content.test.ts`).
+  Row in `docs/observability/label-taxonomy.md`.
+- **`microphone` means the default microphone path OR an embedder-injected
+  capture factory** (a Playwright fake, a processed stream, ...); only the
+  define-gated built-in tone reports `test_tone`. So the safety signal proves a
+  test-tone build is EMITTING the tone, not merely that a build is test-tone: an
+  injected factory in a `__DT_TEST_TONE__` build still reports `microphone`
+  (`session/mediaSelection.ts:selectCaptureSource`).
+- **Only the active mode's series is emitted.** A microphone build never
+  writes a `test_tone` series at `0`: the signal is the series' PRESENCE, and a
+  zero-valued series would make presence lie. Read it as
+  `count(dt_client_media_capture_source{mode="test_tone"}) > 0`, or
+  `sum by(mode)(...)` on a panel.
+- **A gauge, and that is deliberate here** (the other story-2 client signals
+  are counters because N browsers at one stream identity make a gauge
+  last-writer-wins): last-writer-wins is harmless when every writer writes `1`
+  and only the set of `mode` values matters.
+- **Cadence**: set when the media pipeline starts and re-set on every
+  export-interval tick of the pipeline's own timer (the SDK exports DELTA, and a
+  last-value gauge is exported only for an interval in which it was recorded);
+  the timer stops at teardown so a finished session does not pin the series.
+  The pipeline timer and the OTel reader interval are separate clocks, so a
+  single export can miss a recording: **presence is judged over the lookback
+  window, not per scrape.**
+- **Panel**: `infra/grafana/dashboards/client-media.json`. No alert —
+  deliberate: dev and test environments legitimately carry `test_tone`, and the
+  environment dimension is not on the series.
+
+### `dt_client_media_receive_source_deficit_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter. **Unit: assignment-intervals.**
+- **Description**: Per export interval, the number of **ACTIVE** receive
+  assignments from which this client decoded **no** frame in that interval. An
+  active assignment is a declared slot to which MC has assigned a sender and
+  which MC has not marked source-muted (`slot_state = active`); NOT the declared
+  slot count N. Observed decode activity is the receiver's ground truth, and its
+  divergence from MC's claim is the signal: mirroring slot state would read
+  healthy exactly when MC says active and nothing decodes.
+- **Grace rule**: an assignment counts only if it was already active at the
+  previous tick — i.e. it has been active for a full interval — so a join or a
+  slot re-map does not tick the counter spuriously.
+- **Reading it**: `rate(dt_client_media_receive_source_deficit_total[5m]) *
+  export_interval_s` is the mean number of silent active assignments across the
+  fleet (`export_interval_s` = the SDK's metric export interval,
+  `DEFAULT_METRIC_EXPORT_INTERVAL_MS` in
+  `packages/sdk-core/src/config/clientConfig.ts`, read by the tick through
+  `getMetricExportIntervalMs()`). Premise: the encoder runs with DTX off
+  (`lifecycle/muteState.ts`), so a live, unmuted sender always produces frames
+  and zero decoded frames is a real fault, not silence.
+- **Labels**: base only. **No sender, slot or mode label** — ever.
+- **A counter, not a gauge — deliberately.** N browsers at one stream identity
+  make a gauge last-writer-wins; a counter sums them in the collector.
+  Initialised with `add(0)` at pipeline start, so `rate()` has a series before
+  the first deficit.
+- **Blind spot**: a declaration MC rejects whole produces ZERO active
+  assignments, so this reads 0 — see
+  `dt_client_media_receive_slots_rejected_total` for that case.
+- **Panel**: `infra/grafana/dashboards/client-media.json`. Triage:
+  `docs/runbooks/client-dev-local.md` (receive-source deficit).
+
+### `dt_client_media_receive_slots_rejected_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Description**: `startMedia()` calls refused because the client's declared
+  receive-slot count N exceeds the cap MC advertised on
+  `JoinResponse.max_receive_slots` (`MC_MAX_RECEIVE_SLOTS`). MC rejects such a
+  declaration WHOLE, so the SDK refuses it locally, loudly, before sending —
+  never shrinking N to fit. One increment per refusal. With an MC that predates
+  the field (cap unknown) the SDK declares anyway and MC's
+  `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`
+  counts it instead.
+- **Labels**: base only.
+- **Reads zero on a correctly configured deployment**: N is
+  `VITE_DT_RECEIVE_SLOTS` (a build-time client knob outside `dt-guard
+  env-config`'s reach), and the fix for a non-zero reading is to lower it or
+  raise `MC_MAX_RECEIVE_SLOTS`. Initialised with `add(0)` at session start.
+- **The ONLY signal for this failure**: the participant hears nobody, and
+  `dt_client_media_receive_source_deficit_total` stays at 0 because there are no
+  active assignments to be silent.
+- **Panel**: `infra/grafana/dashboards/client-media.json` (its own panel, next
+  to the deficit). Triage: `docs/runbooks/client-dev-local.md`.
 
 ### `dt_client_time_to_first_media_frame_ms`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).

@@ -211,3 +211,145 @@ test('the disposer stops the sampler', async () => {
     vi.useRealTimers();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Story 2 R-1 / R-7 / R-23 / R-30
+// ---------------------------------------------------------------------------
+
+test('receiveSlots: effective N, its source and the cap are projected on join, numbers only', () => {
+  const session = new MockMeetingSession();
+  session.receiveSlots = {
+    declared: 3,
+    source: 'configured',
+    serverCap: { state: 'known', value: 8 },
+  };
+  install(session);
+  session.fire('joined', {
+    participantId: 'self',
+    senderId: 7,
+    existingParticipants: [],
+    mediaServers: [],
+    correlationId: 'corr',
+    bindingToken: 'bind',
+  });
+  const event = events().find((e) => e['type'] === 'receiveSlots');
+  expect(event).toEqual({
+    type: 'receiveSlots',
+    declared: 3,
+    source: 'configured',
+    serverCapState: 'known',
+    serverCap: 8,
+  });
+});
+
+test('slotAssignments: the EXPECTED sender per slot, stringified, whitelist-only', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  session.fire('streamAssignments', {
+    assignments: [
+      { slotId: 0, senderId: 7, mediaHandlerUrl: 'https://mh:1', slotState: 'active' },
+      { slotId: 1, senderId: undefined, mediaHandlerUrl: '', slotState: 'fewer_sources' },
+    ],
+    unreachableSenderIds: [9],
+  });
+  expect(events().find((e) => e['type'] === 'slotAssignments')).toEqual({
+    type: 'slotAssignments',
+    assignments: [
+      { slotId: 0, senderId: '7', slotState: 'active' },
+      { slotId: 1, slotState: 'fewer_sources' },
+    ],
+  });
+});
+
+test('captureSource is announced ONCE when media starts, so the harness asserts the mode', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    install(session);
+    await session.startMedia();
+    session.captureSource = { mode: 'test_tone', toneHz: 625 };
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 3);
+    const announced = events().filter((e) => e['type'] === 'captureSource');
+    expect(announced).toEqual([{ type: 'captureSource', mode: 'test_tone', toneHz: 625 }]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('receive layers and analysis are SAMPLED from the injected instrumentation, whitelist-only', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    const instrumentation = {
+      recorder: undefined as never,
+      playbackFactory: undefined as never,
+      verification: () => ({
+        layers: [{ slot: 0, senderId: 7, keyed: 5, verified: 4, rogue: 'x' }],
+        drops: [
+          { slot: 'undeclared' as const, senderId: null, reason: 'no_roster_entry', count: 1 },
+        ],
+        overflow: 0,
+      }),
+      analysis: () => [
+        {
+          senderId: 7,
+          levelDbfs: -20,
+          ready: true,
+          sampleRateHz: 48_000,
+          fftSize: 8192,
+          smoothingTimeConstant: 0,
+          binHz: 48_000 / 8192,
+          bandStartHz: 560,
+          bandEndHz: 1200,
+          spectrumDb: [-90, -10, -90],
+          pcm: [1, 2, 3],
+        },
+      ],
+    };
+    disposers.push(installE2EHooks(session, instrumentation as never));
+    // Nothing before media starts.
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+    expect(events().some((e) => e['type'] === 'receiveLayers')).toBe(false);
+
+    await session.startMedia();
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+    const layers = events().find((e) => e['type'] === 'receiveLayers');
+    expect(layers?.['layers']).toEqual([{ slot: 0, senderId: '7', keyed: 5, verified: 4 }]);
+    expect(layers?.['drops']).toEqual([
+      { slot: 'undeclared', senderId: null, reason: 'no_roster_entry', count: 1 },
+    ]);
+    const analysis = events().find((e) => e['type'] === 'receiveAnalysis');
+    const lane = (analysis?.['lanes'] as Record<string, unknown>[])[0]!;
+    expect(Object.keys(lane).sort()).toEqual([
+      'bandEndHz',
+      'bandStartHz',
+      'binHz',
+      'fftSize',
+      'levelDbfs',
+      'ready',
+      'sampleRateHz',
+      'senderId',
+      'smoothingTimeConstant',
+      'spectrumDb',
+    ]);
+    expect(lane['senderId']).toBe('7');
+    expect(JSON.stringify(events())).not.toContain('rogue');
+    expect(JSON.stringify(events())).not.toContain('pcm');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('without instrumentation (never injected outside a test build) nothing is sampled', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    install(session);
+    await session.startMedia();
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 2);
+    expect(events().some((e) => e['type'] === 'receiveLayers')).toBe(false);
+    expect(events().some((e) => e['type'] === 'receiveAnalysis')).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
+});

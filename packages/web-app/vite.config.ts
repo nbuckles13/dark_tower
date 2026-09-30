@@ -3,6 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { loadCertFingerprints } from './vite/fingerprints.js';
+import { TEST_TONE_ENV, resolveTestTone } from './vite/testTone.js';
 
 // R-30: web-app dev/build config.
 //
@@ -33,6 +34,10 @@ export default defineConfig(({ mode }) => ({
     // R-29: E2E hooks (window.__darktower_test__ + replay buffer) gate — a
     // SEPARATE flag; `false` in prod so the entire bus module is DCE'd.
     __E2E_HOOKS__: JSON.stringify(mode !== 'production'),
+    // Story 2 R-7: the test-tone build define. OPT-IN (`DT_TEST_TONE=1`), never
+    // default-on, never runtime, and a THROW in production — one predicate for
+    // all three (`vite/testTone.ts`).
+    __DT_TEST_TONE__: JSON.stringify(resolveTestTone(mode, process.env[TEST_TONE_ENV])),
     __SDK_VERSION__: JSON.stringify(pkgVersion),
     // Dev MC/MH cert SHA-256 fingerprints (base64). Empty in prod / when absent.
     __DEV_CERT_SHA256_HASHES__: JSON.stringify(mode !== 'production' ? CERT_HASHES : []),

@@ -122,6 +122,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
   }
   const identity = await MeetingIdentity.create();
   const ref: { pipeline?: AudioPipeline } = {};
+  const intervals: { fn: () => void; ms: number }[] = [];
   // The SAME wiring the session installs, from the SAME module.
   roster.setTransmitKeyInvalidationListener(
     rosterInvalidationListener(
@@ -138,6 +139,8 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
     senderId: RECEIVER_SENDER_ID,
     identity,
     declaredSlotIds: opts.declared ?? [0, 1, 2],
+    captureSource: 'microphone',
+    metricExportIntervalMs: 10_000,
     senderFor: () => undefined,
     readableFor: (url) => transports.get(url)?.datagrams.readable,
     reportMute: () => {},
@@ -146,7 +149,12 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
     decoderFactory: codecs.decoderFactory as never,
     playbackFactory: playback.factory as never,
     clock: sched.clock,
-    setInterval: () => 0 as unknown as ReturnType<typeof setInterval>,
+    // Recorded, never run on wall-clock time: `tickExport()` fires the export-
+    // interval timer (the per-interval signals) on demand.
+    setInterval: (fn, ms) => {
+      intervals.push({ fn, ms });
+      return (intervals.length - 1) as unknown as ReturnType<typeof setInterval>;
+    },
     clearInterval: () => {},
   });
   ref.pipeline = pipeline;
@@ -190,6 +198,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
         slotId: p.slot,
         senderId: p.id,
         mediaHandlerUrl: p.handler,
+        active: true,
       }));
       pipeline.setReceiveAssignments(assignments);
       await waitFor(
@@ -231,6 +240,11 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
     decodedSeqFor(peer: Peer): number[] {
       return codecs.decoded.filter((f) => f.data[0] === peer.byte).map((f) => f.data[1]!);
     },
+    /** Fire the export-interval timer once (the capture gauge + deficit tick). */
+    tickExport() {
+      for (const t of intervals) if (t.ms === 10_000) t.fn();
+    },
+    deficit: () => metric('dt_client_media_receive_source_deficit_total'),
     nextHop(handler: string): number {
       const h = (hops.get(handler) ?? 0) + 1;
       hops.set(handler, h);
@@ -715,6 +729,8 @@ async function makeSender(senderId: number) {
     senderId,
     identity,
     declaredSlotIds: [0],
+    captureSource: 'microphone',
+    metricExportIntervalMs: 10_000,
     senderFor: () => datagrams,
     readableFor: () => undefined,
     reportMute: () => {},
@@ -1012,6 +1028,9 @@ describe('every media metric stays aggregate across senders', () => {
       'outcome',
       'action',
       'source',
+      // Story 2 task 13: `dt_client_media_capture_source{mode}` — build-time,
+      // identity-free, datapoint-only (GC MEDIA_DATAPOINT_EXTRA / keep_keys).
+      'mode',
     ]);
     const FORBIDDEN = /sender|meeting|stream|participant|slot/;
     for (const m of recorded) {
@@ -1049,6 +1068,8 @@ describe('R-13 holds from the first captured frame, not from when start() resolv
       senderId: 79,
       identity: await MeetingIdentity.create(),
       declaredSlotIds: [0],
+      captureSource: 'microphone',
+      metricExportIntervalMs: 10_000,
       senderFor: () => undefined,
       readableFor: () => undefined,
       reportMute: () => {},
@@ -1064,5 +1085,27 @@ describe('R-13 holds from the first captured frame, not from when start() resolv
     await pipeline.start();
     expect(pipeline.transmitGeneration).toBe(1n);
     await pipeline.stop();
+  });
+});
+
+describe('receive-source deficit against REAL decode activity (story 2 R-28)', () => {
+  it('decoding between ticks keeps the deficit at 0; a sender that goes silent then counts', async () => {
+    const { r, a } = await threeSenderMeeting();
+    // Only A remains assigned (and active) from here on.
+    r.pipeline.setReceiveAssignments([
+      { slotId: a.slot, senderId: a.id, mediaHandlerUrl: a.handler, active: true },
+    ]);
+    r.tickExport(); // grace: A's assignment is new relative to the start sample
+    for (let tick = 0; tick < 3; tick += 1) {
+      await send(r, a);
+      await r.drain();
+      r.tickExport();
+    }
+    // A decoded in every interval: the lane-activity wiring really feeds the
+    // decision (a regression to "no activity" would read 3 here).
+    expect(r.deficit()).toBe(0);
+    // Now A falls silent while MC still says it is active.
+    r.tickExport();
+    expect(r.deficit()).toBe(1);
   });
 });

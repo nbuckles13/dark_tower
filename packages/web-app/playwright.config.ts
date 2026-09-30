@@ -69,6 +69,10 @@ export default defineConfig({
     // bus) and the dev cert-fingerprint define are compile-time gates that only
     // exist in dev builds. Never point this at `pnpm preview`/a prod build.
     command: 'pnpm dev',
+    // Story 2 R-7: the test tone is OPT-IN (`DT_TEST_TONE=1` in this process's
+    // env reaches `vite.config.ts`). With `reuseExistingServer` a server started
+    // without it runs the microphone path, so a spec needing the tone must
+    // ASSERT the bus `captureSource` event's `mode`, never assume it.
     // Readiness via the loopback derivation of baseURL (single port encoding,
     // follows an E2E_BASE_URL override; Node does not necessarily resolve
     // *.localhost). The browser itself navigates to baseURL with the org
