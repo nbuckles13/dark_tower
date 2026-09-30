@@ -42,7 +42,7 @@
 # Why the WebTransport rows moved: they were written when the demo's success
 # criterion was sign-up and create-meeting, which run over TCP through the Vite
 # proxy and are unaffected by any WebTransport problem. That is no longer the
-# criterion — the demo is now hearing your own audio back through MH
+# criterion — the demo is now N+1 participants hearing each other through MH
 # (docs/decisions/adr-0036-media-flow.md), so MC and MH reachability IS the
 # demonstrated path. A warning there produced the worst available outcome: a
 # demo that starts, appears to join, and returns no audio.
@@ -123,7 +123,7 @@
 #   the client; never a runtime setting, never in a production bundle). It is
 #   OPT-IN: run `DT_TEST_TONE=1 scripts/dev-web.sh` — this script passes the
 #   environment through to the dev server, whose vite.config reads it
-#   (packages/web-app/vite/testTone.ts accepts only unset or exactly 1). Each
+#   (packages/web-app/vite/testDefines.ts accepts only unset or exactly 1). Each
 #   participant's tone is derived from its per-meeting sender id. Headphones
 #   are for the separate one-microphone human-audibility pass, not the answer
 #   to N-way feedback.
@@ -354,9 +354,9 @@ check_port "GC" "$GC_PORT"
 
 # ─── Cert fingerprints (HARD FAIL — the demonstrated audio path needs these) ──
 # Was a WARN when the demo's success criterion was sign-up/create. It is now
-# hearing your own audio back through MH, and the browser cannot open the
+# participants hearing each other through MH, and the browser cannot open the
 # WebTransport session to MC or MH without these fingerprints — so a warning
-# here yields a demo that starts and silently returns no audio.
+# here yields a demo that starts and silently delivers no audio.
 if [[ -s "$FINGERPRINTS_JSON" ]]; then
     pass "cert fingerprints present ($FINGERPRINTS_JSON)"
 else
@@ -728,7 +728,7 @@ check_receive_slots
 # ─── Test-tone state (INFORMATIONAL, never validated here) ───
 # The other opt-in knob in this workflow, printed beside N so it is visible
 # before anyone has to listen for it. NOT re-validated in bash: the one predicate
-# is packages/web-app/vite/testTone.ts, which throws on any value but unset or
+# is packages/web-app/vite/testDefines.ts, which throws on any value but unset or
 # exactly 1 — a bash copy would drift from it. A reused dev server started with
 # a different setting keeps ITS value; the E2E bus `captureSource` event is the
 # runtime truth.

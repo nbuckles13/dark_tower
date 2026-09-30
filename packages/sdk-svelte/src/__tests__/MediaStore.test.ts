@@ -277,3 +277,37 @@ test('a roster change does not recompute the mute projection', async () => {
   expect(counts.mute).toBe(muteBaseline);
   expect(counts.roster).toBeGreaterThan(rosterBaseline);
 });
+
+// ---------------------------------------------------------------------------
+// Server mute + unmute requests (story 2 R-10/R-11) — wire-only, replace-on-change
+// ---------------------------------------------------------------------------
+
+test('server mutes come ONLY from participantMuteChanged, keyed by participant, replaced per change', () => {
+  const store = new MediaStore();
+  expect(store.serverMutes.size).toBe(0);
+  store.applyParticipantMute({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' });
+  const first = store.serverMutes;
+  expect(first.get('b')).toEqual({ serverMutedBy: 'h' });
+  store.applyParticipantMute({ participantId: 'c', audioServerMuted: true });
+  // Replaced, never mutated in place: a reader holding the old map sees no change.
+  expect(store.serverMutes).not.toBe(first);
+  expect(first.has('c')).toBe(false);
+  store.applyParticipantMute({ participantId: 'b', audioServerMuted: false });
+  expect([...store.serverMutes.keys()]).toEqual(['c']);
+});
+
+test('an unmute request is held only while the requester IS server-muted, and clears on lift', () => {
+  const store = new MediaStore();
+  // A relay for someone not server-muted is not a pending request.
+  store.applyUnmuteRequested({ participantId: 'b' });
+  expect(store.unmuteRequests.size).toBe(0);
+
+  store.applyParticipantMute({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' });
+  store.applyUnmuteRequested({ participantId: 'b' });
+  expect([...store.unmuteRequests]).toEqual(['b']);
+  // The request lifts NOTHING: b is still server-muted (R-10).
+  expect(store.serverMutes.has('b')).toBe(true);
+
+  store.applyParticipantMute({ participantId: 'b', audioServerMuted: false });
+  expect(store.unmuteRequests.size).toBe(0);
+});

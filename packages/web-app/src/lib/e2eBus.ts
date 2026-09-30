@@ -16,6 +16,7 @@
 //     reserved-invalid). Errors cross via `SdkError.toJSON()`
 //     (the R-23 non-secret allowlist), never a raw Error / `.cause` / `.stack`.
 
+import { flushMetrics, getMetricsSink } from '@darktower/sdk-core';
 import type {
   CaptureSourceInfo,
   MediaFrameCounts,
@@ -52,6 +53,14 @@ export interface SessionMediaCounters {
   readonly receiveSlots: ReceiveSlotsDiagnostics;
   /** What feeds the send path, once media has started (story 2 R-7). */
   readonly captureSource: CaptureSourceInfo | undefined;
+  /** The current meeting-KEK generation (public: it is in every key id). Story 2 S6. */
+  readonly currentKekGeneration: number | undefined;
+}
+
+/** What the bus needs to know about the app's build and config. Plain booleans. */
+export interface E2EHookOptions {
+  /** Whether SDK telemetry was configured (`VITE_TELEMETRY_ENDPOINT`). */
+  readonly telemetryConfigured: boolean;
 }
 
 /** The surface {@link installE2EHooks} consumes. */
@@ -71,6 +80,14 @@ type BusEvent = Readonly<Record<string, unknown>> & { readonly type: string };
 
 interface InternalBus {
   events: BusEvent[];
+  /**
+   * Force a metric export NOW (the SDK's `flushMetrics`), for the browser suite's
+   * telemetry credential-scan positive control and the R-27 read-back. REJECTS
+   * with `telemetry_not_configured` when telemetry is off — a silent no-op would
+   * let "flushed" mean "nothing happened". Returns nothing: no export body, header
+   * or response ever reaches the bus.
+   */
+  flushMetrics(): Promise<void>;
   readonly listeners: Map<string, Set<(event: BusEvent) => void>>;
   on(type: string, listener: (event: BusEvent) => void): () => void;
   emit(event: BusEvent): void;
@@ -86,11 +103,14 @@ interface InternalBus {
 export function installE2EHooks(
   session: E2ESessionHandle,
   instrumentation?: E2EInstrumentation,
+  options: E2EHookOptions = { telemetryConfigured: false },
 ): () => void {
   if (__E2E_HOOKS__) {
     const roster = (p: RosterParticipant): Record<string, string> => ({
       participantId: p.participantId,
       name: p.name,
+      // Stringified like every sender id on the bus; omitted when MC set none.
+      ...(p.senderId !== undefined ? { senderId: p.senderId.toString() } : {}),
     });
 
     const projectError = (err: SdkError): Record<string, unknown> => {
@@ -105,6 +125,16 @@ export function installE2EHooks(
     const existing = window.__darktower_test__ as InternalBus | undefined;
     const bus: InternalBus = existing ?? {
       events: [],
+      async flushMetrics() {
+        // The SDK's ACTUAL state, not the config's intent: sdk-core's
+        // `flushMetrics()` resolves having flushed nothing when no provider is
+        // configured, so a config that asked for telemetry but whose
+        // configuration was skipped or failed must still refuse here.
+        if (!options.telemetryConfigured || getMetricsSink() === undefined) {
+          throw new Error('telemetry_not_configured');
+        }
+        await flushMetrics();
+      },
       listeners: new Map<string, Set<(event: BusEvent) => void>>(),
       on(type, listener) {
         let set = this.listeners.get(type);
@@ -139,11 +169,7 @@ export function installE2EHooks(
       }),
     );
     session.on('participantJoined', (event) =>
-      bus.emit({
-        type: 'participantJoined',
-        participantId: event.participant.participantId,
-        name: event.participant.name,
-      }),
+      bus.emit({ type: 'participantJoined', ...roster(event.participant) }),
     );
     session.on('participantLeft', (event) =>
       bus.emit({
@@ -187,8 +213,36 @@ export function installE2EHooks(
           ...(a.senderId !== undefined ? { senderId: a.senderId.toString() } : {}),
           slotState: a.slotState,
         })),
+        // Story 2 R-33: the per-subscriber unreachable set, from the same message.
+        unreachableSenderIds: event.unreachableSenderIds.map((id) => id.toString()),
       }),
     );
+
+    // Story 2 R-10/R-11: SERVER mute from the wire, and the host's relay of an
+    // unmute request. Participant ids only (already bounded by the SDK).
+    session.on('participantMuteChanged', (event) =>
+      bus.emit({
+        type: 'participantMute',
+        participantId: event.participantId,
+        audioServerMuted: event.audioServerMuted,
+        ...(event.serverMutedBy !== undefined ? { serverMutedBy: event.serverMutedBy } : {}),
+      }),
+    );
+    session.on('unmuteRequested', (event) =>
+      bus.emit({ type: 'unmuteRequested', participantId: event.participantId }),
+    );
+
+    // The build knobs the suite asserts before any media assertion, so a dev
+    // server reused without them fails as "reused server", not as "C never heard
+    // A". Plain booleans; the same values the build baked in.
+    bus.emit({
+      type: 'buildKnobs',
+      testLevers: __DT_TEST_LEVERS__,
+      // Config intent AND the SDK's actual state, side by side: an endpoint that
+      // was configured but never reached the SDK reads as the second being false.
+      telemetryConfigured: options.telemetryConfigured,
+      telemetrySinkActive: getMetricsSink() !== undefined,
+    });
     session.on('error', (err) => bus.emit({ type: 'error', ...projectError(err) }));
 
     // ------------------------------------------------------------------
@@ -237,7 +291,15 @@ export function installE2EHooks(
     // ASSERTS tone mode from it rather than assuming the dev server was started
     // with `DT_TEST_TONE=1` (Playwright may reuse an existing server).
     let captureAnnounced = false;
+    // Story 2 S6: the KEK generation, emitted on CHANGE (not every tick) — the
+    // per-participant evidence that this client installed a rotation.
+    let lastKekGeneration: number | undefined;
     const sampler = setInterval(() => {
+      const generation = session.currentKekGeneration;
+      if (generation !== undefined && generation !== lastKekGeneration) {
+        lastKekGeneration = generation;
+        bus.emit({ type: 'kekGeneration', generation, atMs: Date.now() });
+      }
       const source = session.captureSource;
       if (!captureAnnounced && source !== undefined) {
         captureAnnounced = true;

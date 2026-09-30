@@ -165,8 +165,9 @@ const RETENTION_GENERICS: &[&str] = &["$state", "$derived", "writable", "readabl
 /// derives that figure by walking the real tree at test time and fails the build if the
 /// margin is lost — naming the offending file, declaration and span. So this doc's
 /// measurement (2026-07-30: `SignalingClient` **468** lines, then `MeetingSession` 302,
-/// `MediaTransport` 226; 2000 is ~4x) is a convenience for the reader, NOT the thing the
-/// invariant rests on.
+/// `MediaTransport` 226; 2000 was ~4x. 2026-09-30, story 2 task 15: `MeetingSession`
+/// **737** lines after the server-mute surface landed, past 2000 / 3, so raised to 2400,
+/// ~3.3x) is a convenience for the reader, NOT the thing the invariant rests on.
 ///
 /// That distinction is the finding: the first version of that test compared 2000 against
 /// a hardcoded 468 in this same file, so it evaluated `2000 >= 1404` forever regardless
@@ -198,7 +199,7 @@ const RETENTION_GENERICS: &[&str] = &["$state", "$derived", "writable", "readabl
 ///
 /// On trip it calls [`warn_skip`] rather than silently returning a truncated field set —
 /// a truncated set under-matches, which is this guard's worst failure shape.
-const MAX_DECL_BLOCK_LINES: usize = 2000;
+const MAX_DECL_BLOCK_LINES: usize = 2400;
 
 // ---------------------------------------------------------------------------
 // Field-name matching — segment equality over the CATEGORY_A partition

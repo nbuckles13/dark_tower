@@ -147,6 +147,8 @@ export function createMicrophoneCapture(options: {
  */
 export function createTestToneCapture(options: {
   readonly sampleRateHz: number;
+  /** The encoder's channel count — the tone's track MUST match it. */
+  readonly channels: number;
   readonly frequencyHz: number;
 }): Promise<{
   start(onFrame: (data: AudioData) => void, onEnded: () => void): Promise<void>;
@@ -177,6 +179,16 @@ export function createTestToneCapture(options: {
     oscillator.type = 'sine';
     oscillator.frequency.value = options.frequencyHz;
     const destination = context.createMediaStreamDestination();
+    // THE CHANNEL COUNT IS EXPLICIT. A `MediaStreamAudioDestinationNode`
+    // defaults to STEREO, and the encoder is configured for the capture seam's
+    // `channels` (mono): Chromium's `AudioEncoder.encode` rejects a 2-channel
+    // `AudioData` against a 1-channel config, which surfaces as a FATAL encoder
+    // fault on the first 10 ms frame, so a tone build sent nothing at all. A
+    // microphone track avoids it only because `getUserMedia` is asked for
+    // `channelCount` explicitly. (Found by the Layer-7 multi-party env-test,
+    // story 2 task 15; unit tiers use seam doubles and cannot see it.)
+    destination.channelCount = options.channels;
+    destination.channelCountMode = 'explicit';
     oscillator.connect(destination);
     oscillator.start();
     await context.resume();

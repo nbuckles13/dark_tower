@@ -56,6 +56,17 @@ const DIST = resolve(PKG_ROOT, 'dist');
 //     the gated block. NOT `receiveVerification` (an SDK option key, present in
 //     production as a property name), `captureSource` or `streamAssignments`
 //     (SDK getter / event names): all three FAIL the rule.
+//
+// Story 2 task 15 additions (the `__DT_TEST_LEVERS__` per-context levers and the
+// bus surface this task adds), each checked against the same rule:
+//   * `__dt_test_levers__` — the init-script global, read only inside
+//     `if (__DT_TEST_LEVERS__)` in `lib/testLevers.ts`.
+//   * `blockHandlers`, `forceHostControls` — lever keys, named only in
+//     `lib/testLevers.ts` and at `__DT_TEST_LEVERS__`-guarded use sites.
+//   * `buildKnobs`, `telemetry_not_configured` — bus event type / bus flush
+//     refusal, only inside `if (__E2E_HOOKS__)` in `lib/e2eBus.ts`.
+//   NOT `participantMute` (a substring of the SDK's `participantMuteChanged`
+//   event) or `kekGeneration` (a protobuf field name): both FAIL the rule.
 const FORBIDDEN = [
   '__darktower_test__',
   'mediaFrameCounts',
@@ -70,6 +81,12 @@ const FORBIDDEN = [
   'getFloatFrequencyData',
   'receiveLayers',
   'receiveAnalysis',
+  '__DT_TEST_LEVERS__',
+  '__dt_test_levers__',
+  'blockHandlers',
+  'forceHostControls',
+  'buildKnobs',
+  'telemetry_not_configured',
 ] as const;
 
 /**
@@ -82,9 +99,10 @@ const GATE_IDENTIFIERS = new Set<string>([
   '__E2E_HOOKS__',
   '__DEV_TRUST_FINGERPRINT__',
   '__DT_TEST_TONE__',
+  '__DT_TEST_LEVERS__',
 ]);
 
-/** The positive-control build: dev mode with the test tone opted in. */
+/** The positive-control build: dev mode with the test tone AND the test levers opted in. */
 const CONTROL_DIST = resolve(PKG_ROOT, 'dist-e2e-control');
 
 function walk(dir: string): string[] {
@@ -97,10 +115,11 @@ function walk(dir: string): string[] {
   return out;
 }
 
-/** The environment WITHOUT the tone opt-in, whatever the caller's shell carries. */
+/** The environment WITHOUT any test-define opt-in, whatever the caller's shell carries. */
 function envWithoutTone(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env['DT_TEST_TONE'];
+  delete env['DT_TEST_LEVERS'];
   return env;
 }
 
@@ -115,7 +134,11 @@ beforeAll(() => {
   execFileSync(
     'pnpm',
     ['exec', 'vite', 'build', '--mode', 'development', '--outDir', CONTROL_DIST],
-    { cwd: PKG_ROOT, stdio: 'inherit', env: { ...envWithoutTone(), DT_TEST_TONE: '1' } },
+    {
+      cwd: PKG_ROOT,
+      stdio: 'inherit',
+      env: { ...envWithoutTone(), DT_TEST_TONE: '1', DT_TEST_LEVERS: '1' },
+    },
   );
 }, 360_000);
 
@@ -141,7 +164,7 @@ test.each(FORBIDDEN)('production bundle excludes forbidden token %s', (token) =>
 });
 
 test.each(FORBIDDEN.filter((t) => !GATE_IDENTIFIERS.has(t)))(
-  'POSITIVE CONTROL: the gated build (dev + DT_TEST_TONE=1) CONTAINS %s',
+  'POSITIVE CONTROL: the gated build (dev + DT_TEST_TONE=1 + DT_TEST_LEVERS=1) CONTAINS %s',
   (token) => {
     const files = walk(CONTROL_DIST).filter((f) => f.endsWith('.js'));
     expect(files.length).toBeGreaterThan(0);
@@ -172,4 +195,26 @@ test('a PRODUCTION build asked for the test tone FAILS at the gate, never coerce
   expect(failure, 'the production build with DT_TEST_TONE=1 must not succeed').toBeDefined();
   const output = String((failure as { stderr?: unknown }).stderr ?? '');
   expect(output).toContain('DT_TEST_TONE=1 in a production build');
+}, 180_000);
+
+test('a PRODUCTION build asked for the test levers FAILS at the gate, never coerces them off', () => {
+  let failure: unknown;
+  try {
+    execFileSync(
+      'pnpm',
+      ['exec', 'vite', 'build', '--mode', 'production', '--outDir', `${CONTROL_DIST}-prod-levers`],
+      {
+        cwd: PKG_ROOT,
+        stdio: 'pipe',
+        env: { ...envWithoutTone(), DT_TEST_LEVERS: '1' },
+      },
+    );
+  } catch (err) {
+    failure = err;
+  } finally {
+    rmSync(`${CONTROL_DIST}-prod-levers`, { recursive: true, force: true });
+  }
+  expect(failure, 'the production build with DT_TEST_LEVERS=1 must not succeed').toBeDefined();
+  const output = String((failure as { stderr?: unknown }).stderr ?? '');
+  expect(output).toContain('DT_TEST_LEVERS=1 in a production build');
 }, 180_000);

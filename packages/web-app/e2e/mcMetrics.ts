@@ -81,6 +81,14 @@ import {
   type PromResultRow,
 } from './instanceCounters.js';
 import {
+  KEK_GENERATIONS_RETAINED,
+  KEK_UPDATES,
+  KEK_UPDATE_SOURCE,
+  RECEIVED_COUNTER,
+  SEND_COUNTER,
+  clientNamesIn,
+} from './clientMetricNames.js';
+import {
   classifyMissingSender,
   MH_ADMISSION_REJECTED_OUTCOME,
   MH_ADMISSION_REJECTION_RATIO,
@@ -210,13 +218,13 @@ interface PollOptions {
 async function pollUntilAnyInstanceAbove(
   promql: string,
   baseline: InstanceCounters,
-  { timeoutMs = 60_000, intervalMs = 2_000 }: PollOptions,
+  { timeoutMs = 60_000, intervalMs = 2_000, minDelta }: PollOptions & { minDelta?: number },
   timeoutMessage: (lastObserved: string, timeoutMs: number) => string,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const current = await promInstantByInstance(promql);
-    if (anyInstanceExceedsBaseline(baseline, current)) {
+    if (anyInstanceExceedsBaseline(baseline, current, minDelta)) {
       return;
     }
     if (Date.now() > deadline) {
@@ -382,4 +390,118 @@ export async function diagnoseMissingSender(
     egressEdges,
     scrapeUp,
   });
+}
+
+// ============================================================================
+// Story 2 R-27 / S6 — CLIENT series read back out of Prometheus.
+//
+// FLEET-LEVEL EVIDENCE ONLY. Client series carry `instance` = the collector pod
+// (`./instanceCounters` header) and no participant label, so these prove the
+// PIPE (SDK -> GC proxy -> collector -> Prometheus), the exact exported NAME
+// (`_total` survival) and the alert's applicability — never a per-participant
+// claim, which comes from that participant's own E2E bus. No `job`/`instance`
+// selector and no exact label set (`otel_scope_*` is version-dependent).
+//
+// Absent reads as 0 at baseline (`resultsToInstanceMap` of an empty vector is an
+// empty map): these counters are registered lazily, so a first-ever series is
+// BORN by the scenario, and a baseline -> above delta is the only read that can
+// see it. PromQL `increase()` cannot: it has no pre-birth sample, so a series
+// born at N and then flat reads ~0 on correct behaviour.
+//
+// Budget: the SDK export is forced (`flushMetrics()`), then one collector scrape
+// — the default 60 s poll bound covers it with margin (the collector's scrape job
+// in `infra/kubernetes/observability/prometheus.yml`). A liveness bound, never a
+// latency gate.
+// ============================================================================
+
+const SENT_SUM_PROMQL = `sum by (instance) (${SEND_COUNTER})`;
+const RECEIVED_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER})`;
+const KEK_UPDATES_SUM_PROMQL = `sum by (instance) (${KEK_UPDATES}{source="${KEK_UPDATE_SOURCE}"})`;
+const KEK_RETAINED_SUM_PROMQL = `sum by (instance) (${KEK_GENERATIONS_RETAINED})`;
+
+/** Which client counter a read-back is about. */
+export type ClientCounter = 'sent' | 'received' | 'kek_update' | 'kek_retained';
+
+const CLIENT_COUNTER_PROMQL: Record<ClientCounter, string> = {
+  sent: SENT_SUM_PROMQL,
+  received: RECEIVED_SUM_PROMQL,
+  kek_update: KEK_UPDATES_SUM_PROMQL,
+  kek_retained: KEK_RETAINED_SUM_PROMQL,
+};
+
+/** Current per-instance snapshot of a client counter (empty = never exported yet). */
+export async function clientCounterByInstance(which: ClientCounter): Promise<InstanceCounters> {
+  return promInstantByInstance(CLIENT_COUNTER_PROMQL[which]);
+}
+
+/**
+ * Poll until the client counter rose by at least `minDelta` (default: any rise)
+ * past `baseline` on some instance. The query is by the EXACT exported name, so a
+ * pipeline that lost the `_total` suffix returns empty and times out loudly here.
+ */
+export async function waitForClientCounterAbove(
+  which: ClientCounter,
+  baseline: InstanceCounters,
+  why: string,
+  options: PollOptions & { minDelta?: number } = {},
+): Promise<void> {
+  await pollUntilAnyInstanceAbove(
+    CLIENT_COUNTER_PROMQL[which],
+    baseline,
+    options,
+    (lastObserved, timeoutMs) =>
+      `${CLIENT_COUNTER_PROMQL[which]} did not rise ${
+        options.minDelta === undefined ? 'above' : `by >= ${options.minDelta} over`
+      } baseline ${formatInstanceMap(baseline)} within ${timeoutMs}ms (last observed: ` +
+      `${lastObserved}). ${why} If the vector is EMPTY, nothing with this exact name reached ` +
+      `Prometheus: check the SDK export (flushMetrics), GC's /api/v1/telemetry proxy, the ` +
+      `collector's Prometheus exporter (add_metric_suffixes) and its scrape job.`,
+  );
+}
+
+interface PromRulesResponse {
+  readonly status?: string;
+  readonly data?: {
+    readonly groups?: ReadonlyArray<{
+      readonly rules?: ReadonlyArray<{
+        readonly type?: string;
+        readonly name?: string;
+        readonly query?: string;
+      }>;
+    }>;
+  };
+}
+
+/**
+ * The `dt_client_*` names the alert rule Prometheus has LOADED selects — the
+ * running rule, not the committed file. Throws a distinct `rule-not-loaded`
+ * error when Prometheus has no such alert.
+ */
+export async function loadedAlertClientNames(alert: string): Promise<Set<string>> {
+  const url = `${e2eEnv.prometheusUrl}/api/v1/rules?type=alert`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) {
+    throw new Error(`Prometheus rules query failed: ${url} responded ${response.status}`);
+  }
+  const body = (await response.json()) as PromRulesResponse;
+  if (body.status !== 'success') {
+    // A QUERY failure, kept distinct from `rule-not-loaded` so triage is not
+    // sent to reload the observability overlay for a Prometheus error.
+    throw new Error(
+      `Prometheus rules query returned status "${body.status ?? 'undefined'}" (${url}). ` +
+        'Global-setup proved Prometheus healthy, so a query error here is a real problem — ' +
+        'NOT a missing rule. Triage Prometheus/port-forward, not the service under test.',
+    );
+  }
+  const rule = (body.data?.groups ?? [])
+    .flatMap((g) => g.rules ?? [])
+    .find((r) => r.type === 'alerting' && r.name === alert);
+  if (rule?.query === undefined) {
+    throw new Error(
+      `rule-not-loaded: Prometheus at ${e2eEnv.prometheusUrl} has no loaded alert ${alert}. ` +
+        `The committed rule file and the running rules have diverged (reload the Kind ` +
+        `observability overlay), which is a DIFFERENT fault from a selector drift.`,
+    );
+  }
+  return clientNamesIn(rule.query);
 }

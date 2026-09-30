@@ -357,15 +357,18 @@ exists to prove is gone. If the origin is not a secure context, change the origi
 
 ### No microphone on this machine? Launch Chrome with synthesized capture
 
-A laptop with no input device, a VM, or a shared demo box can still hear the loopback tone. Chrome
+A laptop with no input device, a VM, or a shared demo box can still take part in a call. Chrome
 can synthesize a capture stream and auto-accept the permission prompt:
 
 ```
 --use-fake-device-for-media-stream --use-fake-ui-for-media-stream
 ```
 
-You will hear a steady tone rather than your voice — which is enough to prove the round trip, since
-the point is that *something you sent came back through MH*.
+The OTHER participants will hear a steady tone rather than your voice. You never hear yourself —
+loopback is removed (story 2 R-3; a solo participant correctly hears silence, with every slot
+reading "no one to fill this slot yet"). To run several participants on one machine, prefer the
+test-tone build (`DT_TEST_TONE=1 scripts/dev-web.sh`), which gives each participant its own
+frequency so "I hear A and C but not B" is audible, and avoids one microphone feeding N tabs.
 
 These are the same two flags `packages/web-app/playwright.config.ts` launches with, which is where
 the browser E2E suite gets its deterministic audio; keep the two in step. They are **not** security
@@ -405,9 +408,9 @@ here.
 **The WebTransport checks are hard fails, and that is a recent change.** The cert-fingerprint check
 and the MC/MH listener checks used to warn. That was correct when the demo's success criterion was
 sign-up and create-meeting — both run over TCP through the Vite proxy and are unaffected by any
-WebTransport problem. It is no longer the criterion: the demo is now *hearing your own audio back
-through MH* (`docs/decisions/adr-0036-media-flow.md`), so MC and MH reachability is the demonstrated
-path, not a side path. Warning there produced the worst available outcome — a demo that starts,
+WebTransport problem. It is no longer the criterion: the demo is now *N+1 participants hearing each
+other through MH* (`docs/decisions/adr-0036-media-flow.md`), so MC and MH reachability is the
+demonstrated path, not a side path. Warning there produced the worst available outcome — a demo that starts,
 appears to join, and silently returns no audio. See §4 for telling a real join from an optimistic
 one.
 
@@ -728,7 +731,7 @@ notification path, which none of the signals above cover.
 
 ### 4.5 "I joined and I hear nothing" — media triage ladder
 
-**This is the section the loopback story exists for.** Localising a silent call is the whole point:
+**This is the section the media stories exist for.** Localising a silent call is the whole point:
 audio passes through **capture → encrypt → sign → uplink → MH forward → downlink → decrypt →
 verify → playback**, and the hazard is that *every signal reads green while no audio arrives*. §4.2's
 question is the right one here — for each signal, finish *"this proves ___"* without using
@@ -743,7 +746,7 @@ the end of this section about where they can and cannot be read.
 | Rung | Read | Localises to |
 |---|---|---|
 | 1 | Is `dt_client_media_frames_sent_total` moving? | **capture / mute** vs everything downstream. *Moving/flat is the whole read:* the counter is **per datagram**, one per target handler, so a sender directed at two handlers posts ~2x its capture rate — never compare its rate against a capture rate here. |
-| 2 | Is `dt_client_media_frames_received_total` moving? | **round trip** vs receive-side processing |
+| 2 | Is `dt_client_media_frames_received_total` moving? | **delivery** (another sender → MH → this client) vs receive-side processing. A solo participant receives nothing by design (R-3). |
 | 3 | Is `dt_client_media_frames_accepted_total` moving? | **crypto/parse** vs **playback** |
 | 4 | `dt_client_media_frames_dropped_total{reason}` | the exact receive step that rejected, **by name** |
 | 5 | `dt_client_media_send_dropped_total{reason}`, `dt_client_media_send_queue_depth` | **uplink back-pressure** |

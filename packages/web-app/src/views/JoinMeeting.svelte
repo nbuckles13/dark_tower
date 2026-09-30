@@ -16,7 +16,13 @@
   import { installE2EHooks } from '../lib/e2eBus.js';
   import { createE2EInstrumentation } from '../lib/e2eAnalysis.js';
   import { errorText, isSessionRejection } from '../lib/errorText.js';
+  import {
+    hostControlsForced,
+    leverViolationAfterJoin,
+    readTestLeversForSession,
+  } from '../lib/testLevers.js';
   import InMeeting from './InMeeting.svelte';
+  import ParticipantRow from './ParticipantRow.svelte';
 
   let {
     config,
@@ -38,11 +44,19 @@
   // in production, where it is eliminated with the bus. Built BEFORE the session
   // so it can be injected into it.
   const e2e = createE2EInstrumentation();
+  // Story 2 task 15: the per-context test levers, read ONCE here into a frozen
+  // copy — `undefined` in every build without `DT_TEST_LEVERS=1`, where the read
+  // is statically dead. A malformed lever is a loud, visible refusal to join,
+  // never a silent fallback to the production wiring.
+  const { levers, error: leverError = '' } = readTestLeversForSession();
   // svelte-ignore state_referenced_locally
-  const session = buildMeetingSession(config, e2e);
+  const session = buildMeetingSession(config, e2e, levers);
   // Returns a disposer because the bus now runs a sampling timer in test builds
   // (a no-op function in production, where the whole bus is eliminated).
-  const disposeE2EHooks = installE2EHooks(session, e2e);
+  // svelte-ignore state_referenced_locally
+  const disposeE2EHooks = installE2EHooks(session, e2e, {
+    telemetryConfigured: config.telemetryEndpoint !== undefined,
+  });
   const store = bindMeetingSession(session);
   onDestroy(() => {
     disposeE2EHooks();
@@ -50,8 +64,16 @@
   });
 
   let meetingCode = $state('');
-  let joinError = $state('');
+  let joinError = $state(leverError);
   let busy = $state(false);
+  /** This participant's own id, from the settled join (MC's roster excludes self). */
+  let selfParticipantId = $state<string | undefined>(undefined);
+  /**
+   * Whether to render host controls: the meeting-token role HINT (MC authorises
+   * every request), or — in a test-levers build only — forced on so the suite can
+   * drive a NON-host into MC's refusal.
+   */
+  let showHostControls = $state(false);
 
   function credentials(): JoinCredentials {
     // Join presents the token the app already holds. No re-authentication, so no
@@ -70,10 +92,26 @@
 
   async function submit(event: Event): Promise<void> {
     event.preventDefault();
+    if (leverError) return;
     joinError = '';
     busy = true;
     try {
-      await session.join({ orgSubdomain: auth.subdomain, meetingCode, credentials: credentials() });
+      const joined = await session.join({
+        orgSubdomain: auth.subdomain,
+        meetingCode,
+        credentials: credentials(),
+      });
+      // The S10a non-vacuity guard (test-levers builds only): a block naming a
+      // handler MC never offered, or leaving none, is a broken test setup —
+      // refused loudly, never run as "connected to everything".
+      const violation = leverViolationAfterJoin(levers, joined.mediaServers);
+      if (violation !== undefined) {
+        session.disconnect();
+        joinError = violation;
+        return;
+      }
+      selfParticipantId = joined.participantId;
+      showHostControls = session.isHost || hostControlsForced(levers);
     } catch (err) {
       joinError = errorText(err);
       if (isSessionRejection(err)) onSessionInvalid();
@@ -92,7 +130,13 @@
 <p data-testid="meeting-state">{store.meetingState}</p>
 <ul data-testid="participant-list">
   {#each store.participants as participant (participant.participantId)}
-    <li data-testid={`participant-${participant.participantId}`}>{participant.name}</li>
+    <ParticipantRow
+      {participant}
+      {store}
+      {session}
+      {selfParticipantId}
+      hostControls={showHostControls && store.meetingState === MeetingSessionState.Joined}
+    />
   {/each}
 </ul>
 
@@ -104,7 +148,7 @@
   benefit.
 -->
 {#if store.meetingState === MeetingSessionState.Joined}
-  <InMeeting {session} {store} />
+  <InMeeting {session} {store} {selfParticipantId} />
 {/if}
 
 {#if store.lastError}

@@ -59,6 +59,8 @@ import {
   ServerMessageSchema,
   MediaKind,
   MuteRequestSchema,
+  ServerMuteRequestSchema,
+  UnmuteRequestSchema,
   ReceiveCapabilitySchema,
   ReceiveSlotSchema,
   SlotState,
@@ -69,12 +71,14 @@ import type {
   ServerMessage,
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 
-import { isAuthClass, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
-import { mapLeaveReason } from './events.js';
+import { closesConnection, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
+import { MAX_RELAYED_PARTICIPANT_ID_LENGTH, mapLeaveReason } from './events.js';
 import { takeMeetingKek, type MeetingKekSink } from './kekIntake.js';
 import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
 import { RosterKeyFeed } from './rosterKeyFeed.js';
 import type {
+  ParticipantMuteEvent,
+  UnmuteRequestedEvent,
   ReceiveSlotDeclaration,
   RosterKeySink,
   SendDirectiveEvent,
@@ -183,6 +187,15 @@ export interface SignalingEventMap {
    * from that frame's own `key_id.sender_id`, never from an assignment.
    */
   streamAssignments: StreamAssignmentsEvent;
+  /** A participant's SERVER mute changed, or was replayed at join (story 2 R-11). */
+  participantMuteChanged: ParticipantMuteEvent;
+  /** MC relayed a server-muted participant's unmute request (host only, R-10). */
+  unmuteRequested: UnmuteRequestedEvent;
+}
+
+/** Bound an MC-relayed id; an empty string reads as absent. */
+function relayedId(raw: string): string | undefined {
+  return raw === '' ? undefined : raw.slice(0, MAX_RELAYED_PARTICIPANT_ID_LENGTH);
 }
 
 interface Deferred<T> {
@@ -562,6 +575,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           existingParticipants: jr.existingParticipants.map((p) => ({
             participantId: p.participantId,
             name: p.name,
+            senderId: p.senderId,
           })),
           mediaServers: jr.mediaServers.map((m) => m.mediaHandlerUrl),
           correlationId: jr.correlationId,
@@ -576,7 +590,11 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         if (participant !== undefined) {
           this.#rosterKeys.joined([participant]);
           this.emit('participantJoined', {
-            participant: { participantId: participant.participantId, name: participant.name },
+            participant: {
+              participantId: participant.participantId,
+              name: participant.name,
+              senderId: participant.senderId,
+            },
           });
         }
         return;
@@ -640,6 +658,31 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         if (this.#kekSink) {
           takeMeetingKek(message.value, this.#kekSink, MEDIA_KEK_SOURCES.KekUpdate);
         }
+        return;
+      }
+      case 'participantMuteUpdate': {
+        // SERVER mute only (see `ParticipantMuteEvent`); the self-mute snapshot
+        // booleans are informational and deliberately dropped here. Ids are
+        // MC-relayed: bounded before they leave the decode boundary.
+        // One rule for both relays: an empty id carries nothing renderable and
+        // is dropped (as for `unmuteRequest` below).
+        const update = message.value;
+        const participantId = relayedId(update.participantId);
+        if (participantId === undefined) return;
+        const serverMutedBy = update.audioServerMuted ? relayedId(update.serverMutedBy) : undefined;
+        this.emit('participantMuteChanged', {
+          participantId,
+          audioServerMuted: update.audioServerMuted,
+          ...(serverMutedBy !== undefined ? { serverMutedBy } : {}),
+        });
+        return;
+      }
+      case 'unmuteRequest': {
+        // MC's relay to the host. `participant_id` is MC-stamped from the
+        // requester's authenticated connection; an empty one carries nothing
+        // renderable and is dropped rather than shown as "someone".
+        const requester = relayedId(message.value.participantId);
+        if (requester !== undefined) this.emit('unmuteRequested', { participantId: requester });
         return;
       }
       case 'error': {
@@ -712,6 +755,54 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
   }
 
+  /**
+   * Ask MC to server-mute or lift a server mute on another participant
+   * (ADR-0036 §5, story 2 R-8).
+   *
+   * TARGET AND ACTION ONLY. The message has no requester field, and none is
+   * invented: MC identifies the requester from this authenticated connection and
+   * decides authority itself. `reason` is left empty (it is client-controlled and
+   * echoed to another participant). Audio only this story, so `videoMuted` is
+   * false. A refusal arrives as a post-join `FORBIDDEN` session error, which
+   * does NOT close the connection (`errorCodeMap.closesConnection`).
+   *
+   * @throws {SignalingError} `Transport` if called before join settled or after teardown.
+   */
+  async sendServerMuteRequest(targetParticipantId: string, audioMuted: boolean): Promise<void> {
+    const stream = this.#requireOpenStream('sendServerMuteRequest');
+    const clientMessage = create(ClientMessageSchema, {
+      message: {
+        case: 'serverMuteRequest',
+        value: create(ServerMuteRequestSchema, {
+          participantId: targetParticipantId,
+          audioMuted,
+          videoMuted: false,
+        }),
+      },
+    });
+    await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
+  }
+
+  /**
+   * Ask the host to lift this participant's server mute (R-10).
+   *
+   * NOTIFIES ONLY: MC relays it to the host and never clears the mute on it. No
+   * `participant_id` is sent — MC stamps the requester from this connection and
+   * overwrites any client value anyway.
+   *
+   * @throws {SignalingError} `Transport` if called before join settled or after teardown.
+   */
+  async sendUnmuteRequest(): Promise<void> {
+    const stream = this.#requireOpenStream('sendUnmuteRequest');
+    const clientMessage = create(ClientMessageSchema, {
+      message: {
+        case: 'unmuteRequest',
+        value: create(UnmuteRequestSchema, { requestAudio: true, requestVideo: false }),
+      },
+    });
+    await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
+  }
+
   #requireOpenStream(what: string): WebTransportBidirectionalStream {
     const stream = this.#stream;
     if (stream === undefined || this.#terminated || !this.#joinSettled) {
@@ -734,7 +825,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     const error = new SignalingError(signalingCode, text, {
       ...(serverCode !== undefined ? { serverCode } : {}),
     });
-    this.#raise(error, isAuthClass(signalingCode));
+    this.#raise(error, closesConnection(signalingCode, this.#joinSettled ? 'joined' : 'joining'));
   }
 
   // ----------------------------------------------------------------------------

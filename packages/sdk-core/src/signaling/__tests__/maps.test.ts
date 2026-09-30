@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { isAuthClass, mapErrorCode, staticMessageFor } from '../errorCodeMap.js';
+import { closesConnection, mapErrorCode, staticMessageFor } from '../errorCodeMap.js';
 import { ParticipantLeaveReason, mapLeaveReason } from '../events.js';
 import { SignalingErrorCode } from '../../errors/SignalingError.js';
 import { Codec, ErrorCode, LeaveReason } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
@@ -36,7 +36,7 @@ describe('mapLeaveReason', () => {
   });
 });
 
-describe('mapErrorCode / isAuthClass', () => {
+describe('mapErrorCode / closesConnection', () => {
   it('maps the UNSPECIFIED zero value to Unknown', () => {
     // ErrorCode is NOT renumbered: UNKNOWN -> ERROR_CODE_UNSPECIFIED is the
     // same number with the same meaning, so only the name moved.
@@ -44,13 +44,22 @@ describe('mapErrorCode / isAuthClass', () => {
     expect(mapErrorCode(ErrorCode.UNSPECIFIED)).toBe(SignalingErrorCode.Unknown);
   });
 
-  it('maps each proto ErrorCode and flags only UNAUTHORIZED/FORBIDDEN as auth-class', () => {
+  it('maps UNAUTHORIZED', () => {
     expect(mapErrorCode(ErrorCode.UNAUTHORIZED)).toBe(SignalingErrorCode.Unauthorized);
-    expect(isAuthClass(SignalingErrorCode.Unauthorized)).toBe(true);
-    expect(isAuthClass(SignalingErrorCode.Forbidden)).toBe(true);
-    expect(isAuthClass(SignalingErrorCode.CapacityExceeded)).toBe(false);
-    expect(isAuthClass(SignalingErrorCode.Framing)).toBe(false);
   });
+
+  // code x phase: while joining, UNAUTHORIZED and FORBIDDEN close (R-18); once
+  // joined only UNAUTHORIZED does — a post-join FORBIDDEN is MC's server-mute
+  // refusal, a request-level answer on a connection MC keeps open.
+  const closing: Record<'joining' | 'joined', readonly SignalingErrorCode[]> = {
+    joining: [SignalingErrorCode.Unauthorized, SignalingErrorCode.Forbidden],
+    joined: [SignalingErrorCode.Unauthorized],
+  };
+  for (const phase of ['joining', 'joined'] as const) {
+    it.each(Object.values(SignalingErrorCode))(`${phase}: %s closes iff listed`, (code) => {
+      expect(closesConnection(code, phase)).toBe(closing[phase].includes(code));
+    });
+  }
 
   it('collapses an out-of-range ErrorCode to Unknown', () => {
     expect(mapErrorCode(42 as ErrorCode)).toBe(SignalingErrorCode.Unknown);

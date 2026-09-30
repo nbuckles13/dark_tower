@@ -19,6 +19,8 @@ import {
   MediaKind,
   MediaServerInfoSchema,
   MeetingKekUpdateSchema,
+  ParticipantMuteUpdateSchema,
+  UnmuteRequestSchema,
   ParticipantJoinedSchema,
   ParticipantLeftSchema,
   ParticipantSchema,
@@ -50,7 +52,9 @@ function buildServerMessage(
     | { case: 'streamPublished'; value: ReturnType<typeof buildStreamPublished> }
     | { case: 'sendDirective'; value: ReturnType<typeof buildSendDirective> }
     | { case: 'streamAssignments'; value: ReturnType<typeof buildStreamAssignments> }
-    | { case: 'meetingKekUpdate'; value: ReturnType<typeof buildMeetingKekUpdate> },
+    | { case: 'meetingKekUpdate'; value: ReturnType<typeof buildMeetingKekUpdate> }
+    | { case: 'participantMuteUpdate'; value: ReturnType<typeof buildParticipantMuteUpdate> }
+    | { case: 'unmuteRequest'; value: ReturnType<typeof buildUnmuteRequestRelay> },
 ) {
   return create(ServerMessageSchema, { message });
 }
@@ -292,3 +296,38 @@ export function framedMeetingKekUpdate(kek: Uint8Array, generation: number): Uin
 }
 
 export { MediaKind, SlotState };
+
+export function buildParticipantMuteUpdate(init: {
+  participantId: string;
+  audioSelfMuted?: boolean;
+  audioServerMuted: boolean;
+  serverMutedBy?: string;
+}) {
+  return create(ParticipantMuteUpdateSchema, {
+    participantId: init.participantId,
+    audioSelfMuted: init.audioSelfMuted ?? false,
+    audioServerMuted: init.audioServerMuted,
+    serverMutedBy: init.serverMutedBy ?? '',
+  });
+}
+
+export function framedParticipantMuteUpdate(
+  init: Parameters<typeof buildParticipantMuteUpdate>[0],
+): Uint8Array {
+  return frameServerMessage({
+    case: 'participantMuteUpdate',
+    value: buildParticipantMuteUpdate(init),
+  });
+}
+
+/** MC's relay of a participant's unmute request to the host (`participant_id` MC-stamped). */
+export function buildUnmuteRequestRelay(participantId: string) {
+  return create(UnmuteRequestSchema, { requestAudio: true, participantId });
+}
+
+export function framedUnmuteRequestRelay(participantId: string): Uint8Array {
+  return frameServerMessage({
+    case: 'unmuteRequest',
+    value: buildUnmuteRequestRelay(participantId),
+  });
+}

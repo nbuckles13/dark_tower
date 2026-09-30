@@ -258,6 +258,7 @@ test('slotAssignments: the EXPECTED sender per slot, stringified, whitelist-only
       { slotId: 0, senderId: '7', slotState: 'active' },
       { slotId: 1, slotState: 'fewer_sources' },
     ],
+    unreachableSenderIds: ['9'],
   });
 });
 
@@ -352,4 +353,91 @@ test('without instrumentation (never injected outside a test build) nothing is s
   } finally {
     vi.useRealTimers();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Story 2 task 15: server mute, unmute requests, roster sender ids, KEK
+// generation, build knobs, and the gated flush command
+// ---------------------------------------------------------------------------
+
+test('participantMute / unmuteRequested are whitelist projections of the wire', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  session.fire('participantMuteChanged', {
+    participantId: 'b',
+    audioServerMuted: true,
+    serverMutedBy: 'h',
+    ...({ rogue: 'SECRET' } as object),
+  });
+  session.fire('participantMuteChanged', { participantId: 'b', audioServerMuted: false });
+  session.fire('unmuteRequested', { participantId: 'b' });
+  expect(events().filter((e) => e['type'] === 'participantMute')).toEqual([
+    { type: 'participantMute', participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' },
+    { type: 'participantMute', participantId: 'b', audioServerMuted: false },
+  ]);
+  expect(events().find((e) => e['type'] === 'unmuteRequested')).toEqual({
+    type: 'unmuteRequested',
+    participantId: 'b',
+  });
+});
+
+test('roster projections carry the stringified sender id, and only when MC set one', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  session.fire('participantJoined', {
+    participant: { participantId: 'b', name: 'Bea', senderId: 5 },
+  });
+  session.fire('participantJoined', { participant: { participantId: 'c', name: 'Cid' } });
+  expect(events().filter((e) => e['type'] === 'participantJoined')).toEqual([
+    { type: 'participantJoined', participantId: 'b', name: 'Bea', senderId: '5' },
+    { type: 'participantJoined', participantId: 'c', name: 'Cid' },
+  ]);
+});
+
+test('the KEK generation is emitted on CHANGE only', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    install(session);
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 2);
+    session.currentKekGeneration = 1;
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 3);
+    session.currentKekGeneration = 2;
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 3);
+    expect(
+      events()
+        .filter((e) => e['type'] === 'kekGeneration')
+        .map((e) => e['generation']),
+    ).toEqual([1, 2]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('buildKnobs reports the levers define and whether telemetry is configured', () => {
+  const session = new MockMeetingSession();
+  disposers.push(installE2EHooks(session, undefined, { telemetryConfigured: true }));
+  expect(events().find((e) => e['type'] === 'buildKnobs')).toEqual({
+    type: 'buildKnobs',
+    testLevers: false, // the vitest define
+    telemetryConfigured: true,
+    // No SDK telemetry is configured under this test runner: intent alone is not state.
+    telemetrySinkActive: false,
+  });
+});
+
+test('flushMetrics REJECTS when telemetry is not configured — never a silent no-op', async () => {
+  const session = new MockMeetingSession();
+  install(session);
+  await expect(window.__darktower_test__!.flushMetrics()).rejects.toThrow(
+    'telemetry_not_configured',
+  );
+});
+
+test('flushMetrics REJECTS when the config asked for telemetry but the SDK holds no provider', async () => {
+  const session = new MockMeetingSession();
+  disposers.push(installE2EHooks(session, undefined, { telemetryConfigured: true }));
+  await expect(window.__darktower_test__!.flushMetrics()).rejects.toThrow(
+    'telemetry_not_configured',
+  );
 });

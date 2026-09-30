@@ -18,6 +18,7 @@ import {
 import type { WebTransportConnectFn } from '@darktower/sdk-core';
 import type { DemoConfig } from './config.js';
 import type { E2EInstrumentation } from './e2eAnalysis.js';
+import { blockingConnect, type TestLevers } from './testLevers.js';
 
 /** A `connect` that pins the dev MC/MH cert fingerprints (dev only). */
 function makeConnect(config: DemoConfig): WebTransportConnectFn {
@@ -38,17 +39,27 @@ export function buildMeetingClient(config: DemoConfig): MeetingApiClient {
 /**
  * Construct a fresh single-use {@link MeetingSession} (meeting-join view).
  *
- * `receiveSlots` is N from `VITE_DT_RECEIVE_SLOTS` (see `config.ts`). `e2e` is
+ * `receiveSlots` is N from `VITE_DT_RECEIVE_SLOTS` (see `config.ts`), unless a
+ * test-levers build overrides it for this context. `e2e` is
  * the test build's receive-side instrumentation (`e2eAnalysis.ts`); it is
  * `undefined` in production, so neither the verification recorder nor the
  * analysing playback wrapper is ever injected there.
  */
-export function buildMeetingSession(config: DemoConfig, e2e?: E2EInstrumentation): MeetingSession {
+export function buildMeetingSession(
+  config: DemoConfig,
+  e2e?: E2EInstrumentation,
+  levers?: TestLevers,
+): MeetingSession {
+  // `levers` exists only in a `DT_TEST_LEVERS=1` build (`testLevers.ts`). The
+  // define is tested AT EACH USE so the lever code is statically dead — and
+  // tree-shaken — in every other build, not merely unreached.
+  const connect = makeConnect(config);
+  const active = __DT_TEST_LEVERS__ ? levers : undefined;
   return new MeetingSession({
     acOriginTemplate: config.acOriginTemplate,
     gcBaseUrl: config.gcBaseUrl,
-    connect: makeConnect(config),
-    receiveSlots: config.receiveSlots,
+    connect: __DT_TEST_LEVERS__ && active ? blockingConnect(connect, active) : connect,
+    receiveSlots: (__DT_TEST_LEVERS__ ? active?.receiveSlots : undefined) ?? config.receiveSlots,
     ...(e2e ? { receiveVerification: e2e.recorder, playbackFactory: e2e.playbackFactory } : {}),
   });
 }

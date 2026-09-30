@@ -129,9 +129,21 @@ export function resultsToInstanceMap(
 export function anyInstanceExceedsBaseline(
   baseline: InstanceCounters,
   current: InstanceCounters,
+  minDelta?: number,
 ): boolean {
+  if (minDelta !== undefined && !(Number.isInteger(minDelta) && minDelta >= 1)) {
+    // 0 or a negative would pass with NO increment — a vacuous check.
+    throw new RangeError(`minDelta must be an integer >= 1, got ${String(minDelta)}`);
+  }
   for (const [instance, value] of current) {
-    if (value > (baseline.get(instance) ?? 0)) {
+    const base = baseline.get(instance) ?? 0;
+    // Default: strictly above. With `minDelta` (story 2 S6: "at least one
+    // increment per remaining client"), the rise on ONE instance must reach it —
+    // monotone-safe, since a concurrent increment only pushes the value up.
+    // `minDelta` is a DELIBERATE TS-ONLY extension: the Rust twin
+    // (`crates/env-tests/src/fixtures/metrics.rs`) has no consumer for it, so the
+    // mirror-both-suites rule in this module's header applies to the default arm.
+    if (minDelta === undefined ? value > base : value - base >= minDelta) {
       return true;
     }
   }

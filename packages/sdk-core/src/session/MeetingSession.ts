@@ -42,6 +42,7 @@ import { AudioPipeline, type AudioPipelineOptions } from '../media/lifecycle/Aud
 import { MeetingKekHolder } from '../media/setup/kekSource.js';
 import { kekObserver, rosterInvalidationListener, sendDirectiveListener } from './mediaWiring.js';
 import { classifySlotCap, receiveSlotIdsToDeclare, selectCaptureSource } from './mediaSelection.js';
+import { readIsHost } from './meetingRole.js';
 import { MediaMetrics } from '../media/setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
 import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
@@ -311,6 +312,12 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    */
   #advertisedSlotCap: number | undefined;
   #captureSource: CaptureSourceInfo | undefined;
+  /**
+   * Whether the meeting token names this participant host — a UI HINT for the
+   * server-mute affordance, never an authority (MC authorises every request).
+   * Only this boolean survives `join()`; see `meetingRole.ts`.
+   */
+  #isHost = false;
   readonly #encoderFactory: AudioEncoderFactory;
   readonly #decoderFactory: AudioDecoderFactory;
   readonly #playbackFactory: PlaybackSinkFactory;
@@ -409,6 +416,17 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         ...this.#metricLabels,
         meeting_id_hash: await meetingIdHash(joinResp.meetingId),
       };
+      // The host hint (story 2 R-11). The decoded payload never leaves
+      // `readIsHost`; only the boolean and a bounded failure token come back.
+      const role = readIsHost(joinResp.token);
+      this.#isHost = role.isHost;
+      if ('failure' in role) {
+        console.warn(
+          '[dt-meeting-role]',
+          `could not read the meeting role from the meeting token (${role.failure}); ` +
+            'host controls stay hidden. MC still authorises every request.',
+        );
+      }
 
       // ADR-0036 §4 step 1: generate the identity signing keypair BEFORE the
       // join request, so its public half can travel on it. Per meeting, never
@@ -684,6 +702,57 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     return this.#captureSource;
   }
 
+  /**
+   * Whether this participant is the meeting's host, from the meeting token's
+   * `role` claim. A UI HINT for showing the server-mute affordance: MC decides
+   * authority from its own validated token and the connection on every request,
+   * so this being wrong shows or hides a button and grants nothing. `false`
+   * before `join()`.
+   */
+  get isHost(): boolean {
+    return this.#isHost;
+  }
+
+  /**
+   * The CURRENT meeting-KEK generation this client holds, or `undefined` before
+   * one arrives. The generation is already public — it is in every frame's key
+   * id — so this is a diagnostic (the test bus's per-participant rotation
+   * evidence), never key material.
+   */
+  get currentKekGeneration(): number | undefined {
+    return this.#kekSource.currentForWrapping()?.generation;
+  }
+
+  /**
+   * Ask MC to server-mute (`muted = true`) or lift a server mute on another
+   * participant (ADR-0036 §5, story 2 R-8). Carries target and action only; MC
+   * identifies the requester from the connection and refuses a non-host with a
+   * post-join `FORBIDDEN` session `error` (the connection stays up).
+   *
+   * @throws {SignalingError} `Transport` if called before a settled join.
+   */
+  async setServerMute(participantId: string, muted: boolean): Promise<void> {
+    await this.#requireJoinedSignaling('setServerMute').sendServerMuteRequest(participantId, muted);
+  }
+
+  /**
+   * Ask the host to lift THIS participant's server mute (R-10). Only notifies the
+   * host; the server-muted state changes when MC says so, never before.
+   *
+   * @throws {SignalingError} `Transport` if called before a settled join.
+   */
+  async requestUnmute(): Promise<void> {
+    await this.#requireJoinedSignaling('requestUnmute').sendUnmuteRequest();
+  }
+
+  #requireJoinedSignaling(what: string): SignalingClient {
+    const signaling = this.#signaling;
+    if (signaling === undefined || this.#state !== MeetingSessionState.Joined) {
+      throw new SignalingError(SignalingErrorCode.Transport, `${what} requires a settled join`);
+    }
+    return signaling;
+  }
+
   /** The running media pipeline, or `undefined` before `startMedia()`. */
   get media(): AudioPipeline | undefined {
     return this.#pipeline;
@@ -848,6 +917,10 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // reassign slots for a client that has not started media, and a UI that
     // renders "waiting for the controller" must see that happen.
     signaling.on('streamAssignments', (e) => this.emit('streamAssignments', e));
+    // Server-mute state and the host's unmute-request relay (story 2 R-10/R-11):
+    // signalling state, bridged at creation for the same reason.
+    signaling.on('participantMuteChanged', (e) => this.emit('participantMuteChanged', e));
+    signaling.on('unmuteRequested', (e) => this.emit('unmuteRequested', e));
     return signaling;
   }
 

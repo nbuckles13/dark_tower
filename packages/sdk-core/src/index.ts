@@ -140,8 +140,10 @@ export type {
   MhConnectionStatusReport,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
+  ParticipantMuteEvent,
   RosterParticipant,
   SignalingCapabilities,
+  UnmuteRequestedEvent,
   SignalingJoinParams,
 } from './signaling/events.js';
 

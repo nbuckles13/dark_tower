@@ -38,6 +38,7 @@ import {
   SUITE_RECEIVE_SLOTS,
 } from './cohort.js';
 import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS } from '../src/lib/e2eBus.js';
+import { scanRecordedRequests, type RecordedRequest, type ScanReport } from './credentialScan.js';
 import { e2eEnv, toLoopbackUrl } from './env.js';
 import type { InstanceCounters } from './instanceCounters.js';
 import { diagnoseMissingSender } from './mcMetrics.js';
@@ -573,8 +574,10 @@ export async function expectRosterShows(
 ): Promise<void> {
   const entry = page.getByTestId(`participant-${participantId}`);
   await expect(entry, `roster must render participant ${participantId}`).toBeVisible();
+  // The row also carries mute/reachability indicators and (for a host) controls,
+  // so the exact-name check reads the row's NAME element, not the whole row.
   await expect(
-    entry,
+    page.getByTestId(`participant-name-${participantId}`),
     `roster entry for ${participantId} must show its (token-carried) display name`,
   ).toHaveText(expectedName);
 }
@@ -780,13 +783,9 @@ export async function expectLastErrorCode(
 // ============================================================================
 
 /** One recorded HTTP request (WebTransport traffic is not visible here — and the
- * join path puts no credential on WT either: join is token-based end-to-end). */
-export interface RecordedRequest {
-  readonly url: string;
-  readonly method: string;
-  readonly headers: Readonly<Record<string, string>>;
-  readonly postData: string | null;
-}
+ * join path puts no credential on WT either: join is token-based end-to-end).
+ * The type's home is `./credentialScan`, the pure scan. */
+export type { RecordedRequest } from './credentialScan.js';
 
 export interface RequestRecorder {
   /** Stop recording and return everything captured in this window. */
@@ -818,96 +817,31 @@ export function recordRequests(context: BrowserContext): RequestRecorder {
 }
 
 /**
- * The token-only invariant, value-based: within the join window,
- *   1. NO request carries the actual email/password strings anywhere
- *      (URL, headers, body) — values, not field names, so renames can't dodge
- *      it, and both raw AND percent-encoded forms are scanned so a credential
- *      smuggled into a query string (`@` -> `%40`) can't dodge it either;
- *   2. NO request targets /api/v1/auth/* at all (structural guard: the forced
- *      re-login band-aid of commit 7b69288 must never be re-encoded);
- *   3. ANY `Authorization` header in the window is `Bearer ...` — nothing else
- *      (closes the `Basic base64(email:password)` channel, which the value-scan
- *      cannot see);
- *   4. the GC meeting request(s) authenticate via `Authorization: Bearer`.
+ * The token-only invariant over one context's join window — see
+ * `./credentialScan` for the five properties (the scan is the pure half, so a
+ * node-tier test proves every failure class). The window MUST contain a forced
+ * telemetry export (`flushTelemetry(page)` before `recorder.stop()`): property 5
+ * is unconditional in this suite, which asserts telemetry is configured
+ * (`expectBuildKnobs`).
  *
- * SCOPE LOCK: properties 1-3 deliberately apply to EVERY recorded request, not
- * only join traffic — in particular to `/api/v1/telemetry/*`, which since R-27
- * (R15) carries the user's bearer on every metric export. The name says "join"
- * because property 4 is join-specific; do NOT narrow the 1-3 loop back to join
- * paths, or the newest token-carrying surface silently leaves this control.
- * (Whether a telemetry request actually LANDS in the recording window is
- * timing-dependent and is not asserted here — tracked as client task 15's
- * obligation in docs/user-stories/2026-09-21-hear-each-other.md.)
+ * Returns the per-surface counts so a caller can see what the checks ran over.
  */
 export function assertTokenOnlyJoinTraffic(
   records: readonly RecordedRequest[],
   creds: TestCredentials,
   label: string,
-): void {
-  const leaks: string[] = [];
-  const authCalls: string[] = [];
-  const nonBearerAuthHeaders: string[] = [];
-  const meetingRequests: RecordedRequest[] = [];
-  // Raw + percent-encoded forms. Only the email actually differs under
-  // encodeURIComponent (the password is a UUID), but scanning all four is
-  // self-documenting and rename-proof (@security, task #18 review). Each needle
-  // carries its redaction marker: the failure message must show WHERE a value
-  // appeared without repeating it — echoing the credential in an assertion
-  // error would itself be a leak into whatever log sink renders the failure
-  // (@semantic-guard, credential-leak item 8).
-  const needles: ReadonlyArray<readonly [string, string]> = [
-    [creds.email, '[email]'],
-    [creds.password, '[password]'],
-    [encodeURIComponent(creds.email), '[email:urlencoded]'],
-    [encodeURIComponent(creds.password), '[password:urlencoded]'],
-  ];
-  // EVERY string echoed into an expect failure message goes through this —
-  // the exact regression this assertion detects is a credential on a request,
-  // and the failure diagnostic must show WHERE without repeating the value
-  // into whatever log sink renders it. New push/expect sites in this function
-  // must use it too (@semantic-guard, credential-leak item 8).
-  const redact = (s: string): string =>
-    needles.reduce((acc, [needle, marker]) => acc.replaceAll(needle, marker), s);
-
-  for (const record of records) {
-    const haystack = `${record.url}\n${JSON.stringify(record.headers)}\n${record.postData ?? ''}`;
-    if (needles.some(([needle]) => haystack.includes(needle))) {
-      leaks.push(redact(`${record.method} ${record.url}`));
-    }
-    const authHeader = record.headers['authorization'];
-    if (authHeader !== undefined && !authHeader.startsWith('Bearer ')) {
-      const scheme = authHeader.split(' ')[0] ?? '<empty>';
-      nonBearerAuthHeaders.push(redact(`${record.method} ${record.url} (scheme: ${scheme})`));
-    }
-    // DELIBERATELY independent literals (NOT the module consts above): a test
-    // asserting the ABSENCE of auth calls must not derive the forbidden prefix
-    // from the same encoding the drivers use — see docs/TODO.md
-    // §Cross-Service Duplication, #18 entry, nuance (b). Do not "clean up".
-    const pathname = new URL(record.url).pathname;
-    if (pathname.startsWith('/api/v1/auth/')) {
-      authCalls.push(redact(`${record.method} ${record.url}`));
-    }
-    if (pathname.startsWith('/api/v1/meetings')) {
-      meetingRequests.push(record);
-    }
-  }
-
-  expect(leaks, `[${label}] requests carrying raw credentials at join time`).toEqual([]);
-  expect(authCalls, `[${label}] auth endpoints hit at join time (re-login regression)`).toEqual([]);
+): ScanReport['surfaces'] {
+  const report = scanRecordedRequests(records, creds);
   expect(
-    nonBearerAuthHeaders,
-    `[${label}] non-Bearer Authorization headers at join time (Basic/Digest carry credentials)`,
+    report.findings.map((f) => `${f.reason}: ${f.detail}`),
+    `[${label}] token-only join traffic violations (reason: detail — already redacted)`,
   ).toEqual([]);
-  expect(
-    meetingRequests.length,
-    `[${label}] expected at least one GC /api/v1/meetings request in the join window`,
-  ).toBeGreaterThan(0);
-  for (const request of meetingRequests) {
-    expect(
-      request.headers['authorization'] ?? '',
-      `[${label}] GC request ${redact(request.url)} must authenticate via bearer token`,
-    ).toMatch(/^Bearer /);
-  }
+  // Belt and braces on the positive control, stated as counts.
+  expect(report.surfaces.telemetry.scanned, `[${label}] telemetry-not-recorded`).toBeGreaterThan(0);
+  expect(report.surfaces.telemetry.bearerChecked, `[${label}] telemetry-not-bearer-checked`).toBe(
+    report.surfaces.telemetry.scanned,
+  );
+  return report.surfaces;
 }
 
 // ============================================================================
@@ -943,9 +877,9 @@ export async function recoverByJoining(page: Page, meetingCode: string): Promise
 // ============================================================================
 // Media path (story 1 task #20; story 2 R-3 removed loopback — ADR-0036 §5/§6/§10)
 //
-// `waitForFirstMediaFrame`, `setMuteViaUi`, `expectEgressAdvances`,
-// `expectIngressAdvances` and `expectEgressFlatWhileMuted` currently have no
-// browser caller: they need a multi-party meeting, which story 2 task 15 owns.
+// Callers: the multi-party specs (story 2 task 15) — `multi-party-hear.spec.ts`
+// (first media, observed), `server-mute.spec.ts` (client structural mute, the
+// egress/ingress advance checks) — and `solo-participant.spec.ts` (flat window).
 // ============================================================================
 
 /**
@@ -982,8 +916,8 @@ const FIRST_MEDIA_TIMEOUT_MS = 20_000;
  * produces zero readings and "every reading is equal" passes, reporting a broken
  * harness as a working mute.
  */
-const MUTE_OBSERVATION_MS = 2_500;
-const MIN_MUTE_SAMPLES = 4;
+export const FLAT_WINDOW_OBSERVE_MS = 2_500;
+export const MIN_FLAT_WINDOW_SAMPLES = 4;
 
 /**
  * Frames already queued at the instant of mute may still drain — ADR-0036 §5
@@ -992,7 +926,7 @@ const MIN_MUTE_SAMPLES = 4;
  * after this settle rather than at the mute itself; taking it at the mute would
  * make the assertion fail on correct behaviour.
  */
-const MUTE_SETTLE_MS = 750;
+export const FLAT_WINDOW_SETTLE_MS = 750;
 
 /**
  * Render the receive-path accounting identity from the newest sample.
@@ -1084,8 +1018,8 @@ export async function startAudio(page: Page): Promise<void> {
  *
  * A `firstMediaFrame` event means a frame a peer captured, encoded, encrypted,
  * signed and sent arrived via MH and completed verify -> replay -> unwrap ->
- * decrypt -> decode. (Story 1 used this for the loopback; since story 2 R-3 a
- * client never receives its own audio, so this needs a peer that SHARES A
+ * decrypt -> decode. Since story 2 R-3 a client never receives its own audio,
+ * so this needs a peer that SHARES A
  * CONNECTED HANDLER with this client — ADR-0036 §9's visibility rule. With every
  * participant connected to every handler that is any peer; it stops being any
  * peer only under partial connectivity, where a peer sharing none is carried in
@@ -1238,8 +1172,8 @@ export async function expectCountersFlatOverWindow(
     readonly settleMs?: number;
   },
 ): Promise<void> {
-  const settleMs = opts.settleMs ?? MUTE_SETTLE_MS;
-  await page.waitForTimeout(settleMs + MUTE_OBSERVATION_MS);
+  const settleMs = opts.settleMs ?? FLAT_WINDOW_SETTLE_MS;
+  await page.waitForTimeout(settleMs + FLAT_WINDOW_OBSERVE_MS);
 
   const settledAtMs = opts.fromMs + settleMs;
   const samples = (await frameCountSamples(page)).filter((s) => s.atMs >= settledAtMs);
@@ -1247,10 +1181,10 @@ export async function expectCountersFlatOverWindow(
   expect(
     samples.length,
     `the frame-count sampler produced only ${samples.length} sample(s) in the ` +
-      `${MUTE_OBSERVATION_MS}ms observation window (needed >= ${MIN_MUTE_SAMPLES}). This is a ` +
+      `${FLAT_WINDOW_OBSERVE_MS}ms observation window (needed >= ${MIN_FLAT_WINDOW_SAMPLES}). This is a ` +
       `HARNESS failure, not a media failure: with no samples, flatness is vacuously true. Check ` +
       `that the __E2E_HOOKS__ bus sampler is running and that media was started.`,
-  ).toBeGreaterThanOrEqual(MIN_MUTE_SAMPLES);
+  ).toBeGreaterThanOrEqual(MIN_FLAT_WINDOW_SAMPLES);
 
   for (const field of opts.fields) {
     const baseline = samples[0]![field];
@@ -1298,7 +1232,7 @@ export async function expectEgressFlatWhileMuted(page: Page, mutedAtMs: number):
  * reads), and a poll never serialises the whole cumulative buffer, which grows
  * a full-spectrum `receiveAnalysis` record every sampler tick.
  */
-async function latestBusEventsOf<T extends string>(
+export async function latestBusEventsOf<T extends string>(
   page: Page,
   types: readonly T[],
 ): Promise<Record<T, Readonly<Record<string, unknown>> | undefined>> {
@@ -1328,7 +1262,11 @@ async function latestBusEventsOf<T extends string>(
  * demo N may differ) runs its own N; a mismatch would otherwise surface as
  * `not_assigned` / fewer-sources — the misrouting-shaped symptom S1 separates.
  */
-export async function expectDeclaredReceiveSlots(page: Page, label: string): Promise<void> {
+export async function expectDeclaredReceiveSlots(
+  page: Page,
+  label: string,
+  expectedSlots: number = SUITE_RECEIVE_SLOTS,
+): Promise<void> {
   await expect
     .poll(
       async () => (await latestBusEventsOf(page, ['receiveSlots'])).receiveSlots !== undefined,
@@ -1341,16 +1279,65 @@ export async function expectDeclaredReceiveSlots(page: Page, label: string): Pro
   const { receiveSlots: slots } = await latestBusEventsOf(page, ['receiveSlots']);
   expect(
     slots?.['declared'],
-    `${label}: the build declares N=${String(slots?.['declared'])}, the suite needs ` +
-      `SUITE_RECEIVE_SLOTS=${SUITE_RECEIVE_SLOTS}. VITE_DT_RECEIVE_SLOTS is fixed when the dev ` +
+    `${label}: the build declares N=${String(slots?.['declared'])}, the scenario needs ` +
+      `N=${expectedSlots} (suite default SUITE_RECEIVE_SLOTS=${SUITE_RECEIVE_SLOTS}; a per-context ` +
+      `N comes from the receiveSlots test lever). VITE_DT_RECEIVE_SLOTS is fixed when the dev ` +
       `server starts; with reuseExistingServer a server started elsewhere keeps its own N — ` +
       `stop it and let Playwright start one.`,
-  ).toBe(SUITE_RECEIVE_SLOTS);
+  ).toBe(expectedSlots);
   expect(slots?.['serverCapState'], `${label}: MC advertised no receive-slot cap`).toBe('known');
   expect(
     slots?.['serverCap'],
-    `${label}: MC's cap (MC_MAX_RECEIVE_SLOTS) is below the suite's N=${SUITE_RECEIVE_SLOTS}`,
-  ).toBeGreaterThanOrEqual(SUITE_RECEIVE_SLOTS);
+    `${label}: MC's cap (MC_MAX_RECEIVE_SLOTS) is below the scenario's N=${expectedSlots}`,
+  ).toBeGreaterThanOrEqual(expectedSlots);
+}
+
+/**
+ * The build knobs the multi-party suite needs, asserted BEFORE any media
+ * assertion (@operations B, @observability, @test G1): the per-context test
+ * levers (`DT_TEST_LEVERS=1`) and SDK telemetry (`VITE_TELEMETRY_ENDPOINT`). All
+ * three knobs — these two and `DT_TEST_TONE=1` ({@link readOwnTone}) — reach
+ * only a dev server Playwright STARTS (`playwright.config.ts` webServer env); a
+ * reused one keeps whatever it was started with, so the failure names that cause
+ * instead of surfacing later as "C never heard A".
+ */
+export async function expectBuildKnobs(page: Page, label: string): Promise<void> {
+  const { buildKnobs } = await latestBusEventsOf(page, ['buildKnobs']);
+  const reused =
+    'The dev server was reused without it (reuseExistingServer): stop it and let Playwright ' +
+    'start `pnpm dev` with the webServer env in playwright.config.ts.';
+  expect(
+    buildKnobs,
+    `${label}: no buildKnobs bus event — the E2E bus is not installed`,
+  ).toBeDefined();
+  expect(
+    buildKnobs?.['testLevers'],
+    `${label}: build-knob-missing: DT_TEST_LEVERS=1 is not set on this dev server. ${reused}`,
+  ).toBe(true);
+  expect(
+    buildKnobs?.['telemetryConfigured'],
+    `${label}: build-knob-missing: VITE_TELEMETRY_ENDPOINT is not set on this dev server, so no ` +
+      `telemetry exports and the credential-scan positive control would observe nothing. ${reused}`,
+  ).toBe(true);
+  expect(
+    buildKnobs?.['telemetrySinkActive'],
+    `${label}: build-knob-missing: the endpoint is set but the SDK holds no telemetry provider ` +
+      `(configureTelemetryIfEnabled was skipped or failed), so a forced flush would export nothing.`,
+  ).toBe(true);
+}
+
+/**
+ * Force a metric export NOW through the E2E bus (the SDK's `flushMetrics`) and
+ * wait for it. Rejects `telemetry_not_configured` when telemetry is off — never a
+ * silent no-op. Used inside every join-recording window (the credential-scan
+ * positive control) and before every client read-back.
+ */
+export async function flushTelemetry(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const bus = window.__darktower_test__;
+    if (bus === undefined) throw new Error('E2E bus absent: cannot flush telemetry');
+    await bus.flushMetrics();
+  });
 }
 
 /**
@@ -1363,8 +1350,13 @@ export async function expectDeclaredReceiveSlots(page: Page, label: string): Pro
  * asserts the build's declared N first ({@link expectDeclaredReceiveSlots}), so
  * every multi-party participant passes through both build-knob checks.
  */
-export async function readOwnTone(page: Page, label: string): Promise<CohortTone> {
-  await expectDeclaredReceiveSlots(page, label);
+export async function readOwnTone(
+  page: Page,
+  label: string,
+  expectedSlots: number = SUITE_RECEIVE_SLOTS,
+): Promise<CohortTone> {
+  await expectBuildKnobs(page, label);
+  await expectDeclaredReceiveSlots(page, label, expectedSlots);
   await expect
     .poll(
       async () => (await latestBusEventsOf(page, ['captureSource'])).captureSource !== undefined,

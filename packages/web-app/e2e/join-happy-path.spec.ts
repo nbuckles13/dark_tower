@@ -38,6 +38,7 @@ import {
   waitForJoined,
   waitForParticipantJoined,
   waitForParticipantLeft,
+  flushTelemetry,
 } from './fixtures.js';
 import {
   mcConnectedStatusByInstance,
@@ -82,7 +83,9 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
     // handler (task #6) with state=CONNECTED — observed MC-side via Prometheus.
     await waitForMcConnectedStatusAbove(mcStatusBaseline);
 
-    // (e) Token-only invariant (task #58 c-iii).
+    // (e) Token-only invariant (task #58 c-iii), including the telemetry surface:
+    // a forced export INSIDE the window, so the scan provably ran over it.
+    await flushTelemetry(page);
     assertTokenOnlyJoinTraffic(recorder.stop(), SHARED_USER, 'happy-path');
   });
 
@@ -135,6 +138,7 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
       await expectRosterShows(page2, joinedA.participantId, SHARED_USER.displayName);
 
       // (e) Token-only invariant for the distinct second party's join, too.
+      await flushTelemetry(page2);
       assertTokenOnlyJoinTraffic(recorderB.stop(), userB, 'two-party/context-B');
     } finally {
       await context2.close();
@@ -235,6 +239,7 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
     const joined = await waitForJoined(page);
 
     expect(joined.participantId, 'JoinResponse must carry a participant_id').not.toBe('');
+    await flushTelemetry(page);
     assertTokenOnlyJoinTraffic(recorder.stop(), SHARED_USER, 'bootstrap-join');
   });
 });

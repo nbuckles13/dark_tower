@@ -50,6 +50,10 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
     session.on('firstMediaFrame', (elapsedMs) => store.media.applyFirstMediaFrame(elapsedMs)),
     session.on('streamAssignments', (event) => store.media.applyStreamAssignments(event)),
     session.on('mediaFault', (fault) => store.media.applyMediaFault(fault)),
+    // Server-mute state and the host's unmute-request relay (story 2 R-10/R-11),
+    // into the same subscription and the same teardown.
+    session.on('participantMuteChanged', (event) => store.media.applyParticipantMute(event)),
+    session.on('unmuteRequested', (event) => store.media.applyUnmuteRequested(event)),
   ];
   return () => {
     for (const unsubscribe of unsubscribes) unsubscribe();
@@ -65,7 +69,8 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
  *
  * @returns the reactive store; read `.meetingState` / `.participants` /
  *   `.mediaConnections` / `.lastError`, and `.media.audioMuted` /
- *   `.media.firstMediaFrameMs` / `.media.slots` / `.media.lastMediaFault`, in
+ *   `.media.firstMediaFrameMs` / `.media.slots` / `.media.lastMediaFault` /
+ *   `.media.serverMutes` / `.media.unmuteRequests`, in
  *   your template.
  */
 export function bindMeetingSession(session: BoundMeetingSession): MeetingStore {

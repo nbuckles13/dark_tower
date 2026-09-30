@@ -411,6 +411,42 @@ describe('SignalingClient — ErrorMessage → SignalingError (R-18)', () => {
   }
 });
 
+describe('SignalingClient — post-join ErrorMessage close rule (story 2 R-8)', () => {
+  /** Resolves `true` if the transport closes within a few ticks, else `false`. */
+  async function closedSoon(wt: MockWebTransport): Promise<boolean> {
+    return Promise.race([
+      wt.closed.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+  }
+
+  it('a post-join FORBIDDEN (the server-mute refusal) is a session error and KEEPS the connection', async () => {
+    const wt = new MockWebTransport();
+    const { client, joinPromise } = startJoin(wt);
+    await reachJoined(wt);
+    await joinPromise;
+    const errors: SignalingError[] = [];
+    client.on('error', (e) => errors.push(e));
+    wt.simulateServerMessage(0, framedError(ErrorCode.FORBIDDEN, 'Server mute request refused'));
+    await waitFor(() => errors.length > 0);
+    expect(errors[0]?.signalingCode).toBe(SignalingErrorCode.Forbidden);
+    expect(await closedSoon(wt)).toBe(false);
+    // Still usable: a later send goes out.
+    await client.sendMuteRequest(true);
+  });
+
+  it('a post-join UNAUTHORIZED still closes with the typed auth reason', async () => {
+    const wt = new MockWebTransport();
+    const { client, joinPromise } = startJoin(wt);
+    await reachJoined(wt);
+    await joinPromise;
+    client.on('error', () => {});
+    wt.simulateServerMessage(0, framedError(ErrorCode.UNAUTHORIZED, ''));
+    const info = await wt.closed;
+    expect(info.closeCode).toBe(3401);
+  });
+});
+
 describe('SignalingClient — trace injection (R-19)', () => {
   it('populates a W3C traceParent on the outbound ClientMessage when telemetry is configured', async () => {
     configureTelemetry({ telemetryEndpoint: 'https://gc.example/api/v1/telemetry', env: 'test' });

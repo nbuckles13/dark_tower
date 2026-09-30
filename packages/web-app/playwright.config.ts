@@ -79,11 +79,38 @@ export default defineConfig({
     // at runtime (`expectDeclaredReceiveSlots` in e2e/fixtures.ts). N=3 leaves
     // the solo and two-party specs' assertions unchanged (a solo client's slots
     // are all `fewer_sources`; slot-0 is still asserted).
-    env: { VITE_DT_RECEIVE_SLOTS: String(SUITE_RECEIVE_SLOTS) },
-    // Story 2 R-7: the test tone is OPT-IN (`DT_TEST_TONE=1` in this process's
-    // env reaches `vite.config.ts`). With `reuseExistingServer` a server started
-    // without it runs the microphone path, so a spec needing the tone must
-    // ASSERT the bus `captureSource` event's `mode`, never assume it.
+    env: {
+      VITE_DT_RECEIVE_SLOTS: String(SUITE_RECEIVE_SLOTS),
+      // Story 2 R-7: the test tone is OPT-IN (`DT_TEST_TONE=1` reaches
+      // `vite.config.ts` -> `vite/testDefines.ts`). The multi-party scenarios
+      // hear by CONTENT, so every participant sends its own tone.
+      DT_TEST_TONE: '1',
+      // Story 2 task 15: the per-browsing-context test levers (S10a handler
+      // blocking, S2 per-context N, forced host controls). Same predicate.
+      DT_TEST_LEVERS: '1',
+      // SDK telemetry ON — the ONE place the suite sets it (story 2 R-27
+      // read-back, the credential-scan positive control). Unset, web-app's
+      // `configureTelemetryIfEnabled` returns early and every `dt_client_*`
+      // read-back queries an empty pipeline.
+      //
+      // RELATIVE, SAME-ORIGIN, ON PURPOSE. `vite.config.ts` proxies
+      // `/api/v1/telemetry` to GC, so the exporter's fetch stays on the page
+      // origin and never becomes a CORS preflight (which a browser fails
+      // silently). The page origin is per-run AND per-org (`e2e/env.ts` derives
+      // `http://${orgSubdomain}.localhost:5173`) while this value is baked into
+      // `import.meta.env` at dev-server start: an absolute URL would pin ONE
+      // subdomain and every other run would go cross-origin, put `Authorization`
+      // on a preflight GC does not answer, and lose telemetry with no signal.
+      // `loadConfig()`'s origin assertion cannot catch a bad value on this path
+      // (it compares the page origin with itself), so review is the check. Base
+      // URL only: the OTel exporter appends `/v1/metrics`.
+      VITE_TELEMETRY_ENDPOINT: '/api/v1/telemetry',
+    },
+    // All of the above reach ONLY a server Playwright STARTS. With
+    // `reuseExistingServer` a server started elsewhere keeps whatever it was
+    // started with, so the suite ASSERTS each knob at runtime before any media
+    // assertion (`expectBuildKnobs` / `readOwnTone` in e2e/fixtures.ts) and names
+    // the reused-server cause, rather than assuming them.
     // Readiness via the loopback derivation of baseURL (single port encoding,
     // follows an E2E_BASE_URL override; Node does not necessarily resolve
     // *.localhost). The browser itself navigates to baseURL with the org

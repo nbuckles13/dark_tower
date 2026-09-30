@@ -112,11 +112,13 @@ mc-token-rejection reuse their retained session (the latter clears the meetingId
 rewrite first); auth-rejection Test A re-authenticates as V after the session
 drop. This proves a failed join is not a dead end.
 
-## What the media-loopback spec asserts (ADR-0036 story 2 R-3: loopback removed)
+## What the solo-participant spec asserts (ADR-0036 story 2 R-3: loopback removed)
 
-`media-loopback.spec.ts` keeps its story-1 file name, but its subject is now the
-**solo case** of the multi-party model: a participant never hears its own audio, so
-alone in a meeting it hears nothing — explicitly — and is directed to send nothing.
+`solo-participant.spec.ts` (story 1's `media-loopback.spec.ts`, renamed in story 2
+task 15: story 1's hear-yourself expectation is superseded by R-3). Its subject
+is the **solo case** of the multi-party model: a participant never hears its own
+audio, so alone in a meeting it hears nothing — explicitly — and is directed to
+send nothing.
 
 Capture is synthesized and the microphone permission auto-granted by the
 `--use-fake-device-for-media-stream` / `--use-fake-ui-for-media-stream` launch flags
@@ -126,24 +128,73 @@ exclusively through `serverCertificateHashes` pinning.
 
 | # | Assertion | Why it is shaped this way |
 |---|---|---|
-| s1 | `joined.mediaServers` has exactly **one** entry | MC scopes a client to its one placed handler (R-33); the transport is active/active and dials every url it is given. |
+| s1 | `joined.mediaServers` is non-empty and every entry connects | R-33: every participant is offered the meeting's whole handler set and dials all of it. No handler COUNT is asserted — `env.ts` keeps topology out of this tier. |
 | s2 | Slot 0 polls to exactly **`fewer_sources`** | **The positive control.** A specific, non-default wire token proves MC's assignment arrived and says "nobody to hear" — not merely "not awaiting-assignment", which is vacuous under R-3. `active` here would mean MC routed the client to itself. |
-| s3 | `framesSent` and `framesAccepted` are both **flat** over a window after s2 | Egress is flat because MC directs no audio stream to a publisher nobody holds (a `SendDirective` with no streams, §5), so no send instruction is ever applied — not because of mute. Ingress is flat because MC pushed no edge into this client. `waitForFirstMediaFrame` is deliberately not called. |
+| s3 | `framesSent` and `framesAccepted` are both **flat** over a window after s2 | Egress is flat because MC directs no audio stream to a publisher nobody holds (a `SendDirective` with no streams, §5), so no send instruction is ever applied — not because of mute. Ingress is flat because MC pushed no edge into this client. |
 | s4 | The window contains **≥ 4 samples**, asserted separately (shared `expectCountersFlatOverWindow`) | Flatness over zero samples is vacuously true, so a stalled sampler must be reported as a harness failure. |
 
-**Coverage loss, stated rather than dropped.** Story 1's test here was the only
-browser-tier proof of STRUCTURAL client mute (egress flat while muted, then
-resuming). That needs someone to hold this client in a slot, and a two-party Kind
-meeting has zero edges under round-robin placement (ranks 0 and 1 land on different
-handlers). Owner: story 2 task 15's multi-context browser S-tests.
+Browser-tier proof of client STRUCTURAL mute (egress flat while muted, then
+resuming) needs someone to hold the muted client in a slot, so it lives in
+`server-mute.spec.ts` ("client STRUCTURAL mute") — see below.
+
+## What the multi-party specs assert (story 2 task 15: S1, S2, S3, S6, S10a)
+
+One browsing context per cohort member (`e2e/cohortContexts.ts`), each built by
+the same Playwright-started dev server with three build knobs asserted at runtime
+before any media assertion (`expectBuildKnobs`, `readOwnTone`): the test tone
+(`DT_TEST_TONE=1`), the per-context test levers (`DT_TEST_LEVERS=1`) and SDK
+telemetry (`VITE_TELEMETRY_ENDPOINT`). A reused dev server started without them
+fails naming that cause.
+
+**The evidence rule** (`crates/env-tests/README.md`): every claim about what ONE
+participant receives from ONE sender comes from that receiver's own E2E bus —
+`receiveLayers` (layer 1 `keyed`, layer 2 `verified`, per observed slot and
+sender), `receiveAnalysis` (layer 3, the decoded tone, through the pure
+`toneDetector.ts`) and `mediaFrameCounts` (the send counter). Prometheus client
+series are fleet aggregates (the collector is their `instance`, and they carry no
+participant label), so they prove only the pipe, the exported NAME and the
+alert's applicability. Every "flat"/"zero" claim is sampled together with a
+probe that must ADVANCE in the same window, over a ≥ 4-sample floor
+(`receiveEvidence.ts:observeWindow`). Every multi-party test takes the MH
+admission baseline BEFORE its joins, so a missing sender is diagnosed (budget
+rejection / misrouting / unobservable) automatically.
+
+| Spec | Scenario | What is asserted |
+|---|---|---|
+| `multi-party-hear.spec.ts` | **S1** hear by content, N=3, 4 participants | All 12 ordered pairs at all three layers at the slot MC assigned, and no frame keyed to a sender on any other slot. First-media time per receiver is recorded as an annotation — observed, never gated. **R-27 part 1**: the send counter rises in Prometheus under its exact `_total` name (a solo client sends nothing under R-3, so this runs here). **R-27 part 2**: the LOADED `MCMediaMissingKeyMaterial` rule selects exactly the names in `clientMetricNames.ts`, and the received counter rises under that exact name. |
+| `over-subscription.spec.ts` | **S2** under-fill and over-subscription | A receiver declaring N=2 (per-context `receiveSlots` lever): with one sender, slot 1 reads `fewer_sources` as an empty cell in a 2-cell grid; with three senders joined one at a time, its slots hold the two earliest, and the third has zero layer-1/2 at it WHILE the third's send counter and a full-N receiver's accepted-from-third advance. (The task text's "fewer-sources on the third" has no third slot at N=2; both R-2 clauses are covered instead.) |
+| `server-mute.spec.ts` | **S3** server mute | The host clicks the real affordance; every receiver's slot for B reads `source_muted` and its roster row `data-server-muted=true` (`data-client-muted=unknown`); accepted-from-B is flat at every receiver WHILE B's send counter and the other pairs advance; B's tone is absent; B's own client-mute indicator is unchanged. B's unmute request reaches the host and lifts nothing. The host's unmute restores B at all three layers. |
+| `server-mute.spec.ts` | **Client STRUCTURAL mute** (restores the proof task 6 removed) | C mutes itself: `expectEgressFlatWhileMuted(C)` holds WHILE the other pairs advance; receivers see `source_muted` with `data-client-muted=true`. Unmute resumes. Compose: B client-mutes, is server-muted, client-unmutes — B's egress resumes, receivers stay flat. |
+| `server-mute.spec.ts` | **Non-host refusal** (@security M2) | The `forceHostControls` lever renders the affordance for a non-host; MC answers `FORBIDDEN`; the refused client stays joined (post-join `FORBIDDEN` no longer closes the connection) and B keeps being heard. |
+| `partial-connectivity.spec.ts` | **S10a** partial connectivity | A on every handler; B and C each block one (the `blockHandlers` lever, by exact match against A's offered list). Connected sets proven first; A hears B and C, B and C each hear A (all layers); B and C see each other with `data-reachability=source_unreachable` from `unreachable_sender_ids`, in no slot, not muted; C's accepted count at B stays zero WHILE A's advances (and vice versa). |
+| `kek-rotation.spec.ts` | **S6** joiner half | A leave; both remaining clients' bus `kekGeneration` advance to the same generation; `dt_client_media_kek_updates_total{source="kek_update"}` and `dt_client_media_kek_generations_retained_total` each rise by ≥ the remaining-client count (a baseline→delta, not `increase()`, which cannot see a series born in the window); a joiner after the rotation holds that generation and opens every remaining sender's frames at all three layers. Budget from MC's config: grace + W. |
+
+**The token-only scan now covers telemetry** (`credentialScan.ts`): every
+recorded join window forces a metric export (`flushTelemetry` on the E2E bus)
+before it closes, and the scan fails with `telemetry-not-recorded` when no
+`/api/v1/telemetry` request was recorded, and `telemetry-not-bearer` when one
+carried no `Authorization: Bearer` header — the needle scan and the Bearer check
+are counted per surface, so "ran over it" is observable.
+
+**The test levers** (`src/lib/testLevers.ts`): one opt-in build define,
+`__DT_TEST_LEVERS__` (`DT_TEST_LEVERS=1`; THROWS in production; absent from the
+production bundle — `tests/bundle-content.test.ts`), gating one init-script
+global `window.__dt_test_levers__` read once per session: `blockHandlers`
+(refuses dials to exact-match offered handlers — it can only narrow), `receiveSlots`
+(a per-context N through the SDK's strict parser) and `forceHostControls`.
+
+**Traces and HARs** from these multi-context runs contain several live meeting
+and user tokens at once: they stay gitignored, local-only and are never promoted
+to CI artifacts or attached to issues.
 
 **Timing constants** live at the top of `fixtures.ts`'s media section: a 750 ms
 post-mute settle (frames already queued at the instant of mute may still drain —
 §5 stops *capture* within one frame, which is not the same as un-queueing), a
 2 500 ms observation window, and a 4-sample floor.
 
-**Registration cost: 0.** Both tests sign in as the shared user V and create their
-meeting Node-side.
+**Registration cost (solo spec): 0.** Both tests sign in as the shared user V and
+create their meeting Node-side. The multi-party specs spend one sign-in per
+context from the pre-registered cohort (§Budgets).
 
 ## Prerequisites (host-side)
 
@@ -327,22 +378,37 @@ Building blocks for the N+1 specs; each module header carries the detail.
   shard targets its own cluster. This suite assumes a single workstation against
   its own cluster.
 
-- **Wall-clock budget**: `media-loopback.spec.ts` costs roughly **20 s** — join +
-  MH handshake ≈ 5 s, start-audio ≈ 2 s, the slot-state poll, and a 0.75 s settle
-  plus 2.5 s flat window, twice over two tests, plus auth and bootstrap.
-  It shares the suite-wide 600 s `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`) and
-  does not move it. **Why the number is written down**: on budget exhaustion
-  `layer7.sh` prints "exited 124" and emits `FAIL browser-e2e-failed` — the *same*
-  terminal status as a genuine assertion failure, in the implementer lane — so a
-  timeout presents as a diff bug and sends triage hunting a defect that does not
-  exist. If headroom ever gets tight the fix is a deliberate
+- **Wall-clock budget** — measured on the Layer-7 Kind cluster (story 2 task 15,
+  2026-09-30), per test: S1 `multi-party-hear` ≈ 13 s; S2 `over-subscription` ≈ 8 s;
+  S3 `server-mute` ≈ 16 s + client structural mute ≈ 11 s + non-host refusal ≈ 6 s;
+  S10a `partial-connectivity` ≈ 7 s; **S6 `kek-rotation` ≈ 100 s** (it waits out
+  MC's disconnect grace plus the rotation debounce W, both read from MC's config —
+  see the spec header); `solo-participant` ≈ 5 s; the story-1 specs ≈ 60 s
+  (dominated by the leave/rejoin test's grace path). **Whole suite ≈ 3.5–4 min**,
+  including the dev-server start and global setup, against the suite-wide
+  `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`, `DEVLOOP_BROWSER_E2E_TIMEOUT`) —
+  under 40 % of it, so the default is deliberately NOT raised. **Why the numbers
+  are written down**: on budget exhaustion `layer7.sh` prints "exited 124" and
+  emits `FAIL browser-e2e-failed` — the *same* terminal status as a genuine
+  assertion failure, in the implementer lane — so a timeout presents as a diff
+  bug and sends triage hunting a defect that does not exist. S6 scales with
+  `MC_KEK_ROTATION_DEBOUNCE_SECONDS`: raising W (or the grace) is a wall-clock
+  decision for this suite. If headroom gets tight the fix is a deliberate
   `DEVLOOP_BROWSER_E2E_TIMEOUT` change, not a discovery at 3am.
 - **Cohort registration wall clock**: `global-setup.ts` runs N+1 full sign-up
-  UI flows (a fresh context and page load each) before any spec — roughly
-  **10 s at N=3** (an estimate of ~2-3 s per `signUpViaUi`, not yet measured on
-  a run; record the measured figure here after the first Layer-7 run). It comes
-  out of the same `BROWSER_E2E_TIMEOUT` and scales with `SUITE_RECEIVE_SLOTS`,
-  so raising N is a wall-clock decision as well as an auth-budget one.
+  UI flows (a fresh context and page load each) before any spec — measured at
+  **≈ 4 s at N=3** (2026-09-30). It comes out of the same `BROWSER_E2E_TIMEOUT`
+  and scales with `SUITE_RECEIVE_SLOTS`, so raising N is a wall-clock decision as
+  well as an auth-budget one.
+- **Peak concurrency**: at most `cohortSize(SUITE_RECEIVE_SLOTS)` = 4 browsing
+  contexts at once (S1, S2, S3), each left gracefully and closed in a `finally`
+  before the next test opens its own (`e2e/cohortContexts.ts`) — so peaks never
+  stack, and a leaver's MH connections (so its edges) drop at once. RESIDUAL:
+  MC today classifies the SDK's clean close as `server_initiated` and holds the
+  participant through its 30 s disconnect grace before the roster removal (a
+  meeting-controller follow-up in `docs/TODO.md`), so a previous test's
+  participant can outlive its test on MC; the S1 diagnostic's budget verdict is
+  the backstop if that ever reaches MH admission.
 - **`retries: 0`** (ADR-0028): a failure is real. Fix it or delete the test —
   never mask with retries.
 - **Timeouts**: 120s/test ceiling; assertion-meaningful waits are tighter (5s

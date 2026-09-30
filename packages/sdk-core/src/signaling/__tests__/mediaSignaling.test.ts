@@ -13,7 +13,12 @@ import type { MeetingKekHolder } from '../../media/setup/kekSource.js';
 import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
 import { generateIdentityKeyPair } from '../../media/frame/ed25519.js';
 import { SignalingClient } from '../SignalingClient.js';
-import type { SendDirectiveEvent, StreamAssignmentsEvent } from '../events.js';
+import type {
+  ParticipantMuteEvent,
+  SendDirectiveEvent,
+  StreamAssignmentsEvent,
+  UnmuteRequestedEvent,
+} from '../events.js';
 import {
   decodeOutboundClientMessages,
   framedJoinResponse,
@@ -22,6 +27,8 @@ import {
   framedSendDirective,
   LeaveReason,
   framedStreamAssignments,
+  framedParticipantMuteUpdate,
+  framedUnmuteRequestRelay,
   MediaKind,
   SlotState,
   waitFor,
@@ -327,10 +334,43 @@ describe('client sends', () => {
     expect((mute?.message.value as { audioMuted: boolean }).audioMuted).toBe(true);
   });
 
-  it('refuses both sends before a settled join', async () => {
+  it('a server-mute request carries TARGET AND ACTION ONLY — no requester, no reason', async () => {
+    // Story 2 R-8 / @security M1: MC identifies the requester from the
+    // authenticated connection; the message has no field for it and none is sent.
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    await rig.client.sendServerMuteRequest('participant-b', true);
+    await rig.client.sendServerMuteRequest('participant-b', false);
+    const sent = rig
+      .outbound()
+      .filter((m) => m.message.case === 'serverMuteRequest')
+      .map((m) => m.message.value);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toMatchObject({
+      participantId: 'participant-b',
+      audioMuted: true,
+      videoMuted: false,
+      reason: '',
+    });
+    expect(sent[1]).toMatchObject({ participantId: 'participant-b', audioMuted: false });
+  });
+
+  it('an unmute request asks for audio and names nobody (MC stamps the requester)', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    await rig.client.sendUnmuteRequest();
+    const request = rig.outbound().find((m) => m.message.case === 'unmuteRequest');
+    expect(request?.message.value).toMatchObject({
+      requestAudio: true,
+      requestVideo: false,
+      participantId: '',
+    });
+  });
+
+  it('refuses every send before a settled join', async () => {
     const client = new SignalingClient({ connect: () => new MockWebTransport() });
     await expect(client.sendReceiveCapability([])).rejects.toThrow();
     await expect(client.sendMuteRequest(true)).rejects.toThrow();
+    await expect(client.sendServerMuteRequest('p', true)).rejects.toThrow();
+    await expect(client.sendUnmuteRequest()).rejects.toThrow();
   });
 });
 
@@ -379,5 +419,62 @@ describe("a leave removes the leaver's roster key — a second cutoff beside the
     rig.deliver(framedStreamAssignments({ slotId: 0, senderId: 77 }));
     await waitFor(() => seen.length === 1);
     expect(rig.roster.identityKeyFor(77)).toBeDefined();
+  });
+});
+
+describe('server mute state from the wire (story 2 R-10/R-11)', () => {
+  it('projects SERVER mute and who applied it; the self-mute snapshot is not projected', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: ParticipantMuteEvent[] = [];
+    rig.client.on('participantMuteChanged', (e) => seen.push(e));
+    rig.deliver(
+      framedParticipantMuteUpdate({
+        participantId: 'b',
+        audioSelfMuted: true,
+        audioServerMuted: true,
+        serverMutedBy: 'host',
+      }),
+    );
+    rig.deliver(framedParticipantMuteUpdate({ participantId: 'b', audioServerMuted: false }));
+    await waitFor(() => seen.length > 1);
+    expect(seen[0]).toEqual({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'host' });
+    // Unmuted: no `serverMutedBy`, even if MC were to send a stale one.
+    expect(seen[1]).toEqual({ participantId: 'b', audioServerMuted: false });
+  });
+
+  it('bounds MC-relayed ids to 256 before they leave the decode boundary', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: ParticipantMuteEvent[] = [];
+    rig.client.on('participantMuteChanged', (e) => seen.push(e));
+    rig.deliver(
+      framedParticipantMuteUpdate({
+        participantId: 'p'.repeat(300),
+        audioServerMuted: true,
+        serverMutedBy: 'h'.repeat(300),
+      }),
+    );
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]?.participantId).toHaveLength(256);
+    expect(seen[0]?.serverMutedBy).toHaveLength(256);
+  });
+
+  it('drops a mute update with an EMPTY participant id (the same rule as the unmute relay)', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: ParticipantMuteEvent[] = [];
+    rig.client.on('participantMuteChanged', (e) => seen.push(e));
+    rig.deliver(framedParticipantMuteUpdate({ participantId: '', audioServerMuted: true }));
+    rig.deliver(framedParticipantMuteUpdate({ participantId: 'b', audioServerMuted: true }));
+    await waitFor(() => seen.length > 0);
+    expect(seen.map((e) => e.participantId)).toEqual(['b']);
+  });
+
+  it("relays the host's unmute-request notification; an empty requester is dropped", async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: UnmuteRequestedEvent[] = [];
+    rig.client.on('unmuteRequested', (e) => seen.push(e));
+    rig.deliver(framedUnmuteRequestRelay(''));
+    rig.deliver(framedUnmuteRequestRelay('b'));
+    await waitFor(() => seen.length > 0);
+    expect(seen).toEqual([{ participantId: 'b' }]);
   });
 });

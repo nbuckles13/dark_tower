@@ -69,7 +69,7 @@
 
 ## E2E Env-Tests (`crates/env-tests/`)
 - Cluster infra → `src/cluster.rs:ClusterConnection` | Auth/GC fixtures → `src/fixtures/auth_client.rs`, `gc_client.rs`
-- Join → `tests/24_join_flow.rs` | MH QUIC connect/auth → `tests/26_mh_quic.rs` | multi-party MH datagram forwarding → `tests/27_mc_slot_placement.rs` | web-app media loopback → `packages/web-app/e2e/media-loopback.spec.ts`
+- Join → `tests/24_join_flow.rs` | MH QUIC connect/auth → `tests/26_mh_quic.rs` | multi-party MH datagram forwarding → `tests/27_mc_slot_placement.rs` | web-app solo (R-3) → `packages/web-app/e2e/solo-participant.spec.ts`; multi-party S1/S2/S3/S6/S10a → `packages/web-app/e2e/{multi-party-hear,over-subscription,server-mute,kek-rotation,partial-connectivity}.spec.ts`
 
 ## Network Policies & Kind
 - Per-service policies → `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml` | Kind setup → `infra/kind/scripts/setup.sh`

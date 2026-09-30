@@ -1,38 +1,21 @@
-// File: packages/web-app/e2e/media-loopback.spec.ts
+// File: packages/web-app/e2e/solo-participant.spec.ts
 //
-// ADR-0036 story 2 R-3 (loopback REMOVED): a participant never hears their own
-// audio. Alone in a meeting, a client hears nothing — with an explicit
-// "fewer sources" slot state, never a spinner — and is directed to send nothing.
+// ADR-0036 story 2 R-3: a participant never hears their own audio. Alone in a
+// meeting, a client hears nothing — with an explicit "fewer sources" slot state,
+// never a spinner — and is directed to send nothing.
 //
-// (The file keeps its story-1 name so the Layer-7 lane's spec inventory does
-// not churn; its subject is now the solo case of the multi-party model.)
+// (Formerly `media-loopback.spec.ts`: story 1's hear-yourself spec, whose
+// expectation R-3 superseded. Renamed in story 2 task 15 so the name no longer
+// promises a loopback that no longer exists.)
 //
 // This is the Env-Test tier of ADR-0028: real Chromium, real WebTransport with
 // `serverCertificateHashes` pinning, real QUIC to a real media handler. No
 // setting that weakens certificate validation, web security or origin trust
 // appears anywhere in this suite.
 //
-// ---------------------------------------------------------------------------
-// COVERAGE LOSS, STATED LOUDLY
-// ---------------------------------------------------------------------------
-//
-// Story 1's test 1 here was the only browser-tier proof of STRUCTURAL client
-// mute: egress flat while muted, then resuming. That proof needs egress to
-// advance, which needs someone to hold this client in a slot. A solo client is
-// held by nobody, so egress never advances and the proof cannot live here.
-//
-// WHAT THE GAP IS NOW, AND WHAT IT IS NOT. It is the missing SECOND BROWSER
-// CONTEXT — this spec has no helper to drive two participants — and nothing
-// else. It is NOT "the pair would have no edges": that was true under task 6's
-// round-robin placement, which put ranks 0 and 1 on different handlers, and it
-// is false under the ADR-0036 §9 edge model, where two browsers each connected
-// to both Kind handlers share both and co-location puts their edge on one. So a
-// reader who knows round-robin is gone must not conclude the coverage is back:
-// the edge now exists and the proof still does not.
-//
-// OWNER: story 2 task 15 (the multi-context browser S-tests on the task-14 N+1
-// helper) must name client structural mute explicitly. Until it lands,
-// `expectEgressFlatWhileMuted` has no browser caller.
+// Browser-tier proof of client STRUCTURAL mute (egress flat while muted) needs a
+// second participant to hold this client in a slot, so it lives with the
+// multi-party specs: `server-mute.spec.ts`, "client STRUCTURAL mute".
 //
 // ---------------------------------------------------------------------------
 // WHY FLAT IS NOT VACUOUS HERE
