@@ -45,17 +45,36 @@ source "${__here}/lang/_test_helpers.sh"
 # harness's set -e must not abort. report_results sets the final code.
 set +e
 
-# Source setup.sh (BASH_SOURCE guard suppresses main), then call the guard. $1=setup path,
-# $2=runtime arg. `set --` clears the bash -c positional params BEFORE sourcing — otherwise
-# the sourced setup.sh inherits them as its own args and its arg-parser `exit 1`s on the
-# unknown "option" (the setup path). Source noise is discarded; the guard's stderr banner is
-# what we capture.
-RUN_GUARD='sp="$1"; rt="$2"; set --; source "$sp" >/dev/null 2>&1; check_build_disk_space "$rt"'
+# src_run [-u VAR]... <script> <snippet> [args...]: the ONE way this file calls a Kind script's
+# functions directly. Runs <snippet> in ONE fresh `bash -c` with <script> SOURCED (each Kind
+# script's `BASH_SOURCE[0]==$0` guard suppresses its main; `_` is $0, never the script).
+#   - `set --` clears the positionals BEFORE the source, so the caller's args never reach the
+#     sourced script's option parser; the snippet gets them as "${ARGS[@]}".
+#   - Source-time noise is discarded; the snippet's own stdout/stderr pass through.
+#   - The snippet runs under the SOURCED script's shell options (Kind scripts: `set -euo
+#     pipefail`) and its top-level logic (provision.sh: AUTO_YES from `[[ -t 0 ]]`) — a snippet
+#     that needs a failing rc must capture it with `|| rc=$?`.
+#   - `-u VAR` unsets VAR for the run (e.g. an ambient DT_HOST_GATEWAY_IP must not leak in).
+#   - Env for the run is passed as temporary assignments: `FOO=1 src_run …`.
+src_run() {
+  local -a unset_vars=()
+  while [[ "${1:-}" == "-u" ]]; do unset_vars+=("$2"); shift 2; done
+  local sp="$1" snip="$2"; shift 2
+  (
+    for v in "${unset_vars[@]}"; do unset "$v"; done
+    exec bash -c 'sp="$1"; snip="$2"; shift 2; ARGS=("$@"); set --; source "$sp" >/dev/null 2>&1; eval "$snip"' \
+      _ "$sp" "$snip" "$@"
+  )
+}
+
+# Source deploy.sh (src_run; its BASH_SOURCE guard suppresses main), then call the guard with
+# the runtime arg. The guard's stderr banner is what we capture.
+RUN_GUARD='check_build_disk_space "${ARGS[0]}"'
 
 # === (1) forced TRIP: min-disk floor absurdly high → comparison trips on the real fs ========
 # Real df on the real graphroot (or its PROJECT_ROOT fallback — always df-able, so avail_gb
 # is always populated and the huge floor always trips, even on a host without podman).
-trip_out="$(DEVLOOP_MIN_DISK_GB=999999999 bash -c "$RUN_GUARD" _ "$DEPLOY" podman 2>&1)"
+trip_out="$(DEVLOOP_MIN_DISK_GB=999999999 src_run "$DEPLOY" "$RUN_GUARD" podman 2>&1)"
 trip_rc=$?
 assert_rc "trip-exit2" 2 "$trip_rc"
 # The operator contract: line-anchored, greppable by the §4 one-pass scan.
@@ -66,7 +85,7 @@ assert_status "trip-remediation-hint" "podman image prune -f" "$trip_out"
 # === (2) PASS path: a 0 GB floor cannot trip (avail_gb >= 0) → exit 0, no banner ============
 # Guards against a regression where the guard trips unconditionally (which would still pass
 # case 1). Proves the comparison is real, not always-fail.
-pass_out="$(DEVLOOP_MIN_DISK_GB=0 bash -c "$RUN_GUARD" _ "$DEPLOY" podman 2>&1)"
+pass_out="$(DEVLOOP_MIN_DISK_GB=0 src_run "$DEPLOY" "$RUN_GUARD" podman 2>&1)"
 pass_rc=$?
 assert_rc "pass-exit0" 0 "$pass_rc"
 grep -Eq 'PRECONDITION_FAILURE' <<<"$pass_out"
@@ -401,13 +420,13 @@ SLUG41="$(printf 'a%.0s' {1..41})"
 # --- lib/common.sh (definitions only): source + call validate_cluster_name directly. The
 #     function has NO cluster calls, so a reject cannot create anything — "before creation" is
 #     structural. provision.sh reaches it through dt_init_cluster_env, pinned below.
-SETUP_VALIDATE='sp="$1"; nm="$2"; set --; source "$sp" >/dev/null 2>&1; validate_cluster_name "$nm"'
+SETUP_VALIDATE='validate_cluster_name "${ARGS[0]}"'
 
-c_rej_out="$(bash -c "$SETUP_VALIDATE" _ "$LIB_COMMON" "$NAME50" 2>&1)"; c_rej_rc=$?
+c_rej_out="$(src_run "$LIB_COMMON" "$SETUP_VALIDATE" "$NAME50" 2>&1)"; c_rej_rc=$?
 assert_rc     "namelen-setup-reject-exit1"  1 "$c_rej_rc"
 assert_status "namelen-setup-reject-token"  "CLUSTER_NAME_TOO_LONG SUBJECT=cluster-name NAME=${NAME50} LEN=50 MAX=49" "$c_rej_out"
 
-c_acc_out="$(bash -c "$SETUP_VALIDATE" _ "$LIB_COMMON" "$NAME49" 2>&1)"; c_acc_rc=$?
+c_acc_out="$(src_run "$LIB_COMMON" "$SETUP_VALIDATE" "$NAME49" 2>&1)"; c_acc_rc=$?
 assert_rc     "namelen-setup-accept-exit0"    0 "$c_acc_rc"
 assert_absent "namelen-setup-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$c_acc_out"   # not rejecting on some other axis
 # The entry points really apply it: provision.sh with a 50-char DT_CLUSTER_NAME is rejected
@@ -415,6 +434,8 @@ assert_absent "namelen-setup-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$c_acc_ou
 prov_long="$(DT_CLUSTER_NAME="$NAME50" bash "$PROVISION" --check 2>&1)"
 assert_status "namelen-provision-entry-rejects" "CLUSTER_NAME_TOO_LONG SUBJECT=cluster-name NAME=${NAME50}" "$prov_long"
 # Sourcing the lib runs nothing (teardown.sh relies on it: its validation deliberately differs).
+# NOT src_run, deliberately: this case asserts on what SOURCING itself prints, which src_run
+# discards by design.
 lib_src_out="$(DT_CLUSTER_NAME="$NAME50" bash -c 'source "$1"; echo sourced-ok' _ "$LIB_COMMON" 2>&1)"
 assert_status "lib-common-is-definitions-only" "sourced-ok" "$lib_src_out"
 assert_absent "lib-common-sourcing-validates-nothing" "CLUSTER_NAME_TOO_LONG" "$lib_src_out"
@@ -427,7 +448,8 @@ assert_absent "lib-common-sourcing-validates-nothing" "CLUSTER_NAME_TOO_LONG" "$
 cat > "${STUB_BIN}/kind" <<EOF
 #!/usr/bin/env bash
 case "\$1 \$2" in
-  "get clusters")   echo "\${DT_CLUSTER_NAME}" ;;   # report the orphan cluster exists
+  "get clusters")   [[ -z "\${STUB_KIND_LIST_FAIL:-}" ]] || exit 1
+                    echo "\${DT_CLUSTER_NAME}" ;;   # report the orphan cluster exists
   "delete cluster") touch "${MARK}/ran.kind_delete" ;;
   *)                : ;;
 esac
@@ -449,6 +471,14 @@ tdbad_out="$(PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME='Bad_Name' bash "$TEARDO
 assert_rc        "namelen-teardown-charset-reject-exit1"        1 "$tdbad_rc"
 assert_status    "namelen-teardown-charset-reject-msg"          "Invalid cluster name" "$tdbad_out"
 assert_no_marker "namelen-teardown-charset-reject-before-delete" "$MARK" "ran.kind_delete"
+# teardown uses lib/common.sh:cluster_exists: `kind get clusters` FAILING is not "absent" — it
+# fails loudly instead of reporting a teardown that deleted nothing.
+reset_marks
+tdlist_out="$(PATH="${STUB_BIN}:${PATH}" DT_CLUSTER_NAME=pcluster STUB_KIND_LIST_FAIL=1 bash "$TEARDOWN" 2>&1)"; tdlist_rc=$?
+assert_rc        "teardown-kind-list-fail-rc"        1 "$tdlist_rc"
+assert_status    "teardown-kind-list-fail-says-so"   "'kind get clusters' failed" "$tdlist_out"
+assert_absent    "teardown-kind-list-fail-not-absent" "does not exist" "$tdlist_out"
+assert_no_marker "teardown-kind-list-fail-no-delete" "$MARK" "ran.kind_delete"
 
 # --- CHARSET regex in sync (@dry-reviewer): pin the CANONICAL literal absolutely (not just
 #     compare the two files — a change applied to BOTH would pass a mutual compare). The charset
@@ -511,6 +541,32 @@ reset_marks
 dl_acc_out="$(cd "$WORK" && PATH="${STUB_BIN}:${PATH}" bash "$DEVLOOP" "$SLUG41" 2>&1)"
 assert_absent "namelen-devloop-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$dl_acc_out"
 
+# --- devloop.sh detect_orphan_clusters: a FAILED listing is "unknown", never "no orphans" ------
+# devloop.sh has no source guard (sourcing it runs the launcher), so the REAL function body is
+# extracted from the file and run against PATH stubs — never a re-typed copy.
+ORPHAN_FN="$(sed -n '/^detect_orphan_clusters() {/,/^}/p' "$DEVLOOP")"
+assert_rc "orphan-scan-fn-extracted" 0 "$([[ "$ORPHAN_FN" == 'detect_orphan_clusters() {'* && "$ORPHAN_FN" == *$'\n}' && "$ORPHAN_FN" == *'kind get clusters'* ]] && echo 0 || echo 1)"
+OS_BIN="${WORK}/orphanbin"; mkdir -p "$OS_BIN"
+cat > "${OS_BIN}/kind" <<'STUB'
+#!/usr/bin/env bash
+[[ -z "${STUB_KIND_LIST_FAIL:-}" ]] || exit 1
+printf 'devloop-zz-orphan-probe\nother-cluster\n'
+STUB
+printf '#!/usr/bin/env bash\nexit 0\n' > "${OS_BIN}/podman"   # no dev container is running
+chmod +x "${OS_BIN}/kind" "${OS_BIN}/podman"
+orphan_scan() {
+  PATH="${OS_BIN}:${PATH}" bash -c 'eval "$1"; CLUSTER_PREFIX="devloop-"; is_helper_process_alive() { return 1; }; detect_orphan_clusters' _ "$ORPHAN_FN" 2>&1 </dev/null
+}
+os_out="$(STUB_KIND_LIST_FAIL=1 orphan_scan)"; os_rc=$?
+assert_rc     "orphan-scan-list-fail-rc0-advisory"   0 "$os_rc"
+assert_status "orphan-scan-list-fail-warns"          "'kind get clusters' failed; cannot scan for orphaned devloop clusters" "$os_out"
+# Positive control: with a listing, the same function DOES report the prefixed orphan (so the
+# warning above is the failure path, not a scan that never looks).
+os_out="$(orphan_scan)"; os_rc=$?
+assert_rc     "orphan-scan-listing-rc0"              0 "$os_rc"
+assert_status "orphan-scan-listing-reports-orphan"   "Orphaned Kind cluster: devloop-zz-orphan-probe" "$os_out"
+assert_absent "orphan-scan-listing-prefix-only"      "other-cluster" "$os_out"
+
 # =============================================================================================
 # === (P) provision.sh — the blueprint (ADR-0038 §1, step 3) ===================================
 # =============================================================================================
@@ -531,30 +587,40 @@ assert_absent "namelen-devloop-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$dl_acc
 #   STUB_NODE_RUN=fail|hang  the node-container probe (`podman run … kindest/node…`) fails / hangs
 #   STUB_CALICO_BYTES      what the curl stub serves for the Calico manifest (the copy's pin is
 #                          the sha256 of the default, "CALICO FIXTURE v1")
-PTREE="${WORK}/ptree"; PBIN="${WORK}/pbin"; PSTATE="${WORK}/pstate"
+#
+# SHAPE (why this group is not ~75 end-to-end runs). A case runs provision.sh END TO END only
+# where the behaviour under test IS main's orchestration — step order, the decision -> action
+# mapping, the EXIT trap's one-line invariant, mode dispatch, tty detection. Everything else
+# calls the sourced functions directly (src_run via psrc), and a failure path runs under the
+# PRODUCTION mechanism itself — `trap __provision_exit_trap EXIT; pstep <fn>` (ptrap) — so its
+# STEP/REASON line comes from the real trap and the real shared classifier, never a copy.
+# `pstep` is never run under if/||/&&/! there: set -e would be suspended and the trap would see
+# rc 0. A cluster "with a recorded blueprint" is SEEDED by the real blueprint_decide +
+# record_blueprint (seed_record), not by a whole provision.
+PTREE="${WORK}/ptree"; PTEMPLATE="${WORK}/ptree.template"; PBIN="${WORK}/pbin"; PSTATE="${WORK}/pstate"
 mkdir -p "$PBIN"
-make_ptree() {
-  rm -rf "$PTREE" "$PSTATE"; mkdir -p "$PSTATE" "$PTREE/infra/kind/scripts/lib" "$PTREE/scripts" \
-    "$PTREE/infra/services/postgres" "$PTREE/infra/docker/certs"
-  cp "${REPO_ROOT}/infra/kind/scripts/provision.sh" "${REPO_ROOT}/infra/kind/scripts/deploy.sh" "$PTREE/infra/kind/scripts/"
-  cp "${REPO_ROOT}/infra/kind/scripts/lib/common.sh" "$PTREE/infra/kind/scripts/lib/"
-  cp "${REPO_ROOT}/infra/kind/kind-config.yaml" "$PTREE/infra/kind/"
-  cp "${REPO_ROOT}/infra/services/postgres/secret.yaml" "$PTREE/infra/services/postgres/"
-  printf 'MC PUBLIC CERT v1\n' > "$PTREE/infra/docker/certs/mc-webtransport.crt"
-  printf 'MH PUBLIC CERT v1\n' > "$PTREE/infra/docker/certs/mh-webtransport.crt"
-  printf 'NOT-HASHED KEY\n' | tee "$PTREE/infra/docker/certs/mc-webtransport.key" > "$PTREE/infra/docker/certs/mh-webtransport.key"
-  cat > "$PTREE/scripts/generate-dev-certs.sh" <<EOF
+# The pristine tree copy is built ONCE; each case resets it with one `cp -a`.
+mkdir -p "$PTEMPLATE/infra/kind/scripts/lib" "$PTEMPLATE/scripts" \
+  "$PTEMPLATE/infra/services/postgres" "$PTEMPLATE/infra/docker/certs"
+cp "${REPO_ROOT}/infra/kind/scripts/provision.sh" "${REPO_ROOT}/infra/kind/scripts/deploy.sh" "$PTEMPLATE/infra/kind/scripts/"
+cp "${REPO_ROOT}/infra/kind/scripts/lib/common.sh" "$PTEMPLATE/infra/kind/scripts/lib/"
+cp "${REPO_ROOT}/infra/kind/kind-config.yaml" "$PTEMPLATE/infra/kind/"
+cp "${REPO_ROOT}/infra/services/postgres/secret.yaml" "$PTEMPLATE/infra/services/postgres/"
+printf 'MC PUBLIC CERT v1\n' > "$PTEMPLATE/infra/docker/certs/mc-webtransport.crt"
+printf 'MH PUBLIC CERT v1\n' > "$PTEMPLATE/infra/docker/certs/mh-webtransport.crt"
+printf 'NOT-HASHED KEY\n' | tee "$PTEMPLATE/infra/docker/certs/mc-webtransport.key" > "$PTEMPLATE/infra/docker/certs/mh-webtransport.key"
+cat > "$PTEMPLATE/scripts/generate-dev-certs.sh" <<EOF
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "--check-renewal" ]]; then : > "${MARK}/ran.renewal-check"; exit "\${STUB_RENEWAL_RC:-0}"; fi
 : > "${MARK}/ran.recipe"
 [[ -z "\${STUB_RENEW_WRITES:-}" ]] || printf 'MC PUBLIC CERT v2\n' > "$PTREE/infra/docker/certs/mc-webtransport.crt"
 exit 0
 EOF
-  chmod +x "$PTREE/scripts/generate-dev-certs.sh" "$PTREE/infra/kind/scripts/"*.sh
-  # The copy pins the fixture manifest's sha256 (the real pin names the real artifact).
-  sed -i -E "s/^CALICO_MANIFEST_SHA256=\"[0-9a-f]+\"/CALICO_MANIFEST_SHA256=\"$(printf 'CALICO FIXTURE v1\n' | sha256sum | cut -d' ' -f1)\"/" \
-    "$PTREE/infra/kind/scripts/provision.sh"
-}
+chmod +x "$PTEMPLATE/scripts/generate-dev-certs.sh" "$PTEMPLATE/infra/kind/scripts/"*.sh
+# The copy pins the fixture manifest's sha256 (the real pin names the real artifact).
+sed -i -E "s/^CALICO_MANIFEST_SHA256=\"[0-9a-f]+\"/CALICO_MANIFEST_SHA256=\"$(printf 'CALICO FIXTURE v1\n' | sha256sum | cut -d' ' -f1)\"/" \
+  "$PTEMPLATE/infra/kind/scripts/provision.sh"
+make_ptree() { rm -rf "$PTREE" "$PSTATE"; cp -a "$PTEMPLATE" "$PTREE"; mkdir -p "$PSTATE"; }
 PROV_COPY="${PTREE}/infra/kind/scripts/provision.sh"
 
 cat > "${PBIN}/kind" <<EOF
@@ -653,18 +719,60 @@ exit 0
 EOF
 chmod +x "${PBIN}"/*
 
-# prov [args...]: run the copy's provision.sh. Sets P_RC / P_OUT. DT_CLUSTER_NAME defaults
-# to `pcluster`; pass `env -u DT_CLUSTER_NAME` style overrides via PENV (array).
+RWORK_P="${WORK}/prender"; mkdir -p "$RWORK_P"
+# prov [args...]: run the copy's provision.sh END TO END. Sets P_RC / P_OUT. DT_CLUSTER_NAME
+# defaults to `pcluster` (P_CLUSTER overrides); stub knobs are temporary assignments.
 prov() {
   P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" DT_CLUSTER_NAME="${P_CLUSTER-pcluster}" \
-    "${PENV[@]}" bash "$PROV_COPY" "$@" 2>&1 </dev/null)"; P_RC=$?
+    bash "$PROV_COPY" "$@" 2>&1 </dev/null)"; P_RC=$?
 }
-RWORK_P="${WORK}/prender"; mkdir -p "$RWORK_P"
-PENV=(env)
+# psrc '<snippet>' [args...]: src_run over the copy's provision.sh, same env as prov (stdin
+# /dev/null, so AUTO_YES=true as for prov). Output passes through; the caller captures it.
+psrc() {
+  PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" DT_CLUSTER_NAME="${P_CLUSTER-pcluster}" \
+    src_run "$PROV_COPY" "$@" </dev/null
+}
+# psrc_rt '<snippet>' [args...]: psrc with the container runtime detected first (what main does
+# before anything renders: blueprint_render needs KIND_EXPERIMENTAL_PROVIDER).
+psrc_rt() { local snip="$1"; shift; psrc "detect_container_runtime >/dev/null; ${snip}" "$@"; }
+# ptrap <fn> [args...]: run ONE provision step the way main does — the real EXIT trap, then
+# `pstep <fn>` under the sourced script's set -e. P_CREATED=true models "this run created the
+# cluster" (the trap then probes the apiserver). Sets P_RC / P_OUT.
+ptrap() {
+  P_OUT="$(psrc_rt 'trap __provision_exit_trap EXIT; PROVISION_CLUSTER_CREATED="${P_CREATED:-false}"; pstep "${ARGS[@]}"' "$@" 2>&1)"; P_RC=$?
+}
+# decide: the real blueprint_decide against the stubbed cluster. Sets P_RC / P_OUT, whose last
+# line is `DECIDE REASON=<r> CHANGED=<c> RECORDED=<hash|none>`.
+decide() {
+  P_OUT="$(psrc_rt 'blueprint_decide; echo "DECIDE REASON=${BP_REASON} CHANGED=${BP_CHANGED} RECORDED=${BP_RECORDED:-none}"' 2>&1)"; P_RC=$?
+}
+decide_line() { grep -m1 '^DECIDE ' <<< "$P_OUT"; }
+# seed_record: a cluster named P_CLUSTER (default pcluster) with the CURRENT tree's blueprint
+# recorded, by the real blueprint_decide + record_blueprint; marks reset afterwards.
+seed_record() {
+  printf '%s\n' "${P_CLUSTER-pcluster}" > "$PSTATE/clusters"
+  psrc_rt 'blueprint_decide; record_blueprint' >/dev/null 2>&1
+  local rc=$?
+  if [[ $rc -ne 0 || ! -s "$PSTATE/rec.hash" ]]; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[prov-seed-record] seeding a recorded blueprint failed (rc ${rc}) — every case built on it is unproven")
+  fi
+  reset_marks
+}
+# The rendered blueprint of the copy (stdout only). Sets P_RC / P_RENDER.
+prender() { P_RENDER="$(psrc_rt 'blueprint_render' 2>/dev/null)"; P_RC=$?; }
+# One fingerprint of the whole provision state (the cluster record AND the tree copy).
+pstate_sum() {
+  (cd "$WORK" && find pstate ptree -type f -print0 | sort -z | xargs -0 sha256sum) | sha256sum | cut -d' ' -f1
+}
 bp_line() { grep -m1 '^BLUEPRINT ' <<< "$P_OUT"; }
+one_failed_line() {  # $1 = label: exactly ONE PROVISION_FAILED line in P_OUT
+  assert_rc "$1" 1 "$(grep -c '^PROVISION_FAILED' <<< "$P_OUT")"
+}
+
+make_ptree; reset_marks
+PRISTINE_STATE="$(pstate_sum)"
 
 # --- (P1) fresh: no cluster -> build, record LAST; the decision line is emitted ------------
-make_ptree; reset_marks
 prov --yes
 assert_rc "prov-fresh-rc" 0 "$P_RC"
 assert_status "prov-fresh-decision-line" "BLUEPRINT ACTION=rebuild REASON=missing RECORDED=none CURRENT=" "$P_OUT"
@@ -676,6 +784,8 @@ assert_rc "prov-fresh-record-is-sha256" 0 "$([[ "$(cat "$PSTATE/rec.hash" 2>/dev
 # The record is written AFTER every build stage: it is the last kubectl call.
 assert_status "prov-fresh-record-is-last-write" "create configmap devloop-blueprint" "$(tail -n1 "${MARK}/kubectl.calls" 2>/dev/null)"
 # The AC DATABASE_URL is DERIVED from the Postgres Secret (T1), never a second literal.
+# Positive control first: the secret stage was reached at all (a vacuous-pass guard).
+assert_rc "prov-fresh-secrets-created" 0 "$([[ -s "${MARK}/secrets.calls" ]] && echo 0 || echo 1)"
 pg_pw="$(awk '/^  POSTGRES_PASSWORD:/{print $2}' "$PTREE/infra/services/postgres/secret.yaml")"
 assert_status "prov-ac-db-url-derived" "DATABASE_URL=postgresql://darktower:${pg_pw}@postgres" "$(cat "${MARK}/secrets.calls" 2>/dev/null)"
 assert_absent "prov-ac-db-url-no-literal-in-script" "dev_password_change_in_production" "$(grep -v '^[[:space:]]*#' "${REPO_ROOT}/infra/kind/scripts/provision.sh")"
@@ -692,47 +802,126 @@ assert_no_marker "prov-noop-no-record" "$MARK" "ran.record"
 assert_marker "prov-noop-still-exports-kubeconfig" "$MARK" "ran.kind_export"
 
 # --- (P3, test d) determinism + sensitivity: each section class changed once ---------------
-prov --blueprint; m1="$P_OUT"
-prov --blueprint; m2="$P_OUT"
+# Determinism compares the render (STDOUT) only: the old combined-stream compare included a
+# timestamped log line and flaked whenever the two runs straddled a second.
+prender; m1="$P_RENDER"
+prender; m2="$P_RENDER"
 assert_rc "prov-render-deterministic" 0 "$([[ -n "$m1" && "$m1" == "$m2" ]] && echo 0 || echo 1)"
 assert_rc "prov-render-lists-every-input" 0 "$([[ "$(grep -c '^file:' <<< "$m1")" -eq 4 ]] && echo 0 || echo "1 ($(grep -c '^file:' <<< "$m1"))")"
-# The render names public certs only — never a key file, never a line of any input.
-assert_absent "prov-render-no-key-file" ".key" "$m1"
-assert_absent "prov-render-no-input-lines" "POSTGRES_PASSWORD" "$m1"
-sens_case() {  # $1=label $2=expected CHANGED= section; the mutation has been applied by the caller
-  reset_marks; prov --yes
-  assert_status "prov-sensitive-${1}-rebuilds" "ACTION=rebuild REASON=changed" "$(bp_line)"
-  assert_rc "prov-sensitive-${1}-names-exactly-that-section" 0 "$([[ "$(bp_line)" == *" CHANGED=${2}" ]] && echo 0 || echo "1 ($(bp_line))")"
-  assert_marker "prov-sensitive-${1}-deleted" "$MARK" "ran.kind_delete"
+# The render names public certs only — never a key file, never a line of any input — on ANY
+# stream (stdout AND stderr).
+m_all="$(psrc 'detect_container_runtime; blueprint_render' 2>&1)"; m_all_rc=$?
+# Positive control: m_all IS a render (an error line alone would pass every absence below).
+assert_rc "prov-render-all-streams-is-a-render" 0 "$([[ $m_all_rc -eq 0 && "$m_all" == *"dt-blueprint v1"* && "$(grep -c ' sha256:' <<< "$m_all")" -eq 7 ]] && echo 0 || echo "1 (rc=${m_all_rc})")"
+assert_absent "prov-render-no-key-file" ".key" "$m_all"
+assert_absent "prov-render-no-input-lines" "POSTGRES_PASSWORD" "$m_all"
+# The secret VALUE (read from the tree copy, never typed), not only its key name.
+pg_pw_needle="$(awk '/^  POSTGRES_PASSWORD:/{print $2}' "$PTREE/infra/services/postgres/secret.yaml")"
+assert_rc "prov-render-password-needle-read" 0 "$([[ -n "$pg_pw_needle" ]] && echo 0 || echo "1 (no POSTGRES_PASSWORD read from the tree copy's secret.yaml)")"
+assert_absent "prov-render-no-postgres-password" "${pg_pw_needle:-<unread-password-needle>}" "$m_all"
+# One digest per labelled input, taken BY POSITION from one sha256sum call: every rendered
+# digest must equal the per-file `sha256sum < file` of the file its label names (a
+# misalignment would pass every other case here).
+render_digests_aligned() {  # $1 = render; prints mismatches, empty when every digest is right
+  local label val path
+  # IFS: this file runs with IFS=$'\n\t'; a render line splits on its SPACE.
+  while IFS=' ' read -r label val; do
+    [[ "$val" == sha256:* ]] || continue
+    case "$label" in
+      kind-config) path="$PTREE/infra/kind/kind-config.yaml" ;;
+      file:*) path="$PTREE/${label#file:}" ;;
+      tls-cert:*) path="$PTREE/infra/docker/certs/${label#tls-cert:}" ;;
+      *) echo "unknown-label:${label}"; continue ;;
+    esac
+    [[ "${val#sha256:}" == "$(sha256sum < "$path" | cut -d' ' -f1)" ]] || echo "misaligned:${label}"
+  done <<< "$1"
 }
-printf '# edit\n' >> "$PTREE/infra/kind/kind-config.yaml";              sens_case kind-config "kind-config"
-PENV=(env STUB_KIND_VERSION="kind v0.99.0");                            sens_case kind-version "kind-version"; PENV=(env)
-reset_marks; prov --yes   # back to the default kind version, so the next case changes ONE section
-printf '# edit\n' >> "$PTREE/infra/kind/scripts/lib/common.sh";          sens_case lib-file "file:infra/kind/scripts/lib/common.sh"
-printf 'MH PUBLIC CERT v2\n' > "$PTREE/infra/docker/certs/mh-webtransport.crt"; sens_case tls-cert "tls-cert:mh-webtransport.crt"
+mis="$(render_digests_aligned "$m1")"
+assert_rc "prov-render-digest-per-label" 0 "$([[ -z "$mis" && "$(grep -c ' sha256:' <<< "$m1")" -eq 7 ]] && echo 0 || echo "1 (${mis//$'\n'/ } n=$(grep -c ' sha256:' <<< "$m1"))")"
+# An ABSENT TLS cert still renders (`missing`, rc 0) and the digests after it stay aligned.
+mv "$PTREE/infra/docker/certs/mc-webtransport.crt" "$WORK/mc.crt.aside"
+prender
+assert_rc "prov-render-absent-cert-rc" 0 "$P_RC"
+assert_status "prov-render-absent-cert-missing-line" "tls-cert:mc-webtransport.crt missing" "$P_RENDER"
+mis="$(render_digests_aligned "$P_RENDER")"
+assert_rc "prov-render-absent-cert-still-aligned" 0 "$([[ -z "$mis" && "$(grep -c ' sha256:' <<< "$P_RENDER")" -eq 6 ]] && echo 0 || echo "1 (${mis})")"
+mv "$WORK/mc.crt.aside" "$PTREE/infra/docker/certs/mc-webtransport.crt"
+# An input that CANNOT be hashed fails the render — never an empty digest.
+mv "$PTREE/infra/services/postgres/secret.yaml" "$WORK/secret.aside"
+P_OUT="$(psrc_rt 'blueprint_render' 2>&1)"; P_RC=$?
+assert_rc "prov-render-unhashable-input-fails" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
+assert_status "prov-render-unhashable-input-names-file" "infra/services/postgres/secret.yaml" "$P_OUT"
+assert_rc "prov-render-unhashable-no-empty-digest" 0 "$(grep -qE ' sha256:$' <<< "$P_OUT" && echo 1 || echo 0)"
+# ...end to end: the build fails at the decision (the classified line), destroys and records
+# nothing, and prints no decision line; --check fails too. A cluster with a record exists
+# first, so a delete WOULD be possible.
+mv "$WORK/secret.aside" "$PTREE/infra/services/postgres/secret.yaml"
+seed_record
+mv "$PTREE/infra/services/postgres/secret.yaml" "$WORK/secret.aside"
+prov --yes
+assert_rc "prov-unhashable-input-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
+assert_status "prov-unhashable-input-classified" "PROVISION_FAILED REASON=step-failed STEP=blueprint_decide" "$P_OUT"
+one_failed_line "prov-unhashable-input-one-line"
+assert_absent "prov-unhashable-input-no-decision-line" "BLUEPRINT ACTION=" "$P_OUT"
+assert_no_marker "prov-unhashable-input-no-delete" "$MARK" "ran.kind_delete"
+assert_no_marker "prov-unhashable-input-no-create" "$MARK" "ran.kind_create"
+assert_no_marker "prov-unhashable-input-no-record" "$MARK" "ran.record"
+reset_marks; prov --check
+assert_rc "prov-unhashable-input-check-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
+assert_absent "prov-unhashable-input-check-no-decision-line" "BLUEPRINT ACTION=" "$P_OUT"
+mv "$WORK/secret.aside" "$PTREE/infra/services/postgres/secret.yaml"
+
+# Sensitivity: each section class changed once, by the real blueprint_decide against a seeded
+# record. Each case starts from a `match` positive control (a failed restore cannot bleed into
+# the next case) and restores its mutation. That a CHANGED section rebuilds and deletes is
+# main's section-independent mapping, asserted end to end by the kind-config case (P9 below).
+make_ptree; reset_marks; seed_record
+sens_direct() {  # $1=label $2=expected CHANGED= section; the mutation has been applied by the caller
+  decide
+  assert_status "prov-sensitive-${1}-changed" "DECIDE REASON=changed" "$(decide_line)"
+  assert_rc "prov-sensitive-${1}-names-exactly-that-section" 0 "$([[ "$(decide_line)" == *" CHANGED=${2} RECORDED="* ]] && echo 0 || echo "1 ($(decide_line))")"
+}
+sens_baseline() {  # $1=label: the positive control — the tree matches the record before mutating
+  decide
+  assert_status "prov-sensitive-${1}-baseline-match" "DECIDE REASON=match CHANGED=-" "$(decide_line)"
+}
+sens_baseline kind-version
+STUB_KIND_VERSION="kind v0.99.0" sens_direct kind-version "kind-version"
+sens_baseline lib-file
+cp "$PTREE/infra/kind/scripts/lib/common.sh" "$WORK/common.aside"
+printf '# edit\n' >> "$PTREE/infra/kind/scripts/lib/common.sh"; sens_direct lib-file "file:infra/kind/scripts/lib/common.sh"
+cp "$WORK/common.aside" "$PTREE/infra/kind/scripts/lib/common.sh"
+sens_baseline tls-cert
+printf 'MH PUBLIC CERT v2\n' > "$PTREE/infra/docker/certs/mh-webtransport.crt"; sens_direct tls-cert "tls-cert:mh-webtransport.crt"
+printf 'MH PUBLIC CERT v1\n' > "$PTREE/infra/docker/certs/mh-webtransport.crt"
+sens_baseline provider
 # provider: detect_container_runtime prefers podman; with only docker on PATH it is docker.
 mv "${PBIN}/podman" "${PBIN}/podman.off"; cp "${PBIN}/podman.off" "${PBIN}/docker"
-sens_case provider "provider"
+sens_direct provider "provider"
 rm -f "${PBIN}/docker"; mv "${PBIN}/podman.off" "${PBIN}/podman"
-reset_marks; prov --yes   # back to podman, so the next case changes ONE section
 # THE POINT OF THE FILE SPLIT: a deploy.sh-only edit leaves the blueprint unchanged.
+sens_baseline deploy-only-edit
 printf '# edit\n' >> "$PTREE/infra/kind/scripts/deploy.sh"
-reset_marks; prov --yes
-assert_status "prov-deploy-only-edit-is-noop" "ACTION=none REASON=match" "$(bp_line)"
-assert_no_marker "prov-deploy-only-edit-no-delete" "$MARK" "ran.kind_delete"
+decide
+assert_status "prov-deploy-only-edit-matches" "DECIDE REASON=match CHANGED=-" "$(decide_line)"
 
 # --- (P4, test e) --blueprint is PURE: no recipe run, no cluster write ----------------------
 reset_marks; prov --blueprint
+assert_rc "prov-blueprint-rc" 0 "$P_RC"
 assert_no_marker "prov-blueprint-no-recipe" "$MARK" "ran.recipe"
 assert_no_marker "prov-blueprint-no-renewal-probe" "$MARK" "ran.renewal-check"
 assert_no_marker "prov-blueprint-no-kubectl" "$MARK" "ran.kubectl"
 assert_no_marker "prov-blueprint-no-create" "$MARK" "ran.kind_create"
 
 # --- (P5, test b) a failure at ANY build stage leaves NO record; the next run rebuilds ------
+# Each stage failure runs END TO END (main's trap + one-line invariant + "no record"). The
+# create stage also runs with a silent apiserver: a PRE-create step never reports
+# apiserver-unreachable (there is no apiserver yet), and the trap never even asks.
 declare -A STAGE_LINE=([create]="kind stub: create failed" [calico]="kubectl stub: calico failed" [secret]="kubectl stub: secret failed" [record]="kubectl stub: record failed")
+declare -A STAGE_STATE=()
 for stage in create calico secret record; do
   make_ptree; reset_marks
-  PENV=(env STUB_FAIL_AT="$stage"); prov --yes; PENV=(env)
+  if [[ "$stage" == create ]]; then STUB_READYZ=fail STUB_FAIL_AT="$stage" prov --yes; else STUB_FAIL_AT="$stage" prov --yes; fi
   assert_rc "prov-fail-${stage}-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
   # The injected stage was REACHED (not an earlier, unrelated failure).
   assert_status "prov-fail-${stage}-reached" "${STAGE_LINE[$stage]}" "$P_OUT"
@@ -743,28 +932,56 @@ for stage in create calico secret record; do
     secret) want_step=create_ac_secrets ;; record) want_step=record_blueprint ;;
   esac
   assert_status "prov-fail-${stage}-classified-line" "PROVISION_FAILED REASON=step-failed STEP=${want_step}" "$P_OUT"
-  assert_rc "prov-fail-${stage}-one-line" 1 "$(grep -c '^PROVISION_FAILED' <<< "$P_OUT")"
+  one_failed_line "prov-fail-${stage}-one-line"
   assert_rc "prov-fail-${stage}-no-record" 1 "$([[ -s "$PSTATE/rec.hash" ]] && echo 0 || echo 1)"
-  reset_marks; prov --yes
-  assert_status "prov-fail-${stage}-next-run-sees-missing" "ACTION=rebuild REASON=missing" "$(bp_line)"
-  assert_rc "prov-fail-${stage}-next-run-recovers" 0 "$P_RC"
+  if [[ "$stage" == create ]]; then
+    assert_absent "prov-classify-pre-create-no-apiserver-token" "apiserver-unreachable" "$P_OUT"
+    assert_no_marker "prov-classify-pre-create-readyz-not-asked" "$MARK" "ran.readyz"
+  else
+    # After the cluster exists the trap DOES probe the apiserver (main set CLUSTER_CREATED).
+    assert_marker "prov-fail-${stage}-post-create-readyz-asked" "$MARK" "ran.readyz"
+  fi
+  # The next run sees the half-built cluster as MISSING (never `match`)...
+  decide
+  assert_status "prov-fail-${stage}-next-run-sees-missing" "DECIDE REASON=missing" "$(decide_line)"
+  STAGE_STATE[$stage]="$(pstate_sum)"
 done
+# ...and the state each failure leaves is ONE of two shapes, so one recovery run each proves
+# "the next run recovers" for all four. create: nothing was made (== the pristine tree, which
+# P1 builds from). calico/secret/record: the cluster exists with no record — asserted
+# identical, with a positive control that the state really is "listed, unrecorded".
+assert_rc "prov-fail-create-state-equals-pristine" 0 "$([[ "${STAGE_STATE[create]}" == "$PRISTINE_STATE" ]] && echo 0 || echo 1)"
+assert_rc "prov-fail-calico-state-equals-record-failure-state" 0 "$([[ "${STAGE_STATE[calico]}" == "${STAGE_STATE[record]}" ]] && echo 0 || echo 1)"
+assert_rc "prov-fail-secret-state-equals-record-failure-state" 0 "$([[ "${STAGE_STATE[secret]}" == "${STAGE_STATE[record]}" ]] && echo 0 || echo 1)"
+assert_rc "prov-fail-record-state-is-listed-unrecorded" 0 "$([[ "$(cat "$PSTATE/clusters" 2>/dev/null)" == pcluster && ! -e "$PSTATE/rec.hash" ]] && echo 0 || echo 1)"
+# (P8) a MISSING record on an existing cluster (half-built / pre-ADR-0038) rebuilds — this IS
+# the post-record-failure state, so its recovery run is that case.
+reset_marks; prov --yes
+assert_rc "prov-fail-record-next-run-recovers" 0 "$P_RC"
+assert_status "prov-no-record-rebuilds" "ACTION=rebuild REASON=missing RECORDED=none" "$(bp_line)"
+assert_marker "prov-no-record-deletes" "$MARK" "ran.kind_delete"
+assert_marker "prov-fail-record-next-run-records" "$MARK" "ran.record"
+# An UNPARSEABLE record is missing too — rebuild, never skip.
+printf 'not-a-hash' > "$PSTATE/rec.hash"; decide
+assert_status "prov-garbage-record-is-missing" "DECIDE REASON=missing" "$(decide_line)"
 
 # --- (P6, test c) a tree edit DURING the build fails loudly and records nothing ------------
 make_ptree; reset_marks
-PENV=(env STUB_MUTATE_ON_CREATE="infra/kind/scripts/lib/common.sh"); prov --yes; PENV=(env)
+STUB_MUTATE_ON_CREATE="infra/kind/scripts/lib/common.sh" prov --yes
 assert_rc "prov-midbuild-edit-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
 assert_status "prov-midbuild-edit-says-so" "changed DURING the build" "$P_OUT"
 assert_no_marker "prov-midbuild-edit-no-record" "$MARK" "ran.record"
 
 # --- (P6b, SEC-1) the Calico manifest is VERIFIED before it is applied with cluster-admin --
+# install_calico directly, under the trap. (A failed calico stage leaving no record is P5.)
 make_ptree; reset_marks
-PENV=(env STUB_CALICO_BYTES="CALICO TAMPERED"); prov --yes; PENV=(env)
+P_CREATED=true STUB_CALICO_BYTES="CALICO TAMPERED" ptrap install_calico
 assert_rc "prov-calico-tampered-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
 assert_status "prov-calico-tampered-says-so" "Calico manifest integrity check FAILED" "$P_OUT"
 assert_no_marker "prov-calico-tampered-not-applied" "$MARK" "ran.calico-create"
-assert_no_marker "prov-calico-tampered-no-record" "$MARK" "ran.record"
-make_ptree; reset_marks; prov --yes
+reset_marks
+P_CREATED=true ptrap install_calico
+assert_rc "prov-calico-verified-rc" 0 "$P_RC"
 assert_marker "prov-calico-verified-applied" "$MARK" "ran.calico-create"
 assert_status "prov-calico-applied-the-verified-bytes" "CALICO FIXTURE v1" "$(cat "${MARK}/applied.calico" 2>/dev/null)"
 assert_status "prov-calico-https-only" "--proto =https" "$(cat "${MARK}/curl.calls" 2>/dev/null)"
@@ -772,79 +989,134 @@ assert_status "prov-calico-https-only" "--proto =https" "$(cat "${MARK}/curl.cal
 assert_rc "prov-calico-real-pin-shape" 0 "$(grep -qE '^CALICO_MANIFEST_SHA256="[0-9a-f]{64}"$' "${REPO_ROOT}/infra/kind/scripts/provision.sh" && echo 0 || echo 1)"
 
 # --- (P6c, T9) provision failures are classified at the source by the SHARED bounded probes -
-# (lib/common.sh:classify_env_failure). A POST-create step with a silent apiserver is the
-# environment; a PRE-create step never reports apiserver-unreachable (there is no apiserver).
+# (lib/common.sh:classify_env_failure), through the real trap. A POST-create step with a
+# silent apiserver is the environment; the PRE-create case is in P5 (create stage).
 make_ptree; reset_marks
-PENV=(env STUB_FAIL_AT=calico STUB_READYZ=fail); prov --yes; PENV=(env)
+P_CREATED=true STUB_FAIL_AT=calico STUB_READYZ=fail ptrap install_calico
+assert_rc "prov-classify-post-create-apiserver-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
 assert_status "prov-classify-post-create-apiserver" "PROVISION_FAILED REASON=apiserver-unreachable STEP=install_calico" "$P_OUT"
+one_failed_line "prov-classify-post-create-apiserver-one-line"
 assert_marker "prov-classify-post-create-readyz-reached" "$MARK" "ran.readyz"
-make_ptree; reset_marks
-PENV=(env STUB_FAIL_AT=create STUB_READYZ=fail); prov --yes; PENV=(env)
-assert_status "prov-classify-pre-create-never-apiserver" "PROVISION_FAILED REASON=step-failed STEP=create_cluster" "$P_OUT"
-assert_absent "prov-classify-pre-create-no-apiserver-token" "apiserver-unreachable" "$P_OUT"
-assert_no_marker "prov-classify-pre-create-readyz-not-asked" "$MARK" "ran.readyz"
-make_ptree; reset_marks
-PENV=(env STUB_FAIL_AT=create STUB_RUNTIME_INFO=fail); prov --yes; PENV=(env)
+reset_marks
+STUB_FAIL_AT=create STUB_RUNTIME_INFO=fail ptrap create_cluster
+assert_rc "prov-classify-runtime-unreachable-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
 assert_status "prov-classify-runtime-unreachable" "PROVISION_FAILED REASON=runtime-unreachable STEP=create_cluster" "$P_OUT"
+one_failed_line "prov-classify-runtime-unreachable-one-line"
 assert_marker "prov-classify-runtime-info-reached" "$MARK" "ran.runtime-info"
 # HANGS: each probe is bounded (DT_ENV_PROBE_TIMEOUT=1 against a 30s stub).
 for probe in runtime readyz; do
-  make_ptree; reset_marks
-  if [[ "$probe" == runtime ]]; then PENV=(env DT_ENV_PROBE_TIMEOUT=1 STUB_FAIL_AT=calico STUB_RUNTIME_INFO=hang); want=runtime-unreachable
-  else PENV=(env DT_ENV_PROBE_TIMEOUT=1 STUB_FAIL_AT=calico STUB_READYZ=hang); want=apiserver-unreachable; fi
-  t0=$SECONDS; prov --yes; took=$(( SECONDS - t0 )); PENV=(env)
+  reset_marks
+  t0=$SECONDS
+  if [[ "$probe" == runtime ]]; then
+    P_CREATED=true DT_ENV_PROBE_TIMEOUT=1 STUB_FAIL_AT=calico STUB_RUNTIME_INFO=hang ptrap install_calico; want=runtime-unreachable
+  else
+    P_CREATED=true DT_ENV_PROBE_TIMEOUT=1 STUB_FAIL_AT=calico STUB_READYZ=hang ptrap install_calico; want=apiserver-unreachable
+  fi
+  took=$(( SECONDS - t0 ))
+  assert_rc "prov-classify-${probe}-hang-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
   assert_status "prov-classify-${probe}-hang-token" "PROVISION_FAILED REASON=${want} STEP=install_calico" "$P_OUT"
+  one_failed_line "prov-classify-${probe}-hang-one-line"
   assert_rc "prov-classify-${probe}-hang-bounded" 0 "$([[ "$took" -lt 15 ]] && echo 0 || echo "1 (${took}s)")"
 done
-# Directly-classified reasons.
-make_ptree; P_CLUSTER=pcluster; reset_marks; prov --yes; reset_marks
-PENV=(env STUB_RECORD_READ_FAIL=1); prov --yes; PENV=(env)
+# (P7, test a) an UNREADABLE record never destroys — directly classified, end to end.
+make_ptree; seed_record
+STUB_RECORD_READ_FAIL=1 prov --yes
+assert_rc "prov-unreadable-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
+assert_status "prov-unreadable-token" "BLUEPRINT ACTION=refuse REASON=unreadable" "$(bp_line)"
 assert_status "prov-unreadable-classified" "PROVISION_FAILED REASON=blueprint-unreadable" "$P_OUT"
-assert_rc "prov-unreadable-one-line" 1 "$(grep -c '^PROVISION_FAILED' <<< "$P_OUT")"
+one_failed_line "prov-unreadable-one-line"
+assert_marker "prov-unreadable-kubectl-reached" "$MARK" "ran.kubectl"
+assert_no_marker "prov-unreadable-no-delete" "$MARK" "ran.kind_delete"
+assert_no_marker "prov-unreadable-no-create" "$MARK" "ran.kind_create"
+# `kind get clusters` failing is ALSO unreadable, never "missing" (which would rebuild); main's
+# unreadable -> refuse mapping is the case just above.
+STUB_KIND_LIST_FAIL=1 decide
+assert_status "prov-kind-list-fail-is-unreadable" "DECIDE REASON=unreadable" "$(decide_line)"
+# (P9, T4) a non-interactive destroy of an UNNAMED cluster refuses (operator-declined).
 make_ptree; printf 'dark-tower\n' > "$PSTATE/clusters"; reset_marks
-P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" env -u DT_CLUSTER_NAME bash "$PROV_COPY" --yes 2>&1 </dev/null)"
+P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" env -u DT_CLUSTER_NAME bash "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
+assert_rc "prov-unnamed-destroy-refused-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
 assert_status "prov-unnamed-destroy-operator-declined" "PROVISION_FAILED REASON=operator-declined" "$P_OUT"
-# port-held: a real listener on a host port the kind config maps (TCP, by the connect's
-# exit status) → the environment, before `kind create`.
+assert_status "prov-unnamed-destroy-refused-says-why" "never falls back to the default name" "$P_OUT"
+assert_no_marker "prov-unnamed-destroy-no-delete" "$MARK" "ran.kind_delete"
+# ...but CREATING the default cluster (nothing to destroy) still works for the host.
 make_ptree; reset_marks
-PORT_HELD="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-printf 'kind: Cluster\nnodes:\n  - role: control-plane\n    extraPortMappings:\n      - containerPort: 30082\n        hostPort: %s\n        listenAddress: "127.0.0.1"\n        protocol: TCP\n' "$PORT_HELD" > "$PTREE/infra/kind/kind-config.yaml"
-python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4); time.sleep(20)' "$PORT_HELD" &
-LISTENER=$!; sleep 1
-prov --yes
-kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null
-assert_status "prov-port-held-classified" "PROVISION_FAILED REASON=port-held STEP=check_host_ports" "$P_OUT"
-assert_status "prov-port-held-names-port" "127.0.0.1:${PORT_HELD}" "$P_OUT"
-assert_no_marker "prov-port-held-never-creates" "$MARK" "ran.kind_create"
-# ...and the same config with the port free proceeds (positive control).
-reset_marks; prov --yes
-assert_marker "prov-port-free-creates" "$MARK" "ran.kind_create"
-# UDP host ports: read from the bound-socket table (no connect to observe). A real UDP
-# socket on the mapped port is held; one on a NON-overlapping address is not.
-PORT_UDP="$(python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-printf 'kind: Cluster\nnodes:\n  - role: control-plane\n    extraPortMappings:\n      - containerPort: 30083\n        hostPort: %s\n        listenAddress: "127.0.0.1"\n        protocol: UDP\n' "$PORT_UDP" > "$PTREE/infra/kind/kind-config.yaml"
-udp_listen() { python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((sys.argv[1], int(sys.argv[2]))); time.sleep(20)' "$1" "$PORT_UDP" & LISTENER=$!; sleep 1; }
-reset_marks; udp_listen 127.0.0.1; prov --yes
-kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null
-assert_status "prov-udp-port-held-classified" "PROVISION_FAILED REASON=port-held STEP=check_host_ports" "$P_OUT"
-assert_status "prov-udp-port-held-names-port" "127.0.0.1:${PORT_UDP}/udp" "$P_OUT"
-assert_no_marker "prov-udp-port-held-never-creates" "$MARK" "ran.kind_create"
-reset_marks; udp_listen 0.0.0.0; prov --yes
-kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null
-assert_status "prov-udp-wildcard-holder-overlaps" "PROVISION_FAILED REASON=port-held STEP=check_host_ports" "$P_OUT"
-reset_marks; udp_listen 127.0.0.2; prov --yes
-kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null
-assert_absent "prov-udp-other-address-not-held" "port-held" "$P_OUT"
-# (also the positive control: the check lets a non-conflicting config through to create)
-assert_marker "prov-udp-other-address-creates" "$MARK" "ran.kind_create"
+P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" env -u DT_CLUSTER_NAME bash "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
+assert_rc "prov-unnamed-create-ok" 0 "$P_RC"
+
+# port-held: a real listener on a host port the kind config maps → the environment, before
+# `kind create`. listen <tcp|udp> <addr>: binds <addr>:0 (the kernel picks a free port — no
+# pick-then-rebind race), reports the port through a file, and is polled for readiness with a
+# BOUND; on timeout it FAILS loudly and returns 1 — a case never runs without its listener.
+# Sets LISTENER (pid) and LPORT.
+listen() {
+  local pf="${WORK}/listener.port" i
+  rm -f "$pf" "$pf.tmp"
+  python3 -c '
+import socket, sys, os, time
+proto, addr, pf = sys.argv[1], sys.argv[2], sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM)
+s.bind((addr, 0))
+if proto == "tcp":
+    s.listen(4)
+with open(pf + ".tmp", "w") as f:
+    f.write(str(s.getsockname()[1]))
+os.rename(pf + ".tmp", pf)
+time.sleep(20)' "$1" "$2" "$pf" &
+  LISTENER=$!
+  for ((i = 0; i < 100; i++)); do [[ -s "$pf" ]] && break; sleep 0.05; done
+  if [[ ! -s "$pf" ]]; then
+    kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null
+    FAIL=$((FAIL + 1)); FAILURES+=("[prov-listener-${1}-${2}] the ${1} listener on ${2} did not come up within 5s — the port-held cases it serves did NOT run; this is a FAIL, not a skip")
+    return 1
+  fi
+  LPORT="$(cat "$pf")"
+}
+unlisten() { kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null; }
+port_config() {  # $1=TCP|UDP $2=port: the copy's kind config maps exactly that host port on 127.0.0.1
+  printf 'kind: Cluster\nnodes:\n  - role: control-plane\n    extraPortMappings:\n      - containerPort: 30082\n        hostPort: %s\n        listenAddress: "127.0.0.1"\n        protocol: %s\n' "$2" "$1" > "$PTREE/infra/kind/kind-config.yaml"
+}
+# TCP, END TO END: held -> port-held, and main never reaches `kind create`.
+make_ptree; reset_marks
+if listen tcp 127.0.0.1; then
+  port_config TCP "$LPORT"
+  prov --yes
+  unlisten
+  assert_status "prov-port-held-classified" "PROVISION_FAILED REASON=port-held STEP=check_host_ports" "$P_OUT"
+  assert_status "prov-port-held-names-port" "127.0.0.1:${LPORT}" "$P_OUT"
+  assert_no_marker "prov-port-held-never-creates" "$MARK" "ran.kind_create"
+  # ...and the same config with the port free passes the check (positive control).
+  reset_marks; ptrap check_host_ports
+  assert_rc "prov-port-free-passes-check" 0 "$P_RC"
+  assert_absent "prov-port-free-no-failed-line" "PROVISION_FAILED" "$P_OUT"
+fi
+# UDP host ports, directly: read from the bound-socket table (no connect to observe). A real
+# UDP socket on the mapped port is held; one on a NON-overlapping address is not. (That a
+# held port stops main before `kind create` is protocol-independent: the TCP case above.)
+if listen udp 127.0.0.1; then
+  port_config UDP "$LPORT"; reset_marks; ptrap check_host_ports; unlisten
+  assert_rc "prov-udp-port-held-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
+  assert_status "prov-udp-port-held-classified" "PROVISION_FAILED REASON=port-held STEP=check_host_ports" "$P_OUT"
+  assert_status "prov-udp-port-held-names-port" "127.0.0.1:${LPORT}/udp" "$P_OUT"
+  one_failed_line "prov-udp-port-held-one-line"
+fi
+if listen udp 0.0.0.0; then
+  port_config UDP "$LPORT"; reset_marks; ptrap check_host_ports; unlisten
+  assert_status "prov-udp-wildcard-holder-overlaps" "PROVISION_FAILED REASON=port-held STEP=check_host_ports" "$P_OUT"
+fi
+if listen udp 127.0.0.2; then
+  port_config UDP "$LPORT"; reset_marks; ptrap check_host_ports; unlisten
+  assert_absent "prov-udp-other-address-not-held" "port-held" "$P_OUT"
+  # (also the positive control: the check lets a non-conflicting config through)
+  assert_rc "prov-udp-other-address-passes-check" 0 "$P_RC"
+fi
 
 # udp_port_bound over tables that are partly ABSENT (an IPv4-only host has no udp6; mawk
 # aborts on an unopenable file, which would read as "not held").
 UDP_T="${WORK}/udp-tables"; mkdir -p "$UDP_T"
 printf '  sl  local_address rem_address   st\n   0: 0100007F:1F90 00000000:0000 07\n' > "$UDP_T/udp"
 udp_bound() {
-  SP="$PROV_COPY" T4="$UDP_T/udp" T6="$UDP_T/udp6-absent" A="$1" P="$2" \
-    bash -c 'source "$SP" >/dev/null 2>&1 || exit 90; UDP_SOCKET_TABLES=("$T4" "$T6"); udp_port_bound "$A" "$P"'
+  T4="$UDP_T/udp" T6="$UDP_T/udp6-absent" psrc 'UDP_SOCKET_TABLES=("$T4" "$T6"); udp_port_bound "${ARGS[@]}"' "$1" "$2"
 }
 udp_bound 127.0.0.1 8080; assert_rc "udp-table-missing-udp6-still-held" 0 "$?"
 udp_bound 127.0.0.2 8080; assert_rc "udp-table-other-address-not-held" 1 "$?"
@@ -853,32 +1125,36 @@ udp_bound 127.0.0.1 8081; assert_rc "udp-table-other-port-not-held" 1 "$?"
 
 # runtime-incapable (docs/TODO.md §G): `kind create` fails and the SAME container shape on
 # the node image fails too -> the host. The probe keyed on exit status; every other outcome
-# stays `step-failed` (the tree's lane — the conservative direction).
+# stays `step-failed` (the tree's lane — the conservative direction). END TO END once (the
+# specific line + the trap's one-line invariant through main); the other outcomes directly.
 NODE_IMG="docker.io/kindest/node:v1.31.0"
 make_ptree; reset_marks
-PENV=(env STUB_FAIL_AT=create STUB_NODE_IMAGE="$NODE_IMG" STUB_NODE_RUN=fail); prov --yes; PENV=(env)
+STUB_FAIL_AT=create STUB_NODE_IMAGE="$NODE_IMG" STUB_NODE_RUN=fail prov --yes
 assert_status "prov-runtime-incapable-classified" "PROVISION_FAILED REASON=runtime-incapable STEP=create_cluster" "$P_OUT"
-assert_rc "prov-runtime-incapable-one-line" 1 "$(grep -c '^PROVISION_FAILED' <<< "$P_OUT")"
+one_failed_line "prov-runtime-incapable-one-line"
 assert_status "prov-runtime-incapable-probe-shape" "run --rm --pull=never --privileged --hostname dt-node-probe --entrypoint /bin/true ${NODE_IMG}" "$(cat "$MARK/podman.calls")"
-make_ptree; reset_marks
-PENV=(env STUB_FAIL_AT=create STUB_NODE_IMAGE="$NODE_IMG"); prov --yes; PENV=(env)
+reset_marks
+STUB_FAIL_AT=create STUB_NODE_IMAGE="$NODE_IMG" ptrap create_cluster
 assert_status "prov-node-probe-passes-stays-tree" "PROVISION_FAILED REASON=step-failed STEP=create_cluster" "$P_OUT"
+one_failed_line "prov-node-probe-passes-one-line"
 assert_marker "prov-node-probe-passes-reached" "$MARK" "ran.node-probe"
-make_ptree; reset_marks
-PENV=(env STUB_FAIL_AT=create STUB_NODE_RUN=fail); prov --yes; PENV=(env)
+reset_marks
+STUB_FAIL_AT=create STUB_NODE_RUN=fail ptrap create_cluster
 assert_status "prov-node-probe-no-image-stays-tree" "PROVISION_FAILED REASON=step-failed STEP=create_cluster" "$P_OUT"
+one_failed_line "prov-node-probe-no-image-one-line"
 assert_status "prov-node-probe-no-image-warns" "No local kind node image" "$P_OUT"
 assert_no_marker "prov-node-probe-no-image-not-run" "$MARK" "ran.node-probe"
-make_ptree; reset_marks; t0=$SECONDS
-PENV=(env DT_ENV_PROBE_TIMEOUT=1 STUB_FAIL_AT=create STUB_NODE_IMAGE="$NODE_IMG" STUB_NODE_RUN=hang); prov --yes; PENV=(env)
+reset_marks; t0=$SECONDS
+DT_ENV_PROBE_TIMEOUT=1 STUB_FAIL_AT=create STUB_NODE_IMAGE="$NODE_IMG" STUB_NODE_RUN=hang ptrap create_cluster
 took=$(( SECONDS - t0 ))
 assert_status "prov-node-probe-hang-not-incapable" "PROVISION_FAILED REASON=step-failed STEP=create_cluster" "$P_OUT"
+one_failed_line "prov-node-probe-hang-one-line"
 assert_rc "prov-node-probe-hang-bounded" 0 "$([[ "$took" -lt 15 ]] && echo 0 || echo "1 (${took}s)")"
 # A kind create that SUCCEEDS never runs the probe.
 make_ptree; reset_marks
-PENV=(env STUB_NODE_IMAGE="$NODE_IMG" STUB_NODE_RUN=fail); prov --yes; PENV=(env)
+STUB_NODE_IMAGE="$NODE_IMG" STUB_NODE_RUN=fail ptrap create_cluster
+assert_rc "prov-node-probe-create-ok-rc" 0 "$P_RC"
 assert_no_marker "prov-node-probe-only-on-create-failure" "$MARK" "ran.node-probe"
-unset P_CLUSTER
 # No `kind` on the host: a PATH of ONLY the plain tools (no stubs, no host kind/kubectl/
 # runtime), so a real host install cannot leak in and the case always runs.
 PNOKIND_BIN="${WORK}/pbin-nokind"; rm -rf "$PNOKIND_BIN"; mkdir -p "$PNOKIND_BIN"
@@ -889,7 +1165,7 @@ make_ptree; reset_marks
 P_OUT="$(PATH="${PNOKIND_BIN}" TMPDIR="$RWORK_P" DT_CLUSTER_NAME=pcluster "$PNOKIND_BIN/bash" "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
 assert_rc "prov-prerequisite-missing-rc" 1 "$P_RC"
 assert_status "prov-prerequisite-missing-token" "PROVISION_FAILED REASON=prerequisite-missing STEP=provision_check_prerequisites" "$P_OUT"
-assert_rc "prov-prerequisite-missing-one-line" 1 "$(grep -c '^PROVISION_FAILED' <<< "$P_OUT")"
+one_failed_line "prov-prerequisite-missing-one-line"
 # ...and no `timeout` is a named prerequisite for provision too (stubs present, timeout absent).
 PNOTO_BIN="${WORK}/pbin-notimeout"; rm -rf "$PNOTO_BIN"; mkdir -p "$PNOTO_BIN"
 cp "${PBIN}/kind" "${PBIN}/kubectl" "${PBIN}/podman" "${PBIN}/curl" "$PNOTO_BIN/"
@@ -902,48 +1178,20 @@ assert_status "prov-no-timeout-prerequisite-missing" "PROVISION_FAILED REASON=pr
 assert_status "prov-no-timeout-names-it" "timeout is not installed" "$P_OUT"
 assert_absent "prov-no-timeout-never-runtime-unreachable" "runtime-unreachable" "$P_OUT"
 
-# --- (P7, test a) an UNREADABLE record never destroys ----------------------------------------
-make_ptree; reset_marks; prov --yes; reset_marks
-PENV=(env STUB_RECORD_READ_FAIL=1); prov --yes; PENV=(env)
-assert_rc "prov-unreadable-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
-assert_status "prov-unreadable-token" "BLUEPRINT ACTION=refuse REASON=unreadable" "$(bp_line)"
-assert_marker "prov-unreadable-kubectl-reached" "$MARK" "ran.kubectl"
-assert_no_marker "prov-unreadable-no-delete" "$MARK" "ran.kind_delete"
-assert_no_marker "prov-unreadable-no-create" "$MARK" "ran.kind_create"
-# `kind get clusters` failing is ALSO unreadable, never "missing" (which would rebuild).
-reset_marks
-PENV=(env STUB_KIND_LIST_FAIL=1); prov --yes; PENV=(env)
-assert_status "prov-kind-list-fail-is-unreadable" "REASON=unreadable" "$(bp_line)"
-assert_no_marker "prov-kind-list-fail-no-create" "$MARK" "ran.kind_create"
-
-# --- (P8) a MISSING record on an existing cluster (half-built / pre-ADR-0038) rebuilds -------
-make_ptree; printf 'pcluster\n' > "$PSTATE/clusters"; reset_marks
-prov --yes
-assert_status "prov-no-record-rebuilds" "ACTION=rebuild REASON=missing RECORDED=none" "$(bp_line)"
-assert_marker "prov-no-record-deletes" "$MARK" "ran.kind_delete"
-# An UNPARSEABLE record is missing too — rebuild, never skip.
-printf 'not-a-hash' > "$PSTATE/rec.hash"; reset_marks
-prov --yes
-assert_status "prov-garbage-record-rebuilds" "ACTION=rebuild REASON=missing" "$(bp_line)"
-
-# --- (P9, T4) the destroy targets EXACTLY DT_CLUSTER_NAME; unnamed + non-interactive refuses -
-make_ptree; P_CLUSTER=named-cluster; reset_marks; prov --yes
+# --- (P9, T4) a CHANGED blueprint rebuilds and destroys EXACTLY DT_CLUSTER_NAME, once --------
+# END TO END (main's section-independent changed -> rebuild + delete mapping; the per-section
+# sensitivity is P3's direct cases).
+make_ptree; P_CLUSTER=named-cluster; seed_record
 printf '# edit\n' >> "$PTREE/infra/kind/kind-config.yaml"; reset_marks; prov --yes
+assert_status "prov-sensitive-kind-config-rebuilds" "ACTION=rebuild REASON=changed" "$(bp_line)"
+assert_rc "prov-sensitive-kind-config-names-exactly-that-section" 0 "$([[ "$(bp_line)" == *" CHANGED=kind-config" ]] && echo 0 || echo "1 ($(bp_line))")"
+assert_marker "prov-sensitive-kind-config-deleted" "$MARK" "ran.kind_delete"
 assert_status "prov-destroy-exact-name" "delete cluster --name named-cluster" "$(cat "${MARK}/kind_delete.calls" 2>/dev/null)"
 assert_rc "prov-destroy-exact-name-only-once" 1 "$(wc -l < "${MARK}/kind_delete.calls" 2>/dev/null)"
 unset P_CLUSTER
-make_ptree; printf 'dark-tower\n' > "$PSTATE/clusters"; reset_marks
-P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" env -u DT_CLUSTER_NAME bash "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
-assert_rc "prov-unnamed-destroy-refused-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
-assert_status "prov-unnamed-destroy-refused-says-why" "never falls back to the default name" "$P_OUT"
-assert_no_marker "prov-unnamed-destroy-no-delete" "$MARK" "ran.kind_delete"
-# ...but CREATING the default cluster (nothing to destroy) still works for the host.
-make_ptree; reset_marks
-P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" env -u DT_CLUSTER_NAME bash "$PROV_COPY" --yes 2>&1 </dev/null)"; P_RC=$?
-assert_rc "prov-unnamed-create-ok" 0 "$P_RC"
 
 # --- (P10, test a) interactive `N` never destroys ---------------------------------------------
-make_ptree; reset_marks; prov --yes
+make_ptree; seed_record
 printf '# edit\n' >> "$PTREE/infra/kind/kind-config.yaml"; reset_marks
 P_OUT="$(PATH="${PBIN}:${PATH}" TMPDIR="$RWORK_P" DT_CLUSTER_NAME=pcluster \
   script -qec "bash '$PROV_COPY'" /dev/null <<< "n" 2>&1)"; P_RC=$?
@@ -957,8 +1205,8 @@ else
 fi
 
 # --- (P11) TLS renewal: one cause, one CHANGED= token, on BOTH paths ------------------------
-make_ptree; reset_marks; prov --yes; reset_marks
-PENV=(env STUB_RENEWAL_RC=10); prov --check; PENV=(env)
+make_ptree; seed_record
+STUB_RENEWAL_RC=10 prov --check
 assert_rc "prov-check-renewal-due-rc" 1 "$P_RC"
 for m in ran.kind_create ran.kind_delete ran.record ran.recipe ran.calico-create; do
   assert_no_marker "prov-check-renewal-due-never-writes-${m}" "$MARK" "$m"
@@ -966,7 +1214,7 @@ done
 assert_status "prov-check-renewal-due" "BLUEPRINT ACTION=check REASON=changed" "$(bp_line)"
 assert_status "prov-check-renewal-due-token" "tls-renewal-due" "$(bp_line)"
 reset_marks
-PENV=(env STUB_RENEWAL_RC=10 STUB_RENEW_WRITES=1); prov --yes; PENV=(env)
+STUB_RENEWAL_RC=10 STUB_RENEW_WRITES=1 prov --yes
 assert_status "prov-real-renewal-token" "tls-renewal-due" "$(bp_line)"
 assert_status "prov-real-renewal-names-cert" "tls-cert:mc-webtransport.crt" "$(bp_line)"
 assert_status "prov-real-renewal-rebuilds" "ACTION=rebuild" "$(bp_line)"
@@ -978,14 +1226,15 @@ assert_status "prov-check-missing" "BLUEPRINT ACTION=check REASON=missing" "$(bp
 for m in ran.kind_create ran.kind_delete ran.record ran.recipe ran.calico-create; do
   assert_no_marker "prov-check-missing-never-writes-${m}" "$MARK" "$m"
 done
-reset_marks; prov --yes; printf '# edit\n' >> "$PTREE/infra/kind/kind-config.yaml"; reset_marks; prov --check
+seed_record; printf '# edit\n' >> "$PTREE/infra/kind/kind-config.yaml"; reset_marks; prov --check
 assert_rc "prov-check-stale-rc" 1 "$P_RC"
 assert_status "prov-check-stale" "BLUEPRINT ACTION=check REASON=changed" "$(bp_line)"
 for m in ran.kind_create ran.kind_delete ran.record ran.recipe ran.calico-create; do
   assert_no_marker "prov-check-stale-never-writes-${m}" "$MARK" "$m"
 done
-reset_marks; prov --yes; reset_marks; prov --check
+seed_record; prov --check
 assert_rc "prov-check-match-rc" 0 "$P_RC"
+assert_status "prov-check-match" "BLUEPRINT ACTION=check REASON=match" "$(bp_line)"
 assert_no_marker "prov-check-never-creates" "$MARK" "ran.kind_create"
 assert_no_marker "prov-check-never-records" "$MARK" "ran.record"
 assert_no_marker "prov-check-never-materializes" "$MARK" "ran.recipe"
@@ -1047,6 +1296,60 @@ else
   FAIL=$((FAIL + 1)); FAILURES+=("[certs-check-renewal-fresh] openssl not on PATH — cannot mint certs; FAIL, not skip")
 fi
 
+# --- (P15) lib/common.sh helpers every Kind script runs ---------------------------------------
+# cluster_exists: an exact-LINE match (it decides which cluster a destroy targets). A near-miss
+# name must not match, the name is literal (never a glob), the last line matches without a
+# trailing newline, and a failed listing is rc 2 — never "absent".
+CE_BIN="${WORK}/cebin"; mkdir -p "$CE_BIN"
+cat > "${CE_BIN}/kind" <<'STUB'
+#!/usr/bin/env bash
+[[ -z "${STUB_KIND_LIST_FAIL:-}" ]] || exit 1
+printf '%b' "${STUB_CLUSTERS:-}"
+STUB
+chmod +x "${CE_BIN}/kind"
+ce() {  # $1 = listing (printf %b), $2 = CLUSTER_NAME; prints cluster_exists's rc
+  local rc=0
+  PATH="${CE_BIN}:${PATH}" STUB_CLUSTERS="$1" src_run "$LIB_COMMON" 'CLUSTER_NAME="${ARGS[0]}"; rc=0; cluster_exists || rc=$?; echo "$rc"' "$2" 2>/dev/null || rc=$?
+  (( rc == 0 )) || echo "harness-rc-${rc}"
+}
+assert_rc "cluster-exists-exact" 0 "$(ce 'pcluster\n' pcluster)"
+assert_rc "cluster-exists-last-line-no-newline" 0 "$(ce 'other\npcluster' pcluster)"
+assert_rc "cluster-exists-near-miss-suffix" 1 "$(ce 'pcluster-2\n' pcluster)"
+assert_rc "cluster-exists-near-miss-prefix" 1 "$(ce 'xpcluster\n' pcluster)"
+assert_rc "cluster-exists-substring-of-a-line" 1 "$(ce 'a pcluster b\n' pcluster)"
+assert_rc "cluster-exists-name-is-literal-not-glob" 1 "$(ce 'pcluster\n' 'p*')"
+assert_rc "cluster-exists-empty-listing" 1 "$(ce '' pcluster)"
+assert_rc "cluster-exists-list-failure-is-2" 2 "$(STUB_KIND_LIST_FAIL=1 ce 'pcluster\n' pcluster)"
+# ...and it is the ONE existence check: every executed `kind get clusters` under infra/ is
+# cluster_exists's own, plus devloop.sh's orphan scan (a different query: every cluster of this
+# project, by prefix; its listing failure is checked on its own). An inline
+# `kind get clusters | grep -q "^name$"` reads a failed listing as "absent". The needle is the
+# command wherever it is NOT quoted — with or without a stderr redirect; log messages quote it
+# ('kind get clusters' failed). One entry per occurrence, so a second copy in either file shows.
+kgc_sites_in() {  # $@ = files or dirs; prints `<path>:` per unquoted, uncommented occurrence
+  grep -rnE "(^|[^'])kind get clusters" "$@" --include='*.sh' | grep -v '\.test\.sh:' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | sed -E "s#^${REPO_ROOT}/##; s#^${WORK}/##; s#:[0-9]+:.*#:#" | sort | tr '\n' ' '
+}
+kgc_sites="$(kgc_sites_in "${REPO_ROOT}/infra")"
+assert_rc "cluster-exists-is-the-one-existence-check" 0 "$([[ "$kgc_sites" == "infra/devloop/devloop.sh: infra/kind/scripts/lib/common.sh: " ]] && echo 0 || echo "1 (${kgc_sites})")"
+# Positive control: the needle catches the redirect-free inline copy, and not the quoted message.
+KGC_FIX="${WORK}/kgc-fixture"; mkdir -p "$KGC_FIX"
+cp "${REPO_ROOT}/infra/kind/scripts/teardown.sh" "$KGC_FIX/teardown.sh"
+printf '%s\n' 'if kind get clusters | grep -q "^x$"; then :; fi' >> "$KGC_FIX/teardown.sh"
+assert_rc "cluster-exists-guard-catches-inline-copy" 0 "$([[ "$(kgc_sites_in "$KGC_FIX")" == "kgc-fixture/teardown.sh: " ]] && echo 0 || echo "1 ($(kgc_sites_in "$KGC_FIX"))")"
+# The log line shape (the timestamp is a bash builtin, not a `date` fork): colours stripped,
+# `[HH:MM:SS LEVEL] msg`; info/step on stdout, warn/error on STDERR only.
+strip_colour() { sed -E $'s/\x1b\\[[0-9;]*m//g'; }
+LOG_SHAPE='^\[[0-2][0-9]:[0-5][0-9]:[0-5][0-9] '
+log_out="$(src_run "$LIB_COMMON" 'log_info "hello info"; log_step "hello step"' 2>/dev/null | strip_colour)"
+assert_rc "log-line-shape-info" 0 "$(grep -qE "${LOG_SHAPE}INFO\] hello info$" <<< "$log_out" && echo 0 || echo "1 (${log_out})")"
+assert_rc "log-line-shape-step" 0 "$(grep -qE "${LOG_SHAPE}STEP\] hello step$" <<< "$log_out" && echo 0 || echo "1 (${log_out})")"
+log_err="$(src_run "$LIB_COMMON" 'log_warn "hello warn"; log_error "hello error"' 2>&1 >/dev/null | strip_colour)"
+log_err_stdout="$(src_run "$LIB_COMMON" 'log_warn "hello warn"; log_error "hello error"' 2>/dev/null)"
+assert_rc "log-line-shape-warn-stderr" 0 "$(grep -qE "${LOG_SHAPE}WARN\] hello warn$" <<< "$log_err" && echo 0 || echo "1 (${log_err})")"
+assert_rc "log-line-shape-error-stderr" 0 "$(grep -qE "${LOG_SHAPE}ERROR\] hello error$" <<< "$log_err" && echo 0 || echo "1 (${log_err})")"
+assert_rc "log-warn-error-never-stdout" 0 "$([[ -z "$log_err_stdout" ]] && echo 0 || echo "1 (${log_err_stdout})")"
+
 # =============================================================================================
 # === (D) The environment root + content-addressed ConfigMaps (ADR-0038 devloop 1) =============
 # =============================================================================================
@@ -1107,10 +1410,10 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   # a well-formed sha tag, set for exactly the repos the root runs.
   TEST_TAG="sha-0123456789abcdef"
   SET_REFS='for r in $(root_repos); do IMAGE_REFS[$r]="$r:'"${TEST_TAG}"'"; done'
-  RUN_RENDER='sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; '"${SET_REFS}"'; render_env_overlay "$out"'
+  RUN_RENDER='cache_renders; '"${SET_REFS}"'; render_env_overlay "${ARGS[0]}"'
   WRAP="${RWORK}/wrap"; mkdir -p "$WRAP"
   DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=24435 \
-    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 bash -c "$RUN_RENDER" _ "$DEPLOY" "$WRAP" >/dev/null 2>&1
+    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" >/dev/null 2>&1
   assert_rc "wrapper-renders" 0 $?
   render "$WRAP" "${RWORK}/wrapped"; assert_rc "wrapper-kustomize-builds" 0 $?
   wrapped="$(cat "${RWORK}/wrapped.yaml")"
@@ -1132,21 +1435,21 @@ if [[ -n "$REAL_KUBECTL" ]]; then
     "$([[ "$(kind_docs "${RWORK}/root" Secret)" == "$(kind_docs "${RWORK}/wrapped" Secret)" ]] && echo 0 || echo 1)"
   # DRY N1: the wrapper's instance set is DERIVED; it must equal the per-instance generators
   # the root actually renders, so a new instance can never miss its override silently.
-  inst_wrapper="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; advertise_instances' _ "$DEPLOY" | tr '\n' ' ')"
+  inst_wrapper="$(src_run "$DEPLOY" 'advertise_instances' | tr '\n' ' ')"
   inst_root="$(cm_names "${RWORK}/root" | grep -E '^m[ch]-[0-9]+-config-' | sed -E 's/-config-[^-]+$//' | sort | tr '\n' ' ')"
   assert_rc "wrapper-instances-equal-root-generators" 0 \
     "$([[ -n "$inst_root" && "$inst_wrapper" == "$inst_root" ]] && echo 0 || echo "1 (wrapper='${inst_wrapper}' root='${inst_root}')")"
   # Invalid inputs fail the render (the caller then refuses to apply anything).
   bad="$(DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=70000 \
-    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 bash -c "$RUN_RENDER" _ "$DEPLOY" "$WRAP" 2>&1)"; bad_rc=$?
+    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" 2>&1)"; bad_rc=$?
   assert_rc "wrapper-bad-port-rejected" 1 "$bad_rc"
   assert_status "wrapper-bad-port-named" "MC_1_WEBTRANSPORT_PORT" "$bad"
-  DT_HOST_GATEWAY_IP=10.1.2.3 bash -c "$RUN_RENDER" _ "$DEPLOY" "$WRAP" >/dev/null 2>&1
+  DT_HOST_GATEWAY_IP=10.1.2.3 src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" >/dev/null 2>&1
   assert_rc "wrapper-missing-port-rejected" 1 $?
 
   # --- (D2b) Content-tagged images: the wrapper ALWAYS carries the tags (ADR-0038 §2) -------
   STATIC="${RWORK}/static"; mkdir -p "$STATIC"
-  env -u DT_HOST_GATEWAY_IP bash -c "$RUN_RENDER" _ "$DEPLOY" "$STATIC" >/dev/null 2>&1
+  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_RENDER" "$STATIC" >/dev/null 2>&1
   assert_rc "static-wrapper-renders" 0 $?
   render "$STATIC" "${RWORK}/static-r"; assert_rc "static-wrapper-kustomize-builds" 0 $?
   static_r="$(cat "${RWORK}/static-r.yaml")"
@@ -1164,20 +1467,20 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   pull_policies="$(grep -A1 'image: localhost/' <<< "$static_r" | grep -o 'imagePullPolicy: [A-Za-z]*' | sort -u)"
   assert_rc "wrapper-pullpolicy-never" 0 "$([[ "$pull_policies" == "imagePullPolicy: Never" ]] && echo 0 || echo "1 (${pull_policies})")"
   # The repo set is DERIVED — exactly the four services + the migrations image.
-  repos_out="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; first_party_repos' _ "$DEPLOY" 2>/dev/null | tr '\n' ' ')"
+  repos_out="$(src_run "$DEPLOY" 'cache_renders; first_party_repos' 2>/dev/null | tr '\n' ' ')"
   assert_rc "repos-derived-exact-set" 0 "$([[ "$repos_out" == "localhost/ac-service localhost/db-migrate localhost/gc-service localhost/mc-service localhost/mh-service " ]] && echo 0 || echo "1 (${repos_out})")"
   # A render with any root repo lacking a resolved ref refuses (never a placeholder apply).
   NOREF="${RWORK}/noref"; mkdir -p "$NOREF"
-  out="$(bash -c 'sp="$1"; out="$2"; set --; source "$sp" >/dev/null 2>&1; IMAGE_REFS[localhost/ac-service]="localhost/ac-service:sha-0123456789abcdef"; render_env_overlay "$out"' _ "$DEPLOY" "$NOREF" 2>&1)"
+  out="$(src_run "$DEPLOY" 'cache_renders; IMAGE_REFS[localhost/ac-service]="localhost/ac-service:sha-0123456789abcdef"; render_env_overlay "${ARGS[0]}"' "$NOREF" 2>&1)"
   assert_rc "wrapper-missing-ref-refused" 1 "$?"
   assert_status "wrapper-missing-ref-named" "no content-tagged ref resolved for localhost/gc-service" "$out"
 
   # --- (D2c) The migration Job render (ADR-0038 §2 step 3) ------------------------------------
-  RUN_JOB='sp="$1"; out="$2"; ref="$3"; set --; source "$sp" >/dev/null 2>&1; render_migration_job "$out" "$ref"'
+  RUN_JOB='render_migration_job "${ARGS[0]}" "${ARGS[1]}"'
   J1="${RWORK}/job1"; J2="${RWORK}/job2"; J3="${RWORK}/job3"; mkdir -p "$J1" "$J2" "$J3"
-  name1="$(bash -c "$RUN_JOB" _ "$DEPLOY" "$J1" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
-  name2="$(bash -c "$RUN_JOB" _ "$DEPLOY" "$J2" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
-  name3="$(bash -c "$RUN_JOB" _ "$DEPLOY" "$J3" "localhost/db-migrate:sha-fedcba9876543210" 2>/dev/null)"
+  name1="$(src_run "$DEPLOY" "$RUN_JOB" "$J1" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
+  name2="$(src_run "$DEPLOY" "$RUN_JOB" "$J2" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
+  name3="$(src_run "$DEPLOY" "$RUN_JOB" "$J3" "localhost/db-migrate:sha-fedcba9876543210" 2>/dev/null)"
   assert_rc "job-render-named-by-hash" 0 "$([[ "$name1" =~ ^db-migrate-[0-9a-f]{10}$ ]] && echo 0 || echo "1 (${name1})")"
   assert_rc "job-name-stable-when-unchanged" 0 "$([[ -n "$name1" && "$name1" == "$name2" ]] && echo 0 || echo 1)"
   assert_rc "job-name-changes-with-tag" 0 "$([[ -n "$name3" && "$name1" != "$name3" ]] && echo 0 || echo 1)"
@@ -1199,10 +1502,10 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   JCP="${RWORK}/jobcopy"; mkdir -p "$JCP"; cp -r "${REPO_ROOT}/infra" "$JCP/"; cp "${REPO_ROOT}/Cargo.lock" "$JCP/"
   sed -i 's/backoffLimit: 1/backoffLimit: 2/' "$JCP/infra/services/db-migrate/job.yaml"
   J4="${RWORK}/job4"; mkdir -p "$J4"
-  name4="$(bash -c "$RUN_JOB" _ "$JCP/infra/kind/scripts/deploy.sh" "$J4" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
+  name4="$(src_run "$JCP/infra/kind/scripts/deploy.sh" "$RUN_JOB" "$J4" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
   assert_rc "job-name-changes-with-spec" 0 "$([[ -n "$name4" && "$name1" != "$name4" ]] && echo 0 || echo "1 (${name1} vs ${name4})")"
   # A placeholder / :latest ref never renders a Job.
-  bash -c "$RUN_JOB" _ "$DEPLOY" "${RWORK}/job5" "localhost/db-migrate:latest" >/dev/null 2>&1
+  src_run "$DEPLOY" "$RUN_JOB" "${RWORK}/job5" "localhost/db-migrate:latest" >/dev/null 2>&1
   assert_rc "job-render-rejects-latest" 1 $?
   # S3: the postgres ingress rule for the Job is ONE `from` element (AND), not two (OR).
   pg_np="$(awk '/app: db-migrate/{print NR}' "${REPO_ROOT}/infra/services/postgres/network-policy.yaml")"
@@ -1243,6 +1546,7 @@ fi
 #   STUB_APPLY_FAIL=root     the environment-root `apply -k` is rejected by the apiserver
 #   STUB_KIND_LIST_FAIL=1    `kind get clusters` fails
 #   STUB_READYZ_FAIL=1       the apiserver's `/readyz` does not answer (main's EXIT-trap probe)
+#   STUB_KUSTOMIZE_FAIL=<dir>  `kubectl kustomize <dir>` fails (every other render is REAL)
 D4_BIN="${WORK}/d4bin"; mkdir -p "$D4_BIN"
 cat > "${D4_BIN}/kubectl" <<STUB
 #!/usr/bin/env bash
@@ -1251,7 +1555,9 @@ args=("\$@")
 # Drop a leading --context <ctx>.
 if [[ "\${args[0]:-}" == "--context" ]]; then args=("\${args[@]:2}"); fi
 case "\${args[0]:-}" in
-  kustomize) exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]}" ;;
+  kustomize)
+    [[ -n "\${STUB_KUSTOMIZE_FAIL:-}" && "\${args[1]%/}" == "\${STUB_KUSTOMIZE_FAIL%/}" ]] && { echo "kubectl stub: kustomize of \${args[1]} failed" >&2; exit 1; }
+    exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]}" ;;
   apply)
     if [[ "\${args[1]:-}" == "-k" ]]; then
       d="\${args[2]}"; printf '%s\n' "\$d" >> "${MARK}/applied"
@@ -1361,10 +1667,10 @@ chmod +x "${D4_BIN}/kubectl" "${D4_BIN}/docker" "${D4_BIN}/podman" "${D4_BIN}/ki
 BUILT_TAG="sha-bbbbbbbbbbbbbbbb"
 DEPLOYED_TAG="sha-aaaaaaaaaaaaaaaa"
 D4_REFS='for r in $(root_repos); do IMAGE_REFS[$r]="$r:sha-0123456789abcdef"; done'
-RUN_APPLY='sp="$1"; set --; source "$sp" >/dev/null 2>&1; '"${D4_REFS}"'; apply_env_root'
+RUN_APPLY='cache_renders; '"${D4_REFS}"'; apply_env_root'
 
 reset_marks
-PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" env -u DT_HOST_GATEWAY_IP bash -c "$RUN_APPLY" _ "$DEPLOY" >/dev/null 2>&1
+PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "apply-root-plain-rc" 0 $?
 assert_absent "apply-root-plain-never-the-bare-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
 assert_status "apply-root-plain-applied-the-tagged-wrapper" "newTag: sha-" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
@@ -1377,7 +1683,7 @@ assert_rc "apply-root-plain-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-ro
 reset_marks
 PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 \
   MC_1_WEBTRANSPORT_PORT=24435 MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 \
-  bash -c "$RUN_APPLY" _ "$DEPLOY" >/dev/null 2>&1
+  src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "apply-root-gateway-rc" 0 $?
 assert_absent "apply-root-gateway-not-the-plain-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
 assert_status "apply-root-gateway-applied-the-wrapper" "behavior: merge" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
@@ -1386,15 +1692,14 @@ assert_rc "apply-root-gateway-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-
 
 reset_marks
 out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 \
-  bash -c "$RUN_APPLY" _ "$DEPLOY" 2>&1)"; rc=$?
+  src_run "$DEPLOY" "$RUN_APPLY" 2>&1)"; rc=$?
 assert_rc "apply-root-render-failure-aborts" 1 "$rc"
 assert_no_marker "apply-root-render-failure-applies-nothing" "$MARK" "applied"
 assert_status "apply-root-render-failure-says-no-fallback" "NOT applying" "$out"
 assert_rc "apply-root-failure-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
 
 # --- (D5) content_tag: the ONE tag derivation (pure) -------------------------------------------
-RUN_CT='sp="$1"; id="$2"; set --; source "$sp" >/dev/null 2>&1; content_tag "$id"'
-ct() { bash -c "$RUN_CT" _ "$DEPLOY" "$1" 2>/dev/null; }
+ct() { src_run "$DEPLOY" 'content_tag "${ARGS[0]}"' "$1" 2>/dev/null; }
 hex_a="$(printf 'a%.0s' {1..64})"
 id_a="sha256:${hex_a}"; id_b="sha256:${hex_a:0:15}b${hex_a:16}"
 ta1="$(ct "$id_a")"; ta2="$(ct "$id_a")"; tb="$(ct "$id_b")"
@@ -1406,12 +1711,24 @@ ct "sha256:not-hex" >/dev/null; assert_rc "content-tag-rejects-non-sha256" 1 $?
 ct "" >/dev/null; assert_rc "content-tag-rejects-empty" 1 $?
 ct "sha256:abc123" >/dev/null; assert_rc "content-tag-rejects-short" 1 $?
 
+# A derivation called before cache_renders fails LOUDLY, naming the render (never printing it),
+# and first_party_repos does not mask it behind the other render's repos.
+out="$(src_run "$DEPLOY" 'first_party_repos' 2>&1)"; rc=$?
+assert_rc "cache-unprimed-first-party-repos-fails" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
+assert_status "cache-unprimed-names-the-render" "the root render is not cached" "$out"
+assert_absent "cache-unprimed-never-prints-the-render" "kind: " "$out"
+out="$(src_run "$DEPLOY" 'env_root_workloads' 2>&1)"; rc=$?
+assert_rc "cache-unprimed-env-root-workloads-fails" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
+out="$(src_run "$DEPLOY" 'cache_renders; first_party_repos' 2>&1)"; rc=$?
+assert_rc "cache-primed-first-party-repos-rc" 0 "$rc"
+assert_status "cache-primed-first-party-repos-derives" "localhost/db-migrate" "$out"
+
 # --- (D6) Ref resolution: every ref is the one BUILT this run; the deployed one is remembered --
 # deploy builds every first-party image, so there is no deployed-ref fallback (the retired
 # IMAGE_UNRESOLVED path). The pre-converge ref is still READ — it is the previous generation the
 # prune keeps — and an unreadable cluster fails with its own token.
-RUN_RES='sp="$1"; set --; source "$sp" >/dev/null 2>&1; for r in $(first_party_repos); do [[ "$r" == "${SKIP_REPO:-}" ]] || BUILT_REFS[$r]="$r:'"${BUILT_TAG:-sha-bbbbbbbbbbbbbbbb}"'"; done; resolve_image_refs || exit 1; for r in "${!IMAGE_REFS[@]}"; do echo "$r=${IMAGE_REFS[$r]} prev=${DEPLOYED_REFS[$r]:-none}"; done | sort'
-res() { PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster bash -c "$RUN_RES" _ "$DEPLOY" 2>&1; }
+RUN_RES='cache_renders; for r in $(first_party_repos); do [[ "$r" == "${SKIP_REPO:-}" ]] || BUILT_REFS[$r]="$r:'"${BUILT_TAG:-sha-bbbbbbbbbbbbbbbb}"'"; done; resolve_image_refs || exit 1; for r in "${!IMAGE_REFS[@]}"; do echo "$r=${IMAGE_REFS[$r]} prev=${DEPLOYED_REFS[$r]:-none}"; done | sort'
+res() { PATH="${D4_BIN}:${PATH}" DT_CLUSTER_NAME=d4cluster src_run "$DEPLOY" "$RUN_RES" 2>&1; }
 JOBS_OK="1 localhost/db-migrate:${DEPLOYED_TAG}\n"
 reset_marks
 out="$(STUB_JOBS="$JOBS_OK" res)"; rc=$?
@@ -1433,8 +1750,8 @@ assert_rc "resolve-kubectl-read-failure-rc" 1 "$rc"
 assert_status "resolve-kubectl-read-failure-distinct" "REASON=image-ref-read-failed" "$out"
 
 # --- (D7) run_migration_job: fails LOUDLY; an unchanged set is a no-op -----------------------
-RUN_MIG='sp="$1"; set --; source "$sp" >/dev/null 2>&1; IMAGE_REFS[localhost/db-migrate]="localhost/db-migrate:'"${DEPLOYED_TAG}"'"; run_migration_job'
-mig() { PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DT_JOB_POLL_SECONDS=0 bash -c "$RUN_MIG" _ "${1:-$DEPLOY}" 2>&1; }
+RUN_MIG='IMAGE_REFS[localhost/db-migrate]="localhost/db-migrate:'"${DEPLOYED_TAG}"'"; run_migration_job'
+mig() { PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DT_JOB_POLL_SECONDS=0 src_run "${1:-$DEPLOY}" "$RUN_MIG" 2>&1; }
 reset_marks
 out="$(mig)"; rc=$?
 assert_rc "migrate-complete-rc0" 0 "$rc"
@@ -1511,10 +1828,10 @@ assert_status "migrate-existing-complete-still-prunes-older" "metadata.name!=db-
 # main() runs SOURCED with check_blueprint overridden (the guard itself is pinned just below with
 # a stubbed provision.sh) — a harness-side override, not a production seam.
 builds() { grep '^build ' "${MARK}/podman.calls" 2>/dev/null | grep -o 'infra/docker/[a-z-]*/Dockerfile' | sort | tr '\n' ' '; }
-RUN_DEPLOY='sp="$1"; set --; source "$sp" >/dev/null 2>&1; check_blueprint() { : > "'"${MARK}"'/ran.blueprint-check"; }; main'
+RUN_DEPLOY='check_blueprint() { : > "'"${MARK}"'/ran.blueprint-check"; }; main'
 dep() {
   PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 \
-    env -u DT_HOST_GATEWAY_IP bash -c "$RUN_DEPLOY" _ "$DEPLOY" 2>&1
+    src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1
 }
 ALL_DOCKERFILES="infra/docker/ac-service/Dockerfile infra/docker/db-migrate/Dockerfile infra/docker/gc-service/Dockerfile infra/docker/mc-service/Dockerfile infra/docker/mh-service/Dockerfile "
 reset_marks
@@ -1527,6 +1844,10 @@ assert_marker "deploy-runs-the-blueprint-check" "$MARK" "ran.blueprint-check"
 assert_rc "deploy-builds-every-repo" 0 "$([[ "$(builds)" == "$ALL_DOCKERFILES" ]] && echo 0 || echo "1 ($(builds))")"
 assert_status "deploy-db-migrate-gets-sqlx-version" "SQLX_CLI_VERSION=" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
 assert_status "deploy-tags-by-content" "tag sha256:bbbb" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+# ONE render of the environment root per converge (cache_renders): the derivations read the
+# snapshot, never re-render it (the stub logs every kubectl call; kustomize passes through).
+root_renders="$(grep -cE "^kustomize ${ROOT_DIR}/?\$" "${MARK}/kubectl.calls" 2>/dev/null)"
+assert_rc "deploy-renders-the-root-once" 0 "$([[ "$root_renders" == 1 ]] && echo 0 || echo "1 (${root_renders} root renders)")"
 assert_status "deploy-root-carries-built-tags" "name: localhost/mc-service"$'\n'"    newTag: ${BUILT_TAG}" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
 assert_no_marker "deploy-restarts-nothing" "$MARK" "restarted"
 assert_status "deploy-runs-the-migration-job" "render_migration_job" "$(cat "${MARK}/applied.migration.yaml" 2>/dev/null)"
@@ -1562,6 +1883,17 @@ out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$GC_NODE_IMAGES" STUB_RS_ROWS="$GC
 assert_rc "prune-history-unreadable-deploy-still-ok" 0 "$rc"
 assert_status "prune-history-unreadable-warns" "PRUNE_WARN REASON=image-prune-failed REF=- WHERE=history" "$out"
 assert_absent "prune-history-unreadable-evicts-nothing-of-gc" "localhost/gc-service" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
+
+# The environment root cannot be RENDERED: the converge stops at cache_renders with ONE
+# classified line, before building or applying anything.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_KUSTOMIZE_FAIL="$ROOT_DIR" dep)"; rc=$?
+assert_rc "deploy-root-render-failure-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
+assert_status "deploy-root-render-failure-reached" "kubectl stub: kustomize of" "$out"
+assert_status "deploy-root-render-failure-token" "DEPLOY_FAILED REASON=step-failed STEP=cache_renders WORKLOADS=-" "$out"
+assert_rc "deploy-root-render-failure-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
+assert_no_marker "deploy-root-render-failure-applies-nothing" "$MARK" "applied"
+assert_rc "deploy-root-render-failure-builds-nothing" 0 "$([[ -z "$(builds)" ]] && echo 0 || echo "1 ($(builds))")"
 
 # A PostgreSQL rollout that does not finish stops deploy BEFORE the migration Job.
 reset_marks
@@ -1607,7 +1939,7 @@ done
 # Environment reasons are classified at the source, each with its own token.
 reset_marks
 out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=999999999 DT_JOB_POLL_SECONDS=0 \
-  STUB_JOBS="$JOBS_OK" env -u DT_HOST_GATEWAY_IP bash -c "$RUN_DEPLOY" _ "$DEPLOY" 2>&1)"; rc=$?
+  STUB_JOBS="$JOBS_OK" src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1)"; rc=$?
 assert_status "deploy-insufficient-disk-token" "DEPLOY_FAILED REASON=insufficient-disk WORKLOADS=-" "$out"
 assert_rc "deploy-insufficient-disk-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 reset_marks
@@ -1623,7 +1955,7 @@ for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirna
 done
 reset_marks
 out="$(PATH="${NORT_BIN}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 \
-  "$NORT_BIN/env" -u DT_HOST_GATEWAY_IP "$NORT_BIN/bash" -c "$RUN_DEPLOY" _ "$DEPLOY" 2>&1)"; rc=$?
+  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1)"; rc=$?
 assert_status "deploy-prerequisite-missing-token" "DEPLOY_FAILED REASON=prerequisite-missing WORKLOADS=-" "$out"
 assert_rc "deploy-prerequisite-missing-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
 assert_status "deploy-prerequisite-missing-names-runtime" "a container runtime (podman or docker) is not installed" "$out"
@@ -1636,13 +1968,13 @@ for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirna
 done
 reset_marks
 out="$(PATH="${NOTO_BIN}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 \
-  "$NOTO_BIN/env" -u DT_HOST_GATEWAY_IP "$NOTO_BIN/bash" -c "$RUN_DEPLOY" _ "$DEPLOY" 2>&1)"; rc=$?
+  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1)"; rc=$?
 assert_status "deploy-no-timeout-prerequisite-missing" "DEPLOY_FAILED REASON=prerequisite-missing WORKLOADS=-" "$out"
 assert_status "deploy-no-timeout-names-it" "timeout is not installed" "$out"
 assert_absent "deploy-no-timeout-never-runtime-unreachable" "runtime-unreachable" "$out"
-out="$(PATH="${NOTO_BIN}" "$NOTO_BIN/bash" -c 'source "$1"; classify_env_failure apiserver' _ "${REPO_ROOT}/infra/kind/scripts/lib/common.sh" 2>&1)"
+out="$(PATH="${NOTO_BIN}" src_run "$LIB_COMMON" 'classify_env_failure apiserver' 2>&1)"
 assert_rc "classify-no-timeout-names-prerequisite" 0 "$([[ "$out" == prerequisite-missing ]] && echo 0 || echo "1 (${out})")"
-out="$(PATH="${NOTO_BIN}:$(dirname "$(command -v timeout)")" "$NOTO_BIN/bash" -c 'source "$1"; classify_env_failure apiserver' _ "${REPO_ROOT}/infra/kind/scripts/lib/common.sh" 2>&1)"
+out="$(PATH="${NOTO_BIN}:$(dirname "$(command -v timeout)")" src_run "$LIB_COMMON" 'classify_env_failure apiserver' 2>&1)"
 assert_absent "classify-with-timeout-probes-control" "prerequisite-missing" "$out"
 # ...and a migration failure carries BOTH its own banner and the step line.
 reset_marks
@@ -1686,11 +2018,11 @@ echo "BLUEPRINT ACTION=check REASON=${STUB_BP_REASON:-changed} RECORDED=aaaaaaaa
 [[ "${STUB_BP_REASON:-changed}" == match ]]
 STUB
 chmod +x "$PSTUB"
-RUN_GUARDED='sp="$1"; ps="$2"; set --; source "$sp" >/dev/null 2>&1; PROVISION_SH="$ps"; main'
+RUN_GUARDED='PROVISION_SH="${ARGS[0]}"; main'
 for reason in changed missing unreadable; do
   reset_marks
   out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster STUB_BP_REASON="$reason" \
-    bash -c "$RUN_GUARDED" _ "$DEPLOY" "$PSTUB" 2>&1)"; rc=$?
+    src_run "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
   assert_rc "deploy-guard-${reason}-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
   assert_status "deploy-guard-${reason}-token" "DEPLOY_FAILED REASON=blueprint-${reason}" "$out"
   assert_status "deploy-guard-${reason}-names-provision" "dev-cluster provision" "$out"
@@ -1699,7 +2031,7 @@ for reason in changed missing unreadable; do
 done
 reset_marks
 out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 STUB_BP_REASON=match STUB_JOBS="$JOBS_OK" \
-  env -u DT_HOST_GATEWAY_IP bash -c "$RUN_GUARDED" _ "$DEPLOY" "$PSTUB" 2>&1)"; rc=$?
+  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
 assert_rc "deploy-guard-match-proceeds" 0 "$rc"
 # No cluster at all: fails before the check, still naming provision, building nothing.
 reset_marks
@@ -1788,8 +2120,7 @@ if [ "$df_count" -ge 4 ]; then PASS=$((PASS + 1)); else
 # ---- extract_manifest_images: a comment must never become an image ----------------
 # Regression for Gate 2 attempt 1: a ConfigMap-literal comment "# image: without this"
 # was extracted as an image and `podman pull docker.io/without` broke bring-up.
-RUN_EMI='sp="$1"; in="$2"; set --; source "$sp" >/dev/null 2>&1; printf "%s" "$in" | extract_manifest_images'
-emi() { bash -c "$RUN_EMI" _ "$DEPLOY" "$1"; }
+emi() { src_run "$DEPLOY" 'printf "%s" "${ARGS[0]}" | extract_manifest_images' "$1"; }
 # Value-equality check on the extractor's OUTPUT, feeding the shared PASS/FAIL
 # counters. An exit code cannot express "extracted nothing" vs "extracted the wrong
 # thing", and extracting a wrong thing is precisely the regression.
@@ -1814,7 +2145,7 @@ emi_expect "emi-value-text-never-matches" "" "$emi_out"
 
 # --- cargo_lock_version: the ONE Cargo.lock reader (sqlx-cli pin for both images) -----------
 LIB="${REPO_ROOT}/infra/lib/cargo-lock-version.sh"
-clv() { bash -c 'source "$1"; cargo_lock_version "$2" "$3"' _ "$LIB" "$1" "$2" 2>&1; }
+clv() { src_run "$LIB" 'cargo_lock_version "${ARGS[@]}"' "$1" "$2" 2>&1; }
 LOCKS="${WORK}/locks"; mkdir -p "$LOCKS"
 printf '[[package]]\nname = "sqlx-core"\nversion = "9.9.9"\n\n[[package]]\nname = "sqlx"\nversion = "0.8.6"\n' > "$LOCKS/one.lock"
 printf '[[package]]\nname = "sqlx-core"\nversion = "0.8.6"\n' > "$LOCKS/none.lock"
@@ -1881,13 +2212,13 @@ assert_rc "dockerfile-release-mismatch-trips" 0 "$([[ -n "$(debian_release_misma
 if [[ -n "$REAL_KUBECTL" ]]; then
   RCP="${WORK}/repocopy"; mkdir -p "$RCP"; cp -r "${REPO_ROOT}/infra" "$RCP/"; cp "${REPO_ROOT}/Cargo.lock" "$RCP/"
   mv "$RCP/infra/docker/gc-service" "$RCP/infra/docker/gc-service.moved"
-  out="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; first_party_repos' _ "$RCP/infra/kind/scripts/deploy.sh" 2>&1)"; rc=$?
+  out="$(src_run "$RCP/infra/kind/scripts/deploy.sh" 'cache_renders; first_party_repos' 2>&1)"; rc=$?
   assert_rc "repo-without-dockerfile-fails" 1 "$rc"
   assert_status "repo-without-dockerfile-named" "localhost/gc-service has no infra/docker/gc-service/Dockerfile" "$out"
   mv "$RCP/infra/docker/gc-service.moved" "$RCP/infra/docker/gc-service"
   # Zero first-party images anywhere: every localhost/ ref rewritten away.
   grep -rl 'image: localhost/' "$RCP/infra/services" | xargs sed -i 's#image: localhost/#image: example.org/#'
-  out="$(bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; first_party_repos' _ "$RCP/infra/kind/scripts/deploy.sh" 2>&1)"; rc=$?
+  out="$(src_run "$RCP/infra/kind/scripts/deploy.sh" 'cache_renders; first_party_repos' 2>&1)"; rc=$?
   assert_rc "repos-derived-zero-fails" 1 "$rc"
   assert_status "repos-derived-zero-says-vacuous" "refusing a vacuous converge" "$out"
 fi
@@ -1895,7 +2226,7 @@ fi
 # --- An empty --iidfile never becomes a guessed tag ------------------------------------------
 reset_marks
 out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DEVLOOP_MIN_DISK_GB=0 STUB_IID="" \
-  bash -c 'sp="$1"; set --; source "$sp" >/dev/null 2>&1; KIND_EXPERIMENTAL_PROVIDER=podman; build_content_tagged_image localhost/gc-service' _ "$DEPLOY" 2>&1)"; rc=$?
+  src_run "$DEPLOY" 'KIND_EXPERIMENTAL_PROVIDER=podman; build_content_tagged_image localhost/gc-service' 2>&1)"; rc=$?
 assert_rc "iidfile-empty-fails" 1 "$rc"
 assert_status "iidfile-empty-says-so" "wrote no image ID" "$out"
 assert_absent "iidfile-empty-never-tags" "tag " "$(cat "${MARK}/podman.calls" 2>/dev/null | grep -v '^build')"

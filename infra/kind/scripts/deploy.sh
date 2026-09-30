@@ -302,10 +302,10 @@ preload_third_party_images() {
     # Extract third-party images from rendered Kustomize manifests,
     # qualifying Docker Hub short names for podman compatibility.
     local IMAGES
-    IMAGES=$(${KUBECTL} kustomize "${PROJECT_ROOT}/infra/kubernetes/overlays/kind/" \
+    IMAGES="$(cached_render root \
         | extract_manifest_images \
-        | grep -v '^localhost/' \
-        | sort -u)
+        | { grep -v '^localhost/' || true; } \
+        | sort -u)" || return 1
 
     if [ -z "$IMAGES" ]; then
         log_info "No third-party images found in manifests, skipping."
@@ -466,6 +466,40 @@ MIGRATE_BASE="${PROJECT_ROOT}/${MIGRATE_BASE_REL}"
 MIGRATE_REPO="localhost/db-migrate"
 MIGRATE_NAMESPACE="dark-tower"
 
+# ONE render of each static kustomization a converge derives from (the root and
+# the migration base), taken by cache_renders — a `step` of main, before anything
+# derives from them. Every derivation (preload_third_party_images,
+# first_party_repos, root_repos, env_root_workloads) reads THIS snapshot, so
+# preload, build, ref resolution, wait and prune all see the same root within one
+# converge — do not "refresh" it mid-run. Nothing a converge writes lands under
+# ENV_ROOT or MIGRATE_BASE (the wrapper and Job renders go to mktemp dirs). Shell
+# variables only — the root render carries Secret manifests, so it is never
+# written to a file and never printed.
+ROOT_RENDER=""
+MIGRATE_BASE_RENDER=""
+RENDERS_CACHED=false
+cache_renders() {
+    ROOT_RENDER="$(kubectl kustomize "${ENV_ROOT}")" \
+        || { log_error "Could not render ${ENV_ROOT_REL}."; return 1; }
+    MIGRATE_BASE_RENDER="$(kubectl kustomize "${MIGRATE_BASE}")" \
+        || { log_error "Could not render ${MIGRATE_BASE_REL}."; return 1; }
+    RENDERS_CACHED=true
+}
+
+# The cached render of $1 (root|migrate-base). Fails loudly, naming the render
+# (never its content), when cache_renders has not run — never a silent re-render.
+cached_render() {
+    if [[ "${RENDERS_CACHED}" != "true" ]]; then
+        log_error "internal: the ${1} render is not cached; cache_renders must run first (main does)."
+        return 1
+    fi
+    case "$1" in
+        root) printf '%s\n' "${ROOT_RENDER}" ;;
+        migrate-base) printf '%s\n' "${MIGRATE_BASE_RENDER}" ;;
+        *) log_error "internal: no cached render named '${1}'."; return 1 ;;
+    esac
+}
+
 # The per-instance MC/MH ConfigMaps whose advertise address a devloop cluster
 # overrides, DERIVED from the per-instance generator sources on disk (not a
 # hand-kept list): adding mc-2 means adding mc-2-config.env, and the override
@@ -479,16 +513,18 @@ advertise_instances() {
     done | sort
 }
 
-# First-party repos (`localhost/<name>`) the environment root runs, DERIVED
-# from its render — not a hand-kept service list. Prints one per line, sorted.
-# The first-party repos (`localhost/<name>`, tag stripped) a render of $1 names.
+# The first-party repos (`localhost/<name>`, tag stripped) the cached render $1
+# (root|migrate-base) names — DERIVED from the render, not a hand-kept service
+# list. One per line, sorted; empty when it names none; non-zero when the render
+# is not cached.
 first_party_repos_of() {
-    kubectl kustomize "$1" | extract_manifest_images | grep '^localhost/' \
+    cached_render "$1" | extract_manifest_images | { grep '^localhost/' || true; } \
         | sed -E 's/:[^:/]*$//' | sort -u
 }
 
+# First-party repos the environment root runs.
 root_repos() {
-    first_party_repos_of "${ENV_ROOT}"
+    first_party_repos_of root
 }
 
 # Every first-party repo a converge must resolve a ref for: the root's, plus
@@ -496,8 +532,12 @@ root_repos() {
 # Fails when none is derived (a vacuous converge) or when a repo has no
 # infra/docker/<name>/Dockerfile to build it from.
 first_party_repos() {
-    local repos repo missing=0
-    repos="$( { root_repos; first_party_repos_of "${MIGRATE_BASE}"; } | sort -u)" || true
+    local root mig repos repo missing=0
+    # Each derivation checked on its own: a failure of either is never masked by
+    # the other yielding repos.
+    root="$(root_repos)" || return 1
+    mig="$(first_party_repos_of migrate-base)" || return 1
+    repos="$(printf '%s\n%s\n' "${root}" "${mig}" | awk 'NF' | sort -u)"
     if [[ -z "${repos}" ]]; then
         log_error "No first-party (localhost/) images derived from ${ENV_ROOT_REL} or ${MIGRATE_BASE_REL}; refusing a vacuous converge."
         return 1
@@ -518,20 +558,21 @@ first_party_repos() {
 # db-migrate. Returns non-zero when the cluster cannot be READ — that is never
 # folded into "nothing deployed".
 deployed_refs() {
-    local repo="$1" ns res out
+    local repo="$1" ns res out workloads
     if [[ "${repo}" == "${MIGRATE_REPO}" ]]; then
         out="$(${KUBECTL} get jobs -n "${MIGRATE_NAMESPACE}" -l app=db-migrate \
             -o jsonpath='{range .items[*]}{.status.succeeded}{" "}{.spec.template.spec.containers[0].image}{"\n"}{end}')" || return 1
         awk '$1 == "1" { print $2 }' <<< "${out}" | sort -u
         return 0
     fi
+    workloads="$(env_root_workloads "${repo}")" || return 1
     {
         while read -r ns res; do
             [[ -n "${res}" ]] || continue
             out="$(${KUBECTL} get "${res}" -n "${ns}" --ignore-not-found \
                 -o jsonpath='{range .spec.template.spec.containers[*]}{.image}{"\n"}{end}')" || return 1
             grep "^${repo}:" <<< "${out}" || true
-        done <<< "$(env_root_workloads "${repo}")"
+        done <<< "${workloads}"
     } | sort -u
 }
 
@@ -586,7 +627,7 @@ resolve_image_refs() {
 # silently advertise localhost).
 render_env_overlay() {
     local dir="$1" rel inst svc idx svc_uc port_var port instances repos repo ref
-    repos="$(root_repos)"
+    repos="$(root_repos)" || return 1
     if [[ -z "${repos}" ]]; then
         log_error "render_env_overlay: no first-party (localhost/) images in ${ENV_ROOT_REL}"
         return 1
@@ -668,7 +709,7 @@ apply_env_root() (
 # workloads whose pod template runs an image of that repo.
 env_root_workloads() {
     local repo="${1:-}"
-    kubectl kustomize "${ENV_ROOT}" | awk -v img="${repo:+${repo}:}" '
+    cached_render root | awk -v img="${repo:+${repo}:}" '
         function emit() {
             if (k ~ /^(Deployment|StatefulSet|DaemonSet)$/ && (img == "" || has_img)) print ns " " tolower(k) "/" n
             k = ""; n = ""; ns = ""; has_img = 0; m = 0
@@ -707,7 +748,7 @@ dump_workload_diagnostics() {
 wait_for_env_root() {
     log_step "Waiting for every workload in ${ENV_ROOT_REL} to roll out..."
     local workloads ns res failed=()
-    workloads="$(env_root_workloads)"
+    workloads="$(env_root_workloads)" || return 1
     if [[ -z "${workloads}" ]]; then
         log_error "Rendered ${ENV_ROOT_REL} contains no workloads — refusing to report a vacuous success."
         return 1
@@ -937,7 +978,8 @@ run_migration_job() (
 # would otherwise make the current ref its own "previous" and evict the real one.
 # One per line; empty when there is no history. Non-zero when it cannot be read.
 previous_generation_refs() {
-    local repo="$1" ns res kind name sel out
+    local repo="$1" ns res kind name sel out workloads
+    workloads="$(env_root_workloads "${repo}")" || return 1
     while read -r ns res; do
         [[ -n "${res}" ]] || continue
         kind="${res%%/*}"; name="${res#*/}"
@@ -957,7 +999,7 @@ previous_generation_refs() {
         # Rows owned by this workload, newest revision first; the 2nd is the previous.
         awk -v n="${name}" '$2 == n' <<< "${out}" | sort -k1,1nr | sed -n 2p \
             | awk '{ for (i = 3; i <= NF; i++) print $i }' | grep "^${repo}:" || true
-    done <<< "$(env_root_workloads "${repo}")"
+    done <<< "${workloads}"
 }
 
 # Remove first-party images this cluster no longer needs, KEEPING two
@@ -1201,6 +1243,7 @@ main() {
     fi
     step check_blueprint
     step deploy_check_prerequisites
+    step cache_renders
     step preload_third_party_images
     step build_first_party_images
     step resolve_image_refs

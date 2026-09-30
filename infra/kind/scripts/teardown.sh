@@ -48,13 +48,23 @@ main() {
         exit 1
     fi
 
-    if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-        log_info "Deleting kind cluster '${CLUSTER_NAME}'..."
-        kind delete cluster --name "${CLUSTER_NAME}"
-        log_info "Cluster deleted successfully."
-    else
-        log_warn "Cluster '${CLUSTER_NAME}' does not exist."
-    fi
+    # lib/common.sh:cluster_exists — the ONE existence check. rc 2 (`kind get
+    # clusters` failed) is NOT "absent": reporting a teardown that deleted nothing
+    # as done would leave the cluster running.
+    local exists_rc=0
+    cluster_exists || exists_rc=$?
+    case "${exists_rc}" in
+        0)
+            log_info "Deleting kind cluster '${CLUSTER_NAME}'..."
+            kind delete cluster --name "${CLUSTER_NAME}"
+            log_info "Cluster deleted successfully."
+            ;;
+        1) log_warn "Cluster '${CLUSTER_NAME}' does not exist." ;;
+        *)
+            log_error "'kind get clusters' failed — cannot tell whether cluster '${CLUSTER_NAME}' exists; not reporting a teardown. Check the host container runtime."
+            exit 1
+            ;;
+    esac
 
     # Clean up any orphaned port-forward processes
     log_info "Cleaning up port-forward processes..."

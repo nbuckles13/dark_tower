@@ -139,32 +139,70 @@ done
 
 # --- The blueprint ----------------------------------------------------------
 
-sha256_of() { sha256sum < "$1" | cut -d' ' -f1; }
-
 # PURE: reads files and `kind version`, touches no cluster, writes nothing.
 # One `<label> <value>` line per input; the label is the section name a
 # mismatch reports (CHANGED=). Values are sha256s of WHOLE input files — secret-
 # bearing ones included (postgres/secret.yaml; this script's own AC literals): a
 # digest, never content — plus the kind version string and the provider name.
 # Never put a raw line of any input here.
+#
+# Every file is hashed by ONE `sha256sum` call (one process, not one per input)
+# and each digest is taken back BY POSITION — never by parsing a file name back
+# out, never by echoing sha256sum's own lines. Its rc, the digest count and each
+# digest's shape are checked: an input that cannot be hashed FAILS the render
+# (it must never render an empty digest).
 blueprint_render() {
-    local rel leaf crt kind_version
+    local rel p leaf crt kind_version out line i
+    local -a labels=() paths=() lines=() sums=()
     if [[ ! -f "${KIND_CONFIG}" ]]; then
         echo "ERROR: kind config not found: ${KIND_CONFIG}" >&2
         return 1
     fi
     kind_version="$(kind version)" || { echo "ERROR: 'kind version' failed" >&2; return 1; }
-    echo "${BLUEPRINT_FORMAT}"
-    echo "kind-config sha256:$(sha256_of "${KIND_CONFIG}")"
-    echo "kind-version ${kind_version//$'\n'/ }"
-    echo "provider ${KIND_EXPERIMENTAL_PROVIDER:?provider not detected}"
+    # labels[i] names paths[i]: appended together, so they cannot drift apart.
+    labels+=("kind-config"); paths+=("${KIND_CONFIG}")
     for rel in "${PROVISION_INPUTS[@]}"; do
-        echo "file:${rel} sha256:$(sha256_of "$(provision_input "${rel}")")"
+        p="$(provision_input "${rel}")" || return 1
+        labels+=("file:${rel}"); paths+=("${p}")
     done
     for leaf in "${TLS_LEAVES[@]}"; do
         crt="$(tls_file "${leaf}" crt)"
         if [[ -f "${crt}" ]]; then
-            echo "tls-cert:${leaf}.crt sha256:$(sha256_of "${crt}")"
+            labels+=("tls-cert:${leaf}.crt"); paths+=("${crt}")
+        fi
+    done
+    if ! out="$(sha256sum -- "${paths[@]}")"; then
+        echo "ERROR: could not hash every blueprint input (sha256sum names the file above); refusing a partial render" >&2
+        return 1
+    fi
+    mapfile -t lines <<< "${out}"
+    if (( ${#lines[@]} != ${#paths[@]} )); then
+        echo "ERROR: sha256sum returned ${#lines[@]} digests for ${#paths[@]} blueprint inputs; refusing a partial render" >&2
+        return 1
+    fi
+    for line in "${lines[@]}"; do
+        line="${line%% *}"
+        line="${line#\\}"   # GNU marks an escaped file name with a leading backslash
+        if [[ ! "${line}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: unexpected sha256sum output for ${labels[${#sums[@]}]}; refusing a partial render" >&2
+            return 1
+        fi
+        sums+=("${line}")
+    done
+    echo "${BLUEPRINT_FORMAT}"
+    echo "${labels[0]} sha256:${sums[0]}"
+    echo "kind-version ${kind_version//$'\n'/ }"
+    echo "provider ${KIND_EXPERIMENTAL_PROVIDER:?provider not detected}"
+    for (( i = 1; i <= ${#PROVISION_INPUTS[@]}; i++ )); do
+        echo "${labels[i]} sha256:${sums[i]}"
+    done
+    # TLS leaves in TLS_LEAVES order, a missing one in its own place. i = the first
+    # TLS entry of labels/sums (after kind-config and the PROVISION_INPUTS).
+    i=$(( 1 + ${#PROVISION_INPUTS[@]} ))
+    for leaf in "${TLS_LEAVES[@]}"; do
+        if [[ "${labels[i]:-}" == "tls-cert:${leaf}.crt" ]]; then
+            echo "${labels[i]} sha256:${sums[i]}"
+            i=$(( i + 1 ))
         else
             echo "tls-cert:${leaf}.crt missing"
         fi
