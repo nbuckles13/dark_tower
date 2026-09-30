@@ -1,7 +1,8 @@
 // File: packages/web-app/e2e/mcMetrics.ts
 //
-// MC-side Prometheus observations for the browser E2E suite. This module is the
-// ONE home of every PromQL literal the suite uses — specs never inline PromQL.
+// MC-side (and, for the story-2 S1 diagnostic, MH admission) Prometheus
+// observations for the browser E2E suite. This module is the ONE home of every
+// PromQL literal the suite uses — specs never inline PromQL.
 //
 // Task #18 assertion (d): the browser SDK's post-join `MediaConnectionUpdate`
 // (state=CONNECTED) was received AND recorded by MC's R-60 handler (story task
@@ -79,6 +80,16 @@ import {
   type InstanceCounters,
   type PromResultRow,
 } from './instanceCounters.js';
+import {
+  classifyMissingSender,
+  MH_ADMISSION_REJECTED_OUTCOME,
+  MH_ADMISSION_REJECTION_RATIO,
+  MH_ADMISSION_TOTAL,
+  MH_EGRESS_EDGES,
+  MH_EGRESS_STREAM_CEILING,
+  MH_SCRAPE_JOB,
+  type MissingSenderDiagnosis,
+} from './s1Diagnostic.js';
 
 const CONNECTED_SUM_PROMQL =
   'sum by (instance) (mc_participant_mh_status_total{state="connected"})';
@@ -313,4 +324,62 @@ export async function waitForMcSessionJoinFailureAbove(
       `different bug than the rejection this spec drives) or MC classified it under a different ` +
       `error_type (crates/mc-service/src/errors.rs:error_type_label()).`,
   );
+}
+
+// ============================================================================
+// Story 2 S1 diagnostic — MH egress admission (server-side, independent of the
+// client metrics pipe). Names and classification: `./s1Diagnostic`.
+// ============================================================================
+
+const MH_REJECTED_SUM_PROMQL = `sum by (instance) (${MH_ADMISSION_TOTAL}{outcome="${MH_ADMISSION_REJECTED_OUTCOME}"})`;
+const MH_RATIO_PROMQL = `max by (instance) (${MH_ADMISSION_REJECTION_RATIO})`;
+const MH_CEILING_PROMQL = `max by (instance) (${MH_EGRESS_STREAM_CEILING})`;
+const MH_EDGES_PROMQL = `max by (instance) (${MH_EGRESS_EDGES})`;
+const MH_UP_PROMQL = `max by (instance) (up{job="${MH_SCRAPE_JOB}"})`;
+
+/**
+ * Per-MH-instance stream-ceiling rejection counter. Take this BEFORE a
+ * multi-party scenario's first join and hand it to {@link diagnoseMissingSender}:
+ * a baseline taken after the joins would hide the very rejection it looks for.
+ */
+export async function mhAdmissionRejectionsByInstance(): Promise<InstanceCounters> {
+  return promInstantByInstance(MH_REJECTED_SUM_PROMQL);
+}
+
+/**
+ * The S1 diagnostic: call it when a receiver is missing an expected sender and
+ * put the returned `report` in the failure message.
+ *
+ * Waits up to `settleMs` for an in-window rejection to reach Prometheus before
+ * concluding anything else — a rejection that happened after MH's last scrape
+ * would otherwise read as misrouting. The default is three scrapes of the
+ * `mh-service` job (`scrape_interval: 5s` in
+ * `infra/kubernetes/observability/prometheus.yml`). This is a bounded wait for
+ * evidence, never a latency assertion.
+ */
+export async function diagnoseMissingSender(
+  baselineRejected: InstanceCounters,
+  what: string,
+  { settleMs = 15_000, intervalMs = 2_000 }: { settleMs?: number; intervalMs?: number } = {},
+): Promise<MissingSenderDiagnosis> {
+  const deadline = Date.now() + settleMs;
+  let currentRejected = await promInstantByInstance(MH_REJECTED_SUM_PROMQL);
+  while (!anyInstanceExceedsBaseline(baselineRejected, currentRejected) && Date.now() < deadline) {
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, intervalMs));
+    currentRejected = await promInstantByInstance(MH_REJECTED_SUM_PROMQL);
+  }
+  const [rejectionRatio, streamCeiling, egressEdges, scrapeUp] = await Promise.all([
+    promInstantByInstance(MH_RATIO_PROMQL),
+    promInstantByInstance(MH_CEILING_PROMQL),
+    promInstantByInstance(MH_EDGES_PROMQL),
+    promInstantByInstance(MH_UP_PROMQL),
+  ]);
+  return classifyMissingSender(what, {
+    baselineRejected,
+    currentRejected,
+    rejectionRatio,
+    streamCeiling,
+    egressEdges,
+    scrapeUp,
+  });
 }

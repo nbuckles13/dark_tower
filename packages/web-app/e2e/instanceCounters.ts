@@ -15,6 +15,25 @@
 // the two stay identical; the parity tests (including the NaN/+Inf/empty-sample
 // cases, where the two runtimes' default coercions actually diverge) are what
 // keep them from drifting. Add a case to BOTH suites when you change either.
+//
+// CLIENT (`dt_client_*`) SERIES: `instance` IS THE COLLECTOR, NOT THE BROWSER.
+// Browser metrics reach Prometheus through the OTel collector's `otel-collector`
+// scrape job, which leaves `honor_labels` at its default `false` — deliberately,
+// as a security control (`infra/kubernetes/observability/prometheus.yml`). The
+// scrape's own identity therefore wins: every client series carries `instance`
+// = the collector pod, whichever browser produced it, and grouping a client
+// series `by (instance)` groups by COLLECTOR. The stored label shape has one
+// home, `docs/observability/metrics/client.md`; it is not restated here.
+//   - The delta math in this module stays sound for client series because there
+//     is ONE collector replica (`infra/services/otel-collector/deployment.yaml`):
+//     one `instance` holds every browser's contribution. A collector rollover
+//     mints a new `instance` exactly like an MC/MH pod rollover (tolerated here
+//     the same way), but it also RESETS the client series' history, since the
+//     collector re-exposes only what it has accumulated.
+//   - No assertion may read a client series' `instance` as a PARTICIPANT
+//     dimension (which browser, which sender). It is not one, and R-28 forbids
+//     identity labels on client series anyway: per-participant evidence comes
+//     from each participant's own `window.__darktower_test__` bus.
 
 /** A per-instance snapshot of a counter: `instance` label (pod IP:port) → value. */
 export type InstanceCounters = ReadonlyMap<string, number>;
