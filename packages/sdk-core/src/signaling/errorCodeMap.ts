@@ -5,9 +5,13 @@
 // new `ErrorCode` is a compile error here (the `Record<ErrorCode, …>` must list
 // every member) AND forces the parametrized mapping test to update.
 //
-// Auth-class (`UNAUTHORIZED`/`FORBIDDEN`) is identified here too: those close the
-// signaling connection with a typed reason (per R-18). The classification is a
-// pure data table — no transport / token concerns leak in.
+// Which codes CLOSE the signaling connection is decided here too, per join phase
+// (`closesConnection`): while joining, `UNAUTHORIZED`/`FORBIDDEN` are auth-class
+// and close with a typed reason (R-18); once joined, only `UNAUTHORIZED` does. A
+// post-join `FORBIDDEN` is a REQUEST refusal — MC's one post-join use of it is the
+// server-mute refusal, and MC keeps the connection open — so the client must not
+// turn a refused mute into its own disconnect. Pure data; no transport/token
+// concerns leak in.
 
 import { ErrorCode } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { SignalingErrorCode } from '../errors/SignalingError.js';
@@ -60,13 +64,21 @@ export function staticMessageFor(code: SignalingErrorCode): string {
   return STATIC_MESSAGE[code];
 }
 
-/** Auth-class signaling codes that close the connection with a typed reason (R-18). */
-const AUTH_CLASS: ReadonlySet<SignalingErrorCode> = new Set([
-  SignalingErrorCode.Unauthorized,
-  SignalingErrorCode.Forbidden,
-]);
+/** When a signaling error arrives: before the join settled, or after. */
+export type SignalingPhase = 'joining' | 'joined';
 
-/** Whether `code` is auth-class (closes the connection with `CloseReason.AuthFailed`). */
-export function isAuthClass(code: SignalingErrorCode): boolean {
-  return AUTH_CLASS.has(code);
+/** Codes that close the connection with a typed reason (R-18), per phase. */
+const CLOSES_CONNECTION: Readonly<Record<SignalingPhase, ReadonlySet<SignalingErrorCode>>> = {
+  joining: new Set([SignalingErrorCode.Unauthorized, SignalingErrorCode.Forbidden]),
+  // Post-join FORBIDDEN is a request refusal (server-mute, story 2 R-8): surfaced
+  // as a session `error`, connection kept. The server can still close it.
+  joined: new Set([SignalingErrorCode.Unauthorized]),
+};
+
+/**
+ * Whether an `ErrorMessage` carrying `code` in `phase` closes the connection with
+ * `CloseReason.AuthFailed`. The ONE oracle; call sites never special-case a code.
+ */
+export function closesConnection(code: SignalingErrorCode, phase: SignalingPhase): boolean {
+  return CLOSES_CONNECTION[phase].has(code);
 }

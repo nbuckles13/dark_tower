@@ -88,6 +88,23 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
     this.disconnectCalls += 1;
   }
 
+  /** The meeting-token host hint, as the real facade reports it. Mutable. */
+  isHost = false;
+  /** Current KEK generation, as the real facade reports it. Mutable. */
+  currentKekGeneration: number | undefined;
+  /** `setServerMute` calls, in order. */
+  readonly serverMuteCalls: Array<{ participantId: string; muted: boolean }> = [];
+  /** `requestUnmute` calls. */
+  unmuteRequestCalls = 0;
+
+  async setServerMute(participantId: string, muted: boolean): Promise<void> {
+    this.serverMuteCalls.push({ participantId, muted });
+  }
+
+  async requestUnmute(): Promise<void> {
+    this.unmuteRequestCalls += 1;
+  }
+
   /** Effective N / source / server cap, as the real facade reports it. Mutable. */
   receiveSlots: ReceiveSlotsDiagnostics = {
     declared: 1,

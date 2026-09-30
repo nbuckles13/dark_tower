@@ -13,6 +13,9 @@ export default defineConfig({
     // so the default suite runs the microphone path and an accidentally
     // default-on tone cannot hide in it (@security A3).
     __DT_TEST_TONE__: JSON.stringify(false),
+    // Story 2 task 15: the test levers are FALSE under the test runner too; the
+    // lever parser is unit-tested directly (`src/__tests__/testLevers.test.ts`).
+    __DT_TEST_LEVERS__: JSON.stringify(false),
     __SDK_VERSION__: JSON.stringify('0.0.0-test'),
     __DEV_TRUST_FINGERPRINT__: JSON.stringify(true),
     // Enabled so the `window.__darktower_test__` bus is exercisable at this tier.

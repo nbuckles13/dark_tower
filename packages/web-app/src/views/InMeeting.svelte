@@ -1,7 +1,10 @@
 <script lang="ts">
-  // The in-meeting experience (ADR-0036 story 1, §5/§6): the joined participant
-  // sees its slot state, hears its own audio back through the media handler, and
-  // can mute, unmute and choose a microphone.
+  // The in-meeting experience (ADR-0036 §5/§6/§9; story 2 R-2, R-10, R-11): the
+  // joined participant sees a grid of its N receive slots — each with the
+  // participant MC placed there and the slot's wire state — hears the other
+  // participants (never itself: loopback is removed, R-3, so a solo participant's
+  // slots all read "fewer sources"), sees whether the host has muted it for
+  // everyone, and can mute, unmute and choose a microphone.
   //
   // -------------------------------------------------------------------------
   // ONE RULE GOVERNS THIS WHOLE COMPONENT
@@ -19,7 +22,14 @@
   //     wire (§6);
   //   * "audio is coming back" reads `store.media.firstMediaFrameMs`;
   //   * a broken pipeline reads `store.media.lastMediaFault`, so a fault shows as
-  //     a fault instead of as silence.
+  //     a fault instead of as silence;
+  //   * this participant's SERVER mute reads `store.media.serverMutes` — written
+  //     only from MC's `ParticipantMuteUpdate`. Asking the host to unmute changes
+  //     nothing here (R-10); the indicator moves when MC says so.
+  //
+  // Client mute and server mute are DIFFERENT indicators (`mute-state` vs
+  // `server-mute-state`) and compose independently: the client-mute toggle keeps
+  // working while server-muted, and neither can clear the other.
   //
   // -------------------------------------------------------------------------
   // MEDIA IS STARTED EXPLICITLY
@@ -40,14 +50,47 @@
     slotStateText,
     type SlotStateAttr,
   } from '../lib/slotState.js';
+  import {
+    PARTICIPANT_TEXT,
+    nameForParticipantId,
+    nameForSenderId,
+    serverMutedByText,
+  } from '../lib/participantState.js';
 
   let {
     session,
     store,
+    selfParticipantId,
   }: {
     session: MeetingSession;
     store: MeetingStore;
+    /** This participant's id from the settled join (MC's roster excludes self). */
+    selfParticipantId: string | undefined;
   } = $props();
+
+  /** This participant's own server mute, as MC last reported it. */
+  const ownServerMute = $derived(
+    selfParticipantId === undefined ? undefined : store.media.serverMutes.get(selfParticipantId),
+  );
+  /**
+   * Whether this participant has asked the host to unmute it — a local record of
+   * the ASK only, scoped to ONE server-mute episode: cleared when MC reports the
+   * mute lifted, so a later re-mute starts with nothing asked.
+   */
+  let unmuteAsked = $state(false);
+  $effect(() => {
+    if (ownServerMute === undefined) unmuteAsked = false;
+  });
+
+  async function askHostToUnmute(): Promise<void> {
+    mediaError = '';
+    try {
+      await session.requestUnmute();
+      unmuteAsked = true;
+    } catch (err) {
+      mediaError = errorText(err);
+    }
+  }
 
   /** The running pipeline. `undefined` until the participant starts audio. */
   let pipeline = $state<AudioPipeline | undefined>(undefined);
@@ -157,11 +200,27 @@
    * Rendering nothing would make "the controller has not answered yet" look
    * identical to "there are no slots", which is the collapse §6 forbids.
    */
-  const slotRows = $derived.by((): ReadonlyArray<{ id: number; state: SlotStateAttr }> => {
-    const assignments: readonly StreamAssignmentEvent[] = store.media.slots;
-    if (assignments.length === 0) return [{ id: 0, state: AWAITING_ASSIGNMENT }];
-    return assignments.map((a) => ({ id: a.slotId, state: a.slotState }));
-  });
+  const slotRows = $derived.by(
+    (): ReadonlyArray<{
+      id: number;
+      state: SlotStateAttr;
+      senderId: number | undefined;
+      who: string | undefined;
+    }> => {
+      const assignments: readonly StreamAssignmentEvent[] = store.media.slots;
+      if (assignments.length === 0) {
+        return [{ id: 0, state: AWAITING_ASSIGNMENT, senderId: undefined, who: undefined }];
+      }
+      const ctx = { roster: store.participants, selfParticipantId };
+      return assignments.map((a) => ({
+        id: a.slotId,
+        state: a.slotState,
+        senderId: a.senderId,
+        // Presentation only: attribution never comes from an assignment.
+        who: a.senderId === undefined ? undefined : nameForSenderId(a.senderId, ctx),
+      }));
+    },
+  );
 </script>
 
 <section data-testid="in-meeting">
@@ -205,24 +264,54 @@
     </p>
   {/if}
 
+  <!--
+    SERVER mute: a separate indicator from `mute-state`, fed ONLY by MC's
+    `ParticipantMuteUpdate`. Never described as a ban (R-10).
+  -->
+  <p data-testid="server-mute-state" data-server-muted={ownServerMute !== undefined}>
+    {#if ownServerMute !== undefined}
+      {serverMutedByText(
+        nameForParticipantId(ownServerMute.serverMutedBy, {
+          roster: store.participants,
+          selfParticipantId,
+        }),
+      )}
+    {:else}
+      {PARTICIPANT_TEXT.ownNotServerMuted}
+    {/if}
+  </p>
+  {#if ownServerMute !== undefined}
+    <button data-testid="request-unmute" type="button" onclick={askHostToUnmute}>
+      {unmuteAsked ? PARTICIPANT_TEXT.unmuteRequestSent : PARTICIPANT_TEXT.requestUnmute}
+    </button>
+  {/if}
+
   <p data-testid="media-status">
     {#if store.media.hasReceivedMedia}
-      audio returning from the handler
+      receiving audio from other participants
     {:else if pipeline}
-      waiting for audio to return
+      no audio from other participants yet
     {:else}
       audio not started
     {/if}
   </p>
 
-  <ul data-testid="slot-list">
+  <!--
+    The slot GRID: one cell per declared slot. An unfilled slot (`fewer_sources`)
+    is an EMPTY cell carrying its text — an under-filled grid, never a spinner
+    (R-2). An unreachable participant takes no slot (§9); it is marked on its
+    roster row instead.
+  -->
+  <ul data-testid="slot-list" class="slot-grid">
     {#each slotRows as row (row.id)}
       <li
         data-testid={`slot-${row.id}`}
         data-slot-state={row.state}
         data-slot-active={slotIsActive(row.state)}
+        data-sender-id={row.senderId}
       >
-        {slotStateText(row.state)}
+        {#if row.who !== undefined}<strong>{row.who}</strong>:
+        {/if}{slotStateText(row.state)}
       </li>
     {/each}
   </ul>
@@ -234,3 +323,18 @@
     <p data-testid="media-error">{mediaError}</p>
   {/if}
 </section>
+
+<style>
+  .slot-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+    gap: 0.5rem;
+    list-style: none;
+    padding: 0;
+  }
+  .slot-grid > li {
+    border: 1px solid #999;
+    padding: 0.5rem;
+    min-height: 3rem;
+  }
+</style>

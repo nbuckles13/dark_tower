@@ -20,6 +20,54 @@ export { SignalingCodec } from './codecMap.js';
 export interface RosterParticipant {
   readonly participantId: string;
   readonly name: string;
+  /**
+   * The participant's per-meeting sender id (wire `optional uint32`), or
+   * `undefined` when MC published none. Never coerced to 0. It is what maps a
+   * slot's `senderId` and `StreamAssignmentsEvent.unreachableSenderIds` onto a
+   * roster entry — presentation only, never attribution.
+   */
+  readonly senderId?: number | undefined;
+}
+
+/**
+ * Bound on an MC-relayed participant id before it enters a public payload (the
+ * proto's 256-byte "truncate before logging" rule for `server_muted_by` and the
+ * `UnmuteRequest` relay). Ids are ASCII (UUIDs) in practice; the bound is on
+ * UTF-16 code units, which is never looser for ASCII.
+ */
+export const MAX_RELAYED_PARTICIPANT_ID_LENGTH = 256;
+
+/**
+ * Payload of `participantMuteChanged` (proto `ParticipantMuteUpdate`).
+ *
+ * SERVER mute only (ADR-0036 §5, story 2 R-11): MC emits this when a participant's
+ * server mute changes, and replays it to a joiner for every currently server-muted
+ * participant. The proto's self-mute booleans are deliberately NOT projected: MC
+ * sends them as informational snapshots taken at the server-mute change, so they
+ * go stale on the next self-mute and are not a self-mute source (MC's own rule —
+ * self-mute does not fan out; the subscriber-visible signal is the slot's
+ * `source_muted`).
+ */
+export interface ParticipantMuteEvent {
+  readonly participantId: string;
+  /** Whether this participant's audio is server-muted (enforced at MH ingress). */
+  readonly audioServerMuted: boolean;
+  /**
+   * Participant id of whoever applied the server mute, when muted and MC said.
+   * MC's own value, bounded to {@link MAX_RELAYED_PARTICIPANT_ID_LENGTH}. Resolve it
+   * against the roster to render; never render or log the raw string.
+   */
+  readonly serverMutedBy?: string | undefined;
+}
+
+/**
+ * Payload of `unmuteRequested` — MC relayed a server-muted participant's request
+ * to be unmuted to THIS client (only a host receives it). It NOTIFIES; it never
+ * lifts the mute (R-10). `participantId` is MC-stamped from the requester's
+ * authenticated connection, bounded like {@link ParticipantMuteEvent.serverMutedBy}.
+ */
+export interface UnmuteRequestedEvent {
+  readonly participantId: string;
 }
 
 /**

@@ -16,6 +16,6 @@ declare const __SDK_VERSION__: string;
 // Story 2 R-7: the TEST-TONE build define. `false` in the SDK's library build
 // (`vite.config.ts`) and in every vitest config; in the web app it is opt-in
 // (`DT_TEST_TONE=1`) in dev and a hard `false` — with a build-time THROW on the
-// opt-in — in production (`packages/web-app/vite/testTone.ts`). Read at exactly
+// opt-in — in production (`packages/web-app/vite/testDefines.ts`). Read at exactly
 // one site: the capture-source selection, `session/mediaSelection.ts:selectCaptureSource`.
 declare const __DT_TEST_TONE__: boolean;

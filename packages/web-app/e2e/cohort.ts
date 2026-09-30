@@ -32,6 +32,7 @@
 // `infra/services/ac-service/config.env`, READ by {@link parseAcAuthRateLimit}
 // rather than restated here.
 
+import { parseConfigEnv, requirePositiveInt } from './configEnv.js';
 import type { TestCredentials } from './fixtures.js';
 
 /**
@@ -134,28 +135,16 @@ export const AC_REGISTRATION_RATE_LIMIT_WINDOW_KEY = 'AC_REGISTRATION_RATE_LIMIT
  * named only in a comment is not a key.
  */
 export function parseAcAuthRateLimit(configEnvText: string, source: string): AcAuthRateLimit {
-  const values = new Map<string, string>();
-  for (const line of configEnvText.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (trimmed === '' || trimmed.startsWith('#')) continue;
-    const eq = trimmed.indexOf('=');
-    if (eq <= 0) continue;
-    values.set(trimmed.slice(0, eq).trim(), trimmed.slice(eq + 1).trim());
-  }
-  const read = (key: string): number => {
-    const raw = values.get(key);
-    if (raw === undefined) {
-      throw new Error(`${source} declares no ${key}; cannot size the suite's AC auth budget`);
-    }
-    const unquoted = raw.replace(/^"(.*)"$/, '$1');
-    if (!/^[0-9]+$/.test(unquoted) || Number(unquoted) < 1) {
-      throw new Error(`${source} ${key}="${raw}" is not a positive integer`);
-    }
-    return Number(unquoted);
-  };
+  const values = parseConfigEnv(configEnvText);
+  const purpose = "cannot size the suite's AC auth budget";
   return {
-    maxAttempts: read(AC_REGISTRATION_RATE_LIMIT_MAX_KEY),
-    windowMinutes: read(AC_REGISTRATION_RATE_LIMIT_WINDOW_KEY),
+    maxAttempts: requirePositiveInt(values, AC_REGISTRATION_RATE_LIMIT_MAX_KEY, source, purpose),
+    windowMinutes: requirePositiveInt(
+      values,
+      AC_REGISTRATION_RATE_LIMIT_WINDOW_KEY,
+      source,
+      purpose,
+    ),
   };
 }
 

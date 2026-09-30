@@ -70,6 +70,7 @@
 
 import { SdkError, SdkErrorCode } from '../../errors/SdkError.js';
 import type { Bytes } from './hex.js';
+import { base64UrlToBytes } from '../../encoding/base64url.js';
 
 /**
  * Ed25519 public key length.
@@ -245,11 +246,7 @@ export async function importSigningKeyFromSeed(seed: Uint8Array): Promise<Crypto
 export async function exportPublicKey(key: CryptoKey): Promise<Bytes> {
   const jwk = await crypto.subtle.exportKey('jwk', key);
   if (!jwk.x) throw new Error('Ed25519 key export carries no public component');
-  const b64 = jwk.x.replace(/-/g, '+').replace(/_/g, '/');
-  const raw = atob(b64);
-  const out = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i += 1) out[i] = raw.charCodeAt(i);
-  return out;
+  return base64UrlToBytes(jwk.x);
 }
 
 /**

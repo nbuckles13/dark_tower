@@ -202,6 +202,25 @@ export function assertCohortTonesSeparable(cohort: readonly CohortTone[], binHz:
   }
 }
 
+/**
+ * THE tone-presence rule for one lane — the single clause both directions share:
+ * the lane has analysed a full FFT window, is above silence, and carries `hz`
+ * at least {@link PRESENCE_ABOVE_FLOOR_DB} above its noise floor.
+ *
+ * `evaluateSenderLane` composes it with its comparability and dominance clauses
+ * (the strict "hears the sender" verdict); an ABSENCE assertion uses it alone,
+ * which is the fail-closed direction for "must be absent" — any real component
+ * of the tone counts as present. A lane that is not yet ready has decoded no
+ * full window, so it carries no tone.
+ */
+export function laneCarriesTone(
+  lane: Spectrum & Pick<BusLaneAnalysis, 'ready' | 'levelDbfs'>,
+  hz: number,
+): boolean {
+  if (!lane.ready || db(lane.levelDbfs) <= SILENCE_LEVEL_DBFS) return false;
+  return toneLevelDb(lane, hz) - noiseFloorDb(lane) >= PRESENCE_ABOVE_FLOOR_DB;
+}
+
 /** Why a receiver does or does not hear a sender at layer 3. */
 export type ToneVerdictKind =
   /** Expected tone dominant, no other cohort tone present. */
@@ -315,10 +334,7 @@ export function evaluateSenderLane(args: {
 
   // PRESENT means a real component, not another tone's window leakage: above
   // the floor AND comparable to the band's strongest bin.
-  if (
-    !(expected - floor >= PRESENCE_ABOVE_FLOOR_DB) ||
-    !(expected >= peak.db - FOREIGN_BELOW_EXPECTED_DB)
-  ) {
+  if (!laneCarriesTone(lane, sender.toneHz) || !(expected >= peak.db - FOREIGN_BELOW_EXPECTED_DB)) {
     return { kind: 'expected_absent', detail: `${who}: expected tone not present (${levels})` };
   }
   // Foreign BEFORE dominance: when a mis-fed cohort tone sits at a comparable

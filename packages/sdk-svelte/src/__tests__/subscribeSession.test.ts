@@ -45,6 +45,27 @@ test('reacts to each SDK event', () => {
 
   session.fire('error', new SdkError(SdkErrorCode.Signaling, 'nope'));
   expect(store.lastError?.code).toBe(SdkErrorCode.Signaling);
+
+  session.fire('participantMuteChanged', { participantId: 'b', audioServerMuted: true });
+  expect(store.media.serverMutes.has('b')).toBe(true);
+  session.fire('unmuteRequested', { participantId: 'b' });
+  expect(store.media.unmuteRequests.has('b')).toBe(true);
+});
+
+test("the roster carries each participant's sender id through, never coerced", () => {
+  const session = new MockMeetingSession();
+  const store = new MeetingStore();
+  subscribeSession(store, session);
+  session.fire('joined', {
+    participantId: 'self',
+    senderId: 7,
+    existingParticipants: [{ participantId: 'a', name: 'Ann', senderId: 9 }],
+    mediaServers: [],
+    correlationId: 'c',
+    bindingToken: 'b',
+  });
+  session.fire('participantJoined', { participant: { participantId: 'b', name: 'Bob' } });
+  expect(store.participants.map((p) => p.senderId)).toEqual([9, undefined]);
 });
 
 test('aggregate unsubscribe stops all further updates', () => {
@@ -61,6 +82,8 @@ test('aggregate unsubscribe stops all further updates', () => {
   session.fire('stateChange', MeetingSessionState.Disconnecting);
   session.fire('participantJoined', { participant: { participantId: 'x', name: 'X' } });
   session.fire('mediaConnected', 'https://mh-9:4433');
+  session.fire('participantMuteChanged', { participantId: 'x', audioServerMuted: true });
+  expect(store.media.serverMutes.size).toBe(0);
   expect(store.meetingState).toBe(MeetingSessionState.Joined);
   expect(store.participants).toEqual([]);
   expect(store.mediaConnections).toEqual([]);

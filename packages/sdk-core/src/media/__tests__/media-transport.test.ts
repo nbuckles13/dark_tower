@@ -81,6 +81,37 @@ describe('MediaTransport.connectAll — resolver (R-20/R-21)', () => {
     expect(typeof bReport.failureReason).toBe('string');
   });
 
+  it('a SYNCHRONOUSLY throwing connect is a bounded FAILED MH, never a URL stuck connecting', async () => {
+    // e.g. no WebTransport constructor, a URL the constructor rejects, or a
+    // refused dial. Before, the throw escaped the async connect, `allSettled`
+    // swallowed it, and the URL stayed `connecting` with no failure recorded.
+    const mocks = new Map<string, MockWebTransport>();
+    const inner = makeConnect(mocks);
+    const failures: MediaConnectionError[] = [];
+    const mt = new MediaTransport({
+      connect: (url) => {
+        if (url === URL_B) throw new Error('raw platform message with secret-ish detail');
+        return inner(url);
+      },
+    });
+    mt.on('failed', (err) => failures.push(err));
+
+    const p = mt.connectAll([URL_A, URL_B], JWT);
+    mocks.get(URL_A)!.simulateReady();
+    const reports = await p;
+
+    expect(mt.getState(URL_B)).toBe('failed');
+    expect(mt.getState(URL_A)).toBe('connected');
+    const bReport = reports.find((r) => r.mhUrl === URL_B)!;
+    expect(bReport).toMatchObject({
+      state: 'failed',
+      failureCode: MediaConnectionErrorCode.Transport,
+    });
+    expect(bReport.failureReason).not.toContain('secret-ish');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!.message).not.toContain('secret-ish');
+  });
+
   it('all fail → rejects MediaConnectionError(ALL_FAILED); getStatusReports all failed', async () => {
     const mocks = new Map<string, MockWebTransport>();
     const mt = new MediaTransport({ connect: makeConnect(mocks) });

@@ -63,6 +63,7 @@ async function mount(microphones: MediaDeviceInfo[] = []): Promise<Rig> {
   const screen = await render(InMeeting, {
     session: session as unknown as MeetingSession,
     store,
+    selfParticipantId: 'self',
   });
   return { session, store, screen };
 }
@@ -124,7 +125,7 @@ test('starting audio reveals the mute control and reports waiting for return aud
   // different claims, and only one of them is true yet.
   await expect
     .element(screen.getByTestId('media-status'))
-    .toHaveTextContent('waiting for audio to return');
+    .toHaveTextContent('no audio from other participants yet');
 });
 
 test('a start failure surfaces bounded text and leaves the start control available', async () => {
@@ -184,7 +185,7 @@ test('the indicator does NOT move when frames stop arriving', async () => {
   session.fire('firstMediaFrame', 42);
   await expect
     .element(screen.getByTestId('media-status'))
-    .toHaveTextContent('audio returning from the handler');
+    .toHaveTextContent('receiving audio from other participants');
 
   // Silence. No mute event, no frames, nothing.
   await new Promise((resolve) => setTimeout(resolve, 50));
@@ -333,4 +334,103 @@ test('a media fault renders as a fault rather than presenting as silence', async
   await expect
     .element(screen.getByTestId('media-fault'))
     .toHaveTextContent('the audio decoder failed');
+});
+
+// ---------------------------------------------------------------------------
+// Story 2 task 15: the slot grid's identities, and this participant's server mute
+// ---------------------------------------------------------------------------
+
+test('each filled slot names the roster participant MC placed there; an unfilled one is an empty cell', async () => {
+  const { session, screen } = await mount();
+  session.fire('joined', {
+    participantId: 'self',
+    senderId: 1,
+    existingParticipants: [{ participantId: 'b', name: 'Bea', senderId: 258 }],
+    mediaServers: [],
+    correlationId: 'c',
+    bindingToken: 't',
+  });
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [
+      slot({ slotId: 0, senderId: 258, slotState: 'active' }),
+      slot({ slotId: 1, senderId: undefined, slotState: 'fewer_sources' }),
+    ],
+  });
+  await expect.element(screen.getByTestId('slot-0')).toHaveAttribute('data-sender-id', '258');
+  await expect.element(screen.getByTestId('slot-0')).toHaveTextContent('Bea');
+  await expect.element(screen.getByTestId('slot-1')).not.toHaveAttribute('data-sender-id');
+  await expect
+    .element(screen.getByTestId('slot-1'))
+    .toHaveAttribute('data-slot-state', 'fewer_sources');
+});
+
+test('a slot whose sender the roster does not know reads as unknown, never the raw id', async () => {
+  const { session, screen } = await mount();
+  session.fire('streamAssignments', {
+    unreachableSenderIds: [],
+    assignments: [slot({ slotId: 0, senderId: 999, slotState: 'active' })],
+  });
+  await expect.element(screen.getByTestId('slot-0')).toHaveTextContent('unknown participant');
+  expect(screen.getByTestId('slot-0').element().textContent).not.toContain('999');
+});
+
+test('own SERVER mute is a separate indicator, driven only by the wire; asking to unmute changes nothing', async () => {
+  const { session, screen } = await mount();
+  await screen.getByTestId('start-audio').click();
+  await expect
+    .element(screen.getByTestId('server-mute-state'))
+    .toHaveAttribute('data-server-muted', 'false');
+  await expect.element(screen.getByTestId('request-unmute')).not.toBeInTheDocument();
+
+  session.fire('participantMuteChanged', {
+    participantId: 'self',
+    audioServerMuted: true,
+    serverMutedBy: 'nobody-we-know',
+  });
+  await expect
+    .element(screen.getByTestId('server-mute-state'))
+    .toHaveAttribute('data-server-muted', 'true');
+  // The host's id is not on our roster: bounded placeholder, never the raw string.
+  expect(screen.getByTestId('server-mute-state').element().textContent).not.toContain(
+    'nobody-we-know',
+  );
+  // Client mute is untouched by a server mute: two indicators, composing.
+  await expect.element(screen.getByTestId('mute-state')).toHaveAttribute('data-muted', 'false');
+
+  await screen.getByTestId('request-unmute').click();
+  await vi.waitFor(() => expect(session.unmuteRequestCalls).toBe(1));
+  // R-10: the ask lifts nothing — the indicator waits for MC.
+  await expect
+    .element(screen.getByTestId('server-mute-state'))
+    .toHaveAttribute('data-server-muted', 'true');
+
+  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: false });
+  await expect
+    .element(screen.getByTestId('server-mute-state'))
+    .toHaveAttribute('data-server-muted', 'false');
+});
+
+test('nothing in the view calls a server mute a ban', async () => {
+  const { session, screen } = await mount();
+  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: true });
+  await expect
+    .element(screen.getByTestId('server-mute-state'))
+    .toHaveAttribute('data-server-muted', 'true');
+  expect(screen.container.textContent?.toLowerCase()).not.toMatch(/\bban/);
+});
+
+test('the "asked" label belongs to ONE server-mute episode: a re-mute starts with nothing asked', async () => {
+  const { session, screen } = await mount();
+  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: true });
+  await screen.getByTestId('request-unmute').click();
+  await vi.waitFor(() => expect(session.unmuteRequestCalls).toBe(1));
+  await expect.element(screen.getByTestId('request-unmute')).toHaveTextContent('Asked the host');
+
+  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: false });
+  await expect.element(screen.getByTestId('request-unmute')).not.toBeInTheDocument();
+  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: true });
+  await expect
+    .element(screen.getByTestId('request-unmute'))
+    .toHaveTextContent('Ask the host to unmute you');
 });

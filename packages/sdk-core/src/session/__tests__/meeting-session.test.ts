@@ -53,6 +53,9 @@ import {
   framedSendDirective,
   framedSendDirectiveWithoutStreams,
   framedStreamAssignments,
+  framedParticipantMuteUpdate,
+  framedUnmuteRequestRelay,
+  framedMeetingKekUpdate,
 } from '../../signaling/__tests__/helpers.js';
 import {
   decodeClientMessages,
@@ -1865,5 +1868,106 @@ describe('join label bag — PRIMARY, behavioural (ADR-0036 §11; story 2 task 1
       roster,
     );
     expect(violations).toEqual(['dt_client_media_new_thing_total']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 2 R-8 / R-10 / R-11: host hint, server mute, unmute request
+// ---------------------------------------------------------------------------
+
+/** A syntactically valid (unsigned) meeting JWT carrying `claims`. */
+function meetingJwt(claims: Record<string, unknown>): string {
+  const seg = (v: unknown): string =>
+    btoa(JSON.stringify(v)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return `${seg({ alg: 'EdDSA' })}.${seg(claims)}.c2ln`;
+}
+
+/** `fakeFetch`, but the GC join response carries `meetingToken`. */
+function fetchWithMeetingToken(meetingToken: string): FetchLike {
+  const inner = fakeFetch();
+  return (async (input: string | URL, init?: RequestInit) => {
+    const response = await inner(input, init);
+    const url = typeof input === 'string' ? input : input.toString();
+    if (!url.includes('/api/v1/meetings/')) return response;
+    const body = (await response.json()) as Record<string, unknown>;
+    return new Response(JSON.stringify({ ...body, token: meetingToken }), {
+      status: 200,
+      headers: JSON_HEADERS,
+    });
+  }) as unknown as FetchLike;
+}
+
+describe('MeetingSession — host hint and server mute (story 2 R-8/R-10/R-11)', () => {
+  async function joined(meetingToken: string): Promise<{
+    session: MeetingSession;
+    mc: MockWebTransport;
+  }> {
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, { fetchImpl: fetchWithMeetingToken(meetingToken) });
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all');
+    await joinP;
+    return { session, mc: mocks.get(MC_ENDPOINT)! };
+  }
+
+  it('isHost follows the meeting token role claim, exactly "host"', async () => {
+    expect((await joined(meetingJwt({ role: 'host', sub: 'u' }))).session.isHost).toBe(true);
+    expect((await joined(meetingJwt({ role: 'participant' }))).session.isHost).toBe(false);
+  });
+
+  it('an unreadable role is NOT host, WARNs once, and the WARN carries no token material', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { session } = await joined('opaque-meeting-token');
+    expect(session.isHost).toBe(false);
+    const roleWarns = warn.mock.calls.filter((c) => c[0] === '[dt-meeting-role]');
+    expect(roleWarns).toHaveLength(1);
+    expect(JSON.stringify(roleWarns)).not.toContain('opaque-meeting-token');
+  });
+
+  it('setServerMute sends target + action; requestUnmute sends an unmute request', async () => {
+    const { session, mc } = await joined(meetingJwt({ role: 'host' }));
+    await session.setServerMute('participant-b', true);
+    await session.requestUnmute();
+    const messages = decodeOutboundClientMessages(mc.getOutboundBidiWrites(0));
+    const mute = messages.find((m) => m.message.case === 'serverMuteRequest');
+    expect(mute?.message.value).toMatchObject({ participantId: 'participant-b', audioMuted: true });
+    expect(messages.some((m) => m.message.case === 'unmuteRequest')).toBe(true);
+  });
+
+  it('refuses both before a settled join', async () => {
+    const session = makeSession(new Map());
+    await expect(session.setServerMute('b', true)).rejects.toBeInstanceOf(SignalingError);
+    await expect(session.requestUnmute()).rejects.toBeInstanceOf(SignalingError);
+  });
+
+  it('currentKekGeneration is undefined before any KEK, then follows the held CURRENT generation', async () => {
+    expect(makeSession(new Map()).currentKekGeneration).toBeUndefined();
+    const { session, mc } = await joined(meetingJwt({ role: 'participant' }));
+    mc.simulateServerMessage(0, framedMeetingKekUpdate(new Uint8Array(32).fill(7), 3));
+    await waitFor(() => session.currentKekGeneration === 3);
+  });
+
+  it('bridges server-mute updates and the unmute-request relay onto the session', async () => {
+    const { session, mc } = await joined(meetingJwt({ role: 'host' }));
+    const mutes: unknown[] = [];
+    const requests: unknown[] = [];
+    session.on('participantMuteChanged', (e) => mutes.push(e));
+    session.on('unmuteRequested', (e) => requests.push(e));
+    mc.simulateServerMessage(
+      0,
+      framedParticipantMuteUpdate({
+        participantId: 'b',
+        audioServerMuted: true,
+        serverMutedBy: 'h',
+      }),
+    );
+    mc.simulateServerMessage(0, framedUnmuteRequestRelay('b'));
+    await waitFor(() => mutes.length > 0 && requests.length > 0);
+    expect(mutes[0]).toEqual({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' });
+    expect(requests[0]).toEqual({ participantId: 'b' });
   });
 });

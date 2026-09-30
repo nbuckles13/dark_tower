@@ -32,6 +32,7 @@ import {
   parseAcAuthRateLimit,
   SUITE_RECEIVE_SLOTS,
 } from './cohort.js';
+import { serviceConfigEnvPath } from './configEnv.js';
 import { describeEnv, e2eEnv } from './env.js';
 import { registerCohort } from './fixtures.js';
 
@@ -43,9 +44,7 @@ const FINGERPRINTS_JSON = fileURLToPath(
 
 // The AC config the Kind cluster runs — the auth-rate limit's SSoT (the Kind
 // overlay does not patch it). Read, never restated.
-const AC_CONFIG_ENV = fileURLToPath(
-  new URL('../../../infra/services/ac-service/config.env', import.meta.url),
-);
+const AC_CONFIG_ENV = serviceConfigEnvPath('ac-service');
 
 /** Probe one HTTP endpoint with a bounded timeout; return an error line or null. */
 async function probe(label: string, url: string, remediation: string): Promise<string | null> {

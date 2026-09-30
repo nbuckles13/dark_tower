@@ -101,7 +101,11 @@ export function selectCaptureSource(
     const toneHz = testToneFrequencyHz(senderId);
     return {
       factory: (options) =>
-        createTestToneCapture({ sampleRateHz: options.sampleRateHz, frequencyHz: toneHz }),
+        createTestToneCapture({
+          sampleRateHz: options.sampleRateHz,
+          channels: options.channels,
+          frequencyHz: toneHz,
+        }),
       info: { mode: 'test_tone', toneHz },
     };
   }

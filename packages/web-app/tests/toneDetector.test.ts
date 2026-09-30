@@ -20,6 +20,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   evaluateSenderLane,
+  laneCarriesTone,
   ToneCollisionError,
   ToneHarnessError,
   type BusLaneAnalysis,
@@ -354,6 +355,45 @@ describe('lane and assignment states', () => {
     const roundTripped = JSON.parse(JSON.stringify(withGaps)) as BusLaneAnalysis;
     expect(roundTripped.spectrumDb[0]).toBeNull();
     expect(verdictFor(A, B, roundTripped).kind).toBe('ok');
+  });
+});
+
+describe('laneCarriesTone — the one presence rule (absence assertions use it alone)', () => {
+  const sampleRate = 48_000;
+  const bLane = laneFrom(
+    B.senderId,
+    sampleRate,
+    synthesise(sampleRate, [{ hz: B.toneHz, amplitude: TONE_AMPLITUDE }], NOISE),
+  );
+
+  test('a lane with the tone carries it; the same lane does not carry another cohort tone', () => {
+    expect(laneCarriesTone(bLane, B.toneHz)).toBe(true);
+    expect(laneCarriesTone(bLane, D.toneHz)).toBe(false);
+  });
+
+  test('silence, noise alone and a not-ready lane carry no tone', () => {
+    const silent = laneFrom(B.senderId, sampleRate, new Float64Array(FFT_SIZE));
+    expect(laneCarriesTone(silent, B.toneHz)).toBe(false);
+    const noise = laneFrom(B.senderId, sampleRate, synthesise(sampleRate, [], 0.05, 7));
+    expect(laneCarriesTone(noise, B.toneHz)).toBe(false);
+    expect(laneCarriesTone({ ...bLane, ready: false }, B.toneHz)).toBe(false);
+  });
+
+  test('it is LOOSER than the hearing verdict: a tone under a louder foreign one is still present', () => {
+    const mixed = laneFrom(
+      B.senderId,
+      sampleRate,
+      synthesise(
+        sampleRate,
+        [
+          { hz: B.toneHz, amplitude: TONE_AMPLITUDE * 0.1 },
+          { hz: D.toneHz, amplitude: TONE_AMPLITUDE },
+        ],
+        NOISE,
+      ),
+    );
+    expect(laneCarriesTone(mixed, B.toneHz)).toBe(true);
+    expect(verdictFor(A, B, mixed).kind).not.toBe('ok');
   });
 });
 

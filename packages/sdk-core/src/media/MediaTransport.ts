@@ -261,7 +261,18 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   // ----------------------------------------------------------------------------
 
   async #connectOne(url: string, index: number, jwt: string): Promise<void> {
-    const transport = this.#connectFn(url);
+    let transport: IWebTransport;
+    try {
+      transport = this.#connectFn(url);
+    } catch (err) {
+      // A SYNCHRONOUS connect failure (an unavailable WebTransport constructor, a
+      // URL the constructor rejects, a refused dial) is a failed MH like any
+      // other: recorded with the bounded transport reason — never the raw
+      // message (R-23) — rather than escaping this async function, where
+      // `allSettled` would swallow it and leave the URL `connecting` forever.
+      this.#failOne(url, index, MediaConnectionErrorCode.Transport, REASON_TRANSPORT, err);
+      return;
+    }
     // Register for teardown IMMEDIATELY — BEFORE awaiting ready — so disconnect()
     // can always reach an in-flight / never-ready transport (no leak).
     this.#transports.push(transport);

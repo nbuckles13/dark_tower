@@ -59,7 +59,7 @@
 - Harness config (Chromium-only, `retries: 0`) → `packages/web-app/playwright.config.ts`
 - Topology (required `E2E_ORG_SUBDOMAIN`, derived base URL) + global-setup → `packages/web-app/e2e/env.ts`, `global-setup.ts`; node-tier contract → `packages/web-app/tests/e2e-env.test.ts`
 - Fixtures + test bus → `packages/web-app/e2e/fixtures.ts`, `src/lib/e2eBus.ts`, `vite.config.ts`; Prometheus helpers (one PromQL home) → `packages/web-app/e2e/mcMetrics.ts`
-- Specs (incl. `media-loopback.spec.ts`) + division of responsibility vs Rust env-tests → `packages/web-app/e2e/`, `packages/web-app/e2e/README.md`
+- Specs (incl. solo `solo-participant.spec.ts`; multi-party `multi-party-hear` / `over-subscription` / `server-mute` / `kek-rotation` / `partial-connectivity`) + division of responsibility vs Rust env-tests → `packages/web-app/e2e/`, `packages/web-app/e2e/README.md`
 - Layer-7 browser lane (always-runs since 2026-08-20; gated only by Phase-1g dev-cert + Playwright Chromium preconditions) → `scripts/layer7.sh`
 
 ## Environment Tests & Cluster (ADR-0030)

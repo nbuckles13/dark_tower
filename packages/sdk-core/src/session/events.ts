@@ -27,7 +27,9 @@ import type {
   JoinedEvent,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
+  ParticipantMuteEvent,
   StreamAssignmentsEvent,
+  UnmuteRequestedEvent,
 } from '../signaling/events.js';
 
 /**
@@ -177,6 +179,15 @@ export interface MeetingSessionEventMap {
    * instead of presenting as silence.
    */
   mediaFault: MediaFault;
+  /**
+   * A participant's SERVER mute changed (or was replayed at join) — ADR-0036 §5,
+   * story 2 R-11. Includes this participant's own. The ONLY source for rendering
+   * server-muted state: nothing flips it locally, not even this client's own
+   * unmute request.
+   */
+  participantMuteChanged: ParticipantMuteEvent;
+  /** A server-muted participant asked the host to unmute them (host only; R-10). */
+  unmuteRequested: UnmuteRequestedEvent;
 }
 
 /** Construction options for {@link MeetingSession}. */

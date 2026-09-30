@@ -45,9 +45,18 @@
 import type {
   MediaFault,
   MuteSnapshot,
+  ParticipantMuteEvent,
   StreamAssignmentEvent,
   StreamAssignmentsEvent,
+  UnmuteRequestedEvent,
 } from '@darktower/sdk-core';
+import { emptyMap, emptySet, withEntry, withMember } from './snapshots.js';
+
+/** One server-muted participant, as MC last reported it. */
+export interface ServerMuteState {
+  /** Participant id of whoever applied it, when MC said. Resolve via the roster to render. */
+  readonly serverMutedBy?: string | undefined;
+}
 
 export class MediaStore {
   /**
@@ -63,7 +72,7 @@ export class MediaStore {
    * `$firstMediaFrameMs` — ms from media start to the first frame arriving.
    *
    * `undefined` means "no media has come back yet", which is a real, renderable
-   * state and the one the loopback is diagnosing. **Observed, never gated**
+   * state (no sender has reached this receiver yet). **Observed, never gated**
    * (ADR-0036 §10): no threshold may be compared against this, here or in a UI.
    */
   #firstMediaFrameMs = $state<number | undefined>(undefined);
@@ -102,6 +111,24 @@ export class MediaStore {
    */
   #lastMediaFault = $state<MediaFault | undefined>(undefined);
 
+  /**
+   * `$serverMutes` — every participant MC currently reports as SERVER-muted
+   * (this participant included), keyed by participant id (story 2 R-11).
+   *
+   * Written ONLY from `participantMuteChanged` (the wire's `ParticipantMuteUpdate`).
+   * Nothing sets it from a click — not the host's mute button and not a muted
+   * participant's own unmute request (R-10: that only notifies the host). Its own
+   * cell, REPLACED on every change, so reactivity stays per-cell.
+   */
+  #serverMutes = $state<ReadonlyMap<string, ServerMuteState>>(emptyMap());
+
+  /**
+   * `$unmuteRequests` — participants who asked the host to lift their server mute
+   * (only a host receives these). A request is cleared when MC reports that
+   * participant's server mute lifted; it never lifts anything itself.
+   */
+  #unmuteRequests = $state<ReadonlySet<string>>(emptySet());
+
   /** Reactive getter for `$audioMuted`. */
   get audioMuted(): boolean {
     return this.#audioMuted;
@@ -130,6 +157,39 @@ export class MediaStore {
   /** Reactive getter for `$lastMediaFault`. */
   get lastMediaFault(): MediaFault | undefined {
     return this.#lastMediaFault;
+  }
+
+  /** Reactive getter for `$serverMutes` (readonly view). */
+  get serverMutes(): ReadonlyMap<string, ServerMuteState> {
+    return this.#serverMutes;
+  }
+
+  /** Reactive getter for `$unmuteRequests` (readonly view). */
+  get unmuteRequests(): ReadonlySet<string> {
+    return this.#unmuteRequests;
+  }
+
+  /** Apply a `participantMuteChanged` event: replace the map; unmute also clears any request. */
+  applyParticipantMute(event: ParticipantMuteEvent): void {
+    this.#serverMutes = withEntry(
+      this.#serverMutes,
+      event.participantId,
+      event.audioServerMuted ? { serverMutedBy: event.serverMutedBy } : undefined,
+    );
+    if (!event.audioServerMuted && this.#unmuteRequests.has(event.participantId)) {
+      this.#unmuteRequests = withMember(this.#unmuteRequests, event.participantId, false);
+    }
+  }
+
+  /**
+   * Apply an `unmuteRequested` event. Recorded only while MC says the requester
+   * IS server-muted — a stale relay for someone already unmuted is not a pending
+   * request.
+   */
+  applyUnmuteRequested(event: UnmuteRequestedEvent): void {
+    if (!this.#serverMutes.has(event.participantId)) return;
+    if (this.#unmuteRequests.has(event.participantId)) return;
+    this.#unmuteRequests = withMember(this.#unmuteRequests, event.participantId, true);
   }
 
   /** Apply a `muteChanged` event. The SDK's snapshot, unmodified. */

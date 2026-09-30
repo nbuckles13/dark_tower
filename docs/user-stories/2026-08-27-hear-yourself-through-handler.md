@@ -135,8 +135,8 @@ Findings accepted: (1) the loopback self-recognition shortcut → R-4; (2) the c
 
 ### Test
 - **Env-Tests** (live Kind, Layer 7; owned by the implementing specialist, paired with test):
-  - A — browser loopback, hear yourself: driver=Browser, owned by client (task 20), validates R-1, R-27 (observed).
-  - B — mute silences at capture (structural egress-count assertion), unmute resumes: driver=Browser, owned by client (task 20), validates R-2.
+  - A — browser loopback, hear yourself: driver=Browser, owned by client (task 20), validates R-1, R-27 (observed). *(Superseded by story 2 R-3: loopback removed; the spec is now `packages/web-app/e2e/solo-participant.spec.ts`, a solo participant hearing nothing, and N+1 hearing each other is `multi-party-hear.spec.ts`.)*
+  - B — mute silences at capture (structural egress-count assertion), unmute resumes: driver=Browser, owned by client (task 20), validates R-2. *(Now multi-party: story 2 task 15, `server-mute.spec.ts` "client STRUCTURAL mute".)*
   - C — MH forwards an audio datagram frame (extends `26_mh_quic.rs`): driver=Rust, owned by media-handler (task 16), validates R-15, R-18.
   - D — join returns the KEK and MC programs MH with applied-generation echo (extends `24_join_flow.rs`): driver=Rust, owned by meeting-controller (task 13), validates R-10, R-16.
   - E — telemetry hygiene on-cluster (extends `30_observability.rs`): driver=Rust, owned by observability (task 22), validates R-24, R-26.

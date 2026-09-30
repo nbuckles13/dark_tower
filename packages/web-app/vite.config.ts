@@ -3,7 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { loadCertFingerprints } from './vite/fingerprints.js';
-import { TEST_TONE_ENV, resolveTestTone } from './vite/testTone.js';
+import { TEST_LEVERS_ENV, TEST_TONE_ENV, resolveOptInTestDefine } from './vite/testDefines.js';
 
 // R-30: web-app dev/build config.
 //
@@ -36,8 +36,17 @@ export default defineConfig(({ mode }) => ({
     __E2E_HOOKS__: JSON.stringify(mode !== 'production'),
     // Story 2 R-7: the test-tone build define. OPT-IN (`DT_TEST_TONE=1`), never
     // default-on, never runtime, and a THROW in production — one predicate for
-    // all three (`vite/testTone.ts`).
-    __DT_TEST_TONE__: JSON.stringify(resolveTestTone(mode, process.env[TEST_TONE_ENV])),
+    // all three (`vite/testDefines.ts`).
+    __DT_TEST_TONE__: JSON.stringify(
+      resolveOptInTestDefine(TEST_TONE_ENV, mode, process.env[TEST_TONE_ENV]),
+    ),
+    // Story 2 task 15: the per-browsing-context test levers (S10a handler
+    // blocking, S2 per-context N, forced host controls). Same predicate, same
+    // rules: opt-in `DT_TEST_LEVERS=1`, THROW in production. Read at one site,
+    // `src/lib/testLevers.ts`.
+    __DT_TEST_LEVERS__: JSON.stringify(
+      resolveOptInTestDefine(TEST_LEVERS_ENV, mode, process.env[TEST_LEVERS_ENV]),
+    ),
     __SDK_VERSION__: JSON.stringify(pkgVersion),
     // Dev MC/MH cert SHA-256 fingerprints (base64). Empty in prod / when absent.
     __DEV_CERT_SHA256_HASHES__: JSON.stringify(mode !== 'production' ? CERT_HASHES : []),

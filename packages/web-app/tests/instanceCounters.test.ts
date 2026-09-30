@@ -58,9 +58,9 @@ test('(b) does not pass when all instances are present and none increased', () =
 });
 
 test('(c) a non-numeric sample throws loudly, not read as zero', () => {
-  expect(() => resultsToInstanceMap(TEST_PROMQL, rows([['10.0.0.1:8081', 'not-a-number']]))).toThrow(
-    /non-finite\/non-numeric/,
-  );
+  expect(() =>
+    resultsToInstanceMap(TEST_PROMQL, rows([['10.0.0.1:8081', 'not-a-number']])),
+  ).toThrow(/non-finite\/non-numeric/);
 });
 
 // Fail-loud parse parity with the Rust twin (@code-reviewer + @test-reviewer,
@@ -100,3 +100,36 @@ test('an empty result is an empty map (legitimately zero, distinct from an error
   // Empty baseline vs empty current does not pass.
   expect(anyInstanceExceedsBaseline(map, map)).toBe(false);
 });
+
+test('(minDelta) the rise on ONE instance must reach minDelta; two instances rising by 1 do not sum', () => {
+  const baseline = resultsToInstanceMap(
+    TEST_PROMQL,
+    rows([
+      ['a', '3'],
+      ['b', '3'],
+    ]),
+  );
+  const oneEach = resultsToInstanceMap(
+    TEST_PROMQL,
+    rows([
+      ['a', '4'],
+      ['b', '4'],
+    ]),
+  );
+  expect(anyInstanceExceedsBaseline(baseline, oneEach, 2)).toBe(false);
+  const twoOnA = resultsToInstanceMap(TEST_PROMQL, rows([['a', '5']]));
+  expect(anyInstanceExceedsBaseline(baseline, twoOnA, 2)).toBe(true);
+  // Absent from the baseline reads as 0: a series BORN at 2 reaches minDelta 2.
+  const born = resultsToInstanceMap(TEST_PROMQL, rows([['c', '2']]));
+  expect(anyInstanceExceedsBaseline(baseline, born, 2)).toBe(true);
+});
+
+test.each([0, -1, 1.5, Number.NaN])(
+  '(minDelta) %s is refused, never read as "no increment needed"',
+  (bad) => {
+    const empty = resultsToInstanceMap(TEST_PROMQL, rows([]));
+    expect(() => anyInstanceExceedsBaseline(empty, empty, bad)).toThrow(
+      /minDelta must be an integer >= 1/,
+    );
+  },
+);

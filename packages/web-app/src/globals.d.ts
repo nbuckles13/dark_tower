@@ -11,9 +11,15 @@ declare const __E2E_HOOKS__: boolean;
 /**
  * Story 2 R-7: the test-tone build define — opt-in (`DT_TEST_TONE=1`) in dev,
  * a hard `false` in production (the opt-in THROWS there). See
- * `vite/testTone.ts`. Read only by the SDK's capture-source selection.
+ * `vite/testDefines.ts`. Read only by the SDK's capture-source selection.
  */
 declare const __DT_TEST_TONE__: boolean;
+/**
+ * Story 2 task 15: the per-browsing-context TEST LEVERS define — opt-in
+ * (`DT_TEST_LEVERS=1`) in dev, a hard `false` in production (the opt-in THROWS
+ * there). See `vite/testDefines.ts`. Read at one site, `src/lib/testLevers.ts`.
+ */
+declare const __DT_TEST_LEVERS__: boolean;
 /** Dev MC/MH cert SHA-256 fingerprints (base64); empty in prod / when absent. */
 declare const __DEV_CERT_SHA256_HASHES__: readonly string[];
 
@@ -28,6 +34,11 @@ interface DarktowerTestBus {
   readonly events: ReadonlyArray<Readonly<Record<string, unknown>>>;
   /** Subscribe to a bounded event type; returns an unsubscribe closure. */
   on(type: string, listener: (event: Readonly<Record<string, unknown>>) => void): () => void;
+  /**
+   * Force a metric export now (story 2 task 15). Rejects `telemetry_not_configured`
+   * when telemetry is off; resolves with nothing — no export data on the bus.
+   */
+  flushMetrics(): Promise<void>;
 }
 
 interface Window {

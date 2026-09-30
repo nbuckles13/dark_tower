@@ -694,7 +694,7 @@ assert_status "slots-default-is-pass-line" "✓ receive slots: effective N=" "$o
 assert_status "tone-state-off-when-unset" "test tone: OFF (DT_TEST_TONE unset)" "$out"
 assert_absent "tone-state-not-on-when-unset" "test tone: ON" "$out"
 # ...and ON, echoing exactly what was set, when requested. Not re-validated in
-# bash: vite/testTone.ts is the one predicate.
+# bash: vite/testDefines.ts is the one predicate.
 RUN_CHECK_TONE=1 run_check "$root" "$stubs"
 out_tone="$(plain "$RUN_OUT")"
 assert_status "tone-state-on-when-set" "test tone: ON requested (DT_TEST_TONE=1;" "$out_tone"
