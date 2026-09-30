@@ -31,26 +31,17 @@ use crate::NAMESPACE;
 ///
 /// ConfigMaps are content-addressed (ADR-0038 §2): a config change renames the
 /// ConfigMap, which changes the pod template, which rolls the pod on the next
-/// converge. So the fix is to CONVERGE the cluster to the tree — never a
+/// `deploy`. So the fix is to CONVERGE the cluster to the tree — never a
 /// `kubectl rollout restart` (which re-runs the same, stale template) and never
 /// a plain `kubectl apply -k` (the bases carry `:render-required` image
-/// placeholders; only setup.sh's render applies them).
+/// placeholders; only `deploy.sh`'s render applies them).
 ///
-/// ADR-0038 step 3 changes this to `dev-cluster deploy`.
-pub const REDEPLOY_HINT: &str = "converge the cluster to the tree: `dev-cluster rebuild-all` \
-     (from the devloop container) or `./infra/kind/scripts/setup.sh --rebuild-all` (host)";
-
-/// The ONE remediation for "a pod's RUNTIME state needs a fresh start" (a
-/// rotated startup log, in-memory state a test assumed empty). A converge does
-/// not help — pods whose image and config are unchanged are not restarted — and
-/// a direct `kubectl rollout restart` from the devloop container would bypass the
-/// host helper, which by design has no restart verb (ADR-0030/0038). So: a fresh
-/// cluster.
-///
-/// ADR-0038 step 3 renames the rebuild to `provision`, and makes the tests that
-/// need this fresh-pod-independent instead.
-pub const FRESH_CLUSTER_HINT: &str = "`dev-cluster teardown`, then re-run; Layer 7 rebuilds \
-     a missing cluster (after ADR-0038 step 3: `provision`)";
+/// Spelled in three languages (this constant, `infra/kind/scripts/*.sh`
+/// remedies, `docs/runbooks/devloop-validation.md` §6.7) that cannot share a
+/// constant; `scripts/guards/simple/validate-dev-cluster-verbs.sh` keeps every
+/// `dev-cluster <verb>` spelling on a verb the helper accepts.
+pub const REDEPLOY_HINT: &str = "converge the cluster to the tree: `dev-cluster deploy` \
+     (from the devloop container) or `./infra/kind/scripts/deploy.sh` (host)";
 
 /// The name of the ONE ConfigMap generation, for generator base name `base`,
 /// that the live pod(s) of `instance` (`-l instance=<instance>`) reference —

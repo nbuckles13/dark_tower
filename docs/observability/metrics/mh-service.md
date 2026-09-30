@@ -328,7 +328,7 @@ Story 2 R-19, R-23; ADR-0036 §11 "Admission control is keyed on egress bandwidt
 
 **The ratchet — now only for meetings nobody ends.** Ordinary departures re-push shrinking policies and release streams, and a meeting whose MC calls `EndMeeting` (story 2 R-20) releases all of its streams and its registration (`mh_media_meeting_teardowns_total{outcome="released"}`, with `mh_media_egress_edges` and `mh_media_registered_meetings` falling). MC calls `EndMeeting` for every meeting it ends as of story 2 task 12. What remains is a meeting whose MC never COMPLETES `EndMeeting` — (i) an MC crashed or killed before or during teardown, (ii) retries exhausted (`mc_media_end_meeting_total{outcome="unavailable_exhausted"}`) or an MH predating the RPC (`unimplemented`), (iii) a rollback to an MC build without teardown — and such a meeting keeps its streams until the pod restarts (`docs/TODO.md`, "A meeting whose MC never sends `EndMeeting` is never reclaimed"). `current_streams` in MH's GC load report is the same value — so a handler at its ceiling drops out of GC placement, and when every handler is there the first join to a NEW meeting fails with 503. `mh_media_egress_edges` sitting at the ceiling with no live meeting behind it, and rising with pod uptime rather than with load, is that state. Recovery: `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower`; healthy meetings reinstall on their MC's next push.
 
-Every series below carries `key_custody=operator` and NO meeting, participant or stream identity (ADR-0036 §11). All are present from process start: the counter is zero-initialised per outcome, the six static gauges (four admission-chain values plus the two resource-guard `_limit`s) are published right after the recorder installs, and the ratio, installed-streams and registered-meetings gauges are published when the session actor is built.
+Every series below carries `key_custody=operator` and NO meeting, participant or stream identity (ADR-0036 §11). All are present from process start: the counter is zero-initialised per outcome, every gauge `publish_egress_admission` sets (the admission-chain values, every `PolicyLimits` `_limit`, the policy-apply timeout and both per-stream costs) is published right after the recorder installs, and the ratio, installed-streams and registered-meetings gauges are published when the session actor is built.
 
 ### `mh_media_released_meeting_apply_refusals_total`
 - **Expected-empty**: yes — a healthy teardown ordering produces none, so this reads zero when healthy
@@ -435,6 +435,52 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: The denominator for registration occupancy, so no alert or panel needs the number as a PromQL literal. A resource guard, never capacity and never advertised to GC. Static; published once at startup.
+
+**Configuration reflections (ADR-0038 step 3).**
+
+The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforced per-stream costs, each `.set()` once at startup from the ONE `PolicyLimits` / `EgressAdmission` field enforcement reads (never a second literal, never a re-conversion). They exist so the value the RUNNING process loaded is observable without its startup log line, which log rotation loses on a long-lived pod: `crates/env-tests/tests/01_mh_deployment_config.rs` compares every one against the deployed ConfigMap. **Config reflections, not signals — no alert selects on them.** Static; published once at startup; `key_custody`: `operator`; cardinality 1 each. The three `_limit`s are PRE-ALLOCATION bounds on one registration (a registration exceeding one is refused whole as `rejected_invalid`). The two costs are the divisors of `mh_media_egress_stream_ceiling`; the heavier one binds. **Why the costs are two per-kind names, not one gauge with a `media_kind` label:** `media_kind` is declared-not-carried in `docs/observability/label-taxonomy.md`, so no MH metric carries it today. If story 3 folds these into one labelled gauge, that is a RENAME — sweep `infra/grafana/dashboards/mh-media.json` (Per-Stream Egress Costs) and env-test 01's `CONFIG_GAUGES` in the same change — never a silent change.
+
+### `mh_media_egress_streams_per_meeting_limit`
+- **Type**: Gauge
+- **Description**: The configured `MH_MAX_EGRESS_STREAMS_PER_MEETING`, read from `PolicyLimits::max_egress_streams_per_meeting`. Unit: Streams, identity.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Configuration reflection (see above). Static; published once at startup.
+
+### `mh_media_candidate_sources_per_egress_limit`
+- **Type**: Gauge
+- **Description**: The configured `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS`, read from `PolicyLimits::max_candidate_sources_per_egress`. Unit: Sources, identity.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Configuration reflection (see above). Static; published once at startup.
+
+### `mh_media_muted_sources_per_meeting_limit`
+- **Type**: Gauge
+- **Description**: The configured `MH_MAX_MUTED_SOURCES_PER_MEETING`, read from `PolicyLimits::max_muted_sources_per_meeting`. Unit: Sources, identity.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Configuration reflection (see above). Static; published once at startup.
+
+### `mh_media_policy_apply_timeout_seconds`
+- **Type**: Gauge
+- **Description**: The configured `MH_POLICY_APPLY_TIMEOUT_MS`, read from `PolicyLimits::policy_apply_timeout_ms`. Unit: SECONDS (`ms / 1000`), per ADR-0011 base units.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Configuration reflection (see above). Static; published once at startup.
+
+### `mh_media_stream_cost_audio_bytes_per_second`
+- **Type**: Gauge
+- **Description**: The ENFORCED audio stream cost, read from `EgressAdmission::stream_cost_audio_bytes_per_second` (`MH_STREAM_COST_AUDIO_BPS`). Unit: BYTES per second: the key is bits, converted once at load with `div_ceil(8)`.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Configuration reflection (see above). Static; published once at startup.
+
+### `mh_media_stream_cost_video_bytes_per_second`
+- **Type**: Gauge
+- **Description**: The ENFORCED video stream cost, read from `EgressAdmission::stream_cost_video_bytes_per_second` (`MH_STREAM_COST_VIDEO_BPS`). Unit: BYTES per second: the key is bits, converted once at load with `div_ceil(8)`.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: Configuration reflection (see above). Static; published once at startup.
 
 ---
 

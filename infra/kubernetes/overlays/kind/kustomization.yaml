@@ -1,20 +1,20 @@
 # The Kind ENVIRONMENT ROOT (ADR-0038 §2): composes every service, the OTel
-# collector and the observability stack. `infra/kind/scripts/setup.sh`
+# collector and the observability stack. `infra/kind/scripts/deploy.sh`
 # (apply_env_root) is what applies it, and every ConfigMap a pod template
 # consumes is content-addressed, so an apply rolls exactly the workloads whose
 # configuration changed.
 #
-# ALWAYS APPLY THROUGH `setup.sh:apply_env_root`, NEVER a plain `kubectl apply -k`
+# ALWAYS APPLY THROUGH `deploy.sh:apply_env_root`, NEVER a plain `kubectl apply -k`
 # of this directory. apply_env_root layers a rendered wrapper onto this root:
 #   - every first-party image's content tag (`localhost/<name>:sha-<image id>`,
-#     setup.sh:content_tag). The bases name `:render-required`, which nothing
+#     deploy.sh:content_tag). The bases name `:render-required`, which nothing
 #     loads, so a plain apply fails LOUDLY (ErrImageNeverPull) rather than
 #     running a stale image — by design;
 #   - on a devloop cluster, the MC/MH WebTransport advertise addresses
 #     (host-gateway IP + per-slug ports), which a plain apply would silently put
 #     back on the 127.0.0.1 defaults.
 # The migration Job (infra/services/db-migrate/) is NOT a resource here: it runs
-# to Complete before this root is applied (setup.sh:run_migration_job).
+# to Complete before this root is applied (deploy.sh:run_migration_job).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

@@ -8,7 +8,7 @@ resources:
   # mh-service-secrets ONLY
   - secret.yaml
   # mh-service-tls NOT listed — created imperatively by
-  # infra/kind/scripts/setup.sh:create_mh_tls_secret() from the certs
+  # infra/kind/scripts/provision.sh:create_tls_secret() from the certs
   # scripts/generate-dev-certs.sh generates, because listing it would commit
   # TLS key material to git. Consequence: `kubectl apply -k` alone does NOT
   # produce startable pods on a fresh namespace — both mh-{0,1} mount it as
@@ -31,7 +31,8 @@ resources:
   # `kubectl logs` is empty or misleading for all three, and pod phase alone
   # tells them apart before you read anything.
   #
-  # setup.sh is the only supported bootstrap today; making this declarative is
+  # infra/kind/scripts/provision.sh (the dev stand-in for a secret manager,
+  # ADR-0038 §1) is the only supported bootstrap today; making this declarative is
   # tracked in docs/TODO.md §Infrastructure Validation in Devloops.
   - pdb.yaml
   - network-policy.yaml
@@ -96,7 +97,7 @@ labels:
 # Verified against kustomize v5.5.0 (embedded in kubectl v1.32.3), which is what
 # both consumers of this base actually run: the guard
 # (scripts/guards/simple/validate-kustomize.sh) and the deploy path
-# (infra/kind/scripts/setup.sh -> kubectl apply -k the Kind overlay). NOTE: the
+# (infra/kind/scripts/deploy.sh -> kubectl apply -k the Kind environment root). NOTE: the
 # story text claims verification against kustomize v5.7.1; that is not the
 # version this tree runs. See docs/TODO.md.
 replacements:

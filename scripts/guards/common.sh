@@ -33,6 +33,33 @@ else
 fi
 
 # =============================================================================
+# Test seam: a guard's scan root
+# =============================================================================
+
+# guard_seam_root <OVERRIDE_VAR_NAME> <real_root>
+#
+# Print the root a guard scans: the value of the variable NAMED by $1 when — and only
+# when — DEVLOOP_TEST is EXACTLY "1" and that variable is set and non-empty; otherwise
+# <real_root>. The ONE home of the seam every root-scanning guard's self-test uses
+# (validate-subdomain-regex-sync.sh, validate-internal-proto-no-key-material.sh,
+# validate-dev-cluster-verbs.sh).
+#
+# WHY THE GATE: a guard's FAILURE branches can only be driven against a synthetic tree,
+# but redirecting the root at a clean tree outside a test would be a SILENT-VALIDATION-
+# DISABLE lever — the guard would report OK having examined nothing this repo cares about.
+# So the override is honoured only under the test sentinel, which assert_no_ci_sentinel_leak
+# (run at the top of layer3.sh and layer-all.sh) independently reds if it leaks into CI.
+# EXACT match: `DEVLOOP_TEST=0` (or any other value) never enables it.
+guard_seam_root() {
+    local var="$1" real="$2"
+    if [[ "${DEVLOOP_TEST:-}" == "1" && -n "${!var:-}" ]]; then
+        printf '%s\n' "${!var}"
+    else
+        printf '%s\n' "$real"
+    fi
+}
+
+# =============================================================================
 # Changed File Detection
 # =============================================================================
 

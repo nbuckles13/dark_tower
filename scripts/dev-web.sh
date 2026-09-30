@@ -94,7 +94,7 @@
 #      mc-/mh-webtransport leaves list localhost plus service names, no IP.
 #      SCOPED, deliberately: the browser trusts these leaves by
 #      serverCertificateHashes pinning, which matches the hash and checks no
-#      name (infra/kind/scripts/setup.sh's devloop advertise-address patch relies
+#      name (infra/kind/scripts/deploy.sh's devloop advertise-address render relies
 #      on exactly that), so this is NOT a browser-side blocker. It bars a
 #      name-verifying client pointed at a LAN IP. 1 and 2 are each sufficient.
 # So one machine it is — and still never a browser flag (above).
@@ -395,7 +395,7 @@ fi
 # the advertise addresses are read from the committed config files on disk,
 # which is correct for the static host topology this script targets. On a
 # devloop cluster the live ConfigMap is rendered with the host-gateway address
-# (setup.sh:apply_env_root) and the on-disk value is the host default,
+# (deploy.sh:apply_env_root) and the on-disk value is the host default,
 # so this check can go RED against a perfectly healthy cluster — and now that is
 # a blocker, not a misleading green. Every listener failure below therefore
 # prints the ground-truth `kubectl` command for the live value. The honest fix
@@ -403,7 +403,7 @@ fi
 # the check; that is recorded in docs/TODO.md. See runbook §1 and F8.
 #
 # The instance set is DERIVED from the per-instance generator sources — the same
-# glob infra/kind/scripts/setup.sh:advertise_instances() uses — never a
+# glob infra/kind/scripts/deploy.sh:advertise_instances() uses — never a
 # hand-kept list, so a new instance is checked without editing this script.
 shopt -s nullglob
 WT_CONFIGMAPS=(infra/services/m[ch]-service/m[ch]-[0-9]*-config.env)

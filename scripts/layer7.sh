@@ -28,15 +28,20 @@
 #   OK                 (exit 0) — every suite that ran was green (both the Rust env-tests
 #                                 and the browser E2E, which now always runs).
 #   FAIL               (exit 1) — IMPLEMENTER lane: a suite returned non-zero on a
-#                                 confirmed-healthy cluster (the diff's problem).
+#                                 confirmed-healthy cluster (the diff's problem), OR
+#                                 `provision`/`deploy` failed on the TREE
+#                                 (`provision-failed` / `deploy-failed`: the REASON is
+#                                 not an environment reason — CLUSTER_ENV_REASONS;
+#                                 ADR-0038 applies the tree on every gate).
 #   PRECONDITION_FAILURE (exit 2) — OPERATOR lane: a Phase-1 pre-suite step (helper
-#                                 liveness / cluster bring-up / rebuild / health /
+#                                 liveness / provision or deploy on the ENVIRONMENT / health /
 #                                 browser-suite preconditions) failed, OR a LOCAL run
 #                                 with no/dead helper (a local devloop ALWAYS expects a
 #                                 cluster — never a silent skip).
 #
 # TWO-PHASE classifier (task #56 ruling #3 — the suite-output log-grep is RETIRED):
-#   Phase 1 (pre-suite, deterministic) is the ONLY infra lane. It brings the cluster to
+#   Phase 1 (pre-suite, deterministic) is the ONLY infra lane (its one implementer-lane exit
+#   is a provision/deploy failure the script itself classified as the tree). It brings the cluster to
 #   a confirmed-healthy state. Phase 2 runs the suite; ANY non-zero is a test FAIL. We do
 #   NOT grep the suite output for "connection refused" etc. — that would let a real test
 #   failure whose output happens to contain an infra phrase silently escape as infra
@@ -51,8 +56,6 @@ __layer7_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 __repo_root="$(cd "${__layer7_dir}/.." && pwd)"
 # shellcheck source=lang/_common.sh
 source "${__layer7_dir}/lang/_common.sh"
-# shellcheck source=lang/_changed_helpers.sh
-source "${__layer7_dir}/lang/_changed_helpers.sh"
 
 # --- Test seams, DEVLOOP_TEST-gated (security; same class as LAYER_SCRIPT_DIR) ---
 # These three env overrides REDIRECT or EXECUTE the cluster machinery: the dev-cluster
@@ -204,7 +207,7 @@ precondition_fail() {
 # the grep is.
 #
 # COUPLED: these greps parse the EXACT field lines `infra/devloop/dev-cluster` prints
-# (`Cluster exists:`, `Pods healthy:`, `Setup in progress:` — its status-summary block,
+# (`Cluster exists:`, `Pods healthy:`, `Cluster write in progress:` — its status-summary block,
 # ~line 454). Keep the two in sync; a matching cross-ref comment lives there. The self-test's
 # fake dev-cluster is a frozen copy of this wording and can't catch real-client drift — this
 # comment is the insurance (@operations).
@@ -214,9 +217,9 @@ __dev_cluster_status_text() {
 
 # True iff the cluster is READY to run the suite. FAIL-CLOSED, positive-match (@operations
 # condition 2): requires the POSITIVE tokens `Cluster exists: true` AND `Pods healthy: true`
-# AND `Setup in progress: false`. Absence of any positive token — pods down OR the client's
+# AND `Cluster write in progress: false`. Absence of any positive token — pods down OR the client's
 # wording drifted — counts as NOT-ready. This is the load-bearing direction: drift/down
-# degrades to "not ready → setup → (still not ready) PRECONDITION_FAILURE" (operator lane),
+# degrades to "not ready → health wait → self-heal / PRECONDITION_FAILURE" (operator lane),
 # and structurally CANNOT yield a false-ready that runs the suite against a broken cluster.
 # Args: (none)  Returns: 0 if ready, 1 otherwise.
 __cluster_ready() {
@@ -224,22 +227,23 @@ __cluster_ready() {
   out="$(__dev_cluster_status_text)" || return 1
   grep -qE 'Cluster exists:[[:space:]]+true' <<<"$out" \
     && grep -qE 'Pods healthy:[[:space:]]+true' <<<"$out" \
-    && grep -qE 'Setup in progress:[[:space:]]+false' <<<"$out"
+    && grep -qE 'Cluster write in progress:[[:space:]]+false' <<<"$out"
 }
 
-# True while a cluster setup is in flight (poll target).
-# Args: (none)  Returns: 0 if setup in progress, 1 otherwise.
-__cluster_setup_in_progress() {
+# True while a cluster-building write (provision / deploy / recreate / teardown) is in
+# flight — e.g. devloop.sh's eager provision+deploy still running when Layer 7 starts.
+# Args: (none)  Returns: 0 if a cluster write is in progress, 1 otherwise.
+__cluster_write_in_progress() {
   local out
   out="$(__dev_cluster_status_text)" || return 1
-  grep -qE 'Setup in progress:[[:space:]]+true' <<<"$out"
+  grep -qE 'Cluster write in progress:[[:space:]]+true' <<<"$out"
 }
 
-# Block until an in-flight setup finishes (or a bounded timeout). Polls every 10s.
+# Block until an in-flight cluster write finishes (or a bounded timeout). Polls every 10s.
 # Args: (none)  Returns: 0 when no longer in progress, 1 on timeout.
-__poll_setup_idle() {
+__poll_write_idle() {
   local waited=0 budget="${DEVLOOP_SETUP_POLL_BUDGET:-900}"
-  while __cluster_setup_in_progress; do
+  while __cluster_write_in_progress; do
     if (( waited >= budget )); then
       return 1
     fi
@@ -251,7 +255,7 @@ __poll_setup_idle() {
 
 # The devloop cluster's name from ports.json (empty when unresolvable — the CALLER decides the
 # failure, never a default) and its kubectl context. ONE home for both derivations: Phase 1h
-# (per-run org), Phase 1i (MH gRPC forwards) and Phase 1e2 (observability apply) all use them.
+# (per-run org) and Phase 1i (MH gRPC forwards) use them.
 # The `|| true` swallows nothing: every caller inspects the value it produced.
 __devloop_cluster_name() {
   jq -r '.cluster_name // empty' "$ENV_TEST_PORTS_JSON" 2>/dev/null || true
@@ -260,50 +264,11 @@ __kind_context() {  # $1 = cluster name
   printf 'kind-%s' "$1"
 }
 
-# Apply the Kind observability overlay and wait (bounded) for Prometheus to roll onto it.
-# Exits via precondition_fail on any failure — a config that did not apply is an ENVIRONMENT
-# fault the suite must not run against (its settle precondition would fail every metrics
-# test, attributed to the diff).
-__apply_observability_overlay() {
-  local cluster_name context budget="${DEVLOOP_HEALTH_BUDGET:-300}"
-  cluster_name="$(__devloop_cluster_name)"
-  # An unresolvable context is NOT reported here: Phase 1h resolves the SAME context from the
-  # SAME ports.json field and fails with `org-provision-context-unresolved`, which it always
-  # reaches in this state — so the run still fails loudly, and one fault keeps one token.
-  if [[ -z "$cluster_name" ]]; then
-    printf 'WARN OBSERVABILITY_APPLY_DEFERRED: no .cluster_name in %s — Phase 1h will fail on the same missing context\n' "$ENV_TEST_PORTS_JSON" >&2
-    return 0
-  fi
-  context="$(__kind_context "$cluster_name")"
-  echo "Layer7: observability config changed — applying infra/kubernetes/overlays/kind/observability/ to ${context}" >&2
-  "$KUBECTL_BIN" --context "$context" apply -k "${__repo_root}/infra/kubernetes/overlays/kind/observability/" >&2 \
-    || precondition_fail observability-apply-failed \
-      "kubectl apply -k infra/kubernetes/overlays/kind/observability/ failed against ${context}" \
-      "run the same apply by hand and read its error; a rejected manifest is a diff defect, an unreachable apiserver is the environment"
-  "$KUBECTL_BIN" --context "$context" -n dark-tower-observability rollout status deployment/prometheus \
-    --timeout="${budget}s" >&2 \
-    || precondition_fail observability-apply-failed \
-      "the Prometheus Deployment did not finish rolling onto the new config within ${budget}s" \
-      "kubectl -n dark-tower-observability get pods -l app=prometheus; kubectl -n dark-tower-observability logs deploy/prometheus (a config Prometheus rejects crash-loops the new pod)"
-  # Dashboard ConfigMaps are content-addressed and mounted through one projected
-  # volume (ADR-0038 §2), so a changed dashboard renames its ConfigMap and the apply
-  # above rolls Grafana by itself — no restart. WAIT for that rollout; a timeout fails
-  # loudly (a group missing at runtime fails pod start, since the sources are not optional).
-  "$KUBECTL_BIN" --context "$context" -n dark-tower-observability rollout status deployment/grafana \
-    --timeout="${budget}s" >&2 \
-    || precondition_fail observability-apply-failed \
-      "the Grafana Deployment did not finish rolling onto the new dashboard ConfigMaps within ${budget}s" \
-      "kubectl -n dark-tower-observability get pods -l app=grafana; kubectl -n dark-tower-observability describe pod -l app=grafana (a projected-volume source that does not exist blocks pod start)"
-}
-
-# Wait (bounded) for the cluster to become healthy. Since ADR-0038 devloop 2,
-# `dev-cluster rebuild-all` runs `setup.sh --rebuild-all`, which itself waits for every
-# root workload's rollout; this poll is the belt-and-braces check on the HELPER's view
-# (`dev-cluster status`), which can still lag a just-completed rollout (terminating old
-# pods), and it is what a helper built before that change needs — its rebuild-all
-# restarted pods and returned BEFORE they settled (observed on the first live run —
-# STEP=rebuild then an instant cluster-unhealthy). Poll every 10s up to a budget; only a
-# genuinely stuck cluster trips PRECONDITION_FAILURE.
+# Wait (bounded) for the cluster to become healthy. `dev-cluster deploy` itself waits for
+# every root workload's rollout; this poll is the belt-and-braces check on the HELPER's
+# view (`dev-cluster status`), which can still lag a just-completed rollout (terminating
+# old pods). Poll every 10s up to a budget; only a genuinely stuck cluster trips
+# PRECONDITION_FAILURE.
 # Args: $1=budget-seconds (default 300)  Returns: 0 when ready, 1 on timeout.
 # Uses REAL wall-clock (layer_now) rather than counting sleeps, so the budget is
 # honoured against actual elapsed time — each __cluster_ready poll itself costs
@@ -528,7 +493,7 @@ __start_mh_grpc_forward() {
 # One invocation of a dev-cluster WRITE verb, optionally `timeout`-wrapped.
 # DEVLOOP_DC_WRITE_TIMEOUT (a caller `local`) wraps the call in coreutils
 # `timeout` so a wedged helper can't hang the caller; unset ⇒ unbounded (the
-# helper enforces its own setup timeout). Merges stderr so the client's health/
+# helper enforces its own write timeout). Merges stderr so the client's health/
 # summary/self-heal lines (all on stderr) are captured.
 # Args: <verb...>  Outputs: combined stdout+stderr on stdout  Returns: verb rc.
 __dc_write_once() {
@@ -541,13 +506,13 @@ __dc_write_once() {
 
 # The ONE home for busy-tolerant dev-cluster WRITE dispatch (@operations condition
 # 4, @dry-reviewer one-home). The helper serializes writes behind a mutex; if
-# another write holds it (typically devloop.sh's eager-setup still running when
+# another write holds it (typically devloop.sh's eager provision+deploy still running when
 # Layer 7 starts) the verb returns non-zero with a `(busy)` error. That is a
 # transient race, NOT a failure — short-circuiting it to PRECONDITION_FAILURE
 # would spuriously red the operator lane. So on a busy result, wait the in-flight
-# write out (poll-setup-idle) and retry ONCE; a non-busy non-zero is genuine.
+# write out (__poll_write_idle) and retry ONCE; a non-busy non-zero is genuine.
 #
-# CAPTURES AND PRINTS on BOTH attempts (load-bearing): printing relays setup.sh's
+# CAPTURES AND PRINTS on BOTH attempts (load-bearing): printing relays deploy.sh's
 # `REASON=insufficient-disk` banner into layer-7.stderr.log (operators grep it —
 # docs/runbooks/devloop-validation.md §6.7); the capture is REPOPULATED on the
 # retry so a verb that succeeds on the busy-retry is classified from the RETRY's
@@ -562,7 +527,7 @@ __dev_cluster_write() {
   out="$(__dc_write_once "$@")"; rc=$?
   printf '%s\n' "$out" >&2
   if (( rc != 0 )) && grep -qiE '\(busy\)|in.?flight write|another write' <<<"$out"; then
-    if ! __poll_setup_idle; then
+    if ! __poll_write_idle; then
       DC_WRITE_RC=1; DC_WRITE_OUT="$out"; return 1
     fi
     out="$(__dc_write_once "$@")"; rc=$?   # REPOPULATE — classify from the retry
@@ -573,11 +538,73 @@ __dev_cluster_write() {
   return "$rc"
 }
 
-# `dev-cluster setup`, busy-tolerant — a thin caller of the one home above.
-# Args: (none)  Returns: setup's exit code (0 on success).
-__dev_cluster_setup() {
-  __dev_cluster_write setup
-  return "$DC_WRITE_RC"
+# The remedy when the HOST helper predates this tree's verbs (ADR-0030 corollary: the helper
+# is built from the host checkout, the client and this script from the devloop's tree). The
+# old helper answers `invalid command: <verb> (invalid_command)`; that is a version skew, not
+# a cluster fault, and it is never papered over with a fallback to an older verb.
+__fail_if_helper_lacks_verb() {  # $1 = verb
+  if grep -qF '(invalid_command)' <<<"$DC_WRITE_OUT"; then
+    precondition_fail helper-verb-unsupported \
+      "the host devloop helper rejected 'dev-cluster $1' as an unknown command — it was built from a tree older than this one (ADR-0030: the helper cannot validate its own changes)" \
+      "rebuild and restart the helper on the HOST from this tree (re-run infra/devloop/devloop.sh), then re-run Layer 7. Do NOT fall back to an older verb"
+  fi
+}
+
+# The `<VERB>_FAILED REASON=… …` line provision.sh / deploy.sh prints on failure
+# (relayed in the helper's output), or empty when there is none.
+# Args: $1 = provision|deploy
+__cluster_failed_line() {
+  local prefix
+  prefix="$(tr '[:lower:]' '[:upper:]' <<<"$1")_FAILED"
+  grep -m1 -oE "${prefix} REASON=[a-z-]+( STEP=[a-z_]+)?( WORKLOADS=[^[:space:]]*)?" <<<"$DC_WRITE_OUT" || true
+}
+
+# The cluster-failure REASONs that are the ENVIRONMENT (operator lane,
+# PRECONDITION_FAILURE cluster-<verb>-failed) — ONE list for provision and deploy.
+# provision.sh / deploy.sh classify each failure at the source (the shared bounded
+# probes live in infra/kind/scripts/lib/common.sh:classify_env_failure); EVERY other
+# reason — rollout-failed, collector-rollout-failed, step-failed at any step, or a
+# reason this list has never heard of — is the TREE (implementer lane, FAIL
+# <verb>-failed): under ADR-0038 both verbs apply the tree on every gate, so a
+# code-caused failure is the common case, and routing it to the operator would
+# hide it from the implementer. Fail-closed by construction: an unlisted reason
+# is FAIL. scripts/layer7.test.sh extracts every reason both scripts can emit and
+# pins that each lands where this list says.
+readonly CLUSTER_ENV_REASONS=(runtime-unreachable runtime-incapable apiserver-unreachable insufficient-disk prerequisite-missing blueprint-missing blueprint-changed blueprint-unreadable image-ref-read-failed operator-declined port-held)
+
+# Emit the IMPLEMENTER lane for a failure Phase 1 attributes to the tree: a stderr
+# banner plus STATUS=FAIL through the lifecycle (exit 1). Mirrors precondition_fail.
+# Args: $1=reason-token  $2=cause  $3=fix
+implementer_fail() {
+  printf 'FAIL: %s\n  Fix: %s\n' "$2" "$3" >&2
+  emit_status FAIL "$1" | tee_collect_statuses
+  exit 0
+}
+
+# THE routing of a failed `provision` or `deploy`, by the REASON of its
+# `<VERB>_FAILED` line (see CLUSTER_ENV_REASONS). No line at all means the script
+# never reached its EXIT trap (the helper or transport failed, or it was killed) —
+# the environment. Does not return.
+# Args: $1 = provision|deploy
+__cluster_failure_lane() {
+  local verb="$1" line reason env
+  line="$(__cluster_failed_line "$verb")"
+  if [[ -z "$line" ]]; then
+    precondition_fail "cluster-${verb}-failed" \
+      "dev-cluster ${verb} failed and produced no ${verb^^}_FAILED line: the helper or its transport failed, or ${verb}.sh was killed before its EXIT trap (${verb}.sh prints one on every failure it survives)" \
+      "inspect /tmp/devloop/helper.log and the relayed output above; re-run Layer 7 once the helper is healthy"
+  fi
+  reason="$(sed -E 's/^[A-Z]+_FAILED REASON=([a-z-]+).*/\1/' <<<"$line")"
+  for env in "${CLUSTER_ENV_REASONS[@]}"; do
+    if [[ "$reason" == "$env" ]]; then
+      precondition_fail "cluster-${verb}-failed" \
+        "dev-cluster ${verb} failed on the ENVIRONMENT — ${line}" \
+        "read the relayed ${verb} output above and docs/runbooks/devloop-validation.md §6.7 (${reason})"
+    fi
+  done
+  implementer_fail "${verb}-failed" \
+    "dev-cluster ${verb} failed on the TREE — ${line}" \
+    "the relayed ${verb} output above carries the detail; docs/runbooks/devloop-validation.md §6.7. An unfamiliar REASON (not in CLUSTER_ENV_REASONS) is routed here fail-closed — if it is genuinely environmental, add it to that list"
 }
 
 # -----------------------------------------------------------------------------
@@ -597,9 +624,9 @@ __dev_cluster_setup() {
 # -----------------------------------------------------------------------------
 
 # Single-source default for the self-heal write-verb (recreate/restore) `timeout`
-# wrapper (@dry-reviewer C4): generous (> the setup envelope) so a wedged helper
+# wrapper (@dry-reviewer C4): generous (> the provision+deploy envelope) so a wedged helper
 # can't hang recovery, but bounded. The `local DEVLOOP_DC_WRITE_TIMEOUT` pattern
-# must repeat per-verb (a global would apply the timeout to Phase-1a setup too),
+# must repeat per-verb (a global would apply the timeout to Phase-1 provision/deploy too),
 # but the DEFAULT value must not.
 readonly SELF_HEAL_WRITE_TIMEOUT_DEFAULT=900
 
@@ -608,7 +635,7 @@ readonly SELF_HEAL_WRITE_TIMEOUT_DEFAULT=900
 __self_heal_escalate_failed() {
   precondition_fail cluster-self-heal-failed \
     "the automated self-heal (recreate/restore) already ran and the cluster still did not become healthy on re-verify" \
-    "the automated recreate/restore already ran and failed — do NOT run teardown+setup (the self-heal just tried exactly that). Inspect \${DEVLOOP_TMP:-/tmp/devloop}/self-heal-evidence-* + /tmp/devloop/helper.log, check host disk/resources for a fresh KIND cluster, then escalate to the host/operator"
+    "the automated recreate/restore already ran and failed — do NOT run teardown + provision + deploy (the self-heal just tried exactly that). Inspect \${DEVLOOP_TMP:-/tmp/devloop}/self-heal-evidence-* + /tmp/devloop/helper.log, check host disk/resources for a fresh KIND cluster, then escalate to the host/operator"
 }
 
 # Validate the helper-reported EVIDENCE_LEAF and compose the container-side
@@ -675,8 +702,8 @@ __self_heal_parse_helper_line() {
 # precondition_fail.
 __self_heal_recreate() {
   local budget="$1"
-  # Bound the recreate (teardown+setup) so a wedged helper can't hang recovery;
-  # generous (> the setup envelope). `local` is visible to __dc_write_once.
+  # Bound the recreate (teardown + provision + deploy) so a wedged helper can't hang
+  # recovery; generous (> that envelope). `local` is visible to __dc_write_once.
   local DEVLOOP_DC_WRITE_TIMEOUT="${DEVLOOP_SELF_HEAL_WRITE_TIMEOUT:-$SELF_HEAL_WRITE_TIMEOUT_DEFAULT}"
   __dev_cluster_write recreate || true   # rc/output consumed via DC_WRITE_* below
   local SH_OUTCOME SH_ATTEMPT SH_LEAF evidence
@@ -797,9 +824,9 @@ __self_heal_cluster() {
   # dead apiserver from reading as reachable.
   local exists=false reachable=absent
   grep -qE 'Cluster exists:[[:space:]]+true[[:space:]]*$' <<<"$out" && exists=true
-  local pods_healthy=false setup_in_progress=false
+  local pods_healthy=false write_in_progress=false
   grep -qE 'Pods healthy:[[:space:]]+true[[:space:]]*$' <<<"$out" && pods_healthy=true
-  grep -qE 'Setup in progress:[[:space:]]+true[[:space:]]*$' <<<"$out" && setup_in_progress=true
+  grep -qE 'Cluster write in progress:[[:space:]]+true[[:space:]]*$' <<<"$out" && write_in_progress=true
   if   grep -qE 'Apiserver reachable:[[:space:]]+unreachable[[:space:]]*$' <<<"$out"; then reachable=unreachable
   elif grep -qE 'Apiserver reachable:[[:space:]]+reachable[[:space:]]*$'   <<<"$out"; then reachable=reachable
   elif grep -qE 'Apiserver reachable:[[:space:]]+unknown[[:space:]]*$'     <<<"$out"; then reachable=unknown
@@ -810,7 +837,7 @@ __self_heal_cluster() {
   if [[ "$reachable" == "unreachable" || "$exists" == "false" ]]; then
     printf 'SELF_HEAL CASE=apiserver-unreachable ACTION=recreate\n' >&2
     __self_heal_recreate "$budget"
-  elif [[ "$reachable" == "reachable" && "$pods_healthy" == "true" && "$setup_in_progress" == "false" ]]; then
+  elif [[ "$reachable" == "reachable" && "$pods_healthy" == "true" && "$write_in_progress" == "false" ]]; then
     # WHAT THIS ARM ACTUALLY DETECTS (@observability F4): NOT a stale container
     # kubeconfig — the CASE name names a presumed cause the detection path cannot
     # observe. Every input above is HOST-side (helper `cluster_already_exists`,
@@ -827,12 +854,12 @@ __self_heal_cluster() {
   elif [[ "$reachable" == "reachable" && "$pods_healthy" == "false" ]]; then
     printf 'SELF_HEAL CASE=rollout-wedged ACTION=none\n' >&2
     precondition_fail cluster-unhealthy \
-      "cluster did not become healthy within ${budget}s after rebuild-all — the apiserver is LISTENING but pods are not ready (a wedged rollout on a live control plane, NOT a dead cluster; deliberately NOT self-healed — recreating a cluster whose apiserver answers would mask a code defect)" \
-      "'dev-cluster status' for the not-ready pods; check pod logs (rollout may be wedged, e.g. ImagePullBackOff/CrashLoopBackOff). Do NOT teardown+setup."
+      "cluster did not become healthy within ${budget}s after deploy — the apiserver is LISTENING but pods are not ready (a wedged rollout on a live control plane, NOT a dead cluster; deliberately NOT self-healed — recreating a cluster whose apiserver answers would mask a code defect)" \
+      "'dev-cluster status' for the not-ready pods; check pod logs (rollout may be wedged, e.g. ImagePullBackOff/CrashLoopBackOff). Do NOT teardown + provision."
   else
     printf 'SELF_HEAL CASE=probe-inconclusive ACTION=none\n' >&2
     precondition_fail cluster-self-heal-probe-inconclusive \
-      "the self-heal probe could not classify the cluster (apiserver reachable=${reachable}, exists=${exists}, pods_healthy=${pods_healthy}, setup_in_progress=${setup_in_progress}) — failing closed, refusing to destroy on an uncertain state" \
+      "the self-heal probe could not classify the cluster (apiserver reachable=${reachable}, exists=${exists}, pods_healthy=${pods_healthy}, write_in_progress=${write_in_progress}) — failing closed, refusing to destroy on an uncertain state" \
       "determine cluster state by hand ('dev-cluster status' + /tmp/devloop/helper.log). If the control-plane container is up but nothing is listening at the apiserver, inspect its logs before any manual recreate — do not force a destroy"
   fi
 }
@@ -942,6 +969,10 @@ __env_test_export_urls() {
 
 __layer7_main() {
   layer_lifecycle_begin 7
+  # The suite logs and forward logs below live in DEVLOOP_TMP (700-perm). Layer 7 ran
+  # _get_base_ref.sh for its (retired) diff arms, which created it as a side effect; with no
+  # diff inspection left, create it explicitly (layer-all.sh does too; a standalone run must).
+  init_devloop_tmp
 
   # --- Environment / cluster gate (FAIL-CLOSED) -------------------------------
   # The clean-skip lane (SKIPPED-NO-CLUSTER, exit 0) is reachable ONLY when a cluster is
@@ -982,93 +1013,47 @@ __layer7_main() {
       "start the devloop cluster (run devloop.sh on the host); to run only layers 1-6 invoke the individual scripts/layerN.sh"
   fi
 
-  # Populate the changed-files cache + emit the BASE_REF= anchor (used by Phase 1b's
-  # diff_touches_path). Discard the stdout sha — we only need the side effects.
-  "${__layer7_dir}/lang/_get_base_ref.sh" >/dev/null
-
   # ======================= PHASE 1 — pre-suite (operator lane) ===============
   # Every failure below is PRECONDITION_FAILURE (exit 2). This is the ONLY infra lane.
+  #
+  # ADR-0038: Layer 7 is `provision && deploy && tests`. It inspects NO diff — every run
+  # compares the tree with what the cluster RECORDS (provision's blueprint) and converges
+  # the application to the tree (deploy), so cherry-picks, absorbs, reverts and resets
+  # cannot leave the cluster stale. There is no health-then-reuse order: a half-built
+  # cluster carries no blueprint record, so provision rebuilds it.
 
-  # (a) Cluster readiness / setup.
+  # (a) Provision: the platform, rebuilt only when its blueprint changed (the helper runs
+  #     infra/kind/scripts/provision.sh; its `BLUEPRINT ACTION=… REASON=…` decision line is
+  #     relayed into this stream).
   local t_step
   t_step=$(layer_now)
-  if ! __cluster_ready; then
-    if __cluster_setup_in_progress; then
-      __poll_setup_idle || precondition_fail cluster-setup-failed \
-        "cluster setup was in progress but did not complete within the poll budget" \
-        "check 'dev-cluster status' and /tmp/devloop/helper.log; re-run devloop.sh on the host if the helper is wedged"
-    fi
-    if ! __cluster_ready; then
-      __dev_cluster_setup || precondition_fail cluster-setup-failed \
-        "dev-cluster setup failed — cluster could not be brought to a ready state" \
-        "inspect /tmp/devloop/helper.log + 'dev-cluster status'; this is an environment problem, not a code regression"
-    fi
+  if ! __dev_cluster_write provision; then
+    __fail_if_helper_lacks_verb provision
+    __cluster_failure_lane provision
   fi
-  emit_step_duration cluster-ready "$t_step"
+  emit_step_duration provision "$t_step"
 
-  # (b) Infra-change detection: a touched infra/kind/ skeleton is stale ⇒ rebuild it.
-  #
-  # NON-COLLAPSE (Finding 5, reciprocal with cmd_recreate): this branch does an
-  # UNCONDITIONAL teardown+setup and MUST destroy a HEALTHY cluster — the blueprint
-  # (infra/kind/) changed, so the running cluster is stale by definition. That is
-  # the INVERSE precondition of the self-heal's `dev-cluster recreate`
-  # (crates/devloop-helper/src/commands.rs::cmd_recreate), which MUST REFUSE to
-  # destroy a healthy cluster (it re-confirms the control plane is dead first).
-  # Two semantically-opposite operations — do NOT let a DRY pass merge them.
+  # (b) Deploy: converge the application to the tree — content-tagged images, the migration
+  #     Job, the ONE environment root (observability included), a wait for every rollout.
+  #     Content addressing rolls exactly what changed; nothing restarts unconditionally.
   t_step=$(layer_now)
-  if diff_touches_path "infra/kind/"; then
-    echo "Layer7: infra/kind/ changed — tearing down + re-creating the cluster skeleton. Triggering files:" >&2
-    __changed_files | grep '^infra/kind/' >&2 || true
-    "$DEV_CLUSTER" teardown || precondition_fail cluster-rebuild-failed \
-      "dev-cluster teardown failed during infra/kind rebuild" \
-      "inspect /tmp/devloop/helper.log; the cluster may be in a partially-torn-down state"
-    __dev_cluster_setup || precondition_fail cluster-rebuild-failed \
-      "dev-cluster setup failed after an infra/kind teardown" \
-      "inspect /tmp/devloop/helper.log + 'dev-cluster status'"
+  if ! __dev_cluster_write deploy; then
+    __fail_if_helper_lacks_verb deploy
+    __cluster_failure_lane deploy
   fi
-  emit_step_duration infra-change "$t_step"
-
-  # (c0) INTERIM arm (story 2 task 10; ADR-0038 step 3 retires it with the other diff-based
-  #      arms): re-apply when the diff touches a service's manifests. It was needed while
-  #      `rebuild-all` applied NO manifests; since ADR-0038 devloop 2 rebuild-all runs
-  #      `setup.sh --rebuild-all`, which applies the whole environment root itself, so on a
-  #      current helper this arm is redundant (a no-op converge). It stays for a helper built
-  #      before that change (ADR-0030 corollary). `dev-cluster deploy <svc>` runs
-  #      setup.sh --skip-build --only <svc>: it converges on the images already deployed, and
-  #      content-addressed ConfigMaps roll exactly the workloads whose config changed.
-  t_step=$(layer_now)
-  local svc
-  for svc in ac gc mc mh; do
-    if diff_touches_path "infra/services/${svc}-service/" \
-      || diff_touches_path "infra/kubernetes/overlays/kind/services/${svc}-service/"; then
-      echo "Layer7: ${svc}-service manifests changed — applying them (dev-cluster deploy ${svc})" >&2
-      "$DEV_CLUSTER" deploy "$svc" || precondition_fail cluster-rebuild-failed \
-        "dev-cluster deploy ${svc} failed — the changed ${svc}-service manifests could not be applied" \
-        "inspect /tmp/devloop/helper.log; a manifest the apiserver rejects is a diff defect, a helper/cluster failure is the environment"
-    fi
-  done
-  emit_step_duration manifest-apply "$t_step"
-
-  # (c) Rebuild service images so the suite runs against the current diff.
-  t_step=$(layer_now)
-  "$DEV_CLUSTER" rebuild-all || precondition_fail cluster-rebuild-failed \
-    "dev-cluster rebuild-all failed — service images could not be rebuilt/redeployed" \
-    "inspect /tmp/devloop/helper.log; check image build output and pod status"
-  emit_step_duration rebuild "$t_step"
-
+  emit_step_duration deploy "$t_step"
 
   # (d) Wire the env-test service URLs from the helper's port map.
   t_step=$(layer_now)
   __env_test_export_urls || precondition_fail ports-json-missing \
     "/tmp/devloop/ports.json is missing or unreadable — cannot resolve service URLs" \
-    "ensure 'dev-cluster setup' completed; the helper writes ports.json on success"
+    "ensure 'dev-cluster provision' completed; the helper writes ports.json on success"
   emit_step_duration ports-json "$t_step"
 
-  # (e) Wait (bounded) for the cluster to become healthy AFTER rebuild, BEFORE the suite.
+  # (e) Wait (bounded) for the cluster to become healthy AFTER deploy, BEFORE the suite.
   #     This is what makes Phase 2's "any non-zero == the diff's fault" sound — a green
   #     pre-check means a subsequent failure cannot be blamed on cluster bring-up. We POLL
-  #     (not one-shot): see __wait_cluster_ready — the helper's status can lag a converge,
-  #     and a pre-ADR-0038-devloop-2 helper's rebuild-all returned before its pods settled.
+  #     (not one-shot): see __wait_cluster_ready — the helper's status can lag a converge.
   t_step=$(layer_now)
   # SOLE cluster-unhealthy site: on timeout, hand off to the self-heal
   # (Guard-C: scripts/layer7.sh::__self_heal_cluster). It probes the REAL cause
@@ -1078,34 +1063,6 @@ __layer7_main() {
   # __self_heal_cluster returns 0 only if it recovered the cluster.
   __wait_cluster_ready "${DEVLOOP_HEALTH_BUDGET:-300}" || __self_heal_cluster
   emit_step_duration health-confirm "$t_step"
-
-  # (e2) INTERIM arm (story 2 task 10; ADR-0038 step 3 retires it): re-apply the Kind
-  #      OBSERVABILITY overlay when the diff touches it. A current helper's rebuild-all
-  #      already applies the whole root, observability included (this is then a no-op apply);
-  #      a helper built before ADR-0038 devloop 2 (ADR-0030 corollary) redeployed the SERVICES
-  #      only, and teardown+setup fires only for an infra/kind/ diff — so there an edit to the
-  #      Prometheus config (e.g. a scrape cadence) would otherwise never reach the cluster,
-  #      and the env-tests' fail-loud settle precondition
-  #      (crates/env-tests/src/fixtures/metrics.rs::service_job_scrape_settle) would red every
-  #      Prometheus-gated test against a stale config. The generated ConfigMap's content hash
-  #      rolls the Prometheus Deployment; the bounded rollout wait below makes "the config on
-  #      disk is the config Prometheus runs" hold BEFORE the suite. Placed after ports.json is
-  #      wired (d) and the cluster is healthy (e), and before the observability-ready gate (f),
-  #      which then probes the NEW pod.
-  t_step=$(layer_now)
-  #      Trigger = EVERY resource base of the overlay (infra/kubernetes/observability/
-  #      kustomization.yaml pulls in ../../grafana/ and ../../docker/prometheus/, the latter
-  #      generating the prometheus-rules ConfigMap). `diff_touches_path` is a prefix match, so
-  #      the compose-only infra/docker/prometheus/prometheus.yml also triggers — a spurious,
-  #      bounded, idempotent re-apply. That is the correct direction to err: under-triggering
-  #      leaves a stale cluster and a red gate blamed on the diff. Do not "tighten" it.
-  if diff_touches_path "infra/kubernetes/observability/" \
-    || diff_touches_path "infra/kubernetes/overlays/kind/observability/" \
-    || diff_touches_path "infra/docker/prometheus/" \
-    || diff_touches_path "infra/grafana/"; then
-    __apply_observability_overlay
-  fi
-  emit_step_duration observability-apply "$t_step"
 
   # (f) Observability-stack HTTP readiness (Phase-1e completion; task #56 user ruling (a)).
   #     Pods-healthy (1e) confirms the containers are UP; THIS confirms the observability HTTP
@@ -1165,7 +1122,7 @@ __layer7_main() {
   if [[ -z "$cluster_name" ]] || ! command -v kubectl >/dev/null 2>&1; then
     precondition_fail org-provision-context-unresolved \
       "cannot resolve a kubectl context for the devloop cluster (ports.json '.cluster_name'='${cluster_name:-<empty>}', kubectl $(command -v kubectl >/dev/null 2>&1 && echo present || echo MISSING)) — refusing to provision the per-run organization against an unknown database" \
-      "this is a cluster-addressing problem, NOT a database problem: ensure 'dev-cluster setup' completed and wrote /tmp/devloop/ports.json, and that the container kubeconfig is mounted (re-run devloop.sh on the host)"
+      "this is a cluster-addressing problem, NOT a database problem: ensure 'dev-cluster provision' completed and wrote /tmp/devloop/ports.json, and that the container kubeconfig is mounted (re-run devloop.sh on the host)"
   fi
   # Folded into org-provision-failed with an explicit cause rather than a sixth token: the
   # runbook is scoped at five and this cause is too rare to earn a dedicated row (@operations).
@@ -1197,7 +1154,7 @@ __layer7_main() {
   provision_rc=$?
   set -e
   # Relay to STDERR: setup.sh's log_* write to STDOUT, and THIS script's stdout is the STATUS=
-  # channel tee_collect_statuses/parse_status_line consume. Mirrors __dev_cluster_setup:311-312.
+  # channel tee_collect_statuses/parse_status_line consume. Mirrors __dev_cluster_write.
   printf '%s\n' "$provision_out" >&2
   # 124 branched FIRST — a timeout is a distinct operator action from a rejected INSERT.
   if (( provision_rc == 124 )); then
@@ -1236,8 +1193,8 @@ __layer7_main() {
   # would produce exit 127 on every probe and surface as a phantom ac-unreachable against a
   # perfectly healthy AC.
   # ABSENT AC URL IS A FAILURE, NOT A SKIP (@operations). This deliberately INVERTS the `-n`
-  # shape used for Prometheus/Loki at 1f: those are genuinely optional (documented auto-skip
-  # semantics, `--skip-observability` is a supported mode), so guarding them on presence is
+  # shape used for Prometheus/Loki at 1f: those are genuinely optional (the crate's documented
+  # auto-skip semantics when their URL is absent), so guarding them on presence is
   # correct. AC is NOT optional — both suites acquire their tokens through it — so the same
   # shape here would mean the opposite thing. Reachable, not theoretical: Phase 1d's
   # __env_test_export_urls returns 0 when ports.json EXISTS but lacks `.container_urls.ac`
@@ -1250,7 +1207,7 @@ __layer7_main() {
   if [[ -z "${ENV_TEST_AC_URL:-}" ]]; then
     precondition_fail ac-unreachable \
       "ports.json has no '.container_urls.ac', so AC has no address and the per-run organization '${run_org}' cannot be verified — refusing to run the suites against an unverified org" \
-      "re-run 'dev-cluster setup' so the helper rewrites /tmp/devloop/ports.json with a complete container_urls block; inspect it with: jq .container_urls /tmp/devloop/ports.json"
+      "re-run 'dev-cluster provision' so the helper rewrites /tmp/devloop/ports.json with a complete container_urls block; inspect it with: jq .container_urls /tmp/devloop/ports.json"
   fi
   # Verification runs UNCONDITIONALLY from here — there is no path to Phase 2 that skips it.
   __wait_http_ready "${ENV_TEST_AC_URL}/health" "$obs_budget" \
@@ -1432,7 +1389,7 @@ __layer7_main() {
     if [[ -z "$mh_port" ]]; then
       precondition_fail mh-grpc-port-unallocated \
         "ports.json has no '.ports.mh_${mh_n}_grpc' — no local port is allocated for the mh-${mh_n} gRPC forward the MH teardown env-test needs" \
-        "re-run 'dev-cluster setup' so the helper rewrites /tmp/devloop/ports.json with a complete ports block; inspect it with: jq .ports /tmp/devloop/ports.json"
+        "re-run 'dev-cluster provision' so the helper rewrites /tmp/devloop/ports.json with a complete ports block; inspect it with: jq .ports /tmp/devloop/ports.json"
     fi
     __start_mh_grpc_forward "$mh_n" "$(__kind_context "$cluster_name")" "$mh_port"
   done

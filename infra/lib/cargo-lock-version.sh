@@ -1,7 +1,7 @@
 # cargo-lock-version.sh — sourced library; the ONE reader of a crate's resolved
 # version from Cargo.lock.
 #
-# Consumers: infra/kind/scripts/setup.sh (the db-migrate image's sqlx-cli) and
+# Consumers: infra/kind/scripts/deploy.sh (the db-migrate image's sqlx-cli) and
 # infra/devloop/devloop.sh (the devloop image's sqlx-cli). Both pin sqlx-cli to
 # the workspace's `sqlx`, so the CLI that writes `_sqlx_migrations` and the
 # library that reads it (and `#[sqlx::test]`) agree on its shape and checksums.

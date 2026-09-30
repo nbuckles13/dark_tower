@@ -1673,7 +1673,7 @@ For the shared `gc_cors_preflight_total` allowlist query and the fail-closed sem
 # runs with allow_credentials(false); a "*" entry does NOT allow-all — it panics
 # AllowOrigin::list and crashes gc-service at startup).
 # Edit infra/services/gc-service/config.env (or the env overlay), then apply the
-# environment root (Kind: ./infra/kind/scripts/setup.sh --skip-build --only gc).
+# environment root (Kind: ./infra/kind/scripts/deploy.sh, or `dev-cluster deploy`).
 # The content-addressed ConfigMap rolls GC on apply; no restart step:
 kubectl rollout status deployment/gc-service -n dark-tower
 

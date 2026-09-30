@@ -12,9 +12,6 @@ pub enum HelperError {
     #[error("invalid command: {0}")]
     InvalidCommand(String),
 
-    #[error("invalid service: {0}")]
-    InvalidService(String),
-
     #[error("port allocation failed: {0}")]
     PortAllocation(String),
 
@@ -79,7 +76,6 @@ impl HelperError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::InvalidCommand(_) => "invalid_command",
-            Self::InvalidService(_) => "invalid_service",
             Self::PortAllocation(_) => "port_allocation",
             Self::CommandFailed { .. } => "command_failed",
             Self::Io(_) => "io_error",
@@ -204,8 +200,8 @@ mod tests {
     #[test]
     fn test_busy_kind() {
         let err = HelperError::Busy {
-            op: "setup".to_string(),
-            args: vec!["--skip-observability".to_string()],
+            op: "test-sleep".to_string(),
+            args: vec!["5".to_string()],
         };
         assert_eq!(err.kind(), "busy");
     }
@@ -213,12 +209,11 @@ mod tests {
     #[test]
     fn test_busy_display_contains_op_and_args() {
         let err = HelperError::Busy {
-            op: "setup".to_string(),
-            args: vec!["--skip-observability".to_string()],
+            op: "test-sleep".to_string(),
+            args: vec!["5".to_string()],
         };
         let s = err.to_string();
-        assert!(s.contains("setup"), "got: {s}");
-        assert!(s.contains("--skip-observability"), "got: {s}");
+        assert!(s.contains("test-sleep 5"), "got: {s}");
         assert!(s.contains("dev-cluster cancel"), "got: {s}");
     }
 

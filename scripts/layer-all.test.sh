@@ -91,7 +91,7 @@ run_la() {
 # (a) PRECONDITION_FAILURE at Layer 7 → LAYER_ALL_EXIT=2 + summary RESULT cell.
 #     The operator lane survives the orchestrator (the repaired collapse).
 # =============================================================================
-d="$(new_stubdir)"; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+d="$(new_stubdir)"; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 out="$(cat "$LA_OUT")"
 assert_exit   "a-precondition-exit2"   2 "$LA_RC"
@@ -161,7 +161,7 @@ assert_marker "f-all-ok-stubs-ran" "$LA_DT" 'ran.layer*'
 # =============================================================================
 d="$(new_stubdir)"
 mk_stub "$d" 4 FAIL layer4-test-fail 1
-mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=0
 out="$(cat "$LA_OUT")"; err="$(cat "$LA_ERR")"
 assert_exit   "g-worst-wins-exit2" 2 "$LA_RC"
@@ -260,7 +260,7 @@ assert_status "h-report-results-still-prints-failures" "rr-selftest-needle" "$__
 #     would inflate the verdict) — the honesty + no-leak constraints (@security S2).
 d="$(new_stubdir)"
 mk_stub "$d" 4 FAIL layer4-test-fail 1
-mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 out="$(cat "$LA_OUT")"; err="$(cat "$LA_ERR")"
 assert_exit      "i-failfast-exit1-not-2" 1 "$LA_RC"          # L4's rc, NOT L7's 2
@@ -315,7 +315,7 @@ done
 #     stub tree as (g)/(i) → exit 2, all ran.
 d="$(new_stubdir)"
 mk_stub "$d" 4 FAIL layer4-test-fail 1
-mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_HEADLESS=1 DEVLOOP_FAIL_FAST=1
 err="$(cat "$LA_ERR")"
 assert_exit   "k-refused-runs-all-exit2" 2 "$LA_RC"
@@ -327,7 +327,7 @@ assert_status "k-refused-warn"           "WARN FAIL_FAST_OVERRIDE_IGNORED REQUES
 #     story-runner path. Same tree as (g); proves unattended detection alone forces run-all.
 d="$(new_stubdir)"
 mk_stub "$d" 4 FAIL layer4-test-fail 1
-mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_HEADLESS=1
 err="$(cat "$LA_ERR")"
 assert_exit   "v-headless-runs-all-exit2" 2 "$LA_RC"
@@ -381,14 +381,14 @@ err="$(cat "$LA_ERR")"
 assert_absent "d8-3-skipped-no-triage" "FAILURE_TRIAGE" "$err"
 
 # (D8-4) RUN-ALL multi-red (FAIL@L4 + PRECONDITION@L7) → a directive for BOTH failing layers.
-d="$(new_stubdir)"; mk_stub "$d" 4 FAIL layer4-test-fail 1; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+d="$(new_stubdir)"; mk_stub "$d" 4 FAIL layer4-test-fail 1; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=0
 err="$(cat "$LA_ERR")"
 assert_status "d8-4-triage-l4" "FAILURE_TRIAGE LAYER=4 " "$err"
 assert_status "d8-4-triage-l7" "FAILURE_TRIAGE LAYER=7 " "$err"
 
 # (D8-5) FAIL-FAST (same tree, default mode) → stops at L4: directive for L4, ABSENT for NOT-RUN L7.
-d="$(new_stubdir)"; mk_stub "$d" 4 FAIL layer4-test-fail 1; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+d="$(new_stubdir)"; mk_stub "$d" 4 FAIL layer4-test-fail 1; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 err="$(cat "$LA_ERR")"
 assert_status "d8-5-ff-triage-l4"    "FAILURE_TRIAGE LAYER=4 " "$err"
@@ -406,7 +406,7 @@ assert_status "d8-6-lying-triage-l7" "FAILURE_TRIAGE LAYER=7 " "$err"
 #        ^STATUS=FAIL nor ^PRECONDITION_FAILURE:). The `|| true` must keep set -e from aborting on
 #        the grep no-match, so: (a) LAYER_ALL_EXIT stays the TRUE final_exit (2, not demoted to 1),
 #        and (b) the loop COMPLETES — BOTH L3 and L7 get a directive (a mid-loop abort would drop L7).
-d="$(new_stubdir)"; mk_stub "$d" 3 PRECONDITION_FAILURE guard-timeout 2; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-setup-failed 2
+d="$(new_stubdir)"; mk_stub "$d" 3 PRECONDITION_FAILURE guard-timeout 2; mk_stub "$d" 7 PRECONDITION_FAILURE cluster-provision-failed 2
 run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_FAIL_FAST=0
 err="$(cat "$LA_ERR")"
 assert_exit   "d8-7-exit2-survives-nomatch" 2 "$LA_RC"

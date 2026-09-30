@@ -5,21 +5,17 @@
 # Used by Claude Code inside the dev container to manage Kind clusters.
 #
 # Usage:
-#   dev-cluster setup [--skip-observability]
-#   dev-cluster rebuild <service>
-#   dev-cluster rebuild-all
-#   dev-cluster deploy <service>
-#   dev-cluster teardown
-#   dev-cluster recreate
-#   dev-cluster restore-kubeconfig
-#   dev-cluster status
-#   dev-cluster cancel
+#   dev-cluster <verb>          (no verb takes an argument)
 #
-# Services: ac, gc, mc, mh
-#
-# See: docs/decisions/adr-0030-host-side-cluster-helper.md
+# See: docs/decisions/adr-0030-host-side-cluster-helper.md,
+#      docs/decisions/adr-0038-dev-cluster-deploy-parity.md
 
 set -euo pipefail
+
+# The verbs this client sends — the SAME set as the helper's wire allowlist
+# (`VERBS` in crates/devloop-helper/src/protocol.rs). ONE line:
+# scripts/guards/simple/validate-dev-cluster-verbs.sh compares the two literals.
+VERBS="provision deploy teardown recreate restore-kubeconfig status cancel"
 
 # ─── Configuration ──────────────────────────────────────────────
 
@@ -29,89 +25,39 @@ PORTS_FILE="/tmp/devloop/ports.json"
 
 # ─── Argument parsing ───────────────────────────────────────────
 
-if [ $# -lt 1 ]; then
-    echo "Usage: dev-cluster <command> [args]" >&2
+usage() {
+    echo "Usage: dev-cluster <command>" >&2
     echo "" >&2
     echo "Commands:" >&2
-    echo "  setup [--skip-observability]    Create Kind cluster and deploy services" >&2
-    echo "  rebuild <service>               Rebuild one service image (content-tagged), run migrations, apply the root" >&2
-    echo "  rebuild-all                     Rebuild every image, run migrations, apply the root (rolls only what changed)" >&2
-    echo "  deploy <service>                Apply the root with the images already deployed (no rebuild)" >&2
-    echo "  teardown                        Delete Kind cluster and clean up" >&2
-    echo "  recreate                        Self-heal: destroy + recreate ONLY if the host re-confirms the control plane is down" >&2
-    echo "  restore-kubeconfig              Self-heal: regenerate the container kubeconfig from the live cluster (never destroys)" >&2
-    echo "  status                          Check cluster health and readiness" >&2
-    echo "  cancel                          Abort the in-flight write command (no-op if idle)" >&2
-    echo "" >&2
-    echo "Services: ac, gc, mc, mh" >&2
+    echo "  provision            Make sure a cluster matching the blueprint exists: a no-op when its" >&2
+    echo "                       recorded blueprint matches the tree, otherwise tear down + rebuild it" >&2
+    echo "  deploy               Build every image (content-tagged), run migrations, apply the environment" >&2
+    echo "                       root and wait; rolls only what changed" >&2
+    echo "  teardown             Delete Kind cluster and clean up" >&2
+    echo "  recreate             Self-heal: destroy + recreate ONLY if the host re-confirms the control plane is down" >&2
+    echo "  restore-kubeconfig   Self-heal: regenerate the container kubeconfig from the live cluster (never destroys)" >&2
+    echo "  status               Check cluster health and readiness" >&2
+    echo "  cancel               Abort the in-flight write command (no-op if idle)" >&2
+}
+
+if [ $# -lt 1 ]; then
+    usage
     exit 1
 fi
 
-CMD=""
-SVC=""
-SKIP_OBS="false"
-
-case "$1" in
-    setup)
-        CMD="setup"
-        shift
-        while [ $# -gt 0 ]; do
-            case "$1" in
-                --skip-observability) SKIP_OBS="true"; shift ;;
-                *) echo "ERROR: Unknown option for setup: $1" >&2; exit 1 ;;
-            esac
-        done
-        ;;
-    rebuild)
-        CMD="rebuild"
-        if [ $# -lt 2 ]; then
-            echo "ERROR: rebuild requires a service argument (ac, gc, mc, mh)" >&2
-            exit 1
-        fi
-        SVC="$2"
-        ;;
-    rebuild-all)
-        CMD="rebuild-all"
-        ;;
-    deploy)
-        CMD="deploy"
-        if [ $# -lt 2 ]; then
-            echo "ERROR: deploy requires a service argument (ac, gc, mc, mh)" >&2
-            exit 1
-        fi
-        SVC="$2"
-        ;;
-    teardown)
-        CMD="teardown"
-        ;;
-    recreate)
-        CMD="recreate"
-        ;;
-    restore-kubeconfig)
-        CMD="restore-kubeconfig"
-        ;;
-    status)
-        CMD="status"
-        ;;
-    cancel)
-        CMD="cancel"
-        ;;
+CMD="$1"
+shift
+case " ${VERBS} " in
+    *" ${CMD} "*) ;;
     *)
-        echo "ERROR: Unknown command '$1'" >&2
-        echo "Valid commands: setup, rebuild, rebuild-all, deploy, teardown, recreate, restore-kubeconfig, status, cancel" >&2
+        echo "ERROR: Unknown command '${CMD}'" >&2
+        echo "Valid commands: ${VERBS}" >&2
         exit 1
         ;;
 esac
-
-# Validate service name (defense-in-depth; helper also validates server-side)
-if [ -n "$SVC" ]; then
-    case "$SVC" in
-        ac|gc|mc|mh) ;; # valid
-        *)
-            echo "ERROR: Invalid service '$SVC'. Must be one of: ac gc mc mh" >&2
-            exit 1
-            ;;
-    esac
+if [ $# -gt 0 ]; then
+    echo "ERROR: '${CMD}' takes no arguments (got: $*)" >&2
+    exit 1
 fi
 
 # ─── Preflight checks ──────────────────────────────────────────
@@ -151,28 +97,17 @@ fi
 
 # ─── Build JSON request ────────────────────────────────────────
 
-# Use jq to build valid JSON (no shell interpolation into JSON strings)
-if [ -n "$SVC" ]; then
-    REQUEST=$(jq -cn \
-        --arg token "$TOKEN" \
-        --arg cmd "$CMD" \
-        --arg svc "$SVC" \
-        '{token: $token, command: $cmd, service: $svc}')
-elif [ "$SKIP_OBS" = "true" ]; then
-    REQUEST=$(jq -cn \
-        --arg token "$TOKEN" \
-        --arg cmd "$CMD" \
-        '{token: $token, command: $cmd, skip_observability: true}')
-else
-    REQUEST=$(jq -cn \
-        --arg token "$TOKEN" \
-        --arg cmd "$CMD" \
-        '{token: $token, command: $cmd}')
-fi
+# Use jq to build valid JSON (no shell interpolation into JSON strings).
+# The request is {token, command} and nothing else: the helper rejects any
+# other field (ADR-0038 step 3).
+REQUEST=$(jq -cn \
+    --arg token "$TOKEN" \
+    --arg cmd "$CMD" \
+    '{token: $token, command: $cmd}')
 
 # ─── Helper functions ─────────────────────────────────────────
 
-# Display cluster info from ports.json (used by both setup and status).
+# Display cluster info from ports.json (used by both provision and status).
 display_cluster_info() {
     local ports_file="$1"
     if [ ! -f "$ports_file" ]; then
@@ -195,14 +130,10 @@ display_cluster_info() {
     prometheus_url=$(jq -r '.container_urls.prometheus // empty' "$ports_file")
     loki_url=$(jq -r '.container_urls.loki // empty' "$ports_file")
     echo "" >&2
-    if [ -n "$grafana_url" ]; then
-        echo "Observability (from container):" >&2
-        echo "  Grafana:    $grafana_url" >&2
-        echo "  Prometheus: $prometheus_url" >&2
-        echo "  Loki:       $loki_url" >&2
-    else
-        echo "Observability: not deployed (--skip-observability)" >&2
-    fi
+    echo "Observability (from container):" >&2
+    echo "  Grafana:    $grafana_url" >&2
+    echo "  Prometheus: $prometheus_url" >&2
+    echo "  Loki:       $loki_url" >&2
 
     # K8s API
     k8s_port=$(jq -r '.ports.k8s_api // empty' "$ports_file")
@@ -246,7 +177,7 @@ ERROR_DATA=""
 CANCEL_TARGET=""
 
 # socat connects to the unix socket, sends the request, reads streaming NDJSON.
-# -t 600 = 10 minute idle timeout (setup can take ~7 min on first run).
+# -t 600 = 10 minute idle timeout (a provision rebuild can take ~7 min).
 # We use a temp file for the response stream to avoid subshell issues with
 # variable scoping in pipelines.
 RESPONSE_TMPDIR=$(mktemp -d /tmp/dev-cluster.XXXXXX)
@@ -345,7 +276,7 @@ while IFS= read -r line; do
             # helper's STRUCTURED outcome as ONE greppable line for layer7's
             # __self_heal_cluster. Rendered from `.data.self_heal` — the
             # authoritative typed field the helper set — NOT scraped subprocess
-            # stderr, so setup.sh output cannot forge it. One `SELF_HEAL ` prefix
+            # stderr, so script output cannot forge it. One `SELF_HEAL ` prefix
             # family (grep 'SELF_HEAL ' returns the whole story); EVIDENCE_LEAF=
             # is the leaf, distinct from the RESULT= line's composed EVIDENCE=.
             # COUPLED with scripts/layer7.sh::__self_heal_cluster (keys on
@@ -426,8 +357,8 @@ fi
 
 # ─── Post-command summary ──────────────────────────────────────
 
-# After successful setup, display cluster URLs from port map
-if [ "$CMD" = "setup" ] && [ "$EXIT_CODE" -eq 0 ] && [ -f "$PORTS_FILE" ]; then
+# After successful provision, display cluster URLs from port map
+if [ "$CMD" = "provision" ] && [ "$EXIT_CODE" -eq 0 ] && [ -f "$PORTS_FILE" ]; then
     echo "" >&2
     display_cluster_info "$PORTS_FILE"
 fi
@@ -477,20 +408,20 @@ if [ "$CMD" = "status" ] && [ "$EXIT_CODE" -eq 0 ]; then
 
         cluster_exists=$(echo "$RESULT_DATA" | jq -r '.cluster_exists')
         pods_healthy=$(echo "$RESULT_DATA" | jq -r '.pods_healthy')
-        setup_in_progress=$(echo "$RESULT_DATA" | jq -r '.setup_in_progress')
+        cluster_write_in_progress=$(echo "$RESULT_DATA" | jq -r '.cluster_write_in_progress')
         checked_at=$(echo "$RESULT_DATA" | jq -r '.checked_at')
 
         apiserver_reachable=$(echo "$RESULT_DATA" | jq -r '.apiserver_reachable // "unknown"')
 
         echo "=== Cluster Health (${checked_at}) ===" >&2
         # COUPLED: scripts/layer7.sh parses these EXACT lines (positive-match, fail-closed).
-        # `__cluster_ready`/`__cluster_setup_in_progress` grep the first three (task #56); the
+        # `__cluster_ready`/`__cluster_write_in_progress` grep the first three (task #56); the
         # self-heal `__self_heal_cluster` greps the fourth `Apiserver reachable:` line (tail-
         # anchored, three-valued reachable|unreachable|unknown). Changing any wording here
         # silently breaks Layer-7 readiness/self-heal detection — keep in sync.
         echo "  Cluster exists:     ${cluster_exists}" >&2
         echo "  Pods healthy:       ${pods_healthy}" >&2
-        echo "  Setup in progress:  ${setup_in_progress}" >&2
+        echo "  Cluster write in progress: ${cluster_write_in_progress}" >&2
         echo "  Apiserver reachable: ${apiserver_reachable}" >&2
 
         # Show unhealthy pods if any
@@ -512,7 +443,7 @@ if [ "$CMD" = "status" ] && [ "$EXIT_CODE" -eq 0 ]; then
     if [ -f "$PORTS_FILE" ]; then
         display_cluster_info "$PORTS_FILE"
     else
-        echo "No ports.json found — cluster may not be set up yet." >&2
+        echo "No ports.json found — the cluster may not be provisioned yet (dev-cluster provision)." >&2
     fi
 fi
 

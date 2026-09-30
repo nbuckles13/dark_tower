@@ -2,6 +2,7 @@
 //!
 //! JSONL format: one JSON object per line. Machine-parseable for diagnostics.
 
+use crate::protocol::WriteDecisions;
 use serde::Serialize;
 use std::fs;
 use std::io::Write;
@@ -55,6 +56,14 @@ struct LogEntry<'a> {
     /// `startup`) so historical grep tooling continues to parse them.
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<&'a str>,
+    /// A provision's `BLUEPRINT ACTION=… REASON=…` decision line (only on
+    /// writes that ran provision.sh), so "why did this gate take minutes"
+    /// is answerable from helper.log across runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blueprint: Option<&'a str>,
+    /// A failed deploy's `DEPLOY_FAILED REASON=… WORKLOADS=…` line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deploy_failed: Option<&'a str>,
 }
 
 impl AuditLog {
@@ -87,6 +96,8 @@ impl AuditLog {
             exit_code: None,
             error: None,
             outcome: None,
+            blueprint: None,
+            deploy_failed: None,
         });
     }
 
@@ -103,6 +114,33 @@ impl AuditLog {
         error: Option<&str>,
         outcome: Option<&str>,
     ) {
+        self.log_command_with_decisions(
+            cmd,
+            args,
+            duration_ms,
+            exit_code,
+            error,
+            outcome,
+            &WriteDecisions::default(),
+        );
+    }
+
+    /// [`Self::log_command`] for a write whose scripts printed decision lines
+    /// ([`WriteDecisions`]); each present line becomes its own field.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the audit schema's fields, each already typed; a builder would add a type for one call site"
+    )]
+    pub fn log_command_with_decisions(
+        &self,
+        cmd: &str,
+        args: &[String],
+        duration_ms: u64,
+        exit_code: i32,
+        error: Option<&str>,
+        outcome: Option<&str>,
+        decisions: &WriteDecisions,
+    ) {
         self.append(&LogEntry {
             ts: now_rfc3339(),
             cmd,
@@ -111,6 +149,8 @@ impl AuditLog {
             exit_code: Some(exit_code),
             error,
             outcome,
+            blueprint: decisions.blueprint.as_deref(),
+            deploy_failed: decisions.deploy_failed.as_deref(),
         });
     }
 
@@ -171,11 +211,11 @@ mod tests {
         let log = AuditLog::new(&log_path).unwrap();
 
         let args = vec!["ac".to_string()];
-        log.log_command("rebuild", &args, 45123, 0, None, Some("completed"));
+        log.log_command("deploy", &args, 45123, 0, None, Some("completed"));
 
         let contents = fs::read_to_string(&log_path).unwrap();
         let entry: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
-        assert_eq!(entry["cmd"], "rebuild");
+        assert_eq!(entry["cmd"], "deploy");
         assert_eq!(entry["duration_ms"], 45123);
         assert_eq!(entry["exit_code"], 0);
         assert_eq!(entry["outcome"], "completed");
@@ -189,7 +229,7 @@ mod tests {
         let log = AuditLog::new(&log_path).unwrap();
 
         log.log_command(
-            "setup",
+            "provision",
             &[],
             120000,
             1,
@@ -199,7 +239,7 @@ mod tests {
 
         let contents = fs::read_to_string(&log_path).unwrap();
         let entry: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
-        assert_eq!(entry["cmd"], "setup");
+        assert_eq!(entry["cmd"], "provision");
         assert_eq!(entry["exit_code"], 1);
         assert_eq!(entry["error"], "kind create failed");
         assert_eq!(entry["outcome"], "error");
@@ -214,7 +254,7 @@ mod tests {
         let log = AuditLog::new(&log_path).unwrap();
 
         for &outcome in OUTCOMES {
-            log.log_command("setup", &[], 1, 0, None, Some(outcome));
+            log.log_command("provision", &[], 1, 0, None, Some(outcome));
         }
 
         let contents = fs::read_to_string(&log_path).unwrap();
@@ -236,7 +276,7 @@ mod tests {
         let log_path = dir.path().join("helper.log");
         let log = AuditLog::new(&log_path).unwrap();
 
-        log.log_command("setup", &[], 1, 0, None, None);
+        log.log_command("provision", &[], 1, 0, None, None);
 
         let contents = fs::read_to_string(&log_path).unwrap();
         let entry: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
@@ -250,9 +290,9 @@ mod tests {
         let log = AuditLog::new(&log_path).unwrap();
 
         log.log_startup("devloop-test", "/tmp/test.sock", 1);
-        log.log_command("setup", &[], 5000, 0, None, Some("completed"));
+        log.log_command("provision", &[], 5000, 0, None, Some("completed"));
         log.log_command(
-            "rebuild",
+            "deploy",
             &["ac".to_string()],
             3000,
             0,
@@ -268,5 +308,40 @@ mod tests {
         for line in &lines {
             let _: serde_json::Value = serde_json::from_str(line).unwrap();
         }
+    }
+
+    #[test]
+    fn decision_fields_are_written_only_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::new(&path).unwrap();
+        log.log_command("status", &[], 1, 0, None, Some(OUTCOME_COMPLETED));
+        let decisions = WriteDecisions {
+            blueprint: Some(
+                "BLUEPRINT ACTION=none REASON=match RECORDED=a CURRENT=a CHANGED=-".into(),
+            ),
+            deploy_failed: None,
+        };
+        log.log_command_with_decisions(
+            "provision",
+            &[],
+            2,
+            0,
+            None,
+            Some(OUTCOME_COMPLETED),
+            &decisions,
+        );
+        let lines: Vec<serde_json::Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(lines[0].get("blueprint").is_none());
+        assert!(lines[0].get("deploy_failed").is_none());
+        assert_eq!(
+            lines[1]["blueprint"],
+            "BLUEPRINT ACTION=none REASON=match RECORDED=a CURRENT=a CHANGED=-"
+        );
+        assert!(lines[1].get("deploy_failed").is_none());
     }
 }

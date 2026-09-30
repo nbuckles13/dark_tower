@@ -1,6 +1,6 @@
 # ADR-0038: The Dev Cluster Deploys the Way Production Will
 
-**Status**: Proposed
+**Status**: Proposed — *implementation note 2026-09-29: Implementation steps 1–3 are implemented (step 3: devloop `2026-09-29-adr0038-provision-deploy-l7-switchover`). Acceptance is the user's call.*
 
 **Date**: 2026-09-26
 
@@ -189,7 +189,7 @@ Three devloops, in order; each leaves Layer 7 correct:
    container-side cluster write may be added in the meantime.
 
    Also carried from devloop 2 (so it is not lost): **remove the interim Succeeded-pod
-   delete** in `infra/kind/scripts/setup.sh:run_migration_job`. It exists only because a
+   delete** in `infra/kind/scripts/deploy.sh:run_migration_job`. It exists only because a
    helper older than devloop 2 counted a finished Job pod as unhealthy; `parse_pod_health`
    now exempts Job-owned `Succeeded` pods, so once every running helper is built from a tree
    with that fix the delete is dead weight — and it throws away the pod's logs. `setup.sh
@@ -199,7 +199,7 @@ Three devloops, in order; each leaves Layer 7 correct:
    The verb rename (`rebuild-all` → `deploy`; fresh cluster → `provision`) must reach ALL THREE
    places that spell the remedy — they are in two languages and cannot share a constant:
    `crates/env-tests/src/fixtures/kube.rs` (`REDEPLOY_HINT`, `FRESH_CLUSTER_HINT`),
-   `infra/kind/scripts/setup.sh:resolve_image_refs` (the `IMAGE_UNRESOLVED` message), and
+   `infra/kind/scripts/deploy.sh:resolve_image_refs` (the `IMAGE_UNRESOLVED` message), and
    `docs/runbooks/devloop-validation.md` §6.7 (the `cluster-rebuild-failed` sub-causes).
 
    Also observed at step 2's Gate 2: a failed setup leaves a half-built cluster that the next
@@ -228,12 +228,77 @@ Three devloops, in order; each leaves Layer 7 correct:
 
 Until then, today's behaviour (a full rebuild on every gate) stays: slow but correct.
 
+### Step 3 implementation notes (2026-09-29)
+
+- **Where "setup.sh shrinks to the implementation behind provision" landed.** The provision
+  implementation is its own file, `infra/kind/scripts/provision.sh`, so the blueprint can hash
+  the provisioning implementation BY WHOLE FILE without dragging in the deploy path (an edit to
+  the deploy code must never rebuild a cluster). The deploy implementation is
+  `infra/kind/scripts/deploy.sh`; `setup.sh` remains the host one-stop entry (provision, deploy,
+  host conveniences) and `--provision-org`. Shared definitions live in `lib/common.sh` (hashed:
+  only what provision uses) and `lib/cluster-db.sh` (not hashed).
+- **Where the hash is computed.** Host-side, by the provision implementation the helper runs
+  (`provision.sh`), not in Rust: ONE render (`blueprint_render`) serves the check, the build and
+  deploy's own guard (`provision.sh --check`), for the helper and the host alike.
+- **What the render contains.** The rendered kind config (the helper's per-slug render via
+  `DT_KIND_CONFIG`), `kind version` (which pins the node image), the provider, every
+  `PROVISION_INPUT` hashed whole (`provision.sh`, `lib/common.sh`, the TLS recipe
+  `scripts/generate-dev-certs.sh`, and `infra/services/postgres/secret.yaml`, from which AC's
+  `DATABASE_URL` is derived so the credential has one owner), and the PUBLIC MC/MH WebTransport
+  leaf certificates the TLS Secrets carry. The certs are an addition to "hash the recipe": the
+  14-day leaves expire, a time input no recipe hash captures, so provision first materializes
+  the host inputs (the idempotent recipe renews a leaf only when due) and then renders; a renewal
+  rebuilds the cluster (about every 13 days on a long-lived one; `CHANGED=tls-renewal-due`).
+  Never key bytes, never a Secret value. Rule: anything provision reads is a render input
+  (pinned by `scripts/setup.test.sh`).
+- **The record** (`kube-system/configmap/devloop-blueprint`: the hash plus a per-section digest
+  manifest, so a mismatch names what changed) is written as the last step of a successful build,
+  after a re-render confirms nothing changed mid-build. It is an **anti-drift control, not
+  integrity or tamper-evidence**: `provision.sh` is container-writable in the devloop clone, and
+  the container's cluster-admin kubeconfig can rewrite the record. A missing or unparseable
+  record rebuilds; an UNREADABLE one fails loudly and never destroys. Every run prints one
+  `BLUEPRINT ACTION=… REASON=… RECORDED=… CURRENT=… CHANGED=…` line. Every cluster built before
+  step 3 has no record, so it rebuilds once on its first post-merge provision.
+- **`deploy` always builds every first-party image**, so the built > deployed > fail resolution
+  of step 2 (and its `IMAGE_UNRESOLVED` remedy site) is gone rather than renamed; images are
+  loaded into Kind only when the node lacks that content-addressed ref. The image prune keeps two
+  generations — the current ref and the one the workload's own rollout history names as previous
+  (newest non-current ReplicaSet / ControllerRevision: what `kubectl rollout undo` reaches, even
+  after an unchanged redeploy); ConfigMap generations are not pruned. Every failed deploy ends
+  with one `DEPLOY_FAILED REASON=… WORKLOADS=…` line (a specific reason, or `step-failed
+  STEP=<step>` from main's EXIT trap); PostgreSQL/Redis are awaited with `rollout status`, never a
+  label-selector pod wait that would match the old Ready pod on a warm cluster.
+- **Platform manifests are verified.** The Calico manifest is fetched over HTTPS and applied only
+  if its sha256 equals `CALICO_MANIFEST_SHA256` (pinned in `provision.sh`, so part of the
+  blueprint): a moved tag or substituted download cannot change the platform unseen. An
+  unreadable record is `BLUEPRINT ACTION=refuse`. The interim Succeeded-pod delete and the retired grafana-sidecar RBAC delete are
+  gone (every cluster is rebuilt by its first provision).
+- **Helper**: verbs `provision`, `deploy`, `teardown`, `recreate`, `restore-kubeconfig`,
+  `status`, `cancel`, none with an argument (`Request` is `{token, command}`); `setup`,
+  `rebuild`, `rebuild-all`, `deploy <svc>` and `--skip-observability` are retired. Remedy
+  spellings (Rust, shell, markdown) are kept live by `scripts/guards/simple/validate-dev-cluster-verbs.sh`.
+- **Layer 7** is `provision && deploy && tests` (tokens `cluster-provision-failed`,
+  `cluster-deploy-failed`, `helper-verb-unsupported`). Both verbs' failures are routed by the
+  `PROVISION_FAILED` / `DEPLOY_FAILED REASON=` each script classifies at the source, through one
+  function (`scripts/layer7.sh:__cluster_failure_lane`) and one list
+  (`CLUSTER_ENV_REASONS` — blueprint-*, `runtime-unreachable` / `apiserver-unreachable` from the
+  shared bounded probes in `lib/common.sh:classify_env_failure` (provision asks the apiserver only
+  after `kind create cluster`), disk, prerequisites, `port-held` (a host port the kind config maps: TCP by
+  connect, UDP from `/proc/net/udp{,6}`), `runtime-incapable` (`kind create` failed and the same
+  node-container shape fails on the node image — docs/TODO.md §G), `operator-declined`, an unreadable cluster) are the operator lane;
+  everything else is `FAIL provision-failed` / `FAIL deploy-failed`, the implementer lane, because
+  both verbs now run the tree on every gate; `observability-apply-failed` and every
+  diff arm are gone, and no container-side cluster write remains but `--provision-org`.
+- **Env-tests** 01/26/28 (and the wider fresh-state audit: 26, 28, 31, 35 baselines) are
+  fresh-pod-independent: 01's in-effect config is read from MH's published config gauges, not the
+  startup log; `FRESH_CLUSTER_HINT` is deleted.
+
 ## Open questions
 
 - ~~Local registry vs `kind load` for images~~ — **Resolved (devloop 2): `kind load`.**
   Simpler (no per-devloop registry container, port or node trust configuration), and the
   shape is the same: a registry can later replace `load_image_to_kind` alone. The tag is the
-  image's own ID (`<repo>:sha-<first 16 hex>`, `setup.sh:content_tag`), not a hash of build
+  image's own ID (`<repo>:sha-<first 16 hex>`, `infra/kind/scripts/deploy.sh:content_tag`), not a hash of build
   inputs: an input hash would name different bytes under the same tag whenever an unhashed
   input changed (floating base images, apt packages) and nothing would roll. Cost: one extra
   rollout after a build-cache prune. Per-service precision (a GC-only change not rolling
@@ -246,9 +311,13 @@ Until then, today's behaviour (a full rebuild on every gate) stays: slow but cor
   hash**: `db-migrate-<sha256 of the rendered Job, image tag included>`, so an unchanged set
   re-applies as a no-op and any change (migrations or Job spec) is a new Job — which also
   sidesteps Job-template immutability.
-- Whether platform components (Postgres, Redis, the observability stack itself) belong to
-  `provision` or to the environment root; the rule of thumb is that anything a normal
-  task changes belongs in the root.
+- ~~Whether platform components (Postgres, Redis, the observability stack itself) belong to
+  `provision` or to the environment root~~ — **Resolved (step 3): the environment root.**
+  Normal tasks change them (every story-2 dashboard, alert-rule, scrape-config and
+  collector-allowlist task did), they are content-addressed so an unchanged apply is a no-op
+  (Postgres does not restart), and they already were root resources. `provision` holds only
+  what cannot change in place: the node topology and host ports (the kind config), the CNI,
+  the namespaces and the Secret/TLS material.
 
 ## References
 

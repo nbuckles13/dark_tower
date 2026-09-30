@@ -204,7 +204,7 @@ cargo run --bin auth-controller
 
 ```bash
 # Use when you need logs in Loki or K8s-specific testing
-./infra/kind/scripts/setup.sh --only ac
+./infra/kind/scripts/deploy.sh   # ADR-0038: converge the whole tree; rolls only what changed
 ```
 
 > **Superseded (ADR-0038, 2026-09-28):** the Skaffold path originally named here was

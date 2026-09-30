@@ -16,17 +16,9 @@
 
 set -euo pipefail
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
+# Logging (lib/common.sh is definitions-only).
+# shellcheck source=lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
 # Service configuration: key="statefulset:binary:port"
 declare -A SERVICES=(
@@ -45,7 +37,7 @@ TELEPRESENCE_CONNECTED=false
 
 # Find project root (where Cargo.toml lives)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 usage() {
     echo "Usage: $0 <service>"
@@ -98,7 +90,7 @@ cleanup() {
     fi
 }
 
-check_prerequisites() {
+check_iterate_prerequisites() {
     log_step "Checking prerequisites..."
 
     # Check telepresence CLI
@@ -154,7 +146,9 @@ run_local_service() {
     echo ""
 
     # Export environment variables that the service needs
-    export DATABASE_URL="postgresql://darktower:dev_password_change_in_production@localhost:5432/dark_tower"
+    local pg_secret="${PROJECT_ROOT}/infra/services/postgres/secret.yaml"
+    export DATABASE_URL
+    DATABASE_URL="postgresql://$(pg_secret_value POSTGRES_USER "${pg_secret}"):$(pg_secret_value POSTGRES_PASSWORD "${pg_secret}")@localhost:5432/$(pg_secret_value POSTGRES_DB "${pg_secret}")"
     export AC_MASTER_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
     export AC_HASH_SECRET="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
     export RUST_LOG="info,${BINARY//-/_}=debug"
@@ -202,7 +196,7 @@ main() {
     echo ""
 
     # Check prerequisites
-    check_prerequisites
+    check_iterate_prerequisites
 
     # Get current replica count for restoration
     ORIGINAL_REPLICAS=$(kubectl get statefulset/"${STATEFULSET}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}')

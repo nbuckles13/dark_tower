@@ -65,8 +65,9 @@ export default async function globalSetup(): Promise<void> {
     '(see e2e/README.md prerequisites).';
   const prometheusFix =
     'The observability stack is REQUIRED by this suite (assertion (d) reads ' +
-    "mc_participant_mh_status_total via Prometheus) — do NOT use setup.sh's " +
-    '--skip-observability option.';
+    'mc_participant_mh_status_total via Prometheus). The environment root always ' +
+    'deploys it, so it is missing or not Ready yet: check the cluster ' +
+    "(host: kubectl -n dark-tower-observability get pods; devloop: 'dev-cluster status').";
   const failures = (
     await Promise.all([
       probe('AC health', `${e2eEnv.acUrl}/health`, clusterFix),

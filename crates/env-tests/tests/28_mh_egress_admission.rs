@@ -59,8 +59,23 @@
 //! bound is a request-validation step that would count `rejected_invalid`, a
 //! DIFFERENT label. The PRECONDITION phase asserts from the live ConfigMap that
 //! neither other bound can trip first, and the ADMISSION phase keys on the
-//! exact `rejected_stream_ceiling` label, with the `admitted` count rising as a
-//! positive control.
+//! exact `rejected_stream_ceiling` label alone (never summed with
+//! `mh_media_policy_applies_total`). The rejecting instance(s) are identified
+//! after the fact as those whose counter moved — never a hardcoded `mh-N` —
+//! and the positive control requires ADMITTED to have moved on a REJECTING
+//! instance: the same handler both admitted and refused. Assertions are
+//! deltas from SETTLED baselines, never an exact admission count (existing
+//! load can make the first refusal land before `ceiling + 1`).
+//!
+//! # Long-lived pods (ADR-0038)
+//!
+//! Nothing restarts an unchanged MH, so a handler can carry occupancy from
+//! earlier runs. Sizing is occupancy-INDEPENDENT (existing load only makes the
+//! ceiling easier to cross; `P x S > 2 x ceiling` holds for any placement). The
+//! per-instance `mh_media_egress_edges` / `mh_media_registered_meetings` read at
+//! PRECONDITION is DIAGNOSTIC: it gates only that every instance has room for
+//! one participant's slots (else the positive control could starve), and it is
+//! printed in every environment message.
 //!
 //! # No wall-clock gate
 //!
@@ -82,9 +97,10 @@
 //! `EndMeeting` releases it on every handler. A panic before cleanup drops the
 //! sessions instead; MC ends the meeting when their reconnect grace expires and
 //! releases it the same way. Only a meeting whose MC never COMPLETES
-//! `EndMeeting` keeps its streams. If the FIRST join fails with 503, the handlers
-//! were already full before the test started — a distinct PRECONDITION
-//! message, not a GC bug.
+//! `EndMeeting` keeps its streams. If the FIRST join fails with 503, or an
+//! instance lacks headroom at PRECONDITION, that is this leak — an environment
+//! condition reported with the observed occupancy, not a GC bug and not a
+//! reason to rebuild the cluster.
 
 #![cfg(feature = "flows")]
 
@@ -97,10 +113,13 @@ use env_tests::fixtures::egress_admission::{
 };
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
 use env_tests::fixtures::kube::{
-    configmap_key, configmap_name_for_all, configmap_u64, FRESH_CLUSTER_HINT, REDEPLOY_HINT,
+    configmap_key, configmap_name_for_all, configmap_u64, REDEPLOY_HINT,
 };
 use env_tests::fixtures::mc_session::{self, McSession, MhSession};
-use env_tests::fixtures::metrics::{gauge_by_instance_present, poll_until_any_instance_above};
+use env_tests::fixtures::metrics::{
+    gauge_by_instance_present, instances_exceeding_baseline, poll_until_any_instance_above,
+    settled_baseline, InstanceCounters,
+};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
 use proto_gen::dark_tower::signaling::v1::{
     client_message, ClientMessage, MediaKind, ReceiveCapability, ReceiveSlot,
@@ -129,6 +148,36 @@ fn size_meeting(ceiling: u64, slot_cap: u64) -> (u64, u64) {
             max_s9_feasible_ceiling(slot_cap)
         )
     })
+}
+
+/// Per-instance occupancy against ceiling, for the environment messages:
+/// `instance: edges/ceiling streams, registered/limit meetings`. Diagnostic
+/// only — sizing never subtracts occupancy (module doc).
+fn occupancy_report(
+    ceilings: &InstanceCounters,
+    edges: &InstanceCounters,
+    registered: &InstanceCounters,
+    registered_limit: &InstanceCounters,
+) -> String {
+    let mut instances: Vec<&String> = ceilings.keys().collect();
+    instances.sort();
+    instances
+        .iter()
+        .map(|i| {
+            let get = |m: &InstanceCounters| {
+                m.get(*i)
+                    .map_or_else(|| "?".to_string(), |v| format!("{v}"))
+            };
+            format!(
+                "{i}: {}/{} streams, {}/{} meetings",
+                get(edges),
+                get(ceilings),
+                get(registered),
+                get(registered_limit)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn admission_promql(outcome: &str) -> String {
@@ -205,12 +254,80 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         "S9: ceiling={ceiling} slot_cap={slot_cap} -> {participants} participants x {slots} slots"
     );
 
-    let admitted_baseline = prom
-        .instance_counter_map(&admission_promql("admitted"))
-        .await;
-    let rejected_baseline = prom
-        .instance_counter_map(&admission_promql("rejected_stream_ceiling"))
-        .await;
+    // OCCUPANCY, diagnostic only (pods persist across runs, ADR-0038: nothing
+    // restarts an unchanged workload). Sizing above is occupancy-independent —
+    // existing load only makes the ceiling EASIER to cross — but the meeting
+    // lands on ONE handler MC chooses by rotation, and a handler already without
+    // room for even one participant's slots could refuse the whole meeting
+    // before any ADMITTED decision, starving the positive control. So EVERY
+    // instance needs headroom >= `slots`.
+    let edges = gauge_by_instance_present(
+        &prom,
+        "mh_media_egress_edges",
+        MH_INSTANCE_COUNT,
+        GAUGE_PRESENT_BOUND,
+    )
+    .await;
+    let registered = gauge_by_instance_present(
+        &prom,
+        "mh_media_registered_meetings",
+        MH_INSTANCE_COUNT,
+        GAUGE_PRESENT_BOUND,
+    )
+    .await;
+    let registered_limit = gauge_by_instance_present(
+        &prom,
+        "mh_media_registered_meetings_limit",
+        MH_INSTANCE_COUNT,
+        GAUGE_PRESENT_BOUND,
+    )
+    .await;
+    let occupancy = occupancy_report(&ceilings, &edges, &registered, &registered_limit);
+    eprintln!("S9 occupancy (gauges): {occupancy}");
+    // An instance with a ceiling but NO edges series is not "empty": MH publishes
+    // `mh_media_egress_edges` when its session actor is built, so absence is an
+    // environment fault — never read as zero occupancy (which would pass the
+    // headroom check below on no data).
+    for i in ceilings.keys() {
+        assert!(
+            edges.contains_key(i),
+            "PRECONDITION: no mh_media_egress_edges series for {i}, which publishes a stream \
+             ceiling — MH publishes the edges gauge when its session actor is built, so this \
+             is a scrape/startup fault, not zero occupancy ({occupancy})."
+        );
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "slots is a per-participant slot count, far below 2^53"
+    )]
+    let full: Vec<&String> = ceilings
+        .iter()
+        .filter(|(i, c)| *c - edges[*i] < slots as f64)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        full.is_empty(),
+        "PRECONDITION: MH instance(s) {full:?} have less than {slots} streams of headroom \
+         before S9 starts (test-side check over the published gauges — {occupancy}). A handler \
+         holds streams no live meeting releases: a meeting's MC never completed EndMeeting \
+         (compare mh_media_registered_meetings with pod uptime). An ENVIRONMENT/leak condition, \
+         not an admission defect."
+    );
+
+    let admitted_baseline = settled_baseline(
+        &prom,
+        &admission_promql("admitted"),
+        ADMISSION_BOUND,
+        "the admission assertion under test",
+    )
+    .await;
+    let rejected_baseline = settled_baseline(
+        &prom,
+        &admission_promql("rejected_stream_ceiling"),
+        ADMISSION_BOUND,
+        "the admission assertion under test",
+    )
+    .await;
 
     // ---- JOIN-FANOUT: distinct users, one meeting, real GC -> MC joins ------
     let auth = AuthClient::new(&cluster.ac_base_url);
@@ -237,12 +354,11 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         let gc_join = match gc.join_meeting(&created.meeting_code, token).await {
             Ok(join) => join,
             Err(GcClientError::RequestFailed { status: 503, body }) if i == 0 => panic!(
-                "PRECONDITION: all MHs at stream ceiling before S9 started; the ratchet (streams \
-                 of meetings no EndMeeting released) \
-                 (GC answered 503 to the FIRST join: no handler has headroom). A converge will \
-                 not clear MH's in-memory stream state — pods whose image/config are \
-                 unchanged are not restarted. Recovery: {FRESH_CLUSTER_HINT}. \
-                 Body: {body}"
+                "PRECONDITION: GC answered 503 to the FIRST join (no handler has headroom in \
+                 GC's view). MH gauges read before the test: {occupancy}. GC's view comes from \
+                 load reports and can lag the gauges, so the two need not agree. Streams no live \
+                 meeting releases: a meeting never released its streams (MC never completed \
+                 EndMeeting). An environment/leak condition, not a GC bug. Body: {body}"
             ),
             Err(e) => panic!("JOIN-FANOUT: GC join for participant {i} failed: {e}"),
         };
@@ -324,21 +440,43 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         },
     )
     .await;
-    poll_until_any_instance_above(
-        &prom,
-        &admission_promql("admitted"),
-        &admitted_baseline,
-        ADMISSION_BOUND,
-        Duration::from_secs(3),
-        |current| {
-            format!(
-                "ADMISSION (positive control): no MH instance counted an ADMITTED decision \
-                 (baseline {admitted_baseline:?}, now {current:?}) — the meeting never reached \
-                 admission below the ceiling, so the rejection above proves less than it seems."
-            )
-        },
-    )
-    .await;
+    // The instance(s) that refused — whichever MC placed the meeting on, never
+    // a hardcoded mh-N. "Exactly one" is true of MC's placement today but is
+    // LOGGED, not asserted: other meetings (env-tests head toward prod) can
+    // refuse on the sibling inside the window.
+    let rejecting = instances_exceeding_baseline(
+        &rejected_baseline,
+        &prom
+            .instance_counter_map(&admission_promql("rejected_stream_ceiling"))
+            .await,
+    );
+    eprintln!("S9: rejected_stream_ceiling moved on {rejecting:?}");
+    assert!(
+        !rejecting.is_empty(),
+        "ADMISSION: the rejection counter rose and then no instance exceeds its baseline \
+         ({rejected_baseline:?}) — a pod rollover mid-test?"
+    );
+    // Positive control, on the SAME handler: an instance that refused also
+    // ADMITTED, so the refusal is the ceiling binding, not a handler refusing
+    // everything.
+    let deadline = std::time::Instant::now() + ADMISSION_BOUND;
+    loop {
+        let current = prom
+            .instance_counter_map(&admission_promql("admitted"))
+            .await;
+        let admitted_on = instances_exceeding_baseline(&admitted_baseline, &current);
+        if admitted_on.iter().any(|i| rejecting.contains(i)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ADMISSION (positive control): no REJECTING instance ({rejecting:?}) counted an \
+             ADMITTED decision within {ADMISSION_BOUND:?} (baseline {admitted_baseline:?}, now \
+             {current:?}; admitted rose on {admitted_on:?}). The refusing handler never admitted \
+             below the ceiling, so the rejection proves less than it seems."
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 
     // ---- GAUGES: ratio and threshold present on every instance -------------
     let ratios = gauge_by_instance_present(

@@ -46,14 +46,14 @@
 
 ## Devloop Cluster Helper
 - Kind config template → `infra/kind/kind-config.yaml.tmpl`; wrapper → `infra/devloop/devloop.sh`; image → `infra/devloop/Dockerfile`, `entrypoint.sh`; container client → `infra/devloop/dev-cluster`
-- Helper commands (setup/deploy/rebuild/teardown/status), `write_port_map_shell()`, DT_HOST_GATEWAY_IP → `crates/devloop-helper/src/commands.rs`, `protocol.rs`; port registry → `~/.cache/devloop/port-registry.json`
+- Helper commands (provision/deploy/teardown/recreate/restore-kubeconfig/status/cancel), `write_port_map_shell()`, DT_HOST_GATEWAY_IP → `crates/devloop-helper/src/commands.rs`, `protocol.rs`; port registry → `~/.cache/devloop/port-registry.json`
 - Env-test URL config → `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`; per-run org subdomain → `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`, `packages/web-app/e2e/env.ts`
 
 ## Deployment & K8s
-- Kind cluster → `infra/kind/kind-config.yaml`, `infra/kind/scripts/setup.sh` (`load_image_to_kind()`, `deploy_services()`, `run_migration_job()`, `dt_psql()`, `provision_run_org()`), `teardown.sh`
+- Kind cluster → `infra/kind/kind-config.yaml`, `infra/kind/scripts/provision.sh` (platform; `BLUEPRINT ACTION=… REASON=…`), `infra/kind/scripts/deploy.sh` (`run_migration_job()`, `deploy_otel_collector()`, `wait_for_env_root()`, `prune_superseded_images()`), `infra/kind/scripts/setup.sh` (`provision_run_org()`), `lib/cluster-db.sh:dt_psql()`, `teardown.sh`
 - Per-service Kustomize bases (statefulset/deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
 - Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/`; dev certs → `scripts/generate-dev-certs.sh`
-- MC/MH per-instance Deployments + ConfigMaps → `infra/services/mc-service/mc-0-config.env`, `infra/services/mh-service/mh-0-config.env`; devloop patching → `infra/kind/scripts/setup.sh:deploy_mc_service()`, `deploy_mh_service()`
+- MC/MH per-instance Deployments + ConfigMaps → `infra/services/mc-service/mc-0-config.env`, `infra/services/mh-service/mh-0-config.env`; devloop advertise addresses → `infra/kind/scripts/deploy.sh:render_env_overlay()`
 - Per-pod UDP NodePorts `base + ordinal*2` (MC 4433/4435, MH 4434/4436) → `infra/services/mc-service/service.yaml`, `infra/services/mh-service/service.yaml`; netpol → `infra/services/mh-service/network-policy.yaml`; MH→MC gRPC TCP 50052
 - Alert rules → `infra/docker/prometheus/rules/` (`gc-alerts.yaml`, `mc-alerts.yaml`, `mh-alerts.yaml`, `otel-alerts.yaml`, `_template-service-alerts.yaml`)
 

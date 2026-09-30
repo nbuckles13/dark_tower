@@ -33,7 +33,7 @@ spec:
       - name: gc-service
         image: localhost/gc-service:render-required
         # Tag set at render time to the image's content tag (sha-<id>) by
-        # infra/kind/scripts/setup.sh:render_env_overlay (ADR-0038 §2). Nothing loads
+        # infra/kind/scripts/deploy.sh:render_env_overlay (ADR-0038 §2). Nothing loads
         # `:render-required`, so an apply that bypasses the render fails loudly
         # (ErrImageNeverPull) instead of running a stale image. Never: a Kind-loaded
         # image is never pulled; a prod overlay sets registry, tag and pull policy.
@@ -109,11 +109,28 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: CORS_ALLOWED_ORIGINS
-        - name: DATABASE_URL
+        # DATABASE_URL is COMPOSED from the credential's one owner, postgres-secret
+        # (infra/services/postgres/secret.yaml) — never a second literal copy. Kubernetes
+        # dependent env vars: PG_* MUST be declared before DATABASE_URL, or `$(PG_*)`
+        # stays literal. The owner's values must be URL-safe (they are embedded
+        # unencoded; infra/kind/scripts/provision.sh enforces it for AC's copy).
+        - name: PG_USER
           valueFrom:
             secretKeyRef:
-              name: gc-service-secrets
-              key: DATABASE_URL
+              name: postgres-secret
+              key: POSTGRES_USER
+        - name: PG_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_PASSWORD
+        - name: PG_DB
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_DB
+        - name: DATABASE_URL
+          value: "postgresql://$(PG_USER):$(PG_PASSWORD)@postgres.dark-tower.svc.cluster.local:5432/$(PG_DB)"
         # OAuth 2.0 client credentials for AC authentication (ADR-0010)
         - name: GC_CLIENT_ID
           value: "global-controller"

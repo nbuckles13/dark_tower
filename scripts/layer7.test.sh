@@ -8,7 +8,7 @@
 #   - env gate, absent socket + CI (GITHUB_ACTIONS)    → SKIPPED-NO-CLUSTER, exit 0 (the ONLY skip)
 #   - env gate, absent socket + LOCAL                  → PRECONDITION_FAILURE, exit 2 (regression-closer)
 #   - env gate, dead socket (present, unconnectable)   → PRECONDITION_FAILURE helper-unreachable, exit 2
-#   - Phase-1 precondition failure (setup fails)      → PRECONDITION_FAILURE, exit 2 (operator)
+#   - Phase-1 precondition failure (provision/deploy fails) → PRECONDITION_FAILURE, exit 2 (operator)
 #   - Phase-1f Prometheus HARD not-ready              → PRECONDITION_FAILURE observability-prometheus-not-ready, exit 2
 #   - Phase-1f Loki SOFT not-ready                    → loud WARN + PROCEED → OK, exit 0 (never blocks)
 #   - Phase-2 green                                   → OK, exit 0
@@ -89,21 +89,27 @@ case "$1" in
     if [[ -f "$M/healthy" || ( "${FAKE_PODS_FLIP_AFTER:-0}" != "0" && "$n" -gt "${FAKE_PODS_FLIP_AFTER}" ) ]]; then
       echo "  Cluster exists:     true" >&2
       echo "  Pods healthy:       true" >&2
-      echo "  Setup in progress:  false" >&2
+      echo "  Cluster write in progress:  false" >&2
       echo "  Apiserver reachable: ${FAKE_APISERVER_REACHABLE:-reachable}" >&2
       exit 0
     fi
     echo "  Cluster exists:     ${FAKE_CLUSTER_EXISTS:-true}" >&2
     echo "  Pods healthy:       ${FAKE_PODS_HEALTHY:-true}" >&2
-    echo "  Setup in progress:  ${FAKE_SETUP_IN_PROGRESS:-false}" >&2
+    echo "  Cluster write in progress:  ${FAKE_WRITE_IN_PROGRESS:-false}" >&2
     # 4th COUPLED line (self-heal input). Tail-anchored value; three-valued.
     echo "  Apiserver reachable: ${FAKE_APISERVER_REACHABLE:-reachable}" >&2
     exit 0 ;;
-  setup)       exit "${FAKE_SETUP_RC:-0}" ;;
-  teardown)    exit "${FAKE_TEARDOWN_RC:-0}" ;;
-  rebuild-all) exit "${FAKE_REBUILD_RC:-0}" ;;
-  # Phase 1c0 (story 2 task 10): re-apply a service's manifests when the diff touches them.
-  deploy)      exit "${FAKE_DEPLOY_RC:-0}" ;;
+  # ADR-0038: Phase 1 is exactly `provision` then `deploy` — each call is logged in order
+  # (dc.calls) so a case can assert the sequence. *_OUT is printed first (the relayed
+  # helper output: an invalid_command from an old helper, a DEPLOY_FAILED line, ...).
+  provision)
+    echo "provision" >> "$M/dc.calls"
+    [[ -z "${FAKE_DC_PROVISION_OUT:-}" ]] || printf '%b\n' "${FAKE_DC_PROVISION_OUT}" >&2
+    exit "${FAKE_DC_PROVISION_RC:-0}" ;;
+  deploy)
+    echo "deploy" >> "$M/dc.calls"
+    [[ -z "${FAKE_DC_DEPLOY_OUT:-}" ]] || printf '%b\n' "${FAKE_DC_DEPLOY_OUT}" >&2
+    exit "${FAKE_DC_DEPLOY_RC:-0}" ;;
   recreate)
     # Append-counter (one line per invocation) so a case can assert EXACTLY one
     # recreate — the once-per-helper-lifetime bound proof at the shell level.
@@ -329,8 +335,8 @@ mkdir -p "${GOOD_PW_DIR}/chromium-1234"
 EMPTY_PW_DIR="${WORK}/ms-playwright-empty"
 mkdir -p "$EMPTY_PW_DIR"
 
-# Run layer7.sh under a scrubbed env (env -i so a CI GITHUB_ACTIONS doesn't flip
-# _get_base_ref into PR mode) with the given overrides. Writes stdout→$1, stderr→$2.
+# Run layer7.sh under a scrubbed env (env -i so an ambient GITHUB_ACTIONS cannot flip the
+# CI-skip discriminator, and no ambient DEVLOOP_* override leaks in) with the given overrides. Writes stdout→$1, stderr→$2.
 # Caller exports SOCK + optional ENVCMD + FAKE_* before calling. Sets global RC.
 run_layer7() {
   local out_f="$1" err_f="$2"
@@ -361,12 +367,13 @@ run_layer7() {
       FAKE_LOKI_READY="${FAKE_LOKI_READY:-1}" \
       FAKE_CLUSTER_EXISTS="${FAKE_CLUSTER_EXISTS:-true}" \
       FAKE_PODS_HEALTHY="${FAKE_PODS_HEALTHY:-true}" \
-      FAKE_SETUP_IN_PROGRESS="${FAKE_SETUP_IN_PROGRESS:-false}" \
+      FAKE_WRITE_IN_PROGRESS="${FAKE_WRITE_IN_PROGRESS:-false}" \
       FAKE_STATUS_RC="${FAKE_STATUS_RC:-0}" \
       FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-0}" \
-      FAKE_SETUP_RC="${FAKE_SETUP_RC:-0}" \
-      FAKE_TEARDOWN_RC="${FAKE_TEARDOWN_RC:-0}" \
-      FAKE_REBUILD_RC="${FAKE_REBUILD_RC:-0}" \
+      FAKE_DC_PROVISION_RC="${FAKE_DC_PROVISION_RC:-0}" \
+      FAKE_DC_PROVISION_OUT="${FAKE_DC_PROVISION_OUT:-}" \
+      FAKE_DC_DEPLOY_RC="${FAKE_DC_DEPLOY_RC:-0}" \
+      FAKE_DC_DEPLOY_OUT="${FAKE_DC_DEPLOY_OUT:-}" \
       FAKE_APISERVER_REACHABLE="${FAKE_APISERVER_REACHABLE:-reachable}" \
       FAKE_PODS_FLIP_AFTER="${FAKE_PODS_FLIP_AFTER:-0}" \
       FAKE_RECREATE_OUTCOME="${FAKE_RECREATE_OUTCOME:-recreated}" \
@@ -396,8 +403,9 @@ run_layer7() {
 # suite (a `true` BROWSER_CMD keeps it hermetically green when a case only cares about the
 # env-test lane; BROWSER_CMD defaults to a green stub via BROWSER_STUB below).
 reset_case() {
-  unset FAKE_CLUSTER_EXISTS FAKE_PODS_HEALTHY FAKE_SETUP_IN_PROGRESS FAKE_STATUS_RC \
-        FAKE_SETUP_RC FAKE_TEARDOWN_RC FAKE_REBUILD_RC FAKE_PROM_READY FAKE_LOKI_READY \
+  unset FAKE_CLUSTER_EXISTS FAKE_PODS_HEALTHY FAKE_WRITE_IN_PROGRESS FAKE_STATUS_RC \
+        FAKE_DC_PROVISION_RC FAKE_DC_PROVISION_OUT FAKE_DC_DEPLOY_RC FAKE_DC_DEPLOY_OUT \
+        FAKE_PROM_READY FAKE_LOKI_READY \
         ENVCMD CI_FLAG BROWSER_CMD FP_JSON PW_DIR \
         FAKE_PROVISION_RC FAKE_PROVISION_TOKEN FAKE_PROVISION_SLEEP FAKE_PROBE_CODE \
         FAKE_AC_READY FAKE_SUITE_RC PORTS_JSON_OVERRIDE SETUP_SH_OVERRIDE \
@@ -470,8 +478,8 @@ reset_case
 # the VARIABLE level rather than behaviorally on purpose: the canonical socket is PRESENT in a
 # dev container, so a full behavioral run with DEVLOOP_TEST unset would proceed to the REAL
 # cluster — the exact production mutation the gate exists to prevent. Sourcing layer7.sh (its
-# `BASH_SOURCE==$0` guard suppresses __layer7_main; the git work is inside diff_touches_path,
-# not at source time) lets us read the RESOLVED path without running a single cluster verb.
+# `BASH_SOURCE==$0` guard suppresses __layer7_main, and nothing cluster- or git-touching runs
+# at source time) lets us read the RESOLVED path without running a single cluster verb.
 # The behavioral consequence (canonical-absent → PRECONDITION / SKIPPED) is already pinned by
 # the four-way discriminator cases above.
 #
@@ -511,16 +519,19 @@ assert_status "org-probe-seam-honored-under-devloop-test" \
   "$FAKE_ORG_PROBE_BIN" "$(resolve_seam_var ORG_PROBE 1)"
 reset_case
 
-# === Phase-1 precondition failure (cluster not ready + setup fails) ============
+# === Phase-1 precondition failure: provision fails ==============================
 # This doubles as the PARSE-PATH case: the operator lane survives the shared parse/aggregate
 # helpers (not the orchestrator itself — that's layer-all.test.sh / Test B, @test-owned).
 reset_case
-SOCK="$PRESENT_SOCK"; export FAKE_CLUSTER_EXISTS=false FAKE_SETUP_RC=1
+SOCK="$PRESENT_SOCK"; export FAKE_DC_PROVISION_RC=1
 run_layer7 "$OUT" "$ERR"
-assert_exit   "setup-fail-exit2"          2 "$RC"
-assert_status "setup-fail-status"         "STATUS=PRECONDITION_FAILURE" "$(cat "$OUT")"
-assert_status "setup-fail-token"          "REASON=cluster-setup-failed" "$(cat "$OUT")"
-assert_status "setup-fail-banner"         "PRECONDITION_FAILURE:" "$(cat "$ERR")"
+assert_exit   "provision-fail-exit2"          2 "$RC"
+assert_status "provision-fail-status"         "STATUS=PRECONDITION_FAILURE" "$(cat "$OUT")"
+assert_status "provision-fail-token"          "REASON=cluster-provision-failed" "$(cat "$OUT")"
+assert_status "provision-fail-banner"         "PRECONDITION_FAILURE:" "$(cat "$ERR")"
+# A failed provision stops Phase 1: no deploy, no suite.
+assert_rc     "provision-fail-no-deploy" 0 "$([[ "$(cat "${MARKERS}/dc.calls" 2>/dev/null)" == "provision" ]] && echo 0 || echo "1 ($(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null))")"
+assert_no_marker "provision-fail-no-suite" "$MARKERS" "ran.env-suite"
 # The exact seams layer-all.sh uses to render the summary + derive the exit code:
 ps="$(parse_status_line "$OUT")"
 assert_status "orch-parse_status_line"    "PRECONDITION_FAILURE" "$ps"
@@ -528,12 +539,125 @@ assert_status "orch-aggregate-survives"   "PRECONDITION_FAILURE" "$(aggregate_wo
 assert_exit   "orch-status_to_exit_code"  2 "$(status_to_exit_code "$ps")"
 reset_case
 
-# === Phase-1 precondition: rebuild-all fails → PRECONDITION_FAILURE ============
+# === Phase-1 provision/deploy failures are ROUTED by their <VERB>_FAILED REASON (T9) =========
+# ONE list (layer7.sh:CLUSTER_ENV_REASONS) and ONE function (__cluster_failure_lane) for both
+# verbs: ENVIRONMENT reasons → PRECONDITION_FAILURE cluster-<verb>-failed, exit 2; EVERYTHING else
+# (step-failed at any step, rollout failures, an unknown reason — fail-closed) → FAIL
+# <verb>-failed, exit 1; NO line at all → exit 2 with its own wording. Nothing after runs.
+run_cluster_failure() {  # $1 = provision|deploy  $2 = the <VERB>_FAILED line ("" = none)
+  reset_case
+  SOCK="$PRESENT_SOCK"; export ENVCMD="${SUITE_STUB}"
+  local out="relayed ${1} output"; [[ -z "$2" ]] || out="${out}\n$2"
+  if [[ "$1" == provision ]]; then
+    export FAKE_DC_PROVISION_RC=1 FAKE_DC_PROVISION_OUT="$out"
+  else
+    export FAKE_DC_DEPLOY_RC=1 FAKE_DC_DEPLOY_OUT="$out"
+  fi
+  run_layer7 "$OUT" "$ERR"
+}
+expect_route() {  # $1 = verb  $2 = label  $3 = line  $4 = env|tree|none
+  local verb="$1" l="$1-$2"
+  run_cluster_failure "$verb" "$3"
+  case "$4" in
+    env)
+      assert_exit   "route-${l}-exit2" 2 "$RC"
+      assert_status "route-${l}-token" "STATUS=PRECONDITION_FAILURE REASON=cluster-${verb}-failed" "$(cat "$OUT")"
+      assert_status "route-${l}-names-line" "$3" "$(grep '^PRECONDITION_FAILURE:' "$ERR")" ;;
+    tree)
+      assert_exit   "route-${l}-exit1" 1 "$RC"
+      assert_status "route-${l}-token" "STATUS=FAIL REASON=${verb}-failed" "$(cat "$OUT")"
+      assert_absent "route-${l}-not-operator" "cluster-${verb}-failed" "$(cat "$OUT")"
+      assert_status "route-${l}-names-line" "$3" "$(grep '^FAIL:' "$ERR")" ;;
+    none)
+      assert_exit   "route-${l}-exit2" 2 "$RC"
+      assert_status "route-${l}-token" "STATUS=PRECONDITION_FAILURE REASON=cluster-${verb}-failed" "$(cat "$OUT")"
+      assert_status "route-${l}-wording" "produced no ${verb^^}_FAILED line" "$(cat "$ERR")" ;;
+  esac
+  local want="provision"; [[ "$verb" == deploy ]] && want="provision deploy"
+  assert_rc "route-${l}-stops-there" 0 "$([[ "$(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null)" == "${want} " ]] && echo 0 || echo "1 ($(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null))")"
+  assert_no_marker "route-${l}-no-suite" "$MARKERS" "ran.env-suite"
+}
+expect_route deploy rollout "DEPLOY_FAILED REASON=rollout-failed WORKLOADS=dark-tower-observability/deployment/prometheus" tree
+expect_route deploy collector "DEPLOY_FAILED REASON=collector-rollout-failed WORKLOADS=dark-tower/deployment/otel-collector" tree
+expect_route deploy step-apply "DEPLOY_FAILED REASON=step-failed STEP=apply_env_root WORKLOADS=-" tree
+expect_route deploy step-build "DEPLOY_FAILED REASON=step-failed STEP=build_first_party_images WORKLOADS=-" tree
+expect_route deploy step-migrate "DEPLOY_FAILED REASON=step-failed STEP=run_migration_job WORKLOADS=-" tree
+expect_route deploy invented "DEPLOY_FAILED REASON=a-reason-nobody-classified WORKLOADS=-" tree
+assert_status "route-deploy-invented-says-unclassified" "not in CLUSTER_ENV_REASONS" "$(cat "$ERR")"
+expect_route deploy no-line "" none
+expect_route provision step-create "PROVISION_FAILED REASON=step-failed STEP=create_cluster" tree
+expect_route provision step-calico "PROVISION_FAILED REASON=step-failed STEP=install_calico" tree
+expect_route provision step-secrets "PROVISION_FAILED REASON=step-failed STEP=create_ac_secrets" tree
+expect_route provision invented "PROVISION_FAILED REASON=a-reason-nobody-classified STEP=create_cluster" tree
+expect_route provision no-line "" none
+# A provision line must never be read as deploy's, and vice versa (the prefix is the verb).
+expect_route deploy other-verbs-line "PROVISION_FAILED REASON=port-held STEP=check_host_ports" none
+
+# DRIFT: every REASON either script can emit — EXTRACTED from the SOURCE of deploy.sh,
+# provision.sh and lib/common.sh (the emitter call sites, the literal lines, the shared
+# classifier's tokens; deploy's dynamic `blueprint-${reason}` expanded from provision.sh's
+# REASON vocabulary) — routes as CLUSTER_ENV_REASONS (read from layer7.sh) says, for the verb
+# whose script emits it.
+KIND_SCRIPTS_DIR="${REPO_ROOT}/infra/kind/scripts"
+lib_reasons="$(sed -n '/^classify_env_failure() {/,/^}/p' "${KIND_SCRIPTS_DIR}/lib/common.sh" | grep -oE 'echo "[a-z]+-[a-z-]+"' | sed -E 's/echo "(.*)"/\1/' | sort -u)"
+deploy_reasons="$( {
+  grep -oE 'deploy_failed "?[a-z][a-z-]+' "${KIND_SCRIPTS_DIR}/deploy.sh" | sed -E 's/deploy_failed "?//'
+  grep -oE 'DEPLOY_FAILED REASON=[a-z][a-z-]+' "${KIND_SCRIPTS_DIR}/deploy.sh" | sed 's/DEPLOY_FAILED REASON=//'
+  grep -oE 'REASON=\$\{env_reason:-[a-z-]+\}' "${KIND_SCRIPTS_DIR}/deploy.sh" | sed -E 's/.*:-([a-z-]+)\}/\1/'
+  if grep -qF 'deploy_failed "blueprint-${reason' "${KIND_SCRIPTS_DIR}/deploy.sh"; then
+    grep -m1 -oE 'REASON=match\|[a-z|]+' "${KIND_SCRIPTS_DIR}/provision.sh" | sed 's/REASON=//' | tr '|' '\n' | grep -vx match | sed 's/^/blueprint-/'
+  fi
+  grep -q 'classify_env_failure' "${KIND_SCRIPTS_DIR}/deploy.sh" && printf '%s\n' "$lib_reasons"
+} | grep -vxE 'blueprint-?' | sort -u)"
+provision_reasons="$( {
+  grep -oE 'provision_failed [a-z][a-z-]+' "${KIND_SCRIPTS_DIR}/provision.sh" | sed 's/provision_failed //'
+  grep -oE 'REASON=\$\{env_reason:-[a-z-]+\}' "${KIND_SCRIPTS_DIR}/provision.sh" | sed -E 's/.*:-([a-z-]+)\}/\1/'
+  grep -q 'classify_env_failure' "${KIND_SCRIPTS_DIR}/provision.sh" && printf '%s\n' "$lib_reasons"
+} | sort -u)"
+env_list="$(bash -c 'eval "$(grep -E "^readonly CLUSTER_ENV_REASONS=" "$1")"; printf "%s\n" "${CLUSTER_ENV_REASONS[@]}"' _ "$LAYER7" | sort -u)"
+assert_rc "drift-lib-reasons-nonvacuous" 0 "$([[ "$(grep -c . <<< "$lib_reasons")" -ge 2 ]] && echo 0 || echo "1 (${lib_reasons})")"
+assert_rc "drift-deploy-reasons-nonvacuous" 0 "$([[ "$(grep -c . <<< "$deploy_reasons")" -ge 8 ]] && echo 0 || echo "1 ($(tr '\n' ' ' <<< "$deploy_reasons"))")"
+assert_rc "drift-provision-reasons-nonvacuous" 0 "$([[ "$(grep -c . <<< "$provision_reasons")" -ge 5 ]] && echo 0 || echo "1 ($(tr '\n' ' ' <<< "$provision_reasons"))")"
+# Every listed ENV reason is one some script can actually emit (no dead entries).
+dead_env="$(comm -23 <(printf '%s\n' "$env_list") <(printf '%s\n%s\n' "$deploy_reasons" "$provision_reasons" | sort -u))"
+assert_rc "drift-env-list-has-no-dead-entries" 0 "$([[ -z "$dead_env" ]] && echo 0 || echo "1 (${dead_env})")"
+for verb in deploy provision; do
+  if [[ "$verb" == deploy ]]; then toks="$deploy_reasons"; else toks="$provision_reasons"; fi
+  while IFS= read -r tok; do
+    [[ -n "$tok" ]] || continue
+    if grep -qx "$tok" <<< "$env_list"; then want=env; else want=tree; fi
+    if [[ "$verb" == deploy ]]; then line="DEPLOY_FAILED REASON=${tok} STEP=apply_env_root WORKLOADS=-"
+    else line="PROVISION_FAILED REASON=${tok} STEP=install_calico"; fi
+    expect_route "$verb" "extracted-${tok}" "$line" "$want"
+  done <<< "$toks"
+done
 reset_case
-SOCK="$PRESENT_SOCK"; export FAKE_REBUILD_RC=1
+
+# === Phase-1: a host helper older than this tree (unknown verb) → its own token ===========
+for verb in provision deploy; do
+  reset_case
+  SOCK="$PRESENT_SOCK"
+  if [[ "$verb" == provision ]]; then
+    export FAKE_DC_PROVISION_RC=1 FAKE_DC_PROVISION_OUT="ERROR: invalid command: provision (invalid_command)"
+  else
+    export FAKE_DC_DEPLOY_RC=1 FAKE_DC_DEPLOY_OUT="ERROR: invalid command: deploy (invalid_command)"
+  fi
+  run_layer7 "$OUT" "$ERR"
+  assert_exit   "old-helper-${verb}-exit2" 2 "$RC"
+  assert_status "old-helper-${verb}-token" "REASON=helper-verb-unsupported" "$(cat "$OUT")"
+  assert_status "old-helper-${verb}-remedy" "rebuild and restart the helper on the HOST" "$(cat "$ERR")"
+  assert_absent "old-helper-${verb}-not-misfiled" "cluster-${verb}-failed" "$(cat "$OUT")"
+done
+reset_case
+
+# === Phase-1 green order: exactly provision, then deploy — nothing else, once each =========
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="true"
 run_layer7 "$OUT" "$ERR"
-assert_exit   "rebuild-fail-exit2"  2 "$RC"
-assert_status "rebuild-fail-token"  "REASON=cluster-rebuild-failed" "$(cat "$OUT")"
+assert_exit "phase1-order-exit0" 0 "$RC"
+assert_rc   "phase1-order-provision-then-deploy" 0 "$([[ "$(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null)" == "provision deploy " ]] && echo 0 || echo "1 ($(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null))")"
+assert_status "phase1-step-provision-timed" "LAYER=7 STEP=provision DURATION=" "$(cat "$ERR" "$OUT")"
+assert_status "phase1-step-deploy-timed" "LAYER=7 STEP=deploy DURATION=" "$(cat "$ERR" "$OUT")"
 reset_case
 
 # === Phase-1 precondition: ports.json missing → PRECONDITION_FAILURE ==========
@@ -818,18 +942,19 @@ if ! grep -q 'REASON=browser-e2e' "$OUT"; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[env-red-no-browser-status] browser STATUS line emitted despite env-tests FAIL"); fi
 reset_case
 
-# === busy-tolerant setup (@operations condition 4) ============================
-# `__dev_cluster_setup` must RETRY a `(busy)` result (another write holds the helper mutex —
-# e.g. devloop.sh eager-setup), not short-circuit it to PRECONDITION_FAILURE. Exercise the
-# function directly (sourced; the BASH_SOURCE guard keeps __layer7_main from running). Status
-# reports "Setup in progress: false" so __poll_setup_idle returns immediately.
-BUSY_CNT="${WORK}/setup-count"
+# === busy-tolerant cluster writes (@operations condition 4) ===========================
+# `__dev_cluster_write` must RETRY a `(busy)` result (another write holds the helper mutex —
+# e.g. devloop.sh's eager provision+deploy), not short-circuit it to PRECONDITION_FAILURE.
+# Exercise the function directly (sourced; the BASH_SOURCE guard keeps __layer7_main from
+# running). Status reports "Cluster write in progress: false" so __poll_write_idle returns
+# immediately.
+BUSY_CNT="${WORK}/write-count"
 mk_busy_dc() { # $1=path  $2=always-busy(1) | busy-then-ok(0)
   cat > "$1" <<EOF
 #!/usr/bin/env bash
 case "\$1" in
-  status) echo "  Setup in progress:  false" >&2; exit 0 ;;
-  setup)
+  status) echo "  Cluster write in progress:  false" >&2; exit 0 ;;
+  provision|deploy)
     n=\$(( \$(cat "$BUSY_CNT" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$BUSY_CNT"
     if [[ "$2" -eq 1 || "\$n" -eq 1 ]]; then echo "ERROR: cluster busy: in-flight write (busy)" >&2; exit 1; fi
     exit 0 ;;
@@ -838,17 +963,69 @@ esac
 EOF
   chmod +x "$1"
 }
-# busy-then-success → retry yields rc 0 (NOT precondition).
-# NB: `set +e` after sourcing — layer7.sh enables set -e; in the real flow __dev_cluster_setup
-# is called as `… || precondition_fail` (set -e suppressed in the function body), so we mirror
-# that here to exercise its rc contract without an internal command-sub abort.
-mk_busy_dc "${WORK}/dc-busy-ok" 0; : > "$BUSY_CNT"
-rc=$( source "$LAYER7" >/dev/null 2>&1; set +e; DEV_CLUSTER="${WORK}/dc-busy-ok" DEVLOOP_SETUP_POLL_BUDGET=0 __dev_cluster_setup >/dev/null 2>&1; echo $? )
-assert_exit "busy-setup-retries-to-success" 0 "$rc"
-# persistent busy → non-zero (so the caller preconditions — never a silent pass).
-mk_busy_dc "${WORK}/dc-busy-always" 1; : > "$BUSY_CNT"
-rc=$( source "$LAYER7" >/dev/null 2>&1; set +e; DEV_CLUSTER="${WORK}/dc-busy-always" DEVLOOP_SETUP_POLL_BUDGET=0 __dev_cluster_setup >/dev/null 2>&1; echo $? )
-[[ "$rc" -ne 0 ]] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); FAILURES+=("[busy-setup-persistent-nonzero] persistent (busy) returned 0"); }
+# busy-then-success → retry yields rc 0 (NOT precondition), for BOTH verbs.
+# NB: `set +e` after sourcing — layer7.sh enables set -e; in the real flow the write is called
+# in an `if !` condition (set -e suppressed in the function body), so we mirror that here to
+# exercise its rc contract without an internal command-sub abort.
+for verb in provision deploy; do
+  mk_busy_dc "${WORK}/dc-busy-ok" 0; : > "$BUSY_CNT"
+  rc=$( source "$LAYER7" >/dev/null 2>&1; set +e; DEV_CLUSTER="${WORK}/dc-busy-ok" DEVLOOP_SETUP_POLL_BUDGET=0 __dev_cluster_write "$verb" >/dev/null 2>&1; echo $? )
+  assert_exit "busy-${verb}-retries-to-success" 0 "$rc"
+  assert_rc "busy-${verb}-retried-once" 2 "$(cat "$BUSY_CNT")"
+  # persistent busy → non-zero (so the caller preconditions — never a silent pass).
+  mk_busy_dc "${WORK}/dc-busy-always" 1; : > "$BUSY_CNT"
+  rc=$( source "$LAYER7" >/dev/null 2>&1; set +e; DEV_CLUSTER="${WORK}/dc-busy-always" DEVLOOP_SETUP_POLL_BUDGET=0 __dev_cluster_write "$verb" >/dev/null 2>&1; echo $? )
+  [[ "$rc" -ne 0 ]] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); FAILURES+=("[busy-${verb}-persistent-nonzero] persistent (busy) returned 0"); }
+done
+
+# === Layer 7 inspects NO diff (ADR-0038) — runtime proof first, grep second =================
+# RUNTIME (primary): run layer7.sh from a scratch git repo whose tree has STAGED changes under
+# every path the retired arms keyed on (infra/kind/, a service's manifests, the observability
+# overlay), with a PATH `git` stub that records every invocation. Phase 1 must still be exactly
+# provision+deploy, and git must never be asked for a merge-base or a diff.
+DIFFREPO="${WORK}/diffrepo"; GITSTUB="${WORK}/gitstub"
+rm -rf "$DIFFREPO" "$GITSTUB"; mkdir -p "$DIFFREPO" "$GITSTUB"
+cp -r "${REPO_ROOT}/scripts" "$DIFFREPO/"
+REAL_GIT="$(command -v git)"
+cat > "${GITSTUB}/git" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${WORK}/git.calls"
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "${GITSTUB}/git"
+( cd "$DIFFREPO" && "$REAL_GIT" init -q && "$REAL_GIT" -c user.email=t@t -c user.name=t add -A \
+    && "$REAL_GIT" -c user.email=t@t -c user.name=t commit -qm base \
+    && "$REAL_GIT" update-ref refs/remotes/origin/main HEAD \
+    && mkdir -p infra/kind infra/services/mc-service infra/kubernetes/overlays/kind/observability \
+    && echo x > infra/kind/kind-config.yaml && echo x > infra/services/mc-service/config.env \
+    && echo x > infra/kubernetes/overlays/kind/observability/kustomization.yaml && "$REAL_GIT" add -A )
+reset_case; rm -f "${WORK}/git.calls"
+SOCK="$PRESENT_SOCK"; export ENVCMD="true"
+# The fake env-test suite itself calls git THROUGH the run's PATH — the positive control that
+# the stub was live DURING the layer7 run (not merely reachable afterwards).
+GIT_PROBE_SUITE="${WORK}/suite-git-probe.sh"
+printf '#!/usr/bin/env bash\ngit rev-parse HEAD >/dev/null\n' > "$GIT_PROBE_SUITE"; chmod +x "$GIT_PROBE_SUITE"
+( cd "$DIFFREPO" && env -i PATH="${GITSTUB}:$PATH" HOME="$HOME" DEVLOOP_TEST=1 \
+    DEVLOOP_TMP="${WORK}/devloop-tmp" DEVLOOP_HELPER_SOCKET="$SOCK" DEVLOOP_DEV_CLUSTER_BIN="$FAKE_DC" \
+    DEVLOOP_PORTS_JSON="$PORTS" DEVLOOP_ENV_TEST_CMD="$GIT_PROBE_SUITE" DEVLOOP_HTTP_PROBE="$FAKE_PROBE" \
+    DEVLOOP_HEALTH_BUDGET=0 DEVLOOP_SETUP_SH="$FAKE_SETUP" DEVLOOP_ORG_PROBE="$FAKE_ORG_PROBE_BIN" \
+    FAKE_PROBE_CODE=401 FAKE_AC_READY=1 FAKE_PROM_READY=1 FAKE_LOKI_READY=1 \
+    DEVLOOP_BROWSER_E2E_CMD=true DEVLOOP_FINGERPRINTS_JSON="$GOOD_FP" PLAYWRIGHT_BROWSERS_PATH="$GOOD_PW_DIR" \
+    FAKE_DC_MARKERS="$MARKERS" DEVLOOP_KUBECTL="$FAKE_KUBECTL" DEVLOOP_MH_FORWARD_PROBE="$FAKE_MH_PROBE" \
+    FAKE_MH_PODS=1 bash "${DIFFREPO}/scripts/layer7.sh" ) >"$OUT" 2>"$ERR"; RC=$?
+assert_exit "no-diff-staged-infra-exit0" 0 "$RC"
+assert_rc "no-diff-staged-infra-exactly-provision-deploy" 0 "$([[ "$(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null)" == "provision deploy " ]] && echo 0 || echo "1 ($(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null))")"
+assert_absent "no-diff-git-never-asked-merge-base" "merge-base" "$(cat "${WORK}/git.calls" 2>/dev/null)"
+assert_absent "no-diff-git-never-asked-diff" "diff" "$(cat "${WORK}/git.calls" 2>/dev/null)"
+# Positive control: the stub was live INSIDE the run (the fake suite's own `git rev-parse`
+# reached it), so the absent merge-base/diff calls are evidence, not an unreachable stub.
+assert_status "no-diff-git-stub-live-during-the-run" "rev-parse HEAD" "$(cat "${WORK}/git.calls" 2>/dev/null)"
+reset_case
+# STATIC (secondary): none of the retired machinery is left in layer7.sh.
+l7_code="$(grep -vE '^[[:space:]]*#' "$LAYER7")"
+for needle in diff_touches_path _get_base_ref _changed_helpers rebuild-all __apply_observability_overlay "observability-apply-failed"; do
+  assert_absent "no-diff-machinery-left-${needle}" "$needle" "$l7_code"
+done
 
 # === Phase-1f probe is IFS-immune (regression for the 2026-06-30 root-cause) ==========
 # layer7.sh runs under `IFS=$'\n\t'` (no space). __wait_http_ready must split the multi-word
@@ -1313,11 +1490,12 @@ reset_case
 
 # (SH2) kubeconfig-stale → restore-kubeconfig → recovered. A7 flip: initially-not-ready so the
 # self-heal runs, then the self-heal's own probe sees pods healthy + apiserver reachable.
-# FLIP_AFTER=5 = top-liveness(1) + Phase-1a not-ready path(3) + Phase-1e poll(1); the self-heal
-# classification poll (6th) then reads healthy ⇒ kubeconfig-stale.
+# FLIP_AFTER=2 = top-liveness(1) + Phase-1e poll(1) (Phase 1a/1b — provision, deploy — make no
+# status call since ADR-0038 step 3); the self-heal classification poll (3rd) then reads
+# healthy ⇒ kubeconfig-stale.
 reset_case
 SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=reachable \
-  FAKE_PODS_FLIP_AFTER=5 FAKE_RESTORE_OUTCOME=restored ENVCMD="true"
+  FAKE_PODS_FLIP_AFTER=2 FAKE_RESTORE_OUTCOME=restored ENVCMD="true"
 run_layer7 "$OUT" "$ERR"
 assert_status "sh2-case"      "SELF_HEAL CASE=kubeconfig-stale ACTION=restore-kubeconfig" "$(cat "$ERR")"
 assert_status "sh2-recovered" "SELF_HEAL RESULT=recovered ACTION=restore-kubeconfig" "$(cat "$ERR")"
@@ -1418,7 +1596,7 @@ reset_case
 # then the restore verb reports restore-failed.
 reset_case
 SOCK="$PRESENT_SOCK"; export FAKE_PODS_HEALTHY=false FAKE_APISERVER_REACHABLE=reachable \
-  FAKE_PODS_FLIP_AFTER=5 FAKE_RESTORE_OUTCOME=restore-failed
+  FAKE_PODS_FLIP_AFTER=2 FAKE_RESTORE_OUTCOME=restore-failed
 run_layer7 "$OUT" "$ERR"
 assert_status "sh8-case"   "SELF_HEAL CASE=kubeconfig-stale ACTION=restore-kubeconfig" "$(cat "$ERR")"
 assert_status "sh8-detail" "DETAIL=restore-failed" "$(cat "$ERR")"

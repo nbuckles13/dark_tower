@@ -379,7 +379,7 @@ fn build_targets(repo_root: &Path) -> Vec<(PathBuf, String)> {
             "overlay: overlays/kind/observability".to_string(),
         ));
     }
-    // The environment root itself — what setup.sh applies (ADR-0038 §2).
+    // The environment root itself — what deploy.sh applies (ADR-0038 §2).
     if overlays_dir.is_dir() {
         out.push((overlays_dir, ENV_ROOT_LABEL.to_string()));
     }

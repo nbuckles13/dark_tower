@@ -496,10 +496,24 @@ pub const EGRESS_BUDGET_BASIS_UNMEASURED: &str = "unmeasured";
 /// - `mh_media_registered_meetings_limit` —
 ///   `PolicyLimits::max_registered_meetings`, the field the actor's
 ///   registration cap reads, so a registered-meetings alert needs no literal.
+/// - `mh_media_egress_streams_per_meeting_limit`,
+///   `mh_media_candidate_sources_per_egress_limit`,
+///   `mh_media_muted_sources_per_meeting_limit` — the three `PolicyLimits`
+///   PRE-ALLOCATION bounds registration validation reads;
+/// - `mh_media_policy_apply_timeout_seconds` —
+///   `PolicyLimits::policy_apply_timeout_ms`, in SECONDS (ms / 1000);
+/// - `mh_media_stream_cost_{audio,video}_bytes_per_second` — the ENFORCED
+///   per-stream costs (bits on the key, bytes on the gauge, `div_ceil(8)` at
+///   load), the divisors of the stream ceiling.
+///
+/// These are CONFIG REFLECTIONS, not signals: no alert selects on them. They
+/// are also how env-tests read the configuration the RUNNING process loaded
+/// (`crates/env-tests/tests/01_mh_deployment_config.rs`): per-process, static
+/// for the process lifetime, and immune to log rotation.
 #[expect(
     clippy::cast_precision_loss,
-    reason = "gauge values are f64 by the metrics API; a budget above 2^53 bytes/s is not a \
-              real configuration, and the ceiling and both resource bounds are bounded far \
+    reason = "gauge values are f64 by the metrics API; a budget or cost above 2^53 bytes/s is \
+              not a real configuration, and the ceiling and every policy bound are bounded far \
               below that at load"
 )]
 pub fn publish_egress_admission(
@@ -537,6 +551,36 @@ pub fn publish_egress_admission(
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(policy_limits.max_registered_meetings as f64);
+    gauge!(
+        "mh_media_egress_streams_per_meeting_limit",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(policy_limits.max_egress_streams_per_meeting as f64);
+    gauge!(
+        "mh_media_candidate_sources_per_egress_limit",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(policy_limits.max_candidate_sources_per_egress as f64);
+    gauge!(
+        "mh_media_muted_sources_per_meeting_limit",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(policy_limits.max_muted_sources_per_meeting as f64);
+    gauge!(
+        "mh_media_policy_apply_timeout_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(policy_limits.policy_apply_timeout_ms as f64 / 1000.0);
+    gauge!(
+        "mh_media_stream_cost_audio_bytes_per_second",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(admission.stream_cost_audio_bytes_per_second as f64);
+    gauge!(
+        "mh_media_stream_cost_video_bytes_per_second",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(admission.stream_cost_video_bytes_per_second as f64);
 }
 
 /// Metric handles the session actor uses — admission, capacity occupancy and

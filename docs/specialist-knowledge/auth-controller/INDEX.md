@@ -46,7 +46,7 @@
 
 ## Scope Data (ADR-0003)
 - Default scopes per service type -> `crates/ac-service/src/models/mod.rs:ServiceType::default_scopes()`
-- DB seed scopes -> `infra/kind/scripts/setup.sh:457-459`
+- DB seed scopes -> `infra/kind/scripts/deploy.sh:seed_test_data()`
 - Token issuance (scopes from DB, service_type claim) -> `crates/ac-service/src/services/token_service.rs:111-148`
 - ServiceClaims (scope + service_type) -> `crates/common/src/jwt.rs:ServiceClaims`
 

@@ -200,12 +200,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ConfigMap-backed value on this line reports its source explicitly.
         media_latency_sample_ratio = config.media_latency_sample_ratio,
         media_latency_sample_ratio_source = config.media_latency_sample_ratio_source.as_str(),
-        // TEST-LOAD-BEARING: this event's message and these field names are a
-        // test contract. `crates/env-tests/tests/01_mh_deployment_config.rs`
-        // (`CONFIG_LOADED_MESSAGE`, `LOGGED_POLICY_BOUNDS`) reads them off the
-        // running pod and compares them with the deployed ConfigMap. Renaming
-        // either reds that test by design — update its table in the same
-        // change.
+        // OPERATOR-FACING only: nothing parses this line. What the running
+        // process loaded is read from the static gauges
+        // `observability::metrics::publish_egress_admission` sets (env-test
+        // 01), because a startup log line is lost to log rotation on a
+        // long-lived pod.
         "Configuration loaded successfully"
     );
 

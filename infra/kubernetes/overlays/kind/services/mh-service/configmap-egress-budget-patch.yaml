@@ -72,11 +72,10 @@
 # statically (docs/TODO.md §Infrastructure Validation in Devloops, the
 # env-config overlay-coverage entry).
 #
-# CHANGING THIS VALUE needs a pod restart. `kubectl apply -k` updates the
-# ConfigMap but does NOT restart the MH pods, which keep the value they started
-# with. `infra/kind/scripts/setup.sh` restarts them whenever its apply changed
-# this ConfigMap; after a hand `kubectl apply -k`, run:
-#   kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower
+# CHANGING THIS VALUE rolls the MH pods by itself: the ConfigMap is
+# content-addressed (ADR-0038 §2), so a changed value is a new ConfigMap name,
+# hence a new pod template. Deploy it with `infra/kind/scripts/deploy.sh`
+# (devloop container: `dev-cluster deploy`) — no restart.
 apiVersion: v1
 kind: ConfigMap
 metadata:

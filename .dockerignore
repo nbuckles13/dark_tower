@@ -2,8 +2,8 @@
 #
 # The service Dockerfiles (infra/docker/{ac,gc,mc,mh}-service/Dockerfile) are cargo-chef
 # multi-stage builds that `COPY . .` from this repo root (the build CONTEXT is
-# ${PROJECT_ROOT}; see infra/kind/scripts/setup.sh:build_image and the host-side helper's
-# cmd_rebuild in crates/devloop-helper/src/commands.rs). Without this file the context
+# ${PROJECT_ROOT}; see infra/kind/scripts/deploy.sh:build_content_tagged_image, run by
+# the host-side helper's `deploy` verb). Without this file the context
 # includes the ~27 GB host `target/`, which (×4 services, no GC) exhausts the host
 # container-storage filesystem mid-COPY ("no space left on device"). cargo-chef compiles
 # fresh in the container's own /build/target, so the host build artifacts are NEVER read —

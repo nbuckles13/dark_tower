@@ -56,7 +56,7 @@ export default defineConfig(({ mode }) => ({
     //
     // `demo` is NOT a load-bearing label here any more (R-7, story task #3). It remains the
     // interactive `pnpm dev` default, prefilled in SignUp.svelte/SignIn.svelte and seeded by
-    // infra/kind/scripts/setup.sh:seed_demo_org — serve the app at
+    // infra/kind/scripts/deploy.sh:seed_demo_org — serve the app at
     // http://demo.localhost:5173 for that. The browser E2E suite runs against a PER-RUN
     // organization instead: scripts/layer7.sh Phase 1h provisions one and exports
     // E2E_ORG_SUBDOMAIN, from which packages/web-app/e2e/env.ts DERIVES the page origin

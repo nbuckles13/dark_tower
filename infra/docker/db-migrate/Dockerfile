@@ -4,12 +4,12 @@
 #
 # sqlx-cli plus the tree's `migrations/`, run in-cluster as the `db-migrate`
 # Job (infra/services/db-migrate/) BEFORE the environment root is applied.
-# Built by infra/kind/scripts/setup.sh, which tags it by its own image ID
+# Built by infra/kind/scripts/deploy.sh, which tags it by its own image ID
 # (content_tag), like every first-party image.
 #
 # Build context: the repo root (the service images' context and .dockerignore).
 # Build args:
-#   SQLX_CLI_VERSION  REQUIRED. Derived by setup.sh from Cargo.lock's `sqlx`
+#   SQLX_CLI_VERSION  REQUIRED. Derived by deploy.sh from Cargo.lock's `sqlx`
 #                     (infra/lib/cargo-lock-version.sh) so the CLI writing
 #                     `_sqlx_migrations` matches the library reading it.
 #   RUST_VERSION      Same default as the service Dockerfiles; setup.test.sh
@@ -28,7 +28,7 @@ ARG RUST_VERSION=1.91
 FROM docker.io/library/rust:${RUST_VERSION}-slim-bookworm AS builder
 
 ARG SQLX_CLI_VERSION
-RUN test -n "${SQLX_CLI_VERSION}" || { echo "SQLX_CLI_VERSION build-arg is required (derived from Cargo.lock by setup.sh)" >&2; exit 1; }
+RUN test -n "${SQLX_CLI_VERSION}" || { echo "SQLX_CLI_VERSION build-arg is required (derived from Cargo.lock by infra/kind/scripts/deploy.sh)" >&2; exit 1; }
 
 WORKDIR /build
 # The cargo parallelism cap (build.jobs) lives in .cargo/config.toml; copy it in

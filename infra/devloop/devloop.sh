@@ -71,7 +71,7 @@ read_node_version() {
 # `_sqlx_migrations` table it writes is the one `#[sqlx::test]` reads. The
 # Dockerfile takes it as `ARG SQLX_CLI_VERSION` (no default; fails loud if
 # unset); the value comes from the ONE Cargo.lock reader, shared with
-# infra/kind/scripts/setup.sh (the db-migrate image). Fails loud, never floats.
+# infra/kind/scripts/deploy.sh (the db-migrate image). Fails loud, never floats.
 # shellcheck source=../lib/cargo-lock-version.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/cargo-lock-version.sh"
 read_sqlx_cli_version() {
@@ -148,7 +148,7 @@ CLUSTER_NAME_MAX=$(( DNS_LABEL_MAX - ${#NODE_SUFFIX} ))   # 49
 SLUG_MAX=$(( CLUSTER_NAME_MAX - ${#CLUSTER_PREFIX} ))     # 41
 if (( ${#TASK_SLUG} > SLUG_MAX )); then
     # SUBJECT= disambiguates which entity NAME=/LEN=/MAX= describe (this shared token
-    # also fires from setup.sh/teardown.sh with SUBJECT=cluster-name). Here it is the
+    # also fires from the Kind scripts (lib/common.sh) with SUBJECT=cluster-name). Here it is the
     # SLUG the operator typed; MAX is the computed cap, never a literal. A
     # SUBJECT=cluster-name line reaching an operator who launched via devloop.sh means
     # this launcher check was bypassed — itself a finding.
@@ -300,7 +300,7 @@ cleanup() {
     # (`localhost/<name>:sha-<image id>`, ADR-0038 §2), so two slugs building identical code
     # share a tag, and `-af` could yank an image a *parallel* slug is between building and
     # loading. Dangling-only is cross-slug-safe: orphaned layers + unused build cache only,
-    # never a tagged image a concurrent devloop still references. setup.sh already prunes
+    # never a tagged image a concurrent devloop still references. deploy.sh already prunes
     # each cluster's superseded refs after every converge; the precise per-slug rmi of the
     # LAST generation at cleanup needs a record of the deployed refs that outlives the
     # cluster (docs/TODO.md item A). podman-only by design — consistent with every other
@@ -408,8 +408,8 @@ launch_helper() {
 
     # Launch helper binary as a background process.
     #
-    # --project-root points at CLONE_DIR (NOT REPO_ROOT) so service rebuilds,
-    # setup.sh, and kind-config generation reflect the devloop's branch state
+    # --project-root points at CLONE_DIR (NOT REPO_ROOT) so image builds,
+    # provision.sh/deploy.sh, and kind-config generation reflect the devloop's branch state
     # — `/work` inside the dev container is mounted from CLONE_DIR, so this
     # is what edits land in. The helper *binary* is still compiled from
     # REPO_ROOT (see build_helper above) — that pin is what protects the
@@ -530,7 +530,7 @@ is_container_running() {
 # Ensure the per-devloop git clone exists at $CLONE_DIR.
 #
 # Must run BEFORE launch_helper because the helper's --project-root points
-# at $CLONE_DIR (so service rebuilds and setup.sh see the devloop's branch
+# at $CLONE_DIR (so image builds and provision.sh/deploy.sh see the devloop's branch
 # state, not the user's main checkout). Idempotent: no-ops if the clone
 # already exists.
 ensure_clone() {
@@ -638,7 +638,7 @@ if command -v kind &>/dev/null; then
             # Mount the helper runtime directory into the container. This is a read-write
             # mount because: (1) the unix socket requires rw for client connections, and
             # (2) files like kubeconfig/ports.json are created after container start (by
-            # dev-cluster setup) so individual ro file mounts aren't possible (files must
+            # dev-cluster provision) so individual ro file mounts aren't possible (files must
             # exist at mount time). Accepted risk: container can modify host-generated
             # files, but blast radius is limited to the dev session's own state.
             EXTRA_PODMAN_ARGS+=(-v "$HELPER_RUNTIME_DIR:/tmp/devloop:Z")
@@ -808,20 +808,24 @@ if [ -n "$HOST_GATEWAY_IP" ] && command -v kind &>/dev/null; then
     PORTS_FILE_PATH="$HELPER_RUNTIME_DIR/ports.json"
     NEEDS_SETUP=false
     if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-        echo "No Kind cluster found for ${TASK_SLUG}, starting setup in background..."
+        echo "No Kind cluster found for ${TASK_SLUG}, starting provision + deploy in background..."
         NEEDS_SETUP=true
     elif [ ! -f "$PORTS_FILE_PATH" ]; then
-        echo "Ports file missing, running setup in background (idempotent)..."
+        echo "Ports file missing, running provision + deploy in background (idempotent)..."
         NEEDS_SETUP=true
     fi
 
     if $NEEDS_SETUP; then
-        # Subshell ensures setup.pid is cleaned up when setup finishes,
+        # Eager bring-up = the two ADR-0038 verbs, in order: provision the
+        # platform, then deploy the application (only if provision succeeded).
+        # Subshell ensures setup.pid is cleaned up when both finish,
         # preventing stale PID issues on re-attach (PID recycling).
         # Use full path to dev-cluster: `podman exec` does NOT run the
         # container's entrypoint (which prepends /work/infra/devloop to PATH),
         # so a bare `dev-cluster` invocation fails to resolve.
-        (podman exec "$DEV_CONTAINER" /work/infra/devloop/dev-cluster setup \
+        (podman exec "$DEV_CONTAINER" /work/infra/devloop/dev-cluster provision \
+            >> "$HELPER_RUNTIME_DIR/eager-setup.log" 2>&1 \
+            && podman exec "$DEV_CONTAINER" /work/infra/devloop/dev-cluster deploy \
             >> "$HELPER_RUNTIME_DIR/eager-setup.log" 2>&1; \
             rm -f "$HELPER_RUNTIME_DIR/setup.pid") &
         EAGER_SETUP_PID=$!

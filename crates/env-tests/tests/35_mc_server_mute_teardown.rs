@@ -44,7 +44,8 @@ use env_tests::fixtures::media::{
     assert_relayed_on_slot, audio_datagram, bind_until_received, drain,
 };
 use env_tests::fixtures::metrics::{
-    format_instance_map, gauge_by_instance_present, poll_until_any_instance_above, PrometheusClient,
+    format_instance_map, gauge_by_instance_present, poll_until_any_instance_above,
+    settled_baseline, PrometheusClient,
 };
 use env_tests::fixtures::mh_grpc::{self, authed, probe_registration, ReleaseOnDrop};
 use env_tests::fixtures::participant::{
@@ -190,7 +191,13 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
     assert_relayed_on_slot("S3 PRE", &pre[&MARK_A], ps[2].slot_for(a), MARK_A, "A");
 
     // MUTE through MC's public API, by the host.
-    let drops_before = prom.instance_counter_map(SERVER_MUTED_DROPS).await;
+    let drops_before = settled_baseline(
+        &prom,
+        SERVER_MUTED_DROPS,
+        COUNTER_BUDGET,
+        "the assertion under test",
+    )
+    .await;
     let a_id = ps[1].join.participant_id.clone();
     ps[0].session.write(&server_mute(&a_id, true)).await;
     // MC applied it: B's own view marks A's slot SOURCE_MUTED.
@@ -336,9 +343,13 @@ async fn test_non_host_server_mute_is_refused_and_counted() {
     let gc = GcClient::new(&cluster.gc_base_url);
     let mut ps = meeting_of(&auth, &gc, "Server Mute Non-Host", &["H", "A"]).await;
 
-    let before = prom
-        .instance_counter_map(&server_mute_requests("not_permitted"))
-        .await;
+    let before = settled_baseline(
+        &prom,
+        &server_mute_requests("not_permitted"),
+        COUNTER_BUDGET,
+        "the assertion under test",
+    )
+    .await;
     let h_id = ps[0].join.participant_id.clone();
     ps[1].session.write(&server_mute(&h_id, true)).await;
 
@@ -491,8 +502,20 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
     )
     .await;
 
-    let mc_before = prom.instance_counter_map(MC_RELEASED).await;
-    let mh_before = prom.instance_counter_map(MH_RELEASED).await;
+    let mc_before = settled_baseline(
+        &prom,
+        MC_RELEASED,
+        COUNTER_BUDGET,
+        "the assertion under test",
+    )
+    .await;
+    let mh_before = settled_baseline(
+        &prom,
+        MH_RELEASED,
+        COUNTER_BUDGET,
+        "the assertion under test",
+    )
+    .await;
 
     // Everyone leaves through MC. B and C also drop their media sessions; S
     // leaves MC LAST and keeps its media sessions (the crashed tab).

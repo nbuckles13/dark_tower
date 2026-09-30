@@ -4,78 +4,39 @@
 //! terminated by `\n`. Responses use a streaming protocol:
 //!
 //! - Pre-execution errors: `{"success":false,"message":"...","error_kind":"..."}`
-//! - Command started:      `{"started":true,"cmd":"setup","ts":"..."}`
+//! - Command started:      `{"started":true,"cmd":"provision","ts":"..."}`
 //! - Stream lines:         `{"stream":"out","line":"...","ts":"..."}`
 //! - Final result:         `{"result":"ok","exit_code":0,"duration_ms":42000}`
 
 use crate::error::HelperError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::str::FromStr;
 
 /// Maximum request size in bytes (1 MB).
 pub const MAX_REQUEST_SIZE: u64 = 1_048_576;
 
-/// Service names — exhaustive enum match prevents injection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Service {
-    Ac,
-    Gc,
-    Mc,
-    Mh,
-}
+/// Every verb the helper accepts on the wire — the ADR-0030 allowlist, and the
+/// SSoT `scripts/guards/simple/validate-dev-cluster-verbs.sh` compares the
+/// `infra/devloop/dev-cluster` client's `VERBS=` line against. Keep it on ONE
+/// line (the guard reads it as a single literal; `rustfmt::skip` holds it there). `parse_command` accepts
+/// exactly this set (pinned by `test_parse_command_accepts_exactly_verbs`).
+#[rustfmt::skip]
+pub const VERBS: &[&str] = &["provision", "deploy", "teardown", "recreate", "restore-kubeconfig", "status", "cancel"];
 
-impl Service {
-    /// All valid service variants (the round-trip test enumerates them).
-    #[cfg(test)]
-    pub const ALL: [Service; 4] = [Service::Ac, Service::Gc, Service::Mc, Service::Mh];
-
-    /// The service's short name, as setup.sh's `--only` takes it. Image names
-    /// and tags are NOT derived here: setup.sh tags every image by its content
-    /// (ADR-0038 §2), and the helper delegates builds to it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ac => "ac",
-            Self::Gc => "gc",
-            Self::Mc => "mc",
-            Self::Mh => "mh",
-        }
-    }
-}
-
-impl FromStr for Service {
-    type Err = HelperError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ac" => Ok(Self::Ac),
-            "gc" => Ok(Self::Gc),
-            "mc" => Ok(Self::Mc),
-            "mh" => Ok(Self::Mh),
-            other => Err(HelperError::InvalidService(other.to_string())),
-        }
-    }
-}
-
-impl fmt::Display for Service {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Commands the helper can execute.
+/// Commands the helper can execute. None takes an argument: the wire request
+/// is `{token, command}` and nothing else (ADR-0038 step 3), so no
+/// client-supplied string can reach a script's argv or env.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperCommand {
-    /// Allocate ports, generate kind-config, create cluster, run setup.sh.
-    Setup { skip_observability: bool },
-    /// Rebuild one service image (content-tagged) and converge, via
-    /// `setup.sh --only <svc>`.
-    Rebuild(Service),
-    /// Rebuild every first-party image and converge, via `setup.sh --rebuild-all`.
-    RebuildAll,
-    /// Apply manifests only (no image rebuild).
-    Deploy(Service),
+    /// Make sure a cluster matching the blueprint exists: allocate ports,
+    /// render kind-config, run `infra/kind/scripts/provision.sh` (which
+    /// destroys and rebuilds the cluster only when its recorded blueprint
+    /// differs or is missing — ADR-0038 §1).
+    Provision,
+    /// Converge the application to the tree: `infra/kind/scripts/deploy.sh`
+    /// (content-tagged images, migration Job, the one environment root —
+    /// ADR-0038 §2). Rolls only what changed.
+    Deploy,
     /// Delete Kind cluster, clean up all state.
     Teardown,
     /// Self-heal: destroy + recreate this slug's cluster, guarded by a host-side
@@ -115,13 +76,12 @@ pub enum HelperCommand {
 }
 
 impl HelperCommand {
-    /// Get the command name for logging.
+    /// Get the command name for logging (and the wire spelling — every
+    /// non-test name is a member of [`VERBS`]).
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Setup { .. } => "setup",
-            Self::Rebuild(_) => "rebuild",
-            Self::RebuildAll => "rebuild-all",
-            Self::Deploy(_) => "deploy",
+            Self::Provision => "provision",
+            Self::Deploy => "deploy",
             Self::Teardown => "teardown",
             Self::Recreate => "recreate",
             Self::RestoreKubeconfig => "restore-kubeconfig",
@@ -138,18 +98,11 @@ impl HelperCommand {
         }
     }
 
-    /// Get the arguments for logging.
+    /// Get the arguments for logging. Wire verbs carry none.
     pub fn args_for_log(&self) -> Vec<String> {
         match self {
-            Self::Setup { skip_observability } => {
-                if *skip_observability {
-                    vec!["--skip-observability".to_string()]
-                } else {
-                    vec![]
-                }
-            }
-            Self::Rebuild(svc) | Self::Deploy(svc) => vec![svc.to_string()],
-            Self::RebuildAll
+            Self::Provision
+            | Self::Deploy
             | Self::Teardown
             | Self::Recreate
             | Self::RestoreKubeconfig
@@ -171,10 +124,8 @@ impl HelperCommand {
     /// (`Cancel`) signal an in-flight write without acquiring the lock.
     pub fn is_write(&self) -> bool {
         match self {
-            Self::Setup { .. }
-            | Self::Rebuild(_)
-            | Self::RebuildAll
-            | Self::Deploy(_)
+            Self::Provision
+            | Self::Deploy
             | Self::Teardown
             | Self::Recreate
             | Self::RestoreKubeconfig => true,
@@ -192,165 +143,64 @@ impl HelperCommand {
 
 impl fmt::Display for HelperCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Setup { skip_observability } => {
-                write!(f, "setup")?;
-                if *skip_observability {
-                    write!(f, " --skip-observability")?;
-                }
-                Ok(())
-            }
-            Self::Rebuild(svc) => write!(f, "rebuild {svc}"),
-            Self::RebuildAll => write!(f, "rebuild-all"),
-            Self::Deploy(svc) => write!(f, "deploy {svc}"),
-            Self::Teardown => write!(f, "teardown"),
-            Self::Recreate => write!(f, "recreate"),
-            Self::RestoreKubeconfig => write!(f, "restore-kubeconfig"),
-            Self::Status => write!(f, "status"),
-            Self::Cancel => write!(f, "cancel"),
-            #[cfg(test)]
-            Self::TestSleep { seconds } => write!(f, "test-sleep {seconds}"),
-            #[cfg(test)]
-            Self::TestSleepIgnoringTerm { seconds } => {
-                write!(f, "test-sleep-ignoring-term {seconds}")
-            }
-            #[cfg(test)]
-            Self::TestSleepWithChild { seconds } => write!(f, "test-sleep-with-child {seconds}"),
-            #[cfg(test)]
-            Self::TestSleepWithChildIgnoringTerm { seconds } => {
-                write!(f, "test-sleep-with-child-ignoring-term {seconds}")
-            }
+        f.write_str(self.name())?;
+        for arg in self.args_for_log() {
+            write!(f, " {arg}")?;
         }
+        Ok(())
     }
 }
 
-/// Request from the client to the helper.
-#[derive(Debug, Deserialize)]
+/// Request from the client to the helper: a token and a verb, NOTHING else.
+///
+/// `deny_unknown_fields` is the argument allowlist: there is no argument field,
+/// so a client that sends one (the retired `service` / `skip_observability`,
+/// or anything new) is rejected at deserialization — before `parse_command`,
+/// before any exec. Adding a field here reopens the ADR-0030 argument surface
+/// and needs @security's review.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     /// Authentication token.
     pub token: String,
     /// Command name.
     pub command: String,
-    /// Optional service name for rebuild/deploy.
-    #[serde(default)]
-    pub service: Option<String>,
-    /// Optional flags.
-    #[serde(default)]
-    pub skip_observability: bool,
+}
+
+/// Hand-written so a `{:?}` of a request can never print the token.
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("token", &"<redacted>")
+            .field("command", &self.command)
+            .finish()
+    }
 }
 
 impl Request {
-    /// Reject ANY argument beyond `token`+`command` for the no-arg self-heal
-    /// verbs (`recreate`, `restore-kubeconfig`).
-    ///
-    /// Written as an EXHAUSTIVE destructure of `Request` on purpose (@security
-    /// R1): this is the allowlist form, so a future field added to `Request`
-    /// fails to COMPILE at this site until it is classified here, rather than
-    /// being silently accepted by a per-field deny-list. This check is what
-    /// holds the containment invariant — these verbs take no client-supplied
-    /// target — at the parse boundary. Do NOT "simplify" it to
-    /// `self.service.is_none() && !self.skip_observability`; that reopens the
-    /// silent-accept-a-new-field hole.
-    fn reject_all_args(&self, verb: &str) -> Result<(), HelperError> {
-        let Request {
-            token: _,
-            command: _,
-            service,
-            skip_observability,
-        } = self;
-        if service.is_some() || *skip_observability {
-            return Err(HelperError::InvalidRequest(format!(
-                "{verb} command does not accept any arguments"
-            )));
-        }
-        Ok(())
-    }
-
     /// Validate and parse the request into a typed command.
     pub fn parse_command(&self) -> Result<HelperCommand, HelperError> {
         // Reject null bytes and control characters in all string fields
         validate_no_control_chars(&self.command, "command")?;
         validate_no_control_chars(&self.token, "token")?;
-        if let Some(ref svc) = self.service {
-            validate_no_control_chars(svc, "service")?;
-        }
 
         match self.command.as_str() {
-            "setup" => {
-                if self.service.is_some() {
-                    return Err(HelperError::InvalidRequest(
-                        "setup command does not accept a service argument".to_string(),
-                    ));
-                }
-                Ok(HelperCommand::Setup {
-                    skip_observability: self.skip_observability,
-                })
-            }
-            "rebuild" => {
-                let svc_str = self.service.as_deref().ok_or_else(|| {
-                    HelperError::InvalidRequest(
-                        "rebuild command requires a service argument".to_string(),
-                    )
-                })?;
-                let svc = Service::from_str(svc_str)?;
-                Ok(HelperCommand::Rebuild(svc))
-            }
-            "rebuild-all" => {
-                if self.service.is_some() {
-                    return Err(HelperError::InvalidRequest(
-                        "rebuild-all command does not accept a service argument".to_string(),
-                    ));
-                }
-                Ok(HelperCommand::RebuildAll)
-            }
-            "deploy" => {
-                let svc_str = self.service.as_deref().ok_or_else(|| {
-                    HelperError::InvalidRequest(
-                        "deploy command requires a service argument".to_string(),
-                    )
-                })?;
-                let svc = Service::from_str(svc_str)?;
-                Ok(HelperCommand::Deploy(svc))
-            }
-            "teardown" => {
-                if self.service.is_some() {
-                    return Err(HelperError::InvalidRequest(
-                        "teardown command does not accept a service argument".to_string(),
-                    ));
-                }
-                Ok(HelperCommand::Teardown)
-            }
-            "recreate" => {
-                self.reject_all_args("recreate")?;
-                Ok(HelperCommand::Recreate)
-            }
-            "restore-kubeconfig" => {
-                self.reject_all_args("restore-kubeconfig")?;
-                Ok(HelperCommand::RestoreKubeconfig)
-            }
-            "status" => {
-                if self.service.is_some() {
-                    return Err(HelperError::InvalidRequest(
-                        "status command does not accept a service argument".to_string(),
-                    ));
-                }
-                Ok(HelperCommand::Status)
-            }
-            "cancel" => {
-                if self.service.is_some() {
-                    return Err(HelperError::InvalidRequest(
-                        "cancel command does not accept a service argument".to_string(),
-                    ));
-                }
-                if self.skip_observability {
-                    return Err(HelperError::InvalidRequest(
-                        "cancel command does not accept --skip-observability".to_string(),
-                    ));
-                }
-                Ok(HelperCommand::Cancel)
-            }
-            other => Err(HelperError::InvalidCommand(other.to_string())),
+            "provision" => Ok(HelperCommand::Provision),
+            "deploy" => Ok(HelperCommand::Deploy),
+            "teardown" => Ok(HelperCommand::Teardown),
+            "recreate" => Ok(HelperCommand::Recreate),
+            "restore-kubeconfig" => Ok(HelperCommand::RestoreKubeconfig),
+            "status" => Ok(HelperCommand::Status),
+            "cancel" => Ok(HelperCommand::Cancel),
+            // Names the valid set so a client from a different tree (a retired
+            // verb like `rebuild-all`, or a newer one this helper predates)
+            // gets the fix, not just a rejection: client and helper must come
+            // from the same tree (restart the devloop / rebuild the helper).
+            other => Err(HelperError::InvalidCommand(format!(
+                "{other} (this helper accepts: {}; a client/helper from a different tree — \
+                 rebuild and restart the helper via infra/devloop/devloop.sh)",
+                VERBS.join(", ")
+            ))),
         }
     }
 }
@@ -364,7 +214,7 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     /// Optional structured data. On success: command-specific result (e.g.,
-    /// port map on setup). On failure with `error_kind == "busy"`: a
+    /// port map on provision). On failure with `error_kind == "busy"`: a
     /// `{op, args}` object naming the in-flight write that blocked this
     /// request. This is intentionally dual-role to keep the wire schema
     /// additive — older clients ignore unknown JSON keys.
@@ -455,6 +305,47 @@ pub struct CommandResult {
     pub error_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// The decision lines the write's scripts printed ([`WriteDecisions`]),
+    /// for the audit log ONLY: never serialized, so the client wire shape is
+    /// unchanged.
+    #[serde(skip)]
+    pub decisions: WriteDecisions,
+}
+
+/// The two operator-facing decision lines a cluster-building write can print,
+/// captured from its child's output for the audit log (helper.log persists
+/// across runs; the client stream does not). ONLY these two line shapes are
+/// ever recorded — they carry hash prefixes, section labels, reason tokens and
+/// workload names, never secret material — and each is truncated to
+/// [`MAX_LINE_LEN`] like any streamed line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteDecisions {
+    /// The provision decision (`BLUEPRINT ACTION=… REASON=…`). A real
+    /// provision/rebuild line is kept over a later `ACTION=check` one (deploy's
+    /// guard re-checks the blueprint; the decision that cost minutes is the
+    /// provision one).
+    pub blueprint: Option<String>,
+    /// The last `DEPLOY_FAILED REASON=… WORKLOADS=…` line, when deploy failed.
+    pub deploy_failed: Option<String>,
+}
+
+impl WriteDecisions {
+    /// Record `line` if it is one of the two decision shapes; ignore anything
+    /// else.
+    pub fn observe(&mut self, line: &str) {
+        if line.starts_with("BLUEPRINT ") {
+            let is_check = line.contains(" ACTION=check ");
+            let have_real = self
+                .blueprint
+                .as_deref()
+                .is_some_and(|b| !b.contains(" ACTION=check "));
+            if !(is_check && have_real) {
+                self.blueprint = Some(truncate_line(line.to_string(), MAX_LINE_LEN));
+            }
+        } else if line.starts_with("DEPLOY_FAILED ") {
+            self.deploy_failed = Some(truncate_line(line.to_string(), MAX_LINE_LEN));
+        }
+    }
 }
 
 /// Message sent from reader threads to the main thread via mpsc channel.
@@ -496,280 +387,132 @@ fn validate_no_control_chars(s: &str, field_name: &str) -> Result<(), HelperErro
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_service_from_str_valid() {
-        assert_eq!(Service::from_str("ac").unwrap(), Service::Ac);
-        assert_eq!(Service::from_str("gc").unwrap(), Service::Gc);
-        assert_eq!(Service::from_str("mc").unwrap(), Service::Mc);
-        assert_eq!(Service::from_str("mh").unwrap(), Service::Mh);
+    fn req(command: &str) -> Request {
+        Request {
+            token: "abc123".to_string(),
+            command: command.to_string(),
+        }
     }
 
+    /// The wire allowlist: `parse_command` accepts EXACTLY [`VERBS`], and each
+    /// accepted command's `name()` is the wire spelling it was parsed from.
     #[test]
-    fn test_service_from_str_rejects_invalid() {
-        let invalid = [
-            "AC",
-            "Ac",
-            "ac ",
-            " ac",
-            "ac-service",
-            "db",
-            "web",
-            "",
-            "ac\0",
-            "ac\n",
-            "ac;rm -rf /",
+    fn test_parse_command_accepts_exactly_verbs() {
+        assert_eq!(
+            VERBS.len(),
+            7,
+            "positive control: the verb set is non-empty and pinned"
+        );
+        for verb in VERBS {
+            let parsed = req(verb).parse_command();
+            assert!(parsed.is_ok(), "{verb} must parse: {parsed:?}");
+            let cmd = parsed.unwrap();
+            assert_eq!(cmd.name(), *verb, "name() must round-trip the wire verb");
+            assert_eq!(cmd.to_string(), *verb, "Display carries no args");
+        }
+        // Every non-test variant is reachable from the wire (no verb exists
+        // that the allowlist forgot).
+        for cmd in [
+            HelperCommand::Provision,
+            HelperCommand::Deploy,
+            HelperCommand::Teardown,
+            HelperCommand::Recreate,
+            HelperCommand::RestoreKubeconfig,
+            HelperCommand::Status,
+            HelperCommand::Cancel,
+        ] {
+            assert!(
+                VERBS.contains(&cmd.name()),
+                "{} missing from VERBS",
+                cmd.name()
+            );
+        }
+    }
+
+    /// Retired by ADR-0038 step 3: no alias survives, and the rejection names
+    /// the valid set plus the version-skew fix.
+    #[test]
+    fn test_retired_verbs_are_invalid_command() {
+        for retired in ["setup", "rebuild", "rebuild-all"] {
+            let err = req(retired).parse_command().unwrap_err();
+            assert_eq!(err.kind(), "invalid_command", "{retired}");
+            let msg = err.to_string();
+            assert!(msg.contains(retired), "{retired}: {msg}");
+            assert!(msg.contains("provision, deploy"), "{retired}: {msg}");
+            assert!(msg.contains("devloop.sh"), "{retired}: {msg}");
+        }
+    }
+
+    /// The retired argument fields — and any other field — are rejected at
+    /// deserialization, before parse and before any exec.
+    #[test]
+    fn test_argument_fields_rejected_at_deserialization() {
+        for json in [
+            r#"{"token":"abc","command":"deploy","service":"gc"}"#,
+            r#"{"token":"abc","command":"provision","skip_observability":true}"#,
+            r#"{"token":"abc","command":"provision","skip_observability":false}"#,
+            r#"{"token":"abc","command":"status","unknown_field":"evil"}"#,
+            r#"{"token":"abc","command":"recreate","service":null}"#,
+        ] {
+            let err = serde_json::from_str::<Request>(json)
+                .expect_err(&format!("must be rejected: {json}"));
+            assert!(err.to_string().contains("unknown field"), "{json}: {err}");
+        }
+    }
+
+    /// Injection shapes against the `{token, command}` wire: every one is
+    /// rejected by `parse_command` (the gate in front of any exec).
+    #[test]
+    fn test_command_injection_shapes_rejected() {
+        for command in [
+            "deploy mc",
+            "provision ",
+            " provision",
+            "deploy;rm -rf /",
+            "provision && id",
             "$(whoami)",
-        ];
-        for s in &invalid {
+            "`id`",
+            "deploy | cat /etc/passwd",
+            "../provision",
+            "PROVISION",
+            "",
+        ] {
+            let err = req(command).parse_command().unwrap_err();
+            assert_eq!(err.kind(), "invalid_command", "{command:?}");
+        }
+        for command in ["provision\0", "deploy\nteardown", "status\r", "cancel\t"] {
+            let err = req(command).parse_command().unwrap_err();
             assert!(
-                Service::from_str(s).is_err(),
-                "expected rejection for {:?}",
-                s
+                err.to_string().contains("control character"),
+                "{command:?}: {err}"
             );
         }
     }
 
     #[test]
-    fn test_service_round_trip() {
-        for svc in &Service::ALL {
-            assert_eq!(Service::from_str(svc.as_str()).unwrap(), *svc);
-        }
-    }
-
-    #[test]
-    fn test_parse_command_setup() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "setup".to_string(),
-            service: None,
-            skip_observability: false,
+    fn test_parse_command_rejects_tab_in_token() {
+        let r = Request {
+            token: "abc\t123".to_string(),
+            command: "provision".to_string(),
         };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(
-            cmd,
-            HelperCommand::Setup {
-                skip_observability: false
-            }
-        );
+        let err = r.parse_command().unwrap_err();
+        assert!(err.to_string().contains("control character"), "got: {err}");
     }
 
+    /// `{:?}` of a request never prints the token (semantic-guard
+    /// credential-leak).
     #[test]
-    fn test_parse_command_setup_skip_obs() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "setup".to_string(),
-            service: None,
-            skip_observability: true,
-        };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(
-            cmd,
-            HelperCommand::Setup {
-                skip_observability: true
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_command_rebuild() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "rebuild".to_string(),
-            service: Some("ac".to_string()),
-            skip_observability: false,
-        };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(cmd, HelperCommand::Rebuild(Service::Ac));
-    }
-
-    #[test]
-    fn test_parse_command_rebuild_missing_service() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "rebuild".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        assert!(req.parse_command().is_err());
-    }
-
-    #[test]
-    fn test_parse_command_rebuild_invalid_service() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "rebuild".to_string(),
-            service: Some("; rm -rf /".to_string()),
-            skip_observability: false,
-        };
-        assert!(req.parse_command().is_err());
-    }
-
-    #[test]
-    fn test_parse_command_rebuild_all() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "rebuild-all".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(cmd, HelperCommand::RebuildAll);
-    }
-
-    #[test]
-    fn test_parse_command_deploy() {
-        let req = Request {
-            token: "abc123".to_string(),
+    fn test_request_debug_redacts_token() {
+        let r = Request {
+            token: "s3cr3t-token-value".to_string(),
             command: "deploy".to_string(),
-            service: Some("gc".to_string()),
-            skip_observability: false,
         };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(cmd, HelperCommand::Deploy(Service::Gc));
-    }
-
-    #[test]
-    fn test_parse_command_teardown() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "teardown".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(cmd, HelperCommand::Teardown);
-    }
-
-    #[test]
-    fn test_parse_command_recreate() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "recreate".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        assert_eq!(req.parse_command().unwrap(), HelperCommand::Recreate);
-    }
-
-    #[test]
-    fn test_parse_command_restore_kubeconfig() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "restore-kubeconfig".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        assert_eq!(
-            req.parse_command().unwrap(),
-            HelperCommand::RestoreKubeconfig
+        let dbg = format!("{r:?}");
+        assert!(!dbg.contains("s3cr3t-token-value"), "got: {dbg}");
+        assert!(
+            dbg.contains("<redacted>") && dbg.contains("deploy"),
+            "got: {dbg}"
         );
-    }
-
-    /// Containment invariant (P5): both self-heal verbs reject ANY argument —
-    /// not just a service arg — so no client-supplied target can reach them.
-    #[test]
-    fn test_recreate_and_restore_reject_any_arg() {
-        for cmd in ["recreate", "restore-kubeconfig"] {
-            // A service arg is rejected.
-            let with_service = Request {
-                token: "abc123".to_string(),
-                command: cmd.to_string(),
-                service: Some("ac".to_string()),
-                skip_observability: false,
-            };
-            assert!(
-                with_service.parse_command().is_err(),
-                "{cmd} must reject a service arg"
-            );
-            // A stray skip_observability is rejected too (not just service).
-            let with_flag = Request {
-                token: "abc123".to_string(),
-                command: cmd.to_string(),
-                service: None,
-                skip_observability: true,
-            };
-            assert!(
-                with_flag.parse_command().is_err(),
-                "{cmd} must reject skip_observability"
-            );
-        }
-    }
-
-    #[test]
-    fn test_recreate_restore_are_writes() {
-        assert!(HelperCommand::Recreate.is_write());
-        assert!(HelperCommand::RestoreKubeconfig.is_write());
-    }
-
-    #[test]
-    fn test_recreate_restore_display_and_name() {
-        assert_eq!(HelperCommand::Recreate.to_string(), "recreate");
-        assert_eq!(HelperCommand::Recreate.name(), "recreate");
-        assert_eq!(
-            HelperCommand::RestoreKubeconfig.to_string(),
-            "restore-kubeconfig"
-        );
-        assert_eq!(
-            HelperCommand::RestoreKubeconfig.name(),
-            "restore-kubeconfig"
-        );
-    }
-
-    #[test]
-    fn test_parse_command_status() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "status".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(cmd, HelperCommand::Status);
-    }
-
-    #[test]
-    fn test_status_rejects_service_arg() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "status".to_string(),
-            service: Some("ac".to_string()),
-            skip_observability: false,
-        };
-        assert!(req.parse_command().is_err());
-    }
-
-    #[test]
-    fn test_parse_command_cancel() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "cancel".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        let cmd = req.parse_command().unwrap();
-        assert_eq!(cmd, HelperCommand::Cancel);
-    }
-
-    #[test]
-    fn test_cancel_rejects_service_arg() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "cancel".to_string(),
-            service: Some("ac".to_string()),
-            skip_observability: false,
-        };
-        assert!(req.parse_command().is_err());
-    }
-
-    #[test]
-    fn test_cancel_rejects_skip_observability() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "cancel".to_string(),
-            service: None,
-            skip_observability: true,
-        };
-        assert!(req.parse_command().is_err());
     }
 
     /// Security S6 + CR5 + Test #1 regression: the cfg(test) `TestSleep`,
@@ -798,18 +541,11 @@ mod tests {
 
     #[test]
     fn test_is_write_classification() {
-        assert!(HelperCommand::Setup {
-            skip_observability: false
-        }
-        .is_write());
-        assert!(HelperCommand::Setup {
-            skip_observability: true
-        }
-        .is_write());
-        assert!(HelperCommand::Rebuild(Service::Ac).is_write());
-        assert!(HelperCommand::RebuildAll.is_write());
-        assert!(HelperCommand::Deploy(Service::Gc).is_write());
+        assert!(HelperCommand::Provision.is_write());
+        assert!(HelperCommand::Deploy.is_write());
         assert!(HelperCommand::Teardown.is_write());
+        assert!(HelperCommand::Recreate.is_write());
+        assert!(HelperCommand::RestoreKubeconfig.is_write());
         assert!(!HelperCommand::Status.is_write());
         assert!(!HelperCommand::Cancel.is_write());
         // TestSleep variants are classified as writes so the stubs exercise
@@ -823,15 +559,15 @@ mod tests {
     #[test]
     fn test_busy_response_data_carries_op_and_args() {
         let err = HelperError::Busy {
-            op: "setup".to_string(),
-            args: vec!["--skip-observability".to_string()],
+            op: "test-sleep".to_string(),
+            args: vec!["30".to_string()],
         };
         let resp = Response::err(&err);
         assert!(!resp.success);
         assert_eq!(resp.error_kind.as_deref(), Some("busy"));
         let data = resp.data.expect("busy response must include data");
-        assert_eq!(data["op"], "setup");
-        assert_eq!(data["args"][0], "--skip-observability");
+        assert_eq!(data["op"], "test-sleep");
+        assert_eq!(data["args"][0], "30");
     }
 
     #[test]
@@ -839,94 +575,6 @@ mod tests {
         let err = HelperError::AuthFailed;
         let resp = Response::err(&err);
         assert!(resp.data.is_none());
-    }
-
-    #[test]
-    fn test_parse_command_unknown() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "hack".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        assert!(req.parse_command().is_err());
-    }
-
-    #[test]
-    fn test_parse_command_rejects_null_bytes_in_command() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "setup\0extra".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        let err = req.parse_command().unwrap_err();
-        assert!(
-            err.to_string().contains("control character"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_parse_command_rejects_newlines_in_service() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "rebuild".to_string(),
-            service: Some("ac\nmalicious".to_string()),
-            skip_observability: false,
-        };
-        let err = req.parse_command().unwrap_err();
-        assert!(
-            err.to_string().contains("control character"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_parse_command_rejects_tab_in_token() {
-        let req = Request {
-            token: "abc\t123".to_string(),
-            command: "setup".to_string(),
-            service: None,
-            skip_observability: false,
-        };
-        let err = req.parse_command().unwrap_err();
-        assert!(
-            err.to_string().contains("control character"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_setup_rejects_service_arg() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "setup".to_string(),
-            service: Some("ac".to_string()),
-            skip_observability: false,
-        };
-        assert!(req.parse_command().is_err());
-    }
-
-    #[test]
-    fn test_teardown_rejects_service_arg() {
-        let req = Request {
-            token: "abc123".to_string(),
-            command: "teardown".to_string(),
-            service: Some("ac".to_string()),
-            skip_observability: false,
-        };
-        assert!(req.parse_command().is_err());
-    }
-
-    #[test]
-    fn test_serde_rejects_unknown_fields() {
-        let json = r#"{"token":"abc","command":"setup","unknown_field":"evil"}"#;
-        let result: Result<Request, _> = serde_json::from_str(json);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -944,32 +592,6 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"success\":false"));
         assert!(json.contains("\"error_kind\":\"auth_failed\""));
-    }
-
-    #[test]
-    fn test_command_display() {
-        assert_eq!(
-            HelperCommand::Setup {
-                skip_observability: false
-            }
-            .to_string(),
-            "setup"
-        );
-        assert_eq!(
-            HelperCommand::Setup {
-                skip_observability: true
-            }
-            .to_string(),
-            "setup --skip-observability"
-        );
-        assert_eq!(
-            HelperCommand::Rebuild(Service::Ac).to_string(),
-            "rebuild ac"
-        );
-        assert_eq!(HelperCommand::RebuildAll.to_string(), "rebuild-all");
-        assert_eq!(HelperCommand::Deploy(Service::Gc).to_string(), "deploy gc");
-        assert_eq!(HelperCommand::Teardown.to_string(), "teardown");
-        assert_eq!(HelperCommand::Status.to_string(), "status");
     }
 
     // --- Streaming protocol type tests ---
@@ -1034,12 +656,12 @@ mod tests {
     fn test_command_started_serialization() {
         let started = CommandStarted {
             started: true,
-            cmd: "setup".to_string(),
+            cmd: "provision".to_string(),
             ts: "2026-04-08T14:23:45.000Z".to_string(),
         };
         let json = serde_json::to_string(&started).unwrap();
         assert!(json.contains("\"started\":true"));
-        assert!(json.contains("\"cmd\":\"setup\""));
+        assert!(json.contains("\"cmd\":\"provision\""));
     }
 
     #[test]
@@ -1051,8 +673,15 @@ mod tests {
             error: None,
             error_kind: None,
             data: None,
+            decisions: WriteDecisions {
+                blueprint: Some("BLUEPRINT ACTION=none REASON=match".to_string()),
+                deploy_failed: None,
+            },
         };
         let json = serde_json::to_string(&result).unwrap();
+        // The decision lines are for the audit log only — never on the wire.
+        assert!(!json.contains("BLUEPRINT"), "{json}");
+        assert!(!json.contains("decisions"), "{json}");
         assert!(json.contains("\"result\":\"ok\""));
         assert!(json.contains("\"exit_code\":0"));
         assert!(json.contains("\"duration_ms\":42000"));
@@ -1066,14 +695,15 @@ mod tests {
             result: CommandOutcome::Error,
             exit_code: Some(1),
             duration_ms: 5000,
-            error: Some("setup.sh failed".to_string()),
+            error: Some("deploy.sh failed".to_string()),
             error_kind: Some("command_failed".to_string()),
             data: None,
+            decisions: WriteDecisions::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"result\":\"error\""));
         assert!(json.contains("\"exit_code\":1"));
-        assert!(json.contains("\"error\":\"setup.sh failed\""));
+        assert!(json.contains("\"error\":\"deploy.sh failed\""));
     }
 
     #[test]
@@ -1086,6 +716,7 @@ mod tests {
             error: None,
             error_kind: None,
             data: Some(data.clone()),
+            decisions: WriteDecisions::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: CommandResult = serde_json::from_str(&json).unwrap();
@@ -1101,6 +732,7 @@ mod tests {
             error: Some("killed by signal".to_string()),
             error_kind: Some("command_failed".to_string()),
             data: None,
+            decisions: WriteDecisions::default(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: CommandResult = serde_json::from_str(&json).unwrap();
@@ -1146,5 +778,52 @@ mod tests {
         assert!(result.ends_with(" [truncated]"));
         // The truncation should back up to byte 98 (before the emoji)
         assert!(result.starts_with(&"a".repeat(98)));
+    }
+
+    #[test]
+    fn write_decisions_record_only_the_two_decision_shapes() {
+        let mut d = WriteDecisions::default();
+        d.observe("building localhost/gc-service ...");
+        d.observe("  BLUEPRINT indented is not a decision line");
+        d.observe("password=hunter2");
+        assert_eq!(d, WriteDecisions::default());
+        d.observe(
+            "BLUEPRINT ACTION=rebuild REASON=changed RECORDED=a CURRENT=b CHANGED=kind-config",
+        );
+        d.observe("DEPLOY_FAILED REASON=rollout-failed WORKLOADS=dark-tower/deployment/mc-0");
+        assert_eq!(
+            d.blueprint.as_deref(),
+            Some(
+                "BLUEPRINT ACTION=rebuild REASON=changed RECORDED=a CURRENT=b CHANGED=kind-config"
+            )
+        );
+        assert_eq!(
+            d.deploy_failed.as_deref(),
+            Some("DEPLOY_FAILED REASON=rollout-failed WORKLOADS=dark-tower/deployment/mc-0")
+        );
+    }
+
+    /// deploy's guard re-checks the blueprint after a recreate's provision:
+    /// the provision decision (the one that cost minutes) is kept over the
+    /// later `ACTION=check` line — but a check is recorded when it is all
+    /// there is (a plain deploy).
+    #[test]
+    fn write_decisions_keep_the_real_provision_line_over_a_later_check() {
+        let mut d = WriteDecisions::default();
+        d.observe("BLUEPRINT ACTION=check REASON=match RECORDED=a CURRENT=a CHANGED=-");
+        assert!(d.blueprint.as_deref().unwrap().contains("ACTION=check"));
+        d.observe("BLUEPRINT ACTION=rebuild REASON=missing RECORDED=none CURRENT=b CHANGED=-");
+        d.observe("BLUEPRINT ACTION=check REASON=match RECORDED=b CURRENT=b CHANGED=-");
+        assert!(d.blueprint.as_deref().unwrap().contains("ACTION=rebuild"));
+    }
+
+    #[test]
+    fn write_decisions_truncate_like_any_streamed_line() {
+        let mut d = WriteDecisions::default();
+        d.observe(&format!(
+            "DEPLOY_FAILED REASON=rollout-failed WORKLOADS={}",
+            "x".repeat(MAX_LINE_LEN * 2)
+        ));
+        assert!(d.deploy_failed.unwrap().len() <= MAX_LINE_LEN + 32);
     }
 }

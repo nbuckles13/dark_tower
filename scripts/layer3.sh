@@ -48,6 +48,13 @@ layer_lifecycle_begin 3
   # run-guards.sh's `find -name '*.sh'` matches `*.test.sh` too, so it would be auto-run as a
   # guard as well as here. No cluster.
   run_and_emit "subdomain-regex-guard-selftest" "${__here}/guards/validate-subdomain-regex-sync.test.sh" || true
+  # dev-cluster vocabulary guard SELF-TEST (ADR-0038 step 3): same shape and reason. The
+  # guard (auto-discovered above) keeps every `dev-cluster <verb>` / Kind-script `--flag`
+  # remedy spelling live; this drives its failure branches (retired verb/flag, client/helper
+  # allowlist drift, empty remedy site, missing scan root) and its no-false-positive prose
+  # case against synthetic trees via the DEVLOOP_TEST-gated DT_VERBS_GUARD_ROOT seam.
+  # Deliberately NOT under guards/simple/ (find -name '*.sh'). No cluster.
+  run_and_emit "dev-cluster-verbs-guard-selftest" "${__here}/guards/validate-dev-cluster-verbs.test.sh" || true
   # Slug-class sync self-test (story task #4, R-8): same shape and same reason as the
   # subdomain guard above. validate-slug-class-sync.sh pins /close-story's read-time slug
   # regex to the canonical `manifest::SLUG_PATTERN`; in-tree it always passes, so its drift
