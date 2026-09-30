@@ -217,7 +217,8 @@ Complete ALL items before deploying to production:
     a pre-story-2 receiver drops rather than mis-attributes, verification
     always uses the current roster key, and the one-`sender_id`-per-identity-
     per-KEK-generation invariant holds server-side whatever the client version.
-    It only bites in a meeting that has exhausted 65,536 admissions.
+    It only bites in a meeting that has exhausted its `sender_id` namespace (size set by
+    the allocator, `crates/mc-service/src/media_admission/sender_id.rs`).
   - **The Prometheus rules are a FOURTH artifact in this release's coupled
     set, and the coupling runs both ways.** `infra/docker/prometheus/rules/`
     is content-hashed through `configMapGenerator`

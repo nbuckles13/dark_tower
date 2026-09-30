@@ -712,14 +712,20 @@ sudo tcpdump -ni any -c 20 'udp and port 4433'
   which is exactly what the F1 question needs.
 - **Never paste a capture into a ticket or chat.**
 
-> **Expect silence, and do not diagnose it as a fault.** Because the SDK performs no frame I/O
-> after the connect envelope, a **healthy** join on the UDP path looks like: QUIC handshake, one
-> bidirectional stream, one small write, then **quiet**. There is no media plane on this branch at
-> all. A reader who watches the traffic flatline and concludes the system is broken has
-> misdiagnosed a working system.
+> **Expect little on this port, and do not diagnose it as a fault.** This capture watches **MC's**
+> port, which carries signalling only: a healthy join shows the QUIC handshake, the join exchange,
+> then sparse traffic — MC writes when something structural changes (a join, leave, mute or KEK
+> rotation), not continuously. **Audio never crosses this port**: media datagrams go to the MH
+> ports (the MH entries in `infra/kind/kind-config.yaml`), and a participant nobody holds sends
+> none at all (F12). A reader who watches this port go quiet and concludes media is broken has
+> misread which hop they are watching.
+>
+> *Recorded correction (story 2 task 17): this note previously said "there is no media plane on
+> this branch at all" — true when §4 was written, false since the media stories landed. A reader
+> trusting it would have dismissed a media fault as expected silence.*
 
-`tcpdump` proves packets reached the host. It does not prove media flows, because media does not
-flow on this branch.
+`tcpdump` proves packets reached the host. It does not prove media flows — for that, work the
+media ladder in §4.5.
 
 ### 4.4 Roster check
 
@@ -745,7 +751,7 @@ the end of this section about where they can and cannot be read.
 
 | Rung | Read | Localises to |
 |---|---|---|
-| 1 | Is `dt_client_media_frames_sent_total` moving? | **capture / mute** vs everything downstream. *Moving/flat is the whole read:* the counter is **per datagram**, one per target handler, so a sender directed at two handlers posts ~2x its capture rate — never compare its rate against a capture rate here. |
+| 1 | Is `dt_client_media_frames_sent_total` moving? | **capture / mute / nobody holds you** vs everything downstream — flat is CORRECT for a participant nobody holds, a solo participant always (F12). *Moving/flat is the whole read:* the counter is **per datagram**, one per target handler, so a sender directed at two handlers posts ~2x its capture rate — never compare its rate against a capture rate here. |
 | 2 | Is `dt_client_media_frames_received_total` moving? | **delivery** (another sender → MH → this client) vs receive-side processing. A solo participant receives nothing by design (R-3). |
 | 3 | Is `dt_client_media_frames_accepted_total` moving? | **crypto/parse** vs **playback** |
 | 4 | `dt_client_media_frames_dropped_total{reason}` | the exact receive step that rejected, **by name** |
@@ -782,8 +788,8 @@ decoder handoff and audible decrements nothing on the right-hand side, which is 
 
 | Rung 1 | Rung 2 | Meaning |
 |---|---|---|
-| `sent` **flat** | — | Capture or mute-release never resumed. **Not a transport problem.** Go to F12. |
-| `sent` rising | `received` **flat** | Transmitting into something that is not returning. **Two causes, no unique client-side discriminator.** Go to F13. |
+| `sent` **flat** | — | Nobody holds you (a solo participant always — **correct, stop**), or capture or mute-release never resumed. **Not a transport problem.** Go to F12. |
+| `sent` rising | `received` **flat** | Either nobody is being sent to you (every peer muted, or no source for your slots — **correct**) or a source MC says is active is not arriving. F13 splits these on `dt_client_media_receive_source_deficit_total` first. Go to F13. |
 | `sent` rising | `received` rising, `accepted` **flat** | Arriving and failing to open. Read rung 4's `reason` label — it names the step. Go to F15 if the reason is key material. |
 | `sent` rising | `accepted` rising, still silent | The fault is **downstream of decoder handoff**. Go to F14. |
 
@@ -806,8 +812,11 @@ tokens are emitted **individually** rather than collapsed. Grouped by what they 
 # Is MH forwarding at all?
 sum(rate(mh_media_frames_forwarded_total{direction="egress"}[5m]))
 
-# Is MH shedding on its egress queue bound?  (`no_subscriber` and `connection_closed`
-# in this breakdown are routine, not faults -- see MH Scenario 17.)
+# Is MH shedding on its egress queue bound?  `connection_closed` is routine.
+# `no_subscriber` is routine only as a SHORT tail after a sender's last holder
+# leaves; SUSTAINED means a client is sending against an empty edge set: MC's
+# directive and MH's policy disagree, OR a client is ignoring its directive --
+# see MH Scenario 17 for the discriminator.
 sum by(reason) (rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
 
 # Does MC agree about the policy MH applied?  After an MC restart this split can
@@ -1294,6 +1303,24 @@ from every downstream fault: nothing left, so nothing downstream can be at fault
 not hold: the counter is per datagram, one per target handler, so non-flat does not by itself mean
 frames were captured at the expected rate.)
 
+**First, rule out the healthy case: nobody holds you.** Since story 2 removed loopback (R-3), a
+participant that no other participant holds in a receive slot — **a solo participant always** — is
+sent an EMPTY target set by MC, and the SDK builds and sends nothing on an empty set. That reads
+exactly as this discriminator: unmuted, `sent` flat, no error anywhere. It is correct behaviour.
+Sources: `DirectiveOutcome::EmittedEmptyTargets` in `crates/mc-service/src/media_signaling/directive.rs`
+and `submit()` in `packages/sdk-core/src/media/pipeline/egress.ts`; the MC-side view is
+[`mc-incident-response.md` §Client media signalling](mc-incident-response.md#client-media-signalling--where-to-look-no-scenario-number-yet).
+If you are alone in the meeting, stop here. Peers being present is **not** the test — they may
+legitimately not hold you (their slots filled by others). The test is whether some peer shows you in
+an `active` slot (their `data-slot-state`; MC's view is
+[`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster)).
+If one does and your `sent` is still flat, it is a real F12 and the steps below apply.
+
+> **Recorded correction (story 2 task 17).** This entry previously named only a stuck mute, a
+> capture device that never started or an ended track as causes. After loopback was removed a reader
+> trusting that list, testing alone, would have chased a capture fault in a client that was doing
+> what MC told it: send nothing.
+
 **Why.** Client mute is enforced **at capture** — while muted, nothing is encoded, so nothing enters
 the egress queue and nothing is dropped. Mute is therefore invisible on the drop counters by design.
 A stuck mute, a capture device that never started, or a `getUserMedia` track that ended produces
@@ -1312,14 +1339,41 @@ exactly this: silence, with no error on any path.
 
 ### F13 — `sent` rising, `received` flat: transmitting into something that is not returning
 
-**Symptom.** Frames are leaving the device; nothing is coming back. In loopback that is
-unambiguous — you should be hearing yourself.
+**Symptom.** Frames are leaving the device; nothing is coming back.
 
-**Discriminator — and the honest part: THERE IS NO UNIQUE CLIENT-SIDE DISCRIMINATOR.** This reading
-has at least two causes with different remedies, and no client counter separates them:
+> **Recorded correction (story 2 task 17).** This entry used to say: "In loopback that is
+> unambiguous — you should be hearing yourself." Loopback is gone (story 2 R-3): **you never hear
+> yourself**, and `received` counts OTHER participants' audio, which your own `sent` has no bearing
+> on. A reader trusting the old line would have treated "`received` flat" as a failed round trip and
+> gone hunting a reaped NAT binding or stale MH policy while the meeting was simply giving them
+> nobody to hear. (A solo participant does not reach this entry at all: it is directed to send
+> nothing, so its `sent` is flat — see F12's first paragraph.)
 
-1. a **NAT binding reaped** during a mute longer than the QUIC keepalive interval; or
-2. **MH holding stale or absent policy**.
+**Discriminator — fork FIRST on whether MC has directed anyone at you.** `sent` rising only proves
+that somebody holds you. Whether anybody is being sent TO you is a separate fact, and it has a
+client-side reading:
+
+| `dt_client_media_receive_source_deficit_total` | slot rows' `data-slot-state` | Meaning |
+|---|---|---|
+| flat | only `source_muted`, `fewer_sources` or `zero_requested`, **and the roster agrees** — those peers really are muted, there really are fewer unmuted peers than slots, or you declared zero slots | **Correct behaviour.** Silence is what the wire says. Stop. |
+| flat | `fewer_sources` **while the roster shows unmuted peers you should hear** | Those peers are unreachable from you: you share no CONNECTED handler, so MC names them in `unreachable_sender_ids` instead of a slot. A connectivity fault — [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster). |
+| flat | `awaiting-assignment` on every slot, or a media error naming the slot cap | MC never assigned your slots — F18 (receive-slot cap), or MC signalling (§4.1). |
+| flat | `unspecified`, or any token MC does not emit today | An MC defect — [`mc-incident-response.md` §Client media signalling](mc-incident-response.md#client-media-signalling--where-to-look-no-scenario-number-yet) lists which slot states are reachable. File against `meeting-controller`. |
+| flat | `active` | Inside the deficit counter's grace interval (a fresh or just-remapped assignment is not counted yet). Re-read after one export interval; still flat with nothing heard → F14. |
+| **rising** | `active` | **MC says a source is active and nothing is arriving.** This is the fault this entry is for; continue below. |
+
+The deficit counter counts ACTIVE assignments that decoded no frame for a whole export interval
+(definition, grace rule and the export interval it is measured in: `docs/observability/metrics/client.md` §`dt_client_media_receive_source_deficit_total`);
+the slot-state tokens are the wire vocabulary rendered raw into the DOM
+(`packages/web-app/src/lib/slotState.ts`). With a source active and nothing arriving, **THERE IS NO
+UNIQUE CLIENT-SIDE DISCRIMINATOR** between the two remaining causes:
+
+1. a **NAT binding reaped** during a mute longer than the QUIC keepalive interval — a reaped binding
+   takes the downlink with it; or
+2. **MH holding stale or absent policy** — MH has no edge from that sender to you.
+
+(If `received` is rising but you hear only some of the people you should, that is F19, not this
+entry: the same deficit signal with some sources arriving.)
 
 **Fix — work the fork in this order, cheapest first. Rung 1 is the one that separates them:**
 
@@ -1367,6 +1421,16 @@ a frame handed to a decoder is not a frame that was heard: the decoder can error
 discarded, and the audio context can be suspended. The `received = accepted + sum(drops)` identity
 holds at the crypto/parse boundary, not at playback, so a healthy identity is fully compatible with
 total silence.
+
+**With several senders, "`accepted` rising" no longer means every sender is working.** The
+counters carry no sender dimension (by design — §4.5), so `accepted` rising proves that SOME
+sender's frames reached the decoder, not that all did. "I still hear nothing" can mean one sender
+works and the one you are listening for does not — a reading that was unrepresentable in loopback,
+where the only sender was you. Before working the browser-side steps below, ask whether you hear
+**anyone**: if one person is audible and another is not, the playback path is fine and this is a
+per-source fault — go to F19 and
+[`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster).
+The steps below are for silence from **everyone** while `accepted` rises.
 
 **Fix**, in order — all of these are browser-side and none needs the cluster:
 1. **Is the `AudioContext` running?** Chrome suspends it until a user gesture. In devtools, check its
@@ -1594,8 +1658,10 @@ specifics.
   shell form with **no code consumer** (the prior §7 note's "fingerprints.env … has no consumer"
   was, and stays, true for `.env`). See §6.5 for how to run it; kept here as a correction so the
   prior "no Playwright" note is not trusted.
-- **No media plane.** MH connections perform the auth handshake and nothing more: no SFrame, no
-  WebCodecs, no datagrams. See the silence note in §4.3.
+- ~~**No media plane.**~~ **Corrected (story 2 task 17): the media plane EXISTS on this branch** —
+  SFrame-encrypted Opus over MH datagrams, triaged by §4.5 and F12–F19. The bullet previously said
+  MH connections carried no datagrams; a reader trusting it would have treated a silent call as
+  expected and skipped §4.5.
 - **No browser-side join logging or client metrics by default** — see §4.0 rung 1.
 - **The devloop-container cluster** is a different topology and is not what this runbook
   documents — see §1.
@@ -1632,3 +1698,4 @@ yourself updating the same fact in two of these files, one of them is wrong.
 | 2026-08-06 | infrastructure (task #61) | Added **F11** (Vite "cannot find native binding" — engines-skipped optional binding under a below-floor Node) with (a)/(b) sub-case split; updated §5 header + ToC. Reconciled §6.5/§7 with reality: the Playwright browser-E2E lane (tasks #18/#19) now exists and runs diff-triggered in Layer 7 — corrected the stale "no Playwright" §7 note and the §6.5 cross-reference. Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
 | 2026-09-09 | client (story task #20) | Added the frozen `## Secure Context and Media Setup` section between §2 and §3 — the four gated APIs as one all-or-nothing gate, `http://<sub>.localhost:5173` being potentially trustworthy in Chrome, the non-loopback-HTTP failure (**fails at `connecting-mc`, symptom-identical to F1/F8/F9** — WebTransport is one of the four gated APIs and MC signalling has no fallback, so the join never completes; the discriminator is the origin in the address bar), and the fake-device/fake-ui launch for a machine with no microphone. It is the anchor `scripts/dev-web.sh`'s header and §4's ladder both cite; `scripts/dev-web.test.sh` now pins its slug AND its prose. Corrected **F7**'s stale "may warn" (the fingerprints check has been a hard fail since task #61's escalation), added the presence-only/stale-but-present asymmetry that is F7's actual reason for existing, and added F7's anti-flag counter-message — the stale-but-present case is the one branch where `dev-web.sh`'s own warning never prints. Dropped the count from the §5 heading and its ToC entry (`#5-failure-modes-f1f11` -> `#5-failure-modes`, one live referrer, both fixed here) so the anchor stops rotting as F-entries are added — the rule stated under `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`: name a set's members, never restate its count. Per-entry `### F7 — ...` slug untouched (`mh-incident-response.md` links into it three times). Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
 | 2026-09-30 | client (story 2 task 13) | Added **F18** (receive-slot count N over the MC cap: loud refusal, `dt_client_media_receive_slots_rejected_total`, the bus/console discriminators, fix by agreement never by clamping) and **F19** (rising `dt_client_media_receive_source_deficit_total`: an MC-claimed-active source decoding nothing, triage ladder into MH Scenarios 15-17 and MC routing). F16/F17 left for story 2's runbook task. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |
+| 2026-09-30 | operations (story 2 task 17) | Corrected triage prose falsified by loopback removal (R-3), each with a recorded-correction note: **F13** no longer reads `received` flat as a failed round trip — it forks first on `dt_client_media_receive_source_deficit_total` + `data-slot-state` (nobody sent to you is correct), and only "MC says active, nothing arrives" proceeds to the NAT-binding / stale-policy fork; **F12** gains the healthy "nobody holds you" case (a solo participant sends nothing: `EmittedEmptyTargets`); **F14** gains the N-sender note (`accepted` rising can mean one sender works and another does not); §4.5 rung 1, the rung-2 fork table and the rung-6 `no_subscriber` comment (sustained is a fault, not routine) updated to match; stale "no media plane" text in §4.3 and §7 corrected. |

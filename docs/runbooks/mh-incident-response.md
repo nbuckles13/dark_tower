@@ -1518,18 +1518,35 @@ WebTransport exposes no send-side drop event, so the SDK keeps the transport que
 bounded queue above it, makes the drop decision there and counts it — making the drop observable by
 construction. A flat MH counter is **not** evidence that frames are arriving.
 
-#### The loopback reading, and why it does not identify a cause
+#### The client-side reading, and why it does not identify a cause
 
-In loopback (one client, hearing its own audio back through MH), the diagnostic pair is:
+> **Recorded correction (story 2 task 17).** This subsection was "The loopback reading": one
+> client hearing its own audio back through MH, so `sent` rising with `received` flat meant a
+> failed round trip. **Loopback is removed (story 2 R-3).** A reader trusting the old text would
+> have read a participant's silence as a round-trip fault and hunted a reaped NAT binding or stale
+> MH policy that does not exist. Two facts replace it. (1) **A solo participant sends NOTHING**: MC
+> directs a publisher nobody holds to an empty target set and the SDK builds no frame on an empty
+> set, so solo reads `sent` flat, `received` flat, and **MH `no_subscriber` flat** — sources:
+> `DirectiveOutcome::EmittedEmptyTargets` in `crates/mc-service/src/media_signaling/directive.rs`,
+> `submit()` in `packages/sdk-core/src/media/pipeline/egress.ts`. (2) **`received` counts OTHER
+> senders' audio**; a client's own `sent` has no bearing on it.
+
+The client-side pair is still where triage starts:
 
 ```promql
 rate(dt_client_media_frames_sent_total[5m])
 rate(dt_client_media_frames_received_total[5m])
 ```
 
-**`sent` rising while `received` stays flat means audio is not completing its round trip.** That
-reading is real and it is where triage starts — but it has **at least two causes with different
-remedies, and no unique client-side discriminator**:
+but `received` flat is not by itself a fault: it can be correct, an MC-side fault, or an MH-side
+one. **Fork it with the table in
+[`client-dev-local.md` F13](client-dev-local.md#f13--sent-rising-received-flat-transmitting-into-something-that-is-not-returning)**
+(`dt_client_media_receive_source_deficit_total` plus the client's slot states). That table is the
+single home for the fork and is not restated here. Only its "MC says a source is active and nothing
+is arriving" outcome continues into this scenario.
+
+**A source that MC calls active and that is not arriving** has **at least two causes with
+different remedies, and no unique client-side discriminator**:
 
 1. **A NAT binding reaped during a mute longer than the keepalive interval.** QUIC's
    connection-level keepalive is what refreshes NAT bindings while no media flows, and no media
@@ -1541,14 +1558,34 @@ remedies, and no unique client-side discriminator**:
 Both produce the identical client-side counter reading. **Do not guess between them; the ladder
 below separates them at rung 1, cheaply.**
 
+**`no_subscriber` is MORE load-bearing without loopback, not less.** It is MH's view of the
+opposite mismatch: a sender whose frames reach **no** egress edge. Healthy only as a short
+in-flight tail — frames already sent when a sender's last holder leaves, before MC's empty
+directive lands. **Sustained `no_subscriber` means a client is sending against an empty edge set**,
+and that has **two causes** — a solo meeting produces neither:
+
+1. **MC's send directive and MH's installed policy disagree** — MC's assignment and push path, rung
+   2's divergence family.
+2. **A client is ignoring its directive** while MC and MH agree perfectly. The sender is an
+   untrusted client: a stale SDK bundle, or a misbehaving or hostile participant pushing datagrams
+   at MH.
+
+**Discriminator: rung 2.** If the Scenario 15 divergence checks come back clean, it is cause 2 —
+stop chasing MC's push path and look at the client. The aggregation floor is the pod (no sender
+dimension), so narrow by pod and onset time, then treat it like the driven case in
+[MC Scenario 8 root cause 11](mc-incident-response.md#scenario-8-join-failures) (join rate per
+token and per source; a stale bundle clears on reload). Source for the
+reading: `docs/observability/metrics/mh-service.md` §`mh_media_frames_dropped_total` (the solo
+bullet and the `no_subscriber` row of the reason table).
+
 #### Triage ladder
 
 **Fork first, on `sent`:**
 
 | `sent` | Meaning | Go to |
 |---|---|---|
-| **Flat** | Nothing is leaving the device. This is not a transport problem. | Capture or mute-release never resumed. Check `dt_client_media_mute_transitions_total{action}` and the capture pipeline — [`client-dev-local.md` §4.5](client-dev-local.md#45-i-joined-and-i-hear-nothing--media-triage-ladder). Stop here. |
-| **Rising, `received` flat** | Transmitting into something that is not returning. | Rungs 1–4 below, in order. |
+| **Flat** | Nothing is leaving the device. This is not a transport problem. | Either nobody holds this participant — a solo participant ALWAYS, and **correct** — or capture or mute-release never resumed. Check `dt_client_media_mute_transitions_total{action}` and the capture pipeline — [`client-dev-local.md` F12](client-dev-local.md#f12--joined-unmuted-and-dt_client_media_frames_sent_total-is-flat). Stop here. |
+| **Rising, `received` flat** | Somebody holds this participant; whether anybody is sent TO it is a separate fact. | Fork on the [`client-dev-local.md` F13](client-dev-local.md#f13--sent-rising-received-flat-transmitting-into-something-that-is-not-returning) table. Only "MC says a source is active and nothing is arriving" continues to rungs 1–4 below, in order. |
 
 **Rung 1 — is the QUIC connection still up?** This is the cheapest rung and it is the one that
 separates the two causes:
@@ -1627,10 +1664,13 @@ what this alert measures. Two neighbours are routinely non-zero and mean somethi
 
 - `connection_closed` — a participant left underneath a send. **Routine.** Every meeting ends this
   way, many times.
-- `no_subscriber` — nothing was subscribed to that source. Counted **once per frame**, not once per
-  (frame × subscriber), so in a meeting with nobody subscribed it reads as 100% of egress off a
-  single frame. **Do not widen the alert's selector to include it**; that is precisely the false
-  fire the restriction to `egress_queue_overflow` exists to prevent.
+- `no_subscriber` — a sender's frame reached no egress edge. Counted **once per frame**, not once
+  per (frame × subscriber), so while it happens it can read as 100% of egress off a single frame.
+  A **short tail** after a sender's last holder leaves is routine; **sustained is a fault** (MC's
+  directive and MH's policy disagree, or a client is ignoring its directive — see
+  "`no_subscriber` is MORE load-bearing" above for the discriminator). Either way
+  it is not back-pressure: **do not widen the alert's selector to include it**; that is precisely
+  the false fire the restriction to `egress_queue_overflow` exists to prevent.
 
 `mh_media_egress_queue_depth` is a trend input only. **No conclusion may rest on it alone**: it is
 one process-wide, last-writer-wins gauge fed by N per-subscriber queues, and the scrape interval is
@@ -1644,6 +1684,10 @@ orders of magnitude longer than the queue's fill-and-drain time. A reading of ze
   and the affected pod.
 - **A reaped NAT binding** resolves on reconnect; the durable fix is the keepalive interval, which is
   a configuration change and a redeploy.
+- **Sustained `no_subscriber`** (a client sending where MH has no edge for it): if rung 2 finds
+  divergence, treat it as stale policy, next bullet. If rung 2 is clean, the client is ignoring its
+  directive — a stale SDK bundle (reload) or a misbehaving/hostile participant (security
+  response); restarting MH or forcing a push fixes neither.
 - **Stale or absent policy** resolves by forcing a structural change — see MC Scenario 15. **Not by
   restarting MH**, which sheds every media session on the pod (see
   [`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing)).
