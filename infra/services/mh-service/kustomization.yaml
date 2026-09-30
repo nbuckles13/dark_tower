@@ -21,13 +21,9 @@ resources:
   # `Identity::load_pemfiles` is a DIFFERENT failure that needs the Secret to
   # exist and be malformed. `kubectl describe pod` names the Secret; that is the
   # only artifact that says so. All THREE startup-config signals are documented
-  # in the SIBLING service's runbook — docs/runbooks/mc-deployment.md
-  # §Config-failure triage (`CreateContainerConfigError` for a missing ConfigMap
-  # key, `CrashLoopBackOff` for a stale pod template, and this one). The first
-  # two apply verbatim to mh-service, whose five required MH_* transport keys
-  # have the same shape; this one applies with `mh-service-tls`/`mh-tls`
-  # substituted for their MC spellings. mh-deployment.md has no equivalent
-  # section yet, so the MC one is cited deliberately rather than by mistake.
+  # in docs/runbooks/mh-deployment.md §Config-failure triage, with MH spellings
+  # (`CreateContainerConfigError` for a missing ConfigMap key or generation,
+  # `CrashLoopBackOff` for a stale pod template, and this one).
   # `kubectl logs` is empty or misleading for all three, and pod phase alone
   # tells them apart before you read anything.
   #

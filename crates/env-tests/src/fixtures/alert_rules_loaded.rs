@@ -140,6 +140,36 @@ pub fn alert_names_in_yaml(content: &str) -> Option<BTreeSet<String>> {
     )
 }
 
+/// The `expr` of the alerting rule named `alert` in one rules file's YAML.
+///
+/// Lets a test DERIVE a probe from the rule rather than hand-copy its PromQL,
+/// so the probe cannot keep testing a stale expression after the rule changes.
+/// `None` when the document does not parse, or declares no such alert.
+pub fn alert_expr_in_yaml(content: &str, alert: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        groups: Vec<Group>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Group {
+        #[serde(default)]
+        rules: Vec<Rule>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Rule {
+        #[serde(default)]
+        alert: Option<String>,
+        #[serde(default)]
+        expr: Option<String>,
+    }
+    let doc: Doc = serde_norway::from_str(content).ok()?;
+    doc.groups
+        .into_iter()
+        .flat_map(|g| g.rules)
+        .find(|r| r.alert.as_deref() == Some(alert))
+        .and_then(|r| r.expr)
+}
+
 /// Extract every loaded alert name from a Prometheus `/api/v1/rules` response.
 ///
 /// Parsed as JSON, never line-matched. Returns `None` when the envelope is not
@@ -226,6 +256,32 @@ mod tests {
                 .collect()
         );
         assert!(!names.is_empty(), "positive control");
+    }
+
+    #[test]
+    fn expr_kernel_returns_the_named_alerts_expr_and_none_for_unknown() {
+        let yaml = concat!(
+            "groups:\n",
+            "  - name: mh-service-warning\n",
+            "    rules:\n",
+            "      - alert: MHFirst\n",
+            "        expr: |\n",
+            "          a > b\n",
+            "      - record: some:recording:rule\n",
+            "        expr: vector(1)\n",
+            "      - alert: MHSecond\n",
+            "        expr: c / d > 0.8\n",
+        );
+        assert_eq!(
+            alert_expr_in_yaml(yaml, "MHFirst").as_deref(),
+            Some("a > b\n")
+        );
+        assert_eq!(
+            alert_expr_in_yaml(yaml, "MHSecond").as_deref(),
+            Some("c / d > 0.8")
+        );
+        assert!(alert_expr_in_yaml(yaml, "MHAbsent").is_none());
+        assert!(alert_expr_in_yaml("this: [is: not: valid", "MHFirst").is_none());
     }
 
     #[test]
