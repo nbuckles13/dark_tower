@@ -526,7 +526,7 @@ tasks:
   slug: 2026-09-30-client-test-tone-receive-slots-bus
   tag: story-2026-09-21-hear-each-other-task-13
 - id: 14
-  status: pending
+  status: completed
   specialist: test
   deps:
   - 13
@@ -536,6 +536,7 @@ tasks:
     Three deliverables. (1) An N+1 distinct-user provisioning helper: registers the N+1 cohort ONCE per run at the shared-user scope (not per test), honouring the `workers: 1` / `sharedRegistration` coupling in `packages/web-app/playwright.config.ts` (move to global setup if N forces it); org provisioning via the SQL path costs zero registrations; the suite is locked at N=3 (four participants, 12 edges) against the Kind AC limit of 100 registrations per minute (`infra/services/ac-service/config.env`), and escalation is by shards, not parallel workers. Document the new per-run budget in `packages/web-app/e2e/README.md` under Budgets. (2) A receive-side tone detector (Goertzel or FFT over the per-slot analysed value the client exposes) with a per-receiver-per-sender assertion API that is two-sided (receiver A detects f(B) at B's slot AND does not detect f(A) or any other participant's tone there), plus a standalone self-test of the detector against synthetic PCM of known frequencies; the detector must share no code with the SDK's send-side tone synthesis. (3) A correctness comment in `packages/web-app/e2e/instanceCounters.ts`: with the collector scraped under `honor_labels: false`, a `dt_client_*` series carries `instance` equal to the collector pod, not the browser, so grouping by `instance` groups by collector; the delta math stays sound with one collector, but no assertion may read a client series' `instance` as a participant dimension (which R-28 forbids anyway).
 
     Also add the shared S1 diagnostic helper: when a receiver is missing an expected sender, read the MH stream-admission rejection counter and ratio gauge (server-side, scrapeable through the existing `mcMetrics.ts` path, independent of the client metrics pipe) and report "config-caused budget rejection" versus "misrouting", because a defaulted or undersized Kind egress budget rejects admission partway through the largest scenario and presents identically to the routing bug the suite exists to catch. Unit tests for the helper and the detector self-test; no wall-clock gates anywhere.
+  slug: 2026-09-30-browser-multiparty-test-infra
   tag: story-2026-09-21-hear-each-other-task-14
   tier: light
   tier_reason: 'harness-only: provisioning helper, detector, diagnostic; no contract'
