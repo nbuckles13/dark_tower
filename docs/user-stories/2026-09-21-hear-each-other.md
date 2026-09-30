@@ -609,7 +609,7 @@ tasks:
   tier: light
   tier_reason: runbook text corrections only
 - id: 18
-  status: pending
+  status: completed
   specialist: operations
   deps:
   - 3
@@ -629,6 +629,7 @@ tasks:
     `docs/runbooks/client-dev-local.md`: F16, "I could hear everyone, then went silent after someone left" — the rotation signature, discriminated by leave correlation, with the client retained-generations (`dt_client_media_kek_generations_retained_total`, a counter) and kek-updates series and rung 1 checking that any client series is present in Prometheus at all (a dead pipe leaves the missing-key alert green); F17, "I can hear some people but not all" — the static-fill signature (a late joiner is inaudible until someone leaves; read effective N in the UI slot rows and the server cap; no debugger; story 5 replaces it).
 
     Alert: `MHMediaEgressBudgetExhausted` in `infra/docker/prometheus/rules/mh-alerts.yaml`, warning, 10m, comparing `mh_media_stream_admission_rejection_ratio` against `mh_media_stream_admission_rejection_ratio_threshold` with no arithmetic, `runbook_url` to MH 18, with its ADR-0031 block and fire/apply table (inject: lower the deployed budget and confirm the ratio crosses the threshold gauge and the selector matches a real container). Record in the alert inventory that sustained rejection while placement keeps targeting the pod is a triage step, not a second alert. Record the 24-hour watch list in the story file's Operations section in this order: edge occupancy and registered-meeting count trends against pod uptime; rejection ratio against threshold; `mh_media_policy_applies_total{outcome="apply_failed"}`; rotation rate by trigger against 1/W and pending-age against the W gauge; `MCMediaMissingKeyMaterial` with its reason fork, now expecting transients at every rotation; `mc_media_policy_pushes_total{outcome}` for divergence (`handler_id_mismatch` on every MH rollout is a diagnostic, not a fault); and that a client series is present in Prometheus at all. Every new `runbook_url` must resolve under `dt-guard`; no runbook text may carry an end-to-end, zero-trust or forward-secrecy claim.
+  slug: 2026-09-30-media-ops-multi-party
   tag: story-2026-09-21-hear-each-other-task-18
   tier: light
   tier_reason: runbooks plus one alert rule following the existing gauge-vs-gauge pattern
