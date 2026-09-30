@@ -9,20 +9,42 @@
 //      browser refuses the MC/MH handshakes and assertion (b) can only time out.
 //   2. Host-side Kind cluster reachable: AC + GC health, Prometheus healthy
 //      (Prometheus is REQUIRED — assertion (d) reads MC's counter through it).
+//   3. Story 2 R-30: the N+1 multi-party cohort fits AC's auth-rate window
+//      (limit READ from the AC config, never restated), then is registered
+//      ONCE per run through the real sign-up UI and handed to the workers via
+//      `COHORT_ENV_VAR`. Here, not in a worker memo: Playwright restarts the
+//      worker after a failing test (see ./cohort's header). Playwright starts
+//      the `webServer` plugin BEFORE global setup, so the UI is up.
 
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright/test';
 // Reuse the ONE fingerprints parser (writer: scripts/generate-dev-certs.sh, which
 // emits MC_CERT_SHA256 / MH_CERT_SHA256 into BOTH fingerprints.json and the
 // shell-sourceable fingerprints.env — same canonical pair, one writer). The Vite
 // loader degrades gracefully by design (dev server must still serve without
 // certs); this wrapper adds the fail-loud contract the E2E suite needs.
 import { loadCertFingerprints } from '../vite/fingerprints.js';
+import {
+  assertCohortFitsAuthWindow,
+  COHORT_ENV_VAR,
+  encodeCohort,
+  parseAcAuthRateLimit,
+  SUITE_RECEIVE_SLOTS,
+} from './cohort.js';
 import { describeEnv, e2eEnv } from './env.js';
+import { registerCohort } from './fixtures.js';
 
 // ESM-safe repo-relative path (this file runs under Playwright's ESM loader —
 // no __dirname).
 const FINGERPRINTS_JSON = fileURLToPath(
   new URL('../../../infra/docker/certs/fingerprints.json', import.meta.url),
+);
+
+// The AC config the Kind cluster runs — the auth-rate limit's SSoT (the Kind
+// overlay does not patch it). Read, never restated.
+const AC_CONFIG_ENV = fileURLToPath(
+  new URL('../../../infra/services/ac-service/config.env', import.meta.url),
 );
 
 /** Probe one HTTP endpoint with a bounded timeout; return an error line or null. */
@@ -79,6 +101,22 @@ export default async function globalSetup(): Promise<void> {
     throw new Error(`[e2e] cluster preconditions failed:\n  - ${failures.join('\n  - ')}`);
   }
   console.log('[e2e] cluster preconditions OK (AC, GC, Prometheus)');
+
+  // --- 3. N+1 cohort (story 2 R-30) ---
+  const limit = parseAcAuthRateLimit(readFileSync(AC_CONFIG_ENV, 'utf8'), AC_CONFIG_ENV);
+  assertCohortFitsAuthWindow(SUITE_RECEIVE_SLOTS, limit);
+  const browser = await chromium.launch();
+  try {
+    const cohort = await registerCohort(browser, SUITE_RECEIVE_SLOTS);
+    // Playwright's globalSetup -> worker channel: workers inherit this env.
+    process.env[COHORT_ENV_VAR] = encodeCohort(cohort);
+    console.log(
+      `[e2e] registered the N+1 cohort once for this run (N=${SUITE_RECEIVE_SLOTS}, ` +
+        `${cohort.length} accounts)`,
+    );
+  } finally {
+    await browser.close();
+  }
 
   // --- Informational: squatting-server note (see also waitForJoined's failure text) ---
   // reuseExistingServer means an already-running server on the Vite port is

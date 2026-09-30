@@ -10,6 +10,7 @@
 // same version as the Vitest browser provider, zero extra dependencies.
 
 import { defineConfig } from 'playwright/test';
+import { SUITE_RECEIVE_SLOTS } from './e2e/cohort.js';
 import { e2eEnv } from './e2e/env.js';
 
 export default defineConfig({
@@ -20,14 +21,17 @@ export default defineConfig({
   // masked by retry. Do not override per-spec.
   retries: 0,
   // One worker, in-order: a single shared cluster + Vite server backs every
-  // spec, AND the suite's registration budget assumes workers=1 — the shared
-  // valid user (fixtures.ts `SHARED_USER`) is registered ONCE per run via a
-  // module-level memo that only a single worker process makes a per-run
-  // singleton; a second worker would get its own memo and re-register. The
-  // registration rate-limit SSoT is the TARGET cluster's AC config (Kind dev:
-  // 100/min per infra/services/ac-service/config.env; prod default 5/60min)
-  // — see e2e/README.md §Budgets. Escalation path is "more shards" (task #19),
-  // not parallel workers against one cluster.
+  // spec, AND the suite's AC auth budget assumes workers=1 — the shared valid
+  // user (fixtures.ts `SHARED_USER`) is registered via a module-level memo that
+  // only a single worker process makes a per-run singleton (on a green run: a
+  // failing test restarts the worker and costs one re-registration); a second
+  // worker would get its own memo and re-register. The N+1 multi-party cohort is
+  // registered ONCE per run in global-setup.ts instead (e2e/cohort.ts). AC's
+  // limit counts successful token issues — sign-ins too — per source IP; its
+  // SSoT is the TARGET cluster's AC config (Kind: infra/services/ac-service/
+  // config.env, read by global setup) — see e2e/README.md §Budgets. Escalation
+  // path is "more shards", not parallel workers — and shards against one cluster
+  // from one host share the one per-IP bucket.
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env['CI'],
@@ -69,6 +73,13 @@ export default defineConfig({
     // bus) and the dev cert-fingerprint define are compile-time gates that only
     // exist in dev builds. Never point this at `pnpm preview`/a prod build.
     command: 'pnpm dev',
+    // Story 2 R-30: the suite's N, written once in e2e/cohort.ts and derived
+    // here. Only reaches a server Playwright STARTS; a reused one keeps the N it
+    // was started with, so every multi-party participant asserts the declared N
+    // at runtime (`expectDeclaredReceiveSlots` in e2e/fixtures.ts). N=3 leaves
+    // the solo and two-party specs' assertions unchanged (a solo client's slots
+    // are all `fewer_sources`; slot-0 is still asserted).
+    env: { VITE_DT_RECEIVE_SLOTS: String(SUITE_RECEIVE_SLOTS) },
     // Story 2 R-7: the test tone is OPT-IN (`DT_TEST_TONE=1` in this process's
     // env reaches `vite.config.ts`). With `reuseExistingServer` a server started
     // without it runs the microphone path, so a spec needing the tone must

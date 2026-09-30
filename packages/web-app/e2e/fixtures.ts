@@ -16,7 +16,7 @@
 //     gitignored and must never leave the workstation (see e2e/README.md).
 
 import { expect } from 'playwright/test';
-import type { BrowserContext, Page, Request, Response } from 'playwright/test';
+import type { Browser, BrowserContext, Page, Request, Response } from 'playwright/test';
 // Resolved to sdk-core SOURCE via this package's tsconfig `paths` (Playwright
 // honors tsconfig path mapping), keeping GC's R-53 camelCase wire mapping
 // single-sourced instead of re-encoding it in a raw fetch (@dry-reviewer).
@@ -29,7 +29,25 @@ import {
   type RegisterResponse,
   type SdkErrorCode,
 } from '@darktower/sdk-core';
+import {
+  AC_REGISTRATION_RATE_LIMIT_MAX_KEY,
+  AC_REGISTRATION_RATE_LIMIT_WINDOW_KEY,
+  COHORT_ENV_VAR,
+  cohortSize,
+  decodeCohort,
+  SUITE_RECEIVE_SLOTS,
+} from './cohort.js';
+import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS } from '../src/lib/e2eBus.js';
 import { e2eEnv, toLoopbackUrl } from './env.js';
+import type { InstanceCounters } from './instanceCounters.js';
+import { diagnoseMissingSender } from './mcMetrics.js';
+import {
+  evaluateSenderLane,
+  type BusLaneAnalysis,
+  type BusSlotAssignment,
+  type CohortTone,
+  type ToneVerdict,
+} from './toneDetector.js';
 
 // ============================================================================
 // Credentials
@@ -60,12 +78,11 @@ function randomPassword(): string {
 }
 
 /**
- * Fresh throwaway credentials. AC registration is rate-limited — the limit's
- * SSoT for the Kind cluster this suite targets is
- * `infra/services/ac-service/config.env` (`AC_REGISTRATION_RATE_LIMIT_*`,
- * relaxed to 100/min for dev/test); the suite's per-run registration budget is
- * tracked in e2e/README.md §Budgets (2/run: the shared user V + one distinct
- * second party — see {@link SHARED_USER}).
+ * Fresh throwaway credentials. AC rate-limits SUCCESSFUL TOKEN ISSUES per source
+ * IP — every registration AND every sign-in counts (see `./cohort`'s header) —
+ * with the Kind limit's SSoT in `infra/services/ac-service/config.env`
+ * (`AC_REGISTRATION_RATE_LIMIT_*`); the suite's budget in that unit is tracked
+ * in e2e/README.md §Budgets.
  */
 export function randomCredentials(label: string): TestCredentials {
   userCounter += 1;
@@ -77,19 +94,18 @@ export function randomCredentials(label: string): TestCredentials {
 }
 
 /**
- * The suite's ONE shared valid user — the single-source-of-truth for the
- * registration budget (see e2e/README.md §Budgets). Registered exactly ONCE per
- * run and reused everywhere via `signInViaUi` (0 further registrations), so the
- * whole suite spends 2 registrations: this user + the one genuinely-distinct
- * second party (`userB`) in the distinct-user two-party test.
+ * The suite's ONE shared valid user for single-party and two-party specs (see
+ * e2e/README.md §Budgets). Registered once per worker process and reused via
+ * `signInViaUi` — 0 further REGISTRATIONS, though each sign-in is still one
+ * successful token issue against AC's per-IP limit.
  *
- * BUDGET ↔ workers=1 COUPLING (do not decouple silently): "registered once per
- * run" rests on `workers: 1` (playwright.config.ts). A single worker process
- * means the module-level `sharedRegistration` memo below is a per-RUN singleton.
- * Raising `workers` would give each worker its OWN module instance → V would be
- * re-registered per worker, multiplying the budget invisibly. If `workers` ever
- * changes, this memo must move to a global-setup / setup-project that registers
- * V once and hands its creds to workers.
+ * BUDGET ↔ workers=1 COUPLING (do not decouple silently): "registered once"
+ * rests on `workers: 1` (playwright.config.ts) — a single worker process makes
+ * the module-level `sharedRegistration` memo below a per-run singleton ON A
+ * GREEN RUN. Playwright restarts the worker after a failing test, which costs
+ * one re-registration of V per failure; raising `workers` would re-register V
+ * per worker. The multi-party COHORT does not ride this memo for exactly that
+ * reason: it is registered once per run in `global-setup.ts` (see `./cohort`).
  */
 export const SHARED_USER = randomCredentials('shared');
 
@@ -143,6 +159,57 @@ async function ensureSharedUserRegistered(page: Page): Promise<void> {
 export async function authAsSharedUser(page: Page): Promise<string> {
   await ensureSharedUserRegistered(page);
   return signInViaUi(page, SHARED_USER);
+}
+
+// ============================================================================
+// The N+1 multi-party cohort (story 2 R-30) — see ./cohort for the budget
+// ============================================================================
+
+/**
+ * Register the suite's N+1 distinct accounts through the real sign-up UI, ONE
+ * context each (the app's auth session is per-context in-memory state). Called
+ * ONCE per run by `global-setup.ts`, never by a spec. Cost: N+1 successful token
+ * issues; a 429 fails loudly via {@link captureAccessToken}.
+ */
+export async function registerCohort(
+  browser: Browser,
+  receiveSlots: number,
+): Promise<TestCredentials[]> {
+  const cohort: TestCredentials[] = [];
+  for (let i = 0; i < cohortSize(receiveSlots); i += 1) {
+    const creds = randomCredentials(`cohort-${String.fromCharCode(65 + i)}`);
+    const context = await browser.newContext({ baseURL: e2eEnv.baseUrl });
+    try {
+      const page = await context.newPage();
+      await page.goto('/');
+      await signUpViaUi(page, creds);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`cohort member ${i} registration failed: ${detail}`, { cause: err });
+    } finally {
+      await context.close();
+    }
+    cohort.push(creds);
+  }
+  return cohort;
+}
+
+/** The run's cohort (N+1 = `cohortSize(SUITE_RECEIVE_SLOTS)` distinct accounts). */
+export function suiteCohort(): TestCredentials[] {
+  return decodeCohort(process.env[COHORT_ENV_VAR], cohortSize(SUITE_RECEIVE_SLOTS));
+}
+
+/**
+ * Sign `page` in as cohort member `index` (0-based). 0 registrations; ONE
+ * successful token issue against AC's per-IP limit. Returns the access token.
+ */
+export async function authAsCohortMember(page: Page, index: number): Promise<string> {
+  const cohort = suiteCohort();
+  const creds = cohort[index];
+  if (creds === undefined) {
+    throw new RangeError(`cohort has ${cohort.length} members; no member ${index}`);
+  }
+  return signInViaUi(page, creds);
 }
 
 // ============================================================================
@@ -213,6 +280,18 @@ async function captureAccessToken(
   action: () => Promise<void>,
 ): Promise<string> {
   const response = await captureResponse(page, path, action);
+  if (response.status() === 429) {
+    // Named, never retried: the bucket is exhausted, and a retry loop would
+    // only spend more of it (and hide a budget regression behind a slow pass).
+    throw new Error(
+      `auth exchange ${path} was RATE-LIMITED (HTTP 429): AC's per-source-IP bucket of ` +
+        `successful token issues (registrations AND sign-ins) is exhausted. Limit SSoT: ` +
+        `infra/services/ac-service/config.env ${AC_REGISTRATION_RATE_LIMIT_MAX_KEY} / ` +
+        `${AC_REGISTRATION_RATE_LIMIT_WINDOW_KEY}. The bucket is shared with the Rust env-tests run from ` +
+        `this host just before this suite and with every other spec's sign-ins — see ` +
+        `e2e/README.md §Budgets. Do not retry; wait out the window or fix the budget.`,
+    );
+  }
   expect(response.ok(), `auth exchange ${path} failed: HTTP ${response.status()}`).toBe(true);
   // Partial<AuthTokenResponse>: the sdk-core wire type (R-53 camelCase SSoT —
   // covers both /register's RegisterResponse extends AuthTokenResponse and
@@ -1206,4 +1285,182 @@ export async function expectEgressFlatWhileMuted(page: Page, mutedAtMs: number):
       'MUTE REGRESSION — ADR-0036 §5 enforces client mute at capture, so a counter that keeps ' +
       'advancing means the indicator is telling the user something the send path is not doing.',
   });
+}
+
+// ============================================================================
+// Layer 3 (story 2 R-30): own tone, lane analyses, two-sided hear assertion
+// ============================================================================
+
+/**
+ * The latest event of EACH of `types`, read in ONE `page.evaluate` that scans
+ * the replay buffer from the end and returns only those events — so a
+ * multi-type read is one consistent snapshot (the sampler cannot tick between
+ * reads), and a poll never serialises the whole cumulative buffer, which grows
+ * a full-spectrum `receiveAnalysis` record every sampler tick.
+ */
+async function latestBusEventsOf<T extends string>(
+  page: Page,
+  types: readonly T[],
+): Promise<Record<T, Readonly<Record<string, unknown>> | undefined>> {
+  return page.evaluate(
+    (wanted) => {
+      const found: Record<string, unknown> = {};
+      const events = window.__darktower_test__?.events ?? [];
+      for (let i = events.length - 1; i >= 0 && Object.keys(found).length < wanted.length; i -= 1) {
+        const event = events[i];
+        const type = event?.['type'];
+        if (typeof type === 'string' && wanted.includes(type) && !(type in found)) {
+          found[type] = event;
+        }
+      }
+      return found;
+    },
+    types as readonly string[],
+  ) as Promise<Record<T, Readonly<Record<string, unknown>> | undefined>>;
+}
+
+/**
+ * Assert this participant's build declares the suite's N
+ * (`SUITE_RECEIVE_SLOTS`) and MC's advertised cap admits it — the runtime check
+ * `src/lib/config.ts` defers to the suite. `playwright.config.ts` derives the
+ * dev server's `VITE_DT_RECEIVE_SLOTS` from `SUITE_RECEIVE_SLOTS`, but with
+ * `reuseExistingServer` a server started elsewhere (e.g. `dev-web.sh`, whose
+ * demo N may differ) runs its own N; a mismatch would otherwise surface as
+ * `not_assigned` / fewer-sources — the misrouting-shaped symptom S1 separates.
+ */
+export async function expectDeclaredReceiveSlots(page: Page, label: string): Promise<void> {
+  await expect
+    .poll(
+      async () => (await latestBusEventsOf(page, ['receiveSlots'])).receiveSlots !== undefined,
+      {
+        message: `${label}: no receiveSlots bus event — the join never completed`,
+        timeout: 15_000,
+      },
+    )
+    .toBe(true);
+  const { receiveSlots: slots } = await latestBusEventsOf(page, ['receiveSlots']);
+  expect(
+    slots?.['declared'],
+    `${label}: the build declares N=${String(slots?.['declared'])}, the suite needs ` +
+      `SUITE_RECEIVE_SLOTS=${SUITE_RECEIVE_SLOTS}. VITE_DT_RECEIVE_SLOTS is fixed when the dev ` +
+      `server starts; with reuseExistingServer a server started elsewhere keeps its own N — ` +
+      `stop it and let Playwright start one.`,
+  ).toBe(SUITE_RECEIVE_SLOTS);
+  expect(slots?.['serverCapState'], `${label}: MC advertised no receive-slot cap`).toBe('known');
+  expect(
+    slots?.['serverCap'],
+    `${label}: MC's cap (MC_MAX_RECEIVE_SLOTS) is below the suite's N=${SUITE_RECEIVE_SLOTS}`,
+  ).toBeGreaterThanOrEqual(SUITE_RECEIVE_SLOTS);
+}
+
+/**
+ * This participant's identity and ANNOUNCED tone — the expected tone every other
+ * receiver checks for. Read from the participant's own bus (`joined.senderId`,
+ * `captureSource.toneHz`), never derived: the detector shares no code with the
+ * SDK's tone derivation. ASSERTS tone mode rather than assuming the dev server
+ * was started with `DT_TEST_TONE=1` (`reuseExistingServer` may reuse one that
+ * was not). Call after {@link startAudio}; waits for the one-shot event. Also
+ * asserts the build's declared N first ({@link expectDeclaredReceiveSlots}), so
+ * every multi-party participant passes through both build-knob checks.
+ */
+export async function readOwnTone(page: Page, label: string): Promise<CohortTone> {
+  await expectDeclaredReceiveSlots(page, label);
+  await expect
+    .poll(
+      async () => (await latestBusEventsOf(page, ['captureSource'])).captureSource !== undefined,
+      { message: `${label}: no captureSource bus event — media never started`, timeout: 15_000 },
+    )
+    .toBe(true);
+  const { captureSource: source, joined } = await latestBusEventsOf(page, [
+    'captureSource',
+    'joined',
+  ]);
+  expect(
+    source?.['mode'],
+    `${label}: capture source is not the test tone — start the dev server with DT_TEST_TONE=1 ` +
+      `(a reused server may have been started without it)`,
+  ).toBe('test_tone');
+  const senderId = joined?.['senderId'];
+  const toneHz = source?.['toneHz'];
+  if (typeof senderId !== 'string' || typeof toneHz !== 'number') {
+    throw new Error(
+      `${label}: bus lacks its own senderId/toneHz (joined.senderId=${String(senderId)}, ` +
+        `captureSource.toneHz=${String(toneHz)})`,
+    );
+  }
+  return { label, senderId, toneHz };
+}
+
+/** The receiver's latest `slotAssignments` view and `receiveAnalysis` lanes, one snapshot. */
+export async function latestReceiveView(page: Page): Promise<{
+  readonly assignments: readonly BusSlotAssignment[];
+  readonly lanes: readonly BusLaneAnalysis[];
+}> {
+  const latest = await latestBusEventsOf(page, ['slotAssignments', 'receiveAnalysis']);
+  const assignments = latest.slotAssignments?.['assignments'];
+  const lanes = latest.receiveAnalysis?.['lanes'];
+  return {
+    assignments: Array.isArray(assignments) ? (assignments as BusSlotAssignment[]) : [],
+    lanes: Array.isArray(lanes) ? (lanes as BusLaneAnalysis[]) : [],
+  };
+}
+
+/** Liveness bound for a lane to fill an FFT window and settle. Not a latency gate. */
+const HEAR_SENDER_TIMEOUT_MS = 30_000;
+
+/** Verdicts meaning "the sender is not reaching this receiver at all". */
+const MISSING_SENDER_VERDICTS: ReadonlySet<ToneVerdict['kind']> = new Set([
+  'not_assigned',
+  'lane_missing',
+  'silent',
+]);
+
+/**
+ * Two-sided layer-3 assertion: `receiver` (whose `page` this is) hears `sender`'s
+ * tone as the dominant tone of the sender's lane, the sender holds an ACTIVE slot
+ * in the receiver's latest assignment, and NO other cohort tone (the receiver's
+ * own included) is present in that lane. Polls until the verdict is `ok` — the
+ * lane needs a full FFT window of decoded audio first — and on timeout fails
+ * with the LAST verdict, which names the failure class (not_assigned /
+ * lane_missing / not_ready / silent / expected_absent / foreign_present).
+ *
+ * S1 DIAGNOSTIC: pass `admissionBaseline` — `mhAdmissionRejectionsByInstance()`
+ * taken BEFORE the scenario's joins (it cannot be taken after a failure). On a
+ * missing-sender verdict the failure then carries `diagnoseMissingSender`'s
+ * report (budget rejection / misrouting / unobservable); without one it says
+ * the diagnostic was unavailable. The timeout is a liveness bound, never a
+ * latency gate.
+ */
+export async function expectHearsSender(
+  page: Page,
+  receiver: CohortTone,
+  sender: CohortTone,
+  cohort: readonly CohortTone[],
+  {
+    timeoutMs = HEAR_SENDER_TIMEOUT_MS,
+    admissionBaseline,
+  }: { timeoutMs?: number; admissionBaseline?: InstanceCounters } = {},
+): Promise<void> {
+  // A plain loop, not `expect.poll`: a ToneHarnessError / ToneCollisionError
+  // from the detector must fail AT ONCE, not be retried until the timeout.
+  const deadline = Date.now() + timeoutMs;
+  let last: ToneVerdict;
+  for (;;) {
+    const view = await latestReceiveView(page);
+    last = evaluateSenderLane({ receiver, sender, cohort, ...view });
+    if (last.kind === 'ok') return;
+    if (Date.now() > deadline) break;
+    // The bus's own sampling cadence: reading faster only sees the same
+    // `receiveAnalysis` record twice.
+    await page.waitForTimeout(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+  }
+  let diagnosis = '';
+  if (MISSING_SENDER_VERDICTS.has(last.kind)) {
+    diagnosis =
+      admissionBaseline === undefined
+        ? ' — missing sender; no MH admission baseline was taken, so the S1 diagnostic is ' +
+          'unavailable (pass admissionBaseline from mhAdmissionRejectionsByInstance() before the joins).'
+        : ` — ${(await diagnoseMissingSender(admissionBaseline, `${receiver.label} missing ${sender.label}`)).report}`;
+  }
+  throw new Error(`layer 3 verdict ${last.kind} after ${timeoutMs}ms: ${last.detail}${diagnosis}`);
 }

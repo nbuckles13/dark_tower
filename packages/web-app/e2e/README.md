@@ -241,45 +241,92 @@ Defaults trace to `infra/kind/kind-config.yaml` (SSoT), mirrored by
 counterpart). MC/MH endpoints come exclusively from the join response's
 `media_servers`.
 
+## Multi-party harness (story 2, R-30)
+
+Building blocks for the N+1 specs; each module header carries the detail.
+
+- **Cohort** (`cohort.ts`, `fixtures.ts` `authAsCohortMember`): N+1 distinct
+  accounts at the suite's one N (`SUITE_RECEIVE_SLOTS`), registered once per run
+  by `global-setup.ts` — see §Budgets. `playwright.config.ts` derives the dev
+  server's `VITE_DT_RECEIVE_SLOTS` from it, and `readOwnTone` asserts the build's
+  declared N at runtime (`expectDeclaredReceiveSlots`) because a reused server
+  keeps whatever N it was started with.
+- **Layer 3 tone detector** (`toneDetector.ts`, `fixtures.ts` `readOwnTone` /
+  `expectHearsSender`): reads the bus's per-lane dB spectrum; two-sided (the
+  sender's announced tone is dominant in its lane AND no other cohort tone — the
+  receiver's own included — is present). Expected tones come from each
+  participant's own `captureSource.toneHz`; the module shares no code with the
+  SDK's tone derivation or synthesis (enforced by `tests/toneDetector.test.ts`).
+  A cohort whose tones cannot be told apart fails as a precondition, never as
+  misrouting.
+- **S1 diagnostic** (`s1Diagnostic.ts`, `mcMetrics.ts`
+  `mhAdmissionRejectionsByInstance` / `diagnoseMissingSender`): for a missing
+  sender, reads MH's stream-admission rejection counter and reports
+  config-caused budget rejection, misrouting, or unobservable (MH not, or only
+  partly, scraped). Take `mhAdmissionRejectionsByInstance()` BEFORE the
+  scenario's joins and pass it to `expectHearsSender` as `admissionBaseline`;
+  a missing-sender failure then carries the report automatically.
+
 ## Budgets and policies
 
-- **Registration budget: 2 throwaway users per run.** The suite registers
-  exactly two AC accounts:
-  - **V** — the shared valid user (`fixtures.ts` `SHARED_USER`), registered ONCE
-    per run via `authAsSharedUser` (in an isolated, route-mock-safe throwaway
-    context) and reused by every "needs a valid session" role through
-    `signInViaUi` (0 further registrations): the happy-path host, the
-    bootstrap-join, the leave/rejoin participants, and the negative specs
-    (meeting-not-found, mc-token-rejection, and auth-rejection's recovery tail).
-  - **userB** — the ONE genuinely-distinct second party, registered by the
-    distinct-user two-party test so it can assert two different accounts (distinct
-    `user_id`s), not two sessions of the same user.
+- **AC auth-rate budget — the unit is SUCCESSFUL TOKEN ISSUES per source IP,
+  not registrations.** AC's "registration" limit
+  (`AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS` per
+  `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES`) is enforced by
+  `count_registrations_from_ip` in `crates/ac-service/src/services/user_service.rs`,
+  which counts `auth_events` rows with `event_type='user_login' AND success=true`
+  for the caller's IP — and BOTH `/register` and `/user/token` write one. So
+  **every sign-in spends budget exactly like a registration.** The SSoT for the
+  Kind cluster is `infra/services/ac-service/config.env` (the Kind overlay does
+  not patch it; a prod-configured AC falls back to
+  `crates/ac-service/src/config.rs` `DEFAULT_REGISTRATION_RATE_LIMIT_*`, far
+  tighter). The bucket is per source IP, and all host traffic reaches AC from
+  one address, so it is **shared with the Rust env-tests `scripts/layer7.sh`
+  runs from the same host just before this suite** — their logins in the
+  preceding window count, and no static check here can see them.
 
-  **Why not more:** every recovery tail (gap 3) reuses a live/valid session — the
-  meeting-not-found and mc-token-rejection recoveries reuse their spec's retained
-  token; auth-rejection's recovery reuses V. The leave/rejoin second participant
-  is a second V *session* (participant identity is minted per-join), so it costs 0.
+  What the suite spends, by rule (the counts follow the specs; do not freeze a
+  total here):
+  - **Registrations.** V, the shared valid user (`fixtures.ts` `SHARED_USER`),
+    once per worker process — so once on a green run, **plus one per failing
+    test** (Playwright restarts the worker after a failure, re-creating the
+    memo). `userB`, the distinct second party of the two-party test, and the
+    throwaway account auth-rejection signs up to obtain a real retained token:
+    one each. The **N+1 cohort**: `cohortSize(SUITE_RECEIVE_SLOTS)` = **4 at the
+    suite's locked N=3**, registered **once per run in `global-setup.ts`**,
+    whatever fails later.
+  - **Sign-ins.** One per `authAsSharedUser` / `authAsCohortMember` call — i.e.
+    one per browsing context a spec signs in. A multi-party test signs in all
+    N+1 members (the auth session is per-context in-memory state; there is no
+    sign-in-free way in). Rejected sign-ins (auth-rejection's never-registered
+    user) do not count: the row is `success=false`.
 
-  **workers=1 ↔ register-once coupling (do not decouple silently):** "V once per
-  run" holds only because `workers: 1` gives the whole run a single worker
-  process, so `fixtures.ts`'s `sharedRegistration` memo is a per-run singleton.
-  Raising `workers` would give each worker its own module instance and re-register
-  V per worker — move the memo to a global-setup / setup-project first (see the
-  comment at `SHARED_USER` and in `playwright.config.ts`).
+  **Setup-time fit check.** `global-setup.ts` reads the two keys from
+  `config.env` (a missing or malformed key fails loudly) and refuses to start if
+  the cohort's own worst-case window — N+1 registrations plus the first
+  multi-party test's N+1 sign-ins (`cohortWindowSpend` in `cohort.ts`) — exceeds
+  the limit. That is necessary, not sufficient: it catches N raised past the
+  limit or a prod-default AC before any account exists, not the env-tests'
+  share of the bucket. A **429 fails loudly** with the budget named
+  (`captureAccessToken` in `fixtures.ts`) and is **never retried** — a retry only
+  spends more of the bucket.
 
-  The rate-limit **SSoT is the AC config the target cluster actually runs**: the
-  Kind cluster this suite targets ships
-  `infra/services/ac-service/config.env`
-  (`AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS: "100"` per 1-minute window,
-  relaxed for dev/test), so consecutive runs and the Layer-7 retry are safe. A
-  **prod-configured AC** target instead gets the production default of 5 per
-  60-minute window (`crates/ac-service/src/config.rs`
-  `DEFAULT_REGISTRATION_RATE_LIMIT_*`) — at 2/run even the Layer-7 retry
-  (a second in-window run → 4 registrations) stays under that prod default,
-  a margin the previous 4/run budget did not have. A 429 there still cannot
-  false-pass a negative spec (their 401/404-exact assertions reject it). This
-  suite assumes a **single workstation against its own cluster**; it is not
-  designed for concurrent runs sharing one cluster's rate-limit budget.
+  **Why the cohort is in global setup, not a worker memo:** the worker restart
+  after a failing test would re-register all N+1 accounts per failure. Global
+  setup runs once per run (after Playwright's `webServer` is up) and hands the
+  credentials to the workers through `E2E_COHORT_CREDENTIALS` (`COHORT_ENV_VAR`),
+  Playwright's documented globalSetup→worker channel. The credentials are
+  per-run throwaways in the per-run org, never logged; the decoder refuses a
+  short, malformed or duplicated cohort rather than letting two participants
+  share an account (which would read as a routing bug).
+
+  **workers=1; escalate by shards — with care.** `workers: 1` stays
+  (`playwright.config.ts`): a second worker would re-register V. More capacity
+  comes from **shards**, but shards against the **same cluster from the same
+  host share the one per-IP bucket**, so they add auth headroom only when each
+  shard targets its own cluster. This suite assumes a single workstation against
+  its own cluster.
+
 - **Wall-clock budget**: `media-loopback.spec.ts` costs roughly **20 s** — join +
   MH handshake ≈ 5 s, start-audio ≈ 2 s, the slot-state poll, and a 0.75 s settle
   plus 2.5 s flat window, twice over two tests, plus auth and bootstrap.
@@ -290,6 +337,12 @@ counterpart). MC/MH endpoints come exclusively from the join response's
   timeout presents as a diff bug and sends triage hunting a defect that does not
   exist. If headroom ever gets tight the fix is a deliberate
   `DEVLOOP_BROWSER_E2E_TIMEOUT` change, not a discovery at 3am.
+- **Cohort registration wall clock**: `global-setup.ts` runs N+1 full sign-up
+  UI flows (a fresh context and page load each) before any spec — roughly
+  **10 s at N=3** (an estimate of ~2-3 s per `signUpViaUi`, not yet measured on
+  a run; record the measured figure here after the first Layer-7 run). It comes
+  out of the same `BROWSER_E2E_TIMEOUT` and scales with `SUITE_RECEIVE_SLOTS`,
+  so raising N is a wall-clock decision as well as an auth-budget one.
 - **`retries: 0`** (ADR-0028): a failure is real. Fix it or delete the test —
   never mask with retries.
 - **Timeouts**: 120s/test ceiling; assertion-meaningful waits are tighter (5s
