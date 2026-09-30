@@ -737,6 +737,15 @@ if [[ -n "${DT_TEST_TONE:-}" ]]; then
 else
     echo "  test tone: OFF (DT_TEST_TONE unset) — every participant sends its microphone"
 fi
+# Its sibling define, echoed for the same reason: with DT_TEST_LEVERS unset the
+# lever branch is statically dead, so `window.__dt_test_levers__` is a silent
+# no-op. Same rule — not validated here; the E2E bus `buildKnobs.testLevers` is the
+# runtime truth.
+if [[ -n "${DT_TEST_LEVERS:-}" ]]; then
+    echo "  test levers: ON requested (DT_TEST_LEVERS=${DT_TEST_LEVERS}; vite.config.ts accepts only 1 and fails the launch otherwise)"
+else
+    echo "  test levers: OFF (DT_TEST_LEVERS unset) — window.__dt_test_levers__ is ignored"
+fi
 
 # ─── demo.localhost resolution (WARN — WSL2-side tooling only) ───
 # This checks THIS machine's resolver (/etc/hosts + glibc). It is NOT the browser's:

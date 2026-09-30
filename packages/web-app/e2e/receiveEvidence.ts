@@ -15,12 +15,15 @@
 // "Flat" is never asserted alone: `observeWindow` samples EVERY probe on one
 // cadence over one window, requires a sample-count floor (a stalled sampler is a
 // HARNESS failure, never a pass), and a flat probe is always paired, in the same
-// window, with one that must advance.
+// window, with one that must advance ON THE SAME PAGE — each read returns that
+// page's latest bus snapshot, so a page whose in-page sampler stalled would repeat
+// a stale value; its own mover is what fails in that case.
 
 import { expect } from 'playwright/test';
 import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS } from '../src/lib/e2eBus.js';
 import {
   expectHearsSender,
+  FLAT_WINDOW_MAX_OBSERVE_FACTOR,
   FLAT_WINDOW_OBSERVE_MS,
   FLAT_WINDOW_SETTLE_MS,
   latestBusEventsOf,
@@ -30,6 +33,7 @@ import {
 import type { InstanceCounters } from './instanceCounters.js';
 import type { JoinedMember } from './cohortContexts.js';
 import { laneCarriesTone, type BusSlotAssignment, type CohortTone } from './toneDetector.js';
+import { sampleWindow, unpairedObservers } from './windowSampling.js';
 
 /** One (observed slot, sender) row of layers 1 and 2, as the bus projects it. */
 export interface LayerRow {
@@ -128,6 +132,8 @@ export type ProbeExpectation = 'flat' | 'advance' | 'zero';
 /** One sampled quantity. */
 export interface Probe {
   readonly label: string;
+  /** Label of the member whose page this probe reads (the per-page mover rule). */
+  readonly observer: string;
   readonly expect: ProbeExpectation;
   read(): Promise<number>;
 }
@@ -140,6 +146,7 @@ export function acceptedProbe(
 ): Probe {
   return {
     label: `${receiver.label}.acceptedFrom(${sender.label})`,
+    observer: receiver.label,
     expect: expectation,
     read: async () => acceptedFromRows(await latestLayers(receiver), sender.tone.senderId),
   };
@@ -153,6 +160,7 @@ export function keyedProbe(
 ): Probe {
   return {
     label: `${receiver.label}.keyedFrom(${sender.label})`,
+    observer: receiver.label,
     expect: expectation,
     read: async () =>
       (await latestLayers(receiver))
@@ -165,6 +173,7 @@ export function keyedProbe(
 export function sentProbe(member: JoinedMember, expectation: ProbeExpectation): Probe {
   return {
     label: `${member.label}.framesSent`,
+    observer: member.label,
     expect: expectation,
     read: async () => {
       const { mediaFrameCounts } = await latestBusEventsOf(member.page, ['mediaFrameCounts']);
@@ -176,32 +185,45 @@ export function sentProbe(member: JoinedMember, expectation: ProbeExpectation): 
   };
 }
 
-// The window's settle, observation span and sample floor (the anti-vacuity
-// control) have ONE home, shared with `expectCountersFlatOverWindow`:
-// `FLAT_WINDOW_*` / `MIN_FLAT_WINDOW_SAMPLES` in `./fixtures`.
+// The window's settle, observation span, sample floor (the anti-vacuity
+// control) and hard bound have ONE home, shared with
+// `expectCountersFlatOverWindow`: `FLAT_WINDOW_*` / `MIN_FLAT_WINDOW_SAMPLES` in
+// `./fixtures`. The stop rule (span AND floor, else keep sampling until the hard
+// bound, which throws) has one home too: `./windowSampling`.
 
 /**
  * Sample every probe on the bus cadence over ONE window (after `settleMs`) and
- * assert each probe's expectation. Requires at least one probe that must
- * `advance` — a window of only flat/zero probes proves nothing.
+ * assert each probe's expectation. Requires, for EVERY page carrying a flat or
+ * zero probe, a probe on that same page that must `advance` — a flat reading on
+ * a page with no mover could be a stalled sampler repeating a stale snapshot.
  */
 export async function observeWindow(
   probes: readonly Probe[],
   why: string,
   { settleMs = FLAT_WINDOW_SETTLE_MS, observeMs = FLAT_WINDOW_OBSERVE_MS } = {},
 ): Promise<void> {
-  if (!probes.some((p) => p.expect === 'advance')) {
+  const unpaired = unpairedObservers(probes);
+  if (unpaired === null) {
     throw new Error(`observeWindow(${why}): no probe must advance — the window would be vacuous`);
   }
-  if (settleMs > 0) await new Promise((r) => setTimeout(r, settleMs));
-  const samples: number[][] = probes.map(() => []);
-  const end = Date.now() + observeMs;
-  for (;;) {
-    const values = await Promise.all(probes.map((p) => p.read()));
-    values.forEach((v, i) => samples[i]!.push(v));
-    if (Date.now() >= end) break;
-    await new Promise((r) => setTimeout(r, E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS));
+  if (unpaired.length > 0) {
+    throw new Error(
+      `observeWindow(${why}): no probe must advance on ${unpaired.join(', ')} — a flat/zero ` +
+        `reading there could be a stalled sampler, so the window would be vacuous for that page`,
+    );
   }
+  if (settleMs > 0) await new Promise((r) => setTimeout(r, settleMs));
+  const rounds = await sampleWindow({
+    sample: () => Promise.all(probes.map((p) => p.read())),
+    windowMs: observeMs,
+    minSamples: MIN_FLAT_WINDOW_SAMPLES,
+    // Scales with the span actually observed, so an `observeMs` override keeps
+    // the same factor rather than a bound derived from the default span.
+    maxMs: FLAT_WINDOW_MAX_OBSERVE_FACTOR * observeMs,
+    intervalMs: E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS,
+    why,
+  });
+  const samples: number[][] = probes.map((_, i) => rounds.map((round) => round[i]!));
   const summary = probes
     .map((p, i) => `${p.label}[${p.expect}]=${JSON.stringify(samples[i])}`)
     .join('; ');

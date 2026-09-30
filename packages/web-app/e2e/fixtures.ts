@@ -39,6 +39,7 @@ import {
 } from './cohort.js';
 import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS } from '../src/lib/e2eBus.js';
 import { scanRecordedRequests, type RecordedRequest, type ScanReport } from './credentialScan.js';
+import { windowStep } from './windowSampling.js';
 import { e2eEnv, toLoopbackUrl } from './env.js';
 import type { InstanceCounters } from './instanceCounters.js';
 import { diagnoseMissingSender } from './mcMetrics.js';
@@ -920,6 +921,22 @@ export const FLAT_WINDOW_OBSERVE_MS = 2_500;
 export const MIN_FLAT_WINDOW_SAMPLES = 4;
 
 /**
+ * The upper bound on a flat/advance window, as a multiple of its span. Both
+ * windows (`receiveEvidence.ts:observeWindow` and
+ * {@link expectCountersFlatOverWindow}) stop only once they have spanned their
+ * observation window AND reached {@link MIN_FLAT_WINDOW_SAMPLES} (stop rule:
+ * `windowSampling.ts:windowStep`); slow reads or a slipping in-page sampler under
+ * load extend them, up to `factor x span`, where they FAIL as a harness error
+ * rather than ever lowering the floor. Four: room for reads several times slower
+ * than the sample interval. The bound is evaluated between reads, and in
+ * `observeWindow` each read is also raced against it; an in-page history read
+ * that never returns is caught by the Playwright test timeout, not by this bound.
+ */
+export const FLAT_WINDOW_MAX_OBSERVE_FACTOR = 4;
+/** The bound at the default span — for docs and the default path. */
+export const FLAT_WINDOW_MAX_OBSERVE_MS = FLAT_WINDOW_MAX_OBSERVE_FACTOR * FLAT_WINDOW_OBSERVE_MS;
+
+/**
  * Frames already queued at the instant of mute may still drain — ADR-0036 §5
  * stops CAPTURE within one frame, which is a different claim from un-queueing
  * what the egress queue already holds. The flatness baseline is therefore taken
@@ -1176,12 +1193,32 @@ export async function expectCountersFlatOverWindow(
   await page.waitForTimeout(settleMs + FLAT_WINDOW_OBSERVE_MS);
 
   const settledAtMs = opts.fromMs + settleMs;
-  const samples = (await frameCountSamples(page)).filter((s) => s.atMs >= settledAtMs);
+  const settled = async () => (await frameCountSamples(page)).filter((s) => s.atMs >= settledAtMs);
+  let samples = await settled();
+  // The same stop rule as `observeWindow` (`windowSampling.ts:windowStep`): the
+  // in-page 250 ms timer slips under CPU load, so a correct mute can reach the
+  // end of the span short of the floor. Keep reading the timestamped history
+  // until the floor is met or the bound is reached; on overrun the HARNESS
+  // expect below is the loud failure. The floor is never lowered.
+  const extraFrom = Date.now();
+  while (
+    windowStep({
+      samples: samples.length,
+      elapsedMs: FLAT_WINDOW_OBSERVE_MS + (Date.now() - extraFrom),
+      windowMs: FLAT_WINDOW_OBSERVE_MS,
+      minSamples: MIN_FLAT_WINDOW_SAMPLES,
+      maxMs: FLAT_WINDOW_MAX_OBSERVE_MS,
+    }) === 'continue'
+  ) {
+    await page.waitForTimeout(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+    samples = await settled();
+  }
 
   expect(
     samples.length,
-    `the frame-count sampler produced only ${samples.length} sample(s) in the ` +
-      `${FLAT_WINDOW_OBSERVE_MS}ms observation window (needed >= ${MIN_FLAT_WINDOW_SAMPLES}). This is a ` +
+    `HARNESS: the frame-count window reached its hard bound of ${FLAT_WINDOW_MAX_OBSERVE_MS}ms ` +
+      `(span ${FLAT_WINDOW_OBSERVE_MS}ms, extended while short of the floor) with only ` +
+      `${samples.length} sample(s) (needed >= ${MIN_FLAT_WINDOW_SAMPLES}). This is a ` +
       `HARNESS failure, not a media failure: with no samples, flatness is vacuously true. Check ` +
       `that the __E2E_HOOKS__ bus sampler is running and that media was started.`,
   ).toBeGreaterThanOrEqual(MIN_FLAT_WINDOW_SAMPLES);
