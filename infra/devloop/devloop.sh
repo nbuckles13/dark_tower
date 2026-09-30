@@ -74,6 +74,10 @@ read_node_version() {
 # infra/kind/scripts/deploy.sh (the db-migrate image). Fails loud, never floats.
 # shellcheck source=../lib/cargo-lock-version.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/cargo-lock-version.sh"
+# The Kind scripts' shared prelude (definitions only): cluster_exists is the ONE Kind-cluster
+# existence check, with a failed listing (rc 2) kept distinct from "absent".
+# shellcheck source=../kind/scripts/lib/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../kind/scripts/lib/common.sh"
 read_sqlx_cli_version() {
     local script_dir="$1"
     cargo_lock_version "${script_dir}/../../Cargo.lock" sqlx || exit 1
@@ -459,8 +463,14 @@ detect_orphan_clusters() {
     # host, masking the orphaned-cluster leak this function exists to catch (Finding 4,
     # @dry-reviewer). The `-dev`/`-net`/`/tmp/devloop-` sites below share the string
     # only incidentally and are deliberately left as literals.
-    local clusters
-    clusters=$(kind get clusters 2>/dev/null | grep "^${CLUSTER_PREFIX}" || true)
+    # A FAILED listing is "unknown", never "no orphans" (lib/common.sh:cluster_exists's
+    # rc-2 rule): the scan is advisory, so it warns and skips.
+    local clusters listing
+    if ! listing="$(kind get clusters 2>/dev/null)"; then
+        echo "WARNING: 'kind get clusters' failed; cannot scan for orphaned devloop clusters. Check the host container runtime." >&2
+        return 0
+    fi
+    clusters=$(grep "^${CLUSTER_PREFIX}" <<< "${listing}" || true)
     if [ -z "$clusters" ]; then
         return 0
     fi
@@ -807,7 +817,14 @@ if [ -n "$HOST_GATEWAY_IP" ] && command -v kind &>/dev/null; then
     CLUSTER_NAME="${CLUSTER_PREFIX}${TASK_SLUG}"
     PORTS_FILE_PATH="$HELPER_RUNTIME_DIR/ports.json"
     NEEDS_SETUP=false
-    if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
+    CLUSTER_EXISTS_RC=0
+    cluster_exists || CLUSTER_EXISTS_RC=$?
+    if [ "$CLUSTER_EXISTS_RC" -eq 2 ]; then
+        # Never read as "absent": provision re-lists and REFUSES on an unreadable
+        # listing (BLUEPRINT REASON=unreadable), so the failure surfaces there, loudly.
+        echo "WARNING: 'kind get clusters' failed; cannot tell whether ${CLUSTER_NAME} exists. Running provision + deploy in background, which refuses on an unreadable listing (see eager-setup.log)..." >&2
+        NEEDS_SETUP=true
+    elif [ "$CLUSTER_EXISTS_RC" -eq 1 ]; then
         echo "No Kind cluster found for ${TASK_SLUG}, starting provision + deploy in background..."
         NEEDS_SETUP=true
     elif [ ! -f "$PORTS_FILE_PATH" ]; then

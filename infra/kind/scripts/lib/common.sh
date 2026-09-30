@@ -17,24 +17,33 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-_ts() { date '+%H:%M:%S'; }
+# The log timestamp, into __dt_ts: bash's builtin strftime (bash >= 4.2; -1 = now,
+# local time, the same as `date '+%H:%M:%S'`). The ONE place the format lives. A
+# variable, not `$(_ts)`: a command substitution forks a subshell per log line, and
+# the log functions run on every line of every provision/deploy (scripts/setup.test.sh
+# runs them thousands of times).
+_ts() { printf -v __dt_ts '%(%H:%M:%S)T' -1; }
 
 log_info() {
-    echo -e "${GREEN}[$(_ts) INFO]${NC} $1"
+    _ts
+    echo -e "${GREEN}[${__dt_ts} INFO]${NC} $1"
 }
 
 # Diagnostics go to STDERR, so a function called inside `$(...)` can never
 # swallow its own error message (the capture would take stdout only).
 log_warn() {
-    echo -e "${YELLOW}[$(_ts) WARN]${NC} $1" >&2
+    _ts
+    echo -e "${YELLOW}[${__dt_ts} WARN]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[$(_ts) ERROR]${NC} $1" >&2
+    _ts
+    echo -e "${RED}[${__dt_ts} ERROR]${NC} $1" >&2
 }
 
 log_step() {
-    echo -e "${BLUE}[$(_ts) STEP]${NC} $1"
+    _ts
+    echo -e "${BLUE}[${__dt_ts} STEP]${NC} $1"
 }
 
 # --- Cluster name validation (#1 name-length, DERIVED from 63) ---
@@ -129,10 +138,13 @@ dt_init_cluster_env() {
 # True iff a Kind cluster named CLUSTER_NAME exists. `kind get clusters`
 # failing is a failure, never "absent" (rc 2 — the caller must not treat it as
 # a missing cluster: provision would rebuild on it).
+# Exact-LINE match, in bash (no grep fork): the name is QUOTED on the right-hand
+# side, so it is compared literally, never as a glob — this decides which cluster a
+# destroy targets.
 cluster_exists() {
     local out
     out="$(kind get clusters 2>/dev/null)" || return 2
-    grep -qx "${CLUSTER_NAME}" <<< "${out}"
+    [[ $'\n'"${out}"$'\n' == *$'\n'"${CLUSTER_NAME}"$'\n'* ]]
 }
 
 # A key of a Kubernetes Secret manifest's `stringData` (e.g. POSTGRES_PASSWORD
