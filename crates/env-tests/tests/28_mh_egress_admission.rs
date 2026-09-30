@@ -5,7 +5,7 @@
 //! ONE `#[tokio::test]` owns ONE meeting and drives it past the DEPLOYED stream
 //! ceiling through REAL GC/MC joins, then asserts MH refused admission and
 //! counted it. Every failure message names its phase: PRECONDITION /
-//! JOIN-FANOUT / ADMISSION / GAUGES — so a flaky join is triaged as the
+//! JOIN-FANOUT / ADMISSION / GAUGES / ALERT-JOIN-EMPTY — so a flaky join is triaged as the
 //! environment, never as admission logic.
 //!
 //! # Why real joins, not a direct `RegisterMeeting`
@@ -107,6 +107,7 @@
 use std::time::Duration;
 
 use env_tests::cluster::ClusterConnection;
+use env_tests::fixtures::alert_rules_loaded::{alert_expr_in_yaml, RULES_DIR};
 use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::egress_admission::{
     max_s9_feasible_ceiling, size_s9_meeting, MAX_S9_PARTICIPANTS,
@@ -121,6 +122,7 @@ use env_tests::fixtures::metrics::{
     settled_baseline, InstanceCounters,
 };
 use env_tests::fixtures::{AuthClient, PrometheusClient};
+use env_tests::repo_root;
 use proto_gen::dark_tower::signaling::v1::{
     client_message, ClientMessage, MediaKind, ReceiveCapability, ReceiveSlot,
 };
@@ -516,6 +518,50 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
              carries MH_EGRESS_REJECTION_RATIO_THRESHOLD={deployed_threshold}: the gauge must \
              publish the SAME field enforcement reads (or the pod predates the ConfigMap: \
              {REDEPLOY_HINT})."
+        );
+    }
+
+    // ---- ALERT-JOIN-EMPTY: the gauge-vs-gauge alert expressions still JOIN ----
+    // `MHMediaEgressBudgetExhausted` (`ratio > threshold`) and
+    // `MHMediaEgressEdgeHeadroomLow` (`edges / ceiling > fraction`) are
+    // one-to-one vector matches. A label added to ONE side empties the result,
+    // and the rule then loads, evaluates and can never fire (env-test 33 cannot
+    // see that). The probe is DERIVED from each rule's own `expr` in
+    // mh-alerts.yaml, with its single comparison made `bool`. `bool` returns a
+    // series whenever the label sets match, whatever the values, so this proves
+    // each join is non-empty on every instance without crossing a threshold, and
+    // it follows the rule if the rule changes shape.
+    let mh_rules_path = repo_root().join(RULES_DIR).join("mh-alerts.yaml");
+    let mh_rules = std::fs::read_to_string(&mh_rules_path).unwrap_or_else(|e| {
+        panic!(
+            "COULD-NOT-EVALUATE: cannot read {}: {e}",
+            mh_rules_path.display()
+        )
+    });
+    for alert in [
+        "MHMediaEgressBudgetExhausted",
+        "MHMediaEgressEdgeHeadroomLow",
+    ] {
+        let expr = alert_expr_in_yaml(&mh_rules, alert).unwrap_or_else(|| {
+            panic!("COULD-NOT-EVALUATE: no alert `{alert}` with an expr in mh-alerts.yaml")
+        });
+        let expr = expr.trim();
+        assert_eq!(
+            expr.matches(" > ").count(),
+            1,
+            "COULD-NOT-EVALUATE: `{alert}`'s expr `{expr}` does not contain exactly one ` > `, \
+             so the join probe cannot be derived from it; update this probe with the rule"
+        );
+        let join = expr.replacen(" > ", " > bool ", 1);
+        let joined = prom.instance_counter_map(&join).await;
+        assert_eq!(
+            joined.len(),
+            MH_INSTANCE_COUNT,
+            "ALERT-JOIN-EMPTY: `{join}` ({alert}'s comparison) matched {} instance(s), expected \
+             {MH_INSTANCE_COUNT}: the two gauges' label sets have diverged, so the alert can \
+             never fire. Both must carry exactly key_custody plus the scrape labels \
+             (crates/mh-service/src/observability/metrics.rs). Matched: {joined:?}",
+            joined.len()
         );
     }
 

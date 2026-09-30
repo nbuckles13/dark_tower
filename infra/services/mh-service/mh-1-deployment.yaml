@@ -84,11 +84,15 @@ spec:
               key: MH_WEBTRANSPORT_BIND_ADDRESS
         # RETIRED — PENDING REMOVAL, and this reference is deliberately KEPT.
         # Since story 2 task 8's image, nothing reads MH_MAX_STREAMS.
-        # This ref stays anyway: `kubectl rollout undo` restores a Deployment
-        # spec WITH its configMapKeyRefs but never reverts the ConfigMap, so a
-        # key must never be deleted while a HARD ref to it is reachable by
-        # rollout undo. The removal is itself two deploys (first flip this ref
-        # to `optional: true`, then delete key and refs together) — see
+        # This ref stays anyway, as a cheap ordering discipline: the read goes
+        # one deploy before the key. Undo itself is safe either way while the
+        # previous hash-suffixed ConfigMap generation exists (ADR-0038 §2):
+        # that generation holds every key its revision references. The
+        # ordering protects a partial revert/apply, and a future move to a
+        # stable ConfigMap name. It is NOT a defence against pruning; see
+        # docs/runbooks/mh-deployment.md §Config-failure triage. The removal
+        # is itself two deploys (first flip this ref to `optional: true`, then
+        # delete key and refs together) — see
         # docs/TODO.md §Media Path Obligations. Keep this identical in
         # mh-0-deployment.yaml and mh-1-deployment.yaml.
         - name: MH_MAX_STREAMS
@@ -245,7 +249,8 @@ spec:
         # ALWAYS deploy through kustomize (`kubectl apply -k`, or the Kind
         # overlay). `kubectl apply -f` on this file BYPASSES the replacement and
         # applies the sentinel verbatim — both MH pods would then refuse to
-        # start, which is a JOIN outage, not merely a media one.
+        # start: a new-meeting outage plus silent media in every existing
+        # meeting (the scale-to-zero shape; R-6 made "a join outage" wrong).
         #
         # Operational consequence: once task #12 lands, MH's drain window is
         # min(SETTLE_TARGET, terminationGracePeriodSeconds - MARGIN). Editing

@@ -29,6 +29,8 @@
    - [Scenario 15: Media Sessions Declining — No Sender Binding](#scenario-15-media-sessions-declining--no-sender-binding)
    - [Scenario 16: Ingress Datagrams Received But Never Read](#scenario-16-ingress-datagrams-received-but-never-read)
    - [Scenario 17: Media Datagram Drop](#scenario-17-media-datagram-drop)
+   - [Scenario 18: Media Egress Budget Exhaustion](#scenario-18-media-egress-budget-exhaustion)
+   - [Scenario 19: Server Mute Not Taking Effect At Ingress](#scenario-19-server-mute-not-taking-effect-at-ingress)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -800,7 +802,7 @@ histogram_quantile(0.95, rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
 >
 > **Interim remedy: restart the pod — but read the next sentence before you do, because the recovery it used to promise does not exist.** **MC's ADR-0036 §8 re-assert cadence is NOT YET IMPLEMENTED.** MC pushes forwarding policy exactly once, when the first participant joins, and story task 13 deliberately deferred the cadence to the handler-restart story (see `docs/observability/metrics/mh-service.md` §`mh_media_policy_applies_total` and ADR-0036 §8's deferral). So restarting the pod **drops forwarding policy for every live meeting on it, and they are NOT recovered automatically** — no MC-side signal fires either, because the one-shot push already happened and `mc_media_generation_divergence` holds its last healthy value. **Treat the restart as an outage for those meetings**, re-established only by their participants rejoining; prefer a low-occupancy window and expect the meetings on that pod to end. (There is no session-drain path that preserves forwarding policy: MH's `terminationGracePeriodSeconds` settle window drains **in-flight connection teardown** and does nothing for policy, so a graceful restart loses the same meetings a hard one does.) This caveat is retired by the cadence task, not before. **Raising `MH_MAX_TOTAL_EGRESS_EDGES` is not the remedy**: the ceiling is consumed by unreleased meetings at whatever rate they end, independent of concurrent load, so doubling it doubles time-to-onset and changes nothing else. 
 >
-> **The durable fix has partly landed, and which part matters at 3am.** As of story 2 task 12, MC calls `EndMeeting` on the clean paths — a meeting that ends explicitly, and a meeting that empties — so the ratchet above no longer accumulates from ordinary meeting turnover. The residual is narrower and differently shaped: **a meeting whose MC never *completes* `EndMeeting`.** Scope and tracking: the `docs/TODO.md` entry "A meeting whose MC never sends `EndMeeting` is never reclaimed"; the absent-event alert that would detect it is story-2 task 18's and does not exist yet, so every check below is manual. Settle **which cause** before restarting anything. `push_quiesce_bound_seconds` and `teardown_fence_hold_max_seconds` are structured fields on MC's `Configuration loaded successfully` startup line (`mc-deployment.md` §5) — read the live values off the pod rather than computing them.
+> **The durable fix has partly landed, and which part matters at 3am.** As of story 2 task 12, MC calls `EndMeeting` on the clean paths — a meeting that ends explicitly, and a meeting that empties — so the ratchet above no longer accumulates from ordinary meeting turnover. The residual is narrower and differently shaped: **a meeting whose MC never *completes* `EndMeeting`.** Scope and tracking: the `docs/TODO.md` entry "A meeting whose MC never sends `EndMeeting` is never reclaimed"; no absent-event alert detects it. A meeting that holds edges is caught by `MHMediaEgressEdgeHeadroomLow`'s LEAK fork ([Scenario 18](#scenario-18-media-egress-budget-exhaustion) Arm B), but a zero-edge registration has no alert (`docs/TODO.md` §Observability Debt, "No leading indicator for registered-meeting exhaustion"). So the checks below are manual. Settle **which cause** before restarting anything. `push_quiesce_bound_seconds` and `teardown_fence_hold_max_seconds` are structured fields on MC's `Configuration loaded successfully` startup line (`mc-deployment.md` §5) — read the live values off the pod rather than computing them.
 >
 > | You see | What happened | Read it as |
 > |---|---|---|
@@ -819,7 +821,7 @@ histogram_quantile(0.95, rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
 >
 > **What a non-zero `mh_media_released_meeting_apply_refusals_total` means — and the thing it can never tell you.** It always means one thing: the proto's *accepted* deadline residual occurred and the guard caught it. The system working as designed. Informational, with deliberately no alert, because alerting would page on a design decision taken on purpose. That reading does **not** change with story 4 — the deadline race it counts survives unchanged, so the series is stable and needs no retirement. **What it cannot do is show story 4's re-assert fence failing, and that limit is structural rather than a gap to be closed later.** A fence failure is a periodic re-assert resurrecting a released meeting; a re-assert *re-registers* the meeting, so MH's guard passes it by construction and this counter stays FLAT while the fence fails. Story 4 must therefore bring its own signal; do not read a flat value here as evidence its fence is holding. Until that signal exists, the only evidence of a resurrected meeting is the registered-meetings ratchet signature in the row above.
 >
-> **Race B — a registration still in flight — has no signal at all, and it is the one that fails open.** MC waits `push_quiesce_bound_seconds` before releasing, which relies on a dropped client request cancelling MH's server-side handler: a foreign-library property. "The wait was performed" is not the same fact as "the late registration did not land", and there is no counter for the second. If that property regressed, nothing would turn red. **So do not conclude Race B is holding from any quiet signal, and in particular not from Race A's guard being active**: a non-zero `mh_media_released_meeting_apply_refusals_total` proves the guard caught a *queued* apply and says nothing about an in-flight *registration*, which re-registers the meeting and therefore passes that guard by construction — the same blindness the guard has to story 4's fence. Silence here is what a working ordering and a regressed one look like alike. The only trace is `mh_media_registered_meetings` rising with pod uptime while teardowns stay flat — the row above, whose alert is story-2 task 18's and does not exist yet. That is why this row says confirm rather than conclude, and why the handler's registered-meetings gauge is the check that settles it.
+> **Race B — a registration still in flight — has no signal at all, and it is the one that fails open.** MC waits `push_quiesce_bound_seconds` before releasing, which relies on a dropped client request cancelling MH's server-side handler: a foreign-library property. "The wait was performed" is not the same fact as "the late registration did not land", and there is no counter for the second. If that property regressed, nothing would turn red. **So do not conclude Race B is holding from any quiet signal, and in particular not from Race A's guard being active**: a non-zero `mh_media_released_meeting_apply_refusals_total` proves the guard caught a *queued* apply and says nothing about an in-flight *registration*, which re-registers the meeting and therefore passes that guard by construction — the same blindness the guard has to story 4's fence. Silence here is what a working ordering and a regressed one look like alike. The only trace is `mh_media_registered_meetings` rising with pod uptime while teardowns stay flat — the row above. No alert covers it for a zero-edge registration (`docs/TODO.md` §Observability Debt, "No leading indicator for registered-meeting exhaustion"); an edge-holding one reaches `MHMediaEgressEdgeHeadroomLow`. That is why this row says confirm rather than conclude, and why the handler's registered-meetings gauge is the check that settles it.
 >
 > **Meeting-cap arm — new meetings refused, everything else looks fine.** MH refuses a NEW meeting id once it holds `MH_MAX_REGISTERED_MEETINGS` registrations (story 2 R-21): `RegisterMeeting` answers `RESOURCE_EXHAUSTED`, nothing is registered, and that meeting's clients sit in the provisional window and are kicked at the timeout — this scenario's symptom, for a different cause. MC classifies no RegisterMeeting status: it shows only a generic push failure and bounded retries, so **MH's `mh_media_policy_applies_total{outcome="rejected_meeting_cap"}` is the discriminator**. Held meetings keep re-asserting normally (the cap never refuses a meeting it already holds), which is why edge and stream signals stay healthy. Read `mh_media_registered_meetings` against `mh_media_registered_meetings_limit` (mh-media dashboard, "Registered Meetings vs Registration Cap"), then tell three causes apart: **leaked registrations** (meetings whose `EndMeeting` never arrived — occupancy rising with pod uptime, `released` teardowns flat), **an empty-meeting flood** (many registrations against flat `mh_media_egress_edges`), or **genuine load**. The first two are fixed by reclamation or a pod restart, not by raising the key: the value has a hard ceiling in code, and a larger cap only postpones the same exhaustion.
 >
@@ -1507,10 +1509,12 @@ MH.
 > **THE MH-SIDE DROP IS AN APPLICATION QUEUE BOUND, NOT A BANDWIDTH BUDGET.** It is the §1
 > transport-parameter bound: MH owns a bounded egress datagram queue above quinn's datagram send
 > buffer, with drop-oldest, deliberately sized to trip **before** the transport ceiling so the drop
-> is countable in our code rather than silently discarded inside quinn. **There is no egress
-> bandwidth budget, no capacity gauge, no stream ceiling and no admission threshold in this build.**
-> If you are looking for one, you are looking for something that does not exist; do not infer a
-> number from this counter.
+> is countable in our code rather than silently discarded inside quinn. **The egress bandwidth
+> budget, its stream ceiling and its admission threshold (story 2) are a DIFFERENT control**: they
+> refuse a forwarding policy at admission and never shed a datagram, so they cannot move this counter.
+> Budget exhaustion is [Scenario 18](#scenario-18-media-egress-budget-exhaustion); do not infer a
+> budget number from this counter. *(Corrected at story 2 task 18, 2026-09-30: this previously said
+> no budget, ceiling or threshold existed in this build, which story 2 task 8 falsified.)*
 
 **Why the SDK-side drop matters most.** ADR-0036 §11 is explicit: the client-side send drop is the
 one that matters most, **because it occurs in the sender and MH structurally cannot observe it**.
@@ -1680,7 +1684,8 @@ orders of magnitude longer than the queue's fill-and-drain time. A reading of ze
 
 - **Sustained `egress_queue_overflow`** means a subscriber the queue cannot drain into fast enough.
   In this build there is no per-stream lever: the bound is a startup-validated transport parameter,
-  and there is no bandwidth budget to adjust. Escalate to `media-handler` with the reason breakdown
+  and the egress budget is an admission control that does not act on this queue (raising it changes
+  nothing here). Escalate to `media-handler` with the reason breakdown
   and the affected pod.
 - **A reaped NAT binding** resolves on reconnect; the durable fix is the keepalive interval, which is
   a configuration change and a redeploy.
@@ -1699,6 +1704,286 @@ SDK send queue and the capture path; `meeting-controller` if rung 2 finds diverg
 different fault from one that started and stopped forwarding);
 `MCMediaGenerationDivergence` (MC Scenario 15 — rung 2).
 
+
+---
+
+### Scenario 18: Media Egress Budget Exhaustion
+
+**Alert**: `MHMediaEgressBudgetExhausted` (warning); the early warning for two of its three arms is `MHMediaEgressEdgeHeadroomLow` (warning)
+**Severity**: Warning
+**Runbook Section**: `#scenario-18-media-egress-budget-exhaustion`
+
+**What this is.** MH admits egress streams against ONE derived stream ceiling
+(`mh_media_egress_stream_ceiling`: the egress budget divided by the heavier per-stream cost). The same
+value is advertised to GC as `max_streams`. A generation-advancing policy apply that would take the
+handler's installed egress streams above the ceiling is refused whole. The prior generation stays live,
+and the refusal is counted as `mh_media_stream_admission_total{outcome="rejected_stream_ceiling"}` (and as
+the same event on `mh_media_policy_applies_total{outcome="rejected_stream_ceiling"}`; different
+denominators, never summed). The alert compares the windowed refusal share,
+`mh_media_stream_admission_rejection_ratio`, bare against its threshold gauge
+`mh_media_stream_admission_rejection_ratio_threshold`, the value of `MH_EGRESS_REJECTION_RATIO_THRESHOLD`.
+The number lives only in `infra/services/mh-service/config.env`. The window, the defined idle and
+all-rejected values, and why the gauge and a `rate()` ratio disagree are in
+`docs/observability/metrics/mh-service.md` §Egress Admission Metrics. Read them there, not here.
+
+**What the user sees.** Everyone already talking keeps talking, because an equal-generation re-assert
+never re-tests admission. **A participant joining a meeting on this handler hears nobody and is heard by
+nobody**: their join added edges, and the apply that would install them was refused. GC stops placing
+NEW meetings on a handler whose reported `current_streams` has reached its `max_streams`
+(`get_candidate_mhs`, new-meeting only). An already-assigned meeting keeps targeting its handlers
+(R-6 sticky join), so the refusals continue however full the pod is. **Sustained rejection while
+placement keeps targeting this pod is a triage step, not a second alert**: it is the sticky-meeting
+shape, or GC holding a load report older than the refusal. Read GC's view of the handler
+(`gc-incident-response.md`) before assuming placement is broken.
+
+**Is there a leading indicator? It depends on the arm. Do not read "no page yet" as headroom.**
+- **Edge occupancy leads the two ceiling arms.** `MHMediaEgressEdgeHeadroomLow` reads installed edges
+  over the **same** `mh_media_egress_stream_ceiling` that the rejection hits, so it fires before
+  admission reaches the ceiling, whether from genuine demand (Arm A) or the unreclaimed-edge floor
+  (Arm B).
+- **Nothing leads congestion or measured bandwidth.** The budget's basis is `unmeasured`
+  (`mh_media_egress_budget_bytes_per_second{basis}`): it is a configured figure, not a measurement.
+  Nothing in this build measures bandwidth, so a handler whose real link is saturated below its
+  configured budget produces no signal here at all. **This has no leading indicator until story 5
+  lands the congestion-withheld rank gauge.** ADR-0036 §11 names sustained congestion-withholding
+  as egress exhaustion's leading indicator. That gauge does not exist yet, and nothing today stands
+  in for it.
+- **Nothing on edges leads the empty-meeting arm** (Arm C). It binds on the registered-meetings cap,
+  not on edges, so the edge-headroom warning stays silent throughout. It has no leading indicator
+  today. Its missing rule is tracked in `docs/TODO.md` §Observability Debt ("No leading indicator for
+  registered-meeting exhaustion").
+
+**Step 1 — confirm the comparison, then fork.** All three arms present identically to the user: new
+participants are silent, and everyone already talking is fine. **They have three different remedies.**
+Read the fork before touching anything. Arms A and B are also identical on the rejection ratio. Arm C
+refuses at the registration cap, which the ratio never counts
+(`mh_media_policy_applies_total{outcome="rejected_meeting_cap"}` is its signal). So check Arm C whether
+or not the alert fired, and check it alongside A or B when it did. *(Premise correction, story 2
+task 18: the task text said all three present identically at the rejection ratio. Against the shipped
+code, Arm C does not, because `rejected_meeting_cap` is decided on the register path before
+admission.)*
+
+```promql
+mh_media_stream_admission_rejection_ratio                  # per pod, the alert's left side
+mh_media_stream_admission_rejection_ratio_threshold        # per pod, its right side
+mh_media_egress_edges                                      # installed edges (measured)
+mh_media_egress_stream_ceiling                             # the bound admission enforces
+mh_media_egress_stream_ceiling_recommended_min             # advisory: an unsized placeholder budget?
+mh_media_registered_meetings                               # registrations HELD, not meetings in progress
+mh_media_registered_meetings_limit                         # MH_MAX_REGISTERED_MEETINGS
+sum by(outcome) (increase(mh_media_meeting_teardowns_total[1h]))
+```
+
+Pod uptime, for Arm B's discriminator: `kubectl get pods -n dark-tower -l app=mh-service -o custom-columns=POD:.metadata.name,STARTED:.status.startTime`.
+
+Compare **each pod against its own ceiling**, never against the fleet: a meeting's edges sit on one
+handler and never move, so the idle sibling is not headroom for a meeting refused on the busy one.
+The `mh.session.policy` WARN on each refusal carries `installed_meeting_count` and
+`installed_total_streams`, which is the only place one fat policy and many small ones are told apart.
+
+#### Arm A — genuine budget exhaustion (LOAD)
+
+**Signature**: `mh_media_egress_edges` at or near the ceiling and **tracking concurrent load**. It
+rises and falls with `mh_media_registered_meetings` and with the meetings and participants you
+know are live. `released` teardowns are moving normally.
+
+**First check whether the budget was ever sized.** If `mh_media_egress_stream_ceiling` is below
+`mh_media_egress_stream_ceiling_recommended_min`, the deployment is running the base ConfigMap's
+deliberately unsized placeholder (MH logged an INFO "configure me" line naming
+`MH_EGRESS_BUDGET_BPS` at startup). That is a configuration state, not an incident.
+
+**Remedy: capacity, by redeploy only. Prefer adding handlers.** Raise `MH_EGRESS_BUDGET_BPS` in the
+ConfigMap for the target environment (the Kind value is
+`infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`) **only to a
+figure the node's provisioned egress actually supports**. The budget is `unmeasured`: raising it past
+the real link turns a visible admission refusal into congestion that no signal in this build shows.
+Two consequences to plan around:
+- **A budget change rolls both MH pods.** The ConfigMap is content-addressed (ADR-0038 §2), so the
+  apply changes the pod template, and **an MH roll sheds every media session on the pod**
+  (`mh-deployment.md` §Rollout With Media Flowing). Do it in a low-occupancy window.
+- **MH refuses to start if the raised ceiling exceeds `MH_MAX_TOTAL_EGRESS_EDGES`.** Raise that key in
+  the same change if the refusal names it (`mh-deployment.md` §Both pods CrashLoop immediately after
+  apply).
+
+**Never lower `MH_EGRESS_BUDGET_BPS` as a way to "stop" anything.** That is a new-meeting outage plus
+silent media in existing meetings (`mh-deployment.md` §Operator levers).
+
+#### Arm B — the unreclaimed-edge floor (LEAK)
+
+**Signature**: `mh_media_egress_edges` **rising with pod uptime and uncorrelated with concurrent
+load**, while `mh_media_meeting_teardowns_total{outcome="released"}` stays flat or lags the meetings you
+know have ended. **That correlation is the discriminator**: edges held by meetings nobody released.
+Since story 2 task 12 MC calls `EndMeeting` for every meeting it ends. The floor now accumulates only
+from meetings whose MC never **completed** it (an MC crash or kill mid-teardown, exhausted retries,
+an MH predating the RPC, a rollback to an MC build without teardown). The per-cause table is in
+[Scenario 13](#scenario-13-registermeeting-timeout--clients-kicked), in the "Some people can't hear
+anything" callout and the teardown table below it. Do not re-derive it here.
+
+**An edge-headroom warning on a long-lived pod is a TRUE POSITIVE for a reclamation regression.**
+Triage it as one. **Never tune it away by raising the headroom fraction or the threshold.** The fraction
+only moves the time-to-onset. The floor keeps rising at whatever rate unreleased meetings end, so a
+higher threshold hides the regression without changing its outcome. The same holds for raising the
+budget or `MH_MAX_TOTAL_EGRESS_EDGES`: doubling the bound doubles time-to-onset and fixes nothing.
+
+**Remedy.** Recovery is a restart of **the pod showing the signature**, which releases every held
+edge: `kubectl rollout restart deployment/mh-N -n dark-tower`, then
+`kubectl rollout status deployment/mh-N -n dark-tower`. The leak is per pod. Restart the sibling only
+if it independently shows the signature, and only after the first is Ready again. Restarting both at
+once sheds every meeting on a healthy pod for nothing, and it can empty GC's candidate pool, which
+gives new-meeting 503s ([`gc-incident-response.md` Scenario 3](gc-incident-response.md#scenario-3-mc-assignment-failures)).
+**What a restart costs, stated for the shipped build:** it sheds every media session on the pod, and
+MC's periodic re-assert cadence has **not** shipped (ADR-0036 §8 deferral; story 4). So the healthy
+meetings on the pod reinstall only when a structural change re-pushes their policy, in practice when
+their participants rejoin, **not on a timer**. Treat the restart as an outage for the meetings on that
+pod, as Scenario 13 does. The durable fix is the **teardown path**: find which MC-side cause stopped
+`EndMeeting` from completing ([MC Scenario 20](mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet))
+and route it there.
+
+#### Arm C — empty-meeting growth
+
+**Signature**: `mh_media_registered_meetings` high against `mh_media_registered_meetings_limit`, with
+`mh_media_egress_edges` flat or low. There are many meetings at near-zero edges. An empty egress set is
+a legal registration, so the budget is structurally blind to it. What refuses here is the
+registration cap, which counts `mh_media_policy_applies_total{outcome="rejected_meeting_cap"}` and answers
+`RESOURCE_EXHAUSTED`. The stream-ceiling refusal is not involved. The user sees the same thing as a
+ceiling refusal: new meetings on the handler get no media.
+
+**Remedy.** Tell leaked registrations apart from an empty-meeting flood. Leaked registrations show
+occupancy rising with uptime while `released` stays flat, which is Arm B's cause with zero edges; they
+are fixed by reclamation or a pod restart. An empty-meeting flood is many short-lived creates, so
+look for who is creating them. **Do not raise `MH_MAX_REGISTERED_MEETINGS`**: it has a hard
+ceiling in code, and a larger cap only postpones the same exhaustion. The full arm is Scenario 13's
+meeting-cap callout.
+
+**What this scenario is NOT.**
+- **Not `MHMediaEgressQueueOverflowRate`.** That is the §1 transport queue shedding datagrams on a
+  live subscriber ([Scenario 17](#scenario-17-media-datagram-drop)). Admission refuses policies and
+  never sheds a datagram.
+- **Not `apply_failed`.** Edges reaching `mh_media_egress_edges_limit` (the resource-guard backstop)
+  show as `mh_media_policy_applies_total{outcome="apply_failed"}` with
+  `reason=total_egress_edge_cap_exceeded` on the WARN. Because config load refuses a ceiling above
+  that limit, reaching it means the ceiling check did not bind, which is a media-handler defect, not
+  capacity.
+
+**Escalation**: `media-handler` for Arm A sizing and any `apply_failed` backstop hit; `meeting-controller`
+for Arm B's teardown cause (MC Scenario 20); `global-controller` if GC keeps placing NEW meetings on a
+handler whose reported `current_streams` is at `max_streams`.
+
+**Related**: [Scenario 13](#scenario-13-registermeeting-timeout--clients-kicked) (the ratchet, the
+meeting-cap arm and the ownership-reject recovery order);
+[MC Scenario 20](mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
+(`MHMediaEgressEdgeHeadroomLow`'s LEAK vs LOAD fork); `mh-deployment.md` §Operator levers.
+
+---
+
+### Scenario 19: Server Mute Not Taking Effect At Ingress
+
+**Alert**: none, by decision. A non-zero muted-drop rate is healthy moderation, and the inverse
+("a mute that should be dropping is not") needs a per-meeting correlation ADR-0036 §11 bars.
+The decision's home is the `DELIBERATELY NO ALERT` comment in `infra/docker/prometheus/rules/mc-alerts.yaml`.
+**Severity**: triage on report, as a moderation failure. Arm 2 is a security incident.
+**Runbook Section**: `#scenario-19-server-mute-not-taking-effect-at-ingress`
+
+**The report**: "The host muted someone and we can still hear them."
+
+**How it is enforced (story 2 R-9).** A host's server mute is decided at MC and carried to MH as
+`server_muted_sources` on the meeting's next registration snapshot. A change to the muted set alone
+advances `policy_generation`. MH drops that sender's frames at **ingress**, keyed by sender. MH does
+not read the stream component: it sits in the SFrame key id inside the payload, which MH forwards
+without parsing (ADR-0036 §7, type-blind). Each drop is counted as
+`mh_media_frames_dropped_total{direction="ingress",reason="server_muted"}`, present at zero from
+process start. MH logs nothing about mutes (ADR-0036 §11 deny scope). The MC half of this triage,
+covering which host asked, what MC recorded, and whether the push was confirmed, is
+[MC Scenario 21](mc-incident-response.md#scenario-21-server-mute-not-enforced). Start there for
+Steps 1-2, then use the arms below, **in cost order**.
+
+**Comparing MC's mute state with MH's drops** is fleet-aggregate and directional only. The rule, and
+the benign silent-source exclusion, are in MC Scenario 21 Step 3. Do not compare per instance.
+
+#### Arm 1 — refused at MC, while someone believes it applied
+
+Cheapest to check, so check it first. The query and every `outcome` value's meaning are in
+[MC Scenario 21 Step 1](mc-incident-response.md#scenario-21-server-mute-not-enforced). Any outcome
+other than `applied` means MC never recorded a mute, so nothing was sent to MH. The requester's
+belief is the only state that says "muted". The shipped web app renders server-mute state **from MC's
+broadcast, not optimistically**. **If a client UI shows a participant as server-muted while MC
+recorded no `applied` for it, the client is rendering optimistically. That is a client defect**
+(route to `client`), not an enforcement failure. Remedy: the requester must be the meeting's host.
+There is no other authority.
+
+#### Arm 2 — the policy was overwritten by a registration MC did not send
+
+**This is the ownership gap, and it is a security incident until explained.** The registration
+contract authorizes on **caller class alone**: the MC service credential, meaning scope
+`service.write.mh` with service_type `meeting-controller`. It has **no per-meeting ownership binding**.
+`mc_id` is caller-supplied, and any validation-passing registration rebinds the meeting's owner and
+replaces its muted set. So a holder of the MC service credential can set or clear a mute. That
+set includes every MC instance in the fleet (one shared credential), a buggy or failed-over MC, and
+anyone else holding it. **It is not bounded to MC pods**, because the MC→MH channel is plaintext and the
+bearer crosses the pod network in cleartext (`docs/TODO.md` §Media Path Obligations, "The MC→MH
+control channel that now carries a ROUTING AUTHORITY is plaintext"). The open authorization gap is
+tracked in one place: `docs/TODO.md` §Media Path Obligations, "MH does not verify meeting ownership".
+
+**Signature.** The likely entry point is **`MCMediaGenerationDivergence`**. MH holds a generation the
+owning MC never issued, so the owning MC's pushes read `generation_mismatch` on
+`mc_media_policy_pushes_total{outcome}`, and MH records them as `rejected_stale` on
+`mh_media_policy_applies_total{outcome}`. **Discriminator: a divergence with no MC restart behind it.**
+An MC restart's floor adoption is recorded on `mc_media_policy_generation_adoptions_total`, never as a
+mismatch (MC Scenario 15). If the writer used a DIFFERENT `mc_id`, MH logs the WARN "Meeting
+registration taken over by a DIFFERENT MC" (target `mh.session`, fields `registered_mc_id` and
+`caller_mc_id`). **A write that reuses the owning MC's own `mc_id` leaves no such WARN.** Then only
+the generation signature shows it.
+
+**Remedy.**
+1. Identify the unexpected writer from the WARN and MC's logs. **If no MC failover or MC defect explains
+   it, treat it as a security incident**: rotate or revoke the MC client credential in AC and involve
+   `security`. Rotation stops the current bearer's further use. It does not close on-path exposure of
+   the next one until the MC→MH channel is encrypted with mTLS peer authentication (the plaintext-channel
+   entry above). The channel does check the bearer's scope and service_type today.
+2. **Rotating the credential does not restore the affected meeting.** MH's installed generation never
+   moves back down, so a write at an inflated generation leaves the owning MC's pushes stale for that
+   meeting on that handler. Recovering it has a counter-intuitive order, and its one home is
+   [Scenario 13](#scenario-13-registermeeting-timeout--clients-kicked), the ownership-reject arm.
+   Follow it there; it will not self-correct (MC Scenario 15). Escalate to `meeting-controller`.
+
+This path is **unsupported and untooled**. It is not an operator lever, and this runbook gives no
+procedure for exercising it (`mh-deployment.md` §Operator levers).
+
+#### Arm 3 — applied but not enforced
+
+**Signature**: MC applied the mute (`applied`, Arm 1), and the push that carried it was **confirmed**.
+Neither metric is per meeting, so confirm per meeting from logs. `mc_media_policy_pushes_total{outcome="match"}`
+says only that confirmations are happening at all (it has no meeting label, ADR-0036 §11). The
+per-meeting evidence is MC's `mc.register_meeting.trigger` "RegisterMeeting succeeded" line, on the
+pusher span that carries the meeting and the handler endpoint (`crates/mc-service/src/media_routing/pusher.rs`),
+with a `policy_generation` at or after the one the mute advanced to. **That line is DEBUG**, so at the
+default level it is absent. What remains at INFO is the negative: no divergence ERROR from the pusher
+for that meeting and handler (MC Scenario 15). Then the muted participant is
+known to be sending on that handler, yet `mh_media_frames_dropped_total{reason="server_muted"}` on that
+pod stays flat. That series is per pod, so "flat" holds only if no other mute on the handler is
+dropping. MH installed a muted set it is not enforcing. That is an MH defect.
+
+**Remedy: redeploy.** Roll back to, or forward to, an MH build that enforces. **There is no runtime lever**:
+no per-meeting toggle, no admin API, no flag. Restarting MH does not help. The same build re-installs
+the same policy, and the restart sheds every session on the pod. Escalate to `media-handler` with the
+generation MC confirmed and the flat drop rate.
+
+#### Arm 4 — not applied: generation divergence
+
+**Signature**: MC applied the mute, and the push was **not** confirmed. `mc_media_policy_pushes_total`
+shows `generation_mismatch` or `no_applied_generation`, or the RegisterMeeting failed outright. The
+mute rides the same snapshot as every other policy change, so a push that is failing fails for the mute
+too. One mute-specific cause: a muted set larger than `MH_MAX_MUTED_SOURCES_PER_MEETING`
+(`mh_media_muted_sources_per_meeting_limit`) makes MH refuse the **whole** registration as
+`mh_media_policy_applies_total{outcome="rejected_invalid"}`. The previous policy, without the mute,
+stays live. Work [MC Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).
+
+**Escalation**: `client` for Arm 1's optimistic rendering; `security` + `meeting-controller` for Arm 2;
+`media-handler` for Arm 3; `meeting-controller` for Arm 4.
+
+**Related**: [MC Scenario 21](mc-incident-response.md#scenario-21-server-mute-not-enforced);
+[MC Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence);
+`docs/observability/metrics/mh-service.md` (the `server_muted` drop reason).
 
 ---
 

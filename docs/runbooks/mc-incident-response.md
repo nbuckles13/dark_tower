@@ -2394,7 +2394,7 @@ in the response path, not the apply path.
 > stale, so it can no longer be heard either. The remedy for an affected member is a page reload,
 > which is a fresh join and carries the current KEK. The durable fix is task-sized and tracked in
 > `docs/TODO.md` §Media Path Obligations, "Control-plane messages that must not be lost ride a
-> droppable channel". The full rotation arm of this scenario is story 2 task 18.
+> droppable channel". The full rotation walk is [the rotation arm](#rotation-arm--silence-after-someone-left) below.
 
 **What this is.** A receiving client is dropping frames because it does not have the key material
 needed to open them. The counter is **client-side**, by design: MH never opens a frame and
@@ -2445,6 +2445,30 @@ long rather than its threshold being high — see the comment on the rule.
 > lost. (The ratio this alert fires on is unaffected — numerator and denominator were buffered in the
 > same batch and compress together — which is why it is ratio-shaped and why an absolute-rate alert
 > on a `dt_client_*` series would fire on the artefact alone.)
+
+#### First fork — is this key material at all? "The sixth person can't be heard"
+
+**Rule these two out before working the key-material ladder.** Neither drops a frame for key
+material, so this alert and the arms below cannot see them. A report of "I hear some people but not
+all" in a meeting larger than the listener's slot count lands here far more often than on a key
+fault.
+
+- **Slot-cap rejection.** The client's receive-slot count N exceeded MC's cap, and MC rejected the
+  **whole** declaration. The listener hears nobody. Read `mc_media_receive_slot_cap` beside
+  `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`. A rising over-cap
+  rate with the cap below the client's configured N is a configuration mismatch, not a key fault.
+  Client side: `client-dev-local.md` F18.
+- **Static fill.** Slots fill in **join order** and are never reselected (story 2 R-2, R-4). With more
+  senders than slots, the earliest joiners hold the slots, and a later joiner is inaudible to that
+  listener until a slot frees, which happens when someone leaves. That is designed behaviour, not a
+  fault. Read effective N (the client's declared slot count, on the UI's slot rows and the E2E bus
+  `receiveSlots.declared`) and `mc_media_receive_slot_cap`. If the number of other senders the
+  listener shares a handler with exceeds N, the unheard participants are the latest joiners. Nothing
+  drops, nothing is counted as a drop, and `mc_media_slot_states_total{slot_state="active"}` is
+  healthy. Client side: `client-dev-local.md` F17. Speaker-based selection, story 5, replaces static
+  fill; until then there is no debugger for which sender holds which slot beyond the UI's slot rows.
+- A rostered participant the listener shares **no connected handler** with is a routing fork, not
+  this scenario: [Scenario 18](#scenario-18-a-participant-hears-only-part-of-the-roster).
 
 **Triage splits on the `reason` label first, because the four arms have different remedies — and
 because they are not equally instrumented.**
@@ -2596,6 +2620,69 @@ A drop lands here only when the unwrap failed **and** no usable transmit key for
 was already cached. With a usable cached key the same mismatch is the non-dropping
 `wrap_key_id_mismatch`. That is why this arm has no healthy transient: a sustained rate is always
 signal.
+
+#### Rotation arm — silence after someone left
+
+Since story 2, every roster removal triggers a KEK rotation, debounced to once per W (Scenario 17).
+**Every rotation is now a moment when key material can go missing**, and the arms above get a steady
+duty cycle of transients, not only the one at join. This arm crosses Arms 2 and 3. Walk it in this
+order.
+
+**Rung 0 — confirm that a client series is present in Prometheus at all.** Every rung below reads
+client telemetry. If the client pipe is dead, `MCMediaMissingKeyMaterial` stays green and every client
+query comes back empty. Use the quiet-series ladder in `gc-deployment.md` §When the client series go
+quiet.
+
+**Rung 1 — split on the `reason` label, then on what the onset correlates with.**
+
+- `no_kek_for_generation` means the frame's generation is newer than any the client holds, so the new
+  KEK did not arrive (Arm 2). `kek_generation_stale` means the generation is older than the client
+  retains, so the old KEK was already dropped (Arm 3).
+- **The rotation arm correlates with a LEAVE. The join arm correlates with a JOIN.** A rotation shows
+  as `mc_meeting_kek_generated_total{trigger="participant_left"}` (or `sender_space_exhausted`, Scenario
+  17 Arm 2) incrementing at the onset, and on the client as
+  `dt_client_media_kek_updates_total{source="kek_update"}`. A join delivers the KEK on the join
+  response (`source="join_response"`) and increments no rotation `trigger`. A reconnect re-issue also
+  counts as `join_response` and increments no `trigger`. If the onset sits on a join with no rotation
+  near it, go back to Arm 2's join path. This arm is for onsets that sit on a leave.
+- Remember that client timestamps are **collector-arrival time** (the callout above). Check
+  `up{job="otel-collector"}` over the window before trusting any correlation.
+
+**Rung 2 — per-recipient push outcomes: was the new KEK never sent, or sent and not acknowledged?**
+
+```promql
+sum by(outcome) (increase(mc_meeting_kek_pushes_total[15m]))
+```
+
+- **Never sent**: `dropped_outbound` (the member's outbound channel was full or closed),
+  `actor_unavailable` (the participant actor had exited, Scenario 2) and `timed_out` (no answer within
+  the push timeout; read `mc_actor_mailbox_depth`, Scenario 1). MC knows the member did not get it.
+  **There is no re-push** (the callout above): that member stays on the old generation until the next
+  rotation reaches it or it rejoins. The remedy for the affected member is a page reload.
+- **Sent, not acknowledged**: `delivered` means **handed to the connection's outbound stream**. It is
+  not a client acknowledgement, and none exists on the wire. All-`delivered` does not prove the client
+  installed it. The client-side confirmation is `dt_client_media_kek_updates_total{source="kek_update"}`
+  rising in step with MC's rotations. If MC shows `delivered` and the client counter does not move, the
+  loss is between MC's outbound stream and the SDK's install (a client refusal shows on
+  `dt_client_media_kek_install_refusals_total{outcome}`), so route it to `client`.
+- `participant_gone` is benign: the member was inside the reconnect grace and gets the current KEK on
+  return.
+
+**Rung 3 — retention expiry. This rung is CLIENT telemetry only, and MC-side green does NOT rule it
+out.** Every MC signal can be healthy here: the rotation happened, pending age cleared, every push was
+`delivered`. Receivers can still be dropping frames because they retired the previous generation
+before in-flight frames under it stopped arriving. Read the client:
+
+- `dt_client_media_frames_dropped_total{reason="kek_generation_stale"}` sustained after the rotation,
+  not just a short burst.
+- **The PAIR** `dt_client_media_kek_generations_retained_total` against
+  `dt_client_media_kek_updates_total{source="kek_update"}`. Rotations arriving while the retained
+  counter stays flat means **no** previous generation is being kept, which causes an audio gap at
+  every rotation. Neither series alone says anything.
+- `dt_client_media_kek_retention_anomalies_total{outcome}`: `floor_substituted` (the client got no W,
+  e.g. an MC rolled back below the field), `below_rewrap_latency` (W lowered far below the default)
+  and `ceiling_clamped` (a configuration state). Whether raising W helps is decided in Arm 3, and at
+  the shipped default it does not.
 
 #### Tripwires — client key-lifecycle counters that should never move
 
@@ -2854,44 +2941,95 @@ material to a terminal. The one command above reads two kernel/limit values and 
 **Severity**: Warning / Info
 **Runbook Section**: `#scenario-17-kek-rotation-storm--flapping-participant`
 
-> **Minimal section, landed with story 2 task 9 so these alerts' `runbook_url` resolves.** Operations'
-> story 2 task 18 expands it in place under this same heading. The heading is the story's reserved
-> text verbatim, so the anchor does not move.
+**What this is.** MC rotates a meeting's KEK for two reasons (story 2 R-12, R-16). Each rotation
+pushes the new KEK and generation to every member present
+(`mc_meeting_kek_pushes_total{outcome}`, once per recipient) and makes every sender re-wrap its transmit
+keys. A storm multiplies that control-plane and client key work across the fleet. Rotation excludes a
+departed participant from future media keys. It does not make past media unreadable, and it is not
+described here as anything more.
 
-**Fork FIRST on the `trigger` label** of `mc_meeting_kek_generated_total`: the two rotation triggers
-have different bounds and different causes.
+**Fork FIRST on the `trigger` label** of `mc_meeting_kek_generated_total`. The two rotation triggers
+have different bounds, different causes and different remedies, and they are never summed:
 
 ```promql
 sum by(trigger) (rate(mc_meeting_kek_generated_total{trigger!="meeting_created"}[10m]))
+# Per active meeting, against 1/W (W as this pod loaded it):
+sum(rate(mc_meeting_kek_generated_total{trigger="participant_left"}[10m])) / sum(avg_over_time(mc_meetings_active[10m]))
+1 / max(mc_meeting_kek_rotation_window_seconds)
 ```
 
-- **`participant_left` (`MCKekRotationStorm`)** — leave-triggered rotation is **bounded at one per
-  meeting per W** by the debounce, measured from the oldest un-rotated departure. A rate per active
-  meeting above 1/W is not reachable while the debounce works: **suspect the debounce, not the churn.**
-  Many departures in a busy meeting do NOT raise this — they coalesce (MC Media Path → KEK Departures
-  Coalesced per Rotation).
-- **`sender_space_exhausted` (`MCKekEpochResetOnSenderIdExhaustion`)** — immediate and exempt from W,
-  self-limited to once per exhausted namespace in one meeting (size set by the allocator, `crates/mc-service/src/media_admission/sender_id.rs`). **Human churn does not reach this.** Treat it
-  as a possibly **driven** cause — a flapping client or a scripted join loop — until ruled out; MC has no
-  join rate limit and no `jti` replay check. Identify the meeting from
-  `kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id namespace"` (the reset and
-  the high-watermark records share that stem). The meeting is **recovering, not broken — do not end it.**
+#### Arm 1 — `participant_left` (`MCKekRotationStorm`): read the rate against 1/W
 
-**Flapper eviction does not ship — a recorded decision, with this residual.** The debounce bounds
-leave-triggered rotation to one per W; exhaustion-triggered rotation is immediate but self-limited to
-once per exhausted namespace (`sender_id.rs`, above); **nothing bounds a flapping client's join-path cost** — per cycle a roster
+Leave-triggered rotation is **bounded at one per meeting per W** by the debounce, measured from the
+OLDEST un-rotated departure and never restarted by a later one.
+
+**The query is a FLEET AVERAGE per active meeting, and averages dilute** (the rule's own threshold
+provenance says it proves a broad failure, not one meeting's). For one suspected meeting, count its
+`mc.kek.lifecycle` "Meeting KEK rotated" INFO lines with `trigger=participant_left` (the meeting rides
+the actor span) and check their spacing against W.
+
+- **Rate per active meeting ABOVE 1/W: the debounce is not applying, broadly.** One bad meeting among
+  many quiet ones may not lift the average. No amount of human churn gets there, because many departures in a busy meeting coalesce into one rotation (MC Media → KEK
+  Departures Coalesced per Rotation, `mc_meeting_kek_rotation_coalesced_leaves`). A rate above the
+  bound is an MC defect, and the known trap is a debounce that restarts on each departure. Check that
+  `mc_meeting_kek_rotation_window_seconds` equals the ConfigMap's `MC_KEK_ROTATION_DEBOUNCE_SECONDS` on
+  every MC pod. A W far below the intended value is a configuration fault that inflates rotation cost. A W
+  ABOVE it lengthens how long a departed participant's KEK stays current (W is that exposure bound),
+  so treat a mismatch in that direction as a security fact. Otherwise escalate to
+  `meeting-controller`. (The alert fires above 1/W by the multiple in `MCKekRotationStorm`'s expr, so
+  that ordinary variance does not page. Read the rate against 1/W itself.)
+- **Rate AT OR BELOW 1/W is consistent with the debounce working fleet-wide.** The average cannot
+  clear a single meeting; use the log-line spacing above for that. If it holds, the cost you are
+  seeing is the JOIN path. A
+  meeting whose members keep leaving and rejoining rotates at most once per W however fast they cycle,
+  but each rejoin costs a full join. Go to the flapper residual below.
+
+#### Arm 2 — `sender_space_exhausted` (`MCKekEpochResetOnSenderIdExhaustion`)
+
+Exhaustion-triggered rotation is **immediate and unbounded by W**. It is self-limited to once per
+exhausted sender-id namespace in one meeting. The namespace size is the allocator's
+(`crates/mc-service/src/media_admission/sender_id.rs`; after a reset the fresh namespace is smaller,
+because ids bound at the reset are excluded), so read it there rather than from a number copied here.
+**Human churn does not reach this.** Treat it as a possibly **driven** cause, a flapping client or a
+scripted join loop, until ruled out. MC has no join rate limit and no `jti` replay check. Identify the
+meeting from
+`kubectl logs -n dark-tower -l app=mc-service --tail=5000 | grep "sender_id namespace"` (the reset and
+the high-watermark records share that stem). The meeting is **recovering, not broken. Do not end it.**
+
+#### The recorded decision: flapper eviction does not ship
+
+**This is a recorded decision (story 2 R-15), with this residual.** The debounce bounds leave-triggered
+rotation to one per W. Exhaustion-triggered rotation is immediate but self-limited to once per
+exhausted namespace. **Nothing bounds a flapping client's join-path cost.** Per cycle it costs a roster
 read, a meeting-wide assignment recompute and a control-plane push to MH: O(N) work plus a gRPC call at
-the flapper's rate, with leverage that grows with meeting size (so a two-person test shows nothing).
-**The visibility for it is `mc_meeting_sender_ids_issued_max`** (the maximum across live meetings, not a
-sum, so one meeting near a reset is not hidden). It measures namespace consumption **since the last
-epoch reset**, not admissions, and deliberately has no alert.
+the flapper's rate. The leverage grows with meeting size, **so a two-person test shows nothing**.
+Reproduce a suspected flapper in a meeting of realistic size, or not at all.
+
+**The visibility signal is `mc_meeting_sender_ids_issued_max`.** It is the maximum across live
+meetings, not a sum, so one meeting near a reset is not hidden. It measures namespace consumption
+**since the last epoch reset**, not admissions, and it deliberately has no alert, because exhaustion
+self-repairs into Arm 2. A value climbing steadily in a meeting of stable size is a flapper. Its
+join-path cost shows on MC's meeting-actor mailbox (`mc_actor_mailbox_depth{actor_type="meeting"}`,
+Scenario 1) and on the push rate to MH (`mc_media_policy_pushes_total`).
+
+**Remedy, within the decision.** There is no eviction lever, no per-participant block and no
+host-side removal in this build. (`LeaveReason::Removed` exists in MC's vocabulary, but nothing
+issues it.) The flapper stops only when the client stops, or when the meeting ends. If the join-path cost
+threatens other meetings on the pod (Scenario 1's mailbox signals), escalate to `meeting-controller`
+with the meeting identified from the log line above. Do not restart MC: that sheds every session on
+the pod to stop one client.
 
 **If a reset happened and ONE sender then went inaudible to incumbents only**, suspect a **stale SDK
-bundle** before anything server-side: a pre-story-2 client scopes replay state by `sender_id` alone and
-drops a reissued sender's frames as replays, silently and permanently until the user reloads. No MC
-signal shows it and `MCMediaMissingKeyMaterial` cannot (the frame opens, then is refused as a replay).
-Cross-reference [Scenario 18](#scenario-18-a-participant-hears-only-part-of-the-roster) and
+bundle** before anything server-side. A pre-story-2 client scopes replay state by `sender_id` alone
+and drops a reissued sender's frames as replays, silently and permanently until the user reloads. No
+MC signal shows it, and `MCMediaMissingKeyMaterial` cannot (the frame opens, then is refused as a
+replay). Cross-reference [Scenario 18](#scenario-18-a-participant-hears-only-part-of-the-roster) and
 `mc-deployment.md` §Coordination (SDK before MC).
+
+**Not this scenario**: a rotation that should have happened and did not (pending age above
+`mc_meeting_kek_rotation_overdue_threshold_seconds`, `MCKekRotationOverdue`) is
+[Scenario 19](#scenario-19-kek-rotation-stalled), a page; key material missing at a client after a
+rotation is [Scenario 16](#scenario-16-missing-key-material), rotation arm.
 
 ### Scenario 18: A Participant Hears Only Part of the Roster
 
@@ -3215,8 +3353,9 @@ naming the outcome and gRPC code. `mc.grpc.gc_client` carries the notify result.
 
 **What these alerts cannot see.** They fire only for teardowns MC ATTEMPTED. A meeting whose MC
 never completes `EndMeeting` — a crash, a kill mid-teardown, or a rollback to a build without
-teardown — is an ABSENT event, and its rule is story-2 task 18's (MH side), which does not exist
-yet. Until then read `mh_media_registered_meetings` against `mh_media_registered_meetings_limit` on
+teardown — is an ABSENT event. An edge-holding one reaches `MHMediaEgressEdgeHeadroomLow` (LEAK);
+a zero-edge registration has no rule (`docs/TODO.md` §Observability Debt, "No leading indicator for
+registered-meeting exhaustion"), so read `mh_media_registered_meetings` against `mh_media_registered_meetings_limit` on
 each handler: rising with pod uptime while `mh_media_meeting_teardowns_total{outcome="released"}`
 stays flat is that residual (`docs/TODO.md`, "A meeting whose MC never sends `EndMeeting` is never
 reclaimed").
@@ -3270,7 +3409,11 @@ means the requester was not a host — refused BEFORE the target was looked at, 
 nothing. `unknown_target` (host only) means the named participant is not in the meeting.
 `rate_limited` is the per-connection bound. The `mc.webtransport.connection` INFO line
 "Server mute decision" names requester, target, action and outcome for each decided request —
-the meeting-scoped record.
+the meeting-scoped record. A refusal reaches the requester as one generic `Forbidden` error (`not_permitted` and
+`unknown_target` are byte-identical on the wire by design; the first-per-connection WARN "Server-mute
+request refused" tells them apart). Refusal replies are rate-limited, and a suppressed reply is counted
+on `mc_media_refusal_replies_suppressed_total{surface="server_mute"}`, so a looping client may see no
+error at all.
 
 **Step 2 — does MC believe a mute is in force?** `mc_media_server_muted_sources` is the number of
 participants MC holds server-muted, summed across this pod's meetings. It is identity-free by
@@ -3293,9 +3436,12 @@ snapshot as every other policy change, so a push that is failing fails for the m
 §5) — `mc_media_mute_requests_total`. `slot_state="source_muted"` covers both self and server mute
 by design, so it cannot tell them apart; the `ParticipantMuteUpdate` a client receives can.
 
-**Escalation**: `meeting-controller` if Step 1 shows `applied` and Step 4 shows the push confirmed
-but MH never drops; `media-handler` if MH holds the sender in its muted set and still forwards
-(`mh-incident-response.md`, the `server_muted` drop reason in the MH catalog).
+**Escalation**: the routing for "applied at MC, confirmed, MH still forwards" (MH defect) and "applied
+at MC, not confirmed" (push path) is decided in one place, MH Scenario 19 Arms 3 and 4. Route from
+there.
+
+**MH-side arms, including the ownership gap** (a registration MC did not send overwriting the muted
+set): [`mh-incident-response.md` Scenario 19](mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress).
 
 ## Diagnostic Commands
 

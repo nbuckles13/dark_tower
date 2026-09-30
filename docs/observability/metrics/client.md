@@ -880,10 +880,14 @@ the comment's reader.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: `source` — `join_response` (the KEK carried on the join
-  response) or `kek_update` (a KEK pushed over signaling). **A reconnect
-  re-issue and a rotation arrive in the same `kek_update` message and are
-  indistinguishable on this label — deliberately**: the discriminator would be
-  the generation, which is barred below. This counter is the denominator for
+  response, including a reconnect re-issue) or `kek_update` (a KEK pushed over
+  signaling, which only a rotation sends). **A reconnect re-issue counts as
+  `join_response`, merged with a first join; a rotation's CAUSE is not
+  distinguishable on this label — deliberately** (see the next bullet; the only
+  discriminator on the message is the generation, which is barred below).
+  *(Corrected 2026-09-30, story 2 task 18: this bullet previously said a
+  re-issue and a rotation share the `kek_update` message, contradicting the
+  task-16 correction below.)* This counter is the denominator for
   `dt_client_media_kek_retention_anomalies_total`.
 - **THE TWO-VALUE `source` VOCABULARY IS DELIBERATE — do not "fix" it with a third
   value.** `MEDIA_KEK_SOURCES` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`

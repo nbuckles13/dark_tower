@@ -1017,7 +1017,7 @@ increase(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}[15m]) 
 
 ### Deliberate absences (MC)
 
-- **Server mute has no alert, by decision** (story 2 task 12). A non-zero mute rate is healthy moderation, and the refusal-side values are client-inflatable. The inverse condition, "a mute was applied but the muted sender is still heard", would need a per-meeting correlation that ADR-0036 §11 bars. Coverage is the browser env-test S3 (`packages/web-app/e2e/server-mute.spec.ts`), MC runbook Scenario 21 (Server Mute Not Enforced), and MH runbook Scenario 19 once story 2 task 18 writes it, and the ADR-0031 demonstration is to apply a mute and watch **MH's** `mh_media_frames_dropped_total{reason="server_muted"}` move, not only MC's counter. The decision is recorded at `mc-alerts.yaml` above `MCEndMeetingOwnershipRejected`; it is cited here, not restated.
+- **Server mute has no alert, by decision** (story 2 task 12). A non-zero mute rate is healthy moderation, and the refusal-side values are client-inflatable. The inverse condition, "a mute was applied but the muted sender is still heard", would need a per-meeting correlation that ADR-0036 §11 bars. Coverage is the browser env-test S3 (`packages/web-app/e2e/server-mute.spec.ts`), MC runbook Scenario 21 (Server Mute Not Enforced), and MH runbook Scenario 19 (Server Mute Not Taking Effect At Ingress), and the ADR-0031 demonstration is to apply a mute and watch **MH's** `mh_media_frames_dropped_total{reason="server_muted"}` move, not only MC's counter. The decision is recorded at `mc-alerts.yaml` above `MCEndMeetingOwnershipRejected`; it is cited here, not restated.
 
 ---
 
@@ -1026,8 +1026,8 @@ increase(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}[15m]) 
 **Status**: ✅ Exists — **partially inventoried here**
 **File**: `infra/docker/prometheus/rules/mh-alerts.yaml`
 
-**This section inventories two of that file's alerts, `MHMediaEgressQueueOverflowRate` and
-`MHMediaEgressEdgeHeadroomLow`, below. Every other alert in `mh-alerts.yaml` ships uninventoried.** Read the rules file directly, and
+**This section inventories `MHMediaEgressQueueOverflowRate`, `MHMediaEgressEdgeHeadroomLow` and
+`MHMediaEgressBudgetExhausted`, below. Every other alert in `mh-alerts.yaml` ships uninventoried.** Read the rules file directly, and
 **do not treat the absence of an entry below as the absence of an alert** — that is the inference a
 reader naturally makes here, and it is wrong.
 
@@ -1036,7 +1036,7 @@ Inventoried alerts are **named, never counted.** A count would be a second encod
 two struck entries from that failure. A name degrades differently: an alert name that stops existing
 is greppable, a count that stops being right is invisible.
 
-The entries are inventoried because they **landed with their alerts** (ADR-0036 story 1; story 2 task 16), so the
+The entries are inventoried because they **landed with their alerts** (ADR-0036 story 1; story 2 tasks 16 and 18), so the
 byte-identical-PromQL discipline was applied at authoring time rather than reconstructed. The rest
 are deliberately **not retro-filled** — backfilling is tracked in `docs/TODO.md`. Note what the
 `inventory_expr_drift` guard does and does not cover: it holds byte-identity for whatever *is*
@@ -1097,24 +1097,39 @@ mh_media_egress_edges / mh_media_egress_stream_ceiling > 0.8
 ```
 `for: 10m`
 
-**Fork LEAK vs LOAD first.** LEAK means edges climb with uptime while `mh_media_meeting_teardowns_total{outcome="released"}` stays flat. That is a reclamation regression, a true positive on a long-lived pod: never tune the fraction up to silence it. LOAD means edges track `mh_media_registered_meetings` and demand, and the remedy is capacity or placement. This is the **early warning**; the pending `MHMediaEgressBudgetExhausted` is the rejection-side failure. The fraction is **alert-owned and unratified**: it has no config home, so it duplicates no configured value (the derivation is in the rule's ADR-0031 block). **Demonstration**: lower the egress budget so the derived ceiling falls below a demo meeting's edges, and watch the ratio cross (lowering the edge limit instead makes MH refuse to start); confirm both gauges are present per instance with identical label sets.
+**Fork LEAK vs LOAD first.** LEAK means edges climb with uptime while `mh_media_meeting_teardowns_total{outcome="released"}` stays flat. That is a reclamation regression, a true positive on a long-lived pod: never tune the fraction up to silence it. LOAD means edges track `mh_media_registered_meetings` and demand, and the remedy is capacity or placement. This is the **early warning**; `MHMediaEgressBudgetExhausted`, below, is the rejection-side failure. The fraction is **alert-owned and unratified**: it has no config home, so it duplicates no configured value (the derivation is in the rule's ADR-0031 block). **Demonstration**: lower the egress budget so the derived ceiling falls below a demo meeting's edges, and watch the ratio cross (lowering the edge limit instead makes MH refuse to start); confirm both gauges are present per instance with identical label sets.
 
-### Pending (not yet a rule): `MHMediaEgressBudgetExhausted`
+#### MHMediaEgressBudgetExhausted
 
-**No rule exists yet, and this is deliberately NOT a `####` inventory heading.** A `####` heading for a rule that does not exist fails `inventory_expr_drift`, and PromQL written here first would pressure the author to match it. The rule is story 2 task 18's (operations), with runbook MH Scenario 18. Its binding constraints, carried from the story:
-- `severity: warning`, `for: 10m`;
-- gauge-versus-gauge with **no arithmetic and no literal**: `mh_media_stream_admission_rejection_ratio` against `mh_media_stream_admission_rejection_ratio_threshold` (the ConfigMap's `MH_EGRESS_REJECTION_RATIO_THRESHOLD` reaches PromQL only through that gauge; `docs/TODO.md`, the gauge-to-gauge entry);
-- sustained rejection while placement keeps targeting the pod is a triage step, not a second alert.
-- **What its leading indicator is, precisely**: `MHMediaEgressEdgeHeadroomLow` reads installed edges over the **same** `mh_media_egress_stream_ceiling` that the stream-ceiling rejection arm hits. So it LEADS admission reaching the ceiling through edge occupancy (genuine exhaustion, and the unreclaimed-edge floor). It does **not** lead congestion or measured bandwidth: the budget's basis is `unmeasured`, and nothing measures bandwidth until story 5. It does not lead the empty-meeting-growth arm, which binds on `mh_media_registered_meetings_limit`, not on edges. MH Scenario 18's "no leading indicator" must be scoped accordingly (story file, task 18's prompt, correction note of 2026-09-30).
+**Severity**: Warning
+**Condition**: The windowed admission rejection ratio is above its configured threshold, gauge against gauge, for 10 minutes. The threshold is `MH_EGRESS_REJECTION_RATIO_THRESHOLD`, which reaches PromQL only through `mh_media_stream_admission_rejection_ratio_threshold`. There is no arithmetic and no literal.
+**Impact**: New participants on the handler hear nobody and are heard by nobody, while existing participants and every liveness signal read healthy.
+**Runbook**: [Scenario 18: Media Egress Budget Exhaustion](../runbooks/mh-incident-response.md#scenario-18-media-egress-budget-exhaustion)
 
-Promote to a `####` entry in the same commit that lands the rule.
+**PromQL**:
+```promql
+mh_media_stream_admission_rejection_ratio > mh_media_stream_admission_rejection_ratio_threshold
+```
+`for: 10m`
+
+**Sustained rejection while placement keeps targeting the pod is a triage step, not a second alert.** GC removes a handler at its `max_streams` from NEW-meeting placement only. An already-assigned meeting keeps targeting it (R-6), so refusals continue. The runbook reads GC's view at that step.
+
+**Its leading indicator is scoped, not general.** The statement's one home is MH Scenario 18, "Is there a leading indicator?".
+
+**Shape notes** (the derivations are in the rule's ADR-0031 block):
+- Label-set identity: both gauges carry exactly `key_custody` plus the scrape labels. A label added to one of them silently empties the comparison.
+- There is no zero-denominator guard, by construction: an empty window publishes 0.0, and all-rejected publishes 1.0.
+- There is no evidence-floor conjunct. A lone rejection ages out of the 5-minute window long before `for: 10m` elapses. The session actor's WARN applies a minimum decision count and may disagree at low volume. The rule is authoritative.
+- It is not a burn-rate alert and makes no error-budget claim. The MH SLO target is unratified (`docs/observability/slos.md`, story 8).
+
+**Demonstration** (inject blast radius in the rule's ADR-0031 block: both MH pods roll on the lower and again on the revert, and the FIRE half needs sustained refused registrations for the full 10 minutes): on Kind only, lower the deployed `MH_EGRESS_BUDGET_BPS` so the derived ceiling sits below what a demo meeting installs, then keep joining participants. The ratio gauge should cross the threshold gauge. Then confirm the selector matches a real container: both gauges present per `mh` instance with identical label sets. On a live pod, lowering the budget is a new-meeting outage (`docs/runbooks/mh-deployment.md` §Operator levers).
 
 ### Deliberate absences (MH)
 
 These are recorded so that the absence reads as a decision, not an omission:
 1. No burn-rate pair (gated on the unratified MH SLO target; `docs/observability/slos.md`).
 2. No RegisterMeeting-apply alert (same gate).
-3. No teardown-never-arrives rule yet (story 2 task 18's; see the `mh-alerts.yaml` header).
+3. **No teardown-never-arrives rule — recorded here, but an OPEN obligation, not a design decision.** An edge-holding leaked meeting is caught by `MHMediaEgressEdgeHeadroomLow`'s LEAK fork. A ZERO-edge leaked registration has no alert: its first symptom is `rejected_meeting_cap` at the cap. The instrument exists, and only authorship remains. Tracked in `docs/TODO.md` §Observability Debt, "No leading indicator for registered-meeting exhaustion", with owners and trigger. *(Corrected 2026-09-30, story 2 task 18: this entry previously assigned the rule to task 18, which never carried it.)*
 4. **`mh_media_egress_stream_ceiling_recommended_min` has no alert, by design** (story 2 task 16). It is ADVISORY: the ceiling a demo of the configured size needs, published so an operator can compare it with `mh_media_egress_stream_ceiling`. Nothing enforces it, which is exactly why it is spelled `_recommended_min` and not `_threshold` (`docs/observability/label-taxonomy.md` §R4 suffix rule: a threshold spelling tells a responder that something automatic is watching).
 
 **Remaining unbuilt candidates** (aspirational — thresholds are unratified):

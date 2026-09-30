@@ -49,7 +49,7 @@
 - [§3 Bring-up](#3-bring-up)
 - [§4 Is the join real?](#4-is-the-join-real)
   - [§4.5 "I joined and I hear nothing" — media triage ladder](#45-i-joined-and-i-hear-nothing--media-triage-ladder)
-- [§5 Failure modes](#5-failure-modes) (F1–F15, F18–F19)
+- [§5 Failure modes](#5-failure-modes) (F1–F19)
 - [§6 Teardown](#6-teardown)
 - [§6.5 Automated checks that exist today](#65-automated-checks-that-exist-today)
 - [§7 Not on this branch](#7-not-on-this-branch)
@@ -1491,10 +1491,71 @@ all.
   transmit-key material inside the credential-leak guard's scope for exactly this moment. A KEK in a
   log is a KEK in the log pipeline.
 
-### F18 — "I hear nobody", and the media error names the receive-slot cap
+### F16 — "I could hear everyone, then went silent after someone left"
 
-(F16 and F17 are reserved by story 2's runbook task for the rotation-silence and static-fill
-signatures.)
+**Symptom.** Audio from some or all other participants stops at, or shortly after, the moment a
+participant **leaves**. You stay joined, the roster is correct, and the slot grid may still show the
+remaining senders as active.
+
+**Why a leave matters.** Since story 2, every roster removal triggers a meeting KEK rotation
+(debounced to once per W, MC's `MC_KEK_ROTATION_DEBOUNCE_SECONDS`). Every remaining member receives a
+new KEK and generation, and every sender re-wraps its transmit keys. If the new KEK does not reach
+you, or you retire the previous generation while frames under it are still arriving, frames are
+dropped for key material and you hear silence. **This is the rotation signature, and the
+discriminator is leave correlation.** A silence that starts on a leave is this entry. A silence that
+starts on a join is F15's join path, and a silence present from the start is §4.5.
+
+**Where to look, cheapest first.**
+1. **Is ANY client series present in Prometheus at all?** Query `dt_client_media_frames_sent_total`
+   (the solo-safe liveness series). If nothing comes back, the client metrics pipe is dead, and
+   **a dead pipe leaves `MCMediaMissingKeyMaterial` green**. Every rung below reads empty for the same
+   reason. Fix the pipe first (`VITE_TELEMETRY_ENDPOINT` set? then the quiet-series ladder in
+   `gc-deployment.md` §When the client series go quiet), and only then continue.
+2. `dt_client_media_frames_dropped_total{reason}` over the minutes around the leave.
+   `no_kek_for_generation` means the new KEK did not arrive. `kek_generation_stale` means the old one
+   was retired too early. A short burst right after the leave is expected. Sustained is the signal.
+3. **Did the rotation reach you?** `dt_client_media_kek_updates_total{source="kek_update"}` should step
+   once per rotation. Flat across a leave means the rotation push did not arrive. On the MC side,
+   `mc_meeting_kek_generated_total{trigger="participant_left"}` shows whether MC rotated at all.
+4. **Did you keep the previous generation?** Read `dt_client_media_kek_generations_retained_total` (a
+   **counter**: one increment per install that kept the previous generation) against
+   `dt_client_media_kek_updates_total{source="kek_update"}`. If rotations arrive while the retained
+   counter stays flat, nothing is being retained, and you get a gap at every rotation. Neither series
+   alone says anything.
+
+**Fix.** The remedy lives in one place, the rotation arm of
+[`mc-incident-response.md` Scenario 16](mc-incident-response.md#rotation-arm--silence-after-someone-left)
+(per-recipient push outcomes, the retention-expiry rung, and why raising W usually does not help).
+**Do not duplicate it here.** The immediate unblock for you is a **page reload**. That is a fresh
+join, and it carries the current KEK. MC never re-sends a KEK push that was dropped.
+
+### F17 — "I can hear some people but not all"
+
+**Symptom.** In a meeting with more participants than your receive-slot count, you hear the people
+who joined first and not the ones who joined later. Nothing errors, and no drop counter moves.
+
+**Why.** This is **static fill** (story 2 R-2): your client declares N receive slots
+(`VITE_DT_RECEIVE_SLOTS`, capped by MC's `MC_MAX_RECEIVE_SLOTS`), and MC fills them **in join order**
+from the senders you share a connected handler with, and never reselects. A slot changes only when its
+occupant leaves. It is then refilled by the earliest-joined sender not yet assigned. **A late joiner
+is inaudible to you until someone you can hear leaves.** That is the designed behaviour, not a fault.
+
+**Discriminator.**
+- **Effective N**: count the cells in the in-meeting slot grid (`data-testid="slot-list"`, one cell
+  per declared slot, each naming its sender). The E2E bus `receiveSlots.declared` and the console
+  line `[dt-media-slots] declaring N=...` show the same number. The server cap is
+  `mc_media_receive_slot_cap`, also on the bus as `receiveSlots.serverCap`.
+- If every cell is filled and the unheard participants are the latest joiners, it is static fill.
+- If a cell says fewer sources, or an unheard participant is marked unreachable on the roster, it is
+  not static fill. Unreachable (no shared handler) is
+  [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster).
+  An over-cap N that hears nobody at all is F18.
+
+**Fix.** Raise N, up to the cap (`VITE_DT_RECEIVE_SLOTS=<n> scripts/dev-web.sh`), or accept it.
+**There is no debugger for slot selection** beyond the slot grid. Speaker-based selection (story 5)
+replaces static fill.
+
+### F18 — "I hear nobody", and the media error names the receive-slot cap
 
 **Symptom.** Start audio fails and the in-meeting view shows a `media-error` like
 `SIGNALING: this client is configured to receive 5 audio slots, but the meeting controller allows
@@ -1699,3 +1760,4 @@ yourself updating the same fact in two of these files, one of them is wrong.
 | 2026-09-09 | client (story task #20) | Added the frozen `## Secure Context and Media Setup` section between §2 and §3 — the four gated APIs as one all-or-nothing gate, `http://<sub>.localhost:5173` being potentially trustworthy in Chrome, the non-loopback-HTTP failure (**fails at `connecting-mc`, symptom-identical to F1/F8/F9** — WebTransport is one of the four gated APIs and MC signalling has no fallback, so the join never completes; the discriminator is the origin in the address bar), and the fake-device/fake-ui launch for a machine with no microphone. It is the anchor `scripts/dev-web.sh`'s header and §4's ladder both cite; `scripts/dev-web.test.sh` now pins its slug AND its prose. Corrected **F7**'s stale "may warn" (the fingerprints check has been a hard fail since task #61's escalation), added the presence-only/stale-but-present asymmetry that is F7's actual reason for existing, and added F7's anti-flag counter-message — the stale-but-present case is the one branch where `dev-web.sh`'s own warning never prints. Dropped the count from the §5 heading and its ToC entry (`#5-failure-modes-f1f11` -> `#5-failure-modes`, one live referrer, both fixed here) so the anchor stops rotting as F-entries are added — the rule stated under `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`: name a set's members, never restate its count. Per-entry `### F7 — ...` slug untouched (`mh-incident-response.md` links into it three times). Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
 | 2026-09-30 | client (story 2 task 13) | Added **F18** (receive-slot count N over the MC cap: loud refusal, `dt_client_media_receive_slots_rejected_total`, the bus/console discriminators, fix by agreement never by clamping) and **F19** (rising `dt_client_media_receive_source_deficit_total`: an MC-claimed-active source decoding nothing, triage ladder into MH Scenarios 15-17 and MC routing). F16/F17 left for story 2's runbook task. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |
 | 2026-09-30 | operations (story 2 task 17) | Corrected triage prose falsified by loopback removal (R-3), each with a recorded-correction note: **F13** no longer reads `received` flat as a failed round trip — it forks first on `dt_client_media_receive_source_deficit_total` + `data-slot-state` (nobody sent to you is correct), and only "MC says active, nothing arrives" proceeds to the NAT-binding / stale-policy fork; **F12** gains the healthy "nobody holds you" case (a solo participant sends nothing: `EmittedEmptyTargets`); **F14** gains the N-sender note (`accepted` rising can mean one sender works and another does not); §4.5 rung 1, the rung-2 fork table and the rung-6 `no_subscriber` comment (sustained is a fault, not routine) updated to match; stale "no media plane" text in §4.3 and §7 corrected. |
+| 2026-09-30 | operations (story 2 task 18) | Added **F16** (silence after a leave: the KEK-rotation signature, discriminated by leave correlation; rung 1 is the client pipe's presence, because a dead pipe leaves `MCMediaMissingKeyMaterial` green; the retained-generations counter against `kek_update`; remedy in MC Scenario 16's rotation arm) and **F17** (static fill: late joiners inaudible until someone leaves; effective N from the slot grid, the server cap, no debugger until story 5). Removed F18's reservation note. |

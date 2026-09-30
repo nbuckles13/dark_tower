@@ -783,7 +783,10 @@ groups:
       # progressive denial of NEW meetings on the handler, with no
       # client-visible cause until then. These rules see only teardowns MC
       # ATTEMPTED; a teardown that never happens (an MC crash) is an ABSENT
-      # event and belongs to story-2 task 18's MH rule (mh-alerts.yaml).
+      # event. An edge-holding leaked meeting reaches mh-alerts.yaml's
+      # MHMediaEgressEdgeHeadroomLow (LEAK fork); a ZERO-edge leaked
+      # registration has no rule yet (docs/TODO.md §Observability Debt, "No
+      # leading indicator for registered-meeting exhaustion").
       # ------------------------------------------------------------------
       # DELIBERATELY NO ALERT on mc_media_server_mute_requests_total,
       # mc_media_unmute_requests_total or mc_media_refusal_replies_suppressed_total

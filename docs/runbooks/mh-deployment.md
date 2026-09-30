@@ -2,7 +2,7 @@
 
 **Service**: Media Handler (mh-service)
 **Owner**: Operations Team
-**Last Updated**: 2026-05-01
+**Last Updated**: 2026-09-30
 
 ---
 
@@ -21,10 +21,11 @@ For active-incident triage (e.g. "an alert is firing right now"), see the compan
 1. [Deployment Procedure](#deployment-procedure)
 2. [Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination](#post-deploy-monitoring-checklist-mh-webtransport--mcmh-coordination)
 3. [Required environment keys](#required-environment-keys)
-4. [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply)
-5. [Rollout With Media Flowing](#rollout-with-media-flowing)
-6. [Rollback](#rollback)
-7. [References](#references)
+4. [Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)
+5. [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply)
+6. [Rollout With Media Flowing](#rollout-with-media-flowing) (including [Operator levers](#operator-levers-there-are-none-for-media))
+7. [Rollback](#rollback)
+8. [References](#references)
 
 ---
 
@@ -537,33 +538,129 @@ what this story's configuration task found false.)
 | `MH_KEEPALIVE_INTERVAL_MS` | ConfigMap `mh-service-config` | `10000` | QUIC connection-level keepalive. **Enforced by quinn.** This is what refreshes the NAT binding of a **muted** participant, who by definition sends no media — without it an intermediary can reap the path and unmute is not instantaneous. Validated at startup to sit at or below one third of MH's 30 s idle timeout, so one lost keepalive is not fatal. |
 | `MH_MAX_CONNECTIONS` | ConfigMap `mh-service-config` | `500` | Maximum concurrent WebTransport connections. **Enforced by mh-service itself**, at accept, before allocating handler resources. A **resource-exhaustion guard, never a capacity figure, never advertised to GC.** It sits far above expected peak, so rejections attributed to it mean a connection **flood or leak** — not demand that has outgrown the deployment. Scaling out is the wrong response. Visible as `mh_webtransport_connections_total{status="rejected"}`. |
 | `MH_TERMINATION_GRACE_SECONDS` | **Not a ConfigMap key** — written into each Deployment's env at build time by the kustomize `replacements:` block | `35` | The pod's own termination grace, from which MH derives its post-cancellation settle window. **Enforced by mh-service** at startup (it refuses to start if the grace leaves no room for the shutdown margin). **Never hand-type this.** It is derived from that instance's own `spec.template.spec.terminationGracePeriodSeconds`, so the two cannot drift; the literal in the deployment file is a `"0"` sentinel. |
+| `MH_EGRESS_BUDGET_BPS` | ConfigMap `mh-service-config`; Kind value from `infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml` | the patch (the base `config.env` value is a deliberately unsized placeholder) | Egress bandwidth budget, **bits** per second. A **capacity** figure: MH derives ONE egress stream ceiling from it (budget ÷ the heavier per-stream cost), **enforces it at stream admission** (`rejected_stream_ceiling`), **advertises it to GC as `max_streams`** (placement stays soft), and publishes it as `mh_media_egress_stream_ceiling`. MH refuses to start if the ceiling is below 2 (remedy: RAISE this key; never lower the floor) or above `MH_MAX_TOTAL_EGRESS_EDGES`. **Not a kill switch** — see [Operator levers](#operator-levers-there-are-none-for-media). Exhaustion: `mh-incident-response.md` Scenario 18. |
+| `MH_STREAM_COST_AUDIO_BPS` | ConfigMap `mh-service-config` | `config.env` | Per-stream audio cost, bits/s; a divisor of the ceiling. The heavier of the two costs binds (MH stays type-blind). Published as `mh_media_stream_cost_audio_bytes_per_second`. |
+| `MH_STREAM_COST_VIDEO_BPS` | ConfigMap `mh-service-config` | `config.env` | Per-stream video cost, bits/s; the other divisor. Published as `mh_media_stream_cost_video_bytes_per_second`. |
+| `MH_EGRESS_REJECTION_RATIO_THRESHOLD` | ConfigMap `mh-service-config` | `config.env` | The ONE threshold for the admission rejection ratio, `0.0..=1.0`. **Read by** mh-service's debugging WARN and — through the `mh_media_stream_admission_rejection_ratio_threshold` gauge, never as a PromQL literal — by `MHMediaEgressBudgetExhausted`. Tuning it to quiet that alert is the wrong response. |
+| `MH_MAX_REGISTERED_MEETINGS` | ConfigMap `mh-service-config` | `config.env` | Registration cap — a **resource-exhaustion guard, never capacity, never advertised to GC.** Enforced by mh-service when a NEW meeting registers; refusals count as `mh_media_policy_applies_total{outcome="rejected_meeting_cap"}`. `0` and values above its hard ceiling in code refuse to start. Raising it only postpones a leak (Scenario 18 Arm C). |
+| `MH_MAX_EGRESS_STREAMS_PER_MEETING` | ConfigMap `mh-service-config` | `config.env` | ADR-0036 §8 pre-allocation bound on ONE registration. Enforced by mh-service before allocation; a registration exceeding it is refused **whole** as `rejected_invalid`. Resource guard, never capacity. |
+| `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS` | ConfigMap `mh-service-config` | `config.env` | §8 pre-allocation bound, same enforcement and refusal as the row above. |
+| `MH_MAX_MUTED_SOURCES_PER_MEETING` | ConfigMap `mh-service-config` | `config.env` | Bound on a registration's server-muted set, same enforcement and refusal as the rows above — so an over-bound muted set leaves the PREVIOUS policy (without the mute) live (Scenario 19 Arm 4). |
+| `MH_MAX_TOTAL_EGRESS_EDGES` | ConfigMap `mh-service-config` | `config.env` | Aggregate installed-edge **backstop**. Enforced by mh-service at apply (`apply_failed`, `reason=total_egress_edge_cap_exceeded` on the WARN). MH refuses to start with the stream ceiling above it, so the ceiling always binds first; reaching this means the ceiling did not bind. |
+| `MH_POLICY_APPLY_TIMEOUT_MS` | ConfigMap `mh-service-config` | `config.env` | How long a registration waits for the session actor to apply its policy; expiry is `apply_failed` with the prior generation live. Resource guard. |
 
-**Also required since story 2 task 8, rows pending story 2 task 18** (which owns this
-section's story-2 additions): `MH_EGRESS_BUDGET_BPS`, `MH_STREAM_COST_AUDIO_BPS`,
-`MH_STREAM_COST_VIDEO_BPS`, `MH_EGRESS_REJECTION_RATIO_THRESHOLD` (the egress-budget
-admission chain — a **capacity** figure enforced by mh-service at stream admission and
-advertised to GC as `max_streams`), and the four ADR-0036 §8 policy bounds
-`MH_MAX_EGRESS_STREAMS_PER_MEETING`, `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS`,
-`MH_MAX_TOTAL_EGRESS_EDGES`, `MH_POLICY_APPLY_TIMEOUT_MS` (resource-exhaustion guards,
-never capacity) — and, since story 2 task 11, `MH_MAX_REGISTERED_MEETINGS` (the
-registered-meeting cap, a resource-exhaustion guard enforced by mh-service when a NEW
-meeting registers; refusals count as
-`mh_media_policy_applies_total{outcome="rejected_meeting_cap"}`; 0 and values above its
-hard ceiling refuse to start). All live in ConfigMap `mh-service-config`, whose
-comments carry each one's meaning and remedy. Until those rows land, the refusal message itself is the
-runbook: MH also refuses to start when the derived stream ceiling is below 2 (remedy:
-RAISE `MH_EGRESS_BUDGET_BPS`; never lower the floor) or above
-`MH_MAX_TOTAL_EGRESS_EDGES`, and each refusal names the value, the bound and the fix.
+The ConfigMap comments in `infra/services/mh-service/config.env` carry each key's value, derivation
+and remedy; the value column above cites that file rather than restating numbers that live there.
+Each key is also reflected as a gauge MH publishes from the value it loaded
+(`docs/observability/metrics/mh-service.md` §Egress Admission Metrics), which
+`crates/env-tests/tests/01_mh_deployment_config.rs` compares against the deployed ConfigMap.
 
 One non-required key is listed **for contrast only**, because without it there is
 no way to see why the two `MH_MAX_` keys above are not it:
 
 | Key | Source | Kind value | What it bounds — and who enforces it |
 |---|---|---|---|
-| `MH_MAX_STREAMS` *(RETIRED — pending removal; not required)* | ConfigMap `mh-service-config` | `100` | **Retired by story 2.** Superseded by the stream ceiling MH derives from `MH_EGRESS_BUDGET_BPS`, which is what MH advertises to GC as of story 2 task 8. **Nothing reads this key any more** — editing it changes nothing, and the startup log's `egress_stream_ceiling` is the value GC places against. **The key and both `configMapKeyRef` entries deliberately remain for one deploy**: `kubectl rollout undo` restores a Deployment's refs but not the ConfigMap, so deleting them together turns a rollback into `CreateContainerConfigError`. Do not tune it, and do not delete it by hand — the removal is itself two deploys (flip both refs to `optional: true`, then delete key and refs together, so no reachable revision holds a HARD ref to a missing key) and is scheduled in `docs/TODO.md` §Media Path Obligations. |
+| `MH_MAX_STREAMS` *(RETIRED — pending removal; not required)* | ConfigMap `mh-service-config` | `config.env` | **Retired by story 2.** Superseded by the stream ceiling MH derives from `MH_EGRESS_BUDGET_BPS`, which is what MH advertises to GC as of story 2 task 8. **Nothing reads this key any more** — editing it changes nothing, and the startup log's `egress_stream_ceiling` is the value GC places against. **The key and both `configMapKeyRef` entries deliberately remain.** Do not tune it, and do not delete it by hand. The retirement and its ordering are in [`MH_MAX_STREAMS`: the rule applied, over two deploys](#mh_max_streams-the-rule-applied-over-two-deploys). |
 
 Table contributed at the request of the observability review, which found that
 this runbook — unlike GC's, AC's and MC's — had no configuration section at all.
+
+---
+
+## Config-failure triage: three signals, and `kubectl logs` is wrong for all three
+
+MH's startup configuration fails in three distinct ways, with **opposite first steps**. All three present
+at the same moment, right after an apply. What they share is the trap: **the standard `kubectl logs`
+reflex is wrong for every one of them.** The kubelet mechanism is the same for every service and is
+explained once in `mc-deployment.md` §Config-failure triage. This section carries MH's spellings and
+MH's ordering consequences. (Until story 2 task 18, MH borrowed the MC section outright.)
+
+| Cause | Signal | Where the answer is |
+|---|---|---|
+| A Deployment holds a `configMapKeyRef` that its ConfigMap generation lacks: a key deleted while a hard ref to it remains, or a template pointing at a ConfigMap generation that no longer exists | `CreateContainerConfigError`: **no container ever ran** | `kubectl describe pod -n dark-tower -l app=mh-service`. It names the missing key, or the missing `mh-service-config-<hash>`. `logs` is **empty** and `exec` is impossible |
+| A new image started with a pod template that lacks a required `env` entry (`kubectl set image`, a partial apply, the manifests reverted under a newer image) | `CrashLoopBackOff` | `kubectl logs -n dark-tower deployment/mh-0 --previous`: `ConfigError::MissingEnvVar` names the variable. Then [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply) |
+| The `mh-service-tls` Secret is absent (fresh namespace; it is created imperatively by `infra/kind/scripts/provision.sh:create_tls_secret()` and is not in the kustomization) | `FailedMount`; pod Pending in `ContainerCreating` | `kubectl describe pod`. The `mh-tls` volume is not `optional:`, so kubelet blocks the mount and the process **never starts**. There is no config load, no `MH_TLS_CERT_PATH` error and no log at all. A Secret that exists but is malformed is a different failure (`Identity::load_pemfiles`, a CrashLoop with a log) |
+
+**Pod phase alone tells them apart before you read anything**: Pending/`ContainerCreating` is the
+Secret, `CreateContainerConfigError` is the ConfigMap, and a pod that runs and exits is the pod
+template or the image. `describe pod` names the artifact for the first and third. `logs --previous`
+names it for the second, and plain `logs` is empty for both of those.
+
+**ConfigMap names are content-hash-suffixed** (`mh-service-config-<hash>`, `mh-0-config-<hash>`,
+`mh-1-config-<hash>`; `configMapGenerator` in `infra/services/mh-service/kustomization.yaml`, ADR-0038
+§2). A config change changes the pod template and rolls exactly the pods that consume it, so a wrong
+value fails at deploy time. **An MH roll sheds every media session on the pod** ([Rollout With Media
+Flowing](#rollout-with-media-flowing)), so a config-only change is a media-shedding event too. Do not
+`kubectl edit` the live ConfigMap: nothing references that name after the next apply, and the next
+apply of the environment root overwrites it anyway. `kubectl get configmap -n dark-tower -l app=mh-service`
+lists every generation. The pod template's `configMapKeyRef` names the live one.
+
+### The key-ordering rule, and its add-versus-remove inversion
+
+**Adding a required key: the ConfigMap entry lands WITH or BEFORE the image that reads it.** Under
+content addressing, a key and the image that reads it land in one pod template in one apply when they
+are in the same commit, so "with" holds by construction when you deploy the tree through the
+environment root (`dev-cluster deploy` / `infra/kind/scripts/deploy.sh`). **The case that actually
+fails is a split commit or a cherry-pick in which the image lands without its key.** Examples: a
+release branch that takes the MH code change but not the `config.env` / `mh-{0,1}-deployment.yaml`
+change, or a `kubectl set image` ahead of the manifests. That is the CrashLoop row above.
+
+**Removing a key: the INVERSE order. Code read first, key later. A ConfigMap key is never removed in
+the same deploy that removes its code read.** The rule is re-derived here against ADR-0038 §2 because
+its old premise, "`rollout undo` restores the Deployment's refs but never the ConfigMap", is no longer
+true as stated.
+
+- **What undo does now.** It returns each pod template to its previous revision, which references the
+  **previous hash-suffixed ConfigMap generation**. The image and the configuration it shipped with roll
+  back together. The mechanism, and the obligation it creates, are stated once in
+  `mc-deployment.md` §Config-failure triage ("Fast rollback lever"), and they apply to MH unchanged.
+- **Whether that generation still exists when the undo runs decides everything, and key ordering
+  does not change it.** A generator-named generation is immutable, and the revision you undo to
+  started against it, so it contains every key its template references. If it still exists, the undo
+  starts. If it has been pruned, the undo fails `CreateContainerConfigError` naming the ConfigMap,
+  whatever order the keys were removed in. An `optional: true` ref does not save it either, because
+  the same template holds hard refs to other keys in that ConfigMap. **For MH's generator-named
+  ConfigMaps, undo safety rests entirely on retention.** In this tree the generation exists: ADR-0038's
+  step-3 notes record that ConfigMap generations are not pruned, and `deploy.sh`'s
+  `prune_superseded_images()` never touches them. There are two limits:
+  - **On Kind, undo reaches back ONE generation.** The image prune keeps only the current image and
+    the one the workload's rollout history names as previous, so `--to-revision` further back finds
+    its ConfigMap but not its image (`ErrImageNeverPull`: the Deployments set `imagePullPolicy: Never`).
+  - **A pruning pipeline removes it.** A pipeline that prunes superseded generations (`kubectl apply
+    --prune`, or a GitOps controller with pruning on) can delete the previous generation in the same
+    sync that rolls the new revision. No pruning policy is defined for a production overlay yet.
+    **Any future pruning of old ConfigMap generations must spare the ones referenced by retained
+    ReplicaSets or ControllerRevisions**, as the MC runbook states. That obligation, not key
+    ordering, is the defence.
+- **Where the key-ordering rule still bites:**
+  - **A tree revert or partial apply in which the ConfigMap and the Deployments do not move
+    together.** Remove a key in the same commit as its read, then revert only the code, or apply
+    only the manifests, and a running image demands a key its generation lacks. Removing the read one
+    deploy before the key keeps every such intermediate state startable.
+  - **ADR-0038 §2's stable-name-plus-checksum-annotation variant.** If MH's config ever moved to a
+    stable name, the pre-ADR-0038 premise returns exactly: undo restores the Deployment's refs
+    without restoring the ConfigMap.
+- **So the `MH_MAX_STREAMS` two-deploy retirement below stays**, because it is cheap and correct for
+  both cases above. **It is not a defence against pruning.**
+
+**Undo is transient.** The next `dev-cluster deploy` or environment-root apply re-converges to the tree
+and rolls forward over it (ADR-0038: out-of-band `kubectl` changes are overwritten). **The durable
+rollback is a tree revert of the image and its manifests together.** Never revert the ConfigMap alone
+under a newer image. A `git revert` of `config.env` followed by an apply produces a new generation
+that lacks keys the Deployments still hold hard refs to. The apply rolls the pods at once, and they
+come up `CreateContainerConfigError`. If the Deployment env is reverted as well while the newer image
+stays, the pods `CrashLoopBackOff` instead. Either way MH accepts nothing
+([Rollback ordering](#rollback-ordering-the-image-may-roll-back-alone-the-manifests-may-not)).
+
+### `MH_MAX_STREAMS`: the rule applied, over two deploys
+
+`MH_MAX_STREAMS` is retired by story 2 (R-19). **Deploy 1** (story 2 task 8's image) removed the code
+read and kept the ConfigMap key and both `configMapKeyRef` entries. Nothing reads the key; it survives
+so that a rollback onto the previous image has what that image required. **The scheduled removal is
+itself two deploys**: first flip both refs to `optional: true`, then delete the key and both refs
+together. The trigger is the task-8 image deployed and proven, with no rollback taken. The
+entry, with its site inventory and guard interactions, is in `docs/TODO.md` §Media Path Obligations
+("Delete the retired `MH_MAX_STREAMS`"). Do not delete it by hand ahead of that.
 
 ---
 
@@ -657,9 +754,8 @@ operator gets:
   (`Missing required environment variable: MH_...`). That is by design, not an
   omission: its remediation is the
   [Required environment keys](#required-environment-keys) section above, whose
-  table and the paragraph following it together name the source of every one of
-  them. Look the variable up there — the eight keys story 2 task 8 made required
-  are in that paragraph until story 2 task 18 folds them into the table.
+  table names the source of each key it lists. Look the variable up there;
+  story 2's keys are rows in that table.
 
 Deliberately unchanged, so nobody "improves" it: the missing-variable error
 carries the variable as a **plain string literal**, and `dt-guard env-config`
@@ -702,6 +798,17 @@ When an MH pod goes not-ready during a rollout:
 - **Expect user reports of "the call went silent but it still says I'm connected" during every MH
   rollout**, for as long as that gap stands. That is the expected shape, not an incident.
 
+**Multi-party blast radius (story 2): a shed now drops a whole meeting, not one self-loop.** In story 1
+a participant heard only themselves through the handler, so a shed silenced one person's self-loop.
+Since story 2, MC routes each pair of participants through a handler both are connected to. Its
+routing policy co-locates, so an all-connected meeting lands every edge on ONE handler
+(`crates/mc-service/src/media_routing/edges.rs`, `colocate`). **Restarting that pod silences every
+participant of every such meeting at once, each hearing nobody**, and any pair routed through it in a
+partly-connected meeting goes silent too, while signalling, the roster and the slot grid still read
+healthy. Size the announcement to the meetings on the pod, not to the users on it. Recovery is
+unchanged: rejoin. A rejoin re-pushes the meeting's policy. Nothing re-pushes it on a timer until the
+§8 re-assert cadence ships.
+
 **Do not open an incident for this, and do not add a drain in response to it.** The recovery half
 lands with the handler-restart story. When it does, this section is one of the places to revise —
 the shedding stays, the "does not come back on its own" clause goes.
@@ -735,6 +842,26 @@ was aimed at, including meetings that were not affected by whatever prompted the
 **There is no finer-grained lever in this build.** There is no per-meeting media disable, no feature
 flag, and no runtime toggle. If media must be stopped, the only correct action is a **redeploy** of
 the previous image — which is the rollback path below, and which keeps joins working.
+
+### Operator levers: there are none for media
+
+**This story adds zero operator-reachable media levers.**
+
+- **Lowering `MH_EGRESS_BUDGET_BPS` is not a kill switch.** It starves GC placement and produces a
+  new-meeting outage plus silent media in existing meetings, by the same mechanism as
+  [scaling MH to zero](#scaling-mh-to-zero-is-not-a-media-kill-switch). Two facts that section does
+  not carry:
+  - The change is itself a ConfigMap change, so it **rolls both MH pods and sheds every live session
+    immediately** (the shed described above).
+  - The ceiling gates only generation-advancing applies. So it is the roll that silences existing
+    meetings, not the lower budget: their rejoins re-register against the lowered ceiling and are
+    refused.
+- **Server mute is a host control with no operator-facing API or tooling.** But it is carried on the
+  controller-to-handler contract, and is therefore reachable by a holder of those service credentials.
+  That path is unsupported, untooled, and MH 19's second triage arm
+  ([`mh-incident-response.md` Scenario 19](mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress)).
+
+The only supported remedy for bad media-path behaviour is a **rollback** (a redeploy of the previous image, below). It is a remedy, not a media stop control: it sheds sessions, and meetings resume on the rolled-back build.
 
 ### Rollback for the media path
 
@@ -806,7 +933,7 @@ regression.
 
 For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For other rollback scenarios (general service restore, configuration regression), follow the same `kubectl rollout undo` pattern; deeper operational steps will be filled in alongside the deployment-procedure stub.
 
-**`EndMeeting` rollout order (story 2 R-20, R-24).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: `MH_MAX_REGISTERED_MEETINGS` stays in the ConfigMap (a `rollout undo` restores Deployment refs, not the ConfigMap), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
+**`EndMeeting` rollout order (story 2 R-20, R-24).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: a `rollout undo` points each pod template back at the previous hash-suffixed ConfigMap generation, which still exists because nothing prunes generations ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
 
 **`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. There is **no hard ordering either way**, but rolling MH back alone (or an MH pod left on the old image) **degrades** MC to the legacy per-(participant, handler) key: a stale disconnect can then remove a live connection, silencing that participant for the peers routed through that handler until it rejoins. Signalled by `mc_mh_notifications_without_connection_id_total` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
 

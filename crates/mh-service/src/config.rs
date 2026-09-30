@@ -1621,9 +1621,11 @@ pub enum ConfigError {
 
     /// The derived egress stream ceiling is below the refuse-boot floor.
     ///
-    /// Until the MH deployment runbook's config-failure section lands (story 2
-    /// task 18) this message IS the runbook: it is all `kubectl logs --previous`
-    /// shows on a `CrashLoopBackOff`.
+    /// This message carries its remedy inline because it is all `kubectl logs
+    /// --previous` shows on a `CrashLoopBackOff`; the runbook home is the
+    /// "Both pods `CrashLoop` immediately after apply" section of
+    /// `docs/runbooks/mh-deployment.md` (and its "Config-failure triage"
+    /// section for the other two startup signals).
     #[error(
         "Derived egress STREAM ceiling {ceiling} is below the refuse-boot floor of {floor} \
          (two participants hearing each other). ceiling = MH_EGRESS_BUDGET_BPS \
