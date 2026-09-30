@@ -100,7 +100,11 @@ pub use outcome::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientMediaConfig {
     /// Maximum slots one declaration may contain (`MC_MAX_RECEIVE_SLOTS`).
-    pub max_receive_slots: usize,
+    ///
+    /// The ONE value MC enforces (`handle_receive_capability`), publishes
+    /// (`mc_media_receive_slot_cap`) and advertises to the client
+    /// (`JoinResponse.max_receive_slots`). `u8`: see `config.rs`.
+    pub max_receive_slots: u8,
     /// Maximum ACCEPTED declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     pub max_receive_capability_declarations: u32,

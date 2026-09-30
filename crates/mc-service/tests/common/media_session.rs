@@ -130,6 +130,8 @@ pub struct Session {
     pub sender_id: u32,
     /// `JoinResponse.media_servers`, as MC sent it.
     pub media_servers: Vec<String>,
+    /// `JoinResponse.max_receive_slots`, as MC advertised it (absent = `None`).
+    pub max_receive_slots: Option<u32>,
     /// The token `sub` this session joined as (what MH reports).
     pub user: String,
     /// MC's participant id for this session, read off the `JoinResponse`.
@@ -525,7 +527,7 @@ async fn try_join_with_role(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (participant_id, sender_id, media_servers) = match resp.message {
+    let (participant_id, sender_id, media_servers, max_receive_slots) = match resp.message {
         Some(server_message::Message::JoinResponse(r)) => (
             r.participant_id.clone(),
             r.sender_id.expect("MC allocates a sender id at join"),
@@ -533,6 +535,7 @@ async fn try_join_with_role(
                 .into_iter()
                 .map(|m| m.media_handler_url)
                 .collect::<Vec<String>>(),
+            r.max_receive_slots,
         ),
         other => return Err(format!("{other:?}")),
     };
@@ -543,6 +546,7 @@ async fn try_join_with_role(
         recv,
         sender_id,
         media_servers,
+        max_receive_slots,
         user: user.to_string(),
         participant_id,
         meeting_id: meeting_id.to_string(),

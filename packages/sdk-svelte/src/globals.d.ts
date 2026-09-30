@@ -12,3 +12,5 @@
 declare const __SDK_VERSION__: string;
 declare const __DEV_TRUST_FINGERPRINT__: boolean;
 declare const __E2E_HOOKS__: boolean;
+/** Story 2 R-7 test-tone build define; `false` under this package's vitest. */
+declare const __DT_TEST_TONE__: boolean;

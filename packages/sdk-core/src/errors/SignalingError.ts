@@ -59,6 +59,12 @@ export const SignalingErrorCode = {
   Transport: 'TRANSPORT',
   /** LOCAL: the join deadline elapsed without a `JoinResponse` (stalled/wedged MC). */
   Timeout: 'TIMEOUT',
+  /**
+   * LOCAL: the declared receive-slot count N exceeds the cap MC advertised on
+   * `JoinResponse.max_receive_slots`. MC would reject the WHOLE declaration, so
+   * the SDK refuses it before sending and never shrinks N to fit.
+   */
+  ReceiveSlotsOverCap: 'RECEIVE_SLOTS_OVER_CAP',
 } as const;
 
 export type SignalingErrorCode = (typeof SignalingErrorCode)[keyof typeof SignalingErrorCode];

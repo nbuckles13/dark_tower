@@ -587,7 +587,6 @@ async fn rejects_duplicate_slot_ids() {
 async fn the_slot_cap_rejects_one_over_and_accepts_exactly_at() {
     const MEETING: &str = "mcs-meeting-h";
     let cap = client_media_config().max_receive_slots;
-    let cap_u32 = u32::try_from(cap).unwrap();
     let handler = mc_service::media_routing::HandlerId::new("mh-test-1");
 
     let (stack, rig) = start_stack("mcs-cap").await;
@@ -603,6 +602,12 @@ async fn the_slot_cap_rejects_one_over_and_accepts_exactly_at() {
     meeting.get_state().await.unwrap(); // actor drained
     let rendered_before = rig.policy_generations.current(MEETING, &handler).await;
     assert!(rendered_before.is_some(), "the first join rendered");
+
+    // ADVERTISED == ENFORCED, over the real wire: the cap the client is told on
+    // `JoinResponse.max_receive_slots` is the one this test then proves MC
+    // enforces, and the boundary below is driven FROM the advertised value.
+    assert_eq!(a.max_receive_slots, Some(u32::from(cap)));
+    let cap_u32 = a.max_receive_slots.expect("MC always advertises its cap");
 
     let snap = MetricAssertion::snapshot();
     a.write(capability_frame(audio_slots(cap_u32 + 1))).await;
@@ -621,7 +626,7 @@ async fn the_slot_cap_rejects_one_over_and_accepts_exactly_at() {
     let assignments = a.expect_assignments().await;
     assert_eq!(
         assignments.assignments.len(),
-        cap,
+        usize::from(cap),
         "accepted at exactly the cap"
     );
     assert_eq!(
@@ -646,6 +651,9 @@ async fn rejects_a_slot_count_over_a_lowered_configured_cap() {
     config.max_receive_slots = 2;
     let (stack, rig) = start_stack_with("mcs-cap-low", config).await;
     let mut a = solo(&rig, &stack, "mcs-meeting-h2").await;
+    // Positive control for the advertisement: 2 differs from the default 8, so
+    // the wire follows CONFIGURATION, not a literal.
+    assert_eq!(a.max_receive_slots, Some(2));
     a.write(capability_frame(audio_slots(3))).await;
     assert_rejected(&mut a, "slot_count_over_cap", &snap).await;
 }

@@ -188,6 +188,8 @@ message JoinResponse {
   optional uint32 sender_id = 8;                // 16-bit semantics; 1..=65535
   bytes meeting_kek = 9;                        // AES-256, exactly 32 bytes
   uint32 kek_generation = 10;                   // u16 semantics
+  uint32 kek_rotation_debounce_seconds = 11;    // W (story 2); 0/absent = older MC
+  optional uint32 max_receive_slots = 12;       // server cap on slots per ReceiveCapability; absent = unknown
 }
 
 message Participant {
@@ -204,6 +206,14 @@ message MediaServerInfo {
   reserved 2;                                   // was: connection_token
 }
 ```
+
+**`max_receive_slots` (story 2 task 13; R-1, R-23).** MC's cap on the TOTAL slot
+count of one `ReceiveCapability` (`MC_MAX_RECEIVE_SLOTS`), advertised so the
+client can show it and refuse an over-cap declaration before sending. The
+`JoinResponse.max_receive_slots` comment in `signaling.proto` is normative: MC
+stays the enforcer (whole-declaration rejection, never a clamp), MC always sets
+it so absent means an older MC and "cap unknown", a present 0 is a contract
+violation the client surfaces loudly, and the value is per session.
 
 **`sender_id` (ADR-0036 §2).** The joiner's per-meeting numeric sender id, and the
 first half of the attribution chain. A `uint32` on the wire carrying 16-bit
@@ -341,7 +351,7 @@ rate-limited.
 
 ```protobuf
 message ReceiveCapability {
-  repeated ReceiveSlot slots = 1;     // capped by server-side configuration
+  repeated ReceiveSlot slots = 1;     // capped by server-side configuration; cap advertised on JoinResponse.max_receive_slots
 }
 
 message ReceiveSlot {

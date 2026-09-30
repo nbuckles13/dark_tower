@@ -175,14 +175,14 @@ impl ReceiveCapabilityDeclaration {
     /// subscriber can decode; half of it is not a weaker version of it.
     pub fn parse(
         message: &ReceiveCapability,
-        max_slots: usize,
+        max_slots: u8,
         budget_remaining: bool,
     ) -> Result<Self, CapabilityOutcome> {
         if !budget_remaining {
             return Err(CapabilityOutcome::DeclarationBudgetExhausted);
         }
 
-        if message.slots.len() > max_slots {
+        if message.slots.len() > usize::from(max_slots) {
             return Err(CapabilityOutcome::SlotCountOverCap);
         }
 
@@ -258,7 +258,7 @@ mod tests {
     use super::*;
     use proto_gen::dark_tower::signaling::v1::ReceiveSlot;
 
-    const CAP: usize = 8;
+    const CAP: u8 = 8;
 
     fn slot(id: u32, kind: MediaKind, pin: Option<u32>) -> ReceiveSlot {
         ReceiveSlot {
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn rejects_slot_count_over_cap() {
-        let slots = (0..=u32::try_from(CAP).unwrap())
+        let slots = (0..=u32::from(CAP))
             .map(|i| slot(i, MediaKind::Audio, None))
             .collect();
         assert_eq!(parse(slots), Err(CapabilityOutcome::SlotCountOverCap));

@@ -557,6 +557,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // `optional uint32` → `number | undefined`. Absence is passed
           // through, never coerced to 0 (ADR-0036 §2: 0 is reserved-invalid).
           senderId: jr.senderId,
+          // `optional uint32`: absent stays absent, a present 0 stays 0.
+          maxReceiveSlots: jr.maxReceiveSlots,
           existingParticipants: jr.existingParticipants.map((p) => ({
             participantId: p.participantId,
             name: p.name,

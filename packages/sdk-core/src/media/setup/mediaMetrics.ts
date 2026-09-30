@@ -288,6 +288,29 @@ export type MediaKekInstallRefusal =
  */
 export type ReportableWrapOutcome = Exclude<WrapOutcome, 'absent' | 'cached' | 'already_held'>;
 
+/**
+ * Bounded `mode` vocabulary for `dt_client_media_capture_source` — what feeds
+ * this client's send path.
+ *
+ * ---------------------------------------------------------------------------
+ * A TYPE, NOT A CONST OBJECT — DELIBERATELY UNLIKE {@link MEDIA_MUTE_ACTIONS}
+ * ---------------------------------------------------------------------------
+ *
+ * A const object would put the string `test_tone` into every production bundle.
+ * The token must exist ONLY inside the `__DT_TEST_TONE__` build-time gate (the
+ * capture-source selection, `session/mediaSelection.ts:selectCaptureSource`), so a production
+ * build cannot even spell the mode, and
+ * `packages/web-app/tests/bundle-content.test.ts` asserts its absence. Types
+ * vanish at compile time; the union still bounds every call site.
+ *
+ * Bounded and identity-free: a BUILD-TIME property of the bundle, never per
+ * user. Admitted as a datapoint label key by GC's `MEDIA_DATAPOINT_EXTRA` and
+ * the collector's `keep_keys` (`docs/observability/label-taxonomy.md`).
+ * `invalid` is the collector's reserved rewrite sentinel and must never become a
+ * value here.
+ */
+export type MediaCaptureSourceMode = 'microphone' | 'test_tone';
+
 /** The identity dimensions a media metric may carry. Two strings; nothing else. */
 export interface MediaMetricIdentity {
   /** SDK build version. */
@@ -583,6 +606,40 @@ export class MediaMetrics {
    */
   decodeQueueDropped(): void {
     this.#sink?.counter('dt_client_media_decode_queue_dropped_total', this.#base);
+  }
+
+  // ------------------------------------------------------ story 2 task 13 ---
+
+  /**
+   * The active capture source, as a presence gauge: value `1` for the ACTIVE
+   * mode only. Never a `0`-valued series for the other mode — the signal is the
+   * series' presence, and a zero series would make presence lie.
+   *
+   * Re-set on every export-interval tick by the pipeline (the SDK exports DELTA,
+   * and a last-value gauge is exported only for an interval it was recorded in);
+   * the pipeline stops calling it at teardown so the series is not pinned.
+   */
+  captureSource(mode: MediaCaptureSourceMode): void {
+    this.#sink?.gauge('dt_client_media_capture_source', { ...this.#base, mode }, 1);
+  }
+
+  /**
+   * `count` ACTIVE receive assignments decoded nothing in the last export
+   * interval (unit: assignment-intervals). `0` is a legal call — the
+   * zero-initialisation at pipeline start, so `rate()` has a series before the
+   * first deficit. No sender, slot or mode dimension, ever.
+   */
+  receiveSourceDeficit(count: number): void {
+    this.#sink?.counter('dt_client_media_receive_source_deficit_total', this.#base, count);
+  }
+
+  /**
+   * `startMedia()` refused a declaration of N receive slots above the cap MC
+   * advertised. `0` is the zero-initialisation at session start. The only signal
+   * for this failure: with no active assignments the deficit counter reads 0.
+   */
+  receiveSlotsRejected(count: 0 | 1 = 1): void {
+    this.#sink?.counter('dt_client_media_receive_slots_rejected_total', this.#base, count);
   }
 
   /**

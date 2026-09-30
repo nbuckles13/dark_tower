@@ -20,6 +20,13 @@ export default defineConfig(({ mode }) => ({
   define: {
     __DEV_TRUST_FINGERPRINT__: JSON.stringify(mode !== 'production'),
     __SDK_VERSION__: JSON.stringify(pkgVersion),
+    // Story 2 R-7: the test-tone build define is a HARD `false` in the SDK's
+    // library build, in every mode. The tone is an APP-build decision
+    // (`packages/web-app/vite/testTone.ts`, which consumes this package's
+    // SOURCE through an alias and so supplies its own value); a published
+    // sdk-core must never carry the synthesis. `tests/bundle-content.test.ts`
+    // asserts it does not.
+    __DT_TEST_TONE__: JSON.stringify(false),
   },
   build: {
     lib: {

@@ -95,6 +95,8 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
     senderId: SENDER_ID,
     identity,
     declaredSlotIds: [0],
+    captureSource: 'microphone',
+    metricExportIntervalMs: 10_000,
     senderFor: () => sender,
     readableFor: () => transport.datagrams.readable,
     reportMute: () => {},

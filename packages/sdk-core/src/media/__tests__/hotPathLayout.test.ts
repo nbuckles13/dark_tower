@@ -61,9 +61,16 @@
 // because TypeScript has no macro forms to deny. Read it as the weaker form it
 // is: it catches the spellings below, in these directories, and nothing else.
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+
+import { stripComments } from '../../__tests__/stripComments.js';
+import { sourceFiles } from '../../__tests__/sourceFiles.js';
+
+// `__tests__` is not production code and is not in scope: a test may
+// legitimately name a metric it asserts on. `.d.ts` counts like any source.
+const SCAN_SCOPE = { skipDirs: ['__tests__'], includeDts: true } as const;
 
 const MEDIA_ROOT = new URL('..', import.meta.url).pathname;
 const HOT_PATH_DIR = join(MEDIA_ROOT, 'pipeline');
@@ -72,33 +79,12 @@ const SIBLING_DIRS = ['lifecycle', 'setup', 'teardown'].map((d) => join(MEDIA_RO
 /** The ONE file permitted to name a `dt_client_` metric anywhere under `media/**`. */
 const METRIC_HOME = join(MEDIA_ROOT, 'setup', 'mediaMetrics.ts');
 
-function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const path = join(dir, entry);
-    if (statSync(path).isDirectory()) {
-      // `__tests__` is not production code and is not in scope: a test may
-      // legitimately name a metric it asserts on.
-      if (entry === '__tests__') continue;
-      out.push(...sourceFiles(path));
-      continue;
-    }
-    if (entry.endsWith('.ts')) out.push(path);
-  }
-  return out;
-}
-
-/** Strip comments so a file DOCUMENTING a rule does not trip it. */
-function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-}
-
 describe('media hot-path layout (ADR-0036 §11)', () => {
   it('fails if the hot-path directory is absent or empty — the scope fails itself', () => {
     // Not a formality. A scope check that silently passes over a directory
     // nobody renamed it to is a control that reads as coverage and covers
     // nothing, which is the failure mode §11 names by name.
-    const files = sourceFiles(HOT_PATH_DIR);
+    const files = sourceFiles(HOT_PATH_DIR, SCAN_SCOPE);
     expect(
       files.length,
       `media/pipeline contains no .ts sources; the hot-path deny below is covering nothing`,
@@ -111,7 +97,7 @@ describe('media hot-path layout (ADR-0036 §11)', () => {
     // the deny above would start banning code it is supposed to permit.
     for (const dir of SIBLING_DIRS) {
       expect(
-        sourceFiles(dir).length,
+        sourceFiles(dir, SCAN_SCOPE).length,
         `${dir} contains no .ts sources; the sibling layout §11 requires is not in place`,
       ).toBeGreaterThan(0);
       expect(dir.startsWith(HOT_PATH_DIR)).toBe(false);
@@ -119,7 +105,7 @@ describe('media hot-path layout (ADR-0036 §11)', () => {
   });
 
   it('has no logging sink reachable from per-frame code', () => {
-    for (const file of sourceFiles(HOT_PATH_DIR)) {
+    for (const file of sourceFiles(HOT_PATH_DIR, SCAN_SCOPE)) {
       const source = stripComments(readFileSync(file, 'utf8'));
       expect(source, `${file}: console.* is not reachable from the hot path`).not.toMatch(
         /\bconsole\s*\./,
@@ -134,7 +120,7 @@ describe('media hot-path layout (ADR-0036 §11)', () => {
   });
 
   it('names no metric in per-frame code — handles are resolved once, at setup', () => {
-    for (const file of sourceFiles(HOT_PATH_DIR)) {
+    for (const file of sourceFiles(HOT_PATH_DIR, SCAN_SCOPE)) {
       const source = stripComments(readFileSync(file, 'utf8'));
       expect(
         source,
@@ -153,7 +139,7 @@ describe('media hot-path layout (ADR-0036 §11)', () => {
     // assert that exactly one file constructs media labels at all.
     const offenders: string[] = [];
     for (const dir of [HOT_PATH_DIR, ...SIBLING_DIRS]) {
-      for (const file of sourceFiles(dir)) {
+      for (const file of sourceFiles(dir, SCAN_SCOPE)) {
         if (file === METRIC_HOME) continue;
         if (stripComments(readFileSync(file, 'utf8')).includes('dt_client_')) {
           offenders.push(file);

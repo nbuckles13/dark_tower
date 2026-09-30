@@ -108,7 +108,11 @@ pub const MAX_KEK_ROTATION_DEBOUNCE_SECONDS: u32 = 300;
 ///
 /// Zero would mean no client can ever receive media — a silent total outage
 /// that reads as a valid configuration.
-const MIN_RECEIVE_SLOTS: usize = 1;
+///
+/// `u8` end to end (config, `ClientMediaConfig`, the gauge and the
+/// `JoinResponse.max_receive_slots` wire value): the bound fits, so every
+/// widening is a total `From`, never a fallible or truncating conversion.
+const MIN_RECEIVE_SLOTS: u8 = 1;
 
 /// Largest legal `MC_MAX_RECEIVE_SLOTS`.
 ///
@@ -117,7 +121,7 @@ const MIN_RECEIVE_SLOTS: usize = 1;
 /// 100000 quietly retires that property while still looking like a cap, so the
 /// cap's own value is bounded. 64 is generous against the two media kinds §11
 /// ships and a realistic grid of ≤5 video plus audio.
-const MAX_RECEIVE_SLOTS: usize = 64;
+const MAX_RECEIVE_SLOTS: u8 = 64;
 
 /// Smallest legal `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`.
 const MIN_RECEIVE_CAPABILITY_DECLARATIONS: u32 = 1;
@@ -171,7 +175,7 @@ where
 {
     let parsed = raw.trim().parse::<T>().map_err(|e| {
         ConfigError::InvalidValue(format!(
-            "{name} must be a non-negative integer, got '{raw}': {e}"
+            "{name} must be an integer in {min}..={max}, got '{raw}': {e}"
         ))
     })?;
     if parsed < min || parsed > max {
@@ -323,7 +327,7 @@ pub struct Config {
     /// resource-amplification-by-request structurally impossible rather than
     /// rate-limited, so the value itself is validated (`1..=64`) — a cap whose
     /// own value is unbounded is not a cap.
-    pub max_receive_slots: usize,
+    pub max_receive_slots: u8,
 
     /// Connect settle window in milliseconds (`MC_MEDIA_CONNECT_SETTLE_MS`).
     ///
@@ -999,6 +1003,24 @@ mod tests {
             let lifecycle = config.kek_lifecycle();
             assert_eq!(lifecycle.window(), std::time::Duration::from_secs(seconds));
             assert_eq!(u64::from(lifecycle.window_seconds()), seconds);
+        }
+    }
+
+    /// A value too large for the knob's TYPE (not just its range) still names the
+    /// legal range. `MC_MAX_RECEIVE_SLOTS` is a `u8`, so 256 fails in the parse,
+    /// before the range check — and "must be a non-negative integer" would send an
+    /// operator the wrong way, since 256 is one.
+    #[test]
+    fn test_type_overflow_error_names_the_legal_range() {
+        let mut vars = base_vars();
+        vars.insert("MC_MAX_RECEIVE_SLOTS".to_string(), "256".to_string());
+        let err = Config::from_vars(&vars).expect_err("256 must be rejected");
+        match err {
+            ConfigError::InvalidValue(msg) => assert!(
+                msg.contains("1..=64") && msg.contains("MC_MAX_RECEIVE_SLOTS"),
+                "the type-overflow message must state the legal range: {msg}"
+            ),
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 

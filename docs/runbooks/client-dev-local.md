@@ -49,7 +49,7 @@
 - [§3 Bring-up](#3-bring-up)
 - [§4 Is the join real?](#4-is-the-join-real)
   - [§4.5 "I joined and I hear nothing" — media triage ladder](#45-i-joined-and-i-hear-nothing--media-triage-ladder)
-- [§5 Failure modes](#5-failure-modes) (F1–F15)
+- [§5 Failure modes](#5-failure-modes) (F1–F15, F18–F19)
 - [§6 Teardown](#6-teardown)
 - [§6.5 Automated checks that exist today](#65-automated-checks-that-exist-today)
 - [§7 Not on this branch](#7-not-on-this-branch)
@@ -1424,6 +1424,64 @@ all.
   transmit-key material inside the credential-leak guard's scope for exactly this moment. A KEK in a
   log is a KEK in the log pipeline.
 
+### F18 — "I hear nobody", and the media error names the receive-slot cap
+
+(F16 and F17 are reserved by story 2's runbook task for the rotation-silence and static-fill
+signatures.)
+
+**Symptom.** Start audio fails and the in-meeting view shows a `media-error` like
+`SIGNALING: this client is configured to receive 5 audio slots, but the meeting controller allows
+at most 4 ... Lower VITE_DT_RECEIVE_SLOTS ... or raise MC_MAX_RECEIVE_SLOTS`. The participant hears
+nobody; others may still hear them.
+
+**Why it is loud.** N (`VITE_DT_RECEIVE_SLOTS`, the client's declared receive-slot count) is a
+REQUEST bounded by MC's `MC_MAX_RECEIVE_SLOTS`, which MC advertises on
+`JoinResponse.max_receive_slots`. MC rejects an over-cap declaration **whole** — never clamps it — so
+the SDK refuses it before sending rather than presenting as one silent participant, and counts it on
+`dt_client_media_receive_slots_rejected_total`. `dt_client_media_receive_source_deficit_total` reads
+**0** for this failure (there are no active assignments to be silent) — do not read that as health.
+
+**Discriminator.**
+- The effective N and the cap are on the E2E bus (`receiveSlots`: `declared`, `source`,
+  `serverCapState`, `serverCap`) and in the browser console line `[dt-media-slots] declaring N=...
+  receive slots (...); server cap ...`. `source: default` means `VITE_DT_RECEIVE_SLOTS` was not set
+  and the SDK default applied.
+- `serverCapState: unknown` means the MC predates the advertised cap: the SDK declares anyway and MC
+  rejects, which surfaces as a session `error` and counts on MC's
+  `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}` — see the
+  receive-capability rejection section of [`mc-incident-response.md`](mc-incident-response.md).
+- `serverCapState: invalid` (a present 0) is an MC contract violation; the console WARNs with the
+  value. Report it against MC.
+
+**Fix.** Make them agree — never by clamping: `VITE_DT_RECEIVE_SLOTS=<n> scripts/dev-web.sh` with
+`n` at or below the cap (the preflight prints both and refuses a mismatch), or raise
+`MC_MAX_RECEIVE_SLOTS` in the MC ConfigMap. The browser knob is **not** covered by `dt-guard
+env-config`; the runtime value on the bus is the check.
+
+### F19 — Receive-source deficit rising: MC says a source is active and nothing decodes
+
+**Symptom.** `dt_client_media_receive_source_deficit_total` is increasing (client-media board,
+*Receive Path - Silent Active Sources*). Participants report hearing some people but not others.
+
+**What it means.** Per export interval the SDK counts ACTIVE assignments — MC assigned a sender to
+one of this client's declared slots and did not mark it source-muted — from which it decoded **no**
+frame for the whole interval. DTX is off, so a live, unmuted sender always produces frames: MC's
+claim and the receiver's observation disagree. A newly assigned slot gets one interval of grace, so
+a join or re-map alone does not tick it.
+
+**Where to look next, cheapest first.**
+1. Is anything arriving? `dt_client_media_frames_received_total` flat → the frames never reach the
+   client: MH forwarding. Work
+   [`mh-incident-response.md` Scenario 17: Media Datagram Drop](mh-incident-response.md#scenario-17-media-datagram-drop)
+   and [Scenario 16](mh-incident-response.md#scenario-16-ingress-datagrams-received-but-never-read)
+   (and Scenario 15 if senders are not binding).
+2. Arriving but dropped? `dt_client_media_frames_dropped_total{reason}` — key material → F15;
+   `sender_not_assigned` → MC's assignment and MH's routing disagree (MC routing).
+3. Accepted but not decoded? `dt_client_media_decoder_errors_total` and
+   `dt_client_media_decode_queue_dropped_total`.
+4. Nothing on the client side explains it → MC routing: the slot state MC pushed does not match the
+   edges it programmed on MH. See `mc-incident-response.md` (media routing / generation divergence).
+
 ---
 
 ## 6. Teardown
@@ -1570,3 +1628,4 @@ yourself updating the same fact in two of these files, one of them is wrong.
 | 2026-07-29 | operations (task #20) | Initial creation (R-49). Two-machine topology, two-topology cluster split, bring-up, join-verification ladder, F1–F10, teardown, env-tests section. Deliberately diverges from `TEMPLATE.md` — see the banner. |
 | 2026-08-06 | infrastructure (task #61) | Added **F11** (Vite "cannot find native binding" — engines-skipped optional binding under a below-floor Node) with (a)/(b) sub-case split; updated §5 header + ToC. Reconciled §6.5/§7 with reality: the Playwright browser-E2E lane (tasks #18/#19) now exists and runs diff-triggered in Layer 7 — corrected the stale "no Playwright" §7 note and the §6.5 cross-reference. Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
 | 2026-09-09 | client (story task #20) | Added the frozen `## Secure Context and Media Setup` section between §2 and §3 — the four gated APIs as one all-or-nothing gate, `http://<sub>.localhost:5173` being potentially trustworthy in Chrome, the non-loopback-HTTP failure (**fails at `connecting-mc`, symptom-identical to F1/F8/F9** — WebTransport is one of the four gated APIs and MC signalling has no fallback, so the join never completes; the discriminator is the origin in the address bar), and the fake-device/fake-ui launch for a machine with no microphone. It is the anchor `scripts/dev-web.sh`'s header and §4's ladder both cite; `scripts/dev-web.test.sh` now pins its slug AND its prose. Corrected **F7**'s stale "may warn" (the fingerprints check has been a hard fail since task #61's escalation), added the presence-only/stale-but-present asymmetry that is F7's actual reason for existing, and added F7's anti-flag counter-message — the stale-but-present case is the one branch where `dev-web.sh`'s own warning never prints. Dropped the count from the §5 heading and its ToC entry (`#5-failure-modes-f1f11` -> `#5-failure-modes`, one live referrer, both fixed here) so the anchor stops rotting as F-entries are added — the rule stated under `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`: name a set's members, never restate its count. Per-entry `### F7 — ...` slug untouched (`mh-incident-response.md` links into it three times). Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
+| 2026-09-30 | client (story 2 task 13) | Added **F18** (receive-slot count N over the MC cap: loud refusal, `dt_client_media_receive_slots_rejected_total`, the bus/console discriminators, fix by agreement never by clamping) and **F19** (rising `dt_client_media_receive_source_deficit_total`: an MC-claimed-active source decoding nothing, triage ladder into MH Scenarios 15-17 and MC routing). F16/F17 left for story 2's runbook task. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |

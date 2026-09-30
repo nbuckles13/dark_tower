@@ -45,6 +45,12 @@ export interface RosterParticipant {
 export interface JoinedEvent {
   readonly participantId: string;
   readonly senderId?: number | undefined;
+  /**
+   * MC's receive-slot cap (`JoinResponse.max_receive_slots`), passed through
+   * verbatim: `undefined` when absent (older MC), and a present `0` kept as `0`
+   * so the session can surface it as a contract violation. Never coerced.
+   */
+  readonly maxReceiveSlots?: number | undefined;
   readonly existingParticipants: readonly RosterParticipant[];
   readonly mediaServers: readonly string[];
   readonly correlationId: string;

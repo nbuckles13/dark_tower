@@ -162,7 +162,13 @@ run_check() {
   local root="$1" stubs="$2"
   local -a n_env=(-u VITE_DT_RECEIVE_SLOTS)
   if [[ $# -ge 3 ]]; then n_env=("VITE_DT_RECEIVE_SLOTS=$3"); fi
-  RUN_OUT="$(cd "$root" && env "${n_env[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
+  # The test-tone opt-in is hermetic too: unset unless a case sets RUN_CHECK_TONE.
+  # `-u` options must precede any NAME=VALUE for env(1), so this comes first.
+  local -a tone_env=(-u DT_TEST_TONE)
+  if [[ -n "${RUN_CHECK_TONE:-}" ]]; then tone_env=(); fi
+  local -a tone_set=()
+  if [[ -n "${RUN_CHECK_TONE:-}" ]]; then tone_set=("DT_TEST_TONE=${RUN_CHECK_TONE}"); fi
+  RUN_OUT="$(cd "$root" && env "${tone_env[@]}" "${n_env[@]}" "${tone_set[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
     bash "$root/scripts/dev-web.sh" --check 2>&1 || true)"
 }
 
@@ -684,6 +690,15 @@ fi
 assert_status "slots-default-echoes-n-and-cap" \
   "effective N=${default_n} (launcher demo default) <= server cap MC_MAX_RECEIVE_SLOTS=${fixture_cap}" "$out"
 assert_status "slots-default-is-pass-line" "✓ receive slots: effective N=" "$out"
+# The test-tone state is printed beside N (@operations OPS-2): OFF when unset...
+assert_status "tone-state-off-when-unset" "test tone: OFF (DT_TEST_TONE unset)" "$out"
+assert_absent "tone-state-not-on-when-unset" "test tone: ON" "$out"
+# ...and ON, echoing exactly what was set, when requested. Not re-validated in
+# bash: vite/testTone.ts is the one predicate.
+RUN_CHECK_TONE=1 run_check "$root" "$stubs"
+out_tone="$(plain "$RUN_OUT")"
+assert_status "tone-state-on-when-set" "test tone: ON requested (DT_TEST_TONE=1;" "$out_tone"
+assert_absent "tone-state-not-off-when-set" "test tone: OFF" "$out_tone"
 assert_absent "slots-default-not-over-cap" "$OVER_CAP_TEXT" "$out"
 assert_absent "slots-default-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
 # The comment decoy's value must never surface as the cap.

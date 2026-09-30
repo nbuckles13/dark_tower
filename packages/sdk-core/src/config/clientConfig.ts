@@ -218,6 +218,10 @@ export interface IngressConfig {
    * {@link maxCachedIdentityKeys} or `maxTransmitKeysPerSender`: how many
    * decoders to run and how many keys to cache are unrelated decisions, and
    * collapsing them would be a false single source of truth.
+   *
+   * MUST be at least {@link ReceiveConfig.audioSlots} (N): N declared slots can
+   * be filled by N distinct senders, each needing a lane. Checked by
+   * {@link validateMediaConfig}; that relation is the client-side ceiling on N.
    */
   readonly maxDecodeLanes: number;
   /**
@@ -260,6 +264,85 @@ export interface ReceiverStateConfig {
   readonly maxTransmitKeysPerSender: number;
 }
 
+/**
+ * What this client asks to RECEIVE (ADR-0036 §6; story 2 R-1, R-23).
+ */
+export interface ReceiveConfig {
+  /**
+   * N — the number of audio receive slots this client DECLARES in its
+   * `ReceiveCapability` (slot ids `0..N-1`). Each participant hears at most N
+   * others.
+   *
+   * N IS A REQUEST, BOUNDED BY THE SERVER. MC caps the TOTAL slot count of one
+   * declaration at `MC_MAX_RECEIVE_SLOTS`, advertised to this client on
+   * `JoinResponse.max_receive_slots`. A declaration above that cap is REJECTED
+   * WHOLE by MC — never clamped, never accepted as a prefix — so the SDK refuses
+   * an over-cap N locally and loudly before declaring (typed error,
+   * `dt_client_media_receive_slots_rejected_total`), and never shrinks N to fit.
+   * Two quantities, not a duplicate — the `MC_AUDIO_MAX_BITRATE_BPS` /
+   * {@link AudioConfig.defaultBitrateBps} precedent. No copy of the server cap
+   * exists on this side.
+   *
+   * CLIENT CEILING: at most `ingress.maxDecodeLanes` (one decode lane per
+   * assigned sender), checked by {@link validateMediaConfig}.
+   *
+   * THE DEFAULT (1) IS THE SDK's FALLBACK for an embedder that configures
+   * nothing, NOT the demo topology: `scripts/dev-web.sh`'s `DEMO_RECEIVE_SLOTS`
+   * (the four-participant demo, N=3) always exports `VITE_DT_RECEIVE_SLOTS`, which
+   * the web app reads through {@link parseReceiveSlots}. Two quantities.
+   *
+   * NOT COVERED BY `dt-guard env-config`, which reads `infra/services/**` only:
+   * `VITE_DT_RECEIVE_SLOTS` is a browser-side build knob. The browser suite
+   * asserts the effective N at runtime (`MeetingSession.receiveSlots`) instead.
+   */
+  readonly audioSlots: number;
+}
+
+/** The SDK's fallback N when an embedder configures none. See {@link ReceiveConfig}. */
+export const DEFAULT_RECEIVE_AUDIO_SLOTS = 1;
+
+/** Whether N came from the embedder's configuration or the SDK default. */
+export type ReceiveSlotsSource = 'configured' | 'default';
+
+/** A parsed N, with where it came from (R-23: absent vs defaulted is visible). */
+export interface ParsedReceiveSlots {
+  readonly count: number;
+  readonly source: ReceiveSlotsSource;
+}
+
+/**
+ * The ONE accepted spelling of N: a decimal integer >= 1 with no sign, no
+ * leading zero, no whitespace and no fraction. Identical to the class
+ * `scripts/dev-web.sh` accepts, so a value that passes the launcher's preflight
+ * is read the same way in the browser.
+ */
+const RECEIVE_SLOTS_PATTERN = /^[1-9][0-9]*$/;
+
+/**
+ * Parse a configured N (e.g. `VITE_DT_RECEIVE_SLOTS`). THROWS; never falls back.
+ *
+ * `undefined` — the knob is ABSENT — yields the SDK default with
+ * `source: 'default'`. Anything present must match `^[1-9][0-9]*$`: `0`, `03`,
+ * `3.0`, ` 3`, `-1`, the empty string and non-numeric values all throw a
+ * {@link ClientConfigError}, because a silently substituted N is a participant
+ * who hears fewer people than the operator configured with nothing saying so.
+ * The upper bound (`ingress.maxDecodeLanes`) is checked by
+ * {@link validateMediaConfig} against the config the value lands in.
+ */
+export function parseReceiveSlots(raw: string | undefined): ParsedReceiveSlots {
+  if (raw === undefined) {
+    return { count: DEFAULT_RECEIVE_AUDIO_SLOTS, source: 'default' };
+  }
+  if (!RECEIVE_SLOTS_PATTERN.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw new ClientConfigError(
+      'media.receive.audioSlots',
+      `the receive-slot count must be an integer >= 1 written without sign, leading zero, ` +
+        `whitespace or fraction; got ${JSON.stringify(raw.slice(0, 32))}`,
+    );
+  }
+  return { count: Number(raw), source: 'configured' };
+}
+
 /** Telemetry cadence. */
 export interface TelemetryCadenceConfig {
   /**
@@ -291,6 +374,7 @@ export interface MediaConfig {
   readonly egress: EgressConfig;
   readonly ingress: IngressConfig;
   readonly receiverState: ReceiverStateConfig;
+  readonly receive: ReceiveConfig;
 }
 
 /** The SDK's configurable surface. */
@@ -494,6 +578,9 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
       replayWindowBits: DEFAULT_REPLAY_WINDOW_BITS,
       maxTransmitKeysPerSender: DEFAULT_TRANSMIT_KEYS_PER_SENDER,
     },
+    receive: {
+      audioSlots: DEFAULT_RECEIVE_AUDIO_SLOTS,
+    },
   },
   telemetry: {
     metricExportIntervalMs: DEFAULT_METRIC_EXPORT_INTERVAL_MS,
@@ -533,7 +620,7 @@ function positiveInteger(value: number, key: string): void {
  *     to the app queue rather than a backstop.
  */
 export function validateMediaConfig(media: MediaConfig): void {
-  const { audio, keys, egress, ingress, receiverState } = media;
+  const { audio, keys, egress, ingress, receiverState, receive } = media;
 
   positiveInteger(audio.sampleRateHz, 'media.audio.sampleRateHz');
   positiveInteger(audio.channels, 'media.audio.channels');
@@ -569,6 +656,17 @@ export function validateMediaConfig(media: MediaConfig): void {
   positiveInteger(ingress.maxDecodeLanes, 'media.ingress.maxDecodeLanes');
   positiveInteger(ingress.decoderRestartBackoffMs, 'media.ingress.decoderRestartBackoffMs');
   positiveInteger(ingress.decoderPendingFrames, 'media.ingress.decoderPendingFrames');
+  positiveInteger(receive.audioSlots, 'media.receive.audioSlots');
+  // The client-side ceiling on N: every declared slot can be filled by a
+  // distinct sender, and each assigned sender needs its own decode lane.
+  if (receive.audioSlots > ingress.maxDecodeLanes) {
+    throw new ClientConfigError(
+      'media.receive.audioSlots',
+      `media.receive.audioSlots (${receive.audioSlots}) must not exceed ` +
+        `media.ingress.maxDecodeLanes (${ingress.maxDecodeLanes}); otherwise an assigned sender ` +
+        `would have no decoder and every one of its frames would be dropped`,
+    );
+  }
   if (ingress.hopRestartBackwardJumpFrames >= HOP_HALF_SPACE) {
     throw new ClientConfigError(
       'media.ingress.hopRestartBackwardJumpFrames',

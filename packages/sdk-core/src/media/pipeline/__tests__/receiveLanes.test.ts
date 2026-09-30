@@ -256,3 +256,33 @@ describe('close()', () => {
     expect(r.lanes.laneFor(33)).toBeUndefined();
   });
 });
+
+describe('lane decode activity (story 2 R-28 deficit input)', () => {
+  it('counts decoder OUTPUTS per lane, and opens each lane with its sender id', async () => {
+    const r = rig();
+    r.lanes.setAssignments(assign([0, 7], [1, 8]));
+    await settle();
+    expect(r.playback.lanes.map((l) => l.senderId).sort()).toEqual([7, 8]);
+    const before = r.lanes.activityFor(7);
+    expect(before?.decoded).toBe(0);
+    r.lanes.laneFor(7)?.decode(frameOf(1));
+    r.lanes.laneFor(7)?.decode(frameOf(2));
+    expect(r.lanes.activityFor(7)).toEqual({ epoch: before?.epoch, decoded: 2 });
+    expect(r.lanes.activityFor(8)?.decoded).toBe(0);
+    expect(r.lanes.activityFor(99)).toBeUndefined();
+  });
+
+  it('a sender that leaves and returns gets a NEW epoch whose count restarts', async () => {
+    const r = rig();
+    r.lanes.setAssignments(assign([0, 7]));
+    await settle();
+    r.lanes.laneFor(7)?.decode(frameOf(1));
+    const first = r.lanes.activityFor(7);
+    r.lanes.setAssignments(assign([0, undefined]));
+    r.lanes.setAssignments(assign([0, 7]));
+    await settle();
+    const second = r.lanes.activityFor(7);
+    expect(second?.epoch).not.toBe(first?.epoch);
+    expect(second?.decoded).toBe(0);
+  });
+});

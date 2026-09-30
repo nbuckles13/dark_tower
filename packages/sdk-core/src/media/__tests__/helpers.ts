@@ -148,10 +148,12 @@ export function gateFor(...senderIds: number[]): SenderGate & {
 export function assignmentsOn(
   urls: readonly string[],
   senderId: number,
-): { slotId: number; senderId: number | undefined; mediaHandlerUrl: string }[] {
+): { slotId: number; senderId: number | undefined; mediaHandlerUrl: string; active: boolean }[] {
   return urls.map((mediaHandlerUrl, slotId) => ({
     slotId,
     senderId: mediaHandlerUrl === '' ? undefined : senderId,
     mediaHandlerUrl,
+    // A filled slot is MC-active; an unfilled one is not.
+    active: mediaHandlerUrl !== '',
   }));
 }

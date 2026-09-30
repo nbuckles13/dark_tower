@@ -28,6 +28,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { TONE_RUNTIME_TOKENS } from './toneMarkers.js';
 
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO_ROOT = join(PKG_ROOT, '..', '..');
@@ -90,6 +91,20 @@ const FORBIDDEN_TOKENS = [
   ...forbiddenFixtureValues(),
 ];
 
+// Story 2 R-7 (@security A1): the library build's `__DT_TEST_TONE__` is a hard
+// `false`, so the published sdk-core's RUNTIME carries neither the gate nor the
+// tone synthesis nor the `test_tone` mode token. Each marker is a string or DOM
+// method name the minifier cannot rename, and none appears in production code
+// outside that gate. The markers are `TONE_RUNTIME_TOKENS` (`./toneMarkers.ts`);
+// the app bundle's scan asserts its FORBIDDEN list is a superset of them and its
+// positive-control build proves each one real.
+//
+// Scanned in EVERY dist artifact except type declarations (`.d.ts`, `.d.mts`,
+// `.d.cts` and their maps). The declarations legitimately carry the public
+// `MediaCaptureSourceMode = 'microphone' | 'test_tone'` type and the doc comments
+// naming the gate; a type is not code, and forbidding it would forbid the SDK
+// from typing its own metric label. What must never ship is the synthesis.
+
 function listFiles(dir: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(dir)) {
@@ -129,6 +144,20 @@ describe('R-14: production bundle excludes the dev-trust path', () => {
     expect(scanForTokens(executableFiles)).toEqual([]);
   });
 
+  it('carries no test-tone synthesis, gate or mode token outside type declarations', () => {
+    // DENY-list of declaration files, not an allow-list of runtime ones
+    // (@security): a future chunk extension is scanned by default.
+    const isDeclaration = (f: string): boolean => /\.d\.[cm]?ts(\.map)?$/.test(f);
+    const scanned = listFiles(DIST).filter((f) => !isDeclaration(f));
+    // VACUITY CONTROL, with its own message: the scan must have read at least one
+    // runtime file of EACH module format, or "no marker found" proves nothing.
+    expect(
+      scanned.some((f) => f.endsWith('.mjs')) && scanned.some((f) => f.endsWith('.cjs')),
+      'SCAN VACUOUS: no .mjs and .cjs runtime artifact was scanned for the tone markers',
+    ).toBe(true);
+    expect(scanForTokens(scanned, TONE_RUNTIME_TOKENS)).toEqual([]);
+  });
+
   it('contains none of the dev-trust tokens in ANY dist artifact (matches dt-guard dist scan)', () => {
     // Stricter, belt-and-suspenders check aligned with the R-14 dt-guard's
     // state-4 dist scan (`ts_dev_trust.rs`), which walks every file under
@@ -139,11 +168,14 @@ describe('R-14: production bundle excludes the dev-trust path', () => {
   });
 });
 
-function scanForTokens(files: readonly string[]): string[] {
+function scanForTokens(
+  files: readonly string[],
+  tokens: readonly string[] = FORBIDDEN_TOKENS,
+): string[] {
   const offenders: string[] = [];
   for (const file of files) {
     const content = readFileSync(file, 'utf8');
-    for (const token of FORBIDDEN_TOKENS) {
+    for (const token of tokens) {
       if (content.includes(token)) {
         offenders.push(`${file.replace(DIST + '/', '')}: ${token}`);
       }

@@ -310,11 +310,13 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
         meeting_kek: kek.clone(),
         kek_generation: 65535,
         kek_rotation_debounce_seconds: 0,
+        max_receive_slots: Some(8),
     });
 
     assert_eq!(out.sender_id, Some(65535));
     assert_eq!(out.meeting_kek, kek);
     assert_eq!(out.kek_generation, 65535);
+    assert_eq!(out.max_receive_slots, Some(8));
     // The roster carries both halves of the attribution chain and no other key
     // material (ADR-0036 §4).
     assert_eq!(out.existing_participants[0].sender_id, Some(2));
@@ -774,4 +776,68 @@ fn debug_redaction_survives_the_enclosing_envelope() {
     let rendered = format!("{envelope:?}");
     assert!(!rendered.contains("195, 195"));
     assert!(rendered.contains("<redacted 32 B>"));
+}
+
+// ---------------------------------------------------------------------------
+// Story 2 task 13: MC's receive-slot cap advertised on the join (R-1, R-23)
+// ---------------------------------------------------------------------------
+
+/// The cap survives by VALUE. A value other than the default 8 so a codegen
+/// slip that wired the field to a neighbour's tag reds here.
+#[test]
+fn max_receive_slots_roundtrips_by_value() {
+    let out = roundtrip(&JoinResponse {
+        participant_id: "p-1".to_string(),
+        max_receive_slots: Some(5),
+        kek_rotation_debounce_seconds: 60,
+        ..Default::default()
+    });
+    assert_eq!(out.max_receive_slots, Some(5));
+    // The additive field does not disturb its neighbour.
+    assert_eq!(out.kek_rotation_debounce_seconds, 60);
+}
+
+/// ABSENT is the older-MC observable: "cap unknown". It must decode as absent,
+/// never as a present 0 — dropping `optional` would make the two one value.
+#[test]
+fn max_receive_slots_absent_decodes_as_absent_not_zero() {
+    let out = roundtrip(&JoinResponse {
+        participant_id: "p-1".to_string(),
+        max_receive_slots: None,
+        ..Default::default()
+    });
+    assert_eq!(out.max_receive_slots, None);
+    assert_ne!(out.max_receive_slots, Some(0));
+}
+
+/// A PRESENT 0 is a contract violation the client must surface loudly; it can
+/// only do so if the wire keeps it distinct from absence.
+#[test]
+fn max_receive_slots_zero_survives_as_a_present_zero_not_absence() {
+    let out = roundtrip(&JoinResponse {
+        max_receive_slots: Some(0),
+        ..Default::default()
+    });
+    assert_eq!(out.max_receive_slots, Some(0));
+    assert_ne!(out.max_receive_slots, None);
+}
+
+/// The cap is shown in the clear by the hand-written redacting `Debug`, whose
+/// field list has no compiler-enforced exhaustiveness.
+#[test]
+fn debug_shows_the_receive_slot_cap_in_the_clear() {
+    let join = JoinResponse {
+        meeting_kek: vec![0xC3u8; 32],
+        max_receive_slots: Some(7),
+        ..Default::default()
+    };
+    let rendered = format!("{join:?}");
+    assert!(
+        rendered.contains("max_receive_slots: Some(7)"),
+        "the cap must be visible: {rendered}"
+    );
+    assert!(
+        !rendered.contains("195, 195"),
+        "KEK bytes must not be printed"
+    );
 }

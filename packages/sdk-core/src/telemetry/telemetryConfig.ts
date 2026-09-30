@@ -134,6 +134,18 @@ interface ConfiguredProviders {
   readonly meterProvider: MeterProvider;
   readonly tracerProvider: WebTracerProvider;
   readonly metricsSink: MetricsSink;
+  /** The export interval the reader was ACTUALLY built with. */
+  readonly metricExportIntervalMs: number;
+}
+
+/**
+ * THE one computation of the metric export interval. The OTel reader is built
+ * from it, and {@link getMetricExportIntervalMs} reads the value it produced, so
+ * a per-interval media signal (`dt_client_media_receive_source_deficit_total`)
+ * ticks at the cadence the exporter actually runs at.
+ */
+function resolveMetricExportIntervalMs(config: TelemetryConfig | undefined): number {
+  return config?.metricExportIntervalMs ?? DEFAULT_METRIC_EXPORT_INTERVAL_MS;
 }
 
 let configured: ConfiguredProviders | undefined;
@@ -278,9 +290,10 @@ export function configureTelemetry(config: TelemetryConfig): MetricsSink {
   const exporter = createMetricExporter(config.telemetryEndpoint, config.authTokenProvider);
   // Read from ONE named configuration point, never a literal here. See
   // `TelemetryConfig.metricExportIntervalMs` for the global blast radius.
+  const metricExportIntervalMs = resolveMetricExportIntervalMs(config);
   const reader = new PeriodicExportingMetricReader({
     exporter,
-    exportIntervalMillis: config.metricExportIntervalMs ?? DEFAULT_METRIC_EXPORT_INTERVAL_MS,
+    exportIntervalMillis: metricExportIntervalMs,
   });
   const meterProvider = new MeterProvider({ resource, readers: [reader] });
   metrics.setGlobalMeterProvider(meterProvider);
@@ -292,7 +305,7 @@ export function configureTelemetry(config: TelemetryConfig): MetricsSink {
   const meter: Meter = meterProvider.getMeter(METER_NAME, __SDK_VERSION__);
   const metricsSink = new OtelMetricsSink(meter, guardModeFor(config.env));
 
-  configured = { meterProvider, tracerProvider, metricsSink };
+  configured = { meterProvider, tracerProvider, metricsSink, metricExportIntervalMs };
   return metricsSink;
 }
 
@@ -304,6 +317,15 @@ export function getMeter(): Meter | undefined {
 /** The configured global `Tracer`, or `undefined` if `configureTelemetry` has not run. */
 export function getTracer(): Tracer | undefined {
   return configured?.tracerProvider.getTracer(METER_NAME, __SDK_VERSION__);
+}
+
+/**
+ * The metric export interval in ms: the value the configured reader runs at, or
+ * the default a reader WOULD run at when telemetry is unconfigured (nothing is
+ * exported then, so the choice cannot disagree with anything).
+ */
+export function getMetricExportIntervalMs(): number {
+  return configured?.metricExportIntervalMs ?? resolveMetricExportIntervalMs(undefined);
 }
 
 /** The configured production `MetricsSink`, or `undefined` if unconfigured. */

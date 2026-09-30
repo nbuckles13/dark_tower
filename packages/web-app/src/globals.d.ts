@@ -8,6 +8,12 @@ declare const __SDK_VERSION__: string;
 declare const __DEV_TRUST_FINGERPRINT__: boolean;
 /** Separate flag from __DEV_TRUST_FINGERPRINT__: gates the E2E test bus. */
 declare const __E2E_HOOKS__: boolean;
+/**
+ * Story 2 R-7: the test-tone build define — opt-in (`DT_TEST_TONE=1`) in dev,
+ * a hard `false` in production (the opt-in THROWS there). See
+ * `vite/testTone.ts`. Read only by the SDK's capture-source selection.
+ */
+declare const __DT_TEST_TONE__: boolean;
 /** Dev MC/MH cert SHA-256 fingerprints (base64); empty in prod / when absent. */
 declare const __DEV_CERT_SHA256_HASHES__: readonly string[];
 

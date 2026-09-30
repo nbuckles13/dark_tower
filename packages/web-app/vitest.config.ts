@@ -9,6 +9,10 @@ import { playwright } from '@vitest/browser-playwright';
 // here (@observability/@test REQ-2) so telemetry-touching imports resolve.
 export default defineConfig({
   define: {
+    // Story 2 R-7: the test-tone build define is FALSE under every test runner,
+    // so the default suite runs the microphone path and an accidentally
+    // default-on tone cannot hide in it (@security A3).
+    __DT_TEST_TONE__: JSON.stringify(false),
     __SDK_VERSION__: JSON.stringify('0.0.0-test'),
     __DEV_TRUST_FINGERPRINT__: JSON.stringify(true),
     // Enabled so the `window.__darktower_test__` bus is exercisable at this tier.

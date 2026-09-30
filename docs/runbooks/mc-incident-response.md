@@ -1974,7 +1974,11 @@ Every rejection token names a **client** defect, so a rise is a client
 fleet problem and points at a client release, not an MC deploy:
 `duplicate_slot_id`, `slot_count_over_cap` (the client asked for more slots than
 `MC_MAX_RECEIVE_SLOTS` — compare its configured N with the `mc_media_receive_slot_cap`
-gauge; a cap below legitimate clients' N is a configuration mismatch), `slot_id_out_of_range`, `pinned_sender_id_zero`,
+gauge; a cap below legitimate clients' N is a configuration mismatch. A current SDK refuses an
+over-cap N LOCALLY — it reads the cap off `JoinResponse.max_receive_slots` — and counts it on
+`dt_client_media_receive_slots_rejected_total`, so an MC-side `slot_count_over_cap` means an SDK
+predating that field or a client ignoring it; for "hears nobody" with this rate flat, read the
+client counter and `docs/runbooks/client-dev-local.md` F18), `slot_id_out_of_range`, `pinned_sender_id_zero`,
 `pinned_sender_id_out_of_range`, `declaration_budget_exhausted` (the client blew
 `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` on one connection — a re-declaration
 loop). `media_kind_unspecified` most often means a **version-skewed** client, not
@@ -2839,7 +2843,10 @@ reporter's slots are all full with earlier joiners: the N+2th sender gets no slo
 unreachable set ("no slot" is not "unreachable"), and the reporter's slots show `ACTIVE` for the
 earliest joiners. **Remedy: raise the client's N** (`VITE_DT_RECEIVE_SLOTS`), within
 `MC_MAX_RECEIVE_SLOTS` (published as `mc_media_receive_slot_cap`). A declaration above the cap is
-rejected whole and counted as `slot_count_over_cap` — see the client media signalling section.
+rejected whole and counted as `slot_count_over_cap` — see the client media signalling section. A
+current SDK refuses such an N itself (the cap is advertised on `JoinResponse.max_receive_slots`) and
+counts it on `dt_client_media_receive_slots_rejected_total` instead, so a flat MC over-cap rate does
+not rule this arm out.
 
 **(c) MH refused the WHOLE snapshot on a policy bound — a REAL fault.** MC co-locates edges: in an
 all-connected meeting **every** edge lands on ONE handler while the other carries none, and MC does

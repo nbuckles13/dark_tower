@@ -166,6 +166,10 @@ Complete ALL items before deploying to production:
     coupled set then; revisit this line at that point.
   - Note: `## Rollback Procedure` below covers rolling back the *repo*, not a
     *deployment* — a deployment rollback must revert MC and the SDK together.
+  - **Story 2 task 13 (`JoinResponse.max_receive_slots`) needs NO roll order.**
+    The field is additive: an older SDK ignores it; a newer SDK against an older
+    MC sees it absent, treats the cap as unknown and declares, and MC's
+    whole-declaration rejection (`slot_count_over_cap`) stays the enforcer.
   - **Story 2 task 20 (shared-handler edge model) adds a VERSION-SKEW WINDOW,
     not just an ordering rule** — see Deployment Steps §0. MC now offers every
     handler and may direct a sender at SEVERAL handlers and a subscriber's slots

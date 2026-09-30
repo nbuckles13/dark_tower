@@ -24,8 +24,8 @@
 //! authenticate; dropping costs nothing because the value is constant.
 //!
 //! It bounds neither the value domain nor the distinct-value COUNT of any other
-//! key. The bounded-cardinality property of `reason`/`outcome`/`action`/`source`
-//! comes from the SDK types in
+//! key. The bounded-cardinality property of
+//! `reason`/`outcome`/`action`/`source`/`mode` comes from the SDK types in
 //! `packages/sdk-core/src/media/setup/mediaMetrics.ts` and holds for an HONEST
 //! client only: a patched client can inflate their distinct-value count, and the
 //! collector's charset regex bounds bytes and charset, not count.
@@ -38,9 +38,9 @@
 //! # Two key tiers
 //!
 //! The base [`ALLOWLIST`] applies everywhere. Metric **datapoint** attributes
-//! additionally admit [`MEDIA_DATAPOINT_EXTRA`] — the five keys the media
-//! counters discriminate on. The tier is datapoint-only because those four
-//! non-custody keys are GENERIC names: a future free-text `reason` (an error
+//! additionally admit [`MEDIA_DATAPOINT_EXTRA`] — the keys the media metrics
+//! discriminate on. The tier is datapoint-only because its non-custody keys
+//! are GENERIC names: a future free-text `reason` (an error
 //! message, say) riding a SPAN would leak, and the trace path has no collector
 //! `keep_keys` backstop, while spans deliberately retain `meeting_id_hash`.
 //!
@@ -84,7 +84,7 @@ pub const ALLOWLIST: [&str; 12] = [
     "error.code",
 ];
 
-/// The five keys additionally admitted on metric **datapoint** attributes only.
+/// The keys additionally admitted on metric **datapoint** attributes only.
 ///
 /// A DELTA, never a second full list: the union with [`ALLOWLIST`] is computed
 /// in [`key_allowed`] and is deliberately never written down. A 17-key array
@@ -100,18 +100,28 @@ pub const ALLOWLIST: [&str; 12] = [
 /// that does and does not promise): `key_custody` is the constant `operator`;
 /// `reason`, `outcome`, `action` and `source` are bounded enums declared in
 /// `packages/sdk-core/src/media/setup/mediaMetrics.ts` and
-/// `packages/sdk-core/src/media/frame/rejectReason.ts`. None carries a
-/// participant, meeting or stream identity. Deliberately NOT mirrored as a Rust
-/// enum here: that would be a fourth, unguarded copy of a TypeScript-owned
-/// vocabulary whose own SSoT is a Guarded Shared Area.
-pub const MEDIA_DATAPOINT_EXTRA: [&str; 5] =
-    ["reason", "outcome", "action", "source", KEY_CUSTODY_LABEL];
+/// `packages/sdk-core/src/media/frame/rejectReason.ts`; `mode` is the bounded
+/// capture-source type `MediaCaptureSourceMode` (`microphone` | `test_tone`),
+/// declared in `packages/sdk-core/src/media/setup/mediaMetrics.ts` and carried
+/// only by `dt_client_media_capture_source` — a build-time property, not a
+/// per-user one. None carries a participant, meeting or stream identity.
+/// Deliberately NOT mirrored as a Rust enum here: that would be a fourth,
+/// unguarded copy of a TypeScript-owned vocabulary whose own SSoT is a Guarded
+/// Shared Area.
+pub const MEDIA_DATAPOINT_EXTRA: [&str; 6] = [
+    "reason",
+    "outcome",
+    "action",
+    "source",
+    "mode",
+    KEY_CUSTODY_LABEL,
+];
 
 /// Which key tier applies at a given call site.
 ///
 /// Never selected from [`AttrKind`]: exemplar `filtered_attributes` are reported
 /// as `AttrKind::Datapoint` for metric purposes, so tiering on the kind would
-/// silently open the five keys on exemplars.
+/// silently open the media keys on exemplars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tier {
     /// [`ALLOWLIST`] only.
@@ -448,7 +458,7 @@ pub fn filter_metrics(
                                 // Exemplars get the BASE tier, deliberately: this
                                 // call sits directly below the datapoint call
                                 // above and is the site a skimming review merges
-                                // with it. Widening the five generic keys onto
+                                // with it. Widening the generic media keys onto
                                 // exemplar attributes would put them on a path
                                 // with no collector `keep_keys` backstop.
                                 filter_base_attrs(
@@ -471,7 +481,7 @@ pub fn filter_metrics(
                                 // Exemplars get the BASE tier, deliberately: this
                                 // call sits directly below the datapoint call
                                 // above and is the site a skimming review merges
-                                // with it. Widening the five generic keys onto
+                                // with it. Widening the generic media keys onto
                                 // exemplar attributes would put them on a path
                                 // with no collector `keep_keys` backstop.
                                 filter_base_attrs(
@@ -494,7 +504,7 @@ pub fn filter_metrics(
                                 // Exemplars get the BASE tier, deliberately: this
                                 // call sits directly below the datapoint call
                                 // above and is the site a skimming review merges
-                                // with it. Widening the five generic keys onto
+                                // with it. Widening the generic media keys onto
                                 // exemplar attributes would put them on a path
                                 // with no collector `keep_keys` backstop.
                                 filter_base_attrs(
@@ -517,7 +527,7 @@ pub fn filter_metrics(
                                 // Exemplars get the BASE tier, deliberately: this
                                 // call sits directly below the datapoint call
                                 // above and is the site a skimming review merges
-                                // with it. Widening the five generic keys onto
+                                // with it. Widening the generic media keys onto
                                 // exemplar attributes would put them on a path
                                 // with no collector `keep_keys` backstop.
                                 filter_base_attrs(
@@ -554,7 +564,7 @@ pub fn filter_metrics(
 /// `{ message, code }`), so there is nothing to filter there — that is a
 /// documented non-gap, not a skipped level.
 ///
-/// Every level here is BASE tier and overwrite-only: the five media
+/// Every level here is BASE tier and overwrite-only: the media
 /// discriminators do not pass on spans (they are generic names with no collector
 /// backstop on the trace path), and `org_id` is corrected where present but never
 /// invented — a span that carried none still carries none. Same
@@ -1061,23 +1071,51 @@ mod tests {
     // ---- Media datapoint tier (blocker 2) ----------------------------------
 
     #[test]
-    fn media_datapoint_extra_has_exactly_5_keys() {
-        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 5);
+    fn media_datapoint_extra_has_exactly_6_keys() {
+        // The one deliberate length literal: the tripwire that makes adding a
+        // key a conscious edit. Everything else derives from the const.
+        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 6);
+    }
+
+    /// The media-key fixtures below must cover the const EXACTLY, so a seventh
+    /// key that no fixture carries fails here instead of going untested.
+    fn assert_fixture_covers_media_keys(fixture: &[KeyValue]) {
+        let mut got: Vec<&str> = fixture.iter().map(|kv| kv.key.as_str()).collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = MEDIA_DATAPOINT_EXTRA.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "fixture keys must equal MEDIA_DATAPOINT_EXTRA");
+    }
+
+    /// One value per media key, distinct and recognisable.
+    fn media_keys() -> Vec<KeyValue> {
+        vec![
+            string_attr("reason", "decrypt_failed"),
+            string_attr("outcome", "kek_generation_not_held"),
+            string_attr("action", "unmute"),
+            string_attr("source", "join_response"),
+            string_attr("mode", "test_tone"),
+            string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+        ]
     }
 
     #[test]
-    fn five_media_keys_survive_on_a_datapoint_with_values_intact() {
+    fn media_keys_survive_on_a_datapoint_with_values_intact() {
         // Distinct, recognisable values: this pins that the filter neither
         // rewrites a value nor cross-assigns one key's value to another.
-        let mut req = sum_req_with(vec![
+        let media = vec![
             string_attr("reason", "no_kek_for_generation"),
             string_attr("outcome", "wrap_key_id_mismatch"),
             string_attr("action", "mute"),
             string_attr("source", "join_response"),
+            string_attr("mode", "test_tone"),
             string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
-            string_attr("client_version", "0.0.0"),
-            string_attr("participant_id", "p-42"), // not allowlisted → dropped
-        ]);
+        ];
+        assert_fixture_covers_media_keys(&media);
+        let mut attrs = media;
+        attrs.push(string_attr("client_version", "0.0.0"));
+        attrs.push(string_attr("participant_id", "p-42")); // not allowlisted → dropped
+        let mut req = sum_req_with(attrs);
         let counts = filter_metrics(&mut req, TEST_ORG);
 
         assert_eq!(counts.datapoint, 1, "only the unlisted key is dropped");
@@ -1087,6 +1125,7 @@ mod tests {
             ("outcome", "wrap_key_id_mismatch"),
             ("action", "mute"),
             ("source", "join_response"),
+            ("mode", "test_tone"),
             (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             ("client_version", "0.0.0"),
         ] {
@@ -1103,31 +1142,24 @@ mod tests {
     }
 
     #[test]
-    fn five_media_keys_are_dropped_at_resource_and_span_level() {
+    fn media_keys_are_dropped_at_resource_and_span_level() {
         // Pins the tier as DATAPOINT-ONLY, so a later "just add them to
         // ALLOWLIST" refactor fails here rather than silently widening the
         // trace path (which has no collector keep_keys backstop).
-        let five = || {
-            vec![
-                string_attr("reason", "decrypt_failed"),
-                string_attr("outcome", "kek_generation_not_held"),
-                string_attr("action", "unmute"),
-                string_attr("source", "join_response"),
-                string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
-            ]
-        };
+        assert_fixture_covers_media_keys(&media_keys());
+        let expected = MEDIA_DATAPOINT_EXTRA.len() as u64;
 
         let mut m = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    attributes: five(),
+                    attributes: media_keys(),
                     dropped_attributes_count: 0,
                 }),
                 scope_metrics: vec![],
                 schema_url: String::new(),
             }],
         };
-        assert_eq!(filter_metrics(&mut m, TEST_ORG).resource, 5);
+        assert_eq!(filter_metrics(&mut m, TEST_ORG).resource, expected);
 
         let mut t = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -1135,7 +1167,7 @@ mod tests {
                 scope_spans: vec![ScopeSpans {
                     scope: None,
                     spans: vec![Span {
-                        attributes: five(),
+                        attributes: media_keys(),
                         ..Default::default()
                     }],
                     schema_url: String::new(),
@@ -1143,13 +1175,14 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        assert_eq!(filter_traces(&mut t, TEST_ORG).span, 5);
+        assert_eq!(filter_traces(&mut t, TEST_ORG).span, expected);
     }
 
     #[test]
-    fn five_media_keys_are_dropped_on_exemplar_attributes() {
+    fn media_keys_are_dropped_on_exemplar_attributes() {
         // The ninth call site. Exemplars report as `AttrKind::Datapoint`, so a
         // tier selected from the kind would silently open these keys here.
+        assert_fixture_covers_media_keys(&media_keys());
         let mut req = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: None,
@@ -1160,13 +1193,7 @@ mod tests {
                             data_points: vec![NumberDataPoint {
                                 attributes: vec![],
                                 exemplars: vec![Exemplar {
-                                    filtered_attributes: vec![
-                                        string_attr("reason", "decrypt_failed"),
-                                        string_attr("outcome", "wrap_key_id_mismatch"),
-                                        string_attr("action", "mute"),
-                                        string_attr("source", "join_response"),
-                                        string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
-                                    ],
+                                    filtered_attributes: media_keys(),
                                     ..Default::default()
                                 }],
                                 ..Default::default()

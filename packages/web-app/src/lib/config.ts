@@ -6,7 +6,8 @@
 // GC is same-origin too. Telemetry is OFF unless an endpoint is configured
 // (@observability): the SDK stays on NoopMetricsSink until `configure` is called.
 
-import type { DevCertificateHash, TelemetryEnv } from '@darktower/sdk-core';
+import { parseReceiveSlots } from '@darktower/sdk-core';
+import type { DevCertificateHash, ParsedReceiveSlots, TelemetryEnv } from '@darktower/sdk-core';
 
 /** Resolved demo configuration. */
 export interface DemoConfig {
@@ -20,6 +21,23 @@ export interface DemoConfig {
   readonly telemetryEndpoint?: string;
   /** Dev MC/MH cert fingerprints for WebTransport pinning (empty in prod). */
   readonly devCertHashes: readonly DevCertificateHash[];
+  /**
+   * N — the audio receive slots this client declares, from
+   * `VITE_DT_RECEIVE_SLOTS`, with whether it was configured or defaulted.
+   *
+   * N IS A REQUEST bounded by MC's `MC_MAX_RECEIVE_SLOTS` (advertised on
+   * `JoinResponse.max_receive_slots`). Above the cap MC rejects the WHOLE
+   * declaration — never clamps — so the SDK refuses it loudly at `startMedia()`
+   * and the in-meeting view shows the error; nothing shrinks N to fit. Two
+   * quantities, not a duplicate: no copy of the cap exists here.
+   *
+   * A BROWSER-SIDE BUILD KNOB, NOT COVERED BY `dt-guard env-config` (which reads
+   * `infra/services/**` only). The browser suite asserts the effective N at
+   * runtime (the E2E bus `receiveSlots` event) instead. `scripts/dev-web.sh`
+   * always exports it (its demo topology, `DEMO_RECEIVE_SLOTS`); absent, the
+   * SDK's own default applies and is reported as `source: 'default'`.
+   */
+  readonly receiveSlots: ParsedReceiveSlots;
 }
 
 /** Map the Vite mode string to the SDK's bounded telemetry env. */
@@ -51,6 +69,11 @@ export function loadConfig(): DemoConfig {
     value: decodeBase64(b64),
   }));
 
+  // THROWS on a present-but-malformed value (`0`, `03`, `3.0`, ` 3`, empty,
+  // non-numeric) — the same class `scripts/dev-web.sh` refuses — rather than
+  // falling back: a silently substituted N is a participant who hears fewer
+  // people than configured with nothing saying so.
+  const receiveSlots = parseReceiveSlots(env.VITE_DT_RECEIVE_SLOTS);
   const telemetryEndpoint = env.VITE_TELEMETRY_ENDPOINT;
   const gcBaseUrl = env.VITE_GC_BASE_URL ?? '';
   if (telemetryEndpoint) {
@@ -61,6 +84,7 @@ export function loadConfig(): DemoConfig {
     gcBaseUrl,
     env: toTelemetryEnv(env.MODE),
     devCertHashes,
+    receiveSlots,
     ...(telemetryEndpoint ? { telemetryEndpoint } : {}),
   };
 }

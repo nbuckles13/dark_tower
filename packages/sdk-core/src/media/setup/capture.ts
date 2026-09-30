@@ -80,31 +80,11 @@ export function createMicrophoneCapture(options: {
   stop(): void;
 }> {
   const media = globalThis.navigator?.mediaDevices;
-  const Processor = (globalThis as { MediaStreamTrackProcessor?: TrackProcessorCtor })
-    .MediaStreamTrackProcessor;
+  const Processor = trackProcessor();
   if (!media || !Processor) {
     return Promise.reject(captureError(CaptureFailure.PlatformUnsupported));
   }
-
-  let track: MediaStreamTrack | undefined;
-  let reader: ReadableStreamDefaultReader<AudioData> | undefined;
-  let stopped = false;
-
-  const stop = (): void => {
-    stopped = true;
-    // Order matters: cancel the reader first so the pump's `read()` settles,
-    // then stop the track. Stopping first would leave the pump awaiting a stream
-    // that never produces and never ends.
-    try {
-      void reader?.cancel();
-    } catch {
-      // Already cancelled or errored. One bad cancel must not prevent the track
-      // from stopping — the microphone indicator is the thing that matters.
-    }
-    reader = undefined;
-    track?.stop();
-    track = undefined;
-  };
+  const capture = trackCapture(Processor);
 
   const start = async (onFrame: (data: AudioData) => void, onEnded: () => void): Promise<void> => {
     let stream: MediaStream;
@@ -130,9 +110,138 @@ export function createMicrophoneCapture(options: {
         CAPTURE_MESSAGE[CaptureFailure.NoDevice],
       );
     }
-    // REGISTERED BEFORE THE NEXT AWAIT. If anything below throws, `stop()` still
+    capture.attach(first, onFrame, onEnded);
+  };
+
+  return Promise.resolve({ start, stop: capture.stop });
+}
+
+/**
+ * TEST-TONE capture (story 2 R-7): a constant sine at `frequencyHz` in place of
+ * the microphone, behind the SAME capture seam.
+ *
+ * ---------------------------------------------------------------------------
+ * REACHABLE ONLY FROM INSIDE `if (__DT_TEST_TONE__)`
+ * ---------------------------------------------------------------------------
+ *
+ * Its one caller is the capture-source selection, `session/mediaSelection.ts:selectCaptureSource`,
+ * inside the build-time define's gate. In a production build that gate is the
+ * literal `false`, so this function is unreferenced and tree-shaken — which
+ * `packages/web-app/tests/bundle-content.test.ts` and
+ * `packages/sdk-core/tests/bundle-content.test.ts` prove by asserting
+ * `createOscillator` / `createMediaStreamDestination` are absent. Never call it
+ * from anywhere the define does not guard.
+ *
+ * ---------------------------------------------------------------------------
+ * NOTHING DOWNSTREAM KNOWS
+ * ---------------------------------------------------------------------------
+ *
+ * The oscillator feeds a `MediaStreamAudioDestinationNode`, whose track goes
+ * through the same `MediaStreamTrackProcessor` pump as a microphone track. Tone
+ * frames are then encoded, sealed, signed and sent by exactly the path a voice
+ * frame takes: no branch anywhere on the crypto or transport path reads the
+ * capture mode. `deviceId` is ignored — there is no device.
+ *
+ * `frequencyHz` comes from `./testTone.ts` (the meeting-scoped sender id, and
+ * nothing else).
+ */
+export function createTestToneCapture(options: {
+  readonly sampleRateHz: number;
+  readonly frequencyHz: number;
+}): Promise<{
+  start(onFrame: (data: AudioData) => void, onEnded: () => void): Promise<void>;
+  stop(): void;
+}> {
+  const Processor = trackProcessor();
+  const Context = (globalThis as { AudioContext?: typeof AudioContext }).AudioContext;
+  if (!Processor || !Context) {
+    return Promise.reject(captureError(CaptureFailure.PlatformUnsupported));
+  }
+  const capture = trackCapture(Processor);
+  let context: AudioContext | undefined;
+
+  // The shared teardown (reader, then track), then the tone's own context.
+  const stop = (): void => {
+    capture.stop();
+    void context?.close().catch(() => {
+      // Already closed.
+    });
+    context = undefined;
+  };
+
+  const start = async (onFrame: (data: AudioData) => void, onEnded: () => void): Promise<void> => {
+    // REGISTERED BEFORE THE NEXT AWAIT, same rule as the microphone: `stop()`
+    // must reach everything constructed so far.
+    context = new Context({ sampleRate: options.sampleRateHz });
+    const oscillator = context.createOscillator();
+    oscillator.type = 'sine';
+    oscillator.frequency.value = options.frequencyHz;
+    const destination = context.createMediaStreamDestination();
+    oscillator.connect(destination);
+    oscillator.start();
+    await context.resume();
+
+    const [first] = destination.stream.getAudioTracks();
+    if (!first) {
+      stop();
+      throw new MediaCaptureError(
+        CaptureFailure.NoDevice,
+        CAPTURE_MESSAGE[CaptureFailure.NoDevice],
+      );
+    }
+    capture.attach(first, onFrame, onEnded);
+  };
+
+  return Promise.resolve({ start, stop });
+}
+
+/** Chrome's `MediaStreamTrackProcessor`, looked up so its absence is typed. */
+function trackProcessor(): TrackProcessorCtor | undefined {
+  return (globalThis as { MediaStreamTrackProcessor?: TrackProcessorCtor })
+    .MediaStreamTrackProcessor;
+}
+
+/**
+ * THE ONE track -> frames lifecycle, shared by every capture source, so the
+ * teardown ORDER and the registration rule live in one place and a tone frame
+ * leaves through exactly the path a microphone frame does.
+ *
+ * `attach` REGISTERS the track before anything else can throw, so `stop()`
+ * reaches it and the microphone indicator goes out; if `stop()` already ran
+ * during the caller's acquisition it stops the track immediately.
+ */
+function trackCapture(Processor: TrackProcessorCtor): {
+  attach(track: MediaStreamTrack, onFrame: (data: AudioData) => void, onEnded: () => void): void;
+  stop(): void;
+} {
+  let track: MediaStreamTrack | undefined;
+  let reader: ReadableStreamDefaultReader<AudioData> | undefined;
+  let stopped = false;
+
+  const stop = (): void => {
+    stopped = true;
+    // Order matters: cancel the reader first so the pump's `read()` settles,
+    // then stop the track. Stopping first would leave the pump awaiting a stream
+    // that never produces and never ends.
+    try {
+      void reader?.cancel();
+    } catch {
+      // Already cancelled or errored. One bad cancel must not prevent the track
+      // from stopping — the microphone indicator is the thing that matters.
+    }
+    reader = undefined;
+    track?.stop();
+    track = undefined;
+  };
+
+  const attach = (
+    acquired: MediaStreamTrack,
+    onFrame: (data: AudioData) => void,
+    onEnded: () => void,
+  ): void => {
+    // REGISTERED BEFORE ANYTHING ELSE. If anything below throws, `stop()` still
     // reaches the track and the microphone indicator goes out.
-    track = first;
+    track = acquired;
     if (stopped) {
       stop();
       return;
@@ -140,13 +249,12 @@ export function createMicrophoneCapture(options: {
     // A device unplugged, revoked, or taken by the OS ends the track. Surfaced,
     // never absorbed: absence of frames is not a signal.
     track.addEventListener('ended', onEnded, { once: true });
-
     const processor = new Processor({ track });
     reader = processor.readable.getReader();
     void pump(reader, onFrame);
   };
 
-  return Promise.resolve({ start, stop });
+  return { attach, stop };
 }
 
 /**

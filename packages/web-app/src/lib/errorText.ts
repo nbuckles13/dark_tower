@@ -4,10 +4,30 @@
 // expose an SDK-authored `code` + bounded `message` (never a token / raw body);
 // anything else collapses to a generic string. Never `String(err)` / `err.stack`.
 
-import { MeetingUnauthorizedError, SdkError } from '@darktower/sdk-core';
+import {
+  MeetingUnauthorizedError,
+  SdkError,
+  SignalingError,
+  SignalingErrorCode,
+} from '@darktower/sdk-core';
+
+/**
+ * What an operator changes when the declared receive-slot count N is over MC's
+ * cap (story 2 R-1). The SDK message already names both numbers; the knobs are
+ * this app's deployment vocabulary, so they are named here, not in the SDK.
+ */
+const RECEIVE_SLOTS_OVER_CAP_FIX =
+  'Lower VITE_DT_RECEIVE_SLOTS (this app build) or raise MC_MAX_RECEIVE_SLOTS (the meeting ' +
+  'controller); nothing is received until they agree.';
 
 /** A safe, bounded display string for any caught error. */
 export function errorText(err: unknown): string {
+  if (
+    err instanceof SignalingError &&
+    err.signalingCode === SignalingErrorCode.ReceiveSlotsOverCap
+  ) {
+    return `${err.code}: ${err.message}. ${RECEIVE_SLOTS_OVER_CAP_FIX}`;
+  }
   if (err instanceof SdkError) {
     return `${err.code}: ${err.message}`;
   }

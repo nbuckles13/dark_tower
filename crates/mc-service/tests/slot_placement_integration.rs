@@ -1145,8 +1145,7 @@ async fn an_applied_echo_mismatch_on_a_re_push_is_loud() {
 async fn the_published_slot_cap_is_the_enforced_cap() {
     let snap = MetricAssertion::snapshot();
     let (_stack, _rig) = start_stack("slot-cap-gauge").await;
-    #[expect(clippy::cast_precision_loss, reason = "cap is bounded to 1..=64")]
-    let expected = client_media_config().max_receive_slots as f64;
+    let expected = f64::from(client_media_config().max_receive_slots);
     snap.gauge("mc_media_receive_slot_cap")
         .with_labels(&[("key_custody", "operator")])
         .assert_value(expected);

@@ -10,7 +10,9 @@ import {
   ClientConfigError,
   DEFAULT_CLIENT_CONFIG,
   DEFAULT_METRIC_EXPORT_INTERVAL_MS,
+  DEFAULT_RECEIVE_AUDIO_SLOTS,
   MIN_AUDIO_ROTATION_PERIOD_MS,
+  parseReceiveSlots,
   validateMediaConfig,
   type MediaConfig,
 } from '../clientConfig.js';
@@ -191,5 +193,77 @@ describe('the downlink hop-restart bound', () => {
       'media.ingress.hopRestartBackwardJumpFrames',
     );
     expect(configKeyOf(withIngress({ hopRestartBackwardJumpFrames: 2 ** 31 - 1 }))).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 2 R-1 / R-23: the receive-slot count N
+// ---------------------------------------------------------------------------
+
+describe('parseReceiveSlots', () => {
+  it('ABSENT yields the SDK default, marked as the default', () => {
+    expect(parseReceiveSlots(undefined)).toEqual({
+      count: DEFAULT_RECEIVE_AUDIO_SLOTS,
+      source: 'default',
+    });
+  });
+
+  it.each([
+    ['1', 1],
+    ['3', 3],
+    ['32', 32],
+  ])('accepts %j', (raw, count) => {
+    expect(parseReceiveSlots(raw)).toEqual({ count, source: 'configured' });
+  });
+
+  it.each([
+    [''],
+    ['0'],
+    ['03'],
+    ['-1'],
+    ['+3'],
+    ['3.0'],
+    ['1.5'],
+    [' 3'],
+    ['3 '],
+    ['abc'],
+    ['3e2'],
+    ['0x3'],
+    ['99999999999999999999'],
+  ])('REJECTS %j loudly — never falls back to a default', (raw) => {
+    expect(() => parseReceiveSlots(raw)).toThrow(ClientConfigError);
+  });
+});
+
+describe('validateMediaConfig — receive slots', () => {
+  const media = DEFAULT_CLIENT_CONFIG.media;
+
+  it('accepts N up to maxDecodeLanes', () => {
+    expect(() =>
+      validateMediaConfig({
+        ...media,
+        receive: { audioSlots: media.ingress.maxDecodeLanes },
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects N above maxDecodeLanes (the client-side ceiling)', () => {
+    expect(() =>
+      validateMediaConfig({
+        ...media,
+        receive: { audioSlots: media.ingress.maxDecodeLanes + 1 },
+      }),
+    ).toThrow(ClientConfigError);
+  });
+
+  it('rejects a non-positive N', () => {
+    expect(() => validateMediaConfig({ ...media, receive: { audioSlots: 0 } })).toThrow(
+      ClientConfigError,
+    );
+  });
+
+  it('the default maxDecodeLanes covers the demo topology N', () => {
+    // `scripts/dev-web.sh` DEMO_RECEIVE_SLOTS=3.
+    expect(media.ingress.maxDecodeLanes).toBeGreaterThanOrEqual(3);
   });
 });

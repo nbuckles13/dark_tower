@@ -43,6 +43,8 @@ const STATIC_MESSAGE: Record<SignalingErrorCode, string> = {
   [SignalingErrorCode.Framing]: 'Signaling framing error',
   [SignalingErrorCode.Transport]: 'Signaling transport closed',
   [SignalingErrorCode.Timeout]: 'Join timed out before a JoinResponse was received',
+  [SignalingErrorCode.ReceiveSlotsOverCap]:
+    'The receive-slot count exceeds the cap the meeting controller allows',
 };
 
 /**

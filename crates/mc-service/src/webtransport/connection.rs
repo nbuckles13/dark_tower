@@ -18,8 +18,9 @@ use crate::auth::McJwtValidator;
 use crate::errors::McError;
 use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
-    CapabilityOutcome, DirectiveOutcome, MuteOutcome, ReceiveCapabilityDeclaration,
-    RefusalReplySurface, ServerMuteAction, ServerMuteOutcome, UnmuteRequestOutcome,
+    CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MuteOutcome,
+    ReceiveCapabilityDeclaration, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
+    UnmuteRequestOutcome,
 };
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
@@ -182,7 +183,7 @@ pub async fn handle_connection(
     jwt_validator: Arc<McJwtValidator>,
     redis_client: Arc<dyn MhAssignmentStore>,
     media_deps: Arc<MediaRoutingDeps>,
-    client_media_config: crate::media_signaling::ClientMediaConfig,
+    client_media_config: ClientMediaConfig,
     cancel_token: CancellationToken,
 ) -> Result<(), McError> {
     // Step 1: Accept the WebTransport session
@@ -625,7 +626,7 @@ pub async fn handle_connection(
     );
 
     // Step 8: Build and send JoinResponse.
-    let join_response = build_join_response(&join_result);
+    let join_response = build_join_response(&join_result, &client_media_config);
     // R-57: symmetric outbound injection — carry the current server-side trace
     // context back to the client on the JoinResponse (bounded W3C IDs only).
     let (trace_parent, trace_state) = inject_current_context();
@@ -1206,7 +1207,7 @@ struct MediaSignalingContext {
     /// This connection's participant id.
     participant_id: String,
     /// Configured cap on declared slots per declaration.
-    max_receive_slots: usize,
+    max_receive_slots: u8,
     /// Remaining budget of ACCEPTED declarations on this connection.
     declaration_budget: u32,
     /// The last declaration the meeting actor ACCEPTED, if any.
@@ -1843,7 +1844,7 @@ async fn send_signaling(
 fn media_signaling_context(
     meeting_handle: MeetingActorHandle,
     join_result: &JoinResult,
-    config: crate::media_signaling::ClientMediaConfig,
+    config: ClientMediaConfig,
     is_host: bool,
 ) -> MediaSignalingContext {
     MediaSignalingContext::new(
@@ -1860,7 +1861,7 @@ impl MediaSignalingContext {
     fn new(
         meeting_handle: MeetingActorHandle,
         participant_id: String,
-        config: &crate::media_signaling::ClientMediaConfig,
+        config: &ClientMediaConfig,
         is_host: bool,
     ) -> Self {
         // One clock reading for every bucket: they start together at join, so a
@@ -2025,8 +2026,9 @@ async fn read_meeting_handlers(
     .map_err(|e| McError::MhAssignmentMissing(format!("{meeting_id}: {e}")))
 }
 
-/// Build a protobuf `JoinResponse` from the actor's `JoinResult`.
-fn build_join_response(result: &JoinResult) -> JoinResponse {
+/// Build a protobuf `JoinResponse` from the actor's `JoinResult` and the
+/// client media configuration this connection enforces.
+fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinResponse {
     let existing_participants = result
         .participants
         .iter()
@@ -2118,6 +2120,13 @@ fn build_join_response(result: &JoinResult) -> JoinResponse {
         kek_rotation_debounce_seconds: result.kek_rotation_debounce_seconds,
         correlation_id: result.correlation_id.clone(),
         binding_token: result.binding_token.clone(),
+        // The receive-slot cap, from the SAME `ClientMediaConfig` value
+        // `handle_receive_capability` enforces and `WebTransportServer::new`
+        // publishes as `mc_media_receive_slot_cap` — one value, three readers.
+        // INFORMATIONAL: MC stays the enforcer and rejects an over-cap
+        // declaration whole. Always set, so absence on the wire means an older
+        // MC. `u8` widened by `u32::from`: total, never `as`.
+        max_receive_slots: Some(u32::from(media.max_receive_slots)),
     }
 }
 
@@ -2255,7 +2264,7 @@ mod tests {
             crate::media_admission::fixtures::kek_lifecycle(),
         )
         .expect("system CSPRNG must be available in tests");
-        let config = crate::media_signaling::ClientMediaConfig {
+        let config = ClientMediaConfig {
             max_receive_slots: 8,
             max_receive_capability_declarations: 4,
             audio_encoding: crate::media_signaling::AudioEncoding::new(v1::Codec::Opus, 48_000, 50)

@@ -46,7 +46,14 @@ import { EgressPipeline, type DatagramSender } from '../pipeline/egress.js';
 import { IngressPipeline, type AcceptedFrame } from '../pipeline/ingress.js';
 import { ReceiveLanes, type SlotAssignment } from '../pipeline/receiveLanes.js';
 import { FirstMediaObserver } from '../setup/measurement.js';
-import { MEDIA_MUTE_ACTIONS, type MediaMetrics } from '../setup/mediaMetrics.js';
+import {
+  MEDIA_MUTE_ACTIONS,
+  type MediaCaptureSourceMode,
+  type MediaMetrics,
+} from '../setup/mediaMetrics.js';
+import type { ReceiveVerificationRecorder } from '../pipeline/receiveVerification.js';
+import { activeAssignments } from './receiveSourceDeficit.js';
+import { startIntervalSignals } from './intervalSignals.js';
 import type { KekWrapSource, MeetingKekSource } from '../setup/kekSource.js';
 import type { MeetingIdentity } from '../setup/identity.js';
 import type { RosterIdentityKeys } from '../setup/rosterKeys.js';
@@ -148,6 +155,13 @@ export interface PipelineKekSource extends MeetingKekSource, KekWrapSource {
 export interface ReceiveAssignment extends SlotAssignment {
   /** The handler owning this edge. Empty when no source is assigned. */
   readonly mediaHandlerUrl: string;
+  /**
+   * MC states this slot is ACTIVE: a sender is assigned and not source-muted
+   * (`slot_state = active`). The input the receive-source deficit compares
+   * observed decode activity against (story 2 R-28). Presentation state from
+   * MC, never an input to the slot-edge gate.
+   */
+  readonly active: boolean;
 }
 
 /** What MC directed this client to produce. Distilled from `SendDirective`. */
@@ -200,6 +214,20 @@ export interface AudioPipelineOptions {
   readonly encoderFactory: AudioEncoderFactory;
   readonly decoderFactory: AudioDecoderFactory;
   readonly playbackFactory: PlaybackSinkFactory;
+  /**
+   * What feeds the send path, for `dt_client_media_capture_source{mode}`.
+   * Decided by the caller that chose `captureFactory` — the one
+   * `__DT_TEST_TONE__`-gated site, `session/mediaSelection.ts:selectCaptureSource` — never here.
+   */
+  readonly captureSource: MediaCaptureSourceMode;
+  /**
+   * The metric export interval the per-interval signals tick at. The caller
+   * reads it from `telemetry/telemetryConfig.ts:getMetricExportIntervalMs`, the
+   * value the exporter itself runs at.
+   */
+  readonly metricExportIntervalMs: number;
+  /** Test-only receive verification (story 2 R-30). Absent in production. */
+  readonly verification?: ReceiveVerificationRecorder;
   readonly clock?: () => number;
   /** Timer seam, so rotation is testable without wall-clock waits. */
   readonly setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
@@ -481,6 +509,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       replay: this.#replay,
       firstMedia: this.#firstMedia,
       onAccepted: (frame) => this.emit('frameAccepted', frame),
+      ...(this.#options.verification ? { verification: this.#options.verification } : {}),
     });
     const ingress = this.#ingress;
     this.#transports = new ReceiveTransports({
@@ -560,6 +589,19 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     const timer = this.#rotationTimer;
     this.#teardown.register('rotation-timer', () => this.#clearInterval(timer));
 
+    // Capture-source gauge + deficit on one export-cadence timer (`intervalSignals.ts`).
+    this.#teardown.register(
+      'interval-signals-timer',
+      startIntervalSignals({
+        metrics: this.#metrics,
+        mode: this.#options.captureSource,
+        intervalMs: this.#options.metricExportIntervalMs,
+        sample: () => activeAssignments(this.#assignments, this.#options.declaredSlotIds, lanes),
+        setInterval: this.#setInterval,
+        clearInterval: this.#clearInterval,
+      }),
+    );
+
     this.#applyDirective();
     lanes.setAssignments(this.#assignments);
     this.#applyReceive();
@@ -622,10 +664,11 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    */
   setReceiveAssignments(assignments: readonly ReceiveAssignment[]): void {
     if (this.#stopped) return;
-    this.#assignments = assignments.map(({ slotId, senderId, mediaHandlerUrl }) => ({
+    this.#assignments = assignments.map(({ slotId, senderId, mediaHandlerUrl, active }) => ({
       slotId,
       senderId,
       mediaHandlerUrl,
+      active,
     }));
     this.#lanes?.setAssignments(this.#assignments);
     // Empty strings are the proto's "no source assigned" for a slot, not a
@@ -813,7 +856,8 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
         maxQueueFrames: this.#config.egress.maxQueueFrames,
         streamNumber: directive.streamNumber,
         // The relay `stream_id` this client stamps on its uplink. The declared
-        // slot id, so the value space matches what MH routes on.
+        // slot id, so the value space matches what MH routes on. Slot 0 by
+        // construction (ids are `0..N-1`, `session/mediaSelection.ts`).
         streamId: this.#options.declaredSlotIds[0] ?? 0,
         senderFor: (url) => this.#options.senderFor(url),
         onTargetNotConnected: () => {
