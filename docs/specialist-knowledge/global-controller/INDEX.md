@@ -14,29 +14,33 @@
 - Configuration (env vars, thresholds) -> `crates/gc-service/src/config.rs:Config::from_env()`
 - Error enum: HTTP status, `error.code`, `error_type` metric label -> `crates/gc-service/src/errors.rs:GcError`
 - JWT validation (validate + validate_raw for gRPC failure_reason classification) -> `crates/gc-service/src/auth/jwt.rs`
-- JWKS caching -> `crates/gc-service/src/auth/jwks.rs:JwksClient::get_key()`
-- Claims extraction -> `crates/gc-service/src/auth/claims.rs`
+- JWKS caching; claims extraction -> `crates/gc-service/src/auth/jwks.rs:JwksClient::get_key()`, `crates/gc-service/src/auth/claims.rs`
 - HTTP auth middleware (service + user token: require_auth, require_user_auth) -> `crates/gc-service/src/middleware/auth.rs`
-- gRPC auth layer (Tower, two-layer: scope + service_type routing per ADR-0003) -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`
-- gRPC failure_reason classifier for auth metrics -> `crates/gc-service/src/grpc/auth_layer.rs:classify_jwt_error()`
+- gRPC auth layer (Tower, two-layer: scope + service_type routing per ADR-0003); failure_reason classifier -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`, `classify_jwt_error()`
 - Meeting handlers (create, join, guest-token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
 - Create (exhaustive `CreateMeetingOutcome` match, per-cause log + metric label) -> `crates/gc-service/src/handlers/meetings.rs:create_meeting()`
 - Join/settings (user-auth, status allowlist, `home_org_id`, metrics) -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `update_meeting_settings()`
-- Join response construction (shared by join + guest-token) -> `crates/gc-service/src/handlers/meetings.rs:JoinMeetingResponse::new()`
-- McAssignment -> McAssignmentInfo conversion -> `crates/gc-service/src/handlers/meetings.rs:From<McAssignment>`
+- Join response construction (shared by join + guest-token; McAssignment -> McAssignmentInfo) -> `crates/gc-service/src/handlers/meetings.rs:JoinMeetingResponse::new()`, `From<McAssignment>`
 - MC gRPC service (register, heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs:McService`
 - MH gRPC service (register, load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`
-- MC assignment + load balancing; join stickiness (reuse returns existing MC, no MH selection, `mh_selection: None`, R-6) + soft-ceiling pairing note -> `crates/gc-service/src/services/mc_assignment.rs:assign_meeting_with_mh()`
+- MC assignment + load balancing; join stickiness (reuse returns existing MC, no MH selection, `mh_selection: None`, R-6) -> `crates/gc-service/src/services/mc_assignment.rs:assign_meeting_with_mh()`, `AssignmentWithMh`
 - MH selection (active/active `handlers: Vec<MhAssignmentInfo>`; `grpc_endpoint` propagated DB→info→proto) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
 - MC gRPC client (`assign_meeting` RPC carrying per-handler `webtransport_endpoint` + `grpc_endpoint`) -> `crates/gc-service/src/services/mc_client.rs:McClientTrait`
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
 - MC/MH repositories (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/` (`meeting_controllers.rs`, `media_handlers.rs`)
 - Meetings repository (create with limit check, audit log) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository::create_meeting_with_limit_check()`
-- Assignment repository (weighted select, atomic assign, row mapper) -> `crates/gc-service/src/repositories/meeting_assignments.rs`
+- Assignment repository (weighted select, atomic assign incl. ENDED-row revival per meeting incarnation) -> `crates/gc-service/src/repositories/meeting_assignments.rs:MeetingAssignmentsRepository::atomic_assign()`
+- Assignment end + batch jobs keyed on (meeting, region) -> `meeting_assignments.rs:end_assignment()`, `end_stale_assignments()`, `cleanup_old_assignments()`
 - Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`
 - Assignment cleanup (soft/hard delete) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
 - Observability metrics (incl. join metrics) -> `crates/gc-service/src/observability/metrics.rs`
 - Grafana dashboard -> `infra/grafana/dashboards/gc-overview.json`
+
+## Client telemetry proxy (OTLP ingest -> collector)
+- Routes `/api/v1/telemetry/v1/{metrics,traces}` -> `crates/gc-service/src/routes/mod.rs:build_routes()`
+- Ingest handlers, body limit, rate limiter -> `crates/gc-service/src/handlers/telemetry.rs:ingest_metrics()`, `ingest_traces()`, `TelemetryState`
+- Attribute allowlist, media datapoint tier, `org_id` stamped from `UserClaims` -> `crates/gc-service/src/services/telemetry_filter.rs:ALLOWLIST`, `MEDIA_DATAPOINT_EXTRA`, `filter_metrics()`, `filter_traces()`
+- Upstream forwarder -> `crates/gc-service/src/services/telemetry_forwarder.rs:TelemetryForwarder`
 
 ## Meeting-refusal taxonomy
 - Cause enum, metric label, SQL discriminant -> `crates/gc-service/src/repositories/meetings.rs:MeetingRefusal`, `metric_label()`, `from_discriminant()`
@@ -50,16 +54,13 @@
 
 ## Integration Seams
 - GC <-> AC (OAuth token refresh) -> `crates/common/src/token_manager.rs:TokenReceiver`
-- GC <-> AC (meeting/guest token issuance) -> `crates/gc-service/src/services/ac_client.rs`
 - GC <-> AC shared types (MeetingTokenRequest, GuestTokenRequest, TokenResponse, ParticipantType, MeetingRole) -> `crates/common/src/meeting_token.rs`
-- GC <-> MC (gRPC registration + heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs`
 - GC <-> MC (gRPC assignment RPC, requires service.write.mc per ADR-0003) -> `crates/gc-service/src/services/mc_client.rs`
-- GC <-> MH (gRPC registration + load report) -> `crates/gc-service/src/grpc/mh_service.rs`
+- GC <-> MC / MH (gRPC registration, heartbeat, load report) -> `crates/gc-service/src/grpc/mc_service.rs`, `crates/gc-service/src/grpc/mh_service.rs`
 - MhAssignmentInfo -> MhAssignment proto mapping (mh_id, webtransport_endpoint, grpc_endpoint) -> `crates/gc-service/src/services/mc_client.rs:assign_meeting()`
 - GC <-> Client (HTTP API /api/v1/*) -> `crates/gc-service/src/routes/mod.rs`
 - UserClaims (user JWT claims type) -> `crates/common/src/jwt.rs:UserClaims`
-- env-tests GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`
-- Org the env-test/browser suites create meetings in (`ENV_TEST_ORG_SUBDOMAIN`) -> `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`
+- env-tests GC client fixture -> `crates/env-tests/src/fixtures/gc_client.rs`; org the env-test/browser suites create meetings in (`ENV_TEST_ORG_SUBDOMAIN`) -> `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`
 - Per-run org provisioning (Layer 7 Phase 1h, operator lane) -> `scripts/layer7.sh`, `infra/kind/scripts/setup.sh --provision-org`
 
 ## Tests
@@ -69,7 +70,6 @@
 - Auth integration tests -> `crates/gc-service/tests/auth_tests.rs`
 - Per-metric-cluster integration tests (ADR-0032) -> `crates/gc-service/tests/*_metrics_integration.rs`
 - `error_type` label coverage -> `crates/gc-service/tests/meeting_creation_metrics_integration.rs`, `crates/gc-service/tests/errors_metric_integration.rs`
-- Metric unit tests -> `crates/gc-service/src/observability/metrics.rs` (`#[cfg(test)] mod tests`)
+- Telemetry proxy tests -> `crates/gc-service/tests/telemetry_proxy_tests.rs`, `crates/gc-service/tests/telemetry_metrics_integration.rs`
 - Test harness -> `crates/gc-test-utils/src/server_harness.rs`; per-crate JWT fixtures -> `crates/gc-service/tests/common/jwt_fixtures.rs`
-- Shared meeting-token type unit tests -> `crates/common/src/meeting_token.rs` (`#[cfg(test)]`)
 - Metrics catalog (creation + join, `error_type` value list) -> `docs/observability/metrics/gc-service.md`

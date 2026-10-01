@@ -1,7 +1,7 @@
 # User Story: Hear Each Other (N+1 Participants)
 
 **Date**: 2026-09-21
-**Status**: Ready
+**Status**: Complete
 **Participants**: auth-controller, global-controller, meeting-controller, media-handler, client, database, protocol, infrastructure, security, test, observability, operations
 
 ## Story
