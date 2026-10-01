@@ -20,7 +20,9 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Raised from 25: a cold-cache run needs ~29 min (last green on main: 23 min).
+    # The ~10 min target is tracked in docs/TODO.md §Polyglot Pipeline Follow-ups.
+    timeout-minutes: 40
 
     services:
       postgres:
