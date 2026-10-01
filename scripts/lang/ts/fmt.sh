@@ -74,6 +74,9 @@ case "$__mode" in
     __rc=$?
     set -e
     printf '%s\n' "$__out"   # preserve nx/prettier output in the layer log
+    # Parse a colour-free copy: nx colours its output whenever FORCE_COLOR is set, even with no
+    # terminal, and an escape code glued to `prettier` or to a file path defeats the matches below.
+    __out="$(printf '%s\n' "$__out" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')"
     if [[ "$__rc" -ne 0 ]]; then
       emit_status FAIL "nx-format-failed"
       exit 1

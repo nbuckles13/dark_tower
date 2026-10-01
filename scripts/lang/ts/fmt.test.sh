@@ -80,8 +80,10 @@ PJ
 # $1 = workspace; $2.. = extra env assignments (e.g. DEVLOOP_FMT_APPLY=1).
 run_fmt() {
   local ws="$1"; shift
+  # FORCE_COLOR=3: nx then colours its output (as it does in any shell that sets it), so every case
+  # also proves the wrapper parses through ANSI escape codes.
   ( cd "$ws" && env -u DEVLOOP_FMT_APPLY -u DEVLOOP_FMT_CHECK_ONLY -u GITHUB_ACTIONS -u CI \
-      NX_DAEMON=false NX_CACHE_DIRECTORY="${ws}/.nxcache" "$@" \
+      FORCE_COLOR=3 NX_DAEMON=false NX_CACHE_DIRECTORY="${ws}/.nxcache" "$@" \
       bash "${__here}/fmt.sh" 2>&1 )
 }
 
