@@ -412,11 +412,22 @@ echo "WebTransport leaf expiry (${DAYS_WT_CERT}-day validity — Chrome serverCe
 echo "  mc-webtransport: notAfter=${MC_EXPIRES_AT}"
 echo "  mh-webtransport: notAfter=${MH_EXPIRES_AT}"
 echo ""
+# Called by provision.sh, which is loading these certs into the cluster right now:
+# the "how to get them into the cluster" steps below would tell the operator to
+# run what is already running.
+if [[ "${DT_CERTS_CALLER:-}" == provision ]]; then
+  echo "provision is loading these certificates into the cluster now. Restart 'pnpm dev' afterwards"
+  echo "so the browser picks up the new fingerprints (fingerprints.json)."
+  exit 0
+fi
 echo "If the browser later refuses the MC/MH WebTransport handshake, the leaf may have"
 echo "expired (routine given the 14-day window) or the deployed cert/fingerprint may be"
-echo "stale. Re-running this script alone only rewrites the PEMs. To get them into the cluster:"
-echo "  1) dev-cluster provision   (devloop container)  or  ./infra/kind/scripts/setup.sh  (host)"
-echo "     # the provision blueprint hashes these public certs, so a renewed leaf rebuilds the"
-echo "     # cluster with fresh TLS Secrets (and fresh MC/MH pods)"
-echo "  2) restart 'pnpm dev'"
-echo "     # reloads the browser-side fingerprint from fingerprints.json"
+echo "stale. This script only rewrites the PEMs; to get them into the cluster:"
+if [[ -e /run/.containerenv || -e /.dockerenv ]]; then
+  echo "  1) dev-cluster provision"
+else
+  echo "  1) ./infra/kind/scripts/setup.sh"
+fi
+echo "     A renewed leaf changes the provision blueprint, so this rebuilds the cluster"
+echo "     with fresh TLS Secrets and MC/MH pods."
+echo "  2) Restart 'pnpm dev' so the browser picks up the new fingerprints (fingerprints.json)."

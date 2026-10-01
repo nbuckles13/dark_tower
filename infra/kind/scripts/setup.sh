@@ -575,8 +575,8 @@ main() {
 
     local yes=()
     [[ "${AUTO_YES}" != "true" ]] || yes=(--yes)
-    "${SCRIPT_DIR}/provision.sh" "${yes[@]}"
-    "${SCRIPT_DIR}/deploy.sh"
+    DT_CALLER=setup.sh "${SCRIPT_DIR}/provision.sh" "${yes[@]}"
+    DT_CALLER=setup.sh "${SCRIPT_DIR}/deploy.sh"
     install_telepresence
     setup_port_forwards
     print_access_info
