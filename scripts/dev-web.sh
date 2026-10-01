@@ -188,6 +188,30 @@ pass() { echo "  ${GRN}✓${NC} $*"; }
 warn() { echo "  ${YEL}!${NC} $*"; }
 fail() { echo "  ${RED}✗${NC} $*"; HARD_FAIL=1; }
 
+# node_in_engines <version> <range> — 0 if the version satisfies an engines range
+# made of space-separated >=, >, <=, < or exact terms; 1 if not; 2 if the range is
+# empty or uses a form this does not read (a check that cannot run must not pass).
+node_in_engines() {
+    local ver="$1" range="$2" term op want lowest
+    [[ -n "$range" ]] || return 2
+    for term in $range; do
+        if [[ "$term" =~ ^(\>=|\>|\<=|\<|=)?v?([0-9]+(\.[0-9]+){0,2})$ ]]; then
+            op="${BASH_REMATCH[1]:-=}"; want="${BASH_REMATCH[2]}"
+        else
+            return 2
+        fi
+        lowest="$(printf '%s\n%s\n' "$ver" "$want" | sort -V | head -1)"
+        case "$op" in
+            ">=") [[ "$lowest" == "$want" ]] || return 1 ;;
+            ">")  [[ "$lowest" == "$want" && "$ver" != "$want" ]] || return 1 ;;
+            "<=") [[ "$lowest" == "$ver" ]] || return 1 ;;
+            "<")  [[ "$lowest" == "$ver" && "$ver" != "$want" ]] || return 1 ;;
+            "=")  [[ "$ver" == "$want" ]] || return 1 ;;
+        esac
+    done
+    return 0
+}
+
 # ─── Bundler load probe (the native-binding silent-skip class) ──
 # Vite 8 / rolldown load a native binding (@rolldown/binding-linux-x64-gnu) at import
 # time. When the running Node is below the workspace engines floor, pnpm SILENTLY skips
@@ -244,8 +268,8 @@ try { await import(pathToFileURL(entry).href); } catch (e) { console.error("load
         echo "      Cause: node_modules was installed under a Node BELOW the workspace engines floor"
         echo "             (package.json engines.node = ${ENGINES_NODE:-see package.json}), so pnpm SILENTLY"
         echo "             skipped the engines-mismatched optional binding."
-        echo "      This SUPERSEDES any 'same major, likely fine' Node note above — same major is not"
-        echo "             sufficient; satisfying the engines floor is."
+        echo "      This holds even if the Node line above passed: the binding is decided by the Node"
+        echo "             that ran 'pnpm install', not the Node running now."
         echo "      Fix: ${NVM_LOAD}nvm install \"\$(cat .nvmrc)\" && rm -rf node_modules && pnpm install"
         echo "      (If 'node --version' already satisfies the floor, the binding was skipped by an earlier"
         echo "       below-floor install — 'rm -rf node_modules && pnpm install' alone is enough.)"
@@ -258,9 +282,9 @@ EXPECTED_NODE_MAJOR="${EXPECTED_NODE%%.*}"       # e.g. 22
 # packageManager pin, e.g. "pnpm@10.33.2" → 10.33.2 (no node needed to parse)
 EXPECTED_PNPM="$(grep -oE '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@[^"]+"' package.json \
     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-# Root engines.node range — the SSoT Node floor the bundler's native binding needs
-# (e.g. ">=22.13.0 <23"). Used ONLY in the bundler-probe remedy message, never as a
-# version literal compared against here (that would fork the SSoT the drift-guard owns).
+# Root engines.node range — the SSoT for which Node the workspace accepts (e.g.
+# ">=22.13.0 <23"); `pnpm install` enforces it (engine-strict). The Node check below
+# compares against this range as read, never a literal copied from it.
 ENGINES_NODE="$(grep -oE '"node"[[:space:]]*:[[:space:]]*"[^"]+"' package.json \
     | grep -oE '"[^"]+"$' | tr -d '"' | head -1)"
 
@@ -300,11 +324,14 @@ if ! command -v node >/dev/null 2>&1; then
     echo "      (alias default persists across shells; 'nvm use' alone is current-shell-only)"
 else
     NODE_VER="$(node --version)"; NODE_VER="${NODE_VER#v}"
-    if [[ "${NODE_VER%%.*}" != "$EXPECTED_NODE_MAJOR" ]]; then
-        fail "node ${NODE_VER} — .nvmrc pins ${EXPECTED_NODE}. Set it as default so new shells keep it:"
+    engines_rc=0; node_in_engines "$NODE_VER" "$ENGINES_NODE" || engines_rc=$?
+    if (( engines_rc == 2 )); then
+        fail "node: cannot verify ${NODE_VER} against package.json engines.node '${ENGINES_NODE}' (this check reads only space-separated >=, >, <=, < and exact terms)."
+    elif (( engines_rc == 1 )); then
+        fail "node ${NODE_VER} is outside package.json engines.node '${ENGINES_NODE}'; pnpm install refuses it. Set the pinned version as default:"
         echo "      ${NVM_LOAD}nvm alias default ${EXPECTED_NODE} && nvm use ${EXPECTED_NODE}"
     elif [[ "$NODE_VER" != "$EXPECTED_NODE" ]]; then
-        warn "node ${NODE_VER} (pin is ${EXPECTED_NODE}; same major, likely fine)"
+        warn "node ${NODE_VER} (within engines.node '${ENGINES_NODE}'; .nvmrc pins ${EXPECTED_NODE})"
     else
         pass "node ${NODE_VER}"
     fi
