@@ -101,6 +101,25 @@ STUB_BIN="${WORK}/bin"
 MARK="${WORK}/marks"
 mkdir -p "$STUB_BIN" "$MARK"
 
+# A SEALED PATH for everything below: every executable on the outer PATH, symlinked into
+# one directory, EXCEPT the container runtimes and kind. Each case prefixes its own stub
+# dir, so a stub that is absent or deliberately removed (the provider case moves `podman`
+# away) must leave the tool absent, not fall through to the host's real one.
+TOOLBOX="${WORK}/toolbox"
+mkdir -p "$TOOLBOX"
+IFS=: read -r -a __path_dirs <<<"$PATH"
+for __d in "${__path_dirs[@]}"; do
+  [[ -d "$__d" ]] || continue
+  for __f in "$__d"/*; do
+    [[ -f "$__f" && -x "$__f" ]] || continue
+    __n="${__f##*/}"
+    case "$__n" in podman|docker|kind) continue ;; esac
+    [[ -e "$TOOLBOX/$__n" ]] || ln -s "$__f" "$TOOLBOX/$__n"
+  done
+done
+unset __path_dirs __d __f __n
+export PATH="$TOOLBOX"
+
 # --- PATH stubs --------------------------------------------------------------
 # Each stub drops a marker when invoked. Markers, not exit codes, are the evidence here: a
 # rejection case passes trivially on exit code alone, because a BROKEN harness also exits
@@ -604,7 +623,10 @@ mkdir -p "$PTEMPLATE/infra/kind/scripts/lib" "$PTEMPLATE/scripts" \
   "$PTEMPLATE/infra/services/postgres" "$PTEMPLATE/infra/docker/certs"
 cp "${REPO_ROOT}/infra/kind/scripts/provision.sh" "${REPO_ROOT}/infra/kind/scripts/deploy.sh" "$PTEMPLATE/infra/kind/scripts/"
 cp "${REPO_ROOT}/infra/kind/scripts/lib/common.sh" "$PTEMPLATE/infra/kind/scripts/lib/"
-cp "${REPO_ROOT}/infra/kind/kind-config.yaml" "$PTEMPLATE/infra/kind/"
+# The real kind config WITHOUT its `hostPort` lines: those fixed ports (8443, 9090, ...) are
+# held on any host running its dev cluster, and check_host_ports would then fail every
+# end-to-end case with port-held. The port-held cases below write their own config.
+sed '/^[[:space:]]*hostPort:/d' "${REPO_ROOT}/infra/kind/kind-config.yaml" > "$PTEMPLATE/infra/kind/kind-config.yaml"
 cp "${REPO_ROOT}/infra/services/postgres/secret.yaml" "$PTEMPLATE/infra/services/postgres/"
 printf 'MC PUBLIC CERT v1\n' > "$PTEMPLATE/infra/docker/certs/mc-webtransport.crt"
 printf 'MH PUBLIC CERT v1\n' > "$PTEMPLATE/infra/docker/certs/mh-webtransport.crt"
