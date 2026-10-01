@@ -634,7 +634,7 @@ tasks:
   tier: light
   tier_reason: runbooks plus one alert rule following the existing gauge-vs-gauge pattern
 - id: 19
-  status: pending
+  status: completed
   specialist: test
   deps:
   - 4
@@ -647,6 +647,7 @@ tasks:
     CORRECTION (2026-09-24, revised after the shared-handler visibility task, id 20): every participant connects to every handler in the meeting's set and hears everyone it shares a handler with, so in Kind with both handlers healthy each participant hears the other N tones. Record for each participant which handlers it connected to. If task 15 ships the client connectivity lever, add one optional partial-connectivity step (A on both handlers, B on mh-0 only, C on mh-1 only: A hears both, B and C each hear only A and see the other marked unreachable); otherwise note that the Rust mock-client env-test covers it.
 
     Harness flake to fix (added 2026-09-30 from task 17's runner-gate failure): `observeWindow` in `packages/web-app/e2e/receiveEvidence.ts` samples on a fixed time window (`FLAT_WINDOW_OBSERVE_MS`, 2.5s at `E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS`), so slow probe reads under load yield fewer than `MIN_FLAT_WINDOW_SAMPLES` and fail the vacuity guard (`HARNESS: 3 sample(s) … need >= 4` on server-mute.spec.ts S3 structural mute). Keep sampling until the window has elapsed AND the minimum count is reached, under a hard upper bound that fails loudly; keep the vacuity guard. Unit-test the loop's stop condition.
+  slug: 2026-09-30-hear-each-other-manual-test-plan
   tag: story-2026-09-21-hear-each-other-task-19
   tier: light
   tier_reason: manual test plan document, run and recorded
