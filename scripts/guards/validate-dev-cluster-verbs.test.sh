@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: drives validate-dev-cluster-verbs.sh (a shell guard) against fixture trees; it never runs the dt-guard binary via $DT_GUARD
 # validate-dev-cluster-verbs.test.sh — self-test for scripts/guards/simple/validate-dev-cluster-verbs.sh.
 #
 # The guard passing on the real tree proves nothing about its FAILURE branches, so each rule

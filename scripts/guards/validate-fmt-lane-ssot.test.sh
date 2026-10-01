@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: drives validate-fmt-lane-ssot.sh (a shell guard) against fixture trees; it never runs the dt-guard binary via $DT_GUARD
 #
 # Self-test for scripts/guards/simple/validate-fmt-lane-ssot.sh (ADR-0037 §D7).
 #

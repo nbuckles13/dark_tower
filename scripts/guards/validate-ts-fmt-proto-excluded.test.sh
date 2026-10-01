@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: drives validate-ts-fmt-proto-excluded.sh (a shell guard) against fixture trees; it never runs the dt-guard binary via $DT_GUARD
 #
 # Self-test for scripts/guards/simple/validate-ts-fmt-proto-excluded.sh (ADR-0037 §D7; @dry-reviewer
 # standing assertion). The guard PASSES on the real tree, so its failure branches — the two preconditions

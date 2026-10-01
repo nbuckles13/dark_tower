@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# coverage-exempt: drives validate-internal-proto-no-key-material.sh (a shell guard) against fixture trees; it never runs the dt-guard binary via $DT_GUARD
 #
 # Self-test for scripts/guards/simple/validate-internal-proto-no-key-material.sh
 # (ADR-0036 §4 "No key material crosses the MC->MH contract"; rule @security, machinery
