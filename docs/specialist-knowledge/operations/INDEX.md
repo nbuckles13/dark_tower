@@ -11,17 +11,19 @@
 ## Media Path (ADR-0036)
 - MH transport parameters, startup validation, derived drain window → `crates/mh-service/src/config.rs:from_vars()`, `QuicTransportParams`, `DrainWindowSource`, `SHUTDOWN_SETTLE_TARGET_SECONDS`, `SHUTDOWN_MARGIN_SECONDS`
 - Transport build + graceful drain → `crates/mh-service/src/webtransport/server.rs:build_transport_config()`, `crates/mh-service/src/main.rs:shutdown_signal()`
-- MH transport ConfigMap keys; per-instance `MH_TERMINATION_GRACE_SECONDS` via kustomize `replacements:` → `infra/services/mh-service/config.env`, `infra/services/mh-service/kustomization.yaml`
-- Pod-grace ↔ env drift env-test → `crates/env-tests/tests/01_mh_deployment_config.rs`
+- MH ConfigMap keys (transport, egress budget, §8 policy bounds — all required) + per-instance `MH_TERMINATION_GRACE_SECONDS` via `replacements:` → `infra/services/mh-service/config.env`, `kustomization.yaml`; Kind budget → `infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`; drift env-test → `crates/env-tests/tests/01_mh_deployment_config.rs`
+- MH egress admission (budget → stream ceiling, meeting cap) → `crates/mh-service/src/config.rs:EgressAdmission::derive()`, `crates/mh-service/src/session/admission.rs`
+- MH meeting teardown + ownership → `crates/mh-service/src/grpc/mh_service.rs:end_meeting()`, `crates/mh-service/src/session/mod.rs:Ownership`, `crates/mh-service/src/routing/mod.rs:RoutingTable::remove()`
 - MH hot path (no telemetry macro reachable under it) → `crates/mh-service/src/media/`; transport seam → `crates/mh-service/src/webtransport/media_transport.rs`, `crates/mh-service/src/transport/mod.rs`; sender bindings → `crates/mh-service/src/session/mod.rs`; routing → `crates/mh-service/src/routing/mod.rs`
-- MC admission (meeting KEK, identity key, sender-id allocator, binding outcome) → `crates/mc-service/src/media_admission/`
-- MC routing + client signaling; handler URL is server-chosen → `crates/mc-service/src/media_routing/`, `crates/mc-service/src/media_signaling/assignments.rs`; MC connect settle window `MC_MEDIA_CONNECT_SETTLE_MS` (required, bounded `100..=10000`, echoed as `mc_media_connect_settle_window_seconds`) → `crates/mc-service/src/config.rs`, `infra/services/mc-service/config.env`, `docs/runbooks/mc-deployment.md` §Configuration Reference
-- Media-path telemetry deny scope → `scripts/guards/simple/media-telemetry-deny.yaml`, `crates/dt-guard/src/media_telemetry_deny.rs`
-- Frame v2 cross-language vectors + gate → `proto/test-vectors/frame-v2.vectors.json`, `scripts/guards/simple/validate-frame-vectors.sh`, `crates/media-vector-gen/`
-- Release feature-gate self-test → `scripts/release-feature-gate.test.sh`; release profile guard → `crates/dt-guard/src/release_build_profile.rs`
-- Media metric hygiene kernel + live assertion → `crates/env-tests/src/fixtures/metric_hygiene.rs`, `crates/env-tests/tests/32_media_metric_hygiene.rs`
-- Alert-rules-actually-loaded check → `crates/env-tests/src/fixtures/alert_rules_loaded.rs`, `crates/env-tests/tests/33_alert_rules_loaded.rs`; MH datagram forwarding between distinct participants → `crates/env-tests/tests/27_mc_slot_placement.rs`, `crates/env-tests/src/fixtures/media.rs`
-- MH alerts → `infra/docker/prometheus/rules/mh-alerts.yaml`; media dashboards → `infra/grafana/dashboards/mh-media.json`, `infra/grafana/dashboards/client-media.json`; open obligations → `docs/TODO.md` §Media Path Obligations
+- MC admission (meeting KEK, identity key, sender-id allocator, binding outcome) → `crates/mc-service/src/media_admission/`; KEK rotation + epoch reset (`MC_KEK_ROTATION_DEBOUNCE_SECONDS`, bounded 30..=300) → `media_admission/rotation.rs:KekRotationDebounce`, `epoch.rs:AdmissionEpoch`, `crates/mc-service/src/config.rs`
+- MC routing + client signaling; handler URL is server-chosen → `crates/mc-service/src/media_routing/` (`placement.rs`, `slots.rs`, `edges.rs`), `crates/mc-service/src/media_signaling/assignments.rs`; MC connect settle window `MC_MEDIA_CONNECT_SETTLE_MS` → `crates/mc-service/src/config.rs`, `infra/services/mc-service/config.env`, `docs/runbooks/mc-deployment.md` §Configuration Reference
+- MC→MH meeting teardown → `crates/mc-service/src/media_routing/teardown.rs`, `crates/mc-service/src/grpc/mh_client.rs:end_meeting()`; GC join stickiness (reuse skips MH selection) → `crates/gc-service/src/services/mc_assignment.rs`
+- Media-path telemetry deny scope → `scripts/guards/simple/media-telemetry-deny.yaml`, `crates/dt-guard/src/media_telemetry_deny.rs`; no key material on internal proto → `scripts/guards/simple/validate-internal-proto-no-key-material.sh`
+- Frame v2 cross-language vectors + gate → `proto/test-vectors/frame-v2.vectors.json`, `scripts/guards/simple/validate-frame-vectors.sh`, `crates/media-vector-gen/`; release feature-gate → `scripts/release-feature-gate.test.sh`, `crates/dt-guard/src/release_build_profile.rs`
+- Media metric hygiene + alert-rules-loaded → `crates/env-tests/src/fixtures/metric_hygiene.rs`, `alert_rules_loaded.rs`, `crates/env-tests/tests/32_media_metric_hygiene.rs`, `33_alert_rules_loaded.rs`
+- Media env-tests: slot placement `27_mc_slot_placement.rs`, egress admission + alert joins `28_mh_egress_admission.rs`, teardown `29_mh_meeting_teardown.rs`, KEK rotation `34_mc_kek_rotation.rs` → `crates/env-tests/tests/`; MH gRPC fixture → `crates/env-tests/src/fixtures/mh_grpc.rs`; layer7 port-forward cleanup → `scripts/lang/_common.sh:layer_register_cleanup()`
+- Browser multi-party harness (N+1 cohort, tone detector, S1 diagnostic) → `packages/web-app/e2e/cohort.ts`, `toneDetector.ts`, `s1Diagnostic.ts`; manual test plan → `docs/user-stories/2026-09-21-hear-each-other-manual-test-plan.md`
+- Client telemetry export (OTel collector → Prometheus) → `infra/services/otel-collector/collector.yaml`, `scripts/otel-collector/acceptance.sh`; guard → `crates/dt-guard/src/client_metrics_export.rs`; media dashboards → `infra/grafana/dashboards/{mh,mc,client}-media.json`; open obligations → `docs/TODO.md` §Media Path Obligations
 
 ## Story Workflow (ADR-0035)
 - Serial task loop, per-task gate, escalation lanes, audit-remediation + suppression gate → `scripts/workflow/run-story.sh`
@@ -51,22 +53,20 @@
 
 ## Deployment & K8s
 - Kind cluster → `infra/kind/kind-config.yaml`, `infra/kind/scripts/provision.sh` (platform; `BLUEPRINT ACTION=… REASON=…`), `infra/kind/scripts/deploy.sh` (`run_migration_job()`, `deploy_otel_collector()`, `wait_for_env_root()`, `prune_superseded_images()`), `infra/kind/scripts/setup.sh` (`provision_run_org()`), `lib/cluster-db.sh:dt_psql()`, `teardown.sh`
-- Per-service Kustomize bases (statefulset/deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`
-- Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/`; dev certs → `scripts/generate-dev-certs.sh`
+- Per-service Kustomize bases (statefulset/deployment, netpol, PDB) → `infra/services/{ac,gc,mc,mh}-service/`; PostgreSQL + Redis → `infra/services/postgres/`, `redis/`; Dockerfiles → `infra/docker/{ac,gc,mc,mh}-service/`; dev certs → `scripts/generate-dev-certs.sh`
 - MC/MH per-instance Deployments + ConfigMaps → `infra/services/mc-service/mc-0-config.env`, `infra/services/mh-service/mh-0-config.env`; devloop advertise addresses → `infra/kind/scripts/deploy.sh:render_env_overlay()`
 - Per-pod UDP NodePorts `base + ordinal*2` (MC 4433/4435, MH 4434/4436) → `infra/services/mc-service/service.yaml`, `infra/services/mh-service/service.yaml`; netpol → `infra/services/mh-service/network-policy.yaml`; MH→MC gRPC TCP 50052
-- Alert rules → `infra/docker/prometheus/rules/` (`gc-alerts.yaml`, `mc-alerts.yaml`, `mh-alerts.yaml`, `otel-alerts.yaml`, `_template-service-alerts.yaml`)
+- Alert rules → `infra/docker/prometheus/rules/` (`gc-alerts.yaml`, `mc-alerts.yaml`, `mh-alerts.yaml`, `client-alerts.yaml`, `otel-alerts.yaml`, `_template-service-alerts.yaml`)
 
 ## Runbooks
 - Per-service incident + deployment → `docs/runbooks/mh-deployment.md` (post-deploy checklist, R-36 rollback), `docs/runbooks/mc-deployment.md`, `docs/runbooks/gc-deployment.md`, `docs/runbooks/ac-service-deployment.md`
-- MH media scenarios (sender binding, datagrams never read, datagram drop) → `docs/runbooks/mh-incident-response.md` Scenarios 15-17
-- MC media scenarios (connection failure, RegisterMeeting, generation divergence, missing key material) → `docs/runbooks/mc-incident-response.md` Scenarios 11-16
+- MH media scenarios (sender binding, datagram drop, egress budget exhaustion, server mute at ingress) → `docs/runbooks/mh-incident-response.md` Scenarios 15-19
+- MC media scenarios (connection failure, RegisterMeeting, key material, KEK rotation, teardown/budget ratchet, server mute) → `docs/runbooks/mc-incident-response.md` Scenarios 11-21
 - Meeting-refusal triage → `docs/runbooks/gc-incident-response.md` Scenario 8; client dev-local → `docs/runbooks/client-dev-local.md`, `scripts/dev-web.sh:probe_bundler()`
 
 ## Observability
 - Kustomize + Grafana → `infra/kubernetes/observability/`, `infra/grafana/dashboards/`, `infra/grafana/kustomization.yaml`; Prometheus → `infra/docker/prometheus/prometheus.yml`
-- Conventions and objectives → `docs/observability/alert-conventions.md`, `dashboard-conventions.md`, `label-taxonomy.md`, `slos.md`; catalogs → `docs/observability/metrics/`
-- Per-service metric handles → `crates/mh-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`; shared `MetricAssertion` → `crates/common/src/observability/testing.rs`
+- Conventions and objectives → `docs/observability/alert-conventions.md`, `dashboard-conventions.md`, `label-taxonomy.md` (§R4 media-path identity), `slos.md`; catalogs → `docs/observability/metrics/`; per-service metric handles → `crates/mh-service/src/observability/metrics.rs`, `crates/mc-service/src/observability/metrics.rs`; shared `MetricAssertion` → `crates/common/src/observability/testing.rs`
 
 ## Services
 - AC: config → `crates/ac-service/src/config.rs`; JWKS/JWT → `crates/common/src/jwt.rs`; GC↔AC token types → `crates/common/src/meeting_token.rs`; service auth → ADR-0003

@@ -35,13 +35,10 @@ All shapes in `internal.proto`. No-key-material rule → its header + `scripts/g
 - UNSPECIFIED echo is a mismatch NOT a skip; expires at video → `.transport_mode`; restart detection, per-process → `.process_start_epoch_ms`
 - Wire-shape tests + "what these do NOT assert" header → `crates/proto-gen/tests/internal_roundtrip.rs`; runtime MUSTs no story-1 test can catch → `docs/TODO.md` §Media Path Obligations
 
-## gRPC Service Implementations
-- MH MediaHandlerService → `crates/mh-service/src/grpc/mh_service.rs`
-- MC MeetingControllerService, MediaCoordinationService → `crates/mc-service/src/grpc/mc_service.rs`, `media_coordination.rs`
-
-## gRPC Clients (cross-service)
-- GC→MC (AssignMeetingWithMh) → `crates/gc-service/src/services/mc_client.rs`; GC MH selection → `services/mh_selection.rs`
-- MC→MH (RegisterMeeting) + MhRegistrationClient seam → `crates/mc-service/src/grpc/mh_client.rs`; MH→MC → `crates/mh-service/src/grpc/mc_client.rs`
+## gRPC Endpoints (server + client per RPC)
+- GC→MC AssignMeetingWithMh → `crates/gc-service/src/services/mc_client.rs`; GC MH selection → `services/mh_selection.rs`; MC server + MediaCoordinationService → `crates/mc-service/src/grpc/mc_service.rs`, `media_coordination.rs`; MH→MC client → `crates/mh-service/src/grpc/mc_client.rs`
+- MC→MH RegisterMeeting/EndMeeting → `crates/mc-service/src/grpc/mh_client.rs:register_meeting()`, `:end_meeting()`; MH server → `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`, `:end_meeting()`
+- Per-meeting edge set (which MHs get a RegisterMeeting) → `crates/mc-service/src/media_routing/edges.rs`; EndMeeting fan-out plan → `media_routing/teardown.rs:end_meeting_plan()`
 
 ## Auth Layer Pattern (JWKS-based async tower Layer)
 - MH / MC service-token auth layers → `crates/mh-service/src/grpc/auth_interceptor.rs`, `crates/mc-service/src/grpc/auth_interceptor.rs`
@@ -58,17 +55,18 @@ All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
 - Redacting `Debug` → `crates/proto-gen/build.rs`, `src/lib.rs`; wire-shape tests → `crates/proto-gen/tests/signaling_roundtrip.rs`
 - Codegen oracle (presence + absence, both protos) → `packages/proto-gen/scripts/verify-codegen.sh`; SDK codec vocabulary → `packages/sdk-core/src/signaling/codecMap.ts`
 
-## Signaling Messages (signaling.proto)
-- MediaConnectionUpdate (client→MC per-MH ConnectionState, R-60) + handler → `crates/mc-service/src/webtransport/connection.rs`
+## Signaling Producers/Consumers (MC + SDK)
+- MediaConnectionUpdate (R-60) + ServerMuteRequest (`handle_server_mute_request()`) → `crates/mc-service/src/webtransport/connection.rs`
+- `StreamAssignments` builder (slot states, `unreachable_sender_ids`) → `crates/mc-service/src/media_signaling/assignments.rs:build_stream_assignments()`
+- `MeetingKekUpdate` coalescing over W → `crates/mc-service/src/media_admission/rotation.rs`; KEK minting → `media_admission/kek.rs`
+- SDK KEK intake → `packages/sdk-core/src/signaling/kekIntake.ts:takeMeetingKek()`; retention `min(W/2, ceiling)` → `packages/sdk-core/src/media/setup/kekSource.ts:RetentionGuard`
 
 ## HTTP API Error Contracts
 - GC error taxonomy (status + `error.code` + `error_type`) → `crates/gc-service/src/errors.rs`; meeting-creation refusals → `crates/gc-service/src/repositories/meetings.rs`
 
 ## Story Manifest Schema (dt-story)
-- Manifest contract, versioning, per-task state → ADR-0035; schema, `deny_unknown_fields`, `v1` marker, `SLUG_PATTERN`, fence-safe emission → `crates/dt-story/src/manifest.rs`
-- Block discovery, orphan detection → `crates/dt-story/src/markdown.rs:find_manifest_block()`
-- CLI (`validate`, `next`, `complete --slug`, `add-task --deps`) → `crates/dt-story/src/main.rs`
-- Guards: manifest validity, slug-class drift → `scripts/guards/simple/validate-story-manifest.sh`, `validate-slug-class-sync.sh`
+- Contract → ADR-0035; schema + `v1` marker → `crates/dt-story/src/manifest.rs`; block discovery → `crates/dt-story/src/markdown.rs:find_manifest_block()`; CLI → `crates/dt-story/src/main.rs`
+- Guards → `scripts/guards/simple/validate-story-manifest.sh`, `validate-slug-class-sync.sh`
 
 ## Integration Seams
 - Proto-gen consumed by services (re-exports prost::Message, tonic) → `crates/proto-gen/src/lib.rs`

@@ -14,12 +14,12 @@
 ## Code Locations
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`; migrations image (sqlx-cli + `migrations/`) -> `infra/docker/db-migrate/Dockerfile`; Compose (local tests) -> `docker-compose.test.yml`; dev TLS certs (CA + MC + MH) -> `scripts/generate-dev-certs.sh`
 - Service runbooks (`<service>-deployment.md` + `<service>-incident-response.md`) -> `docs/runbooks/`; local web demo bring-up -> `docs/runbooks/client-dev-local.md`
-- Prometheus config, kustomization, per-service alert rules -> `infra/docker/prometheus/`; K8s scrape config -> `infra/kubernetes/observability/{prometheus.yml,prometheus-config.yaml}`
+- Prometheus config, kustomization, alert rules (per-service + `rules/{client,otel}-alerts.yaml`) -> `infra/docker/prometheus/`; K8s scrape config -> `infra/kubernetes/observability/{prometheus.yml,prometheus-config.yaml}`
 - K8s service manifests (Kustomize bases) -> `infra/services/{ac,gc,mc,mh}-service/kustomization.yaml`
 - Service workloads: AC StatefulSet -> `infra/services/ac-service/statefulset.yaml`; GC Deployment -> `infra/services/gc-service/deployment.yaml`; MC/MH per-instance Deployments + PDB -> `infra/services/{mc,mh}-service/{mc,mh}-{0,1}-deployment.yaml`, `pdb.yaml`
 - MC/MH ConfigMap generator sources (shared + per-instance; MH transport parameters) -> `infra/services/{mc,mh}-service/config.env`, `{mc,mh}-{0,1}-config.env`
 - Network policies (per-service ingress/egress) -> `infra/services/{ac,gc,mc,mh}-service/network-policy.yaml`; MC/MH per-instance Services (NodePorts) -> `infra/services/{mc,mh}-service/service.yaml`
-- OTel Collector base (configmap, deployment, service, network policy) -> `infra/services/otel-collector/`; smoke payload -> `infra/smoke/`
+- OTel Collector base (pipeline + Prometheus exporter in `collector.yaml`, deployment, service, network policy) -> `infra/services/otel-collector/`; its scrape jobs `otel-collector` + `otel-collector-telemetry` -> `infra/kubernetes/observability/prometheus.yml`; acceptance harness (reads the committed config) -> `scripts/otel-collector/acceptance.sh`; smoke payload -> `infra/smoke/`
 - Redis + PostgreSQL manifests (Kustomize bases) -> `infra/services/{redis,postgres}/kustomization.yaml`; PostgreSQL init -> `infra/docker/postgres/init.sql`
 - K8s observability manifests (Prometheus, Loki/Promtail, kube-state-metrics, node-exporter) -> `infra/kubernetes/observability/kustomization.yaml`
 - Grafana manifests, dashboards + provisioning -> `infra/grafana/kustomization.yaml`, `infra/grafana/{dashboards,provisioning}/`
@@ -36,7 +36,7 @@
 - Canonical `{ac,gc,mc,mh}` service enumeration SSoT; Bash mirror -> `crates/dt-guard/src/common/services.rs`, `scripts/guards/common.sh`
 - Kustomize policy (build, orphan manifests, kubeconform, securityContext) -> `crates/dt-guard/src/kustomize.rs`, `kustomize_tools.rs`; ConfigMap annotation-size cap -> `kustomize_configmaps.rs`; R-18 kinds (security-owned policy: Deployment, StatefulSet, Job, CronJob) -> `kustomize_tools.rs:SECURITY_CONTEXT_KINDS`
 - Env-config policy (per-workload env-var coverage, `configMapKeyRef` resolution, key==env-name) -> `crates/dt-guard/src/env_config.rs`; live-cluster twin for MH -> `crates/env-tests/tests/01_mh_deployment_config.rs`
-- Observability policy modules -> `crates/dt-guard/src/alert_rules.rs`, `dashboard_panels.rs`, `infrastructure_metrics.rs`, `metric_labels.rs`, `metric_coverage.rs`
+- Observability policy modules -> `crates/dt-guard/src/alert_rules.rs`, `dashboard_panels.rs`, `infrastructure_metrics.rs`, `metric_labels.rs`, `metric_coverage.rs`; browser metrics export drift (SDK -> collector -> alerts) -> `client_metrics_export.rs`, fixtures `crates/dt-guard/tests/client_metrics_export_fixtures.rs`; shared alert-file + TS comment-stripping helpers -> `common/alert_rule_files.rs`, `common/ts_lex.rs`
 - Release-artifact premise for the ADR-0036 §11 compile gate -> `crates/dt-guard/src/release_build_profile.rs`; real-build demo `scripts/release-feature-gate.test.sh`
 - Insecure browser/TLS flag prohibition -> `crates/dt-guard/src/no_insecure_browser_flags.rs`
 - Media-path telemetry deny (config-driven scope, distinct scope-liveness tokens, no suppression) -> `crates/dt-guard/src/media_telemetry_deny.rs`, manifest `scripts/guards/simple/media-telemetry-deny.yaml`, self-test `scripts/guards/media-telemetry-deny.test.sh`
@@ -45,7 +45,7 @@
 - Cross-language frame-vector fixtures -> `scripts/guards/simple/validate-frame-vectors.sh`, self-test `scripts/guards/validate-frame-vectors.test.sh`
 
 ## Validation Pipeline & Toolchain (ADR-0033)
-- Layer scripts -> orchestrator `scripts/layer-all.sh`; Layer 7 (env-tests + browser E2E, one live cluster) -> `scripts/layer7.sh`, failure-map `docs/runbooks/devloop-validation.md` §6.7, Lead attempt-policy `.claude/skills/devloop/SKILL.md`
+- Layer scripts -> orchestrator `scripts/layer-all.sh`; Layer 7 (env-tests + browser E2E, one live cluster) -> `scripts/layer7.sh`, failure-map `docs/runbooks/devloop-validation.md` §6.7, Lead attempt-policy `.claude/skills/devloop/SKILL.md`; per-MH-pod gRPC port-forwards -> `scripts/layer7.sh:__start_mh_grpc_forward()`; layer-script cleanup (no `trap` in layers) -> `scripts/lang/_common.sh:layer_register_cleanup()`; browser multi-party cohort sized from AC rate-limit `config.env` -> `packages/web-app/e2e/cohort.ts`
 - Per-run layer-7 organization (Phase 1h generation, `setup.sh --provision-org`, AC resolution probe) -> `scripts/layer7.sh:__generate_org_subdomain()`; consumers -> `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`, `packages/web-app/e2e/env.ts`; pattern drift guard -> `scripts/guards/simple/validate-subdomain-regex-sync.sh`, self-test `scripts/guards/validate-subdomain-regex-sync.test.sh`
 - Hermetic script self-tests + wiring -> `scripts/layer3.sh`; suites -> `scripts/layer7.test.sh`, `scripts/setup.test.sh`, `scripts/lang/rust/behavior-equivalence.test.sh` (Rust test verb + unit-test DB migration fails loudly), `scripts/layer-all.test.sh`, `scripts/workflow/run-story.test.sh`; shared helper SSoT -> `scripts/lang/_test_helpers.sh`
 - Layer 6 audit dep-change gate -> `scripts/lang/_audit_gate.sh:audit_dep_changed_{rust,ts}`, glob predicate `scripts/lang/_changed_helpers.sh:diff_touches_glob`; design -> ADR-0033 §3/§11
@@ -66,10 +66,10 @@
 ## Host-Side Cluster Helper (ADR-0030)
 - Helper binary: port allocation -> `crates/devloop-helper/src/ports.rs`; commands -> `crates/devloop-helper/src/commands.rs` (verbs `VERBS` in protocol.rs — provision/deploy/teardown/recreate/restore-kubeconfig/status/cancel, none takes an argument; provision/deploy run the Kind scripts via `script_command()`; status exempts Job-owned Succeeded pods in `parse_pod_health()`); NDJSON protocol -> `crates/devloop-helper/src/protocol.rs`
 - Cluster health + port-map writers -> `commands.rs:cmd_status()`, `parse_pod_health()`, `write_port_map_shell()`, `cmd_provision()`, `cmd_deploy()`
-- Port registry (global) -> `~/.cache/devloop/port-registry.json`; per-devloop runtime state (PID, socket, auth token, ports.json, log) -> `/tmp/devloop-{slug}/`; container mount -> `devloop.sh:500`
+- Port registry (global) -> `~/.cache/devloop/port-registry.json`; per-devloop runtime state (PID, socket, auth token, ports.json, log) -> `/tmp/devloop-{slug}/`; container mount -> `devloop.sh` (`HELPER_RUNTIME_DIR`)
 - Env-test URL config -> `crates/env-tests/src/cluster.rs:ClusterPorts::from_env()`
 
 ## Service Config, Probes & Integration Seams
 - MC health endpoints (liveness + readiness) -> `crates/mc-service/src/observability/health.rs:health_router()`; probe config -> `infra/services/{mc,gc,mh}-service/*deployment.yaml`
 - MC/MH advertise-address config -> `crates/mc-service/src/config.rs`, `crates/mh-service/src/config.rs`; GC registration -> `crates/mc-service/src/grpc/gc_client.rs:register()`, `crates/mh-service/src/grpc/gc_client.rs:register()`
-- CanaryPod (NetworkPolicy testing) -> `crates/env-tests/src/canary.rs`; env-tests (cluster health, observability, resilience) -> `crates/env-tests/tests/`
+- CanaryPod (NetworkPolicy testing) -> `crates/env-tests/src/canary.rs`; env-tests (cluster health, observability, resilience, media path) -> `crates/env-tests/tests/`; live ConfigMap reads by generation -> `crates/env-tests/src/fixtures/kube.rs:configmap_key()`, `resolve_generation()`; bounded polling -> `crates/env-tests/src/eventual.rs:assert_eventually()`; instance-pinned metric reads -> `crates/env-tests/src/fixtures/metrics.rs`
