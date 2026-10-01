@@ -2021,14 +2021,21 @@ chmod +x "$PSTUB"
 RUN_GUARDED='PROVISION_SH="${ARGS[0]}"; main'
 for reason in changed missing unreadable; do
   reset_marks
+  # Run as the devloop helper does, so the remedy is the container's command.
   out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster STUB_BP_REASON="$reason" \
-    src_run "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
+    DT_CALLER=devloop-helper src_run "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
   assert_rc "deploy-guard-${reason}-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
   assert_status "deploy-guard-${reason}-token" "DEPLOY_FAILED REASON=blueprint-${reason}" "$out"
   assert_status "deploy-guard-${reason}-names-provision" "dev-cluster provision" "$out"
   assert_rc "deploy-guard-${reason}-builds-nothing" 0 "$([[ -z "$(builds)" ]] && echo 0 || echo "1 ($(builds))")"
   assert_no_marker "deploy-guard-${reason}-applies-nothing" "$MARK" "applied"
 done
+# The same guard run by a person on the host names the host command, not the container's.
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster STUB_BP_REASON=changed \
+  src_run -u DT_CALLER "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"
+assert_status "deploy-guard-host-names-setup" "./infra/kind/scripts/setup.sh" "$out"
+assert_absent "deploy-guard-host-not-container-cmd" "dev-cluster provision" "$out"
 reset_marks
 out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 STUB_BP_REASON=match STUB_JOBS="$JOBS_OK" \
   src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
@@ -2235,5 +2242,20 @@ assert_absent "iidfile-empty-never-tags" "tag " "$(cat "${MARK}/podman.calls" 2>
 entry_code="$(grep -vE '^[[:space:]]*#' "${REPO_ROOT}/infra/devloop/entrypoint.sh")"
 assert_absent "entrypoint-has-no-sqlx-migrate" "sqlx migrate" "$entry_code"
 assert_absent "entrypoint-has-no-masked-migration" "may already be applied" "$entry_code"
+
+# === (G) a remedy names the command its caller can run ========================================
+# provision.sh/deploy.sh always run on the host; who reads the message differs. The devloop
+# helper sets DT_CALLER=devloop-helper (its reader is in a container: `dev-cluster ...`);
+# anyone else is on the host (teardown.sh / setup.sh).
+LIBC="${REPO_ROOT}/infra/kind/scripts/lib/common.sh"
+RUN_REM='sp="$1"; set --; source "$sp" >/dev/null 2>&1; remedy CONTAINER-CMD HOST-CMD'
+assert_status "remedy-helper-gets-container" "CONTAINER-CMD" "$(DT_CALLER=devloop-helper bash -c "$RUN_REM" _ "$LIBC")"
+assert_status "remedy-setup-gets-host" "HOST-CMD" "$(DT_CALLER=setup.sh bash -c "$RUN_REM" _ "$LIBC")"
+assert_status "remedy-person-gets-host" "HOST-CMD" "$(env -u DT_CALLER bash -c "$RUN_REM" _ "$LIBC")"
+assert_absent "remedy-person-not-container" "CONTAINER-CMD" "$(env -u DT_CALLER bash -c "$RUN_REM" _ "$LIBC")"
+# The helper's value and the scripts' value are one string in two languages: they must match.
+rust_val="$(sed -n 's/^const DT_CALLER_DEVLOOP_HELPER: &str = "\([^"]*\)";$/\1/p' "${REPO_ROOT}/crates/devloop-helper/src/commands.rs")"
+sh_val="$(sed -n 's/^DT_CALLER_DEVLOOP_HELPER="\([^"]*\)"$/\1/p' "$LIBC")"
+assert_rc "dt-caller-value-in-sync" 0 "$([[ -n "$rust_val" && "$rust_val" == "$sh_val" ]] && echo 0 || echo "1 (rust='${rust_val}' sh='${sh_val}')")"
 
 report_results "scripts/setup.test.sh"

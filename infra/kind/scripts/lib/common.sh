@@ -181,6 +181,16 @@ missing_prerequisite() {
 # apiserver must not hang the failure path that is trying to name it).
 ENV_PROBE_TIMEOUT="${DT_ENV_PROBE_TIMEOUT:-10}"
 
+# Who runs these scripts decides which command a remedy should name: the devloop
+# helper (DT_CALLER=devloop-helper, set by crates/devloop-helper script_command)
+# runs them for a devloop container, whose operator uses `dev-cluster`; setup.sh
+# sets DT_CALLER=setup.sh; anything else is a person on the host.
+DT_CALLER_DEVLOOP_HELPER="devloop-helper"
+# remedy <devloop-container command> <host command> — print the one for this caller.
+remedy() {
+    if [[ "${DT_CALLER:-}" == "${DT_CALLER_DEVLOOP_HELPER}" ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+
 # The container runtime CLI, from the provider detect_container_runtime()
 # exported (docker when unset — kind's own default provider).
 container_cmd() {

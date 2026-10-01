@@ -291,7 +291,7 @@ tls_renewal_due() {
 # only when it is due (and mints them on a fresh host).
 materialize_inputs() {
     log_step "Materializing dev TLS material (renews a leaf only when due)..."
-    "$(provision_input "${CERTS_RECIPE_REL}")"
+    DT_CERTS_CALLER=provision "$(provision_input "${CERTS_RECIPE_REL}")"
 }
 
 # Record the blueprint in the cluster — the LAST step of a successful build.
@@ -657,7 +657,7 @@ main() {
         unreadable)
             bp_emit refuse
             provision_failed blueprint-unreadable
-            log_error "Cannot tell whether cluster '${CLUSTER_NAME}' matches the blueprint (${BP_DETAIL}); refusing to destroy on uncertainty. Check the host container runtime and 'kind get clusters'; if the control plane is dead, 'dev-cluster recreate' re-confirms that before destroying."
+            log_error "Cannot tell whether cluster '${CLUSTER_NAME}' matches the blueprint (${BP_DETAIL}); refusing to destroy on uncertainty. Check the host container runtime and 'kind get clusters'. If the control plane is dead, recreate the cluster: $(remedy "'dev-cluster recreate' (it re-confirms before destroying)" "'./infra/kind/scripts/teardown.sh' then './infra/kind/scripts/setup.sh'")."
             return 1
             ;;
     esac
@@ -686,7 +686,9 @@ main() {
         return 1
     fi
     pstep record_blueprint
-    log_info "Platform provisioned. Next: deploy the application (dev-cluster deploy, or infra/kind/scripts/deploy.sh on the host)."
+    if [[ "${DT_CALLER:-}" != setup.sh ]]; then
+        log_info "Platform provisioned. Next: deploy the application ($(remedy "'dev-cluster deploy'" "'./infra/kind/scripts/deploy.sh'"))."
+    fi
 }
 
 # Run main only when executed, not when sourced (scripts/setup.test.sh sources

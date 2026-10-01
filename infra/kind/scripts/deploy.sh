@@ -936,7 +936,7 @@ run_migration_job() (
                     exit 1
                 fi
                 echo "MIGRATION_FAILURE: job/${name} failed (reason=${cond#* }) REASON=migration-failed" >&2
-                echo "  The logs above carry sqlx's error. 'previously applied but has been modified' = an applied migration file was edited: restore it, or recreate the dev cluster: 'dev-cluster teardown', then 'dev-cluster provision' + 'dev-cluster deploy' (host: teardown.sh, then setup.sh) — no down-migrations; never hand-edit _sqlx_migrations. See docs/runbooks/devloop-validation.md." >&2
+                echo "  The logs above carry sqlx's error. 'previously applied but has been modified' = an applied migration file was edited: restore it, or recreate the dev cluster: $(remedy "'dev-cluster teardown', then 'dev-cluster provision' + 'dev-cluster deploy'" "'./infra/kind/scripts/teardown.sh', then './infra/kind/scripts/setup.sh'") — no down-migrations; never hand-edit _sqlx_migrations. See docs/runbooks/devloop-validation.md." >&2
                 exit 1
                 ;;
         esac
@@ -1183,7 +1183,7 @@ check_blueprint() {
         local reason
         reason="$(sed -n 's/^BLUEPRINT .*REASON=\([a-z-]*\).*/\1/p' <<< "${out}" | tail -n1)"
         deploy_failed "blueprint-${reason:-unreadable}" -
-        echo "  The cluster's platform does not match the tree (see the BLUEPRINT line above). Provision it first: 'dev-cluster provision' (devloop container) or './infra/kind/scripts/provision.sh' (host)." >&2
+        echo "  The cluster's platform does not match the tree (see the BLUEPRINT line above). Provision it first: $(remedy "'dev-cluster provision'" "'./infra/kind/scripts/setup.sh'")." >&2
         return 1
     fi
 }
@@ -1238,7 +1238,7 @@ main() {
     fi
     if (( exists_rc != 0 )); then
         deploy_failed blueprint-missing -
-        log_error "Cluster '${CLUSTER_NAME}' does not exist. Provision it first: 'dev-cluster provision' (devloop container) or './infra/kind/scripts/provision.sh' (host)."
+        log_error "Cluster '${CLUSTER_NAME}' does not exist. Provision it first: $(remedy "'dev-cluster provision'" "'./infra/kind/scripts/setup.sh'")."
         exit 1
     fi
     step check_blueprint

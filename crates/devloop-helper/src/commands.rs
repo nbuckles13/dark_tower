@@ -1829,6 +1829,10 @@ fn kind_config_path(ctx: &Context) -> PathBuf {
 /// passes and [`script_label`] names.
 const SCRIPT_ARGS: &[&str] = &["--yes"];
 
+/// `DT_CALLER` value the scripts compare against (`DT_CALLER_DEVLOOP_HELPER` in
+/// infra/kind/scripts/lib/common.sh; scripts/setup.test.sh checks they match).
+const DT_CALLER_DEVLOOP_HELPER: &str = "devloop-helper";
+
 /// The log/stream label of a script invocation, derived from the same argv
 /// [`script_command`] passes, so the label cannot drift from what is exec'd.
 fn script_label(script: Script) -> String {
@@ -1856,6 +1860,9 @@ fn script_command(ctx: &Context, script: Script) -> Result<Command, HelperError>
         .env("DT_PORT_MAP", port_map_shell_path(ctx))
         .env("DT_HOST_GATEWAY_IP", gateway_ip)
         .env("DT_KIND_CONFIG", kind_config_path(ctx))
+        // Tells the scripts their output is read inside a devloop container, so
+        // a remedy names the `dev-cluster` command (lib/common.sh:remedy).
+        .env("DT_CALLER", DT_CALLER_DEVLOOP_HELPER)
         .env(env_key, env_val);
     Ok(cmd)
 }
@@ -3343,6 +3350,10 @@ current-context: kind-devloop-test
     fn expected_env(ctx: &Context) -> Vec<(String, String)> {
         let mut env = vec![
             ("DT_CLUSTER_NAME".to_string(), ctx.cluster_name.clone()),
+            (
+                "DT_CALLER".to_string(),
+                DT_CALLER_DEVLOOP_HELPER.to_string(),
+            ),
             (
                 "DT_HOST_GATEWAY_IP".to_string(),
                 DEFAULT_HOST_GATEWAY_IP.to_string(),
