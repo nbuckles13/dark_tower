@@ -82,6 +82,16 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
+      - name: Install sqlx-cli
+        # scripts/lang/rust/test.sh migrates the test DB with sqlx-cli and refuses
+        # to run without it, or with a CLI that differs from Cargo.lock's `sqlx`.
+        # The version comes from the one Cargo.lock reader, as for the devloop
+        # and db-migrate images.
+        run: |
+          source infra/lib/cargo-lock-version.sh
+          v="$(cargo_lock_version Cargo.lock sqlx)"
+          cargo install sqlx-cli --locked --no-default-features --features postgres --version "=${v}"
+
       # buf is provided by `pnpm exec buf` (@bufbuild/buf, lockfile-pinned) after `pnpm install`
       # (ADR-0037 §D7 COLLAPSE) — no separate buf-setup-action install. `pnpm install` runs before
       # `layer-all.sh` below, so the proto wrappers' `pnpm exec buf` resolves.
