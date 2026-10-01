@@ -52,7 +52,10 @@ LABEL org.opencontainers.image.title="Dark Tower DB migrations" \
       org.opencontainers.image.description="sqlx-cli + migrations/, run as the db-migrate Job"
 
 COPY --from=builder /out/bin/sqlx /usr/local/bin/sqlx
-COPY migrations/ /migrations/
+# --chown: the runtime user must be able to read the files whatever their mode on the
+# build host (git does not track read bits, so a host checkout can hold 0600 files that
+# a fresh clone writes 0644). Same pattern as the service images' /migrations copy.
+COPY --chown=nonroot:nonroot migrations/ /migrations/
 
 # Plain `migrate run`: pending-only via `_sqlx_migrations`, and it FAILS on a
 # changed applied migration, a dirty row, or an applied version missing from
