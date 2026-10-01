@@ -1,7 +1,7 @@
 import { defineConfig } from 'vitest/config';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
-import { resolve } from 'node:path';
 import { playwright } from '@vitest/browser-playwright';
+import { sdkSourceAliases } from './vite/sourceAliases.js';
 
 // R-43: REAL Vitest 4 Browser Mode (Chromium) component tests for the demo
 // views + the E2E bus. Mocks `MeetingSession`; no real WebTransport/WebCodecs.
@@ -23,10 +23,7 @@ export default defineConfig({
     __DEV_CERT_SHA256_HASHES__: JSON.stringify([]),
   },
   resolve: {
-    alias: {
-      '@darktower/sdk-core': resolve(__dirname, '../sdk-core/src/index.ts'),
-      '@darktower/sdk-svelte': resolve(__dirname, '../sdk-svelte/src/index.ts'),
-    },
+    alias: sdkSourceAliases,
   },
   plugins: [svelte()],
   test: {
