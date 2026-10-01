@@ -6,7 +6,7 @@
 //!   annotation cap once client-side apply serialises it.
 //!
 //! (A second rule, `dashboard_configmap_label`, checked Grafana dashboard
-//! generators for the label a k8s-sidecar selected on. ADR-0038 §2 replaced the
+//! generators for the label a k8s-sidecar selected on. ADR-0038 Implementation step 1 replaced the
 //! sidecar with one projected volume that names every group, so the label no
 //! longer selects anything; a group left off that volume is now caught by R-21
 //! (`kustomize_content_addressing`: a generated ConfigMap no pod references).)
