@@ -1246,9 +1246,10 @@ earlier (see the sub-cases).
 **Discriminator — is this even F11?** The error names an **engines** violation or a **native
 binding** load failure — not a *missing* binary (that is F2) and not a version that otherwise runs
 (F3/F4). `scripts/dev-web.sh --check` prints a **✗ bundler probe** line naming
-`@rolldown/binding-linux-x64-gnu`; that line is the F11 signature. Crucially this is the exact case
-the script's Node check only **WARNs** on ("same major, likely fine") — F11 is where "same major"
-is *not* fine, because the workspace floor is a *minor*, not merely a major. A reader whose Node is
+`@rolldown/binding-linux-x64-gnu`; that line is the F11 signature. The script's Node check
+now **fails** a Node outside `package.json` `engines.node` (the range `pnpm install` enforces), so
+a below-floor Node is caught at preflight; F11 remains for a `node_modules` installed under an
+*earlier* below-floor Node, which a correct Node now cannot repair without a reinstall. A reader whose Node is
 simply on the wrong `nvm` alias is in F3, not here — confirm the binding/engines wording first.
 
 Once F11 is confirmed, split the two sub-cases — they have different *minimal* fixes:

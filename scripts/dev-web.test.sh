@@ -866,4 +866,40 @@ san_line="$(grep -E 'printf "(DNS|IP):%s"' "$REPO_ROOT/scripts/generate-dev-cert
 assert_status "fact-sans-dns-emitted" 'DNS:%s' "$san_line"
 assert_absent "fact-sans-no-ip-emitted" 'IP:%s' "$san_line"
 
+# ===========================================================================
+# (11) Node is checked against package.json engines.node — the range pnpm install
+#      enforces — not just the .nvmrc major. Fixture: .nvmrc 22.13.0, engines
+#      ">=22.13.0 <23". A `node` stub reports the version; anything else runs real node.
+# ===========================================================================
+REAL_NODE="$(command -v node)"
+node_stub() { # $1 = stubs dir, $2 = version to report
+  cat >"$1/node" <<SH
+#!/usr/bin/env bash
+if [[ "\$1" == "--version" ]]; then echo "v$2"; exit 0; fi
+exec "$REAL_NODE" "\$@"
+SH
+  chmod +x "$1/node"
+}
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+for case in "below-floor:22.11.0" "above-range:23.1.0" "other-major:20.18.0"; do
+  name="${case%%:*}"; ver="${case#*:}"
+  stubs="$(make_stubs ss-absent)"; node_stub "$stubs" "$ver"
+  run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+  assert_hard_fail_branch "node-${name}" "node ${ver} is outside package.json engines.node" "$out"
+  assert_status "node-${name}-names-range" "'>=22.13.0 <23'" "$out"
+  assert_status "node-${name}-gives-fix" "nvm alias default 22.13.0" "$out"
+done
+stubs="$(make_stubs ss-absent)"; node_stub "$stubs" "22.20.0"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_status "node-in-range-not-pin-warns" "! node 22.20.0 (within engines.node '>=22.13.0 <23'; .nvmrc pins 22.13.0)" "$out"
+assert_absent "node-in-range-not-failed" "is outside package.json engines.node" "$out"
+stubs="$(make_stubs ss-absent)"; node_stub "$stubs" "22.13.0"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_status "node-at-pin-passes" "✓ node 22.13.0" "$out"
+# A range form the check does not read must FAIL as unverifiable, never pass.
+printf '{ "packageManager": "pnpm@10.33.2", "engines": { "node": "^22.13.0" } }\n' >"$root/package.json"
+stubs="$(make_stubs ss-absent)"; node_stub "$stubs" "22.13.0"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "node-unparseable-range" "node: cannot verify 22.13.0" "$out"
+
 report_results "scripts/dev-web.test.sh"
