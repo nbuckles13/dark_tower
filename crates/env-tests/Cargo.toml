@@ -91,7 +91,7 @@ tonic = { workspace = true }
 jsonwebtoken = { workspace = true }
 
 # Base64 decoding for JWKS
-base64 = "0.22"
+base64 = "0.23"
 
 # Serial test execution for stateful tests
 serial_test = "3.1"
