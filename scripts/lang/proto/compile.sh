@@ -17,7 +17,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_buf.sh"
 install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
 
 # COLLAPSE branch (ADR-0037 §D7): buf via `pnpm exec buf`. The preflight replaces the old bare-`buf`
-# `command -v` guard with the four-token taxonomy + the writer==checker version assertion (DiD here:
+# `command -v` guard with the five-token taxonomy + the writer==checker version assertion (DiD here:
 # compile is read-only, so a version mismatch is degraded feedback, not an escape — but the check is
 # uniform across the four wrappers so a stale toolchain reds specifically, not as a build failure).
 proto_buf_preflight || exit 1

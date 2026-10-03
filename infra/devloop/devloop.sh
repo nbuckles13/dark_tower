@@ -83,6 +83,17 @@ read_sqlx_cli_version() {
     cargo_lock_version "${script_dir}/../../Cargo.lock" sqlx || exit 1
 }
 
+# ─── pnpm pin (SSoT = repo-root package.json `packageManager`) ──
+# The Dockerfile takes the full `pnpm@X.Y.Z+sha512.<hex>` spec as `ARG PNPM_PACKAGE_MANAGER`
+# (no default; fails loud if unset) and hands it to `corepack prepare`, which verifies the
+# hash. The value comes from the ONE packageManager reader, shared with scripts/dev-web.sh.
+# shellcheck source=../lib/package-manager.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/package-manager.sh"
+read_pnpm_package_manager() {
+    local script_dir="$1"
+    pnpm_package_manager_spec "${script_dir}/../../package.json" || exit 1
+}
+
 # ─── Configuration ──────────────────────────────────────────────
 
 REBUILD_IMAGE=false
@@ -116,8 +127,10 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
     NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
     SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
+    PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$SCRIPT_DIR")"
     podman build --build-arg "NODE_VERSION=${NODE_VERSION}" \
-        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
+        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
+        --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi
@@ -604,8 +617,10 @@ if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
     OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
     NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
     SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
+    PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$SCRIPT_DIR")"
     podman build --build-arg "NODE_VERSION=${NODE_VERSION}" \
-        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" -t "$IMAGE" "$SCRIPT_DIR"
+        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
+        --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
         podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
     fi

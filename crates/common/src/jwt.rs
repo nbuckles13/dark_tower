@@ -1212,6 +1212,131 @@ mod tests {
         assert!(matches!(result, Err(JwtError::MalformedToken)));
     }
 
+    // -------------------------------------------------------------------------
+    // base64 decode strictness pins
+    //
+    // These pin the rejects our decoders rely on, independent of the base64
+    // crate version: a dependency bump that loosened any of them would turn a
+    // malformed header or key into an accepted one. Each reject is matched on
+    // its specific `DecodeError` variant (`{ .. }` matches both the tuple and
+    // struct forms the crate has used) so the test fails closed.
+    // -------------------------------------------------------------------------
+
+    /// RFC 8037 §A.2 Ed25519 public key `x` (32 bytes, base64url, no padding).
+    const RFC8037_X: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+
+    #[test]
+    fn test_decode_jwk_strictness_pins() {
+        use base64::DecodeError;
+
+        // Positive control: the valid key decodes to 32 bytes.
+        assert_eq!(
+            decode_ed25519_public_key_jwk(RFC8037_X).map(|b| b.len()),
+            Ok(32)
+        );
+
+        let padded = format!("{RFC8037_X}=");
+        assert!(
+            matches!(
+                decode_ed25519_public_key_jwk(&padded),
+                Err(DecodeError::InvalidPadding | DecodeError::InvalidByte { .. })
+            ),
+            "padding must be rejected under NO_PAD"
+        );
+
+        let std_alphabet = RFC8037_X.replace('_', "/");
+        assert!(
+            matches!(
+                decode_ed25519_public_key_jwk(&std_alphabet),
+                Err(DecodeError::InvalidByte { .. })
+            ),
+            "standard-alphabet '/' must be rejected under URL_SAFE"
+        );
+
+        // Last char 'o' -> 'p' sets a trailing bit the 2 data bits do not use.
+        let trailing_bits = format!("{}p", &RFC8037_X[..RFC8037_X.len() - 1]);
+        assert!(
+            matches!(
+                decode_ed25519_public_key_jwk(&trailing_bits),
+                Err(DecodeError::InvalidLastSymbol { .. })
+            ),
+            "non-canonical trailing bits must be rejected"
+        );
+
+        assert!(
+            matches!(
+                decode_ed25519_public_key_jwk(&RFC8037_X[..41]),
+                Err(DecodeError::InvalidLength { .. })
+            ),
+            "len % 4 == 1 must be rejected"
+        );
+
+        let mid_quad = format!("{}!{}", &RFC8037_X[..5], &RFC8037_X[6..]);
+        assert!(
+            matches!(
+                decode_ed25519_public_key_jwk(&mid_quad),
+                Err(DecodeError::InvalidByte { .. })
+            ),
+            "an invalid byte inside a complete quad must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_decode_pem_strictness_pins() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::DecodeError;
+
+        // 44 bytes of 0xFB encode to a body containing both '+' and '/', ending
+        // in one '=' of padding (44 = 14 * 3 + 2).
+        let body = STANDARD.encode([0xFBu8; 44]);
+        assert!(body.contains('+') && body.contains('/') && body.ends_with('='));
+        let pem = |b: &str| format!("-----BEGIN PUBLIC KEY-----\n{b}\n-----END PUBLIC KEY-----");
+
+        // Positive control.
+        assert_eq!(
+            decode_ed25519_public_key_pem(&pem(&body)).map(|b| b.len()),
+            Ok(44)
+        );
+
+        let unpadded = body.trim_end_matches('=');
+        assert!(
+            matches!(
+                decode_ed25519_public_key_pem(&pem(unpadded)),
+                Err(DecodeError::InvalidPadding)
+            ),
+            "missing canonical padding must be rejected under STANDARD"
+        );
+
+        let url_safe = body.replace('+', "-").replace('/', "_");
+        assert!(
+            matches!(
+                decode_ed25519_public_key_pem(&pem(&url_safe)),
+                Err(DecodeError::InvalidByte { .. })
+            ),
+            "URL-safe alphabet must be rejected under STANDARD"
+        );
+    }
+
+    #[test]
+    fn test_extract_kid_rejects_padded_header() {
+        // 25 bytes -> a URL_SAFE (padded) encoding ending in "==".
+        let header = r#"{"alg":"EdDSA","kid":"k"}"#;
+        let padded = base64::engine::general_purpose::URL_SAFE.encode(header);
+        assert!(padded.ends_with("=="));
+
+        // Positive control: the same header without padding is accepted.
+        let unpadded = URL_SAFE_NO_PAD.encode(header);
+        assert_eq!(
+            extract_kid(&format!("{unpadded}.payload.signature")).ok(),
+            Some("k".to_string())
+        );
+
+        assert!(matches!(
+            extract_kid(&format!("{padded}.payload.signature")),
+            Err(JwtError::MalformedToken)
+        ));
+    }
+
     #[test]
     fn test_extract_kid_oversized_token() {
         // Create a token larger than MAX_JWT_SIZE_BYTES

@@ -59,8 +59,8 @@ base64 = { workspace = true }
 sysinfo = "0.30"
 
 # Metrics (ADR-0011 Observability, ADR-0023 Section 11)
-metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 # Async gRPC auth layer (JWKS-based service token validation)
 tower = { workspace = true }
@@ -86,20 +86,18 @@ criterion = { workspace = true }
 # Fixed-seed generator for the slot table's property test (workspace dep).
 rand = { workspace = true }
 mc-test-utils = { path = "../mc-test-utils" }
-# Metrics testing
-metrics-util = "0.18"
 # HTTP testing for health endpoint integration tests
-http-body-util = "0.1"
+http-body-util = { workspace = true }
 # Need test-util feature for tokio::time::pause/advance in tests
 tokio = { workspace = true, features = ["test-util"] }
 # For wrapping TcpListener as tonic-compatible stream in integration tests
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
 # InMemorySpanExporter for OTel span-parent assertions in integration tests (R-56/R-57)
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)
 common = { path = "../common", features = ["test-utils"] }
 # JWT validation testing (Ed25519 signing, JWKS mocking)
-wiremock = "0.6"
+wiremock = { workspace = true }
 jsonwebtoken = { workspace = true }
 # WebTransport client for join integration tests (dangerous-configuration for self-signed certs)
 wtransport = { workspace = true, features = ["dangerous-configuration"] }
@@ -107,9 +105,9 @@ wtransport = { workspace = true, features = ["dangerous-configuration"] }
 # Required because `wtransport::Identity::self_signed` returns an opaque Identity with no
 # stable PEM-serialization API, but `WebTransportServer::bind()` reads PEMs from disk via
 # `Identity::load_pemfiles`. The on-disk round-trip exercises the production code path.
-rcgen = "0.13"
+rcgen = { workspace = true }
 # Tempdir for the runtime-generated PEM files; cleaned up on rig drop.
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lib]
 name = "mc_service"

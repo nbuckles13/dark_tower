@@ -1305,10 +1305,10 @@ mod tests {
     //! Behavioral tests for [`await_meeting_registration`].
     //!
     //! Each test isolates metric recording via
-    //! `::metrics::set_default_local_recorder` (RAII thread-local guard).
-    //! `#[tokio::test]` uses the current-thread runtime, so the helper
-    //! runs on the same thread that holds the guard, and recorder calls
-    //! made across `.await` points are captured.
+    //! `common::observability::testing::MetricAssertion::snapshot()`, a
+    //! thread-local recorder. `#[tokio::test]` uses the current-thread
+    //! runtime, so the helper runs on the same thread that holds the
+    //! snapshot, and recorder calls made across `.await` points are captured.
     //!
     //! These tests enforce the invariant documented on
     //! `::metrics::record_register_meeting_timeout`: the counter fires
@@ -1323,34 +1323,12 @@ mod tests {
     //! time.
     use super::*;
     use crate::session::PendingConnection;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use metrics_util::MetricKind;
+    use common::observability::testing::MetricAssertion;
     use std::time::Instant;
 
     const METRIC_NAME: &str = "mh_register_meeting_timeouts_total";
     const TEST_TIMEOUT: Duration = Duration::from_secs(15);
     const LONG_TIMEOUT: Duration = Duration::from_secs(30);
-
-    /// Return the counter value for `mh_register_meeting_timeouts_total`,
-    /// or `None` if the counter was never recorded against this recorder.
-    fn timeout_counter_value(recorder: &DebuggingRecorder) -> Option<u64> {
-        recorder
-            .snapshotter()
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(composite, _unit, _desc, value)| {
-                if composite.kind() == MetricKind::Counter && composite.key().name() == METRIC_NAME
-                {
-                    match value {
-                        DebugValue::Counter(v) => Some(v),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-    }
 
     async fn setup_pending(
         session_manager: &SessionManagerHandle,
@@ -1370,8 +1348,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn timeout_arm_records_metric_once() {
-        let recorder = DebuggingRecorder::new();
-        let _guard = ::metrics::set_default_local_recorder(&recorder);
+        let snap = MetricAssertion::snapshot();
 
         let session_manager =
             SessionManagerHandle::new(crate::session::admission::test_admission());
@@ -1396,17 +1373,13 @@ mod tests {
             matches!(outcome, RegistrationOutcome::Timeout),
             "expected Timeout, got {outcome:?}"
         );
-        assert_eq!(
-            timeout_counter_value(&recorder),
-            Some(1),
-            "timeout arm must record the counter exactly once"
-        );
+        // Timeout arm records the counter exactly once.
+        snap.counter(METRIC_NAME).assert_delta(1);
     }
 
     #[tokio::test]
     async fn cancel_arm_does_not_record_metric() {
-        let recorder = DebuggingRecorder::new();
-        let _guard = ::metrics::set_default_local_recorder(&recorder);
+        let snap = MetricAssertion::snapshot();
 
         let session_manager =
             SessionManagerHandle::new(crate::session::admission::test_admission());
@@ -1432,17 +1405,13 @@ mod tests {
             matches!(outcome, RegistrationOutcome::Cancelled),
             "expected Cancelled, got {outcome:?}"
         );
-        assert!(
-            matches!(timeout_counter_value(&recorder), None | Some(0)),
-            "cancel arm must not record the timeout counter, got {:?}",
-            timeout_counter_value(&recorder)
-        );
+        // Cancel arm must not record the timeout counter.
+        snap.counter(METRIC_NAME).assert_unobserved();
     }
 
     #[tokio::test]
     async fn registered_arm_does_not_record_metric() {
-        let recorder = DebuggingRecorder::new();
-        let _guard = ::metrics::set_default_local_recorder(&recorder);
+        let snap = MetricAssertion::snapshot();
 
         let session_manager =
             SessionManagerHandle::new(crate::session::admission::test_admission());
@@ -1470,11 +1439,8 @@ mod tests {
             matches!(outcome, RegistrationOutcome::Registered),
             "expected Registered, got {outcome:?}"
         );
-        assert!(
-            matches!(timeout_counter_value(&recorder), None | Some(0)),
-            "registered arm must not record the timeout counter, got {:?}",
-            timeout_counter_value(&recorder)
-        );
+        // Registered arm must not record the timeout counter.
+        snap.counter(METRIC_NAME).assert_unobserved();
     }
 
     /// A connection closed by `EndMeeting` release never notifies MC, whatever

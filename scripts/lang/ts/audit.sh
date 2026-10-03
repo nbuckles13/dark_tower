@@ -49,23 +49,39 @@ audit_json="$(pnpm audit --audit-level=high --json 2>/dev/null)" || pnpm_rc=$?
 mapfile -t suppressed < <(audit_read_pnpm_suppressions)
 
 # Decide pass/fail: count advisories at/above the threshold whose id is NOT suppressed.
-# pnpm audit --json emits an `advisories` object (npm-audit v1) or `vulnerabilities`
-# (v2); we handle both, matching on the advisory's GHSA/CVE id and severity. The
-# threshold is high (so high+critical count). Suppressed ids drop out.
-decision="$(python3 - "$pnpm_rc" "${suppressed[@]+"${suppressed[@]}"}" <<'PY'
+# pnpm audit --json emits an `advisories` object; we match on each advisory's GHSA/CVE id
+# and severity. The threshold is high (so high+critical count). Suppressed ids drop out.
+# The PROGRAM is passed with `python3 -c` and the audit JSON on stdin. (Until 2026-10-03
+# both went to stdin — `python3 - <<'PY'` — so Python consumed stdin as its program,
+# `sys.stdin.read()` returned "", and every scan was decided on pnpm's exit code alone
+# with the suppression filter never seeing an advisory.) stdin has no size cap; an
+# argv/env string is capped at 128 KiB, which a large audit report exceeds.
+read -r -d '' __audit_decide_py <<'PY' || true
 import json, sys
 pnpm_rc = sys.argv[1]
 suppressed = set(sys.argv[2:])
 raw = sys.stdin.read().strip()
 if not raw:
-    # No JSON (e.g. pnpm not installed / empty) — if pnpm exited non-zero with no
-    # parseable output, surface that as a fail; else treat as clean.
-    print("FAIL no-json" if pnpm_rc != "0" else "OK")
+    # No JSON at all. A healthy `pnpm audit --json` always prints an object (a clean
+    # tree is `{"advisories":{},...}`), so empty stdout — whatever pnpm's exit code —
+    # means nothing was evaluated: never a pass, and not an advisory finding either.
+    print("FAIL no-json")
     sys.exit(0)
 try:
     data = json.loads(raw)
 except Exception:
     print("FAIL bad-json")
+    sys.exit(0)
+
+# Fail CLOSED on a shape we do not recognise. The filter below reads only the
+# `advisories` object — the shape pnpm (12.x, bulk advisory endpoint) emits; any other
+# shape would yield zero considered advisories and print OK — indistinguishable from a
+# clean scan. An empty `advisories: {}` IS recognised (clean). (An npm-audit v2
+# `vulnerabilities` parser lived here; pnpm never emits it and it was never exercised,
+# so it was removed: that shape now fails as unrecognised rather than being parsed by
+# untested code.)
+if not isinstance(data, dict) or "advisories" not in data:
+    print("FAIL unrecognised-shape")
     sys.exit(0)
 
 THRESH = {"high", "critical"}
@@ -83,31 +99,42 @@ def consider(adv_id, severity):
 # npm-audit v1 shape: {"advisories": {id: {"severity":..., "github_advisory_id":...}}}
 for _, adv in (data.get("advisories") or {}).items():
     sev = (adv.get("severity") or "").lower()
-    aid = adv.get("github_advisory_id") or adv.get("cves", [None])[0] or str(adv.get("id"))
+    aid = adv.get("github_advisory_id") or (adv.get("cves") or [None])[0] or str(adv.get("id"))
     consider(aid, sev)
-
-# npm-audit v2 shape: {"vulnerabilities": {name: {"severity":..., "via":[{...}]}}}
-for _, v in (data.get("vulnerabilities") or {}).items():
-    sev = (v.get("severity") or "").lower()
-    for via in (v.get("via") or []):
-        if isinstance(via, dict):
-            aid = via.get("url", "").rstrip("/").split("/")[-1] or via.get("name")
-            consider(aid, (via.get("severity") or sev).lower())
 
 print(("FAIL" if remaining else "OK"),
       "applied=" + ",".join(sorted(applied)),
       "remaining=" + ",".join(sorted(set(remaining))))
 PY
-)"
+decision="$(printf '%s' "$audit_json" | python3 -c "$__audit_decide_py" "$pnpm_rc" "${suppressed[@]+"${suppressed[@]}"}")" || true
 
 # Surface applied suppressions (observability SUPPRESSED= line) when any were hit.
 applied_ids="$(printf '%s\n' "$decision" | sed -n 's/.*applied=\([^ ]*\).*/\1/p')"
 [[ -n "$applied_ids" ]] && echo "SUPPRESSED=${applied_ids}" >&2
 
+if printf '%s\n' "$decision" | grep -q '^FAIL no-json'; then
+  echo "pnpm audit: --json printed nothing (pnpm rc=${pnpm_rc}) — no report to evaluate. This is not an advisory finding; do not suppress." >&2
+  emit_status FAIL "pnpm-audit-unrecognised-output"
+  exit 1
+fi
+if printf '%s\n' "$decision" | grep -q '^FAIL unrecognised-shape'; then
+  # Its own token, distinct from pnpm-audit-failed: the remedy is to teach the parser the
+  # new shape, NEVER to suppress an advisory.
+  echo "pnpm audit: --json output has no 'advisories' object — the parser does not recognise this shape; update scripts/lang/ts/audit.sh, do not suppress." >&2
+  emit_status FAIL "pnpm-audit-unrecognised-output"
+  exit 1
+fi
 if printf '%s\n' "$decision" | grep -q '^FAIL'; then
   remaining_ids="$(printf '%s\n' "$decision" | sed -n 's/.*remaining=\([^ ]*\).*/\1/p')"
   echo "pnpm audit: unsuppressed high/critical advisories remain: ${remaining_ids:-<see pnpm audit output>}" >&2
   emit_status FAIL "pnpm-audit-failed"
+  exit 1
+fi
+# Pass ONLY on an explicit OK decision: an empty or garbled decision (python missing,
+# killed, printed nothing) is never read as clean.
+if ! printf '%s\n' "$decision" | grep -q '^OK'; then
+  echo "pnpm audit: the decision step produced no verdict (got: '${decision}') — the scan was not evaluated." >&2
+  emit_status FAIL "pnpm-audit-no-decision"
   exit 1
 fi
 emit_status OK "pnpm-audit-passed"

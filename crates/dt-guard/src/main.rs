@@ -45,6 +45,7 @@ use dt_guard::ts_pii;
 use dt_guard::ts_retained_credentials;
 use dt_guard::ts_secrets;
 use dt_guard::ts_test_removal;
+use dt_guard::workspace_deps;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -110,6 +111,17 @@ enum Command {
     /// Release-build premise: assert shipped artifacts are built with
     /// debug-assertions off, so ADR-0036 §11's compile-time control is armed.
     ReleaseBuildProfile {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Rust dependency-version SSoT: members inherit `[workspace.dependencies]`,
+    /// shared deps are hoisted, excluded workspaces match the root, and global
+    /// facade crates resolve to one version in Cargo.lock.
+    WorkspaceDeps {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -442,6 +454,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::ReleaseBuildProfile { root, explain } => {
             release_build_profile::run(&root, explain)
         }
+        Command::WorkspaceDeps { root, explain } => workspace_deps::run(&root, explain),
         Command::MediaTelemetryDeny { root, explain } => media_telemetry_deny::run(&root, explain),
         Command::MetricLabels { root, explain } => metric_labels::run(&root, explain),
         Command::ApplicationMetrics { root, explain } => application_metrics::run(&root, explain),

@@ -110,6 +110,23 @@ is for **bump PRs only**:
 - It is **desirable** for Dependabot to open a bump PR for a currently-suppressed dep
   (e.g. rsa) — that is remediation progress toward removing the suppression, not a
   conflict with it.
+- **Grouping.** Crates and packages that must move together arrive in ONE PR, majors
+  included: cargo `otel-web-stack` (OpenTelemetry + axum/tower/tonic/prost) and
+  `metrics-stack`; npm `@opentelemetry/*`, the protobuf-es pair and the vitest family; and
+  every GitHub Actions update. Everything else is grouped by minor/patch; `@bufbuild/buf`
+  always gets its own PR. Do not split a group PR to land part of it.
+- **Neither delay slows advisory remediation (ADR-0033 §12, 14-day MTTR):**
+  - Dependabot `cooldown` (5 days, 14 for majors) delays **version** updates only. It does
+    not apply to Dependabot **security** updates and is not a suppression surface.
+  - pnpm's `minimumReleaseAge` (built-in 1-day default, non-strict; deliberately not set in
+    `pnpm-workspace.yaml`, because an explicit value makes it strict) does not block a
+    same-day fix: when no version old enough satisfies a range, pnpm installs the newer one
+    and records it under `minimumReleaseAgeExclude` in `pnpm-workspace.yaml`, which shows up
+    in the remediation diff for review. That list is not a suppression surface either.
+- **Transitive fixes** go in `pnpm-workspace.yaml` `overrides:` (pnpm >= 11 ignores the
+  `pnpm` field of `package.json`); see `scripts/lang/ts/audit-remediation.md`.
+
+**TS-lane suppressions before 2026-10-03.** From 2026-06-06 to 2026-10-03, `scripts/lang/ts/audit.sh` never parsed the `pnpm audit` JSON (it read a stdin already consumed by `python3 -`), so `.pnpm-audit-ignore.json` was never applied. The only TS suppression in that window, GHSA-h67p-54hq-rp68 (moderate, below the high gate), was never load-bearing. The wrapper now applies the list and fails closed (`pnpm-audit-unrecognised-output`, `pnpm-audit-no-decision`).
 
 **Manual enablement step:** committing `dependabot.yml` enables Dependabot
 *version-updates*. Dependabot *security-updates* (auto-PR when an advisory is published)

@@ -31,7 +31,7 @@ prost = { workspace = true }
 tonic = { workspace = true }
 # Matches the in-tree idiom: `mc-service` and `mh-service` both declare this
 # directly rather than through `workspace.dependencies`, which has no entry.
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
 
 # Utilities
 uuid = { workspace = true }
@@ -40,10 +40,10 @@ bytes = { workspace = true }
 
 # Cryptography for test fixtures
 ring = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 
 # JWT test utilities (Ed25519 signing, JWKS mocking)
-wiremock = "0.6"
+wiremock = { workspace = true }
 jsonwebtoken = { workspace = true }
 
 # Error handling

@@ -36,16 +36,16 @@ bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
 
 # Additional dependencies for auth controller
-base64 = "0.21"
+base64 = { workspace = true }
 
 # Metrics (ADR-0011 Observability)
-metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 # For field hashing (ADR-0011 privacy)
 sha2 = "0.10"
 hmac = "0.12"
-hex = "0.4"
+hex = { workspace = true }
 
 # Local dependencies
 common = { path = "../common" }
@@ -53,21 +53,18 @@ common = { path = "../common" }
 [dev-dependencies]
 # Testing utilities
 ac-test-utils = { path = "../ac-test-utils" }
-anyhow = "1.0"
+anyhow = { workspace = true }
 
 # Enable common's test-utils feature for MetricAssertion in tests/.
 # Per ADR-0032 Step 4: per-failure-class metric tests live in tests/ and
-# require the thread-local DebuggingRecorder shipped behind this feature.
+# require MetricAssertion's own thread-local recorder, shipped behind this feature.
 common = { path = "../common", features = ["test-utils"] }
 
 # Test framework
 tokio = { workspace = true, features = ["test-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-http-body-util = "0.1"
-
-# Metrics testing
-metrics-util = "0.18"
+reqwest = { workspace = true }
+http-body-util = { workspace = true }
 
 # Benchmarking
 criterion = { workspace = true }
-futures = "0.3.31"
+futures = { workspace = true }

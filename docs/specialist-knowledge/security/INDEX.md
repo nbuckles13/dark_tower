@@ -64,7 +64,7 @@
 
 ## Dependency Audit & Supply Chain
 - Layer-6 audit dep-change gate → `scripts/lang/_audit_gate.sh`; glob predicate → `scripts/lang/_changed_helpers.sh`; ambient safety net → `.github/workflows/audit-scheduled.yml` | ADR-0033 §§3,11
-- Audit-suppression governance (fail-secure to zero, drift-checked) → `audit-suppressions.toml`, `.pnpm-audit-ignore.json`, guard `scripts/audit-suppressions-check.sh` | transitive overrides → root `package.json` | toolchain pin as a security property → `.npmrc`, `.nvmrc`, `infra/devloop/Dockerfile` | release build profile → `crates/dt-guard/src/release_build_profile.rs`
+- Audit-suppression governance (fail-secure to zero, drift-checked) → `audit-suppressions.toml`, `.pnpm-audit-ignore.json`, guard `scripts/audit-suppressions-check.sh` | transitive overrides → `pnpm-workspace.yaml` `overrides:` | toolchain pin as a security property → `pnpm-workspace.yaml` (`engineStrict`, `allowBuilds`), `package.json` `packageManager` (hash-pinned), `.nvmrc`, `infra/devloop/Dockerfile` | release build profile → `crates/dt-guard/src/release_build_profile.rs`
 
 ## Devloop Container, Story Runner, Cluster Isolation
 - Container isolation → ADR-0025 | cluster helper trust model → ADR-0030 | helper binary arg/gateway validation → `crates/devloop-helper/src/commands.rs`; auth token (CSPRNG, constant-time compare, 0600) → `crates/devloop-helper/src/auth.rs`

@@ -37,6 +37,8 @@ layer_lifecycle_begin 3
   run_and_emit "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh" || true
   run_and_emit "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh" || true
   run_and_emit "audit-gate-test" "${__here}/lang/_audit_gate.test.sh" || true
+  run_and_emit "ts-audit-decision-test" "${__here}/lang/ts/audit.test.sh" || true
+  run_and_emit "pnpm-helpers-test" "${__here}/lang/_pnpm.test.sh" || true
   run_and_emit "layer7-selftest" "${__here}/layer7.test.sh" || true
   # Org-subdomain drift guard SELF-TEST (story R-7, task #3). The guard itself is
   # auto-discovered by run-guards.sh above and runs on every devloop — but a PASSING guard

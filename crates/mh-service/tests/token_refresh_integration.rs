@@ -36,7 +36,7 @@ fn success_refresh_emits_token_refresh_metrics_end_to_end() {
         error_category: None,
     });
 
-    // Histogram first — `Snapshotter::snapshot()` drains histograms on read
+    // Histogram first — a `MetricAssertion` snapshot drains histograms on read
     // per `common::observability::testing` §"Delta semantics".
     snap.histogram("mh_token_refresh_duration_seconds")
         .assert_observation_count_at_least(1);

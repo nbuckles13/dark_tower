@@ -167,6 +167,9 @@
 //! while looking like it does — the same inertness this guard exists to
 //! prevent, turned on itself.
 
+use crate::common::cargo_manifest::{
+    members_contain_glob, read_root_manifest, ManifestError, WorkspaceTable,
+};
 use crate::common::explain::{print_finding, Finding};
 use crate::common::scan::warn_skip;
 use crate::common::services::CANONICAL_SERVICES;
@@ -579,32 +582,6 @@ struct ProfileTable {
     build_override: Option<Box<ProfileTable>>,
 }
 
-/// The workspace root manifest, parsed **once** into everything this guard
-/// needs from it.
-///
-/// Previously this was two structs deserialized from the same string at two
-/// call sites, with the second failure swallowed on the grounds that "the
-/// caller's total parse already recorded it". That was false in one narrow
-/// case (@code-reviewer): a `[workspace] members` of the wrong *type* leaves a
-/// profile-only parse succeeding while the workspace parse fails — and the
-/// roster floor then returned silently, green. One parse, one failure path.
-#[derive(Debug, Default, serde::Deserialize)]
-struct WorkspaceManifest {
-    #[serde(default)]
-    profile: std::collections::BTreeMap<String, ProfileTable>,
-    /// `Option`, not `#[serde(default)]`: "there is no `[workspace]` table"
-    /// and "there is an empty one" are different facts, and the roster floor
-    /// needs to tell them apart rather than treat both as an empty roster.
-    #[serde(default)]
-    workspace: Option<WorkspaceTable>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct WorkspaceTable {
-    #[serde(default)]
-    members: Vec<String>,
-}
-
 /// Does this profile reach the shipped artifact?
 ///
 /// `release` itself, plus any profile that `inherits = "release"` **and** is
@@ -965,10 +942,18 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     }
 
     // --- Workspace manifest: profiles + member-derived floor ---------------
-    let manifest_path = repo_root.join("Cargo.toml");
-    let manifest_src = std::fs::read_to_string(&manifest_path).ok();
-    match manifest_src.as_deref() {
-        None => hits.push(Hit {
+    // Parse must be TOTAL: unparseable FAILs, never skips. That totality is
+    // the entire justification for taking a real parser. ONE parse serves
+    // both the profile rules and the roster floor.
+    //
+    // The parse lives in `common::cargo_manifest` (shared with
+    // `workspace_deps`). Previously this guard deserialized two structs from
+    // the same string at two call sites and swallowed the second failure; a
+    // `[workspace] members` of the wrong *type* then left the profile parse
+    // succeeding while the roster floor returned silently, green
+    // (@code-reviewer). One parse, one failure path.
+    match read_root_manifest::<ProfileTable>(repo_root) {
+        Err(ManifestError::Unreadable(_)) => hits.push(Hit {
             rule_id: WORKSPACE_MANIFEST_UNREADABLE,
             detail: "workspace Cargo.toml is absent or unreadable — the release-profile premise \
                      could not be evaluated. DISCOVERY/PRECONDITION failure, not a diff defect."
@@ -976,41 +961,30 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
             file: "Cargo.toml".to_string(),
             line: 0,
         }),
-        Some(src) => {
-            // Parse must be TOTAL: unparseable FAILs, never skips. That
-            // totality is the entire justification for taking a real parser.
-            // ONE parse serves both the profile rules and the roster floor.
-            match toml::from_str::<WorkspaceManifest>(src) {
-                Err(e) => hits.push(Hit {
-                    rule_id: WORKSPACE_MANIFEST_UNREADABLE,
-                    detail: format!(
-                        "workspace Cargo.toml failed to parse as TOML ({e}) — the \
-                         release-profile premise could not be evaluated. \
-                         DISCOVERY/PRECONDITION failure, not a diff defect."
-                    ),
-                    file: "Cargo.toml".to_string(),
-                    line: 0,
-                }),
-                Ok(parsed) => {
-                    // NOTE: a MISSING `[profile.release]` table is deliberately
-                    // NOT a finding — see the module doc. Cargo's built-in
-                    // release defaults already set `debug-assertions = false`,
-                    // so the premise holds; failing there would be a false
-                    // positive, and a guard that false-fails gets bypassed.
-                    check_profiles(
-                        "Cargo.toml",
-                        &parsed.profile,
-                        &all_named_profiles,
-                        RELEASE_PROFILE_DEBUG_ASSERTIONS,
-                        &mut hits,
-                    );
-                    check_service_roster(
-                        parsed.workspace.as_ref(),
-                        &scanned_service_dirs,
-                        &mut hits,
-                    );
-                }
-            }
+        Err(ManifestError::Unparseable(e)) => hits.push(Hit {
+            rule_id: WORKSPACE_MANIFEST_UNREADABLE,
+            detail: format!(
+                "workspace Cargo.toml failed to parse as TOML ({e}) — the \
+                 release-profile premise could not be evaluated. \
+                 DISCOVERY/PRECONDITION failure, not a diff defect."
+            ),
+            file: "Cargo.toml".to_string(),
+            line: 0,
+        }),
+        Ok(parsed) => {
+            // NOTE: a MISSING `[profile.release]` table is deliberately
+            // NOT a finding — see the module doc. Cargo's built-in
+            // release defaults already set `debug-assertions = false`,
+            // so the premise holds; failing there would be a false
+            // positive, and a guard that false-fails gets bypassed.
+            check_profiles(
+                "Cargo.toml",
+                &parsed.profile,
+                &all_named_profiles,
+                RELEASE_PROFILE_DEBUG_ASSERTIONS,
+                &mut hits,
+            );
+            check_service_roster(parsed.workspace.as_ref(), &scanned_service_dirs, &mut hits);
         }
     }
 
@@ -1380,7 +1354,7 @@ fn check_service_roster(
     // the roster untrustworthy even when it is non-empty —
     // `["crates/mh-service", "crates/*"]` derives one service while the glob
     // could be hiding another — so emptiness is the wrong discriminator.
-    if workspace.members.iter().any(|m| m.contains('*')) {
+    if members_contain_glob(&workspace.members) {
         hits.push(Hit {
             rule_id: SERVICE_ROSTER_UNDERIVABLE,
             detail: format!(
@@ -1442,6 +1416,8 @@ fn check_service_roster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type WorkspaceManifest = crate::common::cargo_manifest::RootManifest<ProfileTable>;
 
     // --- logical line joining ---------------------------------------------
 

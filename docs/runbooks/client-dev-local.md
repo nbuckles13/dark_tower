@@ -262,7 +262,7 @@ Both are pinned in the repo, and the pins are **not restated here** — a second
 
 `scripts/dev-web.sh` reads both at runtime and prints the exact `nvm install` / `corepack prepare`
 command with the value already substituted. Run it rather than transcribing a version by hand.
-See F2, F3, F4 for the three ways this goes wrong.
+See F2, F3, F4 for the three ways this goes wrong, and F20 after a pnpm major bump.
 
 ---
 
@@ -1008,7 +1008,7 @@ otherwise runs is F3.
 
 ```bash
 # --- WSL2 ---
-npm install -g corepack@latest && corepack enable && corepack prepare pnpm@<the packageManager pin> --activate
+npm install -g corepack@latest && corepack enable && corepack prepare <the packageManager value> --activate
 ```
 
 **Why it recurs.** It reappears whenever the Node pin moves backwards relative to the pnpm pin.
@@ -1269,7 +1269,7 @@ Once F11 is confirmed, split the two sub-cases — they have different *minimal*
 at or above the workspace floor — the floor value lives in the root `package.json` `engines.node`
 and the lockfile and is **not restated here** (§2.4; a second copy would drift). Under a Node
 *below* that floor, pnpm **silently skips** the engines-mismatched optional binding: the install
-still succeeds and the gap only surfaces at Vite launch. `engine-strict=true` in the repo `.npmrc`
+still succeeds and the gap only surfaces at Vite launch. `engineStrict: true` in the repo `pnpm-workspace.yaml`
 now turns sub-case (a) into a loud `pnpm install` failure. But a `node_modules` tree installed
 *earlier* under a below-floor Node (sub-case b) keeps the gap until it is reinstalled: once pnpm has
 recorded the optional binding as skipped, a plain `pnpm install` over the existing tree may not
@@ -1617,6 +1617,35 @@ a join or re-map alone does not tick it.
    `dt_client_media_decode_queue_dropped_total`.
 4. Nothing on the client side explains it → MC routing: the slot state MC pushed does not match the
    edges it programmed on MH. See `mc-incident-response.md` (media routing / generation divergence).
+
+---
+
+### F20 — After the pnpm 12 move: `dev-web.sh` fails the pnpm check, or `pnpm` refuses to run
+
+**Symptom.** Either `dev-web.sh` hard-fails with `pnpm <10.x> — packageManager pins <12.x>`, or a
+`pnpm run`/`pnpm exec` (and the pipeline wrappers, as `REASON=pnpm-deps-stale`) stops with
+`ERR_PNPM_VERIFY_DEPS_BEFORE_RUN`.
+
+**Discriminator.** The first names two pnpm versions; the second names the lockfile. Neither names a
+keyid (that is F4).
+
+**Cause.** The `packageManager` pin moved from pnpm 10 to 12 (2026-10-03) and now carries a
+`+sha512.` hash, and `pnpm-workspace.yaml` sets `verifyDepsBeforeRun: error`: pnpm refuses to run
+against a `node_modules` that no longer matches the lockfile instead of silently re-installing. A
+`node_modules` tree installed by pnpm 10 is such a tree.
+
+**Fix.** Activate the pinned pnpm (`dev-web.sh` prints the exact, hash-carrying `corepack prepare`
+command), then reinstall from clean:
+
+```bash
+# --- WSL2 ---
+npm install -g corepack@latest && corepack enable && corepack prepare <the packageManager value> --activate
+rm -rf node_modules packages/*/node_modules && pnpm install --frozen-lockfile
+```
+
+**Why it recurs.** On every pnpm major bump, and whenever a branch switch or pull changes the
+lockfile under an existing `node_modules` — the fix for the second case is just
+`pnpm install --frozen-lockfile`.
 
 ---
 

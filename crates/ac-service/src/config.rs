@@ -647,6 +647,69 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::Base64Error(_))));
     }
 
+    /// Pins the STANDARD-decode rejects the master key and hash secret rely on,
+    /// independent of the base64 crate version. Each malformed form must fail
+    /// as a decode error, never reach the length check or load.
+    #[test]
+    fn test_from_vars_master_key_base64_strictness_pins() {
+        use base64::DecodeError;
+
+        let with_key = |key: &str| {
+            HashMap::from([
+                (
+                    "DATABASE_URL".to_string(),
+                    "postgresql://localhost/test".to_string(),
+                ),
+                ("AC_MASTER_KEY".to_string(), key.to_string()),
+            ])
+        };
+
+        // 32 bytes of 0xFB: the encoding contains '+' and '/' and ends "s=".
+        let valid = general_purpose::STANDARD.encode([0xFBu8; 32]);
+        assert!(valid.contains('+') && valid.contains('/') && valid.ends_with("s="));
+        // Positive control: the valid key loads.
+        assert!(Config::from_vars(&with_key(&valid)).is_ok());
+
+        let unpadded = valid.trim_end_matches('=');
+        assert!(
+            matches!(
+                Config::from_vars(&with_key(unpadded)),
+                Err(ConfigError::Base64Error(DecodeError::InvalidPadding))
+            ),
+            "missing canonical padding must be rejected"
+        );
+
+        let url_safe = valid.replace('+', "-").replace('/', "_");
+        assert!(
+            matches!(
+                Config::from_vars(&with_key(&url_safe)),
+                Err(ConfigError::Base64Error(DecodeError::InvalidByte { .. }))
+            ),
+            "URL-safe alphabet must be rejected"
+        );
+
+        // 32 = 10 * 3 + 2: the char before '=' carries 4 data bits and 2 trailing
+        // bits. 's' (44) leaves them clear; 'v' (47) sets them.
+        let trailing_bits = format!("{}v=", &valid[..valid.len() - 2]);
+        assert!(
+            matches!(
+                Config::from_vars(&with_key(&trailing_bits)),
+                Err(ConfigError::Base64Error(
+                    DecodeError::InvalidLastSymbol { .. }
+                ))
+            ),
+            "non-canonical trailing bits must be rejected"
+        );
+
+        assert!(
+            matches!(
+                Config::from_vars(&with_key(&valid[..41])),
+                Err(ConfigError::Base64Error(DecodeError::InvalidLength { .. }))
+            ),
+            "len % 4 == 1 must be rejected"
+        );
+    }
+
     #[test]
     fn test_from_vars_master_key_too_short() {
         let short_key = general_purpose::STANDARD.encode([0u8; 16]);

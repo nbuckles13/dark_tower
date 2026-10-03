@@ -2196,11 +2196,92 @@ assert_status "devloop-sh-derives-sqlx-cli-version" 'cargo_lock_version "${scrip
 assert_status "devloop-dockerfile-pins-sqlx-cli" '--version "=${SQLX_CLI_VERSION}"' "$(cat "${REPO_ROOT}/infra/devloop/Dockerfile")"
 assert_status "db-migrate-dockerfile-pins-sqlx-cli" '--version "=${SQLX_CLI_VERSION}"' "$(cat "${REPO_ROOT}/infra/docker/db-migrate/Dockerfile")"
 
-# --- RUST_VERSION: one checked value across every image Dockerfile ---------------------------
-rv="$(grep -h '^ARG RUST_VERSION=' "${REPO_ROOT}"/infra/docker/*/Dockerfile | sort -u)"
-rv_n="$(grep -c . <<< "$rv")"
-assert_rc "dockerfile-rust-version-defaults-agree" 0 "$([[ "$rv_n" -eq 1 ]] && echo 0 || echo "1 (${rv//$'\n'/ | })")"
-assert_rc "dockerfile-rust-version-nonvacuous" 0 "$([[ "$(grep -l '^ARG RUST_VERSION=' "${REPO_ROOT}"/infra/docker/*/Dockerfile | wc -l)" -ge 5 ]] && echo 0 || echo 1)"
+# --- Rust version: ONE value across every image Dockerfile, the devloop image and CI ----------
+# Sites: the image Dockerfiles' `ARG RUST_VERSION=<v>`, the devloop image's `FROM …/rust:<v>-…`,
+# and every workflow `rustup toolchain install <v>` / `rustup default <v>` that is not nightly
+# (`rustup default` installs a missing toolchain itself, so it is a version site too). Moving to the latest
+# stable from this one pin is docs/TODO.md §Supply Chain.
+rust_versions() {  # $1 = root; prints one "<site>: <version>" line per site
+  local root="$1" f v
+  for f in "${root}"/infra/docker/*/Dockerfile; do
+    v="$(grep -oP '^ARG RUST_VERSION=\K\S+' "$f" || true)"
+    [[ -n "$v" ]] && printf '%s: %s\n' "${f#"${root}"/}" "$v"
+  done
+  v="$(grep -oP '^FROM docker\.io/library/rust:\K[0-9.]+(?=-)' "${root}/infra/devloop/Dockerfile" || true)"
+  [[ -n "$v" ]] && printf '%s: %s\n' "infra/devloop/Dockerfile" "$v"
+  grep -oP 'rustup (toolchain install|default) \K[0-9][0-9.]*' "${root}"/.github/workflows/*.yml 2>/dev/null \
+    | sed "s#^${root}/##; s#:\\(.*\\)\$#: \\1#"
+}
+rv_sites="$(rust_versions "$REPO_ROOT")"
+rv="$(sed 's/^.*: //' <<< "$rv_sites" | sort -u)"
+assert_rc "rust-version-one-value" 0 "$([[ "$(grep -c . <<< "$rv")" -eq 1 ]] && echo 0 || echo "1 (${rv_sites//$'\n'/ | })")"
+# Non-vacuity: 5 image Dockerfiles + the devloop image + 4 workflow steps x (install + default)
+# (ci.yml x2, ci-client.yml, audit-scheduled.yml — fuzz-nightly's nightly is excluded by the digit match).
+assert_rc "rust-version-sites-nonvacuous" 0 "$([[ "$(grep -c . <<< "$rv_sites")" -ge 14 ]] && echo 0 || echo "1 ($(grep -c . <<< "$rv_sites") sites)")"
+assert_status "rust-version-covers-devloop-image" "infra/devloop/Dockerfile: " "$rv_sites"
+assert_status "rust-version-covers-workflows" ".github/workflows/ci.yml: " "$rv_sites"
+# Negative control: one drifted site must trip the one-value check.
+RVROOT="${WORK}/rvroot"; mkdir -p "$RVROOT/infra/docker/x" "$RVROOT/infra/devloop" "$RVROOT/.github/workflows"
+printf 'ARG RUST_VERSION=1.95\n' > "$RVROOT/infra/docker/x/Dockerfile"
+printf 'FROM docker.io/library/rust:1.95-slim-bookworm\n' > "$RVROOT/infra/devloop/Dockerfile"
+printf '        run: rustup toolchain install 1.96 --profile minimal\n' > "$RVROOT/.github/workflows/w.yml"
+rv="$(rust_versions "$RVROOT" | sed 's/^.*: //' | sort -u)"
+assert_rc "rust-version-drift-trips" 0 "$([[ "$(grep -c . <<< "$rv")" -gt 1 ]] && echo 0 || echo 1)"
+# Negative control: install and default disagreeing inside one step must trip too.
+printf '        run: |\n          rustup toolchain install 1.95 --profile minimal\n          rustup default 1.94\n' > "$RVROOT/.github/workflows/w.yml"
+rv="$(rust_versions "$RVROOT" | sed 's/^.*: //' | sort -u)"
+assert_rc "rust-version-install-default-drift-trips" 0 "$([[ "$(grep -c . <<< "$rv")" -gt 1 ]] && echo 0 || echo 1)"
+
+# --- pnpm pin: the ONE packageManager reader (devloop image + dev-web.sh) ----------------------
+PMLIB="${REPO_ROOT}/infra/lib/package-manager.sh"
+pmspec() { src_run "$PMLIB" 'pnpm_package_manager_spec "${ARGS[@]}"' "$1" 2>&1; }
+pmver()  { src_run "$PMLIB" 'pnpm_version "${ARGS[@]}"' "$1" 2>&1; }
+PMS="${WORK}/pm"; mkdir -p "$PMS"
+HEX128="$(printf 'a%.0s' {1..128})"
+printf '{\n  "name": "x",\n  "packageManager": "pnpm@12.8.1+sha512.%s",\n  "private": true\n}\n' "$HEX128" > "$PMS/hashed.json"
+printf '{ "packageManager": "pnpm@12.8.1+sha512.%s", "engines": {} }\n' "$HEX128" > "$PMS/oneline.json"
+printf '{ "packageManager": "pnpm@12.8.1" }\n' > "$PMS/nohash.json"
+printf '{ "name": "x" }\n' > "$PMS/missing.json"
+printf '{ "packageManager": "yarn@4.1.0+sha512.%s" }\n' "$HEX128" > "$PMS/yarn.json"
+printf '{ "packageManager": "pnpm@12.8+sha512.%s" }\n' "$HEX128" > "$PMS/malformed.json"
+printf '{ "packageManager": "pnpm@12.8.1+sha512.%s",\n  "packageManager": "pnpm@12.8.1+sha512.%s" }\n' "$HEX128" "$HEX128" > "$PMS/dup.json"
+out="$(pmspec "$PMS/hashed.json")"; rc=$?
+assert_rc     "pm-spec-hashed-rc"            0 "$rc"
+emi_expect    "pm-spec-hashed-verbatim"      "pnpm@12.8.1+sha512.${HEX128}" "$out"
+out="$(pmver "$PMS/hashed.json")"; rc=$?
+assert_rc     "pm-version-hashed-rc"         0 "$rc"
+emi_expect    "pm-version-strips-hash"       "12.8.1" "$out"
+out="$(pmver "$PMS/oneline.json")";  emi_expect "pm-version-single-line-json" "12.8.1" "$out"
+out="$(pmspec "$PMS/nohash.json")"; rc=$?
+assert_rc     "pm-missing-hash-fails"        1 "$rc"
+assert_status "pm-missing-hash-says-so"      "expected pnpm@X.Y.Z+sha512" "$out"
+out="$(pmspec "$PMS/missing.json")"; rc=$?
+assert_rc     "pm-missing-field-fails"       1 "$rc"
+assert_status "pm-missing-field-says-so"     "found 0" "$out"
+out="$(pmspec "$PMS/yarn.json")"; rc=$?
+assert_rc     "pm-not-pnpm-fails"            1 "$rc"
+out="$(pmspec "$PMS/malformed.json")"; rc=$?
+assert_rc     "pm-malformed-version-fails"   1 "$rc"
+out="$(pmspec "$PMS/dup.json")"; rc=$?
+assert_rc     "pm-duplicate-field-fails"     1 "$rc"
+out="$(pmver "$PMS/absent.json")"; rc=$?
+assert_rc     "pm-unreadable-fails"          1 "$rc"
+out="$(pmver "${REPO_ROOT}/package.json")"; rc=$?
+assert_rc     "pm-real-package-json" 0 "$([[ $rc -eq 0 && "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo 0 || echo "1 (${out})")"
+# Every consumer takes the pin from that reader — never a hand-typed version or a second parser.
+assert_status "devloop-sh-derives-pnpm-spec"     'pnpm_package_manager_spec "${script_dir}/../../package.json"' "$(cat "${REPO_ROOT}/infra/devloop/devloop.sh")"
+assert_status "devloop-dockerfile-prepares-spec" 'corepack prepare "${PNPM_PACKAGE_MANAGER}" --activate' "$(cat "${REPO_ROOT}/infra/devloop/Dockerfile")"
+assert_absent "devloop-dockerfile-no-pnpm-literal" 'ARG PNPM_VERSION=' "$(cat "${REPO_ROOT}/infra/devloop/Dockerfile")"
+assert_status "dev-web-uses-pnpm-reader"         'pnpm_package_manager_spec package.json' "$(cat "${REPO_ROOT}/scripts/dev-web.sh")"
+# pnpm/action-setup must carry NO `version:` key (it reads packageManager; it errors only on a
+# MISMATCH, so an equal re-added pin would be the duplicate coming back silently). The window
+# after `uses:` holds only `with:` / `run_install:`; `node-version-file:` cannot match the anchor.
+pnpm_setup_version_keys() { grep -h -A4 'uses: pnpm/action-setup' "$@" | grep -E '^[[:space:]]+version:' || true; }
+assert_rc "workflows-no-pnpm-version-input" 0 "$([[ -z "$(pnpm_setup_version_keys "${REPO_ROOT}"/.github/workflows/*.yml)" ]] && echo 0 || echo 1)"
+assert_rc "workflows-pnpm-setup-sites-nonvacuous" 0 "$([[ "$(cat "${REPO_ROOT}"/.github/workflows/*.yml | grep -c 'uses: pnpm/action-setup')" -ge 5 ]] && echo 0 || echo 1)"
+PMWF="${WORK}/pmwf.yml"
+printf "      - uses: pnpm/action-setup@deadbeef # v6.1.0\n        with:\n          version: '12.8.1'\n          run_install: false\n" > "$PMWF"
+assert_rc "workflows-pnpm-version-input-trips" 0 "$([[ -n "$(pnpm_setup_version_keys "$PMWF")" ]] && echo 0 || echo 1)"
 
 # --- Builder and runtime on the SAME Debian release (glibc) ----------------------------------
 # A binary links its builder's glibc; a builder newer than the runtime fails at exec with
