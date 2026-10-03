@@ -3,7 +3,7 @@
 **Service**: Authentication Controller (ac-service)
 **Owner**: Security Team
 **On-Call Rotation**: PagerDuty - Dark Tower Auth Team
-**Last Updated**: 2025-12-10
+**History**: `git log --follow -- docs/runbooks/ac-service-incident-response.md`
 
 ---
 
@@ -1064,10 +1064,6 @@ All action items must have an owner and due date. Track in issue tracker.
 2. Review by on-call rotation members
 3. Test new diagnostic commands in staging
 4. Merge and notify team in #dark-tower-ops channel
-
-**Version History**:
-- 2025-12-10: Initial version (Phase 4B Operational Readiness)
-- [Future updates tracked here]
 
 ---
 

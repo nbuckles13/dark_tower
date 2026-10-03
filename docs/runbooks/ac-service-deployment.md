@@ -2,7 +2,7 @@
 
 **Service**: Authentication Controller (ac-service)
 **Version**: Phase 4B (Production Ready)
-**Last Updated**: 2025-12-10
+**History**: `git log --follow -- docs/runbooks/ac-service-deployment.md`
 **Owner**: Operations Team
 
 ---
@@ -1234,6 +1234,5 @@ topk(10, sum by (error_message) (rate({namespace="dark-tower",app="ac-service"} 
 
 ---
 
-**Document Version:** 1.1
 **Last Reviewed:** 2026-03-31
 **Next Review:** 2026-04-30

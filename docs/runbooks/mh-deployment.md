@@ -2,7 +2,7 @@
 
 **Service**: Media Handler (mh-service)
 **Owner**: Operations Team
-**Last Updated**: 2026-09-30
+**History**: `git log --follow -- docs/runbooks/mh-deployment.md`
 
 ---
 
@@ -952,6 +952,5 @@ For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criter
 
 ---
 
-**Document Version**: 1.0
 **Last Reviewed**: 2026-05-01
 **Next Review**: 2026-06-01

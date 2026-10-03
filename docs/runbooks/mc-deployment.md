@@ -2,7 +2,7 @@
 
 **Service**: Meeting Controller (mc-service)
 **Version**: Phase 4a (ADR-0010 Implementation)
-**Last Updated**: 2026-03-27
+**History**: `git log --follow -- docs/runbooks/mc-deployment.md`
 **Owner**: Operations Team
 
 ---
@@ -1721,6 +1721,5 @@ handler.
 
 ---
 
-**Document Version:** 1.2
 **Last Reviewed:** 2026-03-31
 **Next Review:** 2026-04-30
