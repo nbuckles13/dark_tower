@@ -39,7 +39,7 @@ Production code is not modified to add test affordances. No opt-in result channe
 Metric coverage lives in `crates/{service}/tests/` — the **component-test tier**, between unit tests and env-tests:
 
 - Above unit tests: component tests can drive a real server (real `accept_loop`, real spawns, real handlers) so accept-path metrics are reachable without bypassing production code.
-- Below env-tests: component tests run in-process against `DebuggingRecorder`, so negative cases (capacity exhaustion, error branches, expired tokens) are easy to trigger without infrastructure setup.
+- Below env-tests: component tests run in-process against `MetricAssertion`'s thread-local recorder, so negative cases (capacity exhaustion, error branches, expired tokens) are easy to trigger without infrastructure setup.
 
 Each service owns its component tests under `crates/{service}/tests/` per existing convention. Patterns the tier supports:
 
@@ -55,7 +55,7 @@ Where a metric branch is genuinely unreachable from a component test because of 
 
 ### `MetricAssertion` test helper
 
-A shared utility in `crates/common/src/observability/testing.rs`, backed by `metrics-util::debugging::DebuggingRecorder`. Used by component tests for delta/value assertions:
+A shared utility in `crates/common/src/observability/testing.rs`, backed by its own thread-local test recorder (as built, deliberately not `metrics-util`'s `DebuggingRecorder`, which lost an increment in CI — see the module docs). Used by component tests for delta/value assertions:
 
 ```rust
 let snap = MetricAssertion::snapshot();
@@ -178,7 +178,7 @@ The guard runs inside the existing `run-guards.sh` pipeline. Estimated added run
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| `MetricAssertion` helper in `crates/common/src/observability/testing.rs` | ❌ Pending | `DebuggingRecorder`-backed; `assert_delta` / `assert_value_in_range` / `assert_observation_count_at_least` variants. |
+| `MetricAssertion` helper in `crates/common/src/observability/testing.rs` | ✅ Done | Backed by its own thread-local test recorder; `assert_delta` / `assert_value_in_range` / `assert_observation_count_at_least` variants. |
 | `validate-metric-coverage.sh` guard | ❌ Pending | Source scan + test reference check. Wires into `run-guards.sh`. |
 | Audit correction | ❌ Pending | `docs/observability/metrics-coverage-audit-2026-04-20.md` amendment: AC `main.rs:115` is `init_key_metrics()`, not an `on_refresh` closure. AC has no Pattern #2 sites. |
 | AC component-test backfill | ❌ Pending | ~41 sites. Cat C (test-only). |

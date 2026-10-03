@@ -71,5 +71,5 @@
 - Alerts / dashboard → `infra/docker/prometheus/rules/client-alerts.yaml`, `infra/grafana/dashboards/client-media.json`
 
 ## Toolchain & Build
-- Node version SSoT → `.nvmrc`; pnpm overrides → `package.json:pnpm.overrides`; dev-web preflight → `scripts/dev-web.sh`
+- Node version SSoT → `.nvmrc`; pnpm overrides and settings → `pnpm-workspace.yaml`; dev-web preflight → `scripts/dev-web.sh`
 - Secure-context runbook → `docs/runbooks/client-dev-local.md`; client CI → `.github/workflows/ci-client.yml`

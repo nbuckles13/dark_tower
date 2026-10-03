@@ -60,3 +60,4 @@ pub mod ts_pii;
 pub mod ts_retained_credentials;
 pub mod ts_secrets;
 pub mod ts_test_removal;
+pub mod workspace_deps;

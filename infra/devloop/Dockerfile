@@ -3,10 +3,10 @@
 # Pre-built image with full Rust toolchain and development tools.
 # Used by devloop.sh for isolated Claude Code execution.
 #
-# Build:  ./infra/devloop/devloop.sh --rebuild   (reads .nvmrc, passes NODE_VERSION)
-#   or:   podman build --build-arg NODE_VERSION="$(cat .nvmrc)" -t darktower-dev:latest infra/devloop/
+# Build:  ./infra/devloop/devloop.sh --rebuild   (reads .nvmrc, package.json packageManager and
+#         Cargo.lock; passes NODE_VERSION, PNPM_PACKAGE_MANAGER and SQLX_CLI_VERSION)
 # Rebuild weekly or when toolchain/dependencies change.
-# NOTE: NODE_VERSION has no default and the build FAILS without it — see the Node block.
+# NOTE: NODE_VERSION and PNPM_PACKAGE_MANAGER have no default and the build FAILS without them.
 
 FROM docker.io/library/rust:1.95-slim-bookworm
 
@@ -117,7 +117,9 @@ RUN : "${NODE_VERSION:?NODE_VERSION build-arg is required — derive it from rep
 # from /opt/ms-playwright if size becomes a constraint — see TODO.md.
 # Measure: podman image inspect darktower-dev:latest --format '{{.Size}}'.
 
-# pnpm via Corepack (Node 22 ships corepack; no apt install needed).
+# pnpm via Corepack (Node 22 ships corepack; no apt install needed). pnpm >= 12's npm package is a
+# launcher that fetches the native `@pnpm/exe.<platform>` binary on first run (verifying npm registry
+# signatures); the `pnpm --version` below does that at build time so the binary is baked.
 # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 is persistent — without it, every first-use
 # of pnpm in a running container prompts interactively to download the tarball.
 # COREPACK_HOME pins the activation state to a system path. Without this,
@@ -129,15 +131,16 @@ RUN : "${NODE_VERSION:?NODE_VERSION build-arg is required — derive it from rep
 # `corepack prepare ... --activate` only registers the version; the actual
 # download is lazy. The `pnpm --version` line forces the download into the
 # image so containers ship with pnpm fully resolved.
-# Version contract: PNPM_VERSION here MUST match `packageManager` in the
-# repo-root package.json. Corepack reads packageManager when running pnpm
-# inside /work, and a mismatch causes a runtime download (defeating the bake).
+# Version contract: PNPM_PACKAGE_MANAGER is DERIVED from `packageManager` in the
+# repo-root package.json (the full `pnpm@X.Y.Z+sha512.<hex>` spec) by devloop.sh,
+# via infra/lib/package-manager.sh. Corepack verifies the tarball against that hash.
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     COREPACK_HOME=/opt/corepack
-ARG PNPM_VERSION=10.33.2
-RUN mkdir -p /opt/corepack \
+ARG PNPM_PACKAGE_MANAGER
+RUN : "${PNPM_PACKAGE_MANAGER:?PNPM_PACKAGE_MANAGER build-arg is required — derive it from repo-root package.json packageManager; build via devloop.sh --rebuild}" \
+ && mkdir -p /opt/corepack \
  && corepack enable \
- && corepack prepare pnpm@${PNPM_VERSION} --activate \
+ && corepack prepare "${PNPM_PACKAGE_MANAGER}" --activate \
  && pnpm --version \
  && chmod -R a+rX /opt/corepack
 

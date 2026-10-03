@@ -3,9 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.33.2",
+  "packageManager": "pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45",
   "engines": {
-    "node": ">=22.13.0 <23"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "lint": "nx run-many -t lint && svelte-check --workspace packages/ --threshold error",
@@ -29,21 +29,5 @@
     "svelte-check": "^4.7.4",
     "typescript": "6.0.3",
     "typescript-eslint": "^8.65.0"
-  },
-  "pnpm": {
-    "overrides": {
-      "axios": ">=1.20.0 <2",
-      "brace-expansion": ">=5.0.11",
-      "devalue": ">=5.9.3 <6",
-      "fast-uri": ">=3.1.6 <4",
-      "nanoid": ">=3.3.17 <4",
-      "postcss": ">=8.5.18",
-      "smol-toml": ">=1.7.1"
-    },
-    "ignoredBuiltDependencies": [
-      "@bufbuild/buf",
-      "msw",
-      "nx"
-    ]
   }
 }

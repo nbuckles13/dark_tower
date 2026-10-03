@@ -24,7 +24,7 @@
 # binary links the builder's glibc, and a newer builder than runtime fails at
 # exec with "GLIBC_2.xx not found" (seen at ADR-0038 devloop 2 Gate 2, when the
 # floating `-slim` tag had moved to trixie). setup.test.sh fails on any drift.
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.95
 FROM docker.io/library/rust:${RUST_VERSION}-slim-bookworm AS builder
 
 ARG SQLX_CLI_VERSION

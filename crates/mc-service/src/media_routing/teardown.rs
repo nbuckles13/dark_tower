@@ -768,10 +768,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_drain_past_the_bound_reports_timed_out_after_the_ordered_wait() {
+        let snap = common::observability::testing::MetricAssertion::snapshot();
         let start = tokio::time::Instant::now();
         let stuck = tokio::spawn(std::future::pending::<()>());
         let quiesced = quiesce(CancellationToken::new(), vec![stuck]).await;
         assert!(quiesced.timed_out);
+        // The exact series the MCPushQuiesceTimeouts alert selects.
+        snap.counter("mc_media_push_quiesce_total")
+            .with_labels(&[("outcome", "timed_out"), ("key_custody", "operator")])
+            .assert_delta(1);
         assert!(
             start.elapsed() >= PUSH_QUIESCE_BOUND * 2,
             "the timeout path waits one FURTHER attempt window before releasing (Race B)"

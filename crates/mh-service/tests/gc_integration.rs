@@ -307,7 +307,7 @@ async fn test_gc_client_registration_success() {
 
     assert!(gc_client.is_registered());
 
-    // Histogram first — `Snapshotter::snapshot` drains histograms on read.
+    // Histogram first — a `MetricAssertion` snapshot drains histograms on read.
     snap.histogram("mh_gc_registration_duration_seconds")
         .assert_observation_count_at_least(1);
     snap.counter("mh_gc_registration_total")

@@ -20,7 +20,7 @@ all = ["smoke", "flows", "observability", "resilience"]
 tokio = { workspace = true }
 
 # HTTP client (use rustls to avoid OpenSSL dependency)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -29,19 +29,19 @@ serde_json = { workspace = true }
 # `alert:` sweeps in comment lines and produces expectations that can never be
 # satisfied; same family as the escaped-JSON trap `32_media_metric_hygiene.rs`
 # documents. Same crate `dt-guard` uses for the same files.
-serde_norway = "0.9.42"
+serde_norway = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
 
 # UUID for unique identifiers (canary pod names, meeting IDs)
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 
 # Regex for sanitizing error bodies
-regex = "1.10"
+regex = { workspace = true }
 
 # The signalling client fixtures (`fixtures/mc_session.rs`) live in the LIB, so
 # the WebTransport client, the generated wire types, and the framing primitives
@@ -91,7 +91,7 @@ tonic = { workspace = true }
 jsonwebtoken = { workspace = true }
 
 # Base64 decoding for JWKS
-base64 = "0.22"
+base64 = { workspace = true }
 
 # Serial test execution for stateful tests
 serial_test = "3.1"

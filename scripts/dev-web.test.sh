@@ -81,11 +81,14 @@ make_root() {
   mkdir -p "$root/scripts" "$root/packages/web-app" "$root/infra/docker/certs"
   cp "$DEV_WEB" "$root/scripts/dev-web.sh"
   chmod +x "$root/scripts/dev-web.sh"
+  # dev-web.sh reads the pnpm pin through the ONE parser; the root must carry it.
+  mkdir -p "$root/infra/lib"
+  cp "${DEV_WEB%/scripts/dev-web.sh}/infra/lib/package-manager.sh" "$root/infra/lib/package-manager.sh"
 
   # SSoT files the preflight reads for version pins.
   printf '22.13.0\n' >"$root/.nvmrc"
   cat >"$root/package.json" <<'JSON'
-{ "packageManager": "pnpm@10.33.2", "engines": { "node": ">=22.13.0 <23" } }
+{ "packageManager": "pnpm@10.33.2+sha512.a90faf6feeab71ad6c6e57f94e0fe1a12f5dcc22cd754db40ae9593eb6a3e0b6b12e3540218bb37ae083404b1f2ce6db2a4121e979829b4aff94b99f49da1cf8", "engines": { "node": ">=22.13.0 <23" } }
 JSON
 
   if [[ "$fingerprints" == "with-fingerprints" ]]; then
@@ -897,7 +900,7 @@ stubs="$(make_stubs ss-absent)"; node_stub "$stubs" "22.13.0"
 run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
 assert_status "node-at-pin-passes" "✓ node 22.13.0" "$out"
 # A range form the check does not read must FAIL as unverifiable, never pass.
-printf '{ "packageManager": "pnpm@10.33.2", "engines": { "node": "^22.13.0" } }\n' >"$root/package.json"
+printf '{ "packageManager": "pnpm@10.33.2+sha512.a90faf6feeab71ad6c6e57f94e0fe1a12f5dcc22cd754db40ae9593eb6a3e0b6b12e3540218bb37ae083404b1f2ce6db2a4121e979829b4aff94b99f49da1cf8", "engines": { "node": "^22.13.0" } }\n' >"$root/package.json"
 stubs="$(make_stubs ss-absent)"; node_stub "$stubs" "22.13.0"
 run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
 assert_hard_fail_branch "node-unparseable-range" "node: cannot verify 22.13.0" "$out"

@@ -2443,7 +2443,7 @@ mod tests {
     // `test_cardinality_bounds`).
     //
     // The newer per-failure-class tests in this module use
-    // `MetricAssertion::snapshot()` which binds a per-thread `DebuggingRecorder`
+    // `MetricAssertion::snapshot()` which binds its own per-thread test recorder
     // for the duration of the snapshot — see `common::observability::testing`
     // module docs for the isolation model. These tests live in
     // `#[test]` (not `#[tokio::test]`) blocks: the recorders bind to the test

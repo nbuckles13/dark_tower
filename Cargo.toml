@@ -120,9 +120,9 @@ thiserror = "1.0"
 # the split. `small_rng` is opted into per consumer, not here — only the
 # sampler needs it.
 rand = "0.8"
-uuid = { version = "1.10", features = ["v4", "serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-bytes = "1.7"
+bytes = "1.9"
 
 # Cryptography (for E2E encryption and passwords)
 ring = "0.17"
@@ -133,11 +133,39 @@ hex = "0.4"
 
 # JWT
 jsonwebtoken = "9.3"
-base64 = "0.22"
+# `default-features = false` drops the `simd-unsafe` default (0.23+), the crate's
+# only `unsafe` code: we use only the scalar `general_purpose` engines. Every
+# member inherits this entry (no member-level literal, which would re-enable
+# defaults for the whole graph through feature unification); the excluded
+# `crates/ac-service/fuzz` workspace repeats it, checked by dt-guard
+# workspace-deps R3.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+
+# Metrics. `metrics` is the process-global recorder facade; it and the exporter
+# move together (dt-guard workspace-deps R4 fails on a second `metrics` in the lock).
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# HTTP client. Every consumer uses rustls with defaults off.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+http-body-util = "0.1"
+futures = "0.3.31"
+tokio-stream = "0.1"
+
+# CLI and parsing (dt-guard, dt-story, devloop-helper, env-tests)
+clap = { version = "4", features = ["derive"] }
+regex = "1.10"
+serde_norway = "0.9.42"
 
 # Testing
 criterion = "0.5"
-metrics-util = "0.18"
+wiremock = "0.6"
+tempfile = "3"
+assert_cmd = "2"
+rcgen = "0.13"
+# Used by no member: the pin the two root-`exclude` fuzz workspaces share. They cannot
+# inherit, so each repeats it, and dt-guard workspace-deps R3 binds both to this entry.
+libfuzzer-sys = "0.4"
 
 [profile.release]
 opt-level = 3

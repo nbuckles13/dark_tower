@@ -59,7 +59,7 @@ source "${__here}/../_common.sh"
 source "${__here}/_buf.sh"
 install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
 
-# PRECONDITION (before any buf call): toolchain present + writer==checker version. Four-token taxonomy
+# PRECONDITION (before any buf call): toolchain present + writer==checker version. Five-token taxonomy
 # lives in _buf.sh; this precedes the format check so a stale writer reds as version-mismatch, not drift.
 proto_buf_preflight || exit 1
 

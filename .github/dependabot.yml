@@ -13,26 +13,114 @@
 #
 # (It is DESIRABLE for Dependabot to open a bump PR for a currently-suppressed dep like
 # rsa — that is remediation progress, not a conflict with the suppression.)
+#
+# GROUP ORDER MATTERS: "If a dependency matches more than one rule, it's included in the first
+# group that it matches" (Dependabot options reference, `groups`). Pattern groups — crates and
+# packages that must move together, majors included (a pattern-only group has no update-types
+# filter) — are therefore listed BEFORE each ecosystem's update-type catch-all.
+#
+# COOLDOWN delays VERSION updates only. It never delays Dependabot SECURITY updates and is not a
+# suppression surface: advisory remediation runs on the ADR-0033 §12 14-day MTTR as before.
+# (GitHub Actions supports only `default-days`; the semver-* keys are cargo/npm only.)
 
 version: 2
 updates:
   - package-ecosystem: "cargo"
+    # Root workspace only. The two fuzz crates (root [workspace] exclude) are independent
+    # workspaces with their own block below. They are NOT extra `directories` here: per the
+    # options reference (`group-by`), `group-by: dependency-name` creates "a single pull request
+    # for each dependency update across all specified directories, rather than separate pull
+    # requests per directory" — i.e. the default is one PR per directory, and the cross-directory
+    # merge is per dependency, which would break the pattern groups below.
+    # Crates the fuzz crates SHARE with the root (they repeat the root's requirement) move with
+    # this block's PR: when a requirement string moves, the PR goes red on dt-guard
+    # workspace-deps R3 and the fuzz literal is edited by hand IN THE SAME PR.
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # Cargo.lock is tracked: raise a requirement only when the new version falls outside it.
+    versioning-strategy: increase-if-necessary
+    cooldown:
+      default-days: 5
+      semver-major-days: 14
     groups:
+      # opentelemetry* and the web stack are ONE group because they are coupled:
+      # opentelemetry-otlp takes our tonic::transport::Channel
+      # (crates/common/src/observability/otel.rs `with_channel`), gc-service encodes
+      # opentelemetry-proto messages with our prost, and opentelemetry-proto/otlp 0.33 require
+      # prost ^0.14 + tonic ^0.14.1. An otel-only bump cannot compile (PR #75 went red).
+      # tonic/prost bumps regenerate proto-gen (wire format, a Guarded Shared Area): they need
+      # protocol + security review.
+      otel-web-stack:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
+          - "axum*"
+          - "tower*"
+          - "tonic*"
+          - "prost*"
+      # `metrics` holds the process-global recorder; the exporter installs into it. A second
+      # `metrics` in the graph silently disconnects every service metric (dt-guard workspace-deps
+      # R4 fails on it), so the pair moves together.
+      metrics-stack:
+        patterns:
+          - "metrics"
+          - "metrics-exporter-prometheus"
       cargo-minor-patch:
         update-types:
           - "minor"
           - "patch"
+
+  - package-ecosystem: "cargo"
+    # The root-`exclude` fuzz crates. Crates ONLY they use are absent from the root Cargo.lock,
+    # and dependabot-core's cargo parser skips any [workspace.dependencies] entry the lockfile
+    # does not resolve, so the root block never offers them. This block does, one PR per crate
+    # across both fuzz crates (`group-by: dependency-name`, quoted above). `allow:` must name
+    # exactly the fuzz-only crates (declared by a fuzz crate, used by no member): dt-guard
+    # workspace-deps R6 fails on a missing or extra name, or if `directories` stops matching the
+    # root `exclude` list. Shared crates are not allowed here; they move with the root PR.
+    # A fuzz-only crate pinned in the root table (libfuzzer-sys, bound by R3) turns this PR red on
+    # R3 until the root entry is edited in the same PR.
+    directories:
+      - "/crates/ac-service/fuzz"
+      - "/crates/media-protocol/fuzz"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    versioning-strategy: increase-if-necessary
+    cooldown:
+      default-days: 5
+      semver-major-days: 14
+    allow:
+      - dependency-name: "libfuzzer-sys"
+    groups:
+      fuzz-only:
+        group-by: dependency-name
 
   - package-ecosystem: "npm"   # Dependabot's "npm" ecosystem handles pnpm lockfiles
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 5
+      semver-major-days: 14
     groups:
+      npm-otel:
+        patterns:
+          - "@opentelemetry/*"
+      # The protobuf-es runtime and its code generator must be the same version. Named
+      # explicitly — NOT "@bufbuild/*", which would pull @bufbuild/buf into a group (see below).
+      npm-protobuf-es:
+        patterns:
+          - "@bufbuild/protobuf"
+          - "@bufbuild/protoc-gen-es"
+      npm-vitest:
+        patterns:
+          - "vitest"
+          - "@vitest/*"
+          - "vitest-browser-svelte"
       npm-minor-patch:
         # @bufbuild/buf is EXCLUDED from the grouped bump (ADR-0037 §D7 COLLAPSE, @security): under the
         # collapse it is the proto wire-FORMATTER that `pnpm exec buf` runs, so a version change is a
@@ -51,8 +139,12 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 5
     groups:
-      actions-minor-patch:
-        update-types:
-          - "minor"
-          - "patch"
+      # Every action update, majors included, in ONE PR. Per-update PRs hit
+      # open-pull-requests-limit and starved the rest (checkout/setup-node majors never opened).
+      # Actions are SHA-pinned with a `# vX.Y.Z` comment; Dependabot updates both.
+      github-actions:
+        patterns:
+          - "*"

@@ -4,6 +4,7 @@
 //! Each submodule is a single-responsibility unit.
 
 pub mod alert_rule_files;
+pub mod cargo_manifest;
 pub mod duration;
 pub mod explain;
 pub mod git_changes;

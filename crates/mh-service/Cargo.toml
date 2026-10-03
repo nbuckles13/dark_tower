@@ -52,8 +52,8 @@ tracing-opentelemetry = { workspace = true }
 tower = { workspace = true }
 
 # Metrics (ADR-0011 Observability)
-metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 # HTTP server for health endpoints and metrics
 axum = { workspace = true }
@@ -98,15 +98,13 @@ criterion = { workspace = true }
 mh-test-utils = { path = "../mh-test-utils" }
 # HTTP testing for health endpoint integration tests — tower is now a regular dep
 # Stream utilities for mock gRPC server
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
 # Need test-util feature for tokio::time::pause/advance in tests
 tokio = { workspace = true, features = ["test-util"] }
-# Metrics test recorder for integration tests
-metrics-util = "0.18"
 # Enable test-utils feature for common (e.g., TokenReceiver::from_test_channel)
 common = { path = "../common", features = ["test-utils"] }
 # JWT validation testing (Ed25519 signing, JWKS mocking)
-wiremock = "0.6"
+wiremock = { workspace = true }
 jsonwebtoken = { workspace = true }
 ring = { workspace = true }
 base64 = { workspace = true }
@@ -119,9 +117,9 @@ wtransport = { workspace = true, features = ["dangerous-configuration"] }
 # `Identity::load_pemfiles` (same code path as runtime). `wtransport`'s
 # in-memory `Identity::self_signed` is not usable because the production
 # `WebTransportServer::bind()` reads PEMs from disk.
-rcgen = "0.13"
+rcgen = { workspace = true }
 # TempDir for scoping PEMs to the test lifetime with automatic cleanup.
-tempfile = "3"
+tempfile = { workspace = true }
 # In-memory span exporter for OTel wiring tests (R-55/R-56/R-58): lets tests
 # assert on exported SpanData (trace_id, parent_span_id) instead of only on
 # side effects. Mirrors common/Cargo.toml's own dev-dependency override.

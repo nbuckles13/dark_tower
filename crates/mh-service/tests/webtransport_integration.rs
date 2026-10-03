@@ -190,7 +190,7 @@ async fn valid_meeting_jwt_connection_accepted_and_tracked() {
         "accept path did not register an active connection within 3s",
     );
 
-    // Assert histogram FIRST — `Snapshotter::snapshot()` drains histograms on
+    // Assert histogram FIRST — a `MetricAssertion` snapshot drains histograms on
     // read per common::observability::testing §"Delta semantics"; counters
     // are idempotent under re-reads.
     snap.histogram("mh_webtransport_handshake_duration_seconds")

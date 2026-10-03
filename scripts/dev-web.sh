@@ -216,14 +216,14 @@ node_in_engines() {
 # Vite 8 / rolldown load a native binding (@rolldown/binding-linux-x64-gnu) at import
 # time. When the running Node is below the workspace engines floor, pnpm SILENTLY skips
 # that engines-mismatched optional binding at install; `pnpm install` succeeds and vite
-# then crashes at LAUNCH with "cannot find native binding". engine-strict now fails a
-# below-floor install loudly (see .npmrc + root package.json engines) — but a
+# then crashes at LAUNCH with "cannot find native binding". engineStrict now fails a
+# below-floor install loudly (see pnpm-workspace.yaml + root package.json engines) — but a
 # node_modules tree installed EARLIER under a below-floor Node keeps the gap until it is
 # reinstalled, and that residual case is exactly what this probe catches.
 #
 # Guarded on node_modules presence: only meaningful when a tree exists (so --check and
 # --no-install catch the stale-tree case). A fresh clone has nothing to probe — skip with
-# a note; the fresh case is caught loudly by engine-strict at `pnpm install`.
+# a note; the fresh case is caught loudly by engineStrict at `pnpm install`.
 #
 # It does a REAL dynamic import() of rolldown's entry (resolved from vite) — the exact
 # operation that loads the native binding; a resolve-only check would false-pass. Two
@@ -233,7 +233,7 @@ node_in_engines() {
 # package.json engines.node (ENGINES_NODE), the in-repo SSoT.
 probe_bundler() {
     if [[ ! -d node_modules ]]; then
-        warn "bundler load probe skipped — no node_modules yet (fresh clone). 'pnpm install' below is the loud gate; engine-strict fails a below-floor Node install."
+        warn "bundler load probe skipped — no node_modules yet (fresh clone). 'pnpm install' below is the loud gate; engineStrict fails a below-floor Node install."
         return
     fi
     if ! command -v node >/dev/null 2>&1; then
@@ -279,11 +279,17 @@ try { await import(pathToFileURL(entry).href); } catch (e) { console.error("load
 # ─── SSoT: expected versions read from the repo ─────────────────
 EXPECTED_NODE="$(<.nvmrc)"                       # from .nvmrc (SSoT)
 EXPECTED_NODE_MAJOR="${EXPECTED_NODE%%.*}"       # e.g. 22
-# packageManager pin, e.g. "pnpm@10.33.2" → 10.33.2 (no node needed to parse)
-EXPECTED_PNPM="$(grep -oE '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@[^"]+"' package.json \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+# packageManager pin, read by the ONE parser (infra/lib/package-manager.sh): the full
+# hash-carrying spec for `corepack prepare`, and the bare version for the comparison.
+# shellcheck source=../infra/lib/package-manager.sh
+source "${REPO_ROOT}/infra/lib/package-manager.sh"
+EXPECTED_PNPM_SPEC="$(pnpm_package_manager_spec package.json)" || {
+    echo "FATAL: cannot read the pnpm pin from package.json packageManager (see the error above)." >&2
+    exit 1
+}
+EXPECTED_PNPM="$(pnpm_version package.json)"
 # Root engines.node range — the SSoT for which Node the workspace accepts (e.g.
-# ">=22.13.0 <23"); `pnpm install` enforces it (engine-strict). The Node check below
+# ">=22.13.0"); `pnpm install` enforces it (engineStrict). The Node check below
 # compares against this range as read, never a literal copied from it.
 ENGINES_NODE="$(grep -oE '"node"[[:space:]]*:[[:space:]]*"[^"]+"' package.json \
     | grep -oE '"[^"]+"$' | tr -d '"' | head -1)"
@@ -342,7 +348,7 @@ fi
 # pnpm signing keys and fails `corepack prepare` on newer pnpm with
 # "Cannot find matching keyid". So the fix leads with `npm i -g corepack@latest`
 # (current keys) before enable/prepare — robust regardless of Node's vintage.
-COREPACK_FIX="npm install -g corepack@latest && corepack enable && corepack prepare pnpm@${EXPECTED_PNPM} --activate"
+COREPACK_FIX="npm install -g corepack@latest && corepack enable && corepack prepare ${EXPECTED_PNPM_SPEC} --activate"
 if ! command -v pnpm >/dev/null 2>&1; then
     fail "pnpm not found. Activate the pinned version via corepack:"
     echo "      ${COREPACK_FIX}"
