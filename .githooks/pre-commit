@@ -101,7 +101,8 @@ fi
 # LOCAL-ONLY / ADVISORY: this hook is anti-drift, NOT a security boundary —
 # `git commit --no-verify` bypasses it entirely, and an agent with filesystem
 # write can hand-author a PASS verdict. CI's independent from-scratch re-run of
-# layer-all.sh is the only non-bypassable enforcement point
+# layer-all.sh on PRs into main/develop (.github/workflows/ci.yml `on:`) is the only
+# non-bypassable enforcement point
 # (see docs/runbooks/devloop-validation.md).
 echo "  ➜ Checking Gate-2 validation verdict (devloop commits)..."
 __gate2_repo_root="$(git rev-parse --show-toplevel)"

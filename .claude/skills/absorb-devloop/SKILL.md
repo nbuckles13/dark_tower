@@ -27,9 +27,9 @@ Report the plan (fast-forward or cherry-pick, the commits, any skipped as alread
 
 On a conflict (exit 3), resolve, `git add` the files, and rerun the same command; it finishes the paused commit and absorbs the rest.
 
-- `docs/specialist-knowledge/*/INDEX.md` and `docs/devloop-outputs/**`: take the incoming side (`git checkout --theirs`).
+- `docs/specialist-knowledge/*/INDEX.md` and `docs/devloop-outputs/**`: take the incoming side (`git checkout --theirs`). That keeps the devloop's `main.md` byte-identical, which is what lets the Gate-2 hook accept the replayed devloop commit without a verdict (`docs/runbooks/devloop-validation.md` §8.5).
 - Everything else: read both sides and merge. If a resolution needs a judgment call beyond combining both sides, ask the user.
-- If the pre-commit hook refuses the finished commit (e.g. a Gate-2 verdict for a devloop-completion commit), stop and ask the user. Bypassing the hook is their decision.
+- If the pre-commit hook still refuses the finished commit, its output names the reason (Gate-2 refusals: §8.5 failure table). For `[main-md-modified]`, restore the file as the hook says and rerun. For any other refusal, stop and ask the user: a local verdict needs Layer 7's devloop cluster helper, which the host usually lacks, so the choice is between that and `--no-verify` — bypassing the hook is their decision.
 
 Report the result with `git log --oneline` for the absorbed range.
 
