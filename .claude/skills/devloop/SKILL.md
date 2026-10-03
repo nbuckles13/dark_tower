@@ -283,6 +283,7 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 - Use SendMessage to message reviewers directly with your plan and questions
 - Use SendMessage to tell @team-lead for phase transitions ("Ready for review", etc.)
 - Use SendMessage to discuss review findings with reviewers directly
+- **Never end your turn while a command you started is still running.** Finishing in the background does not wake you. Run long commands (e.g. `./scripts/layer-fast.sh`) in the foreground with `timeout: 600000`; if one is moved to the background, wait for it in the foreground (`until grep -q 'exited with code' <output-file>; do sleep 10; done`, `timeout: 600000`, repeated) and only then continue or report.
 - **Do NOT start implementing until @team-lead sends you "Plan approved"**
 ```
 
@@ -317,6 +318,7 @@ All teammate communication MUST use the SendMessage tool. Plain text output is n
 - Use SendMessage to message @implementer directly with feedback
 - Use SendMessage to message other reviewers if you spot issues in their domain
 - Use SendMessage to tell @team-lead for confirmations and verdicts (CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED)
+- **Never end your turn while a command you started is still running.** Finishing in the background does not wake you. Run long commands (e.g. `./scripts/layer-fast.sh`) in the foreground with `timeout: 600000`; if one is moved to the background, wait for it in the foreground (`until grep -q 'exited with code' <output-file>; do sleep 10; done`, `timeout: 600000`, repeated) and only then continue or report.
 - **Do NOT start reviewing code until @team-lead sends you "Start Review"**
 ```
 
