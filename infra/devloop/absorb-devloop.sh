@@ -184,13 +184,13 @@ $markers
         # not pick it again.
         say "Resolution is empty (the change is already on $TARGET_BRANCH) — recording it as an empty commit."
         git commit --quiet --allow-empty --no-edit \
-            || fail "The pre-commit hook refused the paused commit (output above). Fix what it reports, then rerun." 3
+            || fail "The pre-commit hook refused the paused commit (output above). Fix what it reports, then rerun. (Gate-2 refusals: docs/runbooks/devloop-validation.md §8.5.)" 3
         if [[ -d "$GIT_DIR_ABS/sequencer" ]]; then
             GIT_EDITOR=true git cherry-pick --continue || stop_on_conflict
         fi
     elif ! GIT_EDITOR=true git cherry-pick --continue; then
         if [[ "$(git rev-parse HEAD)" == "$before" && "$(paused_sha)" == "$paused" ]]; then
-            fail "The pre-commit hook refused the paused commit (output above); the resolution is still staged. Fix what it reports (a Gate-2 verdict needs ./scripts/layer-all.sh on this tree), then rerun." 3
+            fail "The pre-commit hook refused the paused commit (output above); the resolution is still staged. An unedited devloop replay needs no Gate-2 verdict, so a Gate-2 refusal names its reason. If main.md was edited, take --theirs for docs/devloop-outputs/** and rerun. Otherwise a local verdict needs Layer 7's devloop cluster helper (./scripts/layer-all.sh && git add -A, then rerun); without it, committing with --no-verify is the user's decision. See docs/runbooks/devloop-validation.md §8.5." 3
         fi
         stop_on_conflict
     fi

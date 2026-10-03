@@ -907,6 +907,8 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `❌ Gate-2: ... validated but not staged: <path>` | A validated (often untracked/transient, e.g. a dirtied lockfile) file is in the verdict but not staged — re-run, or `--no-verify` if intentional. | §8.5 |
 | `❌ Gate-2: verdict is for a different devloop` | Stale verdict from another devloop in the same `/tmp` session — re-run for THIS one. | §8.5 |
 | `❌ Gate-2: shared library missing` | Broken checkout (`scripts/lang/_gate2_binding.sh` absent) — restore it, or `--no-verify` if intentional. | §8.5 |
+| `⚠️  Gate-2: replay skip: <path> …` (at commit) | A conflict-resolved cherry-pick/rebase of a validated devloop commit; no local verdict checked for this commit. Not a failure. | §8.5 Replays |
+| `⚠️  Gate-2: replay skip not applied to <path> … [<token>]` (at commit) | A replay that isn't vouched for; the reason token selects the fix. | §8.5 failure table |
 
 ### Caveat: a missing guard binary reaches the implementer lane
 
@@ -1007,8 +1009,8 @@ boundary.** Two facts make that explicit:
    well-formed `gate2-verdict` whose signature matches the staged tree. The verdict is
    a flat text file in `/tmp`; nothing cryptographically binds it to a *real* run.
 
-The only **non-bypassable** enforcement is **CI**: `.github/workflows/ci.yml` re-runs
-`./scripts/layer-all.sh` from scratch on every push/PR and **never reads** the `/tmp`
+The only **non-bypassable** enforcement is **CI**: on PRs into main/develop (see
+`.github/workflows/ci.yml` `on:`) it re-runs `./scripts/layer-all.sh` from scratch and **never reads** the `/tmp`
 artifact. That independent re-run is the forgery defense — which is also why the
 artifact is ephemeral in `/tmp` and is never committed. Treat the local hook as a fast
 "did you actually run it / has the tree drifted since" check, and CI as the source of
@@ -1026,6 +1028,87 @@ plus a tree-wide `docs/devloop-outputs/**` widening): `docs/devloop-outputs/**`,
 main.md-only edit (validated set empty) therefore no-ops; a non-devloop commit no-ops.
 The hook is **FAIL-CLOSED**: any error evaluating the trigger or verdict blocks.
 
+**Exception — vouched replays.** A staged complete main.md that is a byte-identical replay of
+an already-validated devloop commit (conflict-resolved cherry-pick or rebase) does not count
+toward conjunct 1. See [Replays](#replays) below.
+
+### Replays
+
+A conflict-resolved replay re-stages a devloop main.md that already passed Gate 2 when the
+replayed commit was made. The validated bytes don't travel with the patch, so before this
+exception every such replay needed `--no-verify`. Now, while git is replaying, a staged
+complete main.md is dropped from the trigger iff **all** hold
+(`gate2_replay_source` + `gate2_replay_qualifies` in `scripts/lang/_gate2_binding.sh`):
+
+1. no `MERGE_HEAD` (merges are not vouched for — see below);
+2. exactly one of `CHERRY_PICK_HEAD` / `REBASE_HEAD` resolves to a commit, and it is the
+   pseudoref itself, not a branch of that name;
+3. the staged blob equals that path's blob in the **replayed commit** (the pseudoref's
+   commit itself — not an ancestor);
+4. the replayed commit carries exactly one `Devloop:` trailer (parsed by
+   `git interpret-trailers`, not grep), equal to the main.md's slug.
+
+Anything else — edited main.md, no trailer, a different devloop's trailer, no replay in
+progress — keeps the verdict requirement. Any git error while checking does too (never a skip).
+
+**What this relaxes — the user's decision, stated plainly.** Only the trigger. When every
+staged complete main.md qualifies, the **whole commit** needs no local verdict, including the
+bound files the conflict resolution changed — bytes nobody validated locally. A mixed commit
+(one vouched replay plus another complete main.md) still requires a verdict. The binding,
+signature and exclusions are unchanged. CI on PRs into main/develop (see
+`.github/workflows/ci.yml` `on:`) re-runs the full pipeline over those bytes; to validate
+earlier, run `./scripts/layer-all.sh` yourself.
+
+**Rebase — don't merge — branches carrying devloop records.** A merge carries a whole branch,
+not one replayed commit, so `MERGE_HEAD` present (alone, or with `REBASE_HEAD` as in a
+`rebase -r` stopped on a merge) never skips. Know which replays reach the hook at all
+(git 2.39, verified):
+
+| Operation | Runs pre-commit? | Replay state the hook sees |
+|-----------|------------------|-----------------------------|
+| `git cherry-pick --continue` / `git commit` at a cherry-pick stop | yes | `CHERRY_PICK_HEAD` → skip can apply |
+| `git commit` at a stopped rebase | yes | `REBASE_HEAD` → skip can apply |
+| `git rebase --continue` | **no** (the sequencer passes `-n`) | — Gate 2 is CI-only on this path, independent of this exception |
+| `git commit` concluding a conflicted merge | yes | `MERGE_HEAD` → never skips |
+| clean cherry-pick / rebase pick / merge (incl. absorb's `git merge --ff-only`) | no | — unaffected |
+
+`absorb-devloop.sh` fast-forwards (no commit, no hook) or cherry-picks (covered above), so the
+recommended rebase/absorb paths need no bypass.
+
+**What you see.** When the skip fires, one line per main.md (terminal only — nothing persists
+it; keep the replay output if you need the record):
+
+```
+⚠️  Gate-2: replay skip: <path> blob <oid> == <REF> <full-sha> (Devloop: <slug>); Gate-2 verdict NOT checked for this commit — <N> bound path(s) not validated locally (<M> differ from the replayed commit) — run ./scripts/layer-all.sh to validate, or rely on CI on PRs into main/develop (.github/workflows/ci.yml `on:`).
+```
+
+If the counts can't be computed (a git error), the skip is withdrawn — no audit record, no
+skip. In a mixed commit the vouched main.md prints
+`⚠️  Gate-2: replay vouched for <path> (<REF> <full-sha>) — but another complete main.md in this commit still requires a verdict.`
+instead, because the verdict *is* checked.
+
+When a replay is in progress but the skip does not apply, a
+`⚠️  Gate-2: replay skip not applied to <path> (<REF> <sha>|unresolved): [<token>] <reason>`
+line prints directly above the usual ❌ block (git errors name the failed step and its rc,
+with git's own stderr above). Then one action line per kind of refusal: a restore line naming
+each edited path for `[main-md-modified]`, the merge recovery for `[merge-not-vouched]`, and
+the validate-or-bypass line for everything else. With no replay in progress nothing new
+prints.
+
+**Validating on the host.** `./scripts/layer-all.sh` only yields a PASS verdict where Layer 7
+can run, i.e. with the devloop cluster helper; on a bare host (where `absorb-devloop.sh` runs)
+Layer 7 is a `PRECONDITION_FAILURE` and the verdict is FAIL. There, the realistic paths for a
+refused replay are restoring main.md (`[main-md-modified]`) or a deliberate
+`git commit --no-verify` with CI as the check — the user's decision.
+
+**Reconstruct a skip decision afterwards** from the line's `<full-sha>`, `<path>` and `<oid>`:
+`git rev-parse <full-sha>:<path>` must print `<oid>`, and
+`git log -1 --format=%B <full-sha> | git interpret-trailers --parse` must show exactly one
+`Devloop: <slug>`.
+
+The exception adds no state and no kill switch; `git commit --no-verify` remains the escape
+hatch, and reverting the commit that introduced it restores the old behaviour.
+
 ### Failure shapes (all block the commit)
 
 | Hook message | Meaning | Fix |
@@ -1037,18 +1120,29 @@ The hook is **FAIL-CLOSED**: any error evaluating the trigger or verdict blocks.
 | `signature mismatch` → `validated but not staged: <path>` | A path the verdict bound is not in the staged commit. Common benign cause: a layer transiently **dirtied a lockfile** (`Cargo.lock`/`pnpm-lock.yaml`) the producer saw in the worktree but you never staged. | If the lockfile change is real, `git add` it and re-run. If transient/unwanted, revert it and re-run — or `git commit --no-verify` if you are sure the staged tree is correct. (Lockfiles are deliberately NOT excluded: a *real* committed lockfile change must stay bound.) |
 | `verdict is for a different devloop` | Stale verdict (`SLUG=` mismatch) from another devloop in the same `/tmp` session. | Re-run for the devloop you are committing. |
 | `shared library missing` | `scripts/lang/_gate2_binding.sh` absent — broken checkout. | Restore the file, or `--no-verify` if intentional. |
+| `error evaluating the commit trigger (rc=3)` | The staged changeset could not be enumerated, or a present staged devloop main.md could not be read (git's error is above it). | Fix the repository error; the hook never treats an unreadable changeset as empty or an unreadable main.md as "not complete". |
+| `error enumerating the staged changeset` / `error recomputing the staged-tree signature` | A git error while listing or hashing the staged tree (git's error is above it). Fail-closed. | Fix the repository error and retry. |
+| `replay skip not applied … [main-md-modified]` | The staged main.md differs from the replayed commit's (edited during conflict resolution). | Take the incoming side: `git checkout <REF> -- <path>` (absorb: `--theirs` for `docs/devloop-outputs/**`), re-stage, resume. Or `./scripts/layer-all.sh && git add -A`, then resume. |
+| `replay skip not applied … [path-absent-in-replayed-commit]` | A complete main.md is staged that the replayed commit doesn't contain. | Unstage it if it doesn't belong to this commit; otherwise validate (`./scripts/layer-all.sh && git add -A`) and resume. |
+| `replay skip not applied … [no-trailer]` / `[duplicate-trailer]` / `[trailer-slug-mismatch]` | The replayed commit has no `Devloop:` trailer, several, or one naming a different devloop — it is not that devloop's validated completion. Restoring main.md can't fix this. | With the devloop cluster helper: `./scripts/layer-all.sh && git add -A`, then resume (`git cherry-pick --continue` / `git commit` / rerun the absorb). On a bare host (no Layer 7): `--no-verify` with CI as the check — your decision. |
+| `replay skip not applied … [merge-not-vouched]` | A merge is in progress; merges are never vouched for ([Replays](#replays)). | `git merge --abort` (discards the in-progress resolution), then rebase or rerun `absorb-devloop.sh`; or `git commit --no-verify` if you accept CI as the only check — your decision. |
+| `replay skip not applied … [multiple-replay-states]` / `[ref-not-pseudoref]` | Both `CHERRY_PICK_HEAD` and `REBASE_HEAD` exist, or a **branch** is named like a pseudoref. | Finish or abort the stray operation / rename the branch; or validate and resume. |
+| `replay skip not applied … [git-error]` | A git command failed while checking (its own error is printed above; the line names the step and rc). The skip is never granted on an error. | Fix the git error and resume, or validate (`./scripts/layer-all.sh && git add -A`, needs the devloop cluster helper). |
 
 ### Rollback / escape hatch
 
 If a hook bug ever **wedges** a legitimate commit, `git commit --no-verify` bypasses it.
-That is the documented escape hatch while diagnosing — but remember CI still re-runs the
-full pipeline, so a genuinely failing tree will be caught there regardless.
+That is the documented escape hatch while diagnosing — but remember CI on PRs into
+main/develop (see `.github/workflows/ci.yml` `on:`) re-runs the full pipeline, so a genuinely
+failing tree will be caught there regardless.
 
 ### Isolation self-test
 
 `scripts/guards/simple/selftest-gate2-verdict.sh` drives the producer + validator against
 synthetic staged trees in throwaway temp git repos, covering the verification matrix
-(a–f) plus slug-mismatch and extra-staged-file drift. It runs in Layer 3 (guards) every
+(a–f) plus slug-mismatch and extra-staged-file drift, and the replay skip against real
+conflicted cherry-pick / rebase / merge state (`q*` allow, `r*` refuse — one case per refusal
+token). It runs in Layer 3 (guards) every
 devloop and in CI, and emits the ADR-0033 `STATUS=` contract line. Run it standalone to
 reproduce a hook-logic regression without touching your real index:
 `./scripts/guards/simple/selftest-gate2-verdict.sh`.
