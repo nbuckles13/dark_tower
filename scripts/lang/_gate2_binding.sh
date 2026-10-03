@@ -650,11 +650,18 @@ gate2_verdict_get() {
 #   2. exactly one of CHERRY_PICK_HEAD / REBASE_HEAD resolves to a commit, and it is
 #      the pseudoref itself (not a branch of that name);
 #   3. the staged blob == that path's blob in the replayed commit (OID equality);
-#   4. the replayed commit carries exactly one `Devloop:` trailer, equal to the slug.
-# The replayed commit ITSELF is the source — no ancestor walk, so an ancestor's
-# trailer can never vouch for the commit actually being replayed. It need not itself
-# have changed main.md: its tree holding that exact record at that path under its own
-# `Devloop: <slug>` trailer is the same evidence (user's rule, as written).
+#   4. the replayed commit has exactly ONE parent (read from the raw object, ignoring
+#      replace refs/grafts): a root or a merge is never vouched for;
+#   5. it wrote exactly one complete devloop main.md, and that is this path (added or
+#      modified relative to its parent — `diff-tree`, so an unreadable parent tree is a
+#      git error, never "absent").
+# The evidence is the commit's TREE, not its message. A commit writing a complete main.md
+# went through this hook when it was made, OR through a hook-free path (`--no-verify`,
+# `rebase --continue`, a clean pick, `commit-tree`) — a message line could claim no more,
+# and CI on PRs into main/develop is the backstop either way. The replayed commit ITSELF
+# is the source — no ancestor walk, so a record an ancestor wrote is never vouched for by
+# a later commit that did not touch it. The path carries the slug. Exactly-one mirrors the
+# creation-time invariant: a commit completing two devloops could only have bypassed it.
 #
 # WHAT THIS RELAXES (the user's decision): only trigger conjunct 1. When every staged
 # complete main.md qualifies, the WHOLE commit needs no local verdict, including the
@@ -664,11 +671,9 @@ gate2_verdict_get() {
 # (.github/workflows/ci.yml `on:`) re-runs the full pipeline.
 #
 # FORGERY: a hand-written CHERRY_PICK_HEAD can only replay a main.md byte-identical,
-# at the same path, to one already in a real commit carrying `Devloop: <slug>` — it
-# cannot mint a new completion record. Strictly weaker than `--no-verify` or a
+# at the same path, to one a real commit already wrote — it cannot mint a new
+# completion record. Strictly weaker than `--no-verify` or a
 # hand-authored PASS verdict, both of which already exist (THREAT MODEL above).
-# `git interpret-trailers` honours local `trailer.*` config (separators, key aliases);
-# local config is the same actor as `--no-verify`, so that is inside the model too.
 #
 # FAIL-CLOSED: these run from `if`/`$(…)` contexts where `set -e` is inert, so every
 # git call is rc-checked explicitly and every enumeration goes through
@@ -684,14 +689,17 @@ __gate2_replay_ref=""      # CHERRY_PICK_HEAD | REBASE_HEAD | MERGE_HEAD (when r
 __gate2_replay_sha=""      # full commit OID of the replayed commit ("" if unresolvable)
 __gate2_replay_token=""    # refusal token when gate2_replay_source returns 2
 __gate2_replay_reason=""   # refusal reason when gate2_replay_source returns 2
+__gate2_commit_checked=0   # gate2_replay_commit_facts ran for this commit
+__gate2_commit_token=""    # its refusal token ("" = the commit can vouch)
+__gate2_commit_reason=""   # its refusal reason
+__gate2_commit_written=""  # the one complete devloop main.md path the replayed commit wrote
 __gate2_refused_tokens=()  # every refusal token printed this commit
 __gate2_modified_paths=()  # paths refused as main-md-modified (the only restorable kind)
 __gate2_vouched_paths=()   # paths gate2_replay_qualifies vouched for
 __gate2_vouched_blobs=()   # their staged blob OIDs (parallel to __gate2_vouched_paths)
-__gate2_trailer_error=""   # which step of gate2_commit_devloop_trailer failed, and its rc
 
 # __gate2_printable <text> — the text with control bytes (newline, ESC, …) replaced by
-# `?`, so a hostile path / trailer can't inject escapes or forge extra hook lines.
+# `?`, so a hostile path can't inject escapes or forge extra hook lines.
 __gate2_printable() {
   printf '%s' "${1//[[:cntrl:]]/?}"
 }
@@ -780,32 +788,55 @@ gate2_replay_source() {
   return 0
 }
 
-# gate2_commit_devloop_trailer <sha> <array-name> — fill the named array with the value
-# of every `Devloop:` trailer on <sha>, whitespace-trimmed. Uses git's own trailer
-# parser: a `Devloop:` line in a body paragraph is not a trailer. Key match is exact
-# and case-sensitive. On a git error returns 1 and names the failed step + rc in
-# __gate2_trailer_error. (Out-array, not stdout, so it runs in the caller's shell and
-# __gate2_trailer_error survives.)
-gate2_commit_devloop_trailer() {
-  local -n __gate2_trailer_out="$2"
-  local msg trailers line key val rc=0
-  __gate2_trailer_out=() __gate2_trailer_error=""
-  msg="$(git log -1 --format=%B "$1")" || rc=$?
+# __gate2_is_complete <content> — 0 iff the main.md content's Loop State Phase row has
+# leading word `complete` (row shape: `| Phase | `<value>` |`, value maybe backticked).
+__gate2_is_complete() {
+  local w
+  w="$(printf '%s\n' "$1" | grep -m1 '^| Phase |' \
+    | sed -E 's/^\| Phase \| *`?([A-Za-z0-9-]+).*/\1/' || true)"
+  [[ "$w" == "complete" ]]
+}
+
+# gate2_replay_commit_facts — rules 4 and 5 for the replayed commit, once per commit:
+# sets __gate2_commit_token/_reason (refusal) or __gate2_commit_written (the one record
+# it wrote). Objects are read with --no-replace-objects, so a graft or replace ref can't
+# make the commit look like a root; a missing object (shallow boundary) is a git error.
+gate2_replay_commit_facts() {
+  [[ "$__gate2_commit_checked" -eq 1 ]] && return 0
+  __gate2_commit_checked=1 __gate2_commit_token="" __gate2_commit_reason="" __gate2_commit_written=""
+  local sha="$__gate2_replay_sha" raw line parent="" nparents=0 rc=0 f content
+  local -a changed=() complete=()
+  raw="$(git --no-replace-objects cat-file commit "$sha")" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    __gate2_trailer_error="git log -1 --format=%B failed (rc=$rc)"; return 1
-  fi
-  trailers="$(git interpret-trailers --parse <<<"$msg")" || rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    __gate2_trailer_error="git interpret-trailers --parse failed (rc=$rc)"; return 1
+    __gate2_commit_token="git-error" __gate2_commit_reason="cat-file commit <replayed> failed (rc=$rc)"; return 0
   fi
   while IFS= read -r line; do
-    key="${line%%:*}"
-    [[ "$key" == "Devloop" && "$line" == *:* ]] || continue
-    val="${line#*:}"
-    val="${val#"${val%%[![:space:]]*}"}"   # trim leading whitespace
-    val="${val%"${val##*[![:space:]]}"}"   # trim trailing whitespace (incl. CR)
-    __gate2_trailer_out+=("$val")
-  done <<<"$trailers"
+    [[ -z "$line" ]] && break                       # end of the header
+    if [[ "$line" == "parent "* ]]; then parent="${line#parent }"; nparents=$((nparents + 1)); fi
+  done <<<"$raw"
+  if [[ "$nparents" -eq 0 ]]; then
+    __gate2_commit_token="root-commit-not-vouched" __gate2_commit_reason="the replayed commit has no parent"; return 0
+  elif [[ "$nparents" -gt 1 ]]; then
+    __gate2_commit_token="replayed-merge-not-vouched"
+    __gate2_commit_reason="the replayed commit is a merge ($nparents parents) — merges are not vouched for (runbook §8.5)"; return 0
+  fi
+  __gate2_capture_nul changed git --no-replace-objects diff-tree -r -z --no-commit-id --name-only --diff-filter=AM "$parent" "$sha" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    __gate2_commit_token="git-error" __gate2_commit_reason="diff-tree <parent> <replayed> failed (rc=$rc)"; return 0
+  fi
+  for f in "${changed[@]+"${changed[@]}"}"; do
+    gate2_is_devloop_mainmd "$f" || continue
+    rc=0; content="$(git --no-replace-objects cat-file blob "$sha:$f")" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      __gate2_commit_token="git-error" __gate2_commit_reason="cat-file blob <replayed>:<path> failed (rc=$rc)"; return 0
+    fi
+    __gate2_is_complete "$content" && complete+=("$f")
+  done
+  if [[ ${#complete[@]} -gt 1 ]]; then
+    __gate2_commit_token="multiple-records-in-replayed-commit"
+    __gate2_commit_reason="the replayed commit wrote ${#complete[@]} complete devloop main.md (a commit completes exactly one devloop)"; return 0
+  fi
+  __gate2_commit_written="${complete[0]:-}"
 }
 
 # gate2_replay_qualifies <path> — the per-main.md predicate, after gate2_replay_source
@@ -813,17 +844,15 @@ gate2_commit_devloop_trailer() {
 # the skip line is printed by the caller once the whole commit is known); otherwise
 # prints the refusal line and returns 1.
 gate2_replay_qualifies() {
-  local path="$1" slug staged_oid src_oid rc val n
-  local -a vals=()
+  local path="$1" staged_oid src_oid rc
   local sha="$__gate2_replay_sha"
-  slug="$(gate2_mainmd_slug "$path")"
 
   rc=0; staged_oid="$(git rev-parse --verify --quiet ":$path")" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     __gate2_replay_refuse "$path" git-error "rev-parse :<path> failed (rc=$rc)"
     return 1
   fi
-  rc=0; src_oid="$(git rev-parse --verify --quiet "$sha:$path")" || rc=$?
+  rc=0; src_oid="$(git --no-replace-objects rev-parse --verify --quiet "$sha:$path")" || rc=$?
   if [[ "$rc" -eq 1 ]]; then
     __gate2_replay_refuse "$path" path-absent-in-replayed-commit "the replayed commit's tree has no such path"
     return 1
@@ -836,20 +865,14 @@ gate2_replay_qualifies() {
     return 1
   fi
 
-  if ! gate2_commit_devloop_trailer "$sha" vals; then
-    __gate2_replay_refuse "$path" git-error "reading the Devloop: trailer: $__gate2_trailer_error"
+  # (4)+(5) one parent, and this is the one complete record the commit wrote.
+  gate2_replay_commit_facts
+  if [[ -n "$__gate2_commit_token" ]]; then
+    __gate2_replay_refuse "$path" "$__gate2_commit_token" "$__gate2_commit_reason"
     return 1
   fi
-  n="${#vals[@]}"
-  if [[ "$n" -eq 0 ]]; then
-    __gate2_replay_refuse "$path" no-trailer "the replayed commit has no Devloop: trailer"
-    return 1
-  elif [[ "$n" -gt 1 ]]; then
-    __gate2_replay_refuse "$path" duplicate-trailer "the replayed commit has $n Devloop: trailers"
-    return 1
-  elif [[ "${vals[0]}" != "$slug" ]]; then
-    val="$(__gate2_printable "${vals[0]}")"
-    __gate2_replay_refuse "$path" trailer-slug-mismatch "Devloop: trailer is '${val:0:80}', expected '$(__gate2_printable "$slug")'"
+  if [[ "$__gate2_commit_written" != "$path" ]]; then
+    __gate2_replay_refuse "$path" not-written-by-replayed-commit "the replayed commit did not write this path (it holds the same blob as its parent)"
     return 1
   fi
   __gate2_vouched_paths+=("$path")
@@ -902,7 +925,7 @@ __gate2_replay_report_vouched() {
     return 0
   fi
   for i in "${!__gate2_vouched_paths[@]}"; do
-    printf '⚠️  Gate-2: replay skip: %s blob %s == %s %s (Devloop: %s); Gate-2 verdict NOT checked for this commit — %s bound path(s) not validated locally (%s differ from the replayed commit) — run ./scripts/layer-all.sh to validate, or rely on CI on PRs into main/develop (.github/workflows/ci.yml `on:`).\n' \
+    printf '⚠️  Gate-2: replay skip: %s blob %s == %s %s (slug %s); Gate-2 verdict NOT checked for this commit — %s bound path(s) not validated locally (%s differ from the replayed commit) — run ./scripts/layer-all.sh to validate, or rely on CI on PRs into main/develop (.github/workflows/ci.yml `on:`).\n' \
       "$(__gate2_printable "${__gate2_vouched_paths[$i]}")" "${__gate2_vouched_blobs[$i]}" \
       "$__gate2_replay_ref" "$__gate2_replay_sha" \
       "$(__gate2_printable "$(gate2_mainmd_slug "${__gate2_vouched_paths[$i]}")")" \
@@ -960,13 +983,13 @@ __gate2_replay_action_lines() {
 # token; reflection/planning/review/implementation/gate-3/setup are not). Trailing
 # annotations like `complete (iteration 2)` still count as complete.
 gate2_staged_trigger_slug() {
-  local f staged phase_word rc=0
+  local f staged rc=0
   local -a found=() candidates=()
   local replay_rc=-1
   # Reset the per-commit replay state, so a second call in one shell (or a direct,
   # non-`$(…)` call) never inherits earlier refusals or vouches.
   __gate2_refused_tokens=() __gate2_modified_paths=() __gate2_vouched_paths=() __gate2_vouched_blobs=()
-  __gate2_trailer_error=""
+  __gate2_commit_checked=0 __gate2_commit_token="" __gate2_commit_reason="" __gate2_commit_written=""
   __gate2_capture_nul candidates git diff --cached -z --name-only --diff-filter=d || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     printf 'gate2: enumerating staged changes failed (rc=%s)\n' "$rc" >&2
@@ -981,12 +1004,7 @@ gate2_staged_trigger_slug() {
       return 3
     fi
     [[ -n "$staged" ]] || continue
-    # Extract the Phase row's value cell and its leading word.
-    # Row shape: `| Phase | `<value>` |` (value may be backtick-wrapped).
-    phase_word="$(printf '%s\n' "$staged" \
-      | grep -m1 '^| Phase |' \
-      | sed -E 's/^\| Phase \| *`?([A-Za-z0-9-]+).*/\1/' || true)"
-    [[ "$phase_word" == "complete" ]] || continue
+    __gate2_is_complete "$staged" || continue
 
     # Replay skip: classify the replay state once, then vouch per main.md.
     if [[ "$replay_rc" -eq -1 ]]; then

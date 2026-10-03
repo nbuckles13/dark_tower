@@ -536,8 +536,7 @@ case_p() {
 
 __real_git="$(command -v git)"
 
-# commit_msg <message> — commit the index with an exact message (verbatim, so trailing
-# whitespace / CR in a trailer survives for the trim cases).
+# commit_msg <message> — commit the index with an exact message (verbatim).
 commit_msg() {
   printf '%s\n' "$1" > "$DEVLOOP_TMP/msg"
   git commit -q --cleanup=verbatim -F "$DEVLOOP_TMP/msg"
@@ -641,7 +640,7 @@ case_q1() {
   run_validate
   if [[ "$rc" -ne 0 ]]; then bad "(q1) cherry-pick replay should ALLOW (rc=$rc); output: $out"; return; fi
   if [[ "$m" -lt 1 ]]; then bad "(q1) precondition: the resolution must differ from the replayed commit (M=$m)"; fi
-  if grep -qF "Gate-2: replay skip: $path blob $blob == CHERRY_PICK_HEAD $sha (Devloop: story-q1); Gate-2 verdict NOT checked for this commit — $n bound path(s) not validated locally ($m differ from the replayed commit)" <<<"$out"; then
+  if grep -qF "Gate-2: replay skip: $path blob $blob == CHERRY_PICK_HEAD $sha (slug story-q1); Gate-2 verdict NOT checked for this commit — $n bound path(s) not validated locally ($m differ from the replayed commit)" <<<"$out"; then
     [[ "$__case_failed" -eq 0 ]] && ok "(q1) conflicted cherry-pick, hand-edited resolution → allow; skip line names path/blob/ref/sha/slug, N=$n M=$m"
   else
     bad "(q1) skip line missing or wrong; output: $out"
@@ -657,7 +656,7 @@ case_q2() {
   if [[ "$(git rev-parse -q --verify REBASE_HEAD)" != "$sha" ]]; then bad "setup: REBASE_HEAD is not the devloop commit"; return; fi
   echo hand-resolved > src.rs; git add src.rs
   run_validate
-  if [[ "$rc" -eq 0 ]] && grep -qF "== REBASE_HEAD $sha (Devloop: story-q2)" <<<"$out"; then
+  if [[ "$rc" -eq 0 ]] && grep -qF "== REBASE_HEAD $sha (slug story-q2)" <<<"$out"; then
     ok "(q2) conflicted rebase stopped on the devloop commit → allow, skip line names REBASE_HEAD"
   else
     bad "(q2) rebase replay should ALLOW with a REBASE_HEAD skip line (rc=$rc); output: $out"
@@ -673,7 +672,7 @@ case_q3() {
   conflicted_pick devloop || return
   if [[ -e "$(git rev-parse --git-common-dir)/CHERRY_PICK_HEAD" ]]; then bad "setup: CHERRY_PICK_HEAD landed in the common dir, not per-worktree"; return; fi
   run_validate
-  if [[ "$rc" -eq 0 ]] && grep -qF "== CHERRY_PICK_HEAD $(git rev-parse devloop) (Devloop: story-q3)" <<<"$out"; then
+  if [[ "$rc" -eq 0 ]] && grep -qF "== CHERRY_PICK_HEAD $(git rev-parse devloop) (slug story-q3)" <<<"$out"; then
     ok "(q3) cherry-pick in a linked worktree → allow (per-worktree pseudoref resolved)"
   else
     bad "(q3) linked-worktree replay should ALLOW (rc=$rc); output: $out"
@@ -723,21 +722,8 @@ case_q5() {
   fi
 }
 
-# (q6) trailer value with trailing spaces + CR → trimmed → allow.
-case_q6() {
-  replay_fixture story-q6 "$(printf 'devloop work\n\nDevloop: story-q6  \r')"
-  conflicted_pick devloop || return
-  run_validate
-  if [[ "$rc" -eq 0 ]] && grep -qF '(Devloop: story-q6)' <<<"$out"; then
-    ok "(q6) trailer value with trailing whitespace/CR → trimmed → allow"
-  else
-    bad "(q6) trimmed trailer should ALLOW (rc=$rc); output: $out"
-  fi
-}
-
-# (q7) the replayed commit carries the matching trailer but did NOT itself change
-#      main.md; main.md hand-staged identical to its tree → allow (user's rule as
-#      written: trailer on the replayed commit + byte-identical to that commit's blob).
+# (q7) the replayed commit did NOT itself change main.md (an earlier commit wrote it);
+#      main.md hand-staged identical to its tree → [not-written-by-replayed-commit].
 case_q7() {
   seed_commit
   echo base > src.rs; git add src.rs; git commit -qm base-src
@@ -749,11 +735,38 @@ case_q7() {
   conflicted_pick devloop || return
   git checkout devloop -- docs/devloop-outputs/story-q7/main.md
   run_validate
-  if [[ "$rc" -eq 0 ]] && grep -q 'Gate-2: replay skip: docs/devloop-outputs/story-q7/main.md' <<<"$out"; then
-    ok "(q7) trailer commit that didn't touch main.md, main.md identical to its tree → allow"
-  else
-    bad "(q7) should ALLOW (rc=$rc); output: $out"
+  # Restoring main.md can't fix this: the action is validate-or-bypass.
+  if grep -q 'git checkout' <<<"$out" || ! grep -q 'Not fixable by restoring main.md' <<<"$out"; then
+    bad "(q7) not-written must not advise git checkout, and must give the validate/--no-verify action; output: $out"
   fi
+  expect_refusal "(q7) replayed commit didn't write main.md" not-written-by-replayed-commit
+}
+
+# (q8) absorbed commit replayed again: the commit being picked is itself a
+#      `cherry-pick -x` copy (message ends in a "(cherry picked from …)" paragraph) →
+#      allow; the message is irrelevant.
+case_q8() {
+  replay_fixture story-q8 "$(printf '%s\n\n(cherry picked from commit %s)' "$(devloop_msg story-q8)" 0123456789abcdef0123456789abcdef01234567)"
+  conflicted_pick devloop || return
+  run_validate
+  if [[ "$rc" -eq 0 ]] && grep -qF '(slug story-q8)' <<<"$out"; then
+    ok "(q8) absorbed (-x) commit replayed → allow"
+  else
+    bad "(q8) should ALLOW (rc=$rc); output: $out"
+  fi
+}
+
+# (q9) the replayed commit is a ROOT commit (no parent) that adds main.md → refused:
+#      no legitimate devloop commit is a root.
+case_q9() {
+  seed_commit
+  echo target > src.rs; git add src.rs; git commit -qm target
+  git checkout -q --orphan devloop; git rm -rq --cached . >/dev/null; rm -rf docs src.rs
+  mk_main_md story-q9 complete; echo devloop > src.rs
+  git add -A; commit_msg "$(devloop_msg story-q9)"
+  git checkout -q main
+  conflicted_pick devloop || return
+  run_validate; expect_refusal "(q9) root replayed commit" root-commit-not-vouched
 }
 
 # (r1) main.md edited during resolution → block; the ⚠️ reason line directly precedes
@@ -776,30 +789,17 @@ case_r1() {
   expect_refusal "(r1) edited main.md" main-md-modified
 }
 
-# (r2) replayed commit has no trailer.
+# (r2) the replayed commit's MESSAGE names no devloop → still allow: the evidence is
+#      that the commit wrote the record, not what its message says.
 case_r2() {
   replay_fixture story-r2 "devloop work without a trailer"
   conflicted_pick devloop || return
   run_validate
-  # Restoring main.md can't fix a missing trailer: the action is validate-or-bypass.
-  if grep -q 'git checkout' <<<"$out" || ! grep -q 'Not fixable by restoring main.md' <<<"$out"; then
-    bad "(r2) no-trailer must not advise git checkout, and must give the validate/--no-verify action; output: $out"
+  if [[ "$rc" -eq 0 ]] && grep -qF '(slug story-r2)' <<<"$out"; then
+    ok "(r2) message without a Devloop: line, commit wrote main.md → allow"
+  else
+    bad "(r2) should ALLOW (rc=$rc); output: $out"
   fi
-  expect_refusal "(r2) no trailer" no-trailer
-}
-
-# (r3) trailer names a different devloop.
-case_r3() {
-  replay_fixture story-r3 "$(devloop_msg other-slug)"
-  conflicted_pick devloop || return
-  run_validate; expect_refusal "(r3) Devloop: other-slug" trailer-slug-mismatch
-}
-
-# (r4) `Devloop:` in a body paragraph, not the trailer block → not a trailer.
-case_r4() {
-  replay_fixture story-r4 "$(printf 'devloop work\n\nDevloop: story-r4\nis mentioned in this body paragraph.\n\nClosing paragraph.')"
-  conflicted_pick devloop || return
-  run_validate; expect_refusal "(r4) body-only Devloop: line" no-trailer
 }
 
 # (r5) no replay in progress → today's block, and NO replay line of either kind.
@@ -817,7 +817,7 @@ case_r5() {
 }
 
 # (r6) conflicted MERGE that would otherwise qualify (main.md identical to MERGE_HEAD's
-#      tree, MERGE_HEAD's tip carries the matching trailer) → refused by the merge rule.
+#      tree, MERGE_HEAD's tip wrote it) → refused by the merge rule.
 case_r6() {
   replay_fixture story-r6 "$(devloop_msg story-r6)"
   if git merge devloop >/dev/null 2>&1; then bad "setup: merge did not conflict"; return; fi
@@ -874,7 +874,7 @@ case_r8() {
   [[ "$__case_failed" -eq 0 ]] && ok "(r8) forged CHERRY_PICK_HEAD (garbage / tree OID) → today's no-verdict block, no replay line"
 }
 
-# (r9) CHERRY_PICK_HEAD forged to a REAL trailer-bearing commit holding a different
+# (r9) CHERRY_PICK_HEAD forged to a REAL commit that wrote a different
 #      main.md blob at that path → [main-md-modified].
 case_r9() {
   replay_fixture story-r9 "$(devloop_msg story-r9)"
@@ -904,8 +904,8 @@ case_r10() {
   fi
 }
 
-# (r10b) one replayed commit carrying TWO complete main.md under one trailer → the
-#        non-matching one refuses, the commit blocks.
+# (r10b) one replayed commit that wrote TWO complete main.md → refused for both: the
+#        hook never lets a commit complete two devloops, so this one bypassed it.
 case_r10b() {
   seed_commit
   echo base > src.rs; git add src.rs; git commit -qm base-src
@@ -915,13 +915,12 @@ case_r10b() {
   git checkout -q main; echo target > src.rs; git commit -qam target
   conflicted_pick devloop || return
   run_validate
-  if ! grep -q 'Gate-2: replay vouched for docs/devloop-outputs/story-a/main.md' <<<"$out" || grep -q 'Gate-2: replay skip: ' <<<"$out"; then
-    bad "(r10b) story-a should be vouched without a 'verdict NOT checked' line; output: $out"
-  fi
-  if [[ "$rc" -ne 0 ]] && grep -q 'not applied to docs/devloop-outputs/story-b/main.md.*\[trailer-slug-mismatch\]' <<<"$out"; then
-    [[ "$__case_failed" -eq 0 ]] && ok "(r10b) two main.md under one trailer → the other refuses [trailer-slug-mismatch], block"
+  if [[ "$rc" -ne 0 ]] && grep -q 'not applied to docs/devloop-outputs/story-a/main.md.*\[multiple-records-in-replayed-commit\]' <<<"$out" \
+     && grep -q 'not applied to docs/devloop-outputs/story-b/main.md.*\[multiple-records-in-replayed-commit\]' <<<"$out" \
+     && ! grep -q 'Gate-2: replay skip: ' <<<"$out"; then
+    ok "(r10b) replayed commit wrote two complete main.md → both refused, block"
   else
-    bad "(r10b) story-b must refuse with [trailer-slug-mismatch] and block (rc=$rc); output: $out"
+    bad "(r10b) both must refuse [multiple-records-in-replayed-commit] (rc=$rc); output: $out"
   fi
 }
 
@@ -942,16 +941,21 @@ case_r11() {
   fi
 }
 
-# (r12) git error FAIL-CLOSED: (a) interpret-trailers fails; (b) MID-CHECK —
-#       `rev-parse <replayed>:<path>` fails after replay state resolved. Each blocks
+# (r12) git error FAIL-CLOSED: (a) `cat-file commit <replayed>` fails; (b) MID-CHECK —
+#       `rev-parse <replayed>:<path>` fails after replay state resolved; (d) `diff-tree
+#       <parent> <replayed>` fails (e.g. a shallow boundary: the parent is missing). Each blocks
 #       with [git-error] and git's (here: the shim's) own stderr is not swallowed.
 case_r12() {
   replay_fixture story-r12 "$(devloop_msg story-r12)"
   conflicted_pick devloop || return
-  with_git_shim 'interpret-trailers'
-  if [[ "$rc" -eq 0 ]] || ! grep -qF '[git-error]' <<<"$out" || ! grep -qF 'git interpret-trailers --parse failed (rc=97)' <<<"$out" \
-     || ! grep -q 'shim: injected git failure for interpret-trailers' <<<"$out" || grep -q 'Gate-2: replay skip: ' <<<"$out"; then
-    bad "(r12a) interpret-trailers failure must block with [git-error] + git's stderr (rc=$rc); output: $out"
+  with_git_shim 'cat-file'
+  if [[ "$rc" -eq 0 ]] || ! grep -qF '[git-error]' <<<"$out" || ! grep -qF 'cat-file commit <replayed> failed (rc=97)' <<<"$out" \
+     || ! grep -q 'shim: injected git failure for cat-file' <<<"$out" || grep -q 'Gate-2: replay skip: ' <<<"$out"; then
+    bad "(r12a) cat-file failure must block with [git-error] + git's stderr (rc=$rc); output: $out"
+  fi
+  with_git_shim 'diff-tree'
+  if [[ "$rc" -eq 0 ]] || ! grep -qF 'diff-tree <parent> <replayed> failed (rc=97)' <<<"$out" || grep -q 'Gate-2: replay skip: ' <<<"$out"; then
+    bad "(r12d) diff-tree failure must block with [git-error] (rc=$rc); output: $out"
   fi
   with_git_shim "$(git rev-parse devloop):docs/*"
   if [[ "$rc" -eq 0 ]] || ! grep -qF '[git-error]' <<<"$out" || ! grep -q 'rc=97' <<<"$out" || ! grep -q 'shim: injected git failure' <<<"$out" || grep -q 'Gate-2: replay skip: ' <<<"$out"; then
@@ -1094,11 +1098,32 @@ case_r13() {
   fi
 }
 
-# (r14) two Devloop: trailers on the replayed commit.
-case_r14() {
-  replay_fixture story-r14 "$(printf 'devloop work\n\nDevloop: story-r14\nDevloop: story-r14')"
+# (r23) `cherry-pick -m 1 <merge>`: the replayed commit is a MERGE that brought in a
+#       devloop branch → refused (a merge carries a whole branch; never vouched).
+case_r23() {
+  seed_commit
+  echo base > src.rs; git add src.rs; git commit -qm base-src
+  git checkout -qb devloop
+  mk_main_md story-r23 complete; echo devloop > src.rs; git add -A; commit_msg "$(devloop_msg story-r23)"
+  git checkout -qb integ main; git merge -q --no-ff -m "merge devloop" devloop
+  git checkout -q main; echo target > src.rs; git commit -qam target
+  if git cherry-pick -m 1 integ >/dev/null 2>&1; then bad "setup: cherry-pick -m did not conflict"; return; fi
+  echo hand-resolved > src.rs; git add src.rs
+  run_validate; expect_refusal "(r23) replayed merge commit (cherry-pick -m)" replayed-merge-not-vouched
+}
+
+# (r24) a graft (`git replace --graft <sha>`, no parents) cannot make the replayed
+#       commit look like a root, nor hide its parent: objects are read raw → allow.
+case_r24() {
+  replay_fixture story-r24 "$(devloop_msg story-r24)"
+  git replace --graft devloop
   conflicted_pick devloop || return
-  run_validate; expect_refusal "(r14) duplicate Devloop: trailer" duplicate-trailer
+  run_validate
+  if [[ "$rc" -eq 0 ]] && grep -qF '(slug story-r24)' <<<"$out"; then
+    ok "(r24) graft making the commit parentless is ignored → allow on the raw parent"
+  else
+    bad "(r24) should ALLOW on the raw object's parent (rc=$rc); output: $out"
+  fi
 }
 
 # (r15) a staged DELETION of a complete main.md is not a trigger (and must not hit the
@@ -1118,8 +1143,8 @@ case_r15() {
   fi
 }
 
-# (r16) REGRESSION GUARD for the dropped ancestor walk: A (Devloop: story-r16) adds
-#       main.md; B (no trailer) on top touches src.rs only. Cherry-pick B with a
+# (r16) REGRESSION GUARD against an ancestor walk: A adds main.md; B on top touches
+#       src.rs only. Cherry-pick B with a
 #       conflict and hand-stage main.md identical to B's tree (else it isn't in the
 #       changeset and the case is vacuous). An ancestor-walk rule would allow this.
 case_r16() {
@@ -1131,11 +1156,12 @@ case_r16() {
   git checkout -q main; echo target > src.rs; git commit -qam target
   conflicted_pick devloop || return
   git checkout devloop -- docs/devloop-outputs/story-r16/main.md
-  run_validate; expect_refusal "(r16) only an ANCESTOR carries the trailer" no-trailer
+  run_validate; expect_refusal "(r16) only an ANCESTOR wrote main.md" not-written-by-replayed-commit
 }
 
-# (r17) rebase stopped on a LATER non-trailer commit (REBASE_HEAD = that commit), with
-#       main.md staged identical to its tree → [no-trailer].
+# (r17) rebase stopped on a LATER commit that itself rewrote main.md (REBASE_HEAD =
+#       that commit) → allow: that commit wrote the blob, so it passed the hook (or
+#       was bypassed) when it was made, like any other writer.
 case_r17() {
   seed_commit
   echo base > src.rs; git add src.rs; git commit -qm base-src
@@ -1148,21 +1174,19 @@ case_r17() {
   if git rebase main >/dev/null 2>&1; then bad "setup: rebase did not conflict"; return; fi
   if [[ "$(git rev-parse -q --verify REBASE_HEAD)" != "$(git rev-parse devloop)" ]]; then bad "setup: rebase did not stop on the later commit"; return; fi
   echo hand-resolved > src.rs; git add src.rs
-  run_validate; expect_refusal "(r17) rebase stopped on a later non-trailer commit" no-trailer
+  run_validate
+  if [[ "$rc" -eq 0 ]] && grep -qF '== REBASE_HEAD' <<<"$out"; then
+    ok "(r17) rebase stopped on a later commit that rewrote main.md → allow"
+  else
+    bad "(r17) should ALLOW (rc=$rc); output: $out"
+  fi
 }
 
-# (r18) a MISMATCHED slug with trailing whitespace — trimming must not create a match.
-case_r18() {
-  replay_fixture story-r18 "$(printf 'devloop work\n\nDevloop: story-r18x  \r')"
-  conflicted_pick devloop || return
-  run_validate; expect_refusal "(r18) Devloop: story-r18x + whitespace" trailer-slug-mismatch
-}
-
-printf 'gate2 isolation self-test (matrix a–f + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q7/r1–r18):\n'
+printf 'gate2 isolation self-test (matrix a–f + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q9/r1–r24):\n'
 for c in case_a case_b case_c case_d case_e case_f case_g case_h case_i case_j case_k case_l case_m case_n case_o case_p \
-         case_q1 case_q2 case_q3 case_q4 case_q5 case_q6 case_q7 \
-         case_r1 case_r2 case_r3 case_r4 case_r5 case_r6 case_r6b case_r6c case_r7 case_r8 case_r9 \
-         case_r10 case_r10b case_r11 case_r12 case_r12c case_r13 case_r19 case_r20 case_r21 case_r22 case_r14 case_r15 case_r16 case_r17 case_r18; do
+         case_q1 case_q2 case_q3 case_q4 case_q5 case_q7 case_q8 case_q9 \
+         case_r1 case_r2 case_r5 case_r6 case_r6b case_r6c case_r7 case_r8 case_r9 \
+         case_r10 case_r10b case_r11 case_r12 case_r12c case_r13 case_r19 case_r20 case_r21 case_r22 case_r15 case_r16 case_r17 case_r23 case_r24; do
   with_temp_repo "$c" || true
 done
 
