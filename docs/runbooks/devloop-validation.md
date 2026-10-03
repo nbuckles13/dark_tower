@@ -1045,11 +1045,19 @@ complete main.md is dropped from the trigger iff **all** hold
    pseudoref itself, not a branch of that name;
 3. the staged blob equals that path's blob in the **replayed commit** (the pseudoref's
    commit itself — not an ancestor);
-4. the replayed commit carries exactly one `Devloop:` trailer (parsed by
-   `git interpret-trailers`, not grep), equal to the main.md's slug.
+4. the replayed commit has exactly **one parent**, read from the raw object (replace refs and
+   grafts are ignored) — a root or a merge commit is never vouched for;
+5. the replayed commit **wrote exactly one** complete devloop main.md (added or modified
+   against that parent), and it is this path.
 
-Anything else — edited main.md, no trailer, a different devloop's trailer, no replay in
-progress — keeps the verdict requirement. Any git error while checking does too (never a skip).
+The evidence is the commit's tree, not its message; the path carries the slug. A commit that
+writes a complete main.md went through this hook when it was made, or through a hook-free
+path (`--no-verify`, `git rebase --continue`, a clean pick, `commit-tree`) — CI is the
+backstop either way. Exactly-one mirrors the creation-time rule: a commit completing two
+devloops can only have bypassed the hook.
+
+Anything else — edited main.md, a record an earlier commit wrote, a root or merge commit, a
+commit writing two records, no replay in progress — keeps the verdict requirement. Any git error while checking does too (never a skip).
 
 **What this relaxes — the user's decision, stated plainly.** Only the trigger. When every
 staged complete main.md qualifies, the **whole commit** needs no local verdict, including the
@@ -1079,7 +1087,7 @@ recommended rebase/absorb paths need no bypass.
 it; keep the replay output if you need the record):
 
 ```
-⚠️  Gate-2: replay skip: <path> blob <oid> == <REF> <full-sha> (Devloop: <slug>); Gate-2 verdict NOT checked for this commit — <N> bound path(s) not validated locally (<M> differ from the replayed commit) — run ./scripts/layer-all.sh to validate, or rely on CI on PRs into main/develop (.github/workflows/ci.yml `on:`).
+⚠️  Gate-2: replay skip: <path> blob <oid> == <REF> <full-sha> (slug <slug>); Gate-2 verdict NOT checked for this commit — <N> bound path(s) not validated locally (<M> differ from the replayed commit) — run ./scripts/layer-all.sh to validate, or rely on CI on PRs into main/develop (.github/workflows/ci.yml `on:`).
 ```
 
 If the counts can't be computed (a git error), the skip is withdrawn — no audit record, no
@@ -1102,9 +1110,10 @@ refused replay are restoring main.md (`[main-md-modified]`) or a deliberate
 `git commit --no-verify` with CI as the check — the user's decision.
 
 **Reconstruct a skip decision afterwards** from the line's `<full-sha>`, `<path>` and `<oid>`:
-`git rev-parse <full-sha>:<path>` must print `<oid>`, and
-`git log -1 --format=%B <full-sha> | git interpret-trailers --parse` must show exactly one
-`Devloop: <slug>`.
+`git rev-parse <full-sha>:<path>` must print `<oid>`;
+`git --no-replace-objects cat-file commit <full-sha>` must show exactly one `parent` line; and
+`git --no-replace-objects diff-tree -r --name-only <parent> <full-sha>` must list `<path>` as
+the only complete devloop main.md.
 
 The exception adds no state and no kill switch; `git commit --no-verify` remains the escape
 hatch, and reverting the commit that introduced it restores the old behaviour.
@@ -1124,7 +1133,7 @@ hatch, and reverting the commit that introduced it restores the old behaviour.
 | `error enumerating the staged changeset` / `error recomputing the staged-tree signature` | A git error while listing or hashing the staged tree (git's error is above it). Fail-closed. | Fix the repository error and retry. |
 | `replay skip not applied … [main-md-modified]` | The staged main.md differs from the replayed commit's (edited during conflict resolution). | Take the incoming side: `git checkout <REF> -- <path>` (absorb: `--theirs` for `docs/devloop-outputs/**`), re-stage, resume. Or `./scripts/layer-all.sh && git add -A`, then resume. |
 | `replay skip not applied … [path-absent-in-replayed-commit]` | A complete main.md is staged that the replayed commit doesn't contain. | Unstage it if it doesn't belong to this commit; otherwise validate (`./scripts/layer-all.sh && git add -A`) and resume. |
-| `replay skip not applied … [no-trailer]` / `[duplicate-trailer]` / `[trailer-slug-mismatch]` | The replayed commit has no `Devloop:` trailer, several, or one naming a different devloop — it is not that devloop's validated completion. Restoring main.md can't fix this. | With the devloop cluster helper: `./scripts/layer-all.sh && git add -A`, then resume (`git cherry-pick --continue` / `git commit` / rerun the absorb). On a bare host (no Layer 7): `--no-verify` with CI as the check — your decision. |
+| `replay skip not applied … [not-written-by-replayed-commit]` / `[root-commit-not-vouched]` / `[replayed-merge-not-vouched]` / `[multiple-records-in-replayed-commit]` | The replayed commit did not write this main.md (an earlier commit did), has no parent, is a merge (`cherry-pick -m`), or wrote two complete records — it is not that record's single validated completion. Restoring main.md can't fix this. | With the devloop cluster helper: `./scripts/layer-all.sh && git add -A`, then resume (`git cherry-pick --continue` / `git commit` / rerun the absorb). On a bare host (no Layer 7): `--no-verify` with CI as the check — your decision. |
 | `replay skip not applied … [merge-not-vouched]` | A merge is in progress; merges are never vouched for ([Replays](#replays)). | `git merge --abort` (discards the in-progress resolution), then rebase or rerun `absorb-devloop.sh`; or `git commit --no-verify` if you accept CI as the only check — your decision. |
 | `replay skip not applied … [multiple-replay-states]` / `[ref-not-pseudoref]` | Both `CHERRY_PICK_HEAD` and `REBASE_HEAD` exist, or a **branch** is named like a pseudoref. | Finish or abort the stray operation / rename the branch; or validate and resume. |
 | `replay skip not applied … [git-error]` | A git command failed while checking (its own error is printed above; the line names the step and rc). The skip is never granted on an error. | Fix the git error and resume, or validate (`./scripts/layer-all.sh && git add -A`, needs the devloop cluster helper). |

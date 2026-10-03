@@ -51,7 +51,7 @@
 - Layer 6 audit dep-change gate -> `scripts/lang/_audit_gate.sh:audit_dep_changed_{rust,ts}`, glob predicate `scripts/lang/_changed_helpers.sh:diff_touches_glob`; design -> ADR-0033 §3/§11
 - Audit suppressions (pnpm + cargo) -> `.pnpm-audit-ignore.json`, `.cargo/audit.toml`, lib `scripts/lang/_audit_suppressions_lib.sh`, drift check `scripts/audit-suppressions-check.sh`, wrappers `scripts/lang/rust/audit.sh`, `scripts/lang/ts/audit.sh`
 - Node toolchain pin (SSoT `.nvmrc` -> Dockerfile ARG + lockfile engines floor) -> `.nvmrc`, `.npmrc`, root `package.json`, `infra/devloop/Dockerfile`, `infra/devloop/devloop.sh:read_node_version()`
-- Gate-2 tree-bound verdict (producer + pre-commit validator) -> `scripts/lang/_gate2_binding.sh:emit_gate2_verdict()`, `gate2_validate_commit()`, `gate2_staged_trigger_slug()`; replay skip (cherry-pick/rebase only, runbook §8.5 Replays) -> `gate2_replay_source()`, `gate2_replay_qualifies()`; `Devloop:` trailer parser -> `gate2_commit_devloop_trailer()`; selftest `scripts/guards/simple/selftest-gate2-verdict.sh`
+- Gate-2 tree-bound verdict (producer + pre-commit validator) -> `scripts/lang/_gate2_binding.sh:emit_gate2_verdict()`, `gate2_validate_commit()`, `gate2_staged_trigger_slug()`; replay skip (cherry-pick/rebase only, runbook §8.5 Replays) -> `gate2_replay_source()`, `gate2_replay_qualifies()`; replayed-commit tree check -> `gate2_replay_commit_facts()`; selftest `scripts/guards/simple/selftest-gate2-verdict.sh`
 - CI pipelines -> `.github/workflows/{ci.yml,ci-client.yml}`; scheduled ambient audit -> `audit-scheduled.yml`; fuzz nightly -> `fuzz-nightly.yml`
 
 ## Story Runner (ADR-0035)
