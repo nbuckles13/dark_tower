@@ -4,7 +4,7 @@
 **Severity**: [Critical | Warning]
 **Service**: [Service Name - e.g., Global Controller]
 **Owner**: [Team Name - e.g., SRE Team]
-**Last Updated**: [YYYY-MM-DD]
+**History**: `git log --follow -- docs/runbooks/[runbook-file].md`
 
 ---
 
@@ -243,13 +243,4 @@ Within 3 business days, schedule a blameless retrospective:
 
 ---
 
-## Changelog
-
-| Date | Author | Changes |
-|------|--------|---------|
-| YYYY-MM-DD | [Your Name] | Initial creation from TEMPLATE.md |
-
----
-
-**Template Version**: 1.0
 **Template Source**: `docs/runbooks/TEMPLATE.md`

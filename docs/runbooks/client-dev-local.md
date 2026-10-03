@@ -2,7 +2,7 @@
 
 **Service(s)**: web-app demo + AC / GC / MC / MH (local Kind)
 **Owner**: operations
-**Last Updated**: 2026-09-09
+**History**: `git log --follow -- docs/runbooks/client-dev-local.md`
 **Executable companion**: `scripts/dev-web.sh`
 
 > ## ⚠ NON-GOAL BANNER — THIS IS NOT A PRODUCTION PATTERN
@@ -49,12 +49,11 @@
 - [§3 Bring-up](#3-bring-up)
 - [§4 Is the join real?](#4-is-the-join-real)
   - [§4.5 "I joined and I hear nothing" — media triage ladder](#45-i-joined-and-i-hear-nothing--media-triage-ladder)
-- [§5 Failure modes](#5-failure-modes) (F1–F19)
+- [§5 Failure modes](#5-failure-modes)
 - [§6 Teardown](#6-teardown)
 - [§6.5 Automated checks that exist today](#65-automated-checks-that-exist-today)
 - [§7 Not on this branch](#7-not-on-this-branch)
 - [Related runbooks and docs](#related-runbooks-and-docs)
-- [Changelog](#changelog)
 
 ---
 
@@ -881,6 +880,12 @@ the datagram-drop and keepalive story lives in
 Each scenario gives a **discriminator** — something you can run to tell it apart from the
 scenarios that share its symptom. F1/F8 and F1/F9 are symptom-identical pairs; without a
 discriminator you would be guessing.
+
+> **Maintainers — keep these anchors stable.** This heading deliberately carries no F-count, so
+> `#5-failure-modes` does not change as entries are added (rule and rationale:
+> `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`).
+> F-entry headings are linked from other docs by slug and by heading title, so do not retitle an
+> `### F<n> — …` heading without updating every referrer (`grep -rn 'client-dev-local.md' docs crates scripts packages .claude`).
 
 ### F1 — Join dies at `connecting-mc`; sign-up and create work fine
 
@@ -1751,17 +1756,3 @@ yourself updating the same fact in two of these files, one of them is wrong.
   scenarios that the dev-time failures here mirror.
 - `scripts/dev-web.sh` — owns the executable preflight check list. This runbook owns the *why* and
   the diagnosis; the script owns *what is checked*.
-
----
-
-## Changelog
-
-| Date | Author | Changes |
-|------|--------|---------|
-| 2026-07-29 | operations (task #20) | Initial creation (R-49). Two-machine topology, two-topology cluster split, bring-up, join-verification ladder, F1–F10, teardown, env-tests section. Deliberately diverges from `TEMPLATE.md` — see the banner. |
-| 2026-08-06 | infrastructure (task #61) | Added **F11** (Vite "cannot find native binding" — engines-skipped optional binding under a below-floor Node) with (a)/(b) sub-case split; updated §5 header + ToC. Reconciled §6.5/§7 with reality: the Playwright browser-E2E lane (tasks #18/#19) now exists and runs diff-triggered in Layer 7 — corrected the stale "no Playwright" §7 note and the §6.5 cross-reference. Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
-| 2026-09-09 | client (story task #20) | Added the frozen `## Secure Context and Media Setup` section between §2 and §3 — the four gated APIs as one all-or-nothing gate, `http://<sub>.localhost:5173` being potentially trustworthy in Chrome, the non-loopback-HTTP failure (**fails at `connecting-mc`, symptom-identical to F1/F8/F9** — WebTransport is one of the four gated APIs and MC signalling has no fallback, so the join never completes; the discriminator is the origin in the address bar), and the fake-device/fake-ui launch for a machine with no microphone. It is the anchor `scripts/dev-web.sh`'s header and §4's ladder both cite; `scripts/dev-web.test.sh` now pins its slug AND its prose. Corrected **F7**'s stale "may warn" (the fingerprints check has been a hard fail since task #61's escalation), added the presence-only/stale-but-present asymmetry that is F7's actual reason for existing, and added F7's anti-flag counter-message — the stale-but-present case is the one branch where `dev-web.sh`'s own warning never prints. Dropped the count from the §5 heading and its ToC entry (`#5-failure-modes-f1f11` -> `#5-failure-modes`, one live referrer, both fixed here) so the anchor stops rotting as F-entries are added — the rule stated under `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`: name a set's members, never restate its count. Per-entry `### F7 — ...` slug untouched (`mh-incident-response.md` links into it three times). Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
-| 2026-09-30 | client (story 2 task 13) | Added **F18** (receive-slot count N over the MC cap: loud refusal, `dt_client_media_receive_slots_rejected_total`, the bus/console discriminators, fix by agreement never by clamping) and **F19** (rising `dt_client_media_receive_source_deficit_total`: an MC-claimed-active source decoding nothing, triage ladder into MH Scenarios 15-17 and MC routing). F16/F17 left for story 2's runbook task. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |
-| 2026-09-30 | operations (story 2 task 17) | Corrected triage prose falsified by loopback removal (R-3), each with a recorded-correction note: **F13** no longer reads `received` flat as a failed round trip — it forks first on `dt_client_media_receive_source_deficit_total` + `data-slot-state` (nobody sent to you is correct), and only "MC says active, nothing arrives" proceeds to the NAT-binding / stale-policy fork; **F12** gains the healthy "nobody holds you" case (a solo participant sends nothing: `EmittedEmptyTargets`); **F14** gains the N-sender note (`accepted` rising can mean one sender works and another does not); §4.5 rung 1, the rung-2 fork table and the rung-6 `no_subscriber` comment (sustained is a fault, not routine) updated to match; stale "no media plane" text in §4.3 and §7 corrected. |
-| 2026-09-30 | operations (story 2 task 18) | Added **F16** (silence after a leave: the KEK-rotation signature, discriminated by leave correlation; rung 1 is the client pipe's presence, because a dead pipe leaves `MCMediaMissingKeyMaterial` green; the retained-generations counter against `kek_update`; remedy in MC Scenario 16's rotation arm) and **F17** (static fill: late joiners inaudible until someone leaves; effective N from the slot grid, the server cap, no debugger until story 5). Removed F18's reservation note. |
-| 2026-09-30 | test (story 2 task 19) | F16's immediate unblock corrected from "page reload" to a rejoin via the Create then Join navs: a reload drops the in-memory sign-in. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |

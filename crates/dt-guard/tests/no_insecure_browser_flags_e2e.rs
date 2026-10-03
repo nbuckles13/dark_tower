@@ -252,8 +252,9 @@ fn allowlisted_path_is_exempt_but_its_sibling_is_not() {
     // greps `^WARN ` from PASSING guards; routing an expected steady state
     // through that channel buries the real coverage holes (an absent
     // `kubeconform` silently skipping R-17 schema validation). Contract:
-    // `docs/runbooks/devloop-validation.md:624`, cross-referenced as
-    // load-bearing from `scripts/guards/run-guards.sh:183`.
+    // `docs/runbooks/devloop-validation.md` § "8. Symptom → Resolution Catalogue (Cross-Reference Index)"
+    // (`NOTE dt-guard allowlisted mention` row), cross-referenced as
+    // load-bearing from `scripts/guards/run-guards.sh`'s exit-0 arm `^WARN ` grep.
     //
     // Deliberately NOT `survives_run_guards_filter` (line 96): that helper
     // models the FAILURE arm's unanchored pattern, which is a different arm.

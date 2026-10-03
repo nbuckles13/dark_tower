@@ -44,8 +44,6 @@ Prometheus alerts link directly to specific sections within the incident respons
 6. **Smoke Tests** - 5 tests (health, readiness, metrics, authenticated endpoint, meeting join)
 7. **Monitoring and Verification** - Key metrics, dashboards, alerting rules
 
-**Last Updated**: 2026-02-05
-
 ---
 
 ### GC Incident Response Runbook
@@ -86,8 +84,6 @@ Prometheus alerts link directly to specific sections within the incident respons
 | `GCErrorBudgetBurnRateWarning` | Scenario 5: High Error Rate |
 | `GCPodRestartingFrequently` | Scenario 4: Complete Service Outage |
 
-**Last Updated**: 2026-02-05
-
 ---
 
 ## Authentication Controller Runbooks
@@ -107,8 +103,6 @@ Prometheus alerts link directly to specific sections within the incident respons
 6. Smoke Tests (5 tests)
 7. Monitoring and Verification
 
-**Last Updated**: 2025-12-10
-
 ---
 
 ### AC Incident Response Runbook
@@ -125,8 +119,6 @@ Prometheus alerts link directly to specific sections within the incident respons
 5. Recovery Procedures
 6. Postmortem Template
 7. Maintenance and Updates
-
-**Last Updated**: 2025-12-10
 
 ---
 
@@ -167,7 +159,7 @@ All runbooks follow the ADR-0011 two-runbook pattern:
 
 ### Incident Response Runbook Structure
 
-1. **Header** - Service, owner, on-call rotation, last updated, table of contents
+1. **Header** - Service, owner, on-call rotation, history pointer (`git log --follow -- <runbook path>`), table of contents
 2. **Severity Classification** - P1-P4 matrix with response times, examples, escalation
 3. **Escalation Paths** - Initial response, escalation chain, specialist contacts, external dependencies
 4. **Common Failure Scenarios** - At least 7 scenarios, each with:
@@ -179,7 +171,7 @@ All runbooks follow the ADR-0011 two-runbook pattern:
 5. **Diagnostic Commands** - Quick health check, metrics analysis, database queries, log analysis, resource utilization, network debugging
 6. **Recovery Procedures** - Service restart, database failover, emergency procedures
 7. **Postmortem Template** - Complete template for P1/P2 incidents
-8. **Maintenance and Updates** - Ownership, review schedule, change process, version history
+8. **Maintenance and Updates** - Ownership, review schedule, change process
 9. **Additional Resources** - Links to ADRs, metrics catalog, SLO definitions, architecture docs
 
 ---
@@ -197,7 +189,7 @@ All runbooks follow the ADR-0011 two-runbook pattern:
 All runbooks are version-controlled in Git:
 - Changes tracked in commit history
 - Use PR review process for updates
-- Include "Last Updated" date in each runbook
+- `git log` is the only record of a runbook's history: no changelog/version-history tables, `Last Updated` dates, or document version numbers in the file. Each runbook header carries one ``**History**: `git log --follow -- <runbook path>` `` pointer instead. Hand-maintained copies drift from git and make every parallel branch conflict at the same hunk. (`Last Reviewed` / `Next Review` are not history — a no-change review leaves no commit — and stay.)
 
 ### Ownership
 
@@ -210,7 +202,6 @@ All runbooks are version-controlled in Git:
 
 ---
 
-**Last Updated**: 2026-02-05
 **Maintained By**: Observability Specialist + Service Teams
 **Related Documents**:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)

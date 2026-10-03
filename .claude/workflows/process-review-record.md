@@ -204,7 +204,6 @@ Each specialist proposes:
 
 - Reference PRRs in commit messages when fixing gaps
 - Link PRRs from updated specialist definitions
-- Add PRR numbers to workflow changelogs
 
 ## Success Metrics
 

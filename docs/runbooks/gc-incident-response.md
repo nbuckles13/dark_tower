@@ -3,7 +3,7 @@
 **Service**: Global Controller (gc-service)
 **Owner**: SRE Team
 **On-Call Rotation**: PagerDuty - Dark Tower GC Team
-**Last Updated**: 2026-08-03
+**History**: `git log --follow -- docs/runbooks/gc-incident-response.md`
 
 ---
 
@@ -2136,11 +2136,6 @@ All times in UTC. Link to relevant Slack threads, PagerDuty incidents, and dashb
 2. Review by on-call rotation members
 3. Test new diagnostic commands in staging
 4. Merge and notify team in #dark-tower-ops channel
-
-**Version History**:
-- 2026-02-05: Initial version (consolidated from gc-high-latency.md, gc-mc-assignment-failures.md, gc-database-issues.md)
-- 2026-02-28: Added Scenario 8 (Meeting Creation Limit Exhaustion) and Scenario 9 (Meeting Code Collision)
-- 2026-08-14: Scenario 8 extended to the three meeting-creation refusal causes (story R-6). `error_type="forbidden"` narrowed to role denial; cap exhaustion is now `org_limit`. Added `org_inactive` / `org_not_provisioned` cause tables, the duration discriminator, absence semantics, and a Scenario 5 cross-reference warning against rolling back a data-caused 5xx. Symptoms previously cited a log line (`meeting creation forbidden: org concurrent meeting limit reached`) that existed nowhere in the codebase; the refusal path emitted no log at all until this change. Remediation scoped to `org_limit` with an explicit do-not-run guard for the two organization-state causes — its `psql` writes cannot fix them, and `org_not_provisioned`'s second-ranked cause is a `DATABASE_URL` mismatch, which makes an unfiltered `UPDATE meetings` a write against a possibly-wrong target. Recovery-verification comment repointed from `forbidden` to `org_limit`.
 
 ---
 
