@@ -25,6 +25,7 @@ set -euo pipefail
 IFS=$'\n\t'
 __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${__here}/../_common.sh"
+source "${__here}/../_pnpm.sh"
 install_wrapper_exit_trap  # task #50: a set -e abort before we emit a STATUS must still emit one
 
 __verdict="$(fmt_mode)"
@@ -40,6 +41,8 @@ __mode="${__verdict%% *}"
 # APPLY arms; the INVALID / unknown-verdict arms exit before reaching it (no nx call on those paths).
 __assert_format_targets() {
   local wt
+  # A stale node_modules would make the probe below fail and read as "no targets"; name it first.
+  pnpm_deps_fresh || exit 1
   wt="$(pnpm exec nx show projects --with-target format --json 2>/dev/null || true)"
   printf '%s' "$wt" | grep -q '"' && return 0
   emit_status FAIL "no-ts-format-targets"

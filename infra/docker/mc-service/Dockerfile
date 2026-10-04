@@ -16,7 +16,7 @@
 # ========================================
 # Stage 1: Chef base (install cargo-chef)
 # ========================================
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.95
 # Builder pinned to the runtime's Debian release (bookworm = distroless
 # cc-debian12): the binary links the builder's glibc, and the floating `-slim`
 # tag has moved on to trixie. setup.test.sh fails on builder/runtime drift.

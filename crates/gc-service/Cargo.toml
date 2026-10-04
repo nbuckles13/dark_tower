@@ -37,7 +37,7 @@ async-trait = "0.1"
 tokio-util = { workspace = true }
 
 # HTTP client for JWKS fetching and AC communication
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 # CSPRNG for meeting code and join token secret generation
 ring = { workspace = true }
@@ -46,8 +46,8 @@ ring = { workspace = true }
 hex = { workspace = true }
 
 # Metrics (ADR-0011 Observability)
-metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 # Telemetry proxy (R-2): OTLP protobuf message types + per-user rate limiter.
 # opentelemetry-proto supplies the OTLP message structs; prost decodes/re-encodes
@@ -73,16 +73,15 @@ path = "src/main.rs"
 criterion = { workspace = true }
 gc-test-utils = { path = "../gc-test-utils" }
 anyhow = { workspace = true }
-http-body-util = "0.1"
-wiremock = "0.6"
-futures = "0.3"
+http-body-util = { workspace = true }
+wiremock = { workspace = true }
+futures = { workspace = true }
 tower = { workspace = true, features = ["util"] }
-metrics-util = "0.18"
 # Re-export for integration tests (metrics-exporter-prometheus is also in deps)
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = { workspace = true }
 # JWT/base64 used in test code (auth_layer async_tests)
 jsonwebtoken = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 # Enable common's test-utils feature for MetricAssertion in tests/
 # (mirrors AC's pattern — ADR-0032 Step 5).
 common = { path = "../common", features = ["test-utils"] }
@@ -101,4 +100,4 @@ tracing-opentelemetry = { workspace = true }
 # Real mock Tonic server for otel_http_grpc_bridge.rs / otel_grpc_inbound_continuity.rs
 # (mirrors mh-service/tests/common/mock_mc.rs's TcpListenerStream pattern —
 # bind first to learn the OS-assigned port, then adapt to tonic's incoming stream).
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }

@@ -15,6 +15,16 @@ name: Scheduled Audit (drift-catcher)
 # issue (open/closed = current drift status). The default cron-failure email goes only
 # to the schedule's last-editor, too weak for a security drift-catcher — the issue is
 # the durable, assignable signal.
+#
+# TWO JOBS, so the write token never coexists with third-party code. `scan` checks out,
+# installs the toolchains and runs `pnpm install` (dependency lifecycle scripts) with a
+# read-only token and no persisted git credentials. `report` holds `issues: write` and
+# runs only github-script over the scan's uploaded output — no checkout, no install.
+#
+# The issue is closed ONLY on a scan that completed AND reported clean. A scan that did
+# not complete (a failed install, a timeout, a cancel, a missing output) comments
+# "scan did not complete" and leaves the issue open: a broken run must never clear the
+# drift signal. Every non-clean outcome turns the run red.
 
 on:
   schedule:
@@ -24,7 +34,6 @@ on:
 
 permissions:
   contents: read
-  issues: write   # least-privilege: default GITHUB_TOKEN, only what the dedup-issue needs
 
 concurrency:
   group: audit-scheduled
@@ -35,15 +44,22 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  scheduled-audit:
+  scan:
     name: Weekly full advisory scan
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
     outputs:
-      audit_failed: ${{ steps.scan.outputs.failed }}
+      failed: ${{ steps.scan.outputs.failed }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The parent commit must be present: scripts/lang/proto/breaking.sh compares
+          # against HEAD~1 here, and a depth-1 clone makes it compare HEAD with itself.
+          fetch-depth: 2
 
       - name: Install system dependencies
         run: |
@@ -51,25 +67,27 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
-        # Pinned to the devloop image's toolchain (infra/devloop/Dockerfile rust:1.95)
-        # until the move to latest stable (docs/TODO.md §Supply Chain).
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95"
+        # One Rust version everywhere: this, infra/devloop/Dockerfile and the image
+        # Dockerfiles' RUST_VERSION agree, checked by scripts/setup.test.sh. rustup is
+        # preinstalled on the runner, so no third-party toolchain action is needed.
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.2
           run_install: false
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install pnpm dependencies
@@ -78,89 +96,159 @@ jobs:
       # Force the dep-change gate ON so both wrappers scan unconditionally. This is a
       # GATE bypass, not a suppression bypass — DEVLOOP_AUDIT_FORCE_RUN is force-run-only
       # and the tracked derived files still filter suppressed advisories. We capture the
-      # outcome rather than letting a red scan fail the step, so the dedup-issue step
-      # always runs and reflects current state.
+      # outcome rather than letting a red scan fail the step, so the output is always
+      # uploaded for the report job; the last step below turns the job red.
       - name: Run full audit (force-run, suppressions still applied)
         id: scan
         env:
           DEVLOOP_AUDIT_FORCE_RUN: '1'
         run: |
           set +e
-          ./scripts/audit.sh 2>&1 | tee /tmp/audit-output.txt
+          ./scripts/audit.sh 2>&1 | tee "${RUNNER_TEMP}/audit-output.txt"
           rc=${PIPESTATUS[0]}
           if [[ "$rc" -ne 0 ]]; then
-            echo "::error::Scheduled audit found unsuppressed advisories — see the audit-drift issue."
+            echo "::error::Scheduled audit failed — the STATUS=FAIL REASON= lines in the output name the cause (an advisory, or a broken tool)."
             echo "failed=true" >> "$GITHUB_OUTPUT"
           else
             echo "failed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Open-or-update a single rolling `audit-drift` issue on failure; close it on a
-      # clean run. Dedup on a STABLE title slug so re-runs UPDATE one issue (never
-      # one-per-week). Uses actions/github-script (first-party — no new marketplace dep).
-      - name: Surface drift via deduplicated issue
+      - name: Upload audit output
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          script: |
-            const TITLE = 'Scheduled audit drift — unsuppressed advisory detected';
-            const LABEL = 'audit-drift';
-            const failed = '${{ steps.scan.outputs.failed }}' === 'true';
-            const fs = require('fs');
-            let body = '';
-            try { body = fs.readFileSync('/tmp/audit-output.txt', 'utf8'); } catch (e) { body = '(no output captured)'; }
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-
-            // Find the single rolling open issue by exact title (stable dedup key).
-            const existing = await github.paginate(github.rest.issues.listForRepo, {
-              owner: context.repo.owner, repo: context.repo.repo,
-              state: 'open', labels: LABEL, per_page: 100,
-            });
-            const issue = existing.find(i => i.title === TITLE);
-
-            if (failed) {
-              const marker = '<!-- audit-drift-bot -->';
-              const md = [
-                marker,
-                `### Scheduled audit drift (run ${context.runId})`,
-                ``,
-                `The weekly scheduled audit found **unsuppressed** advisories against the current lockfile.`,
-                `Suppressions in \`audit-suppressions.toml\` were applied — these are NEW/unsuppressed.`,
-                ``,
-                `**Remediate** (do NOT dismiss the alert): fix the dep, or suppress in \`audit-suppressions.toml\``,
-                `(reviewed PR) per docs/contributor/audit-suppressions.md. The manifest is the ONLY sanctioned`,
-                `suppression channel (ADR-0033 §11).`,
-                ``,
-                `Run: ${runUrl}`,
-                ``,
-                '```',
-                body.slice(0, 60000),
-                '```',
-              ].join('\n');
-              if (issue) {
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner, repo: context.repo.repo,
-                  issue_number: issue.number, body: md,
-                });
-              } else {
-                await github.rest.issues.create({
-                  owner: context.repo.owner, repo: context.repo.repo,
-                  title: TITLE, labels: [LABEL], body: md,
-                });
-              }
-            } else if (issue) {
-              // Clean run — auto-close the rolling issue (open/closed = current state).
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: issue.number,
-                body: `Resolved: scheduled audit is clean as of run ${runUrl}. Auto-closing.`,
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: issue.number, state: 'closed',
-              });
-            }
+          name: audit-output
+          path: ${{ runner.temp }}/audit-output.txt
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Fail the run if audit failed
         if: steps.scan.outputs.failed == 'true'
         run: exit 1
+
+  # Open-or-update a single rolling `audit-drift` issue on failure; close it on a clean
+  # run. Dedup on a STABLE title slug so re-runs UPDATE one issue (never one-per-week).
+  # Uses actions/github-script (first-party — no new marketplace dep).
+  report:
+    name: Surface drift via deduplicated issue
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Download audit output
+        # A scan that died before uploading leaves no artifact; the script below still
+        # runs and reports "scan did not complete", so this step must not stop the job.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: audit-output
+          path: ${{ runner.temp }}/audit
+
+      - name: Open, update or close the audit-drift issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          # Passed through the environment, never interpolated into the script source.
+          AUDIT_FAILED: ${{ needs.scan.outputs.failed }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+        with:
+          script: |
+            // Neutral: the issue covers an advisory, a broken audit tool and a scan that did not
+            // complete. The comment's STATUS=FAIL REASON= lines name which.
+            const TITLE = 'Scheduled audit failing — see STATUS=FAIL REASON= in the latest comment';
+            const OLD_TITLES = ['Scheduled audit drift — unsuppressed advisory detected'];
+            const LABEL = 'audit-drift';
+            const failed = process.env.AUDIT_FAILED;
+            const scanResult = process.env.SCAN_RESULT;
+            // Three states. ONLY a completed scan that reported clean may close the issue;
+            // an empty/unknown output is never read as clean.
+            const state = failed === 'true' ? 'drift'
+              : (scanResult === 'success' && failed === 'false') ? 'clean'
+              : 'incomplete';
+            const fs = require('fs');
+            let body = '';
+            try {
+              body = fs.readFileSync(`${process.env.RUNNER_TEMP}/audit/audit-output.txt`, 'utf8');
+            } catch (e) { body = '(no output captured)'; }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Find the single rolling open issue: the label plus the current or a previous
+            // title (stable dedup key). One found under an old title is renamed, never orphaned.
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: LABEL, per_page: 100,
+            });
+            const issue = existing.find(i => i.title === TITLE || OLD_TITLES.includes(i.title));
+            if (issue && issue.title !== TITLE) {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, title: TITLE,
+              });
+            }
+
+            if (state === 'clean') {
+              if (issue) {
+                // Clean run — auto-close the rolling issue (open/closed = current state).
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `Resolved: scheduled audit is clean as of run ${runUrl}. Auto-closing.`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issue.number, state: 'closed',
+                });
+              }
+              return;
+            }
+
+            const marker = '<!-- audit-drift-bot -->';
+            // The output carries text we do not control (advisory titles, package names, paths).
+            // Size the code fence past its longest backtick run so it cannot close the fence and
+            // render as live markdown (links, images, @-mentions) under the repo's identity.
+            const shown = body.slice(0, 60000);
+            const longest = Math.max(0, ...(shown.match(/`+/g) || []).map(s => s.length));
+            const fence = '`'.repeat(Math.max(3, longest + 1));
+            const lead = state === 'drift'
+              ? [
+                  `The weekly scheduled audit FAILED against the current lockfile. Read the`,
+                  `\`STATUS=FAIL REASON=\` lines below: they name the cause — an unsuppressed advisory,`,
+                  `or a broken audit tool. Suppressions in \`audit-suppressions.toml\` were applied.`,
+                  ``,
+                  `**Remediate an advisory** (do NOT dismiss the alert): fix the dep, or suppress in`,
+                  `\`audit-suppressions.toml\` (reviewed PR) per docs/contributor/audit-suppressions.md.`,
+                  `The manifest is the ONLY sanctioned suppression channel (ADR-0033 §11).`,
+                ]
+              : [
+                  `The weekly scheduled audit did NOT complete (scan job result: \`${scanResult || 'unknown'}\`).`,
+                  `No verdict was reached, so this issue stays open: fix the run and re-dispatch it.`,
+                ];
+            const md = [
+              marker,
+              `### Scheduled audit ${state === 'drift' ? 'drift' : 'did not complete'} (run ${context.runId})`,
+              ``,
+              ...lead,
+              ``,
+              `Run: ${runUrl}`,
+              ``,
+              fence,
+              shown,
+              fence,
+            ].join('\n');
+            if (issue) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, body: md,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: TITLE, labels: [LABEL], body: md,
+              });
+            }
+            // Second signal besides the issue: the run is red on drift AND on an incomplete scan.
+            core.setFailed(state === 'drift'
+              ? 'Scheduled audit found a failure — see the audit-drift issue.'
+              : `Scheduled audit did not complete (scan result: ${scanResult || 'unknown'}).`);

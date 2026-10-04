@@ -18,8 +18,8 @@
 //!   registered `BoundedTraceContextPropagator`.
 //! - [`testing`] — test-side `MetricAssertion` helper, only compiled when
 //!   `cfg(test)` is active or the `test-utils` feature is enabled, so
-//!   production builds of consumer services do not pull in `metrics-util`
-//!   or the `metrics` facade through this crate.
+//!   production builds of consumer services do not pull in the `metrics`
+//!   facade through this crate.
 
 pub mod labels;
 pub mod otel;

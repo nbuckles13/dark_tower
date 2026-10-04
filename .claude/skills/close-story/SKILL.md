@@ -213,7 +213,13 @@ There is no team object to delete. Mirrors `/devloop` Step 8.5. Prevents stale t
 git log --oneline "$(git merge-base HEAD main)..HEAD"
 ```
 
-Categorize each: **story-devloop** (references a `docs/devloop-outputs/{slug}/` path or has a `Devloop:` trailer matching a slug from the manifest), **story-close** (this skill's own commit), or **adjacent** (anything else).
+Categorize each: **story-close** (this skill's own commit), **story-devloop** (any other commit that changes `docs/devloop-outputs/{slug}/main.md` for a slug from the manifest), or **adjacent** (anything else). Find the story-devloop commits from the tree, not the message:
+
+```bash
+git log --format=%h "$(git merge-base HEAD main)..HEAD" -- "docs/devloop-outputs/{slug}/main.md"
+```
+
+(Messages are not reliable here: `git interpret-trailers` misses the `Devloop:` block when `Co-Authored-By` follows as its own paragraph. The pre-commit hook's replay rule uses the same tree test — runbook `devloop-validation.md` §Replays.)
 
 **PR body synthesis — structured fields only**. For each story-devloop main.md, include ONLY:
 

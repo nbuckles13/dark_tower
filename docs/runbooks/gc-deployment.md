@@ -2,7 +2,7 @@
 
 **Service**: Global Controller (gc-service)
 **Version**: Phase 4 (ADR-0010 Implementation)
-**Last Updated**: 2026-03-27
+**History**: `git log --follow -- docs/runbooks/gc-deployment.md`
 **Owner**: Operations Team
 
 ---
@@ -1871,6 +1871,5 @@ before investigating individual services.
 
 ---
 
-**Document Version:** 1.3
 **Last Reviewed:** 2026-03-31
 **Next Review:** 2026-04-30

@@ -24,10 +24,10 @@ sqlx = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["trace", "timeout"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 # Metrics (for test server initialization)
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -39,7 +39,7 @@ chrono = { workspace = true }
 
 # Cryptography (for test fixtures)
 ring = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 
 # JWT
 jsonwebtoken = { workspace = true }

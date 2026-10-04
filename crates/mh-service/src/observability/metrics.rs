@@ -2433,8 +2433,8 @@ mod tests {
         // Migrated from hand-rolled `DebuggingRecorder::new() + recorder.install()`
         // to `common::observability::testing::MetricAssertion` purely as DRY
         // cleanup (removes one of two hand-rolled-install sites tracked in
-        // `docs/TODO.md`). `MetricAssertion::snapshot()` binds a per-thread
-        // `DebuggingRecorder` for this test, dropping the global-install
+        // `docs/TODO.md`). `MetricAssertion::snapshot()` binds its own per-thread
+        // test recorder for this test, dropping the global-install
         // isolation pain the original inline comment called out.
         use common::observability::testing::MetricAssertion;
 
@@ -2443,7 +2443,7 @@ mod tests {
         // Record the same set of MH metrics the legacy test exercised so the
         // "every recorded metric actually lands in the recorder" intent is
         // preserved. Histograms are asserted before counters because
-        // `Snapshotter::snapshot` drains histogram observations on read
+        // a `MetricAssertion` snapshot drains histogram observations on read
         // (see common::observability::testing §"Delta semantics").
         record_gc_registration("success");
         record_gc_registration("error");
@@ -2458,7 +2458,7 @@ mod tests {
         record_media_policy_apply(PolicyApplyOutcome::Applied);
         record_error("gc_heartbeat", "grpc", 503);
 
-        // Single histogram assertion — `Snapshotter::snapshot()` drains
+        // Single histogram assertion — a `MetricAssertion` snapshot drains
         // every histogram across all names on read, so asserting multiple
         // histogram names after each other would see zero on the 2nd+ call.
         // A single representative observation proves the recorder captured
@@ -2496,7 +2496,7 @@ mod tests {
     // These tests cover the `TokenRefreshEvent -> metrics` mapping lifted out
     // of `main.rs` per ADR-0032 Step 2. Each test takes its own per-thread
     // `MetricAssertion::snapshot()`; histograms are asserted first because
-    // `Snapshotter::snapshot()` drains histogram observations on read.
+    // a `MetricAssertion` snapshot drains histogram observations on read.
 
     #[test]
     fn record_token_refresh_metrics_success_event_emits_counter_and_histogram() {

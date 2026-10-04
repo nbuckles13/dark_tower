@@ -1,2 +1,51 @@
 packages:
   - 'packages/*'
+
+# pnpm settings live HERE and nowhere else. pnpm >= 11 reads only auth/registry settings
+# from .npmrc and ignores the `pnpm` field of package.json, so a setting placed in either
+# of those is silently dropped. pnpm 12 fails the install on a key it does not recognise
+# here (ERR_PNPM_UNRECOGNIZED_WORKSPACE_SETTINGS), so a misspelled setting fails loudly.
+
+# engineStrict: fail `pnpm install` LOUDLY when the running Node/pnpm does not
+# satisfy the root package.json `engines` range, instead of silently skipping
+# engines-mismatched optional native bindings (e.g. @rolldown/binding-linux-x64-gnu).
+# Root `engines.node` is the SSoT this keys off — its floor is the true workspace
+# floor so a below-floor Node fails here rather than at vite launch with
+# "cannot find native binding". Incident: 2026-08-05 host dev-env failure; see
+# docs/runbooks/client-dev-local.md F11. `engines.node` carries no upper bound:
+# Dependabot's npm updater runs Node 24, and a cap fails every one of its runs.
+engineStrict: true
+
+# strictDepBuilds: no dependency install script runs unless approved. Every dependency
+# that ships one must be classified in `allowBuilds` (true = run it, false = skip it) or
+# `pnpm install` FAILS, instead of listing it in a warning nobody reads. The default is
+# already true in pnpm >= 11; it is stated so the policy does not depend on a default.
+strictDepBuilds: true
+
+# Skipped, verified no-ops here (2026-09-30):
+#   @bufbuild/buf — install.js re-checks the platform binary, which arrives as an optional
+#                   dependency (it downloads one only if optional deps were dropped)
+#   msw           — copies mockServiceWorker.js only when msw.workerDirectory is set; msw is
+#                   used as a Node test server (setupServer) only
+#   nx            — asserts platform support and updates the Nx Cloud client; no Nx Cloud
+allowBuilds:
+  '@bufbuild/buf': false
+  msw: false
+  nx: false
+
+# verifyDepsBeforeRun: `pnpm run` / `pnpm exec` REFUSE to run against a node_modules that
+# no longer matches the lockfile (ERR_PNPM_VERIFY_DEPS_BEFORE_RUN), instead of pnpm >= 11's
+# default of silently re-installing. Remedy: `pnpm install --frozen-lockfile`. The pipeline
+# wrappers report it as REASON=pnpm-deps-stale (scripts/lang/_pnpm.sh).
+verifyDepsBeforeRun: error
+
+# Security floors for transitive dependencies (advisory remediation). Add or raise an entry
+# here to force a patched version; see scripts/lang/ts/audit-remediation.md.
+overrides:
+  axios: '>=1.20.0 <2'
+  brace-expansion: '>=5.0.11'
+  devalue: '>=5.9.3 <6'
+  fast-uri: '>=3.1.6 <4'
+  nanoid: '>=3.3.17 <4'
+  postcss: '>=8.5.18'
+  smol-toml: '>=1.7.1'

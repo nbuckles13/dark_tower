@@ -519,22 +519,21 @@ To request a new dashboard:
 
 ## Dashboard Ownership
 
-| Dashboard | Owner | Reviewer | Last Updated |
-|-----------|-------|----------|--------------|
-| GC Overview | Observability | GC Team | 2026-02-28 |
-| GC SLOs | Observability | Operations | 2026-02-05 |
-| AC Overview | Observability | AC Team | TBD |
-| MC Overview | Observability | MC Team | 2026-03-27 |
-| MC Media Path | Observability | MC Team | 2026-09-27 |
-| MH Overview | Observability | MH Team | TBD |
-| MH Media Path | MH Team (ADR-0031) | Observability | 2026-09-09 |
-| Client SDK Media Path | Client Team (ADR-0031) | Observability | 2026-09-09 |
+| Dashboard | Owner | Reviewer |
+|-----------|-------|----------|
+| GC Overview | Observability | GC Team |
+| GC SLOs | Observability | Operations |
+| AC Overview | Observability | AC Team |
+| MC Overview | Observability | MC Team |
+| MC Media Path | Observability | MC Team |
+| MH Overview | Observability | MH Team |
+| MH Media Path | MH Team (ADR-0031) | Observability |
+| Client SDK Media Path | Client Team (ADR-0031) | Observability |
 
 **Update Frequency**: Review quarterly or after major service changes.
 
 ---
 
-**Last Updated**: 2026-03-27
 **Maintained By**: Observability Specialist
 **Related Documents**:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)

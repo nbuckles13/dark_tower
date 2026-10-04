@@ -3,7 +3,7 @@
 **Service**: Meeting Controller (mc-service)
 **Owner**: SRE Team
 **On-Call Rotation**: PagerDuty - Dark Tower MC Team
-**Last Updated**: 2026-05-01
+**History**: `git log --follow -- docs/runbooks/mc-incident-response.md`
 
 ---
 
@@ -102,6 +102,8 @@ Use this table to classify incidents and determine response times:
 | **P2 (High)** | Degraded performance, some meetings affected | **1 hour** | High latency (p95 > 1s), Mailbox depth critical (>500), Single pod failing, GC heartbeat intermittent | Page if persists > 15 min, escalate to Service Owner after 2 hours |
 | **P3 (Medium)** | Non-critical issue, workaround available | **4 hours** | Warning-level mailbox depth, Single meeting stuck, Metrics unavailable, High CPU (non-critical) | Slack notification, escalate if not resolved in 8 hours |
 | **P4 (Low)** | Minor issue, no immediate impact | **24 hours** | Log noise, Cosmetic dashboard issues, Non-critical warnings | Normal ticket, review in next on-call handoff |
+
+**Per-scenario `**Severity**:` casing is mixed — do not normalize it piecemeal.** Some scenarios use ADR-0031's canonical lowercase alert-label vocabulary (`page` / `warning` / `info`, per `docs/observability/alert-conventions.md`); others carry the inherited Title Case or a free-form triage value. Converting one to the other is a vocabulary decision, not a cleanup, so it needs an ADR-0031 follow-up first.
 
 ### Severity Upgrade Triggers
 
@@ -3705,13 +3707,6 @@ All times in UTC.
 - After every P1/P2 incident (update within 24 hours)
 - Monthly review during on-call handoff
 - Quarterly comprehensive review
-
-**Version History**:
-- 2026-07-07: Reintroduce Sc 11 (Media Connection Failures) in browser-client-join Task #6, rebuilt atop `mc_participant_mh_status_total{state}` + the `MCMediaConnectionAllFailed` page alert (fires at >0.80 failed-share for 5m). Detection/diagnosis rewritten from the old `all_failed` boolean to the failed-share ratio; adds the `mc_participant_mh_status_dropped_total{reason}` abuse-vs-failure triage. Completes the 2026-05-03 reintroduction commitment.
-- 2026-05-03: Remove Sc 11 + `MCMediaConnectionAllFailed` alert + dashboard panel id 45 in browser-client-join Task #2 (proto `MediaConnectionFailed` + `mc_media_connection_failures_total` deleted via R-60 redesign). Task #6 reintroduces all four atop `mc_participant_mh_status_total{state}`. Tracked in `docs/TODO.md`.
-- 2026-05-01: Add Scenarios 11-13 (MediaConnectionFailed reports, RegisterMeeting coordination failures, unexpected MH notifications) — covers MC↔MH coordination failure modes for the client→MH QUIC connection story. New scenarios use ADR-0031 canonical lowercase severity vocabulary (`page` / `warning` / `info`) deliberately; existing Sc 1-10 retain inherited Title Case (`Warning` / `Critical` / `Info`) — do NOT normalize one to the other without an ADR follow-up.
-- 2026-03-27: Add Scenarios 8-10 (join failures, WebTransport rejections, JWT validation failures); fix 7 stale metric references
-- 2026-02-09: Initial version
 
 ---
 

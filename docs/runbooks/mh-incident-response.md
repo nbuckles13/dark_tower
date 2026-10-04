@@ -3,7 +3,7 @@
 **Service**: Media Handler (mh-service)
 **Owner**: SRE Team / Media Handler Service Owner
 **On-Call Rotation**: PagerDuty - Dark Tower MH Team
-**Last Updated**: 2026-09-08
+**History**: `git log --follow -- docs/runbooks/mh-incident-response.md`
 
 ---
 

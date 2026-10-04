@@ -5,6 +5,8 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
+  # Manual run on any branch (e.g. a branch whose PR targets neither main nor develop).
+  workflow_dispatch:
 
 # Least-privilege default token for every job (matches ci-client.yml /
 # audit-scheduled.yml). The coverage job's Codecov upload uses its own
@@ -41,8 +43,9 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install system dependencies
@@ -51,38 +54,39 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
-        # Pinned to the devloop image's toolchain (infra/devloop/Dockerfile rust:1.95)
-        # until the move to latest stable (docs/TODO.md §Supply Chain).
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95"
-          components: rustfmt, clippy
+        # One Rust version everywhere: this, infra/devloop/Dockerfile and the image
+        # Dockerfiles' RUST_VERSION agree, checked by scripts/setup.test.sh. rustup is
+        # preinstalled on the runner, so no third-party toolchain action is needed.
+        run: |
+          rustup toolchain install 1.95 --profile minimal --component rustfmt,clippy
+          rustup default 1.95
 
       - name: Install Rust nightly (for guards)
         run: rustup toolchain install nightly
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: "ci-cache"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.2
           run_install: false
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version-file: '.nvmrc'
           cache: 'pnpm'
 
       - name: Install pnpm dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit
 
       - name: Install sqlx-cli
         # scripts/lang/rust/test.sh migrates the test DB with sqlx-cli and refuses
@@ -173,7 +177,9 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
         # fetch-depth omitted: coverage job runs cargo-llvm-cov over the full
         # working tree; no diff-aware tooling is invoked here. The pipeline
         # job above requires fetch-depth: 0 — keep that surface tight.
@@ -184,20 +190,22 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
-        # Pinned to the devloop image's toolchain (infra/devloop/Dockerfile rust:1.95)
-        # until the move to latest stable (docs/TODO.md §Supply Chain).
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95"
-          components: llvm-tools-preview
+        # One Rust version everywhere: this, infra/devloop/Dockerfile and the image
+        # Dockerfiles' RUST_VERSION agree, checked by scripts/setup.test.sh. rustup is
+        # preinstalled on the runner, so no third-party toolchain action is needed.
+        run: |
+          rustup toolchain install 1.95 --profile minimal --component llvm-tools-preview
+          rustup default 1.95
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: "coverage-cache"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-llvm-cov
 
       - name: Run tests with coverage
         env:
@@ -308,7 +316,7 @@ jobs:
           cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           fail_ci_if_error: true

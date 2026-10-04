@@ -4,7 +4,7 @@
 # This preflight is the PRECONDITION each wrapper runs BEFORE its buf call, so a stale/absent toolchain
 # reds with a specific, actionable token INSTEAD of surfacing as a downstream failure.
 #
-# FOUR DISTINCT failure states, FOUR DISTINCT REASON tokens — no two share one (@operations/@security):
+# FIVE DISTINCT failure states, FIVE DISTINCT REASON tokens — no two share one (@operations/@security):
 # each sends a triager somewhere different, so conflating them is the exact defect this loop caught 3×
 # (fmt pre-pass rc=1; the old `command -v buf`; here).
 #
@@ -20,6 +20,15 @@
 # checks fresh. This assertion is the only thing that closes that gap.
 #
 # `proto_buf_preflight` emit_status FAILs + returns 1 on any failure (caller: `|| exit 1`); returns 0 clean.
+#
+# pnpm-workspace.yaml's `verifyDepsBeforeRun: error` would make `pnpm exec buf --version` refuse on a stale
+# tree before buf runs, so state (2) would report a stale writer as `buf-not-installed`. The version probe
+# therefore goes through `pnpm_exec_unverified` (scripts/lang/_pnpm.sh), and a fifth state after (4) —
+# `pnpm_deps_fresh` → `pnpm-deps-stale` — catches staleness that is not the buf pin. Precedence holds: a stale
+# buf is `buf-version-mismatch`; any other stale dependency is `pnpm-deps-stale`.
+
+# shellcheck source=../_pnpm.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../_pnpm.sh"
 
 __buf_repo_root() {
   # Prefer git; fall back to the fixed script-relative repo root (scripts/lang/proto/ -> ../../..).
@@ -35,7 +44,7 @@ proto_buf_preflight() {
   fi
   # (2) @bufbuild/buf actually installed (does `pnpm exec buf` resolve a binary)?
   local actual
-  if ! actual="$(pnpm exec buf --version 2>/dev/null)"; then
+  if ! actual="$(pnpm_exec_unverified buf --version 2>/dev/null)"; then
     emit_status FAIL "buf-not-installed"
     printf '`pnpm exec buf` did not resolve — @bufbuild/buf is not installed; run `pnpm install --frozen-lockfile`.\n' >&2
     return 1
@@ -56,5 +65,7 @@ proto_buf_preflight() {
     printf 'buf %s != pinned @bufbuild/buf %s — run `pnpm install --frozen-lockfile` (do NOT reformat; a stale writer would rewrite into the old style).\n' "$actual" "$expected" >&2
     return 1
   fi
+  # (5) The rest of node_modules in step with the lockfile — after (4), so a stale buf keeps its token.
+  pnpm_deps_fresh || return 1
   return 0
 }

@@ -1478,21 +1478,20 @@ Before deploying alerts, test:
 
 ## Alert Ownership
 
-| Alert Group | Owner | Reviewer | Last Updated |
-|-------------|-------|----------|--------------|
-| GC Critical | Observability | GC Team + Operations | 2026-02-28 |
-| GC Warning | Observability | GC Team | 2026-02-28 |
-| AC Critical | Observability | AC Team + Operations | TBD |
-| MC Critical | Observability | MC Team + Operations | 2026-03-27 |
-| MC Warning (Join) | Observability | MC Team | 2026-03-27 |
-| MC Info (Join) | Observability | MC Team | 2026-03-27 |
-| MH Critical | Observability | MH Team + Operations | TBD |
+| Alert Group | Owner | Reviewer |
+|-------------|-------|----------|
+| GC Critical | Observability | GC Team + Operations |
+| GC Warning | Observability | GC Team |
+| AC Critical | Observability | AC Team + Operations |
+| MC Critical | Observability | MC Team + Operations |
+| MC Warning (Join) | Observability | MC Team |
+| MC Info (Join) | Observability | MC Team |
+| MH Critical | Observability | MH Team + Operations |
 
 **Update Frequency**: Review quarterly or after major SLO changes.
 
 ---
 
-**Last Updated**: 2026-03-27
 **Maintained By**: Observability Specialist + Operations Team
 **Related Documents**:
 - [ADR-0011: Observability Framework](../decisions/adr-0011-observability-framework.md)

@@ -39,6 +39,14 @@ cat > "${__stubbin}/pnpm" <<'STUB'
 #!/usr/bin/env bash
 # stub pnpm — records argv, models `pnpm exec buf` per env (see the foreign-model residual in fmt.test.sh).
 printf 'pnpm %s\n' "$*" >> "$STUB_LOG"
+# Models pnpm-workspace.yaml `verifyDepsBeforeRun: error`: with STUB_DEPS_STALE set, every `exec` REFUSES
+# (rc 1) unless the verify step is bypassed with --config.verify-deps-before-run=false (the ONE bypass,
+# _pnpm.sh:pnpm_exec_unverified). The bypass flag is consumed so `$1`/`$2` below are `exec`/<cmd>.
+verify=1
+if [[ "$1" == "--config.verify-deps-before-run=false" ]]; then verify=0; shift; fi
+if [[ "$1" == "exec" && -n "${STUB_DEPS_STALE:-}" && "$verify" -eq 1 ]]; then
+  echo "ERR_PNPM_VERIFY_DEPS_BEFORE_RUN (stub)" >&2; exit 1
+fi
 [[ "$1" == "exec" && "$2" == "buf" ]] || exit 0
 shift 2                                                        # $@ is now buf's own args
 case "$1" in
@@ -70,7 +78,7 @@ run_fmt() {  # $@ = env assignments for this invocation
   STUB_LOG="${__work}/argv.$$"; : > "$STUB_LOG"
   : > "${__work}/diffcount.$$"
   env -u DEVLOOP_FMT_CHECK_ONLY -u DEVLOOP_FMT_APPLY -u GITHUB_ACTIONS -u CI \
-      -u STUB_BUF_VERSION -u STUB_FMT -u STUB_POST_FMT -u STUB_APPLY_RC \
+      -u STUB_BUF_VERSION -u STUB_FMT -u STUB_POST_FMT -u STUB_APPLY_RC -u STUB_DEPS_STALE \
       STUB_LOG="$STUB_LOG" STUB_DIFF_COUNT="${__work}/diffcount.$$" STUB_BUF_VERSION="$__pin" \
       PATH="${__stubbin}:$PATH" "$@" \
       bash "${__here}/fmt.sh" 2>&1
@@ -123,11 +131,22 @@ out="$(run_fmt DEVLOOP_FMT_APPLY=1 STUB_BUF_VERSION=0.0.0-stale STUB_FMT=drift)"
 assert_status "stale writer -> version-mismatch"      "STATUS=FAIL REASON=buf-version-mismatch" "$out"
 assert_absent "version-mismatch never ran format"     "buf format"                              "$(argv)"
 
-# --- FOUR-TOKEN taxonomy: buf-not-installed (pnpm present, `pnpm exec buf --version` fails to resolve) ---
+# --- verifyDepsBeforeRun: error (pnpm-workspace.yaml). A stale tree must NOT be misread as buf-not-installed:
+#     the version probe bypasses the verify step, so a stale BUF keeps its precedence token, and staleness
+#     elsewhere is the distinct pnpm-deps-stale. Neither ever reaches `buf format`. ---
+out="$(run_fmt STUB_DEPS_STALE=1 STUB_BUF_VERSION=0.0.0-stale STUB_FMT=clean)" || true
+assert_status "stale tree + stale buf -> version-mismatch"  "STATUS=FAIL REASON=buf-version-mismatch" "$out"
+assert_absent "stale buf not misread as not-installed"      "buf-not-installed"                       "$out"
+assert_status "version probe bypassed verify (pos control)" "pnpm --config.verify-deps-before-run=false exec buf --version" "$(argv)"
+out="$(run_fmt STUB_DEPS_STALE=1 STUB_FMT=clean)" || true
+assert_status "stale tree, buf current -> pnpm-deps-stale"  "STATUS=FAIL REASON=pnpm-deps-stale"      "$out"
+assert_absent "deps-stale never ran format"                 "buf format"                              "$(argv)"
+
+# --- FIVE-TOKEN taxonomy: buf-not-installed (pnpm present, `pnpm exec buf --version` fails to resolve) ---
 out="$(run_fmt STUB_BUF_VERSION= STUB_FMT=clean)" || true   # empty version -> stub exits 1 on --version
 assert_status "buf unresolved -> buf-not-installed"   "STATUS=FAIL REASON=buf-not-installed" "$out"
 
-# --- FOUR-TOKEN discriminator: bare `buf` on PATH but NO pnpm -> pnpm-unavailable (NOT buf-not-installed).
+# --- FIVE-TOKEN discriminator: bare `buf` on PATH but NO pnpm -> pnpm-unavailable (NOT buf-not-installed).
 #     This is the COLLAPSE decision under test: the lane does NOT fall back to a bare-PATH buf. Build an
 #     isolated bin with the REAL coreutils (so _common.sh sources normally) but NO pnpm, plus a bare buf.
 #     (This box ships a real pnpm on the default PATH, so we cannot just trim PATH to /usr/bin.) ---
@@ -152,6 +171,7 @@ assert_absent "invalid knob never ran buf format"      "buf format"             
 __ghost="${__work}/ghost/lang/proto"; mkdir -p "$__ghost"
 cp "${__here}/fmt.sh" "${__ghost}/fmt.sh"
 cp "${__here}/_buf.sh" "${__ghost}/_buf.sh"
+cp "${__here}/../_pnpm.sh" "${__work}/ghost/lang/_pnpm.sh"   # _buf.sh sources ../_pnpm.sh
 printf '#!/usr/bin/env bash\nsource %q\nfmt_mode() { printf "%%s\\n" "GHOST unreachable-verdict"; }\n' \
   "$(cd "${__here}/.." && pwd)/_common.sh" > "${__work}/ghost/lang/_common.sh"
 out="$(env -u DEVLOOP_FMT_CHECK_ONLY -u DEVLOOP_FMT_APPLY -u GITHUB_ACTIONS -u CI \

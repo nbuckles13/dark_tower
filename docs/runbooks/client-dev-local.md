@@ -2,7 +2,7 @@
 
 **Service(s)**: web-app demo + AC / GC / MC / MH (local Kind)
 **Owner**: operations
-**Last Updated**: 2026-09-09
+**History**: `git log --follow -- docs/runbooks/client-dev-local.md`
 **Executable companion**: `scripts/dev-web.sh`
 
 > ## ⚠ NON-GOAL BANNER — THIS IS NOT A PRODUCTION PATTERN
@@ -49,12 +49,11 @@
 - [§3 Bring-up](#3-bring-up)
 - [§4 Is the join real?](#4-is-the-join-real)
   - [§4.5 "I joined and I hear nothing" — media triage ladder](#45-i-joined-and-i-hear-nothing--media-triage-ladder)
-- [§5 Failure modes](#5-failure-modes) (F1–F19)
+- [§5 Failure modes](#5-failure-modes)
 - [§6 Teardown](#6-teardown)
 - [§6.5 Automated checks that exist today](#65-automated-checks-that-exist-today)
 - [§7 Not on this branch](#7-not-on-this-branch)
 - [Related runbooks and docs](#related-runbooks-and-docs)
-- [Changelog](#changelog)
 
 ---
 
@@ -263,7 +262,7 @@ Both are pinned in the repo, and the pins are **not restated here** — a second
 
 `scripts/dev-web.sh` reads both at runtime and prints the exact `nvm install` / `corepack prepare`
 command with the value already substituted. Run it rather than transcribing a version by hand.
-See F2, F3, F4 for the three ways this goes wrong.
+See F2, F3, F4 for the three ways this goes wrong, and F20 after a pnpm major bump.
 
 ---
 
@@ -882,6 +881,12 @@ Each scenario gives a **discriminator** — something you can run to tell it apa
 scenarios that share its symptom. F1/F8 and F1/F9 are symptom-identical pairs; without a
 discriminator you would be guessing.
 
+> **Maintainers — keep these anchors stable.** This heading deliberately carries no F-count, so
+> `#5-failure-modes` does not change as entries are added (rule and rationale:
+> `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`).
+> F-entry headings are linked from other docs by slug and by heading title, so do not retitle an
+> `### F<n> — …` heading without updating every referrer (`grep -rn 'client-dev-local.md' docs crates scripts packages .claude`).
+
 ### F1 — Join dies at `connecting-mc`; sign-up and create work fine
 
 **Symptom.** Sign-up and create-meeting succeed. Join hangs, then fails with **one** of:
@@ -1003,7 +1008,7 @@ otherwise runs is F3.
 
 ```bash
 # --- WSL2 ---
-npm install -g corepack@latest && corepack enable && corepack prepare pnpm@<the packageManager pin> --activate
+npm install -g corepack@latest && corepack enable && corepack prepare <the packageManager value> --activate
 ```
 
 **Why it recurs.** It reappears whenever the Node pin moves backwards relative to the pnpm pin.
@@ -1264,7 +1269,7 @@ Once F11 is confirmed, split the two sub-cases — they have different *minimal*
 at or above the workspace floor — the floor value lives in the root `package.json` `engines.node`
 and the lockfile and is **not restated here** (§2.4; a second copy would drift). Under a Node
 *below* that floor, pnpm **silently skips** the engines-mismatched optional binding: the install
-still succeeds and the gap only surfaces at Vite launch. `engine-strict=true` in the repo `.npmrc`
+still succeeds and the gap only surfaces at Vite launch. `engineStrict: true` in the repo `pnpm-workspace.yaml`
 now turns sub-case (a) into a loud `pnpm install` failure. But a `node_modules` tree installed
 *earlier* under a below-floor Node (sub-case b) keeps the gap until it is reinstalled: once pnpm has
 recorded the optional binding as skipped, a plain `pnpm install` over the existing tree may not
@@ -1615,6 +1620,35 @@ a join or re-map alone does not tick it.
 
 ---
 
+### F20 — After the pnpm 12 move: `dev-web.sh` fails the pnpm check, or `pnpm` refuses to run
+
+**Symptom.** Either `dev-web.sh` hard-fails with `pnpm <10.x> — packageManager pins <12.x>`, or a
+`pnpm run`/`pnpm exec` (and the pipeline wrappers, as `REASON=pnpm-deps-stale`) stops with
+`ERR_PNPM_VERIFY_DEPS_BEFORE_RUN`.
+
+**Discriminator.** The first names two pnpm versions; the second names the lockfile. Neither names a
+keyid (that is F4).
+
+**Cause.** The `packageManager` pin moved from pnpm 10 to 12 (2026-10-03) and now carries a
+`+sha512.` hash, and `pnpm-workspace.yaml` sets `verifyDepsBeforeRun: error`: pnpm refuses to run
+against a `node_modules` that no longer matches the lockfile instead of silently re-installing. A
+`node_modules` tree installed by pnpm 10 is such a tree.
+
+**Fix.** Activate the pinned pnpm (`dev-web.sh` prints the exact, hash-carrying `corepack prepare`
+command), then reinstall from clean:
+
+```bash
+# --- WSL2 ---
+npm install -g corepack@latest && corepack enable && corepack prepare <the packageManager value> --activate
+rm -rf node_modules packages/*/node_modules && pnpm install --frozen-lockfile
+```
+
+**Why it recurs.** On every pnpm major bump, and whenever a branch switch or pull changes the
+lockfile under an existing `node_modules` — the fix for the second case is just
+`pnpm install --frozen-lockfile`.
+
+---
+
 ## 6. Teardown
 
 ```bash
@@ -1751,17 +1785,3 @@ yourself updating the same fact in two of these files, one of them is wrong.
   scenarios that the dev-time failures here mirror.
 - `scripts/dev-web.sh` — owns the executable preflight check list. This runbook owns the *why* and
   the diagnosis; the script owns *what is checked*.
-
----
-
-## Changelog
-
-| Date | Author | Changes |
-|------|--------|---------|
-| 2026-07-29 | operations (task #20) | Initial creation (R-49). Two-machine topology, two-topology cluster split, bring-up, join-verification ladder, F1–F10, teardown, env-tests section. Deliberately diverges from `TEMPLATE.md` — see the banner. |
-| 2026-08-06 | infrastructure (task #61) | Added **F11** (Vite "cannot find native binding" — engines-skipped optional binding under a below-floor Node) with (a)/(b) sub-case split; updated §5 header + ToC. Reconciled §6.5/§7 with reality: the Playwright browser-E2E lane (tasks #18/#19) now exists and runs diff-triggered in Layer 7 — corrected the stale "no Playwright" §7 note and the §6.5 cross-reference. Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
-| 2026-09-09 | client (story task #20) | Added the frozen `## Secure Context and Media Setup` section between §2 and §3 — the four gated APIs as one all-or-nothing gate, `http://<sub>.localhost:5173` being potentially trustworthy in Chrome, the non-loopback-HTTP failure (**fails at `connecting-mc`, symptom-identical to F1/F8/F9** — WebTransport is one of the four gated APIs and MC signalling has no fallback, so the join never completes; the discriminator is the origin in the address bar), and the fake-device/fake-ui launch for a machine with no microphone. It is the anchor `scripts/dev-web.sh`'s header and §4's ladder both cite; `scripts/dev-web.test.sh` now pins its slug AND its prose. Corrected **F7**'s stale "may warn" (the fingerprints check has been a hard fail since task #61's escalation), added the presence-only/stale-but-present asymmetry that is F7's actual reason for existing, and added F7's anti-flag counter-message — the stale-but-present case is the one branch where `dev-web.sh`'s own warning never prints. Dropped the count from the §5 heading and its ToC entry (`#5-failure-modes-f1f11` -> `#5-failure-modes`, one live referrer, both fixed here) so the anchor stops rotting as F-entries are added — the rule stated under `docs/observability/metrics/mc-service.md` §`mc_media_sender_binding_responses_total`: name a set's members, never restate its count. Per-entry `### F7 — ...` slug untouched (`mh-incident-response.md` links into it three times). Cross-boundary edit into this operations-owned runbook, confirmed by operations at Gate 1/Gate 3. |
-| 2026-09-30 | client (story 2 task 13) | Added **F18** (receive-slot count N over the MC cap: loud refusal, `dt_client_media_receive_slots_rejected_total`, the bus/console discriminators, fix by agreement never by clamping) and **F19** (rising `dt_client_media_receive_source_deficit_total`: an MC-claimed-active source decoding nothing, triage ladder into MH Scenarios 15-17 and MC routing). F16/F17 left for story 2's runbook task. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |
-| 2026-09-30 | operations (story 2 task 17) | Corrected triage prose falsified by loopback removal (R-3), each with a recorded-correction note: **F13** no longer reads `received` flat as a failed round trip — it forks first on `dt_client_media_receive_source_deficit_total` + `data-slot-state` (nobody sent to you is correct), and only "MC says active, nothing arrives" proceeds to the NAT-binding / stale-policy fork; **F12** gains the healthy "nobody holds you" case (a solo participant sends nothing: `EmittedEmptyTargets`); **F14** gains the N-sender note (`accepted` rising can mean one sender works and another does not); §4.5 rung 1, the rung-2 fork table and the rung-6 `no_subscriber` comment (sustained is a fault, not routine) updated to match; stale "no media plane" text in §4.3 and §7 corrected. |
-| 2026-09-30 | operations (story 2 task 18) | Added **F16** (silence after a leave: the KEK-rotation signature, discriminated by leave correlation; rung 1 is the client pipe's presence, because a dead pipe leaves `MCMediaMissingKeyMaterial` green; the retained-generations counter against `kek_update`; remedy in MC Scenario 16's rotation arm) and **F17** (static fill: late joiners inaudible until someone leaves; effective N from the slot grid, the server cap, no debugger until story 5). Removed F18's reservation note. |
-| 2026-09-30 | test (story 2 task 19) | F16's immediate unblock corrected from "page reload" to a rejoin via the Create then Join navs: a reload drops the in-memory sign-in. Cross-boundary edit into this operations-owned runbook, reviewed by operations. |

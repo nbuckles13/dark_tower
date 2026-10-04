@@ -35,7 +35,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_buf.sh"
 install_wrapper_exit_trap  # task #50: BASE_SHA=$(...) can set -e abort before run_and_emit
 
 # COLLAPSE branch (ADR-0037 §D7): buf via `pnpm exec buf`; the preflight replaces the bare-`buf`
-# `command -v` guard (four-token taxonomy + version assertion; DiD — breaking is read-only, but the
+# `command -v` guard (five-token taxonomy + version assertion; DiD — breaking is read-only, but the
 # uniform check means a stale toolchain reds as version-mismatch, not a spurious wire-compat pass/fail).
 proto_buf_preflight || exit 1
 

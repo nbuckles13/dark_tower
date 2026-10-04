@@ -49,6 +49,11 @@ mk_ws() {
   cp "${__repo}/.prettierrc.json" "${ws}/.prettierrc.json"   # copy-at-runtime SSoT (real config)
   printf '{ "name": "fixws", "version": "0.0.0", "private": true }\n' > "${ws}/package.json"
   printf '{ "$schema": "./node_modules/nx/schemas/nx-schema.json" }\n' > "${ws}/nx.json"
+  # The workspace BORROWS the repo's node_modules (symlink above), so pnpm must never install into it.
+  # pnpm >= 11 defaults `verifyDepsBeforeRun` to `install`: `pnpm exec` here would re-install into the
+  # REAL repo node_modules for this synthetic manifest and leave the repo tree stale (every later
+  # `pnpm exec` there refuses with ERR_PNPM_VERIFY_DEPS_BEFORE_RUN). Turn the check off for this fixture.
+  printf 'verifyDepsBeforeRun: false\n' > "${ws}/pnpm-workspace.yaml"
   mkdir -p "${ws}/packages/fixpkg/src"
   if [[ "$mode" == with-target ]]; then
     # Mirrors the real per-package shape: repo-root cwd (omitted), repo-relative glob, cache:false.
@@ -184,6 +189,7 @@ assert_absent "unrecognized output does NOT report passed" "REASON=nx-format-pas
 __stub="$(mktemp -d "${__work}/stub.XXXXXX")"
 mkdir -p "${__stub}/lang/ts"
 cp "${__here}/fmt.sh" "${__stub}/lang/ts/fmt.sh"
+cp "${__here}/../_pnpm.sh" "${__stub}/lang/_pnpm.sh"   # fmt.sh sources ../_pnpm.sh (defines only, no calls at source time)
 cat > "${__stub}/lang/_common.sh" <<'STUB'
 set -euo pipefail; IFS=$'\n\t'
 install_wrapper_exit_trap() { :; }

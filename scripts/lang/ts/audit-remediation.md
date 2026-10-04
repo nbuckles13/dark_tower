@@ -16,7 +16,8 @@ PREFER A REAL FIX OVER SUPPRESSION. In order of preference:
 1. Bump the vulnerable package to a patched version. For a direct dep, raise the
    range in the owning `packages/<pkg>/package.json` and `pnpm install`.
 2. For a TRANSITIVE dep (advisory path shows `... > intermediate > vulnerable`),
-   add or raise a `pnpm.overrides` entry in the root `package.json` forcing the
+   add or raise an `overrides:` entry in the root `pnpm-workspace.yaml` (pnpm >= 11
+   ignores the `pnpm` field of `package.json`) forcing the
    patched version tree-wide, or bump the intermediate dep to a release that
    pulls the fixed version — whichever yields the smaller, cleaner lockfile delta.
 3. SUPPRESS ONLY as a last resort, and ONLY when the advisory is genuinely
