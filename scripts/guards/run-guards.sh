@@ -221,8 +221,18 @@ if [[ -d "$SIMPLE_GUARDS_DIR" ]]; then
                 # to stderr on IO/parse swallow sites (see common/scan.rs).
                 # Surfacing them here gives oncall coverage-hole visibility in
                 # non-verbose CI logs.
+                #
+                # No marker line at all (e.g. a self-test that reports `❌ (case) …`):
+                # print the output's tail instead, so a CI log always names what failed.
                 if [[ -n "$captured" ]]; then
-                    { echo "$captured" | grep -E "(VIOLATION|violation|ERROR|error|WARN)" | head -5; } || true
+                    local hits
+                    hits="$({ echo "$captured" | grep -E "(VIOLATION|violation|ERROR|error|WARN)" | head -5; } || true)"
+                    if [[ -n "$hits" ]]; then
+                        echo "$hits"
+                    else
+                        echo "  (no VIOLATION/ERROR/WARN line in its output; last 20 lines:)"
+                        echo "$captured" | tail -n 20
+                    fi
                 fi
                 ;;
         esac

@@ -254,4 +254,32 @@ if ! grep -q "$(printf '\033')" "$RG_OUT"; then PASS=$((PASS + 1)); else
   FAIL=$((FAIL + 1)); FAILURES+=("[rt-no-ansi] RG_OUT has raw ANSI escapes under redirect — colors not tty-gated"); fi
 assert_status "rt-failed-colon-greppable" "$(printf '\nFAILED: ')" "$(printf '\n%s' "$out")"
 
+# =============================================================================
+# (F) FAILURE DETAIL: a failing guard whose output has no VIOLATION/ERROR/WARN line
+#     (a self-test printing `❌ (case) …`) still gets its output's tail printed, so a
+#     CI log names the failing case; one WITH a marker line keeps the filtered view.
+# =============================================================================
+d="$WORK/stubtail"; mkdir -p "$d"
+cat > "$d/timeout" <<'STUB'
+#!/usr/bin/env bash
+printf '  ok (a) fine\n  x (r6b) setup did not take\n1 case(s) failed\n'
+exit 1
+STUB
+chmod +x "$d/timeout"
+run_rg "$d"
+out="$(cat "$RG_OUT")"
+assert_status "f-tail-names-failing-case" "(r6b) setup did not take" "$out"
+assert_status "f-tail-says-why"           "no VIOLATION/ERROR/WARN line" "$out"
+d="$WORK/stubmark"; mkdir -p "$d"
+cat > "$d/timeout" <<'STUB'
+#!/usr/bin/env bash
+printf 'context line\nVIOLATION: something specific\n'
+exit 1
+STUB
+chmod +x "$d/timeout"
+run_rg "$d"
+out="$(cat "$RG_OUT")"
+assert_status "f-marker-line-shown"     "VIOLATION: something specific" "$out"
+assert_absent "f-marker-no-tail-header" "no VIOLATION/ERROR/WARN line" "$out"
+
 report_results "scripts/guards/run-guards.test.sh"
