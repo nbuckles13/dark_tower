@@ -828,21 +828,31 @@ case_r6() {
   expect_refusal "(r6) conflicted merge, otherwise qualifying" merge-not-vouched
 }
 
-# (r6b) MERGE_HEAD alongside a pick (`rebase -r` stopped on a merge shape; written with
-#       update-ref because reaching it through real git needs a rebase-merges script)
+# set_pseudoref <NAME> <rev> — write a replay pseudoref FILE directly (git >= 2.45
+# refuses `update-ref` on pseudorefs like MERGE_HEAD), then require that it resolves:
+# a setup that silently fails turns a refusal case into a plain pick that passes.
+set_pseudoref() {
+  git rev-parse "$2" > "$(git rev-parse --git-path "$1")" || { bad "setup: cannot write $1"; return 1; }
+  if [[ "$(git rev-parse -q --verify "$1^{commit}")" != "$(git rev-parse "$2")" ]]; then
+    bad "setup: $1 does not resolve to $2"; return 1
+  fi
+}
+
+# (r6b) MERGE_HEAD alongside a pick (`rebase -r` stopped on a merge shape; the file is
+#       written directly because reaching it through real git needs a rebase-merges script)
 #       → the merge rule wins over an otherwise-qualifying pick.
 case_r6b() {
   replay_fixture story-r6b "$(devloop_msg story-r6b)"
   conflicted_pick devloop || return
-  git update-ref MERGE_HEAD devloop
+  set_pseudoref MERGE_HEAD devloop || return
   run_validate; expect_refusal "(r6b) MERGE_HEAD + CHERRY_PICK_HEAD" merge-not-vouched
 }
 
-# (r6c) CHERRY_PICK_HEAD and REBASE_HEAD both present (REBASE_HEAD via update-ref).
+# (r6c) CHERRY_PICK_HEAD and REBASE_HEAD both present (REBASE_HEAD written directly).
 case_r6c() {
   replay_fixture story-r6c "$(devloop_msg story-r6c)"
   conflicted_pick devloop || return
-  git update-ref REBASE_HEAD devloop
+  set_pseudoref REBASE_HEAD devloop || return
   run_validate; expect_refusal "(r6c) CHERRY_PICK_HEAD + REBASE_HEAD" multiple-replay-states
 }
 
