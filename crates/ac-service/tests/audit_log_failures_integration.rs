@@ -30,44 +30,30 @@
 #[path = "common/mod.rs"]
 mod test_common;
 
+use ac_service::models::AuthEventType;
 use ac_service::services::{key_management_service, registration_service, user_service};
 use ac_test_utils::crypto_fixtures::test_master_key;
 use common::observability::testing::{MetricAssertion, MetricSnapshot};
 use sqlx::PgPool;
 
-/// Every event_type production sites pass to `record_audit_log_failure`.
-/// Authoritative production-site mapping (one per callsite); per @test T-F4,
-/// the constant must match production exactly so a future maintainer adding
-/// a wrapper call also updates this constant (CR catches the omission):
-///
-///   service_registered      → registration_service.rs:78
-///   scopes_updated          → registration_service.rs:124
-///   service_deactivated     → registration_service.rs:158
-///   key_generated           → key_management_service.rs:96
-///   key_rotated             → key_management_service.rs:166
-///   key_expired             → key_management_service.rs:384
-///   user_registered         → user_service.rs:144
-///   service_token_failed    → token_service.rs:105
-///   service_token_issued    → token_service.rs:172
-///   user_login              → token_service.rs:362 (success=true branch)
-///   user_login_failed       → token_service.rs:362 (success=false branch)
-///
-/// Used for `assert_delta(0)` adjacency on every sibling under the same
-/// `reason="db_write_failed"` filter (label-swap-bug catcher per ADR-0032
+/// Every event_type label `ac_audit_log_failures_total` can carry, derived
+/// from `AuthEventType::ALL` (the vocabulary SSoT) — the label IS the variant's
+/// `as_str()` via the typed `record_audit_log_failure`, so no hand-typed copy
+/// can drift. Used for `assert_delta(0)` adjacency on every sibling under the
+/// same `reason="db_write_failed"` filter (label-swap-bug catcher per ADR-0032
 /// §Pattern #3).
-const ALL_EVENT_TYPES: &[&str] = &[
-    "service_registered",
-    "scopes_updated",
-    "service_deactivated",
-    "key_generated",
-    "key_rotated",
-    "key_expired",
-    "user_registered",
-    "service_token_issued",
-    "service_token_failed",
-    "user_login",
-    "user_login_failed",
-];
+fn all_event_types() -> Vec<&'static str> {
+    AuthEventType::ALL.iter().map(|v| v.as_str()).collect()
+}
+
+/// Look up the credential id for a seeded `client_id`.
+async fn credential_id(pool: &PgPool, client_id: &str) -> uuid::Uuid {
+    ac_service::repositories::service_credentials::get_by_client_id(pool, client_id)
+        .await
+        .unwrap()
+        .expect("seeded credential")
+        .credential_id
+}
 
 /// Force `auth_events::log_event` INSERT failures while still allowing
 /// SELECT queries (used by `issue_service_token`'s rate-check at
@@ -111,12 +97,12 @@ fn assert_only_event_type(snap: &MetricSnapshot, expected_event_type: &str) {
         ])
         .assert_delta(1);
 
-    for sibling in ALL_EVENT_TYPES
-        .iter()
-        .filter(|e| **e != expected_event_type)
+    for sibling in all_event_types()
+        .into_iter()
+        .filter(|e| *e != expected_event_type)
     {
         snap.counter("ac_audit_log_failures_total")
-            .with_labels(&[("event_type", *sibling), ("reason", "db_write_failed")])
+            .with_labels(&[("event_type", sibling), ("reason", "db_write_failed")])
             .assert_delta(0);
     }
 }
@@ -164,9 +150,11 @@ async fn audit_log_failure_emits_event_type_user_registered(pool: PgPool) {
     .await
     .unwrap();
 
-    break_auth_events_table(&pool).await;
+    // Surgical break: the registration limiter READS auth_events first (and
+    // fails closed if it cannot), so only inserts may fail here.
+    break_auth_events_inserts(&pool).await;
     let snap = MetricAssertion::snapshot();
-    let _ = user_service::register_user(
+    let result = user_service::register_user(
         &pool,
         &master_key,
         &master_key,
@@ -176,7 +164,7 @@ async fn audit_log_failure_emits_event_type_user_registered(pool: PgPool) {
             password: "test-password-12345".to_string(),
             display_name: "Audit User".to_string(),
         },
-        None,
+        "198.51.100.3",
         None,
         ac_service::config::MIN_BCRYPT_COST,
         ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -185,6 +173,21 @@ async fn audit_log_failure_emits_event_type_user_registered(pool: PgPool) {
         ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
     )
     .await;
+    // Fail-soft: the registration itself succeeds and the user is persisted.
+    assert!(
+        result.is_ok(),
+        "audit failure is non-fatal: {:?}",
+        result.err()
+    );
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = $1")
+        .bind("audit-user@example.com")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        users, 1,
+        "the user row must be persisted despite the audit failure"
+    );
 
     // `register_user` emits BOTH `user_registered` (user_service.rs:144) AND
     // chains to `issue_user_token` (auto-login) which emits `user_login` via
@@ -202,12 +205,12 @@ async fn audit_log_failure_emits_event_type_user_registered(pool: PgPool) {
 
     // Adjacency: every OTHER event_type stays at 0 (label-swap-bug catcher
     // for the 9 sibling cells).
-    for sibling in ALL_EVENT_TYPES
-        .iter()
-        .filter(|e| **e != "user_registered" && **e != "user_login")
+    for sibling in all_event_types()
+        .into_iter()
+        .filter(|e| *e != "user_registered" && *e != "user_login")
     {
         snap.counter("ac_audit_log_failures_total")
-            .with_labels(&[("event_type", *sibling), ("reason", "db_write_failed")])
+            .with_labels(&[("event_type", sibling), ("reason", "db_write_failed")])
             .assert_delta(0);
     }
 }
@@ -352,19 +355,26 @@ async fn audit_log_failure_emits_event_type_scopes_updated(pool: PgPool) {
     use ac_service::services::registration_service;
     use test_common::test_state::seed_service_credential;
 
-    seed_service_credential(&pool, "audit-svc-scopes", &["service.read"])
+    seed_service_credential(&pool, "audit-svc-scopes", &["service.write.mc"])
         .await
         .unwrap();
+    let id = credential_id(&pool, "audit-svc-scopes").await;
 
     break_auth_events_inserts(&pool).await;
     let snap = MetricAssertion::snapshot();
-    let _ = registration_service::update_service_scopes(
-        &pool,
-        "audit-svc-scopes",
-        vec!["service.write".to_string()],
-    )
-    .await;
-    assert_only_event_type(&snap, "scopes_updated");
+    let result = registration_service::update_service_scopes(&pool, id, vec![], "admin").await;
+    assert!(result.is_ok(), "audit failure is non-fatal: {result:?}");
+    let (scopes,): (Vec<String>,) =
+        sqlx::query_as("SELECT scopes FROM service_credentials WHERE credential_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        scopes.is_empty(),
+        "the scope change must persist: {scopes:?}"
+    );
+    assert_only_event_type(&snap, "service_scopes_updated");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -377,9 +387,19 @@ async fn audit_log_failure_emits_event_type_service_deactivated(pool: PgPool) {
         .await
         .unwrap();
 
+    let id = credential_id(&pool, "audit-svc-deactivate").await;
+
     break_auth_events_inserts(&pool).await;
     let snap = MetricAssertion::snapshot();
-    let _ = registration_service::deactivate_service(&pool, "audit-svc-deactivate").await;
+    let result = registration_service::deactivate_service(&pool, id, "admin").await;
+    assert!(result.is_ok(), "audit failure is non-fatal: {result:?}");
+    let (is_active,): (bool,) =
+        sqlx::query_as("SELECT is_active FROM service_credentials WHERE credential_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!is_active, "the deactivation must persist");
     assert_only_event_type(&snap, "service_deactivated");
 }
 
@@ -417,7 +437,7 @@ async fn audit_log_failure_emits_event_type_user_login(pool: PgPool) {
             password: "test-password-12345".to_string(),
             display_name: "Audit Login".to_string(),
         },
-        Some("198.51.100.1"),
+        "198.51.100.1",
         None,
         ac_service::config::MIN_BCRYPT_COST,
         ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -477,7 +497,7 @@ async fn audit_log_failure_emits_event_type_user_login_failed(pool: PgPool) {
             password: "correct-password-12345".to_string(),
             display_name: "Audit LoginFail".to_string(),
         },
-        Some("198.51.100.2"),
+        "198.51.100.2",
         None,
         ac_service::config::MIN_BCRYPT_COST,
         ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -504,4 +524,88 @@ async fn audit_log_failure_emits_event_type_user_login_failed(pool: PgPool) {
     )
     .await;
     assert_only_event_type(&snap, "user_login_failed");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn audit_log_failure_emits_event_type_service_secret_rotated(pool: PgPool) {
+    // Drive `registration_service::rotate_service_secret`: the rotation
+    // completes (non-fatal audit failure) and the metric fires.
+    use test_common::test_state::seed_service_credential;
+
+    seed_service_credential(&pool, "audit-svc-rotate", &["service.write.mc"])
+        .await
+        .unwrap();
+    let id = credential_id(&pool, "audit-svc-rotate").await;
+    let hash_before = secret_hash(&pool, id).await;
+
+    break_auth_events_inserts(&pool).await;
+    let snap = MetricAssertion::snapshot();
+    let result = registration_service::rotate_service_secret(
+        &pool,
+        id,
+        "admin",
+        ac_service::config::MIN_BCRYPT_COST,
+    )
+    .await;
+    assert!(result.is_ok(), "audit failure is non-fatal: {result:?}");
+    assert_ne!(
+        secret_hash(&pool, id).await,
+        hash_before,
+        "the rotation must persist a new secret hash"
+    );
+    assert_only_event_type(&snap, "service_secret_rotated");
+}
+
+async fn secret_hash(pool: &PgPool, id: uuid::Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT client_secret_hash FROM service_credentials WHERE credential_id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn audit_log_failure_emits_event_type_user_registration_failed(pool: PgPool) {
+    // Drive a refused registration: the 400 is still returned and the
+    // failure-row write failure is counted.
+    let org_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "INSERT INTO organizations (subdomain, display_name) VALUES ($1, $2) RETURNING org_id",
+    )
+    .bind(format!("audit-{}", uuid::Uuid::new_v4()))
+    .bind("Audit test")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    break_auth_events_inserts(&pool).await;
+    let snap = MetricAssertion::snapshot();
+    let master_key = test_master_key();
+    let result = user_service::register_user(
+        &pool,
+        &master_key,
+        &master_key,
+        org_id,
+        user_service::RegistrationRequest {
+            email: "not-an-email".to_string(),
+            password: "test-password-12345".to_string(),
+            display_name: "Audit Fail".to_string(),
+        },
+        "198.51.100.4",
+        None,
+        ac_service::config::MIN_BCRYPT_COST,
+        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
+        ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ac_service::errors::AcError::BadRequest(
+            "Invalid email format"
+        ))
+    ));
+    assert_only_event_type(&snap, "user_registration_failed");
 }

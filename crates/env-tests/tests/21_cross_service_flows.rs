@@ -18,7 +18,9 @@
 #![cfg(feature = "flows")]
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::{TokenRequest, UserRegistrationRequest};
+use env_tests::fixtures::auth_client::{
+    TokenRequest, UserRegistrationRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET,
+};
 use env_tests::fixtures::gc_client::{GcClient, GuestTokenRequest, UpdateMeetingSettingsRequest};
 use env_tests::fixtures::AuthClient;
 
@@ -92,7 +94,7 @@ async fn test_gc_validates_ac_token_via_me_endpoint() {
 
     // Step 1: Get token from AC
     let token_request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(token_request)
@@ -107,7 +109,7 @@ async fn test_gc_validates_ac_token_via_me_endpoint() {
 
     // Step 3: Verify response contains expected claims
     assert_eq!(
-        me_response.sub, "test-client",
+        me_response.sub, DEV_TEST_CLIENT_ID,
         "Subject should match AC token subject"
     );
     assert!(
@@ -429,7 +431,7 @@ async fn test_token_validation_consistency() {
 
     // Get token from AC
     let token_request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(token_request)
@@ -444,7 +446,7 @@ async fn test_token_validation_consistency() {
             .unwrap_or_else(|_| panic!("GC should validate token on attempt {}", i + 1));
 
         assert_eq!(
-            me_response.sub, "test-client",
+            me_response.sub, DEV_TEST_CLIENT_ID,
             "Subject should be consistent across validations"
         );
     }
@@ -462,8 +464,8 @@ async fn test_multiple_tokens_validated() {
     let mut tokens = Vec::new();
     for i in 0..3 {
         let token_request = TokenRequest::client_credentials(
-            "test-client",
-            "test-client-secret-dev-999",
+            DEV_TEST_CLIENT_ID,
+            DEV_TEST_CLIENT_SECRET,
             "test:all",
         );
 
@@ -482,7 +484,7 @@ async fn test_multiple_tokens_validated() {
             .await
             .unwrap_or_else(|_| panic!("GC should validate token {}", i));
 
-        assert_eq!(me_response.sub, "test-client");
+        assert_eq!(me_response.sub, DEV_TEST_CLIENT_ID);
         assert!(
             me_response.scopes.contains(&"test:all".to_string()),
             "Token {} should have scope test:all",

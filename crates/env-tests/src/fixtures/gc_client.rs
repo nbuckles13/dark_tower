@@ -22,6 +22,14 @@ static JWT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?").unwrap()
 });
 
+/// The JWT-shape regex ([`JWT_PATTERN`]): one home for "does this text carry a
+/// raw JWT", shared by the error-body sanitizer here and the collector-log leak
+/// scan (`fixtures::collector`).
+#[must_use]
+pub fn jwt_pattern() -> &'static Regex {
+    &JWT_PATTERN
+}
+
 /// Regex pattern for Bearer tokens in text.
 #[expect(
     clippy::disallowed_methods,

@@ -24,13 +24,15 @@
 // WHAT THE AC "REGISTRATION" LIMIT ACTUALLY COUNTS
 // ---------------------------------------------------------------------------
 //
-// SUCCESSFUL TOKEN ISSUES per source IP per window — not registrations:
-// `crates/ac-service/src/services/user_service.rs` `count_registrations_from_ip`
-// counts `auth_events` rows with `event_type='user_login' AND success=true`,
-// and BOTH `/register` and `/user/token` write one. So every sign-in spends
-// budget too. The limit's SSoT for the Kind cluster is
-// `infra/services/ac-service/config.env`, READ by {@link parseAcAuthRateLimit}
-// rather than restated here.
+// REGISTRATION ATTEMPTS per source IP per window — successful AND failed:
+// `crates/ac-service/src/repositories/auth_events.rs` `count_registration_attempts_by_ip`
+// counts `auth_events` rows whose `event_type` is `user_registered` or
+// `user_registration_failed` (the `AuthEventType` SSoT in
+// `crates/ac-service/src/models/mod.rs`), any `success`. Sign-ins (`/user/token`)
+// do NOT spend it. A failed `/register` (bad format, email already exists) DOES.
+// A request the limiter itself refuses (429) writes no row. The limit's SSoT for
+// the Kind cluster is `infra/services/ac-service/config.env`, READ by
+// {@link parseAcAuthRateLimit} rather than restated here.
 
 import { parseConfigEnv, requirePositiveInt } from './configEnv.js';
 import type { TestCredentials } from './fixtures.js';
@@ -149,23 +151,20 @@ export function parseAcAuthRateLimit(configEnvText: string, source: string): AcA
 }
 
 /**
- * The worst-case successful AC token issues that can share ONE window with the
- * cohort's creation, as named terms rather than a bare factor:
+ * The worst-case AC registration attempts the cohort's creation spends in ONE
+ * window, as named terms rather than a bare factor:
  *   - `registrations`: global setup registers all N+1 back-to-back (each
- *     `/register` is a successful `user_login` row);
- *   - `firstTestSignIns`: the first multi-party test signs every member in (one
- *     browsing context each — the app's auth session is per-context in-memory
- *     state, so there is no sign-in-free way in), and it can start within the
- *     same window as global setup.
+ *     `/register` writes one `user_registered` row; the cohort uses fresh
+ *     emails, so it writes no `user_registration_failed` rows).
+ * The first multi-party test's N+1 sign-ins are NOT a term: AC's limiter does
+ * not count `/user/token`.
  */
 export function cohortWindowSpend(receiveSlots: number): {
   readonly registrations: number;
-  readonly firstTestSignIns: number;
   readonly total: number;
 } {
   const registrations = cohortSize(receiveSlots);
-  const firstTestSignIns = cohortSize(receiveSlots);
-  return { registrations, firstTestSignIns, total: registrations + firstTestSignIns };
+  return { registrations, total: registrations };
 }
 
 /**
@@ -173,19 +172,18 @@ export function cohortWindowSpend(receiveSlots: number): {
  * ({@link cohortWindowSpend} names the terms).
  *
  * NECESSARY, NOT SUFFICIENT — the per-IP bucket is shared with every other
- * spec's sign-ins and with the Rust env-tests run from the same host just
- * before this suite (their logins from the preceding window count too, and no
- * static check can see them; e2e/README.md §Budgets). This catches the
- * structural misfit (N raised past the limit, or a prod-default AC config)
- * before any account is created.
+ * spec's registrations and with the Rust env-tests run from the same host just
+ * before this suite (their registrations from the preceding window count too —
+ * failed ones included — and no static check can see them; e2e/README.md
+ * §Budgets). This catches the structural misfit (N raised past the limit, or an
+ * AC limit below N+1) before any account is created.
  */
 export function assertCohortFitsAuthWindow(receiveSlots: number, limit: AcAuthRateLimit): void {
   const spend = cohortWindowSpend(receiveSlots);
   if (spend.total > limit.maxAttempts) {
     throw new Error(
-      `the N+1 cohort (N=${receiveSlots}) needs ${spend.total} successful AC token issues in one ` +
-        `${limit.windowMinutes}-minute window (${spend.registrations} registrations + ` +
-        `${spend.firstTestSignIns} first-test sign-ins), above the configured ` +
+      `the N+1 cohort (N=${receiveSlots}) needs ${spend.total} AC registration attempts in one ` +
+        `${limit.windowMinutes}-minute window (${spend.registrations} registrations), above the configured ` +
         `${AC_REGISTRATION_RATE_LIMIT_MAX_KEY}=${limit.maxAttempts}. Lower N or target a cluster whose AC ` +
         `config allows it — never raise workers (e2e/README.md §Budgets).`,
     );

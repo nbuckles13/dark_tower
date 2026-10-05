@@ -71,7 +71,7 @@ export function memberLabel(index: number): string {
 
 /**
  * Open a context for cohort member `index`, install its levers, sign it in.
- * One successful AC token issue; zero registrations.
+ * Zero registrations, so no registration budget spent (a sign-in never counts).
  */
 export async function openMember(
   browser: Browser,

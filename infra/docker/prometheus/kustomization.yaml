@@ -39,6 +39,7 @@ configMapGenerator:
         app: prometheus
         component: monitoring
     files:
+      - rules/ac-alerts.yaml
       - rules/client-alerts.yaml
       - rules/gc-alerts.yaml
       - rules/mc-alerts.yaml

@@ -52,7 +52,10 @@ export class AuthApiClient {
   /**
    * Register a new user, returning identity + an auto-login token.
    * `POST {acOrigin}/api/v1/auth/register` with body `{email, password, displayName}`.
-   * @throws {AuthError} on a mapped AC failure; {@link ValidationError} for
+   * @throws {AuthError} on a mapped AC failure — {@link AuthBadRequestError} (400,
+   *   server-side format validation), {@link AuthConflictError} (409, email already
+   *   exists in the org), {@link AuthRateLimitError} (429, per-IP registration
+   *   throttle, which counts failed attempts too); {@link ValidationError} for
    *   client-side validation failures (thrown before any network call).
    */
   async register(input: RegisterInput): Promise<RegisterResponse> {

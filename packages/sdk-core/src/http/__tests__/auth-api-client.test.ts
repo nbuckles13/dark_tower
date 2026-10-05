@@ -10,7 +10,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 import { AuthApiClient } from '../AuthApiClient.js';
-import { AuthRateLimitError, AuthUnauthorizedError } from '../../errors/AuthError.js';
+import {
+  AuthBadRequestError,
+  AuthConflictError,
+  AuthRateLimitError,
+  AuthUnauthorizedError,
+} from '../../errors/AuthError.js';
 import { ValidationError } from '../../errors/ValidationError.js';
 
 const AC_TEMPLATE = 'https://{subdomain}.localhost:8443';
@@ -90,6 +95,49 @@ describe('AuthApiClient.register', () => {
     expect(rate.serverCode).toBe('RATE_LIMIT_EXCEEDED');
     expect(rate.retryAfterSeconds).toBe(42);
   });
+
+  // AC registration validation: format failures are 400 INVALID_REQUEST and an
+  // existing email is 409 CONFLICT (never 401). AC's fixed body message must reach the
+  // caller verbatim — the sign-up UI renders it.
+  it.each([
+    {
+      status: 400,
+      code: 'INVALID_REQUEST',
+      message: 'Invalid email format',
+      expected: AuthBadRequestError,
+    },
+    {
+      status: 409,
+      code: 'CONFLICT',
+      message: 'An account with this email already exists',
+      expected: AuthConflictError,
+    },
+  ])(
+    'maps register $status $code to $expected.name',
+    async ({ status, code, message, expected }) => {
+      server.use(
+        http.post('https://demo.localhost:8443/api/v1/auth/register', () =>
+          HttpResponse.json({ error: { code, message } }, { status }),
+        ),
+      );
+
+      const err = await client()
+        .register({
+          subdomain: 'demo',
+          email: 'a@b.co',
+          password: 'pw-long-enough',
+          displayName: 'A',
+        })
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(expected);
+      expect(err).not.toBeInstanceOf(AuthUnauthorizedError);
+      const authErr = err as AuthBadRequestError | AuthConflictError;
+      expect(authErr.status).toBe(status);
+      expect(authErr.serverCode).toBe(code);
+      expect(authErr.message).toBe(message);
+    },
+  );
 });
 
 describe('AuthApiClient.login', () => {

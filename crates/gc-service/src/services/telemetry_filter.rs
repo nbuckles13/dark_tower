@@ -54,6 +54,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+use opentelemetry_proto::tonic::resource::v1::Resource;
 
 /// The 12-key BASE attribute allowlist, applied at every nesting level of both
 /// signals. Any attribute key not in this set — and not in
@@ -368,6 +369,7 @@ fn stamp_org_id(
             value: Some(AnyValue {
                 value: Some(Value::StringValue(authenticated_org_id.to_string())),
             }),
+            key_strindex: 0,
         });
     }
 }
@@ -391,8 +393,10 @@ fn warn_if_empty_claim(authenticated_org_id: &str) {
 const ORG_ID_KEY: &str = "org_id";
 
 /// True if the attribute's value is a scalar (`String`/`Bool`/`Int`/`Double`)
-/// or absent. `ArrayValue`/`KvlistValue` (nested structures) and `BytesValue`
-/// (opaque) are non-scalar and return false — they can carry un-filtered PII.
+/// or absent. `ArrayValue`/`KvlistValue` (nested structures), `BytesValue`
+/// (opaque) and `StringValueStrindex` (an index into a dictionary this proxy
+/// does not forward or inspect) are non-scalar and return false — they can
+/// carry un-filtered PII.
 fn value_is_scalar(kv: &KeyValue) -> bool {
     match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
         // Absent value (proto3 default) — nothing to smuggle.
@@ -402,10 +406,30 @@ fn value_is_scalar(kv: &KeyValue) -> bool {
         | Some(Value::IntValue(_))
         | Some(Value::DoubleValue(_)) => true,
         // Non-scalar / opaque — drop the attribute.
-        Some(Value::ArrayValue(_)) | Some(Value::KvlistValue(_)) | Some(Value::BytesValue(_)) => {
-            false
-        }
+        Some(Value::ArrayValue(_))
+        | Some(Value::KvlistValue(_))
+        | Some(Value::BytesValue(_))
+        | Some(Value::StringValueStrindex(_)) => false,
     }
+}
+
+/// Filter one OTLP `Resource` — the single definition of what survives on a
+/// resource, shared by [`filter_metrics`] and [`filter_traces`] so a new
+/// resource field cannot be handled in one and missed in the other.
+///
+/// Attributes go through the base allowlist. `entity_refs` (OTLP 0.33+: entity
+/// type, schema URL and id/description key names — free strings the browser
+/// controls) are cleared outright; prost dropped them as unknown fields before
+/// the upgrade, so clearing keeps the forwarded shape unchanged. They are not
+/// attributes, so they are not counted as attribute drops.
+fn filter_resource(resource: &mut Resource, authenticated_org_id: &str, counts: &mut DropCounts) {
+    filter_base_attrs(
+        &mut resource.attributes,
+        AttrKind::Resource,
+        authenticated_org_id,
+        counts,
+    );
+    resource.entity_refs.clear();
 }
 
 /// Filter a decoded OTLP metrics request in place, returning per-kind drop
@@ -426,12 +450,7 @@ pub fn filter_metrics(
 
     for rm in &mut req.resource_metrics {
         if let Some(resource) = rm.resource.as_mut() {
-            filter_base_attrs(
-                &mut resource.attributes,
-                AttrKind::Resource,
-                authenticated_org_id,
-                &mut counts,
-            );
+            filter_resource(resource, authenticated_org_id, &mut counts);
         }
         for sm in &mut rm.scope_metrics {
             if let Some(scope) = sm.scope.as_mut() {
@@ -443,6 +462,16 @@ pub fn filter_metrics(
                 );
             }
             for metric in &mut sm.metrics {
+                // `Metric.metadata` is a free `KeyValue` list that rides with
+                // the metric and is never a series label we want. Private by
+                // default: cleared outright, every entry counted as refused
+                // (reported under the datapoint kind — it travels with the
+                // datapoints' series, and a new `kind` label value would widen
+                // the bounded label set).
+                if !metric.metadata.is_empty() {
+                    counts.add(AttrKind::Datapoint, metric.metadata.len() as u64);
+                    metric.metadata.clear();
+                }
                 // Each data variant carries its own datapoint type; only
                 // NumberDataPoint/Histogram/ExponentialHistogram have exemplars
                 // (SummaryDataPoint does NOT).
@@ -578,12 +607,7 @@ pub fn filter_traces(
 
     for rs in &mut req.resource_spans {
         if let Some(resource) = rs.resource.as_mut() {
-            filter_base_attrs(
-                &mut resource.attributes,
-                AttrKind::Resource,
-                authenticated_org_id,
-                &mut counts,
-            );
+            filter_resource(resource, authenticated_org_id, &mut counts);
         }
         for ss in &mut rs.scope_spans {
             if let Some(scope) = ss.scope.as_mut() {
@@ -635,7 +659,6 @@ mod tests {
         HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary,
         SummaryDataPoint,
     };
-    use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{
         span::{Event, Link},
         ResourceSpans, ScopeSpans, Span,
@@ -655,6 +678,7 @@ mod tests {
 
     fn string_attr(key: &str, val: &str) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::StringValue(val.to_string())),
@@ -715,10 +739,12 @@ mod tests {
     fn mixed_attrs() -> Vec<KeyValue> {
         vec![
             KeyValue {
+                key_strindex: 0,
                 key: "org_id".to_string(),
                 value: None,
             },
             KeyValue {
+                key_strindex: 0,
                 key: "user_email".to_string(), // not allowlisted → dropped
                 value: None,
             },
@@ -750,6 +776,7 @@ mod tests {
         let mut attrs: Vec<KeyValue> = ALLOWLIST
             .iter()
             .map(|k| KeyValue {
+                key_strindex: 0,
                 key: (*k).to_string(),
                 value: None,
             })
@@ -770,6 +797,7 @@ mod tests {
 
     fn allowlisted(key: &str, value: Option<Value>) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: value.map(|v| AnyValue { value: Some(v) }),
         }
@@ -841,9 +869,47 @@ mod tests {
         assert_eq!(counts.span_event, 1);
     }
 
+    /// OTLP 0.33's dictionary-indexed string value: an index into a table this
+    /// proxy neither forwards nor inspects, so it is non-scalar and dropped even
+    /// under an allowlisted key.
+    #[test]
+    fn string_value_strindex_on_allowlisted_key_is_dropped() {
+        let mut attrs = vec![allowlisted(
+            "error.code",
+            Some(Value::StringValueStrindex(7)),
+        )];
+        let mut counts = DropCounts::default();
+        filter_base_attrs(&mut attrs, AttrKind::SpanEvent, TEST_ORG, &mut counts);
+
+        assert!(attrs.is_empty(), "dictionary-indexed value must be dropped");
+        assert_eq!(counts.span_event, 1);
+    }
+
+    /// A dictionary-keyed attribute (`key_strindex` set, `key` empty) has no
+    /// allowlisted key, so it is dropped.
+    #[test]
+    fn key_strindex_keyed_attribute_is_dropped() {
+        let mut attrs = vec![KeyValue {
+            key: String::new(),
+            key_strindex: 3,
+            value: Some(AnyValue {
+                value: Some(Value::StringValue("x".to_string())),
+            }),
+        }];
+        let mut counts = DropCounts::default();
+        filter_base_attrs(&mut attrs, AttrKind::Span, TEST_ORG, &mut counts);
+
+        assert!(
+            attrs.is_empty(),
+            "key_strindex-keyed attribute must be dropped"
+        );
+        assert_eq!(counts.span, 1);
+    }
+
     /// Helper: a KeyValue with a string value (for building nested kvlists).
     fn allowlisted_raw(key: &str, val: &str) -> KeyValue {
         KeyValue {
+            key_strindex: 0,
             key: key.to_string(),
             value: Some(AnyValue {
                 value: Some(Value::StringValue(val.to_string())),
@@ -868,6 +934,7 @@ mod tests {
         ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
+                    entity_refs: vec![],
                     attributes: mixed_attrs(),
                     dropped_attributes_count: 0,
                 }),
@@ -987,11 +1054,88 @@ mod tests {
 
     // ---- Traces: drop at span / event / link --------------------------------
 
+    fn entity_ref() -> opentelemetry_proto::tonic::common::v1::EntityRef {
+        opentelemetry_proto::tonic::common::v1::EntityRef {
+            schema_url: "https://example.test/schema".to_string(),
+            r#type: "user.device".to_string(),
+            id_keys: vec!["user_email".to_string()],
+            description_keys: vec!["display_name".to_string()],
+        }
+    }
+
+    /// `Resource.entity_refs` (new in OTLP 0.33) carries free strings and is
+    /// cleared on the metrics path.
+    #[test]
+    fn filter_metrics_clears_resource_entity_refs() {
+        let mut req = metrics_req_with_gauge();
+        if let Some(r) = req.resource_metrics[0].resource.as_mut() {
+            r.entity_refs = vec![entity_ref()];
+        }
+        let counts = filter_metrics(&mut req, TEST_ORG);
+
+        let resource = req.resource_metrics[0].resource.as_ref().unwrap();
+        assert!(
+            resource.entity_refs.is_empty(),
+            "entity_refs must be cleared"
+        );
+        // Clearing entity_refs is not an attribute drop; the attribute count is
+        // the same as without them.
+        assert_eq!(counts.resource, 1);
+    }
+
+    /// Same rule on the traces path (one `filter_resource` serves both).
+    #[test]
+    fn filter_traces_clears_resource_entity_refs() {
+        let mut req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    entity_refs: vec![entity_ref()],
+                    attributes: mixed_attrs(),
+                    dropped_attributes_count: 0,
+                }),
+                scope_spans: vec![],
+                schema_url: String::new(),
+            }],
+        };
+        let counts = filter_traces(&mut req, TEST_ORG);
+
+        let resource = req.resource_spans[0].resource.as_ref().unwrap();
+        assert!(
+            resource.entity_refs.is_empty(),
+            "entity_refs must be cleared"
+        );
+        assert_eq!(keys(&resource.attributes), vec!["org_id"]);
+        assert_eq!(counts.resource, 1);
+    }
+
+    /// `Metric.metadata` is a free `KeyValue` list (present since OTLP 0.7 and
+    /// previously forwarded unfiltered): nothing survives, and every entry is
+    /// counted as a datapoint-kind drop.
+    #[test]
+    fn filter_metrics_clears_metric_metadata() {
+        let mut req = sum_req_with(vec![]);
+        req.resource_metrics[0].scope_metrics[0].metrics[0].metadata = vec![
+            string_attr("user_email", "a@b.co"),
+            string_attr("org_id", "acme"),
+        ];
+        let counts = filter_metrics(&mut req, TEST_ORG);
+
+        assert!(
+            req.resource_metrics[0].scope_metrics[0].metrics[0]
+                .metadata
+                .is_empty(),
+            "Metric.metadata must not survive filter_metrics"
+        );
+        assert_eq!(counts.datapoint, 2);
+        assert_eq!(counts.total(), 2);
+    }
+
     #[test]
     fn filter_traces_drops_at_resource_scope_span_event_link() {
         let mut req = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 resource: Some(Resource {
+                    entity_refs: vec![],
                     attributes: mixed_attrs(),
                     dropped_attributes_count: 0,
                 }),
@@ -1044,6 +1188,7 @@ mod tests {
                     scope: None,
                     spans: vec![Span {
                         attributes: vec![KeyValue {
+                            key_strindex: 0,
                             key: "org_id".to_string(),
                             value: None,
                         }],
@@ -1152,6 +1297,7 @@ mod tests {
         let mut m = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
+                    entity_refs: vec![],
                     attributes: media_keys(),
                     dropped_attributes_count: 0,
                 }),
@@ -1334,6 +1480,7 @@ mod tests {
         let mut m = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
+                    entity_refs: vec![],
                     attributes: vec![string_attr("org_id", "victim-org")],
                     dropped_attributes_count: 0,
                 }),

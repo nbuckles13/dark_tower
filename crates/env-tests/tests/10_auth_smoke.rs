@@ -5,7 +5,7 @@
 #![cfg(feature = "smoke")]
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::TokenRequest;
+use env_tests::fixtures::auth_client::{TokenRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET};
 use env_tests::fixtures::AuthClient;
 
 /// Helper to create a cluster connection for tests.
@@ -21,7 +21,7 @@ async fn test_token_issuance_with_valid_credentials() {
     let auth_client = AuthClient::new(&cluster.ac_base_url);
 
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -39,7 +39,7 @@ async fn test_token_issuance_rejected_invalid_credentials() {
     let cluster = cluster().await;
     let auth_client = AuthClient::new(&cluster.ac_base_url);
 
-    let request = TokenRequest::client_credentials("test-client", "wrong-secret", "test:all");
+    let request = TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, "wrong-secret", "test:all");
 
     let result = auth_client.issue_token(request).await;
 
@@ -197,7 +197,7 @@ async fn test_rate_limiting_via_requests(cluster: &ClusterConnection) {
     for i in 0..max_requests {
         // Use invalid credentials to avoid consuming valid tokens
         let request =
-            TokenRequest::client_credentials("test-client", "wrong-secret-xxx", "test:all");
+            TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, "wrong-secret-xxx", "test:all");
 
         let result = auth_client.issue_token(request).await;
 

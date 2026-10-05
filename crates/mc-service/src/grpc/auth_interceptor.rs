@@ -9,6 +9,9 @@
 //! # Security
 //!
 //! - All gRPC requests require valid Bearer token
+//! - Trace context is extracted BEFORE this layer, so a rejected request's span may
+//!   sit inside a caller-chosen trace. Auth-rejection forensics must key on this
+//!   layer's own log fields/metrics, never on trace membership.
 //! - Tokens validated cryptographically via `JwtValidator<ServiceClaims>`
 //! - Layer 1: Scope authorization enforced (`service.write.mc`) (ADR-0003)
 //! - Layer 2: Caller service_type must match gRPC service being called
@@ -33,7 +36,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tonic::body::BoxBody;
+use tonic::body::Body;
 use tower::{Layer, Service};
 
 /// Required scope for MC service tokens (ADR-0003).
@@ -117,9 +120,9 @@ pub struct McAuthService<S> {
     require_auth: bool,
 }
 
-impl<S> Service<http::Request<BoxBody>> for McAuthService<S>
+impl<S> Service<http::Request<Body>> for McAuthService<S>
 where
-    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>> + Clone + Send + 'static,
+    S: Service<http::Request<Body>, Response = http::Response<Body>> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
     type Response = S::Response;
@@ -131,7 +134,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: http::Request<BoxBody>) -> Self::Future {
+    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         // Clone the inner service for use in the async block
         let mut inner = self.inner.clone();
         // Swap so self.inner is the ready clone (per tower Service contract)
@@ -409,8 +412,8 @@ mod tests {
     #[derive(Clone)]
     struct NoopService;
 
-    impl Service<http::Request<BoxBody>> for NoopService {
-        type Response = http::Response<BoxBody>;
+    impl Service<http::Request<Body>> for NoopService {
+        type Response = http::Response<Body>;
         type Error = Box<dyn std::error::Error + Send + Sync>;
         type Future =
             Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -419,13 +422,13 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _request: http::Request<BoxBody>) -> Self::Future {
-            Box::pin(async { Ok(http::Response::new(BoxBody::default())) })
+        fn call(&mut self, _request: http::Request<Body>) -> Self::Future {
+            Box::pin(async { Ok(http::Response::new(Body::default())) })
         }
     }
 
     /// Helper to assert a response has gRPC UNAUTHENTICATED status.
-    fn assert_unauthenticated(response: &http::Response<BoxBody>, context: &str) {
+    fn assert_unauthenticated(response: &http::Response<Body>, context: &str) {
         let status = tonic::Status::from_header_map(response.headers());
         assert!(
             status.is_some(),
@@ -439,7 +442,7 @@ mod tests {
     }
 
     /// Helper to assert a response has gRPC PERMISSION_DENIED status.
-    fn assert_permission_denied(response: &http::Response<BoxBody>, context: &str) {
+    fn assert_permission_denied(response: &http::Response<Body>, context: &str) {
         let status = tonic::Status::from_header_map(response.headers());
         assert!(
             status.is_some(),
@@ -457,7 +460,7 @@ mod tests {
         let (_mock_server, _keypair, layer) = setup_auth_layer().await;
         let mut svc = layer.layer(NoopService);
 
-        let request = http::Request::builder().body(BoxBody::default()).unwrap();
+        let request = http::Request::builder().body(Body::default()).unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
         assert_unauthenticated(&response, "missing auth header");
@@ -470,7 +473,7 @@ mod tests {
 
         let request = http::Request::builder()
             .header("authorization", "Basic dXNlcjpwYXNz")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -484,7 +487,7 @@ mod tests {
 
         let request = http::Request::builder()
             .header("authorization", "Bearer ")
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -499,7 +502,7 @@ mod tests {
         let oversized = "a".repeat(8193);
         let request = http::Request::builder()
             .header("authorization", format!("Bearer {oversized}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -519,7 +522,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -537,7 +540,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -560,7 +563,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(GC_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -584,7 +587,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -597,7 +600,7 @@ mod tests {
         let mut svc = layer.layer(NoopService);
 
         // No auth header at all
-        let request = http::Request::builder().body(BoxBody::default()).unwrap();
+        let request = http::Request::builder().body(Body::default()).unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
         let status = tonic::Status::from_header_map(response.headers());
@@ -627,7 +630,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -650,7 +653,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(GC_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -669,7 +672,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -688,7 +691,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -706,7 +709,7 @@ mod tests {
         let request = http::Request::builder()
             .uri("/dark_tower.internal.v1.UnknownService/SomeMethod")
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();
@@ -721,8 +724,8 @@ mod tests {
         #[derive(Clone)]
         struct ClaimsCheckService;
 
-        impl Service<http::Request<BoxBody>> for ClaimsCheckService {
-            type Response = http::Response<BoxBody>;
+        impl Service<http::Request<Body>> for ClaimsCheckService {
+            type Response = http::Response<Body>;
             type Error = Box<dyn std::error::Error + Send + Sync>;
             type Future =
                 Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -731,11 +734,11 @@ mod tests {
                 Poll::Ready(Ok(()))
             }
 
-            fn call(&mut self, request: http::Request<BoxBody>) -> Self::Future {
+            fn call(&mut self, request: http::Request<Body>) -> Self::Future {
                 let has_claims = request.extensions().get::<ServiceClaims>().is_some();
                 Box::pin(async move {
                     if has_claims {
-                        Ok(http::Response::new(BoxBody::default()))
+                        Ok(http::Response::new(Body::default()))
                     } else {
                         // Return an error response to indicate claims were missing
                         let response =
@@ -754,7 +757,7 @@ mod tests {
         let request = http::Request::builder()
             .uri(MH_GRPC_PATH)
             .header("authorization", format!("Bearer {token}"))
-            .body(BoxBody::default())
+            .body(Body::default())
             .unwrap();
 
         let response = svc.ready().await.unwrap().call(request).await.unwrap();

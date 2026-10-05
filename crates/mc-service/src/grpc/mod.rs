@@ -31,3 +31,20 @@ pub use gc_client::GcClient;
 pub use mc_service::McAssignmentService;
 pub use media_coordination::McMediaCoordinationService;
 pub use mh_client::{MeetingProgramming, MhClient, MhRegistrationClient};
+
+/// MC's inbound gRPC layer stack: request span → trace-context extraction →
+/// `auth`. The ONE place the ordering is decided (see
+/// [`common::observability::otel_grpc::inbound_layers`]); `main.rs` and the
+/// test rigs both use it.
+#[must_use]
+pub fn server_layers(
+    auth: McAuthLayer,
+) -> common::observability::otel_grpc::InboundLayers<
+    common::observability::otel_grpc::GrpcTraceLayer,
+    McAuthLayer,
+> {
+    common::observability::otel_grpc::inbound_layers(
+        common::observability::otel_grpc::grpc_trace_layer(),
+        auth,
+    )
+}

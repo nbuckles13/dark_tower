@@ -121,7 +121,7 @@ pub fn build_routes(
         .route("/ready", get(handlers::readiness_check))
         // Guest token endpoint (public; rate limiting NOT implemented — docs/TODO.md §Rate Limiting)
         .route(
-            "/api/v1/meetings/:code/guest-token",
+            "/api/v1/meetings/{code}/guest-token",
             post(handlers::get_guest_token),
         )
         .with_state(state.clone());
@@ -136,10 +136,10 @@ pub fn build_routes(
         // Meeting creation endpoint
         .route("/api/v1/meetings", post(handlers::create_meeting))
         // Meeting join endpoint
-        .route("/api/v1/meetings/:code", get(handlers::join_meeting))
+        .route("/api/v1/meetings/{code}", get(handlers::join_meeting))
         // Meeting settings endpoint
         .route(
-            "/api/v1/meetings/:id/settings",
+            "/api/v1/meetings/{id}/settings",
             patch(handlers::update_meeting_settings),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -233,7 +233,7 @@ pub fn build_routes(
     // INNER than `TraceLayer` and therefore executes AFTER `TraceLayer` has
     // created and entered its request span, but BEFORE the handler. At that
     // point `tracing::Span::current()` resolves to `TraceLayer`'s span, so
-    // the middleware's `.set_parent()` call (via
+    // the middleware's `set_remote_parent` call (via
     // `common::observability::otel_http::extract_trace_context`) correctly
     // attaches the extracted W3C parent to it — every span the handler
     // creates afterward (including the MC client's `#[instrument]` span)
@@ -254,8 +254,22 @@ pub fn build_routes(
         // CorsLayer so it is more OUTER and sees CorsLayer's ACAO decision.
         .layer(cors_layer)
         .layer(middleware::from_fn(cors_preflight_observer))
-        .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        // Request span: method + normalized endpoint only (never the raw URI,
+        // which carries meeting codes), INFO for API traffic so inbound
+        // extraction can reparent it under the deployed log filter, DEBUG for
+        // probes/scrapes (`common::observability::otel_http::http_request_span`).
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                common::observability::otel_http::http_request_span(
+                    request.method(),
+                    &crate::observability::metrics::normalize_endpoint(request.uri().path()),
+                )
+            }),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ))
         // HTTP metrics layer (outermost) - captures ALL responses including
         // framework-level errors like 415, 400, 404, 405
         .layer(middleware::from_fn(http_metrics_middleware)))

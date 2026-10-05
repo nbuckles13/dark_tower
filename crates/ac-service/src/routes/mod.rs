@@ -5,7 +5,7 @@ use crate::middleware::org_extraction::{require_org_context, OrgExtractionState}
 use crate::repositories::signing_keys;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post},
@@ -15,7 +15,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{set_header::SetResponseHeaderLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 pub fn build_routes(
     state: Arc<auth_handler::AppState>,
@@ -121,19 +121,47 @@ pub fn build_routes(
         .with_state(state);
 
     // Merge routes with global layers
-    // Layer order (bottom-to-top execution):
-    // 1. TimeoutLayer - Timeout the request (innermost)
-    // 2. TraceLayer - Log request details
-    // 3. http_metrics_middleware - Record ALL responses (outermost)
+    // Layer order (axum: last-added runs first; innermost listed first):
+    // 1. extract_trace_context_middleware - attach inbound W3C parent (innermost)
+    // 2. TraceLayer - request span
+    // 3. TimeoutLayer - Timeout the request
+    // 4. http_metrics_middleware - Record ALL responses (outermost)
     admin_routes
         .merge(key_rotation_routes)
         .merge(internal_token_routes)
         .merge(user_auth_routes)
         .merge(metrics_routes)
         .merge(public_routes)
-        .layer(TraceLayer::new_for_http())
+        // Inbound W3C extraction: first global layer → innermost, so it runs
+        // inside TraceLayer's request span and before route-level auth
+        // middleware creates child spans (see `middleware/otel.rs`).
+        .layer(middleware::from_fn(
+            crate::middleware::otel::extract_trace_context_middleware,
+        ))
+        // Request span: method + normalized endpoint only (no raw URI), INFO
+        // for API traffic so extraction can reparent it under the deployed
+        // log filter, DEBUG for probes/scrapes
+        // (`common::observability::otel_http::http_request_span`).
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                common::observability::otel_http::http_request_span(
+                    request.method(),
+                    &crate::observability::metrics::normalize_path(request.uri().path()),
+                )
+            }),
+        )
         // ADR-0012: 30s HTTP request timeout to prevent hung connections
-        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ))
+        // Cache-Control: no-store on every response that does not set its own
+        // (RFC 6749 §5.1 MUST for token responses; also covers client-secret
+        // create/rotate). `if_not_present` keeps JWKS's explicit max-age.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         // HTTP metrics layer (outermost) - captures ALL responses including
         // framework-level errors like 415, 400, 404, 405
         .layer(middleware::from_fn(http_metrics_middleware))

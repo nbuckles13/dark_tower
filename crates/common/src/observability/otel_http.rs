@@ -132,6 +132,30 @@ pub fn inject_trace_context(headers: &mut HeaderMap) {
     });
 }
 
+/// Normalized endpoints whose request spans stay at DEBUG: kubelet probes and
+/// Prometheus scrapes. At INFO they would export a root span every few
+/// seconds per pod, drowning real traffic in the collector (operations
+/// ruling). Compared against the SAME normalized endpoint the span records
+/// (see [`http_request_span`]), so there is no second path list.
+pub const PROBE_ENDPOINTS: &[&str] = &["/health", "/ready", "/metrics"];
+
+/// Build the HTTP request span for a `TraceLayer::make_span_with` closure.
+///
+/// Records ONLY `method` and `endpoint`, where `endpoint` is the caller's
+/// metric-label normalizer output (GC `normalize_endpoint`, AC
+/// `normalize_path`) — never the raw URI, query string or headers: GC paths
+/// carry meeting codes, which are guest-access capabilities (security
+/// R-URI). INFO for API traffic, so the span exists under the deployed log
+/// filter and inbound extraction can reparent it; DEBUG for
+/// [`PROBE_ENDPOINTS`].
+pub fn http_request_span(method: &http::Method, endpoint: &str) -> tracing::Span {
+    if PROBE_ENDPOINTS.contains(&endpoint) {
+        tracing::debug_span!("request", method = %method, endpoint = %endpoint)
+    } else {
+        tracing::info_span!("request", method = %method, endpoint = %endpoint)
+    }
+}
+
 /// Extract the W3C trace context from `headers` and attach it as the parent
 /// of the current `tracing::Span`.
 ///
@@ -145,7 +169,7 @@ pub fn extract_trace_context(headers: &HeaderMap) {
     let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderExtractor { headers })
     });
-    tracing::Span::current().set_parent(parent_cx);
+    crate::observability::otel::set_remote_parent(&tracing::Span::current(), parent_cx);
 }
 
 // =============================================================================
@@ -160,6 +184,9 @@ pub fn extract_trace_context(headers: &HeaderMap) {
 mod tests {
     use super::*;
     use crate::observability::otel_grpc::BoundedTraceContextPropagator;
+    use crate::observability::testing::otel::{
+        known_traceparent, KNOWN_SPAN_ID_U64, KNOWN_TRACE_ID_U128,
+    };
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
@@ -177,9 +204,6 @@ mod tests {
         });
     }
 
-    const KNOWN_TRACE_ID_U128: u128 = 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736;
-    const KNOWN_SPAN_ID_U64: u64 = 0x00f0_67aa_0ba9_02b7;
-
     fn known_span_context() -> SpanContext {
         SpanContext::new(
             TraceId::from(KNOWN_TRACE_ID_U128),
@@ -188,10 +212,6 @@ mod tests {
             true,
             TraceState::default(),
         )
-    }
-
-    fn known_traceparent_header() -> String {
-        format!("00-{KNOWN_TRACE_ID_U128:032x}-{KNOWN_SPAN_ID_U64:016x}-01")
     }
 
     /// Build a `tracing_subscriber::Registry` with the OpenTelemetry layer
@@ -203,13 +223,12 @@ mod tests {
         F: FnOnce() -> R,
     {
         use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::trace::TracerProvider;
-        use tracing_opentelemetry::OpenTelemetryLayer;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
         use tracing_subscriber::layer::SubscriberExt;
 
-        let provider = TracerProvider::builder().build();
+        let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("test");
-        let layer = OpenTelemetryLayer::new(tracer);
+        let layer = crate::observability::otel::configured_layer(tracer);
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, f)
     }
@@ -225,7 +244,7 @@ mod tests {
         with_test_subscriber(|| {
             let span = tracing::info_span!("test_inject");
             let parent_cx = Context::new().with_remote_span_context(known_span_context());
-            span.set_parent(parent_cx);
+            assert!(span.set_parent(parent_cx).is_ok());
             span.in_scope(|| inject_trace_context(&mut headers));
         });
 
@@ -255,7 +274,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "traceparent",
-            HeaderValue::from_str(&known_traceparent_header())
+            HeaderValue::from_str(&known_traceparent())
                 .unwrap_or_else(|e| panic!("known traceparent must parse: {e}")),
         );
 
@@ -282,7 +301,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         with_test_subscriber(|| {
             let span = tracing::info_span!("test_round_trip_inject");
-            span.set_parent(Context::new().with_remote_span_context(known_span_context()));
+            assert!(span
+                .set_parent(Context::new().with_remote_span_context(known_span_context()))
+                .is_ok());
             span.in_scope(|| inject_trace_context(&mut headers));
         });
 
@@ -323,7 +344,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "traceparent",
-            HeaderValue::from_str(&format!("{}-EXTRAEXTRAEXTRA", known_traceparent_header()))
+            HeaderValue::from_str(&format!("{}-EXTRAEXTRAEXTRA", known_traceparent()))
                 .unwrap_or_else(|e| panic!("test fixture: {e}")),
         );
 
@@ -385,7 +406,7 @@ mod tests {
         );
         headers.insert(
             "traceparent",
-            HeaderValue::from_str(&known_traceparent_header())
+            HeaderValue::from_str(&known_traceparent())
                 .unwrap_or_else(|e| panic!("test fixture: {e}")),
         );
 
@@ -424,7 +445,9 @@ mod tests {
 
         with_test_subscriber(|| {
             let span = tracing::info_span!("test_no_auth_leak_inject");
-            span.set_parent(Context::new().with_remote_span_context(known_span_context()));
+            assert!(span
+                .set_parent(Context::new().with_remote_span_context(known_span_context()))
+                .is_ok());
             span.in_scope(|| inject_trace_context(&mut headers));
         });
 
@@ -456,7 +479,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         with_test_subscriber(|| {
             let span = tracing::info_span!("test_only_w3c_keys");
-            span.set_parent(Context::new().with_remote_span_context(known_span_context()));
+            assert!(span
+                .set_parent(Context::new().with_remote_span_context(known_span_context()))
+                .is_ok());
             span.in_scope(|| inject_trace_context(&mut headers));
         });
 

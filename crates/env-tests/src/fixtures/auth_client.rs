@@ -171,6 +171,11 @@ fn org_subdomain() -> Result<String, OrgSubdomainError> {
     Ok(resolved)
 }
 
+/// The dev client-credentials client seeded into every Kind cluster.
+pub const DEV_TEST_CLIENT_ID: &str = "test-client";
+/// Secret of [`DEV_TEST_CLIENT_ID`] (dev-only seed value).
+pub const DEV_TEST_CLIENT_SECRET: &str = "test-client-secret-dev-999";
+
 /// OAuth 2.0 token request.
 #[derive(Debug, Serialize)]
 pub struct TokenRequest {

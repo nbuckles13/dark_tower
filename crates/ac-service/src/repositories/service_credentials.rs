@@ -63,51 +63,74 @@ pub async fn get_by_client_id(
     Ok(credential)
 }
 
-/// Update scopes for a service credential
-#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
+/// Row returned by [`update_scopes`]: the updated credential plus the scopes
+/// it held immediately before this UPDATE.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ScopeUpdate {
+    #[sqlx(flatten)]
+    pub credential: ServiceCredential,
+    pub old_scopes: Vec<String>,
+}
+
+/// Update scopes for a service credential.
+///
+/// `old_scopes` is read from the row this statement locks (`FOR UPDATE`), not
+/// from an earlier read, so concurrent updates can never record a stale
+/// "before" value. `None` when the credential does not exist.
 pub async fn update_scopes(
     pool: &PgPool,
     credential_id: Uuid,
     scopes: &[String],
-) -> Result<ServiceCredential, AcError> {
-    let credential = sqlx::query_as::<_, ServiceCredential>(
+) -> Result<Option<ScopeUpdate>, AcError> {
+    sqlx::query_as::<_, ScopeUpdate>(
         r#"
-        UPDATE service_credentials
+        UPDATE service_credentials s
         SET scopes = $2, updated_at = NOW()
-        WHERE credential_id = $1
+        FROM (
+            SELECT credential_id, scopes AS old_scopes
+            FROM service_credentials
+            WHERE credential_id = $1
+            FOR UPDATE
+        ) o
+        WHERE s.credential_id = o.credential_id
         RETURNING
-            credential_id, client_id, client_secret_hash, service_type, region, scopes,
-            is_active, created_at, updated_at
+            s.credential_id, s.client_id, s.client_secret_hash, s.service_type, s.region,
+            s.scopes, s.is_active, s.created_at, s.updated_at, o.old_scopes
         "#,
     )
     .bind(credential_id)
     .bind(scopes)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(|e| AcError::Database(format!("Failed to update scopes: {}", e)))?;
-
-    Ok(credential)
+    .map_err(|e| AcError::Database(format!("Failed to update scopes: {}", e)))
 }
 
-/// Deactivate a service credential
-#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
-pub async fn deactivate(pool: &PgPool, credential_id: Uuid) -> Result<ServiceCredential, AcError> {
-    let credential = sqlx::query_as::<_, ServiceCredential>(
+/// Deactivate a service credential (revoke). Token issuance rejects inactive
+/// credentials; rows are never hard-deleted because `auth_events.credential_id`
+/// references them (the audit trail must survive revocation).
+///
+/// Conditional on `is_active`: returns `Some` only for the call that performed
+/// the active→inactive transition, `None` when the credential was already
+/// inactive or does not exist. The check is part of the write, so concurrent
+/// callers cannot both observe the transition.
+pub async fn deactivate(
+    pool: &PgPool,
+    credential_id: Uuid,
+) -> Result<Option<ServiceCredential>, AcError> {
+    sqlx::query_as::<_, ServiceCredential>(
         r#"
         UPDATE service_credentials
         SET is_active = false, updated_at = NOW()
-        WHERE credential_id = $1
+        WHERE credential_id = $1 AND is_active = true
         RETURNING
             credential_id, client_id, client_secret_hash, service_type, region, scopes,
             is_active, created_at, updated_at
         "#,
     )
     .bind(credential_id)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(|e| AcError::Database(format!("Failed to deactivate credential: {}", e)))?;
-
-    Ok(credential)
+    .map_err(|e| AcError::Database(format!("Failed to deactivate credential: {}", e)))
 }
 
 /// Get all active service credentials by service type
@@ -174,62 +197,21 @@ pub async fn get_by_credential_id(
     Ok(credential)
 }
 
-/// Update service credential metadata (name is stored in service_type for now)
-pub async fn update_metadata(
-    pool: &PgPool,
-    credential_id: Uuid,
-    scopes: &[String],
-) -> Result<ServiceCredential, AcError> {
-    let credential = sqlx::query_as::<_, ServiceCredential>(
-        r#"
-        UPDATE service_credentials
-        SET scopes = $2, updated_at = NOW()
-        WHERE credential_id = $1
-        RETURNING
-            credential_id, client_id, client_secret_hash, service_type, region, scopes,
-            is_active, created_at, updated_at
-        "#,
-    )
-    .bind(credential_id)
-    .bind(scopes)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to update metadata: {}", e)))?;
-
-    Ok(credential)
-}
-
-/// Delete service credential (hard delete)
-pub async fn delete(pool: &PgPool, credential_id: Uuid) -> Result<(), AcError> {
-    let result = sqlx::query(
-        r#"
-        DELETE FROM service_credentials
-        WHERE credential_id = $1
-        "#,
-    )
-    .bind(credential_id)
-    .execute(pool)
-    .await
-    .map_err(|e| AcError::Database(format!("Failed to delete credential: {}", e)))?;
-
-    if result.rows_affected() == 0 {
-        return Err(AcError::Database("Credential not found".to_string()));
-    }
-
-    Ok(())
-}
-
-/// Rotate client secret (update hash)
+/// Rotate client secret (update hash).
+///
+/// Conditional on `is_active`: an inactive (or missing) credential is not
+/// updated and `None` is returned, so a secret is never stored for a
+/// credential that was revoked concurrently with the rotation.
 pub async fn rotate_secret(
     pool: &PgPool,
     credential_id: Uuid,
     new_secret_hash: &str,
-) -> Result<ServiceCredential, AcError> {
-    let credential = sqlx::query_as::<_, ServiceCredential>(
+) -> Result<Option<ServiceCredential>, AcError> {
+    sqlx::query_as::<_, ServiceCredential>(
         r#"
         UPDATE service_credentials
         SET client_secret_hash = $2, updated_at = NOW()
-        WHERE credential_id = $1
+        WHERE credential_id = $1 AND is_active = true
         RETURNING
             credential_id, client_id, client_secret_hash, service_type, region, scopes,
             is_active, created_at, updated_at
@@ -237,11 +219,9 @@ pub async fn rotate_secret(
     )
     .bind(credential_id)
     .bind(new_secret_hash)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(|e| AcError::Database(format!("Failed to rotate secret: {}", e)))?;
-
-    Ok(credential)
+    .map_err(|e| AcError::Database(format!("Failed to rotate secret: {}", e)))
 }
 
 #[cfg(test)]
@@ -307,7 +287,11 @@ mod tests {
             "scope-b".to_string(),
             "scope-c".to_string(),
         ];
-        let updated = update_scopes(&pool, credential.credential_id, &new_scopes).await?;
+        let update = update_scopes(&pool, credential.credential_id, &new_scopes)
+            .await?
+            .expect("existing credential must be updated");
+        assert_eq!(update.old_scopes, initial_scopes);
+        let updated = update.credential;
 
         assert_eq!(updated.scopes, new_scopes);
         assert_eq!(updated.credential_id, credential.credential_id);
@@ -332,7 +316,9 @@ mod tests {
         assert!(credential.is_active);
 
         // Deactivate
-        let deactivated = deactivate(&pool, credential.credential_id).await?;
+        let deactivated = deactivate(&pool, credential.credential_id)
+            .await?
+            .expect("active credential must transition to inactive");
         assert!(!deactivated.is_active);
         assert_eq!(deactivated.credential_id, credential.credential_id);
 
@@ -525,11 +511,13 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn test_update_metadata_success(pool: PgPool) -> Result<(), AcError> {
+    async fn test_update_scopes_returns_row_and_bumps_updated_at(
+        pool: PgPool,
+    ) -> Result<(), AcError> {
         // Create credential with initial scopes
         let created = create_service_credential(
             &pool,
-            "test-update-meta",
+            "test-update-scopes-ts",
             "hash",
             "meeting-controller",
             None,
@@ -543,7 +531,10 @@ mod tests {
             "scope2".to_string(),
             "scope3".to_string(),
         ];
-        let updated = update_metadata(&pool, created.credential_id, &new_scopes).await?;
+        let updated = update_scopes(&pool, created.credential_id, &new_scopes)
+            .await?
+            .expect("existing credential must be updated")
+            .credential;
 
         assert_eq!(updated.credential_id, created.credential_id);
         assert_eq!(updated.scopes, new_scopes);
@@ -561,62 +552,12 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn test_update_metadata_not_found(pool: PgPool) -> Result<(), AcError> {
+    async fn test_update_scopes_not_found(pool: PgPool) -> Result<(), AcError> {
         // Try to update nonexistent credential
         let random_uuid = Uuid::new_v4();
-        let result = update_metadata(&pool, random_uuid, &["scope".to_string()]).await;
+        let result = update_scopes(&pool, random_uuid, &["scope".to_string()]).await?;
 
-        assert!(result.is_err(), "Should error for unknown credential");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, AcError::Database(_)),
-            "Should be Database error"
-        );
-
-        Ok(())
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn test_delete_success(pool: PgPool) -> Result<(), AcError> {
-        // Create credential
-        let created = create_service_credential(
-            &pool,
-            "test-delete",
-            "hash",
-            "media-handler",
-            None,
-            &["valid-scope".to_string()],
-        )
-        .await?;
-
-        // Verify it exists
-        let before_delete = get_by_credential_id(&pool, created.credential_id).await?;
-        assert!(before_delete.is_some());
-
-        // Delete credential
-        let delete_result = delete(&pool, created.credential_id).await;
-        assert!(delete_result.is_ok(), "Should delete successfully");
-
-        // Verify it's gone
-        let after_delete = get_by_credential_id(&pool, created.credential_id).await?;
-        assert!(after_delete.is_none(), "Credential should be deleted");
-
-        Ok(())
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn test_delete_not_found(pool: PgPool) -> Result<(), AcError> {
-        // Try to delete nonexistent credential
-        let random_uuid = Uuid::new_v4();
-        let result = delete(&pool, random_uuid).await;
-
-        assert!(result.is_err(), "Should error for unknown credential");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(&err, AcError::Database(msg) if msg.contains("not found")),
-            "Expected Database error with 'not found', got: {:?}",
-            err
-        );
+        assert!(result.is_none(), "unknown credential updates nothing");
 
         Ok(())
     }
@@ -638,7 +579,9 @@ mod tests {
 
         // Rotate secret
         let new_hash = "new-hash-value";
-        let rotated = rotate_secret(&pool, created.credential_id, new_hash).await?;
+        let rotated = rotate_secret(&pool, created.credential_id, new_hash)
+            .await?
+            .expect("active credential must be rotated");
 
         assert_eq!(rotated.credential_id, created.credential_id);
         assert_eq!(rotated.client_secret_hash, new_hash);
@@ -660,14 +603,59 @@ mod tests {
     async fn test_rotate_secret_not_found(pool: PgPool) -> Result<(), AcError> {
         // Try to rotate secret for nonexistent credential
         let random_uuid = Uuid::new_v4();
-        let result = rotate_secret(&pool, random_uuid, "new-hash").await;
+        let result = rotate_secret(&pool, random_uuid, "new-hash").await?;
 
-        assert!(result.is_err(), "Should error for unknown credential");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, AcError::Database(_)),
-            "Should be Database error"
-        );
+        assert!(result.is_none(), "unknown credential rotates nothing");
+
+        Ok(())
+    }
+
+    /// The state check is part of the write: rotating an inactive credential
+    /// stores nothing, so a secret can never be persisted for a credential
+    /// revoked concurrently with the rotation.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_rotate_secret_on_inactive_credential_is_none_and_hash_unchanged(
+        pool: PgPool,
+    ) -> Result<(), AcError> {
+        let created = create_service_credential(
+            &pool,
+            "test-rotate-inactive",
+            "original-hash",
+            "global-controller",
+            None,
+            &["valid-scope".to_string()],
+        )
+        .await?;
+        deactivate(&pool, created.credential_id).await?;
+
+        let result = rotate_secret(&pool, created.credential_id, "new-hash").await?;
+        assert!(result.is_none(), "inactive credential must not be rotated");
+
+        let stored = get_by_credential_id(&pool, created.credential_id)
+            .await?
+            .expect("credential still exists");
+        assert_eq!(stored.client_secret_hash, "original-hash");
+
+        Ok(())
+    }
+
+    /// Only the call that performs the active→inactive transition gets a row
+    /// back; a second deactivate (or a concurrent one that lost the race) sees
+    /// `None`, so the transition is observed exactly once.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_deactivate_on_inactive_credential_is_none(pool: PgPool) -> Result<(), AcError> {
+        let created = create_service_credential(
+            &pool,
+            "test-deactivate-twice",
+            "hash",
+            "media-handler",
+            None,
+            &["valid-scope".to_string()],
+        )
+        .await?;
+
+        assert!(deactivate(&pool, created.credential_id).await?.is_some());
+        assert!(deactivate(&pool, created.credential_id).await?.is_none());
 
         Ok(())
     }

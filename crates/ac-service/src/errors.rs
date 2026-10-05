@@ -29,6 +29,20 @@ pub enum AcError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// Client-attributable rejection of a well-formed-but-invalid request.
+    ///
+    /// The `&'static str` IS the response body `message`, verbatim. Being a
+    /// compile-time literal, a runtime string (DB error, echoed input) cannot
+    /// reach the body; log offending values at the call site instead.
+    #[error("Bad request: {0}")]
+    BadRequest(&'static str),
+
+    /// The request conflicts with the resource's current state (e.g. an
+    /// existing email, a deactivated client). Same `&'static str` body
+    /// contract as [`AcError::BadRequest`].
+    #[error("Conflict: {0}")]
+    Conflict(&'static str),
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
@@ -50,6 +64,8 @@ impl AcError {
             AcError::InvalidCredentials | AcError::InvalidToken(_) => 401,
             AcError::InsufficientScope { .. } => 403,
             AcError::NotFound(_) => 404,
+            AcError::BadRequest(_) => 400,
+            AcError::Conflict(_) => 409,
             AcError::RateLimitExceeded | AcError::TooManyRequests { .. } => 429,
         }
     }
@@ -124,6 +140,22 @@ impl IntoResponse for AcError {
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
                 resource.clone(),
+                None,
+                None,
+                None,
+            ),
+            AcError::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                (*message).to_string(),
+                None,
+                None,
+                None,
+            ),
+            AcError::Conflict(message) => (
+                StatusCode::CONFLICT,
+                "CONFLICT",
+                (*message).to_string(),
                 None,
                 None,
                 None,
@@ -394,5 +426,33 @@ mod tests {
         let body_json = read_body_json(response.into_body()).await;
         assert_eq!(body_json["error"]["code"], "INTERNAL_ERROR");
         assert_eq!(body_json["error"]["message"], "An internal error occurred");
+    }
+
+    #[tokio::test]
+    async fn test_into_response_bad_request_passes_message_verbatim() {
+        let error = AcError::BadRequest("Invalid email format");
+        assert_eq!(error.status_code(), 400);
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get("WWW-Authenticate").is_none());
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "INVALID_REQUEST");
+        assert_eq!(body_json["error"]["message"], "Invalid email format");
+    }
+
+    #[tokio::test]
+    async fn test_into_response_conflict_passes_message_verbatim() {
+        let error = AcError::Conflict("client is deactivated");
+        assert_eq!(error.status_code(), 409);
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.headers().get("WWW-Authenticate").is_none());
+
+        let body_json = read_body_json(response.into_body()).await;
+        assert_eq!(body_json["error"]["code"], "CONFLICT");
+        assert_eq!(body_json["error"]["message"], "client is deactivated");
     }
 }

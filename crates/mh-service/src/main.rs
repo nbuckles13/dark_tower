@@ -32,7 +32,7 @@ use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use mh_service::auth::MhJwtValidator;
 use mh_service::config::Config;
 use mh_service::errors::MhError;
-use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService, SpanLayer};
+use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService};
 use mh_service::observability::{health_router, HealthState};
 use mh_service::session::{SessionManagerHandle, StreamAdmission};
 use mh_service::webtransport::WebTransportServer;
@@ -415,7 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Independent of `auth_layer` above — that reads `authorization`, this
     // reads only the two W3C headers (common::observability::otel_grpc).
     //
-    // `SpanLayer` is REQUIRED for the interceptor's `set_parent` call to have
+    // `SpanLayer` is REQUIRED for the interceptor's `set_remote_parent` call to have
     // any effect: it supplies the ambient tracing span the interceptor
     // attaches to and keeps active through the handler's own `#[instrument]`
     // span (see `grpc::span_layer` module docs — without it, the extracted
@@ -423,9 +423,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // root trace, verified empirically).
     let grpc_shutdown_token = shutdown_token.child_token();
     let grpc_server = tonic::transport::Server::builder()
-        .layer(SpanLayer)
-        .layer(auth_layer)
-        .add_service(tonic::service::interceptor::InterceptedService::new(
+        // Layer ORDER (SpanLayer → extraction → auth) is decided in one place:
+        // `grpc::server_layers` → `common::observability::otel_grpc::inbound_layers`
+        // (see its INVARIANT doc).
+        .layer(mh_service::grpc::server_layers(auth_layer))
+        .add_service(
             // Explicit, not implicit. `RegisterMeetingRequest` grew two
             // unbounded repeated fields with the ADR-0036 §8 reshape, so the
             // decoder is the OUTERMOST allocation bound on this path — the
@@ -434,14 +436,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // default happens to be 4 MiB; stating it means a future default
             // change cannot silently widen MH's control-plane allocation
             // surface.
-            //
-            // Built explicitly rather than via `with_interceptor` because the
-            // size limit belongs on the generated server, and
-            // `InterceptedService` does not forward it.
             MediaHandlerServiceServer::new(mh_media_service)
                 .max_decoding_message_size(MAX_GRPC_DECODING_BYTES),
-            common::observability::otel_grpc::server_interceptor(),
-        ))
+        )
         .serve_with_shutdown(grpc_addr, async move {
             grpc_shutdown_token.cancelled().await;
             info!("gRPC server shutting down");

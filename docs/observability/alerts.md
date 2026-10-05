@@ -268,7 +268,7 @@ or
 1. Check user-facing traffic first (`gc_http_requests_total` rate + error rate) — whole-service silence → Scenario 4
 2. Check CORS preflight outcomes (`gc_cors_preflight_total`) for a denied/403 spike
 3. Determine which silence shape fired (run the two branches separately); absent shape → check deploy/restart timeline (rolling restart in a low-traffic environment is a known benign trigger)
-4. Check 401s on `gc_http_requests_total{endpoint="/other"}` + GC logs (auth regression rejects telemetry pre-handler; `gc_jwt_validations_total` is service-token/gRPC-only — corroboration for shared JWKS root causes, never clearance for the HTTP user-token path)
+4. Check 401s on `gc_http_requests_total{endpoint=~"/api/v1/telemetry/v1/(metrics|traces)"}` + GC logs (auth regression rejects telemetry pre-handler; `gc_jwt_validations_total` is service-token/gRPC-only — corroboration for shared JWKS root causes, never clearance for the HTTP user-token path)
 5. Rule out benign causes: client rollout disabled/sampled-down telemetry; natural traffic trough
 
 ---
@@ -576,7 +576,7 @@ sum(rate(gc_telemetry_ingest_total[10m])) > 0
 
 **Response**:
 1. Split fault direction on the telemetry counter's own `status` values (`rejected_size`/`rejected_rate` → client fault; `error` → step 2)
-2. Split `error` via paired HTTP status codes — 400/415 client fault vs 502/503 collector fault (caveat: telemetry routes report as `endpoint="/other"` on `gc_http_*`, conflated with other unrecognized paths; confirm via GC logs)
+2. Split `error` via paired HTTP status codes — 400/415 client fault vs 502/503 collector fault (on `gc_http_requests_total{endpoint=~"/api/v1/telemetry/v1/(metrics|traces)"}`)
 3. If rate-limited: check `gc_telemetry_rate_limited_total` by reason (client retry loop without backoff?)
 4. If client fault: correlate with web-app/SDK deploy timeline → Client/Web-App Team rollback
 5. If collector fault: check otel-collector health → Infrastructure/SRE
@@ -611,19 +611,29 @@ histogram_quantile(0.95,
 
 ## Authentication Controller Alerts
 
-**Status**: 🚧 To be created
-**File**: `infra/docker/prometheus/rules/ac-alerts.yaml` (planned)
+**Status**: ✅ Exists — one rule
+**File**: `infra/docker/prometheus/rules/ac-alerts.yaml`
 
-**Planned Critical Alerts**:
-- `ACDown` - No AC pods running
-- `ACHighTokenIssuanceLatency` - Token issuance p99 >350ms
-- `ACHighTokenValidationErrorRate` - Validation errors >1%
-- `ACKeyRotationFailed` - Key rotation failed
+Authored per ADR-0031 by the AC owner (auth-controller); reviewed by observability.
 
-**Planned Warning Alerts**:
-- `ACHighCPU` - CPU >80%
-- `ACHighMemory` - Memory >85%
-- `ACJWKSCacheMissRate` - JWKS cache miss rate >10%
+**Still planned, not created**: `ACDown`, `ACHighTokenIssuanceLatency`, `ACHighTokenValidationErrorRate`,
+`ACKeyRotationFailed` (critical); `ACHighCPU`, `ACHighMemory`, `ACJWKSCacheMissRate` (warning).
+
+#### ACAuditLogWriteFailures
+
+**Severity**: Warning
+**Condition**: any increase of `ac_audit_log_failures_total` in 10 minutes, per `event_type`, for 1 minute
+**Impact**: Forensic gap in the auth audit trail — the audited operation succeeded (best-effort audit, ADR-0032) but its `auth_events` row was lost. No user-facing impact; for registration events the per-IP registration limiter undercounts.
+**Runbook**: [Scenario 7: Audit Log Write Failures](../runbooks/ac-service-incident-response.md#audit-log-write-failures)
+
+```promql
+sum by (event_type) (increase(ac_audit_log_failures_total{job="ac-service"}[10m])) > 0
+```
+`for: 1m`
+
+**Response**:
+1. The `event_type` label names the write site; follow the runbook's triage order (DB health first, then a CHECK violation from code deployed ahead of its migration).
+2. A missing-migration cause is fixed by applying the migration, never by rolling back the code.
 
 ---
 
@@ -1483,6 +1493,7 @@ Before deploying alerts, test:
 | GC Critical | Observability | GC Team + Operations |
 | GC Warning | Observability | GC Team |
 | AC Critical | Observability | AC Team + Operations |
+| AC Warning (Audit) | auth-controller (ADR-0031) | Observability |
 | MC Critical | Observability | MC Team + Operations |
 | MC Warning (Join) | Observability | MC Team |
 | MC Info (Join) | Observability | MC Team |

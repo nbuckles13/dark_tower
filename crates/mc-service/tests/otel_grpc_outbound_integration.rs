@@ -52,7 +52,6 @@ type Captured = Arc<Mutex<Vec<Option<String>>>>;
 
 // `tonic::Status` is a large `Err` variant, but the `Interceptor` closure
 // signature is fixed by tonic — boxing it isn't possible here.
-#[allow(clippy::result_large_err)]
 fn capture_interceptor(store: Captured) -> impl tonic::service::Interceptor + Clone {
     move |req: Request<()>| -> Result<Request<()>, Status> {
         let tp = req
@@ -222,7 +221,7 @@ async fn gc_client_register_injects_active_span_traceparent() {
         .unwrap();
 
     let span = tracing::info_span!("mc.outbound.gc");
-    span.set_parent(known_remote_context());
+    assert!(span.set_parent(known_remote_context()).is_ok());
     gc_client.register().instrument(span).await.unwrap();
 
     let captured = captured_traceparents(&store);
@@ -255,7 +254,7 @@ async fn mh_client_register_meeting_injects_active_span_traceparent() {
     let mh_client = MhClient::new(test_token_receiver());
 
     let span = tracing::info_span!("mc.outbound.mh");
-    span.set_parent(known_remote_context());
+    assert!(span.set_parent(known_remote_context()).is_ok());
     let assignment = two_party_assignment();
     mh_client
         .register_meeting(&MeetingProgramming {

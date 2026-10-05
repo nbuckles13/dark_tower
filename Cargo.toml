@@ -57,9 +57,9 @@ tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"
 
 # Web frameworks
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
-tower-http = "0.5"
+tower-http = "0.7"
 # HTTP types (HeaderMap/HeaderName/HeaderValue) shared by axum/reqwest/tonic.
 # Direct dep for `common::observability::otel_http` (R-56 HTTP propagation);
 # previously only transitive.
@@ -78,12 +78,13 @@ arc-swap = "1.9"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-prost = "0.13"
-prost-types = "0.13"
+prost = "0.14"
+prost-types = "0.14"
 
 # gRPC
-tonic = "0.12"
-tonic-build = "0.12"
+tonic = "0.14"
+tonic-prost-build = "0.14"
+tonic-prost = "0.14"
 
 # Database clients
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate"] }
@@ -92,14 +93,19 @@ redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = "0.24"
-opentelemetry_sdk = { version = "0.24", features = ["rt-tokio", "trace"] }
-opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.25"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["trace"] }
+# `default-features = false`: 0.33's defaults add the OTLP/HTTP exporter
+# (`http-proto` + `reqwest-blocking-client`), which would pull a second reqwest
+# (0.13) into the lock. We export over gRPC only; `internal-logs` is kept so SDK
+# export failures surface through our subscriber (observability ruling).
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace", "internal-logs"] }
+tracing-opentelemetry = "0.34"
 # OTLP protobuf message types for the GC telemetry proxy (R-2). Message types
 # only (no gRPC transport) — GC re-encodes with prost and forwards over reqwest.
-# 0.7 matches the opentelemetry = 0.24 line and resolves with prost 0.13.
-opentelemetry-proto = { version = "0.7", features = ["gen-tonic-messages", "metrics", "trace"] }
+# Moves in lockstep with the opentelemetry crates above (0.33 requires
+# prost ^0.14 + tonic ^0.14.1, the workspace's own prost/tonic).
+opentelemetry-proto = { version = "0.33", features = ["gen-tonic-messages", "metrics", "trace"] }
 
 # Rate limiting
 # In-process GCRA keyed rate limiter for the GC telemetry proxy (R-2,
@@ -107,6 +113,7 @@ opentelemetry-proto = { version = "0.7", features = ["gen-tonic-messages", "metr
 governor = { version = "0.10", features = ["std", "dashmap"] }
 
 # Error handling
+async-trait = "0.1"
 anyhow = "1.0"
 thiserror = "1.0"
 

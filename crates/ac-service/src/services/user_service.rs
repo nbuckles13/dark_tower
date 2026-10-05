@@ -4,6 +4,7 @@
 
 use crate::crypto;
 use crate::errors::AcError;
+use crate::models::AuthEventType;
 use crate::observability::metrics::{record_audit_log_failure, record_rate_limit_decision};
 use crate::repositories::{auth_events, users};
 use crate::services::token_service;
@@ -12,6 +13,10 @@ use uuid::Uuid;
 
 // Configuration
 const MIN_PASSWORD_LENGTH: usize = 8;
+
+/// Body message for a too-short password. Must name `MIN_PASSWORD_LENGTH`
+/// (pinned by `tests::weak_password_message_names_min_length`).
+const WEAK_PASSWORD_MESSAGE: &str = "Password must be at least 8 characters";
 
 /// Registration request data.
 #[derive(Debug, Clone)]
@@ -32,26 +37,65 @@ pub struct RegistrationResponse {
     pub expires_in: u64,
 }
 
+/// A registration attempt refused by validation, with its fixed audit
+/// `failure_reason` token. The submitted email, password and display name are
+/// never logged or recorded (ADR-0011 PII).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationRejection {
+    InvalidEmail,
+    WeakPassword,
+    EmptyDisplayName,
+    EmailExists,
+}
+
+impl RegistrationRejection {
+    fn failure_reason(self) -> &'static str {
+        match self {
+            RegistrationRejection::InvalidEmail => "invalid_email",
+            RegistrationRejection::WeakPassword => "weak_password",
+            RegistrationRejection::EmptyDisplayName => "empty_display_name",
+            RegistrationRejection::EmailExists => "email_exists",
+        }
+    }
+
+    fn error(self) -> AcError {
+        match self {
+            RegistrationRejection::InvalidEmail => AcError::BadRequest("Invalid email format"),
+            RegistrationRejection::WeakPassword => AcError::BadRequest(WEAK_PASSWORD_MESSAGE),
+            RegistrationRejection::EmptyDisplayName => {
+                AcError::BadRequest("Display name cannot be empty")
+            }
+            // Message verbatim until the email-existence oracle is removed
+            // (docs/TODO.md, auth-controller).
+            RegistrationRejection::EmailExists => {
+                AcError::Conflict("An account with this email already exists")
+            }
+        }
+    }
+}
+
 /// Register a new user in an organization (ADR-0020).
 ///
 /// # Steps
 ///
-/// 1. Rate limit by IP
-/// 2. Validate email format
-/// 3. Validate password (min 8 chars)
-/// 4. Check email doesn't exist in org
-/// 5. Hash password (bcrypt cost 12)
-/// 6. Insert user
-/// 7. Add default "user" role
-/// 8. Issue token (auto-login)
-/// 9. Log registration event
+/// 1. Rate limit by IP (successful + failed registrations share one budget)
+/// 2. Validate email format, password length, display name
+/// 3. Check email doesn't exist in org
+/// 4. Hash password, insert user, add default "user" role
+/// 5. Log the `user_registered` event, then issue a token (auto-login)
+///
+/// Every validation failure writes exactly one subject-less
+/// `user_registration_failed` row (fixed `failure_reason`, no metadata); a
+/// rate-limited request writes none, so a blocked IP cannot extend its own
+/// window.
 ///
 /// # Security
 ///
-/// - Rate limiting prevents abuse
+/// - Rate limiting prevents abuse and throttles the email-existence oracle
 /// - Password minimum length enforced
 /// - Email uniqueness per organization
-/// - Auto-login provides seamless UX without exposing credentials
+/// - `ip_address` is required: the handler always has the ConnectInfo peer, so
+///   the limiter cannot be bypassed by a missing address
 #[expect(clippy::too_many_arguments)]
 pub async fn register_user(
     pool: &PgPool,
@@ -59,7 +103,7 @@ pub async fn register_user(
     hash_secret: &[u8],
     org_id: Uuid,
     request: RegistrationRequest,
-    ip_address: Option<&str>,
+    ip_address: &str,
     user_agent: Option<&str>,
     bcrypt_cost: u32,
     registration_rate_limit_window_minutes: i64,
@@ -67,57 +111,41 @@ pub async fn register_user(
     rate_limit_window_minutes: i64,
     rate_limit_max_attempts: i64,
 ) -> Result<RegistrationResponse, AcError> {
-    // Rate limit by IP (if IP is available)
-    if let Some(ip) = ip_address {
-        let rate_limit_window_ago =
-            chrono::Utc::now() - chrono::Duration::minutes(registration_rate_limit_window_minutes);
-
-        // Count registrations (we use a different event type check here)
-        // For simplicity, we check auth events. A more robust approach would be
-        // to track registration attempts separately.
-        let registration_count = count_registrations_from_ip(pool, ip, rate_limit_window_ago).await;
-
-        if registration_count >= registration_rate_limit_max_attempts {
-            tracing::warn!(
-                "Registration rate limit exceeded for IP (count={})",
-                registration_count
-            );
-            record_rate_limit_decision("rejected");
-            return Err(AcError::TooManyRequests {
-                retry_after_seconds: registration_rate_limit_window_minutes * 60,
-                message: "Too many registration attempts. Please try again later.".to_string(),
-            });
-        }
-        record_rate_limit_decision("allowed");
+    // Rate limit by IP, BEFORE any validation or lookup.
+    //
+    // Fails closed: a count-query error propagates, so registration fails
+    // rather than running unthrottled. Accepted residuals: (a) the counted rows
+    // are best-effort audit rows (ADR-0032), so a failed insert leaves that
+    // attempt uncounted — `ACAuditLogWriteFailures` detects it; (c)
+    // count-then-insert is not atomic, so a parallel burst can exceed the
+    // maximum by up to its concurrency.
+    let rate_limit_window_ago =
+        chrono::Utc::now() - chrono::Duration::minutes(registration_rate_limit_window_minutes);
+    let registration_count =
+        auth_events::count_registration_attempts_by_ip(pool, ip_address, rate_limit_window_ago)
+            .await?;
+    if registration_count >= registration_rate_limit_max_attempts {
+        tracing::warn!(
+            "Registration rate limit exceeded for IP (count={})",
+            registration_count
+        );
+        record_rate_limit_decision("rejected");
+        return Err(AcError::TooManyRequests {
+            retry_after_seconds: registration_rate_limit_window_minutes * 60,
+            message: "Too many registration attempts. Please try again later.".to_string(),
+        });
     }
+    record_rate_limit_decision("allowed");
 
-    // Validate email format
-    if !is_valid_email(&request.email) {
-        return Err(AcError::InvalidToken("Invalid email format".to_string()));
+    if let Err(rejection) = validate_registration(pool, org_id, &request).await? {
+        tracing::info!(
+            failure_reason = rejection.failure_reason(),
+            "Registration rejected"
+        );
+        log_registration_failure(pool, rejection, ip_address, user_agent).await;
+        return Err(rejection.error());
     }
-
-    // Validate password (min 8 characters)
-    if request.password.len() < MIN_PASSWORD_LENGTH {
-        return Err(AcError::InvalidToken(format!(
-            "Password must be at least {} characters",
-            MIN_PASSWORD_LENGTH
-        )));
-    }
-
-    // Validate display name
     let display_name = request.display_name.trim();
-    if display_name.is_empty() {
-        return Err(AcError::InvalidToken(
-            "Display name cannot be empty".to_string(),
-        ));
-    }
-
-    // Check email doesn't already exist in this org
-    if users::email_exists_in_org(pool, org_id, &request.email).await? {
-        return Err(AcError::InvalidToken(
-            "An account with this email already exists".to_string(),
-        ));
-    }
 
     // Hash password with configured bcrypt cost
     let password_hash = crypto::hash_client_secret(&request.password, bcrypt_cost)?;
@@ -138,10 +166,10 @@ pub async fn register_user(
             AcError::Internal
         })?;
 
-    // Log registration event
+    // Log registration event (counted by the registration limiter).
     if let Err(e) = log_registration_event(pool, &user.user_id, ip_address, user_agent).await {
         tracing::warn!("Failed to log registration event: {}", e);
-        record_audit_log_failure("user_registered", "db_write_failed");
+        record_audit_log_failure(AuthEventType::UserRegistered, "db_write_failed");
     }
 
     // Issue token (auto-login)
@@ -152,7 +180,7 @@ pub async fn register_user(
         org_id,
         &request.email,
         &request.password,
-        ip_address,
+        Some(ip_address),
         user_agent,
         rate_limit_window_minutes,
         rate_limit_max_attempts,
@@ -167,6 +195,28 @@ pub async fn register_user(
         token_type: token_response.token_type,
         expires_in: token_response.expires_in,
     })
+}
+
+/// Validate a registration request. `Ok(Err(_))` is a client rejection;
+/// `Err(_)` is an internal failure of the email-existence lookup.
+async fn validate_registration(
+    pool: &PgPool,
+    org_id: Uuid,
+    request: &RegistrationRequest,
+) -> Result<Result<(), RegistrationRejection>, AcError> {
+    if !is_valid_email(&request.email) {
+        return Ok(Err(RegistrationRejection::InvalidEmail));
+    }
+    if request.password.len() < MIN_PASSWORD_LENGTH {
+        return Ok(Err(RegistrationRejection::WeakPassword));
+    }
+    if request.display_name.trim().is_empty() {
+        return Ok(Err(RegistrationRejection::EmptyDisplayName));
+    }
+    if users::email_exists_in_org(pool, org_id, &request.email).await? {
+        return Ok(Err(RegistrationRejection::EmailExists));
+    }
+    Ok(Ok(()))
 }
 
 /// Simple email validation.
@@ -200,58 +250,56 @@ fn is_valid_email(email: &str) -> bool {
     domain_parts.iter().all(|p| !p.is_empty())
 }
 
-/// Count registrations from an IP address within a time window.
-///
-/// Uses auth_events to track registration events (service_registered).
-async fn count_registrations_from_ip(
-    pool: &PgPool,
-    ip_address: &str,
-    since: chrono::DateTime<chrono::Utc>,
-) -> i64 {
-    // Query registration events from this IP
-    // We look for user_login events with success=true that were preceded by registration
-    // For simplicity, we count successful user_login events from this IP (new accounts log in)
-    let result: Result<(i64,), _> = sqlx::query_as(
-        r#"
-        SELECT COUNT(*)
-        FROM auth_events
-        WHERE ip_address = $1::inet
-          AND event_type = 'user_login'
-          AND success = true
-          AND created_at >= $2
-        "#,
-    )
-    .bind(ip_address)
-    .bind(since)
-    .fetch_one(pool)
-    .await;
-
-    result.map(|(count,)| count).unwrap_or(0)
-}
-
-/// Log a user registration event.
+/// Log a user registration event (`user_registered`). Feeds the registration
+/// limiter (see [`auth_events::count_registration_attempts_by_ip`]) — keep
+/// `ip_address` on it.
 async fn log_registration_event(
     pool: &PgPool,
     user_id: &Uuid,
-    ip_address: Option<&str>,
+    ip_address: &str,
     user_agent: Option<&str>,
 ) -> Result<(), AcError> {
-    // We use "service_registered" event type for now
-    // A proper implementation would add a "user_registered" event type
     auth_events::log_event(
         pool,
-        "user_login", // First login after registration
+        AuthEventType::UserRegistered.as_str(),
         Some(*user_id),
         None,
         true,
         None,
-        ip_address,
+        Some(ip_address),
         user_agent,
-        Some(serde_json::json!({"registration": true})),
+        None,
     )
     .await?;
 
     Ok(())
+}
+
+/// Log a refused registration attempt (`user_registration_failed`):
+/// subject-less, fixed `failure_reason`, no metadata. Feeds the registration
+/// limiter. Best-effort (ADR-0032).
+async fn log_registration_failure(
+    pool: &PgPool,
+    rejection: RegistrationRejection,
+    ip_address: &str,
+    user_agent: Option<&str>,
+) {
+    if let Err(e) = auth_events::log_event(
+        pool,
+        AuthEventType::UserRegistrationFailed.as_str(),
+        None,
+        None,
+        false,
+        Some(rejection.failure_reason()),
+        Some(ip_address),
+        user_agent,
+        None,
+    )
+    .await
+    {
+        tracing::warn!("Failed to log registration failure event: {}", e);
+        record_audit_log_failure(AuthEventType::UserRegistrationFailed, "db_write_failed");
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +336,13 @@ mod tests {
     #[test]
     fn test_password_length_requirement() {
         assert_eq!(MIN_PASSWORD_LENGTH, 8);
+    }
+
+    /// The weak-password message is a fixed literal (it is the response body);
+    /// keep it in step with `MIN_PASSWORD_LENGTH`.
+    #[test]
+    fn weak_password_message_names_min_length() {
+        assert!(WEAK_PASSWORD_MESSAGE.contains(&MIN_PASSWORD_LENGTH.to_string()));
     }
 
     #[test]
@@ -346,7 +401,7 @@ mod tests {
             &master_key,
             org_id,
             request,
-            Some("192.168.1.1"),
+            "192.168.1.1",
             Some("TestAgent/1.0"),
             DEFAULT_BCRYPT_COST,
             DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -377,10 +432,11 @@ mod tests {
         Ok(())
     }
 
-    /// Test register_user: rate limiting kicks in after enough registrations per IP
+    /// Test register_user: exactly the configured number of registrations per IP
+    /// succeed, and the next one is rate limited.
     ///
-    /// The rate limiting is based on counting user_login events (auto-logins from registrations).
-    /// This test verifies that after some threshold, further registrations are blocked.
+    /// The limiter counts `user_registered` + `user_registration_failed` rows per IP
+    /// (one row per attempt), so the threshold is the configured maximum itself.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_register_user_rate_limiting(pool: PgPool) -> Result<(), AcError> {
         let master_key = crypto::generate_random_bytes(32)?;
@@ -389,12 +445,12 @@ mod tests {
         let org_id = create_test_org(&pool, "reg-rate").await;
         let ip = "192.168.1.100";
 
-        // Keep registering until we hit the rate limit
+        let max = usize::try_from(DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS)
+            .expect("configured maximum fits usize");
         let mut success_count = 0;
         let mut hit_rate_limit = false;
 
-        for i in 0..20 {
-            // Try more than enough to hit limit
+        for i in 0..=max {
             let request = RegistrationRequest {
                 email: format!("user{}@example.com", i),
                 password: "securepassword123".to_string(),
@@ -407,7 +463,7 @@ mod tests {
                 &master_key,
                 org_id,
                 request,
-                Some(ip),
+                ip,
                 None,
                 DEFAULT_BCRYPT_COST,
                 DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -427,25 +483,12 @@ mod tests {
             }
         }
 
-        // We should have been rate limited at some point
-        assert!(
-            hit_rate_limit,
-            "Should have hit rate limit after {} successful registrations",
-            success_count
+        // Exactly MAX registrations succeed; attempt MAX+1 is refused.
+        assert_eq!(
+            success_count, max,
+            "exactly the configured maximum of registrations should succeed"
         );
-
-        // At least some registrations should have succeeded before hitting the limit
-        assert!(
-            success_count >= 1,
-            "At least 1 registration should succeed before rate limiting"
-        );
-
-        // Should be limited to roughly 5 (the configured max attempts)
-        assert!(
-            success_count <= 6,
-            "Should be limited to around 5 registrations, got {}",
-            success_count
-        );
+        assert!(hit_rate_limit, "attempt {} should be rate limited", max + 1);
 
         Ok(())
     }
@@ -467,7 +510,9 @@ mod tests {
             "",
         ];
 
-        for email in invalid_emails {
+        for (i, email) in invalid_emails.into_iter().enumerate() {
+            // Distinct IPs: every refused attempt spends registration budget.
+            let ip = format!("192.0.2.{}", 10 + i);
             let request = RegistrationRequest {
                 email: email.to_string(),
                 password: "securepassword123".to_string(),
@@ -480,7 +525,7 @@ mod tests {
                 &master_key,
                 org_id,
                 request,
-                None,
+                &ip,
                 None,
                 DEFAULT_BCRYPT_COST,
                 DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -491,7 +536,7 @@ mod tests {
             .await;
 
             assert!(
-                matches!(result, Err(AcError::InvalidToken(_))),
+                matches!(result, Err(AcError::BadRequest("Invalid email format"))),
                 "Invalid email '{}' should be rejected",
                 email
             );
@@ -523,7 +568,7 @@ mod tests {
                 &master_key,
                 org_id,
                 request,
-                None,
+                "192.0.2.1",
                 None,
                 DEFAULT_BCRYPT_COST,
                 DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -534,7 +579,7 @@ mod tests {
             .await;
 
             assert!(
-                matches!(result, Err(AcError::InvalidToken(msg)) if msg.contains("8 characters")),
+                matches!(result, Err(AcError::BadRequest(msg)) if msg == WEAK_PASSWORD_MESSAGE),
                 "Password '{}' should be rejected for being too short",
                 password
             );
@@ -564,7 +609,7 @@ mod tests {
             &master_key,
             org_id,
             request1,
-            None,
+            "192.0.2.1",
             None,
             DEFAULT_BCRYPT_COST,
             DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -588,7 +633,7 @@ mod tests {
             &master_key,
             org_id,
             request2,
-            None,
+            "192.0.2.1",
             None,
             DEFAULT_BCRYPT_COST,
             DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -599,7 +644,12 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result2, Err(AcError::InvalidToken(msg)) if msg.contains("already exists")),
+            matches!(
+                result2,
+                Err(AcError::Conflict(
+                    "An account with this email already exists"
+                ))
+            ),
             "Duplicate email should be rejected"
         );
 
@@ -629,7 +679,7 @@ mod tests {
                 &master_key,
                 org_id,
                 request,
-                None,
+                "192.0.2.1",
                 None,
                 DEFAULT_BCRYPT_COST,
                 DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -640,7 +690,10 @@ mod tests {
             .await;
 
             assert!(
-                matches!(result, Err(AcError::InvalidToken(msg)) if msg.contains("Display name")),
+                matches!(
+                    result,
+                    Err(AcError::BadRequest("Display name cannot be empty"))
+                ),
                 "Empty display name '{}' should be rejected",
                 name.escape_debug()
             );
@@ -669,7 +722,7 @@ mod tests {
             &master_key,
             org_id,
             request,
-            None,
+            "192.0.2.1",
             None,
             DEFAULT_BCRYPT_COST,
             DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -708,7 +761,7 @@ mod tests {
             &master_key,
             org1,
             request1,
-            None,
+            "192.0.2.1",
             None,
             DEFAULT_BCRYPT_COST,
             DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -732,7 +785,7 @@ mod tests {
             &master_key,
             org2,
             request2,
-            None,
+            "192.0.2.1",
             None,
             DEFAULT_BCRYPT_COST,
             DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
@@ -754,48 +807,6 @@ mod tests {
         assert_ne!(user1.user_id, user2.user_id);
         assert_eq!(user1.display_name, "Org 1 User");
         assert_eq!(user2.display_name, "Org 2 User");
-
-        Ok(())
-    }
-
-    /// Test register_user: registration without IP (rate limiting skipped)
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn test_register_user_without_ip_address(pool: PgPool) -> Result<(), AcError> {
-        let master_key = crypto::generate_random_bytes(32)?;
-        key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
-
-        let org_id = create_test_org(&pool, "reg-noip").await;
-
-        // Register many users without IP - should not be rate limited
-        for i in 0..10 {
-            let request = RegistrationRequest {
-                email: format!("noip{}@example.com", i),
-                password: "securepassword123".to_string(),
-                display_name: format!("No IP User {}", i),
-            };
-
-            let result = register_user(
-                &pool,
-                &master_key,
-                &master_key,
-                org_id,
-                request,
-                None, // No IP address
-                None,
-                DEFAULT_BCRYPT_COST,
-                DEFAULT_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            )
-            .await;
-
-            assert!(
-                result.is_ok(),
-                "Registration {} without IP should succeed",
-                i
-            );
-        }
 
         Ok(())
     }

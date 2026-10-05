@@ -19,7 +19,7 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   - `endpoint`: Normalized endpoint path (e.g., `/api/v1/meetings/{code}`)
   - `status_code`: HTTP response status code — raw code as a string
     (`"200"`, `"400"`, `"401"`, `"403"`, `"404"`, `"500"`, etc.)
-- **Cardinality**: nominal worst-case ~1,050 combinations (7 methods × 10 endpoints
+- **Cardinality**: nominal worst-case ~1,260 combinations (7 methods × 12 `normalize_endpoint` outputs — `/`, `/health`, `/ready`, `/metrics`, `/api/v1/me`, `/api/v1/meetings`, the two telemetry paths, the three meeting templates, `/other` —
   × ~15 realistic status codes) notionally nudges the ADR-0011 §62-63 1,000/metric
   ceiling, but observed series stay well under 300 because no single
   (method, endpoint) pair surfaces more than ~3 codes in practice (e.g., `POST
@@ -601,25 +601,21 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
 > **Two emitted-but-incomplete statuses whose full picture needs a `gc_http`
 > UNION** (the counter is honest, not complete, where pre-handler layers reject):
 > - `rejected_size` — covers `(max_bytes, 2×max_bytes]` only; union with
->   `gc_http_requests_total{endpoint="/other",status_code="413"}` for gross
->   overage (see the `status` label note below and the endpoint caveat).
+>   `gc_http_requests_total{endpoint=~"/api/v1/telemetry/v1/(metrics|traces)",status_code="413"}` for gross
+>   overage (see the `status` label note below).
 > - `rejected_auth` is declared-unemitted (above), so its size-class analogue —
->   401 visibility — is `gc_http_requests_total{endpoint="/other",status_code="401"}`
->   (approximate; see endpoint caveat) plus GC logs (authoritative).
+>   401 visibility — is `gc_http_requests_total{endpoint=~"/api/v1/telemetry/v1/(metrics|traces)",status_code="401"}`
+>   plus GC logs (authoritative).
 >   `gc_jwt_validations_total` does NOT provide this visibility — it records
 >   the gRPC service-token path only (user/guest HTTP tokens are never recorded
 >   on it); treat it as corroboration for shared JWKS/AC root causes, never as
 >   clearance for the HTTP user-token path telemetry uses.
 >
-> **Endpoint caveat (union selectors)**: `normalize_endpoint()`
-> (`crates/gc-service/src/observability/metrics.rs`) has no arm for
-> `/api/v1/telemetry/v1/{metrics,traces}`, so ALL telemetry requests emit
-> `endpoint="/other"` on `gc_http_*` series — conflated with every other
-> unrecognized path. An endpoint-scoped selector such as
-> `endpoint=~".*/telemetry/.*"` matches NOTHING today. Use
-> `endpoint="/other"` + `status_code` plus GC logs, and treat the split as
-> approximate until the telemetry normalization arm lands (tracked in
-> `docs/TODO.md` §Observability Debt).
+> **Endpoint selectors (union)**: `normalize_endpoint()`
+> (`crates/gc-service/src/observability/metrics.rs`) has explicit arms for
+> `/api/v1/telemetry/v1/{metrics,traces}`, so telemetry requests carry their
+> own `endpoint` values on `gc_http_*` series; `endpoint="/other"` holds only
+> genuinely unrecognized paths (404s, scanners, typos).
 
 ### `gc_telemetry_ingest_total`
 - **Zero-init**: exempt — absence is load-bearing: absent_over_time(gc_telemetry_ingest_total[15m]) at gc-alerts.yaml:144 detects restart-silence, which present-at-zero would defeat
@@ -641,9 +637,7 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
     `gc_http_requests_total{status_code="413"}`, never here. **Alert authors:
     the size-rejection class is the UNION**
     `gc_telemetry_ingest_total{status="rejected_size"}` ∪
-    `gc_http_requests_total{endpoint="/other",status_code="413"}` (see the
-    endpoint caveat in the honesty block — telemetry routes normalize to
-    `/other` today) —
+    `gc_http_requests_total{endpoint=~"/api/v1/telemetry/v1/(metrics|traces)",status_code="413"}` —
     do not key a size-rejection rate/absent alert on the telemetry counter alone
     (it has a documented blind spot above the ceiling). This is the intended
     trade-off of @security's two-tier cap (bounded handler buffering); the counter
@@ -652,7 +646,7 @@ Metrics for the client telemetry proxy `POST /api/v1/telemetry/v1/{metrics,trace
     (client fault) and collector-502 + disabled-503 (server fault). It does NOT
     distinguish them — split client-vs-server via the paired
     `gc_http_requests_total{status_code}` series (`415|400` vs `502|503`) for
-    triage — with the endpoint caveat above (`endpoint="/other"` conflation).
+    triage, scoped to the telemetry `endpoint` values.
     (Distinct `error` sub-statuses were considered for the shipped alerts and
     deliberately NOT split: `GCTelemetryProxyHighRejectionRate` keeps the
     catalog-canonical `rejected_.*|error` selector — dropping `error` would

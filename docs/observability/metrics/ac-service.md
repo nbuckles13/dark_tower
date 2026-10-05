@@ -49,8 +49,8 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Description**: Total number of token validation attempts
 - **Labels**:
   - `status`: Validation result (`success`, `error`)
-  - `error_category`: Category of validation error (`authentication`, `authorization`, `cryptographic`, `internal`, `clock_skew`, `none`)
-- **Cardinality**: Low (2 statuses × 6 categories = 12 series)
+  - `error_category`: Category of validation error (`authentication`, `authorization`, `cryptographic`, `internal`, `clock_skew`, `validation`, `none`)
+- **Cardinality**: Low (2 statuses × 7 categories = 14 series)
 - **Status**: Defined but not currently used (future)
 - **Usage**: Track validation rate and error types. `clock_skew` is the only category currently emitted from production (via `crypto::verify_jwt` / `verify_user_jwt` iat-skew branches); the others are forward-looking reservations bounded by the `ErrorCategory` enum in `crates/ac-service/src/observability/mod.rs`.
 
@@ -166,17 +166,23 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Type**: Counter
 - **Description**: Total number of audit log write failures (compliance-critical)
 - **Labels**:
-  - `event_type`: Type of audit event that failed to log (`key_generated`, `key_rotated`, `key_expired`,
-    `user_registered`, `service_registered`, `service_deactivated`, `service_token_issued`,
-    `service_token_failed`, `scopes_updated`, `user_login`, `user_login_failed`)
-  - `reason`: Reason for failure (`db_write_failed`, `encryption_failed`)
-- **Cardinality**: a CLOSED **pair set** of 11 real `(event_type, reason)` combinations, NOT the
+  - `event_type`: Type of audit event that failed to log — the `AuthEventType::as_str()` value, identical
+    to the `auth_events.event_type` the lost row would have carried (`key_generated`, `key_rotated`,
+    `key_expired`, `user_registered`, `user_registration_failed`, `service_registered`,
+    `service_scopes_updated`, `service_deactivated`, `service_secret_rotated`, `service_token_issued`,
+    `service_token_failed`, `user_login`, `user_login_failed`). `record_audit_log_failure` takes the enum, so
+    no label string exists without a variant.
+  - `reason`: Reason for failure (`db_write_failed` at every production site)
+- **Cardinality**: a CLOSED **pair set** of 13 real `(event_type, reason)` combinations, NOT the
   `event_type × reason` cross-product — most cells never occur (e.g. `key_generated/encryption_failed` does
-  not). Zero-init touches only the 11 real pairs (`AUDIT_LOG_FAILURE_PAIRS` in `observability/metrics.rs`,
-  closed at the emit sites); a check comparing this metric's domain must compare PAIRS, not expand the two
-  per-label lists into a cross-product (which would fabricate ~10 impossible always-zero series around a
-  page-on-any-value alert).
-- **Alert Threshold**: ANY non-zero value should trigger oncall page
+  not). Zero-init touches only the 13 real pairs (`AUDIT_LOG_FAILURE_PAIRS` in `observability/metrics.rs`,
+  typed as `AuthEventType` and pinned to every emitting variant by a unit test); a check comparing this
+  metric's domain must compare PAIRS, not expand the two per-label lists into a cross-product (which would
+  fabricate impossible always-zero series around an any-value alert).
+- **Alert**: `ACAuditLogWriteFailures` (warning) fires on any increase in 10m — see
+  `infra/docker/prometheus/rules/ac-alerts.yaml` and the runbook anchor
+  `docs/runbooks/ac-service-incident-response.md#audit-log-write-failures`. Audit writes are best-effort
+  (ADR-0032): the operation succeeded, its audit row was lost.
 - **Usage**: Detect audit log failures that could impact compliance
 - **Call Sites**: `token_service`, `user_service`, `key_management_service`, `registration_service`
 
@@ -190,9 +196,11 @@ All AC service metrics follow ADR-0011 naming conventions with the `ac_` prefix.
 - **Description**: Total number of errors by category
 - **Labels**:
   - `operation`: Operation that failed (`token_issuance`, `key_rotation`, `db_query`, etc.)
-  - `error_category`: Error classification (`authentication`, `authorization`, `cryptographic`, `internal`)
-  - `status_code`: HTTP status code (e.g., `401`, `403`, `500`)
-- **Cardinality**: Medium (bounded by operations, 4 categories, and common status codes)
+  - `error_category`: Error classification — what `From<&AcError> for ErrorCategory` produces:
+    `authentication`, `authorization`, `cryptographic`, `internal`, `validation` (`validation` = a
+    client-attributable rejection: `AcError::BadRequest` → 400, `AcError::Conflict` → 409)
+  - `status_code`: HTTP status code (e.g., `400`, `401`, `403`, `409`, `500`)
+- **Cardinality**: Medium (bounded by operations, 5 categories, and common status codes)
 - **Usage**: Track error rates by type, identify patterns in failures
 
 ---
@@ -314,7 +322,7 @@ All AC service metrics follow strict cardinality bounds per ADR-0011:
 |-------|-------|--------|
 | `grant_type` | 4 max | `client_credentials`, `authorization_code`, `refresh_token`, `password` |
 | `status` | 2 | `success`, `error` |
-| `error_category` | 6 | `authentication`, `authorization`, `cryptographic`, `internal`, `clock_skew`, `none` |
+| `error_category` | 7 | `authentication`, `authorization`, `cryptographic`, `internal`, `clock_skew`, `validation`, `none` (bounded by the `ErrorCategory` enum) |
 | `operation` | Bounded by code | `select`, `insert`, `update`, `delete`, etc. |
 | `table` | Bounded by schema | ~7 tables (`service_credentials`, `signing_keys`, `auth_events`, `users`, `user_roles`, `organizations`, etc.) |
 | `cache_status` | 3 | `hit`, `miss`, `bypass` |

@@ -116,8 +116,11 @@ describe('parseAcAuthRateLimit', () => {
 });
 
 describe('assertCohortFitsAuthWindow', () => {
-  test('the window spend is N+1 registrations plus N+1 first-test sign-ins', () => {
-    expect(cohortWindowSpend(3)).toEqual({ registrations: 4, firstTestSignIns: 4, total: 8 });
+  // AC's limiter counts registration attempts (`user_registered` +
+  // `user_registration_failed`), not sign-ins, so the cohort spends only its N+1
+  // registrations.
+  test('the window spend is the N+1 registrations only (sign-ins are not counted)', () => {
+    expect(cohortWindowSpend(3)).toEqual({ registrations: 4, total: 4 });
   });
 
   test('the suite N fits the real Kind AC config', () => {
@@ -126,14 +129,16 @@ describe('assertCohortFitsAuthWindow', () => {
   });
 
   test('passes at exactly the limit and fails one above it', () => {
-    expect(() => assertCohortFitsAuthWindow(3, { maxAttempts: 8, windowMinutes: 1 })).not.toThrow();
-    expect(() => assertCohortFitsAuthWindow(3, { maxAttempts: 7, windowMinutes: 1 })).toThrow(
-      /needs 8 successful AC token issues .*\(4 registrations \+ 4 first-test sign-ins\)/,
+    expect(() => assertCohortFitsAuthWindow(3, { maxAttempts: 4, windowMinutes: 1 })).not.toThrow();
+    expect(() => assertCohortFitsAuthWindow(3, { maxAttempts: 3, windowMinutes: 1 })).toThrow(
+      /needs 4 AC registration attempts .*\(4 registrations\)/,
     );
   });
 
-  test('a prod-default-sized limit fails at setup, not mid-suite', () => {
-    expect(() => assertCohortFitsAuthWindow(3, { maxAttempts: 5, windowMinutes: 60 })).toThrow(
+  // The prod default (5 per 60 min) now fits the cohort alone (4 registrations),
+  // so the structural misfit this guards is a limit below N+1.
+  test('a limit below N+1 fails at setup, not mid-suite', () => {
+    expect(() => assertCohortFitsAuthWindow(3, { maxAttempts: 3, windowMinutes: 60 })).toThrow(
       AC_REGISTRATION_RATE_LIMIT_MAX_KEY,
     );
   });

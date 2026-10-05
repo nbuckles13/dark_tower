@@ -78,7 +78,7 @@ case future drift emerges from new services or metric additions.
 | `endpoint` | Semantic HTTP path (normalized) | Bounded by `normalize_endpoint()` table |
 | `operation` | Subsystem-specific verb | Bounded by code (e.g., `select`, `insert`, `update`, `delete`) |
 | `error_type` | Bounded error variant | Bounded by the service's `error_type_label()` enum |
-| `error_category` | Coarser error class | `authentication`, `authorization`, `cryptographic`, `internal` |
+| `error_category` | Coarser error class | Bounded by AC `ErrorCategory` enum (`crates/ac-service/src/observability/mod.rs`) |
 | `event_type` | Bounded event discriminator | Bounded by the event enum (e.g., `connected`, `disconnected`) |
 | `action` | **What operation a request asked for** — the verb, never its result | Closed enum **per metric**, defined in that metric's catalog entry — deliberately not enumerated here |
 | `region` | Geographic/deployment region | Bounded by cloud region set |

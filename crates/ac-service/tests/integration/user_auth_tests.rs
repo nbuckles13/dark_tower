@@ -312,12 +312,15 @@ async fn test_register_invalid_email(pool: PgPool) -> Result<(), anyhow::Error> 
         .send()
         .await?;
 
-    // Assert
+    // Assert: 400 INVALID_REQUEST with the fixed message, and exactly one
+    // subject-less failure row (the registration limiter's input).
     assert_eq!(
         response.status(),
-        StatusCode::UNAUTHORIZED,
-        "Invalid email should return 401 (using InvalidToken error)"
+        StatusCode::BAD_REQUEST,
+        "Invalid email should return 400"
     );
+    assert_error_body(response, "INVALID_REQUEST", "Invalid email format").await?;
+    assert_eq!(failure_rows(server.pool(), "invalid_email").await?, 1);
 
     Ok(())
 }
@@ -345,17 +348,16 @@ async fn test_register_password_too_short(pool: PgPool) -> Result<(), anyhow::Er
     // Assert
     assert_eq!(
         response.status(),
-        StatusCode::UNAUTHORIZED,
-        "Short password should return 401 (using InvalidToken error)"
+        StatusCode::BAD_REQUEST,
+        "Short password should return 400"
     );
-
-    let body: serde_json::Value = response.json().await?;
-    let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        message.contains("8 characters"),
-        "Error message should mention 8 characters requirement, got: {}",
-        message
-    );
+    assert_error_body(
+        response,
+        "INVALID_REQUEST",
+        "Password must be at least 8 characters",
+    )
+    .await?;
+    assert_eq!(failure_rows(server.pool(), "weak_password").await?, 1);
 
     Ok(())
 }
@@ -383,17 +385,11 @@ async fn test_register_empty_display_name(pool: PgPool) -> Result<(), anyhow::Er
     // Assert
     assert_eq!(
         response.status(),
-        StatusCode::UNAUTHORIZED,
-        "Empty display name should return 401 (using InvalidToken error)"
+        StatusCode::BAD_REQUEST,
+        "Empty display name should return 400"
     );
-
-    let body: serde_json::Value = response.json().await?;
-    let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        message.contains("Display name"),
-        "Error message should mention display name, got: {}",
-        message
-    );
+    assert_error_body(response, "INVALID_REQUEST", "Display name cannot be empty").await?;
+    assert_eq!(failure_rows(server.pool(), "empty_display_name").await?, 1);
 
     Ok(())
 }
@@ -440,17 +436,16 @@ async fn test_register_duplicate_email(pool: PgPool) -> Result<(), anyhow::Error
     // Assert
     assert_eq!(
         response2.status(),
-        StatusCode::UNAUTHORIZED,
-        "Duplicate email should return 401 (using InvalidToken error for 'already exists')"
+        StatusCode::CONFLICT,
+        "Duplicate email should return 409"
     );
-
-    let body: serde_json::Value = response2.json().await?;
-    let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        message.contains("already exists"),
-        "Error message should mention already exists, got: {}",
-        message
-    );
+    assert_error_body(
+        response2,
+        "CONFLICT",
+        "An account with this email already exists",
+    )
+    .await?;
+    assert_eq!(failure_rows(server.pool(), "email_exists").await?, 1);
 
     Ok(())
 }
@@ -578,9 +573,11 @@ async fn test_register_unknown_org(pool: PgPool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Test that registration rate limiting kicks in after 5 attempts.
+/// Test that exactly the configured number of registrations per IP succeed
+/// and the next is rate limited (429).
 ///
-/// The 6th registration from the same IP within an hour should return 429.
+/// The limiter counts `user_registered` + `user_registration_failed` rows per
+/// IP — one per attempt — so the threshold is the configured maximum itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_register_rate_limit(pool: PgPool) -> Result<(), anyhow::Error> {
     // Arrange
@@ -588,14 +585,12 @@ async fn test_register_rate_limit(pool: PgPool) -> Result<(), anyhow::Error> {
     let _org_id = server
         .create_test_org("ratelimit", "Rate Limit Corp")
         .await?;
+    let max = usize::try_from(server.config().registration_rate_limit_max_attempts)?;
 
-    // Register 5 users (should all succeed, at least initially)
-    // Note: Rate limiting is based on auth_events counting, which tracks successful logins
-    // The actual rate limit behavior may vary based on implementation details
     let mut success_count = 0;
     let mut hit_rate_limit = false;
 
-    for i in 0..10 {
+    for i in 0..=max {
         let response = server
             .client()
             .post(format!("{}/api/v1/auth/register", server.url()))
@@ -616,12 +611,12 @@ async fn test_register_rate_limit(pool: PgPool) -> Result<(), anyhow::Error> {
         }
     }
 
-    // Assert - should have hit rate limit at some point
-    assert!(
-        hit_rate_limit || success_count <= 6,
-        "Should hit rate limit or be limited to around 5-6 registrations, got {} successes",
-        success_count
+    // Assert: exactly MAX succeed, attempt MAX+1 is refused.
+    assert_eq!(
+        success_count, max,
+        "exactly the configured maximum of registrations should succeed"
     );
+    assert!(hit_rate_limit, "attempt {} should be rate limited", max + 1);
 
     Ok(())
 }
@@ -1134,5 +1129,409 @@ async fn test_org_extraction_uppercase_rejected(pool: PgPool) -> Result<(), anyh
         "Uppercase subdomain should be rejected"
     );
 
+    Ok(())
+}
+
+// ============================================================================
+// Registration error bodies + failed-attempt throttle (ADR-0020; devloop
+// 2026-10-04 §10)
+// ============================================================================
+
+/// Assert an AC error body's `code` and exact `message`.
+async fn assert_error_body(
+    response: reqwest::Response,
+    code: &str,
+    message: &str,
+) -> Result<(), anyhow::Error> {
+    let body: serde_json::Value = response.json().await?;
+    let error = body.get("error");
+    assert_eq!(
+        error.and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+        Some(code),
+        "body: {body}"
+    );
+    assert_eq!(
+        error
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str()),
+        Some(message),
+        "body: {body}"
+    );
+    Ok(())
+}
+
+/// Number of `user_registration_failed` rows with `failure_reason`.
+async fn failure_rows(pool: &PgPool, reason: &str) -> Result<i64, anyhow::Error> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_events \
+         WHERE event_type = 'user_registration_failed' AND failure_reason = $1",
+    )
+    .bind(reason)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Total `auth_events` rows (for exact-delta assertions).
+async fn total_events(pool: &PgPool) -> Result<i64, anyhow::Error> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM auth_events")
+        .fetch_one(pool)
+        .await?)
+}
+
+/// POST /api/v1/auth/register for `subdomain`.
+async fn register(
+    server: &TestAuthServer,
+    subdomain: &str,
+    email: &str,
+    password: &str,
+    display_name: &str,
+) -> Result<reqwest::Response, anyhow::Error> {
+    Ok(server
+        .client()
+        .post(format!("{}/api/v1/auth/register", server.url()))
+        .header("Host", server.host_header(subdomain))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "displayName": display_name
+        }))
+        .send()
+        .await?)
+}
+
+/// Insert a registration-limiter row for `ip` at `age` in the past (a
+/// subject-less `user_registration_failed`, exactly what the limiter counts).
+async fn insert_limiter_row(
+    pool: &PgPool,
+    ip: &str,
+    age: chrono::Duration,
+) -> Result<(), anyhow::Error> {
+    sqlx::query(
+        "INSERT INTO auth_events (event_type, success, failure_reason, ip_address, created_at) \
+         VALUES ('user_registration_failed', false, 'invalid_email', $1::inet, $2)",
+    )
+    .bind(ip)
+    .bind(chrono::Utc::now() - age)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// (event_type, success, failure_reason, user_id, credential_id, ip, metadata,
+/// whole row as JSON text).
+type FailureRow = (
+    String,
+    bool,
+    Option<String>,
+    Option<uuid::Uuid>,
+    Option<uuid::Uuid>,
+    Option<String>,
+    Option<serde_json::Value>,
+    String,
+);
+
+/// T3: each failed attempt writes exactly one row (total delta 1), subject-
+/// less, with the IP, a fixed reason and NULL metadata — and none of the
+/// submitted strings anywhere in the row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_failure_row_contents_carry_no_pii(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("pii", "Pii Corp").await?;
+
+    let before = total_events(server.pool()).await?;
+    let response = register(
+        &server,
+        "pii",
+        "pii-probe@example.com",
+        "short",
+        "Pii Probe Name",
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(total_events(server.pool()).await? - before, 1);
+
+    let row: FailureRow = sqlx::query_as(
+        "SELECT event_type, success, failure_reason, user_id, credential_id, \
+             host(ip_address), metadata, row_to_json(auth_events)::text \
+             FROM auth_events WHERE event_type = 'user_registration_failed'",
+    )
+    .fetch_one(server.pool())
+    .await?;
+    assert_eq!(row.0, "user_registration_failed");
+    assert!(!row.1);
+    assert_eq!(row.2.as_deref(), Some("weak_password"));
+    assert!(row.3.is_none() && row.4.is_none());
+    assert_eq!(row.5.as_deref(), Some("127.0.0.1"));
+    assert!(row.6.is_none(), "metadata must be NULL");
+    for submitted in [
+        "pii-probe@example.com",
+        "pii-probe",
+        "short",
+        "Pii Probe Name",
+    ] {
+        assert!(
+            !row.7.contains(submitted),
+            "row must not contain submitted value {submitted:?}: {}",
+            row.7
+        );
+    }
+    Ok(())
+}
+
+/// T1: N failed attempts exhaust the budget; attempt N+1 is 429.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_failed_attempts_exhaust_budget(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("failbudget", "Fail Corp").await?;
+    let max = server.config().registration_rate_limit_max_attempts;
+
+    for i in 0..max {
+        let r = register(
+            &server,
+            "failbudget",
+            &format!("bad{i}"),
+            "password123",
+            "X",
+        )
+        .await?;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "attempt {i}");
+    }
+    let r = register(&server, "failbudget", "ok@example.com", "password123", "Ok").await?;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    Ok(())
+}
+
+/// T1: failed and successful attempts share one budget, each counted once:
+/// N-1 mixed attempts leave room for one more; N mixed attempts do not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_mixed_attempts_share_budget(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("mixed", "Mixed Corp").await?;
+    let max = server.config().registration_rate_limit_max_attempts;
+    assert!(max >= 3, "test needs a budget of at least 3");
+
+    // 2 successes, then failures up to N-1 attempts total.
+    for i in 0..2 {
+        let r = register(
+            &server,
+            "mixed",
+            &format!("ok{i}@example.com"),
+            "password123",
+            "Ok",
+        )
+        .await?;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    for i in 2..(max - 1) {
+        let r = register(&server, "mixed", &format!("bad{i}"), "password123", "X").await?;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+    // Attempt N is still allowed (a failure here, to keep the count exact).
+    let r = register(&server, "mixed", "badlast", "password123", "X").await?;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "attempt N is allowed");
+    // Attempt N+1 is refused.
+    let r = register(
+        &server,
+        "mixed",
+        "ok-final@example.com",
+        "password123",
+        "Ok",
+    )
+    .await?;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    Ok(())
+}
+
+/// T2 + limiter-before-validation: at the limit an INVALID request gets 429
+/// (not 400), and refused requests write no row — the count stays flat.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_rate_limited_requests_write_no_row(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("flat", "Flat Corp").await?;
+    let max = server.config().registration_rate_limit_max_attempts;
+    for _ in 0..max {
+        insert_limiter_row(server.pool(), "127.0.0.1", chrono::Duration::zero()).await?;
+    }
+
+    let before = total_events(server.pool()).await?;
+    for _ in 0..3 {
+        // Weak password: would be a 400 if validation ran first.
+        let r = register(&server, "flat", "x@example.com", "short", "X").await?;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(
+        total_events(server.pool()).await?,
+        before,
+        "429s must write no row"
+    );
+    Ok(())
+}
+
+/// T6: attempts from another IP do not count against this one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_budget_is_per_ip(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("perip", "PerIp Corp").await?;
+    let max = server.config().registration_rate_limit_max_attempts;
+    for _ in 0..max {
+        insert_limiter_row(server.pool(), "192.0.2.77", chrono::Duration::zero()).await?;
+    }
+
+    let r = register(&server, "perip", "a@example.com", "password123", "A").await?;
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "IP-B's attempts must not block IP-A"
+    );
+    Ok(())
+}
+
+/// T6 window edge: rows just outside the window are not counted, rows just
+/// inside are.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_window_edge(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("window", "Window Corp").await?;
+    let max = server.config().registration_rate_limit_max_attempts;
+    let window = chrono::Duration::minutes(server.config().registration_rate_limit_window_minutes);
+    let margin = chrono::Duration::seconds(30);
+
+    // Outside the window: a full budget's worth does not block.
+    for _ in 0..max {
+        insert_limiter_row(server.pool(), "127.0.0.1", window + margin).await?;
+    }
+    let r = register(&server, "window", "a@example.com", "password123", "A").await?;
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "rows outside the window must not count"
+    );
+
+    // Just inside: top the in-window count up to the budget → refused.
+    // (The successful registration above already spent one.)
+    for _ in 0..(max - 1) {
+        insert_limiter_row(server.pool(), "127.0.0.1", window - margin).await?;
+    }
+    let r = register(&server, "window", "b@example.com", "password123", "B").await?;
+    assert_eq!(
+        r.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "rows just inside the window must count"
+    );
+    Ok(())
+}
+
+/// T7: successful and failed logins do not consume the registration budget.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_logins_do_not_consume_budget(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    let org_id = server.create_test_org("logins", "Logins Corp").await?;
+    server
+        .create_test_user(org_id, "login@example.com", "password123", "Login User")
+        .await?;
+    let max = server.config().registration_rate_limit_max_attempts;
+
+    for i in 0..max {
+        let password = if i % 2 == 0 {
+            "password123"
+        } else {
+            "wrong-password"
+        };
+        let response = server
+            .client()
+            .post(format!("{}/api/v1/auth/user/token", server.url()))
+            .header("Host", server.host_header("logins"))
+            .json(&json!({ "email": "login@example.com", "password": password }))
+            .send()
+            .await?;
+        // Each login must actually reach authentication (and write its
+        // user_login / user_login_failed row) — otherwise this test would pass
+        // without exercising the decoupling.
+        let expected = if i % 2 == 0 {
+            StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        assert_eq!(response.status(), expected, "login {i}");
+    }
+    let login_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_events WHERE event_type IN ('user_login', 'user_login_failed')",
+    )
+    .fetch_one(server.pool())
+    .await?;
+    assert_eq!(login_rows, max, "every login wrote its audit row");
+
+    for i in 0..max {
+        let r = register(
+            &server,
+            "logins",
+            &format!("new{i}@example.com"),
+            "password123",
+            "N",
+        )
+        .await?;
+        assert_eq!(r.status(), StatusCode::OK, "registration {i}");
+    }
+    Ok(())
+}
+
+/// The limiter fails closed: when its count query cannot read `auth_events`,
+/// registration is refused with 500 BEFORE any user row is inserted (a
+/// `unwrap_or(0)` regression would let it through unthrottled).
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_fails_closed_when_limiter_cannot_count(
+    pool: PgPool,
+) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("closed", "Closed Corp").await?;
+    // Break only the auth_events read path; `users` is untouched.
+    sqlx::query("ALTER TABLE auth_events RENAME TO auth_events_unavailable")
+        .execute(server.pool())
+        .await?;
+
+    let r = register(&server, "closed", "closed@example.com", "password123", "C").await?;
+    assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value = r.json().await?;
+    assert_eq!(body["error"]["code"], "DATABASE_ERROR");
+
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = $1")
+        .bind("closed@example.com")
+        .fetch_one(server.pool())
+        .await?;
+    assert_eq!(
+        users, 0,
+        "no user may be created when the limiter cannot count"
+    );
+    Ok(())
+}
+
+/// Registration records `user_registered` (plus the auto-login `user_login`)
+/// — no longer two `user_login` rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_register_writes_user_registered_event(pool: PgPool) -> Result<(), anyhow::Error> {
+    let server = TestAuthServer::spawn(pool).await?;
+    server.create_test_org("events", "Events Corp").await?;
+
+    let r = register(&server, "events", "ev@example.com", "password123", "Ev").await?;
+    assert_eq!(r.status(), StatusCode::OK);
+
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT event_type, COUNT(*) FROM auth_events \
+         WHERE event_type IN ('user_registered', 'user_login') GROUP BY event_type \
+         ORDER BY event_type",
+    )
+    .fetch_all(server.pool())
+    .await?;
+    assert_eq!(
+        counts,
+        vec![
+            ("user_login".to_string(), 1),
+            ("user_registered".to_string(), 1)
+        ]
+    );
     Ok(())
 }

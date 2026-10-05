@@ -10,7 +10,9 @@
 
 #[path = "common/mod.rs"]
 mod test_common;
-use test_common::otel_support::{known_traceparent, setup_otel_test_environment};
+use test_common::otel_support::{
+    known_traceparent, setup_otel_test_environment, KNOWN_SPAN_ID_U64, KNOWN_TRACE_ID_U128,
+};
 
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
@@ -35,8 +37,8 @@ fn test_token_receiver(token: &str) -> TokenReceiver {
 fn known_remote_span_context() -> opentelemetry::trace::SpanContext {
     use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
     SpanContext::new(
-        TraceId::from(0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736_u128),
-        SpanId::from(0x00f0_67aa_0ba9_02b7_u64),
+        TraceId::from(KNOWN_TRACE_ID_U128),
+        SpanId::from(KNOWN_SPAN_ID_U64),
         TraceFlags::SAMPLED,
         true,
         TraceState::default(),
@@ -76,7 +78,9 @@ async fn ac_client_meeting_token_request_carries_active_span_traceparent() {
     // an inbound request that already had trace context extracted (surface
     // (a)) before reaching this handler-level call.
     let span = tracing::info_span!("test_gc_join_meeting_handler");
-    span.set_parent(Context::new().with_remote_span_context(known_remote_span_context()));
+    assert!(span
+        .set_parent(Context::new().with_remote_span_context(known_remote_span_context()))
+        .is_ok());
     let _entered = span.enter();
 
     let result = client.request_meeting_token(&request).await;
@@ -145,7 +149,9 @@ async fn ac_client_guest_token_request_carries_active_span_traceparent() {
     };
 
     let span = tracing::info_span!("test_gc_guest_token_handler");
-    span.set_parent(Context::new().with_remote_span_context(known_remote_span_context()));
+    assert!(span
+        .set_parent(Context::new().with_remote_span_context(known_remote_span_context()))
+        .is_ok());
     let _entered = span.enter();
 
     let result = client.request_guest_token(&request).await;

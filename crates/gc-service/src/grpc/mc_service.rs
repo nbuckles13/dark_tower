@@ -79,10 +79,6 @@ impl McService {
     }
 
     /// Validate a controller ID.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_controller_id(id: &str) -> Result<(), Status> {
         if id.is_empty() {
             return Err(Status::invalid_argument("controller_id is required"));
@@ -103,10 +99,6 @@ impl McService {
     }
 
     /// Validate a meeting ID.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_meeting_id(id: &str) -> Result<(), Status> {
         if id.is_empty() {
             return Err(Status::invalid_argument("meeting_id is required"));
@@ -127,10 +119,6 @@ impl McService {
     }
 
     /// Validate a region.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_region(region: &str) -> Result<(), Status> {
         if region.is_empty() {
             return Err(Status::invalid_argument("region is required"));
@@ -142,10 +130,6 @@ impl McService {
     }
 
     /// Validate an endpoint URL.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_endpoint(endpoint: &str, field_name: &str) -> Result<(), Status> {
         if endpoint.is_empty() {
             return Err(Status::invalid_argument(format!(
@@ -170,10 +154,6 @@ impl McService {
     }
 
     /// Validate capacity values.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_capacity(max_meetings: u32, max_participants: u32) -> Result<(), Status> {
         if max_meetings == 0 {
             return Err(Status::invalid_argument(

@@ -210,6 +210,8 @@
     reason = "test-only assertion helper; intentional panics on mismatch are the contract"
 )]
 
+pub mod otel;
+
 use metrics::{
     Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, LocalRecorderGuard,
     Metadata, Recorder, SharedString, Unit,

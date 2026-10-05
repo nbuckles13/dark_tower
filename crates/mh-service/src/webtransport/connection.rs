@@ -40,7 +40,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wtransport::endpoint::IncomingSession;
 use wtransport::stream::RecvStream;
 
@@ -263,7 +262,12 @@ pub async fn handle_connection(
     let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&trace_carrier)
     });
-    tracing::Span::current().set_parent(parent_cx);
+    //
+    // INVARIANT: no span may be created under the connection span before this
+    // reparent: tracing-opentelemetry >=0.32 starts the parent's context when a
+    // child is created, and set_parent then fails AlreadyStarted (warned by
+    // `set_remote_parent`).
+    common::observability::otel::set_remote_parent(&tracing::Span::current(), parent_cx);
 
     // Decode failure, empty oneof, and unknown variant all collapse to a single
     // generic client-facing error: in all three the JWT was never extracted, so

@@ -22,6 +22,9 @@ const TOKEN_EXPIRY_SECONDS_I64: i64 = 3600; // 1 hour (for timestamp calculation
 #[cfg(test)]
 const MAX_TIMING_VARIANCE_PERCENT: f64 = 30.0; // Timing attack tolerance threshold
 
+/// The log message emitted once per successful service-token issuance.
+pub const SERVICE_TOKEN_ISSUED_MESSAGE: &str = "Service token issued";
+
 /// Issue a service token using OAuth 2.0 Client Credentials flow
 ///
 /// Verifies client credentials, generates JWT with scopes, logs event
@@ -102,7 +105,7 @@ pub async fn issue_service_token(
         .await
         {
             tracing::warn!("Failed to log auth event: {}", e);
-            record_audit_log_failure("service_token_failed", "db_write_failed");
+            record_audit_log_failure(AuthEventType::ServiceTokenFailed, "db_write_failed");
         }
 
         return Err(AcError::InvalidCredentials);
@@ -169,8 +172,14 @@ pub async fn issue_service_token(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
-        record_audit_log_failure("service_token_issued", "db_write_failed");
+        record_audit_log_failure(AuthEventType::ServiceTokenIssued, "db_write_failed");
     }
+
+    // No identifiers: the request span already carries the normalized
+    // `endpoint`, and the audit row carries the credential. One line per
+    // issuance makes a successful client-credentials grant visible in the log
+    // stream (the env-test leak scan's in-window positive control keys on it).
+    tracing::info!("{SERVICE_TOKEN_ISSUED_MESSAGE}");
 
     Ok(TokenResponse {
         access_token: token,
@@ -344,14 +353,14 @@ async fn log_user_auth_event(
     user_agent: Option<&str>,
 ) {
     let event_type = if success {
-        AuthEventType::UserLogin.as_str()
+        AuthEventType::UserLogin
     } else {
-        AuthEventType::UserLoginFailed.as_str()
+        AuthEventType::UserLoginFailed
     };
 
     if let Err(e) = auth_events::log_event(
         pool,
-        event_type,
+        event_type.as_str(),
         Some(*user_id),
         None,
         success,

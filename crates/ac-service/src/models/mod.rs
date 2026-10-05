@@ -183,13 +183,54 @@ pub struct JsonWebKey {
     pub alg: String, // Algorithm (e.g., "EdDSA")
 }
 
-/// Service type enum
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ServiceType {
-    GlobalController,
-    MeetingController,
-    MediaHandler,
+/// Declare a fieldless enum together with its string vocabulary from ONE
+/// list of `Variant => "string"` pairs, generating the enum, `ALL` (every
+/// variant, in declaration order) and `as_str`. Because `ALL` comes from the
+/// same list as the enum, it cannot omit a variant — a hand-maintained list
+/// guarded by a test can.
+macro_rules! string_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident => $s:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis enum $name {
+            $( $(#[$vmeta])* $variant ),+
+        }
+
+        impl $name {
+            /// Every variant, generated from the same list as the enum.
+            #[allow(
+                dead_code,
+                reason = "generated for every string_enum; not every target uses it"
+            )]
+            pub const ALL: &'static [$name] = &[ $( $name::$variant ),+ ];
+
+            /// The variant's wire/storage string.
+            #[allow(
+                dead_code,
+                reason = "generated for every string_enum; not every target uses it"
+            )]
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $( $name::$variant => $s ),+
+                }
+            }
+        }
+    };
+}
+
+string_enum! {
+    /// Service type enum. The strings equal the serde `kebab-case` names.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum ServiceType {
+        GlobalController => "global-controller",
+        MeetingController => "meeting-controller",
+        MediaHandler => "media-handler",
+    }
 }
 
 impl ServiceType {
@@ -213,72 +254,102 @@ impl ServiceType {
             ],
         }
     }
-
-    /// Convert to string
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ServiceType::GlobalController => "global-controller",
-            ServiceType::MeetingController => "meeting-controller",
-            ServiceType::MediaHandler => "media-handler",
-        }
-    }
 }
 
 impl FromStr for ServiceType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "global-controller" => Ok(ServiceType::GlobalController),
-            "meeting-controller" => Ok(ServiceType::MeetingController),
-            "media-handler" => Ok(ServiceType::MediaHandler),
-            _ => Err(format!("Invalid service type: {}", s)),
-        }
+        ServiceType::ALL
+            .iter()
+            .copied()
+            .find(|t| t.as_str() == s)
+            .ok_or_else(|| format!("Invalid service type: {}", s))
     }
 }
 
-/// Auth event type enum
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthEventType {
-    #[allow(dead_code)] // Will be used in Phase 4 user auth
-    UserLogin,
-    #[allow(dead_code)] // Will be used in Phase 4 user auth
-    UserLoginFailed,
-    ServiceTokenIssued,
-    ServiceTokenFailed,
-    ServiceRegistered,
-    KeyGenerated,
-    #[allow(dead_code)] // Will be used in Phase 4 key rotation
-    KeyRotated,
-    #[allow(dead_code)] // Will be used in Phase 4 key rotation
-    KeyExpired,
-    #[allow(dead_code)] // Will be used in Phase 4 token validation
-    TokenValidationFailed,
-    #[allow(dead_code)] // Will be used in Phase 4 rate limiting
-    RateLimitExceeded,
-}
-
-impl AuthEventType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AuthEventType::UserLogin => "user_login",
-            AuthEventType::UserLoginFailed => "user_login_failed",
-            AuthEventType::ServiceTokenIssued => "service_token_issued",
-            AuthEventType::ServiceTokenFailed => "service_token_failed",
-            AuthEventType::ServiceRegistered => "service_registered",
-            AuthEventType::KeyGenerated => "key_generated",
-            AuthEventType::KeyRotated => "key_rotated",
-            AuthEventType::KeyExpired => "key_expired",
-            AuthEventType::TokenValidationFailed => "token_validation_failed",
-            AuthEventType::RateLimitExceeded => "rate_limit_exceeded",
-        }
+string_enum! {
+    /// Auth event type enum — the ONE home of the audit event vocabulary.
+    ///
+    /// Each variant's [`AuthEventType::as_str`] is simultaneously the
+    /// `auth_events.event_type` value and the `ac_audit_log_failures_total
+    /// {event_type}` label. The SQL `valid_event_type` CHECK cannot be derived
+    /// from this enum, so **adding a variant requires a migration extending that
+    /// CHECK** — `tests/auth_events_check_drift.rs` fails on drift in either
+    /// direction.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AuthEventType {
+        UserLogin => "user_login",
+        UserLoginFailed => "user_login_failed",
+        ServiceTokenIssued => "service_token_issued",
+        ServiceTokenFailed => "service_token_failed",
+        ServiceRegistered => "service_registered",
+        KeyGenerated => "key_generated",
+        KeyRotated => "key_rotated",
+        KeyExpired => "key_expired",
+        #[allow(
+            dead_code,
+            reason = "allowed by the CHECK; no emitter yet (Phase 4). Dead only in the bin target, which \
+                      compiles modules privately, so #[expect] would be unfulfilled in the lib target"
+        )]
+        TokenValidationFailed => "token_validation_failed",
+        #[allow(
+            dead_code,
+            reason = "allowed by the CHECK; no emitter yet (Phase 4). Dead only in the bin target, which \
+                      compiles modules privately, so #[expect] would be unfulfilled in the lib target"
+        )]
+        RateLimitExceeded => "rate_limit_exceeded",
+        /// Admin narrowed (or was refused narrowing) a credential's scopes.
+        ServiceScopesUpdated => "service_scopes_updated",
+        /// Admin revoked a credential (active → inactive transition only).
+        ServiceDeactivated => "service_deactivated",
+        /// Admin rotated (or was refused rotating) a credential's secret.
+        ServiceSecretRotated => "service_secret_rotated",
+        /// A user account was registered.
+        UserRegistered => "user_registered",
+        /// A registration attempt failed validation; subject-less row that feeds
+        /// the per-IP registration limiter.
+        UserRegistrationFailed => "user_registration_failed",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ALL` is complete by construction (`string_enum!`); what remains to
+    /// check is that the strings are distinct, for both enums.
+    #[test]
+    fn string_enum_strings_are_distinct() {
+        let mut events: Vec<&str> = AuthEventType::ALL.iter().map(|v| v.as_str()).collect();
+        events.sort_unstable();
+        events.dedup();
+        assert_eq!(
+            events.len(),
+            AuthEventType::ALL.len(),
+            "duplicate AuthEventType string"
+        );
+
+        let mut types: Vec<&str> = ServiceType::ALL.iter().map(|v| v.as_str()).collect();
+        types.sort_unstable();
+        types.dedup();
+        assert_eq!(
+            types.len(),
+            ServiceType::ALL.len(),
+            "duplicate ServiceType string"
+        );
+    }
+
+    /// `as_str` must equal the serde wire name, and `from_str` must invert it.
+    #[test]
+    fn service_type_strings_match_serde_and_round_trip() {
+        for t in ServiceType::ALL {
+            let json = serde_json::to_string(t).unwrap_or_default();
+            assert_eq!(json, format!("\"{}\"", t.as_str()));
+            assert_eq!(t.as_str().parse::<ServiceType>().ok(), Some(*t));
+        }
+        assert!("not-a-type".parse::<ServiceType>().is_err());
+    }
 
     #[test]
     fn test_service_type_scopes() {

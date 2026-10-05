@@ -139,7 +139,7 @@ Certain surfaces raise the bar regardless of how clean the edit looks. The imple
 - `crates/common/src/webtransport/**` — wire-runtime coupling
 - `crates/ac-service/src/jwks/**`, `src/token/**`, `src/crypto/**` — crypto primitives
 - `crates/ac-service/src/audit/**` — detection/forensics contract
-- `db/migrations/**` — schema evolution
+- `migrations/**` — schema evolution
 - ADR-0027-approved crypto primitives (wherever referenced) — path-independent; guards a concept, not a directory. New call sites of enumerated primitives inherit Guarded status regardless of the containing file.
 
 **Intersection rule**: edits spanning two GSA (e.g., auth-routing fields in `proto/internal.proto` crossing wire-format × auth-routing-policy) require all affected owners present as reviewers and all confirming at Gate 1 / Gate 3. Canonical case: changes to `ServiceType` enum, scope enums, or identity fields in `proto/internal.proto` need protocol + auth-controller + security (ADR-0003 §5.7).

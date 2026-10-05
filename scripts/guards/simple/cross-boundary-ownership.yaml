@@ -41,4 +41,4 @@
 "crates/ac-service/src/token/**": [auth-controller]
 "crates/ac-service/src/crypto/**": [auth-controller, security]
 "crates/ac-service/src/audit/**": [security]
-"db/migrations/**": [database]
+"migrations/**": [database]

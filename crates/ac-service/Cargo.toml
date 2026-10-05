@@ -22,7 +22,7 @@ path = "src/main.rs"
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true, features = ["trace", "cors", "timeout"] }
+tower-http = { workspace = true, features = ["trace", "cors", "timeout", "set-header"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
@@ -64,6 +64,12 @@ common = { path = "../common", features = ["test-utils"] }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
 http-body-util = { workspace = true }
+
+# Request-span / inbound trace-context tests (tests/otel_*.rs): exported-span
+# capture and `tower::ServiceExt::oneshot` over the real router.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["trace", "testing"] }
+tower = { workspace = true, features = ["util"] }
 
 # Benchmarking
 criterion = { workspace = true }

@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::jwt::JwksClient;
-use common::observability::otel_grpc::server_interceptor;
-use mh_service::grpc::{MhAuthLayer, MhMediaService, SpanLayer};
+use mh_service::grpc::{MhAuthLayer, MhMediaService};
 use mh_service::session::SessionManagerHandle;
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerServiceServer;
 use tokio::task::JoinHandle;
@@ -70,18 +69,12 @@ impl GrpcRig {
 
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
-        // R-56: mirror main.rs — inbound W3C trace-context extraction via
-        // server_interceptor(), independent of auth_layer (different headers).
-        // SpanLayer supplies the ambient span the interceptor attaches to
-        // (see `grpc::span_layer` module docs) — required for the interceptor
-        // to have any effect.
+        // R-56: the SAME layer stack `main.rs` uses (`grpc::server_layers`:
+        // SpanLayer → trace-context extraction → auth), so the ordering is
+        // exercised as shipped.
         let server = Server::builder()
-            .layer(SpanLayer)
-            .layer(auth_layer)
-            .add_service(MediaHandlerServiceServer::with_interceptor(
-                mh_media_service,
-                server_interceptor(),
-            ))
+            .layer(mh_service::grpc::server_layers(auth_layer))
+            .add_service(MediaHandlerServiceServer::new(mh_media_service))
             .serve_with_incoming_shutdown(incoming, async move {
                 cancel_token_clone.cancelled().await;
             });

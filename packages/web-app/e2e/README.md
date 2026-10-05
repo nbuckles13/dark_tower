@@ -200,8 +200,8 @@ a `HARNESS:` error — the floor is never lowered (stop rule:
 that bound, so a hung read fails there too.
 
 **Registration cost (solo spec): 0.** Both tests sign in as the shared user V and
-create their meeting Node-side. The multi-party specs spend one sign-in per
-context from the pre-registered cohort (§Budgets).
+create their meeting Node-side. The multi-party specs sign each context in from
+the pre-registered cohort; sign-ins spend no AC registration budget (§Budgets).
 
 ## Prerequisites (host-side)
 
@@ -327,21 +327,25 @@ Building blocks for the N+1 specs; each module header carries the detail.
 
 ## Budgets and policies
 
-- **AC auth-rate budget — the unit is SUCCESSFUL TOKEN ISSUES per source IP,
-  not registrations.** AC's "registration" limit
+- **AC auth-rate budget — the unit is REGISTRATION ATTEMPTS per source IP,
+  successful AND failed; sign-ins do not count.** AC's registration limit
   (`AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS` per
   `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES`) is enforced by
-  `count_registrations_from_ip` in `crates/ac-service/src/services/user_service.rs`,
-  which counts `auth_events` rows with `event_type='user_login' AND success=true`
-  for the caller's IP — and BOTH `/register` and `/user/token` write one. So
-  **every sign-in spends budget exactly like a registration.** The SSoT for the
-  Kind cluster is `infra/services/ac-service/config.env` (the Kind overlay does
-  not patch it; a prod-configured AC falls back to
+  `count_registration_attempts_by_ip` in `crates/ac-service/src/repositories/auth_events.rs`,
+  which counts `auth_events` rows whose `event_type` is `user_registered` or
+  `user_registration_failed` (the `AuthEventType` SSoT in
+  `crates/ac-service/src/models/mod.rs`) for the caller's IP, any `success`.
+  `/user/token` sign-ins write `user_login` and **do not spend this budget**.
+  A request the limiter itself refuses (429) writes no row. The SSoT for the
+  Kind cluster is `infra/services/ac-service/config.env` (100 per 1 minute; the
+  Kind overlay does not patch it; a prod-configured AC falls back to
   `crates/ac-service/src/config.rs` `DEFAULT_REGISTRATION_RATE_LIMIT_*`, far
   tighter). The bucket is per source IP, and all host traffic reaches AC from
   one address, so it is **shared with the Rust env-tests `scripts/layer7.sh`
-  runs from the same host just before this suite** — their logins in the
-  preceding window count, and no static check here can see them.
+  runs from the same host just before this suite** — their registrations in the
+  preceding window count, **failed ones included** (any negative `/register`
+  case: bad format, email already exists), and no static check here can see
+  them.
 
   What the suite spends, by rule (the counts follow the specs; do not freeze a
   total here):
@@ -353,21 +357,21 @@ Building blocks for the N+1 specs; each module header carries the detail.
     one each. The **N+1 cohort**: `cohortSize(SUITE_RECEIVE_SLOTS)` = **4 at the
     suite's locked N=3**, registered **once per run in `global-setup.ts`**,
     whatever fails later.
-  - **Sign-ins.** One per `authAsSharedUser` / `authAsCohortMember` call — i.e.
-    one per browsing context a spec signs in. A multi-party test signs in all
-    N+1 members (the auth session is per-context in-memory state; there is no
-    sign-in-free way in). Rejected sign-ins (auth-rejection's never-registered
-    user) do not count: the row is `success=false`.
+  - **Failed registrations.** Any `/register` that reaches AC and is refused for
+    its input (400/409) spends one. auth-rejection's `/register` is
+    route-fulfilled in the browser (a 200 with a garbage token) and never reaches
+    AC, so it spends nothing; no spec sends a failing `/register` to AC.
+  - **Sign-ins spend nothing** here (AC's login limiter is a separate per-user
+    failed-attempt count).
 
   **Setup-time fit check.** `global-setup.ts` reads the two keys from
   `config.env` (a missing or malformed key fails loudly) and refuses to start if
-  the cohort's own worst-case window — N+1 registrations plus the first
-  multi-party test's N+1 sign-ins (`cohortWindowSpend` in `cohort.ts`) — exceeds
-  the limit. That is necessary, not sufficient: it catches N raised past the
-  limit or a prod-default AC before any account exists, not the env-tests'
-  share of the bucket. A **429 fails loudly** with the budget named
-  (`captureAccessToken` in `fixtures.ts`) and is **never retried** — a retry only
-  spends more of the bucket.
+  the cohort's own worst-case window — its N+1 registrations
+  (`cohortWindowSpend` in `cohort.ts`) — exceeds the limit. That is necessary,
+  not sufficient: it catches N raised past the limit, or an AC limit below N+1,
+  before any account exists, not the env-tests' share of the bucket. A **429
+  fails loudly** with the budget named (`captureAccessToken` in `fixtures.ts`)
+  and is **never retried** — a retry only spends more of the bucket.
 
   **Why the cohort is in global setup, not a worker memo:** the worker restart
   after a failing test would re-register all N+1 accounts per failure. Global

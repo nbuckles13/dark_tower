@@ -409,7 +409,7 @@ groups:
           component: telemetry-proxy
         annotations:
           summary: "Telemetry proxy rejection rate high ({{ $value | humanizePercentage }})"
-          description: "Telemetry ingest rejection rate is {{ $value | humanizePercentage }} for 10 minutes, above the 10% threshold. Triage on the telemetry counter's own status values first: rejected_size / rejected_rate point at a broken or abusive client; error aggregates client-fault decode/content-type failures (HTTP 400/415) and collector-fault forwarding failures (HTTP 502/503) — split via the paired HTTP status codes in the runbook. Note the telemetry endpoint currently reports as endpoint /other on gc_http_requests_total (conflated with other unrecognized paths — see runbook caveat)."
+          description: "Telemetry ingest rejection rate is {{ $value | humanizePercentage }} for 10 minutes, above the 10% threshold. Triage on the telemetry counter's own status values first: rejected_size / rejected_rate point at a broken or abusive client; error aggregates client-fault decode/content-type failures (HTTP 400/415) and collector-fault forwarding failures (HTTP 502/503) — split via the paired HTTP status codes in the runbook. The telemetry routes have their own endpoint label values on gc_http_requests_total (/api/v1/telemetry/v1/metrics and /api/v1/telemetry/v1/traces)."
           impact: "Client telemetry is being dropped — degraded client-side observability. If the error status dominates with 502/503, the collector path is failing and accepted telemetry may not be forwarding either."
           runbook_url: "docs/runbooks/gc-incident-response.md#scenario-10-telemetry-proxy-high-rejection-rate"
 

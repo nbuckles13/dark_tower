@@ -96,3 +96,15 @@ pub async fn seed_service_credential(
 /// The deterministic test client secret used by `seed_service_credential`.
 /// Exposed so tests can drive `handle_service_token` with the matching secret.
 pub const TEST_CLIENT_SECRET: &str = "test-secret-12345";
+
+/// The `Extension<Claims>` `require_admin_scope` inserts for an admin token,
+/// for tests that call the admin handlers directly.
+pub fn admin_claims() -> axum::Extension<crypto::Claims> {
+    axum::Extension(crypto::Claims::new(
+        "admin-test".to_string(),
+        0,
+        0,
+        "admin:services".to_string(),
+        None,
+    ))
+}

@@ -416,7 +416,7 @@ Certain surfaces override the category classification: even a "mechanical-lookin
 - `crates/common/src/webtransport/**` — wire-runtime coupling
 - `crates/ac-service/src/jwks/**`, `src/token/**`, `src/crypto/**` — crypto primitives
 - `crates/ac-service/src/audit/**` — detection/forensics contract
-- `db/migrations/**` — schema evolution
+- `migrations/**` — schema evolution
 - ADR-0027-approved crypto primitives (wherever referenced)
 
 **Intersection rule.** When an edit spans two Guarded Shared Areas (e.g., auth-routing fields in `proto/internal.proto` span both wire-format *and* auth-routing-policy), all affected owners must be reviewers on the devloop and must confirm the edit at Gate 1. Canonical case: `ServiceType` enum, scope enums, and identity fields in `proto/internal.proto` require protocol + auth-controller + security all present and all approving per ADR-0003 §5.7.

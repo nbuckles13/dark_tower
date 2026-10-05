@@ -105,7 +105,7 @@ pub async fn handle_user_token(
     let start = Instant::now();
 
     // Extract IP address and User-Agent
-    let ip_address = Some(addr.ip().to_string());
+    let ip_address = addr.ip().to_string();
     let user_agent = headers
         .get("user-agent")
         .and_then(|h| h.to_str().ok())
@@ -118,7 +118,7 @@ pub async fn handle_user_token(
         org_context.org_id,
         &payload.email,
         payload.password.expose_secret(),
-        ip_address.as_deref(),
+        Some(ip_address.as_str()),
         user_agent.as_deref(),
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,
@@ -160,7 +160,7 @@ pub async fn handle_register(
     let start = Instant::now();
 
     // Extract IP address and User-Agent
-    let ip_address = Some(addr.ip().to_string());
+    let ip_address = addr.ip().to_string();
     let user_agent = headers
         .get("user-agent")
         .and_then(|h| h.to_str().ok())
@@ -178,7 +178,7 @@ pub async fn handle_register(
         state.config.hash_secret.expose_secret(),
         org_context.org_id,
         request,
-        ip_address.as_deref(),
+        &ip_address,
         user_agent.as_deref(),
         state.config.bcrypt_cost,
         state.config.registration_rate_limit_window_minutes,
@@ -264,7 +264,7 @@ pub async fn handle_service_token(
     };
 
     // Extract IP address and User-Agent
-    let ip_address = Some(addr.ip().to_string());
+    let ip_address = addr.ip().to_string();
     let user_agent = headers
         .get("user-agent")
         .and_then(|h| h.to_str().ok())
@@ -286,7 +286,7 @@ pub async fn handle_service_token(
         &client_secret,
         &payload.grant_type,
         requested_scopes,
-        ip_address.as_deref(),
+        Some(ip_address.as_str()),
         user_agent.as_deref(),
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,

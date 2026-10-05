@@ -9,4 +9,5 @@
 pub use ac_test_utils::*;
 
 pub mod jwt_fixtures;
+pub mod otel;
 pub mod test_state;

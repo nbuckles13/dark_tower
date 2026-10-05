@@ -19,7 +19,8 @@
 //! intentionally unguarded against weak input — the threat model is
 //! "test fixture," not "production crypto."
 
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
+#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod grpc_auth;
 pub mod jwt_fixtures;
 pub mod otel_support;

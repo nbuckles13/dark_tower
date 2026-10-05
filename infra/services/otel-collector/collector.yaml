@@ -393,18 +393,26 @@ processors:
     max_streams: 500
 
 exporters:
-  # `debug` is the dev sink — writes received span/metric counts + names to
-  # the collector log. (R-59 item 1 also names `logging`, but `logging` was
-  # deprecated upstream at collector v0.86.0 and REMOVED at v0.111.0 in favor
-  # of `debug`. It is a redundant alias of `debug`, not a second sink, so
-  # `debug` alone is the correct, forward-safe dev config.)
+  # `debug` is the DEV-ONLY sink (this collector is the Kind/dev deployment;
+  # it is not a production trace backend). (R-59 item 1 also names `logging`,
+  # but `logging` was deprecated upstream at collector v0.86.0 and REMOVED at
+  # v0.111.0 in favor of `debug`. It is a redundant alias of `debug`, not a
+  # second sink, so `debug` alone is the correct, forward-safe dev config.)
   #
-  # verbosity is `normal`, NOT `detailed`: `detailed` dumps every span
-  # attribute value to the pod log, so any PII/secret on a span would land in
-  # the collector log in cleartext — and `test_secrets_not_in_logs` only scans
-  # ac-service logs, not the collector pod, so that leak path would be
-  # unguarded. `normal` removes the leak path while still giving span
-  # names/counts for dev debugging (@security).
+  # What `normal` actually prints (verified against contrib 0.161.0): one line
+  # per resource with ALL resource attributes (`service.name=…` and the rest),
+  # and one line per span with its name, trace_id, span_id AND its span
+  # attributes. It is less than `detailed` (no per-attribute multi-line dump,
+  # no events/links detail), but it is NOT a counts-only view: whatever a span
+  # carries reaches this pod log. The env-tests rely on this to assert a
+  # cross-service trace_id (30_observability.rs).
+  #
+  # Controls, in order: (1) PRIMARY — ADR-0011 source discipline: services
+  # never put PII/secrets on spans (`skip_all` instrumentation, the custom
+  # request MakeSpan records method + normalized endpoint only). (2) SECONDARY
+  # — this collector log is a sink like any other service log, so
+  # `test_secrets_not_in_logs` (00_cluster_health.rs) scans the otel-collector
+  # pod log after traffic has flowed, alongside the service logs (@security).
   debug:
     verbosity: normal
 

@@ -45,7 +45,10 @@ pub fn reparent_current_span(trace_parent: &str, trace_state: &str) {
     if trace_parent.is_empty() && trace_state.is_empty() {
         return;
     }
-    tracing::Span::current().set_parent(extract_parent(trace_parent, trace_state));
+    common::observability::otel::set_remote_parent(
+        &tracing::Span::current(),
+        extract_parent(trace_parent, trace_state),
+    );
 }
 
 /// Inject the CURRENT span's W3C trace context, returning
