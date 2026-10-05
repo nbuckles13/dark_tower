@@ -757,8 +757,11 @@ mod tests {
         }
 
         impl SpanExporter for CapturingExporter {
-            async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
-                Ok(())
+            fn export(
+                &self,
+                _batch: Vec<SpanData>,
+            ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+                std::future::ready(Ok(()))
             }
             fn set_resource(&mut self, resource: &Resource) {
                 if let Ok(mut guard) = self.resource.lock() {

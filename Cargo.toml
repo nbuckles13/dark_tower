@@ -113,7 +113,12 @@ opentelemetry-proto = { version = "0.33", features = ["gen-tonic-messages", "met
 governor = { version = "0.10", features = ["std", "dashmap"] }
 
 # Error handling
-async-trait = "0.1"
+# Floor 0.1.92: earlier releases put a bare `#[must_use]` on each desugared method's
+# already-must_use `Pin<Box<dyn Future>>`, which clippy >= 1.99 rejects as
+# `double_must_use` in proto-gen's generated tonic server traits and gc's
+# `McClientTrait`. Declared here, not only in Cargo.lock, so a lock regeneration or a
+# minimal-versions resolve cannot bring the lint back. tonic's copy unifies with it.
+async-trait = "0.1.92"
 anyhow = "1.0"
 thiserror = "1.0"
 

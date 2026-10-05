@@ -45,6 +45,14 @@ source "${__here}/lang/_test_helpers.sh"
 # harness's set -e must not abort. report_results sets the final code.
 set +e
 
+# A copy of the repo inputs deploy.sh reads, for tests that mutate them: `infra/` plus the
+# ONE list of root files deploy.sh reads (Cargo.lock: sqlx-cli pin; rust-toolchain.toml: image
+# RUST_VERSION). A new root input is added HERE, once, not at each copy site.
+deploy_tree_copy() {
+  mkdir -p "$1"; cp -r "${REPO_ROOT}/infra" "$1/"
+  cp "${REPO_ROOT}/Cargo.lock" "${REPO_ROOT}/rust-toolchain.toml" "$1/"
+}
+
 # src_run [-u VAR]... <script> <snippet> [args...]: the ONE way this file calls a Kind script's
 # functions directly. Runs <snippet> in ONE fresh `bash -c` with <script> SOURCED (each Kind
 # script's `BASH_SOURCE[0]==$0` guard suppresses its main; `_` is $0, never the script).
@@ -1521,7 +1529,7 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   assert_absent "job-render-url-has-no-userinfo" "@postgres" "$(grep -A1 'name: DATABASE_URL' <<< "$job_r")"
   assert_absent "job-render-no-sslmode" "sslmode" "$job_r"
   # A changed Job SPEC renames it too (immutable pod template): copy the tree, edit job.yaml.
-  JCP="${RWORK}/jobcopy"; mkdir -p "$JCP"; cp -r "${REPO_ROOT}/infra" "$JCP/"; cp "${REPO_ROOT}/Cargo.lock" "$JCP/"
+  JCP="${RWORK}/jobcopy"; deploy_tree_copy "$JCP"
   sed -i 's/backoffLimit: 1/backoffLimit: 2/' "$JCP/infra/services/db-migrate/job.yaml"
   J4="${RWORK}/job4"; mkdir -p "$J4"
   name4="$(src_run "$JCP/infra/kind/scripts/deploy.sh" "$RUN_JOB" "$J4" "localhost/db-migrate:${TEST_TAG}" 2>/dev/null)"
@@ -1813,7 +1821,7 @@ assert_absent "migrate-deadline-exceeded-not-sqlx-advice" "carry sqlx's error" "
 assert_status "migrate-deadline-exceeded-hint" "ErrImageNeverPull" "$out"
 
 # The derived wait: a copy of the tree with a 1s activeDeadlineSeconds and a 0s margin.
-MCP="${RWORK}/migcopy"; rm -rf "$MCP"; mkdir -p "$MCP"; cp -r "${REPO_ROOT}/infra" "$MCP/"; cp "${REPO_ROOT}/Cargo.lock" "$MCP/"
+MCP="${RWORK}/migcopy"; rm -rf "$MCP"; deploy_tree_copy "$MCP"
 sed -i 's/activeDeadlineSeconds: 300/activeDeadlineSeconds: 1/' "$MCP/infra/services/db-migrate/job.yaml"
 reset_marks
 out="$(STUB_JOB_COND_AFTER_APPLY="" DT_JOB_WAIT_MARGIN_SECONDS=0 mig "$MCP/infra/kind/scripts/deploy.sh")"; rc=$?
@@ -1865,6 +1873,16 @@ assert_rc "deploy-rc" 0 "$rc"
 assert_marker "deploy-runs-the-blueprint-check" "$MARK" "ran.blueprint-check"
 assert_rc "deploy-builds-every-repo" 0 "$([[ "$(builds)" == "$ALL_DOCKERFILES" ]] && echo 0 || echo "1 ($(builds))")"
 assert_status "deploy-db-migrate-gets-sqlx-version" "SQLX_CLI_VERSION=" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+# EVERY image build carries the reader's RUST_VERSION (none of the Dockerfiles has a default), and
+# every SERVICE build its CARGO_CHEF_VERSION — counted per build line against the Dockerfile set,
+# so one hit cannot satisfy it and a build path that bypasses image_build_args trips it.
+D8_RUST="$(src_run "${REPO_ROOT}/infra/lib/rust-toolchain.sh" 'rust_toolchain_version "${ARGS[0]}"' "${REPO_ROOT}/rust-toolchain.toml")"
+d8_builds="$(grep -c '^build ' "${MARK}/podman.calls" 2>/dev/null)"
+d8_rust="$(grep '^build ' "${MARK}/podman.calls" 2>/dev/null | grep -c -- "--build-arg RUST_VERSION=${D8_RUST} ")"
+d8_chef="$(grep '^build ' "${MARK}/podman.calls" 2>/dev/null | grep -- '-service/Dockerfile' | grep -c -- '--build-arg CARGO_CHEF_VERSION=[0-9]')"
+d8_files="$(wc -w <<< "$ALL_DOCKERFILES")"
+assert_rc "deploy-every-build-gets-rust-version" 0 "$([[ -n "$D8_RUST" && "$d8_builds" -eq "$d8_files" && "$d8_rust" -eq "$d8_files" ]] && echo 0 || echo "1 (builds=${d8_builds} with-rust=${d8_rust} dockerfiles=${d8_files} rust=${D8_RUST})")"
+assert_rc "deploy-every-service-build-gets-cargo-chef" 0 "$([[ "$d8_chef" -eq $((d8_files - 1)) ]] && echo 0 || echo "1 (${d8_chef} service builds with CARGO_CHEF_VERSION)")"
 assert_status "deploy-tags-by-content" "tag sha256:bbbb" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
 # ONE render of the environment root per converge (cache_renders): the derivations read the
 # snapshot, never re-render it (the stub logs every kubectl call; kustomize passes through).
@@ -2196,41 +2214,126 @@ assert_status "devloop-sh-derives-sqlx-cli-version" 'cargo_lock_version "${scrip
 assert_status "devloop-dockerfile-pins-sqlx-cli" '--version "=${SQLX_CLI_VERSION}"' "$(cat "${REPO_ROOT}/infra/devloop/Dockerfile")"
 assert_status "db-migrate-dockerfile-pins-sqlx-cli" '--version "=${SQLX_CLI_VERSION}"' "$(cat "${REPO_ROOT}/infra/docker/db-migrate/Dockerfile")"
 
-# --- Rust version: ONE value across every image Dockerfile, the devloop image and CI ----------
-# Sites: the image Dockerfiles' `ARG RUST_VERSION=<v>`, the devloop image's `FROM …/rust:<v>-…`,
-# and every workflow `rustup toolchain install <v>` / `rustup default <v>` that is not nightly
-# (`rustup default` installs a missing toolchain itself, so it is a version site too). Moving to the latest
-# stable from this one pin is docs/TODO.md §Supply Chain.
-rust_versions() {  # $1 = root; prints one "<site>: <version>" line per site
-  local root="$1" f v
-  for f in "${root}"/infra/docker/*/Dockerfile; do
-    v="$(grep -oP '^ARG RUST_VERSION=\K\S+' "$f" || true)"
-    [[ -n "$v" ]] && printf '%s: %s\n' "${f#"${root}"/}" "$v"
-  done
-  v="$(grep -oP '^FROM docker\.io/library/rust:\K[0-9.]+(?=-)' "${root}/infra/devloop/Dockerfile" || true)"
-  [[ -n "$v" ]] && printf '%s: %s\n' "infra/devloop/Dockerfile" "$v"
-  grep -oP 'rustup (toolchain install|default) \K[0-9][0-9.]*' "${root}"/.github/workflows/*.yml 2>/dev/null \
-    | sed "s#^${root}/##; s#:\\(.*\\)\$#: \\1#"
+# --- Rust version: rust-toolchain.toml is the ONE source; every site derives from it ----------
+# rustup reads the file on every cargo/rustc call (CI, devloop container, host helper build);
+# the images take `ARG RUST_VERSION` (no default) from the ONE reader, infra/lib/rust-toolchain.sh,
+# via devloop.sh and deploy.sh:image_build_args. These checks prove DERIVATION (a sentinel value
+# comes out of every consumer) and that no literal copy is left anywhere it could drift.
+RTLIB="${REPO_ROOT}/infra/lib/rust-toolchain.sh"
+rtv() { src_run "$RTLIB" 'rust_toolchain_version "${ARGS[@]}"' "$1" 2>&1; }
+RTS="${WORK}/rt"; mkdir -p "$RTS"
+rt_file() { printf '%b' "$2" > "$RTS/$1.toml"; }
+rt_file good      '[toolchain]\nchannel = "9.8.7"\nprofile = "minimal"\ncomponents = ["rustfmt", "clippy"]\n'
+rt_file commented '# header\n\n[toolchain]\nchannel = "9.8.7"\n'
+rt_file nochannel '[toolchain]\nprofile = "minimal"\n'
+rt_file dup       '[toolchain]\nchannel = "9.8.7"\nchannel = "9.8.7"\n'
+rt_file stable    '[toolchain]\nchannel = "stable"\n'
+rt_file nightly   '[toolchain]\nchannel = "nightly"\n'
+rt_file twopart   '[toolchain]\nchannel = "1.99"\n'
+rt_file trailing  '[toolchain]\nchannel = "9.8.7" # pinned\n'
+rt_file squote    "[toolchain]\nchannel = '9.8.7'\n"
+rt_file path      '[toolchain]\nchannel = "9.8.7"\npath = "/tmp/evil"\n'
+rt_file unknown   '[toolchain]\nchannel = "9.8.7"\ntargets = ["wasm32-unknown-unknown"]\n'
+rt_file twotables '[toolchain]\nchannel = "9.8.7"\n[other]\nchannel = "1.0.0"\n'
+rt_file notable   'channel = "9.8.7"\n'
+out="$(rtv "$RTS/good.toml")"; rc=$?
+assert_rc  "rust-toolchain-exact-rc" 0 "$rc"
+emi_expect "rust-toolchain-exact" "9.8.7" "$out"
+out="$(rtv "$RTS/commented.toml")"; emi_expect "rust-toolchain-comments-and-blanks-ok" "9.8.7" "$out"
+for bad in nochannel dup stable nightly twopart trailing squote path unknown twotables notable; do
+  out="$(rtv "$RTS/${bad}.toml")"; rc=$?
+  assert_rc "rust-toolchain-${bad}-rejected" 1 "$rc"
+  assert_status "rust-toolchain-${bad}-says-why" "ERROR: rust_toolchain_version" "$out"
+done
+out="$(rtv "$RTS/path.toml")";    assert_status "rust-toolchain-path-names-allow-list" "allow-list" "$out"
+out="$(rtv "$RTS/absent.toml")"; rc=$?
+assert_rc "rust-toolchain-unreadable-fails" 1 "$rc"
+RUST_PIN="$(rtv "${REPO_ROOT}/rust-toolchain.toml")"; rc=$?
+assert_rc "rust-toolchain-real-file" 0 "$([[ $rc -eq 0 && "$RUST_PIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo 0 || echo "1 (${RUST_PIN})")"
+# The ONLY toolchain file in the tree is the root rust-toolchain.toml. rustup resolves the
+# override by walking UP from the cwd, so a nested `rust-toolchain[.toml]` (e.g. under a fuzz
+# crate) or a legacy plain-text root `rust-toolchain` would win for every cargo call made there,
+# without ever passing through the reader's allow-list / X.Y.Z check.
+toolchain_files() {  # $1 = root; prints every toolchain file, relative to the root
+  find "$1" \( -name rust-toolchain -o -name rust-toolchain.toml \) \
+    -not -path '*/target/*' -not -path '*/node_modules/*' -not -path '*/.git/*' | sed "s#^$1/##" | sort
 }
-rv_sites="$(rust_versions "$REPO_ROOT")"
-rv="$(sed 's/^.*: //' <<< "$rv_sites" | sort -u)"
-assert_rc "rust-version-one-value" 0 "$([[ "$(grep -c . <<< "$rv")" -eq 1 ]] && echo 0 || echo "1 (${rv_sites//$'\n'/ | })")"
-# Non-vacuity: 5 image Dockerfiles + the devloop image + 4 workflow steps x (install + default)
-# (ci.yml x2, ci-client.yml, audit-scheduled.yml — fuzz-nightly's nightly is excluded by the digit match).
-assert_rc "rust-version-sites-nonvacuous" 0 "$([[ "$(grep -c . <<< "$rv_sites")" -ge 14 ]] && echo 0 || echo "1 ($(grep -c . <<< "$rv_sites") sites)")"
-assert_status "rust-version-covers-devloop-image" "infra/devloop/Dockerfile: " "$rv_sites"
-assert_status "rust-version-covers-workflows" ".github/workflows/ci.yml: " "$rv_sites"
-# Negative control: one drifted site must trip the one-value check.
+tf="$(toolchain_files "$REPO_ROOT")"
+emi_expect "only-root-rust-toolchain-file" "rust-toolchain.toml" "$tf"
+TFROOT="${WORK}/tfroot"; mkdir -p "$TFROOT/crates/x/fuzz"; : > "$TFROOT/rust-toolchain.toml"
+: > "$TFROOT/crates/x/fuzz/rust-toolchain.toml"
+tf="$(toolchain_files "$TFROOT")"
+assert_rc "nested-rust-toolchain-file-trips" 0 "$([[ "$tf" != "rust-toolchain.toml" ]] && echo 0 || echo 1)"
+rm "$TFROOT/crates/x/fuzz/rust-toolchain.toml"; : > "$TFROOT/rust-toolchain"
+tf="$(toolchain_files "$TFROOT")"
+assert_rc "legacy-rust-toolchain-file-trips" 0 "$([[ "$tf" != "rust-toolchain.toml" ]] && echo 0 || echo 1)"
+
+# Derivation, not agreement: deploy.sh:image_build_args against a root whose file says 9.8.7.
+RTROOT="${WORK}/rtroot"; mkdir -p "$RTROOT"; cp "$RTS/good.toml" "$RTROOT/rust-toolchain.toml"; cp "${REPO_ROOT}/Cargo.lock" "$RTROOT/"
+iba() { src_run "$DEPLOY" 'PROJECT_ROOT="${ARGS[0]}"; image_build_args "${ARGS[1]}"' "$RTROOT" "$1" 2>&1 | tr '\n' ' '; }
+out="$(iba localhost/ac-service)"
+assert_status "image-build-args-service-derives-rust" "--build-arg RUST_VERSION=9.8.7 " "$out"
+assert_rc     "image-build-args-service-pins-cargo-chef" 0 "$([[ "$out" =~ --build-arg\ CARGO_CHEF_VERSION=[0-9]+\.[0-9]+\.[0-9]+\  ]] && echo 0 || echo "1 (${out})")"
+out="$(iba localhost/db-migrate)"
+assert_status "image-build-args-migrate-derives-rust" "--build-arg RUST_VERSION=9.8.7 " "$out"
+assert_status "image-build-args-migrate-keeps-sqlx" "--build-arg SQLX_CLI_VERSION=" "$out"
+rm "$RTROOT/rust-toolchain.toml"
+out="$(src_run "$DEPLOY" 'PROJECT_ROOT="${ARGS[0]}"; image_build_args "${ARGS[1]}"' "$RTROOT" localhost/ac-service 2>&1)"; rc=$?
+assert_rc "image-build-args-missing-toolchain-fails" 1 "$rc"
+# devloop.sh: derives through the reader, and every RUST_VERSION build-arg is a variable, one per build.
+DLSH="$(cat "${REPO_ROOT}/infra/devloop/devloop.sh")"
+assert_status "devloop-sh-derives-rust-version" 'rust_toolchain_version "${script_dir}/../../rust-toolchain.toml"' "$DLSH"
+dl_builds="$(grep -c 'podman build ' <<< "$DLSH")"
+dl_rust_var="$(grep -c -- '--build-arg "RUST_VERSION=\${RUST_VERSION}"' <<< "$DLSH")"
+dl_rust_any="$(grep -c -- '--build-arg "RUST_VERSION=' <<< "$DLSH")"
+# ...and that variable is assigned from the reader once per build site, never from a literal.
+dl_rust_set="$(grep -cF 'RUST_VERSION="$(read_rust_version "$SCRIPT_DIR")"' <<< "$DLSH")"
+assert_rc "devloop-sh-rust-build-arg-per-build" 0 "$([[ "$dl_builds" -ge 2 && "$dl_rust_var" -eq "$dl_builds" && "$dl_rust_any" -eq "$dl_builds" && "$dl_rust_set" -eq "$dl_builds" ]] && echo 0 || echo "1 (builds=${dl_builds} var=${dl_rust_var} any=${dl_rust_any} from-reader=${dl_rust_set})")"
+assert_rc "devloop-sh-no-literal-rust-assignment" 0 "$(grep -qE '(^|[^_A-Z])RUST_VERSION=["'"'"']?[0-9]' <<< "$DLSH" && echo 1 || echo 0)"
+assert_status "devloop-sh-helper-built-from-repo-root" '(cd "$REPO_ROOT" && cargo build --release -p devloop-helper' "$DLSH"
+
+# No literal Rust version anywhere it could drift. Positive controls keep the scans non-vacuous.
+rust_literal_sites() {  # $1 = root; prints one line per literal Rust-version site
+  local root="$1"
+  grep -HnE '^ARG RUST_VERSION=' "${root}"/infra/docker/*/Dockerfile "${root}/infra/devloop/Dockerfile" 2>/dev/null
+  grep -HniE '^[[:space:]]*FROM[[:space:]].*rust:[0-9]' "${root}"/infra/docker/*/Dockerfile "${root}/infra/devloop/Dockerfile" 2>/dev/null
+  grep -HnE 'rustup (toolchain install|default) [0-9]|rustup default' "${root}"/.github/workflows/*.yml 2>/dev/null
+}
+rl="$(rust_literal_sites "$REPO_ROOT")"
+assert_rc "rust-version-no-literal-sites" 0 "$([[ -z "$rl" ]] && echo 0 || echo "1 (${rl//$'\n'/ | })")"
+rv_files="$(ls "${REPO_ROOT}"/infra/docker/*/Dockerfile "${REPO_ROOT}/infra/devloop/Dockerfile" | wc -l)"
+rv_from="$(cat "${REPO_ROOT}"/infra/docker/*/Dockerfile "${REPO_ROOT}/infra/devloop/Dockerfile" | grep -cE '^FROM docker\.io/library/rust:\$\{RUST_VERSION\}-')"
+rv_arg="$(cat "${REPO_ROOT}"/infra/docker/*/Dockerfile "${REPO_ROOT}/infra/devloop/Dockerfile" | grep -cx 'ARG RUST_VERSION')"
+assert_rc "rust-version-dockerfiles-nonvacuous" 0 "$([[ "$rv_files" -ge 6 && "$rv_from" -eq "$rv_files" && "$rv_arg" -eq "$rv_files" ]] && echo 0 || echo "1 (files=${rv_files} from=${rv_from} arg=${rv_arg})")"
+rv_install="$(cat "${REPO_ROOT}"/.github/workflows/*.yml | grep -cE '^[[:space:]]+rustup toolchain install$')"
+assert_rc "rust-version-workflows-read-the-file" 0 "$([[ "$rv_install" -ge 4 ]] && echo 0 || echo "1 (${rv_install} no-arg installs)")"
+assert_rc "dockerignore-excludes-rust-toolchain" 0 "$(grep -qx 'rust-toolchain.toml' "${REPO_ROOT}/.dockerignore" && echo 0 || echo 1)"
+# cargo-chef: ONE value in deploy.sh, no Dockerfile default, never an unpinned install.
+chef_sites="$(cat "${REPO_ROOT}"/infra/docker/*-service/Dockerfile | grep -c 'cargo install cargo-chef --locked --version "=${CARGO_CHEF_VERSION}"')"
+chef_files="$(ls "${REPO_ROOT}"/infra/docker/*-service/Dockerfile | wc -l)"
+assert_rc "cargo-chef-pinned-in-every-service-image" 0 "$([[ "$chef_files" -ge 4 && "$chef_sites" -eq "$chef_files" ]] && echo 0 || echo "1 (${chef_sites} of ${chef_files})")"
+assert_rc "cargo-chef-no-dockerfile-default" 0 "$(grep -qE '^ARG CARGO_CHEF_VERSION=' "${REPO_ROOT}"/infra/docker/*/Dockerfile && echo 1 || echo 0)"
+assert_rc "cargo-chef-no-unpinned-install" 0 "$(grep -hE 'cargo install cargo-chef' "${REPO_ROOT}"/infra/docker/*/Dockerfile | grep -qv -- '--version' && echo 1 || echo 0)"
+# MSRV (`rust-version`) is deliberately NOT declared: this is an application workspace, so the
+# minimum Rust IS the pinned toolchain and a `rust-version` would be a second copy of it with no
+# consumer (resolver 2 — not MSRV-aware). See docs/devloop-outputs/2026-10-05-rust-latest-stable/.
+msrv="$(find "${REPO_ROOT}" -name Cargo.toml -not -path '*/target/*' -not -path '*/node_modules/*' -exec grep -lE '^[[:space:]]*rust-version[[:space:]]*=' {} + 2>/dev/null)"
+assert_rc "no-rust-version-msrv-declared" 0 "$([[ -z "$msrv" ]] && echo 0 || echo "1 (${msrv//$'\n'/ })")"
+# Negative controls: each literal kind trips the scan.
 RVROOT="${WORK}/rvroot"; mkdir -p "$RVROOT/infra/docker/x" "$RVROOT/infra/devloop" "$RVROOT/.github/workflows"
-printf 'ARG RUST_VERSION=1.95\n' > "$RVROOT/infra/docker/x/Dockerfile"
-printf 'FROM docker.io/library/rust:1.95-slim-bookworm\n' > "$RVROOT/infra/devloop/Dockerfile"
-printf '        run: rustup toolchain install 1.96 --profile minimal\n' > "$RVROOT/.github/workflows/w.yml"
-rv="$(rust_versions "$RVROOT" | sed 's/^.*: //' | sort -u)"
-assert_rc "rust-version-drift-trips" 0 "$([[ "$(grep -c . <<< "$rv")" -gt 1 ]] && echo 0 || echo 1)"
-# Negative control: install and default disagreeing inside one step must trip too.
-printf '        run: |\n          rustup toolchain install 1.95 --profile minimal\n          rustup default 1.94\n' > "$RVROOT/.github/workflows/w.yml"
-rv="$(rust_versions "$RVROOT" | sed 's/^.*: //' | sort -u)"
-assert_rc "rust-version-install-default-drift-trips" 0 "$([[ "$(grep -c . <<< "$rv")" -gt 1 ]] && echo 0 || echo 1)"
+printf 'ARG RUST_VERSION\nFROM docker.io/library/rust:${RUST_VERSION}-slim-bookworm\n' > "$RVROOT/infra/devloop/Dockerfile"
+printf 'ARG RUST_VERSION=1.99.0\n' > "$RVROOT/infra/docker/x/Dockerfile"
+assert_rc "rust-version-arg-default-trips" 0 "$([[ -n "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
+printf 'FROM docker.io/library/rust:1.99.0-slim-bookworm\n' > "$RVROOT/infra/docker/x/Dockerfile"
+assert_rc "rust-version-from-literal-trips" 0 "$([[ -n "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
+printf 'from --platform=linux/amd64 docker.io/library/rust:1.99.0-slim-bookworm AS extra\n' > "$RVROOT/infra/docker/x/Dockerfile"
+assert_rc "rust-version-from-flag-stage-literal-trips" 0 "$([[ -n "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
+printf 'ARG RUST_VERSION\n' > "$RVROOT/infra/docker/x/Dockerfile"
+assert_rc "rust-version-clean-root-passes" 0 "$([[ -z "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
+printf '        run: rustup toolchain install 1.99.0 --profile minimal\n' > "$RVROOT/.github/workflows/w.yml"
+assert_rc "rust-version-workflow-install-literal-trips" 0 "$([[ -n "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
+printf '        run: |\n          rustup toolchain install\n          rustup default 1.99.0\n' > "$RVROOT/.github/workflows/w.yml"
+assert_rc "rust-version-workflow-default-trips" 0 "$([[ -n "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
 
 # --- pnpm pin: the ONE packageManager reader (devloop image + dev-web.sh) ----------------------
 PMLIB="${REPO_ROOT}/infra/lib/package-manager.sh"
@@ -2320,7 +2423,7 @@ assert_rc "dockerfile-release-mismatch-trips" 0 "$([[ -n "$(debian_release_misma
 
 # --- Repo derivation fails loudly (zero repos / a repo with no Dockerfile) --------------------
 if [[ -n "$REAL_KUBECTL" ]]; then
-  RCP="${WORK}/repocopy"; mkdir -p "$RCP"; cp -r "${REPO_ROOT}/infra" "$RCP/"; cp "${REPO_ROOT}/Cargo.lock" "$RCP/"
+  RCP="${WORK}/repocopy"; deploy_tree_copy "$RCP"
   mv "$RCP/infra/docker/gc-service" "$RCP/infra/docker/gc-service.moved"
   out="$(src_run "$RCP/infra/kind/scripts/deploy.sh" 'cache_renders; first_party_repos' 2>&1)"; rc=$?
   assert_rc "repo-without-dockerfile-fails" 1 "$rc"

@@ -172,7 +172,7 @@ fn check_main_md(main_md: &Path, manifest: &Manifest, repo_root: &Path) -> Resul
                 hits.push(Hit {
                     rule_id: OWNER_NOT_IN_MANIFEST_RULE_ID,
                     detail: format!(
-                        "path {path:?} lists Owner={owner:?} but manifest allows only {{{}}}",
+                        "path {path:?} lists Owner={owner:?}; Owner must be exactly ONE of {{{}}}",
                         valid.join(", ")
                     ),
                     file: rel.clone(),
@@ -362,6 +362,31 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| h.rule_id == OWNER_NOT_IN_MANIFEST_RULE_ID));
+    }
+
+    // (3b) FAIL — a comma-list Owner is rejected even when every name is in the
+    // manifest, and the message says why (exactly ONE name), rather than reading as
+    // "lists {a, b} but allows only {a, b}".
+    #[test]
+    fn case_3b_comma_list_owner_rejected_with_exactly_one_wording() {
+        let manifest =
+            manifest_with(&[("crates/common/src/jwt.rs", &["auth-controller", "security"])]);
+        let md = main_md_with_table(&[(
+            "crates/common/src/jwt.rs",
+            "Not mine, Domain-judgment",
+            "auth-controller, security",
+        )]);
+        let hits = run_check(&md, &manifest);
+        let hit = hits
+            .iter()
+            .find(|h| h.rule_id == OWNER_NOT_IN_MANIFEST_RULE_ID)
+            .expect("comma-list Owner must be rejected");
+        assert!(
+            hit.detail
+                .contains("Owner must be exactly ONE of {auth-controller, security}"),
+            "unexpected detail: {}",
+            hit.detail
+        );
     }
 
     // (4) PASS — GSA Mine row skipped.

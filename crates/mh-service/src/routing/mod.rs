@@ -1068,7 +1068,10 @@ mod tests {
         // And meeting B's own sender still resolves, so the negative arm above
         // is not just "meeting B is empty".
         assert_eq!(sources_for(&snapshot, &meeting_b, sender(7)).len(), 1);
-        assert!(sources_for(&snapshot, &meeting_a, sender(7)).is_empty());
+        assert_eq!(
+            sources_for(&snapshot, &meeting_a, sender(7)),
+            Vec::<&EgressEdge>::new()
+        );
     }
 
     // -- structural rejects -----------------------------------------------
@@ -1207,7 +1210,7 @@ mod tests {
         let parsed =
             MeetingPolicy::from_request(&request("m", 1, vec![]), &PolicyLimits::for_tests())
                 .unwrap();
-        assert!(parsed.edges.is_empty());
+        assert_eq!(parsed.edges, Vec::<EgressEdge>::new());
         assert_eq!(
             parsed.transport_mode, None,
             "an empty policy applies no mode; fabricating one would put a mode on the §8 echo \
@@ -1558,6 +1561,9 @@ mod tests {
         let meeting = MeetingKey::new("m");
         assert_eq!(sources_for(&snapshot, &meeting, sender(5)).len(), 1);
         assert_eq!(sources_for(&snapshot, &meeting, sender(6)).len(), 1);
-        assert!(sources_for(&snapshot, &meeting, sender(8)).is_empty());
+        assert_eq!(
+            sources_for(&snapshot, &meeting, sender(8)),
+            Vec::<&EgressEdge>::new()
+        );
     }
 }

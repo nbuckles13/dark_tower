@@ -1528,7 +1528,7 @@ mod tests {
         };
 
         assert!(!claims.has_scope("read"));
-        assert!(claims.scopes().is_empty());
+        assert_eq!(claims.scopes(), Vec::<&str>::new());
     }
 
     #[test]
@@ -1886,7 +1886,7 @@ mod tests {
 
         let json = serde_json::to_string(&claims).unwrap();
         let deserialized: MeetingTokenClaims = serde_json::from_str(&json).unwrap();
-        assert!(deserialized.capabilities.is_empty());
+        assert_eq!(deserialized.capabilities, Vec::<String>::new());
     }
 
     #[test]
@@ -1908,7 +1908,7 @@ mod tests {
 
         let json = serde_json::to_string(&claims).unwrap();
         let deserialized: GuestTokenClaims = serde_json::from_str(&json).unwrap();
-        assert!(deserialized.capabilities.is_empty());
+        assert_eq!(deserialized.capabilities, Vec::<String>::new());
     }
 
     #[test]

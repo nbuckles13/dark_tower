@@ -12,8 +12,9 @@
 #   SQLX_CLI_VERSION  REQUIRED. Derived by deploy.sh from Cargo.lock's `sqlx`
 #                     (infra/lib/cargo-lock-version.sh) so the CLI writing
 #                     `_sqlx_migrations` matches the library reading it.
-#   RUST_VERSION      Same default as the service Dockerfiles; setup.test.sh
-#                     fails if the defaults across infra/docker/*/Dockerfile drift.
+#   RUST_VERSION      REQUIRED (no default). The repo's ONE Rust version, derived by
+#                     deploy.sh from rust-toolchain.toml (infra/lib/rust-toolchain.sh).
+#                     Unset yields `rust:-slim-bookworm`, an invalid reference.
 #
 # Layer order is load-bearing: `migrations/` is the LAST layer, so a changed
 # migration rebuilds only that layer (sqlx-cli stays cached) and changes the
@@ -24,7 +25,7 @@
 # binary links the builder's glibc, and a newer builder than runtime fails at
 # exec with "GLIBC_2.xx not found" (seen at ADR-0038 devloop 2 Gate 2, when the
 # floating `-slim` tag had moved to trixie). setup.test.sh fails on any drift.
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION
 FROM docker.io/library/rust:${RUST_VERSION}-slim-bookworm AS builder
 
 ARG SQLX_CLI_VERSION
