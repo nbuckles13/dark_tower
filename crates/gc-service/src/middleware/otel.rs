@@ -17,7 +17,7 @@
 //! so it executes AFTER `TraceLayer` enters its span and BEFORE the handler.
 //! At that point `tracing::Span::current()` correctly resolves to the
 //! request span `TraceLayer` created, and `extract_trace_context`'s
-//! `.set_parent()` call attaches the extracted W3C parent to it — so every
+//! `set_remote_parent` call attaches the extracted W3C parent to it — so every
 //! span the handler creates (including the MC client's `#[instrument]` span)
 //! inherits it via the tracing hierarchy.
 //!
@@ -122,7 +122,7 @@ mod tests {
                     .header("cookie", "session=SECRETcookie")
                     .header(
                         "traceparent",
-                        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                        common::observability::testing::otel::known_traceparent(),
                     )
                     .body(Body::empty())
                     .expect("valid request"),
@@ -228,7 +228,7 @@ mod tests {
                     .header("cookie", "session=SECRETcookie")
                     .header(
                         "traceparent",
-                        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                        common::observability::testing::otel::known_traceparent(),
                     )
                     .body(Body::empty())
                     .expect("valid request"),

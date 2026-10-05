@@ -1408,10 +1408,10 @@ sum by(status) (rate(gc_telemetry_ingest_total{status=~"rejected_.*|error"}[10m]
 #   follow Scenario 5 (High Error Rate) practices for the forwarding path
 
 # 2. Split the aggregated `error` status via paired HTTP status codes.
-# CAVEAT: telemetry routes currently normalize to endpoint="/other" on gc_http_* —
-# this series conflates ALL unrecognized paths, so treat it as approximate and
-# confirm via logs (see docs/TODO.md "Observability Debt" for the normalization fix).
-sum by(status_code) (rate(gc_http_requests_total{endpoint="/other", status_code=~"400|413|415|429|502|503"}[10m]))
+# The telemetry routes have their own endpoint values; endpoint="/other" now
+# holds only genuinely unrecognized paths (404s, scanners, typos) — telemetry,
+# /ready and all routed paths are labelled individually.
+sum by(status_code) (rate(gc_http_requests_total{endpoint=~"/api/v1/telemetry/v1/(metrics|traces)", status_code=~"400|413|415|429|502|503"}[10m]))
 #   400/415 -> client sending malformed OTLP or wrong Content-Type (bad SDK rollout?)
 #   502/503 -> collector unreachable or telemetry disabled -> collector path, step 5
 
@@ -1528,8 +1528,7 @@ kubectl get pods -n dark-tower -l app=gc-service -o wide   # look at pod AGE
 # 4. Check 401s — an auth regression rejects telemetry at the route layer,
 # BEFORE the handler, so it produces silence on the telemetry counter (the
 # declared rejected_auth status is never emitted; 401s land on gc_http only).
-# Same endpoint="/other" conflation caveat as Scenario 10 step 2.
-sum(rate(gc_http_requests_total{endpoint="/other", status_code="401"}[15m]))
+sum(rate(gc_http_requests_total{endpoint=~"/api/v1/telemetry/v1/(metrics|traces)", status_code="401"}[15m]))
 # GC logs are the AUTHORITATIVE user-token 401 diagnosis (not conflated):
 kubectl logs -n dark-tower -l app=gc-service --tail=500 | grep -i "unauthorized\|401"
 # Corroboration ONLY — the following counter covers the gRPC SERVICE-token path
@@ -1696,7 +1695,7 @@ kubectl rollout undo deployment/gc-service -n dark-tower
 **Runbook Section**: `#scenario-13-telemetry-proxy-unreachable--rate-limit-storm`
 **Related**: focused companion to **Scenario 10** (Telemetry Proxy High Rejection Rate) and **Scenario 11** (Telemetry Ingest Silent). Use their diagnosis for the rejection-rate taxonomy and the silence shapes; this scenario adds only the two angles they do not fully cover: (i) distinguishing a broken GC→collector network path from a collector-pod outage, and (ii) a burst-shaped per-user rate-limit storm.
 
-> **Do not restate 10/11.** For the `status`-value fault split (`rejected_size` / `rejected_rate` / `error`), the `error`→502/503 collector branch, and the `endpoint="/other"` conflation caveat, follow **Scenario 10 → Diagnosis**. For the silent-ingest branches (flat vs absent series, auth-401 pre-handler), follow **Scenario 11 → Diagnosis**. The alert PromQL/thresholds live in `docs/observability/alerts.md` and `infra/docker/prometheus/rules/gc-alerts.yaml` — not repeated here.
+> **Do not restate 10/11.** For the `status`-value fault split (`rejected_size` / `rejected_rate` / `error`), and the `error`→502/503 collector branch (with the per-route telemetry `endpoint` split), follow **Scenario 10 → Diagnosis**. For the silent-ingest branches (flat vs absent series, auth-401 pre-handler), follow **Scenario 11 → Diagnosis**. The alert PromQL/thresholds live in `docs/observability/alerts.md` and `infra/docker/prometheus/rules/gc-alerts.yaml` — not repeated here.
 
 #### 13a. Collector unreachable (502 storm)
 

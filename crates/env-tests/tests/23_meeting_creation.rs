@@ -24,7 +24,9 @@
 #![cfg(feature = "flows")]
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::{TokenRequest, UserRegistrationRequest};
+use env_tests::fixtures::auth_client::{
+    TokenRequest, UserRegistrationRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET,
+};
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient};
 use env_tests::fixtures::AuthClient;
 use std::collections::HashSet;
@@ -176,7 +178,7 @@ async fn test_create_meeting_round_trip_findable() {
 
     // Step 2: Get service token for join endpoint (which uses require_auth, not require_user_auth)
     let service_token_request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
     let service_token = auth_client
         .issue_token(service_token_request)
         .await
@@ -184,7 +186,7 @@ async fn test_create_meeting_round_trip_findable() {
 
     // Step 3: Try to join by meeting code with service token
     // The join handler will find the meeting (not 404) but fail at
-    // parse_user_id since the service token sub is "test-client" (not a UUID).
+    // parse_user_id since the service token sub is DEV_TEST_CLIENT_ID (not a UUID).
     let result = gc_client
         .raw_join_meeting(&created.meeting_code, Some(&service_token.access_token))
         .await
@@ -253,7 +255,7 @@ async fn test_create_meeting_rejects_service_token() {
 
     // Get a valid service token (client_credentials flow)
     let token_request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
     let token_response = auth_client
         .issue_token(token_request)
         .await

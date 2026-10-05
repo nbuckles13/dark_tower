@@ -81,6 +81,19 @@ it escalates and a human decides.
 > §Validation) records the working invocation and control. Do **not** narrow the
 > ignore list mid-story. `buf.yaml` explains why: precision returns when the whole
 > key is deleted.
+>
+> **Correction (2026-10-04, carve-out removed).** The two notes above describe a
+> state that no longer holds. The restore condition was met — an ignore-free
+> `buf breaking` against the pipeline's base ref (a merge-base inside
+> `origin/main`) reported zero findings, with a positive control (one injected
+> tag change per file) reporting findings in both files — so the `ignore:` key
+> was deleted from `proto/buf.yaml`
+> (`docs/devloop-outputs/2026-10-04-web-stack-and-otel-upgrade/main.md`
+> §Protocol (paired)). **Both `signaling.proto` and `internal.proto` are under
+> full FILE enforcement again, and a green Layer 6 with no `SUPPRESSED=` line is
+> evidence for every proto.** `scripts/lang/proto/breaking.sh` keeps its
+> `SUPPRESSED=` detector, so any future `breaking.ignore` entry is loud on every
+> run; adding one still requires the human acceptance described above.
 
 ## Rules
 

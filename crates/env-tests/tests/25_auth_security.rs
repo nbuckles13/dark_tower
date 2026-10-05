@@ -8,7 +8,7 @@
 use base64::Engine;
 use chrono::Utc;
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::TokenRequest;
+use env_tests::fixtures::auth_client::{TokenRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET};
 use env_tests::fixtures::AuthClient;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,7 @@ async fn test_tampered_token_rejected() {
 
     // Issue a valid token
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -107,7 +107,7 @@ async fn test_wrong_algorithm_rejected() {
 
     // Issue a valid EdDSA token
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -172,7 +172,7 @@ async fn test_missing_required_claims_rejected() {
 
     // Issue a valid token
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -296,7 +296,7 @@ async fn test_iat_claim_is_current() {
 
     // Issue a token
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -353,7 +353,7 @@ async fn test_token_lifetime_is_reasonable() {
 
     // Issue a token
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -409,7 +409,7 @@ async fn test_kid_injection_rejected() {
 
     // Issue a valid token first
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -490,7 +490,7 @@ async fn test_jwk_header_injection_rejected() {
 
     // Issue a valid token
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)
@@ -566,7 +566,7 @@ async fn test_jku_header_injection_rejected() {
 
     // Issue a valid token
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
 
     let token_response = auth_client
         .issue_token(request)

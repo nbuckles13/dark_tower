@@ -37,7 +37,7 @@ use common::observability::testing::MetricAssertion;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use test_common::test_state::make_app_state;
+use test_common::test_state::{admin_claims, make_app_state};
 
 /// All (operation, status) cells `record_credential_operation` can emit per
 /// `admin_handler.rs` (operations: list, get, create, update, delete,
@@ -190,9 +190,11 @@ async fn credential_op_update_success_emits_label(pool: PgPool) {
     let snap = MetricAssertion::snapshot();
     let _ = handle_update_client(
         State(state),
+        admin_claims(),
         Path(create_resp.id),
         Json(UpdateClientRequest {
-            scopes: Some(vec!["scope-a".to_string()]),
+            // PUT may only narrow: a subset of the GC defaults.
+            scopes: Some(vec!["service.write.mc".to_string()]),
         }),
     )
     .await
@@ -207,6 +209,7 @@ async fn credential_op_update_error_emits_label(pool: PgPool) {
     let snap = MetricAssertion::snapshot();
     let _ = handle_update_client(
         State(state),
+        admin_claims(),
         Path(Uuid::new_v4()),
         Json(UpdateClientRequest {
             scopes: Some(vec!["valid".to_string()]),
@@ -224,28 +227,23 @@ async fn credential_op_update_error_emits_label(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn credential_op_delete_success_emits_label(pool: PgPool) {
-    // Note: `handle_create_client` writes auth_events that reference the
-    // new credential via FK; a subsequent delete fails on
-    // `auth_events_credential_id_fkey`. Mirror the existing
-    // `admin_handler::tests::test_handle_delete_client_success` pattern
-    // which seeds via `service_credentials::create_service_credential`
-    // directly to avoid the auth_events FK chain (admin_handler.rs:1716-1734).
-    use ac_service::repositories::service_credentials;
-
+    // Seed through the create handler: DELETE is a soft delete (deactivate),
+    // so the `service_registered` auth_events row referencing the credential
+    // no longer blocks it.
     let state = make_app_state(pool.clone());
-    let credential = service_credentials::create_service_credential(
-        &pool,
-        "test-delete-target",
-        "hash",
-        "global-controller",
-        None,
-        &["valid-scope".to_string()],
+    let create_resp = handle_create_client(
+        State(state.clone()),
+        Json(CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        }),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .0;
 
     let snap = MetricAssertion::snapshot();
-    let _ = handle_delete_client(State(state), Path(credential.credential_id))
+    let _ = handle_delete_client(State(state), admin_claims(), Path(create_resp.id))
         .await
         .unwrap();
 
@@ -256,7 +254,7 @@ async fn credential_op_delete_success_emits_label(pool: PgPool) {
 async fn credential_op_delete_error_emits_label(pool: PgPool) {
     let state = make_app_state(pool);
     let snap = MetricAssertion::snapshot();
-    let _ = handle_delete_client(State(state), Path(Uuid::new_v4()))
+    let _ = handle_delete_client(State(state), admin_claims(), Path(Uuid::new_v4()))
         .await
         .unwrap_err();
 
@@ -282,7 +280,7 @@ async fn credential_op_rotate_secret_success_emits_label(pool: PgPool) {
     .0;
 
     let snap = MetricAssertion::snapshot();
-    let _ = handle_rotate_client_secret(State(state), Path(create_resp.id))
+    let _ = handle_rotate_client_secret(State(state), admin_claims(), Path(create_resp.id))
         .await
         .unwrap();
 
@@ -293,33 +291,11 @@ async fn credential_op_rotate_secret_success_emits_label(pool: PgPool) {
 async fn credential_op_rotate_secret_error_emits_label(pool: PgPool) {
     let state = make_app_state(pool);
     let snap = MetricAssertion::snapshot();
-    let _ = handle_rotate_client_secret(State(state), Path(Uuid::new_v4()))
+    let _ = handle_rotate_client_secret(State(state), admin_claims(), Path(Uuid::new_v4()))
         .await
         .unwrap_err();
 
-    // rotate_secret error path: the not-found branch at admin_handler.rs:1080
-    // returns BEFORE calling record_credential_operation (no `error` emission
-    // on this specific path). Compare against admin_handler.rs:1136 which IS
-    // wrapped, where the credential exists but DB rotate fails. Hence
-    // assert_unobserved on rotate_secret/error here — production behavior
-    // documented inline.
-    //
-    // (The success-path test above proves the wrapper is wired correctly.)
-    snap.counter("ac_credential_operations_total")
-        .with_labels(&[("operation", "rotate_secret"), ("status", "error")])
-        .assert_unobserved();
-
-    // Per @team-lead 12-cell adjacency: every OTHER cell must also be 0 on
-    // this path (no emission of any kind). Catches a refactor that
-    // accidentally wires this branch to a different (op, status) cell.
-    for op in ALL_OPERATIONS {
-        for status in ALL_STATUSES {
-            if *op == "rotate_secret" && *status == "error" {
-                continue;
-            }
-            snap.counter("ac_credential_operations_total")
-                .with_labels(&[("operation", *op), ("status", *status)])
-                .assert_delta(0);
-        }
-    }
+    // Not-found records rotate_secret/error, like update and delete (the
+    // shared failure path in admin_handler.rs).
+    assert_only_cell(&snap, "rotate_secret", "error", 1);
 }

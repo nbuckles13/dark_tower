@@ -266,7 +266,7 @@ async fn rate_limit_decision_allowed_emits_for_registration_gate(pool: PgPool) {
         state.config.hash_secret.expose_secret(),
         org_id,
         request,
-        Some("198.51.100.42"), // Documentation-range IP; rate-limit branch fires only with Some(ip).
+        "198.51.100.42", // Documentation-range IP.
         None,
         state.config.bcrypt_cost,
         state.config.registration_rate_limit_window_minutes,
@@ -302,9 +302,9 @@ async fn rate_limit_decision_rejected_emits_for_registration_gate(pool: PgPool) 
     .await
     .unwrap();
 
-    // The registration rate-limit branch counts `user_login` events
-    // (success=true) from the same IP within the window — see
-    // `user_service::count_registrations_from_ip` at user_service.rs:206-230.
+    // The registration rate-limit branch counts `user_registered` +
+    // `user_registration_failed` events from the same IP within the window —
+    // see `auth_events::count_registration_attempts_by_ip`.
     // The auth_events table requires either user_id or credential_id (per
     // the `event_has_subject` CHECK constraint in
     // migrations/20250122000001_auth_controller_tables.sql). Seed a sentinel
@@ -322,7 +322,7 @@ async fn rate_limit_decision_rejected_emits_for_registration_gate(pool: PgPool) 
         sqlx::query(
             "INSERT INTO auth_events \
              (event_type, user_id, success, ip_address, created_at) \
-             VALUES ('user_login', $1, true, $2::inet, NOW())",
+             VALUES ('user_registered', $1, true, $2::inet, NOW())",
         )
         .bind(sentinel_user_id)
         .bind(test_ip)
@@ -343,7 +343,7 @@ async fn rate_limit_decision_rejected_emits_for_registration_gate(pool: PgPool) 
         state.config.hash_secret.expose_secret(),
         org_id,
         request,
-        Some(test_ip),
+        test_ip,
         None,
         state.config.bcrypt_cost,
         state.config.registration_rate_limit_window_minutes,

@@ -5,7 +5,7 @@
 // in-tree generated files, no `extern_path` remapping — every proto package
 // gets a Rust module at its proto-package path (e.g. `dark_tower::signaling::v1`).
 //
-// `tonic-build` maps `.google.protobuf.*` to `::prost_types` by default, so
+// `tonic-prost-build` maps `.google.protobuf.*` to `::prost_types` by default, so
 // `signaling.MhConnectionStatus.observed_at` (`google.protobuf.Timestamp`)
 // generates as `::prost_types::Timestamp` without an explicit `extern_path`.
 // WKT `.proto` files are resolved from the system protoc include path
@@ -36,11 +36,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // transitively, and `crates/mh-service/src/webtransport/connection.rs`'s
     // malformed-envelope `warn!` arms are one `?envelope` away from logging it.
     // The `\btoken\b` guard gap above applies verbatim.
-    tonic_build::configure()
-        .skip_debug("dark_tower.signaling.v1.JoinRequest")
-        .skip_debug("dark_tower.signaling.v1.JoinResponse")
-        .skip_debug("dark_tower.signaling.v1.MeetingKekUpdate")
-        .skip_debug("dark_tower.signaling.v1.MhConnectRequest")
+    tonic_prost_build::configure()
+        .skip_debug(["dark_tower.signaling.v1.JoinRequest"])
+        .skip_debug(["dark_tower.signaling.v1.JoinResponse"])
+        .skip_debug(["dark_tower.signaling.v1.MeetingKekUpdate"])
+        .skip_debug(["dark_tower.signaling.v1.MhConnectRequest"])
         // `Participant` carries `name` (PII, ADR-0011 membership disclosure) and
         // `identity_public_key` (a stable per-participant identifier). It is
         // broadcast on every join via `ParticipantJoined`, which rides inside
@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // would leave the same PII printable one participant at a time. Redact
         // the type itself; both consumers (`JoinResponse` roster, which prints a
         // count, and `ParticipantJoined`) are covered by one impl.
-        .skip_debug("dark_tower.signaling.v1.Participant")
+        .skip_debug(["dark_tower.signaling.v1.Participant"])
         .compile_protos(
             &[
                 "../../proto/dark_tower/signaling/v1/signaling.proto",

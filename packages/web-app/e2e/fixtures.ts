@@ -80,8 +80,9 @@ function randomPassword(): string {
 }
 
 /**
- * Fresh throwaway credentials. AC rate-limits SUCCESSFUL TOKEN ISSUES per source
- * IP — every registration AND every sign-in counts (see `./cohort`'s header) —
+ * Fresh throwaway credentials. AC rate-limits REGISTRATION ATTEMPTS per source
+ * IP — successful and failed registrations count, sign-ins do not (see
+ * `./cohort`'s header) —
  * with the Kind limit's SSoT in `infra/services/ac-service/config.env`
  * (`AC_REGISTRATION_RATE_LIMIT_*`); the suite's budget in that unit is tracked
  * in e2e/README.md §Budgets.
@@ -98,8 +99,8 @@ export function randomCredentials(label: string): TestCredentials {
 /**
  * The suite's ONE shared valid user for single-party and two-party specs (see
  * e2e/README.md §Budgets). Registered once per worker process and reused via
- * `signInViaUi` — 0 further REGISTRATIONS, though each sign-in is still one
- * successful token issue against AC's per-IP limit.
+ * `signInViaUi` — 0 further REGISTRATIONS; a sign-in spends no registration
+ * budget (AC's per-IP limit counts registration attempts only).
  *
  * BUDGET ↔ workers=1 COUPLING (do not decouple silently): "registered once"
  * rests on `workers: 1` (playwright.config.ts) — a single worker process makes
@@ -202,8 +203,8 @@ export function suiteCohort(): TestCredentials[] {
 }
 
 /**
- * Sign `page` in as cohort member `index` (0-based). 0 registrations; ONE
- * successful token issue against AC's per-IP limit. Returns the access token.
+ * Sign `page` in as cohort member `index` (0-based). 0 registrations, so no
+ * registration budget spent (a sign-in never counts). Returns the access token.
  */
 export async function authAsCohortMember(page: Page, index: number): Promise<string> {
   const cohort = suiteCohort();
@@ -287,10 +288,10 @@ async function captureAccessToken(
     // only spend more of it (and hide a budget regression behind a slow pass).
     throw new Error(
       `auth exchange ${path} was RATE-LIMITED (HTTP 429): AC's per-source-IP bucket of ` +
-        `successful token issues (registrations AND sign-ins) is exhausted. Limit SSoT: ` +
+        `registration attempts (successful AND failed registrations) is exhausted. Limit SSoT: ` +
         `infra/services/ac-service/config.env ${AC_REGISTRATION_RATE_LIMIT_MAX_KEY} / ` +
         `${AC_REGISTRATION_RATE_LIMIT_WINDOW_KEY}. The bucket is shared with the Rust env-tests run from ` +
-        `this host just before this suite and with every other spec's sign-ins — see ` +
+        `this host just before this suite and with every other spec's registrations — see ` +
         `e2e/README.md §Budgets. Do not retry; wait out the window or fix the budget.`,
     );
   }

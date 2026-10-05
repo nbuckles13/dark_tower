@@ -19,7 +19,9 @@
 #![cfg(feature = "flows")]
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::{TokenRequest, UserRegistrationRequest};
+use env_tests::fixtures::auth_client::{
+    TokenRequest, UserRegistrationRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET,
+};
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
 use env_tests::fixtures::mc_session::{self, McSession};
 use env_tests::fixtures::AuthClient;
@@ -258,7 +260,7 @@ async fn test_gc_join_rejects_service_token() {
 
     // Get a service token (client_credentials flow)
     let token_request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
     let token_response = auth_client
         .issue_token(token_request)
         .await

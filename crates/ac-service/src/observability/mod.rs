@@ -84,6 +84,9 @@ pub enum ErrorCategory {
     Cryptographic,
     /// Internal errors (database, system)
     Internal,
+    /// Client-attributable rejection of the request (validation failure,
+    /// state conflict). `status_code` separates 400 from 409.
+    Validation,
     /// JWT iat-validation skew rejection (NTP / clock-drift signal).
     ///
     /// Emitted via `record_token_validation` from `crypto::verify_jwt` and
@@ -104,6 +107,7 @@ impl ErrorCategory {
             ErrorCategory::Cryptographic => "cryptographic",
             ErrorCategory::Internal => "internal",
             ErrorCategory::ClockSkew => "clock_skew",
+            ErrorCategory::Validation => "validation",
         }
     }
 }
@@ -120,6 +124,8 @@ impl From<&crate::errors::AcError> for ErrorCategory {
             AcError::Database(_) | AcError::Internal | AcError::NotFound(_) => {
                 ErrorCategory::Internal
             }
+            AcError::BadRequest(_) => ErrorCategory::Validation,
+            AcError::Conflict(_) => ErrorCategory::Validation,
         }
     }
 }
@@ -191,6 +197,14 @@ mod tests {
             ErrorCategory::from(&AcError::Internal),
             ErrorCategory::Internal
         );
+        assert_eq!(
+            ErrorCategory::from(&AcError::BadRequest("x")),
+            ErrorCategory::Validation
+        );
+        assert_eq!(
+            ErrorCategory::from(&AcError::Conflict("x")),
+            ErrorCategory::Validation
+        );
     }
 
     #[test]
@@ -223,6 +237,7 @@ mod tests {
         assert_eq!(ErrorCategory::Cryptographic.as_str(), "cryptographic");
         assert_eq!(ErrorCategory::Internal.as_str(), "internal");
         assert_eq!(ErrorCategory::ClockSkew.as_str(), "clock_skew");
+        assert_eq!(ErrorCategory::Validation.as_str(), "validation");
     }
 
     #[test]

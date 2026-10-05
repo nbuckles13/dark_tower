@@ -222,9 +222,11 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-prot
 
 **Used by**: Auth Controller (`crates/ac-service`) for user authentication
 
-#### prost-build v0.13.5
+#### prost-build v0.14 (via `tonic-prost-build` 0.14)
 
-**What it does**: Generates Rust code from `.proto` files at build time
+**What it does**: Generates Rust code from `.proto` files at build time (tonic 0.14
+split prost codegen into `tonic-prost-build`; the generated code's runtime codec
+lives in `tonic-prost`)
 
 **Build requirements**:
 - System `protoc` binary in PATH
@@ -232,7 +234,8 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-prot
 
 **Used by**: `crates/proto-gen/build.rs`
 
-**Generated code location**: `crates/proto-gen/src/generated/`
+**Generated code location**: Cargo `OUT_DIR` (not checked in), included from
+`crates/proto-gen/src/lib.rs` via `include!(concat!(env!("OUT_DIR"), ...))`
 
 ### Secondary Native Dependencies
 

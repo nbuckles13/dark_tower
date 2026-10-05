@@ -6,6 +6,12 @@
 #![cfg(feature = "smoke")]
 
 use env_tests::cluster::ClusterConnection;
+use env_tests::eventual::{assert_eventually, ConsistencyCategory};
+use env_tests::fixtures::auth_client::{TokenRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET};
+use env_tests::fixtures::collector::{
+    assert_collector_log_has_no_secrets, assert_log_has_no_secret_fields, collector_log,
+    OTEL_COLLECTOR_SELECTOR,
+};
 use env_tests::NAMESPACE;
 use std::process::Command;
 
@@ -177,11 +183,24 @@ async fn test_secrets_not_in_env_vars() {
 
 #[tokio::test]
 async fn test_secrets_not_in_logs() {
-    // Use kubectl to sample recent logs and check for leaked credentials
-    assert_pods_exist(AC_SELECTOR);
+    // Drive secret- and token-bearing traffic FIRST (dev client credentials →
+    // AC, its service token → GC), so both scans below cover it.
+    let traffic = drive_authenticated_traffic().await;
 
+    // AC service logs: the same shared secret-field + secret-literal scan as
+    // the collector log (one detector, so the two cannot drift), over the
+    // window that holds the traffic above.
+    assert_pods_exist(AC_SELECTOR);
     let output = Command::new("kubectl")
-        .args(["logs", "-n", NAMESPACE, "-l", AC_SELECTOR, "--tail=100"])
+        .args([
+            "logs",
+            "-n",
+            NAMESPACE,
+            "-l",
+            AC_SELECTOR,
+            "--tail=-1",
+            &format!("--since={COLLECTOR_LOG_WINDOW}"),
+        ])
         .output();
 
     let output = output.unwrap_or_else(|e| {
@@ -199,17 +218,23 @@ async fn test_secrets_not_in_logs() {
     );
 
     let logs = String::from_utf8_lossy(&output.stdout);
-
-    // Check for common credential patterns
-    // Note: These patterns are heuristic - they may have false positives/negatives
+    // In-window positive control: the scan must cover the client-credentials
+    // grant driven above, or it passes vacuously on an empty / wrong-selector /
+    // out-of-window log. AC logs `SERVICE_TOKEN_ISSUED_MESSAGE`
+    // (`ac-service/src/services/token_service.rs`) once per issuance, inside the
+    // request span whose `endpoint` is the service-token route. env-tests does
+    // not depend on ac-service, so the string is restated here; a rename fails
+    // this assertion loudly rather than silently.
     assert!(
-        !logs.contains("client_secret"),
-        "Logs should not contain client_secret field values"
+        logs.lines()
+            .any(|line| line.contains("Service token issued")
+                && line.contains("/api/v1/auth/service/token")),
+        "positive control: the AC log window has no service-token issuance line for the \
+         client-credentials request just driven, so the AC leak scan would scan nothing \
+         ({} lines in window)",
+        logs.lines().count()
     );
-    assert!(
-        !logs.contains("password="),
-        "Logs should not contain password= patterns"
-    );
+    assert_log_has_no_secret_fields("AC service", &logs, &[DEV_TEST_CLIENT_SECRET]);
 
     // JWT tokens are expected in some log contexts (e.g., "issued token"),
     // but shouldn't appear as raw bearer tokens
@@ -219,7 +244,91 @@ async fn test_secrets_not_in_logs() {
         "Logs should not contain raw Bearer tokens (found {} instances)",
         bearer_count
     );
+
+    assert_collector_log_has_no_secrets_after_authenticated_traffic(&traffic).await;
 }
+
+/// Token-bearing traffic driven for the leak scans: the fresh trace_id sent on
+/// it and the AC-minted service token.
+struct AuthenticatedTraffic {
+    trace_id: String,
+    token: String,
+}
+
+/// Authenticate the dev client with its client secret (AC's client-credentials
+/// path), then send the AC-minted service token to GC `/api/v1/me` — which
+/// validates service tokens — with a fresh `traceparent`. Must get a 2xx so
+/// that request's spans are exported into the scanned window.
+async fn drive_authenticated_traffic() -> AuthenticatedTraffic {
+    let cluster = cluster().await;
+
+    let auth = env_tests::fixtures::AuthClient::new(&cluster.ac_base_url);
+    let token = auth
+        .issue_token(TokenRequest::client_credentials(
+            DEV_TEST_CLIENT_ID,
+            DEV_TEST_CLIENT_SECRET,
+            "test:all",
+        ))
+        .await
+        .expect("AC should issue the dev client a service token")
+        .access_token;
+
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let parent_span_id: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(16)
+        .collect();
+    let gc = env_tests::fixtures::GcClient::new(&cluster.gc_base_url);
+    let response = gc
+        .http_client()
+        .get(format!("{}/api/v1/me", gc.base_url()))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("traceparent", format!("00-{trace_id}-{parent_span_id}-01"))
+        .send()
+        .await
+        .expect("authenticated GC request should send");
+    assert!(
+        response.status().is_success(),
+        "authenticated GC request should succeed, got {}",
+        response.status()
+    );
+    AuthenticatedTraffic { trace_id, token }
+}
+
+/// The collector log is a secondary sink for anything a service puts on a span
+/// (see `env_tests::fixtures::collector`), so it gets the same leak scan as the
+/// service logs — but only AFTER secret- and token-bearing traffic has flowed,
+/// or the scan proves nothing.
+///
+/// Waits until the traffic's trace_id is in the collector log, then runs the
+/// shared collector scan over that window (trace_id presence, the JWT regex
+/// matching the real token, and the dev client secret literal are its
+/// controls).
+async fn assert_collector_log_has_no_secrets_after_authenticated_traffic(
+    traffic: &AuthenticatedTraffic,
+) {
+    assert_pods_exist(OTEL_COLLECTOR_SELECTOR);
+
+    let mut log = String::new();
+    let _ = assert_eventually(ConsistencyCategory::LogAggregation, || {
+        log = collector_log(COLLECTOR_LOG_WINDOW);
+        let present = log.contains(&traffic.trace_id);
+        async move { present }
+    })
+    .await;
+    assert_collector_log_has_no_secrets(
+        &log,
+        &traffic.trace_id,
+        &traffic.token,
+        &[DEV_TEST_CLIENT_SECRET],
+    );
+}
+
+/// Window for the collector-log scan; the trace_id is fresh per run, so the
+/// window only bounds output.
+const COLLECTOR_LOG_WINDOW: &str = "5m";
 
 /// The dev OTel collector (R-59) must be Ready. This asserts the cluster-setup
 /// readiness gate is correct: the `app=otel-collector` selector here MUST match
@@ -247,7 +356,7 @@ async fn test_otel_collector_ready() {
             "--for=condition=Ready",
             "pod",
             "-l",
-            "app=otel-collector",
+            OTEL_COLLECTOR_SELECTOR,
             "-n",
             NAMESPACE,
             "--timeout=10s",
@@ -264,7 +373,7 @@ async fn test_otel_collector_ready() {
 
     assert!(
         output.status.success(),
-        "OTel collector pod (-l app=otel-collector -n dark-tower) is not Ready - \
+        "OTel collector pod (-l {OTEL_COLLECTOR_SELECTOR} -n {NAMESPACE}) is not Ready - \
          the deploy_otel_collector readiness gate may be misconfigured (selector/namespace \
          mismatch) or the collector failed to start: {}",
         String::from_utf8_lossy(&output.stderr)

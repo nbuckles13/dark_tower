@@ -291,7 +291,7 @@ async fn configure_routes() -> Router {
 fn v1_routes() -> Router {
     Router::new()
         .route("/meetings", post(create_meeting_v1))
-        .route("/meetings/:id", get(get_meeting_v1))
+        .route("/meetings/{id}", get(get_meeting_v1))
         .route("/auth/user/token", post(user_token_v1))
 }
 ```

@@ -48,7 +48,7 @@ use axum::http;
 use chrono::Utc;
 use mc_service::grpc::McAuthLayer;
 use mc_test_utils::jwt_test::{mount_jwks_mock, TestKeypair};
-use tonic::body::BoxBody;
+use tonic::body::Body;
 use tower::{Layer, Service, ServiceExt};
 use wiremock::MockServer;
 
@@ -72,8 +72,8 @@ const ALL_FAILURE_REASONS: &[&str] = &[
 #[derive(Clone)]
 struct NoopService;
 
-impl Service<http::Request<BoxBody>> for NoopService {
-    type Response = http::Response<BoxBody>;
+impl Service<http::Request<Body>> for NoopService {
+    type Response = http::Response<Body>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future =
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
@@ -82,8 +82,8 @@ impl Service<http::Request<BoxBody>> for NoopService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _request: http::Request<BoxBody>) -> Self::Future {
-        Box::pin(async { Ok(http::Response::new(BoxBody::default())) })
+    fn call(&mut self, _request: http::Request<Body>) -> Self::Future {
+        Box::pin(async { Ok(http::Response::new(Body::default())) })
     }
 }
 
@@ -112,11 +112,11 @@ fn make_service_claims(
     )
 }
 
-fn bearer_request(uri: &str, token: &str) -> http::Request<BoxBody> {
+fn bearer_request(uri: &str, token: &str) -> http::Request<Body> {
     http::Request::builder()
         .uri(uri)
         .header("authorization", format!("Bearer {token}"))
-        .body(BoxBody::default())
+        .body(Body::default())
         .unwrap()
 }
 

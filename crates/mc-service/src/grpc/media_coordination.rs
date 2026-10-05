@@ -147,7 +147,6 @@ impl McMediaCoordinationService {
 }
 
 /// Validate that an ID field is non-empty and within length bounds.
-#[allow(clippy::result_large_err)] // tonic::Status is inherently large; standard tonic pattern
 fn validate_id_field(value: &str, field_name: &str) -> Result<(), Status> {
     if value.is_empty() {
         debug!(
@@ -181,7 +180,6 @@ fn validate_id_field(value: &str, field_name: &str) -> Result<(), Status> {
 /// reach `sub` resolution. `tests::identity_fields_still_reject_empty` exists
 /// to fail if the two are ever unified. The value is opaque: never parsed, no
 /// shape asserted.
-#[allow(clippy::result_large_err)] // tonic::Status is inherently large; standard tonic pattern
 fn validate_optional_id_field(value: &str, field_name: &str) -> Result<(), Status> {
     if value.len() > MAX_ID_LENGTH {
         debug!(

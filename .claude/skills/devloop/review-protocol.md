@@ -27,7 +27,7 @@ Guarded Shared Areas (current snapshot):
 - `crates/common/src/webtransport/**` — wire-runtime coupling
 - `crates/ac-service/src/jwks/**`, `src/token/**`, `src/crypto/**` — crypto primitives
 - `crates/ac-service/src/audit/**` — detection/forensics contract
-- `db/migrations/**` — schema evolution
+- `migrations/**` — schema evolution
 - ADR-0027-approved crypto primitives (wherever referenced) — path-independent
 
 **Intersection rule**: edits spanning two GSA (e.g., auth-routing fields in `proto/internal.proto` crossing wire-format × auth-routing-policy) pull all affected owners **and security** into planning + review (protocol + auth-controller + security for that example; ADR-0003 §5.7). An optional `Approved-Cross-Boundary:` trailer per owner may be recorded as an audit breadcrumb. **Mechanical classification is disallowed inside GSA** (a GSA edit is always at least Domain-judgment-level owner involvement).

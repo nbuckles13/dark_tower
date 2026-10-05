@@ -1,5 +1,5 @@
 use crate::errors::AcError;
-use crate::models::AuthEvent;
+use crate::models::{AuthEvent, AuthEventType};
 use crate::observability::metrics::record_db_query;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -163,6 +163,42 @@ pub async fn get_events_by_type(
     .map_err(|e| AcError::Database(format!("Failed to fetch events by type: {}", e)))?;
 
     Ok(events)
+}
+
+/// Count registration attempts from an IP address since a given time.
+///
+/// Counts `user_registered` + `user_registration_failed` rows (any `success`)
+/// — the unit of `registration_rate_limit_max_attempts` is registration
+/// attempts, and logins do not consume it. **Coupling:** the registration
+/// limiter depends on those two event types being written with `ip_address`
+/// (`user_service`); changing either write silently changes the limiter.
+pub async fn count_registration_attempts_by_ip(
+    pool: &PgPool,
+    ip_address: &str,
+    since: DateTime<Utc>,
+) -> Result<i64, AcError> {
+    let start = Instant::now();
+    let result = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM auth_events
+        WHERE ip_address = $1::inet
+          AND event_type IN ($3, $4)
+          AND created_at >= $2
+        "#,
+    )
+    .bind(ip_address)
+    .bind(since)
+    .bind(AuthEventType::UserRegistered.as_str())
+    .bind(AuthEventType::UserRegistrationFailed.as_str())
+    .fetch_one(pool)
+    .await;
+    let status = if result.is_ok() { "success" } else { "error" };
+    record_db_query("select", "auth_events", status, start.elapsed());
+    let count: (i64,) =
+        result.map_err(|e| AcError::Database(format!("Failed to count registrations: {}", e)))?;
+
+    Ok(count.0)
 }
 
 /// Get count of failed authentication attempts for a credential since a given time

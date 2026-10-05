@@ -294,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // span-creating layer on this builder, `otel_grpc::server_interceptor()`
     // below runs with no active `tracing::Span` to attach a parent to —
     // `Span::current()` resolves to the disabled/none span and
-    // `.set_parent()` on it is a silent no-op (verified against
+    // the reparent (`set_remote_parent`) has no span to attach to (verified against
     // `GrpcAuthService::call`, which only emits `debug!`/`warn!` events, and
     // against this builder, which previously had no span-creating layer at
     // all). (Gate-1 finding, @observability — 2026-07-03 GC OTel wiring devloop.)
@@ -307,21 +307,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // — both so its span exists before `grpc_auth_layer`/the per-service
     // interceptor run inside it, AND because `GrpcAuthService`'s hand-rolled
     // `Service` impl (`grpc/auth_layer.rs`) requires its wrapped inner
-    // service's response body type to be exactly `tonic`'s `BoxBody` —
+    // service's response body type to be exactly `tonic`'s `Body` —
     // `TraceLayer` changes that body type, so it must wrap `GrpcAuthService`
     // from the outside, not be wrapped by it (confirmed by a body-type
     // mismatch compile error when the order was reversed).
+    //
+    // The extraction interceptor runs as a layer DIRECTLY inside `TraceLayer`,
+    // before `grpc_auth_layer`: tracing-opentelemetry 0.32+ starts a span's
+    // OTel context as soon as a child span is created under it, after which
+    // reparenting fails. Auth's JWT validation creates child spans, so the
+    // parent must be attached before auth runs.
+    // The layer ORDER (span → extraction → auth) is decided in one place,
+    // `grpc::server_layers` → `common::observability::otel_grpc::inbound_layers`
+    // (see its INVARIANT doc).
     let grpc_server = TonicServer::builder()
-        .layer(tower_http::trace::TraceLayer::new_for_grpc())
-        .layer(grpc_auth_layer)
-        .add_service(GlobalControllerServiceServer::with_interceptor(
-            mc_service,
-            common::observability::otel_grpc::server_interceptor(),
-        ))
-        .add_service(MediaHandlerRegistryServiceServer::with_interceptor(
-            mh_service,
-            common::observability::otel_grpc::server_interceptor(),
-        ))
+        .layer(grpc::server_layers(grpc_auth_layer))
+        .add_service(GlobalControllerServiceServer::new(mc_service))
+        .add_service(MediaHandlerRegistryServiceServer::new(mh_service))
         .serve(grpc_addr);
 
     // Run both servers concurrently with graceful shutdown

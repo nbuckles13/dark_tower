@@ -26,17 +26,13 @@ use test_common::jwks_rig::JwksRig;
 use test_common::mock_mc::{
     start_mock_mc_server, MockBehavior, MockMcHandle, MockMcServer, SenderReplies,
 };
-use test_common::otel_capture::{install_test_propagator, trace_id_hex, SpanCapture};
+use test_common::otel_capture::{
+    deployed_rust_log, install_test_propagator, known_traceparent, trace_id_hex, SpanCapture,
+    KNOWN_TRACE_ID_U128,
+};
 use test_common::test_token_receiver;
 use test_common::tokens::mint_meeting_token;
 use test_common::wt_client::{connect_and_open_bi, write_mh_connect_with_trace};
-
-const KNOWN_TRACE_ID_U128: u128 = 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736;
-const KNOWN_SPAN_ID_U64: u64 = 0x00f0_67aa_0ba9_02b7;
-
-fn known_traceparent_header() -> String {
-    format!("00-{KNOWN_TRACE_ID_U128:032x}-{KNOWN_SPAN_ID_U64:016x}-01")
-}
 
 /// The participant these tests connect as — the `sub` of the minted token, and
 /// therefore the key MC answers a `sender_id` for.
@@ -125,8 +121,22 @@ async fn wait_for_active_count(
 #[tokio::test]
 async fn test_wt_valid_traceparent_reparents_connection_span() {
     install_test_propagator();
-    let capture = SpanCapture::install();
+    assert_valid_traceparent_reparents(SpanCapture::install()).await;
+}
 
+/// The same reparent under MH's DEPLOYED `RUST_LOG` (read from the manifest).
+/// The deployed filter enables `mh_service=debug`, so any debug span a future
+/// change creates under the connection span before the reparent would start
+/// the parent's context and break continuity in production; this test is the
+/// tripwire for that (the all-levels test above also is, more strictly).
+#[tokio::test]
+async fn test_wt_valid_traceparent_reparents_under_deployed_filter() {
+    install_test_propagator();
+    assert_valid_traceparent_reparents(SpanCapture::install_with_filter(&deployed_rust_log()))
+        .await;
+}
+
+async fn assert_valid_traceparent_reparents(capture: SpanCapture) {
     let suite = WtSuite::start().await;
     suite
         .session_manager
@@ -144,7 +154,7 @@ async fn test_wt_valid_traceparent_reparents_connection_span() {
 
     let token = mint_meeting_token(&suite.jwks.keypair, "otel-wt-meeting", OTEL_WT_PARTICIPANT);
     let (conn, mut send, recv) = connect_and_open_bi(&suite.wt.url).await;
-    write_mh_connect_with_trace(&mut send, &token, &known_traceparent_header(), "")
+    write_mh_connect_with_trace(&mut send, &token, &known_traceparent(), "")
         .await
         .expect("failed to write MhClientMessage frame");
 

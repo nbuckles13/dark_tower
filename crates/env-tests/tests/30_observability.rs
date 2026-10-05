@@ -7,8 +7,12 @@
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::eventual::{assert_eventually, ConsistencyCategory};
+use env_tests::fixtures::collector::{assert_collector_log_has_no_secrets, collector_log};
+use env_tests::fixtures::metrics::{
+    format_instance_map, instances_exceeding_baseline, poll_until_any_instance_above,
+};
 use env_tests::fixtures::PrometheusClient;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Helper to create a cluster connection for tests.
 async fn cluster() -> ClusterConnection {
@@ -627,4 +631,238 @@ async fn zero_initialized_counter_is_present_at_zero_on_a_running_pod() {
              controller actor genuinely panicked on that pod. Investigate; not a flake."
         );
     }
+}
+
+// ============================================================================
+// OTLP export, end to end (web-stack + OTel 0.33 upgrade devloop, 2026-10-04)
+// ============================================================================
+//
+// Unit/integration harnesses never exercise the real exporter; these two tests
+// do. The first proves spans ARRIVE at the collector; the second proves inbound
+// trace context CONTINUES across GC → MC and GC → AC (one trace_id under each
+// service), which is the deployed-config check for the request-span level and
+// `with_context_activation(false)`.
+
+/// The collector's own telemetry job (`otel-collector-telemetry` in
+/// `infra/kubernetes/observability/prometheus.yml`), scraped on port 8888.
+const COLLECTOR_TELEMETRY_JOB: &str = "otel-collector-telemetry";
+
+/// Greppable: the accepted-spans series did not exist before the test drove any
+/// traffic. Distinct from [`TRIAGE_COLLECTOR_NO_RISE`] — a missing series means
+/// the collector or its scrape is not wired at all, not that this test's spans
+/// were lost.
+const TRIAGE_COLLECTOR_SERIES_ABSENT: &str = "collector-accepted-spans-series-absent";
+
+/// Greppable: the series existed but did not rise after GC → MC traffic.
+const TRIAGE_COLLECTOR_NO_RISE: &str = "collector-accepted-spans-did-not-rise";
+
+/// Greppable: the collector log holds no global-controller span at all in the
+/// window, so "continuity broken" cannot be judged (nothing was exported).
+const TRIAGE_COLLECTOR_LOG_NO_GC_SPANS: &str = "collector-log-has-no-gc-spans";
+
+/// Services whose spans must carry the joined request's trace_id. The GC join
+/// path calls MC (assignment gRPC, on a fresh meeting) and AC (meeting token)
+/// on every successful join. MH is not asserted: Kind has no MH OTel overlay.
+const CONTINUITY_SERVICES: &[&str] =
+    &["global-controller", "meeting-controller", "auth-controller"];
+
+/// The OTLP test user: its access token and the registration password this
+/// file actually sent to AC (a secret value the leak scan checks for).
+struct OtlpUser {
+    token: String,
+    password: String,
+}
+
+static OTLP_USER: tokio::sync::OnceCell<OtlpUser> = tokio::sync::OnceCell::const_new();
+
+/// One registered user shared by this file's OTLP tests (one registration).
+async fn otlp_user(cluster: &ClusterConnection) -> &'static OtlpUser {
+    OTLP_USER
+        .get_or_init(|| async {
+            let auth = env_tests::fixtures::AuthClient::new(&cluster.ac_base_url);
+            let request = env_tests::fixtures::auth_client::UserRegistrationRequest::unique(
+                "OTLP Export User",
+            );
+            let token = auth
+                .register_user(&request)
+                .await
+                .expect("AC should register the OTLP test user")
+                .access_token;
+            OtlpUser {
+                token,
+                password: request.password,
+            }
+        })
+        .await
+}
+
+async fn otlp_user_token(cluster: &ClusterConnection) -> &'static String {
+    &otlp_user(cluster).await.token
+}
+
+/// Create a fresh meeting and join it through GC, optionally carrying a W3C
+/// `traceparent`. A fresh meeting forces GC's MC-assignment gRPC call.
+async fn join_fresh_meeting(cluster: &ClusterConnection, traceparent: Option<&str>) {
+    let token = otlp_user_token(cluster).await;
+    let gc = env_tests::fixtures::GcClient::new(&cluster.gc_base_url);
+    let created = gc
+        .create_meeting(
+            token,
+            &env_tests::fixtures::gc_client::CreateMeetingRequest::new("OTLP Export Meeting"),
+        )
+        .await
+        .expect("GC should create the meeting");
+    let mut request = gc
+        .http_client()
+        .get(format!(
+            "{}/api/v1/meetings/{}",
+            gc.base_url(),
+            created.meeting_code
+        ))
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(tp) = traceparent {
+        request = request.header("traceparent", tp);
+    }
+    let response = request.send().await.expect("GC join request should send");
+    assert!(
+        response.status().is_success(),
+        "GC join should succeed, got {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn otlp_spans_reach_the_collector_and_none_are_refused() {
+    let cluster_conn = cluster().await;
+    let cluster = &cluster_conn;
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let accepted = format!(
+        r#"sum by (instance) (otelcol_receiver_accepted_spans{{job="{COLLECTOR_TELEMETRY_JOB}"}})"#
+    );
+    let refused = format!(
+        r#"sum by (instance) (otelcol_receiver_refused_spans{{job="{COLLECTOR_TELEMETRY_JOB}"}})"#
+    );
+
+    // Precondition: the series must already exist. The services export spans
+    // continuously (MC/MH → GC heartbeats), so an absent series means the
+    // collector, its receiver or its scrape is broken — not a pass, and not
+    // the same failure as "did not rise".
+    let accepted_baseline = prom.instance_counter_map(&accepted).await;
+    assert!(
+        !accepted_baseline.is_empty(),
+        "{TRIAGE_COLLECTOR_SERIES_ABSENT}: `{accepted}` returned no series before any test \
+         traffic — check the collector pod, its OTLP receiver and the \
+         `{COLLECTOR_TELEMETRY_JOB}` scrape job"
+    );
+    // Refused is healthy-zero and may be absent until the first refusal; an
+    // absent instance reads as 0 in the comparison below.
+    let refused_baseline = prom.instance_counter_map(&refused).await;
+
+    join_fresh_meeting(cluster, None).await;
+
+    poll_until_any_instance_above(
+        &prom,
+        &accepted,
+        &accepted_baseline,
+        ConsistencyCategory::MetricsScrape.timeout(),
+        Duration::from_secs(1),
+        |current| {
+            format!(
+                "{TRIAGE_COLLECTOR_NO_RISE}: `{accepted}` did not rise after a GC → MC join. \
+                 baseline={} current={}",
+                format_instance_map(&accepted_baseline),
+                format_instance_map(current)
+            )
+        },
+    )
+    .await;
+
+    let refused_now = prom.instance_counter_map(&refused).await;
+    let risen = instances_exceeding_baseline(&refused_baseline, &refused_now);
+    assert!(
+        risen.is_empty(),
+        "collector refused spans during the test on {risen:?}: baseline={} now={}",
+        format_instance_map(&refused_baseline),
+        format_instance_map(&refused_now)
+    );
+}
+
+/// The `kubectl logs` window. The trace_id is minted fresh per run, so lines
+/// from earlier runs cannot satisfy the test; the window only bounds output.
+const COLLECTOR_LOG_WINDOW: &str = "5m";
+
+/// Services under which `trace_id` appears in the debug exporter's `normal`
+/// output: each `ResourceTraces` block names its resource attributes
+/// (`service.name=...`), and every span line under it carries its trace id.
+fn services_with_trace_id(log: &str, trace_id: &str) -> std::collections::BTreeSet<String> {
+    let mut current: Option<String> = None;
+    let mut found = std::collections::BTreeSet::new();
+    for line in log.lines() {
+        if let Some(rest) = line.split("service.name=").nth(1) {
+            current = rest.split_whitespace().next().map(str::to_owned);
+        }
+        if line.contains(trace_id) {
+            if let Some(service) = &current {
+                found.insert(service.clone());
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn inbound_trace_context_continues_across_gc_mc_and_ac() {
+    let cluster_conn = cluster().await;
+    let cluster = &cluster_conn;
+
+    // Fresh per run: a previous run's log lines can never match.
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let parent_span_id: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(16)
+        .collect();
+    let traceparent = format!("00-{trace_id}-{parent_span_id}-01");
+
+    join_fresh_meeting(cluster, Some(&traceparent)).await;
+
+    let mut last_found = std::collections::BTreeSet::new();
+    let mut saw_gc = false;
+    let mut last_log = String::new();
+    let result = assert_eventually(ConsistencyCategory::LogAggregation, || {
+        let log = collector_log(COLLECTOR_LOG_WINDOW);
+        last_log.clone_from(&log);
+        saw_gc = log.contains("service.name=global-controller");
+        last_found = services_with_trace_id(&log, &trace_id);
+        let done = CONTINUITY_SERVICES.iter().all(|s| last_found.contains(*s));
+        async move { done }
+    })
+    .await;
+
+    if result.is_err() {
+        assert!(
+            saw_gc,
+            "{TRIAGE_COLLECTOR_LOG_NO_GC_SPANS}: the collector log (last {COLLECTOR_LOG_WINDOW}) \
+             holds no global-controller span at all — export is broken, so continuity cannot \
+             be judged"
+        );
+        panic!(
+            "trace {trace_id} (sent as traceparent on a GC join) did not appear under every \
+             service: expected {CONTINUITY_SERVICES:?}, found {last_found:?} — inbound trace \
+             context is not continuing across services"
+        );
+    }
+
+    // The same window now holds this join's GC/MC/AC spans (including AC's
+    // meeting-token path), i.e. token-bearing traffic: leak-scan it, with the
+    // fresh trace_id as the in-window positive control.
+    assert_collector_log_has_no_secrets(
+        &last_log,
+        &trace_id,
+        otlp_user_token(cluster).await,
+        // The OTLP user's registration password: a secret this file actually
+        // sent to AC inside the scanned window.
+        &[otlp_user(cluster).await.password.as_str()],
+    );
 }

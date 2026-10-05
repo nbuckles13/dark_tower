@@ -39,16 +39,16 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use test_common::grpc_rig::GrpcRig;
 use test_common::jwks_rig::JwksRig;
 use test_common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer};
-use test_common::otel_capture::{install_test_propagator, trace_id_hex, SpanCapture};
+use test_common::otel_capture::{
+    install_test_propagator, known_traceparent, trace_id_hex, SpanCapture, KNOWN_SPAN_ID_U64,
+    KNOWN_TRACE_ID_U128,
+};
 use test_common::test_token_receiver;
 use test_common::tokens::mint_valid_mc_token;
 
 // ============================================================================
 // Shared fixtures
 // ============================================================================
-
-const KNOWN_TRACE_ID_U128: u128 = 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736;
-const KNOWN_SPAN_ID_U64: u64 = 0x00f0_67aa_0ba9_02b7;
 
 /// A remote `Context` with a known, fixed trace/span id — used as the
 /// "caller's" ambient trace context for injection assertions.
@@ -60,12 +60,6 @@ fn known_remote_context() -> Context {
         true,
         TraceState::default(),
     ))
-}
-
-/// A raw W3C `traceparent` header value for [`KNOWN_TRACE_ID_U128`] /
-/// [`KNOWN_SPAN_ID_U64`] (version 00, sampled).
-fn known_traceparent_header() -> String {
-    format!("00-{KNOWN_TRACE_ID_U128:032x}-{KNOWN_SPAN_ID_U64:016x}-01")
 }
 
 // ============================================================================
@@ -89,7 +83,7 @@ async fn test_mc_client_notify_connected_injects_traceparent_matching_ambient_sp
     let client = McClient::new(test_token_receiver());
 
     let span = tracing::info_span!("test_notify_connected_root");
-    span.set_parent(known_remote_context());
+    assert!(span.set_parent(known_remote_context()).is_ok());
     async {
         client
             .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
@@ -172,7 +166,7 @@ async fn test_mc_client_retry_injects_same_traceparent_on_every_attempt() {
     let client = McClient::new(test_token_receiver());
 
     let span = tracing::info_span!("test_retry_root");
-    span.set_parent(known_remote_context());
+    assert!(span.set_parent(known_remote_context()).is_ok());
     async {
         client
             .notify_participant_connected(&mc_url, "meeting-1", "user-1", "mh-1", "conn-1")
@@ -261,7 +255,7 @@ async fn test_inbound_register_meeting_reparents_handler_span_to_injected_trace(
         .parse()
         .expect("authorization header parses");
     request.metadata_mut().insert("authorization", auth_value);
-    let tp_value: MetadataValue<_> = known_traceparent_header()
+    let tp_value: MetadataValue<_> = known_traceparent()
         .parse()
         .expect("traceparent header parses");
     request.metadata_mut().insert("traceparent", tp_value);

@@ -83,6 +83,8 @@ Dark Tower is a distributed system with multiple services that need to communica
 
 `internal:meeting-token` is an AC-internal HTTP scope for meeting token issuance, not a gRPC service-to-service scope. It does not follow the `service.write.*` pattern.
 
+`admin:services` is an AC-internal HTTP scope gating `/api/v1/admin/*`; it is not in any `default_scopes()` set and does not follow the `service.*` pattern.
+
 Scopes are registered per service in AC's `ServiceType::default_scopes()` (`crates/ac-service/src/models/mod.rs`) and seeded in `infra/kind/scripts/setup.sh`. AC issues all registered scopes in the JWT `scope` claim. The caller cannot request scopes beyond what is registered.
 
 ### Component 3: Token Types

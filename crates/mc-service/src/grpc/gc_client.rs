@@ -81,7 +81,7 @@ pub const MAX_NOTIFY_ATTEMPTS: u32 = 6;
 /// This is decided from the RETURNED `Status`, never from a readiness probe
 /// beforehand. After the first successful connect tonic's reconnecting channel
 /// reports ready even when a reconnect fails: it parks the connect error and
-/// returns it from `call()` (tonic 0.12 `transport/channel/service/reconnect.rs`,
+/// returns it from `call()` (tonic 0.14 `transport/channel/service/reconnect.rs`,
 /// the `has_been_connected || is_lazy` branch). A readiness pre-check therefore
 /// never sees a GC restart and would leave the retry unreachable.
 /// `Status::try_from_error` keeps the

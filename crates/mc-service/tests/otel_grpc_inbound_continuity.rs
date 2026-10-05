@@ -5,26 +5,22 @@
 //! the handler's own `#[instrument(name = "mc.grpc.media_coordination.connected")]`
 //! span MUST inherit the same trace-id.
 //!
-//! This is the test that catches the "silent no-op" regression:
-//! `.with_interceptor(...)` alone does nothing without a span-creating layer
-//! (`TraceLayer::new_for_grpc()`) ahead of it on the server builder — without
-//! that layer the assertion below fails (the interceptor finds no active span,
-//! and the handler span comes up as an unrelated root). Verified by temporarily
-//! removing `.layer(TraceLayer::new_for_grpc())` → the positive test fails →
-//! restored.
+//! The server is built through `mc_service::grpc::server_layers` (the same
+//! function `main.rs` uses) with the REAL `McAuthLayer`, so the request span →
+//! extraction → auth ordering is exercised as shipped. Moving extraction outside
+//! the span layer turns these tests red; moving it after auth does not compile
+//! (auth is bound to tonic's `Body`).
 //!
 //! ## Coverage scope — why MediaCoordinationService, not MeetingControllerService
 //!
-//! MC's inbound builder serves TWO services, each with its own
-//! `.with_interceptor(server_interceptor())` — `MediaCoordinationServiceServer`
-//! and `MeetingControllerServiceServer`. This component-tier test exercises
+//! MC's inbound builder serves TWO services behind the one shared layer stack —
+//! `MediaCoordinationServiceServer` and `MeetingControllerServiceServer`. This component-tier test exercises
 //! `MediaCoordinationService` because it constructs with only an in-memory
 //! meeting-controller handle. `MeetingControllerService` (`McAssignmentService`)
 //! requires an `Arc<FencedRedisClient>` whose constructor eagerly connects to a
 //! live Redis — not available at the component tier (no MC component test
-//! instantiates `FencedRedisClient`). Both services compose the IDENTICAL
-//! `server_interceptor()` behind the SAME shared `TraceLayer`, so this proves
-//! the reparent mechanism for the generated `*Server::with_interceptor` shape;
+//! instantiates `FencedRedisClient`). Both services sit behind the SAME
+//! `server_layers` stack, so this proves the reparent mechanism for both;
 //! the `MeetingControllerService` path is exercised end-to-end in the env-test
 //! tier (real cluster + Redis).
 
@@ -46,12 +42,19 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Endpoint, Server as TonicServer};
 use tonic::Request as TonicRequest;
 
+use ::common::jwt::{JwksClient, ServiceClaims};
+use mc_service::grpc::McAuthLayer;
+use mc_test_utils::jwt_test::{mount_jwks_mock, TestKeypair};
+
 use test_common::otel_capture::{
-    install_test_propagator, known_trace_id_hex, known_traceparent, trace_id_hex, SpanCapture,
+    deployed_rust_log, install_test_propagator, known_trace_id_hex, known_traceparent,
+    trace_id_hex, SpanCapture, KNOWN_SPAN_ID_U64,
 };
 
 struct TestGrpcServer {
     addr: std::net::SocketAddr,
+    keypair: TestKeypair,
+    _jwks: wiremock::MockServer,
     cancel: CancellationToken,
     handle: Option<JoinHandle<()>>,
 }
@@ -65,13 +68,30 @@ impl Drop for TestGrpcServer {
     }
 }
 
-/// Start MC's REAL inbound gRPC stack for `MediaCoordinationService`, wired
-/// exactly as `main.rs` wires it (R-56): `TraceLayer::new_for_grpc()` OUTERMOST
-/// (first `.layer()` — required so `server_interceptor()` has an active span to
-/// attach the parent to), then `.with_interceptor(svc, server_interceptor())`.
-/// `McAuthLayer` is intentionally omitted — auth is a separate, already-tested
-/// boundary; this test isolates trace-continuity only. The layer stack is
-/// visible + removable HERE so the non-tautology proof is demonstrable.
+impl TestGrpcServer {
+    /// Attach a valid MH→MC service token (scope `service.write.mc`,
+    /// `service_type` media-handler) so the request passes the real auth layer.
+    fn authed<T>(&self, mut request: TonicRequest<T>) -> TonicRequest<T> {
+        let now = chrono::Utc::now().timestamp();
+        let token = self.keypair.sign_token(&ServiceClaims::new(
+            "mh-otel-rig".to_string(),
+            now + 3600,
+            now,
+            "service.write.mc".to_string(),
+            Some("media-handler".to_string()),
+        ));
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("bearer parses"),
+        );
+        request
+    }
+}
+
+/// Start MC's REAL inbound gRPC stack for `MediaCoordinationService` through
+/// `mc_service::grpc::server_layers` — the same function `main.rs` uses — with
+/// the real `McAuthLayer`, whose JWT-validation child spans are what make the
+/// request span → extraction → auth ordering load-bearing.
 async fn start_test_grpc_server() -> TestGrpcServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -95,12 +115,17 @@ async fn start_test_grpc_server() -> TestGrpcServer {
     ));
     let svc = McMediaCoordinationService::new(controller);
 
+    let jwks = wiremock::MockServer::start().await;
+    let keypair = TestKeypair::new(42, "mc-otel-rig-key-01");
+    let jwks_url = mount_jwks_mock(&jwks, &keypair).await;
+    let auth = McAuthLayer::new(
+        Arc::new(JwksClient::new(jwks_url).expect("JwksClient")),
+        300,
+    );
+
     let server = TonicServer::builder()
-        .layer(tower_http::trace::TraceLayer::new_for_grpc())
-        .add_service(MediaCoordinationServiceServer::with_interceptor(
-            svc,
-            common::observability::otel_grpc::server_interceptor(),
-        ))
+        .layer(mc_service::grpc::server_layers(auth))
+        .add_service(MediaCoordinationServiceServer::new(svc))
         .serve_with_incoming_shutdown(incoming, async move {
             cancel_clone.cancelled().await;
         });
@@ -112,6 +137,8 @@ async fn start_test_grpc_server() -> TestGrpcServer {
 
     TestGrpcServer {
         addr,
+        keypair,
+        _jwks: jwks,
         cancel,
         handle: Some(handle),
     }
@@ -145,7 +172,7 @@ async fn inbound_call_with_traceparent_produces_matching_span() {
     let server = start_test_grpc_server().await;
     let mut client = connect(server.addr).await;
 
-    let mut request = TonicRequest::new(connected_request());
+    let mut request = server.authed(TonicRequest::new(connected_request()));
     request.metadata_mut().insert(
         "traceparent",
         known_traceparent().parse().expect("traceparent parses"),
@@ -164,8 +191,15 @@ async fn inbound_call_with_traceparent_produces_matching_span() {
         trace_id_hex(&span),
         known_trace_id_hex(),
         "handler span's trace_id must match the inbound traceparent — this FAILS if \
-         TraceLayer::new_for_grpc() is removed (server_interceptor would have no active span \
-         to attach the parent to, and the span would come up as an unrelated root)"
+         the extraction layer is removed from, or moved after auth in, `server_layers` (no \
+         span to attach to, or auth's child spans already started it)"
+    );
+    // `configured_layer` sets `with_target(false)`: tracing-opentelemetry
+    // 0.32+ would otherwise add a `target` attribute to every span.
+    assert!(
+        !span.attributes.iter().any(|kv| kv.key.as_str() == "target"),
+        "exported span must not carry a `target` attribute: {:?}",
+        span.attributes
     );
 
     drop(server);
@@ -182,7 +216,7 @@ async fn inbound_call_without_traceparent_gets_fresh_trace_id() {
     let mut client = connect(server.addr).await;
 
     client
-        .notify_participant_connected(TonicRequest::new(connected_request()))
+        .notify_participant_connected(server.authed(TonicRequest::new(connected_request())))
         .await
         .expect("notify_participant_connected should succeed");
 
@@ -212,15 +246,21 @@ async fn inbound_call_does_not_leak_authorization_into_span() {
     let server = start_test_grpc_server().await;
     let mut client = connect(server.addr).await;
 
-    let secret = "super-secret-jwt-value-abc123";
-    let mut request = TonicRequest::new(connected_request());
+    // A REAL token (the request must pass auth to reach the handler span).
+    let mut request = server.authed(TonicRequest::new(connected_request()));
+    let auth_value = request
+        .metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .expect("authed request carries authorization")
+        .to_string();
+    let secret = auth_value
+        .strip_prefix("Bearer ")
+        .expect("bearer prefix")
+        .to_string();
     request.metadata_mut().insert(
         "traceparent",
         known_traceparent().parse().expect("traceparent parses"),
-    );
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {secret}").parse().expect("auth parses"),
     );
     client
         .notify_participant_connected(request)
@@ -243,10 +283,44 @@ async fn inbound_call_does_not_leak_authorization_into_span() {
             "span attribute key {key:?} references auth metadata"
         );
         assert!(
-            !value.contains(secret) && !value.contains("Bearer"),
+            !value.contains(secret.as_str()) && !value.contains("Bearer"),
             "span attribute {key:?} leaked the bearer token"
         );
     }
+
+    drop(server);
+}
+
+/// Same call under MC's DEPLOYED log filter (§11 (c)): the `TraceLayer`
+/// request span must exist at INFO and carry the inbound parent. With the
+/// DEBUG-default span this filter disables it, and reparenting is a no-op.
+#[tokio::test]
+async fn request_span_reparents_under_deployed_filter() {
+    install_test_propagator();
+    let capture = SpanCapture::install_with_filter(&deployed_rust_log());
+
+    let server = start_test_grpc_server().await;
+    let mut client = connect(server.addr).await;
+
+    let mut request = server.authed(TonicRequest::new(connected_request()));
+    request.metadata_mut().insert(
+        "traceparent",
+        known_traceparent().parse().expect("traceparent parses"),
+    );
+    client
+        .notify_participant_connected(request)
+        .await
+        .expect("notify_participant_connected should succeed");
+    tokio::task::yield_now().await;
+
+    let span = capture
+        .find_span("request")
+        .expect("expected an exported gRPC `request` span under the deployed filter");
+    assert_eq!(trace_id_hex(&span), known_trace_id_hex());
+    assert_eq!(
+        format!("{:016x}", span.parent_span_id),
+        format!("{KNOWN_SPAN_ID_U64:016x}")
+    );
 
     drop(server);
 }

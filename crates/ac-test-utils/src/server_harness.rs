@@ -210,30 +210,12 @@ impl TestAuthServer {
         Ok(token_response.access_token)
     }
 
-    /// Create a user token with specified scopes
-    ///
-    /// Creates a JWT with user claims (service_type: None).
-    /// Useful for testing endpoints that reject user tokens.
-    ///
-    /// # Arguments
-    /// * `user_id` - Subject identifier for the user
-    /// * `scopes` - List of scopes to include in token
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let token = server.create_user_token("user-123", &["user.read"]).await?;
-    /// ```
-    pub async fn create_user_token(
-        &self,
-        user_id: &str,
-        scopes: &[&str],
-    ) -> Result<String, anyhow::Error> {
-        // Get active signing key
+    /// The active signing key's decrypted private key bytes and key id, for the
+    /// token-minting helpers below.
+    async fn active_signing_key(&self) -> Result<(Vec<u8>, String), anyhow::Error> {
         let signing_key = signing_keys::get_active_key(&self.pool)
             .await?
             .ok_or_else(|| anyhow::anyhow!("No active signing key available"))?;
-
-        // Decrypt private key
         let encrypted_key = crypto::EncryptedKey {
             encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone())),
             nonce: signing_key.encryption_nonce.clone(),
@@ -241,11 +223,37 @@ impl TestAuthServer {
         };
         let private_key_bytes =
             crypto::decrypt_private_key(&encrypted_key, self.config.master_key.expose_secret())?;
+        Ok((private_key_bytes, signing_key.key_id))
+    }
 
-        // Create user claims (service_type: None)
+    /// Create a scope-bearing token WITHOUT a `service_type` claim.
+    ///
+    /// NOTE: this is NOT a real AC user token — it signs `ServiceClaims`
+    /// (with `scope`) and leaves `service_type: None`. Real user tokens are
+    /// `UserClaims` (no `scope` field); use [`Self::create_real_user_token`]
+    /// for those.
+    ///
+    /// # Arguments
+    /// * `sub` - Subject identifier
+    /// * `scopes` - List of scopes to include in token
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let token = server
+    ///     .create_scope_token_without_service_type("user-123", &["user.read"])
+    ///     .await?;
+    /// ```
+    pub async fn create_scope_token_without_service_type(
+        &self,
+        sub: &str,
+        scopes: &[&str],
+    ) -> Result<String, anyhow::Error> {
+        let (private_key_bytes, key_id) = self.active_signing_key().await?;
+
+        // ServiceClaims with no service_type (see doc comment)
         let now = Utc::now().timestamp();
         let claims = crypto::Claims {
-            sub: user_id.to_string(),
+            sub: sub.to_string(),
             exp: now + 3600, // 1 hour
             iat: now,
             scope: scopes.join(" "),
@@ -253,8 +261,30 @@ impl TestAuthServer {
         };
 
         // Sign and return JWT
-        let token = crypto::sign_jwt(&claims, &private_key_bytes, &signing_key.key_id)?;
+        let token = crypto::sign_jwt(&claims, &private_key_bytes, &key_id)?;
         Ok(token)
+    }
+
+    /// Create a REAL AC user token: `UserClaims` signed with the active key
+    /// via `crypto::sign_user_jwt`, exactly as user login issues them.
+    pub async fn create_real_user_token(
+        &self,
+        org_id: uuid::Uuid,
+        roles: &[&str],
+    ) -> Result<String, anyhow::Error> {
+        let (private_key_bytes, key_id) = self.active_signing_key().await?;
+
+        let now = Utc::now().timestamp();
+        let claims = crypto::UserClaims {
+            sub: uuid::Uuid::new_v4().to_string(),
+            org_id: org_id.to_string(),
+            email: "real-user@example.com".to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            iat: now,
+            exp: now + 3600,
+            jti: uuid::Uuid::new_v4().to_string(),
+        };
+        Ok(crypto::sign_user_jwt(&claims, &private_key_bytes, &key_id)?)
     }
 
     /// Create an expired service token
@@ -277,19 +307,7 @@ impl TestAuthServer {
         scopes: &[&str],
         expired_seconds_ago: i64,
     ) -> Result<String, anyhow::Error> {
-        // Get active signing key
-        let signing_key = signing_keys::get_active_key(&self.pool)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("No active signing key available"))?;
-
-        // Decrypt private key
-        let encrypted_key = crypto::EncryptedKey {
-            encrypted_data: SecretBox::new(Box::new(signing_key.private_key_encrypted.clone())),
-            nonce: signing_key.encryption_nonce.clone(),
-            tag: signing_key.encryption_tag.clone(),
-        };
-        let private_key_bytes =
-            crypto::decrypt_private_key(&encrypted_key, self.config.master_key.expose_secret())?;
+        let (private_key_bytes, key_id) = self.active_signing_key().await?;
 
         // Create expired claims
         let now = Utc::now().timestamp();
@@ -305,7 +323,7 @@ impl TestAuthServer {
         };
 
         // Sign and return JWT
-        let token = crypto::sign_jwt(&claims, &private_key_bytes, &signing_key.key_id)?;
+        let token = crypto::sign_jwt(&claims, &private_key_bytes, &key_id)?;
         Ok(token)
     }
 

@@ -453,8 +453,7 @@ impl MediaHandlerService for MhMediaService {
 /// `mh_grpc_requests_total` error, because the `method` label differs.
 ///
 /// Returns the `INVALID_ARGUMENT` message, not a `Status`: the caller builds the
-/// status, which keeps this `Result` small (a `Status` is large enough to trip
-/// `clippy::result_large_err`).
+/// status.
 fn validate_caller_ids(meeting_id: &str, mc_id: &str) -> Result<(), String> {
     for (field, value) in [("meeting_id", meeting_id), ("mc_id", mc_id)] {
         if value.is_empty() {

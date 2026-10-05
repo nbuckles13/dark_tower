@@ -1,0 +1,34 @@
+# Auth Controller alert rules. Authored per ADR-0031 by the AC owner
+# (auth-controller); reviewed by observability.
+#
+# Loaded by Prometheus via the `rules/[a-z]*-alerts.yaml` glob and mounted in
+# the cluster through `infra/docker/prometheus/kustomization.yaml` (`files:`).
+
+groups:
+  - name: ac-service-warning
+    interval: 60s
+    rules:
+      - alert: ACAuditLogWriteFailures
+        # Any lost audit row. AC audit writes are best-effort (ADR-0032): the
+        # operation (token issuance, registration, admin credential change)
+        # succeeded but its `auth_events` row was not written. Every lost row
+        # is a forensic gap, so the threshold is "any".
+        #
+        # The 10m `increase` window keeps a single failure visible for ~10m, so
+        # a 1m `for:` cannot miss it. `ac_audit_log_failures_total` is
+        # zero-initialized for every real (event_type, reason) pair, so an
+        # absent series means a scrape/pipeline break, not zero — no absent()
+        # clause is needed here. Per-event_type so each write site fires its own
+        # alert.
+        expr: |
+          sum by (event_type) (increase(ac_audit_log_failures_total{job="ac-service"}[10m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: ac-service
+          component: audit
+        annotations:
+          summary: "AC audit-log writes failing for {{ $labels.event_type }}"
+          description: "Auth Controller failed to write {{ $labels.event_type }} audit rows in the last 10 minutes. The audited operations succeeded; their auth_events rows were lost."
+          impact: "Forensic gap in the auth audit trail. No user-facing impact. For registration events the per-IP registration limiter also undercounts."
+          runbook_url: "docs/runbooks/ac-service-incident-response.md#audit-log-write-failures"

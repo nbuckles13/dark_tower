@@ -568,62 +568,33 @@ curl http://ac-service:8080/ready
 
 ---
 
-### Scenario 7: Audit Log Failures
+<a id="audit-log-write-failures"></a>
 
-**Symptoms**:
-- Alert: `ac_audit_log_failures_total > 0` (compliance-critical)
-- Logs: Audit log write failures
-- Security team notification
+### Scenario 7: Audit Log Write Failures
 
-**Diagnosis**:
+**Alert**: `ACAuditLogWriteFailures` (warning) — `sum by (event_type) (increase(ac_audit_log_failures_total{job="ac-service"}[10m])) > 0` for 1m (`infra/docker/prometheus/rules/ac-alerts.yaml`).
 
-```bash
-# 1. Check audit log failure metrics
-curl http://ac-service:9090/metrics | grep ac_audit_log_failures_total
+**What it means**: AC audit writes are best-effort (ADR-0032). The operation itself — token issuance, user registration, an admin credential change — **succeeded**, but its `auth_events` row was not written. Every lost row is a forensic gap. For `user_registered` / `user_registration_failed` the per-IP registration limiter also undercounts, because it counts those rows.
 
-# 2. Check logs for audit failures
-kubectl logs -n dark-tower -l app=ac-service --tail=500 | grep -i "audit.*fail"
+**Triage** (AC owner's steps):
 
-# 3. Check audit_logs table connectivity
-kubectl exec -it -n dark-tower deployment/ac-service -- sh -c 'psql $DATABASE_URL -c "SELECT COUNT(*) FROM audit_logs WHERE created_at > NOW() - interval '\''1 hour'\'';"'
-
-# 4. Check database disk space (via DB team)
-```
-
-**Common Root Causes**:
-
-1. **Database Write Failure**: Database unavailable for writes
-   - Check: Database status, replication lag
-   - Fix: Database team investigation
-
-2. **Table Partition Missing**: Audit log partition not created for current month
-   - Check: `\d+ audit_logs` in psql
-   - Fix: Create partition for current period
-
-3. **Disk Full**: Database disk full, cannot write
-   - Check: Database team monitors
-   - Fix: Database team expands disk or cleans up old partitions
-
-**Remediation**:
+1. **Identify the write site.** The `event_type` label is the `AuthEventType` of the lost row (it equals the `auth_events.event_type` value), so it names the code path that failed.
+2. **Correlate with database health.** Check AC DB error metrics and pool saturation (`ac_db_queries_total{table="auth_events",status="error"}`, connection-pool metrics). If those spiked too, this is a database outage: follow [Scenario 1: Database Connection Failures](#scenario-1-database-connection-failures).
+3. **Database healthy? Look for a CHECK violation.** Grep AC warn logs for `Failed to log auth event` carrying a constraint error (`valid_event_type` / `event_has_subject`). That means code emitting a new event type was deployed ahead of its migration. **Remediate by applying the migration** (re-run the db-migrate Job) — not by rolling back the code.
+4. **Recover the lost rows from the log stream.** The handlers also emit `target: "audit"` tracing events for admin operations. Export the alert window's audit log events before log retention expires; they are the only record of what the missing rows held.
+5. **Admin-event gaps are admin-action forensics loss.** If the gap is `service_secret_rotated`, `service_deactivated` or `service_scopes_updated`, identify the `admin:services` token holders active in the window and confirm the changes were intended.
 
 ```bash
-# Option 1: Create missing partition (if applicable)
-kubectl exec -it -n dark-tower deployment/ac-service -- sh -c 'psql $DATABASE_URL -c "CREATE TABLE IF NOT EXISTS audit_logs_y2025m12 PARTITION OF audit_logs FOR VALUES FROM ('\''2025-12-01'\'') TO ('\''2026-01-01'\'');"'
+# Which event types are failing
+curl -s http://ac-service:9090/metrics | grep ac_audit_log_failures_total
 
-# Option 2: Escalate to Database Team immediately
-# Audit log failures are compliance-critical - cannot be ignored
-
-# Verify recovery
-# Check that new audit entries are being written
-kubectl exec -it -n dark-tower deployment/ac-service -- sh -c 'psql $DATABASE_URL -c "SELECT COUNT(*) FROM audit_logs WHERE created_at > NOW() - interval '\''5 minutes'\'';"'
-
-# Verify metric reset
-curl http://ac-service:9090/metrics | grep ac_audit_log_failures_total
+# Failed-write warnings and constraint errors
+kubectl logs -n dark-tower -l app=ac-service --tail=2000 | grep -i "failed to log"
 ```
 
-**Escalation**:
-- **IMMEDIATE**: Page Database Team AND Security Team
-- Audit log failures are compliance violations - highest priority after service outage
+**Escalation**: Security Team for any admin-event gap (step 5); Database Team when step 2 shows a DB fault.
+
+**Deploy/revert note (registration limiter)**: during a rollout or a revert across the 2026-10-04 web-stack/OTel upgrade, the per-IP registration limiter undercounts for up to one `registration_rate_limit_window_minutes`: the old binary counts `user_login` rows, the new one counts `user_registered` + `user_registration_failed`, and each ignores the other's rows. A short burst of registrations passing right after a deploy or revert is expected, not an incident.
 
 ---
 

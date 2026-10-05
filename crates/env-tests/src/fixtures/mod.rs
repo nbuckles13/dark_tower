@@ -2,6 +2,7 @@
 
 pub mod alert_rules_loaded;
 pub mod auth_client;
+pub mod collector;
 pub mod egress_admission;
 pub mod gc_client;
 pub mod kube;

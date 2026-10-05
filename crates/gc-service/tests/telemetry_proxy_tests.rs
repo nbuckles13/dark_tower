@@ -220,12 +220,15 @@ fn metrics_payload_with_pii() -> Vec<u8> {
     let req = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
+                entity_refs: vec![],
                 attributes: vec![
                     KeyValue {
+                        key_strindex: 0,
                         key: "org_id".to_string(),
                         value: None,
                     },
                     KeyValue {
+                        key_strindex: 0,
                         key: "secret_user".to_string(),
                         value: None,
                     },
@@ -261,6 +264,7 @@ fn metrics_payload_with_value_smuggling() -> Vec<u8> {
     let smuggled = AnyValue {
         value: Some(Value::KvlistValue(KeyValueList {
             values: vec![KeyValue {
+                key_strindex: 0,
                 key: "secret_email".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue("victim@example.com".to_string())),
@@ -271,14 +275,17 @@ fn metrics_payload_with_value_smuggling() -> Vec<u8> {
     let req = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
+                entity_refs: vec![],
                 attributes: vec![
                     // Allowlisted key, but non-scalar (kvlist) value → must drop.
                     KeyValue {
+                        key_strindex: 0,
                         key: "org_id".to_string(),
                         value: Some(smuggled),
                     },
                     // Allowlisted key, scalar value → must survive.
                     KeyValue {
+                        key_strindex: 0,
                         key: "client_version".to_string(),
                         value: Some(AnyValue {
                             value: Some(Value::StringValue("1.2.3".to_string())),

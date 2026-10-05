@@ -31,3 +31,14 @@ pub use gc_client::GcClient;
 pub use mc_client::McClient;
 pub use mh_service::MhMediaService;
 pub use span_layer::SpanLayer;
+
+/// MH's inbound gRPC layer stack: `SpanLayer` → trace-context extraction →
+/// `auth`. The ONE place the ordering is decided (see
+/// [`common::observability::otel_grpc::inbound_layers`]); `main.rs` and the
+/// test rig both use it.
+#[must_use]
+pub fn server_layers(
+    auth: MhAuthLayer,
+) -> common::observability::otel_grpc::InboundLayers<SpanLayer, MhAuthLayer> {
+    common::observability::otel_grpc::inbound_layers(SpanLayer, auth)
+}

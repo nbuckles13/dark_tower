@@ -2,10 +2,10 @@
 use crate::config::DEFAULT_BCRYPT_COST;
 use crate::crypto;
 use crate::errors::AcError;
-use crate::models::{AuthEventType, RegisterServiceResponse, ServiceType};
+use crate::models::{AuthEventType, RegisterServiceResponse, ServiceCredential, ServiceType};
 use crate::observability::metrics::record_audit_log_failure;
 use crate::repositories::{auth_events, service_credentials};
-use common::secret::ExposeSecret;
+use common::secret::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -28,9 +28,8 @@ pub async fn register_service(
     bcrypt_cost: u32,
 ) -> Result<RegisterServiceResponse, AcError> {
     // Validate and parse service_type
-    let svc_type = ServiceType::from_str(service_type).map_err(|e| {
-        AcError::Database(format!("Invalid service_type: '{}'. {}", service_type, e))
-    })?;
+    let svc_type = ServiceType::from_str(service_type)
+        .map_err(|_| AcError::BadRequest(INVALID_SERVICE_TYPE_MESSAGE))?;
 
     // Generate client_id (UUID)
     let client_id = Uuid::new_v4().to_string();
@@ -57,26 +56,19 @@ pub async fn register_service(
     .await?;
 
     // Log registration event
-    if let Err(e) = auth_events::log_event(
+    log_admin_event(
         pool,
-        AuthEventType::ServiceRegistered.as_str(),
-        None,
-        Some(credential.credential_id),
+        AuthEventType::ServiceRegistered,
+        credential.credential_id,
         true,
         None,
-        None,
-        None,
-        Some(serde_json::json!({
+        serde_json::json!({
             "service_type": service_type,
             "region": region,
             "scopes": scopes,
-        })),
+        }),
     )
-    .await
-    {
-        tracing::warn!("Failed to log auth event: {}", e);
-        record_audit_log_failure("service_registered", "db_write_failed");
-    }
+    .await;
 
     // Return credentials (this is the ONLY time the plaintext client_secret is shown)
     Ok(RegisterServiceResponse {
@@ -87,78 +79,277 @@ pub async fn register_service(
     })
 }
 
-/// Update scopes for an existing service
-#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
-pub async fn update_service_scopes(
-    pool: &PgPool,
-    client_id: &str,
-    new_scopes: Vec<String>,
-) -> Result<(), AcError> {
-    // Fetch credential
-    let credential = service_credentials::get_by_client_id(pool, client_id)
-        .await?
-        .ok_or_else(|| AcError::Database("Service credential not found".to_string()))?;
+/// Maximum number of scopes a client credential may hold. Bounds the PUT
+/// payload and the requested-scopes list recorded on a refused audit row.
+pub const MAX_SCOPES_PER_CLIENT: usize = 32;
 
-    // Update scopes
-    service_credentials::update_scopes(pool, credential.credential_id, &new_scopes).await?;
+/// Maximum length of a single scope string.
+const MAX_SCOPE_LEN: usize = 100;
 
-    // Log scope update
-    if let Err(e) = auth_events::log_event(
-        pool,
-        AuthEventType::ServiceTokenIssued.as_str(), // Reusing token issued type
-        None,
-        Some(credential.credential_id),
-        true,
-        None,
-        None,
-        None,
-        Some(serde_json::json!({
-            "action": "scopes_updated",
-            "old_scopes": credential.scopes,
-            "new_scopes": new_scopes,
-        })),
-    )
-    .await
-    {
-        tracing::warn!("Failed to log auth event: {}", e);
-        record_audit_log_failure("scopes_updated", "db_write_failed");
+/// Body message for an unknown `service_type`. Lists every valid
+/// [`ServiceType`] (pinned by `tests::invalid_service_type_message_names_every_type`).
+pub const INVALID_SERVICE_TYPE_MESSAGE: &str =
+    "Invalid service_type. Must be one of: global-controller, meeting-controller, media-handler";
+
+/// Body message when a credential is not active (rotate on a deactivated client).
+pub const CLIENT_DEACTIVATED_MESSAGE: &str = "client is deactivated";
+
+/// Why a scope-update request was refused, with its fixed audit
+/// `failure_reason` token and body message. Never carries the raw input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeRejection {
+    TooMany,
+    Empty,
+    TooLong,
+    InvalidCharacters,
+    NotPermitted,
+}
+
+impl ScopeRejection {
+    fn failure_reason(self) -> &'static str {
+        match self {
+            ScopeRejection::TooMany => "too_many_scopes",
+            ScopeRejection::Empty | ScopeRejection::TooLong | ScopeRejection::InvalidCharacters => {
+                "invalid_scope_format"
+            }
+            ScopeRejection::NotPermitted => "scope_not_permitted",
+        }
     }
 
+    fn message(self) -> &'static str {
+        match self {
+            ScopeRejection::TooMany => "Too many scopes",
+            ScopeRejection::Empty => "Scope cannot be empty",
+            ScopeRejection::TooLong => "Scope exceeds maximum length of 100 characters",
+            ScopeRejection::InvalidCharacters => "Scope contains invalid characters",
+            ScopeRejection::NotPermitted => "Scope not permitted for this client's service type",
+        }
+    }
+}
+
+/// Validate a requested scope list against format rules and the scope policy.
+///
+/// Policy (ADR-0003 Component 2, auth-controller ruling A1): PUT may only
+/// NARROW — every requested scope must be in the credential's
+/// `ServiceType::default_scopes()` (the SSoT). An unparseable stored
+/// `service_type` permits nothing (fail closed). An empty list is allowed.
+fn check_scopes(service_type: &str, requested: &[String]) -> Result<(), ScopeRejection> {
+    if requested.len() > MAX_SCOPES_PER_CLIENT {
+        return Err(ScopeRejection::TooMany);
+    }
+    for scope in requested {
+        if scope.is_empty() {
+            return Err(ScopeRejection::Empty);
+        }
+        if scope.len() > MAX_SCOPE_LEN {
+            return Err(ScopeRejection::TooLong);
+        }
+        // Alphanumeric, hyphens, dots, colons (common in OAuth scopes).
+        if !scope
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == ':')
+        {
+            return Err(ScopeRejection::InvalidCharacters);
+        }
+    }
+    let permitted = ServiceType::from_str(service_type)
+        .map(|t| t.default_scopes())
+        .unwrap_or_default();
+    if requested.iter().any(|s| !permitted.contains(s)) {
+        return Err(ScopeRejection::NotPermitted);
+    }
     Ok(())
 }
 
-/// Deactivate a service credential
-#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
-pub async fn deactivate_service(pool: &PgPool, client_id: &str) -> Result<(), AcError> {
-    // Fetch credential
-    let credential = service_credentials::get_by_client_id(pool, client_id)
-        .await?
-        .ok_or_else(|| AcError::Database("Service credential not found".to_string()))?;
-
-    // Deactivate
-    service_credentials::deactivate(pool, credential.credential_id).await?;
-
-    // Log deactivation
+/// Write one audit row for a credential-scoped event (registration and the
+/// admin mutations) on `credential_id`. Best-effort (ADR-0032): a
+/// failed insert logs a warning and bumps `ac_audit_log_failures_total`; the
+/// caller's operation still succeeds.
+async fn log_admin_event(
+    pool: &PgPool,
+    event_type: AuthEventType,
+    credential_id: Uuid,
+    success: bool,
+    failure_reason: Option<&str>,
+    metadata: serde_json::Value,
+) {
     if let Err(e) = auth_events::log_event(
         pool,
-        AuthEventType::ServiceTokenFailed.as_str(), // Reusing failed type
+        event_type.as_str(),
         None,
-        Some(credential.credential_id),
-        true,
+        Some(credential_id),
+        success,
+        failure_reason,
         None,
         None,
-        None,
-        Some(serde_json::json!({
-            "action": "service_deactivated",
-        })),
+        Some(metadata),
     )
     .await
     {
-        tracing::warn!("Failed to log auth event: {}", e);
-        record_audit_log_failure("service_deactivated", "db_write_failed");
+        tracing::warn!(event_type = event_type.as_str(), error = %e, "Failed to log auth event");
+        record_audit_log_failure(event_type, "db_write_failed");
+    }
+}
+
+/// Fetch a credential by id, mapping absence to `NotFound`. The single home of
+/// the admin "client not found" error (handlers and the mutations below).
+pub async fn get_service(pool: &PgPool, credential_id: Uuid) -> Result<ServiceCredential, AcError> {
+    service_credentials::get_by_credential_id(pool, credential_id)
+        .await?
+        .ok_or_else(|| not_found(credential_id))
+}
+
+fn not_found(credential_id: Uuid) -> AcError {
+    AcError::NotFound(format!("Client with ID {} not found", credential_id))
+}
+
+/// Narrow a credential's scopes (PUT `/api/v1/admin/clients/{id}`).
+///
+/// The single writer of the scope change, its `service_scopes_updated` audit
+/// row and the audit-failure metric. A refused request on an existing
+/// credential writes a `success=false` row with a fixed `failure_reason`
+/// (`scope_not_permitted` also records the requested scopes — format-valid and
+/// at most [`MAX_SCOPES_PER_CLIENT`]; format failures record nothing of the
+/// input). Does not touch `is_active`. Unknown id → `NotFound`, no row.
+pub async fn update_service_scopes(
+    pool: &PgPool,
+    credential_id: Uuid,
+    new_scopes: Vec<String>,
+    actor_sub: &str,
+) -> Result<ServiceCredential, AcError> {
+    let credential = get_service(pool, credential_id).await?;
+
+    if let Err(rejection) = check_scopes(&credential.service_type, &new_scopes) {
+        let metadata = if rejection == ScopeRejection::NotPermitted {
+            serde_json::json!({ "actor_sub": actor_sub, "requested_scopes": new_scopes })
+        } else {
+            serde_json::json!({ "actor_sub": actor_sub })
+        };
+        log_admin_event(
+            pool,
+            AuthEventType::ServiceScopesUpdated,
+            credential_id,
+            false,
+            Some(rejection.failure_reason()),
+            metadata,
+        )
+        .await;
+        return Err(AcError::BadRequest(rejection.message()));
     }
 
-    Ok(())
+    // `old_scopes` comes from the row the UPDATE locked, not the read above,
+    // so a concurrent PUT can never make the audit row record a stale value.
+    let update = service_credentials::update_scopes(pool, credential_id, &new_scopes)
+        .await?
+        .ok_or_else(|| not_found(credential_id))?;
+    log_admin_event(
+        pool,
+        AuthEventType::ServiceScopesUpdated,
+        credential_id,
+        true,
+        None,
+        serde_json::json!({
+            "actor_sub": actor_sub,
+            "old_scopes": update.old_scopes,
+            "new_scopes": new_scopes,
+        }),
+    )
+    .await;
+    Ok(update.credential)
+}
+
+/// Revoke a credential (DELETE `/api/v1/admin/clients/{id}`).
+///
+/// Soft delete: `is_active = false`. A hard delete is impossible —
+/// `auth_events.credential_id` references the row with no `ON DELETE` (SET
+/// NULL would violate `event_has_subject`, CASCADE would destroy the audit
+/// trail). Idempotent: an already-inactive credential returns `Ok` with no new
+/// audit row; `service_deactivated` is written only on the active→inactive
+/// transition. Tokens already issued stay valid until `exp` (stateless JWTs,
+/// ADR-0007). Unknown id → `NotFound`.
+pub async fn deactivate_service(
+    pool: &PgPool,
+    credential_id: Uuid,
+    actor_sub: &str,
+) -> Result<ServiceCredential, AcError> {
+    // The conditional UPDATE is authoritative: only the call that performs the
+    // active→inactive transition gets a row back and writes the audit row, so
+    // concurrent DELETEs record the transition exactly once.
+    let Some(deactivated) = service_credentials::deactivate(pool, credential_id).await? else {
+        // Already inactive (or gone): idempotent, no audit row.
+        return get_service(pool, credential_id).await;
+    };
+    log_admin_event(
+        pool,
+        AuthEventType::ServiceDeactivated,
+        credential_id,
+        true,
+        None,
+        serde_json::json!({ "actor_sub": actor_sub }),
+    )
+    .await;
+    Ok(deactivated)
+}
+
+/// Rotate a credential's secret (POST `/api/v1/admin/clients/{id}/rotate-secret`).
+///
+/// Returns the credential and the new plaintext secret — the only time it is
+/// ever shown. A deactivated credential is refused with `Conflict` BEFORE any
+/// secret is generated (the stored hash is untouched; the UPDATE is also
+/// conditional on `is_active`, so a concurrent revoke cannot slip through) and a `success=false`
+/// row with `failure_reason = "client_deactivated"`. The audit row never
+/// carries the secret or its hash. Tokens already issued under the old secret
+/// stay valid until `exp` (ADR-0007). Unknown id → `NotFound`.
+pub async fn rotate_service_secret(
+    pool: &PgPool,
+    credential_id: Uuid,
+    actor_sub: &str,
+    bcrypt_cost: u32,
+) -> Result<(ServiceCredential, SecretString), AcError> {
+    let credential = get_service(pool, credential_id).await?;
+    if !credential.is_active {
+        return Err(refuse_rotation_of_inactive(pool, credential_id, actor_sub).await);
+    }
+
+    // Generate new client_secret (32 bytes, CSPRNG, base64) and hash it.
+    let new_secret = crypto::generate_client_secret()?;
+    let new_secret_hash = crypto::hash_client_secret(new_secret.expose_secret(), bcrypt_cost)?;
+    // The UPDATE is conditional on `is_active`: if the credential was revoked
+    // after the check above, nothing is stored and the new secret is dropped
+    // here, never returned.
+    let Some(rotated) =
+        service_credentials::rotate_secret(pool, credential_id, &new_secret_hash).await?
+    else {
+        return Err(refuse_rotation_of_inactive(pool, credential_id, actor_sub).await);
+    };
+    log_admin_event(
+        pool,
+        AuthEventType::ServiceSecretRotated,
+        credential_id,
+        true,
+        None,
+        serde_json::json!({ "actor_sub": actor_sub, "client_id": credential.client_id }),
+    )
+    .await;
+    Ok((rotated, new_secret))
+}
+
+/// Record a refused rotation of an inactive credential and build its error.
+async fn refuse_rotation_of_inactive(
+    pool: &PgPool,
+    credential_id: Uuid,
+    actor_sub: &str,
+) -> AcError {
+    log_admin_event(
+        pool,
+        AuthEventType::ServiceSecretRotated,
+        credential_id,
+        false,
+        Some("client_deactivated"),
+        serde_json::json!({ "actor_sub": actor_sub }),
+    )
+    .await;
+    AcError::Conflict(CLIENT_DEACTIVATED_MESSAGE)
 }
 
 #[cfg(test)]
@@ -848,78 +1039,127 @@ mod tests {
         Ok(())
     }
 
-    /// Test update_service_scopes function
+    /// Narrowing to a subset of the type's default scopes succeeds, persists,
+    /// and leaves `is_active` alone.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_update_service_scopes(pool: PgPool) -> Result<(), AcError> {
-        // Register a service first
         let response =
             register_service(&pool, "meeting-controller", None, DEFAULT_BCRYPT_COST).await?;
-        let original_scopes = response.scopes.clone();
-
-        // Define new scopes
-        let new_scopes = vec!["custom:read".to_string(), "custom:write".to_string()];
-
-        // Update scopes
-        update_service_scopes(&pool, &response.client_id, new_scopes.clone()).await?;
-
-        // Verify scopes were updated
         let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
             .await?
             .expect("Credential should exist");
 
-        assert_eq!(credential.scopes, new_scopes);
-        assert_ne!(credential.scopes, original_scopes);
+        let new_scopes = vec!["service.write.gc".to_string()];
+        let updated =
+            update_service_scopes(&pool, credential.credential_id, new_scopes.clone(), "admin")
+                .await?;
+
+        assert_eq!(updated.scopes, new_scopes);
+        assert_ne!(updated.scopes, response.scopes);
+        assert!(updated.is_active);
 
         Ok(())
     }
 
-    /// Test update_service_scopes with non-existent client_id
+    /// Unknown credential id → NotFound.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_update_service_scopes_not_found(pool: PgPool) -> Result<(), AcError> {
-        let result = update_service_scopes(
-            &pool,
-            "non-existent-client-id",
-            vec!["test:scope".to_string()],
-        )
-        .await;
-
-        assert!(result.is_err(), "Should fail for non-existent client_id");
-
+        let result = update_service_scopes(&pool, Uuid::new_v4(), vec![], "admin").await;
+        assert!(matches!(result, Err(AcError::NotFound(_))));
         Ok(())
     }
 
-    /// Test deactivate_service function
+    #[test]
+    fn check_scopes_enforces_type_subset_and_format() {
+        let ok = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Subset of the GC defaults (and empty) are allowed.
+        assert_eq!(
+            check_scopes("global-controller", &ok(&["service.write.mc"])),
+            Ok(())
+        );
+        assert_eq!(check_scopes("global-controller", &[]), Ok(()));
+        // Escalation attempts are refused.
+        for scope in [
+            "admin:services",
+            "admin.force-rotate-keys.ac",
+            "service.rotate-keys.ac",
+            "service.write.mh",
+        ] {
+            assert_eq!(
+                check_scopes("global-controller", &ok(&[scope])),
+                Err(ScopeRejection::NotPermitted),
+                "{scope}"
+            );
+        }
+        assert_eq!(
+            check_scopes("media-handler", &ok(&["internal:meeting-token"])),
+            Err(ScopeRejection::NotPermitted)
+        );
+        // Unparseable stored service_type permits nothing (fail closed), but
+        // still allows the empty list.
+        assert_eq!(
+            check_scopes("not-a-type", &ok(&["service.write.mc"])),
+            Err(ScopeRejection::NotPermitted)
+        );
+        assert_eq!(check_scopes("not-a-type", &[]), Ok(()));
+        // Format.
+        assert_eq!(
+            check_scopes("global-controller", &ok(&[""])),
+            Err(ScopeRejection::Empty)
+        );
+        assert_eq!(
+            check_scopes("global-controller", &ok(&[&"a".repeat(101)])),
+            Err(ScopeRejection::TooLong)
+        );
+        assert_eq!(
+            check_scopes("global-controller", &ok(&["bad scope!"])),
+            Err(ScopeRejection::InvalidCharacters)
+        );
+        let too_many: Vec<String> = (0..=MAX_SCOPES_PER_CLIENT)
+            .map(|i| format!("s{i}"))
+            .collect();
+        assert_eq!(
+            check_scopes("global-controller", &too_many),
+            Err(ScopeRejection::TooMany)
+        );
+    }
+
+    /// Deactivation flips `is_active`, and repeating it is a no-op `Ok`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_deactivate_service(pool: PgPool) -> Result<(), AcError> {
-        // Register a service first
         let response = register_service(&pool, "media-handler", None, DEFAULT_BCRYPT_COST).await?;
-
-        // Verify it's active
         let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
             .await?
             .expect("Credential should exist");
         assert!(credential.is_active);
 
-        // Deactivate
-        deactivate_service(&pool, &response.client_id).await?;
-
-        // Verify it's deactivated
-        let credential = service_credentials::get_by_client_id(&pool, &response.client_id)
-            .await?
-            .expect("Credential should still exist");
-        assert!(!credential.is_active);
+        let deactivated = deactivate_service(&pool, credential.credential_id, "admin").await?;
+        assert!(!deactivated.is_active);
+        let again = deactivate_service(&pool, credential.credential_id, "admin").await?;
+        assert!(!again.is_active);
 
         Ok(())
     }
 
-    /// Test deactivate_service with non-existent client_id
+    /// Unknown credential id → NotFound.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_deactivate_service_not_found(pool: PgPool) -> Result<(), AcError> {
-        let result = deactivate_service(&pool, "non-existent-client-id").await;
-
-        assert!(result.is_err(), "Should fail for non-existent client_id");
-
+        let result = deactivate_service(&pool, Uuid::new_v4(), "admin").await;
+        assert!(matches!(result, Err(AcError::NotFound(_))));
         Ok(())
+    }
+
+    #[test]
+    fn invalid_service_type_message_names_every_type() {
+        // `ServiceType::ALL` is generated from the same list as the enum
+        // (`string_enum!`), so a new variant is covered here automatically.
+        for t in ServiceType::ALL {
+            assert!(
+                INVALID_SERVICE_TYPE_MESSAGE.contains(t.as_str()),
+                "{} missing from the message",
+                t.as_str()
+            );
+        }
     }
 
     /// Test registration with invalid service type
@@ -927,14 +1167,10 @@ mod tests {
     async fn test_register_invalid_service_type(pool: PgPool) -> Result<(), AcError> {
         let result = register_service(&pool, "invalid-service", None, DEFAULT_BCRYPT_COST).await;
 
-        assert!(result.is_err(), "Should fail for invalid service type");
-
-        // Verify error message mentions the invalid type
-        let err = result.unwrap_err();
-        let err_msg = format!("{}", err);
+        // A fixed message: the caller's input is never echoed into the body.
         assert!(
-            err_msg.contains("invalid-service"),
-            "Error should mention the invalid service type"
+            matches!(result, Err(AcError::BadRequest(msg)) if msg == INVALID_SERVICE_TYPE_MESSAGE),
+            "Should fail with the fixed invalid-service-type BadRequest"
         );
 
         Ok(())

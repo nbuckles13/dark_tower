@@ -3,7 +3,8 @@
 //! # Why this exists
 //!
 //! `common::observability::otel_grpc::server_interceptor()` extracts the
-//! inbound W3C trace context and calls `tracing::Span::current().set_parent(cx)`.
+//! inbound W3C trace context and reparents the current span via
+//! `common::observability::otel::set_remote_parent`.
 //! That call only has an effect if SOME tracing span is already active
 //! ("entered") at the moment the interceptor runs, and that span stays
 //! active (via [`tracing::Instrument`]) through to the handler's own

@@ -31,7 +31,7 @@ bcrypt = { workspace = true }
 tonic = { workspace = true }
 
 # Async trait for mock implementations
-async-trait = "0.1"
+async-trait = { workspace = true }
 
 # Cancellation tokens for graceful shutdown
 tokio-util = { workspace = true }
@@ -95,7 +95,7 @@ opentelemetry = { workspace = true }
 # otel_grpc_inbound_continuity.rs to assert the actual exported span's
 # trace_id (not just that the RPC succeeded) — mirrors common's own dev-dep
 # shape for the same feature.
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "trace", "testing"] }
+opentelemetry_sdk = { workspace = true, features = ["trace", "testing"] }
 tracing-opentelemetry = { workspace = true }
 # Real mock Tonic server for otel_http_grpc_bridge.rs / otel_grpc_inbound_continuity.rs
 # (mirrors mh-service/tests/common/mock_mc.rs's TcpListenerStream pattern —

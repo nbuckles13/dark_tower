@@ -82,3 +82,29 @@ test('sign-in renders org-subdomain and surfaces a typed error on 401', async ()
 
   await expect.element(screen.getByTestId('last-error')).toBeInTheDocument();
 });
+
+test('sign-up surfaces AC 409 duplicate-email message verbatim', async () => {
+  // AC returns 409 CONFLICT (not 401) for an existing email, carrying a fixed body
+  // message. The view renders `errorText` = "<code>: <message>", so this pins the
+  // exact user-visible text across the 401 -> 409 status change.
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      jsonResponse(
+        { error: { code: 'CONFLICT', message: 'An account with this email already exists' } },
+        409,
+      ),
+    ),
+  );
+  const screen = await render(SignUp, { config, onAuthed: () => {} });
+
+  await screen.getByTestId('email').fill('user@example.com');
+  await screen.getByTestId('password').fill('correct horse battery');
+  await screen.getByTestId('display-name').fill('Ann');
+  await screen.getByTestId('org-subdomain').fill('demo');
+  await screen.getByTestId('create-account-button').click();
+
+  await expect
+    .element(screen.getByTestId('last-error'))
+    .toHaveTextContent(/^AUTH: An account with this email already exists$/);
+});

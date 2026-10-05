@@ -37,7 +37,7 @@ const CANON: &[&str] = &[
     "crates/ac-service/src/token/**",
     "crates/ac-service/src/crypto/**",
     "crates/ac-service/src/audit/**",
-    "db/migrations/**",
+    "migrations/**",
 ];
 
 /// YAML-only intersection-rule sub-paths per ADR-0003 §5.7.

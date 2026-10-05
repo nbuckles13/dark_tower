@@ -8,9 +8,8 @@
 //! tests, hoisted here since multiple integration test BINARIES need it.
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::sync::OnceLock;
-use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::SubscriberExt;
 
 /// Install the globally-registered `BoundedTraceContextPropagator` exactly
@@ -30,7 +29,7 @@ pub fn ensure_global_propagator_installed() {
 /// RAII guard: while held, the current OS thread's default `tracing`
 /// subscriber has an `OpenTelemetryLayer` wired to a real (non-exporting)
 /// `TracerProvider`. Required for `tracing::Span::current().context()` /
-/// `.set_parent()` (used throughout `otel_http`/`otel_grpc`) to actually
+/// `set_remote_parent` (used throughout `otel_http`/`otel_grpc`) to actually
 /// carry W3C trace context, rather than being no-ops against a subscriber
 /// with no OTel bridge. Thread-local — safe to call independently from
 /// parallel tests (each on its own OS thread under `cargo test`'s default
@@ -46,9 +45,9 @@ pub struct TestOtelSubscriberGuard {
 }
 
 pub fn install_test_otel_subscriber() -> TestOtelSubscriberGuard {
-    let provider = TracerProvider::builder().build();
+    let provider = SdkTracerProvider::builder().build();
     let tracer = provider.tracer("gc-service-otel-integration-test");
-    let layer = OpenTelemetryLayer::new(tracer);
+    let layer = common::observability::otel::configured_layer(tracer);
     let subscriber = tracing_subscriber::registry().with(layer);
     TestOtelSubscriberGuard {
         _guard: tracing::subscriber::set_default(subscriber),
@@ -72,16 +71,16 @@ pub fn setup_otel_test_environment() -> TestOtelSubscriberGuard {
 #[must_use = "the subscriber override is only active while this guard is held"]
 pub fn setup_otel_test_environment_with_exporter() -> (
     TestOtelSubscriberGuard,
-    opentelemetry_sdk::testing::trace::InMemorySpanExporter,
+    opentelemetry_sdk::trace::InMemorySpanExporter,
 ) {
     ensure_global_propagator_installed();
 
-    let exporter = opentelemetry_sdk::testing::trace::InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     let tracer = provider.tracer("gc-service-otel-integration-test");
-    let layer = OpenTelemetryLayer::new(tracer);
+    let layer = common::observability::otel::configured_layer(tracer);
     let subscriber = tracing_subscriber::registry().with(layer);
     let guard = TestOtelSubscriberGuard {
         _guard: tracing::subscriber::set_default(subscriber),
@@ -89,16 +88,15 @@ pub fn setup_otel_test_environment_with_exporter() -> (
     (guard, exporter)
 }
 
-/// A fixed, valid W3C `traceparent` trace-id (version 00, sampled) usable
-/// wherever a test needs a known, injectable inbound header.
-pub const KNOWN_TRACE_ID_HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
-/// Matching fixed parent span-id for the same fixture.
-pub const KNOWN_PARENT_SPAN_ID_HEX: &str = "00f067aa0ba902b7";
-
-/// Build the full W3C `traceparent` header value for the fixed trace-id.
-pub fn known_traceparent() -> String {
-    format!("00-{KNOWN_TRACE_ID_HEX}-{KNOWN_PARENT_SPAN_ID_HEX}-01")
-}
+// The known trace/span fixtures have one home: `common::observability::testing::otel`.
+#[allow(
+    unused_imports,
+    reason = "shared test module: each test binary uses a subset of these re-exports"
+)]
+pub use common::observability::testing::otel::{
+    known_traceparent, KNOWN_PARENT_SPAN_ID_HEX, KNOWN_SPAN_ID_U64, KNOWN_TRACE_ID_HEX,
+    KNOWN_TRACE_ID_U128,
+};
 
 /// Extract the 32-hex-char trace-id portion from a W3C `traceparent` header
 /// value (`"{version}-{trace_id}-{parent_id}-{flags}"`). Returns `None` if

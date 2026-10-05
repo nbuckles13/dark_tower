@@ -27,7 +27,8 @@ use wtransport::{ClientConfig, Endpoint};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::otel_capture::{
-    install_test_propagator, known_trace_id_hex, known_traceparent, trace_id_hex, SpanCapture,
+    deployed_rust_log, install_test_propagator, known_trace_id_hex, known_traceparent,
+    trace_id_hex, SpanCapture,
 };
 use test_common::{
     build_test_stack, sample_identity_public_key, seed_meeting_with_mh, TestStackHandles,
@@ -119,7 +120,7 @@ async fn join_with_trace(
 async fn await_connection_span(
     capture: &SpanCapture,
     deadline: Duration,
-) -> opentelemetry_sdk::export::trace::SpanData {
+) -> opentelemetry_sdk::trace::SpanData {
     let stop = Instant::now() + deadline;
     loop {
         if let Some(span) = capture.find_span("mc.webtransport.connection") {
@@ -136,9 +137,26 @@ async fn await_connection_span(
 #[tokio::test]
 async fn test_wt_valid_traceparent_reparents_connection_span() {
     install_test_propagator();
-    let capture = SpanCapture::install();
+    assert_valid_traceparent_reparents(SpanCapture::install(), "otel-wt-valid").await;
+}
 
-    let (stack, rig) = start_stack("otel-wt-valid").await;
+/// The same reparent under MC's DEPLOYED `RUST_LOG` (read from the manifest).
+/// The deployed filter enables `mc_service=debug`, so any debug span a future
+/// change creates under the connection span before the reparent would start
+/// the parent's context and break continuity in production; this test is the
+/// tripwire for that (the all-levels test above also is, more strictly).
+#[tokio::test]
+async fn test_wt_valid_traceparent_reparents_under_deployed_filter() {
+    install_test_propagator();
+    assert_valid_traceparent_reparents(
+        SpanCapture::install_with_filter(&deployed_rust_log()),
+        "otel-wt-deployed",
+    )
+    .await;
+}
+
+async fn assert_valid_traceparent_reparents(capture: SpanCapture, stack_name: &str) {
+    let (stack, rig) = start_stack(stack_name).await;
     seed_meeting_with_mh(&stack, "otel-wt-meeting").await;
     let token = stack
         .keypair

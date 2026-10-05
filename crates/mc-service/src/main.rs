@@ -443,28 +443,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_shutdown_token = shutdown_token.child_token();
     let grpc_server = tonic::transport::Server::builder()
         // R-56: `TraceLayer::new_for_grpc()` creates the per-request tracing span
-        // that `server_interceptor()`'s `set_parent` attaches the inbound W3C
-        // context to — WITHOUT it, `set_parent` runs before any span exists at
+        // that `server_interceptor()`'s `set_remote_parent` attaches the inbound W3C
+        // context to — WITHOUT it, the reparent runs before any span exists at
         // the dispatch point and is a silent no-op (every inbound call becomes a
         // fresh root; verified by the inbound-continuity integration test).
         //
         // It MUST be the FIRST/outermost `.layer()`: `McAuthService`
-        // (grpc/auth_interceptor.rs) is bound to `http::Response<BoxBody>`
+        // (grpc/auth_interceptor.rs) is bound to `http::Response<Body>`
         // exactly, so wrapping it in `TraceLayer` (which changes the body type)
-        // fails to compile (E0271). Auth must wrap `Routes` (→ BoxBody) directly;
+        // fails to compile (E0271). Auth must wrap `Routes` (→ Body) directly;
         // TraceLayer wraps auth's output. Identical constraint + ordering to
-        // GC #26 (single builder + BoxBody-bound auth layer). Zero new deps —
+        // GC #26 (single builder + Body-bound auth layer). Zero new deps —
         // tower-http's "trace" feature is already enabled.
-        .layer(tower_http::trace::TraceLayer::new_for_grpc())
-        .layer(mc_auth_layer)
-        .add_service(MeetingControllerServiceServer::with_interceptor(
-            mc_assignment_service,
-            common::observability::otel_grpc::server_interceptor(),
-        ))
-        .add_service(MediaCoordinationServiceServer::with_interceptor(
-            media_coord_service,
-            common::observability::otel_grpc::server_interceptor(),
-        ))
+        //
+        // Layer ORDER (span → extraction → auth) is decided in one place:
+        // `grpc::server_layers` → `common::observability::otel_grpc::inbound_layers`
+        // (see its INVARIANT doc).
+        .layer(mc_service::grpc::server_layers(mc_auth_layer))
+        .add_service(MeetingControllerServiceServer::new(mc_assignment_service))
+        .add_service(MediaCoordinationServiceServer::new(media_coord_service))
         .serve_with_shutdown(grpc_addr, async move {
             grpc_shutdown_token.cancelled().await;
             info!("gRPC server shutting down");

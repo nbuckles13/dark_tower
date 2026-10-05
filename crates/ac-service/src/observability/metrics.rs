@@ -10,10 +10,14 @@
 //! Labels are bounded to prevent cardinality explosion:
 //! - `grant_type`: 4 values max (client_credentials, authorization_code, etc.)
 //! - `status`: 2 values (success, error)
-//! - `error_category`: 4 values (authentication, authorization, cryptographic, internal)
+//! - `error_category`: bounded by the `ErrorCategory` enum
+//!   (`crate::observability::ErrorCategory`)
+//! - `event_type` (`ac_audit_log_failures_total`): bounded by the
+//!   `AuthEventType` enum (`crate::models::AuthEventType`)
 //! - `operation`: bounded by code (select, insert, update, delete)
 //! - `table`: bounded by schema (~5 tables)
 
+use crate::models::AuthEventType;
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
@@ -223,9 +227,13 @@ pub fn record_jwks_request(cache_status: &str) {
 /// Metric: `ac_audit_log_failures_total`
 /// Labels: `event_type`, `reason`
 ///
-/// ALERT: Any non-zero value should trigger oncall page
-pub fn record_audit_log_failure(event_type: &str, reason: &str) {
-    counter!("ac_audit_log_failures_total", "event_type" => event_type.to_string(), "reason" => reason.to_string())
+/// The `event_type` label is the variant's `as_str()` — the same string the
+/// failed `auth_events` row would have carried — so the label vocabulary
+/// cannot fork from the DB vocabulary.
+///
+/// ALERT: `ACAuditLogWriteFailures` (`ac-alerts.yaml`) warns on any increase.
+pub fn record_audit_log_failure(event_type: AuthEventType, reason: &str) {
+    counter!("ac_audit_log_failures_total", "event_type" => event_type.as_str(), "reason" => reason.to_string())
         .increment(1);
 }
 
@@ -300,7 +308,7 @@ pub fn record_http_request(method: &str, path: &str, status_code: u16, duration:
 /// Normalize path to prevent label cardinality explosion
 ///
 /// Replaces dynamic segments (UUIDs, numeric IDs) with placeholders.
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     // Simple normalization: keep known paths, replace others with pattern
     // This prevents unbounded cardinality from dynamic path segments
     match path {
@@ -438,27 +446,26 @@ const CREDENTIAL_OPERATIONS: &[&str] =
     &["list", "get", "create", "update", "delete", "rotate_secret"];
 /// `ac_audit_log_failures_total{event_type, reason}` — the CLOSED prod pair set
 /// (the two labels are correlated, so only real pairs are touched, never the
-/// cross-product). Un-exempted 2026-09-10 (was wrongly "unbounded"): every emit
-/// site passes literals except `token_service.rs:366`, whose `event_type` is
-/// `AuthEventType::{UserLogin,UserLoginFailed}.as_str()` = `"user_login"`/
-/// `"user_login_failed"` — still a closed typed-enum set. `reason` is
-/// `"db_write_failed"` at EVERY prod site; `encryption_failed`/`log_overflow`
-/// appear only in unit-test fixtures and are NOT prod-emittable, so they are not
-/// fabricated here. Emit sites: `key_management_service.rs:96,166,384`,
-/// `user_service.rs:144`, `token_service.rs:105,172,366`,
-/// `registration_service.rs:78,124,158`.
-const AUDIT_LOG_FAILURE_PAIRS: &[(&str, &str)] = &[
-    ("key_generated", "db_write_failed"),
-    ("key_rotated", "db_write_failed"),
-    ("key_expired", "db_write_failed"),
-    ("user_registered", "db_write_failed"),
-    ("service_token_failed", "db_write_failed"),
-    ("service_token_issued", "db_write_failed"),
-    ("service_registered", "db_write_failed"),
-    ("scopes_updated", "db_write_failed"),
-    ("service_deactivated", "db_write_failed"),
-    ("user_login", "db_write_failed"),
-    ("user_login_failed", "db_write_failed"),
+/// cross-product). Typed: every `event_type` is an `AuthEventType` variant, so
+/// no label string exists without a variant. One entry per variant that has an
+/// audit-write site (every variant except `TokenValidationFailed` and
+/// `RateLimitExceeded`, which have none) — pinned by
+/// `tests::audit_failure_pairs_cover_every_emitting_variant`. `reason` is
+/// `"db_write_failed"` at EVERY prod site.
+const AUDIT_LOG_FAILURE_PAIRS: &[(AuthEventType, &str)] = &[
+    (AuthEventType::KeyGenerated, "db_write_failed"),
+    (AuthEventType::KeyRotated, "db_write_failed"),
+    (AuthEventType::KeyExpired, "db_write_failed"),
+    (AuthEventType::UserRegistered, "db_write_failed"),
+    (AuthEventType::UserRegistrationFailed, "db_write_failed"),
+    (AuthEventType::ServiceTokenFailed, "db_write_failed"),
+    (AuthEventType::ServiceTokenIssued, "db_write_failed"),
+    (AuthEventType::ServiceRegistered, "db_write_failed"),
+    (AuthEventType::ServiceScopesUpdated, "db_write_failed"),
+    (AuthEventType::ServiceDeactivated, "db_write_failed"),
+    (AuthEventType::ServiceSecretRotated, "db_write_failed"),
+    (AuthEventType::UserLogin, "db_write_failed"),
+    (AuthEventType::UserLoginFailed, "db_write_failed"),
 ];
 /// `ac_token_validations_total{status, error_category}` — un-exempted 2026-09-10
 /// (was wrongly "no emit site": `crypto/mod.rs:284,439` DO call it in prod). The
@@ -529,7 +536,7 @@ pub fn zero_initialize_counters() {
     }
     // ac_audit_log_failures_total{event_type, reason} — closed prod pair set.
     for (event_type, reason) in AUDIT_LOG_FAILURE_PAIRS {
-        counter!("ac_audit_log_failures_total", "event_type" => *event_type, "reason" => *reason)
+        counter!("ac_audit_log_failures_total", "event_type" => event_type.as_str(), "reason" => *reason)
             .increment(0);
     }
     // ac_db_queries_total{operation, table, status} — observed (op,table) pairs × status
@@ -843,25 +850,51 @@ mod tests {
     fn metrics_module_emits_audit_failures_cluster() {
         let snap = MetricAssertion::snapshot();
 
-        record_audit_log_failure("token_issued", "db_write_failed");
-        record_audit_log_failure("key_rotation", "encryption_failed");
-        record_audit_log_failure("authentication", "log_overflow");
+        record_audit_log_failure(AuthEventType::ServiceTokenIssued, "db_write_failed");
+        record_audit_log_failure(AuthEventType::KeyRotated, "encryption_failed");
+        record_audit_log_failure(AuthEventType::ServiceSecretRotated, "log_overflow");
 
         snap.counter("ac_audit_log_failures_total")
             .with_labels(&[
-                ("event_type", "token_issued"),
+                ("event_type", "service_token_issued"),
                 ("reason", "db_write_failed"),
             ])
             .assert_delta(1);
         snap.counter("ac_audit_log_failures_total")
             .with_labels(&[
-                ("event_type", "key_rotation"),
+                ("event_type", "key_rotated"),
                 ("reason", "encryption_failed"),
             ])
             .assert_delta(1);
         snap.counter("ac_audit_log_failures_total")
-            .with_labels(&[("event_type", "authentication"), ("reason", "log_overflow")])
+            .with_labels(&[
+                ("event_type", "service_secret_rotated"),
+                ("reason", "log_overflow"),
+            ])
             .assert_delta(1);
+    }
+
+    /// The closed pair set lists exactly the variants that have an audit-write
+    /// site: every `AuthEventType` except the two with no emitter. A new
+    /// variant with an emitter must be added here (and to the migration CHECK).
+    #[test]
+    fn audit_failure_pairs_cover_every_emitting_variant() {
+        let no_emitter = [
+            AuthEventType::TokenValidationFailed,
+            AuthEventType::RateLimitExceeded,
+        ];
+        let mut expected: Vec<&str> = AuthEventType::ALL
+            .iter()
+            .filter(|v| !no_emitter.contains(v))
+            .map(|v| v.as_str())
+            .collect();
+        let mut actual: Vec<&str> = AUDIT_LOG_FAILURE_PAIRS
+            .iter()
+            .map(|(v, _)| v.as_str())
+            .collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]

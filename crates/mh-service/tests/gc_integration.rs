@@ -27,7 +27,9 @@ use proto_gen::dark_tower::internal::v1::media_handler_registry_service_server::
 use proto_gen::dark_tower::internal::v1::{
     RegisterMhRequest, RegisterMhResponse, SendLoadReportRequest, SendLoadReportResponse,
 };
-use test_common::otel_capture::{install_test_propagator, SpanCapture};
+use test_common::otel_capture::{
+    install_test_propagator, SpanCapture, KNOWN_SPAN_ID_U64, KNOWN_TRACE_ID_U128,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
@@ -555,9 +557,6 @@ async fn test_gc_client_load_report_not_found_clears_registration() {
 // cover) and assert the mock actually receives a `traceparent` header whose
 // trace id matches a known ambient span the RPC call is wrapped in.
 
-const KNOWN_TRACE_ID_U128: u128 = 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736;
-const KNOWN_SPAN_ID_U64: u64 = 0x00f0_67aa_0ba9_02b7;
-
 /// A remote `Context` with a known, fixed trace/span id — used as the
 /// "caller's" ambient trace context for injection assertions.
 fn known_remote_context() -> Context {
@@ -589,7 +588,7 @@ async fn test_gc_client_register_injects_traceparent_matching_ambient_span() {
         .unwrap();
 
     let span = tracing::info_span!("test_register_root");
-    span.set_parent(known_remote_context());
+    assert!(span.set_parent(known_remote_context()).is_ok());
     async {
         gc_client.register().await.unwrap();
     }
@@ -636,7 +635,7 @@ async fn test_gc_client_send_load_report_injects_traceparent_matching_ambient_sp
     gc_client.register().await.unwrap();
 
     let span = tracing::info_span!("test_load_report_root");
-    span.set_parent(known_remote_context());
+    assert!(span.set_parent(known_remote_context()).is_ok());
     async {
         gc_client.send_load_report().await.unwrap();
     }

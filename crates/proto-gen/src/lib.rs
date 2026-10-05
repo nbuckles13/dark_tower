@@ -16,7 +16,6 @@
 #![allow(clippy::default_trait_access)] // Generated code uses Default::default()
 #![allow(clippy::too_many_lines)] // Generated code has long functions
 #![allow(clippy::struct_excessive_bools)] // Generated protobuf structs may have many bool fields
-#![allow(clippy::result_large_err)] // Generated tonic client/server fns return Result<_, tonic::Status>; Status is ~176 bytes and not ours to shrink
 
 // Re-export prost traits for convenience
 pub use prost::Message;
@@ -43,7 +42,7 @@ pub mod dark_tower {
 // Redacting `Debug` for credential- and key-bearing signalling messages
 // ---------------------------------------------------------------------------
 //
-// prost's derived `Debug` is suppressed for these three messages in
+// prost's derived `Debug` is suppressed for these five messages in
 // `build.rs` (`skip_debug`), so the impls below are the ONLY `Debug` they
 // have. They are written rather than omitted because the enclosing envelopes
 // (`ClientMessage`, `ServerMessage`) derive `Debug` transitively and callers

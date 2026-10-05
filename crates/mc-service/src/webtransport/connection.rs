@@ -267,6 +267,11 @@ pub async fn handle_connection(
     // trace so the whole join flow (and the `mc.actor.participant` spawn) become
     // children of the client's `dt_client.join` span. Extraction uses the global
     // bounded propagator; empty proto3-default fields → clean root (no-op).
+    //
+    // INVARIANT: no span may be created under the connection span before this
+    // reparent: tracing-opentelemetry >=0.32 starts the parent's context when a
+    // child is created, and set_parent then fails AlreadyStarted (warned by
+    // `set_remote_parent`).
     reparent_current_span(&client_message.trace_parent, &client_message.trace_state);
 
     // Step 4: Extract JoinRequest

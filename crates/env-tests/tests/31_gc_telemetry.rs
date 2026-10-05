@@ -29,7 +29,9 @@
 #![cfg(feature = "flows")]
 
 use env_tests::cluster::ClusterConnection;
-use env_tests::fixtures::auth_client::{TokenRequest, UserRegistrationRequest};
+use env_tests::fixtures::auth_client::{
+    TokenRequest, UserRegistrationRequest, DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET,
+};
 use env_tests::fixtures::gc_client::GcClient;
 use env_tests::fixtures::AuthClient;
 use prost::Message;
@@ -140,7 +142,7 @@ async fn ratelimit_user_token(cluster: &ClusterConnection) -> &'static str {
 async fn service_token(cluster: &ClusterConnection) -> String {
     let auth = AuthClient::new(&cluster.ac_base_url);
     let request =
-        TokenRequest::client_credentials("test-client", "test-client-secret-dev-999", "test:all");
+        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
     auth.issue_token(request)
         .await
         .expect("AC should issue a service token")
@@ -155,6 +157,7 @@ async fn service_token(cluster: &ClusterConnection) -> String {
 /// A `KeyValue` carrying a scalar string value.
 fn string_attr(key: &str, val: &str) -> KeyValue {
     KeyValue {
+        key_strindex: 0,
         key: key.to_string(),
         value: Some(AnyValue {
             value: Some(Value::StringValue(val.to_string())),
@@ -169,6 +172,7 @@ fn minimal_metrics_payload() -> Vec<u8> {
     ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
+                entity_refs: vec![],
                 attributes: vec![string_attr("org_id", "env-test")],
                 dropped_attributes_count: 0,
             }),
@@ -193,6 +197,7 @@ fn minimal_traces_payload() -> Vec<u8> {
     ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             resource: Some(Resource {
+                entity_refs: vec![],
                 attributes: vec![string_attr("org_id", "env-test")],
                 dropped_attributes_count: 0,
             }),
@@ -219,6 +224,7 @@ fn metrics_payload_pii_resource() -> Vec<u8> {
     ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
+                entity_refs: vec![],
                 attributes: vec![
                     string_attr("org_id", "env-test"), // allowlisted scalar → kept
                     string_attr("dt_not_allowlisted", "synthetic-pii-marker"), // → dropped
@@ -258,6 +264,7 @@ fn metrics_payload_pii_nonscalar_datapoint() -> Vec<u8> {
                     data: Some(Data::Gauge(Gauge {
                         data_points: vec![NumberDataPoint {
                             attributes: vec![KeyValue {
+                                key_strindex: 0,
                                 key: "org_id".to_string(),
                                 value: Some(AnyValue {
                                     value: Some(nested),

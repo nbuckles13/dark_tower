@@ -93,7 +93,7 @@ pub async fn initialize_signing_key(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
-        record_audit_log_failure("key_generated", "db_write_failed");
+        record_audit_log_failure(AuthEventType::KeyGenerated, "db_write_failed");
     }
 
     // Update key management gauges
@@ -163,7 +163,7 @@ pub async fn rotate_signing_key(
     .await
     {
         tracing::warn!("Failed to log auth event: {}", e);
-        record_audit_log_failure("key_rotated", "db_write_failed");
+        record_audit_log_failure(AuthEventType::KeyRotated, "db_write_failed");
     }
 
     // Update key management gauges
@@ -381,7 +381,7 @@ pub async fn expire_old_keys(pool: &PgPool) -> Result<Vec<String>, AcError> {
         .await
         {
             tracing::warn!("Failed to log key expiration event: {}", e);
-            record_audit_log_failure("key_expired", "db_write_failed");
+            record_audit_log_failure(AuthEventType::KeyExpired, "db_write_failed");
         }
     }
 

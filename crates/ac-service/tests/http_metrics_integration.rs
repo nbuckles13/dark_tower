@@ -198,3 +198,43 @@ async fn http_request_emits_only_one_observation_per_request() {
         ])
         .assert_observation_count(1);
 }
+
+/// The admin client `{id}` routes (live since axum 0.8) label as the template,
+/// never the raw UUID — including the `/rotate-secret` child route.
+#[tokio::test(flavor = "current_thread")]
+async fn admin_client_uuid_paths_normalize_to_id_template() {
+    let snap = MetricAssertion::snapshot();
+    let app = Router::new()
+        .route("/api/v1/admin/clients/{id}", get(handler_200))
+        .route("/api/v1/admin/clients/{id}/rotate-secret", get(handler_200))
+        .layer(middleware::from_fn(http_metrics_middleware));
+    let id = "550e8400-e29b-41d4-a716-446655440000";
+
+    for uri in [
+        format!("/api/v1/admin/clients/{id}"),
+        format!("/api/v1/admin/clients/{id}/rotate-secret"),
+    ] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    snap.counter("ac_http_requests_total")
+        .with_labels(&[
+            ("method", "GET"),
+            ("endpoint", "/api/v1/admin/clients/{id}"),
+            ("status_code", "200"),
+        ])
+        .assert_delta(1);
+    snap.counter("ac_http_requests_total")
+        .with_labels(&[
+            ("method", "GET"),
+            ("endpoint", "/api/v1/admin/clients/{id}/rotate-secret"),
+            ("status_code", "200"),
+        ])
+        .assert_delta(1);
+}

@@ -47,10 +47,6 @@ impl MhService {
     ///
     /// Handler IDs must be non-empty, at most 255 characters, and contain
     /// only alphanumeric characters, hyphens, and underscores.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_handler_id(id: &str) -> Result<(), Status> {
         if id.is_empty() {
             return Err(Status::invalid_argument("handler_id is required"));
@@ -71,10 +67,6 @@ impl MhService {
     }
 
     /// Validate a region.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_region(region: &str) -> Result<(), Status> {
         if region.is_empty() {
             return Err(Status::invalid_argument("region is required"));
@@ -89,10 +81,6 @@ impl MhService {
     ///
     /// Endpoints must be non-empty, at most 255 characters, and start with
     /// http:// or https://.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Status is the standard gRPC error type"
-    )]
     fn validate_endpoint(endpoint: &str, field_name: &str) -> Result<(), Status> {
         if endpoint.is_empty() {
             return Err(Status::invalid_argument(format!(

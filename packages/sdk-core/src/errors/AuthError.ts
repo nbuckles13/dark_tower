@@ -4,12 +4,12 @@
 // `SdkError` and is subtyped by HTTP status. Mapping is BY HTTP STATUS, read from
 // the `{error:{code,message}}` envelope (`crates/ac-service/src/errors.rs`).
 //
-// FORWARD-COMPAT NOTE: AC today emits only 401/403/404/429/500. R-11 asks AuthError
-// to cover 400/401/403/409/429, so the 400 (`AuthBadRequestError`) and 409
-// (`AuthConflictError`) branches exist and are unit-tested synthetically, but AC has
-// no live source for them yet — a future AC 400/409 lands on the typed subtype
-// rather than the generic fallthrough. (404 surfaces as the generic `AuthError`
-// base for AC; the meeting-side 404 is `MeetingNotFoundError`.)
+// LIVE STATUSES: AC emits 400 `INVALID_REQUEST` (registration format validation —
+// bad email, short password, empty display name — and admin validation) and 409
+// `CONFLICT` (registering an email that already exists in the org), alongside
+// 401/403/404/429/500. Both land on their typed subtypes (`AuthBadRequestError` /
+// `AuthConflictError`) and carry AC's fixed body message verbatim. (404 surfaces as
+// the generic `AuthError` base for AC; the meeting-side 404 is `MeetingNotFoundError`.)
 //
 // Each subclass overrides `this.name` (per @code-reviewer relay) so a serialized
 // error reports its concrete class, not the base name. `serverCode` is carried by
@@ -55,7 +55,7 @@ export class AuthError extends SdkError {
   }
 }
 
-/** 400 — malformed request (forward-compat; AC has no live 400 today). */
+/** 400 — malformed request (e.g. registration format validation). */
 export class AuthBadRequestError extends AuthError {
   constructor(message: string, serverCode?: string) {
     super(message, 400, serverCode);
@@ -82,7 +82,7 @@ export class AuthForbiddenError extends AuthError {
   }
 }
 
-/** 409 — conflict, e.g. duplicate registration (forward-compat; no live AC 409 today). */
+/** 409 — conflict, e.g. registering an email that already exists in the org. */
 export class AuthConflictError extends AuthError {
   constructor(message: string, serverCode?: string) {
     super(message, 409, serverCode);

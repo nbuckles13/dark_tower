@@ -5,12 +5,11 @@
 //! `#[instrument(name = "gc.grpc.register_mc")]` span MUST inherit the same
 //! trace-id.
 //!
-//! This is the test that catches the surface-(d) "silent no-op" regression
-//! found during Gate-1 review: `.with_interceptor(...)` alone does nothing
-//! without a span-creating layer (`TraceLayer::new_for_grpc()`) ahead of it
-//! on the server builder — without that layer, this test fails (the
-//! interceptor finds no active span to attach the parent to, and
-//! `register_mc`'s span comes up as an unrelated root). Distinct boundary
+//! The server is built through `gc_service::grpc::server_layers` (the same
+//! function `main.rs` uses) with the REAL `GrpcAuthLayer`, so the request span
+//! → extraction → auth ordering is exercised as shipped. Moving extraction
+//! outside the span layer turns this test red; moving it after auth does not
+//! compile (auth is bound to tonic's `Body`). Distinct boundary
 //! from `otel_http_grpc_bridge.rs` (that one is GC-as-client / MC-as-server;
 //! this one is GC-as-server / MC-as-client) — same "spin up a real server,
 //! don't mock the mechanism under test" principle, opposite direction.
@@ -19,6 +18,8 @@
 
 #[path = "common/mod.rs"]
 mod test_common;
+use test_common::grpc_auth::{grpc_auth, mc_bearer};
+use test_common::jwt_fixtures::TestKeypair;
 use test_common::otel_support::{known_traceparent, setup_otel_test_environment_with_exporter};
 
 use common::secret::SecretString;
@@ -42,6 +43,8 @@ use tonic::Request as TonicRequest;
 
 struct TestGrpcServer {
     addr: std::net::SocketAddr,
+    keypair: TestKeypair,
+    _jwks: wiremock::MockServer,
     cancel: CancellationToken,
     handle: Option<JoinHandle<()>>,
 }
@@ -81,14 +84,11 @@ async fn minimal_app_state(pool: PgPool) -> Arc<AppState> {
     })
 }
 
-/// Start GC's REAL inbound gRPC stack for `GlobalControllerService`, wired
-/// exactly as `main.rs` wires it for R-56 surface (d): `TraceLayer::new_for_grpc()`
-/// OUTERMOST (first `.layer()` — required so `otel_grpc::server_interceptor()`
-/// has an active span to attach the parent to; see `main.rs`'s comment for
-/// why this ordering is the opposite of axum's), then
-/// `.with_interceptor(mc_service, otel_grpc::server_interceptor())`.
-/// `GrpcAuthLayer` is intentionally omitted — auth is a separate, already-
-/// tested boundary; this test isolates trace-continuity only.
+/// Start GC's REAL inbound gRPC stack for `GlobalControllerService` through
+/// `gc_service::grpc::server_layers` — the same function `main.rs` uses, so
+/// the request span → extraction → auth ordering is exercised as shipped,
+/// with the real `GrpcAuthLayer` (its JWT-validation child spans are what make
+/// the ordering load-bearing).
 async fn start_test_grpc_server(state: Arc<AppState>) -> TestGrpcServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -99,13 +99,11 @@ async fn start_test_grpc_server(state: Arc<AppState>) -> TestGrpcServer {
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
     let mc_service = McService::new(state);
+    let (jwks, keypair, auth) = grpc_auth().await;
 
     let server = TonicServer::builder()
-        .layer(tower_http::trace::TraceLayer::new_for_grpc())
-        .add_service(GlobalControllerServiceServer::with_interceptor(
-            mc_service,
-            common::observability::otel_grpc::server_interceptor(),
-        ))
+        .layer(gc_service::grpc::server_layers(auth))
+        .add_service(GlobalControllerServiceServer::new(mc_service))
         .serve_with_incoming_shutdown(incoming, async move {
             cancel_clone.cancelled().await;
         });
@@ -118,6 +116,8 @@ async fn start_test_grpc_server(state: Arc<AppState>) -> TestGrpcServer {
 
     TestGrpcServer {
         addr,
+        keypair,
+        _jwks: jwks,
         cancel,
         handle: Some(handle),
     }
@@ -152,6 +152,9 @@ async fn inbound_register_mc_call_with_traceparent_produces_matching_span(pool: 
             .parse()
             .expect("known traceparent should parse as MetadataValue"),
     );
+    request
+        .metadata_mut()
+        .insert("authorization", mc_bearer(&server.keypair));
 
     let response = client
         .register_mc(request)
@@ -187,9 +190,9 @@ async fn inbound_register_mc_call_with_traceparent_produces_matching_span(pool: 
     assert_eq!(
         actual_trace_id, expected_trace_id,
         "gc.grpc.register_mc span's trace_id must match the inbound traceparent's trace-id — \
-         this is the assertion that fails if TraceLayer::new_for_grpc() is removed from the \
-         grpc_server builder (server_interceptor() would then have no active span to attach \
-         the parent to, and this span would come up as an unrelated root)"
+         this is the assertion that fails if the extraction layer is removed from, or moved \
+         after auth in, `server_layers` (the reparent would then have no span to attach to, \
+         or auth's child spans would already have started it)"
     );
 
     drop(server);

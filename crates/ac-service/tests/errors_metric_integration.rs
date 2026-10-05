@@ -65,6 +65,7 @@ const ALL_CATEGORIES: &[&str] = &[
     "authorization",
     "cryptographic",
     "internal",
+    "validation",
 ];
 
 // ---------------------------------------------------------------------------
@@ -244,4 +245,147 @@ async fn handle_get_client_not_found_emits_internal_category(pool: PgPool) {
             .with_labels(&[("operation", "get_client"), ("error_category", *sibling)])
             .assert_delta(0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Validation (client-attributable rejections: 400 BadRequest / 409 Conflict)
+// ---------------------------------------------------------------------------
+
+fn assert_only_validation(
+    snap: &common::observability::testing::MetricSnapshot,
+    operation: &str,
+    status_code: &str,
+) {
+    snap.counter("ac_errors_total")
+        .with_labels(&[
+            ("operation", operation),
+            ("error_category", "validation"),
+            ("status_code", status_code),
+        ])
+        .assert_delta(1);
+    for sibling in ALL_CATEGORIES.iter().filter(|c| **c != "validation") {
+        snap.counter("ac_errors_total")
+            .with_labels(&[("operation", operation), ("error_category", *sibling)])
+            .assert_delta(0);
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn handle_create_client_invalid_service_type_emits_validation_category(pool: PgPool) {
+    use ac_service::handlers::admin_handler::{handle_create_client, CreateClientRequest};
+
+    let state = make_app_state(pool);
+    let snap = MetricAssertion::snapshot();
+    let _ = handle_create_client(
+        State(state),
+        Json(CreateClientRequest {
+            service_type: "not-a-type".to_string(),
+            region: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_only_validation(&snap, "create_client", "400");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn handle_update_client_scope_not_permitted_emits_validation_category(pool: PgPool) {
+    use ac_service::handlers::admin_handler::{
+        handle_create_client, handle_update_client, CreateClientRequest, UpdateClientRequest,
+    };
+    use test_common::test_state::admin_claims;
+
+    let state = make_app_state(pool);
+    let created = handle_create_client(
+        State(state.clone()),
+        Json(CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    let snap = MetricAssertion::snapshot();
+    let _ = handle_update_client(
+        State(state),
+        admin_claims(),
+        Path(created.id),
+        Json(UpdateClientRequest {
+            scopes: Some(vec!["admin:services".to_string()]),
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_only_validation(&snap, "update_client", "400");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn handle_rotate_client_secret_deactivated_emits_validation_409(pool: PgPool) {
+    use ac_service::handlers::admin_handler::{
+        handle_create_client, handle_delete_client, handle_rotate_client_secret,
+        CreateClientRequest,
+    };
+    use test_common::test_state::admin_claims;
+
+    let state = make_app_state(pool);
+    let created = handle_create_client(
+        State(state.clone()),
+        Json(CreateClientRequest {
+            service_type: "global-controller".to_string(),
+            region: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    let _ = handle_delete_client(State(state.clone()), admin_claims(), Path(created.id))
+        .await
+        .unwrap();
+
+    let snap = MetricAssertion::snapshot();
+    let _ = handle_rotate_client_secret(State(state), admin_claims(), Path(created.id))
+        .await
+        .unwrap_err();
+
+    assert_only_validation(&snap, "rotate_client_secret", "409");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn handle_register_validation_emits_validation_category(pool: PgPool) {
+    use ac_service::handlers::auth_handler::{handle_register, UserRegistrationRequest};
+    use ac_service::middleware::org_extraction::OrgContext;
+    use axum::Extension;
+    use common::secret::SecretString;
+
+    let org_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO organizations (subdomain, display_name) VALUES ('valcat', 'Val') \
+         RETURNING org_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let state = make_app_state(pool);
+    let snap = MetricAssertion::snapshot();
+    let _ = handle_register(
+        State(state),
+        ConnectInfo(TEST_ADDR.parse::<SocketAddr>().unwrap()),
+        Extension(OrgContext {
+            org_id,
+            subdomain: "valcat".to_string(),
+        }),
+        HeaderMap::new(),
+        Json(UserRegistrationRequest {
+            email: "not-an-email".to_string(),
+            password: SecretString::from("password123".to_string()),
+            display_name: "Val".to_string(),
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_only_validation(&snap, "register_user", "400");
 }

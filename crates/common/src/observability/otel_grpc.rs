@@ -91,8 +91,10 @@ impl BoundedTraceContextPropagator {
     /// Returns true if the extractor's `traceparent`/`tracestate` headers
     /// pass W3C size and member-count bounds. Format / lowercase / all-zero
     /// checks are delegated to the inner `TraceContextPropagator`, which
-    /// already enforces W3C §3.2.2 invariants (verified by inspection of
-    /// `opentelemetry_sdk` 0.24 source).
+    /// already enforces W3C §3.2.2 invariants: version `ff` / non-hex /
+    /// uppercase / all-zero ids are rejected, and unknown trace-flags bits are
+    /// accepted but zeroed per W3C §3.2.2.5 (re-verified by inspection of
+    /// `opentelemetry_sdk` 0.33 `propagation/trace_context.rs`).
     fn within_bounds(extractor: &dyn Extractor) -> bool {
         if let Some(tp) = extractor.get("traceparent") {
             if tp.len() > TRACEPARENT_MAX_LEN {
@@ -193,11 +195,6 @@ impl Extractor for MetadataExtractor<'_> {
 /// no propagated parent). Never reads any inbound metadata, never touches
 /// `authorization` or any non-W3C header.
 #[must_use]
-#[expect(
-    clippy::result_large_err,
-    reason = "tonic::service::Interceptor::call signature is fixed by upstream; \
-              the closure body never returns Err but the trait demands Result<_, Status>"
-)]
 pub fn client_interceptor() -> impl tonic::service::Interceptor + Clone + Send + Sync + 'static {
     |mut req: tonic::Request<()>| -> Result<tonic::Request<()>, Status> {
         let cx = tracing::Span::current().context();
@@ -213,6 +210,16 @@ pub fn client_interceptor() -> impl tonic::service::Interceptor + Clone + Send +
     }
 }
 
+/// Request-span builder for every gRPC server's `TraceLayer::new_for_grpc()`
+/// that hosts [`server_interceptor`]. The span is INFO: the default DEBUG span
+/// is disabled under the deployed `RUST_LOG=info,<svc>=debug`, which turns the
+/// interceptor's reparenting into a no-op. The gRPC `uri` it records is the
+/// bounded `/package.Service/Method` path.
+#[must_use]
+pub fn grpc_make_span() -> tower_http::trace::DefaultMakeSpan {
+    tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO)
+}
+
 /// Tonic server interceptor that extracts inbound W3C trace context from the
 /// request's metadata and attaches it as the parent of the current
 /// `tracing::Span`. Subsequent spans created during the handler's execution
@@ -221,21 +228,69 @@ pub fn client_interceptor() -> impl tonic::service::Interceptor + Clone + Send +
 /// Reads ONLY `traceparent` / `tracestate`. Never reads `authorization` or
 /// any other metadata key. Never copies metadata into span attributes.
 #[must_use]
-#[expect(
-    clippy::result_large_err,
-    reason = "tonic::service::Interceptor::call signature is fixed by upstream; \
-              the closure body never returns Err but the trait demands Result<_, Status>"
-)]
-pub fn server_interceptor() -> impl tonic::service::Interceptor + Clone + Send + Sync + 'static {
-    |req: tonic::Request<()>| -> Result<tonic::Request<()>, Status> {
+pub fn server_interceptor() -> ServerTraceInterceptor {
+    ServerTraceInterceptor
+}
+
+/// The interceptor returned by [`server_interceptor`]: a named type so the
+/// inbound layer stack ([`InboundLayers`]) can be spelled in signatures.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServerTraceInterceptor;
+
+impl tonic::service::Interceptor for ServerTraceInterceptor {
+    fn call(&mut self, req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
         let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.extract(&MetadataExtractor {
                 metadata: req.metadata(),
             })
         });
-        tracing::Span::current().set_parent(parent_cx);
+        crate::observability::otel::set_remote_parent(&tracing::Span::current(), parent_cx);
         Ok(req)
     }
+}
+
+/// The inbound gRPC layer stack: `span_layer` outermost, then trace-context
+/// extraction, then `auth_layer`.
+pub type InboundLayers<L, A> = tower::layer::util::Stack<
+    A,
+    tower::layer::util::Stack<tonic::service::InterceptorLayer<ServerTraceInterceptor>, L>,
+>;
+
+/// Compose the inbound gRPC layers in the one order that keeps trace
+/// continuity working: `span_layer` (creates the request span) → extraction
+/// (attaches the inbound W3C parent) → `auth_layer`. Pass the result to
+/// `tonic::transport::Server::builder().layer(..)`.
+///
+/// INVARIANT, enforced here rather than by per-service comments: extraction
+/// must sit between the span layer and any span-creating layer such as auth.
+/// tracing-opentelemetry ≥0.32 starts a span's `OTel` context as soon as a child
+/// span is created under it, after which the parent can no longer be attached
+/// (`AlreadyStarted`); auth's JWT validation creates such child spans.
+///
+/// The span layer is a parameter so services can supply their own (GC/MC use
+/// [`grpc_trace_layer`]; MH uses its attribute-less `SpanLayer`).
+#[must_use]
+pub fn inbound_layers<L, A>(span_layer: L, auth_layer: A) -> InboundLayers<L, A> {
+    tower::layer::util::Stack::new(
+        auth_layer,
+        tower::layer::util::Stack::new(
+            tonic::service::InterceptorLayer::new(server_interceptor()),
+            span_layer,
+        ),
+    )
+}
+
+/// The type of [`grpc_trace_layer`].
+pub type GrpcTraceLayer = tower_http::trace::TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::GrpcErrorsAsFailures>,
+    tower_http::trace::DefaultMakeSpan,
+>;
+
+/// The gRPC request-span layer GC and MC host extraction in:
+/// `TraceLayer::new_for_grpc()` with [`grpc_make_span`].
+#[must_use]
+pub fn grpc_trace_layer() -> GrpcTraceLayer {
+    tower_http::trace::TraceLayer::new_for_grpc().make_span_with(grpc_make_span())
 }
 
 // =============================================================================
@@ -249,6 +304,9 @@ pub fn server_interceptor() -> impl tonic::service::Interceptor + Clone + Send +
 )]
 mod tests {
     use super::*;
+    use crate::observability::testing::otel::{
+        known_traceparent, KNOWN_SPAN_ID_U64, KNOWN_TRACE_ID_U128,
+    };
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
@@ -272,9 +330,6 @@ mod tests {
         });
     }
 
-    const KNOWN_TRACE_ID_U128: u128 = 0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736;
-    const KNOWN_SPAN_ID_U64: u64 = 0x00f0_67aa_0ba9_02b7;
-
     fn known_trace_id() -> TraceId {
         TraceId::from(KNOWN_TRACE_ID_U128)
     }
@@ -289,10 +344,6 @@ mod tests {
             true,
             TraceState::default(),
         )
-    }
-    fn known_traceparent_header() -> String {
-        // Version 00, sampled flag set — 55 chars total per W3C §3.2.2.
-        format!("00-{KNOWN_TRACE_ID_U128:032x}-{KNOWN_SPAN_ID_U64:016x}-01")
     }
 
     // -------------------------------------------------------------------------
@@ -329,7 +380,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert(
             "traceparent".to_string(),
-            format!("{}-EXTRAEXTRAEXTRA", known_traceparent_header()),
+            format!("{}-EXTRAEXTRAEXTRA", known_traceparent()),
         );
         let ctx = propagator.extract_with_context(&Context::new(), &headers);
         assert!(
@@ -344,7 +395,7 @@ mod tests {
     fn bounded_propagator_rejects_overlength_tracestate() {
         let propagator = BoundedTraceContextPropagator::new();
         let mut headers = HashMap::new();
-        headers.insert("traceparent".to_string(), known_traceparent_header());
+        headers.insert("traceparent".to_string(), known_traceparent());
         // 600-byte value: "foo=" + 596 ASCII 'a' bytes.
         let big = format!("foo={}", "a".repeat(596));
         assert!(big.len() > TRACESTATE_MAX_BYTES);
@@ -361,7 +412,7 @@ mod tests {
     fn bounded_propagator_rejects_too_many_tracestate_list_members() {
         let propagator = BoundedTraceContextPropagator::new();
         let mut headers = HashMap::new();
-        headers.insert("traceparent".to_string(), known_traceparent_header());
+        headers.insert("traceparent".to_string(), known_traceparent());
         // 40 list members, each short enough to keep total bytes well under
         // 512 so we test the member-count axis in isolation.
         let members: Vec<String> = (0..40).map(|i| format!("k{i}=v")).collect();
@@ -460,13 +511,12 @@ mod tests {
         F: FnOnce() -> R,
     {
         use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::trace::TracerProvider;
-        use tracing_opentelemetry::OpenTelemetryLayer;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
         use tracing_subscriber::layer::SubscriberExt;
 
-        let provider = TracerProvider::builder().build();
+        let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("test");
-        let layer = OpenTelemetryLayer::new(tracer);
+        let layer = crate::observability::otel::configured_layer(tracer);
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, f)
     }
@@ -481,7 +531,7 @@ mod tests {
         let req = with_test_subscriber(|| {
             let span = tracing::info_span!("test_client_inject");
             let parent_cx = Context::new().with_remote_span_context(known_span_context());
-            span.set_parent(parent_cx);
+            assert!(span.set_parent(parent_cx).is_ok());
             span.in_scope(|| {
                 let mut interceptor = client_interceptor();
                 interceptor
@@ -518,7 +568,7 @@ mod tests {
         let mut req = tonic::Request::new(());
         req.metadata_mut().insert(
             "traceparent",
-            MetadataValue::try_from(known_traceparent_header())
+            MetadataValue::try_from(known_traceparent())
                 .unwrap_or_else(|e| panic!("known traceparent must parse: {e}")),
         );
 
@@ -536,6 +586,58 @@ mod tests {
         let sc = recovered.span().span_context().clone();
         assert!(sc.is_valid(), "extracted parent context should be valid");
         assert_eq!(sc.trace_id(), known_trace_id());
+    }
+
+    /// `opentelemetry_sdk` 0.33's inner `TraceContextPropagator` accepts unknown
+    /// trace-flags bits and zeroes them (W3C §3.2.2.5). A valid traceparent
+    /// with flags `03` is therefore ACCEPTED through the bounded propagator,
+    /// keeps its trace/span ids, and carries exactly `SAMPLED`. Driven through
+    /// the real `server_interceptor` → `set_remote_parent` path too, so it is
+    /// also the positive control that a valid parent attaches with context
+    /// activation off.
+    #[test]
+    fn traceparent_with_unknown_flags_is_accepted_with_flags_masked_to_sampled() {
+        let _g = GLOBAL_PROPAGATOR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ensure_bounded_propagator_installed();
+
+        let header = format!("00-{KNOWN_TRACE_ID_U128:032x}-{KNOWN_SPAN_ID_U64:016x}-03");
+
+        let mut carrier = HashMap::new();
+        carrier.insert("traceparent".to_string(), header.clone());
+        let extracted = BoundedTraceContextPropagator::new().extract(&carrier);
+        let sc = extracted.span().span_context().clone();
+        assert!(sc.is_valid(), "flags 03 must be accepted");
+        assert!(sc.is_remote());
+        assert_eq!(sc.trace_id(), known_trace_id());
+        assert_eq!(sc.span_id(), known_span_id());
+        assert!(sc.is_sampled());
+        assert_eq!(sc.trace_flags(), TraceFlags::SAMPLED);
+
+        let mut req = tonic::Request::new(());
+        req.metadata_mut().insert(
+            "traceparent",
+            MetadataValue::try_from(header)
+                .unwrap_or_else(|e| panic!("traceparent must parse: {e}")),
+        );
+        let recovered = with_test_subscriber(|| {
+            let span = tracing::info_span!("test_flags_03");
+            span.in_scope(|| {
+                let mut interceptor = server_interceptor();
+                let _ = interceptor
+                    .call(req)
+                    .unwrap_or_else(|e| panic!("interceptor returned err: {e}"));
+                tracing::Span::current().context()
+            })
+        });
+        let child = recovered.span().span_context().clone();
+        assert_eq!(
+            child.trace_id(),
+            known_trace_id(),
+            "span must join the inbound trace"
+        );
+        assert!(child.is_sampled());
     }
 
     // -------------------------------------------------------------------------
@@ -558,7 +660,7 @@ mod tests {
         );
         req.metadata_mut().insert(
             "traceparent",
-            MetadataValue::try_from(known_traceparent_header())
+            MetadataValue::try_from(known_traceparent())
                 .unwrap_or_else(|e| panic!("test fixture: {e}")),
         );
 
@@ -589,7 +691,9 @@ mod tests {
 
         let req = with_test_subscriber(|| {
             let span = tracing::info_span!("test_no_auth_leak");
-            span.set_parent(Context::new().with_remote_span_context(known_span_context()));
+            assert!(span
+                .set_parent(Context::new().with_remote_span_context(known_span_context()))
+                .is_ok());
             span.in_scope(|| {
                 let mut interceptor = client_interceptor();
                 interceptor
@@ -615,7 +719,9 @@ mod tests {
 
         let req = with_test_subscriber(|| {
             let span = tracing::info_span!("test_only_w3c_keys");
-            span.set_parent(Context::new().with_remote_span_context(known_span_context()));
+            assert!(span
+                .set_parent(Context::new().with_remote_span_context(known_span_context()))
+                .is_ok());
             span.in_scope(|| {
                 let mut interceptor = client_interceptor();
                 interceptor
@@ -695,7 +801,7 @@ mod tests {
             );
             req.metadata_mut().insert(
                 "traceparent",
-                MetadataValue::try_from(known_traceparent_header())
+                MetadataValue::try_from(known_traceparent())
                     .unwrap_or_else(|e| panic!("test fixture: {e}")),
             );
             run_interceptor(req);

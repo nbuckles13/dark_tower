@@ -14,8 +14,9 @@ default = []
 # Enable test utilities (e.g., TokenReceiver::from_test_channel,
 # MetricAssertion at `observability::testing`). The test-utils feature
 # is NOT default-enabled so production builds of consumer services do
-# not pull in test-only dependencies (the metrics facade).
-test-utils = ["dep:metrics"]
+# not pull in test-only dependencies (the metrics facade, the SDK's
+# in-memory exporter for `observability::testing::otel`).
+test-utils = ["dep:metrics", "opentelemetry_sdk/testing"]
 
 [dependencies]
 # Workspace dependencies
@@ -36,6 +37,10 @@ tonic = { workspace = true }
 # HTTP types (HeaderMap/HeaderName/HeaderValue) for the OTel HTTP-transport
 # adapter (`observability::otel_http`, R-56). Framework-agnostic — no axum dep.
 http = { workspace = true }
+# Shared request-span builders for tower-http `TraceLayer`s (R-56 inbound
+# extraction hosts), so every service's request span has one definition.
+tower-http = { workspace = true, features = ["trace"] }
+tower = { workspace = true }
 
 # OpenTelemetry SDK + OTLP-gRPC exporter + tracing bridge for `observability::otel`.
 opentelemetry = { workspace = true }
@@ -65,7 +70,10 @@ jsonwebtoken = { workspace = true }
 # For MetricAssertion's own in-file unit tests (module is cfg(test)-visible
 # without needing the test-utils feature to be enabled for `cargo test -p common`).
 metrics = { workspace = true }
-# Pull the `testing` feature on `opentelemetry_sdk` for `InMemorySpanExporter`
-# and the `TraceId::from_u128` / `SpanId::from_u64` test-only constructors
-# used by `observability::otel::tests` and `observability::otel_grpc::tests`.
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "trace", "testing"] }
+# Pull the `testing` feature on `opentelemetry_sdk` for `InMemorySpanExporter`,
+# used by `observability::otel::tests`.
+opentelemetry_sdk = { workspace = true, features = ["trace", "testing"] }
+# OTLP `TraceService` server types for the fake collector that proves
+# `OtelGuard`'s shutdown flush in `observability::otel::tests`.
+opentelemetry-proto = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }

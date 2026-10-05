@@ -76,10 +76,10 @@ fi
 #
 # COVERAGE LIMIT: `.github/workflows/ci-client.yml` does NOT route through this wrapper —
 # it hand-rolls `pnpm exec buf breaking` with its own `git merge-base` (self-described
-# there as an INTERIM PATCH pending "run CI in the devloop image"). The buf.yaml carve-out
-# itself DOES apply there (buf reads proto/buf.yaml regardless of caller — verified on the
-# CI-pinned buf 1.72.0), but this SUPPRESSED= line does not, so GitHub CI still shows a
-# bare green. Routing that step through this wrapper is the fix and is NOT a drop-in:
+# there as an INTERIM PATCH pending "run CI in the devloop image"). Any buf.yaml carve-out
+# DOES apply there (buf reads proto/buf.yaml regardless of caller — verified on the
+# CI-pinned buf 1.72.0), but this SUPPRESSED= line does not, so while one exists GitHub CI
+# shows a bare green. Routing that step through this wrapper is the fix and is NOT a drop-in:
 # ci-client.yml also runs on `push: [main, develop]`, where its hand-roll bases on
 # origin/main while _get_base_ref.sh bases on HEAD~1. Owner: infrastructure.
 #

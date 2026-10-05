@@ -551,6 +551,32 @@ describe('MeetingSession.join — failure paths (R-22)', () => {
     expect(sink.getCounter('dt_client_signaling_connection_total', {})).toBe(0);
   });
 
+  it('register 409 (email already exists) → rejects, failure_stage signup', async () => {
+    // AC answers a duplicate-email registration with 409 CONFLICT (not 401); the
+    // signup stage label must not depend on which AC status the failure carried.
+    const sink = new InMemoryMetricsSink();
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, {
+      fetchImpl: statusFetch({ authStatus: 409 }),
+      metricsSink: sink,
+    });
+    const credentials: JoinCredentials = {
+      mode: 'register',
+      email: 'taken@demo.test',
+      password: 'hunter2hunter2',
+      displayName: 'Dup',
+    };
+    await expect(
+      session.join({ orgSubdomain: 'demo', meetingCode: MEETING_CODE, credentials }),
+    ).rejects.toBeDefined();
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'signup' },
+      1,
+    );
+    expect(sink.getCounter('dt_client_signaling_connection_total', {})).toBe(0);
+  });
+
   it('GC join failure → rejects, failure_stage gc_join', async () => {
     const sink = new InMemoryMetricsSink();
     const mocks = new Map<string, MockWebTransport>();

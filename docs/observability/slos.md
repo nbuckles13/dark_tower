@@ -393,7 +393,7 @@ forward-path gates, Tier 2 regression deltas, Tier 3 non-gating objective).
 | MH media-path forwarding **target** and its error budget | Story 8 (performance) | observability + operations |
 | MH burn-rate alert pair | The target above | media-handler (rule), observability + operations (reviewers) |
 | `MCRegisterMeetingFailureRate` re-assert-failure alert | The MH target, then the handler-restart story | meeting-controller (rule), media-handler + observability + operations (reviewers) |
-| GC availability numerator counts client-attributable 4xx | Own scoping — moves a shipped baseline | observability |
+| GC and AC availability numerators count client-attributable 4xx. GC's error class is `status_code=~"[45].."`; AC's numerator is `ac_errors_total` across ALL `error_category` values, including `authentication`, `authorization` and `validation` (400/409 client rejections) | Own scoping — moves a shipped baseline | observability |
 | No SLO for the MC→MH control plane's applied-generation echo | Handler-restart story | observability + operations |
 | KEK **rotation latency** (departure → every remaining member holding the new generation) — **explicitly OPEN, no number ratified** (story 2 task 16). Instruments exist: `mc_meeting_kek_rotation_duration_seconds` and the pending-age gauge against the published W and overdue-threshold gauges. The only rule is `MCKekRotationOverdue`, a confidentiality page on a W multiple, not a latency objective. Do not read that page's threshold as the objective | Story 8 (performance) | observability + meeting-controller + security |
 

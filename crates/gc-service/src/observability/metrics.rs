@@ -192,11 +192,15 @@ pub fn record_http_request(method: &str, endpoint: &str, status_code: u16, durat
 /// Normalize endpoint path to prevent label cardinality explosion
 ///
 /// Replaces dynamic segments (UUIDs, meeting codes) with placeholders.
-fn normalize_endpoint(path: &str) -> String {
+pub(crate) fn normalize_endpoint(path: &str) -> String {
     // Known static paths
     match path {
         "/" => "/".to_string(),
         "/health" => "/health".to_string(),
+        // Readiness probe. A static label like `/health`, and it must normalize
+        // to itself so the request-span level picks DEBUG for it
+        // (`common::observability::otel_http::PROBE_ENDPOINTS`).
+        "/ready" => "/ready".to_string(),
         "/metrics" => "/metrics".to_string(),
         "/api/v1/me" => "/api/v1/me".to_string(),
         "/api/v1/meetings" => "/api/v1/meetings".to_string(),
@@ -1225,6 +1229,7 @@ mod tests {
     fn test_normalize_endpoint_known_paths() {
         assert_eq!(normalize_endpoint("/"), "/");
         assert_eq!(normalize_endpoint("/health"), "/health");
+        assert_eq!(normalize_endpoint("/ready"), "/ready");
         assert_eq!(normalize_endpoint("/metrics"), "/metrics");
         assert_eq!(normalize_endpoint("/api/v1/me"), "/api/v1/me");
         assert_eq!(normalize_endpoint("/api/v1/meetings"), "/api/v1/meetings");

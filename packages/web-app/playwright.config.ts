@@ -27,7 +27,7 @@ export default defineConfig({
   // failing test restarts the worker and costs one re-registration); a second
   // worker would get its own memo and re-register. The N+1 multi-party cohort is
   // registered ONCE per run in global-setup.ts instead (e2e/cohort.ts). AC's
-  // limit counts successful token issues — sign-ins too — per source IP; its
+  // limit counts registration attempts — failed ones too, sign-ins not — per source IP; its
   // SSoT is the TARGET cluster's AC config (Kind: infra/services/ac-service/
   // config.env, read by global setup) — see e2e/README.md §Budgets. Escalation
   // path is "more shards", not parallel workers — and shards against one cluster
