@@ -771,7 +771,13 @@ pub async fn update_meeting_settings(
 // ============================================================================
 
 /// SQL query for selecting all meeting fields.
-const MEETING_SELECT_QUERY: &str = r#"
+//
+// A macro, not a const: `concat!` only accepts literal tokens, and sqlx 0.9's
+// `query()` takes `SqlSafeStr` (a `&'static str`), so a const joined with
+// `format!` no longer compiles. `concat!` keeps every query fully static.
+macro_rules! meeting_select_query {
+    () => {
+        r#"
     SELECT
         meeting_id,
         org_id,
@@ -795,13 +801,13 @@ const MEETING_SELECT_QUERY: &str = r#"
         allow_external_participants,
         waiting_room_enabled
     FROM meetings
-"#;
+"#
+    };
+}
 
 /// Find a meeting by its code.
 async fn find_meeting_by_code(pool: &PgPool, code: &str) -> Result<MeetingRow, GcError> {
-    let query = format!("{} WHERE meeting_code = $1", MEETING_SELECT_QUERY);
-
-    let row = sqlx::query(&query)
+    let row = sqlx::query(concat!(meeting_select_query!(), " WHERE meeting_code = $1"))
         .bind(code)
         .fetch_optional(pool)
         .await?
@@ -812,9 +818,7 @@ async fn find_meeting_by_code(pool: &PgPool, code: &str) -> Result<MeetingRow, G
 
 /// Find a meeting by its ID.
 async fn find_meeting_by_id(pool: &PgPool, meeting_id: Uuid) -> Result<MeetingRow, GcError> {
-    let query = format!("{} WHERE meeting_id = $1", MEETING_SELECT_QUERY);
-
-    let row = sqlx::query(&query)
+    let row = sqlx::query(concat!(meeting_select_query!(), " WHERE meeting_id = $1"))
         .bind(meeting_id)
         .fetch_optional(pool)
         .await?

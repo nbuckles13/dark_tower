@@ -16,6 +16,12 @@ pub mod types;
 /// Module for common configuration
 pub mod config;
 
+/// Shared Postgres connect path (pool settings, statement timeout,
+/// credential-safe connect errors). Compiled only with the `db` feature
+/// (AC, GC) or under `cfg(test)`.
+#[cfg(any(test, feature = "db"))]
+pub mod db;
+
 /// Module for secret types that prevent accidental logging
 pub mod secret;
 

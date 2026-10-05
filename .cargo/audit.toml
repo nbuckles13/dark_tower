@@ -3,8 +3,6 @@
 # Suppression is sourced ONLY from the manifest (ADR-0033 §11).
 #
 # Per-id rationale (mirrored from audit-suppressions.toml):
-#   RUSTSEC-2023-0071: rsa 0.9.10 Marvin timing side-channel; LOCKFILE-ONLY — not built at all (no mysql feature; `cargo tree -p rsa --invert --edges normal` prints nothing, verified 2026-09-02), present only because sqlx-mysql is a recorded optional dep; fail-closed if the verify command ever prints anything; no upstream fix and cargo-audit scans the lockfile not the build graph, so dropping this makes Layer 6 permanently red with no remedy. Full rationale in comment above + docs/TODO.md Cluster C.
-#     expires 2026-12-01 — re-verify per the reason line above before renewing; renewal workflow: docs/contributor/audit-suppressions.md.
 
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = []

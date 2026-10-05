@@ -58,7 +58,8 @@ prost = { workspace = true }
 bytes = { workspace = true }
 
 # Local dependencies
-common = { path = "../common" }
+# `db`: the shared Postgres connect path (`common::db`); only AC and GC enable it.
+common = { path = "../common", features = ["db"] }
 proto-gen = { path = "../proto-gen" }
 
 [lib]
@@ -84,7 +85,7 @@ jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 # Enable common's test-utils feature for MetricAssertion in tests/
 # (mirrors AC's pattern — ADR-0032 Step 5).
-common = { path = "../common", features = ["test-utils"] }
+common = { path = "../common", features = ["test-utils", "db"] }
 # R-56 trace-continuity integration tests (tests/otel_*.rs) construct
 # SpanContext fixtures and a local TracerProvider/OpenTelemetryLayer directly
 # — transitive via `common` is not enough for `use`, hence direct dev-deps.
