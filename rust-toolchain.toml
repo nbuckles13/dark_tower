@@ -1,0 +1,9 @@
+# The ONE Rust version for the whole repo: rustup reads this file on every cargo/rustc
+# call under the repo (CI, the devloop container, host builds of devloop-helper). The
+# images derive their `FROM rust:<v>-slim-bookworm` from it through the ONE reader,
+# infra/lib/rust-toolchain.sh. Keep `channel` an exact X.Y.Z: it doubles as the image
+# tag, and the reader rejects anything else (and any key outside the three below).
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -139,7 +139,7 @@ async fn every_on_disk_alert_rule_is_loaded_by_prometheus() {
         panic!(
             "COULD-NOT-EVALUATE: /api/v1/rules did not return a successful, well-formed \
              rules envelope. Body starts: {}",
-            &body.chars().take(200).collect::<String>()
+            body.chars().take(200).collect::<String>()
         )
     });
 

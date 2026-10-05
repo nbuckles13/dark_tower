@@ -3,12 +3,20 @@
 # Pre-built image with full Rust toolchain and development tools.
 # Used by devloop.sh for isolated Claude Code execution.
 #
-# Build:  ./infra/devloop/devloop.sh --rebuild   (reads .nvmrc, package.json packageManager and
-#         Cargo.lock; passes NODE_VERSION, PNPM_PACKAGE_MANAGER and SQLX_CLI_VERSION)
+# Build:  ./infra/devloop/devloop.sh --rebuild   (reads rust-toolchain.toml, .nvmrc, package.json
+#         packageManager and Cargo.lock; passes RUST_VERSION, NODE_VERSION, PNPM_PACKAGE_MANAGER
+#         and SQLX_CLI_VERSION)
 # Rebuild weekly or when toolchain/dependencies change.
-# NOTE: NODE_VERSION and PNPM_PACKAGE_MANAGER have no default and the build FAILS without them.
+# NOTE: RUST_VERSION, NODE_VERSION and PNPM_PACKAGE_MANAGER have no default and the build FAILS
+# without them.
 
-FROM docker.io/library/rust:1.95-slim-bookworm
+# RUST_VERSION is the repo's ONE Rust version, derived from rust-toolchain.toml by
+# infra/lib/rust-toolchain.sh (the build context, infra/devloop/, cannot COPY the file).
+# The image installs it as toolchain `<RUST_VERSION>-<host>`, the same name rustup resolves
+# from the mounted rust-toolchain.toml, so a current image never downloads a toolchain.
+# Unset yields `rust:-slim-bookworm`, an invalid reference.
+ARG RUST_VERSION
+FROM docker.io/library/rust:${RUST_VERSION}-slim-bookworm
 
 # System packages required for building (ring, bcrypt, protobuf), guards (jq, bc),
 # and database tools (postgresql-client for pg_isready used by entrypoint + test.sh).

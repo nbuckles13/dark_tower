@@ -1596,6 +1596,7 @@ impl MediaMetricHandles {
     /// construction — a new [`MediaDirection`] variant fails to compile here
     /// AND in `ALL`, rather than resolving to a fallback handle that quietly
     /// mislabels.
+    #[must_use]
     pub fn forwarded(&self, direction: MediaDirection) -> &Counter {
         let [ingress, egress] = &self.forwarded;
         match direction {
@@ -1605,6 +1606,7 @@ impl MediaMetricHandles {
     }
 
     /// The drop counter for one MH-local reason.
+    #[must_use]
     pub fn dropped(&self, reason: MediaDropReason) -> &Counter {
         let [ingress_overflow, egress_overflow, send_refused, closed, oversize, rate_limited, no_policy, no_subscriber, no_local, rewrite_failed, partial, receive_dropped, no_session, server_muted] =
             &self.dropped;
@@ -1644,6 +1646,7 @@ impl MediaMetricHandles {
     }
 
     /// The latency histogram for one phase.
+    #[must_use]
     pub fn latency(&self, phase: MediaLatencyPhase) -> &Histogram {
         let [receive_buffer, processing, transmit_buffer, total] = &self.latency;
         match phase {
@@ -1655,6 +1658,7 @@ impl MediaMetricHandles {
     }
 
     /// The egress-queue-depth gauge.
+    #[must_use]
     pub const fn egress_queue_depth(&self) -> &Gauge {
         &self.egress_queue_depth
     }

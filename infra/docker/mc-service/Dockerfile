@@ -9,14 +9,25 @@
 #   - Default: Minimal distroless (production-ready, no HEALTHCHECK)
 #   - runtime-with-healthcheck: Debug distroless (includes HEALTHCHECK, for testing)
 #
-# Build commands:
-#   docker build -t mc-service:prod .
-#   docker build -t mc-service:debug --target runtime-with-healthcheck .
+# Build commands (normally infra/kind/scripts/deploy.sh:build_content_tagged_image,
+# which passes both build args; from the repo root by hand):
+#   docker build -f infra/docker/mc-service/Dockerfile -t mc-service:prod \
+#     --build-arg RUST_VERSION="$(. infra/lib/rust-toolchain.sh && rust_toolchain_version rust-toolchain.toml)" \
+#     --build-arg CARGO_CHEF_VERSION=<deploy.sh's CARGO_CHEF_VERSION> .
+#   add `--target runtime-with-healthcheck` (tag :debug) for the debug variant.
+#
+# Build args (both REQUIRED, no defaults — a missing one fails the build):
+#   RUST_VERSION        The repo's ONE Rust version, derived from rust-toolchain.toml by
+#                       infra/lib/rust-toolchain.sh. Unset yields `rust:-slim-bookworm`,
+#                       an invalid reference.
+#   CARGO_CHEF_VERSION  Exact cargo-chef pin, ONE value in deploy.sh. Unpinned,
+#                       `cargo install` resolves the newest release, which can require
+#                       a newer rustc than the pinned base and break every image at once.
 
 # ========================================
 # Stage 1: Chef base (install cargo-chef)
 # ========================================
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION
 # Builder pinned to the runtime's Debian release (bookworm = distroless
 # cc-debian12): the binary links the builder's glibc, and the floating `-slim`
 # tag has moved on to trixie. setup.test.sh fails on builder/runtime drift.
@@ -26,7 +37,9 @@ FROM docker.io/library/rust:${RUST_VERSION}-slim-bookworm AS chef
 # compile, including this one: cargo reads config from the working directory up.
 WORKDIR /build
 COPY .cargo/ .cargo/
-RUN cargo install cargo-chef
+ARG CARGO_CHEF_VERSION
+RUN test -n "${CARGO_CHEF_VERSION}" || { echo "CARGO_CHEF_VERSION build-arg is required (set by infra/kind/scripts/deploy.sh)" >&2; exit 1; } && \
+    cargo install cargo-chef --locked --version "=${CARGO_CHEF_VERSION}"
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

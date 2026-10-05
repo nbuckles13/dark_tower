@@ -67,12 +67,14 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust toolchain
-        # One Rust version everywhere: this, infra/devloop/Dockerfile and the image
-        # Dockerfiles' RUST_VERSION agree, checked by scripts/setup.test.sh. rustup is
-        # preinstalled on the runner, so no third-party toolchain action is needed.
+        # One Rust version everywhere: rust-toolchain.toml. With no argument, rustup
+        # installs the toolchain (and components) that file names, and every later cargo
+        # call in the checkout resolves to it; the images derive theirs from the same
+        # file (infra/lib/rust-toolchain.sh). rustup is preinstalled on the runner, so no
+        # third-party toolchain action is needed.
         run: |
-          rustup toolchain install 1.95 --profile minimal
-          rustup default 1.95
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22

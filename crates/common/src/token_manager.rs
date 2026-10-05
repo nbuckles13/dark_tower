@@ -944,7 +944,8 @@ mod tests {
         // Multiple calls should all return valid token
         for _ in 0..10 {
             let token = receiver.token();
-            assert!(!token.expose_secret().is_empty());
+            // Length, not value: never format the secret on failure (not clippy's `assert_ne!(secret, "")`).
+            assert_ne!(token.expose_secret().len(), 0);
         }
 
         handle.abort();
@@ -1053,7 +1054,8 @@ mod tests {
 
         // Can still get token
         let token2 = receiver.token();
-        assert!(!token2.expose_secret().is_empty());
+        // Length, not value: never format the secret on failure (not clippy's `assert_ne!(secret, "")`).
+        assert_ne!(token2.expose_secret().len(), 0);
 
         handle.abort();
     }

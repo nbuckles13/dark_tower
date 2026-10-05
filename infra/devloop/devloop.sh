@@ -83,6 +83,17 @@ read_sqlx_cli_version() {
     cargo_lock_version "${script_dir}/../../Cargo.lock" sqlx || exit 1
 }
 
+# ─── Rust pin (SSoT = repo-root rust-toolchain.toml) ────────────
+# The Dockerfile takes `ARG RUST_VERSION` (no default) for its `FROM rust:<v>-slim-bookworm`.
+# The build context is infra/devloop/, which cannot COPY the repo-root file, so the value
+# comes from the ONE reader, shared with infra/kind/scripts/deploy.sh. Fails loud.
+# shellcheck source=../lib/rust-toolchain.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/rust-toolchain.sh"
+read_rust_version() {
+    local script_dir="$1"
+    rust_toolchain_version "${script_dir}/../../rust-toolchain.toml" || exit 1
+}
+
 # ─── pnpm pin (SSoT = repo-root package.json `packageManager`) ──
 # The Dockerfile takes the full `pnpm@X.Y.Z+sha512.<hex>` spec as `ARG PNPM_PACKAGE_MANAGER`
 # (no default; fails loud if unset) and hands it to `corepack prepare`, which verifies the
@@ -128,7 +139,9 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
     SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
     PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$SCRIPT_DIR")"
-    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" \
+    RUST_VERSION="$(read_rust_version "$SCRIPT_DIR")"
+    podman build --build-arg "RUST_VERSION=${RUST_VERSION}" \
+        --build-arg "NODE_VERSION=${NODE_VERSION}" \
         --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
         --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
@@ -364,11 +377,14 @@ fi
 # Build the devloop-helper binary (ADR-0030).
 # Always rebuilds — cargo no-ops if source unchanged (~0.1s), and stale
 # binaries cause hard-to-debug port-map issues.
+# Runs from $REPO_ROOT: rustup finds rust-toolchain.toml by the CURRENT DIRECTORY (not
+# --manifest-path), so this is what builds the helper on the pinned Rust wherever
+# devloop.sh is invoked from.
 build_helper() {
     echo "Building devloop-helper..."
-    cargo build --release -p devloop-helper \
+    (cd "$REPO_ROOT" && cargo build --release -p devloop-helper \
         --target-dir "$HELPER_TARGET_DIR" \
-        --manifest-path "$REPO_ROOT/Cargo.toml"
+        --manifest-path "$REPO_ROOT/Cargo.toml")
 }
 
 # Detect the podman host-gateway IP address (ADR-0030).
@@ -618,7 +634,9 @@ if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
     NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
     SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
     PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$SCRIPT_DIR")"
-    podman build --build-arg "NODE_VERSION=${NODE_VERSION}" \
+    RUST_VERSION="$(read_rust_version "$SCRIPT_DIR")"
+    podman build --build-arg "RUST_VERSION=${RUST_VERSION}" \
+        --build-arg "NODE_VERSION=${NODE_VERSION}" \
         --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
         --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" -t "$IMAGE" "$SCRIPT_DIR"
     if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then

@@ -75,13 +75,15 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q protobuf-compiler
 
-      - name: Install Rust stable toolchain
-        # One Rust version everywhere: this, infra/devloop/Dockerfile and the image
-        # Dockerfiles' RUST_VERSION agree, checked by scripts/setup.test.sh. rustup is
-        # preinstalled on the runner, so no third-party toolchain action is needed.
+      - name: Install Rust toolchain
+        # One Rust version everywhere: rust-toolchain.toml. With no argument, rustup
+        # installs the toolchain (and components) that file names, and every later cargo
+        # call in the checkout resolves to it; the images derive theirs from the same
+        # file (infra/lib/rust-toolchain.sh). rustup is preinstalled on the runner, so no
+        # third-party toolchain action is needed.
         run: |
-          rustup toolchain install 1.95 --profile minimal
-          rustup default 1.95
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

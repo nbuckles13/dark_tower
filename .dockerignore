@@ -18,6 +18,16 @@
 # stay: Cargo.toml, Cargo.lock, crates/** (sources + build.rs), proto/** (proto-gen/build.rs
 # compiles ../../proto/), migrations/** (the runtime stage COPYs /build/migrations), .cargo/.
 # Patterns below are disjoint from those, so no negation (!) rules are needed.
+#
+# ONE EXCEPTION to that rule — rust-toolchain.toml, which cargo/rustup DO read. Excluded on
+# purpose: the image's toolchain is already the file's version (each Dockerfile's
+# `FROM rust:${RUST_VERSION}-…` is derived from it by infra/lib/rust-toolchain.sh via
+# deploy.sh), and inside the build rustup would otherwise reconcile the file's
+# `components` (the `rust:` images are --profile minimal) over the network mid-release-build.
+# Do not "fix" this exclusion away; scripts/setup.test.sh asserts it.
+
+# --- The Rust toolchain file (the exception above) ---
+rust-toolchain.toml
 
 # --- Rust build artifacts (the 27 GB keystone) ---
 target/

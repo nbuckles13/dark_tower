@@ -203,7 +203,7 @@ impl LossSchedule {
         match self.mode.load(Ordering::Acquire) {
             1 => self
                 .param
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok(),
@@ -716,19 +716,18 @@ impl MediaTransport for LossDelayTransport {
             return Err(DatagramSendError::TooLarge);
         }
 
-        // Consume one unit of capacity, or refuse. `fetch_update` keeps the
+        // Consume one unit of capacity, or refuse. `try_update` keeps the
         // check-and-decrement atomic so a cloned handle cannot oversend.
-        let consumed = self.state.send_capacity.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |remaining| {
-                if remaining == UNLIMITED_CAPACITY {
-                    Some(UNLIMITED_CAPACITY)
-                } else {
-                    remaining.checked_sub(1)
-                }
-            },
-        );
+        let consumed =
+            self.state
+                .send_capacity
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining == UNLIMITED_CAPACITY {
+                        Some(UNLIMITED_CAPACITY)
+                    } else {
+                        remaining.checked_sub(1)
+                    }
+                });
         if consumed.is_err() {
             self.state
                 .refused_for_capacity
