@@ -486,6 +486,16 @@ psql $DATABASE_URL
 | `AC_REGISTRATION_RATE_LIMIT_WINDOW_MINUTES` | No | Registration rate limit sliding window (minutes). Range: 1-1440 | `60` | `1` (dev/test) |
 | `AC_REGISTRATION_RATE_LIMIT_MAX_ATTEMPTS` | No | Registration rate limit max attempts per IP per window. Range: 1-100 | `5` | `100` (dev/test) |
 
+> **Log targets (since 2026-10-05).** AC's module events (handlers, services, repositories, …)
+> carry the lib crate's target, `ac_service::<module>`, now that the `auth-controller` binary
+> imports the lib instead of re-compiling its modules; before, they carried
+> `auth_controller::<module>`. The binary's own startup / shutdown / drain events still carry
+> `auth_controller`, which is why the fallback filter (used when `RUST_LOG` is unset) names both
+> (`auth_controller=debug,ac_service=debug,tower_http=debug`, the first derived from
+> `CARGO_CRATE_NAME`). A `RUST_LOG` directive or a Loki query keyed on a module target must use
+> `ac_service`, not `auth_controller`. Log volume did not change: every AC `debug!` sets an explicit
+> target (`crypto`, `org_extraction`, `audit`). Only the JSON `target` field value moved.
+
 > **Enabling OpenTelemetry — fail-hard contract (R-54).** The contract is a property of the shared
 > `init_otel` helper (`crates/common/src/observability/otel.rs`), so it holds identically for every
 > service that wires it; R-55 is the per-service *wiring* requirement, not the contract.

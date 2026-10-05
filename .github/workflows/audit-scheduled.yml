@@ -76,10 +76,19 @@ jobs:
           rustup toolchain install
           rustup show active-toolchain
 
+      - name: Read tool pins
+        # The ONE pin for CI and the devloop image (infra/cargo-tools.versions).
+        # Assign first, then write (a failing `$(…)` inside echo's arguments does not trip `bash -e`).
+        id: pins
+        run: |
+          source infra/lib/cargo-tools.sh
+          v="$(cargo_tool_version infra/cargo-tools.versions cargo-audit)"
+          echo "cargo-audit=${v}" >> "$GITHUB_OUTPUT"
+
       - name: Install cargo-audit
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-audit
+          tool: cargo-audit@${{ steps.pins.outputs.cargo-audit }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0

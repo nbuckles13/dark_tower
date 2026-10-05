@@ -12,7 +12,6 @@ use uuid::Uuid;
 /// Represents the lifecycle state of a meeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Will be used in Phase 2+ for meeting management
 pub enum MeetingStatus {
     /// Meeting is scheduled but not yet active.
     Scheduled,
@@ -29,7 +28,6 @@ pub enum MeetingStatus {
 
 impl MeetingStatus {
     /// Returns the string representation of the status.
-    #[allow(dead_code)] // Will be used in Phase 2+
     pub fn as_str(&self) -> &'static str {
         match self {
             MeetingStatus::Scheduled => "scheduled",
@@ -46,7 +44,6 @@ impl MeetingStatus {
 /// Note: Currently unused as /health returns plain text "OK" per ADR-0012.
 /// Kept for potential future use if detailed health check is needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct HealthResponse {
     /// Service health status ("healthy" or "unhealthy").
     pub status: String,
@@ -90,7 +87,6 @@ pub struct ReadinessResponse {
 /// Represents a participant in a meeting, tracking their type (member/external),
 /// role (host/participant), and active status via `left_at`.
 #[derive(Debug, Clone, sqlx::FromRow)]
-#[allow(dead_code)] // Used by integration tests and future join handler
 pub struct Participant {
     /// Unique participant record identifier.
     pub participant_id: Uuid,
@@ -136,7 +132,6 @@ pub const MIN_GUEST_DISPLAY_NAME_LENGTH: usize = 2;
 /// `Debug` puts it one `?row` away from the log stream. Same treatment as
 /// `Config` (`config.rs`) and `UserContext` (`auth/claims.rs`) in this crate.
 #[derive(Clone)]
-#[allow(dead_code)] // Fields used in database queries and future phases
 pub struct MeetingRow {
     /// Unique meeting identifier.
     pub meeting_id: Uuid,

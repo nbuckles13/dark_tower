@@ -495,4 +495,144 @@ run_la_args "$d" "--bogus" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 assert_exit   "f4-unknown-exit2"      2 "$LA_RC"
 assert_status "f4-unknown-token"      "unknown argument" "$(cat "$LA_ERR")"
 
+# =============================================================================
+# (G) CI SHARD — `--layers L,...` (one parallel CI job's slice of the pipeline).
+#     Runs exactly its layers from scratch, writes the shard summary the Test Suite
+#     aggregate reads, and NEVER writes, removes or overwrites a Gate-2 verdict.
+#     Driven through the LAYER_SCRIPT_DIR test seam (GITHUB_ACTIONS is rejected with it).
+# =============================================================================
+# run_shard <stubdir> <layers-arg> [KEY=VAL ...] — like run_la_args, but seeds a sentinel
+# verdict file in the fresh DEVLOOP_TMP first, so a case can prove it is left untouched.
+run_shard() {
+  local stubdir="$1" layers="$2"; shift 2
+  local t; t="$(mktemp -d "$WORK/run.XXXXXX")"
+  LA_DT="$t/dt"; LA_OUT="$t/out"; LA_ERR="$t/err"
+  mkdir -p "$LA_DT"; printf 'sentinel-verdict\n' > "$LA_DT/gate2-verdict"
+  env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TMP="$LA_DT" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$stubdir" "$@" \
+      bash "$LAYER_ALL" --layers "$layers" >"$LA_OUT" 2>"$LA_ERR"
+  LA_RC=$?
+}
+
+# (G1) HAPPY PATH: --layers 1,3 runs layers 1 and 3 only, writes exactly their summary
+#      lines, and leaves the pre-existing verdict byte-identical.
+d="$(new_stubdir)"
+run_shard "$d" 1,3 GITHUB_OUTPUT="$WORK/ghout.g1"
+assert_exit      "g1-shard-exit0"          0 "$LA_RC"
+# CI's upload step reads the summary's path from this output (never restates it).
+g1_path="$(sed -n 's/^summary-path=//p' "$WORK/ghout.g1" 2>/dev/null)"
+assert_exit      "g1-summary-path-output"  0 "$([[ "$g1_path" == "$LA_DT/layer-summary.txt" && -s "$g1_path" ]] && echo 0 || echo "1 (${g1_path})")"
+assert_marker    "g1-l1-ran"               "$LA_DT" 'ran.layer1'
+assert_marker    "g1-l3-ran"               "$LA_DT" 'ran.layer3'
+assert_no_marker "g1-l2-not-run"           "$LA_DT" 'ran.layer2'
+assert_no_marker "g1-l7-not-run"           "$LA_DT" 'ran.layer7'
+assert_status    "g1-banner"               "CI_SHARD=1 LAYERS=1,3" "$(cat "$LA_ERR")"
+g1_sum="$(sed 's/DURATION=[0-9]*/DURATION=D/' "$LA_DT/layer-summary.txt" 2>/dev/null)"
+assert_exit      "g1-summary-exact"        0 "$([[ "$g1_sum" == $'LAYER=1 RESULT=OK DURATION=D RC=0\nLAYER=3 RESULT=OK DURATION=D RC=0' ]] && echo 0 || echo 1)"
+assert_exit      "g1-verdict-untouched"    0 "$([[ "$(cat "$LA_DT/gate2-verdict")" == "sentinel-verdict" ]] && echo 0 || echo 1)"
+
+# (G2) The summary carries each layer's REAL exit code (the input to the aggregate's rc
+#      FLOOR): a lying `STATUS=OK; exit 1` layer is recorded RESULT=OK RC=1.
+d="$(new_stubdir)"; mk_stub "$d" 3 OK lying-ok 1
+run_shard "$d" 3 DEVLOOP_FAIL_FAST=0
+assert_exit   "g2-shard-exit1"        1 "$LA_RC"
+assert_status "g2-summary-real-rc"    "LAYER=3 RESULT=OK DURATION=" "$(cat "$LA_DT/layer-summary.txt" 2>/dev/null)"
+assert_status "g2-summary-rc1"        " RC=1" "$(cat "$LA_DT/layer-summary.txt" 2>/dev/null)"
+
+# (G3) REFUSALS (exit 2, nothing runs): outside CI with no test seam; inside a run-story
+#      gate / pre-commit (DEVLOOP_FMT_CHECK_ONLY); malformed lists; mixed with --max-layer.
+d="$(new_stubdir)"
+t="$(mktemp -d "$WORK/run.XXXXXX")"
+env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TMP="$t" bash "$LAYER_ALL" --layers 1 >/dev/null 2>"$t/err"
+assert_exit      "g3-local-refused-exit2"  2 "$?"
+assert_status    "g3-local-refused-token"  "REASON=shard-outside-ci" "$(cat "$t/err")"
+run_shard "$d" 1 DEVLOOP_FMT_CHECK_ONLY=1
+assert_exit      "g3-attesting-refused"    2 "$LA_RC"
+assert_no_marker "g3-attesting-no-stub"    "$LA_DT" 'ran.layer*'
+for bad in "2,1" "1,1" "8" "0" "1,x" ","; do
+  run_shard "$d" "$bad"
+  assert_exit      "g3-list-${bad:-empty}-exit2"   2 "$LA_RC"
+  assert_status    "g3-list-${bad:-empty}-token"   "REASON=shard-layer-list-invalid" "$(cat "$LA_ERR")"
+  assert_no_marker "g3-list-${bad:-empty}-no-stub" "$LA_DT" 'ran.layer*'
+done
+run_shard "$d" ""
+assert_exit   "g3-list-empty-exit2"  2 "$LA_RC"
+assert_status "g3-list-empty-token"  "--layers needs a value" "$(cat "$LA_ERR")"
+run_la_args "$d" "--max-layer 3 --layers 1" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+assert_exit   "g3-exclusive-exit2"   2 "$LA_RC"
+assert_status "g3-exclusive-token"   "mutually exclusive" "$(cat "$LA_ERR")"
+
+# =============================================================================
+# (H) CI AGGREGATE — `--aggregate DIR` (the `Test Suite` job). Every layer 1..LAYER_MAX
+#     exactly once across the shard summaries, strictly parsed; worst status + rc FLOOR.
+# =============================================================================
+# mk_summary <aggdir> <shard> <line>... — write <aggdir>/<shard>/layer-summary.txt.
+mk_summary() { local a="$1" sh="$2"; shift 2; mkdir -p "$a/$sh"; printf '%s\n' "$@" > "$a/$sh/layer-summary.txt"; }
+# mk_partition <aggdir> — the real CI partition, all green (layer 7 = the CI clean skip).
+mk_partition() {
+  mk_summary "$1" guards "LAYER=1 RESULT=OK DURATION=1 RC=0" "LAYER=2 RESULT=OK DURATION=1 RC=0" \
+    "LAYER=3 RESULT=OK DURATION=1 RC=0" "LAYER=6 RESULT=OK DURATION=1 RC=0" \
+    "LAYER=7 RESULT=SKIPPED-NO-CLUSTER DURATION=0 RC=0"
+  mk_summary "$1" test "LAYER=4 RESULT=OK DURATION=1 RC=0"
+  mk_summary "$1" lint "LAYER=5 RESULT=OK DURATION=1 RC=0"
+}
+run_agg() {
+  LA_OUT="$WORK/agg.out"; LA_ERR="$WORK/agg.err"
+  env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TMP="$WORK/agg.dt" bash "$LAYER_ALL" --aggregate "$1" >"$LA_OUT" 2>"$LA_ERR"
+  LA_RC=$?
+}
+
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; run_agg "$a"
+assert_exit   "h1-all-green-exit0"     0 "$LA_RC"
+assert_status "h1-total-ok"            "TOTAL_RESULT=OK" "$(cat "$LA_OUT")"
+assert_status "h1-l7-skip-cell"        "LAYER=7 RESULT=SKIPPED-NO-CLUSTER" "$(cat "$LA_OUT")"
+assert_absent "h1-no-triage"           "FAILURE_TRIAGE" "$(cat "$LA_ERR")"
+
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" test "LAYER=4 RESULT=FAIL DURATION=9 RC=1"; run_agg "$a"
+assert_exit   "h2-worst-status-exit1"  1 "$LA_RC"
+assert_status "h2-total-fail"          "TOTAL_RESULT=FAIL" "$(cat "$LA_OUT")"
+assert_status "h2-triage-names-shard"  "FAILURE_TRIAGE LAYER=4 SHARD=test" "$(cat "$LA_ERR")"
+
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" lint "LAYER=5 RESULT=OK DURATION=1 RC=1"; run_agg "$a"
+assert_exit   "h3-rc-floor-wins"       1 "$LA_RC"
+
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" test "LAYER=4 RESULT=PRECONDITION_FAILURE DURATION=1 RC=2"; run_agg "$a"
+assert_exit   "h4-operator-lane-exit2" 2 "$LA_RC"
+
+# Every malformed partition is exit 2 with its own REASON (never a pass, never a FAIL).
+agg_case() {  # agg_case <label> <reason>  (aggregate the dir in $a)
+  run_agg "$a"
+  assert_exit   "$1-exit2"  2 "$LA_RC"
+  assert_status "$1-reason" "REASON=aggregate-$2" "$(cat "$LA_OUT")"
+}
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; rm "$a/lint/layer-summary.txt"; agg_case h5-missing-layer missing-layer
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" extra "LAYER=4 RESULT=OK DURATION=1 RC=0"; agg_case h6-duplicate-layer duplicate-layer
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" lint "LAYER=5 RESULT=OK DURATION=1"; agg_case h7-malformed-line malformed-line
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" lint "LAYER=5 RESULT=PASSED DURATION=1 RC=0"; agg_case h8-unknown-status unknown-status
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" lint "LAYER=5 RESULT=NOT-RUN DURATION=0 RC=0"; agg_case h9-not-run-is-not-a-result unknown-status
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" lint "LAYER=5 RESULT=OK DURATION=1 RC=0" "LAYER=8 RESULT=OK DURATION=1 RC=0"; agg_case h10-out-of-range layer-out-of-range
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" lint 'LAYER=5 RESULT=OK DURATION=1 RC=0; touch /tmp/x'; agg_case h11-trailing-text-rejected malformed-line
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; agg_case h12-empty-dir no-summaries
+a="$WORK/does-not-exist"; agg_case h13-missing-dir dir-unreadable
+
+# (H14) ROUND TRIP: real shard runs (G-mode, stub layers) feed the aggregate, which then
+#       reports the full pipeline — proving the shard writer and aggregate parser agree.
+d="$(new_stubdir)"; a="$(mktemp -d "$WORK/agg.XXXXXX")"
+for part in guards:1,2,3,6,7 test:4 lint:5; do
+  run_shard "$d" "${part#*:}"
+  mkdir -p "$a/${part%%:*}"; cp "$LA_DT/layer-summary.txt" "$a/${part%%:*}/"
+done
+run_agg "$a"
+assert_exit   "h14-round-trip-exit0"   0 "$LA_RC"
+assert_status "h14-round-trip-l5"      "LAYER=5 RESULT=OK" "$(cat "$LA_OUT")"
+
+# (H15) ONE EMITTER: the aggregate's LAYER_SUMMARY block is the same shape as a full run's
+#       over the same stub layers (durations normalised) — the parsed contract cannot drift
+#       between the single-invocation path and the CI aggregate.
+summary_block() { sed -n '/=== LAYER_SUMMARY_BEGIN ===/,/^TOTAL_DURATION=/p' "$1" | sed 's/DURATION=[0-9]*/DURATION=D/'; }
+h15_agg="$(summary_block "$LA_OUT")"
+d="$(new_stubdir)"  # same all-OK stubs the H14 shards ran
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+h15_full="$(summary_block "$LA_OUT")"
+assert_exit "h15-summary-block-identical" 0 "$([[ -n "$h15_full" && "$h15_agg" == "$h15_full" ]] && echo 0 || echo "1 (agg: ${h15_agg//$'\n'/|} full: ${h15_full//$'\n'/|})")"
+
 report_results "scripts/layer-all.test.sh"

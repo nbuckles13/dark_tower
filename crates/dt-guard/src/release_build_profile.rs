@@ -89,9 +89,9 @@
 //! Stated once, at module level, so a future contributor does not "complete"
 //! the guard by adding these:
 //!
-//! * `.github/workflows/ci.yml` and `ci-client.yml` `cargo build --release`
-//!   lines build the **host** `dt-guard`/`dt-story` binaries. Different
-//!   artifact class; not an encoding of this premise.
+//! * `.github/workflows/ci-client.yml`'s `cargo build --release` line builds the
+//!   **host** `dt-guard` binary (as `scripts/lang/rust/compile.sh` does for the
+//!   pipeline). Different artifact class; not an encoding of this premise.
 //! * `docs/BUILD_REQUIREMENTS.md` carries an illustrative Dockerfile.
 //!   Documentation, not a build path.
 //! * `RUSTFLAGS` appears legitimately in prose in six-plus tracked docs (mold
@@ -1764,7 +1764,7 @@ mod tests {
 
     #[test]
     fn scan_execution_path_ignores_benign_ci_rustflags() {
-        // ci.yml:170 sets `RUSTFLAGS: --cfg coverage` legitimately.
+        // ci.yml's coverage job sets `RUSTFLAGS: --cfg coverage` legitimately.
         let mut hits = Vec::new();
         scan_execution_path_file(
             ".github/workflows/ci.yml",

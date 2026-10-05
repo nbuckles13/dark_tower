@@ -581,8 +581,12 @@ dt-guard also emits `WARN dt-guard auxiliary skip: <path> (<error-kind>)` to std
 
 | REASON token | Wrapper | Cause / Fix |
 |--------------|---------|-------------|
-| `cargo-test-failed` | `lang/rust/test.sh` (`cargo test "$@"`) | A test failed. The wrapper brings up the test postgres container (podman / docker), applies pending sqlx migrations, then runs `cargo test`. Failure output is the cargo test stderr — fix the test. **Read the row below FIRST if the output contains a linker abort**: this token is also what a machine-resource failure arrives as, and "fix the test" is then the wrong instruction. |
-| `cargo-test-failed` **carrying `ld terminated with signal 6`** | same wrapper — **not a test failure at all** | **The linker was killed under memory pressure; the diff is not implicated.** Symptom: `collect2: fatal error: ld terminated with signal 6 [Aborted], core dumped` (or `signal 9`), from `ld` / `rust-lld`. **The tell is the spread, not the message**: several test binaries fail to *link* at once, including binaries the diff does not touch — a real link error (undefined symbol, duplicate symbol) is specific to what changed, this is not. Linking many large binaries in parallel is the pipeline's peak-memory moment. **First action: check free memory, then re-run Layer 4 in isolation** (`./scripts/layer4.sh`) before reading any test output; a clean isolated run confirms it. **Operator lane — does not consume a devloop attempt.** Classifying this automatically is filed in `docs/TODO.md` (owner `infrastructure`); until it lands, this row is the only thing separating it from a genuine test failure. |
+| `cargo-nextest-failed` (closing line `rust-test-lanes-failed-nextest…`) | `lang/rust/test.sh` (`cargo nextest run --profile layer4 "$@"`) | A test failed. The wrapper brings up the test postgres container (podman / docker), applies pending sqlx migrations, then runs every test binary with cargo-nextest, one process per test, in parallel (`.config/nextest.toml`: no retries, no fail-fast). The failing test's output is printed immediately and repeated in nextest's final summary — fix the test. A test that hangs is named `SLOW` at 60 s and killed (`TIMEOUT`) at 5 min. **Read the linker-abort row below FIRST if the output contains one**: this token is also what a machine-resource failure arrives as. |
+| `cargo-doctest-failed` (closing line `…-doctest`) | same wrapper (`cargo test --doc`, the package-selection subset of `"$@"`) | A doctest failed (nextest does not run doctests, so they have their own lane). Fix the doc example. |
+| `cargo-doctest-no-lib-targets` (STATUS=OK) | same wrapper | Expected: every selected package is bin-only (e.g. `./scripts/test.sh -p devloop-helper`), so there are no doctests; decided from `cargo metadata`, and reported rather than silently skipped. |
+| `cargo-nextest-failed` with nextest's `error: no tests to run` (exit 4) | same wrapper, narrowed by caller args | **Intentional and loud**: the caller's `-p`/filter selected zero tests (`cargo test` used to pass this). Fix the selection; the pipeline itself never narrows. |
+| `cargo-nextest-missing` / `cargo-nextest-version-mismatch` (`CARGO_NEXTEST_VERSION_MISMATCH:` on stderr) | same wrapper, before any migration or test | **Environment, not the diff.** The container's cargo-nextest is absent or differs from `infra/cargo-tools.versions`. Fix (host): `infra/devloop/devloop.sh --rebuild`. Every container on an image older than the pin hits this after a pin change. There is deliberately no fallback to `cargo test`. Operator lane. |
+| `cargo-nextest-failed` **carrying `ld terminated with signal 6`** | same wrapper — **not a test failure at all** | **The linker was killed under memory pressure; the diff is not implicated.** Symptom: `collect2: fatal error: ld terminated with signal 6 [Aborted], core dumped` (or `signal 9`), from `ld` / `rust-lld`. **The tell is the spread, not the message**: several test binaries fail to *link* at once, including binaries the diff does not touch — a real link error (undefined symbol, duplicate symbol) is specific to what changed, this is not. Linking many large binaries in parallel is the pipeline's peak-memory moment. **First action: check free memory, then re-run Layer 4 in isolation** (`./scripts/layer4.sh`) before reading any test output; a clean isolated run confirms it. **Operator lane — does not consume a devloop attempt.** Classifying this automatically is filed in `docs/TODO.md` (owner `infrastructure`); until it lands, this row is the only thing separating it from a genuine test failure. |
 | `wrapper-aborted-early-exit-<rc>` (runtime missing) | `lang/rust/test.sh:detect_runtime` | `Neither podman nor docker found. Please install one.` — install a container runtime. The wrapper aborts before reaching `run_and_emit`; since task #50 its EXIT trap emits `STATUS=FAIL REASON=wrapper-aborted-early-exit-<rc>` so the layer aggregates **FAIL** (not the old silent `UNKNOWN`). `<rc>` is the abort code. |
 | `wrapper-aborted-early-exit-<rc>` (db-bringup failure) | `lang/rust/test.sh:wait_for_db` / `run_migrations_if_needed` | `Database did not become ready within ${MAX_WAIT_SECONDS}s` (or a migration failure) — container started but pg never accepted connections. Same EXIT-trap path: STATUS=FAIL emitted before exit. Check the test container logs. |
 | `nx-test-failed` | `lang/ts/test.sh` (`nx affected -t test:unit test:component`) | A TS unit/component test failed. Run the offending project's test target locally. |
@@ -814,7 +818,9 @@ Grep-driven entry point. Match the symptom, jump to the section.
 | `NOTE dt-guard allowlisted mention` | Expected steady state — an allowlist hit is the allowlist working. Emitted below `WARN ` on purpose so it does not bury real coverage holes. | §6.3 |
 | `warn: the missing active toolchain` … `has been auto-installed` on the first cargo call; or, offline, a rustup download error naming that toolchain (`could not download file … channel-rust-1.X.Y.toml`) | **The devloop image predates a `rust-toolchain.toml` bump.** rustup selects the pinned toolchain from the file. When the image does not carry it, rustup auto-installs it into the container's `/usr/local/rustup` and cargo proceeds; that works, but costs a download per container. Offline, it fails loudly. **Fix (host): `./infra/devloop/devloop.sh --rebuild --recreate`**: the image's `FROM rust:<v>` is derived from the same file (`infra/lib/rust-toolchain.sh`). A separate `rustup is not installed at '/tmp/cargo-home'` after an explicit `rustup toolchain install` in the container is cosmetic: the toolchain installed, and only rustup's self-check missed its binary under the redirected `CARGO_HOME`. | §6.1 |
 | `RESULT=FAIL` on a layer; first hit | Read the per-layer subsection | §6 |
-| `ld terminated with signal 6 [Aborted], core dumped` / `collect2: fatal error:` — arrives as `REASON=cargo-test-failed` | **The linker was killed under memory pressure. NOT a test failure, and the diff is not implicated** — do not start by reading test output, which is what the bare `cargo-test-failed` row tells you to do. The tell is that several test binaries fail to *link* at once, **including ones the diff does not touch**; a genuine link error is specific to what changed. Check free memory, re-run Layer 4 in isolation to confirm. Operator lane, consumes no attempt. | §6.4 |
+| `REASON=cargo-nextest-missing` / `CARGO_NEXTEST_VERSION_MISMATCH:` | The devloop image predates `infra/cargo-tools.versions` (or a pin change). **Host: `infra/devloop/devloop.sh --rebuild`.** Environment, operator lane. | §6.4 + §8.7 |
+| red `Test Suite` in CI; `REASON=aggregate-…` or `FAILURE_TRIAGE LAYER=<n> SHARD=<shard>` | The CI pipeline is sharded; the aggregate names the layer and the shard job to open. | §8.7 |
+| `ld terminated with signal 6 [Aborted], core dumped` / `collect2: fatal error:` — arrives as `REASON=cargo-nextest-failed` | **The linker was killed under memory pressure. NOT a test failure, and the diff is not implicated** — do not start by reading test output, which is what the bare `cargo-nextest-failed` row tells you to do. The tell is that several test binaries fail to *link* at once, **including ones the diff does not touch**; a genuine link error is specific to what changed. Check free memory, re-run Layer 4 in isolation to confirm. Operator lane, consumes no attempt. | §6.4 |
 | `FAILED: media-telemetry-deny` | A telemetry macro form, or a `tracing`/`log`/`metrics` import, appears under `crates/mh-service/src/media/` (ADR-0036 §11). `VIOLATION:` names path:line and the macro SPELLING — never its arguments. Fix by using a cached metric handle. No bypass marker exists. | §6.3 |
 | `media-telemetry-deny-scope-directory-missing` | **A DIFF DEFECT, not a machine fault — do NOT re-run on a quiet machine.** The configured media directory does not exist: you renamed or moved it and did not update `scripts/guards/simple/media-telemetry-deny.yaml`. Restore the directory, or update the manifest. | §6.3 |
 | `media-telemetry-deny-scope-directory-empty` | **A DIFF DEFECT, like `-missing` — the two differ in WHAT was edited, not in who caused it.** The configured directory still exists but holds zero `.rs` files: its contents were moved or renamed out from under it. Restore them, or update the manifest to where they went. Suspect the guard's own walk (`common/scope.rs`) only if the media tree looks intact. | §6.3 |
@@ -987,9 +993,11 @@ names either symptom above, the task is not the cause — rebuild the binaries a
 Largely resolved as of 2026-08-20: the compile verb is now **always-run** (ADR-0033 §3 — the
 skip-if-untouched short-circuit was retired), so guard-binary production already sits on an
 always-run path and the skip-skew that produced these symptoms is gone. What remains as a possible
-`docs/TODO.md` follow-up is only the cosmetic consolidation of the three build/assert sites
-(`lang/rust/compile.sh`, `ci.yml`, `preflight-story.sh`) into one plus a `run_and_emit` enum that
-can carry `PRECONDITION_FAILURE` — no longer a correctness fix.
+`docs/TODO.md` follow-up is a `run_and_emit` enum that can carry `PRECONDITION_FAILURE` (the lane,
+above). The build sites are down to what each context needs (2026-10-05): `lang/rust/compile.sh`
+produces for every pipeline run, local or CI (ci.yml's separate build step is gone — its guards
+shard runs Layer 1 first); `ci-client.yml`'s Lint job builds its own, being the only producer in a
+job that has no Layer 1; `preflight-story.sh` asserts.
 
 ---
 
@@ -1016,7 +1024,9 @@ boundary.** Two facts make that explicit:
    a flat text file in `/tmp`; nothing cryptographically binds it to a *real* run.
 
 The only **non-bypassable** enforcement is **CI**: on PRs into main/develop (see
-`.github/workflows/ci.yml` `on:`) it re-runs `./scripts/layer-all.sh` from scratch and **never reads** the `/tmp`
+`.github/workflows/ci.yml` `on:`) it re-runs `./scripts/layer-all.sh` from scratch — sharded
+across parallel jobs (`--layers`), with the `Test Suite` aggregate (`--aggregate`) proving
+every layer ran exactly once (§8.7) — and **never reads** the `/tmp`
 artifact. That independent re-run is the forgery defense — which is also why the
 artifact is ephemeral in `/tmp` and is never committed. Treat the local hook as a fast
 "did you actually run it / has the tree drifted since" check, and CI as the source of
@@ -1237,6 +1247,83 @@ make loud, and that loudness is wasted if nobody is looking. **Once required**, 
 To make it enforce, a repo admin adds `Code Coverage` to the `main` branch-protection required checks —
 a policy call for the repo owner, not this devloop. **Tracked in `docs/TODO.md` under "Polyglot Pipeline
 Follow-ups", pending the repo-owner decision**; record the state here once decided.
+
+**`Test Suite` (the pipeline) is the aggregate since 2026-10-05.** The pipeline runs as
+`Pipeline (…)` shard jobs plus a `Test Suite` job that fails on any shard result other than
+success and on any layer missing from the shards (§8.7). Only `Test Suite` needs to be
+required — it kept the pre-split job's name so its branch-protection entry still applies; the
+shard contexts need not be added.
+
+## 8.7 CI Pipeline Shards (`.github/workflows/ci.yml` — `Pipeline (…)` jobs + `Test Suite`)
+
+CI runs the same `layer-all.sh` as the devloop, split across parallel jobs so one runner no
+longer builds the dev, test and clippy cargo graphs in series. Each **shard** runs
+`./scripts/layer-all.sh --layers <list>` from scratch; the **`Test Suite`** job (the required
+check, same context name as the old single job) runs `./scripts/layer-all.sh --aggregate` over
+the shards' uploaded summaries. The partition is written only in the ci.yml matrix; the
+aggregate requires every layer 1..`LAYER_MAX` (`scripts/lang/_common.sh`) exactly once, so a
+layer dropped from or duplicated in the matrix reds `Test Suite`.
+
+### Job map
+
+| Job | Layers | Tools it installs (matrix flags) | Local repro |
+|-----|--------|----------------------------------|-------------|
+| `Pipeline (guards, layers 1,2,3,6,7)` | 1 compile, 2 fmt, 3 guards, 6 audit, 7 (CI clean skip) | nightly, kubectl assert, cargo-audit | `./scripts/layer1.sh` … or `./scripts/layer-fast.sh` |
+| `Pipeline (test, layers 4)` | 4 test (cargo-nextest + doctests, TS) | postgres, sqlx-cli (cached by version), cargo-nextest, Playwright | `./scripts/layer4.sh` |
+| `Pipeline (lint, layers 5)` | 5 lint (clippy, TS lint) | — | `./scripts/layer5.sh` |
+| `Test Suite` | none — aggregates | — | `./scripts/layer-all.sh --aggregate <dir of */layer-summary.txt>` |
+
+L1 and L3 share a shard on purpose: L3's guards consume the release `dt-guard`/`dt-story` that
+L1's `scripts/lang/rust/compile.sh` builds. A layer moved to another shard needs its tool flags
+moved with it; a missing tool fails loudly (tool not found), never silently.
+
+### Reading a red `Test Suite`
+
+| Symptom (in the `Test Suite` log) | Meaning | First action |
+|-----------------------------------|---------|--------------|
+| `::error::pipeline shards result is 'failure'` (or `cancelled` / `skipped`) | A shard job did not succeed. This step fails first, before anything is read. | Open the red `Pipeline (…)` job. The aggregate below it usually also prints which layer. |
+| `FAILURE_TRIAGE LAYER=<n> SHARD=<shard> RC=<rc> RESULT=<status>` | Layer `<n>` failed in that shard. | Open that shard's job log: its own `FAILURE_TRIAGE` line and layer detail are there. Triage per §6.<n>. |
+| `REASON=aggregate-missing-layer` | No shard reported that layer: the matrix stopped covering it, or a shard died before writing its summary (its upload step then also errors). | Check the shard's log first; if every shard ran, the ci.yml matrix lost the layer — restore it. **Never** "fix" by narrowing `LAYER_MAX`. |
+| `REASON=aggregate-duplicate-layer` | Two shards ran the same layer. | Fix the matrix `layers` lists. |
+| `REASON=aggregate-malformed-line` / `-unknown-status` / `-layer-out-of-range` | A summary line is not the exact shape layer-all writes (`LAYER=n RESULT=s DURATION=d RC=r`), or carries a status that is not a pipeline status (incl. `NOT-RUN` — CI shards always run all their layers). | The writer and parser live in the same file (`scripts/layer-all.sh`); a mismatch is a wiring bug, infrastructure lane. |
+| `REASON=aggregate-no-summaries` / `-dir-unreadable` | Nothing was downloaded. | Usually every shard died before upload — open the shard jobs. |
+
+### Rolling back
+
+One devloop commit introduced the split together with its runner changes, so roll back per
+concern:
+
+- **CI split**: revert `.github/workflows/ci.yml` alone. `--layers`/`--aggregate` in
+  `layer-all.sh` are additive and unused by the single-job form. **Never revert `layer-all.sh`
+  without `ci.yml`** — the shards would call a flag that no longer exists.
+- **nextest + tool pins**: revert `scripts/lang/rust/test.sh`, `.config/nextest.toml` and
+  `infra/cargo-tools.versions`/`infra/lib/cargo-tools.sh` with their consumers, then rebuild the
+  devloop image (`infra/devloop/devloop.sh --rebuild`).
+- **Thin service binaries**: revert the ac/gc `main.rs`, the `allow(dead_code)` sweep **and**
+  the `bin-lib-single-compile` guard together (the guard reds without the rest).
+
+### Tool pins and image rebuilds
+
+`infra/cargo-tools.versions` is the one pin for cargo-nextest, cargo-audit, cargo-llvm-cov,
+cargo-fuzz and cargo-chef, read by CI (every workflow), the devloop image build and the service
+image builds (`infra/kind/scripts/deploy.sh`, which rebuilds them on every deploy). CI picks a change up on the
+next run. **Every existing devloop and run-story container** keeps its old binaries until the host
+runs `infra/devloop/devloop.sh --rebuild`; until then Layer 4 reds with
+`REASON=cargo-nextest-missing` or `cargo-nextest-version-mismatch` (§8 catalogue).
+
+**When Dependabot opens a `rust-toolchain` PR** (a new stable Rust): review it like the 1.99 bump
+(3651ebf7) — it changes only `channel` in `rust-toolchain.toml`, and every image derives its
+`rust:<v>` from that file. Expect a cold Rust cache on that PR (rustc is in every cache key).
+After merge, hosts run `infra/devloop/devloop.sh --rebuild`.
+
+### Cache notes
+
+Each shard saves its own rust-cache key (`ci-pipeline-<shard>`), also on red runs
+(`cache-on-failure`). A `pull_request` run saves to its PR's ref and reads `main`'s cache; main
+never reads a PR's (safe only while no workflow uses `pull_request_target`/`workflow_run`).
+Caches unused for 7 days are evicted, and the repo holds 10 GB in total; if a first run on a PR
+is repeatedly cold although `main` was pushed within the week, check the repo's cache list for
+eviction thrash (shards + `coverage-cache` + `ci-client-dt-guard` + PR refs).
 
 ---
 

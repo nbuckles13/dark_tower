@@ -2269,26 +2269,29 @@ tf="$(toolchain_files "$TFROOT")"
 assert_rc "legacy-rust-toolchain-file-trips" 0 "$([[ "$tf" != "rust-toolchain.toml" ]] && echo 0 || echo 1)"
 
 # Derivation, not agreement: deploy.sh:image_build_args against a root whose file says 9.8.7.
-RTROOT="${WORK}/rtroot"; mkdir -p "$RTROOT"; cp "$RTS/good.toml" "$RTROOT/rust-toolchain.toml"; cp "${REPO_ROOT}/Cargo.lock" "$RTROOT/"
+RTROOT="${WORK}/rtroot"; mkdir -p "$RTROOT/infra"; cp "$RTS/good.toml" "$RTROOT/rust-toolchain.toml"; cp "${REPO_ROOT}/Cargo.lock" "$RTROOT/"
+printf 'cargo-chef 7.6.5\n' > "$RTROOT/infra/cargo-tools.versions"
 iba() { src_run "$DEPLOY" 'PROJECT_ROOT="${ARGS[0]}"; image_build_args "${ARGS[1]}"' "$RTROOT" "$1" 2>&1 | tr '\n' ' '; }
 out="$(iba localhost/ac-service)"
 assert_status "image-build-args-service-derives-rust" "--build-arg RUST_VERSION=9.8.7 " "$out"
-assert_rc     "image-build-args-service-pins-cargo-chef" 0 "$([[ "$out" =~ --build-arg\ CARGO_CHEF_VERSION=[0-9]+\.[0-9]+\.[0-9]+\  ]] && echo 0 || echo "1 (${out})")"
+assert_status "image-build-args-service-derives-cargo-chef" "--build-arg CARGO_CHEF_VERSION=7.6.5 " "$out"
 out="$(iba localhost/db-migrate)"
 assert_status "image-build-args-migrate-derives-rust" "--build-arg RUST_VERSION=9.8.7 " "$out"
 assert_status "image-build-args-migrate-keeps-sqlx" "--build-arg SQLX_CLI_VERSION=" "$out"
 rm "$RTROOT/rust-toolchain.toml"
 out="$(src_run "$DEPLOY" 'PROJECT_ROOT="${ARGS[0]}"; image_build_args "${ARGS[1]}"' "$RTROOT" localhost/ac-service 2>&1)"; rc=$?
 assert_rc "image-build-args-missing-toolchain-fails" 1 "$rc"
-# devloop.sh: derives through the reader, and every RUST_VERSION build-arg is a variable, one per build.
+# devloop.sh: ONE build site (build_devloop_image), reached from both the image-only
+# `--rebuild` path and the launch path; its RUST_VERSION build-arg is a variable assigned
+# from the reader, never a literal.
 DLSH="$(cat "${REPO_ROOT}/infra/devloop/devloop.sh")"
 assert_status "devloop-sh-derives-rust-version" 'rust_toolchain_version "${script_dir}/../../rust-toolchain.toml"' "$DLSH"
 dl_builds="$(grep -c 'podman build ' <<< "$DLSH")"
+dl_callers="$(grep -cE '^[[:space:]]+build_devloop_image "\$SCRIPT_DIR" "\$IMAGE"$' <<< "$DLSH")"
 dl_rust_var="$(grep -c -- '--build-arg "RUST_VERSION=\${RUST_VERSION}"' <<< "$DLSH")"
 dl_rust_any="$(grep -c -- '--build-arg "RUST_VERSION=' <<< "$DLSH")"
-# ...and that variable is assigned from the reader once per build site, never from a literal.
-dl_rust_set="$(grep -cF 'RUST_VERSION="$(read_rust_version "$SCRIPT_DIR")"' <<< "$DLSH")"
-assert_rc "devloop-sh-rust-build-arg-per-build" 0 "$([[ "$dl_builds" -ge 2 && "$dl_rust_var" -eq "$dl_builds" && "$dl_rust_any" -eq "$dl_builds" && "$dl_rust_set" -eq "$dl_builds" ]] && echo 0 || echo "1 (builds=${dl_builds} var=${dl_rust_var} any=${dl_rust_any} from-reader=${dl_rust_set})")"
+dl_rust_set="$(grep -cF 'RUST_VERSION="$(read_rust_version "$script_dir")"' <<< "$DLSH")"
+assert_rc "devloop-sh-one-build-site" 0 "$([[ "$dl_builds" -eq 1 && "$dl_callers" -eq 2 && "$dl_rust_var" -eq 1 && "$dl_rust_any" -eq 1 && "$dl_rust_set" -eq 1 ]] && echo 0 || echo "1 (builds=${dl_builds} callers=${dl_callers} var=${dl_rust_var} any=${dl_rust_any} from-reader=${dl_rust_set})")"
 assert_rc "devloop-sh-no-literal-rust-assignment" 0 "$(grep -qE '(^|[^_A-Z])RUST_VERSION=["'"'"']?[0-9]' <<< "$DLSH" && echo 1 || echo 0)"
 assert_status "devloop-sh-helper-built-from-repo-root" '(cd "$REPO_ROOT" && cargo build --release -p devloop-helper' "$DLSH"
 
@@ -2308,7 +2311,8 @@ assert_rc "rust-version-dockerfiles-nonvacuous" 0 "$([[ "$rv_files" -ge 6 && "$r
 rv_install="$(cat "${REPO_ROOT}"/.github/workflows/*.yml | grep -cE '^[[:space:]]+rustup toolchain install$')"
 assert_rc "rust-version-workflows-read-the-file" 0 "$([[ "$rv_install" -ge 4 ]] && echo 0 || echo "1 (${rv_install} no-arg installs)")"
 assert_rc "dockerignore-excludes-rust-toolchain" 0 "$(grep -qx 'rust-toolchain.toml' "${REPO_ROOT}/.dockerignore" && echo 0 || echo 1)"
-# cargo-chef: ONE value in deploy.sh, no Dockerfile default, never an unpinned install.
+# cargo-chef: ONE value (infra/cargo-tools.versions, read by deploy.sh), no Dockerfile default,
+# never an unpinned install.
 chef_sites="$(cat "${REPO_ROOT}"/infra/docker/*-service/Dockerfile | grep -c 'cargo install cargo-chef --locked --version "=${CARGO_CHEF_VERSION}"')"
 chef_files="$(ls "${REPO_ROOT}"/infra/docker/*-service/Dockerfile | wc -l)"
 assert_rc "cargo-chef-pinned-in-every-service-image" 0 "$([[ "$chef_files" -ge 4 && "$chef_sites" -eq "$chef_files" ]] && echo 0 || echo "1 (${chef_sites} of ${chef_files})")"
@@ -2334,6 +2338,91 @@ printf '        run: rustup toolchain install 1.99.0 --profile minimal\n' > "$RV
 assert_rc "rust-version-workflow-install-literal-trips" 0 "$([[ -n "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
 printf '        run: |\n          rustup toolchain install\n          rustup default 1.99.0\n' > "$RVROOT/.github/workflows/w.yml"
 assert_rc "rust-version-workflow-default-trips" 0 "$([[ -n "$(rust_literal_sites "$RVROOT")" ]] && echo 0 || echo 1)"
+
+# --- cargo tool pins: infra/cargo-tools.versions is the ONE source (devloop image + every workflow)
+# cargo-nextest / cargo-audit / cargo-llvm-cov / cargo-fuzz are read through the ONE reader,
+# infra/lib/cargo-tools.sh; sqlx-cli's pin is Cargo.lock's `sqlx` (checked above).
+CTLIB="${REPO_ROOT}/infra/lib/cargo-tools.sh"
+ctv() { src_run "$CTLIB" 'cargo_tool_version "${ARGS[@]}"' "$@" 2>&1; }
+CTS="${WORK}/ct"; mkdir -p "$CTS"
+printf '# header\n\ncargo-nextest 9.8.7\ncargo-audit 1.2.3\n' > "$CTS/good"
+printf 'cargo-nextest 9.8\n'                         > "$CTS/twopart"
+printf 'cargo-nextest 9.8.7 # pinned\n'              > "$CTS/trailing"
+printf 'cargo-nextest 9.8.7\ncargo-nextest 9.8.8\n'  > "$CTS/dup"
+printf 'cargo-audit 1.2.3\n'                         > "$CTS/absent"
+out="$(ctv "$CTS/good" cargo-nextest)"; rc=$?
+assert_rc  "cargo-tools-exact-rc" 0 "$rc"
+emi_expect "cargo-tools-exact" "9.8.7" "$out"
+emi_expect "cargo-tools-second-entry" "1.2.3" "$(ctv "$CTS/good" cargo-audit)"
+for bad in twopart trailing dup absent; do
+  out="$(ctv "$CTS/${bad}" cargo-nextest)"; rc=$?
+  assert_rc     "cargo-tools-${bad}-rejected"  1 "$rc"
+  assert_status "cargo-tools-${bad}-says-why"  "ERROR: cargo_tool_version" "$out"
+done
+out="$(ctv "$CTS/missing-file" cargo-nextest)"; rc=$?
+assert_rc "cargo-tools-unreadable-fails" 1 "$rc"
+for tool in cargo-nextest cargo-audit cargo-llvm-cov cargo-fuzz cargo-chef; do
+  out="$(ctv "${REPO_ROOT}/infra/cargo-tools.versions" "$tool")"; rc=$?
+  assert_rc "cargo-tools-real-${tool}" 0 "$([[ $rc -eq 0 && "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo 0 || echo "1 (${out})")"
+done
+
+# devloop.sh: each image tool pin is read through the reader and passed as its build arg;
+# the Dockerfile has no defaults for them and installs exactly those versions.
+DLDF="$(cat "${REPO_ROOT}/infra/devloop/Dockerfile")"
+for pair in CARGO_NEXTEST_VERSION:cargo-nextest CARGO_LLVM_COV_VERSION:cargo-llvm-cov CARGO_AUDIT_VERSION:cargo-audit; do
+  var="${pair%%:*}"; tool="${pair#*:}"
+  assert_status "devloop-sh-reads-${tool}"      "${var}=\"\$(read_cargo_tool_version \"\$script_dir\" ${tool})\"" "$DLSH"
+  assert_status "devloop-sh-passes-${tool}"     "--build-arg \"${var}=\${${var}}\"" "$DLSH"
+  assert_rc     "devloop-dockerfile-no-default-${tool}" 0 "$(grep -qE "^ARG ${var}=" <<< "$DLDF" && echo 1 || echo 0)"
+  assert_status "devloop-dockerfile-installs-${tool}" "cargo install ${tool} --locked --version \"=\${${var}}\"" "$DLDF"
+done
+
+# No cargo tool install in a workflow or an image may float or carry a literal version:
+# `tool: cargo-x` must be `@${{ steps.pins.outputs.cargo-x }}`, and every `cargo install`
+# must be --locked with a `--version "=${VAR}"` variable. Scans ALL workflow files and ALL
+# Dockerfiles, so the next unpinned install is caught wherever it lands. sqlx-cli is pinned
+# by Cargo.lock, not this file, and checked above (db-migrate's install spans two lines).
+# Positive controls below.
+cargo_tool_pin_violations() {  # $1 = root; prints one line per unpinned/literal install
+  local root="$1" f
+  for f in "${root}"/.github/workflows/*.yml "${root}/infra/devloop/Dockerfile" "${root}"/infra/docker/*/Dockerfile; do
+    [[ -r "$f" ]] || continue
+    grep -HnE '^[[:space:]]*tool:[[:space:]]*cargo-' "$f" \
+      | grep -vE 'tool:[[:space:]]*(cargo-[a-z0-9-]+)@\$\{\{ steps\.pins\.outputs\.\1 \}\}[[:space:]]*$'
+    grep -HnE 'cargo install [a-z]' "$f" \
+      | grep -vE 'cargo install sqlx-cli ' \
+      | grep -vE 'cargo install [a-z0-9-]+ (.* )?--locked( .*)? --version "=\$\{[A-Za-z_]+\}"' \
+      | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#'
+  done
+  return 0
+}
+cv="$(cargo_tool_pin_violations "$REPO_ROOT")"
+assert_rc "cargo-tool-pins-no-violations" 0 "$([[ -z "$cv" ]] && echo 0 || echo "1 (${cv//$'\n'/ | })")"
+# A command substitution inside echo's arguments does not trip `bash -e`, so a failing pin
+# reader would write `x=` and pass an empty version on. Assign first, then echo.
+ECHO_SUB_RE='^[[:space:]]*echo "[A-Za-z0-9_-]+=\$\('
+ct_echo_sub="$(grep -HnE "$ECHO_SUB_RE" "${REPO_ROOT}"/.github/workflows/*.yml)"
+assert_rc "workflow-outputs-never-echo-a-substitution" 0 "$([[ -z "$ct_echo_sub" ]] && echo 0 || echo "1 (${ct_echo_sub//$'\n'/ | })")"
+assert_rc "workflow-echo-substitution-control-trips" 0 "$(printf '          echo "cargo-audit=$(cargo_tool_version f cargo-audit)" >> "$GITHUB_OUTPUT"\n' | grep -qE "$ECHO_SUB_RE" && echo 0 || echo 1)"
+ct_pinned="$(cat "${REPO_ROOT}"/.github/workflows/*.yml | grep -cE 'tool:[[:space:]]*cargo-[a-z0-9-]+@\$\{\{ steps\.pins\.outputs\.')"
+assert_rc "cargo-tool-pins-nonvacuous" 0 "$([[ "$ct_pinned" -ge 4 ]] && echo 0 || echo "1 (${ct_pinned} pinned tool: installs)")"
+CTROOT="${WORK}/ctroot"; mkdir -p "$CTROOT/.github/workflows" "$CTROOT/infra/devloop"
+printf '          tool: cargo-audit\n' > "$CTROOT/.github/workflows/w.yml"
+assert_rc "cargo-tool-pins-unpinned-tool-trips" 0 "$([[ -n "$(cargo_tool_pin_violations "$CTROOT")" ]] && echo 0 || echo 1)"
+printf '          tool: cargo-audit@0.22.2\n' > "$CTROOT/.github/workflows/w.yml"
+assert_rc "cargo-tool-pins-literal-tool-trips" 0 "$([[ -n "$(cargo_tool_pin_violations "$CTROOT")" ]] && echo 0 || echo 1)"
+printf '        run: cargo install cargo-fuzz\n' > "$CTROOT/.github/workflows/w.yml"
+assert_rc "cargo-tool-pins-unpinned-install-trips" 0 "$([[ -n "$(cargo_tool_pin_violations "$CTROOT")" ]] && echo 0 || echo 1)"
+printf '        run: cargo install cargo-fuzz --locked --version =0.13.2\n' > "$CTROOT/.github/workflows/w.yml"
+assert_rc "cargo-tool-pins-literal-install-trips" 0 "$([[ -n "$(cargo_tool_pin_violations "$CTROOT")" ]] && echo 0 || echo 1)"
+printf 'RUN cargo install cargo-nextest --version "=${V}"\n' > "$CTROOT/infra/devloop/Dockerfile"; : > "$CTROOT/.github/workflows/w.yml"
+assert_rc "cargo-tool-pins-unlocked-image-install-trips" 0 "$([[ -n "$(cargo_tool_pin_violations "$CTROOT")" ]] && echo 0 || echo 1)"
+mkdir -p "$CTROOT/infra/docker/x"; printf 'RUN cargo install cargo-chef --locked --version "=0.1.78"\n' > "$CTROOT/infra/docker/x/Dockerfile"
+assert_rc "cargo-tool-pins-service-image-literal-trips" 0 "$([[ -n "$(cargo_tool_pin_violations "$CTROOT")" ]] && echo 0 || echo 1)"
+printf 'RUN cargo install cargo-chef --locked --version "=${CARGO_CHEF_VERSION}"\nRUN cargo install sqlx-cli --locked \\\n    --version "=${SQLX_CLI_VERSION}"\n' > "$CTROOT/infra/docker/x/Dockerfile"
+printf 'RUN cargo install cargo-nextest --locked --version "=${V}"\n' > "$CTROOT/infra/devloop/Dockerfile"
+printf '          tool: cargo-audit@${{ steps.pins.outputs.cargo-audit }}\n' > "$CTROOT/.github/workflows/w.yml"
+assert_rc "cargo-tool-pins-clean-root-passes" 0 "$([[ -z "$(cargo_tool_pin_violations "$CTROOT")" ]] && echo 0 || echo 1)"
 
 # --- pnpm pin: the ONE packageManager reader (devloop image + dev-web.sh) ----------------------
 PMLIB="${REPO_ROOT}/infra/lib/package-manager.sh"

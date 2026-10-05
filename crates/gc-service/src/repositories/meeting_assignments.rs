@@ -30,7 +30,6 @@ const DEFAULT_CLEANUP_BATCH_SIZE: i64 = 1000;
 
 /// Meeting assignment record from database.
 // Allow: Fields used in tests; struct will be used by future query handlers
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MeetingAssignment {
     /// Meeting ID.
@@ -680,7 +679,10 @@ struct McCandidateRow {
 
 #[derive(sqlx::FromRow)]
 struct AtomicAssignResult {
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "decoded by query_as from the RETURNING row; only Some/None is read"
+    )]
     meeting_controller_id: String,
 }
 

@@ -13,35 +13,26 @@
 //!
 //! - Health checker: Monitors MC heartbeats and marks stale controllers unhealthy
 
-mod auth;
-mod config;
-mod errors;
-mod grpc;
-mod handlers;
-mod middleware;
-mod models;
-mod observability;
-mod repositories;
-mod routes;
-mod services;
-mod tasks;
-
-use auth::{JwksClient, JwtValidator};
+// Thin binary over the `gc_service` lib: the module tree is compiled (and its unit
+// tests run) once, in the lib. Re-declaring it here with `mod` would compile and test
+// it a second time (dt-guard bin-lib-single-compile).
 use common::token_manager::{spawn_token_manager, TokenManagerConfig};
-use config::Config;
-use grpc::auth_layer::GrpcAuthLayer;
-use grpc::{McService, MhService};
-use proto_gen::dark_tower::internal::v1::global_controller_service_server::GlobalControllerServiceServer;
-use proto_gen::dark_tower::internal::v1::media_handler_registry_service_server::MediaHandlerRegistryServiceServer;
-use repositories::MeetingControllersRepository;
-use routes::AppState;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use tasks::{
+use gc_service::auth::{JwksClient, JwtValidator};
+use gc_service::config::Config;
+use gc_service::grpc::auth_layer::GrpcAuthLayer;
+use gc_service::grpc::{McService, MhService};
+use gc_service::repositories::MeetingControllersRepository;
+use gc_service::routes::AppState;
+use gc_service::tasks::{
     start_assignment_cleanup, start_health_checker, start_mh_health_checker,
     AssignmentCleanupConfig,
 };
+use gc_service::{grpc, handlers, observability, repositories, routes, services};
+use proto_gen::dark_tower::internal::v1::global_controller_service_server::GlobalControllerServiceServer;
+use proto_gen::dark_tower::internal::v1::media_handler_registry_service_server::MediaHandlerRegistryServiceServer;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

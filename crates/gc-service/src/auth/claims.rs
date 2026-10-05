@@ -56,7 +56,6 @@ impl Claims {
     /// Check if the token has a specific scope.
     ///
     /// Scopes are space-separated in the JWT claims.
-    #[allow(dead_code)] // Will be used in Phase 3 for scope checking
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scope.split_whitespace().any(|s| s == scope)
     }

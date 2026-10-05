@@ -52,9 +52,9 @@ set -euo pipefail
 # ─── Node pin (SSoT = repo-root .nvmrc) ─────────────────────────
 # The Dockerfile pins Node via `ARG NODE_VERSION` (no default; fails loud if unset).
 # The build context is infra/devloop/ (SCRIPT_DIR), which cannot COPY the repo-root
-# .nvmrc, so we read .nvmrc here and pass it as --build-arg at BOTH `podman build`
-# sites. This keeps .nvmrc the single source and prevents the .nvmrc/Dockerfile/lockfile
-# pin drift behind the 2026-08-05 host dev-env failure. Fails loud on a missing/empty
+# .nvmrc, so we read .nvmrc here and pass it as --build-arg at the one `podman build`
+# site (build_devloop_image). This keeps .nvmrc the single source and prevents the
+# .nvmrc/Dockerfile/lockfile pin drift behind the 2026-08-05 host dev-env failure. Fails loud on a missing/empty
 # .nvmrc rather than defaulting to a floating version.
 read_node_version() {
     local script_dir="$1" nvmrc ver
@@ -105,6 +105,44 @@ read_pnpm_package_manager() {
     pnpm_package_manager_spec "${script_dir}/../../package.json" || exit 1
 }
 
+# ─── cargo tool pins (SSoT = infra/cargo-tools.versions) ────────
+# cargo-nextest (Layer 4's runner), cargo-llvm-cov and cargo-audit: the same pins CI
+# installs, read through the ONE reader. The Dockerfile ARGs have no defaults.
+# shellcheck source=../lib/cargo-tools.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/cargo-tools.sh"
+read_cargo_tool_version() {
+    local script_dir="$1" tool="$2"
+    cargo_tool_version "${script_dir}/../../infra/cargo-tools.versions" "$tool" || exit 1
+}
+
+# ─── Image build (the ONE build site) ───────────────────────────
+# Every pin is read here, once per build, and passed as a build arg; the previous image
+# is removed only after a successful build produced a different one.
+build_devloop_image() {
+    local script_dir="$1" image="$2" old_image_id
+    local RUST_VERSION NODE_VERSION SQLX_CLI_VERSION PNPM_PACKAGE_MANAGER
+    local CARGO_NEXTEST_VERSION CARGO_LLVM_COV_VERSION CARGO_AUDIT_VERSION
+    echo "Building dev container image..."
+    old_image_id=$(podman images -q "$image" 2>/dev/null || true)
+    NODE_VERSION="$(read_node_version "$script_dir")"
+    SQLX_CLI_VERSION="$(read_sqlx_cli_version "$script_dir")"
+    PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$script_dir")"
+    RUST_VERSION="$(read_rust_version "$script_dir")"
+    CARGO_NEXTEST_VERSION="$(read_cargo_tool_version "$script_dir" cargo-nextest)"
+    CARGO_LLVM_COV_VERSION="$(read_cargo_tool_version "$script_dir" cargo-llvm-cov)"
+    CARGO_AUDIT_VERSION="$(read_cargo_tool_version "$script_dir" cargo-audit)"
+    podman build --build-arg "RUST_VERSION=${RUST_VERSION}" \
+        --build-arg "NODE_VERSION=${NODE_VERSION}" \
+        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
+        --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" \
+        --build-arg "CARGO_NEXTEST_VERSION=${CARGO_NEXTEST_VERSION}" \
+        --build-arg "CARGO_LLVM_COV_VERSION=${CARGO_LLVM_COV_VERSION}" \
+        --build-arg "CARGO_AUDIT_VERSION=${CARGO_AUDIT_VERSION}" -t "$image" "$script_dir"
+    if [ -n "$old_image_id" ] && [ "$old_image_id" != "$(podman images -q "$image")" ]; then
+        podman rmi "$old_image_id" 2>/dev/null || true
+    fi
+}
+
 # ─── Configuration ──────────────────────────────────────────────
 
 REBUILD_IMAGE=false
@@ -134,19 +172,7 @@ done
 if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     IMAGE="darktower-dev:latest"
-    echo "Building dev container image..."
-    OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
-    NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
-    SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
-    PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$SCRIPT_DIR")"
-    RUST_VERSION="$(read_rust_version "$SCRIPT_DIR")"
-    podman build --build-arg "RUST_VERSION=${RUST_VERSION}" \
-        --build-arg "NODE_VERSION=${NODE_VERSION}" \
-        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
-        --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" -t "$IMAGE" "$SCRIPT_DIR"
-    if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
-        podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
-    fi
+    build_devloop_image "$SCRIPT_DIR" "$IMAGE"
     echo "Image rebuilt: ${IMAGE}"
     exit 0
 fi
@@ -629,19 +655,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if $REBUILD_IMAGE || ! podman image exists "$IMAGE"; then
-    echo "Building dev container image..."
-    OLD_IMAGE_ID=$(podman images -q "$IMAGE" 2>/dev/null || true)
-    NODE_VERSION="$(read_node_version "$SCRIPT_DIR")"
-    SQLX_CLI_VERSION="$(read_sqlx_cli_version "$SCRIPT_DIR")"
-    PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$SCRIPT_DIR")"
-    RUST_VERSION="$(read_rust_version "$SCRIPT_DIR")"
-    podman build --build-arg "RUST_VERSION=${RUST_VERSION}" \
-        --build-arg "NODE_VERSION=${NODE_VERSION}" \
-        --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
-        --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" -t "$IMAGE" "$SCRIPT_DIR"
-    if [ -n "$OLD_IMAGE_ID" ] && [ "$OLD_IMAGE_ID" != "$(podman images -q "$IMAGE")" ]; then
-        podman rmi "$OLD_IMAGE_ID" 2>/dev/null || true
-    fi
+    build_devloop_image "$SCRIPT_DIR" "$IMAGE"
 fi
 
 # ─── Helper setup (ADR-0030/0031) ─────────────────────────────

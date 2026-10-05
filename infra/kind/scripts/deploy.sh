@@ -58,6 +58,8 @@ source "${SCRIPT_DIR}/lib/cluster-db.sh"
 source "${PROJECT_ROOT}/infra/lib/cargo-lock-version.sh"
 # shellcheck source=../../lib/rust-toolchain.sh
 source "${PROJECT_ROOT}/infra/lib/rust-toolchain.sh"
+# shellcheck source=../../lib/cargo-tools.sh
+source "${PROJECT_ROOT}/infra/lib/cargo-tools.sh"
 dt_init_cluster_env
 
 PROVISION_SH="${SCRIPT_DIR}/provision.sh"
@@ -237,17 +239,13 @@ declare -A DEPLOYED_REFS=()
 # run.
 declare -A IMAGE_REFS=()
 
-# The exact cargo-chef the four service images install — the ONE value (their
-# Dockerfiles take `ARG CARGO_CHEF_VERSION` with no default). Pinned because an
-# unpinned `cargo install` resolves the newest release, which can require a newer
-# rustc than the pinned base image. Bump it here, deliberately.
-CARGO_CHEF_VERSION="0.1.78"
-
 # Build-args a first-party image needs; none of these Dockerfile ARGs has a default.
 # Every image: RUST_VERSION, the repo's ONE Rust version (the one reader:
 # infra/lib/rust-toolchain.sh over rust-toolchain.toml). db-migrate: sqlx-cli pinned
 # to the workspace's `sqlx` (the one reader: infra/lib/cargo-lock-version.sh). The
-# service images: CARGO_CHEF_VERSION above.
+# service images: CARGO_CHEF_VERSION, the exact cargo-chef they install, pinned in
+# infra/cargo-tools.versions (the one reader: infra/lib/cargo-tools.sh) — unpinned,
+# `cargo install` resolves the newest release, which can require a newer rustc.
 image_build_args() {
     local repo="$1" v
     v="$(rust_toolchain_version "${PROJECT_ROOT}/rust-toolchain.toml")" || return 1
@@ -258,7 +256,8 @@ image_build_args() {
             printf '%s\n' "--build-arg" "SQLX_CLI_VERSION=${v}"
             ;;
         *)
-            printf '%s\n' "--build-arg" "CARGO_CHEF_VERSION=${CARGO_CHEF_VERSION}"
+            v="$(cargo_tool_version "${PROJECT_ROOT}/infra/cargo-tools.versions" cargo-chef)" || return 1
+            printf '%s\n' "--build-arg" "CARGO_CHEF_VERSION=${v}"
             ;;
     esac
 }

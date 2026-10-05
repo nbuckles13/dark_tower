@@ -580,6 +580,32 @@ pub(crate) fn blank_non_code(line: &str, in_block_comment: bool) -> (String, boo
     lex_line(line, in_block_comment, NonCodeMode::BlankNonCode)
 }
 
+/// [`blank_non_code`] across a whole file: comments and string bodies blanked,
+/// byte offsets preserved, so a position computed on the blanked text is valid
+/// in the source. Block comments are threaded across lines; ordinary string
+/// literals are lexed per line (see [`lex_line`] for what is not handled).
+///
+/// Consumers: `media_telemetry_deny` (macro shapes spanning lines) and
+/// `bin_lib_single_compile` (top-level `mod` declarations + brace depth).
+pub fn blank_file(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut in_block = false;
+    for (idx, line) in content.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let (blanked, still) = blank_non_code(line, in_block);
+        in_block = still;
+        // `blank_non_code` truncates at a line comment; pad back to length so
+        // byte offsets stay aligned with the source.
+        out.push_str(&blanked);
+        for _ in blanked.len()..line.len() {
+            out.push(' ');
+        }
+    }
+    out
+}
+
 struct DepthState {
     depth: i32,
     in_block_comment: bool,

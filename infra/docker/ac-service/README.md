@@ -213,7 +213,7 @@ spec:
 - **Network:** Minimal (only pulls updated base images)
 
 ### Caching Strategy
-1. **Layer 1:** Rust toolchain (rust:1.83-slim)
+1. **Layer 1:** Rust toolchain (`rust:${RUST_VERSION}-slim-bookworm`; the version comes from `rust-toolchain.toml` through `infra/lib/rust-toolchain.sh`)
 2. **Layer 2:** Cargo dependencies (cached via dummy src)
 3. **Layer 3:** Application code (rebuilds on code changes)
 4. **Layer 4:** Runtime (distroless base)

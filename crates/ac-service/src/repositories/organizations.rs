@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 /// Organization model (maps to organizations table)
 #[derive(Debug, Clone, sqlx::FromRow)]
-#[allow(dead_code)] // Library type - fields read in future phases
 pub struct Organization {
     pub org_id: Uuid,
     pub subdomain: String,
@@ -56,7 +55,6 @@ pub async fn get_by_subdomain(
 }
 
 /// Get organization by org_id.
-#[allow(dead_code)] // Library function - will be used in future phases
 pub async fn get_by_id(pool: &PgPool, org_id: Uuid) -> Result<Option<Organization>, AcError> {
     let start = Instant::now();
     let result = sqlx::query_as::<_, Organization>(

@@ -2010,14 +2010,15 @@ else
   o1v="$(DEVLOOP_TMP=/seam DEVLOOP_STORY_RUN_BASE=/carrier HOME=/h o1_call run-dir)"
   assert_status "o1-tmp-dominates" "/seam/story-runner" "$o1v"
   if [ "$o1v" = "/seam/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-tmp-dominates-exact] got '$o1v'"); fi
-  # (2) carrier wins over HOME when DEVLOOP_TMP unset
-  o1v="$(DEVLOOP_STORY_RUN_BASE=/carrier HOME=/h o1_call run-dir)"
+  # (2) carrier wins over HOME when DEVLOOP_TMP unset. The "unset" cases unset the inputs
+  #     explicitly: an ambient DEVLOOP_TMP (any caller that relocates it) would otherwise win.
+  o1v="$(unset DEVLOOP_TMP; DEVLOOP_STORY_RUN_BASE=/carrier HOME=/h o1_call run-dir)"
   if [ "$o1v" = "/carrier/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-carrier-over-home] expected /carrier/story-runner got '$o1v'"); fi
   # (3) HOME default when both unset — HOME PINNED (mech #5)
-  o1v="$(HOME=/home/dev o1_call run-dir)"
+  o1v="$(unset DEVLOOP_TMP DEVLOOP_STORY_RUN_BASE; HOME=/home/dev o1_call run-dir)"
   if [ "$o1v" = "/home/dev/.cache/devloop/story-runs/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-home-default] expected /home/dev/.cache/devloop/story-runs/story-runner got '$o1v'"); fi
   # marker base stays DEVLOOP_TMP-based and does NOT collapse into the run-dir base
-  o1m="$(HOME=/home/dev o1_call marker)"
+  o1m="$(unset DEVLOOP_TMP DEVLOOP_STORY_RUN_BASE; HOME=/home/dev o1_call marker)"
   if [ "$o1m" = "/tmp/devloop/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-marker-default] expected /tmp/devloop/story-runner got '$o1m'"); fi
   o1m="$(DEVLOOP_TMP=/seam o1_call marker)"
   if [ "$o1m" = "/seam/story-runner" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("[o1-marker-tmp] expected /seam/story-runner got '$o1m'"); fi

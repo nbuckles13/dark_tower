@@ -82,7 +82,6 @@ pub struct AssignmentWithMh {
     /// `mc_assignment`, and handler ids are logged inside this service. It is the
     /// service's return contract, asserted by the integration tests to prove which
     /// branch ran (`None` = no MH selection on reuse).
-    #[allow(dead_code)] // Read only by integration tests (bin target sees no reader)
     pub mh_selection: Option<MhSelection>,
 }
 
@@ -132,7 +131,6 @@ impl McAssignmentService {
     /// * `meeting_id` - Meeting to look up
     /// * `region` - Region to look up in
     // Allow: Used in tests; will be used for future status endpoints
-    #[allow(dead_code)]
     #[instrument(skip_all, fields(meeting_id = %meeting_id, region = %region))]
     pub async fn get_assignment(
         pool: &PgPool,

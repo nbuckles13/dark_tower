@@ -52,7 +52,6 @@ impl HealthStatus {
     }
 
     /// Parse from database string representation.
-    #[allow(dead_code)] // Used by get_controller
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "pending" => HealthStatus::Pending,
@@ -67,7 +66,6 @@ impl HealthStatus {
 
 /// Meeting controller record from database.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Will be used for MC lookup
 pub struct MeetingController {
     pub controller_id: String,
     pub region: String,
@@ -311,7 +309,6 @@ impl MeetingControllersRepository {
     /// # Returns
     ///
     /// Returns `Some(MeetingController)` if found, `None` otherwise.
-    #[allow(dead_code)] // Will be used in future phases
     #[instrument(skip_all, fields(controller_id = %controller_id))]
     pub async fn get_controller(
         pool: &PgPool,
@@ -420,7 +417,6 @@ struct ControllerCountRow {
 
 /// Database row representation for meeting controllers.
 #[derive(sqlx::FromRow)]
-#[allow(dead_code)] // Used by get_controller
 struct MeetingControllerRow {
     controller_id: String,
     region: String,

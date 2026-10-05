@@ -18,10 +18,8 @@ use tracing::instrument;
 use uuid::Uuid;
 
 /// Repository for meeting participant operations.
-#[allow(dead_code)] // Used by integration tests and future join handler
 pub struct ParticipantsRepository;
 
-#[allow(dead_code)] // Methods used by integration tests and future join handler
 impl ParticipantsRepository {
     /// Count active participants in a meeting.
     ///

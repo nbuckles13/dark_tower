@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# cargo-shim — records its argv to $CARGO_SHIM_ARGV_LOG and exits 0.
+# cargo-shim — records its argv to $CARGO_SHIM_ARGV_LOG and exits 0 (100 for the
+# subcommand named by $CARGO_SHIM_FAIL_ON).
 # Used by behavior-equivalence.test.sh to verify dispatcher arg-passthrough
 # without depending on a real cargo invocation.
 set -euo pipefail
@@ -19,4 +20,8 @@ fi
   printf '\n'
 } >> "$CARGO_SHIM_ARGV_LOG"
 
+# CARGO_SHIM_FAIL_ON=<subcommand>: fail that subcommand (e.g. `nextest`) to drive a red lane.
+if [[ -n "${CARGO_SHIM_FAIL_ON:-}" && "${1:-}" == "${CARGO_SHIM_FAIL_ON}" ]]; then
+  exit 100
+fi
 exit 0

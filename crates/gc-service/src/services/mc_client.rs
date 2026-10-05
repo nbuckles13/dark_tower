@@ -248,7 +248,6 @@ impl McClient {
 }
 
 /// Trait for MC client operations (enables mocking).
-#[allow(dead_code)] // Used by mock implementation
 #[async_trait::async_trait]
 pub trait McClientTrait: Send + Sync {
     /// Assign a meeting to an MC.
@@ -279,7 +278,6 @@ impl McClientTrait for McClient {
 ///
 /// This module provides mock implementations of the MC client for use in tests.
 /// Note: This is `pub` to allow integration tests in `tests/` to use it.
-#[allow(dead_code)]
 pub mod mock {
 
     use super::*;

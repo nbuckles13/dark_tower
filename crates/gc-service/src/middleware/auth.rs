@@ -98,7 +98,6 @@ pub async fn require_user_auth(
 /// Extension trait for extracting claims from request.
 ///
 /// Provides a convenient method for handlers to get the authenticated claims.
-#[allow(dead_code)] // API for handlers that need claims from request
 pub trait ClaimsExt {
     /// Get the authenticated claims from request extensions.
     ///
@@ -106,7 +105,6 @@ pub trait ClaimsExt {
     fn claims(&self) -> Option<&Claims>;
 }
 
-#[allow(dead_code)] // Implementation for ClaimsExt trait
 impl<B> ClaimsExt for axum::extract::Request<B> {
     fn claims(&self) -> Option<&Claims> {
         self.extensions().get::<Claims>()

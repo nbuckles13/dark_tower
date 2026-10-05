@@ -4,8 +4,8 @@
 # Used by devloop.sh for isolated Claude Code execution.
 #
 # Build:  ./infra/devloop/devloop.sh --rebuild   (reads rust-toolchain.toml, .nvmrc, package.json
-#         packageManager and Cargo.lock; passes RUST_VERSION, NODE_VERSION, PNPM_PACKAGE_MANAGER
-#         and SQLX_CLI_VERSION)
+#         packageManager, Cargo.lock and infra/cargo-tools.versions; passes RUST_VERSION,
+#         NODE_VERSION, PNPM_PACKAGE_MANAGER, SQLX_CLI_VERSION and the CARGO_*_VERSION tool pins)
 # Rebuild weekly or when toolchain/dependencies change.
 # NOTE: RUST_VERSION, NODE_VERSION and PNPM_PACKAGE_MANAGER have no default and the build FAILS
 # without them.
@@ -60,13 +60,20 @@ RUN rustup component add llvm-tools-preview rustfmt clippy
 # migrates the unit-test DB (scripts/lang/rust/test.sh) writes the
 # `_sqlx_migrations` shape the library reads. devloop.sh derives the value
 # (infra/lib/cargo-lock-version.sh — the same reader the db-migrate image uses).
-# cargo-llvm-cov and cargo-audit are pinned and `--locked` (their own lockfiles):
-# unpinned, `cargo install` resolves the newest dependencies, which can require a
-# newer rustc than the base image. Bump these here, deliberately, when needed.
+# cargo-nextest (Layer 4's test runner), cargo-llvm-cov and cargo-audit are pinned
+# in infra/cargo-tools.versions — the ONE pin CI also installs from — and devloop.sh
+# passes them through infra/lib/cargo-tools.sh. No defaults: an unset ARG fails the
+# build instead of floating. All `--locked` (their own lockfiles): unlocked,
+# `cargo install` resolves the newest dependencies, which can require a newer rustc.
 ARG SQLX_CLI_VERSION
-ARG CARGO_LLVM_COV_VERSION=0.8.7
-ARG CARGO_AUDIT_VERSION=0.22.2
+ARG CARGO_NEXTEST_VERSION
+ARG CARGO_LLVM_COV_VERSION
+ARG CARGO_AUDIT_VERSION
 RUN : "${SQLX_CLI_VERSION:?SQLX_CLI_VERSION build-arg is required — derived from Cargo.lock; build via devloop.sh --rebuild}" && \
+    : "${CARGO_NEXTEST_VERSION:?CARGO_NEXTEST_VERSION build-arg is required — from infra/cargo-tools.versions; build via devloop.sh --rebuild}" && \
+    : "${CARGO_LLVM_COV_VERSION:?CARGO_LLVM_COV_VERSION build-arg is required — from infra/cargo-tools.versions; build via devloop.sh --rebuild}" && \
+    : "${CARGO_AUDIT_VERSION:?CARGO_AUDIT_VERSION build-arg is required — from infra/cargo-tools.versions; build via devloop.sh --rebuild}" && \
+    cargo install cargo-nextest --locked --version "=${CARGO_NEXTEST_VERSION}" && \
     cargo install cargo-llvm-cov --locked --version "=${CARGO_LLVM_COV_VERSION}" && \
     cargo install sqlx-cli --locked --no-default-features --features postgres --version "=${SQLX_CLI_VERSION}" && \
     cargo install cargo-audit --locked --version "=${CARGO_AUDIT_VERSION}"

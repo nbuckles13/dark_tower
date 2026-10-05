@@ -1,0 +1,22 @@
+# The ONE pin for every cargo tool that a workflow (.github/workflows/*.yml), the
+# devloop image (infra/devloop/Dockerfile) or a service image (infra/docker/*/Dockerfile,
+# via infra/kind/scripts/deploy.sh) installs. Read ONLY through
+# infra/lib/cargo-tools.sh:cargo_tool_version; never copy a version elsewhere
+# (scripts/setup.test.sh fails on a literal or unpinned install anywhere).
+#
+# Exception: sqlx-cli, whose pin is the workspace's `sqlx` in Cargo.lock
+# (infra/lib/cargo-lock-version.sh), so the CLI and library always agree.
+#
+# Bump deliberately: CI picks the new version up on the next run; devloop and
+# run-story containers need `infra/devloop/devloop.sh --rebuild` (Layer 4 fails
+# with CARGO_NEXTEST_VERSION_MISMATCH until then).
+#
+# Format: `<crate> <X.Y.Z>`, one per line.
+cargo-nextest 0.9.146
+cargo-audit 0.22.2
+# The coverage job's comments assert cargo-llvm-cov 0.8.x behaviour (show-env
+# wrapper flow); re-verify them before moving off 0.8.
+cargo-llvm-cov 0.8.7
+cargo-fuzz 0.13.2
+# The four service images' cargo-chef (dependency-layer caching).
+cargo-chef 0.1.78

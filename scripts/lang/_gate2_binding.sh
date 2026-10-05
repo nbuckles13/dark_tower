@@ -26,8 +26,9 @@
 # can hand-author a well-formed PASS verdict whose signature matches the staged
 # tree, and `git commit --no-verify` bypasses the hook entirely. CI's independent
 # from-scratch re-run of layer-all.sh on PRs into main/develop (.github/workflows/ci.yml
-# `on:`), which never reads the /tmp artifact, is the only non-bypassable enforcement
-# point. The artifact is ephemeral in /tmp and is
+# `on:`) — sharded across parallel jobs (`--layers`), with the `Test Suite` job's
+# `--aggregate` proving every layer ran exactly once — never reads the /tmp artifact and
+# is the only non-bypassable enforcement point. The artifact is ephemeral in /tmp and is
 # never committed. A conflict-resolved cherry-pick/rebase of an already-validated
 # devloop commit needs no local verdict (REPLAY SKIP, above gate2_staged_trigger_slug);
 # that relaxation stays inside this model — see its FORGERY note.

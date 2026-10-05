@@ -123,7 +123,6 @@ pub fn record_meeting_display_name_outcome(outcome: &str) {
 /// Labels: `status`, `error_category`
 ///
 /// NOTE: Defined per ADR-0011 for future token validation metrics.
-#[allow(dead_code)] // Will be used in Phase 4 token validation endpoints
 pub fn record_token_validation(status: &str, error_category: Option<&str>) {
     let category = error_category.unwrap_or("none");
     counter!("ac_token_validations_total", "status" => status.to_string(), "error_category" => category.to_string())
@@ -468,7 +467,8 @@ const AUDIT_LOG_FAILURE_PAIRS: &[(AuthEventType, &str)] = &[
     (AuthEventType::UserLoginFailed, "db_write_failed"),
 ];
 /// `ac_token_validations_total{status, error_category}` — un-exempted 2026-09-10
-/// (was wrongly "no emit site": `crypto/mod.rs:284,439` DO call it in prod). The
+/// (was wrongly "no emit site": the iat-skew branches of `crypto::verify_jwt` and
+/// `crypto::verify_user_jwt` DO call it in prod). The
 /// only PROD-emittable combo today is `error`/`clock_skew` (the JWT clock-skew
 /// rejection path); the other `error_category` values documented in ADR-0011
 /// (authentication/authorization/cryptographic/internal) and the `success` path
@@ -707,8 +707,8 @@ mod tests {
 
     // WRAPPER-CAT-C: production callers planned for Phase 4 token-validation
     // endpoint. Today the wrapper has only TWO real call sites — both
-    // `("error", Some("clock_skew"))` from `crypto/mod.rs:284` (`verify_jwt`)
-    // and `:439` (`verify_user_jwt`). The 4 other label combos exercised here
+    // `("error", Some("clock_skew"))`, from the iat-skew branches of
+    // `crypto::verify_jwt` and `crypto::verify_user_jwt`. The 4 other label combos exercised here
     // (success, error+authentication, error+authorization, error+cryptographic,
     // error+internal) are forward-looking reservations from `ADR-0011`. The
     // production-path coverage for `clock_skew` lives in

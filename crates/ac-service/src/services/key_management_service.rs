@@ -105,7 +105,6 @@ pub async fn initialize_signing_key(
 }
 
 /// Rotate signing keys (generate new key, mark old keys as inactive)
-#[allow(dead_code)] // Library function - will be used in Phase 4 key rotation endpoints
 pub async fn rotate_signing_key(
     pool: &PgPool,
     master_key: &[u8],
@@ -176,7 +175,6 @@ pub async fn rotate_signing_key(
 
 /// Rotate signing keys within a transaction (for atomic rate limiting + rotation)
 /// This version accepts a transaction to ensure atomicity with rate limit checks
-#[allow(dead_code)]
 pub async fn rotate_signing_key_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     master_key: &[u8],
@@ -341,7 +339,6 @@ pub async fn init_key_metrics(pool: &PgPool) -> Result<(), AcError> {
 ///
 /// Finds all keys where `valid_until < NOW()` and `is_active = true`,
 /// then deactivates them. Returns the list of deactivated key IDs.
-#[allow(dead_code)] // Will be used in background tasks/cron jobs in production
 pub async fn expire_old_keys(pool: &PgPool) -> Result<Vec<String>, AcError> {
     // Find expired keys that are still active
     let expired_keys: Vec<(String,)> = sqlx::query_as(

@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 /// User model (maps to users table)
 #[derive(Debug, Clone, sqlx::FromRow)]
-#[allow(dead_code)] // Library type - fields read in future phases
 pub struct User {
     pub user_id: Uuid,
     pub org_id: Uuid,
@@ -191,7 +190,6 @@ pub async fn add_user_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(
 }
 
 /// Remove a role from a user.
-#[allow(dead_code)] // Library function - will be used in future phases
 pub async fn remove_user_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), AcError> {
     let start = Instant::now();
     let result = sqlx::query(
