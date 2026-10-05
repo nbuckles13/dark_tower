@@ -16,8 +16,8 @@
 #
 # RULE: exclude build-irrelevant trees ONLY. Everything the cargo-chef build reads MUST
 # stay: Cargo.toml, Cargo.lock, crates/** (sources + build.rs), proto/** (proto-gen/build.rs
-# compiles ../../proto/), migrations/** (the runtime stage COPYs /build/migrations), .cargo/,
-# .sqlx/. Patterns below are disjoint from those, so no negation (!) rules are needed.
+# compiles ../../proto/), migrations/** (the runtime stage COPYs /build/migrations), .cargo/.
+# Patterns below are disjoint from those, so no negation (!) rules are needed.
 
 # --- Rust build artifacts (the 27 GB keystone) ---
 target/

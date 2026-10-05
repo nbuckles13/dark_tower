@@ -108,21 +108,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Initialize database connection pool with query timeout
-    // ADR-0012: 5s statement timeout to fail fast on hung queries
     info!("Connecting to database...");
-    let db_url_with_timeout = add_query_timeout(&config.database_url, 5);
-    let db_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20) // ADR-0012: Increased from 5 to 20 for production capacity
-        .min_connections(2) // Keep warm connections to reduce latency
-        .acquire_timeout(Duration::from_secs(5)) // Fail fast on connection issues
-        .idle_timeout(Duration::from_secs(600)) // 10 minutes
-        .max_lifetime(Duration::from_secs(1800)) // 30 minutes
-        .connect(&db_url_with_timeout)
-        .await
-        .map_err(|e| {
-            error!("Failed to connect to database: {}", e);
-            e
-        })?;
+    let db_pool =
+        common::db::connect_pool(&config.database_url, &common::db::PoolSettings::default())
+            .await
+            .map_err(|e| {
+                // `e` is already credential-safe: `common::db` redacts sqlx
+                // `Configuration` errors, which can embed password characters.
+                error!("Failed to connect to database: {}", e);
+                e
+            })?;
 
     info!("Database connection established");
 
@@ -243,14 +238,4 @@ async fn shutdown_signal() {
     } else {
         info!("Skipping drain period (AC_DRAIN_SECONDS=0)");
     }
-}
-
-/// Adds statement_timeout to the database URL
-/// This ensures queries don't hang indefinitely
-fn add_query_timeout(url: &str, timeout_secs: u32) -> String {
-    let separator = if url.contains('?') { '&' } else { '?' };
-    format!(
-        "{}{}options=-c%20statement_timeout%3D{}s",
-        url, separator, timeout_secs
-    )
 }

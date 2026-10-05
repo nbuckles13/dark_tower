@@ -73,8 +73,9 @@ there is no warn-ahead window in this round, so renew proactively per the cadenc
 below). Renewing is the **sanctioned** remediation — it is NOT an ad-hoc incident-time
 silencing:
 
-1. **Re-verify the justification.** For RUSTSEC-2023-0071, re-run the build-time-only
-   invariant: `cargo tree -p rsa --invert` — confirm the runtime tree is still empty.
+1. **Re-verify the justification.** Re-run the verify command of record named in the
+   entry's comment in `audit-suppressions.toml` (e.g. a `cargo tree -p <crate> --invert`
+   invariant) and confirm it still holds.
    If the invariant no longer holds, do NOT renew — fix or re-justify with a fresh
    exposure analysis.
 2. **Edit `expires`** in `audit-suppressions.toml` to a new date (default +90 days),

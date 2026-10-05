@@ -122,39 +122,114 @@ assert_rc "indeterminate base-ref -> run(2) fail-closed" 2 "$rc"
 rm -rf "$nogit"
 
 # -----------------------------------------------------------------------------
+# Shared hermetic wrapper repo for Parts 3-4: a throwaway git repo holding
+# lang/rust/audit.sh and every helper it sources, plus a PATH-stubbed cargo that
+# records its argv to <dir>/cargo_was_called. Add any new helper audit.sh sources
+# HERE, once — a missing helper makes the wrapper abort early and look like a result.
+# -----------------------------------------------------------------------------
+make_wrapper_repo() {
+  local dir="$1"
+  (
+    cd "$dir"
+    git init -q; git config user.email t@t; git config user.name t
+    mkdir -p scripts/lang/rust stubbin
+    cp "${REPO_ROOT}/scripts/lang/_common.sh" scripts/lang/_common.sh
+    cp "${REPO_ROOT}/scripts/lang/_changed_helpers.sh" scripts/lang/_changed_helpers.sh
+    cp "${REPO_ROOT}/scripts/lang/_get_base_ref.sh" scripts/lang/_get_base_ref.sh
+    cp "${REPO_ROOT}/scripts/lang/_audit_gate.sh" scripts/lang/_audit_gate.sh
+    cp "${REPO_ROOT}/scripts/lang/_audit_suppressions_lib.sh" scripts/lang/_audit_suppressions_lib.sh
+    cp "${REPO_ROOT}/scripts/lang/rust/audit.sh" scripts/lang/rust/audit.sh
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "%s/cargo_was_called"\n' "$dir" > stubbin/cargo
+    chmod +x stubbin/cargo
+  )
+}
+
+# Run the wrapper hermetically in <dir>; sets WRAP_OUT / WRAP_RC.
+run_wrapper() {
+  local dir="$1"
+  WRAP_OUT="$(cd "$dir" && env -i PATH="${dir}/stubbin:$PATH" HOME="$dir" \
+        bash scripts/lang/rust/audit.sh 2>&1)"; WRAP_RC=$?
+}
+
+# -----------------------------------------------------------------------------
 # Part 3 — WRAPPER-level proof: on a PROVEN no-dep change, lang/rust/audit.sh emits
-# SKIPPED-NO-DIFF AND does NOT invoke the scanner (cargo). Hermetic throwaway git repo
-# + PATH-stubbed cargo that drops a sentinel if called.
+# SKIPPED-NO-DIFF AND does NOT invoke the scanner (cargo).
 # -----------------------------------------------------------------------------
 wrap="$(mktemp -d)"
+make_wrapper_repo "$wrap"
 (
   cd "$wrap"
-  git init -q; git config user.email t@t; git config user.name t
   # Seed a commit, then make a NO-DEP change (a docs file) so the gate proves "no dep".
-  mkdir -p docs scripts/lang/rust
-  cp "${REPO_ROOT}/scripts/lang/_common.sh" scripts/lang/_common.sh
-  cp "${REPO_ROOT}/scripts/lang/_changed_helpers.sh" scripts/lang/_changed_helpers.sh
-  cp "${REPO_ROOT}/scripts/lang/_get_base_ref.sh" scripts/lang/_get_base_ref.sh
-  cp "${REPO_ROOT}/scripts/lang/_audit_gate.sh" scripts/lang/_audit_gate.sh
-  cp "${REPO_ROOT}/scripts/lang/_audit_suppressions_lib.sh" scripts/lang/_audit_suppressions_lib.sh
-  cp "${REPO_ROOT}/scripts/lang/rust/audit.sh" scripts/lang/rust/audit.sh
+  mkdir -p docs
   echo "seed" > docs/seed.md
   git add -A; git commit -qm seed
   echo "change" > docs/changed.md  # untracked no-dep change -> gate should SKIP
-  # PATH-stub cargo: writes a sentinel if invoked (it must NOT be on a skip).
-  mkdir -p stubbin
-  printf '#!/usr/bin/env bash\ntouch "%s/cargo_was_called"\n' "$wrap" > stubbin/cargo
-  chmod +x stubbin/cargo
 )
-out="$(cd "$wrap" && env -i PATH="${wrap}/stubbin:$PATH" HOME="$wrap" \
-        bash scripts/lang/rust/audit.sh 2>&1)"; wrc=$?
-assert_status "wrapper no-dep -> SKIPPED-NO-DIFF" "STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes" "$out"
-assert_rc "wrapper no-dep -> exit 0" 0 "$wrc"
+run_wrapper "$wrap"
+assert_status "wrapper no-dep -> SKIPPED-NO-DIFF" "STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes" "$WRAP_OUT"
+assert_rc "wrapper no-dep -> exit 0" 0 "$WRAP_RC"
 if [[ -f "${wrap}/cargo_was_called" ]]; then
   FAIL=$((FAIL+1)); FAILURES+=("[wrapper no-dep -> scanner NOT invoked] cargo was called on a skip")
 else
   PASS=$((PASS+1))
 fi
 rm -rf "$wrap"
+
+# -----------------------------------------------------------------------------
+# Part 4 — WRAPPER-level proof: on a dep change, lang/rust/audit.sh RUNS the scanner
+# and emits its STATUS whether the generated .cargo/audit.toml ignores something or
+# nothing. Regression: an empty `ignore = []` (zero suppressions, a valid manifest
+# state) made the SUPPRESSED= grep exit 1 and aborted the wrapper under pipefail
+# (wrapper-aborted-early-exit-1). Only grep's no-match (1) is tolerated: an
+# unreadable audit.toml (grep 2) must still abort, never be masked.
+# -----------------------------------------------------------------------------
+# Sets WRAP_OUT / WRAP_RC / WRAP_CALLED for a dep change with the given audit.toml
+# body. Mode `unreadable` adds a PATH-stubbed grep that fails with exit 2 (a read
+# error) for .cargo/audit.toml only and defers to the real grep otherwise, so the
+# failure lands exactly on the SUPPRESSED= line, as any uid (chmod 000 is no barrier
+# to root).
+run_wrapper_on_dep_change() {
+  local ignore_line="$1" mode="${2:-}" dir
+  dir="$(mktemp -d)"
+  make_wrapper_repo "$dir"
+  (
+    cd "$dir"
+    mkdir -p .cargo
+    printf '[advisories]\n%s\n' "$ignore_line" > .cargo/audit.toml
+    echo "seed" > Cargo.lock
+    git add -A; git commit -qm seed
+    echo "bumped" > Cargo.lock  # dep-manifest change -> gate must RUN
+    if [[ "$mode" == "unreadable" ]]; then
+      real_grep="$(command -v grep)"
+      printf '#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == *.cargo/audit.toml ]] && { echo "grep: $a: Permission denied" >&2; exit 2; }; done
+exec %q "$@"
+' "$real_grep" > stubbin/grep
+      chmod +x stubbin/grep
+    fi
+  )
+  run_wrapper "$dir"
+  # 1 only if the scanner itself ran: cargo was invoked with exactly `audit`.
+  WRAP_CALLED=0; [[ "$(cat "${dir}/cargo_was_called" 2>/dev/null)" == "audit" ]] && WRAP_CALLED=1
+  rm -rf "$dir"
+}
+
+run_wrapper_on_dep_change 'ignore = []'
+assert_status "wrapper dep change, empty ignore -> scanner STATUS" "STATUS=OK REASON=cargo-audit-passed" "$WRAP_OUT"
+assert_rc "wrapper dep change, empty ignore -> exit 0" 0 "$WRAP_RC"
+assert_rc "wrapper dep change, empty ignore -> scanner invoked" 1 "$WRAP_CALLED"
+
+# Positive control: a non-empty ignore list is surfaced as SUPPRESSED= and still runs.
+run_wrapper_on_dep_change 'ignore = ["RUSTSEC-2000-0001"]'
+assert_status "wrapper dep change, one ignore -> scanner STATUS" "STATUS=OK REASON=cargo-audit-passed" "$WRAP_OUT"
+assert_status "wrapper dep change, one ignore -> SUPPRESSED surfaced" "SUPPRESSED=RUSTSEC-2000-0001" "$WRAP_OUT"
+assert_rc "wrapper dep change, one ignore -> scanner invoked" 1 "$WRAP_CALLED"
+
+# Fail-loud: an unreadable audit.toml (grep exit 2) aborts the wrapper — it is NOT
+# treated as "no suppressions".
+run_wrapper_on_dep_change 'ignore = []' unreadable
+assert_rc "wrapper dep change, unreadable audit.toml -> nonzero exit" 1 "$(( WRAP_RC != 0 ))"
+assert_rc "wrapper dep change, unreadable audit.toml -> scanner NOT invoked" 0 "$WRAP_CALLED"
+assert_status "wrapper dep change, unreadable audit.toml -> STATUS=FAIL" "STATUS=FAIL" "$WRAP_OUT"
 
 report_results "scripts/lang/_audit_gate.test.sh"

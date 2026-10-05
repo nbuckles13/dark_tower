@@ -45,7 +45,10 @@ fi
 # the manifest. No line is emitted when nothing is configured to suppress.
 __cargo_audit_toml="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/.cargo/audit.toml"
 if [[ -f "$__cargo_audit_toml" ]]; then
-  applied="$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$__cargo_audit_toml" | sort -u | paste -sd, -)"
+  # grep exit 1 (no match) is a valid state: an empty ignore list, i.e. no
+  # suppressions. Any other grep failure (e.g. 2, unreadable file) still aborts
+  # the wrapper under `set -o pipefail` — never mask it.
+  applied="$({ grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$__cargo_audit_toml" || [[ $? -eq 1 ]]; } | sort -u | paste -sd, -)"
   [[ -n "$applied" ]] && echo "SUPPRESSED=${applied}" >&2
 fi
 

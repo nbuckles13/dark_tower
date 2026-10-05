@@ -17,6 +17,10 @@ default = []
 # not pull in test-only dependencies (the metrics facade, the SDK's
 # in-memory exporter for `observability::testing::otel`).
 test-utils = ["dep:metrics", "opentelemetry_sdk/testing"]
+# Shared Postgres connect path (`common::db`): pool construction, statement
+# timeout and credential-safe connect errors. Enabled only by the services
+# that own a database (AC, GC), so MC/MH builds do not compile sqlx.
+db = ["dep:sqlx"]
 
 [dependencies]
 # Workspace dependencies
@@ -61,6 +65,9 @@ reqwest = { workspace = true }
 # Used exclusively by `observability::testing::MetricAssertion`.
 metrics = { workspace = true, optional = true }
 
+# Gated behind the `db` feature. Used exclusively by `db`.
+sqlx = { workspace = true, optional = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 serde_json = { workspace = true }
@@ -77,3 +84,6 @@ opentelemetry_sdk = { workspace = true, features = ["trace", "testing"] }
 # `OtelGuard`'s shutdown flush in `observability::otel::tests`.
 opentelemetry-proto = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
+# For `db`'s own unit + `#[sqlx::test]` tests (module is cfg(test)-visible
+# without needing the `db` feature to be enabled for `cargo test -p common`).
+sqlx = { workspace = true }

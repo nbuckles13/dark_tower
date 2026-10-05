@@ -724,6 +724,7 @@ resources:
 **Symptoms:**
 - Pods stuck in CrashLoopBackOff
 - Logs show: `Failed to connect to database: <error>`
+- Logs show: `Failed to connect to database: invalid database configuration (detail redacted: may contain credential material; check the DATABASE_URL secret)`. The connection settings were rejected client-side, either while parsing the URL (no network I/O) or by the client during SCRAM authentication (Postgres was reached, and its log may show the connection ending during auth). Network policy, DNS and Postgres availability are NOT the cause; see the checklist below.
 - Readiness probe fails
 
 **Causes:**
@@ -731,6 +732,12 @@ resources:
 - Database not accessible (network policy, DNS, credentials)
 - Database not accepting connections (max_connections reached)
 - TLS configuration mismatch (`sslmode` incorrect)
+
+**Redacted "invalid database configuration" checklist** (the error detail is withheld because sqlx can embed password characters in it; check the decoded `DATABASE_URL`):
+- the port is numeric;
+- `sslmode`, if set, is one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`;
+- reserved characters (`@ : / ? # % [ ]`) in the user and password are percent-encoded;
+- the user **and** password contain no characters SASLprep rejects (control characters, private-use or other code points prohibited by RFC 4013; printable ASCII is always accepted). This is the case the redaction exists for.
 
 **Resolution:**
 

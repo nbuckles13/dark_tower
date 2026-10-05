@@ -42,13 +42,11 @@ base64 = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
-# For field hashing (ADR-0011 privacy)
-sha2 = "0.10"
-hmac = "0.12"
 hex = { workspace = true }
 
 # Local dependencies
-common = { path = "../common" }
+# `db`: the shared Postgres connect path (`common::db`); only AC and GC enable it.
+common = { path = "../common", features = ["db"] }
 
 [dev-dependencies]
 # Testing utilities
@@ -58,7 +56,7 @@ anyhow = { workspace = true }
 # Enable common's test-utils feature for MetricAssertion in tests/.
 # Per ADR-0032 Step 4: per-failure-class metric tests live in tests/ and
 # require MetricAssertion's own thread-local recorder, shipped behind this feature.
-common = { path = "../common", features = ["test-utils"] }
+common = { path = "../common", features = ["test-utils", "db"] }
 
 # Test framework
 tokio = { workspace = true, features = ["test-util"] }
