@@ -415,7 +415,6 @@ impl MeetingsRepository {
     ///
     /// `Some((meeting_id, org_id))` if the meeting was activated (was `scheduled`),
     /// `None` if no transition occurred (already `active`/`ended`/`cancelled`).
-    #[allow(dead_code)] // Used by integration tests and future join handler
     #[instrument(skip_all, name = "gc.repo.activate_meeting", fields(meeting_id = %meeting_id))]
     pub async fn activate_meeting(
         pool: &PgPool,

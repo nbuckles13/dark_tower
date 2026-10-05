@@ -47,45 +47,231 @@ else
 fi
 printf 'cargo jobs cap: %s — capped for memory; export CARGO_BUILD_JOBS=N or pass --jobs to override\n' "$__cap" >&2
 
+# --- One result model for every mode -----------------------------------------------------
+# A full run, a fast lane, a CI shard and the CI aggregate all report through the same
+# per-layer arrays (layer_status / layer_dur / layer_rc, indexed by layer number, over the
+# layers in layers_to_run) and the same two functions below, so the parsed LAYER_SUMMARY
+# contract has exactly one emitter. layer_shard is filled only by --aggregate.
+declare -a layers_to_run=() layer_status=() layer_dur=() layer_rc=()
+declare -A layer_shard=()
+
+# Sets total_result (worst status of the layers that ACTUALLY ran) and total_dur. NOT-RUN
+# layers are DISPLAY-ONLY: skipped so they never vote (not a new aggregation enum), so under
+# fail-fast TOTAL_RESULT is the failing layer's status.
+compute_layer_totals() {
+  local n
+  total_dur=0
+  total_result="OK"
+  for n in "${layers_to_run[@]}"; do
+    total_dur=$(( total_dur + ${layer_dur[$n]:-0} ))
+    [[ "${layer_status[$n]:-UNKNOWN}" == "$NOT_RUN" ]] && continue
+    total_result=$(aggregate_worst_status "$total_result" "${layer_status[$n]:-UNKNOWN}")
+  done
+}
+
+# The machine-parseable LAYER_SUMMARY block (paired-operations §5) + the human table. The
+# table gains a Shard column only when --aggregate filled layer_shard.
+print_layer_summary() {
+  local n
+  printf '\n=== LAYER_SUMMARY_BEGIN ===\n'
+  for n in "${layers_to_run[@]}"; do
+    printf 'LAYER=%d RESULT=%s DURATION=%s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}"
+  done
+  printf '=== LAYER_SUMMARY_END ===\n'
+  printf 'TOTAL_DURATION=%s TOTAL_RESULT=%s\n\n' "$total_dur" "$total_result"
+  if (( ${#layer_shard[@]} )); then
+    printf '%-8s %-22s %-12s %s\n' "Layer" "Status" "Duration(s)" "Shard"
+    printf '%-8s %-22s %-12s %s\n' "-----" "------" "-----------" "-----"
+    for n in "${layers_to_run[@]}"; do
+      printf '%-8s %-22s %-12s %s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}" "${layer_shard[$n]:-}"
+    done
+  else
+    printf '%-8s %-22s %s\n' "Layer" "Status" "Duration(s)"
+    printf '%-8s %-22s %s\n' "-----" "------" "-----------"
+    for n in "${layers_to_run[@]}"; do
+      printf '%-8s %-22s %s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}"
+    done
+  fi
+}
+
+# The shard summary's file name: written by `--layers` into DEVLOOP_TMP, read by
+# `--aggregate` from every shard's directory (ci.yml uploads it by this name).
+SHARD_SUMMARY_FILE="layer-summary.txt"
+
+# --- CI aggregate (`--aggregate DIR`) ------------------------------------------------------
+# Reads every `layer-summary.txt` under DIR (one per CI shard, downloaded from THIS workflow
+# run) and decides the pipeline result as if one invocation had run every layer. It is the
+# Gate-2 backstop's completeness proof once CI is sharded, so it is strict:
+#   * each line must match one anchored shape with a KNOWN status (a status
+#     __status_rank ranks below its fail-closed catch-all, or UNKNOWN — the token a layer
+#     with no STATUS line records). The file is never sourced/eval'd;
+#   * every layer 1..LAYER_MAX must appear EXACTLY once across all summaries;
+#   * any violation, or no summary at all, is PRECONDITION_FAILURE (exit 2) with a REASON.
+# Then TOTAL_RESULT = worst status, exit = max(status_to_exit_code(TOTAL), every RC) — the
+# same aggregation and observed-rc FLOOR as a single invocation.
+aggregate_shard_summaries() {
+  local dir="$1" f line n status dur rc shard
+  local -a files=()
+  agg_fail() {
+    printf 'PRECONDITION_FAILURE: --aggregate: %s REASON=aggregate-%s\n' "$2" "$1" >&2
+    printf 'STATUS=PRECONDITION_FAILURE REASON=aggregate-%s\n' "$1"
+    return 2
+  }
+  [[ -d "$dir" && -r "$dir" ]] || { agg_fail dir-unreadable "summary directory ${dir@Q} is missing or unreadable"; return 2; }
+  mapfile -t files < <(find "$dir" -type f -name "$SHARD_SUMMARY_FILE" | sort)
+  (( ${#files[@]} )) || { agg_fail no-summaries "no ${SHARD_SUMMARY_FILE} under ${dir@Q} — no shard reported"; return 2; }
+  for f in "${files[@]}"; do
+    shard="$(basename "$(dirname "$f")")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ ! "$line" =~ ^LAYER=([1-9][0-9]*)\ RESULT=([A-Z/_-]+)\ DURATION=([0-9]+)\ RC=([0-9]+)$ ]]; then
+        agg_fail malformed-line "${f}: unparseable line ${line@Q}"; return 2
+      fi
+      n="${BASH_REMATCH[1]}"; status="${BASH_REMATCH[2]}"; dur="${BASH_REMATCH[3]}"; rc="${BASH_REMATCH[4]}"
+      if [[ "$status" != "UNKNOWN" && "$(__status_rank "$status")" -ge "$(__status_rank UNKNOWN)" ]]; then
+        agg_fail unknown-status "${f}: layer ${n} RESULT=${status} is not a pipeline status"; return 2
+      fi
+      if (( n > LAYER_MAX )); then
+        agg_fail layer-out-of-range "${f}: layer ${n} is outside 1..${LAYER_MAX}"; return 2
+      fi
+      if [[ -n "${layer_status[$n]:-}" ]]; then
+        agg_fail duplicate-layer "layer ${n} reported by both ${layer_shard[$n]} and ${shard}"; return 2
+      fi
+      layer_status[$n]="$status"; layer_dur[$n]="$dur"; layer_rc[$n]="$rc"; layer_shard[$n]="$shard"
+    done < "$f"
+  done
+  local missing=""
+  for n in "${layers_to_run[@]}"; do
+    [[ -n "${layer_status[$n]:-}" ]] || missing="${missing:+${missing},}${n}"
+  done
+  [[ -z "$missing" ]] || { agg_fail missing-layer "layer(s) ${missing} reported by no shard — the CI partition must cover 1..${LAYER_MAX}"; return 2; }
+
+  # Same totals and the same exit rule as one invocation: max(mapped status, every RC).
+  local worst_rc=0 mapped
+  compute_layer_totals
+  for n in "${layers_to_run[@]}"; do
+    (( layer_rc[n] > worst_rc )) && worst_rc=${layer_rc[n]}
+  done
+  mapped=$(status_to_exit_code "$total_result")
+  (( mapped > worst_rc )) && worst_rc=$mapped
+
+  print_layer_summary
+  # Point at the shard job whose log holds the detail (same token family as a local run).
+  for n in "${layers_to_run[@]}"; do
+    if [[ "$(status_to_exit_code "${layer_status[$n]}")" -ne 0 || "${layer_rc[$n]}" -ne 0 ]]; then
+      printf 'FAILURE_TRIAGE LAYER=%d SHARD=%s RC=%s RESULT=%s\n' "$n" "${layer_shard[$n]}" "${layer_rc[$n]}" "${layer_status[$n]}" >&2
+      printf '    open the %s shard job log: its layer-%d detail and FAILURE_TRIAGE line are there.\n' "${layer_shard[$n]}" "$n" >&2
+    fi
+  done
+  return "$worst_rc"
+}
+
 # --- Layer range (developer fast lane) ---------------------------------------
-# Default: the full authority pipeline, layers 1..7. `--max-layer N` runs layers
+# Default: the full authority pipeline, layers 1..LAYER_MAX. `--max-layer N` runs layers
 # 1..N only; it is the mechanism behind scripts/layer-fast.sh — the non-destructive
 # inner-loop check an implementer runs before "Ready for review", which stops
 # BEFORE Layer 7's shared-cluster bring-up (the resource a concurrent run thrashes).
 #
 # Two guardrails keep the fast lane off the authority path:
-#   1. A shortened range is REFUSED in any tree-attesting context (CI, the run-story
+#   1. A shortened `--max-layer` range is REFUSED in any tree-attesting context (CI, the run-story
 #      authority/close gate, pre-commit — the same GITHUB_ACTIONS/DEVLOOP_FMT_CHECK_ONLY
 #      sentinels CARGO_LOCKED gates on). The authority pipeline can never be shortened.
 #   2. A shortened run emits NO Gate-2 verdict (the EXIT trap below is not installed for
 #      it). A missing verdict is fail-closed — a commit still needs a full layer-all.sh —
 #      so a fast run can never be mistaken for an authority PASS.
-# No caller passes positional args today (ci.yml, run-story, verify-completion, pre-commit
-# all invoke bare), so the default path is byte-identical to before.
+# No local caller passes positional args (run-story, verify-completion, pre-commit invoke
+# bare), so the default path is byte-identical to before.
+#
+# --- CI shards (`--layers`) and their aggregate (`--aggregate`) ---------------------------
+# CI splits the pipeline across parallel jobs (.github/workflows/ci.yml): each shard runs
+# `layer-all.sh --layers <list>` FROM SCRATCH, and a final `Test Suite` job runs
+# `layer-all.sh --aggregate <dir>` over the shards' summaries. The aggregate requires
+# every layer 1..LAYER_MAX exactly once, so the union of the shards provably equals this
+# pipeline: a layer dropped from (or duplicated in) the CI partition fails loudly.
+#   * `--layers` is accepted only under GITHUB_ACTIONS (or the hermetic test seam). That is
+#     CONVENIENCE gating, NOT a
+#     security control — the variable is trivially set locally. It is acceptable only
+#     because a `--layers` run never writes, removes or overwrites a Gate-2 verdict (the
+#     EXIT trap below is not installed for it); its output is the shard summary file,
+#     which only the aggregate reads. Local users keep `--max-layer`.
+#   * `--aggregate` runs no layer and writes no verdict; it only reads summary files.
 layer_lo=1
-layer_hi=7
+layer_hi="$LAYER_MAX"
+layers_arg=""
+aggregate_dir=""
+mode="full"
+set_mode() {  # one mode per invocation; --max-layer / --layers / --aggregate are exclusive
+  if [[ "$mode" != "full" && "$mode" != "$1" ]]; then
+    printf 'PRECONDITION_FAILURE: --max-layer, --layers and --aggregate are mutually exclusive.\n' >&2
+    exit 2
+  fi
+  mode="$1"
+}
+need_value() {
+  [[ $# -gt 1 && -n "$2" ]] || { printf 'PRECONDITION_FAILURE: %s needs a value.\n' "$1" >&2; exit 2; }
+}
 while (( $# )); do
   case "$1" in
-    --max-layer) shift; [[ $# -gt 0 ]] || { printf 'PRECONDITION_FAILURE: --max-layer needs a value (1..7).\n' >&2; exit 2; }; layer_hi="$1" ;;
-    --max-layer=*) layer_hi="${1#--max-layer=}" ;;
-    *) printf 'PRECONDITION_FAILURE: unknown argument %q — layer-all.sh accepts only --max-layer N.\n' "$1" >&2; exit 2 ;;
+    --max-layer)   need_value "$@"; set_mode max; shift; layer_hi="$1" ;;
+    --max-layer=*) set_mode max; layer_hi="${1#--max-layer=}" ;;
+    --layers)      need_value "$@"; set_mode shard; shift; layers_arg="$1" ;;
+    --layers=*)    set_mode shard; layers_arg="${1#--layers=}" ;;
+    --aggregate)   need_value "$@"; set_mode aggregate; shift; aggregate_dir="$1" ;;
+    --aggregate=*) set_mode aggregate; aggregate_dir="${1#--aggregate=}" ;;
+    *) printf 'PRECONDITION_FAILURE: unknown argument %q — layer-all.sh accepts only --max-layer N, --layers L,... (CI) or --aggregate DIR.\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
-[[ "$layer_hi" =~ ^[1-7]$ ]] || { printf 'PRECONDITION_FAILURE: --max-layer must be an integer 1..7 (got %q).\n' "$layer_hi" >&2; exit 2; }
-fast_lane=0
-if (( layer_hi < 7 )); then
-  if [[ -n "${GITHUB_ACTIONS:-}" || -n "${DEVLOOP_FMT_CHECK_ONLY:-}" ]]; then
-    printf 'PRECONDITION_FAILURE: --max-layer=%s refused in an attesting context (CI / run-story gate / pre-commit) — the authority pipeline runs all 7 layers. REASON=fast-lane-in-attesting-context\n' "$layer_hi" >&2
-    exit 2
-  fi
-  fast_lane=1
-fi
+is_layer_number() { [[ "$1" =~ ^[1-9][0-9]*$ ]] && (( $1 >= 1 && $1 <= LAYER_MAX )); }
 
-# Per-layer result/duration accumulators — declared BEFORE the EXIT trap installs
-# so emit_gate2_verdict's namerefs always bind to existing (possibly-empty) arrays,
-# even on an early exit that fires before the layer loop populates them.
-declare -a layer_status layer_dur layer_rc
+fast_lane=0
+shard_mode=0
+case "$mode" in
+  full|max)
+    is_layer_number "$layer_hi" || { printf 'PRECONDITION_FAILURE: --max-layer must be an integer 1..%s (got %q).\n' "$LAYER_MAX" "$layer_hi" >&2; exit 2; }
+    for (( n = layer_lo; n <= layer_hi; n++ )); do layers_to_run+=("$n"); done
+    if (( layer_hi < LAYER_MAX )); then
+      if [[ -n "${GITHUB_ACTIONS:-}" || -n "${DEVLOOP_FMT_CHECK_ONLY:-}" ]]; then
+        printf 'PRECONDITION_FAILURE: --max-layer=%s refused in an attesting context (CI / run-story gate / pre-commit) — the authority pipeline runs all %s layers. REASON=fast-lane-in-attesting-context\n' "$layer_hi" "$LAYER_MAX" >&2
+        exit 2
+      fi
+      fast_lane=1
+    fi
+    ;;
+  shard)
+    # GITHUB_ACTIONS, or the hermetic LAYER_SCRIPT_DIR test seam (DEVLOOP_TEST-gated, and
+    # DEVLOOP_TEST can never be set in CI — assert_no_ci_sentinel_leak), so
+    # scripts/layer-all.test.sh can drive shard mode against stub layers.
+    if [[ ( -z "${GITHUB_ACTIONS:-}" && ! ( "${DEVLOOP_TEST:-}" == "1" && -n "${LAYER_SCRIPT_DIR:-}" ) ) || -n "${DEVLOOP_FMT_CHECK_ONLY:-}" ]]; then
+      printf 'PRECONDITION_FAILURE: --layers is the CI shard mode (GITHUB_ACTIONS only, never a run-story gate / pre-commit); locally use --max-layer N or the full pipeline. REASON=shard-outside-ci\n' >&2
+      exit 2
+    fi
+    prev=0
+    IFS=',' read -r -a __shard_list <<< "$layers_arg"
+    for n in "${__shard_list[@]}"; do
+      if ! is_layer_number "$n" || (( n <= prev )); then
+        printf 'PRECONDITION_FAILURE: --layers must be ascending, distinct integers 1..%s, comma-separated (got %q). REASON=shard-layer-list-invalid\n' "$LAYER_MAX" "$layers_arg" >&2
+        exit 2
+      fi
+      layers_to_run+=("$n"); prev=$n
+    done
+    (( ${#layers_to_run[@]} )) || { printf 'PRECONDITION_FAILURE: --layers is empty. REASON=shard-layer-list-invalid\n' >&2; exit 2; }
+    shard_mode=1
+    # CI reads the summary's path from here (the upload step's `path:`), so the file name
+    # and directory live only in this script: emitted up front, before any layer can fail.
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+      printf 'summary-path=%s\n' "${DEVLOOP_TMP}/${SHARD_SUMMARY_FILE}" >> "$GITHUB_OUTPUT"
+    fi
+    ;;
+  aggregate)
+    for (( n = 1; n <= LAYER_MAX; n++ )); do layers_to_run+=("$n"); done
+    ;;
+esac
+layer_hi="${layers_to_run[-1]}"
+
+# The per-layer accumulators (layer_status / layer_dur / layer_rc) are declared at the top
+# ("One result model"), i.e. BEFORE the EXIT trap installs, so emit_gate2_verdict's namerefs
+# always bind to existing (possibly-empty) arrays, even on an early exit that fires before
+# the layer loop populates them.
 final_exit=0
 stopped_early=0   # >0 = the layer at which interactive fail-fast stopped the run (0 = ran all)
 
@@ -98,6 +284,12 @@ stopped_early=0   # >0 = the layer at which interactive fail-fast stopped the ru
 # well-meaning `NOT-RUN → 0` arm would silently reopen the fail-fast GATE2=PASS-forgery vector
 # (a stopped-early run exiting 0 over layers that never ran). Do not "complete the enum".
 readonly NOT_RUN="NOT-RUN"
+
+# --aggregate runs no layer and writes no verdict: dispatch it before the verdict trap.
+if [[ "$mode" == "aggregate" ]]; then
+  aggregate_shard_summaries "$aggregate_dir"
+  exit $?
+fi
 
 # Gate-2 producer: emit the tree-bound verdict as the pipeline's FINAL step via an
 # EXIT trap (task #51; design main.md §Design point 1). Installing it HERE — before
@@ -117,9 +309,10 @@ __gate2_emit_trap() {
   fi
   exit "$__rc"
 }
-# Authority runs only: a fast-lane run (--max-layer < 7) writes no Gate-2 verdict
-# (guardrail 2 above), so its EXIT must not fire the emitter.
-if (( ! fast_lane )); then
+# Authority runs only: a fast-lane run (--max-layer < LAYER_MAX) writes no Gate-2 verdict
+# (guardrail 2 above), and neither does a CI shard (--layers), so neither EXIT may fire
+# the emitter — a shard run must never write, remove or overwrite a verdict file.
+if (( ! fast_lane && ! shard_mode )); then
   trap '__gate2_emit_trap' EXIT
 fi
 
@@ -152,7 +345,7 @@ if [[ -n "$__precondition_ref" ]] && ! git merge-base "${__precondition_ref}" HE
 fi
 
 # Cleanup prior run's logs (paired-operations §4).
-rm -f "${DEVLOOP_TMP}"/layer-*.log "${DEVLOOP_TMP}"/layer-*.stderr.log "${DEVLOOP_TMP}"/changed-files.layer-*
+rm -f "${DEVLOOP_TMP}"/layer-*.log "${DEVLOOP_TMP}"/layer-*.stderr.log "${DEVLOOP_TMP}"/changed-files.layer-* "${DEVLOOP_TMP}/${SHARD_SUMMARY_FILE}"
 
 # layer_status / layer_dur / final_exit are declared at the top (before the EXIT
 # trap install) so the verdict emitter's namerefs always bind.
@@ -193,10 +386,13 @@ if [[ "$ff_source" == "unattended-override-refused" ]]; then
   echo "WARN FAIL_FAST_OVERRIDE_IGNORED REQUESTED=1 MODE=run-all" >&2
 fi
 if (( fast_lane )); then
-  printf 'FAST_LANE=1 LAYERS=%d-%d — developer inner-loop check; NOT an authority Gate-2 run; no verdict emitted. Layer 7 (shared cluster) is the Lead Gate 2.\n' "$layer_lo" "$layer_hi" >&2
+  printf 'FAST_LANE=1 LAYERS=%d-%d — developer inner-loop check; NOT an authority Gate-2 run; no verdict emitted. Layer %d (shared cluster) is the Lead Gate 2.\n' "$layer_lo" "$layer_hi" "$LAYER_MAX" >&2
+fi
+if (( shard_mode )); then
+  printf 'CI_SHARD=1 LAYERS=%s — runs these layers from scratch; no verdict emitted; the Test Suite job aggregates every shard (--aggregate).\n' "$layers_arg" >&2
 fi
 
-for n in $(seq "$layer_lo" "$layer_hi"); do
+for n in "${layers_to_run[@]}"; do
   start=$(date +%s)
   # observability O3: atomic stderr append redirect (no process-sub race with stdout tee).
   # Capture the LAYER's real exit code (PIPESTATUS[0], NOT tee's). set +e/-e around the
@@ -231,7 +427,7 @@ for n in $(seq "$layer_lo" "$layer_hi"); do
   # ~10–15 min envelope (ADR-0033 §4), so a Layer-7 BUDGET_BREACH would false-fire every
   # run and train operators to ignore the token. Layer 7 is also excluded from the 90s
   # guard+audit fast-tier total below (which sums only layers 3 + 6).
-  if [[ $n -ne 7 && $dur -gt $budget_secs_per_layer ]]; then
+  if [[ $n -ne $LAYER_MAX && $dur -gt $budget_secs_per_layer ]]; then
     echo "WARN BUDGET_BREACH LAYER=${n} DURATION=${dur} BUDGET=${budget_secs_per_layer}" >&2
   fi
 
@@ -253,7 +449,8 @@ done
 # line so "layers N+1..7 missing" is never ambiguous with a truncated log.
 if (( stopped_early > 0 )); then
   not_run_list=""
-  for (( n = stopped_early + 1; n <= layer_hi; n++ )); do
+  for n in "${layers_to_run[@]}"; do
+    (( n > stopped_early )) || continue
     layer_status[$n]="$NOT_RUN"
     layer_dur[$n]=0
     not_run_list="${not_run_list:+${not_run_list},}${n}"
@@ -276,28 +473,21 @@ fi
 # silently stops checking (CLAUDE.md "fail loudly; never mask"). Skip it with a loud greppable
 # token (joins the WARN BUDGET_* family) rather than compare against absent data. Keyed off the
 # NOT-RUN status, not layer_dur==0 (a genuinely fast layer 6 can legitimately measure 0s).
-if (( layer_hi >= 6 )) && [[ "${layer_status[3]:-}" != "$NOT_RUN" && "${layer_status[6]:-}" != "$NOT_RUN" ]]; then
+# Only measurable when this invocation includes both layers: a fast lane that stops before
+# 6, or a CI shard without 3 and 6, has nothing to sum (and nothing to warn about).
+__runs_layer() { local x; for x in "${layers_to_run[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+if ! __runs_layer 3 || ! __runs_layer 6; then
+  : # this invocation does not include both fast-tier layers; the budget is not measurable here.
+elif [[ "${layer_status[3]:-}" != "$NOT_RUN" && "${layer_status[6]:-}" != "$NOT_RUN" ]]; then
   guard_audit_dur=$(( ${layer_dur[3]:-0} + ${layer_dur[6]:-0} ))
   if [[ $guard_audit_dur -gt $total_budget_secs ]]; then
     echo "WARN BUDGET_TOTAL_BREACH GUARD_AUDIT_DURATION=${guard_audit_dur} BUDGET=${total_budget_secs}" >&2
   fi
-elif (( layer_hi < 6 )); then
-  : # fast lane stopped before layer 6 — the guard+audit fast-tier budget is not measurable; nothing to warn.
 else
   echo "WARN BUDGET_TOTAL_SKIPPED REASON=layers-not-run LAST_RAN=${stopped_early}" >&2
 fi
 
-# Aggregate total + emit machine-parseable summary block (paired-operations §5).
-# NOT-RUN layers are DISPLAY-ONLY: skipped here so they never vote (not a new aggregation
-# enum). TOTAL_RESULT is therefore the worst of the layers that ACTUALLY ran (through the
-# failing one) = the failing layer's status; final_exit already holds its rc.
-total_dur=0
-total_result="OK"
-for n in $(seq "$layer_lo" "$layer_hi"); do
-  total_dur=$(( total_dur + ${layer_dur[$n]:-0} ))
-  [[ "${layer_status[$n]:-UNKNOWN}" == "$NOT_RUN" ]] && continue
-  total_result=$(aggregate_worst_status "$total_result" "${layer_status[$n]:-UNKNOWN}")
-done
+compute_layer_totals
 
 # Authoritative process exit = max(status_to_exit_code(total_result), worst-observed-rc).
 # The enum mapping (dry-reviewer F1 single source) carries the SEMANTICS — so the operator
@@ -309,19 +499,15 @@ done
 mapped_exit=$(status_to_exit_code "$total_result")
 if (( mapped_exit > final_exit )); then final_exit=$mapped_exit; fi
 
-printf '\n=== LAYER_SUMMARY_BEGIN ===\n'
-for n in $(seq "$layer_lo" "$layer_hi"); do
-  printf 'LAYER=%d RESULT=%s DURATION=%s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}"
-done
-printf '=== LAYER_SUMMARY_END ===\n'
-printf 'TOTAL_DURATION=%s TOTAL_RESULT=%s\n\n' "$total_dur" "$total_result"
+print_layer_summary
 
-# Human-readable table.
-printf '%-8s %-22s %s\n' "Layer" "Status" "Duration(s)"
-printf '%-8s %-22s %s\n' "-----" "------" "-----------"
-for n in $(seq "$layer_lo" "$layer_hi"); do
-  printf '%-8s %-22s %s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}"
-done
+# CI shard: hand this invocation's per-layer results to the Test Suite aggregate
+# (--aggregate). One line per layer this shard ran, in the shape the aggregate parses.
+if (( shard_mode )); then
+  for n in "${layers_to_run[@]}"; do
+    printf 'LAYER=%d RESULT=%s DURATION=%s RC=%s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}" "${layer_rc[$n]:-0}"
+  done > "${DEVLOOP_TMP}/${SHARD_SUMMARY_FILE}"
+fi
 
 # ADR-0037 D8 — point-of-failure log directive (ADD-ONLY, DISPLAY-ONLY). Each failing layer's
 # detail is ALREADY captured (run-guards.sh names the guard + first error lines; each layer's
@@ -346,7 +532,7 @@ done
 # NOT complete the enum" guardrail on the NOT_RUN decl above). OK / N/A / SKIPPED-* map to 0 with
 # rc 0, so they are silently skipped. Works under BOTH modes: fail-fast (un-run layers are NOT-RUN
 # -> skipped; the one red layer gets it) and run-all (every red layer gets one).
-for n in $(seq "$layer_lo" "$layer_hi"); do
+for n in "${layers_to_run[@]}"; do
   st="${layer_status[$n]:-UNKNOWN}"
   [[ "$st" == "$NOT_RUN" ]] && continue
   # ${layer_rc[$n]:-0} defaulted for `set -u`: fail-fast sets layer_status/layer_dur for un-run
@@ -359,7 +545,7 @@ for n in $(seq "$layer_lo" "$layer_hi"); do
     printf 'FAILURE_TRIAGE LAYER=%d LOG=%s STDERR_LOG=%s RESULT=%s\n' \
       "$n" "$triage_log" "$triage_errlog" "$st" >&2
     printf '    read the log(s) to triage; do NOT re-run the layer to capture detail — it is already there.\n' >&2
-    if [[ $n -eq 7 ]]; then
+    if [[ $n -eq $LAYER_MAX ]]; then
       printf '    (layer 7: env-test / browser-e2e sublogs + failure map in docs/runbooks/devloop-validation.md §6.7)\n' >&2
     fi
     # Layer 3: name the exact failed guard(s) from the structured, closed-vocabulary token (a list

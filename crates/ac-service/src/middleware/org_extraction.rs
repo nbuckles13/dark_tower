@@ -18,7 +18,6 @@ use uuid::Uuid;
 ///
 /// Injected into request extensions by the middleware.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Library type - subdomain used for logging/tracing
 pub struct OrgContext {
     /// Organization ID from database
     pub org_id: Uuid,

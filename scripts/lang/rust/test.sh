@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Rust test wrapper.
 #
-# Body migrated verbatim from the original scripts/test.sh:
+# Body migrated from the original scripts/test.sh:
 #   - Detects podman/docker runtime and compose command.
 #   - Brings up the test postgres container if not running.
 #   - Applies pending sqlx migrations.
-#   - Runs `cargo test "$@"` (args flow through).
+#   - Runs the tests in two lanes (args flow through):
+#       cargo-nextest:  `cargo nextest run --profile layer4 … "$@"` — every test
+#                       binary, one process per test, in parallel (.config/nextest.toml);
+#       cargo-doctest:  `cargo test --doc …` — nextest does not run doctests. It gets
+#                       the package-selection subset of "$@" (`--doc` rejects target
+#                       selectors such as `--lib`), never a wider set.
+#     Args nextest rejects (e.g. libtest's `-- --test-threads=1`; nextest spells it
+#     `--test-threads 1`) fail loudly through nextest's own usage error.
 #
-# Wraps the cargo invocation with the ADR-0033 §6 STATUS contract.
+# Wraps each invocation with the ADR-0033 §6 STATUS contract.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -123,6 +130,82 @@ run_migrations() {
   fi
 }
 
+# cargo-nextest must be present and at the ONE pin (infra/cargo-tools.versions). No
+# fallback to `cargo test`: a missing runner is an environment fault, reported as one.
+check_nextest() {
+  local want have
+  # shellcheck source=../../../infra/lib/cargo-tools.sh
+  source "${__rust_test_repo_root}/infra/lib/cargo-tools.sh"
+  want="$(cargo_tool_version "${__rust_test_repo_root}/infra/cargo-tools.versions" cargo-nextest)" || exit 1
+  if ! have="$(cargo nextest --version 2>/dev/null)"; then
+    log_error "cargo-nextest not found — Layer 4 runs the Rust tests with it. The devloop image installs it; rebuild the image: infra/devloop/devloop.sh --rebuild (host). Outside the devloop: cargo install cargo-nextest --locked --version =${want}"
+    emit_status FAIL cargo-nextest-missing
+    exit 1
+  fi
+  have="$(awk 'NR==1 {print $2}' <<< "$have")"
+  if [[ "$have" != "$want" ]]; then
+    log_error "CARGO_NEXTEST_VERSION_MISMATCH: cargo-nextest ${have:-<unknown>} != pinned ${want} (infra/cargo-tools.versions). Rebuild the devloop image: infra/devloop/devloop.sh --rebuild (host). Outside the devloop: cargo install cargo-nextest --locked --version =${want}"
+    emit_status FAIL cargo-nextest-version-mismatch
+    exit 1
+  fi
+}
+
+# The package-selection subset of the caller's args, for the doctest lane: `--doc`
+# cannot be combined with target selectors (`--lib`, `--test x`, …), and test-binary
+# args after `--` belong to nextest. Feature flags are kept (they change what compiles).
+package_selection_args() {
+  local -a out=()
+  while (( $# )); do
+    case "$1" in
+      --) break ;;
+      --workspace|--all|--all-features|--no-default-features) out+=("$1") ;;
+      -p|--package|--exclude|-F|--features) out+=("$1"); [[ $# -ge 2 ]] && { out+=("$2"); shift; } ;;
+      -p?*|--package=*|--exclude=*|--features=*|-F?*) out+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#out[@]} )) && printf '%s\n' "${out[@]}"
+  return 0
+}
+
+# Whether the doctest lane has anything to run: doctests live only in lib targets, and
+# `cargo test --doc` FAILS (exit 101) when every selected package lacks one (e.g.
+# `-p devloop-helper`, a bin-only crate). Decided from the manifest (`cargo metadata`), never
+# from cargo's error wording. No package named (--workspace / bare) means the workspace,
+# which has libs. Returns 0 = some selected package has a lib, 1 = none does.
+selection_has_lib() {
+  local -a pkgs=()
+  while (( $# )); do
+    case "$1" in
+      -p|--package) [[ $# -ge 2 ]] && { pkgs+=("$2"); shift; } ;;
+      -p?*) pkgs+=("${1#-p}") ;;
+      --package=*) pkgs+=("${1#--package=}") ;;
+    esac
+    shift
+  done
+  (( ${#pkgs[@]} )) || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    log_error "jq not found — needed to read the selected packages' targets (cargo metadata) for the doctest lane"
+    emit_status FAIL cargo-doctest-jq-missing
+    exit 1
+  fi
+  local meta p
+  if ! meta="$(cargo metadata --no-deps --format-version 1 "${CARGO_LOCKED[@]}")"; then
+    log_error "cargo metadata failed — cannot tell which selected packages have a lib target"
+    emit_status FAIL cargo-doctest-metadata-failed
+    exit 1
+  fi
+  for p in "${pkgs[@]}"; do
+    # A package spec may carry a version (`name@1.2.3`); match on the name.
+    if jq -e --arg n "${p%%@*}" \
+        '[.packages[] | select(.name == $n) | .targets[] | select(.kind | index("lib"))] | length > 0' \
+        <<< "$meta" >/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 check_external_db() {
   if [[ -z "${DATABASE_URL:-}" ]]; then
     return 1
@@ -151,15 +234,35 @@ main() {
     fi
   fi
 
+  check_nextest
   run_migrations
 
-  log_info "Running: cargo test $*"
   export DATABASE_URL
+  local -a doc_args=()
+  mapfile -t doc_args < <(package_selection_args "$@")
 
-  # Wrap cargo with the STATUS contract via run_and_emit.
-  # --no-fail-fast: every test binary runs even when one fails, so one red run reports every
-  # failure (all test runners, every layer — scripts/layer7.test.sh pins it).
-  run_and_emit "cargo-test" cargo test --no-fail-fast "${CARGO_LOCKED[@]}" "$@"
+  # Each lane is wrapped with the STATUS contract via run_and_emit; both always run.
+  # No fail-fast in either: every test binary runs even when one fails, so one red run
+  # reports every failure (all test runners, every layer — scripts/layer7.test.sh pins it).
+  # nextest's is `fail-fast = false` in the layer4 profile; the doctest lane's is the flag.
+  local -a failed=()
+  log_info "Running: cargo nextest run --profile layer4 $(IFS=' '; printf '%s' "$*")"
+  run_and_emit "cargo-nextest" cargo nextest run --profile layer4 --show-progress none "${CARGO_LOCKED[@]}" "$@" || failed+=(nextest)
+  if selection_has_lib "${doc_args[@]}"; then
+    log_info "Running: cargo test --doc $(IFS=' '; printf '%s' "${doc_args[*]}")"
+    run_and_emit "cargo-doctest" cargo test --doc --no-fail-fast "${CARGO_LOCKED[@]}" "${doc_args[@]}" || failed+=(doctest)
+  else
+    # Explicit, never a silent gap: the selection has no lib target, so it has no doctests.
+    log_info "No doctests: none of the selected packages ($(IFS=' '; printf '%s' "${doc_args[*]}")) has a lib target"
+    emit_status OK cargo-doctest-no-lib-targets
+  fi
+  # The dispatcher reads this wrapper's LAST STATUS line, so a red first lane must not be
+  # followed by a green last line: close with the verdict over both lanes.
+  if (( ${#failed[@]} )); then
+    local IFS=-
+    emit_status FAIL "rust-test-lanes-failed-${failed[*]}"
+    exit 1
+  fi
 }
 
 main "$@"

@@ -134,6 +134,18 @@ updates:
           - "minor"
           - "patch"
 
+  - package-ecosystem: "rust-toolchain"
+    # New stable Rust releases: a PR bumping `channel` in rust-toolchain.toml (the ONE Rust
+    # version; GitHub changelog 2025-08-19 "Dependabot now supports Rust toolchain
+    # updates"). It keeps the exact X.Y.Z shape infra/lib/rust-toolchain.sh requires, and
+    # every image derives its `rust:<v>` from that file, so this is the only file bumped.
+    # Expect a cold Rust cache on that PR (the rustc version is in every cache key). After
+    # merge, hosts run `infra/devloop/devloop.sh --rebuild` (docs/runbooks/devloop-validation.md).
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 1
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

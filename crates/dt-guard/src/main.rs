@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use dt_guard::alert_rules;
 use dt_guard::api_version;
 use dt_guard::application_metrics;
+use dt_guard::bin_lib_single_compile;
 use dt_guard::cite_extract;
 use dt_guard::client_metrics_export;
 use dt_guard::common::status::{emit_fail, reason_token};
@@ -111,6 +112,17 @@ enum Command {
     /// Release-build premise: assert shipped artifacts are built with
     /// debug-assertions off, so ADR-0036 §11's compile-time control is armed.
     ReleaseBuildProfile {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// A crate's bin must not re-declare its lib's modules (`mod x;` in
+    /// `main.rs` for a module `lib.rs` also declares): that compiles the module
+    /// and runs its unit tests twice.
+    BinLibSingleCompile {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -453,6 +465,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::ReleaseBuildProfile { root, explain } => {
             release_build_profile::run(&root, explain)
+        }
+        Command::BinLibSingleCompile { root, explain } => {
+            bin_lib_single_compile::run(&root, explain)
         }
         Command::WorkspaceDeps { root, explain } => workspace_deps::run(&root, explain),
         Command::MediaTelemetryDeny { root, explain } => media_telemetry_deny::run(&root, explain),

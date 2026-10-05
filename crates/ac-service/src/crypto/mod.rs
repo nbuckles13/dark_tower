@@ -273,7 +273,7 @@ pub fn verify_jwt(
     validation.validate_exp = true;
 
     let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|e| {
-        tracing::debug!(target: "crypto", error = %e, "Token verification failed");
+        tracing::debug!(target: "crypto", error = %e, "JWT verification failed");
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 
@@ -398,7 +398,6 @@ pub fn sign_user_jwt(
 /// - Signature (EdDSA/Ed25519)
 /// - Expiration (`exp` claim)
 /// - Issued-at time (`iat` claim) with clock skew tolerance
-#[allow(dead_code)] // Library function - will be used by GC and MC for token validation
 #[instrument(skip_all)]
 pub fn verify_user_jwt(
     token: &str,
@@ -430,7 +429,7 @@ pub fn verify_user_jwt(
     validation.validate_exp = true;
 
     let token_data = decode::<UserClaims>(token, &decoding_key, &validation).map_err(|e| {
-        tracing::debug!(target: "crypto", error = %e, "User token verification failed");
+        tracing::debug!(target: "crypto", error = %e, "User JWT verification failed");
         AcError::InvalidToken("The access token is invalid or expired".to_string())
     })?;
 

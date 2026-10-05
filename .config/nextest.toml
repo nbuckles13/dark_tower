@@ -1,0 +1,30 @@
+# cargo-nextest configuration — the ONE home of Layer 4's Rust test-runner policy.
+#
+# scripts/lang/rust/test.sh always selects `--profile layer4`, so CI and local
+# runs use identical settings. Output is tuned for non-interactive consumers
+# (CI logs, devloop / story-runner captured output). The progress display is
+# not a profile key; test.sh passes `--show-progress none`.
+#
+# The version is pinned in infra/cargo-tools.versions. Every key below was
+# checked against that version.
+
+[profile.layer4]
+# Every test runs even after a failure, so one red run reports all failures
+# (the `--no-fail-fast` contract every test runner in the pipeline keeps).
+fail-fast = false
+# ADR-0028: zero retries. A flaky test must fail, never retry to green.
+retries = 0
+# The slow binaries are DB- and sleep-bound, not CPU-bound: on 4 CPUs (the CI
+# runner) 12 threads measured 337 s -> ~200 s with three consecutive clean runs.
+# One value everywhere, so a local run reproduces CI's concurrency.
+test-threads = 12
+# Name a hung test at 60 s and kill it at 5 minutes (the slowest real test is
+# ~55 s), well inside the CI shard timeout, so the kill names the test instead
+# of the job timing out anonymously.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Print failures and SLOW warnings as they happen, nothing per passing test.
+status-level = "slow"
+final-status-level = "slow"
+# Failing output shown immediately and repeated in the final summary.
+failure-output = "immediate-final"
+success-output = "never"

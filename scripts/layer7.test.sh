@@ -1683,15 +1683,25 @@ fi
 # ONE place pins it for every layer's test runner: a run that stops at the first red hides every
 # later failure, so a fix-and-rerun loop pays one full run PER failure. (layer-all.sh's
 # cross-LAYER interactive fail-fast is a different, intentional mechanism and is not covered.)
-#   - cargo (Rust L4 + L7 env-tests): cargo test STOPS at the first failing test binary by
-#     default, so both invocations must carry --no-fail-fast.
+#   - cargo (Rust L4 doctests + L7 env-tests): cargo test STOPS at the first failing test
+#     binary by default, so both invocations must carry --no-fail-fast.
+#   - cargo-nextest (Rust L4): fail-fast by default too; the ONE home of its policy is the
+#     `layer4` profile in .config/nextest.toml, which must say `fail-fast = false`, and the
+#     L4 invocation must select that profile.
 #   - nx run-many + vitest (TS L4) and Playwright (L7 browser): run everything by default; pin
 #     that no bail / max-failures option is introduced.
 RUST_TEST_SH="${REPO_ROOT}/scripts/lang/rust/test.sh"
 TS_TEST_SH="${REPO_ROOT}/scripts/lang/ts/test.sh"
 PW_CONFIG="${REPO_ROOT}/packages/web-app/playwright.config.ts"
 code_of() { grep -vE '^[[:space:]]*(#|//)' "$1"; }
-assert_status "no-fail-fast-rust-l4" 'cargo test --no-fail-fast' "$(code_of "$RUST_TEST_SH" | grep 'run_and_emit "cargo-test"')"
+NEXTEST_TOML="${REPO_ROOT}/.config/nextest.toml"
+assert_status "no-fail-fast-rust-l4-doctest" 'cargo test --doc --no-fail-fast' "$(code_of "$RUST_TEST_SH" | grep 'run_and_emit "cargo-doctest"')"
+assert_status "no-fail-fast-rust-l4-nextest-profile" 'cargo nextest run --profile layer4' "$(code_of "$RUST_TEST_SH" | grep 'run_and_emit "cargo-nextest"')"
+assert_status "no-fail-fast-nextest-layer4-profile" 'fail-fast = false' "$(code_of "$NEXTEST_TOML" | sed -n '/^\[profile\.layer4\]/,/^\[/p')"
+# ADR-0028 zero-retry: a flaky test must red, never retry to green. Pinned at the one home of
+# the runner policy, and no `--retries` may be added at the call site.
+assert_status "zero-retries-nextest-layer4-profile" 'retries = 0' "$(code_of "$NEXTEST_TOML" | sed -n '/^\[profile\.layer4\]/,/^\[/p')"
+assert_rc "zero-retries-no-cli-override" 0 "$(code_of "$RUST_TEST_SH" | grep -qE -- '--retries|NEXTEST_RETRIES' && echo 1 || echo 0)"
 assert_status "no-fail-fast-env-tests-l7" 'env_test_cmd=(cargo test --no-fail-fast -p env-tests' "$(code_of "$LAYER7")"
 # Non-vacuous: each file actually carries the runner being pinned.
 assert_status "runner-present-ts-l4" 'nx run-many -t test:unit' "$(code_of "$TS_TEST_SH")"

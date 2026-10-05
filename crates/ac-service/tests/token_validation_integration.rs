@@ -9,10 +9,10 @@
 //! # Production-reachable label set is narrow (orphan-style finding)
 //!
 //! Per the plan-stage @observability re-review: the `record_token_validation`
-//! wrapper at `metrics.rs:95` is `#[allow(dead_code)]` with comment
-//! "Will be used in Phase 4 token validation endpoints." Production has
-//! exactly TWO call sites — both `("error", Some("clock_skew"))` from
-//! `crypto/mod.rs:284` (`verify_jwt`) and `:439` (`verify_user_jwt`). The
+//! wrapper in `observability::metrics` is reserved for Phase 4 token validation
+//! endpoints. Production has exactly TWO call sites — both
+//! `("error", Some("clock_skew"))`, from the iat-skew branches of
+//! `crypto::verify_jwt` and `crypto::verify_user_jwt`. The
 //! 4 other label combos shown in the in-src smoke test are forward-looking
 //! reservations.
 //!
@@ -45,11 +45,11 @@ use test_common::jwt_fixtures::{sign_service_token, sign_user_token};
 use test_common::test_state::seed_signing_key;
 
 /// All bounded `error_category` values the wrapper can record (per
-/// `metrics.rs:94` `#[allow(dead_code)]` comment + `crypto/mod.rs` callers).
+/// `record_token_validation` doc + its `crypto::verify_jwt`/`verify_user_jwt` callers).
 /// Used for `assert_delta(0)` adjacency on every reserved-but-unreachable
 /// sibling combo per ADR-0032 §Pattern #3.
 const ALL_ERROR_CATEGORIES: &[&str] = &[
-    "clock_skew",     // production-reachable (crypto/mod.rs:284,439)
+    "clock_skew",     // production-reachable (crypto::verify_jwt / verify_user_jwt)
     "authentication", // reserved for Phase 4
     "authorization",  // reserved for Phase 4
     "cryptographic",  // reserved for Phase 4

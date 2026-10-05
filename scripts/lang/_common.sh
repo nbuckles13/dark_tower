@@ -46,6 +46,12 @@ DEVLOOP_TMP="${DEVLOOP_TMP:-/tmp/devloop}"
 # Args: (none)
 # Outputs: (none)
 # Returns: 0 on success
+# The pipeline's layers are 1..LAYER_MAX; the last one is the cluster layer (env-tests +
+# browser E2E). The ONE home of that range: layer-all.sh validates --max-layer / --layers
+# against it and checks --aggregate completeness against it; layer-fast.sh runs all but
+# the last. A plain assignment (not readonly): several wrappers source this file twice.
+LAYER_MAX=7
+
 init_devloop_tmp() {
   mkdir -p "$DEVLOOP_TMP"
   chmod 700 "$DEVLOOP_TMP"

@@ -134,7 +134,6 @@ pub async fn deactivate(
 }
 
 /// Get all active service credentials by service type
-#[allow(dead_code)] // Library function - will be used in Phase 4 admin endpoints
 pub async fn get_active_by_service_type(
     pool: &PgPool,
     service_type: &str,

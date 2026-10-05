@@ -73,7 +73,6 @@ pub fn hash_for_correlation(value: &str, secret: &[u8]) -> String {
 /// The per-label value cap was raised to 10 in the 2026-04-27 amendment
 /// to preserve operational distinction between failure modes (e.g., `ClockSkew`
 /// vs the broader `Cryptographic` category) when alerting/runbooks differ.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
     /// Authentication failures (invalid credentials, rate limit)
@@ -99,7 +98,6 @@ pub enum ErrorCategory {
 }
 
 impl ErrorCategory {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCategory::Authentication => "authentication",

@@ -36,16 +36,6 @@ pub enum GcError {
     NotFound(String),
 
     /// A resource conflict (409).
-    // No constructor yet — the only variant of this enum without one. Scoped here
-    // rather than the enum-wide `#[allow(dead_code)]` this replaces, which masked
-    // all fifteen. `#[expect]` is unusable: `main.rs` re-declares these modules
-    // privately, so the lint fires for the bin target but not the lib, where the
-    // enum is `pub` and never dead — an `#[expect]` would be unfulfilled in the
-    // lib build and warn there instead.
-    #[allow(
-        dead_code,
-        reason = "Conflict has no constructor; all other variants are live"
-    )]
     #[error("Conflict: {0}")]
     Conflict(String),
 

@@ -1,18 +1,11 @@
-mod config;
-mod crypto;
-mod errors;
-mod handlers;
-mod middleware;
-mod models;
-mod observability;
-mod repositories;
-mod routes;
-mod services;
-
+// Thin binary over the `ac_service` lib: the module tree is compiled (and its unit
+// tests run) once, in the lib. Re-declaring it here with `mod` would compile and test
+// it a second time (dt-guard bin-lib-single-compile).
+use ac_service::config::{self, Config};
+use ac_service::handlers::auth_handler::AppState;
+use ac_service::services::key_management_service;
+use ac_service::{observability, routes};
 use common::secret::ExposeSecret;
-use config::Config;
-use handlers::auth_handler::AppState;
-use services::key_management_service;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,7 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(otel_layer)
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ac_service=debug,tower_http=debug".into()),
+                // The bin's own events (startup, shutdown, drain) carry this crate's
+                // target, `auth_controller`, which differs from the lib's `ac_service`.
+                .unwrap_or_else(|_| {
+                    concat!(
+                        env!("CARGO_CRATE_NAME"),
+                        "=debug,ac_service=debug,tower_http=debug"
+                    )
+                    .into()
+                }),
         )
         .with(tracing_subscriber::fmt::layer().json())
         .init();

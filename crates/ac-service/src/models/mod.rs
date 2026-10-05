@@ -31,17 +31,13 @@ pub struct InternalTokenResponse {
 #[derive(Debug, Clone, FromRow)]
 pub struct ServiceCredential {
     pub credential_id: Uuid,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub client_id: String,
     pub client_secret_hash: String,
     pub service_type: String,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub region: Option<String>,
     pub scopes: Vec<String>,
     pub is_active: bool,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub created_at: DateTime<Utc>,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub updated_at: DateTime<Utc>,
 }
 
@@ -53,44 +49,27 @@ pub struct SigningKey {
     pub private_key_encrypted: Vec<u8>,
     pub encryption_nonce: Vec<u8>,
     pub encryption_tag: Vec<u8>,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub encryption_algorithm: String,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub master_key_version: i32,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub algorithm: String,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub is_active: bool,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub valid_from: DateTime<Utc>,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub valid_until: DateTime<Utc>,
-    #[allow(dead_code)] // Will be used in Phase 4 admin endpoints
     pub created_at: DateTime<Utc>,
 }
 
 /// Auth event model (maps to auth_events table)
 #[derive(Debug, Clone, FromRow)]
 pub struct AuthEvent {
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub event_id: Uuid,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub event_type: String,
-    #[allow(dead_code)] // Will be used in Phase 4 user auth
     pub user_id: Option<Uuid>,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub credential_id: Option<Uuid>,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub success: bool,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub failure_reason: Option<String>,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub ip_address: Option<String>,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub user_agent: Option<String>,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub metadata: Option<serde_json::Value>,
-    #[allow(dead_code)] // Will be used in Phase 4 audit endpoints
     pub created_at: DateTime<Utc>,
 }
 
@@ -202,17 +181,9 @@ macro_rules! string_enum {
 
         impl $name {
             /// Every variant, generated from the same list as the enum.
-            #[allow(
-                dead_code,
-                reason = "generated for every string_enum; not every target uses it"
-            )]
             pub const ALL: &'static [$name] = &[ $( $name::$variant ),+ ];
 
             /// The variant's wire/storage string.
-            #[allow(
-                dead_code,
-                reason = "generated for every string_enum; not every target uses it"
-            )]
             pub fn as_str(&self) -> &'static str {
                 match self {
                     $( $name::$variant => $s ),+
@@ -287,17 +258,7 @@ string_enum! {
         KeyGenerated => "key_generated",
         KeyRotated => "key_rotated",
         KeyExpired => "key_expired",
-        #[allow(
-            dead_code,
-            reason = "allowed by the CHECK; no emitter yet (Phase 4). Dead only in the bin target, which \
-                      compiles modules privately, so #[expect] would be unfulfilled in the lib target"
-        )]
         TokenValidationFailed => "token_validation_failed",
-        #[allow(
-            dead_code,
-            reason = "allowed by the CHECK; no emitter yet (Phase 4). Dead only in the bin target, which \
-                      compiles modules privately, so #[expect] would be unfulfilled in the lib target"
-        )]
         RateLimitExceeded => "rate_limit_exceeded",
         /// Admin narrowed (or was refused narrowing) a credential's scopes.
         ServiceScopesUpdated => "service_scopes_updated",

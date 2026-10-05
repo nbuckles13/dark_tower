@@ -225,7 +225,7 @@
 use crate::common::explain::{print_secret_finding, SecretFinding};
 use crate::common::scope::{assert_scope_live, ScopeFailure, ScopeRoot};
 use crate::common::status::{emit_fail, emit_ok, emit_scope};
-use crate::common::test_code_filter::blank_non_code;
+use crate::common::test_code_filter::blank_file;
 use crate::metric_macros::MACRO_NAME_ALTERNATION;
 use crate::telemetry_macros::{alternation_for, TelemetryGroup, INSTRUMENT_ATTR_ANY_RE};
 use anyhow::{Context, Result};
@@ -763,27 +763,6 @@ fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
         }
     }
     (line, offset.saturating_sub(last_nl) + 1)
-}
-
-/// Blank comments and string bodies across a whole file, preserving byte
-/// offsets so positions computed on the blanked text are valid in the source.
-pub fn blank_file(content: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut in_block = false;
-    for (idx, line) in content.split('\n').enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        let (blanked, still) = blank_non_code(line, in_block);
-        in_block = still;
-        // `blank_non_code` truncates at a line comment; pad back to length so
-        // byte offsets stay aligned with the source.
-        out.push_str(&blanked);
-        for _ in blanked.len()..line.len() {
-            out.push(' ');
-        }
-    }
-    out
 }
 
 /// The pure policy function: findings for one file's content.

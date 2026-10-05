@@ -19,14 +19,50 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Test Suite
+  # The validation pipeline (scripts/layer-all.sh), split across parallel jobs by cargo
+  # graph so one 4-vCPU runner no longer builds dev + test + clippy graphs in series.
+  # Each matrix entry is a SHARD: `layer-all.sh --layers <its layers>`, from scratch. The
+  # partition is written ONLY here (the matrix `layers` values); the `Test Suite` job below
+  # aggregates the shards and fails unless every layer 1..LAYER_MAX ran exactly once, so a
+  # layer dropped from (or duplicated in) this matrix reds the required check.
+  # Local repro of one shard: `./scripts/layerN.sh` per layer, or `./scripts/layer-fast.sh`.
+  # Job map + triage: docs/runbooks/devloop-validation.md §8.7.
+  pipeline:
+    name: Pipeline (${{ matrix.shard }}, layers ${{ matrix.layers }})
     runs-on: ubuntu-latest
-    # Raised from 25: a cold-cache run needs ~29 min (last green on main: 23 min).
-    # The ~10 min target is tracked in docs/TODO.md §Polyglot Pipeline Follow-ups.
-    timeout-minutes: 40
+    # Per shard, from measurement rather than a guess: the projected CI cold duration
+    # (4-CPU local emulation x the ~1.4 local->CI factor, plus setup; docs/devloop-outputs/
+    # 2026-10-05-ci-test-suite-speed/main.md §CI Timings) x 2, rounded up to 5 min.
+    # A test that hangs is killed by nextest at 5 min (.config/nextest.toml), well inside.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      # Every shard reports even when another is red: the aggregate needs all summaries.
+      fail-fast: false
+      matrix:
+        # Tools are keyed off explicit per-shard flags, never off `layers` contents. A
+        # layer moved without its flag fails loudly (tool-not-found), never silently.
+        include:
+          # L3's guards consume the release dt-guard/dt-story that L1's
+          # scripts/lang/rust/compile.sh builds, so 1 and 3 share a job.
+          - shard: guards
+            layers: "1,2,3,6,7"
+            timeout_minutes: 20  # projected cold ~9 min
+            needs_nightly: true
+            needs_kubectl: true
+            needs_audit: true
+          - shard: test
+            layers: "4"
+            timeout_minutes: 25  # projected cold ~11 min
+            needs_db: true
+            needs_nextest: true
+            needs_playwright: true
+          - shard: lint
+            layers: "5"
+            timeout_minutes: 10  # projected cold ~3 min
 
     services:
+      # Only the test shard uses it; GitHub cannot make `services:` conditional per matrix
+      # entry, and it costs ~20 s of parallel container start.
       postgres:
         image: postgres:16
         env:
@@ -46,6 +82,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Every shard runs layer-all.sh, whose merge-base precondition needs full history.
           fetch-depth: 0
 
       - name: Install system dependencies
@@ -64,12 +101,23 @@ jobs:
           rustup show active-toolchain
 
       - name: Install Rust nightly (for guards)
+        if: matrix.needs_nightly
         run: rustup toolchain install nightly
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: "ci-cache"
+          # One key per shard: parallel jobs saving one key would race (last writer wins).
+          shared-key: "ci-pipeline-${{ matrix.shard }}"
+          # Save even when the run is red, so the next push to a failing PR starts warm
+          # (default is success-only, so a red branch never warmed the cache). SAFE ONLY
+          # WHILE no workflow uses `pull_request_target` or `workflow_run`: a
+          # `pull_request` run's cache is scoped to that PR's ref, and main never reads it;
+          # PRs read main's (base-branch) cache.
+          cache-on-failure: true
+          # ~/.cargo/bin is not cached here: the pinned tools below are installed (or
+          # cache-restored by version) explicitly, so a stale binary cannot ride along.
+          cache-bin: false
 
       - name: Install pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -85,37 +133,70 @@ jobs:
       - name: Install pnpm dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Read tool pins
+        # The ONE pin for CI and the devloop image: infra/cargo-tools.versions, through
+        # its one reader. sqlx-cli is pinned to Cargo.lock's `sqlx` by its own reader.
+        # Assign first, then write: a failing `$(…)` inside echo's arguments does NOT trip
+        # `bash -e`, so `echo "x=$(reader)"` would write `x=` and pass an empty version on.
+        id: pins
+        run: |
+          source infra/lib/cargo-tools.sh
+          source infra/lib/cargo-lock-version.sh
+          audit="$(cargo_tool_version infra/cargo-tools.versions cargo-audit)"
+          nextest="$(cargo_tool_version infra/cargo-tools.versions cargo-nextest)"
+          sqlx="$(cargo_lock_version Cargo.lock sqlx)"
+          rustc_full="$(rustc --version)"
+          rustc_v="${rustc_full#rustc }"; rustc_v="${rustc_v%% *}"
+          [ -n "$rustc_v" ] || { echo "::error::could not read the rustc version from '${rustc_full}'"; exit 1; }
+          {
+            echo "cargo-audit=${audit}"
+            echo "cargo-nextest=${nextest}"
+            echo "sqlx=${sqlx}"
+            echo "rustc=${rustc_v}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Install cargo-audit
+        if: matrix.needs_audit
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-audit
+          tool: cargo-audit@${{ steps.pins.outputs.cargo-audit }}
+
+      - name: Install cargo-nextest
+        # Layer 4's test runner (scripts/lang/rust/test.sh checks the version against the pin).
+        if: matrix.needs_nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest@${{ steps.pins.outputs.cargo-nextest }}
+
+      - name: Cache sqlx-cli
+        # Compiling sqlx-cli costs ~50 s per run. The key carries the exact version and
+        # rustc, and scripts/lang/rust/test.sh still checks the CLI against Cargo.lock, so
+        # a stale binary fails loudly rather than migrating with the wrong shape.
+        # Same scoping premise as the rust-cache step: no pull_request_target/workflow_run.
+        if: matrix.needs_db
+        id: sqlx-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/bin/cargo-sqlx
+          key: sqlx-cli-${{ runner.os }}-rustc-${{ steps.pins.outputs.rustc }}-${{ steps.pins.outputs.sqlx }}
 
       - name: Install sqlx-cli
         # scripts/lang/rust/test.sh migrates the test DB with sqlx-cli and refuses
         # to run without it, or with a CLI that differs from Cargo.lock's `sqlx`.
-        # The version comes from the one Cargo.lock reader, as for the devloop
-        # and db-migrate images.
-        run: |
-          source infra/lib/cargo-lock-version.sh
-          v="$(cargo_lock_version Cargo.lock sqlx)"
-          cargo install sqlx-cli --locked --no-default-features --features postgres --version "=${v}"
+        if: matrix.needs_db && steps.sqlx-cache.outputs.cache-hit != 'true'
+        env:
+          SQLX_VERSION: ${{ steps.pins.outputs.sqlx }}
+        run: cargo install sqlx-cli --locked --no-default-features --features postgres --version "=${SQLX_VERSION}"
 
       # buf is provided by `pnpm exec buf` (@bufbuild/buf, lockfile-pinned) after `pnpm install`
-      # (ADR-0037 §D7 COLLAPSE) — no separate buf-setup-action install. `pnpm install` runs before
-      # `layer-all.sh` below, so the proto wrappers' `pnpm exec buf` resolves.
-      - name: Build guard binaries
-        # Layer 3 guards are always-run and consume target/release/dt-guard and
-        # dt-story. Those binaries are produced by scripts/lang/rust/compile.sh,
-        # which — since the skip-if-untouched short-circuit was retired 2026-08-20
-        # (ADR-0033 §3) — now ALWAYS runs, on every diff including packages/**-only
-        # and docs-only ones. So the old producer/consumer skew (binaries absent on
-        # a non-Rust diff) can no longer occur; this step is now BELT-AND-BRACES:
-        # compile.sh's verb is `cargo build`/`cargo check` and this explicit release
-        # build guarantees target/release presence for the guards regardless. It is
-        # a second build site for the same two binaries (a knowingly-accepted SSoT
-        # cost, no longer a correctness requirement — see docs/TODO.md §Polyglot).
-        # Mirrors ci-client.yml's equivalent step.
-        run: cargo build --release -p dt-guard -p dt-story --locked
+      # (ADR-0037 §D7 COLLAPSE) — no separate buf-setup-action install.
+      #
+      # No separate dt-guard/dt-story build here: Layer 3's guards consume
+      # target/release/{dt-guard,dt-story}, which scripts/lang/rust/compile.sh (Layer 1,
+      # always-run) builds earlier in this same shard. A missing binary still fails Layer 3
+      # loudly (scripts/guards/simple/_dt_guard_wrapper.sh), never skips.
 
       - name: Assert kubectl is present (kustomize R-21 renders the environment root)
         # `dt-guard kustomize` R-21 (ADR-0038 content-addressed ConfigMaps) FAILS
@@ -125,6 +206,7 @@ jobs:
         # image change surfaces here and not as a confusing guard failure. The
         # devloop image pins kubectl in infra/devloop/Dockerfile (KUBECTL_VERSION).
         # See docs/TODO.md "validate-kustomize maps 'I did not check this'...".
+        if: matrix.needs_kubectl
         run: kubectl version --client && kubectl kustomize --help >/dev/null
 
       - name: Install Playwright Chromium
@@ -134,25 +216,87 @@ jobs:
         # provision it too or Layer 4 fails "Executable doesn't exist …
         # chromium_headless_shell". `playwright` is a package-level dep, so resolve
         # via the workspace package (not `npx` at root).
+        if: matrix.needs_playwright
         run: pnpm --filter @darktower/web-app exec playwright install --with-deps chromium
 
-      # Single end-to-end pipeline call — same router as local devloop's
-      # scripts/verify-completion.sh --layer full (ADR-0033 §4). Local repro
-      # of an audit failure: `./scripts/layer6.sh`.
+      # Same router as local devloop's scripts/verify-completion.sh --layer full
+      # (ADR-0033 §4), one shard of it. Local repro of an audit failure: `./scripts/layer6.sh`.
       #
-      # Gate-2 forgery backstop (task #51): this runs layer-all.sh FROM SCRATCH
-      # and deliberately does NOT read the local /tmp/devloop/gate2-verdict
-      # artifact. The verdict is an anti-drift convenience for the local
-      # pre-commit hook (which an agent could forge or bypass with --no-verify);
-      # CI's independent re-run is the only non-bypassable enforcement. Do NOT
-      # "optimize" by trusting the committed/uploaded verdict — that would
-      # reintroduce the authority skip-vector. See docs/runbooks/devloop-validation.md.
-      - name: Run polyglot validation pipeline
+      # Gate-2 forgery backstop (task #51): each shard runs its layers of layer-all.sh FROM
+      # SCRATCH and deliberately does NOT read the local /tmp/devloop/gate2-verdict
+      # artifact (a `--layers` run never writes one either). The verdict is an anti-drift
+      # convenience for the local pre-commit hook (which an agent could forge or bypass
+      # with --no-verify); CI's independent re-run — these shards, proven complete by the
+      # `Test Suite` aggregate — is the only non-bypassable enforcement. Do NOT "optimize"
+      # by trusting the committed/uploaded verdict — that would reintroduce the authority
+      # skip-vector. See docs/runbooks/devloop-validation.md.
+      - name: Run pipeline shard
+        # Also emits `summary-path` (where it writes the shard summary) for the upload below.
+        id: shard
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dark_tower_test
           AC_MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
           AC_BIND_ADDRESS: 127.0.0.1:8082
-        run: ./scripts/layer-all.sh
+          SHARD_LAYERS: ${{ matrix.layers }}
+        run: ./scripts/layer-all.sh --layers "${SHARD_LAYERS}"
+
+      - name: Upload shard summary
+        # Always: a red shard's summary must still reach the aggregate, so `Test Suite`
+        # reports the real FAIL instead of a generic missing-layer PRECONDITION.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: layer-summary-${{ matrix.shard }}
+          # The path layer-all.sh reported (its own directory + file name): never restated here.
+          path: ${{ steps.shard.outputs.summary-path }}
+          if-no-files-found: error
+          retention-days: 5
+
+  test:
+    # The required check. Its name is the branch-protection context, so it keeps the
+    # pre-split job's name: renaming it would silently drop the requirement.
+    name: Test Suite
+    needs: pipeline
+    # Always runs, so a skipped/cancelled/failed shard still produces a red `Test Suite`
+    # (a skipped required check would otherwise read as passing).
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every shard to have succeeded
+        # FIRST, before reading anything: success is the only acceptable matrix result
+        # (skipped / cancelled / failure all red this job). The steps below still run
+        # (`if: always()`) so a red run also prints which layer failed, but they can only
+        # add a failure, never clear this one.
+        env:
+          SHARDS_RESULT: ${{ needs.pipeline.result }}
+        run: |
+          if [ "${SHARDS_RESULT}" != "success" ]; then
+            echo "::error::pipeline shards result is '${SHARDS_RESULT}', not success — open the red 'Pipeline (...)' job (the aggregate below names the failing layer when its summary was uploaded)"
+            exit 1
+          fi
+
+      - name: Checkout code
+        if: always()
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download shard summaries
+        # This workflow run's artifacts only (no run-id / github-token): the aggregate
+        # reads what these shards just produced, never a verdict or another run's output.
+        if: always()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: layer-summary-*
+          path: shard-summaries
+
+      - name: Aggregate the pipeline
+        # Every layer 1..LAYER_MAX exactly once across the shards (strictly parsed), worst
+        # status + observed-rc floor — the same result one full layer-all.sh would give.
+        # See the Gate-2 backstop note on the "Run pipeline shard" step above.
+        if: always()
+        run: ./scripts/layer-all.sh --aggregate shard-summaries
 
   coverage:
     name: Code Coverage
@@ -206,11 +350,25 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: "coverage-cache"
+          # Save on red runs too. SAFE ONLY WHILE no workflow uses `pull_request_target` or
+          # `workflow_run`: a `pull_request` run's cache is scoped to that PR's ref, and
+          # main never reads it (see the pipeline job's cache step).
+          cache-on-failure: true
+
+      - name: Read tool pins
+        # The ONE pin for CI and the devloop image (infra/cargo-tools.versions). The
+        # comments below assert cargo-llvm-cov 0.8.x behaviour; the pin keeps that true.
+        # Assign first, then write (a failing `$(…)` inside echo's arguments does not trip `bash -e`).
+        id: pins
+        run: |
+          source infra/lib/cargo-tools.sh
+          v="$(cargo_tool_version infra/cargo-tools.versions cargo-llvm-cov)"
+          echo "cargo-llvm-cov=${v}" >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@${{ steps.pins.outputs.cargo-llvm-cov }}
 
       - name: Run tests with coverage
         env:

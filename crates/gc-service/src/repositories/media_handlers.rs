@@ -9,10 +9,6 @@
 //! - Sensitive data is not logged
 //! - Uses UPSERT pattern for registration
 
-// Allow dead code during incremental development - these types are used in tests
-// and will be wired into handlers in future phases.
-#![allow(dead_code)]
-
 use crate::errors::GcError;
 use crate::observability::metrics;
 use crate::repositories::HealthStatus;
@@ -339,7 +335,6 @@ impl MediaHandlersRepository {
     /// # Returns
     ///
     /// Returns `Some(MediaHandler)` if found, `None` otherwise.
-    #[allow(dead_code)] // Will be used in future phases
     #[instrument(skip_all, fields(handler_id = %handler_id))]
     pub async fn get_handler(
         pool: &PgPool,
@@ -409,7 +404,6 @@ struct MhCandidateRow {
 }
 
 #[derive(sqlx::FromRow)]
-#[allow(dead_code)]
 struct MediaHandlerRow {
     handler_id: String,
     region: String,

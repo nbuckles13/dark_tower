@@ -50,7 +50,12 @@ jobs:
           shared-key: "fuzz-nightly-${{ matrix.fuzz_target.crate }}"
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        # Pinned and --locked from the ONE tool pin (infra/cargo-tools.versions): unpinned,
+        # `cargo install` floats to the newest release and its newest dependencies.
+        run: |
+          source infra/lib/cargo-tools.sh
+          v="$(cargo_tool_version infra/cargo-tools.versions cargo-fuzz)"
+          cargo install cargo-fuzz --locked --version "=${v}"
 
       - name: Run extended fuzz test
         working-directory: crates/${{ matrix.fuzz_target.crate }}

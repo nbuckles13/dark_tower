@@ -91,12 +91,19 @@ jobs:
           # Isolated cache key: only caches dt-guard, not the full workspace
           # build used by ci.yml. Keeps cache sizes predictable.
           shared-key: "ci-client-dt-guard"
+          # Save on red runs too. SAFE ONLY WHILE no workflow uses `pull_request_target` or
+          # `workflow_run`: a `pull_request` run's cache is scoped to that PR's ref, and
+          # main never reads it.
+          cache-on-failure: true
 
       - name: Build dt-guard binary
         # Guards scripts/guards/simple/ts/*.sh delegate to this binary
         # (ADR-0034). The wrapper _dt_guard_wrapper.sh exits 1 with
         # STATUS=FAIL REASON=dt-guard-binary-missing if the binary is absent
         # or non-executable — no separate existence check needed (S2).
+        # Not a duplicate build site: this job runs guards directly, with no Layer 1
+        # (scripts/lang/rust/compile.sh, the pipeline's producer), so this is its only
+        # producer. ci.yml no longer has one (its guards shard runs Layer 1 first).
         run: cargo build --release -p dt-guard --quiet
 
       - name: Install pnpm
