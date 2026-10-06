@@ -92,6 +92,10 @@ fi
 # main.md at Phase=complete WITH validated files staged), require a fresh,
 # tree-matching, PASSing pipeline verdict produced by scripts/layer-all.sh — so a
 # pipeline run cannot be asserted in lieu of actually running (skip-vector C).
+# And a commit that stages a devloop main.md NOT at Phase=complete together with
+# validated files is refused outright (2026-10-06), so leaving Phase unset can't skip
+# the verdict — set Phase to `complete` (devloop SKILL.md Step 8), or commit an older
+# record's edit separately from code.
 #
 # All logic lives in the shared library function gate2_validate_commit (single
 # source with the producer, so the binding can't diverge). It is FAIL-CLOSED: any

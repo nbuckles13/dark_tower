@@ -223,6 +223,8 @@ Create `main.md` (see `docs/devloop-outputs/_template/main.md` for the full temp
 - **Phase**: `setup`
 - **Mode**: panel mode — `full` (Gate-1 present) or `light` (`--light`, 3-teammate panel). **Distinct from the `Tier` row**, which is the Gate-1 planning-round tier; a run-story task is always full panel mode with `Tier` as its only Gate-1 lever. When `Tier` is `light`, note it on the Mode line too (`full panel; Gate-1 SKIPPED — <tier_reason>`) so a reader sees the gate shape at a glance.
 
+From here until Step 8 sets Phase to `complete`, the pre-commit hook **refuses any commit that stages this main.md together with validated files** (`docs/runbooks/devloop-validation.md` §8.5 "Phase not complete"). If you must commit pending work before starting (Pre-Work), stage it by path — never `git add -A`, which would sweep in this `setup`-phase main.md.
+
 **The `Tier` row is PROVENANCE, not a copy of the manifest.** It records *what this attempt did* (Gate 1 run, or skipped under tier=light) — a historical fact of a decision already taken. It is NOT a cache of the dt-story manifest's `tier` field (which is the SSoT for *what tier a task is* and is human-editable). This is the same different-provenance-different-rule split as the `commit`-vs-`slug` provenance note on `Task::slug` in `crates/dt-story/src/manifest.rs` — do not "reconcile" the two by having a resumed devloop re-read the manifest (see Step 5 / Continue Mode: resume reads THIS row, not the manifest).
 
 For security-critical implementations, the implementer should maintain a "Security Decisions" table in main.md:
@@ -489,7 +491,7 @@ The **only** remaining `SKIPPED-NO-DIFF` producer is the Layer-6 audit dep-manif
 
 A wrapper script under `scripts/lang/<X>/` may report `STATUS=N/A` (incl. an **intentional-gap** placeholder wrapper emitting `REASON=not-applicable-to-this-lang`, e.g. proto's deliberately-absent test/audit phases registered as `proto/test.sh` / `proto/audit.sh`), `SKIPPED-NO-DIFF`, or `SKIPPED-NO-VERB` (`all-langs-filtered`, operator intent) per the wrapper contract in ADR-0033 §6. `scripts/layer-all.sh` records the status + `REASON=…` in its summary table; the implementer does **not** owe Gate 2 a separate explanation in *those* cases — the wrapper's own `REASON=…` is the justification. This self-justifying set does NOT include `FAIL-MISSING-VERB` (REASON `<lang>-<verb>-verb-missing-or-not-executable`): per task #52 a verb wrapper that should exist but is missing/non-executable reds the layer (exit 2) and IS a Gate 2 failure the implementer must act on — restore the wrapper (or register an intentional-gap placeholder emitting `N/A`), do not rationalize it as a deliberate skip. It ALSO does NOT include `RESULT=NOT-RUN` (2026-08-21): under interactive fail-fast, layers AFTER the first failing one render `NOT-RUN` in the summary — that means "never evaluated", NOT a clean skip. Do not rationalize a `NOT-RUN` layer at Gate 2 the way a `SKIPPED-NO-DIFF` can be justified; the verdict is the FAILING layer that stopped the run, and the `NOT-RUN` layers are simply unmeasured (re-run with `DEVLOOP_FAIL_FAST=0` to evaluate them all).
 
-The cases requiring implementer action are an unexpected `STATUS=N/A` outside the documented gap/placeholder cases, OR a `FAIL-MISSING-VERB` — both indicate a wrapper/wiring bug. Escalate to operations rather than defer.
+The cases requiring implementer action are an unexpected `STATUS=N/A` outside the documented gap/placeholder cases, OR a `FAIL-MISSING-VERB` (including `no-languages-registered`, an empty lang root) — both indicate a wrapper/wiring bug. Escalate to operations rather than defer. Since `N/A` ranks below `OK` (ADR-0033 2026-10-06 amendment), an unexpected `N/A` beside a passing sibling shows only in the child `STATUS=` lines, not in the layer `RESULT`; the property that catches it is the N/A emitter allow-list in `scripts/lang/_dispatch.test.sh` (Layer 3 reds on any `N/A` emitter other than the two proto placeholders). A green run reports `TOTAL_RESULT=OK`; a top-line `TOTAL_RESULT=N/A` means no layer did real work.
 
 **ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
 
@@ -538,8 +540,7 @@ Layer 7 is the seventh shell-layer in `scripts/layer-all.sh`, executed automatic
 
 ### Step 8: Commit
 
-After Gate 2 passes, update main.md: Phase = complete, then stage and commit:
-
+0. **Set main.md's Loop State Phase to `complete` BEFORE staging.** The pre-commit hook refuses a commit that stages this main.md at any other Phase together with code (`docs/runbooks/devloop-validation.md` §8.5 "Phase not complete"); at `complete` it requires the Gate-2 verdict from Step 7.5. Leaving Phase at `setup` is not a way past the gate — it is a refusal.
 1. `git add -A`
 2. **Commit-intent checkpoint (headless only).** This is written after
    Gate 2 passes, i.e. AFTER the reviewer verdicts (and any `Approved-Cross-Boundary:`

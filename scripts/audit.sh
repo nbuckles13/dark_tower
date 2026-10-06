@@ -13,7 +13,7 @@ source "$(dirname "$0")/lang/_dispatch.sh"
 # Audit dispatch. Stream STATUS lines straight to stdout so the layer's
 # `audit.sh 2>&1 | tee_collect_statuses` (layer6.sh) collects them. A deleted
 # or chmod-stripped `<lang>/audit.sh` now natively reds the layer: the dispatcher emits
-# FAIL-MISSING-VERB (rank 5), which beats a sibling's OK in aggregate_worst_status → the
+# FAIL-MISSING-VERB, which outranks a sibling's OK (_common.sh::__status_rank) in aggregate_worst_status → the
 # layer aggregate is FAIL-MISSING-VERB → exit 2. No post-processing/tee/grep needed
 # (task #52 retired #50's audit-slice workaround — the ladder closes the masking).
 #

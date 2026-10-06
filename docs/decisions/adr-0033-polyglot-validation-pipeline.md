@@ -172,7 +172,7 @@ Applied to the former hard cases:
 
 #### Amendment (task #47, 2026-06-06) — audit scan reclassified to dep-change-gated
 
-`cargo audit` / `pnpm audit` are reclassified from unconditional always-run to **dep-change-gated**. When no dependency manifest (`Cargo.toml`/`Cargo.lock`; `package.json`/`pnpm-lock.yaml`/`pnpm-workspace.yaml`) is in the changed-file set, the per-language `audit.sh` wrapper emits `STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes` (exit 0, non-dominating — **not** N/A, which ranks above OK in `aggregate_worst_status` and would mask a passing layer) instead of scanning. This **reverses** the previously-rejected Alternatives-Considered entry *"Per-toolchain Always-Run audit only on lockfile touch — Rejected"* below.
+`cargo audit` / `pnpm audit` are reclassified from unconditional always-run to **dep-change-gated**. When no dependency manifest (`Cargo.toml`/`Cargo.lock`; `package.json`/`pnpm-lock.yaml`/`pnpm-workspace.yaml`) is in the changed-file set, the per-language `audit.sh` wrapper emits `STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes` (exit 0, non-dominating — **not** N/A, which at the time ranked above OK in `aggregate_worst_status` and would have masked a passing layer; since the 2026-10-06 amendment (§6) N/A ranks below OK too, and stays reserved for intentional-gap placeholders) instead of scanning. This **reverses** the previously-rejected Alternatives-Considered entry *"Per-toolchain Always-Run audit only on lockfile touch — Rejected"* below.
 
 **Why the original rejection no longer blocks this — compensating controls that did NOT exist when this ADR was authored.** The "audit only on lockfile touch" alternative was rejected because, at authoring time, there was *no other mechanism* catching transitive vulns that surface without a current-branch lockfile diff (the minimatch class: advisories land via Dependabot / sibling merges to `main`). Gating the scan then would have left that vector uncovered. Task #47 ADDS the missing mechanisms, which is what makes the reversal legitimate rather than a regression:
 1. **Any dep-bump PR carries a lockfile diff** → it runs the full scan (the gate fires true). Task #47 also adds `.github/dependabot.yml` (cargo + npm/pnpm, weekly), so bump PRs are now partly automated. Suppression stays manifest-only (Dependabot is for bump PRs, never a suppression channel — see §11).
@@ -197,7 +197,7 @@ All pipeline orchestration lives in shell scripts. `SKILL.md` Step 6 collapses t
 - Sources `scripts/lang/_common.sh` for cache paths and shared state
 - Calls per-verb dispatchers (`scripts/{audit,lint,test,fmt,build}.sh`) or directly invokes per-language wrappers
 - Streams every child wrapper's `STATUS=` line verbatim to stdout
-- Computes its own `STATUS=` as the **worst child STATUS** (FAIL > N/A > SKIPPED-NO-DIFF > OK) and emits as the final stdout line
+- Computes its own `STATUS=` as the **worst child STATUS** per the one ladder, `scripts/lang/_common.sh::__status_rank` (`UNKNOWN > FAIL-MISSING-VERB > PRECONDITION_FAILURE > FAIL > OK > N/A > SKIPPED-NO-CLUSTER > SKIPPED-NO-DIFF > SKIPPED-NO-VERB`, with an unknown token ranked at the top — fail-closed), and emits it as the final stdout line
 - Emits one summary line to **stderr**: `LAYER=N START=<unix-ts> END=<unix-ts> RESULT=<enum>`
 
 **`scripts/layer-all.sh`** is the recommended entry point for full validation:
@@ -233,9 +233,9 @@ Every per-language wrapper (`lang/<X>/<verb>.sh`) honors a uniform exit-and-outp
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB (all-langs-filtered, operator intent) / `SKIPPED-NO-CLUSTER` (Layer 7 CI no-cluster skip — task #56) / N/A-with-reason (success; incl. intentional-gap placeholders) |
+| 0         | OK / SKIPPED-NO-DIFF / SKIPPED-NO-VERB (all-langs-filtered, operator intent) / `SKIPPED-NO-CLUSTER` (Layer 7 CI no-cluster skip — task #56) / N/A-with-reason (success; intentional-gap placeholders ONLY — ranks below OK since 2026-10-06) |
 | 1         | FAIL (the work ran and detected a problem) |
-| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) — incl. `FAIL-MISSING-VERB` for a verb wrapper that should exist but is missing/non-executable, `UNKNOWN` (see 2026-06-19 amendment), and `PRECONDITION_FAILURE` (Layer 7 operator lane — environment / cluster bring-up failure; task #56) |
+| 2         | Wrapper / dispatcher bug (unexpected error; investigate the script itself) — incl. `FAIL-MISSING-VERB` for a verb wrapper that should exist but is missing/non-executable (and, since 2026-10-06, `REASON=no-languages-registered` for an empty/misdirected lang root), `UNKNOWN` (see 2026-06-19 amendment), and `PRECONDITION_FAILURE` (Layer 7 operator lane — environment / cluster bring-up failure; task #56) |
 
 Final stdout line: `STATUS=<OK|FAIL|FAIL-MISSING-VERB|PRECONDITION_FAILURE|SKIPPED-NO-DIFF|SKIPPED-NO-VERB|SKIPPED-NO-CLUSTER|N/A> REASON=<short string, no spaces in value>`. Dispatchers parse this for aggregation; CI summary jobs reuse the same parser. (Layer-level enums `SKIPPED-NO-CLUSTER` + `PRECONDITION_FAILURE` are emitted by `layerN.sh` scripts, not per-language wrappers — see the 2026-06-26/task-#56 amendment.)
 
@@ -251,7 +251,7 @@ for_each_lang_with_verb "test" || exit 1
 1. Iterates `lang/*/` directories (excluding underscore-prefixed)
 2. Invokes the requested verb script for EVERY language, unconditionally (always-run — the
    skip-if-untouched short-circuit and its `changed.sh` lint were retired 2026-08-20, §3 amendment)
-3. If the verb script is missing or not executable, emits `STATUS=FAIL-MISSING-VERB REASON=<lang>-<verb>-verb-missing-or-not-executable` (exit 2) — never silently continues. A lang that *intentionally* has no real `<verb>.sh` ships a one-line placeholder wrapper emitting `STATUS=N/A` instead (see the placeholder convention below), so reaching this branch always means a wiring fault.
+3. If the verb script is missing or not executable, emits `STATUS=FAIL-MISSING-VERB REASON=<lang>-<verb>-verb-missing-or-not-executable` (exit 2) — never silently continues. A lang that *intentionally* has no real `<verb>.sh` ships a one-line placeholder wrapper emitting `STATUS=N/A` instead (see the placeholder convention below), so reaching this branch always means a wiring fault. A lang root with no language directory at all (before any INCLUDE/EXCLUDE filter) is likewise `FAIL-MISSING-VERB REASON=no-languages-registered` (2026-10-06; it was `N/A`); a filter that clears the set is operator intent, `SKIPPED-NO-VERB all-langs-filtered`.
 
 This means a deleted/`chmod`-stripped wrapper produces a loud `FAIL-MISSING-VERB` entry that reds the layer (it outranks a sibling lang's OK — see §STATUS aggregation), while proto's deliberate lack of a real `test.sh`/`audit.sh` shows up as a benign `N/A` from its placeholder, not silent absence.
 
@@ -273,7 +273,7 @@ global worst-wins aggregation ladder (`_common.sh::__status_rank` / `status_to_e
   set + no devloop helper socket (no Kind cluster, none provisionable). Below `OK` so a sibling's
   real pass dominates and a green CI run reports `TOTAL_RESULT=OK`. It is deliberately NOT
   `SKIPPED-NO-DIFF` (env-tests are always-run, so the verb DID apply — a cluster just wasn't
-  present) and NOT `N/A` (which ranks ABOVE `OK` and would wrongly dominate CI's total). REASON
+  present) and NOT `N/A` (which then ranked ABOVE `OK` and would have dominated CI's total; N/A is reserved for intentional-gap placeholders — 2026-10-06 amendment). REASON
   `no-cluster-ci`. **Reachable ONLY in CI** — a LOCAL run with no/dead helper is the loud
   `PRECONDITION_FAILURE` below, never a silent skip (the silent-skip-hole closer).
 - **`PRECONDITION_FAILURE`** (exit 2, ranked ABOVE `FAIL`, BELOW `FAIL-MISSING-VERB`): the OPERATOR
@@ -305,7 +305,9 @@ emit_status N/A not-applicable-to-this-lang
 ```
 
 The dispatcher then sees an executable wrapper emitting `N/A` (exit 0) — a benign,
-self-documenting gap visible at the filesystem level (`ls scripts/lang/<X>/`). This
+self-documenting gap visible at the filesystem level (`ls scripts/lang/<X>/`). A new
+placeholder must also be added to the N/A emitter allow-list in
+`scripts/lang/_dispatch.test.sh` (2026-10-06 amendment below). This
 replaces #50's `__intentional_missing_verbs` allowlist and its `DEVLOOP_TEST`-gated env
 seam (both removed — no allowlist↔filesystem drift). `proto/test.sh` and `proto/audit.sh`
 are the worked examples (`buf` contract checks / `breaking.sh` are proto's real gates).
@@ -318,6 +320,27 @@ emitting a STATUS line (e.g. `set -e` abort in DB bring-up), so a pre-emit crash
 as FAIL (exit 1) rather than an empty pipe the aggregator reads as `UNKNOWN`. See
 `docs/devloop-outputs/2026-06-19-polyglot-ladder-cleanup/` and
 `docs/runbooks/devloop-validation.md` §3/§6/§7/§8.
+
+**Amendment (2026-10-06 — N/A ranks just below OK; a green run totals OK).** `N/A` moves from
+above `OK` to just below it, above the `SKIPPED-*` band (`_common.sh::__status_rank`; exit codes
+unchanged — `N/A` was and stays 0). Before this, the intentional-gap placeholders (`proto/test.sh`,
+`proto/audit.sh`) made Layers 4 and 6, and therefore `TOTAL_RESULT`, read `N/A` on every fully green
+run, so the one line the devloop reads as the verdict could not say OK — the hazard the #47 and #56
+amendments above twice steered around for skips. Now `N/A` beside a real `OK` aggregates to `OK`, and
+a layer where nothing real ran still reads `N/A` (e.g. Layer 6 with no dependency change: rust/ts
+`SKIPPED-NO-DIFF` + proto `N/A`; the per-run dep-gate fact is in the child lines). `FAIL`,
+`PRECONDITION_FAILURE`, `FAIL-MISSING-VERB`, `UNKNOWN` and the fail-closed `*)` arm still outrank `OK`.
+- **Residual, and its replacement detection.** Ranked above `OK`, an *unexpected* `N/A` (a wrapper
+  that should have run) was visible at the layer line; ranked below, it is masked by a sibling's
+  `OK` there. Detection moves from the ladder to a static check: `_dispatch.test.sh`'s N/A emitter
+  allow-list fails Layer 3 unless the only `N/A` emitters in `scripts/` are the two proto
+  placeholders and the dispatcher's `<verb>-aggregate-na` passthrough (with a positive control, so
+  a vacuous scan goes red).
+- **`no-languages-registered` is a wiring fault.** It was the one other `N/A` emitter, and it means
+  the lang root had no language directory at all — no gate ran. Below `OK` it would have folded
+  into a green total, so it is now `FAIL-MISSING-VERB` (exit 2).
+- Supersedes the "split the enum" proposal in the `docs/TODO.md` entry on top-line
+  `TOTAL_RESULT=N/A` (closed). Design: `docs/devloop-outputs/2026-10-06-pipeline-status-phase-gate-playwright/`.
 
 ### 7. Diff Base Resolution
 

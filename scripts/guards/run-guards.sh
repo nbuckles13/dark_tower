@@ -333,7 +333,7 @@ if [[ $PRECONDITION_GUARDS -gt 0 && $FAILED_GUARDS -gt 0 ]]; then
 fi
 
 # ANCHOR (DRY): this exit precedence MIRRORS scripts/lang/_common.sh __status_rank +
-# status_to_exit_code (PRECONDITION_FAILURE rank 6 > FAIL rank 5 > OK → exit 2 > 1 > 0).
+# status_to_exit_code (PRECONDITION_FAILURE > FAIL > OK → exit 2 > 1 > 0).
 # run-guards.sh sources scripts/guards/common.sh, NOT lang/_common.sh, so it cannot call
 # status_to_exit_code directly — this hand-copy is the SAME ONE ladder as the layer
 # aggregation (standalone exit == layer verdict == pipeline lane; no divergence). The mirror,

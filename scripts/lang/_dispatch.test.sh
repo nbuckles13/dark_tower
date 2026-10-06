@@ -84,8 +84,8 @@ EOF
 # -----------------------------------------------------------------------------
 # Test: stream-verbatim contract + cross-lang-masking CLOSED (task #52).
 #
-# Pairs no_verb_lang (a verb wrapper that should exist is missing → FAIL-MISSING-VERB,
-# rank 5) with ok_lang (a working test.sh → OK, rank 2). Since the dispatcher always-runs
+# Pairs no_verb_lang (a verb wrapper that should exist is missing → FAIL-MISSING-VERB)
+# with ok_lang (a working test.sh → OK). Since the dispatcher always-runs
 # every registered lang's verb (no changed.sh gate), ok_lang's verb runs and emits OK, and
 # the masking assertion is that FAIL-MISSING-VERB beats OK in aggregate_worst_status — so
 # the wiring fault wins the aggregate and the dispatcher exits 2, no sibling status can
@@ -147,14 +147,14 @@ ${out}
   fi
 
   # (a) aggregated dispatcher STATUS line is the LAST STATUS= line; FAIL-MISSING-VERB
-  # (rank 5) wins over OK (rank 2) — masking closed.
+  # outranks OK — masking closed.
   local last_status
   last_status=$(grep '^STATUS=' <<<"$out" | tail -n1 | sed -n 's/^STATUS=\([^ ]*\).*/\1/p')
   if [[ "$last_status" == "FAIL-MISSING-VERB" ]]; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[stream-verbatim] aggregated STATUS expected FAIL-MISSING-VERB (rank 5 beats OK), got '${last_status}': ${out}")
+    FAILURES+=("[stream-verbatim] aggregated STATUS expected FAIL-MISSING-VERB (outranks OK), got '${last_status}': ${out}")
   fi
   # And the dispatcher exits 2 — the wiring fault is no longer masked by the sibling.
   assert_nonzero_exit "stream-verbatim:rc" "$rc"
@@ -327,6 +327,32 @@ test_filter_empty_after_filter() {
     FAIL=$((FAIL + 1))
     FAILURES+=("[empty-after-filter:rc] expected 0 (operator-intent), got '${rc}': ${out}")
   fi
+  # The filter runs AFTER the empty-lang-root check, so a filtered-to-zero set must never
+  # reach the no-languages-registered FAIL-MISSING-VERB arm (2026-10-06).
+  if grep -q 'FAIL-MISSING-VERB' <<<"$out"; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[empty-after-filter:no-missing-verb] filter-to-zero must not emit FAIL-MISSING-VERB: ${out}")
+  else
+    PASS=$((PASS + 1))
+  fi
+
+  # EXCLUDE twin: the only lang excluded → same operator-intent outcome.
+  out=$(
+    set +e
+    DEVLOOP_LANG_ROOT="${tmp}/lang" \
+    DEVLOOP_DISPATCH_EXCLUDE_LANGS=fakelang \
+    bash -c "
+      source '${tmp}/lang/_dispatch.sh'
+      for_each_lang_with_verb 'test'
+    " 2>&1
+    echo "__rc=$?"
+  )
+  rc=$(grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1 | cut -d= -f2)
+  assert_pattern_in "exclude-to-zero:status" "STATUS=SKIPPED-NO-VERB REASON=all-langs-filtered" "$out"
+  if [[ "$rc" == "0" ]] && ! grep -q 'FAIL-MISSING-VERB' <<<"$out"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("[exclude-to-zero] expected rc 0 and no FAIL-MISSING-VERB, got rc='${rc}': ${out}")
+  fi
 
   rm -rf "$tmp"
   trap - RETURN
@@ -335,8 +361,8 @@ test_filter_empty_after_filter() {
 # -----------------------------------------------------------------------------
 # Test: aggregate_worst_status precedence — OK-beats-SKIPPED regression test.
 #
-# Locks the lower portion of the current ladder (full ladder, task #52:
-# UNKNOWN > FAIL-MISSING-VERB > FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB).
+# Locks the lower portion of the ladder (_common.sh::__status_rank; full ladder pinned in
+# _common.test.sh).
 # This test pins the OK > SKIPPED-* relationship specifically: a Wave-1 ladder put
 # SKIPPED-* above OK, which broke "loud success" once a 2nd lang registered with a
 # verb wrapper (rust-clean PR aggregated to SKIPPED-NO-DIFF instead of OK). The upper
@@ -367,15 +393,17 @@ test_aggregate_precedence_ok_beats_skipped() {
     FAILURES+=("[precedence:FAIL-wins] expected FAIL, got '${agg}'")
   fi
 
+  # 2026-10-06: N/A ranks just below OK — a placeholder N/A beside a real OK no longer
+  # dominates, so a green run totals OK.
   agg=$(bash -c "
     source '${__here}/_common.sh'
     aggregate_worst_status OK N/A
   ")
-  if [[ "$agg" == "N/A" ]]; then
+  if [[ "$agg" == "OK" ]]; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("[precedence:NA-beats-OK] expected N/A, got '${agg}'")
+    FAILURES+=("[precedence:OK-beats-NA] expected OK, got '${agg}'")
   fi
 }
 
@@ -458,7 +486,7 @@ test_audit_fail_closed_aggregation() {
 # A deleted/chmod-stripped rust|ts audit.sh masked by a sibling's OK would fail-OPEN an
 # audit (security) gate — the dep-vuln scan silently never runs while the layer stays
 # green. #50 patched the AUDIT slice with a post-processor in scripts/audit.sh; task #52
-# closes it GENERALLY at the ladder: the missing wrapper → FAIL-MISSING-VERB (rank 5)
+# closes it GENERALLY at the ladder: the missing wrapper → FAIL-MISSING-VERB
 # beats the sibling's OK → the layer reds at exit 2. These tests drive the REAL audit
 # dispatch through a real layer6 lifecycle and assert the layer reds with the
 # FAIL-MISSING-VERB token, plus a placeholder-gap control that stays exit 0.
@@ -504,7 +532,7 @@ test_audit_missing_wrapper_reds_layer() {
 
   # Masking case (criterion f): `present` lang has a working audit.sh (OK); `gone` lang
   # is missing its audit.sh (the deleted/chmod-stripped dep-vuln gate). Under always-run,
-  # `gone` → FAIL-MISSING-VERB (rank 5) beats present's OK → LAYER reds at exit 2. Dual
+  # `gone` → FAIL-MISSING-VERB beats present's OK → LAYER reds at exit 2. Dual
   # assert (rc AND token): FAIL-MISSING-VERB→2 and UNKNOWN→2 collide on the bare code, so
   # the token proves the layer redded for the RIGHT cause.
   mkdir -p "${tmp}/present" "${tmp}/gone"
@@ -525,8 +553,8 @@ test_audit_missing_wrapper_reds_layer() {
 }
 
 # Control: a proto-style INTENTIONAL gap registered via a placeholder audit.sh (emits
-# N/A) co-running with a real OK audit → LAYER stays exit 0, aggregate is N/A (the
-# placeholder's N/A rank 3 beats OK rank 2), NO FAIL-MISSING-VERB anywhere. Proves the
+# N/A) co-running with a real OK audit → LAYER stays exit 0, aggregate is OK (N/A ranks
+# just below OK, so the placeholder no longer dominates), NO FAIL-MISSING-VERB anywhere. Proves the
 # placeholder convention keeps intentional gaps green under always-run audit.
 test_audit_placeholder_gap_stays_0() {
   local tmp; tmp=$(mktemp -d)
@@ -552,6 +580,7 @@ test_audit_placeholder_gap_stays_0() {
   else
     PASS=$((PASS + 1))
   fi
+  assert_pattern_in "audit-placeholder:aggregate-ok" "STATUS=OK REASON=audit-all-langs-ok" "$out"
 
   rm -rf "$tmp"; trap - RETURN
 }
@@ -652,8 +681,8 @@ test_placeholder_gap_verb_zero() {
 
 # PARAMETRIC cross-lang-masking CLOSED across EVERY verb (criterion a). For each of
 # compile/fmt/lint/test/audit: an `ok` lang with a working <verb>.sh (emits OK) co-running
-# with a `missing` lang that lacks <verb>.sh → aggregate FAIL-MISSING-VERB (rank 5 beats
-# OK rank 2) → exit 2. Every verb — including `audit` (the security-critical (f) path) —
+# with a `missing` lang that lacks <verb>.sh → aggregate FAIL-MISSING-VERB (outranks
+# OK) → exit 2. Every verb — including `audit` (the security-critical (f) path) —
 # runs under the dispatcher's unconditional always-run behavior (no env knob). Dual assert
 # per verb (aggregate token AND rc): FAIL-MISSING-VERB→2 and UNKNOWN→2 collide on the bare
 # code, so the token proves it redded for the RIGHT cause.
@@ -695,6 +724,137 @@ test_parametric_masking_closed_all_verbs() {
   rm -rf "$tmp"; trap - RETURN
 }
 
+
+# -----------------------------------------------------------------------------
+# 2026-10-06 — N/A ranks just below OK, above SKIPPED-*; an empty lang root is a wiring
+# fault. Driven through the REAL dispatcher (not only aggregate_worst_status), so the
+# aggregate-arm selection in _dispatch.sh is pinned too.
+# -----------------------------------------------------------------------------
+
+# __synth_lang_root <tmp> <lang>=<STATUS line> ... — a lang root whose <lang>/test.sh
+# prints the given STATUS line.
+__synth_lang_root() {
+  local tmp="$1"; shift
+  mkdir -p "${tmp}/lang"
+  cp "${__here}/_common.sh"   "${tmp}/lang/_common.sh"
+  cp "${__here}/_dispatch.sh" "${tmp}/lang/_dispatch.sh"
+  local pair name line
+  for pair in "$@"; do
+    name="${pair%%=*}"; line="${pair#*=}"
+    mkdir -p "${tmp}/lang/${name}"
+    printf '#!/usr/bin/env bash\necho "%s"\n' "$line" > "${tmp}/lang/${name}/test.sh"
+    chmod +x "${tmp}/lang/${name}/test.sh"
+  done
+}
+
+# __dispatch_last <lang_root> — run the test verb; print the LAST STATUS line, then __rc=.
+__dispatch_last() {
+  local out
+  out=$(run_dispatch "$1" "" "test")
+  printf '%s\n' "$(grep '^STATUS=' <<<"$out" | tail -n1)"
+  grep -oE '__rc=[0-9]+' <<<"$out" | tail -n1
+}
+
+test_na_beside_ok_aggregates_ok() {
+  local tmp; tmp=$(mktemp -d); trap "rm -rf '$tmp'" RETURN
+  __synth_lang_root "$tmp" "real=STATUS=OK REASON=real-test-passed" "protolike=STATUS=N/A REASON=not-applicable-to-this-lang"
+  local r; r=$(__dispatch_last "${tmp}/lang")
+  assert_pattern_in "na-beside-ok:aggregate" "STATUS=OK REASON=test-all-langs-ok" "$r"
+  assert_pattern_in "na-beside-ok:rc" "__rc=0" "$r"
+  rm -rf "$tmp"; trap - RETURN
+}
+
+# The Layer-6 no-dependency-change shape: two audits dep-gated + the proto placeholder.
+# N/A outranks SKIPPED-* → the layer reads N/A ("nothing real ran"); exit 0.
+test_l6_no_dep_change_shape_reads_na() {
+  local tmp; tmp=$(mktemp -d); trap "rm -rf '$tmp'" RETURN
+  __synth_lang_root "$tmp" "rustlike=STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes" \
+    "tslike=STATUS=SKIPPED-NO-DIFF REASON=no-dep-changes" "protolike=STATUS=N/A REASON=not-applicable-to-this-lang"
+  local r; r=$(__dispatch_last "${tmp}/lang")
+  assert_pattern_in "l6-shape:aggregate" "STATUS=N/A REASON=test-aggregate-na" "$r"
+  assert_pattern_in "l6-shape:rc" "__rc=0" "$r"
+  rm -rf "$tmp"; trap - RETURN
+}
+
+# Empty lang root (no language directory at all) → FAIL-MISSING-VERB, exit 2.
+test_empty_lang_root_is_wiring_fault() {
+  local tmp; tmp=$(mktemp -d); trap "rm -rf '$tmp'" RETURN
+  __synth_lang_root "$tmp"
+  local r; r=$(__dispatch_last "${tmp}/lang")
+  assert_pattern_in "empty-root:status" "STATUS=FAIL-MISSING-VERB REASON=no-languages-registered" "$r"
+  assert_pattern_in "empty-root:rc" "__rc=2" "$r"
+  rm -rf "$tmp"; trap - RETURN
+}
+
+# N/A EMITTER ALLOW-LIST (2026-10-06). N/A now ranks BELOW OK, so the ladder no longer
+# surfaces an unexpected N/A beside a sibling's OK; this static check replaces that
+# detection. Every N/A emission in scripts/**/*.sh (excluding *.test.sh) must be one of the
+# documented emitters. Matches every spelling (bare / double- / single-quoted, emit_status
+# or a raw STATUS=); the fixture tree below proves each spelling is caught.
+# SCOPE (where the check stops): it matches LITERAL N/A emissions only. A variable-carried
+# emission (`s=N/A; emit_status "$s"`) is invisible to it; today the only variable emitters
+# are _dispatch.sh's missing-verb arm (only ever FAIL-MISSING-VERB) and _common.sh's
+# layer-aggregate emission (which only forwards child statuses this scan sees at their literal
+# source). Not exhaustive against a NEW variable emitter.
+__NA_EMIT_RE='(emit_status[[:space:]]+["'"'"']?N/A["'"'"']?([[:space:]]|$)|STATUS=["'"'"']?N/A)'
+
+# __na_emitters <root> — print "<relpath>" for every N/A emission site under <root>/scripts,
+# one per line, sorted. Comment lines are ignored.
+__na_emitters() {
+  local root="$1"
+  ( cd "$root" && grep -rnE --include='*.sh' "$__NA_EMIT_RE" scripts \
+      | grep -v '\.test\.sh:' \
+      | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+      | cut -d: -f1 | LC_ALL=C sort )
+}
+
+test_na_emitter_allowlist() {
+  local repo; repo="$(cd "${__here}/../.." && pwd)"
+  local got expected
+  got="$(__na_emitters "$repo")"
+  # Exactly the two proto placeholders + the dispatcher's <verb>-aggregate-na passthrough.
+  expected=$'scripts/lang/_dispatch.sh\nscripts/lang/proto/audit.sh\nscripts/lang/proto/test.sh'
+  # Positive control (distinct token): the scan must FIND both placeholders — a scan run
+  # from the wrong dir or with a broken pattern must go red, not green.
+  if grep -qx 'scripts/lang/proto/test.sh' <<<"$got" && grep -qx 'scripts/lang/proto/audit.sh' <<<"$got"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("[n/a-allowlist-scan-vacuous] scan did not find the proto placeholders; got: ${got:-<nothing>}")
+  fi
+  if [[ "$got" == "$expected" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("[n/a-unexpected-emitter] N/A emitters must be exactly {proto/test.sh, proto/audit.sh, _dispatch.sh aggregate arm}; got: ${got//$'\n'/, }")
+  fi
+  # The _dispatch.sh hit must be ONLY the aggregate passthrough arm.
+  local dhits; dhits="$(cd "$repo" && grep -nE "$__NA_EMIT_RE" scripts/lang/_dispatch.sh | grep -vE '^[0-9]+:[[:space:]]*#')"
+  if [[ "$(grep -c . <<<"$dhits")" -eq 1 ]] && grep -q 'aggregate-na' <<<"$dhits"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("[n/a-unexpected-emitter] _dispatch.sh may emit N/A only in its <verb>-aggregate-na arm; got: ${dhits}")
+  fi
+
+  # Spelling fixtures: each form is detected; a comment and a non-N/A status are not.
+  local tmp; tmp=$(mktemp -d); trap "rm -rf '$tmp'" RETURN
+  mkdir -p "${tmp}/scripts/x"
+  printf 'emit_status N/A r\n'          > "${tmp}/scripts/x/bare.sh"
+  printf 'emit_status "N/A" r\n'        > "${tmp}/scripts/x/dq.sh"
+  printf "emit_status 'N/A' r\n"        > "${tmp}/scripts/x/sq.sh"
+  printf 'echo "STATUS=N/A REASON=r"\n' > "${tmp}/scripts/x/raw.sh"
+  printf 'echo STATUS="N/A"\n'          > "${tmp}/scripts/x/rawq.sh"
+  printf '# emit_status N/A r\n'        > "${tmp}/scripts/x/comment.sh"
+  printf 'emit_status OK r\n'           > "${tmp}/scripts/x/ok.sh"
+  printf 'emit_status N/A r\n'          > "${tmp}/scripts/x/ignored.test.sh"
+  got="$(__na_emitters "$tmp")"
+  expected=$'scripts/x/bare.sh\nscripts/x/dq.sh\nscripts/x/raw.sh\nscripts/x/rawq.sh\nscripts/x/sq.sh'
+  if [[ "$got" == "$expected" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("[n/a-allowlist-spellings] expected every N/A spelling caught (and comments/.test.sh/OK not); got: ${got//$'\n'/, }")
+  fi
+  rm -rf "$tmp"; trap - RETURN
+}
+
 # -----------------------------------------------------------------------------
 # Run all
 # -----------------------------------------------------------------------------
@@ -712,6 +872,10 @@ test_missing_verb_single_lang
 test_missing_verb_all_langs
 test_placeholder_gap_verb_zero
 test_parametric_masking_closed_all_verbs
+test_na_beside_ok_aggregates_ok
+test_l6_no_dep_change_shape_reads_na
+test_empty_lang_root_is_wiring_fault
+test_na_emitter_allowlist
 
 printf '\n_dispatch.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

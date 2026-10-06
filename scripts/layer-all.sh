@@ -280,7 +280,7 @@ stopped_early=0   # >0 = the layer at which interactive fail-fast stopped the ru
 # arm in status_to_exit_code. It is deliberately kept OUT of aggregation: the aggregation loop
 # `continue`s past it and status_to_exit_code is never called on it, so an un-run layer can
 # neither demote nor inflate TOTAL_RESULT / LAYER_ALL_EXIT. The `*)` fail-closed backstops in
-# __status_rank (rank 8) and status_to_exit_code (exit 2) make an accidental leak LOUD — but a
+# __status_rank (top rank) and status_to_exit_code (exit 2) make an accidental leak LOUD — but a
 # well-meaning `NOT-RUN → 0` arm would silently reopen the fail-fast GATE2=PASS-forgery vector
 # (a stopped-early run exiting 0 over layers that never ran). Do not "complete the enum".
 readonly NOT_RUN="NOT-RUN"
