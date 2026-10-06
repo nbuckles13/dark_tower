@@ -67,15 +67,15 @@
 # LAYER-3 LANE FOR COULD-NOT-VERIFY (verified end-to-end before adopting).
 #
 # Without this, every exit-2 path below reaches run_and_emit, which appends
-# STATUS=FAIL, which lang/_common.sh ranks 5 -> Layer 3 exits 1 -> the story
+# STATUS=FAIL, which lang/_common.sh maps to exit 1 -> Layer 3 exits 1 -> the story
 # runner's gate reads rc 1 as IMPLEMENTER and escalates a task against a clean
 # diff. A concurrent reviewer edit would blame the task. That is R-4's exact
 # class, produced by the suite built to prevent it.
 #
 # Printing our own STATUS line to STDOUT fixes it with existing vocabulary and
 # no _common.sh change: tee_collect_statuses collects EVERY STATUS= line in the
-# stream (not just run_and_emit's), and __status_rank puts PRECONDITION_FAILURE
-# at 6 above FAIL at 5, so worst-wins carries ours. Measured:
+# stream (not just run_and_emit's), and __status_rank ranks PRECONDITION_FAILURE
+# above FAIL, so worst-wins carries ours. Measured:
 #   collected: PRECONDITION_FAILURE FAIL  ->  worst=PRECONDITION_FAILURE, exit 2
 #
 # THREE couplings this acquires, named because none of them is asserted anywhere
@@ -85,7 +85,7 @@
 #      prints the needle, not the haystack) — but both are now load-bearing.
 #      Do not print a bare STATUS= line from a fixture, stub or assertion.
 #   2. BOTH status lines reach the log. A human reading a red Layer 3 sees ours
-#      AND `FAIL REASON=run-story-selftest-failed`; OURS WINS, by rank 6 > 5.
+#      AND `FAIL REASON=run-story-selftest-failed`; OURS WINS (PRECONDITION_FAILURE outranks FAIL).
 #   3. Correctness rests on run_and_emit staying ADDITIVE and on that rank
 #      ordering holding. If either changes, this lane silently reverts to FAIL
 #      and starts escalating tasks again. This line is deliberate, not debris.

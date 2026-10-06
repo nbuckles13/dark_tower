@@ -282,27 +282,30 @@ assert_no_ci_sentinel_leak() {
 
 # Aggregate multiple STATUS values; print the worst per precedence.
 #
-# Precedence (task #52 inserted FAIL-MISSING-VERB; task #56 inserted SKIPPED-NO-CLUSTER
-# + PRECONDITION_FAILURE):
-#   UNKNOWN > FAIL-MISSING-VERB > PRECONDITION_FAILURE > FAIL > N/A > OK
-#           > SKIPPED-NO-CLUSTER > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
-# Reasoning: if any child did real work and passed, the layer passed; otherwise
-# the SKIPPED-* state is informative. SKIPPED-NO-CLUSTER (task #56) = "the verb APPLIES
-# but a condition blocked it" (Layer 7 is always-run, so env-tests apply; a missing CI
-# cluster blocked them — identical tier to SKIPPED-NO-DIFF) — exit 0, ranks BELOW OK so a
-# sibling's real OK dominates and a green CI run reports TOTAL_RESULT=OK. N/A is a
-# different tier: "the verb does not APPLY to this lang" (proto placeholder wrappers); it
-# ranks above OK. FAIL means "this lang did real work and found a problem".
-# PRECONDITION_FAILURE (task #56) means "the ENVIRONMENT the gate needs was unavailable"
-# (Layer 7: cluster bring-up/health failed) — the OPERATOR lane; it ranks ABOVE FAIL but
-# BELOW FAIL-MISSING-VERB: the Kind cluster is needed ONLY by Layer 7, so a cluster-down
-# PRECONDITION does NOT invalidate layers 1-6, whereas a missing verb wrapper is a
-# persistent pipeline-machinery defect — "broken machinery" outranks "transient env not
-# ready" (@test's ladder; ordering = most-fundamental-machinery-problem first). UNKNOWN
-# (dispatcher bug — no STATUS emitted) stays on top.
+# Precedence (the ladder is __status_rank below — the ONE executable copy; docs cite it,
+# never restate its integers):
+#   UNKNOWN > FAIL-MISSING-VERB > PRECONDITION_FAILURE > FAIL > OK
+#           > N/A > SKIPPED-NO-CLUSTER > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
+# Reasoning: if any child did real work and passed, the layer passed; otherwise the
+# exit-0 below-OK state is informative. Every exit-0 status other than OK ranks BELOW OK
+# so it can never mask a passing sibling: a green run reports TOTAL_RESULT=OK.
+#   - N/A (2026-10-06 re-rank) = "the verb does not APPLY to this lang" — emitted ONLY by
+#     the intentional-gap placeholders (lang/proto/test.sh, lang/proto/audit.sh; pinned by
+#     the emitter allow-list test in _dispatch.test.sh) and the dispatcher's
+#     `<verb>-aggregate-na` passthrough. It ranks just below OK and ABOVE the SKIPPED-*
+#     band, so a layer where nothing real ran (e.g. Layer 6 with no dependency change:
+#     rust/ts SKIPPED-NO-DIFF + proto N/A) still reads N/A. Before the re-rank N/A ranked
+#     above OK and so dominated every green run (ADR-0033 2026-10-06 amendment).
+#   - SKIPPED-NO-CLUSTER (task #56) = "the verb APPLIES but a condition blocked it" (Layer 7
+#     in CI: no devloop cluster) — same tier as SKIPPED-NO-DIFF.
+# FAIL means "this lang did real work and found a problem". PRECONDITION_FAILURE (task #56)
+# means "the ENVIRONMENT the gate needs was unavailable" (Layer 7 cluster bring-up, a Layer-3
+# guard timeout) — the OPERATOR lane; above FAIL, below FAIL-MISSING-VERB: a missing verb
+# wrapper (or an empty lang root, `no-languages-registered`) is a persistent
+# pipeline-machinery defect, and "broken machinery" outranks "transient env not ready".
+# UNKNOWN (dispatcher bug — no STATUS emitted) stays on top.
 # Ranking FAIL-MISSING-VERB above OK is what closes the cross-lang-masking residual: a
-# missing verb can no longer be hidden by a sibling's clean run (task #52, replaces the
-# #50 reason-tiebreak + the audit-slice post-processor).
+# missing verb can no longer be hidden by a sibling's clean run (task #52).
 #
 # Exit-code mapping (status_to_exit_code): OK / SKIPPED-* / N/A → 0; FAIL → 1;
 # FAIL-MISSING-VERB / PRECONDITION_FAILURE / UNKNOWN → 2 (the §6 "investigate the
@@ -331,8 +334,8 @@ __status_rank() {
     SKIPPED-NO-VERB)      printf '0\n' ;;
     SKIPPED-NO-DIFF)      printf '1\n' ;;
     SKIPPED-NO-CLUSTER)   printf '2\n' ;;  # exit-0 clean skip: CI has no devloop cluster — below OK (task #56)
-    OK)                   printf '3\n' ;;
-    N/A)                  printf '4\n' ;;
+    N/A)                  printf '3\n' ;;  # intentional-gap placeholder — just below OK, above SKIPPED-* (2026-10-06)
+    OK)                   printf '4\n' ;;
     FAIL)                 printf '5\n' ;;
     PRECONDITION_FAILURE) printf '6\n' ;;  # operator/infra lane — outranks FAIL, below the wiring fault (task #56)
     FAIL-MISSING-VERB)    printf '7\n' ;;  # wiring fault — outranks FAIL + PRECONDITION_FAILURE (task #52)

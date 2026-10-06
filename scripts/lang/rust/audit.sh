@@ -30,7 +30,8 @@ gate_rc=0
 audit_gate audit_dep_changed_rust || gate_rc=$?
 if [[ "$gate_rc" -eq 1 ]]; then
   # Proven no dep-manifest change. Non-dominating skip (SKIPPED-NO-DIFF ranks below
-  # OK so a sibling's real OK still wins). NOT N/A (which would dominate). See
+  # OK so a sibling's real OK still wins). NOT N/A, which is reserved for the intentional-gap
+  # placeholders ("the verb does not apply"; allow-listed in _dispatch.test.sh). See
   # ADR-0033 §3 amendment + docs/runbooks/devloop-validation.md §6.6.
   emit_status SKIPPED-NO-DIFF no-dep-changes
   exit 0

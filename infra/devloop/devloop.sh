@@ -105,6 +105,19 @@ read_pnpm_package_manager() {
     pnpm_package_manager_spec "${script_dir}/../../package.json" || exit 1
 }
 
+# ─── Playwright pin (SSoT = pnpm-lock.yaml's `playwright`) ───────
+# The image bakes Chromium for ONE Playwright version, and Playwright refuses to launch a
+# browser revision its package doesn't record, so the image must follow the lockfile the
+# tests run against. The Dockerfile takes `ARG PLAYWRIGHT_VERSION` (no default; fails loud
+# if unset); the value comes from the ONE pnpm-lock.yaml reader, which fails loudly if the
+# workspace resolves more than one playwright version.
+# shellcheck source=../lib/pnpm-lock-version.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/pnpm-lock-version.sh"
+read_playwright_version() {
+    local script_dir="$1"
+    pnpm_lock_version "${script_dir}/../../pnpm-lock.yaml" playwright || exit 1
+}
+
 # ─── cargo tool pins (SSoT = infra/cargo-tools.versions) ────────
 # cargo-nextest (Layer 4's runner), cargo-llvm-cov and cargo-audit: the same pins CI
 # installs, read through the ONE reader. The Dockerfile ARGs have no defaults.
@@ -120,7 +133,7 @@ read_cargo_tool_version() {
 # is removed only after a successful build produced a different one.
 build_devloop_image() {
     local script_dir="$1" image="$2" old_image_id
-    local RUST_VERSION NODE_VERSION SQLX_CLI_VERSION PNPM_PACKAGE_MANAGER
+    local RUST_VERSION NODE_VERSION SQLX_CLI_VERSION PNPM_PACKAGE_MANAGER PLAYWRIGHT_VERSION
     local CARGO_NEXTEST_VERSION CARGO_LLVM_COV_VERSION CARGO_AUDIT_VERSION
     echo "Building dev container image..."
     old_image_id=$(podman images -q "$image" 2>/dev/null || true)
@@ -128,6 +141,7 @@ build_devloop_image() {
     SQLX_CLI_VERSION="$(read_sqlx_cli_version "$script_dir")"
     PNPM_PACKAGE_MANAGER="$(read_pnpm_package_manager "$script_dir")"
     RUST_VERSION="$(read_rust_version "$script_dir")"
+    PLAYWRIGHT_VERSION="$(read_playwright_version "$script_dir")"
     CARGO_NEXTEST_VERSION="$(read_cargo_tool_version "$script_dir" cargo-nextest)"
     CARGO_LLVM_COV_VERSION="$(read_cargo_tool_version "$script_dir" cargo-llvm-cov)"
     CARGO_AUDIT_VERSION="$(read_cargo_tool_version "$script_dir" cargo-audit)"
@@ -135,6 +149,7 @@ build_devloop_image() {
         --build-arg "NODE_VERSION=${NODE_VERSION}" \
         --build-arg "SQLX_CLI_VERSION=${SQLX_CLI_VERSION}" \
         --build-arg "PNPM_PACKAGE_MANAGER=${PNPM_PACKAGE_MANAGER}" \
+        --build-arg "PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION}" \
         --build-arg "CARGO_NEXTEST_VERSION=${CARGO_NEXTEST_VERSION}" \
         --build-arg "CARGO_LLVM_COV_VERSION=${CARGO_LLVM_COV_VERSION}" \
         --build-arg "CARGO_AUDIT_VERSION=${CARGO_AUDIT_VERSION}" -t "$image" "$script_dir"

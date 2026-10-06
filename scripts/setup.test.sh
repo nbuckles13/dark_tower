@@ -2377,6 +2377,125 @@ for pair in CARGO_NEXTEST_VERSION:cargo-nextest CARGO_LLVM_COV_VERSION:cargo-llv
   assert_status "devloop-dockerfile-installs-${tool}" "cargo install ${tool} --locked --version \"=\${${var}}\"" "$DLDF"
 done
 
+# --- Playwright pin: pnpm-lock.yaml is the ONE source (devloop image) ------------------------
+# The devloop image's baked Chromium must match the `playwright` package the tests run. The
+# Dockerfile takes `ARG PLAYWRIGHT_VERSION` (no default) from the ONE reader,
+# infra/lib/pnpm-lock-version.sh, via devloop.sh. Reader contract + derivation + the
+# package.json pins agreeing with the lockfile.
+PLLIB="${REPO_ROOT}/infra/lib/pnpm-lock-version.sh"
+plv() { src_run "$PLLIB" 'pnpm_lock_version "${ARGS[@]}"' "$1" "$2" 2>&1; }
+PLS="${WORK}/pnpm-locks"; mkdir -p "$PLS"
+pl_file() { printf '%b' "$2" > "$PLS/$1.yaml"; }
+# importers + snapshots carry DIFFERENT playwright versions (9.9.9): only packages: counts.
+pl_file good "lockfileVersion: '9.0'\n\nimporters:\n\n  packages/web-app:\n    devDependencies:\n      playwright:\n        specifier: 9.9.9\n        version: 9.9.9\n\npackages:\n\n  playwright-core@9.9.9:\n    resolution: {integrity: sha512-x}\n\n  playwright@1.62.1:\n    resolution: {integrity: sha512-y}\n\n  '@vitest/browser-playwright@4.1.10':\n    resolution: {integrity: sha512-z}\n\nsnapshots:\n\n  playwright@9.9.9:\n    dependencies:\n      playwright-core: 9.9.9\n\n  '@vitest/browser-playwright@4.1.10(playwright@9.9.9)':\n    dependencies:\n      playwright: 9.9.9\n"
+pl_file quoted "packages:\n\n  'playwright@1.62.1':\n    resolution: {integrity: sha512-y}\n"
+pl_file peer   "packages:\n\n  playwright@1.62.1(foo@1.0.0):\n    resolution: {integrity: sha512-y}\n"
+pl_file pre    "packages:\n\n  playwright@1.63.0-alpha.2:\n    resolution: {integrity: sha512-y}\n"
+pl_file two    "packages:\n\n  playwright@1.62.1:\n    resolution: {}\n\n  playwright@1.55.0:\n    resolution: {}\n"
+pl_file none   "packages:\n\n  playwright-core@1.62.1:\n    resolution: {}\n\nsnapshots:\n\n  playwright@1.62.1: {}\n"
+pl_file badver "packages:\n\n  playwright@1.62.1;rm:\n    resolution: {}\n"
+out="$(plv "$PLS/good.yaml" playwright)"; rc=$?
+assert_rc  "pnpm-lock-version-exact-rc" 0 "$rc"
+emi_expect "pnpm-lock-version-packages-section-only" "1.62.1" "$out"
+emi_expect "pnpm-lock-version-not-fooled-by-playwright-core" "9.9.9" "$(plv "$PLS/good.yaml" playwright-core)"
+emi_expect "pnpm-lock-version-scoped-quoted-key" "4.1.10" "$(plv "$PLS/good.yaml" @vitest/browser-playwright)"
+emi_expect "pnpm-lock-version-quoted-key"  "1.62.1" "$(plv "$PLS/quoted.yaml" playwright)"
+emi_expect "pnpm-lock-version-peer-suffix" "1.62.1" "$(plv "$PLS/peer.yaml" playwright)"
+emi_expect "pnpm-lock-version-prerelease"  "1.63.0-alpha.2" "$(plv "$PLS/pre.yaml" playwright)"
+out="$(plv "$PLS/two.yaml" playwright)"; rc=$?
+assert_rc     "pnpm-lock-version-ambiguous-fails" 1 "$rc"
+assert_status "pnpm-lock-version-ambiguous-says-so" "more than one version" "$out"
+assert_status "pnpm-lock-version-ambiguous-lists-versions" "1.55.0 1.62.1" "$out"
+out="$(plv "$PLS/none.yaml" playwright)"; rc=$?
+assert_rc     "pnpm-lock-version-missing-fails" 1 "$rc"
+assert_status "pnpm-lock-version-missing-says-so" "no \`playwright\` package" "$out"
+out="$(plv "$PLS/badver.yaml" playwright)"; rc=$?
+assert_rc     "pnpm-lock-version-bad-shape-fails" 1 "$rc"
+assert_status "pnpm-lock-version-bad-shape-says-so" "is not X.Y.Z" "$out"
+out="$(plv "$PLS/absent.yaml" playwright)"; rc=$?
+assert_rc "pnpm-lock-version-unreadable-fails" 1 "$rc"
+re_lib="$(sed -n "s/^__PNPM_LOCK_VERSION_RE='\(.*\)'$/\1/p" "$PLLIB")"
+PW_PIN="$(plv "${REPO_ROOT}/pnpm-lock.yaml" playwright)"; rc=$?
+assert_rc "pnpm-lock-version-real-lock" 0 "$([[ $rc -eq 0 && -n "$re_lib" && "$PW_PIN" =~ $re_lib ]] && echo 0 || echo "1 (${PW_PIN})")"
+# Every workspace package declaring `playwright` pins EXACTLY the version the lockfile
+# resolves — so the packages agree with each other AND with the image. Set derived by glob;
+# non-vacuous (web-app + sdk-svelte today).
+pw_pins=0; pw_bad=""
+for pj in "${REPO_ROOT}"/packages/*/package.json; do
+  pin="$(grep -oE '"playwright"[[:space:]]*:[[:space:]]*"[^"]*"' "$pj" | sed -E 's/.*"([^"]*)"$/\1/')"
+  [[ -n "$pin" ]] || continue
+  pw_pins=$((pw_pins + 1))
+  [[ "$pin" == "$PW_PIN" ]] || pw_bad+=" ${pj#"${REPO_ROOT}/"}=${pin}"
+done
+assert_rc "playwright-package-pins-match-lock" 0 "$([[ "$pw_pins" -ge 2 && -z "$pw_bad" ]] && echo 0 || echo "1 (pins=${pw_pins} lock=${PW_PIN}${pw_bad})")"
+# devloop.sh derives + passes it; the Dockerfile has no default and no literal version.
+assert_status "devloop-sh-derives-playwright-version" 'pnpm_lock_version "${script_dir}/../../pnpm-lock.yaml" playwright' "$DLSH"
+assert_status "devloop-sh-reads-playwright"  'PLAYWRIGHT_VERSION="$(read_playwright_version "$script_dir")"' "$DLSH"
+assert_status "devloop-sh-passes-playwright" '--build-arg "PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION}"' "$DLSH"
+assert_rc     "devloop-dockerfile-bare-playwright-arg" 0 "$(grep -cx 'ARG PLAYWRIGHT_VERSION' <<< "$DLDF" | grep -qx 1 && echo 0 || echo 1)"
+assert_status "devloop-dockerfile-runs-playwright-install" 'playwright-install.sh "${PLAYWRIGHT_VERSION}"' "$DLDF"
+pw_lit="$(cat "${REPO_ROOT}/infra/devloop/Dockerfile" "${REPO_ROOT}/infra/devloop/devloop.sh" | grep -nE 'playwright@[0-9]|PLAYWRIGHT_VERSION=[0-9]' || true)"
+assert_rc "playwright-no-literal-version" 0 "$([[ -z "$pw_lit" ]] && echo 0 || echo "1 (${pw_lit//$'\n'/ | })")"
+
+# --- playwright-install.sh: bounded + retried browser download (hermetic, stub npx) ----------
+PWI="${REPO_ROOT}/infra/devloop/playwright-install.sh"
+# Version-shape regex: two byte-identical copies (the image build context can't source the
+# reader) — drift guard. Non-vacuous: both extractions must be non-empty.
+re_pwi="$(sed -n "s/^__PLAYWRIGHT_VERSION_RE='\(.*\)'$/\1/p" "$PWI")"
+assert_rc "playwright-version-regex-copies-identical" 0 "$([[ -n "$re_lib" && "$re_lib" == "$re_pwi" ]] && echo 0 || echo "1 (lib=${re_lib@Q} install=${re_pwi@Q})")"
+PWS="${WORK}/pwi"; mkdir -p "$PWS/bin"
+# Stub npx: counts invocations in $PWS/count; behaviour from $PWS/mode:
+#   ok | fail | hang | hang-ignore-term | fail-then-ok. Each attempt plants a partial browser
+#   dir and records whether the previous attempt's dir was still present.
+cat > "$PWS/bin/npx" <<'STUB'
+#!/usr/bin/env bash
+n=$(( $(cat "$PWI_DIR/count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$PWI_DIR/count"
+[[ -e "$PLAYWRIGHT_BROWSERS_PATH/partial" ]] && echo "stale-on-attempt-$n" >> "$PWI_DIR/stale"
+mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"; : > "$PLAYWRIGHT_BROWSERS_PATH/partial"
+echo "$*" > "$PWI_DIR/args"
+case "$(cat "$PWI_DIR/mode")" in
+  ok) exit 0 ;;
+  fail) exit 3 ;;
+  hang) exec sleep 30 ;;
+  hang-ignore-term) trap '' TERM; sleep 30 & wait; sleep 30 ;;
+  fail-then-ok) [[ "$n" -ge 2 ]] && exit 0 || exit 3 ;;
+esac
+STUB
+chmod +x "$PWS/bin/npx"
+pwi_run() {  # $1 = mode, rest = args; sets out/rc/attempts
+  rm -rf "$PWS/count" "$PWS/stale" "$PWS/args" "$PWS/browsers"; echo "$1" > "$PWS/mode"; shift
+  out="$(PATH="$PWS/bin:$PATH" PWI_DIR="$PWS" PLAYWRIGHT_BROWSERS_PATH="$PWS/browsers" \
+    PLAYWRIGHT_INSTALL_TIMEOUT_SECS=0.2 PLAYWRIGHT_INSTALL_KILL_AFTER_SECS=0.2 \
+    PLAYWRIGHT_INSTALL_ATTEMPTS=3 PLAYWRIGHT_INSTALL_RETRY_SLEEP_SECS=0 \
+    timeout 60 bash "$PWI" "$@" 2>&1)"; rc=$?
+  attempts="$(cat "$PWS/count" 2>/dev/null || echo 0)"
+}
+pwi_run ok 1.62.1
+assert_rc  "pwi-ok-rc" 0 "$rc"
+emi_expect "pwi-ok-one-attempt" "1" "$attempts"
+emi_expect "pwi-ok-pinned-args" "-y playwright@1.62.1 install chromium" "$(cat "$PWS/args")"
+pwi_run fail-then-ok 1.62.1
+assert_rc  "pwi-retry-rc" 0 "$rc"
+emi_expect "pwi-retry-two-attempts" "2" "$attempts"
+assert_status "pwi-retry-logs-attempt-rc" "attempt 1/3 rc=3" "$out"
+assert_rc "pwi-partial-wiped-between-attempts" 0 "$([[ ! -e "$PWS/stale" ]] && echo 0 || echo "1 ($(cat "$PWS/stale"))")"
+pwi_run hang 1.62.1
+assert_rc  "pwi-hang-fails" 1 "$rc"
+emi_expect "pwi-hang-exactly-n-attempts" "3" "$attempts"
+assert_status "pwi-hang-logs-timeout" "rc=124 (124=timeout" "$out"
+assert_status "pwi-hang-names-step" "ERROR: devloop image step 'npx playwright@1.62.1 install chromium' failed after 3 attempt(s) (timeout 0.2s each, last rc=124)" "$out"
+pwi_run hang-ignore-term 1.62.1
+assert_rc  "pwi-term-ignored-still-bounded" 1 "$rc"
+emi_expect "pwi-term-ignored-exactly-n-attempts" "3" "$attempts"
+assert_status "pwi-term-ignored-killed" "last rc=137" "$out"
+pwi_run fail 1.62.1
+assert_rc  "pwi-fail-fails" 1 "$rc"
+assert_rc "pwi-fail-wipes-final-partial" 0 "$([[ ! -e "$PWS/browsers" ]] && echo 0 || echo 1)"
+pwi_run ok '1.62.1;rm -rf /'
+assert_rc  "pwi-bad-version-refused" 1 "$rc"
+emi_expect "pwi-bad-version-no-npx" "0" "$attempts"
+assert_status "pwi-bad-version-says-why" "is not X.Y.Z" "$out"
+
 # No cargo tool install in a workflow or an image may float or carry a literal version:
 # `tool: cargo-x` must be `@${{ steps.pins.outputs.cargo-x }}`, and every `cargo install`
 # must be --locked with a `--version "=${VAR}"` variable. Scans ALL workflow files and ALL

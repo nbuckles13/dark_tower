@@ -4,11 +4,11 @@
 # Used by devloop.sh for isolated Claude Code execution.
 #
 # Build:  ./infra/devloop/devloop.sh --rebuild   (reads rust-toolchain.toml, .nvmrc, package.json
-#         packageManager, Cargo.lock and infra/cargo-tools.versions; passes RUST_VERSION,
-#         NODE_VERSION, PNPM_PACKAGE_MANAGER, SQLX_CLI_VERSION and the CARGO_*_VERSION tool pins)
+#         packageManager, Cargo.lock, pnpm-lock.yaml and infra/cargo-tools.versions; passes
+#         RUST_VERSION, NODE_VERSION, PNPM_PACKAGE_MANAGER, SQLX_CLI_VERSION, PLAYWRIGHT_VERSION
+#         and the CARGO_*_VERSION tool pins)
 # Rebuild weekly or when toolchain/dependencies change.
-# NOTE: RUST_VERSION, NODE_VERSION and PNPM_PACKAGE_MANAGER have no default and the build FAILS
-# without them.
+# NOTE: none of those pins has a default; the build FAILS without them.
 
 # RUST_VERSION is the repo's ONE Rust version, derived from rust-toolchain.toml by
 # infra/lib/rust-toolchain.sh (the build context, infra/devloop/, cannot COPY the file).
@@ -186,28 +186,32 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
 
 # Pre-cache Chromium. Load-bearing: PLAYWRIGHT_VERSION is the contract version
 # between this image (which bakes Chromium at /opt/ms-playwright) and the
-# `playwright` devDep pinned in packages/sdk-svelte + packages/web-app. The
-# lockfile is authoritative: bumping the package pin REQUIRES bumping this ARG
-# in the SAME commit — Playwright refuses to launch a Chromium revision that
-# does not match its npm-package's recorded revision. The edit here is in-tree
-# and belongs with the package bump; only the image *rebake* is host-side.
-# Drift manifests as a phantom "Executable doesn't exist at
-# .../chromium_headless_shell-<rev>/..." at test-run, NOT at build — which is
-# how a 1.49.0-image / 1.55.1-package skew rode along after commit 16fb5e6
-# bumped the packages but not this ARG.
+# `playwright` devDep pinned in packages/sdk-svelte + packages/web-app — Playwright
+# refuses to launch a Chromium revision that does not match its npm-package's recorded
+# revision. It is DERIVED, never typed here: devloop.sh reads the one version pnpm-lock.yaml
+# resolves (infra/lib/pnpm-lock-version.sh; >1 resolved version fails the build) and passes
+# it as a build arg with no default. A package bump therefore needs only the host-side image
+# rebake (devloop.sh --rebuild). Drift manifests as a phantom "Executable doesn't exist at
+# .../chromium_headless_shell-<rev>/..." at test-run, NOT at build — which is how a
+# 1.49.0-image / 1.55.1-package skew rode along after commit 16fb5e6 bumped the packages
+# but not the then hand-typed ARG.
 # Trust chain: the Chromium browser blob is fetched from Playwright's HTTPS CDN.
 # Integrity is established transitively through the version-pinned `playwright`
-# npm tarball (integrity-checked by npm), which carries the Chromium revision
-# and download manifest. Playwright does not publish per-version sha256 for the
-# browser blob, so equivalent verification to the kubectl block above is not
-# applicable; this is the same trust posture as official mcr.microsoft.com/playwright
-# images, acceptable inside the devloop sandbox per ADR-0025.
-# `chmod -R a+rX` makes the cache world-readable + dir-traversable (least-privilege)
-# so --userns=keep-id mapped users can read it. The cache is intentionally
-# read-only at runtime; mutating the baked browser requires an image rebuild.
-ARG PLAYWRIGHT_VERSION=1.62.1
-RUN npx -y playwright@${PLAYWRIGHT_VERSION} install chromium \
- && chmod -R a+rX /opt/ms-playwright
+# npm tarball, which carries the Chromium revision and download manifest. npx fetches it
+# without a lockfile, so the tarball is version-pinned but not integrity-pinned, and
+# Playwright publishes no per-version sha256 for the browser blob (docs/TODO.md tracks
+# hash-pinning) — the same trust posture as official mcr.microsoft.com/playwright images,
+# acceptable inside the devloop sandbox per ADR-0025.
+# The install is BOUNDED and retried by playwright-install.sh (timeout --kill-after per
+# attempt, a small fixed attempt count, partial state wiped between attempts, a loud final
+# error naming the step); it also makes the cache world-readable + dir-traversable
+# (`chmod -R a+rX`, least-privilege) so --userns=keep-id mapped users can read it. The
+# cache is intentionally read-only at runtime; mutating the baked browser requires an
+# image rebuild.
+ARG PLAYWRIGHT_VERSION
+COPY playwright-install.sh /usr/local/lib/devloop/playwright-install.sh
+RUN : "${PLAYWRIGHT_VERSION:?PLAYWRIGHT_VERSION build-arg is required — derived from pnpm-lock.yaml; build via devloop.sh --rebuild}" \
+ && bash /usr/local/lib/devloop/playwright-install.sh "${PLAYWRIGHT_VERSION}"
 
 # Build-time smoke: catches missing shared libs (e.g., libnspr4, libcups2,
 # libatk1.0-0) that Playwright's install step does NOT detect (extraction !=

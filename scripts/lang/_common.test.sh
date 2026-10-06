@@ -2,8 +2,9 @@
 # _common.test.sh — STATUS aggregation precedence test (test §D).
 #
 # Encodes the canonical precedence as a spec test that fails if anyone reorders.
-# Precedence (task #52 — FAIL-MISSING-VERB inserted at rank 5):
-#   UNKNOWN > FAIL-MISSING-VERB > FAIL > N/A > OK > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
+# Precedence (the ladder is _common.sh::__status_rank; this file pins every pair):
+#   UNKNOWN > FAIL-MISSING-VERB > PRECONDITION_FAILURE > FAIL > OK
+#           > N/A > SKIPPED-NO-CLUSTER > SKIPPED-NO-DIFF > SKIPPED-NO-VERB
 # Rationale: see _common.sh comment block above aggregate_worst_status.
 set -euo pipefail
 IFS=$'\n\t'
@@ -33,20 +34,25 @@ assert_aggregate "OK" "OK" "OK"
 assert_aggregate "OK" "OK"
 assert_aggregate "OK"  # zero args → OK
 
-# Single-step elevations (OK ranks above SKIPPED-*; N/A and FAIL still beat OK).
+# Single-step elevations (OK ranks above N/A and SKIPPED-*; FAIL still beats OK).
 assert_aggregate "OK"              "OK" "SKIPPED-NO-VERB"   # OK wins over SKIPPED-NO-VERB
 assert_aggregate "OK"              "OK" "SKIPPED-NO-DIFF"   # OK wins over SKIPPED-NO-DIFF
-assert_aggregate "N/A"             "OK" "N/A"               # N/A beats OK (deliberate documented gap)
+assert_aggregate "OK"              "OK" "N/A"               # OK beats N/A (2026-10-06: a green run totals OK)
+assert_aggregate "OK"              "N/A" "OK"               # order-independent
+assert_aggregate "N/A"             "N/A"                    # a layer where nothing real ran still reads N/A
 assert_aggregate "FAIL"            "OK" "FAIL"              # FAIL beats OK
 
-# Cross-precedence (code-reviewer locked).
+# Cross-precedence (code-reviewer locked). N/A ranks just below OK and ABOVE every SKIPPED-*.
 assert_aggregate "SKIPPED-NO-DIFF" "SKIPPED-NO-VERB" "SKIPPED-NO-DIFF"   # NO-DIFF beats NO-VERB
 assert_aggregate "N/A"             "SKIPPED-NO-DIFF" "N/A"               # N/A beats NO-DIFF
 assert_aggregate "N/A"             "N/A" "SKIPPED-NO-VERB"               # N/A beats NO-VERB
+assert_aggregate "N/A"             "SKIPPED-NO-CLUSTER" "N/A"            # N/A beats NO-CLUSTER
 assert_aggregate "FAIL"            "FAIL" "N/A"                          # FAIL beats N/A
 assert_aggregate "FAIL"            "OK" "FAIL"                           # FAIL beats OK
+# The Layer-6 no-dependency-change triple (rust/ts dep-gated + proto placeholder): N/A.
+assert_aggregate "N/A"             "SKIPPED-NO-DIFF" "SKIPPED-NO-DIFF" "N/A"
 
-# FAIL-MISSING-VERB rank 5 (task #52): outranks OK, N/A, and FAIL (a wiring fault must
+# FAIL-MISSING-VERB (task #52): outranks OK, N/A, and FAIL (a wiring fault must
 # not be masked by a sibling lang's clean run or even a sibling's real FAIL); UNKNOWN
 # (dispatcher bug) still outranks it. This is the rank that closes cross-lang-masking.
 assert_aggregate "FAIL-MISSING-VERB" "OK" "FAIL-MISSING-VERB"                 # beats OK (the masking case)
@@ -60,10 +66,10 @@ assert_aggregate "UNKNOWN"           "FAIL-MISSING-VERB" "UNKNOWN"            # 
 assert_aggregate "OK"                 "OK" "SKIPPED-NO-CLUSTER"               # OK dominates → CI TOTAL stays OK
 assert_aggregate "SKIPPED-NO-CLUSTER" "SKIPPED-NO-CLUSTER"                    # lone skip (Layer 7 alone)
 assert_aggregate "SKIPPED-NO-CLUSTER" "SKIPPED-NO-DIFF" "SKIPPED-NO-CLUSTER" # same skip tier, above NO-DIFF
-assert_aggregate "N/A"                "N/A" "SKIPPED-NO-CLUSTER"              # N/A (different tier) still beats a skip
+assert_aggregate "N/A"                "N/A" "SKIPPED-NO-CLUSTER"              # N/A sits above the skip band
 
 # PRECONDITION_FAILURE (task #56): exit-2 operator/infra lane (Layer 7 Phase-1 gate).
-# Rank 6 (@test/@team-lead): outranks FAIL (an infra precondition dominates a sibling test
+# (@test/@team-lead): outranks FAIL (an infra precondition dominates a sibling test
 # failure) but BELOW FAIL-MISSING-VERB (a missing-wrapper pipeline-machinery defect is more
 # fundamental than a transient cluster-down) and UNKNOWN.
 assert_aggregate "PRECONDITION_FAILURE" "OK" "PRECONDITION_FAILURE"                  # beats OK
@@ -75,7 +81,12 @@ assert_aggregate "PRECONDITION_FAILURE" "OK" "SKIPPED-NO-DIFF" "PRECONDITION_FAI
 
 # Multi-arg cases.
 assert_aggregate "FAIL"            "OK" "OK" "FAIL" "OK"
-assert_aggregate "N/A"             "OK" "SKIPPED-NO-DIFF" "N/A" "SKIPPED-NO-VERB"
+assert_aggregate "OK"              "OK" "SKIPPED-NO-DIFF" "N/A" "SKIPPED-NO-VERB"   # one real OK lifts the field
+assert_aggregate "PRECONDITION_FAILURE" "N/A" "OK" "PRECONDITION_FAILURE"
+# FAIL-CLOSED catch-all: an enum with no arm still outranks OK and N/A.
+assert_aggregate "NOT-A-STATUS"    "OK" "NOT-A-STATUS"
+assert_aggregate "NOT-A-STATUS"    "N/A" "NOT-A-STATUS"
+assert_aggregate "UNKNOWN"         "OK" "N/A" "UNKNOWN"
 assert_aggregate "OK"              "OK" "OK" "OK"
 
 # Multi-lang success path: one OK lang among SKIPPED-* siblings aggregates to OK, so a
@@ -83,6 +94,18 @@ assert_aggregate "OK"              "OK" "OK" "OK"
 # is the all-langs-filtered enum — its only producer since task #52; a genuinely missing
 # verb is FAIL-MISSING-VERB, which would NOT aggregate to OK. This locks OK > SKIPPED-*.)
 assert_aggregate "OK" "OK" "SKIPPED-NO-VERB" "SKIPPED-NO-DIFF"
+
+# Ladder-order drift guard: ADR-0033 §4's worst-child bullet restates the order in words.
+# Render __status_rank's case arms (file order = lowest first; the `*)` backstop excluded),
+# highest first as "A > B > …", and require the ADR to contain exactly that chain.
+ladder="$(awk '/^__status_rank\(\)/{f=1;next} f&&/^}/{f=0} f' "${__here}/_common.sh" \
+  | sed -nE 's/^[[:space:]]+([A-Z/_-]+)\)[[:space:]].*/\1/p' | tac | paste -sd'>' - | sed 's/>/ > /g')"
+adr="${__here}/../../docs/decisions/adr-0033-polyglot-validation-pipeline.md"
+if [[ "$(grep -o '>' <<<"$ladder" | wc -l)" -ge 8 ]] && grep -qF "(\`${ladder}\`" "$adr"; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("[ladder-order-adr-drift] ADR-0033 §4 must state the __status_rank order '${ladder}'")
+fi
 
 # emit_status formatting.
 out=$(emit_status OK "test-passed")

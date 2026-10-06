@@ -179,7 +179,7 @@ test_layer_intentional_gap_exits_0() {
 }
 
 # (b-masking-closed-e2e) a FAIL-MISSING-VERB child co-running with an OK sibling → the
-# layer exits == 2: the wiring fault (rank 5) beats the sibling's OK (rank 2), so masking
+# layer exits == 2: the wiring fault outranks the sibling's OK (__status_rank), so masking
 # is closed AT THE LAYER EDGE (task #52 — the case #50's reason-tiebreak could not catch
 # because OK was the aggregate winner). Dual-assert rc AND the FAIL-MISSING-VERB token.
 test_layer_missing_verb_beats_sibling_ok() {

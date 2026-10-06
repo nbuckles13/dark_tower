@@ -160,6 +160,13 @@ gate2_is_excluded() {
 # two sides would canonicalize differently and the signature would falsely differ.
 # Both apply gate2_is_excluded with the SAME predicate above.
 #
+# Both also pass `--no-renames` (2026-10-06, security). Porcelain `git diff --name-only`
+# honours diff.renames (default on), so a rename lists ONLY its destination and
+# `--diff-filter=D` never sees the source: a `git mv` of a bound file into
+# docs/devloop-outputs/ would delete it with zero binding visibility, and a bound→bound
+# rename would drop the source's DELETED record. Every file-list diff in this file carries
+# the flag, producer and hook alike, independent of the user's config.
+#
 # Each emits one path per line of OUTPUT via a NUL-safe printf '%s\0' stream on
 # fd to the caller's `mapfile -d ''`. We expose array-returning helpers instead of
 # pipelines to avoid `shopt -s lastpipe` (kept out so the hook context stays simple).
@@ -205,7 +212,7 @@ gate2_changeset_worktree() {
   # __gate2_capture_nul) where errexit is inert, so a failing `git diff` must fail the
   # group explicitly or pipefail would only see ls-files' status.
   {
-    git diff -z --name-only HEAD &&
+    git diff -z --no-renames --name-only HEAD &&
     git ls-files -z --others --exclude-standard
   } | __gate2_filter_excluded | LC_ALL=C sort -z -u
 }
@@ -215,7 +222,7 @@ gate2_changeset_worktree() {
 # is authoritative for what the commit will contain. Deduped, LC_ALL=C sorted.
 gate2_changeset_staged() {
   local -; set -euo pipefail   # function-local opts (bash 4.4+): auto-restored, never leaks to sourcer
-  git diff --cached -z --name-only | __gate2_filter_excluded | LC_ALL=C sort -z -u
+  git diff --cached -z --no-renames --name-only | __gate2_filter_excluded | LC_ALL=C sort -z -u
 }
 
 # -----------------------------------------------------------------------------
@@ -278,11 +285,11 @@ readonly GATE2_DELETED_OID="DELETED"
 # deletions; hook reads the staged (index-vs-HEAD) deletions.
 gate2_deletions_worktree() {
   local -; set -euo pipefail
-  git diff --diff-filter=D -z --name-only HEAD | __gate2_filter_excluded | LC_ALL=C sort -z -u
+  git diff --diff-filter=D -z --no-renames --name-only HEAD | __gate2_filter_excluded | LC_ALL=C sort -z -u
 }
 gate2_deletions_staged() {
   local -; set -euo pipefail
-  git diff --cached --diff-filter=D -z --name-only | __gate2_filter_excluded | LC_ALL=C sort -z -u
+  git diff --cached --diff-filter=D -z --no-renames --name-only | __gate2_filter_excluded | LC_ALL=C sort -z -u
 }
 
 # __gate2_in_nulset <path> <nul-set...> — internal: is <path> a member of the
@@ -490,7 +497,7 @@ gate2_layer4_counts() {
 # __gate2_raw_worktree_paths — the producer's RAW (pre-exclusion) changed-path list,
 # NUL-delimited, for slug derivation. `&&` so a failing `git diff` fails the call.
 __gate2_raw_worktree_paths() {
-  git diff -z --name-only HEAD &&
+  git diff -z --no-renames --name-only HEAD &&
   git ls-files -z --others --exclude-standard
 }
 
@@ -789,12 +796,32 @@ gate2_replay_source() {
   return 0
 }
 
+# __gate2_phase_cell <content> — print the value cell of the main.md content's FIRST
+# Loop State Phase row (`| Phase | <cell> |`), trimmed; return 1 if there is no such row.
+# The ONE Phase-row parser: __gate2_is_complete decides on it, and the Phase≠complete
+# refusal displays it, so the two can never read different rows.
+__gate2_phase_cell() {
+  local row
+  row="$(printf '%s\n' "$1" | grep -m1 '^| Phase |' || true)"
+  [[ -n "$row" ]] || return 1
+  row="${row#| Phase |}"
+  row="${row%%|*}"
+  row="${row#"${row%%[![:space:]]*}"}"   # trim leading whitespace
+  row="${row%"${row##*[![:space:]]}"}"   # trim trailing whitespace
+  printf '%s' "$row"
+}
+
 # __gate2_is_complete <content> — 0 iff the main.md content's Loop State Phase row has
 # leading word `complete` (row shape: `| Phase | `<value>` |`, value maybe backticked).
+# Exactly lowercase `complete`: no row, an empty cell, `COMPLETE`, `Complete`, `**Phase**`
+# or `|Phase|complete|` are all NOT complete (fail-closed — the Phase≠complete refusal
+# treats every one of them as an incomplete record).
 __gate2_is_complete() {
-  local w
-  w="$(printf '%s\n' "$1" | grep -m1 '^| Phase |' \
-    | sed -E 's/^\| Phase \| *`?([A-Za-z0-9-]+).*/\1/' || true)"
+  local cell w
+  cell="$(__gate2_phase_cell "$1")" || return 1
+  cell="${cell#\`}"
+  [[ "$cell" =~ ^([A-Za-z0-9-]+) ]] || return 1
+  w="${BASH_REMATCH[1]}"
   [[ "$w" == "complete" ]]
 }
 
@@ -821,7 +848,7 @@ gate2_replay_commit_facts() {
     __gate2_commit_token="replayed-merge-not-vouched"
     __gate2_commit_reason="the replayed commit is a merge ($nparents parents) — merges are not vouched for (runbook §8.5)"; return 0
   fi
-  __gate2_capture_nul changed git --no-replace-objects diff-tree -r -z --no-commit-id --name-only --diff-filter=AM "$parent" "$sha" || rc=$?
+  __gate2_capture_nul changed git --no-replace-objects diff-tree -r -z --no-renames --no-commit-id --name-only --diff-filter=AM "$parent" "$sha" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     __gate2_commit_token="git-error" __gate2_commit_reason="diff-tree <parent> <replayed> failed (rc=$rc)"; return 0
   fi
@@ -893,7 +920,7 @@ __gate2_replay_unvalidated_counts() {
     printf 'enumerating the staged changeset failed (rc=%s)' "$rc"; return 1
   fi
   if [[ ${#bound[@]} -gt 0 ]]; then
-    __gate2_capture_nul differ git --literal-pathspecs diff --cached -z --name-only "$sha" -- "${bound[@]}" || rc=$?
+    __gate2_capture_nul differ git --literal-pathspecs diff --cached -z --no-renames --name-only "$sha" -- "${bound[@]}" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
       printf 'diff --cached against the replayed commit failed (rc=%s)' "$rc"; return 1
     fi
@@ -957,6 +984,39 @@ __gate2_replay_action_lines() {
   fi
 }
 
+# __gate2_staged_mainmds — the ONE fail-closed enumeration of staged devloop records,
+# shared by the trigger (gate2_staged_trigger_slug) and the Phase≠complete refusal
+# (gate2_refuse_incomplete_mainmds) so they cannot disagree about which files are devloop
+# records or how a read error fails closed. Sets the parallel arrays __gate2_mm_paths /
+# __gate2_mm_contents to every staged, non-deleted (`--diff-filter=d`: a deleted record
+# has no Phase, and `git show :<deleted>` is rc 128), non-template devloop main.md and its
+# STAGED (index) content. It makes NO empty/complete decision — each caller applies its
+# own policy (the trigger skips empty content; the refusal treats empty as incomplete).
+# Returns 0, or 3 (with a stderr diagnostic) if the staged changeset cannot be enumerated
+# or a present staged main.md cannot be read — never "no records".
+__gate2_mm_paths=()
+__gate2_mm_contents=()
+__gate2_staged_mainmds() {
+  local f content rc=0
+  local -a candidates=()
+  __gate2_mm_paths=() __gate2_mm_contents=()
+  __gate2_capture_nul candidates git diff --cached -z --no-renames --name-only --diff-filter=d || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    printf 'gate2: enumerating staged changes failed (rc=%s)\n' "$rc" >&2
+    return 3
+  fi
+  for f in "${candidates[@]+"${candidates[@]}"}"; do
+    gate2_is_devloop_mainmd "$f" || continue
+    if ! content="$(git show ":$f")"; then
+      printf 'gate2: cannot read staged %s\n' "$(__gate2_printable "$f")" >&2
+      return 3
+    fi
+    __gate2_mm_paths+=("$f")
+    __gate2_mm_contents+=("$content")
+  done
+  return 0
+}
+
 # gate2_staged_trigger_slug — print the slug of the SINGLE staged devloop main.md that
 # is at Phase=complete AND is not a vouched replay (see REPLAY SKIP above).
 #   exactly one → prints the slug, returns 0.
@@ -984,26 +1044,17 @@ __gate2_replay_action_lines() {
 # token; reflection/planning/review/implementation/gate-3/setup are not). Trailing
 # annotations like `complete (iteration 2)` still count as complete.
 gate2_staged_trigger_slug() {
-  local f staged rc=0
-  local -a found=() candidates=()
+  local f staged i
+  local -a found=()
   local replay_rc=-1
   # Reset the per-commit replay state, so a second call in one shell (or a direct,
   # non-`$(…)` call) never inherits earlier refusals or vouches.
   __gate2_refused_tokens=() __gate2_modified_paths=() __gate2_vouched_paths=() __gate2_vouched_blobs=()
   __gate2_commit_checked=0 __gate2_commit_token="" __gate2_commit_reason="" __gate2_commit_written=""
-  __gate2_capture_nul candidates git diff --cached -z --name-only --diff-filter=d || rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    printf 'gate2: enumerating staged changes failed (rc=%s)\n' "$rc" >&2
-    return 3
-  fi
-  for f in "${candidates[@]+"${candidates[@]}"}"; do
-    # Only devloop main.md (non-template) — shared predicate (dry-reviewer).
-    gate2_is_devloop_mainmd "$f" || continue
-    # Read STAGED content (the index blob), not the worktree. Fail closed.
-    if ! staged="$(git show ":$f")"; then
-      printf 'gate2: cannot read staged %s\n' "$(__gate2_printable "$f")" >&2
-      return 3
-    fi
+  # Staged devloop records with their INDEX content (shared, fail-closed enumerator).
+  __gate2_staged_mainmds || return 3
+  for i in "${!__gate2_mm_paths[@]}"; do
+    f="${__gate2_mm_paths[$i]}" staged="${__gate2_mm_contents[$i]}"
     [[ -n "$staged" ]] || continue
     __gate2_is_complete "$staged" || continue
 
@@ -1045,6 +1096,93 @@ gate2_staged_trigger_slug() {
   return 0   # zero found
 }
 
+# -----------------------------------------------------------------------------
+# PHASE≠COMPLETE REFUSAL (devloop 2026-10-06-pipeline-status-phase-gate-playwright;
+# runbook §8.5 "Phase not complete").
+#
+# The verdict trigger (conjunct 1) fires only for a staged main.md at Phase=complete, so a
+# commit that staged its devloop record with Phase still `setup` (the ci-speed commit)
+# carried its code past the gate with no verdict checked. This closes that knob: a commit
+# that stages ANY devloop main.md that is not at Phase=complete together with ≥1 BOUND
+# file is refused. The two sets are a PARTITION (security B1): every staged non-template,
+# non-deleted devloop main.md is either complete (__gate2_is_complete → the verdict path)
+# or not — an empty file, a missing/garbled row, `COMPLETE` all land here; no third state
+# allows.
+#
+# "Bound" is the binding universe, gate2_changeset_staged — the SAME set conjunct 2 uses
+# (Lead ruling; deliberately not the task's literal "outside docs/devloop-outputs/"): the
+# refusal fires exactly when setting Phase=complete would make the verdict REQUIRED, so
+# Phase can never change WHETHER a verdict is required, and there is no second exclusion
+# list to drift from the binding's.
+#
+# Runs FIRST in gate2_validate_commit, independent of the trigger slug, the replay skip
+# and conjunct 2, so mixed commits (a complete record + another incomplete one + code)
+# are refused too. NO replay exemption (security B5): a conflict-resolved replay of one of
+# the historical commits whose record never reached `complete` is refused; the operator
+# decides on `--no-verify` (the message says so, scoped). The replay skip for COMPLETE
+# records is unchanged.
+#
+# Returns 0 (nothing to refuse) or 1 (refused, or any git error — fail-closed). On the
+# refusal path only, it calls gate2_replay_source to word the message, which sets the
+# __gate2_replay_* globals in the hook's shell; harmless, because that path ends the commit
+# (and the trigger resets its own replay state at entry).
+# -----------------------------------------------------------------------------
+GATE2_REFUSAL_LIST_MAX=5   # bound files named in the refusal before "+N more"
+
+gate2_refuse_incomplete_mainmds() {
+  local i f content cell n
+  local -a bad=() bad_desc=() bound=()
+  # A failed enumeration/read here is the SAME failure the trigger would hit (shared
+  # enumerator), so it reports with the trigger-error message the runbook documents.
+  local mm_rc=0
+  __gate2_staged_mainmds || mm_rc=$?
+  if [[ "$mm_rc" -ne 0 ]]; then
+    printf '\n❌ Gate-2: error evaluating the commit trigger (rc=%s) — blocking (fail-closed).\n' "$mm_rc" >&2
+    return 1
+  fi
+  for i in "${!__gate2_mm_paths[@]}"; do
+    f="${__gate2_mm_paths[$i]}" content="${__gate2_mm_contents[$i]}"
+    __gate2_is_complete "$content" && continue
+    bad+=("$f")
+    if cell="$(__gate2_phase_cell "$content")"; then
+      bad_desc+=("Phase reads '$(__gate2_printable "$cell")'")
+    elif [[ -z "$content" ]]; then
+      bad_desc+=('the staged file is empty (no Loop State "| Phase |" row)')
+    else
+      bad_desc+=('no Loop State "| Phase |" row')
+    fi
+  done
+  [[ ${#bad[@]} -gt 0 ]] || return 0
+
+  if ! __gate2_capture_nul bound gate2_changeset_staged; then
+    printf '\n❌ Gate-2: error enumerating the staged changeset for the Phase check (git output above) — blocking (fail-closed).\n' >&2
+    return 1
+  fi
+  [[ ${#bound[@]} -gt 0 ]] || return 0   # bookkeeping-only commit: no verdict could be required
+
+  printf '\n❌ Gate-2: [phase-not-complete] devloop main.md staged at Phase≠complete with validated files\n' >&2
+  for i in "${!bad[@]}"; do
+    printf '   %s: %s; the gate needs the Loop State row "| Phase | `complete` |".\n' \
+      "$(__gate2_printable "${bad[$i]}")" "${bad_desc[$i]}" >&2
+  done
+  printf '   Validated files staged with it (%s):' "${#bound[@]}" >&2
+  for ((n = 0; n < ${#bound[@]} && n < GATE2_REFUSAL_LIST_MAX; n++)); do
+    printf ' %s' "$(__gate2_printable "${bound[$n]}")" >&2
+  done
+  if [[ ${#bound[@]} -gt GATE2_REFUSAL_LIST_MAX ]]; then
+    printf ' +%s more' "$(( ${#bound[@]} - GATE2_REFUSAL_LIST_MAX ))" >&2
+  fi
+  printf '\n' >&2
+  printf '   If this is the devloop you are committing: set its Loop State Phase to `complete` — the hook then requires the Gate-2 verdict (devloop SKILL.md Step 8).\n' >&2
+  printf '   If you are editing an older devloop record: commit the docs/devloop-outputs/ change separately from the code.\n' >&2
+  if gate2_replay_source; then
+    printf '   Replay in progress (%s %s): only if you are replaying a historical commit whose record never reached `complete`, after resolving the conflict, with this main.md byte-identical to the replayed commit, `git commit --no-verify` is your decision — it skips ALL pre-commit checks; CI on PRs into main/develop re-runs the pipeline (it does not check the record).\n' \
+      "$__gate2_replay_ref" "${__gate2_replay_sha:0:12}" >&2
+  fi
+  printf '   See docs/runbooks/devloop-validation.md §8.5 ("Phase not complete").\n' >&2
+  return 1
+}
+
 # gate2_validate_commit — the hook's entry point. See contract above.
 #
 # NOTE this function is called DIRECTLY by the hook (not in a subshell), so it must
@@ -1065,6 +1203,9 @@ gate2_validate_commit() {
   fi
   local verdict="$GATE2_VERDICT_FILE"
   local staged_slug
+
+  # --- Phase≠complete refusal: runs FIRST, independent of everything below. ---------
+  gate2_refuse_incomplete_mainmds || return 1
 
   # --- TRIGGER conjunct 1: a staged devloop main.md at Phase=complete? ---------
   # (Vouched replays are filtered out inside gate2_staged_trigger_slug — REPLAY SKIP.)

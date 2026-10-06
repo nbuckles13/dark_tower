@@ -183,8 +183,9 @@ case_e() {
 }
 
 # ---------------------------------------------------------------------------
-# (f) a NON-devloop commit (no staged complete main.md) → hook no-ops.
-#     Two sub-cases: no main.md at all, and a main.md NOT at Phase=complete.
+# (f) a NON-devloop commit (no staged devloop main.md) → hook no-ops. f2 (2026-10-06)
+#     is the REVERSE pin: a main.md NOT at Phase=complete staged with validated files —
+#     the ci-speed commit's shape — is now REFUSED (it used to no-op: the Phase knob).
 # ---------------------------------------------------------------------------
 case_f() {
   seed_commit
@@ -194,13 +195,314 @@ case_f() {
   rm -f "$GATE2_VERDICT_FILE"
   if gate2_validate_commit; then ok "(f1) non-devloop commit → no-op (allow)"; else bad "(f1) non-devloop commit should ALLOW"; fi
 
-  # f2: a devloop main.md staged but at Phase=implementation (not complete) →
-  #     trigger conjunct-1 false → no-op even with validated files + no verdict.
-  mk_main_md "story-f2" "implementation"
-  echo "more" > src2.rs
+  # f2: the ci-speed shape — main.md at Phase=setup + validated code, no verdict → REFUSED,
+  #     and the message names the record, the Phase it read, the file, and the remedy.
+  git commit -qm f1
+  mk_main_md "story-f2" "setup"
+  mkdir -p crates/x; echo "more" > crates/x/src2.rs
   git add -A
   rm -f "$GATE2_VERDICT_FILE"
-  if gate2_validate_commit; then ok "(f2) main.md not-complete → no-op (allow)"; else bad "(f2) non-complete phase should ALLOW"; fi
+  run_validate
+  expect_phase_refusal "(f2) ci-speed shape (Phase=setup + code)" "docs/devloop-outputs/story-f2/main.md" \
+    "Phase reads '\`setup\`'" "crates/x/src2.rs"
+}
+
+# ===========================================================================
+# PHASE≠COMPLETE REFUSAL (devloop 2026-10-06-pipeline-status-phase-gate-playwright;
+# runbook §8.5 "Phase not complete"). Every refusal asserts rc≠0 AND the token AND message
+# content; every allow asserts rc=0 AND the token absent.
+# ===========================================================================
+PHASE_TOKEN='devloop main.md staged at Phase≠complete with validated files'
+
+# expect_phase_refusal <case> <path> [<needle>...] — blocked by the Phase refusal: rc≠0,
+# the token, the path, the remedy, and every extra needle.
+expect_phase_refusal() {
+  local c="$1" path="$2" n; shift 2
+  if [[ "$rc" -eq 0 ]] || ! grep -qF "$PHASE_TOKEN" <<<"$out" || ! grep -qF '[phase-not-complete]' <<<"$out"; then
+    bad "$c should BLOCK with the Phase refusal (rc=$rc); output: $out"; return
+  fi
+  for n in "$path" 'set its Loop State Phase to `complete`' 'commit the docs/devloop-outputs/ change separately' "$@"; do
+    grep -qF -- "$n" <<<"$out" || { bad "$c: refusal message lacks '$n'; output: $out"; return; }
+  done
+  ok "$c → Phase refusal names the record + remedy"
+}
+
+# expect_no_phase_refusal <case> — rc=0 and no refusal token.
+expect_no_phase_refusal() {
+  if [[ "$rc" -eq 0 ]] && ! grep -qF "$PHASE_TOKEN" <<<"$out"; then
+    ok "$1 → allowed, no Phase refusal"
+  else
+    bad "$1 should ALLOW without the Phase refusal (rc=$rc); output: $out"
+  fi
+}
+
+# (f2b) the ci-speed shape WITH a valid PASS verdict for that exact tree → still refused:
+#       the refusal must not depend on the verdict being absent (in the incident Gate 2 had
+#       in fact passed).
+case_f2b() {
+  seed_commit
+  mk_main_md story-f2b setup
+  echo "fn main() {}" > src.rs
+  git add -A
+  declare -A ls=( [4]=OK ) ld=( [4]=2 )
+  emit_gate2_verdict 0 ls ld
+  if [[ "$(gate2_verdict_get GATE2 "$GATE2_VERDICT_FILE")" != "PASS" ]]; then bad "(f2b) setup: no PASS verdict"; return; fi
+  run_validate
+  expect_phase_refusal "(f2b) ci-speed shape with a PASS verdict present" "docs/devloop-outputs/story-f2b/main.md"
+}
+
+# (s1) TABLE-DRIVEN Phase variants, each + code, through the real entry point
+#      (gate2_validate_commit): all are NOT complete (fail-closed) → refused.
+case_s1() {
+  seed_commit
+  local v content desc path
+  local -a variants=(norow emptycell emptyfile upper capital nospace bold)
+  for v in "${variants[@]}"; do
+    path="docs/devloop-outputs/story-s1-${v}/main.md"
+    mkdir -p "$(dirname "$path")"
+    case "$v" in
+      norow)     content=$'# Devloop Output\n\nno loop-state table here\n'; desc='no Loop State "| Phase |" row' ;;
+      emptycell) content=$'| Field | Value |\n|-------|-------|\n| Phase | |\n'; desc="Phase reads ''" ;;
+      emptyfile) content='';                                              desc='the staged file is empty' ;;
+      upper)     content=$'| Phase | `COMPLETE` |\n';                      desc="Phase reads '\`COMPLETE\`'" ;;
+      capital)   content=$'| Phase | `Complete` |\n';                      desc="Phase reads '\`Complete\`'" ;;
+      nospace)   content=$'|Phase|complete|\n';                             desc='no Loop State "| Phase |" row' ;;
+      bold)      content=$'| **Phase** | `complete` |\n';                  desc='no Loop State "| Phase |" row' ;;
+    esac
+    printf '%s' "$content" > "$path"
+    echo "fn $v() {}" > "src_${v}.rs"
+    git add "$path" "src_${v}.rs"
+    run_validate
+    expect_phase_refusal "(s1-${v})" "$path" "$desc"
+    git reset -q; rm -rf "docs/devloop-outputs/story-s1-${v}" "src_${v}.rs"
+  done
+}
+
+# (s2) the refusal reads the STAGED blob: index says setup, worktree says complete → refused.
+case_s2() {
+  seed_commit
+  mk_main_md story-s2 setup
+  echo "fn main() {}" > src.rs
+  git add -A
+  mk_main_md story-s2 complete     # worktree only
+  run_validate
+  expect_phase_refusal "(s2) staged setup / worktree complete" "docs/devloop-outputs/story-s2/main.md" "Phase reads '\`setup\`'"
+}
+
+# (s3a) docs-only: a setup main.md alone → allowed.
+case_s3a() {
+  seed_commit
+  mk_main_md story-s3a setup
+  git add -A
+  run_validate
+  expect_no_phase_refusal "(s3a) setup main.md alone"
+}
+
+# (s3b) bookkeeping-only: setup main.md + other devloop-outputs + docs/TODO.md + a specialist
+#       INDEX.md (all in the binding's exclusion set) → allowed: no verdict could be required.
+case_s3b() {
+  seed_commit
+  mk_main_md story-s3b setup
+  echo note > docs/devloop-outputs/story-s3b/notes.md
+  mkdir -p docs/specialist-knowledge/infrastructure
+  echo todo > docs/TODO.md; echo idx > docs/specialist-knowledge/infrastructure/INDEX.md
+  git add -A
+  run_validate
+  expect_no_phase_refusal "(s3b) setup main.md + bookkeeping files only"
+}
+
+# (s4) the _template main.md is not a devloop record → not refused (and no trigger).
+case_s4() {
+  seed_commit
+  mk_main_md _template setup
+  echo "fn main() {}" > src.rs
+  git add -A
+  run_validate
+  expect_no_phase_refusal "(s4) _template/main.md at setup + code"
+}
+
+# (s5) MIXED: a complete main.md with a matching PASS verdict + ANOTHER devloop's main.md at
+#      setup + code → refused (the refusal runs first, regardless of the verdict path).
+case_s5() {
+  seed_commit
+  mk_main_md story-s5a complete
+  mk_main_md story-s5b setup
+  echo "fn main() {}" > src.rs
+  git add -A
+  declare -A ls=( [4]=OK ) ld=( [4]=2 )
+  emit_gate2_verdict 0 ls ld
+  run_validate
+  expect_phase_refusal "(s5) complete+verdict + another setup record + code" "docs/devloop-outputs/story-s5b/main.md"
+  if grep -qF 'story-s5a/main.md:' <<<"$out"; then bad "(s5) the COMPLETE record must not be listed as incomplete: $out"; fi
+}
+
+# (s6) a VOUCHED complete replay + another devloop's main.md at setup + code → refused (the
+#      replay skip does not reach the refusal).
+case_s6() {
+  replay_fixture story-s6 "$(devloop_msg story-s6)"
+  conflicted_pick devloop || return
+  mk_main_md story-s6-other setup
+  git add docs/devloop-outputs/story-s6-other/main.md
+  run_validate
+  expect_phase_refusal "(s6) vouched complete replay + setup record + code" "docs/devloop-outputs/story-s6-other/main.md"
+}
+
+# (s7) REPLAY of a historical commit whose record never reached `complete` (setup + code),
+#      conflict-resolved, main.md untouched → REFUSED (no replay exemption, security B5),
+#      with the scoped --no-verify line naming the replay ref. The complete-record replay
+#      skip is unchanged (q1).
+case_s7() {
+  seed_commit
+  echo base > src.rs; git add src.rs; git commit -qm base-src
+  git checkout -qb devloop
+  mk_main_md story-s7 setup; echo devloop > src.rs
+  git add -A; commit_msg "$(devloop_msg story-s7)"
+  git checkout -q main; echo target > src.rs; git commit -qam target
+  conflicted_pick devloop || return
+  run_validate
+  expect_phase_refusal "(s7) replay of a never-complete historical commit" "docs/devloop-outputs/story-s7/main.md" \
+    "Replay in progress (CHERRY_PICK_HEAD $(git rev-parse --short=12 devloop))" "it skips ALL pre-commit checks"
+}
+
+# (s8) a staged DELETION of a setup main.md + code → no refusal (a deleted record has no Phase).
+case_s8() {
+  seed_commit
+  mk_main_md story-s8 setup
+  echo one > src.rs
+  git add -A; git commit -qm "record + code"
+  git rm -q docs/devloop-outputs/story-s8/main.md
+  echo two > src.rs; git add src.rs
+  run_validate
+  expect_no_phase_refusal "(s8) staged deletion of a setup main.md + code"
+}
+
+# (s9) FAIL-CLOSED: the staged setup main.md cannot be read → the trigger-error block, not a
+#       silent "no incomplete record".
+case_s9() {
+  seed_commit
+  mk_main_md story-s9 setup
+  echo "fn main() {}" > src.rs
+  git add -A
+  with_git_shim ':docs/devloop-outputs/*/main.md' show
+  if [[ "$rc" -ne 0 ]] && grep -q 'error evaluating the commit trigger (rc=3)' <<<"$out" && ! grep -qF "$PHASE_TOKEN" <<<"$out"; then
+    ok "(s9) unreadable staged setup main.md → fail-closed trigger-error block"
+  else
+    bad "(s9) should BLOCK via the trigger error (rc=$rc); output: $out"
+  fi
+}
+
+# (s10) RENAMES (security B6-i): validate, then `git mv` a BOUND file into
+#       docs/devloop-outputs/ → its deletion must be visible to the binding (block, named).
+#       Pre-fix, rename detection listed only the (excluded) destination → false PASS.
+case_s10() {
+  mkdir -p crates; echo keep > crates/a.rs; seed_commit; git add crates; git commit -qm crates
+  mk_main_md story-s10 complete
+  echo "fn main() {}" > src.rs
+  git add -A
+  declare -A ls=( [4]=OK ) ld=( [4]=2 )
+  emit_gate2_verdict 0 ls ld
+  git mv crates/a.rs docs/devloop-outputs/story-s10/a.rs
+  run_validate
+  if [[ "$rc" -ne 0 ]] && grep -q 'signature mismatch' <<<"$out" && grep -q 'staged but not in verdict: crates/a.rs' <<<"$out"; then
+    ok "(s10) git mv of a bound file into devloop-outputs after validation → block, deletion named"
+  else
+    bad "(s10) rename into devloop-outputs must BLOCK naming crates/a.rs (rc=$rc); output: $out"
+  fi
+}
+
+# (s11) RENAMES (B6-ii): setup main.md + `git mv` of a bound file into devloop-outputs → the
+#       bound deletion makes the Phase refusal fire.
+case_s11() {
+  mkdir -p crates; echo keep > crates/a.rs; seed_commit; git add crates; git commit -qm crates
+  mk_main_md story-s11 setup
+  git add -A
+  git mv crates/a.rs docs/devloop-outputs/story-s11/a.rs
+  run_validate
+  expect_phase_refusal "(s11) setup record + rename of a bound file into devloop-outputs" \
+    "docs/devloop-outputs/story-s11/main.md" "crates/a.rs"
+}
+
+# (s12) RENAMES (B6-iii): a bound→bound rename is recorded as DELETED <old> + <blob> <new> in
+#       the staged records stream (the signature's input), not as the destination alone.
+case_s12() {
+  mkdir -p crates; echo keep > crates/a.rs; seed_commit; git add crates; git commit -qm crates
+  mkdir -p crates2; git mv crates/a.rs crates2/a.rs
+  local recs blob
+  recs="$(gate2_records_staged | tr '\0' '\n')"
+  blob="$(git rev-parse :crates2/a.rs)"
+  if grep -qx 'DELETED crates/a.rs' <<<"$recs" && grep -qx "$blob crates2/a.rs" <<<"$recs"; then
+    ok "(s12) bound→bound rename → DELETED old + blob new in the records stream"
+  else
+    bad "(s12) rename records wrong; got: $recs"
+  fi
+}
+
+# (s12b) RENAMES, PRODUCER side (@test T1): the worktree record stream also binds a
+#        bound→bound rename as DELETED <old> + <blob> <new> — the producer twin of s12.
+case_s12b() {
+  mkdir -p crates; echo keep > crates/a.rs; seed_commit; git add crates; git commit -qm crates
+  mkdir -p crates2; git mv crates/a.rs crates2/a.rs
+  local recs blob
+  recs="$(gate2_records_worktree | tr '\0' '\n')"
+  blob="$(git hash-object crates2/a.rs)"
+  if grep -qx 'DELETED crates/a.rs' <<<"$recs" && grep -qx "$blob crates2/a.rs" <<<"$recs"; then
+    ok "(s12b) producer: bound→bound rename → DELETED old + blob new"
+  else
+    bad "(s12b) producer rename records wrong; got: $recs"
+  fi
+}
+
+# (s12c) RENAMES, END TO END: complete main.md + a bound→bound `git mv`, verdict emitted over
+#        the worktree, validated over the index → ALLOW. Pins producer/hook symmetry across a
+#        rename (one side dropping --no-renames would be a false signature mismatch here).
+case_s12c() {
+  mkdir -p crates; echo keep > crates/a.rs; seed_commit; git add crates; git commit -qm crates
+  mk_main_md story-s12c complete
+  mkdir -p crates2; git mv crates/a.rs crates2/a.rs
+  git add -A
+  declare -A ls=( [4]=OK ) ld=( [4]=2 )
+  emit_gate2_verdict 0 ls ld
+  run_validate
+  if [[ "$rc" -eq 0 ]] && grep -q '^FILE crates/a.rs	DELETED$' "$GATE2_VERDICT_FILE"; then
+    ok "(s12c) rename → emit → validate → allow; verdict binds the source deletion"
+  else
+    bad "(s12c) rename round-trip should ALLOW with the deletion bound (rc=$rc); output: $out; verdict: $(cat "$GATE2_VERDICT_FILE")"
+  fi
+}
+
+# (s13) MIRROR of s1 — the ACCEPTING Phase forms (rewritten parser, positive pin). Each + code
+#       goes down the VERDICT path: blocked as "no validation verdict found" without one (proving
+#       the trigger fired), allowed with a matching PASS verdict — never the Phase refusal.
+case_s13() {
+  seed_commit
+  local v content path
+  local -a variants=(bare backticked annotated bare-annotated tabbed nospace-after)
+  for v in "${variants[@]}"; do
+    path="docs/devloop-outputs/story-s13-${v}/main.md"
+    mkdir -p "$(dirname "$path")"
+    case "$v" in
+      bare)           content=$'| Phase | complete |\n' ;;
+      backticked)     content=$'| Phase | `complete` |\n' ;;
+      annotated)      content=$'| Phase | `complete` (iteration 2) |\n' ;;
+      bare-annotated) content=$'| Phase | complete (iteration 2) |\n' ;;
+      tabbed)         content=$'| Phase |\t`complete`\t|\n' ;;
+      nospace-after)  content=$'| Phase |complete|\n' ;;
+    esac
+    printf '%s' "$content" > "$path"
+    echo "fn $v() {}" > "src_${v}.rs"
+    git add "$path" "src_${v}.rs"
+    rm -f "$GATE2_VERDICT_FILE"
+    run_validate
+    if [[ "$rc" -eq 0 ]] || ! grep -q 'no validation verdict found' <<<"$out" || grep -qF "$PHASE_TOKEN" <<<"$out"; then
+      bad "(s13-${v}) complete form must reach the verdict path (rc=$rc); output: $out"
+    else
+      declare -A ls=( [4]=OK ) ld=( [4]=2 )
+      emit_gate2_verdict 0 ls ld
+      run_validate
+      expect_no_phase_refusal "(s13-${v}) accepted as complete, matching verdict"
+    fi
+    git reset -q; rm -rf "docs/devloop-outputs/story-s13-${v}" "src_${v}.rs"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -1192,8 +1494,9 @@ case_r17() {
   fi
 }
 
-printf 'gate2 isolation self-test (matrix a–f + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q9/r1–r24):\n'
-for c in case_a case_b case_c case_d case_e case_f case_g case_h case_i case_j case_k case_l case_m case_n case_o case_p \
+printf 'gate2 isolation self-test (matrix a–f + Phase≠complete refusal f2/f2b/s1–s13 + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q9/r1–r24):\n'
+for c in case_a case_b case_c case_d case_e case_f case_f2b case_s1 case_s2 case_s3a case_s3b case_s4 case_s5 \
+         case_s6 case_s7 case_s8 case_s9 case_s10 case_s11 case_s12 case_s12b case_s12c case_s13 case_g case_h case_i case_j case_k case_l case_m case_n case_o case_p \
          case_q1 case_q2 case_q3 case_q4 case_q5 case_q7 case_q8 case_q9 \
          case_r1 case_r2 case_r5 case_r6 case_r6b case_r6c case_r7 case_r8 case_r9 \
          case_r10 case_r10b case_r11 case_r12 case_r12c case_r13 case_r19 case_r20 case_r21 case_r22 case_r15 case_r16 case_r17 case_r23 case_r24; do

@@ -62,7 +62,8 @@ source "${__here}/_common.sh"
 #   stdout = streamed child STATUS lines + (when 2+ langs) one aggregated STATUS
 #   stderr = diagnostic notes (e.g. an INCLUDE/EXCLUDE filter that cleared the lang set)
 #
-# Returns: 0 on OK/SKIPPED/N/A; 1 on FAIL; 2 on dispatcher bug.
+# Returns: 0 on OK/SKIPPED/N/A; 1 on FAIL; 2 on a wiring fault (FAIL-MISSING-VERB, incl. an
+# empty lang root) or dispatcher bug.
 for_each_lang_with_verb() {
   local verb="$1"; shift
   local lang_root="${DEVLOOP_LANG_ROOT:-${__here}}"
@@ -80,9 +81,15 @@ for_each_lang_with_verb() {
     langs+=("$name")
   done
 
+  # No language directory at all, BEFORE any INCLUDE/EXCLUDE filter: the lang root is
+  # empty or misdirected (broken checkout / bad DEVLOOP_LANG_ROOT) — no gate ran. A wiring
+  # fault, not a documented gap: FAIL-MISSING-VERB (exit 2) outranks every sibling layer's
+  # OK, so a pipeline that dispatched no language can never total OK (2026-10-06; it was
+  # N/A, which the N/A-below-OK re-rank would have folded into a green total). Operator
+  # intent — a filter that cleared the set — is the separate SKIPPED-NO-VERB arm below.
   if [[ ${#langs[@]} -eq 0 ]]; then
-    emit_status N/A "no-languages-registered"
-    return 0
+    emit_status FAIL-MISSING-VERB "no-languages-registered"
+    return "$(status_to_exit_code FAIL-MISSING-VERB)"
   fi
 
   # Apply INCLUDE/EXCLUDE filter BEFORE dispatch: a filtered-out lang is
@@ -162,7 +169,7 @@ for_each_lang_with_verb() {
       # Verb script genuinely missing-or-not-executable → always a WIRING fault
       # (task #52). Intentional gaps register as placeholder <verb>.sh scripts that
       # emit N/A (taking the `-x` branch above), so reaching HERE means a wrapper that
-      # should exist is missing/chmod-stripped — FAIL-MISSING-VERB (rank 5), which
+      # should exist is missing/chmod-stripped — FAIL-MISSING-VERB (outranks OK and FAIL), which
       # status_to_exit_code maps to exit 2 (§6 wiring-fault class). No allowlist: the
       # enum carries the semantics, so a sibling lang's OK can never mask this.
       lang_status="FAIL-MISSING-VERB"
@@ -198,6 +205,8 @@ for_each_lang_with_verb() {
       # route this valid low-rank aggregate to the `*)` FAIL catch-all (a false FAIL).
       SKIPPED-NO-DIFF)    emit_status SKIPPED-NO-DIFF   "all-langs-skipped" ;;
       SKIPPED-NO-VERB)    emit_status SKIPPED-NO-VERB   "$worst_reason" ;;
+      # Reachable only when no child reported OK or worse: every child is N/A or SKIPPED-*
+      # with at least one N/A (N/A ranks just below OK, above SKIPPED-* — __status_rank).
       N/A)                emit_status N/A               "${verb}-aggregate-na" ;;
       FAIL)               emit_status FAIL              "${verb}-some-lang-failed" ;;
       # Emit the offending lang/verb REASON so the loud exit names why.

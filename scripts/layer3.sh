@@ -202,6 +202,20 @@ layer_lifecycle_begin 3
   # the STATUS-aggregation precedence, fail_fast_mode, AND the fmt_mode truth table (incl. the two
   # load-bearing apply-opt-in-loses-to-CI/override cells). Hermetic: pure bash, no cargo/cluster/network.
   run_and_emit "common-selftest" "${__here}/lang/_common.test.sh" || true
+  # Dispatcher, wrapper-trap and base-ref resolver unit tests (2026-10-06 — all three were
+  # orphaned/unrun). _dispatch.test.sh carries the N/A emitter allow-list, the replacement
+  # detection for N/A ranking below OK (ADR-0033 2026-10-06 amendment), and the
+  # no-languages-registered / filter-to-zero / L6-shape dispatcher cases. All hermetic (pure
+  # bash + temp git repos; no cargo/cluster/network), each well under a second. None prints a
+  # bare STATUS= line, so none casts a vote in this layer's aggregate beyond run_and_emit's own.
+  # (_get_base_ref.behavior-equivalence.test.sh is deliberately NOT wired: it runs the whole
+  # real layer-all.sh inside a fixture repo, ~7 min, and two cases are stale — docs/TODO.md.)
+  run_and_emit "dispatch-selftest" "${__here}/lang/_dispatch.test.sh" || true
+  run_and_emit "wrapper-trap-selftest" "${__here}/lang/_wrapper_trap.test.sh" || true
+  run_and_emit "get-base-ref-selftest" "${__here}/lang/_get_base_ref.test.sh" || true
+  # Layer-script skeleton conventions (no raw date/LAYER=/STATUS=/trap/aggregation in layerN.sh);
+  # read-only scan, hermetic, ~0.02s. Also orphaned until 2026-10-06.
+  run_and_emit "layer-skeleton-selftest" "${__here}/lang/_layer_skeleton.test.sh" || true
   # Rust fmt wrapper integration (ADR-0037 §D7): stubbed `cargo` on PATH (hermetic — a PATH stub, NOT the
   # real toolchain, so the "no cargo" invariant above holds), argv-asserted mode dispatch + the four-arm
   # apply pre-pass + positive controls. Under scripts/lang/rust/ (NOT guards/simple/ — the find-name reason).

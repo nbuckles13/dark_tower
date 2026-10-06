@@ -118,6 +118,19 @@ assert_status "c-skipped-no-cluster-cell"  "LAYER=7 RESULT=SKIPPED-NO-CLUSTER" "
 assert_status "c-total-stays-ok"           "TOTAL_RESULT=OK"                   "$out"
 
 # =============================================================================
+# (c2) GREEN RUN WITH AN N/A LAYER (2026-10-06): N/A ranks just below OK, so the proto
+#      placeholder's N/A layer no longer dominates — TOTAL_RESULT=OK, exit 0 — while the
+#      per-layer line keeps saying N/A (the information is not lost, only demoted).
+# =============================================================================
+d="$(new_stubdir)"; mk_stub "$d" 4 N/A test-aggregate-na 0; mk_stub "$d" 6 N/A audit-aggregate-na 0
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
+out="$(cat "$LA_OUT")"
+assert_exit   "c2-na-layer-exit0"   0 "$LA_RC"
+assert_status "c2-na-layer-cell"    "LAYER=4 RESULT=N/A" "$out"
+assert_status "c2-na-layer6-cell"   "LAYER=6 RESULT=N/A" "$out"
+assert_status "c2-na-total-ok"      "TOTAL_RESULT=OK"    "$out"
+
+# =============================================================================
 # (d) NON-DEMOTION FLOOR: a layer whose STATUS line says OK but whose process exits 1 must
 #     NOT let LAYER_ALL_EXIT demote to 0. The rc FLOOR is the belt to the enum's suspenders.
 # =============================================================================
@@ -586,6 +599,17 @@ assert_exit   "h1-all-green-exit0"     0 "$LA_RC"
 assert_status "h1-total-ok"            "TOTAL_RESULT=OK" "$(cat "$LA_OUT")"
 assert_status "h1-l7-skip-cell"        "LAYER=7 RESULT=SKIPPED-NO-CLUSTER" "$(cat "$LA_OUT")"
 assert_absent "h1-no-triage"           "FAILURE_TRIAGE" "$(cat "$LA_ERR")"
+
+# The same N/A demotion on the CI aggregate path (one ladder: aggregate_worst_status).
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"
+mk_summary "$a" guards "LAYER=1 RESULT=OK DURATION=1 RC=0" "LAYER=2 RESULT=OK DURATION=1 RC=0" \
+  "LAYER=3 RESULT=OK DURATION=1 RC=0" "LAYER=6 RESULT=N/A DURATION=1 RC=0" \
+  "LAYER=7 RESULT=SKIPPED-NO-CLUSTER DURATION=0 RC=0"
+mk_summary "$a" test "LAYER=4 RESULT=N/A DURATION=1 RC=0"
+run_agg "$a"
+assert_exit   "h1b-na-shards-exit0"    0 "$LA_RC"
+assert_status "h1b-na-cell-kept"       "LAYER=6 RESULT=N/A" "$(cat "$LA_OUT")"
+assert_status "h1b-na-total-ok"        "TOTAL_RESULT=OK" "$(cat "$LA_OUT")"
 
 a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_partition "$a"; mk_summary "$a" test "LAYER=4 RESULT=FAIL DURATION=9 RC=1"; run_agg "$a"
 assert_exit   "h2-worst-status-exit1"  1 "$LA_RC"
