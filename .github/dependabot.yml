@@ -40,7 +40,8 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     # Cargo.lock is tracked: raise a requirement only when the new version falls outside it.
-    versioning-strategy: increase-if-necessary
+    # For cargo that is `auto` (Dependabot accepts only `auto` or `lockfile-only` here).
+    versioning-strategy: auto
     cooldown:
       default-days: 5
       semver-major-days: 14
@@ -88,7 +89,7 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
-    versioning-strategy: increase-if-necessary
+    versioning-strategy: auto
     cooldown:
       default-days: 5
       semver-major-days: 14
