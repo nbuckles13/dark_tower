@@ -493,15 +493,15 @@ A wrapper script under `scripts/lang/<X>/` may report `STATUS=N/A` (incl. an **i
 
 The cases requiring implementer action are an unexpected `STATUS=N/A` outside the documented gap/placeholder cases, OR a `FAIL-MISSING-VERB` (including `no-languages-registered`, an empty lang root) — both indicate a wrapper/wiring bug. Escalate to operations rather than defer. Since `N/A` ranks below `OK` (ADR-0033 2026-10-06 amendment), an unexpected `N/A` beside a passing sibling shows only in the child `STATUS=` lines, not in the layer `RESULT`; the property that catches it is the N/A emitter allow-list in `scripts/lang/_dispatch.test.sh` (Layer 3 reds on any `N/A` emitter other than the two proto placeholders). A green run reports `TOTAL_RESULT=OK`; a top-line `TOTAL_RESULT=N/A` means no layer did real work.
 
-**ARTIFACT-SPECIFIC** (mandatory when detected file types are in the changeset):
+**ARTIFACT-SPECIFIC** — what the layers actually check per artifact type. Do not claim a check at Gate 2 that this table marks as not automated; do it by hand and say so, or leave it out.
 
-| Artifact | Verification | Trigger |
-|----------|-------------|---------|
-| `.proto` files | Proto compilation, freshness check (regenerate + diff `proto-gen/`), backward compat | `git diff --name-only` includes `proto/` |
-| `migrations/` | Sequential numbering, `.sqlx/` offline data freshness, reversibility documented | `git diff --name-only` includes `migrations/` |
-| K8s manifests | `kubeconform` schema validation | `git diff --name-only` includes `infra/kubernetes/` |
-| Dockerfiles | `hadolint` lint | `git diff --name-only` includes `Dockerfile` |
-| Shell scripts | `shellcheck` lint | `git diff --name-only` includes `*.sh` |
+| Artifact | Automated today | Not automated |
+|----------|-----------------|---------------|
+| `.proto` files | Compilation (Layer 1, `proto-gen`), `buf lint` (Layer 5), `buf breaking` (Layer 6) | — |
+| `migrations/` | Applied by Layer 4 (`scripts/lang/rust/test.sh` migrates the test DB) and by Layer 7's in-cluster `db-migrate` Job | Sequential numbering and reversibility: check by hand. (There is no `.sqlx/` offline data; it was removed with sqlx 0.9.) |
+| K8s manifests | `dt-guard validate-kustomize` (Layer 3) | `kubeconform` schema validation: wired, but `kubeconform` is not installed in the devloop image or CI, so the guard WARNs and skips it |
+| Dockerfiles | Built by Layer 7 / `dev-cluster deploy` | Lint: `hadolint` is not installed or run anywhere |
+| Shell scripts | Their `*.test.sh` self-tests (Layer 3) | `shellcheck`, `shfmt` and a `bash -n` sweep: not installed or run anywhere (pending the shell-as-a-language debate) |
 
 **Layer 7 — Env-tests (Integration)**:
 
