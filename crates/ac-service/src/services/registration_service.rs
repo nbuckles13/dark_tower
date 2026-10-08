@@ -355,6 +355,7 @@ async fn refuse_rotation_of_inactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MIN_BCRYPT_COST;
     use crate::crypto;
     use sqlx::PgPool;
 
@@ -868,9 +869,11 @@ mod tests {
         for (attack_location, service_type, region) in time_based_attacks {
             let start_time = Instant::now();
 
-            // Attempt registration with time-based injection
+            // Attempt registration with time-based injection. The cheapest accepted bcrypt
+            // cost keeps the timing about the SQL, not the hash: at the default cost, CPU
+            // contention from parallel test processes (nextest) pushed one call to 6 s.
             let result =
-                register_service(&pool, service_type, region.clone(), DEFAULT_BCRYPT_COST).await;
+                register_service(&pool, service_type, region.clone(), MIN_BCRYPT_COST).await;
 
             let elapsed = start_time.elapsed();
 
