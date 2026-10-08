@@ -41,7 +41,7 @@
   },
   "devDependencies": {
     "@darktower/test-utils": "workspace:*",
-    "@types/node": "22.20.1",
+    "@types/node": "26.6.2",
     "@vitest/coverage-v8": "4.1.10",
     "msw": "2.15.0",
     "typescript": "6.0.3",
