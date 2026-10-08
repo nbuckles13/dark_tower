@@ -188,3 +188,13 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+# bcrypt's Blowfish rounds are pure CPU, and unoptimised they dominate ac-service's
+# tests (every token issuance and secret hash runs bcrypt at cost 10-14). Optimising
+# just these two crates in dev/test builds made one crypto test 2.4x faster; the
+# release profile is unaffected (it already builds everything at opt-level 3).
+[profile.dev.package.bcrypt]
+opt-level = 3
+
+[profile.dev.package.blowfish]
+opt-level = 3
