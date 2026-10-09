@@ -108,6 +108,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Rate limit configuration"
     );
 
+    // Compute the dummy bcrypt hash for the configured cost now, so the first
+    // login for an unknown account doesn't pay a one-off hash that would make it
+    // measurably slower than a known one.
+    ac_service::crypto::dummy_hash(config.bcrypt_cost).map_err(|e| {
+        error!("Failed to compute dummy bcrypt hash: {}", e);
+        e
+    })?;
+
     // Initialize database connection pool with query timeout
     info!("Connecting to database...");
     let db_pool =

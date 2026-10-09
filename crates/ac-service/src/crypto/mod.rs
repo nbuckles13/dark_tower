@@ -336,6 +336,62 @@ pub fn verify_client_secret(secret: &str, hash: &str) -> Result<bool, AcError> {
     result
 }
 
+/// Bcrypt hash of a random, discarded secret at `cost`, computed once per cost
+/// and cached for the life of the process.
+///
+/// Verified in place of a stored hash when the account does not exist, so the
+/// not-found path does the same bcrypt work as the found path. bcrypt's run
+/// time is set by the cost in the hash alone, so the dummy must carry the
+/// configured cost: a fixed-cost dummy leaks account existence whenever the
+/// configured cost differs from it.
+///
+/// The first call for a cost runs a bcrypt hash; call it at startup (see
+/// `main.rs`) so no request pays that cost.
+///
+/// # Errors
+///
+/// Returns `AcError::Crypto` if `cost` is outside `MIN_BCRYPT_COST..=MAX_BCRYPT_COST`
+/// or hashing fails.
+pub fn dummy_hash(cost: u32) -> Result<&'static str, AcError> {
+    const SLOTS: usize = (MAX_BCRYPT_COST - MIN_BCRYPT_COST + 1) as usize;
+    static DUMMY_HASHES: [std::sync::OnceLock<String>; SLOTS] =
+        [const { std::sync::OnceLock::new() }; SLOTS];
+
+    let slot = cost
+        .checked_sub(MIN_BCRYPT_COST)
+        .and_then(|i| DUMMY_HASHES.get(i as usize))
+        .ok_or_else(|| {
+            AcError::Crypto(format!(
+                "Invalid bcrypt cost: {} (must be {}-{})",
+                cost, MIN_BCRYPT_COST, MAX_BCRYPT_COST
+            ))
+        })?;
+    if let Some(hash) = slot.get() {
+        return Ok(hash);
+    }
+    let secret = hex::encode(generate_random_bytes(32)?);
+    let hash = hash_client_secret(&secret, cost)?;
+    // A concurrent first call may have filled the slot; either hash is valid.
+    Ok(slot.get_or_init(|| hash))
+}
+
+/// Verify `secret` against `stored_hash`, or against [`dummy_hash`] at `cost`
+/// when there is no stored hash (the account does not exist).
+///
+/// Both branches run exactly one bcrypt verify at the same cost, so callers
+/// must not branch on account existence before calling this. Returns
+/// `Ok(false)` whenever `stored_hash` is `None`.
+pub fn verify_secret_or_dummy(
+    secret: &str,
+    stored_hash: Option<&str>,
+    cost: u32,
+) -> Result<bool, AcError> {
+    match stored_hash {
+        Some(hash) => verify_client_secret(secret, hash),
+        None => verify_client_secret(secret, dummy_hash(cost)?).map(|_| false),
+    }
+}
+
 /// Generate cryptographically secure random bytes
 pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>, AcError> {
     let rng = SystemRandom::new();
@@ -1516,6 +1572,70 @@ mod tests {
         // Cost 32 (above bcrypt library max) should also be rejected by our validation first
         let result = hash_client_secret(secret, 32);
         assert!(result.is_err(), "Cost 32 should be rejected");
+    }
+
+    /// The not-found path's timing defence rests on the dummy hash carrying the
+    /// configured cost: bcrypt verify time is set by the cost in the hash alone.
+    #[test]
+    fn test_dummy_hash_carries_requested_cost_for_every_valid_cost() {
+        for cost in MIN_BCRYPT_COST..=MAX_BCRYPT_COST {
+            let hash = dummy_hash(cost).expect("valid cost should produce a dummy hash");
+            assert_eq!(
+                hash.split('$').nth(2).unwrap(),
+                format!("{cost:02}"),
+                "dummy hash must carry cost {cost}"
+            );
+            assert!(
+                std::ptr::eq(hash, dummy_hash(cost).unwrap()),
+                "dummy hash for cost {cost} should be computed once and cached"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dummy_hash_rejects_out_of_range_cost() {
+        for cost in [0, MIN_BCRYPT_COST - 1, MAX_BCRYPT_COST + 1] {
+            match dummy_hash(cost) {
+                Err(AcError::Crypto(msg)) => assert!(
+                    msg.contains("Invalid bcrypt cost"),
+                    "unexpected message for cost {cost}: {msg}"
+                ),
+                other => panic!("cost {cost} should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// Account-not-found does exactly one bcrypt verify and no hash, the same
+    /// bcrypt work as account-found (cost equality is covered above).
+    #[test]
+    fn test_verify_secret_or_dummy_without_stored_hash_runs_one_verify() {
+        // Fill the cache outside the snapshot so its one-time hash isn't counted.
+        dummy_hash(MIN_BCRYPT_COST).unwrap();
+
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        let is_valid = verify_secret_or_dummy("any-secret", None, MIN_BCRYPT_COST).unwrap();
+        assert!(!is_valid, "no stored hash must never verify");
+
+        snap.histogram("ac_bcrypt_duration_seconds")
+            .with_labels(&[("operation", "verify")])
+            .assert_observation_count(1);
+        snap.histogram("ac_bcrypt_duration_seconds")
+            .with_labels(&[("operation", "hash")])
+            .assert_unobserved();
+    }
+
+    #[test]
+    fn test_verify_secret_or_dummy_with_stored_hash_runs_one_verify() {
+        let stored = hash_client_secret("right-secret", MIN_BCRYPT_COST).unwrap();
+
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        assert!(verify_secret_or_dummy("right-secret", Some(&stored), MIN_BCRYPT_COST).unwrap());
+        snap.histogram("ac_bcrypt_duration_seconds")
+            .with_labels(&[("operation", "verify")])
+            .assert_observation_count(1);
+        drop(snap);
+
+        assert!(!verify_secret_or_dummy("wrong-secret", Some(&stored), MIN_BCRYPT_COST).unwrap());
     }
 
     /// Test that hashes created with one cost can be verified regardless of current cost config.

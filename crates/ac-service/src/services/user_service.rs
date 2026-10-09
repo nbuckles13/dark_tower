@@ -184,6 +184,7 @@ pub async fn register_user(
         user_agent,
         rate_limit_window_minutes,
         rate_limit_max_attempts,
+        bcrypt_cost,
     )
     .await?;
 

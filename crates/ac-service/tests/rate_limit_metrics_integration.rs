@@ -62,6 +62,7 @@ async fn rate_limit_decision_allowed_emits_for_service_token_gate(pool: PgPool) 
         None,
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,
+        state.config.bcrypt_cost,
     )
     .await;
 
@@ -97,6 +98,7 @@ async fn rate_limit_decision_rejected_emits_for_service_token_gate(pool: PgPool)
             None,
             state.config.rate_limit_window_minutes,
             state.config.rate_limit_max_attempts,
+            state.config.bcrypt_cost,
         )
         .await;
     }
@@ -116,6 +118,7 @@ async fn rate_limit_decision_rejected_emits_for_service_token_gate(pool: PgPool)
         None,
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,
+        state.config.bcrypt_cost,
     )
     .await;
 
@@ -181,6 +184,7 @@ async fn rate_limit_decision_allowed_emits_for_user_token_gate(pool: PgPool) {
         None,
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,
+        state.config.bcrypt_cost,
     )
     .await;
 
@@ -210,6 +214,7 @@ async fn rate_limit_decision_rejected_emits_for_user_token_gate(pool: PgPool) {
             None,
             state.config.rate_limit_window_minutes,
             state.config.rate_limit_max_attempts,
+            state.config.bcrypt_cost,
         )
         .await;
     }
@@ -226,6 +231,7 @@ async fn rate_limit_decision_rejected_emits_for_user_token_gate(pool: PgPool) {
         None,
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,
+        state.config.bcrypt_cost,
     )
     .await;
 

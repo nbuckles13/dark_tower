@@ -18,10 +18,6 @@ use uuid::Uuid;
 const TOKEN_EXPIRY_SECONDS: u64 = 3600; // 1 hour
 const TOKEN_EXPIRY_SECONDS_I64: i64 = 3600; // 1 hour (for timestamp calculations)
 
-// Security test configuration
-#[cfg(test)]
-const MAX_TIMING_VARIANCE_PERCENT: f64 = 30.0; // Timing attack tolerance threshold
-
 /// The log message emitted once per successful service-token issuance.
 pub const SERVICE_TOKEN_ISSUED_MESSAGE: &str = "Service token issued";
 
@@ -41,6 +37,7 @@ pub async fn issue_service_token(
     user_agent: Option<&str>,
     rate_limit_window_minutes: i64,
     rate_limit_max_attempts: i64,
+    bcrypt_cost: u32,
 ) -> Result<TokenResponse, AcError> {
     // Validate grant_type
     if grant_type != "client_credentials" {
@@ -73,14 +70,13 @@ pub async fn issue_service_token(
         record_rate_limit_decision("allowed");
     }
 
-    // Always run bcrypt to prevent timing attacks
-    // Use dummy hash if credential not found (constant-time operation)
-    let hash_to_verify = match &credential {
-        Some(c) => c.client_secret_hash.as_str(),
-        None => "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYqExt7YD3a", // Dummy bcrypt hash
-    };
-
-    let is_valid = crypto::verify_client_secret(client_secret, hash_to_verify)?;
+    // Always run bcrypt, against a dummy hash at the configured cost when the
+    // credential doesn't exist, so response time doesn't reveal existence.
+    let is_valid = crypto::verify_secret_or_dummy(
+        client_secret,
+        credential.as_ref().map(|c| c.client_secret_hash.as_str()),
+        bcrypt_cost,
+    )?;
 
     // Now check if credential existed and was active
     let credential = credential.ok_or(AcError::InvalidCredentials)?;
@@ -225,6 +221,7 @@ pub async fn issue_user_token(
     user_agent: Option<&str>,
     rate_limit_window_minutes: i64,
     rate_limit_max_attempts: i64,
+    bcrypt_cost: u32,
 ) -> Result<UserTokenResponse, AcError> {
     // Check for account lockout (prevent brute force)
     // We use email as the identifier for rate limiting in user context
@@ -255,14 +252,13 @@ pub async fn issue_user_token(
         record_rate_limit_decision("allowed");
     }
 
-    // Always run bcrypt to prevent timing attacks
-    // Use dummy hash if user not found (constant-time operation)
-    let hash_to_verify = match &user {
-        Some(u) => u.password_hash.as_str(),
-        None => "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYqExt7YD3a", // Dummy bcrypt hash
-    };
-
-    let is_valid = crypto::verify_client_secret(password, hash_to_verify)?;
+    // Always run bcrypt, against a dummy hash at the configured cost when the
+    // user doesn't exist, so response time doesn't reveal existence.
+    let is_valid = crypto::verify_secret_or_dummy(
+        password,
+        user.as_ref().map(|u| u.password_hash.as_str()),
+        bcrypt_cost,
+    )?;
 
     // Now check if user existed and credentials were valid
     let user = user.ok_or(AcError::InvalidCredentials)?;
@@ -382,87 +378,43 @@ mod tests {
     use crate::crypto;
     use crate::repositories::service_credentials;
     use crate::services::key_management_service;
-    use std::time::Instant;
+    use common::observability::testing::MetricAssertion;
 
     /// P0-1 (CG-1): Test timing attack prevention - invalid client_id
     ///
-    /// Verifies that authentication attempts with non-existent client_ids
-    /// take roughly the same time as valid client_ids to prevent username enumeration.
-    ///
-    /// Uses warmup + multiple iterations with median comparison to reduce flakiness
-    /// from cold-start effects and system noise.
-    ///
-    /// Note: Ignored under coverage builds because instrumentation adds significant
-    /// overhead that makes timing comparisons meaningless.
+    /// An unknown client_id must cost the same bcrypt work as a known one, or
+    /// response time reveals which client_ids exist. bcrypt verify time is set by
+    /// the cost in the hash alone, so this reduces to two exact facts: each path
+    /// runs one verify and no hash (asserted here), and the not-found path's dummy
+    /// hash carries the configured cost (`crypto::tests::test_dummy_hash_carries_
+    /// requested_cost_for_every_valid_cost`). This replaces a wall-clock comparison
+    /// that flaked under CI CPU contention.
     #[sqlx::test(migrations = "../../migrations")]
-    #[cfg_attr(coverage, ignore)]
     async fn test_timing_attack_prevention_invalid_client_id(pool: PgPool) -> Result<(), AcError> {
-        const ITERATIONS: usize = 5;
-
-        // Setup: Create master key (32 bytes for AES-256-GCM) and signing key
         let master_key = crypto::generate_random_bytes(32)?;
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
-        // Create multiple valid credentials (one per iteration + warmup) to avoid rate limiting
-        // Rate limiting kicks in after 5 failures per client_id, which would cause early returns
-        // and invalidate timing measurements
-        let valid_secret = "valid-secret-12345";
-        let valid_hash = crypto::hash_client_secret(valid_secret, DEFAULT_BCRYPT_COST)?;
-
-        for i in 0..=ITERATIONS {
-            service_credentials::create_service_credential(
-                &pool,
-                &format!("valid-client-{}", i),
-                &valid_hash,
-                "global-controller",
-                None,
-                &["test:scope".to_string()],
-            )
-            .await?;
-        }
-
-        // Warmup: Run both paths once to warm up CPU caches, connection pools, etc.
-        let _ = issue_service_token(
+        let valid_hash = crypto::hash_client_secret("valid-secret-12345", DEFAULT_BCRYPT_COST)?;
+        service_credentials::create_service_credential(
             &pool,
-            &master_key,
-            &master_key,
-            "valid-client-0",
-            "wrong-password",
-            "client_credentials",
+            "valid-client",
+            &valid_hash,
+            "global-controller",
             None,
-            None,
-            None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            &["test:scope".to_string()],
         )
-        .await;
-        let _ = issue_service_token(
-            &pool,
-            &master_key,
-            &master_key,
-            "nonexistent-client-0",
-            "some-password",
-            "client_credentials",
-            None,
-            None,
-            None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        )
-        .await;
+        .await?;
+        // Fill the dummy-hash cache now, as main.rs does at startup, so its
+        // one-time hash isn't counted against the not-found path.
+        crypto::dummy_hash(DEFAULT_BCRYPT_COST)?;
 
-        // Measure multiple iterations using unique client IDs to avoid rate limiting
-        let mut valid_times = Vec::with_capacity(ITERATIONS);
-        let mut invalid_times = Vec::with_capacity(ITERATIONS);
-
-        for i in 1..=ITERATIONS {
-            // Measure valid client with wrong password (unique client_id per iteration)
-            let start = Instant::now();
-            let _ = issue_service_token(
+        for client_id in ["valid-client", "nonexistent-client"] {
+            let snap = MetricAssertion::snapshot();
+            let result = issue_service_token(
                 &pool,
                 &master_key,
                 &master_key,
-                &format!("valid-client-{}", i),
+                client_id,
                 "wrong-password",
                 "client_credentials",
                 None,
@@ -470,59 +422,21 @@ mod tests {
                 None,
                 DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
                 DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_BCRYPT_COST,
             )
             .await;
-            valid_times.push(start.elapsed());
 
-            // Measure invalid client (unique client_id per iteration)
-            let start = Instant::now();
-            let _ = issue_service_token(
-                &pool,
-                &master_key,
-                &master_key,
-                &format!("nonexistent-client-{}", i),
-                "some-password",
-                "client_credentials",
-                None,
-                None,
-                None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            )
-            .await;
-            invalid_times.push(start.elapsed());
+            assert!(
+                matches!(result, Err(AcError::InvalidCredentials)),
+                "{client_id}: expected InvalidCredentials, got {result:?}"
+            );
+            snap.histogram("ac_bcrypt_duration_seconds")
+                .with_labels(&[("operation", "verify")])
+                .assert_observation_count(1);
+            snap.histogram("ac_bcrypt_duration_seconds")
+                .with_labels(&[("operation", "hash")])
+                .assert_unobserved();
         }
-
-        // Compare minimum times - CI noise only makes things slower, not faster,
-        // so the fastest times represent the true operation time without resource contention.
-        let valid_min = valid_times.iter().min().copied().unwrap();
-        let invalid_min = invalid_times.iter().min().copied().unwrap();
-
-        let time_diff = valid_min.abs_diff(invalid_min);
-        let max_time = valid_min.max(invalid_min);
-        let diff_percentage = (time_diff.as_millis() as f64 / max_time.as_millis() as f64) * 100.0;
-
-        // Timing difference should be less than 30% of the longer operation
-        // Tightened from 50% based on security review to reduce timing attack surface.
-        // bcrypt operations have inherent variance, but 30% tolerance is acceptable
-        // while still catching timing vulnerabilities.
-        assert!(
-            diff_percentage < MAX_TIMING_VARIANCE_PERCENT,
-            "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability.\n  \
-             Valid client min: {:?}\n  \
-             Invalid client min: {:?}\n  \
-             Max allowed variance: {:.1}%\n  \
-             All valid times: {:?}\n  \
-             All invalid times: {:?}",
-            time_diff.as_millis(),
-            diff_percentage,
-            max_time.as_millis(),
-            valid_min,
-            invalid_min,
-            MAX_TIMING_VARIANCE_PERCENT,
-            valid_times,
-            invalid_times
-        );
 
         Ok(())
     }
@@ -562,6 +476,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -578,6 +493,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -626,6 +542,7 @@ mod tests {
                 None,
                 DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
                 DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_BCRYPT_COST,
             )
             .await;
         }
@@ -643,6 +560,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -661,6 +579,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -707,6 +626,7 @@ mod tests {
                 None,
                 DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
                 DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_BCRYPT_COST,
             )
             .await;
         }
@@ -724,6 +644,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -769,6 +690,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -813,6 +735,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -857,6 +780,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -897,6 +821,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -936,6 +861,7 @@ mod tests {
             Some("TestAgent/1.0"),
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -997,6 +923,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -1131,6 +1058,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -1194,6 +1122,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -1274,6 +1203,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -1799,6 +1729,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -1982,6 +1913,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -2189,6 +2121,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -2445,6 +2378,7 @@ mod tests {
                 None,
                 DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
                 DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_BCRYPT_COST,
             )
             .await;
 
@@ -2543,6 +2477,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -2558,6 +2493,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -2666,6 +2602,7 @@ mod tests {
             Some("TestAgent/1.0"),
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -2716,6 +2653,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -2731,6 +2669,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -2782,6 +2721,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -2818,6 +2758,7 @@ mod tests {
                 None,
                 DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
                 DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_BCRYPT_COST,
             )
             .await;
         }
@@ -2834,6 +2775,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -2854,6 +2796,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await;
 
@@ -2898,6 +2841,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -2940,6 +2884,7 @@ mod tests {
             None,
             DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
             DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+            DEFAULT_BCRYPT_COST,
         )
         .await?;
 
@@ -2962,129 +2907,47 @@ mod tests {
 
     /// Test issue_user_token: timing attack prevention with dummy hash
     ///
-    /// Verifies that authentication for non-existent users takes roughly the same
-    /// time as for existing users (both run bcrypt).
+    /// An unknown email must cost the same bcrypt work as a known one. Same
+    /// method as `test_timing_attack_prevention_invalid_client_id`: one verify and
+    /// no hash on each path; dummy-hash cost is covered in `crypto::tests`.
     #[sqlx::test(migrations = "../../migrations")]
-    #[cfg_attr(coverage, ignore)]
     async fn test_issue_user_token_timing_attack_prevention(pool: PgPool) -> Result<(), AcError> {
-        // Robust timing methodology (mirrors test_timing_attack_prevention_invalid_client_id):
-        // measure MULTIPLE samples per path and compare the MINIMUM of each. Rationale — CI/host
-        // noise (scheduler contention, GC) only ever makes an operation SLOWER, never faster, so
-        // the fastest sample is the true uncontended time. A single-sample comparison (the old
-        // shape) flakes when one lone bcrypt-cost-12 call (~400ms) is descheduled by >30% under
-        // load, even though the true existing-vs-nonexistent difference is ~0.4-2%. Unique emails
-        // per iteration avoid the 5-attempt/window rate limit (which would early-return and
-        // corrupt timings), and a warmup pass removes the cold-first-call bias.
-        const ITERATIONS: usize = 5;
-
         let master_key = crypto::generate_random_bytes(32)?;
         key_management_service::initialize_signing_key(&pool, &master_key, "test").await?;
 
         let org_id = create_test_org(&pool, "timing-test").await;
-        let password = "secure-password-123";
+        create_test_user(&pool, org_id, "exists@example.com", "secure-password-123").await;
+        // Fill the dummy-hash cache now, as main.rs does at startup.
+        crypto::dummy_hash(DEFAULT_BCRYPT_COST)?;
 
-        // Create ITERATIONS + 1 real users (unique emails: index 0 for warmup, 1..=N for samples).
-        for i in 0..=ITERATIONS {
-            let _ = create_test_user(
-                &pool,
-                org_id,
-                &format!("timing-{}@example.com", i),
-                password,
-            )
-            .await;
-        }
-
-        // Warmup both paths once (cold connection-pool/cache/lazy-init costs must not bias sample 1).
-        let _ = issue_user_token(
-            &pool,
-            &master_key,
-            &master_key,
-            org_id,
-            "timing-0@example.com",
-            "wrong-password",
-            None,
-            None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        )
-        .await;
-        let _ = issue_user_token(
-            &pool,
-            &master_key,
-            &master_key,
-            org_id,
-            "nonexistent-0@example.com",
-            "some-password",
-            None,
-            None,
-            DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-            DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-        )
-        .await;
-
-        let mut existing_times = Vec::with_capacity(ITERATIONS);
-        let mut nonexistent_times = Vec::with_capacity(ITERATIONS);
-        for i in 1..=ITERATIONS {
-            // Existing user with wrong password (real bcrypt verify) — unique email per iteration.
-            let start = Instant::now();
-            let _ = issue_user_token(
+        for email in ["exists@example.com", "nonexistent@example.com"] {
+            let snap = MetricAssertion::snapshot();
+            let result = issue_user_token(
                 &pool,
                 &master_key,
                 &master_key,
                 org_id,
-                &format!("timing-{}@example.com", i),
+                email,
                 "wrong-password",
                 None,
                 None,
                 DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
                 DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+                DEFAULT_BCRYPT_COST,
             )
             .await;
-            existing_times.push(start.elapsed());
 
-            // Non-existent user (dummy hash verify) — unique email per iteration.
-            let start = Instant::now();
-            let _ = issue_user_token(
-                &pool,
-                &master_key,
-                &master_key,
-                org_id,
-                &format!("nonexistent-{}@example.com", i),
-                "some-password",
-                None,
-                None,
-                DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
-                DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
-            )
-            .await;
-            nonexistent_times.push(start.elapsed());
+            assert!(
+                matches!(result, Err(AcError::InvalidCredentials)),
+                "{email}: expected InvalidCredentials, got {result:?}"
+            );
+            snap.histogram("ac_bcrypt_duration_seconds")
+                .with_labels(&[("operation", "verify")])
+                .assert_observation_count(1);
+            snap.histogram("ac_bcrypt_duration_seconds")
+                .with_labels(&[("operation", "hash")])
+                .assert_unobserved();
         }
-
-        // Compare minimums — both should be near-identical due to dummy-hash verification on the
-        // non-existent path (timing-attack prevention).
-        let existing_min = existing_times.iter().min().copied().unwrap();
-        let nonexistent_min = nonexistent_times.iter().min().copied().unwrap();
-        let time_diff = existing_min.abs_diff(nonexistent_min);
-        let max_time = existing_min.max(nonexistent_min);
-        let diff_percentage = (time_diff.as_millis() as f64 / max_time.as_millis() as f64) * 100.0;
-
-        assert!(
-            diff_percentage < MAX_TIMING_VARIANCE_PERCENT,
-            "Timing difference too large: {}ms ({:.1}% of {}ms) - potential timing attack vulnerability.\n  \
-             Existing-user min: {:?}\n  \
-             Non-existent-user min: {:?}\n  \
-             Max allowed variance: {:.1}%\n  \
-             All existing times: {:?}\n  \
-             All non-existent times: {:?}",
-            time_diff.as_millis(),
-            diff_percentage,
-            max_time.as_millis(),
-            existing_min,
-            nonexistent_min,
-            MAX_TIMING_VARIANCE_PERCENT,
-            existing_times,
-            nonexistent_times
-        );
 
         Ok(())
     }

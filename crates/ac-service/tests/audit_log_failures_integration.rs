@@ -247,6 +247,7 @@ async fn audit_log_failure_emits_event_type_service_token_failed(pool: PgPool) {
         None,
         ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
         ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::DEFAULT_BCRYPT_COST,
     )
     .await;
 
@@ -284,6 +285,7 @@ async fn audit_log_failure_emits_event_type_service_token_issued(pool: PgPool) {
         None,
         ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
         ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::DEFAULT_BCRYPT_COST,
     )
     .await;
 
@@ -461,6 +463,7 @@ async fn audit_log_failure_emits_event_type_user_login(pool: PgPool) {
         None,
         ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
         ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::DEFAULT_BCRYPT_COST,
     )
     .await;
     assert_only_event_type(&snap, "user_login");
@@ -521,6 +524,7 @@ async fn audit_log_failure_emits_event_type_user_login_failed(pool: PgPool) {
         None,
         ac_service::config::DEFAULT_RATE_LIMIT_WINDOW_MINUTES,
         ac_service::config::DEFAULT_RATE_LIMIT_MAX_ATTEMPTS,
+        ac_service::config::DEFAULT_BCRYPT_COST,
     )
     .await;
     assert_only_event_type(&snap, "user_login_failed");
