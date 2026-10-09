@@ -178,6 +178,11 @@ assert_cmd = "2"
 rcgen = "0.13"
 # Used by no member: the pin the two root-`exclude` fuzz workspaces share. They cannot
 # inherit, so each repeats it, and dt-guard workspace-deps R3 binds both to this entry.
+# No Dependabot PR ever reaches it (absent from Cargo.lock; the fuzz crates cannot have a
+# block — see .github/dependabot.yml). 0.4.x releases float in at every fuzz build; an
+# advisory fails scripts/lang/rust/audit.sh, which audits the fuzz graphs. There is NO
+# automated signal for a new major absent an advisory: bump this entry and both fuzz
+# manifests by hand, in one PR.
 libfuzzer-sys = "0.4"
 
 [profile.release]

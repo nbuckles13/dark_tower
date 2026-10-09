@@ -126,6 +126,78 @@ exit 1
   assert_contains "trap-silent-fail:status" "STATUS=FAIL REASON=my-fail" "$out"
 }
 
+# Cleanup hook: runs on a set -e abort, a failing cleanup cannot swallow the STATUS
+# fallback, the original rc survives, and it also runs on the normal path.
+test_trap_cleanup_runs_on_set_e_abort() {
+  local r; r=$(run_snippet '
+cleanup() { echo CLEANUP-RAN; false; }
+install_wrapper_exit_trap cleanup
+false           # set -e abort before any emit
+emit_status OK never-reached
+')
+  local rc; rc=$(rc_of "$r")
+  local out; out=$(body_of "$r")
+  assert_eq       "trap-cleanup-abort:rc"      "1" "$rc"
+  assert_contains "trap-cleanup-abort:ran"     "CLEANUP-RAN" "$out"
+  assert_contains "trap-cleanup-abort:status"  "STATUS=FAIL REASON=wrapper-aborted-early-exit-1" "$out"
+}
+
+test_trap_cleanup_runs_on_normal_ok() {
+  local r; r=$(run_snippet '
+cleanup() { echo CLEANUP-RAN; }
+install_wrapper_exit_trap cleanup
+run_and_emit "x" true
+')
+  local rc; rc=$(rc_of "$r")
+  local out; out=$(body_of "$r")
+  local n; n=$(grep -c '^STATUS=' <<<"$out" || true)
+  assert_eq       "trap-cleanup-ok:rc"    "0" "$rc"
+  assert_eq       "trap-cleanup-ok:count" "1" "$n"
+  assert_contains "trap-cleanup-ok:ran"   "CLEANUP-RAN" "$out"
+}
+
+# A cleanup that FAILS inside the handler during an abort with a non-1 rc: the STATUS
+# fallback still carries rc 3 and the process exits 3 (the handler's `set +e` contract).
+test_trap_failing_cleanup_keeps_rc() {
+  local r; r=$(run_snippet '
+cleanup() { return 7; }
+install_wrapper_exit_trap cleanup
+(exit 3)        # set -e abort with rc 3
+emit_status OK never-reached
+')
+  assert_eq       "trap-cleanup-fails:rc"     "3" "$(rc_of "$r")"
+  assert_contains "trap-cleanup-fails:status" "STATUS=FAIL REASON=wrapper-aborted-early-exit-3" "$(body_of "$r")"
+}
+
+# The cleanup runs on EVERY exit (abort and normal emitted exit), observed through a
+# marker file rather than its own output.
+test_trap_cleanup_touches_marker_on_every_exit() {
+  local marker body; marker="$(mktemp -u)"
+  for body in 'false' 'emit_status OK done'; do
+    rm -f "$marker"
+    run_snippet "
+cleanup() { : > $(printf '%q' "$marker"); }
+install_wrapper_exit_trap cleanup
+${body}
+" >/dev/null
+    assert_eq "trap-cleanup-marker:${body}" "yes" "$([[ -e "$marker" ]] && echo yes || echo no)"
+  done
+  rm -f "$marker"
+}
+
+# An undefined cleanup is refused loudly at install (rc 1, message) and NO trap is
+# installed, never silently skipped at exit.
+test_trap_cleanup_must_be_defined() {
+  local r; r=$(run_snippet '
+install_wrapper_exit_trap no_such_fn || { echo "INSTALL-REFUSED rc=$?"; echo "TRAP=[$(trap -p EXIT)]"; exit 3; }
+')
+  local out; out=$(body_of "$r")
+  assert_eq       "trap-cleanup-undefined:rc"      "3" "$(rc_of "$r")"
+  assert_contains "trap-cleanup-undefined:refused" "INSTALL-REFUSED rc=1" "$out"
+  assert_contains "trap-cleanup-undefined:message" "install_wrapper_exit_trap: no_such_fn is not a defined shell function" "$out"
+  assert_contains "trap-cleanup-undefined:no-trap" "TRAP=[]" "$out"
+}
+
 # =============================================================================
 # Block D — LAYER EDGE end-to-end (test-reviewer Q1)
 #
@@ -232,6 +304,11 @@ test_trap_fires_on_explicit_early_exit
 test_trap_fires_on_set_e_abort
 test_trap_silent_on_normal_ok
 test_trap_silent_on_explicit_fail
+test_trap_cleanup_runs_on_set_e_abort
+test_trap_cleanup_runs_on_normal_ok
+test_trap_failing_cleanup_keeps_rc
+test_trap_cleanup_touches_marker_on_every_exit
+test_trap_cleanup_must_be_defined
 test_layer_missing_verb_exits_2
 test_layer_intentional_gap_exits_0
 test_layer_missing_verb_beats_sibling_ok

@@ -16,6 +16,12 @@ PREFER A REAL FIX OVER SUPPRESSION. In order of preference:
 1. Bump the vulnerable crate to a patched version — usually a `cargo update -p
    <crate> --precise <ver>` plus the resulting `Cargo.lock` change; for a direct
    dep, bump the version in the owning crate's `Cargo.toml`. Rebuild + test.
+   A finding in a FUZZ graph (`AUDIT_GRAPH=crates/<x>/fuzz/Cargo.lock LOCK=resolved`)
+   has no tracked lock to pin: `--precise` does nothing durable there. A fix inside
+   the existing requirement is picked up on the next run by itself; otherwise raise
+   the requirement where it is written — the fuzz `Cargo.toml`(s) that declare it,
+   plus the root `[workspace.dependencies]` entry when R3 binds it (e.g.
+   `libfuzzer-sys`), in the same change. For a transitive dep, bump its parent.
 2. If the advisory is reached only transitively and the direct dep has no patched
    release, try a `[patch]` or a minimal-version bump of the intermediate dep.
 3. SUPPRESS ONLY as a last resort, and ONLY when the advisory is genuinely

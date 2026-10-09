@@ -51,26 +51,13 @@ fn fixture(a_deps: &str, b_deps: &str, fuzz_deps: &str, lock: &str) -> TempDir {
         &format!("[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n{fuzz_deps}"),
     );
     write(dir.path(), "Cargo.lock", lock);
-    // R6: the fixtures' only fuzz-only crate is base64 (declared by the fuzz crate, no member uses it).
-    write(
-        dir.path(),
-        ".github/dependabot.yml",
-        &dependabot(&["base64"]),
-    );
+    // R6 input: the repo's shape, one cargo block over the root only.
+    write(dir.path(), ".github/dependabot.yml", ROOT_ONLY_DEPENDABOT);
     dir
 }
 
-/// A root cargo block plus a fuzz block over `/fuzz` allowing `allow`.
-fn dependabot(allow: &[&str]) -> String {
-    let mut y = String::from(
-        "version: 2\nupdates:\n  - package-ecosystem: \"cargo\"\n    directory: \"/\"\n  \
-         - package-ecosystem: \"cargo\"\n    directories: [\"/fuzz\"]\n    allow:\n",
-    );
-    for a in allow {
-        y.push_str(&format!("      - dependency-name: \"{a}\"\n"));
-    }
-    y
-}
+const ROOT_ONLY_DEPENDABOT: &str =
+    "version: 2\nupdates:\n  - package-ecosystem: \"cargo\"\n    directory: \"/\"\n";
 
 fn run_guard(root: &Path) -> (bool, String) {
     let out = Command::cargo_bin("dt-guard")
@@ -153,21 +140,23 @@ fn r4_facade_absent_from_lock_is_a_precondition() {
 }
 
 #[test]
-fn r6_positive_control_allow_missing() {
-    let dir = fixture(A_CLEAN, "", FUZZ_CLEAN, LOCK_OK);
-    write(dir.path(), ".github/dependabot.yml", &dependabot(&[]));
-    assert_fails_with(dir.path(), "dependabot-fuzz-allow-missing");
-}
-
-#[test]
-fn r6_positive_control_block_missing() {
+fn r6_positive_control() {
     let dir = fixture(A_CLEAN, "", FUZZ_CLEAN, LOCK_OK);
     write(
         dir.path(),
         ".github/dependabot.yml",
-        "version: 2\nupdates:\n  - package-ecosystem: \"cargo\"\n    directory: \"/\"\n",
+        &format!(
+            "{ROOT_ONLY_DEPENDABOT}  - package-ecosystem: \"cargo\"\n    directories: [\"/fuzz\"]\n"
+        ),
     );
-    assert_fails_with(dir.path(), "dependabot-fuzz-block-missing");
+    assert_fails_with(dir.path(), "dependabot-cargo-block-names-excluded-crate");
+}
+
+#[test]
+fn r6_unreadable_config_is_a_precondition() {
+    let dir = fixture(A_CLEAN, "", FUZZ_CLEAN, LOCK_OK);
+    std::fs::remove_file(dir.path().join(".github/dependabot.yml")).unwrap();
+    assert_fails_with(dir.path(), "workspace-deps-dependabot-config-unreadable");
 }
 
 #[test]
