@@ -1350,9 +1350,10 @@ mod tests {
     /// whenever everyone is connected to everything.
     #[test]
     fn properties_hold_over_generated_connectivity() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_0020);
         let subsets: [&[&str]; 4] = [&[], &["mh-0"], &["mh-1"], &["mh-0", "mh-1"]];
+        let mut production_full_mesh_cases = 0u32;
         for case in 0..400 {
             for (chooser, is_production) in [
                 (colocate as EdgeChooser, true),
@@ -1360,14 +1361,14 @@ mod tests {
                 (spread as EdgeChooser, false),
             ] {
                 let mut t = SlotTable::with_chooser(chooser);
-                let n: u16 = rng.gen_range(1..=7);
+                let n: u16 = rng.random_range(1..=7);
                 let mut all_connected = true;
                 for s in 1..=n {
                     admit(&mut t, s);
-                    t.set_demand(sender(s), (0..rng.gen_range(0..=4u16)).collect());
+                    t.set_demand(sender(s), (0..rng.random_range(0..=4u16)).collect());
                 }
                 for s in 1..=n {
-                    let pick = subsets[rng.gen_range(0..subsets.len())];
+                    let pick = subsets[rng.random_range(0..subsets.len())];
                     all_connected &= pick.len() == H.len();
                     t.set_connectivity(sender(s), if pick.is_empty() { None } else { on(pick) });
                 }
@@ -1383,12 +1384,17 @@ mod tests {
                 }
                 assert_eq!(replay, t, "case {case}: deterministic");
                 if all_connected && is_production {
+                    production_full_mesh_cases += 1;
                     for s in 1..=n {
                         assert!(t.targets_of(sender(s)).len() <= 1, "case {case}");
                     }
                 }
             }
         }
+        assert!(
+            production_full_mesh_cases > 0,
+            "generator never produced an all-connected roster for the production chooser"
+        );
     }
 
     // ------------------------------------------------- exhaustive model check

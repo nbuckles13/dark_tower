@@ -33,7 +33,7 @@ use crate::webtransport::WtMediaTransport;
 use prost::Message;
 use proto_gen::dark_tower::internal::v1::{DisconnectReason, NotifyParticipantConnectedResponse};
 use proto_gen::dark_tower::signaling::v1::{mh_client_message, MhClientMessage};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -958,7 +958,7 @@ async fn close_declined_connection(
     }
 
     if outcome == metrics::MediaSessionStartOutcome::DeclinedMcUnavailable {
-        let jitter = rand::thread_rng().gen_range(0..=MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS);
+        let jitter = rand::rng().random_range(0..=MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS);
         tokio::time::sleep(Duration::from_millis(jitter)).await;
     }
 

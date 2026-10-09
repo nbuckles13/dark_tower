@@ -60,10 +60,9 @@ axum = { workspace = true }
 
 # Random one-in-N latency sampling on the media forward path (ADR-0036 §11:
 # "Sampling must be random, not deterministic per stream" — the natural modulo
-# implementation reconstructs the voice-activity trace). `small_rng` is opted
-# into here rather than at the workspace: `SmallRng` is the per-connection PRNG
-# the sampler wants and no other consumer needs it.
-rand = { workspace = true, features = ["small_rng"] }
+# implementation reconstructs the voice-activity trace). The sampler holds a
+# per-connection `SmallRng`.
+rand = { workspace = true }
 
 # Time utilities
 chrono = { workspace = true }

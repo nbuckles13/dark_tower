@@ -75,8 +75,8 @@ impl UserId {
     /// Create a new random user ID
     #[must_use]
     pub fn new() -> Self {
-        use rand::Rng;
-        Self(rand::thread_rng().gen())
+        use rand::RngExt;
+        Self(rand::rng().random())
     }
 
     /// Get the underlying u64 value
