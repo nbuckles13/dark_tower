@@ -18,21 +18,21 @@
 //! - an RNG seeded from a stream identifier;
 //! - a fixed period with a random phase.
 //!
-//! The sampler therefore holds a **per-connection** PRNG seeded from the
-//! operating system and draws independently per frame. Two connections fed
-//! identical arrival patterns produce different sample sets, which is asserted
-//! rather than assumed (see this module's tests).
+//! The sampler therefore holds a **per-connection** PRNG seeded from
+//! `rand::rng()` (an OS-seeded CSPRNG) and draws independently per frame.
+//! Two connections fed identical arrival patterns produce different sample
+//! sets, which is asserted rather than assumed (see this module's tests).
 
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::RngExt;
 
 /// A per-connection one-in-N sampler.
 ///
 /// `SmallRng` rather than `ThreadRng`: this is per-connection state on a
 /// per-frame path, and `SmallRng` is a small, fast, non-cryptographic generator
-/// — appropriate because nothing here is a secret. It is seeded
-/// `from_entropy()`, i.e. from the OS, and **never** from anything derived from
-/// stream identity.
+/// — appropriate because nothing here is a secret. It is seeded via
+/// `rand::make_rng()` from `rand::rng()` (`ThreadRng`, an OS-seeded CSPRNG),
+/// and **never** from anything derived from stream identity.
 #[derive(Debug)]
 pub struct LatencySampler {
     rng: SmallRng,
@@ -49,7 +49,7 @@ impl LatencySampler {
     #[must_use]
     pub fn new(ratio: f64) -> Self {
         Self {
-            rng: SmallRng::from_entropy(),
+            rng: rand::make_rng::<SmallRng>(),
             ratio: ratio.clamp(0.0, 1.0),
         }
     }
@@ -65,7 +65,7 @@ impl LatencySampler {
 
     /// Whether this frame's latency should be observed.
     pub fn should_sample(&mut self) -> bool {
-        self.rng.gen_bool(self.ratio)
+        self.rng.random_bool(self.ratio)
     }
 }
 
