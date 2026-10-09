@@ -64,7 +64,9 @@ SELECTED=()
 for f in "${ALL_TEST_SH[@]}"; do
   # Reference to DT_GUARD on a NON-comment line — a real use of the binary
   # override, not a `# coverage-exempt:` marker that merely names it in prose.
-  if grep -vE '^[[:space:]]*#' "$f" | grep -qE 'DT_GUARD'; then
+  # One process, no pipe: `grep -v ... | grep -q` under pipefail drops a suite
+  # whenever `grep -q` exits early and the writer dies of SIGPIPE.
+  if awk '!/^[[:space:]]*#/ && /DT_GUARD/ { found = 1; exit } END { exit !found }' "$f"; then
     SELECTED+=("$f")
   fi
 done
