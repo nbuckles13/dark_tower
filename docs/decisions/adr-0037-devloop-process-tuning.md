@@ -147,7 +147,7 @@ seat per task.
 
 - **Decision**: spawn semantic-guard **only when the diff plausibly touches a
   check surface** in `scripts/guards/semantic/checks.md` (payload `Debug`/
-  `Display`, credential/secret types, comment-vs-code drift, etc.); otherwise
+  `Display`, credential/secret types, etc.); otherwise
   skip it for that task. Do **not** rebuild it as scripted per-check model
   infrastructure — that is machinery this ADR is explicitly not investing in.
 - **Fallout accepted**: a check-surface heuristic that under-fires could miss a
