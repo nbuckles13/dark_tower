@@ -94,7 +94,8 @@ audit_gate() {
 # SSoT anchor: the glob is coupled to the crate layout in the root Cargo.toml
 # [workspace] block (members + exclude). `*` in bash [[ == ]] crosses `/`, so
 # crates/*/Cargo.toml matches every member manifest AND the workspace-EXCLUDED
-# crates/*/fuzz/Cargo.toml at two levels — the fail-safe "run" direction. A future
+# crates/*/fuzz/Cargo.toml at two levels — a fuzz-manifest change runs the wrapper, which
+# resolves and audits that fuzz graph (lang/rust/audit.sh audits every workspace). A future
 # member outside crates/* would open a false-SKIP hole: the SSoT-drift guard in
 # _audit_gate.test.sh asserts every git-tracked manifest stays covered.
 #

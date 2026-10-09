@@ -6,6 +6,10 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch: # Allow manual trigger
 
+# It builds a fresh, unlocked third-party graph (C++ build.rs included): read-only token.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1

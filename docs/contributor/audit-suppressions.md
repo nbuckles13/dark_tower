@@ -116,6 +116,16 @@ is for **bump PRs only**:
   `metrics-stack`; npm `@opentelemetry/*`, the protobuf-es pair and the vitest family; and
   every GitHub Actions update. Everything else is grouped by minor/patch; `@bufbuild/buf`
   always gets its own PR. Do not split a group PR to land part of it.
+- **The fuzz crates have no Dependabot coverage** (`crates/{ac-service,media-protocol}/fuzz`,
+  independent workspaces with untracked lockfiles). dependabot-core cannot resolve
+  `media-protocol/fuzz` (its path dep inherits from a root it never fetches), and with no tracked
+  lockfile a block could only PR a new major anyway, so dt-guard workspace-deps R6 forbids a
+  cargo block over either, and neither version nor security
+  updates/alerts see their graphs. Their advisory channel is `scripts/lang/rust/audit.sh`, which
+  resolves and audits every Cargo workspace (Layer 6 + the weekly scan). Fuzz-only crates
+  (`libfuzzer-sys`) float within their requirement; there is **no automated signal for a new
+  major absent an advisory** — bump the root `[workspace.dependencies]` entry and both fuzz
+  manifests by hand, in one PR.
 - **Neither delay slows advisory remediation (ADR-0033 §12, 14-day MTTR):**
   - Dependabot `cooldown` (5 days, 14 for majors) delays **version** updates only. It does
     not apply to Dependabot **security** updates and is not a suppression surface.

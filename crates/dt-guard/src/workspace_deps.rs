@@ -11,7 +11,7 @@
 //! | R1 | `workspace-dep-redeclared` | a member declares a dep that IS in `[workspace.dependencies]` without `workspace = true` |
 //! | R2 | `dep-pinned-in-multiple-members` | a registry dep carries a literal version in ≥2 distinct crates (members and root-`exclude` crates alike) and is NOT in `[workspace.dependencies]` |
 //! | R3 | `excluded-workspace-version-drift` | a crate under root `[workspace] exclude` (an independent workspace, e.g. the fuzz crates) pins a workspace dep at a different requirement, or keeps default features the root disables |
-//! | R6 | `dependabot-fuzz-block-missing` / `dependabot-fuzz-allow-missing` / `dependabot-fuzz-allow-extra` | `.github/dependabot.yml` has no cargo block whose `directories` are exactly the root-`exclude` crates (or another cargo block overlaps them); or that block's `allow:` omits / adds a crate relative to the fuzz-only set (declared by an excluded crate, used by no member). Fuzz-only crates are absent from the root Cargo.lock, so dependabot-core never offers them from the root block |
+//! | R6 | `dependabot-cargo-block-names-excluded-crate` | a cargo block in `.github/dependabot.yml` lists a root-`exclude` crate (or a glob) in `directory`/`directories`. Resolution is layout-dependent — dependabot-core cannot resolve `crates/media-protocol/fuzz` (its path dep inherits from a root it never fetches) — and with no tracked lockfile a block could only ever PR a new major |
 //! | R4 | `facade-crate-duplicated` | `Cargo.lock` holds more than one version of a [`SINGLE_VERSION_CRATES`] crate |
 //! | R5 | `member-default-features-ignored` | a member writes `{ workspace = true, default-features = false }` against a workspace entry that keeps default features (cargo ignores the member flag with only a warning, so features silently turn on) |
 //!
@@ -54,9 +54,8 @@ pub const DEP_PINNED_IN_MULTIPLE_MEMBERS: &str = "dep_pinned_in_multiple_members
 pub const EXCLUDED_WORKSPACE_VERSION_DRIFT: &str = "excluded_workspace_version_drift";
 pub const FACADE_CRATE_DUPLICATED: &str = "facade_crate_duplicated";
 pub const MEMBER_DEFAULT_FEATURES_IGNORED: &str = "member_default_features_ignored";
-pub const DEPENDABOT_FUZZ_BLOCK_MISSING: &str = "dependabot_fuzz_block_missing";
-pub const DEPENDABOT_FUZZ_ALLOW_MISSING: &str = "dependabot_fuzz_allow_missing";
-pub const DEPENDABOT_FUZZ_ALLOW_EXTRA: &str = "dependabot_fuzz_allow_extra";
+pub const DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE: &str =
+    "dependabot_cargo_block_names_excluded_crate";
 
 pub const WORKSPACE_MANIFEST_UNREADABLE: &str = "workspace_manifest_unreadable";
 pub const WORKSPACE_MEMBERS_EMPTY: &str = "workspace_members_empty";
@@ -127,14 +126,9 @@ const RULE_ORDER: &[(&str, &str)] = &[
         "member-default-features-ignored",
     ),
     (
-        DEPENDABOT_FUZZ_BLOCK_MISSING,
-        "dependabot-fuzz-block-missing",
+        DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE,
+        "dependabot-cargo-block-names-excluded-crate",
     ),
-    (
-        DEPENDABOT_FUZZ_ALLOW_MISSING,
-        "dependabot-fuzz-allow-missing",
-    ),
-    (DEPENDABOT_FUZZ_ALLOW_EXTRA, "dependabot-fuzz-allow-extra"),
 ];
 
 const PRECONDITION_RULES: &[&str] = &[
@@ -277,14 +271,12 @@ pub fn evaluate(repo_root: &Path) -> (Vec<Hit>, Scope) {
     // package -> distinct crates (members, then root-`exclude` crates) declaring
     // it with a literal version; R2 reads it after both phases.
     let mut literal_pins: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut member_packages: BTreeSet<String> = BTreeSet::new();
-    let mut excluded_seen = Excluded::default();
+    let mut excluded_dirs: BTreeSet<String> = BTreeSet::new();
     scope.members = check_members(
         repo_root,
         &workspace.members,
         &ws_deps,
         &mut literal_pins,
-        &mut member_packages,
         &mut hits,
     );
     scope.excluded = check_excluded(
@@ -292,18 +284,13 @@ pub fn evaluate(repo_root: &Path) -> (Vec<Hit>, Scope) {
         &workspace.exclude,
         &ws_deps,
         &mut literal_pins,
-        &mut excluded_seen,
+        &mut excluded_dirs,
         &mut hits,
     );
     hits.extend(check_multi_pins(&literal_pins));
     scope.lock_packages = check_lock(repo_root, &mut hits);
-    if !excluded_seen.dirs.is_empty() {
-        let fuzz_only: BTreeSet<String> = excluded_seen
-            .packages
-            .difference(&member_packages)
-            .cloned()
-            .collect();
-        hits.extend(check_dependabot(repo_root, &excluded_seen.dirs, &fuzz_only));
+    if !excluded_dirs.is_empty() {
+        hits.extend(check_dependabot(repo_root, &excluded_dirs));
     }
 
     (hits, scope)
@@ -355,21 +342,12 @@ fn record_literal_pin(
     }
 }
 
-/// Root-`exclude` crates: every listed directory, and the registry packages
-/// the readable ones declare (R6 input).
-#[derive(Debug, Default)]
-struct Excluded {
-    dirs: BTreeSet<String>,
-    packages: BTreeSet<String>,
-}
-
-/// Members: R1 + R5 per dependency, and R2/R6 input. Returns the members evaluated.
+/// Members: R1 + R5 per dependency, and R2 input. Returns the members evaluated.
 fn check_members(
     repo_root: &Path,
     members: &[String],
     ws_deps: &BTreeMap<String, WsDep>,
     literal_pins: &mut BTreeMap<String, BTreeSet<String>>,
-    member_packages: &mut BTreeSet<String>,
     hits: &mut Vec<Hit>,
 ) -> usize {
     let mut evaluated = 0;
@@ -390,9 +368,6 @@ fn check_members(
         for dep in deps {
             check_member_dep(&rel, &dep, ws_deps, hits);
             record_literal_pin(&dep, ws_deps, member, literal_pins);
-            if !matches!(dep.spec, DepSpec::Path | DepSpec::Git) {
-                member_packages.insert(dep.package.clone());
-            }
         }
     }
     evaluated
@@ -400,21 +375,21 @@ fn check_members(
 
 /// Root-`exclude` independent workspaces: R3 per dependency, and R2 input (an
 /// excluded crate cannot inherit, but a version it shares with another crate is
-/// still written twice — R2 moves it into the root table, where R3 binds it).
-/// Returns the excluded crates evaluated.
+/// still written twice — R2 moves it into the root table, where R3 binds it),
+/// and every listed directory as R6 input. Returns the excluded crates evaluated.
 fn check_excluded(
     repo_root: &Path,
     exclude: &[String],
     ws_deps: &BTreeMap<String, WsDep>,
     literal_pins: &mut BTreeMap<String, BTreeSet<String>>,
-    seen: &mut Excluded,
+    excluded_dirs: &mut BTreeSet<String>,
     hits: &mut Vec<Hit>,
 ) -> usize {
     let mut evaluated = 0;
     for excluded in exclude {
         let rel = format!("{}/Cargo.toml", excluded.trim_end_matches('/'));
         let path = repo_root.join(&rel);
-        seen.dirs.insert(excluded.trim_end_matches('/').to_string());
+        excluded_dirs.insert(excluded.trim_end_matches('/').to_string());
         if !path.is_file() {
             // Never a silent skip: a moved or renamed crate would quietly shrink
             // the set R3 and R6 compare against.
@@ -442,28 +417,27 @@ fn check_excluded(
         for dep in deps {
             check_excluded_dep(&rel, &dep, ws_deps, hits);
             record_literal_pin(&dep, ws_deps, excluded, literal_pins);
-            if let DepSpec::Version { .. } = dep.spec {
-                seen.packages.insert(dep.package.clone());
-            }
         }
     }
     evaluated
 }
 
-/// R6: the Dependabot cargo block for the root-`exclude` crates.
+/// R6: no Dependabot cargo block may name a root-`exclude` crate.
 ///
-/// dependabot-core's cargo parser skips any `[workspace.dependencies]` entry the
-/// root Cargo.lock does not resolve (`file_parser.rb`: `next if lockfile &&
-/// !version_from_lockfile(...)`), and the fuzz crates' own lockfiles are not
-/// tracked. So a crate only the fuzz crates use gets a PR solely from a cargo
-/// block listing their directories, and that block must `allow:` exactly those
-/// crates: shared crates stay on the root block's PR (R3 forces the matching
-/// fuzz edit there), and a fuzz-only crate missing from the list never gets one.
-fn check_dependabot(
-    repo_root: &Path,
-    excluded_dirs: &BTreeSet<String>,
-    fuzz_only: &BTreeSet<String>,
-) -> Vec<Hit> {
+/// Two reasons, one uniform rule. (1) Resolution is layout-dependent:
+/// dependabot-core finds a path dep's workspace root by walking up a depth
+/// computed from the dep's job-relative name (`file_fetcher.rb`
+/// `find_workspace_root`). From `/crates/media-protocol/fuzz` the dep `..` walks
+/// only to `crates/`, the repo root is never fetched, and cargo fails "failed to
+/// find a workspace root" on the dep's `*.workspace = true` keys (run
+/// 37724549271; upstream dependabot/dependabot-core#11861). Any excluded crate
+/// whose path dep undershoots the root the same way fails too. (2) With no tracked
+/// lockfile, the cargo updater leaves a requirement alone while it admits the
+/// latest release, so even a resolving block could only PR a new major. Their
+/// dependencies are covered instead by floating and by `scripts/lang/rust/audit.sh`,
+/// which audits their graphs. A glob directory cannot be compared against
+/// `exclude`, so it is refused too.
+fn check_dependabot(repo_root: &Path, excluded_dirs: &BTreeSet<String>) -> Vec<Hit> {
     const FILE: &str = ".github/dependabot.yml";
     let raw = match std::fs::read_to_string(repo_root.join(FILE)) {
         Ok(r) => r,
@@ -471,7 +445,7 @@ fn check_dependabot(
             return vec![precondition(
                 DEPENDABOT_CONFIG_UNREADABLE,
                 FILE,
-                format!("{e} — R6 (fuzz-only Dependabot coverage) could not be evaluated"),
+                format!("{e} — R6 (no cargo block over excluded crates) could not be evaluated"),
             )]
         }
     };
@@ -485,18 +459,12 @@ fn check_dependabot(
             )]
         }
     };
-    let hit = |rule_id: &'static str, detail: String| Hit {
-        rule_id,
-        file: FILE.to_string(),
-        detail,
-    };
-    let mut hits = Vec::new();
-    let mut fuzz_block: Option<BTreeSet<String>> = None;
     let updates = doc
         .get("updates")
         .and_then(serde_norway::Value::as_sequence)
         .cloned()
         .unwrap_or_default();
+    let mut hits = Vec::new();
     for block in &updates {
         if block
             .get("package-ecosystem")
@@ -505,73 +473,60 @@ fn check_dependabot(
         {
             continue;
         }
-        let dirs: BTreeSet<String> = match (block.get("directory"), block.get("directories")) {
-            (Some(d), _) => d.as_str().into_iter().map(norm_dir).collect(),
-            (None, Some(ds)) => ds
-                .as_sequence()
-                .map(|v| {
-                    v.iter()
-                        .filter_map(serde_norway::Value::as_str)
-                        .map(norm_dir)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            (None, None) => BTreeSet::new(),
-        };
-        if &dirs == excluded_dirs {
-            let allowed = block
-                .get("allow")
-                .and_then(serde_norway::Value::as_sequence)
-                .map(|v| {
-                    v.iter()
-                        .filter_map(|a| {
-                            a.get("dependency-name")
-                                .and_then(serde_norway::Value::as_str)
-                        })
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            fuzz_block = Some(allowed);
-        } else if dirs.iter().any(|d| excluded_dirs.contains(d)) {
-            hits.push(hit(
-                DEPENDABOT_FUZZ_BLOCK_MISSING,
-                format!(
-                    "a cargo block lists {dirs:?}, overlapping the root-`exclude` crates \
-                     {excluded_dirs:?}: give those crates exactly one block of their own"
-                ),
-            ));
+        // Both keys, unioned: a block carrying both must not hide one behind the other.
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        for key in ["directory", "directories"] {
+            let Some(value) = block.get(key) else {
+                continue;
+            };
+            let entries: Vec<&serde_norway::Value> = match value.as_sequence() {
+                Some(seq) => seq.iter().collect(),
+                None => vec![value],
+            };
+            for entry in entries {
+                let Some(d) = entry.as_str() else {
+                    hits.push(precondition(
+                        DEPENDABOT_CONFIG_UNREADABLE,
+                        FILE,
+                        format!(
+                            "a cargo block's `{key}` holds a non-string entry ({entry:?}) — R6 \
+                             could not be evaluated"
+                        ),
+                    ));
+                    continue;
+                };
+                dirs.insert(norm_dir(d));
+            }
         }
-    }
-    let Some(allowed) = fuzz_block else {
-        hits.push(hit(
-            DEPENDABOT_FUZZ_BLOCK_MISSING,
-            format!(
-                "no cargo block has `directories` equal to the root-`exclude` crates \
-                 {excluded_dirs:?}; their fuzz-only crates {fuzz_only:?} would never get a \
-                 Dependabot PR"
-            ),
-        ));
-        return hits;
-    };
-    for name in fuzz_only.difference(&allowed) {
-        hits.push(hit(
-            DEPENDABOT_FUZZ_ALLOW_MISSING,
-            format!(
-                "`{name}` is used only by the root-`exclude` crates but is not in the fuzz \
-                 block's `allow:` — it would never get a Dependabot PR; add it"
-            ),
-        ));
-    }
-    for name in allowed.difference(fuzz_only) {
-        hits.push(hit(
-            DEPENDABOT_FUZZ_ALLOW_EXTRA,
-            format!(
-                "`{name}` is in the fuzz block's `allow:` but is not fuzz-only (unused by the \
-                 excluded crates, or used by a member and so bumped by the root block's PR); \
-                 remove it"
-            ),
-        ));
+        // Dependabot expands globs; a literal comparison against `exclude` cannot.
+        let globbed: Vec<&String> = dirs
+            .iter()
+            .filter(|d| d.contains(['*', '?', '[', '{']))
+            .collect();
+        if !globbed.is_empty() {
+            hits.push(Hit {
+                rule_id: DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE,
+                file: FILE.to_string(),
+                detail: format!(
+                    "a cargo block lists glob directories {globbed:?}: they cannot be checked \
+                     against the root `exclude` list; list cargo directories literally"
+                ),
+            });
+        }
+        let named: Vec<&String> = dirs.intersection(excluded_dirs).collect();
+        if !named.is_empty() {
+            hits.push(Hit {
+                rule_id: DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE,
+                file: FILE.to_string(),
+                detail: format!(
+                    "a cargo block lists the root-`exclude` crate(s) {named:?}: such a block may \
+                     not resolve (layout-dependent; crates/media-protocol/fuzz fails, \
+                     dependabot/dependabot-core#11861) and, with no tracked lockfile, could only \
+                     PR a major. Remove them from the block; their dependencies float at each \
+                     build and are audited by scripts/lang/rust/audit.sh"
+                ),
+            });
+        }
     }
     hits
 }
@@ -822,24 +777,18 @@ mod tests {
                            [[package]]\nname = \"tracing-core\"\nversion = \"0.1.34\"\n\
                            [[package]]\nname = \"opentelemetry\"\nversion = \"0.24.0\"\n";
 
-    /// Write `.github/dependabot.yml` with a root cargo block and, when `fuzz_dirs`
-    /// is non-empty, a fuzz block over those directories allowing `allow`.
-    fn dependabot(dir: &TempDir, fuzz_dirs: &[&str], allow: &[&str]) {
-        let mut y = String::from(
-            "version: 2\nupdates:\n  - package-ecosystem: \"cargo\"\n    directory: \"/\"\n",
-        );
-        if !fuzz_dirs.is_empty() {
-            y.push_str("  - package-ecosystem: \"cargo\"\n    directories:\n");
-            for d in fuzz_dirs {
-                y.push_str(&format!("      - \"/{d}\"\n"));
-            }
-            y.push_str("    allow:\n");
-            for a in allow {
-                y.push_str(&format!("      - dependency-name: \"{a}\"\n"));
-            }
-        }
+    /// Write `.github/dependabot.yml` with `body` verbatim.
+    fn write_dependabot(dir: &TempDir, body: &str) {
         fs::create_dir_all(dir.path().join(".github")).unwrap();
-        fs::write(dir.path().join(".github/dependabot.yml"), y).unwrap();
+        fs::write(dir.path().join(".github/dependabot.yml"), body).unwrap();
+    }
+
+    const ROOT_ONLY_DEPENDABOT: &str =
+        "version: 2\nupdates:\n  - package-ecosystem: \"cargo\"\n    directory: \"/\"\n";
+
+    /// The repo's shape: one cargo block over the root workspace only.
+    fn root_only_dependabot(dir: &TempDir) {
+        write_dependabot(dir, ROOT_ONLY_DEPENDABOT);
     }
 
     fn rules(dir: &TempDir) -> Vec<&'static str> {
@@ -948,7 +897,7 @@ mod tests {
         let fuzz = "[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n\
                     [dependencies]\nserde = \"1.0.200\"\nbase64 = \"0.23\"\n";
         let dir = ws(&root, &[("a", &a), ("b", &b), ("fuzz", fuzz)], None);
-        dependabot(&dir, &["fuzz"], &["base64", "serde"]);
+        root_only_dependabot(&dir);
         let got = rules(&dir);
         assert_eq!(
             got,
@@ -964,7 +913,7 @@ mod tests {
                        [dependencies]\nserde = { version = \"1.0\", default-features = false }\n\
                        base64 = { version = \"0.23\", default-features = false }\n";
         let dir = ws(&root, &[("a", &a), ("b", &b), ("fuzz", fuzz_ok)], None);
-        dependabot(&dir, &["fuzz"], &["base64", "serde"]);
+        root_only_dependabot(&dir);
         assert!(rules(&dir).is_empty());
     }
 
@@ -1017,12 +966,12 @@ mod tests {
             )
         };
         let (f1, f2) = (f("f1"), f("f2"));
-        let with_fuzz_block = |dir: TempDir| {
-            dependabot(&dir, &["fuzz1", "fuzz2"], &["libfuzzer-sys"]);
+        let with_dependabot = |dir: TempDir| {
+            root_only_dependabot(&dir);
             dir
         };
         assert_eq!(
-            rules(&with_fuzz_block(ws(
+            rules(&with_dependabot(ws(
                 &root,
                 &[("a", &a), ("b", &b), ("fuzz1", &f1), ("fuzz2", &f2)],
                 None
@@ -1031,7 +980,7 @@ mod tests {
         );
         // Hoisted to the root table: R2 is satisfied and R3 binds both literals.
         let hoisted = format!("{root}libfuzzer-sys = \"0.4\"\n");
-        assert!(rules(&with_fuzz_block(ws(
+        assert!(rules(&with_dependabot(ws(
             &hoisted,
             &[("a", &a), ("b", &b), ("fuzz1", &f1), ("fuzz2", &f2)],
             None
@@ -1039,7 +988,7 @@ mod tests {
         .is_empty());
         let f2_drift = f2.replace("\"0.4\"", "\"0.4.10\"");
         assert_eq!(
-            rules(&with_fuzz_block(ws(
+            rules(&with_dependabot(ws(
                 &hoisted,
                 &[("a", &a), ("b", &b), ("fuzz1", &f1), ("fuzz2", &f2_drift)],
                 None
@@ -1048,59 +997,156 @@ mod tests {
         );
     }
 
-    /// One excluded crate declaring a fuzz-only crate (`libfuzzer-sys`) and a
-    /// shared one (`serde`, also used by member `a`).
+    /// Two excluded crates at the repo's real depth (`crates/<x>/fuzz`).
     fn r6_fixture() -> TempDir {
         let root = ROOT.replace(
             "members = [\"a\", \"b\"]\n",
-            "members = [\"a\", \"b\"]\nexclude = [\"fuzz\"]\n",
+            "members = [\"a\", \"b\"]\nexclude = [\"crates/x/fuzz\", \"crates/y/fuzz\"]\n",
         );
-        let a = pkg("a", "[dependencies]\nserde = { workspace = true }\n");
+        let a = pkg("a", "");
         let b = pkg("b", "");
-        let fuzz = "[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n\
-                    [dependencies]\nserde = \"1.0\"\nlibfuzzer-sys = \"0.4\"\n";
-        ws(&root, &[("a", &a), ("b", &b), ("fuzz", fuzz)], None)
+        let fuzz = "[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n";
+        ws(
+            &root,
+            &[
+                ("a", &a),
+                ("b", &b),
+                ("crates/x/fuzz", fuzz),
+                ("crates/y/fuzz", fuzz),
+            ],
+            None,
+        )
+    }
+
+    fn cargo_block(dirs_yaml: &str) -> String {
+        format!("{ROOT_ONLY_DEPENDABOT}  - package-ecosystem: \"cargo\"\n{dirs_yaml}")
     }
 
     #[test]
-    fn r6_fuzz_block_allows_exactly_the_fuzz_only_crates() {
+    fn r6_root_only_config_passes() {
         let dir = r6_fixture();
-        dependabot(&dir, &["fuzz"], &["libfuzzer-sys"]);
+        root_only_dependabot(&dir);
         assert!(rules(&dir).is_empty());
     }
 
     #[test]
-    fn r6_allow_missing_and_extra_have_distinct_tokens() {
+    fn r6_fires_on_the_shipped_fuzz_block() {
+        // The block run 37724549271 failed on: both fuzz crates, `directories:`.
         let dir = r6_fixture();
-        dependabot(&dir, &["fuzz"], &[]);
-        assert_eq!(rules(&dir), vec![DEPENDABOT_FUZZ_ALLOW_MISSING]);
-        // `serde` is shared (a member uses it): it moves with the root PR.
-        dependabot(&dir, &["fuzz"], &["libfuzzer-sys", "serde"]);
-        assert_eq!(rules(&dir), vec![DEPENDABOT_FUZZ_ALLOW_EXTRA]);
+        write_dependabot(
+            &dir,
+            &cargo_block(
+                "    directories:\n      - \"/crates/x/fuzz\"\n      - \"/crates/y/fuzz\"\n    \
+                 allow:\n      - dependency-name: \"libfuzzer-sys\"\n",
+            ),
+        );
+        let (hits, _) = evaluate(dir.path());
+        assert_eq!(
+            hits.iter().map(|h| h.rule_id).collect::<Vec<_>>(),
+            vec![DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE]
+        );
+        assert!(hits[0].detail.contains("crates/x/fuzz"), "{hits:?}");
+        assert!(hits[0].detail.contains("crates/y/fuzz"), "{hits:?}");
     }
 
     #[test]
-    fn r6_block_missing_or_overlapping_fires() {
+    fn r6_fires_on_either_key_shape_and_slash_variant() {
         let dir = r6_fixture();
-        dependabot(&dir, &[], &[]);
-        assert_eq!(rules(&dir), vec![DEPENDABOT_FUZZ_BLOCK_MISSING]);
-        // Directories that do not equal the exclude list are not the fuzz block.
-        dependabot(&dir, &["fuzz", "elsewhere"], &["libfuzzer-sys"]);
-        let got = rules(&dir);
-        assert!(got.contains(&DEPENDABOT_FUZZ_BLOCK_MISSING), "{got:?}");
-        // The root block also listing the fuzz crate overlaps it.
-        let y = "version: 2\nupdates:\n  - package-ecosystem: \"cargo\"\n    directories: [\"/\", \"/fuzz\"]\n  \
-                 - package-ecosystem: \"cargo\"\n    directories: [\"/fuzz\"]\n    allow:\n      - dependency-name: \"libfuzzer-sys\"\n";
-        fs::write(dir.path().join(".github/dependabot.yml"), y).unwrap();
-        assert_eq!(rules(&dir), vec![DEPENDABOT_FUZZ_BLOCK_MISSING]);
+        for d in ["/crates/x/fuzz", "crates/x/fuzz", "/crates/x/fuzz/"] {
+            write_dependabot(&dir, &cargo_block(&format!("    directory: \"{d}\"\n")));
+            assert_eq!(
+                rules(&dir),
+                vec![DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE],
+                "directory: {d}"
+            );
+            write_dependabot(
+                &dir,
+                &cargo_block(&format!("    directories:\n      - \"{d}\"\n")),
+            );
+            assert_eq!(
+                rules(&dir),
+                vec![DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE],
+                "directories: [{d}]"
+            );
+        }
+        // The root block itself widened to an excluded crate fires too.
+        write_dependabot(
+            &dir,
+            "version: 2\nupdates:\n  - package-ecosystem: \"cargo\"\n    \
+             directories: [\"/\", \"/crates/y/fuzz\"]\n",
+        );
+        assert_eq!(
+            rules(&dir),
+            vec![DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE]
+        );
+    }
+
+    #[test]
+    fn r6_ignores_other_ecosystems_and_prefix_dirs() {
+        let dir = r6_fixture();
+        write_dependabot(
+            &dir,
+            &format!(
+                "{ROOT_ONLY_DEPENDABOT}  - package-ecosystem: \"npm\"\n    \
+                 directory: \"/crates/x/fuzz\"\n"
+            ),
+        );
+        assert!(rules(&dir).is_empty());
+        write_dependabot(&dir, &cargo_block("    directory: \"/crates/x\"\n"));
+        assert!(rules(&dir).is_empty());
+    }
+
+    #[test]
+    fn r6_fires_on_glob_directories() {
+        let dir = r6_fixture();
+        for g in ["/crates/**", "/crates/*/fuzz", "/crates/x/fuz?"] {
+            write_dependabot(
+                &dir,
+                &cargo_block(&format!("    directories:\n      - \"{g}\"\n")),
+            );
+            assert_eq!(
+                rules(&dir),
+                vec![DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE],
+                "glob {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn r6_reads_both_keys_when_both_are_present() {
+        let dir = r6_fixture();
+        write_dependabot(
+            &dir,
+            &cargo_block("    directory: \"/elsewhere\"\n    directories: [\"/crates/x/fuzz\"]\n"),
+        );
+        assert_eq!(
+            rules(&dir),
+            vec![DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE]
+        );
+        write_dependabot(
+            &dir,
+            &cargo_block("    directory: \"/crates/x/fuzz\"\n    directories: [\"/elsewhere\"]\n"),
+        );
+        assert_eq!(
+            rules(&dir),
+            vec![DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE]
+        );
+    }
+
+    #[test]
+    fn r6_non_string_directory_is_a_precondition_not_a_drop() {
+        let dir = r6_fixture();
+        write_dependabot(&dir, &cargo_block("    directories:\n      - 7\n"));
+        assert_eq!(rules(&dir), vec![DEPENDABOT_CONFIG_UNREADABLE]);
+        write_dependabot(&dir, &cargo_block("    directory: {a: 1}\n"));
+        assert_eq!(rules(&dir), vec![DEPENDABOT_CONFIG_UNREADABLE]);
     }
 
     #[test]
     fn r6_preconditions_never_pass() {
         let dir = r6_fixture();
         assert_eq!(rules(&dir), vec![DEPENDABOT_CONFIG_UNREADABLE]);
-        fs::create_dir_all(dir.path().join(".github")).unwrap();
-        fs::write(dir.path().join(".github/dependabot.yml"), "updates: [\n").unwrap();
+        write_dependabot(&dir, "updates: [\n");
         assert_eq!(rules(&dir), vec![DEPENDABOT_CONFIG_UNREADABLE]);
 
         // An exclude entry with no manifest is never silently skipped.
@@ -1111,7 +1157,7 @@ mod tests {
         let a = pkg("a", "");
         let b = pkg("b", "");
         let dir = ws(&root, &[("a", &a), ("b", &b)], None);
-        dependabot(&dir, &["gone"], &[]);
+        root_only_dependabot(&dir);
         assert_eq!(rules(&dir), vec![EXCLUDED_MANIFEST_MISSING]);
     }
 
@@ -1191,9 +1237,7 @@ mod tests {
             EXCLUDED_WORKSPACE_VERSION_DRIFT,
             FACADE_CRATE_DUPLICATED,
             MEMBER_DEFAULT_FEATURES_IGNORED,
-            DEPENDABOT_FUZZ_BLOCK_MISSING,
-            DEPENDABOT_FUZZ_ALLOW_MISSING,
-            DEPENDABOT_FUZZ_ALLOW_EXTRA,
+            DEPENDABOT_CARGO_BLOCK_NAMES_EXCLUDED_CRATE,
         ]
         .iter()
         .chain(PRECONDITION_RULES)

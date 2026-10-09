@@ -141,10 +141,22 @@ emit_status() {
 # Do NOT call from layer scripts (they own the layer_lifecycle_begin EXIT trap; a second
 # trap would clobber it).
 #
-# Args: (none)
+# A wrapper that must clean up on EVERY exit path (including a `set -e` abort) passes a
+# cleanup FUNCTION NAME (nothing is eval'd) instead of installing its own trap: bash
+# REPLACES an EXIT trap rather than chaining it, so a second trap would drop the
+# STATUS=FAIL fallback. The handler runs the cleanup with errors tolerated, then emits.
+# Calling it again replaces the registered cleanup.
+#
+# Args: $1=cleanup function name (optional; must already be defined)
 # Outputs: (none at install time)
-# Returns: 0
+# Returns: 0 installed; 1 the named cleanup is not a defined function
 install_wrapper_exit_trap() {
+  local fn="${1:-}"
+  if [[ -n "$fn" ]] && ! declare -F "$fn" >/dev/null; then
+    printf 'install_wrapper_exit_trap: %s is not a defined shell function\n' "$fn" >&2
+    return 1
+  fi
+  __WRAPPER_EXIT_CLEANUP="$fn"
   trap '__wrapper_early_exit_trap' EXIT
 }
 
@@ -158,9 +170,14 @@ install_wrapper_exit_trap() {
 # CRITICAL: `rc=$?` MUST be the literal first statement — any prior command would
 # overwrite $? (semantic-guard check 1). The handler ends in `exit "${rc:-1}"`, never
 # `exit 0`, so a pre-emit crash can never be converted to a silent success (a trailing
-# printf would otherwise leave $?=0).
+# printf would otherwise leave $?=0). `set +e` comes next: errexit is still live inside
+# a trap, so a failing cleanup would otherwise end the handler before the STATUS line.
 __wrapper_early_exit_trap() {
   local rc=$?
+  set +e
+  if [[ -n "${__WRAPPER_EXIT_CLEANUP:-}" ]]; then
+    "$__WRAPPER_EXIT_CLEANUP"
+  fi
   if [[ "${_status_emitted:-0}" != "1" ]]; then
     printf 'STATUS=FAIL REASON=wrapper-aborted-early-exit-%s\n' "$rc"
   fi
