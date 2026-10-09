@@ -122,6 +122,7 @@ pub async fn handle_user_token(
         user_agent.as_deref(),
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,
+        state.config.bcrypt_cost,
     )
     .await;
 
@@ -290,6 +291,7 @@ pub async fn handle_service_token(
         user_agent.as_deref(),
         state.config.rate_limit_window_minutes,
         state.config.rate_limit_max_attempts,
+        state.config.bcrypt_cost,
     )
     .await;
 

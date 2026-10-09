@@ -204,6 +204,7 @@ impl TestAuthServer {
             None,                 // user_agent
             self.config.rate_limit_window_minutes,
             self.config.rate_limit_max_attempts,
+            self.config.bcrypt_cost,
         )
         .await?;
 
