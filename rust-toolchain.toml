@@ -4,6 +4,6 @@
 # infra/lib/rust-toolchain.sh. Keep `channel` an exact X.Y.Z: it doubles as the image
 # tag, and the reader rejects anything else (and any key outside the three below).
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
