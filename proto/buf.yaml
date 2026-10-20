@@ -4,6 +4,20 @@ modules:
 lint:
   use:
     - STANDARD
+# Breaking-change policy: wire compatibility, not source compatibility.
+# FILE keeps package/file/service/RPC/message-deletion detection (WIRE_JSON alone
+# misses RPC deletion and package-rename-via-file-move); WIRE_JSON adds the
+# reserve-aware and JSON-name rules. The three FILE rules excepted below are
+# source-only: each has a wire-safe counterpart in WIRE_JSON that still fires
+# (deletion without reserving number AND name; a wire-incompatible cardinality
+# change). Rationale and measured controls: docs/protocol/CONVENTIONS.md
+# §Enforcement (2026-10-20). Do not add `ignore:` here without the human
+# acceptance described there; breaking.sh prints SUPPRESSED= if you do.
 breaking:
   use:
     - FILE
+    - WIRE_JSON
+  except:
+    - ENUM_VALUE_NO_DELETE
+    - FIELD_SAME_CARDINALITY
+    - FIELD_NO_DELETE
