@@ -10,11 +10,15 @@ rules from the start; pre-existing deviations are draining via the R-61 chain.
 `proto/buf.yaml` is the enforcement mechanism. It pins:
 
 - `lint.use: [STANDARD]` — the full buf STANDARD ruleset, no carve-outs.
-- `breaking.use: [FILE]` — symbol-set breakage detection, the strictest
-  category. Chosen over `WIRE_JSON` on 2026-05-20 (`docs/TODO.md`): `WIRE_JSON`
-  covers binary-wire compatibility only, so a package rename via file move —
-  same tags, same types, no wire-encoding change — passed it silently. `FILE`
-  catches `PACKAGE_NO_DELETE`, `FILE_NO_DELETE` and message removal.
+- `breaking.use: [FILE, WIRE_JSON]` with `except: [ENUM_VALUE_NO_DELETE,
+  FIELD_SAME_CARDINALITY, FIELD_NO_DELETE]` — wire compatibility, not source
+  compatibility (2026-10-20, user decision; see the correction note below).
+  `FILE` stays in the set for what `WIRE_JSON` alone misses: a package rename
+  via file move (the 2026-05-20 reason `FILE` was chosen, `docs/TODO.md`) and
+  RPC/service deletion, which `WIRE_JSON` reports as zero findings yet breaks
+  every gRPC caller. `WIRE_JSON` adds the reserve-aware and JSON-name rules.
+  The three excepted rules are source-only; each has a wire counterpart that
+  still fires.
 
 There is no `lint.ignore` block, and as of the ADR-0036 signalling reshape no
 `// buf:lint:ignore` annotations either — `signaling.proto` carried five, all
@@ -94,6 +98,28 @@ it escalates and a human decides.
 > evidence for every proto.** `scripts/lang/proto/breaking.sh` keeps its
 > `SUPPRESSED=` detector, so any future `breaking.ignore` entry is loud on every
 > run; adding one still requires the human acceptance described above.
+>
+> **Correction (2026-10-20, story 3 P1 escalation; user decision).** "Full FILE
+> enforcement" above is no longer the policy. With no production deployment and
+> components co-deployed, source compatibility (adding `optional` presence,
+> deleting a reserved enum value or field) is not worth an escalation per story,
+> while wire compatibility still is: mixed versions run during rolling restarts,
+> and R-25 of story 3 allows one-component rollback within the v3 era.
+> `proto/buf.yaml` now uses `FILE` + `WIRE_JSON` minus the three source-only rules
+> listed under Enforcement. Measured with buf 1.72 on a scratch copy of `proto/`
+> against the pre-P1 tree:
+> - P1's five changes (reserve `SLOT_STATE_ZERO_REQUESTED`, four `bool` →
+>   `optional bool`) produce 5 findings under `FILE` and **0** under the new set;
+> - positive controls all still fire under the new set: RPC deletion, tag
+>   change, type change, field rename, and field or enum-value deletion without
+>   reserving its number and name;
+> - field deletion **with** number and name reserved produces 0. That is the
+>   shape MC-B's superseded-field deletion must use.
+>
+> **What this means for "Intentional wire breaks" above.** The declaration and
+> human-acceptance rule now applies to *wire* breaks. A change the new set
+> passes is not a break and needs no declaration. A real wire break still turns
+> Layer 6 red, and a headless Lead still may not accept it.
 
 ## Rules
 
