@@ -427,7 +427,7 @@ Revised 2026-10-13 after a final review: MH-A, C-A and C-C were each split in tw
 story: 2026-10-07-see-each-other
 tasks:
 - id: 1
-  status: pending
+  status: completed
   specialist: protocol
   prompt: |-
     Story 3 protocol contract and ADR-0036 amendment bundle (docs/user-stories/2026-10-07-see-each-other.md; requirements R-2, R-4, R-5, R-8, R-9, R-10, R-11, R-13, R-14, R-15, R-16, R-17, R-18, R-20, R-22 (wire half), R-36). Task 1 (P1), protocol. No dependencies. Every `proto/**` edit is a Guarded Shared Area edit. Pair with security as reviewer of every ADR edit and of the rewritten mute reasoning; with meeting-controller, media-handler and client as consumers; with observability for the slot-state vocabulary telemetry mirrors.
@@ -598,6 +598,7 @@ tasks:
     - `key_custody=operator` wording is unchanged. Nothing describes the media path as end-to-end or zero-trust.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-20-story3-protocol-contract
   tag: story-2026-10-07-see-each-other-task-1
 - id: 2
   status: pending
