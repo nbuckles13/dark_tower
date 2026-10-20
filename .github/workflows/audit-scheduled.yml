@@ -86,7 +86,7 @@ jobs:
           echo "cargo-audit=${v}" >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-audit@${{ steps.pins.outputs.cargo-audit }}
 
@@ -96,7 +96,7 @@ jobs:
           run_install: false
 
       - name: Install Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
@@ -126,7 +126,7 @@ jobs:
 
       - name: Upload audit output
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: audit-output
           path: ${{ runner.temp }}/audit-output.txt
@@ -153,7 +153,7 @@ jobs:
         # A scan that died before uploading leaves no artifact; the script below still
         # runs and reports "scan did not complete", so this step must not stop the job.
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: audit-output
           path: ${{ runner.temp }}/audit
