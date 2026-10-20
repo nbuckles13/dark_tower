@@ -14,6 +14,7 @@ use test_common::jwt_fixtures::{TestKeypair, TestUserClaims};
 
 use anyhow::Result;
 use chrono::Utc;
+use common::observability::labels::MEDIA_KIND_LABEL;
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
 use gc_service::config::Config;
@@ -63,8 +64,9 @@ struct TestTelemetryServer {
     addr: SocketAddr,
     _handle: JoinHandle<()>,
     // Held to keep the wiremock JWKS + collector receivers alive for the
-    // lifetime of the test server.
-    _mock_server: MockServer,
+    // lifetime of the test server. Also the forwarded-body capture: wiremock
+    // records every received request, read back by [`Self::forwarded_bodies`].
+    mock_server: MockServer,
     keypair: TestKeypair,
 }
 
@@ -189,9 +191,22 @@ impl TestTelemetryServer {
         Ok(Self {
             addr,
             _handle: handle,
-            _mock_server: mock_server,
+            mock_server,
             keypair,
         })
+    }
+
+    /// Every body the collector receiver got on `collector_path` (e.g.
+    /// `/v1/metrics`), in arrival order — the bytes GC actually forwarded.
+    async fn forwarded_bodies(&self, collector_path: &str) -> Vec<Vec<u8>> {
+        self.mock_server
+            .received_requests()
+            .await
+            .expect("wiremock request recording is disabled; forwarded-body capture cannot work")
+            .into_iter()
+            .filter(|r| r.url.path() == collector_path)
+            .map(|r| r.body)
+            .collect()
     }
 
     fn url(&self, signal: &str) -> String {
@@ -1028,5 +1043,133 @@ async fn telemetry_413_two_tier_boundary_and_layer_path_is_metricless(pool: PgPo
         "> 2×max_bytes → layer 413 (DoS backstop)"
     );
 
+    Ok(())
+}
+
+/// A string-valued attribute.
+fn str_kv(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key_strindex: 0,
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::StringValue(value.to_string())),
+        }),
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn media_kind_survives_on_a_metric_datapoint_and_is_stripped_from_spans_and_exemplars(
+    pool: PgPool,
+) -> Result<()> {
+    // Story 3 R-29: `media_kind` is in the DATAPOINT-ONLY tier
+    // (`MEDIA_DATAPOINT_EXTRA`). Proven on the real user-JWT path against the
+    // bytes GC actually forwards: kept on a Sum datapoint, byte-identical;
+    // stripped from that datapoint's exemplar and from a span.
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::metrics::v1::{Exemplar, Sum};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    let server = TestTelemetryServer::spawn(pool, TelemetryServerOpts::default()).await?;
+    let token = server.user_token("user-media-kind");
+
+    let metrics = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: "dt_client_media_frames_received_total".to_string(),
+                    data: Some(Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![str_kv(MEDIA_KIND_LABEL, "video")],
+                            exemplars: vec![Exemplar {
+                                filtered_attributes: vec![str_kv(MEDIA_KIND_LABEL, "video")],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let traces = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: None,
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    name: "join".to_string(),
+                    attributes: vec![str_kv(MEDIA_KIND_LABEL, "video")],
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+
+    let client = reqwest::Client::new();
+    for (signal, body) in [
+        ("metrics", metrics.encode_to_vec()),
+        ("traces", traces.encode_to_vec()),
+    ] {
+        let resp = client
+            .post(server.url(signal))
+            .bearer_auth(&token)
+            .header("Content-Type", PROTOBUF)
+            .body(body)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 202, "{signal} must be accepted");
+    }
+
+    // Positive control: a forward that never happened must not let "stripped"
+    // pass vacuously.
+    let m_bodies = server.forwarded_bodies("/v1/metrics").await;
+    let m_body = m_bodies
+        .last()
+        .expect("GC forwarded NO metrics body to the collector; the strip assertions below would be vacuous");
+    let t_bodies = server.forwarded_bodies("/v1/traces").await;
+    let t_body = t_bodies.last().expect(
+        "GC forwarded NO traces body to the collector; the span-strip assertion would be vacuous",
+    );
+
+    let fwd = ExportMetricsServiceRequest::decode(m_body.as_slice())?;
+    let Some(Data::Sum(sum)) = fwd.resource_metrics[0].scope_metrics[0].metrics[0]
+        .data
+        .as_ref()
+    else {
+        unreachable!("payload was built with a Sum; the filter never changes the data kind");
+    };
+    let dp = &sum.data_points[0];
+    let kind = dp.attributes.iter().find(|kv| kv.key == MEDIA_KIND_LABEL);
+    assert!(
+        matches!(
+            kind.and_then(|kv| kv.value.as_ref()).and_then(|v| v.value.as_ref()),
+            Some(Value::StringValue(v)) if v == "video"
+        ),
+        "media_kind must survive on the datapoint byte-identical; got {:?}",
+        dp.attributes
+    );
+    assert!(
+        !dp.exemplars[0]
+            .filtered_attributes
+            .iter()
+            .any(|kv| kv.key == MEDIA_KIND_LABEL),
+        "exemplars take the BASE tier; media_kind must be stripped there"
+    );
+
+    let fwd_t = ExportTraceServiceRequest::decode(t_body.as_slice())?;
+    let span = &fwd_t.resource_spans[0].scope_spans[0].spans[0];
+    assert!(
+        !span.attributes.iter().any(|kv| kv.key == MEDIA_KIND_LABEL),
+        "media_kind is datapoint-only and must be stripped from spans; got {:?}",
+        span.attributes
+    );
     Ok(())
 }

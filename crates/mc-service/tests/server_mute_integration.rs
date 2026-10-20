@@ -131,13 +131,31 @@ async fn a_server_mute_rides_every_snapshot_advances_the_generation_and_mutes_th
         muted.assignment.egress_streams, before.assignment.egress_streams,
         "the mute changed nothing but the muted set"
     );
+    // One increment per (request, named kind), each with THAT kind's
+    // direction: the request muted audio and left video unmuted.
     snap.counter("mc_media_server_mute_requests_total")
         .with_labels(&[
             ("action", "mute"),
             ("outcome", "applied"),
+            ("media_kind", "audio"),
             ("key_custody", "operator"),
         ])
         .assert_delta(1);
+    snap.counter("mc_media_server_mute_requests_total")
+        .with_labels(&[
+            ("action", "unmute"),
+            ("outcome", "unchanged"),
+            ("media_kind", "video"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(1);
+    snap.counter("mc_media_server_mute_requests_total")
+        .with_labels(&[
+            ("action", "mute"),
+            ("outcome", "applied"),
+            ("media_kind", "video"),
+        ])
+        .assert_delta(0);
 
     // B, who holds A, is told A's slot is SOURCE_MUTED (the R-4 third driver).
     let view = b
@@ -340,10 +358,21 @@ async fn a_non_host_server_mute_is_refused_and_programs_nothing() {
         last_before.policy_generation + 1,
         "the refused request was not a structural change"
     );
+    // A request-level refusal counts once per named kind, with each kind's
+    // own direction.
     snap.counter("mc_media_server_mute_requests_total")
         .with_labels(&[
             ("action", "mute"),
             ("outcome", "not_permitted"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(1);
+    snap.counter("mc_media_server_mute_requests_total")
+        .with_labels(&[
+            ("action", "unmute"),
+            ("outcome", "not_permitted"),
+            ("media_kind", "video"),
             ("key_custody", "operator"),
         ])
         .assert_delta(1);
@@ -414,8 +443,11 @@ async fn an_unmute_request_reaches_the_host_as_the_requester_and_leaves_the_mute
 
     // The pod-level gauge reports the one mute in force.
     snap.gauge("mc_media_server_muted_sources")
-        .with_labels(&[("key_custody", "operator")])
+        .with_labels(&[("media_kind", "audio"), ("key_custody", "operator")])
         .assert_value(1.0);
+    snap.gauge("mc_media_server_muted_sources")
+        .with_labels(&[("media_kind", "video"), ("key_custody", "operator")])
+        .assert_value(0.0);
 
     a.write(unmute_request_frame(&b.participant_id)).await;
     let relayed = loop {
@@ -438,8 +470,11 @@ async fn an_unmute_request_reaches_the_host_as_the_requester_and_leaves_the_mute
 
     // Still muted: the gauge is unchanged and MC pushed nothing new.
     snap.gauge("mc_media_server_muted_sources")
-        .with_labels(&[("key_custody", "operator")])
+        .with_labels(&[("media_kind", "audio"), ("key_custody", "operator")])
         .assert_value(1.0);
+    snap.gauge("mc_media_server_muted_sources")
+        .with_labels(&[("media_kind", "video"), ("key_custody", "operator")])
+        .assert_value(0.0);
     let last = pushes_to(&stack, "sm-unmute-m", MH)
         .last()
         .cloned()
@@ -454,7 +489,10 @@ async fn an_unmute_request_reaches_the_host_as_the_requester_and_leaves_the_mute
     })
     .await;
     snap.gauge("mc_media_server_muted_sources")
-        .with_labels(&[("key_custody", "operator")])
+        .with_labels(&[("media_kind", "audio"), ("key_custody", "operator")])
+        .assert_value(0.0);
+    snap.gauge("mc_media_server_muted_sources")
+        .with_labels(&[("media_kind", "video"), ("key_custody", "operator")])
         .assert_value(0.0);
 }
 
@@ -483,6 +521,7 @@ async fn refusal_replies_past_the_burst_are_withheld_and_counted() {
         .with_labels(&[
             ("action", "mute"),
             ("outcome", "not_permitted"),
+            ("media_kind", "audio"),
             ("key_custody", "operator"),
         ])
         .delta()

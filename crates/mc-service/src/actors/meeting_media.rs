@@ -93,8 +93,8 @@ use crate::media_routing::{
     ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, SlotTable, Unapplied,
 };
 use crate::media_signaling::{
-    build_send_directive, build_stream_assignments, DirectiveOutcome, MediaStreamPolicy,
-    ReceiveCapabilityDeclaration, SlotViewEmission, SourceMuteView,
+    build_send_directive, build_stream_assignments, DirectiveOutcome, MediaKindLabel,
+    MediaStreamPolicy, ReceiveCapabilityDeclaration, SlotViewEmission, SourceMuteView,
 };
 use crate::observability::metrics;
 use proto_gen::dark_tower::signaling::v1::{
@@ -166,19 +166,30 @@ impl std::fmt::Debug for MediaRoutingDeps {
 /// Delete the second and the gauge is stale but correct. Delete the first and
 /// the drift class this design exists to prevent comes back — silently, and in
 /// the one gauge whose job is to be read against MH's `server_muted` drops.
+///
+/// # Per (meeting, kind) — story 3 OBS-A
+///
+/// Each meeting holds one count PER KIND, a `[u64; 2]` indexed by
+/// [`MediaKindLabel::index`] (built with [`MediaKindLabel::per_kind`]). The map key is the meeting id ONLY — never a
+/// participant or sender id. [`Self::publish`] sets EVERY kind in
+/// [`MediaKindLabel::ALL`] on every call, zero included: setting only the kinds
+/// present in the map would leave the video gauge stuck at its last non-zero
+/// value after the last video-muted meeting ends — exactly the drift this
+/// recompute design exists to prevent.
 #[derive(Debug, Default)]
 pub struct MutedSourceCensus {
-    counts: std::sync::Mutex<HashMap<String, u64>>,
+    counts: std::sync::Mutex<HashMap<String, [u64; 2]>>,
 }
 
 impl MutedSourceCensus {
-    /// Record `meeting_id`'s absolute server-muted count (0 forgets it).
-    pub fn set(&self, meeting_id: &str, count: u64) {
+    /// Record `meeting_id`'s absolute per-kind server-muted counts, indexed by
+    /// [`MediaKindLabel::index`] (all-zero forgets it).
+    pub fn set(&self, meeting_id: &str, counts_by_kind: [u64; 2]) {
         let mut counts = self.lock();
-        if count == 0 {
+        if counts_by_kind == [0; 2] {
             counts.remove(meeting_id);
         } else {
-            counts.insert(meeting_id.to_string(), count);
+            counts.insert(meeting_id.to_string(), counts_by_kind);
         }
     }
 
@@ -187,13 +198,25 @@ impl MutedSourceCensus {
         self.lock().retain(|id, _| live(id));
     }
 
-    /// Recompute the pod total from the census and publish it.
+    /// Recompute the pod total PER KIND from the census and publish every kind.
     pub fn publish(&self) {
-        let total = self.lock().values().sum();
-        metrics::set_server_muted_sources(total);
+        let totals = self.totals();
+        for kind in MediaKindLabel::ALL {
+            metrics::set_server_muted_sources(kind, kind.of(totals));
+        }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+    /// The pod totals per kind, indexed by [`MediaKindLabel::index`].
+    fn totals(&self) -> [u64; 2] {
+        let census = self.lock();
+        MediaKindLabel::per_kind(|k| {
+            census
+                .values()
+                .fold(0u64, |t, c| t.saturating_add(k.of(*c)))
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, [u64; 2]>> {
         // A poisoned census still holds valid counts (every write is a single
         // insert or remove), so recover rather than propagate a panic into
         // every meeting that mutes.
@@ -930,7 +953,7 @@ impl MeetingMedia {
             None => Err(DirectiveOutcome::AssignmentFailed),
             Some(assignment) => {
                 build_send_directive(view.sender, assignment, handlers, &deps.stream_policy)
-                    .and_then(|(directive, outcome)| {
+                    .and_then(|(directive, outcome, stream_kinds)| {
                         build_stream_assignments(
                             view.sender,
                             declaration,
@@ -939,12 +962,12 @@ impl MeetingMedia {
                             mute,
                             &self.slots.unreachable_for(view.sender),
                         )
-                        .map(|composition| (directive, outcome, composition))
+                        .map(|composition| (directive, outcome, stream_kinds, composition))
                     })
             }
         };
 
-        let (directive, directive_outcome, composition) = match composed {
+        let (directive, directive_outcome, stream_kinds, composition) = match composed {
             Ok(composed) => composed,
             Err(outcome) => {
                 // Fails CLOSED: nothing is emitted for this participant — never
@@ -971,7 +994,14 @@ impl MeetingMedia {
         let mut delivered = true;
         if directive_changed {
             metrics::record_send_directive(directive_outcome);
-            metrics::record_send_targets(directive.streams.iter().map(|s| s.targets.len()).sum());
+            // PER STREAM, with that stream's kind — never summed across the
+            // directive's streams (which would put video targets on an audio
+            // series). The per-stream counts sum to the old total.
+            // `stream_kinds` is parallel to `directive.streams`, projected once
+            // at composition, so there is no fallible lookup here.
+            for (kind, stream) in stream_kinds.iter().zip(&directive.streams) {
+                metrics::record_send_targets(*kind, stream.targets.len());
+            }
             delivered &= send(
                 connection,
                 server_message::Message::SendDirective(directive.clone()),
@@ -979,8 +1009,8 @@ impl MeetingMedia {
             .await;
         }
         if assignments_changed && delivered {
-            for state in &composition.slot_states {
-                metrics::record_slot_state(*state);
+            for (kind, state) in &composition.slot_states {
+                metrics::record_slot_state(*kind, *state);
             }
             delivered &= send(
                 connection,
@@ -1034,4 +1064,44 @@ async fn send(connection: &ParticipantActorHandle, message: server_message::Mess
         .send(SignalingPayload::server_message(&message))
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+    use crate::observability::metrics::MEDIA_KIND_LABEL;
+    use common::observability::testing::MetricAssertion;
+
+    /// Per (meeting, kind), and `publish` sets EVERY kind every time: after the
+    /// last video-muted meeting is forgotten the video gauge reads 0, not its
+    /// last non-zero value.
+    #[test]
+    fn publish_sets_every_kind_including_zero_after_the_last_video_mute_ends() {
+        let census = MutedSourceCensus::default();
+        let snap = MetricAssertion::snapshot();
+        census.set("m-1", MediaKindLabel::per_kind(|k| k.pick(2, 1)));
+        census.set("m-2", MediaKindLabel::per_kind(|k| k.pick(1, 0)));
+        census.publish();
+        snap.gauge("mc_media_server_muted_sources")
+            .with_labels(&[(MEDIA_KIND_LABEL, "audio")])
+            .assert_value(3.0);
+        snap.gauge("mc_media_server_muted_sources")
+            .with_labels(&[(MEDIA_KIND_LABEL, "video")])
+            .assert_value(1.0);
+
+        census.set("m-1", [0; 2]);
+        census.publish();
+        snap.gauge("mc_media_server_muted_sources")
+            .with_labels(&[(MEDIA_KIND_LABEL, "audio")])
+            .assert_value(1.0);
+        snap.gauge("mc_media_server_muted_sources")
+            .with_labels(&[(MEDIA_KIND_LABEL, "video")])
+            .assert_value(0.0);
+
+        census.retain(|_| false);
+        census.publish();
+        snap.gauge("mc_media_server_muted_sources")
+            .with_labels(&[(MEDIA_KIND_LABEL, "audio")])
+            .assert_value(0.0);
+    }
 }

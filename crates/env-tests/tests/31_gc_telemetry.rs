@@ -718,3 +718,191 @@ async fn test_traces_pii_nonallowlisted_span_attr_filtered() {
     #[cfg(feature = "observability")]
     assert_drop_counter_increased(cluster, "span", before).await;
 }
+
+// ============================================================================
+// Story 3 R-29: the collector's EXACT `media_kind` value rule, end to end
+// ============================================================================
+
+/// The media-kind label key (pinned against `common` in the hygiene kernel).
+#[cfg(feature = "observability")]
+use env_tests::fixtures::metric_hygiene::MEDIA_KIND_KEY;
+
+/// An EXPORTED, per-kind client name that NO alert or browser read-back
+/// selects on, written at value 0. Not `frames_received`: that feeds
+/// `MCMediaMissingKeyMaterial` and the R-29 browser read-back, and a synthetic
+/// `media_kind="video"` series living there for `metric_expiration` would let a
+/// later video read-back pass vacuously. A gauge also sidesteps
+/// `delta_to_cumulative` temporality.
+#[cfg(feature = "observability")]
+const MEDIA_KIND_PROBE_METRIC: &str = "dt_client_media_send_queue_depth";
+
+/// One gauge datapoint at 0 whose `client_version` is a per-case MARKER (kept
+/// and shape-checked by the collector), so the read-back selects only this
+/// run's case and a stale series from an earlier run cannot satisfy it.
+#[cfg(feature = "observability")]
+fn media_kind_probe_point(marker: &str, kind: Option<Value>) -> NumberDataPoint {
+    let mut attributes = vec![
+        string_attr("client_version", marker),
+        string_attr("key_custody", "operator"),
+    ];
+    if let Some(v) = kind {
+        attributes.push(KeyValue {
+            key_strindex: 0,
+            key: MEDIA_KIND_KEY.to_string(),
+            value: Some(AnyValue { value: Some(v) }),
+        });
+    }
+    let now_ns = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos(),
+    )
+    .expect("timestamp fits u64");
+    NumberDataPoint {
+        attributes,
+        time_unix_nano: now_ns,
+        value: Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)),
+        ..Default::default()
+    }
+}
+
+/// (r29) The collector's `media_kind` value rule FIRES and APPLIES: posted
+/// through the real GC proxy (user JWT) into the deployed Kind collector, a
+/// `video` value reaches Prometheus intact, a `bogus` one arrives as `invalid`
+/// (and never as `bogus`), and a non-string one arrives as `invalid`.
+///
+/// GC deliberately does not value-check `media_kind`, so the collector rule is
+/// the only value bound; this is the proof it is live in the deployed config
+/// (the Kind overlay loads `infra/services/otel-collector/collector.yaml`
+/// verbatim through its content-addressed `configMapGenerator`).
+///
+/// Observability-only: without Prometheus this proves nothing, so it does not
+/// degrade to a 202-only check.
+#[cfg(feature = "observability")]
+#[tokio::test]
+async fn test_metrics_media_kind_value_rule_fires_and_applies() {
+    let cluster = cluster().await;
+    let token = shared_user_token(cluster).await;
+    let gc = GcClient::new(&cluster.gc_base_url);
+
+    let run = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    // (case, sent value, expected stored value). `absent` stands in for the
+    // KIND-FREE session series (KEK, roster, capture source): the collector rule
+    // is not name-scoped, so a probe sent with NO media_kind proves the
+    // `!= nil` conjunct live — it must arrive with no media_kind at all, never
+    // `invalid`.
+    let cases: [(&str, Option<Value>, Option<&str>); 4] = [
+        (
+            "video",
+            Some(Value::StringValue("video".into())),
+            Some("video"),
+        ),
+        (
+            "bogus",
+            Some(Value::StringValue("bogus".into())),
+            Some("invalid"),
+        ),
+        ("int", Some(Value::IntValue(7)), Some("invalid")),
+        ("absent", None, None),
+    ];
+    let markers: Vec<String> = cases
+        .iter()
+        .map(|(name, _, _)| format!("et31-mk-{name}-{run}"))
+        .collect();
+
+    let body = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: MEDIA_KIND_PROBE_METRIC.to_string(),
+                    data: Some(Data::Gauge(Gauge {
+                        data_points: cases
+                            .iter()
+                            .zip(&markers)
+                            .map(|((_, v, _), m)| media_kind_probe_point(m, v.clone()))
+                            .collect(),
+                    })),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec();
+
+    let resp = gc
+        .raw_ingest_telemetry("metrics", Some(token), Some(PROTOBUF_CT), body)
+        .await
+        .expect("network request should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        202,
+        "media_kind probe POST must be accepted"
+    );
+
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let selector = format!(
+        "{MEDIA_KIND_PROBE_METRIC}{{client_version=~\"{}\"}}",
+        markers.join("|")
+    );
+    // Positive control: every marker's series arrived. Only then are the
+    // per-case value checks (including "bogus is absent") meaningful.
+    let arrived =
+        env_tests::eventual::assert_eventually(ConsistencyCategory::MetricsScrape, || {
+            let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+            let selector = selector.clone();
+            let markers = markers.clone();
+            async move {
+                prom.query_promql(&selector).await.ok().is_some_and(|r| {
+                    markers.iter().all(|m| {
+                        r.data
+                            .result
+                            .iter()
+                            .any(|s| s.metric.get("client_version") == Some(m))
+                    })
+                })
+            }
+        })
+        .await;
+    assert!(
+        arrived.is_ok(),
+        "media-kind-probe-not-stored: the marker series {markers:?} never reached \
+         Prometheus via GC -> collector -> scrape. The value-rule assertions would be \
+         vacuous; investigate the collector name filter / scrape before the rule."
+    );
+
+    let result = prom
+        .query_promql(&selector)
+        .await
+        .expect("Prometheus query should succeed")
+        .data
+        .result;
+    for ((name, _, want), marker) in cases.iter().zip(&markers) {
+        let mine: Vec<_> = result
+            .iter()
+            .filter(|s| s.metric.get("client_version") == Some(marker))
+            .collect();
+        let kinds: Vec<Option<&String>> =
+            mine.iter().map(|s| s.metric.get(MEDIA_KIND_KEY)).collect();
+        assert_eq!(
+            kinds,
+            vec![want.map(str::to_string).as_ref()],
+            "media-kind-value-rule: case `{name}` must arrive as exactly one series with \
+             {MEDIA_KIND_KEY}={want:?}; got {kinds:?}. `bogus`/int surviving means the \
+             collector's exact `^(audio|video)$` rewrite is not in the deployed config; \
+             `video` rewritten means the rule is over-tight; `absent` acquiring a value \
+             means the rule's `!= nil` guard is broken and kind-free series are being \
+             stamped `invalid`."
+        );
+    }
+    assert!(
+        !result
+            .iter()
+            .any(|s| s.metric.get(MEDIA_KIND_KEY).map(String::as_str) == Some("bogus")),
+        "media-kind-value-rule: a `{MEDIA_KIND_KEY}=\"bogus\"` series was stored"
+    );
+}

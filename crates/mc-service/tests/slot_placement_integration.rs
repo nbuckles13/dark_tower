@@ -394,7 +394,7 @@ async fn canonical_partial_connectivity_routes_only_through_shared_handlers() {
     );
     assert!(
         snap.counter("mc_media_send_targets_total")
-            .with_labels(&[("key_custody", "operator")])
+            .with_labels(&[("media_kind", "audio"), ("key_custody", "operator")])
             .delta()
             >= 2
     );
@@ -1147,8 +1147,14 @@ async fn the_published_slot_cap_is_the_enforced_cap() {
     let (_stack, _rig) = start_stack("slot-cap-gauge").await;
     let expected = f64::from(client_media_config().max_receive_slots);
     snap.gauge("mc_media_receive_slot_cap")
-        .with_labels(&[("key_custody", "operator")])
+        .with_labels(&[("media_kind", "audio"), ("key_custody", "operator")])
         .assert_value(expected);
+    // No video cap is published until MC-A adds the per-kind cap: a video `0`
+    // will mean "the R-26 video-off lever applied", so publishing it early would
+    // be a false reading.
+    snap.gauge("mc_media_receive_slot_cap")
+        .with_labels(&[("media_kind", "video")])
+        .assert_unobserved();
 }
 
 // ============================================================================

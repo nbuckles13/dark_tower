@@ -286,6 +286,20 @@ pub const DECLARED_WRAPPERS: &[DeclaredWrapper] = &[
         method: "#histogram",
         injects: "this.#metricLabels",
     },
+    // The SDK's kind-free SESSION-level media series (KEK lifecycle, roster key
+    // changes, capture source): `MediaSessionMetrics` emits only through these
+    // two wrappers, which inject its object-literal `this.#sessionLabels`
+    // (story 3 OBS-A). Per-kind series keep resolving through `this.#base`.
+    DeclaredWrapper {
+        file: MEDIA_METRICS_TS,
+        method: "#sessionCounter",
+        injects: "this.#sessionLabels",
+    },
+    DeclaredWrapper {
+        file: MEDIA_METRICS_TS,
+        method: "#sessionGauge",
+        injects: "this.#sessionLabels",
+    },
 ];
 
 /// The media-path base label bag in [`MEDIA_METRICS_TS`].
@@ -2930,6 +2944,8 @@ some prose but no marker
         // BOTH forms must parse: `cargo fmt` reflows a short array onto one
         // line, and a line-keyed parser would under-count after a formatting
         // pass — reporting an extraction failure on a healthy file.
+        // Synthetic parser input, deliberately not a mirror of GC's
+        // MEDIA_DATAPOINT_EXTRA (its own declared length is what is asserted).
         let one_line = r#"
 pub const MEDIA_DATAPOINT_EXTRA: [&str; 5] =
     ["reason", "outcome", "action", "source", KEY_CUSTODY_LABEL];
@@ -2947,6 +2963,8 @@ pub const MEDIA_DATAPOINT_EXTRA: [&str; 5] =
 
     #[test]
     fn extracts_rust_string_arrays_and_flags_unresolved_consts() {
+        // Synthetic parser input, deliberately not a mirror of GC's
+        // MEDIA_DATAPOINT_EXTRA (its own declared length is what is asserted).
         let src = r#"
 pub const ALLOWLIST: [&str; 3] = [
     "client_version",

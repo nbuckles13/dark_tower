@@ -1552,7 +1552,7 @@ is inaudible to you until someone you can hear leaves.** That is the designed be
 - **Effective N**: count the cells in the in-meeting slot grid (`data-testid="slot-list"`, one cell
   per declared slot, each naming its sender). The E2E bus `receiveSlots.declared` and the console
   line `[dt-media-slots] declaring N=...` show the same number. The server cap is
-  `mc_media_receive_slot_cap`, also on the bus as `receiveSlots.serverCap`.
+  `mc_media_receive_slot_cap{media_kind="audio"}`, also on the bus as `receiveSlots.serverCap`.
 - If every cell is filled and the unheard participants are the latest joiners, it is static fill.
 - If a cell says fewer sources, or an unheard participant is marked unreachable on the roster, it is
   not static fill. Unreachable (no shared handler) is

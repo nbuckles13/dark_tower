@@ -30,7 +30,7 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { DEFAULT_CLIENT_CONFIG } from '../../../config/clientConfig.js';
 import { MeetingIdentity } from '../../setup/identity.js';
 import { kekHolderWith } from '../../__tests__/helpers.js';
-import { MediaMetrics } from '../../setup/mediaMetrics.js';
+import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { decodeFrame } from '../../frame/frameCodec.js';
 import { parseSframe } from '../../frame/sframe.js';
@@ -86,7 +86,11 @@ interface Rig {
 
 async function makeRig(urls: readonly string[]): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
-  const metrics = new MediaMetrics({ clientVersion: 'v', orgId: 'o' }, sink);
+  const metrics = new MediaKindMetrics(
+    { clientVersion: 'v', orgId: 'o' },
+    MEDIA_KIND_LABELS.Audio,
+    sink,
+  );
   const kekSource = kekHolderWith(KEK, 0);
   const identity = await MeetingIdentity.create();
   const senders = new Map<string, RecordingSender>();

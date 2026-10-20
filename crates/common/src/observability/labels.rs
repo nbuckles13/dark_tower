@@ -35,6 +35,24 @@ pub const KEY_CUSTODY_LABEL: &str = "key_custody";
 /// a customer. The label carries the truth; a boolean would carry a claim.
 pub const KEY_CUSTODY_OPERATOR: &str = "operator";
 
+/// Label KEY for the media kind a series' subject has.
+///
+/// Closed value set `{audio, video}`. The single source of truth for the key
+/// and its values is the `media_kind` row of
+/// `docs/observability/label-taxonomy.md`; each service's value vocabulary
+/// (MC's `MediaKindLabel`, the SDK's `MediaKindLabel` union) carries an
+/// `ANCHOR (DRY):` back to it and a test reading that row.
+///
+/// Carried by MC and the client SDK ONLY. **MH must not import this
+/// constant**: ADR-0036 §7 makes MH type-blind, so no `mh_*` series may carry a
+/// media kind — MH labels by the behaviour it was told (e.g. transport
+/// `datagram`/`stream`), never by kind. Nothing at source level enforces that
+/// today: the live env-test hygiene rule
+/// (`crates/env-tests/src/fixtures/metric_hygiene.rs`) fails if any scraped
+/// `mh_*` series carries the key, and the missing per-service source check is
+/// recorded in `docs/TODO.md` §Guard Coverage Gaps.
+pub const MEDIA_KIND_LABEL: &str = "media_kind";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +64,12 @@ mod tests {
     fn key_custody_literals_are_stable() {
         assert_eq!(KEY_CUSTODY_LABEL, "key_custody");
         assert_eq!(KEY_CUSTODY_OPERATOR, "operator");
+    }
+
+    /// Same reason: `media_kind` is selected on by dashboards, alerts and the
+    /// browser read-back, and GC's datapoint allowlist holds this constant.
+    #[test]
+    fn media_kind_literal_is_stable() {
+        assert_eq!(MEDIA_KIND_LABEL, "media_kind");
     }
 }

@@ -43,7 +43,7 @@
 //     here ever touches the replay window, the transmit-key cache or the roster,
 //     which are per sender and owned elsewhere.
 
-import type { MediaMetrics } from '../setup/mediaMetrics.js';
+import type { MediaKindMetrics } from '../setup/mediaMetrics.js';
 import type {
   AudioDecoderFactory,
   AudioDecoderSeam,
@@ -79,7 +79,7 @@ export interface LaneActivity {
 
 /** Construction options for {@link ReceiveLanes}. */
 export interface ReceiveLanesOptions {
-  readonly metrics: MediaMetrics;
+  readonly metrics: MediaKindMetrics;
   readonly decoderFactory: AudioDecoderFactory;
   readonly playback: PlaybackSink;
   readonly sampleRateHz: number;
@@ -231,7 +231,7 @@ class Lane implements DecodeLane {
     }
     if (this.#pending.length >= this.#options.pendingFrames) {
       // Bounded: evict the OLDEST and count it. A post-accept loss — see
-      // `MediaMetrics.decodeQueueDropped` for why it is not a frame drop reason.
+      // `MediaKindMetrics.decodeQueueDropped` for why it is not a frame drop reason.
       this.#pending.shift();
       this.#options.metrics.decodeQueueDropped();
     }

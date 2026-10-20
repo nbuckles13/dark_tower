@@ -33,7 +33,7 @@ use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor}
 use super::participant::{ParticipantActor, ParticipantActorHandle};
 use super::session::{SessionBindingManager, StoredBinding};
 use crate::media_routing::{ConnectionKey, Unapplied};
-use crate::media_signaling::ReceiveCapabilityDeclaration;
+use crate::media_signaling::{MediaKindLabel, ReceiveCapabilityDeclaration};
 
 use common::secret::SecretBox;
 use std::collections::{BTreeSet, HashMap};
@@ -2250,13 +2250,21 @@ impl MeetingActor {
         let Some(participant) = self.participants.get_mut(target_participant_id) else {
             return Err(ServerMuteRefusal::UnknownTarget);
         };
-        if participant.audio_server_muted == audio_muted
-            && participant.video_server_muted == video_muted
-        {
-            return Ok(ServerMuteDecision::Unchanged);
+        // Per-kind, and the whole-request short-circuit is derived from the
+        // SAME two flags, so it cannot drift from the per-kind decision.
+        let decision = ServerMuteDecision {
+            changed: MediaKindLabel::per_kind(|k| {
+                k.pick(
+                    participant.audio_server_muted,
+                    participant.video_server_muted,
+                ) != k.pick(audio_muted, video_muted)
+            }),
+        };
+        if decision.is_unchanged() {
+            return Ok(decision);
         }
 
-        let audio_changed = participant.audio_server_muted != audio_muted;
+        let audio_changed = decision.changed(MediaKindLabel::Audio);
         participant.audio_server_muted = audio_muted;
         participant.video_server_muted = video_muted;
         // Cleared in lockstep with the flags it qualifies.
@@ -2282,7 +2290,7 @@ impl MeetingActor {
             self.reconcile_media(Affected::HoldersOf(sender)).await;
             self.flush_views().await;
         }
-        Ok(ServerMuteDecision::Applied)
+        Ok(decision)
     }
 
     /// A participant's current mute state as the wire update, the ONE shape
@@ -2433,19 +2441,27 @@ impl MeetingActor {
         self.media.reconcile(affected, &server_muted).await;
     }
 
-    /// Write this meeting's ABSOLUTE server-muted count into the pod census and
-    /// publish (freshness only — see `MutedSourceCensus` for the load-bearing
-    /// caller). Counts the audio flag, which is what MH enforces.
+    /// Write this meeting's ABSOLUTE per-kind server-muted counts into the pod
+    /// census and publish (freshness only — see `MutedSourceCensus` for the
+    /// load-bearing caller).
+    ///
+    /// Each kind counts its OWN flag: `audio_server_muted` for audio,
+    /// `video_server_muted` for video. A participant muted on both kinds is one
+    /// source on each. MH is told only the audio-server-muted senders
+    /// (`reconcile_media`), so `{media_kind="audio"}` is TODAY's reading
+    /// comparable with MH's `server_muted` drops; it becomes the sum across
+    /// kinds when MC-A adds per-stream DROP_AT_INGRESS dispositions for video.
     fn publish_mute_census(&self) {
         if let Some(wiring) = &self.wiring {
-            let count = self
-                .participants
-                .values()
-                .filter(|p| p.audio_server_muted)
-                .count();
-            wiring
-                .muted_census
-                .set(&self.meeting_id, u64::try_from(count).unwrap_or(u64::MAX));
+            let counts = MediaKindLabel::per_kind(|kind| {
+                let n = self
+                    .participants
+                    .values()
+                    .filter(|p| kind.pick(p.audio_server_muted, p.video_server_muted))
+                    .count();
+                u64::try_from(n).unwrap_or(u64::MAX)
+            });
+            wiring.muted_census.set(&self.meeting_id, counts);
             wiring.muted_census.publish();
         }
     }
@@ -2490,7 +2506,7 @@ impl MeetingActor {
     fn hand_off_teardown(&mut self, cause: MeetingEndCause) {
         let lifecycle = self.wiring.as_ref().map(|w| w.lifecycle.clone());
         if let Some(wiring) = &self.wiring {
-            wiring.muted_census.set(&self.meeting_id, 0);
+            wiring.muted_census.set(&self.meeting_id, [0; 2]);
             wiring.muted_census.publish();
             let _ = wiring.lifecycle.send(MeetingLifecycleEvent::Ended {
                 meeting_id: self.meeting_id.clone(),
@@ -3480,7 +3496,12 @@ mod tests {
             .server_mute("part-2".to_string(), "host".to_string(), true, false)
             .await
             .unwrap();
-        assert_eq!(result, Ok(ServerMuteDecision::Applied));
+        assert_eq!(
+            result,
+            Ok(ServerMuteDecision {
+                changed: MediaKindLabel::per_kind(|k| k == MediaKindLabel::Audio)
+            })
+        );
         let p2 = state_of(&handle, "part-2").await;
         assert!(p2.audio_server_muted);
         assert!(!p2.video_server_muted);
@@ -3489,7 +3510,7 @@ mod tests {
             .server_mute("part-2".to_string(), "host".to_string(), true, false)
             .await
             .unwrap();
-        assert_eq!(again, Ok(ServerMuteDecision::Unchanged));
+        assert!(again.unwrap().is_unchanged());
     }
 
     /// R-8, the ORDERING invariant: authority is checked BEFORE the target is

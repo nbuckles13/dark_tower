@@ -77,7 +77,7 @@ import {
 } from '../frame/receivePath.js';
 import { FrameRejectedError, assignmentReject } from '../frame/rejectReason.js';
 import type { RejectReason } from '../frame/rejectReason.js';
-import type { MediaMetrics } from '../setup/mediaMetrics.js';
+import type { MediaKindMetrics } from '../setup/mediaMetrics.js';
 import type { DecodeLane } from './receiveLanes.js';
 import type { FirstMediaObserver } from '../setup/measurement.js';
 import type { HopSequenceMonitor } from './hopSequenceMonitor.js';
@@ -105,7 +105,7 @@ export interface SenderGate {
 
 /** Construction options for {@link IngressPipeline}. */
 export interface IngressPipelineOptions {
-  readonly metrics: MediaMetrics;
+  readonly metrics: MediaKindMetrics;
   readonly roster: IdentityKeyResolver;
   readonly lanes: SenderGate;
   readonly keys: ReceiverKeys;
@@ -131,7 +131,7 @@ export interface IngressPipelineOptions {
  * restart would reopen the replay surface.
  */
 export class IngressPipeline {
-  readonly #metrics: MediaMetrics;
+  readonly #metrics: MediaKindMetrics;
   readonly #roster: IdentityKeyResolver;
   readonly #lanes: SenderGate;
   readonly #keys: ReceiverKeys;
@@ -145,7 +145,7 @@ export class IngressPipeline {
    * Frames that completed the receive path, since construction. Monotone.
    *
    * A plain field read, sampled by an embedder — never a per-frame emission.
-   * Bumped at the single site beside `MediaMetrics.frameAccepted()`.
+   * Bumped at the single site beside `MediaKindMetrics.frameAccepted()`.
    */
   #framesAccepted = 0;
   /**
@@ -174,7 +174,7 @@ export class IngressPipeline {
    * field, and `string` is the annotation that lets a `DOMException.message` or
    * an interpolated identifier land here and compile. That is the journey
    * ADR-0036 §11 and `label-taxonomy.md` R2 exist to block. Same discipline as
-   * `MediaMetrics.frameDropped(reason: RejectReason)` beside the call sites.
+   * `MediaKindMetrics.frameDropped(reason: RejectReason)` beside the call sites.
    */
   #lastDropReason: RejectReason | undefined;
 
@@ -194,7 +194,7 @@ export class IngressPipeline {
    * Frames accepted since construction (monotone).
    *
    * Named `Accepted`, not `Received`, and the distinction is the one
-   * `MediaMetrics.frameAccepted` already draws: a received frame may be dropped
+   * `MediaKindMetrics.frameAccepted` already draws: a received frame may be dropped
    * for a wire reason, so `received = accepted + sum(drops by reason)`. This
    * counts the left-hand side's *accepted* term, so it moves only for a frame
    * that verified, decrypted and reached the decoder.

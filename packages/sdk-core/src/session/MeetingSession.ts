@@ -282,7 +282,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    * The media metric handles. Built at JOIN rather than at `startMedia()`, so a
    * KEK arriving on the join response — before media starts — is counted on
    * arrival rather than inferred later from whether one happens to be held.
-   * Media-path labels are an allow-list of two strings; see `mediaMetrics.ts`.
+   * Media-path labels are an allow-list of two strings (plus a closed media kind on
+   * per-kind handles); see `mediaMetrics.ts`.
    */
   #mediaMetrics: MediaMetrics | undefined;
   #rosterKeys: RosterIdentityKeys | undefined;
@@ -381,12 +382,9 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       meeting_id_hash: 'none',
     };
     this.#orgId = options.orgSubdomain;
-    const mediaMetrics = new MediaMetrics(
-      { clientVersion: __SDK_VERSION__, orgId: this.#orgId },
-      this.#metricsSink,
-    );
+    const mediaMetrics = this.#buildMediaMetrics();
     this.#mediaMetrics = mediaMetrics;
-    this.#kekSource.setObserver(kekObserver(mediaMetrics));
+    this.#kekSource.setObserver(kekObserver(mediaMetrics.session));
     let stage: FailureStage = FailureStage.Internal;
     try {
       // --- fetching-token: auth + GC meeting token ---
@@ -558,17 +556,16 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // The media label set is built BY ALLOW-LIST from two named strings. It
     // shares nothing with `this.#metricLabels`, which carries `meeting_id_hash`
     // — the dimension ADR-0036 §11 bars from every media emission.
-    const metrics =
-      this.#mediaMetrics ??
-      new MediaMetrics({ clientVersion: __SDK_VERSION__, orgId: this.#orgId }, this.#metricsSink);
+    const metrics = this.#mediaMetrics ?? this.#buildMediaMetrics();
 
     // Zero-initialised, so `rate()` has a series before the first refusal.
-    metrics.receiveSlotsRejected(0);
+    // Audio only: no video handle exists yet (see `MediaMetrics`).
+    metrics.audio.receiveSlotsRejected(0);
     const slotIds = receiveSlotIdsToDeclare({
       count: this.#mediaConfig.receive.audioSlots,
       source: this.#receiveSlotsSource,
       cap: classifySlotCap(this.#advertisedSlotCap),
-      metrics,
+      metrics: metrics.audio,
     });
     const capture = selectCaptureSource(this.#injectedCaptureFactory, senderId);
     const media = this.#media;
@@ -896,7 +893,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // (never its replay state). See `mediaWiring.ts`.
     this.#rosterKeys.setTransmitKeyInvalidationListener(
       rosterInvalidationListener(
-        () => this.#mediaMetrics,
+        () => this.#mediaMetrics?.session,
         () => this.#pipeline,
       ),
     );
@@ -967,6 +964,14 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       ...(this.#metricsSink ? { metricsSink: this.#metricsSink } : {}),
     };
     return new MediaTransport(opts);
+  }
+
+  /** The ONE construction of the media handles (join and the startMedia fallback). */
+  #buildMediaMetrics(): MediaMetrics {
+    return new MediaMetrics(
+      { clientVersion: __SDK_VERSION__, orgId: this.#orgId },
+      this.#metricsSink,
+    );
   }
 
   #setState(state: MeetingSessionState): void {

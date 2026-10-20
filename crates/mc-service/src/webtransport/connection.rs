@@ -6,9 +6,7 @@
 //! 3. Runs the bridge loop forwarding `ParticipantUpdate` messages to the client
 //! 4. Notifies the meeting when the connection drops (via `MeetingActorHandle`)
 
-use crate::actors::messages::{
-    DisconnectCause, JoinResult, ServerMuteDecision, ServerMuteRefusal, UnmuteRelay,
-};
+use crate::actors::messages::{DisconnectCause, JoinResult, ServerMuteRefusal, UnmuteRelay};
 use crate::actors::{
     BoundedMhStatus, MeetingActorHandle, MeetingControllerActorHandle, MhState,
     ParticipantActorHandle,
@@ -18,7 +16,7 @@ use crate::auth::McJwtValidator;
 use crate::errors::McError;
 use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
-    CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MuteOutcome,
+    CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MediaKindLabel, MuteOutcome,
     ReceiveCapabilityDeclaration, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
     UnmuteRequestOutcome,
 };
@@ -1436,6 +1434,43 @@ async fn reject_capability(
     .await;
 }
 
+/// The kinds a mute or server-mute request NAMES, each with the target value
+/// MC applies to it — the counting unit of `mc_media_mute_requests_total` and
+/// `mc_media_server_mute_requests_total` is one increment per (request, named
+/// kind).
+///
+/// # INTERIM: returns BOTH kinds, whatever the request carried
+///
+/// This does NOT return "only the present fields" yet. P1's interim shim reads
+/// an absent per-kind field as `false`, so MC writes BOTH kinds on every
+/// request; both are therefore acted on, and both are counted, each with the
+/// value MC applied. That leaves no zero-increment hole (a both-absent request
+/// is still applied as an unmute of both) and invents no kind. MC-B switches
+/// the parse to absent = unchanged; THEN this narrows to the present fields and
+/// the both-absent request becomes a rejection counted on the generic path.
+/// `named_kinds_interim_names_both_kinds_because_of_the_p1_shim` pins today's
+/// behaviour, so MC-B has a failing test to flip.
+///
+/// Derived ONCE at the top of each handler and passed to every exit arm.
+///
+/// Laid out by [`MediaKindLabel::index`], so a handler reads its target values
+/// back out of THIS array (`named_value`) and never re-derives them.
+fn named_kinds(audio: Option<bool>, video: Option<bool>) -> [(MediaKindLabel, bool); 2] {
+    MediaKindLabel::per_kind(|k| (k, k.pick(audio, video).unwrap_or(false)))
+}
+
+/// The target value `named` carries for `kind`.
+fn named_value(named: &[(MediaKindLabel, bool); 2], kind: MediaKindLabel) -> bool {
+    kind.of(*named).1
+}
+
+/// Record one request-level mute outcome once per named kind.
+fn record_mute_for_each(named: &[(MediaKindLabel, bool)], outcome: MuteOutcome) {
+    for (kind, _) in named {
+        metrics::record_mute_request(*kind, outcome);
+    }
+}
+
 /// Handle a post-join `MuteRequest` (ADR-0036 §5 client mute).
 ///
 /// Records the reported state on the meeting actor (the single home for mute),
@@ -1478,11 +1513,12 @@ async fn handle_mute_request(
     // reads as `false`, byte-for-byte today's semantics (proto3 omitted `false`
     // from the wire). MC-B replaces this with absent = unchanged, both-absent
     // rejected and counted.
-    let audio_muted = request.audio_muted.unwrap_or(false);
-    let video_muted = request.video_muted.unwrap_or(false);
+    let named = named_kinds(request.audio_muted, request.video_muted);
+    let audio_muted = named_value(&named, MediaKindLabel::Audio);
+    let video_muted = named_value(&named, MediaKindLabel::Video);
     let reported = (audio_muted, video_muted);
     if media.last_reported_mute == Some(reported) {
-        metrics::record_mute_request(MuteOutcome::Unchanged);
+        record_mute_for_each(&named, MuteOutcome::Unchanged);
         return;
     }
 
@@ -1492,7 +1528,7 @@ async fn handle_mute_request(
     // GENUINE toggle, and would report `rate_limited` for a path that was never
     // approached.
     if !media.mute_limiter.try_spend(Instant::now()) {
-        metrics::record_mute_request(MuteOutcome::RateLimited);
+        record_mute_for_each(&named, MuteOutcome::RateLimited);
 
         // The report is DROPPED, not queued. That is safe because ADR-0036 §5
         // enforces client mute at CAPTURE on the client: a suppressed report
@@ -1524,7 +1560,7 @@ async fn handle_mute_request(
     // Captured BEFORE the cache is overwritten. `None` — the first report after
     // join — stands for `(false, false)`, which is the actual post-join actor
     // state, so a first report of "not muted" correctly counts as no change.
-    let previously_audio_muted = media.last_reported_mute.is_some_and(|(audio, _)| audio);
+    let previous = media.last_reported_mute.unwrap_or((false, false));
 
     if let Err(e) = media
         .meeting_handle
@@ -1537,7 +1573,7 @@ async fn handle_mute_request(
             error = %e,
             "Failed to record client mute on the meeting actor"
         );
-        metrics::record_mute_request(MuteOutcome::ActorUnavailable);
+        record_mute_for_each(&named, MuteOutcome::ActorUnavailable);
         return;
     }
 
@@ -1550,16 +1586,29 @@ async fn handle_mute_request(
     // ordering it correctly free.
     media.last_reported_mute = Some(reported);
 
-    // `applied` means the audio flag moved on a declared connection, so the
-    // actor re-emits to the holders of this source. A video-only change, or a
-    // report before any declaration, is recorded by the actor and re-emits
-    // nothing: the slot view reads only audio mute. A camera button produces
-    // `applied_no_recompose`, which is routine.
-    if media.declaration.is_none() || previously_audio_muted == audio_muted {
-        metrics::record_mute_request(MuteOutcome::AppliedNoRecompose);
-        return;
+    // PER KIND. Audio: `applied` means the audio flag moved on a declared
+    // connection, so the actor re-emits to the holders of this source; an audio
+    // move before any declaration is `applied_no_recompose`. Video: a moved
+    // flag is recorded by the actor and re-emits nothing (the slot view reads
+    // only audio mute), so it is `applied_no_recompose` — a camera button
+    // produces it, routinely. A kind whose flag did not move is `unchanged`.
+    for (kind, muted) in named {
+        let moved = kind.pick(previous.0, previous.1) != muted;
+        let outcome = match (kind, moved) {
+            (_, false) => MuteOutcome::Unchanged,
+            (MediaKindLabel::Audio, true) if media.declaration.is_some() => MuteOutcome::Applied,
+            (_, true) => MuteOutcome::AppliedNoRecompose,
+        };
+        metrics::record_mute_request(kind, outcome);
     }
-    metrics::record_mute_request(MuteOutcome::Applied);
+}
+
+/// Record one request-level server-mute outcome once per named kind, each with
+/// THAT kind's asked-for direction (`ServerMuteAction::from_muted`).
+fn record_server_mute_for_each(named: &[(MediaKindLabel, bool)], outcome: ServerMuteOutcome) {
+    for (kind, muted) in named {
+        metrics::record_server_mute_request(*kind, ServerMuteAction::from_muted(*muted), outcome);
+    }
 }
 
 /// `message_kind` for the server-mute refusal `ErrorMessage`.
@@ -1601,15 +1650,15 @@ async fn handle_server_mute_request(
     // INTERIM (story 3 P1): absent reads as `false`, today's semantics. MC-B
     // replaces this with per-kind actions (absent = unchanged, both-absent
     // rejected and counted).
-    let audio_muted = request.audio_muted.unwrap_or(false);
-    let video_muted = request.video_muted.unwrap_or(false);
-    let action = ServerMuteAction::from_request(audio_muted, video_muted);
+    let named = named_kinds(request.audio_muted, request.video_muted);
+    let audio_muted = named_value(&named, MediaKindLabel::Audio);
+    let video_muted = named_value(&named, MediaKindLabel::Video);
 
     // 1. Authority.
     if !media.is_host {
         refuse_server_mute(
             ServerMuteRefusal::NotPermitted,
-            action,
+            &named,
             None,
             connection_id,
             participant_handle,
@@ -1621,7 +1670,7 @@ async fn handle_server_mute_request(
 
     // 2. Rate limit (host work only).
     if !media.server_mute_limiter.try_spend(Instant::now()) {
-        metrics::record_server_mute_request(action, ServerMuteOutcome::RateLimited);
+        record_server_mute_for_each(&named, ServerMuteOutcome::RateLimited);
         if !media.server_mute_rate_limit_logged {
             media.server_mute_rate_limit_logged = true;
             warn!(
@@ -1649,7 +1698,7 @@ async fn handle_server_mute_request(
         .await
     {
         Err(e) => {
-            metrics::record_server_mute_request(action, ServerMuteOutcome::ActorUnavailable);
+            record_server_mute_for_each(&named, ServerMuteOutcome::ActorUnavailable);
             debug!(
                 target: "mc.webtransport.connection",
                 connection_id = %connection_id,
@@ -1658,11 +1707,25 @@ async fn handle_server_mute_request(
             );
         }
         Ok(Ok(decision)) => {
-            let outcome = match decision {
-                ServerMuteDecision::Applied => ServerMuteOutcome::Applied,
-                ServerMuteDecision::Unchanged => ServerMuteOutcome::Unchanged,
+            // Per kind, from the actor's per-kind decision: a request that
+            // changes only audio is `applied` for audio, `unchanged` for video.
+            for (kind, muted) in named {
+                let outcome = if decision.changed(kind) {
+                    ServerMuteOutcome::Applied
+                } else {
+                    ServerMuteOutcome::Unchanged
+                };
+                metrics::record_server_mute_request(
+                    kind,
+                    ServerMuteAction::from_muted(muted),
+                    outcome,
+                );
+            }
+            let outcome = if decision.is_unchanged() {
+                ServerMuteOutcome::Unchanged
+            } else {
+                ServerMuteOutcome::Applied
             };
-            metrics::record_server_mute_request(action, outcome);
             // The decision, with who asked and about whom, on the signalling
             // path where identity is legitimate. Participant ids only — never a
             // sender id, user id or display name.
@@ -1671,7 +1734,6 @@ async fn handle_server_mute_request(
                 connection_id = %connection_id,
                 requester_participant_id = %media.participant_id,
                 target_participant_id = %target,
-                action = action.label(),
                 outcome = outcome.label(),
                 audio_muted = audio_muted,
                 video_muted = video_muted,
@@ -1681,7 +1743,7 @@ async fn handle_server_mute_request(
         Ok(Err(refusal)) => {
             refuse_server_mute(
                 refusal,
-                action,
+                &named,
                 Some(&target),
                 connection_id,
                 participant_handle,
@@ -1701,7 +1763,7 @@ async fn handle_server_mute_request(
 /// rationed by its own bucket, and a withheld reply is itself counted.
 async fn refuse_server_mute(
     refusal: ServerMuteRefusal,
-    action: ServerMuteAction,
+    named: &[(MediaKindLabel, bool); 2],
     target: Option<&str>,
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
@@ -1711,7 +1773,7 @@ async fn refuse_server_mute(
         ServerMuteRefusal::NotPermitted => ServerMuteOutcome::NotPermitted,
         ServerMuteRefusal::UnknownTarget => ServerMuteOutcome::UnknownTarget,
     };
-    metrics::record_server_mute_request(action, outcome);
+    record_server_mute_for_each(named, outcome);
 
     if !media.server_mute_refusal_logged {
         media.server_mute_refusal_logged = true;
@@ -1722,8 +1784,10 @@ async fn refuse_server_mute(
             connection_id = %connection_id,
             requester_participant_id = %media.participant_id,
             target_participant_id = target.unwrap_or(""),
-            action = action.label(),
             outcome = outcome.label(),
+            // What was asked for, per kind (booleans, not identity).
+            audio_muted = named_value(named, MediaKindLabel::Audio),
+            video_muted = named_value(named, MediaKindLabel::Video),
             "Server-mute request refused. Further refusals on this connection are counted, not \
              logged."
         );
@@ -2151,7 +2215,84 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::observability::metrics::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
+    use crate::observability::metrics::{
+        KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL,
+    };
+
+    /// PINS THE D1 INTERIM (story 3 OBS-A). P1's shim reads an absent per-kind
+    /// field as `false`, so MC acts on — and counts — BOTH kinds for every
+    /// request, including one naming only audio and one naming neither.
+    ///
+    /// MC-B FLIPS THIS TEST: when absent becomes "unchanged", `named_kinds`
+    /// narrows to the present fields (`(Some(true), None)` names audio only)
+    /// and a both-absent request becomes a rejection on the generic path.
+    #[test]
+    fn named_kinds_interim_names_both_kinds_because_of_the_p1_shim() {
+        assert_eq!(
+            named_kinds(Some(true), None),
+            [
+                (MediaKindLabel::Audio, true),
+                (MediaKindLabel::Video, false)
+            ]
+        );
+        assert_eq!(
+            named_kinds(None, None),
+            [
+                (MediaKindLabel::Audio, false),
+                (MediaKindLabel::Video, false)
+            ]
+        );
+        assert_eq!(
+            named_kinds(Some(false), Some(true)),
+            [
+                (MediaKindLabel::Audio, false),
+                (MediaKindLabel::Video, true)
+            ]
+        );
+    }
+
+    /// One request-level outcome counts once PER NAMED KIND, and a server-mute
+    /// refusal carries each kind's own direction: `{audio: true, video: false}`
+    /// is `mute`/audio + `unmute`/video, never `mute` on both.
+    #[test]
+    fn request_level_outcomes_count_once_per_named_kind_with_that_kinds_action() {
+        use common::observability::testing::MetricAssertion;
+
+        let snap = MetricAssertion::snapshot();
+        let named = named_kinds(Some(true), Some(false));
+        record_server_mute_for_each(&named, ServerMuteOutcome::NotPermitted);
+        record_mute_for_each(&named, MuteOutcome::RateLimited);
+
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "not_permitted"),
+                (MEDIA_KIND_LABEL, "audio"),
+            ])
+            .assert_delta(1);
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "unmute"),
+                ("outcome", "not_permitted"),
+                (MEDIA_KIND_LABEL, "video"),
+            ])
+            .assert_delta(1);
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "mute"),
+                ("outcome", "not_permitted"),
+                (MEDIA_KIND_LABEL, "video"),
+            ])
+            .assert_delta(0);
+        for kind in MediaKindLabel::ALL {
+            snap.counter("mc_media_mute_requests_total")
+                .with_labels(&[
+                    ("outcome", "rate_limited"),
+                    (MEDIA_KIND_LABEL, kind.label()),
+                ])
+                .assert_delta(1);
+        }
+    }
 
     // Full R-60 behavioral coverage (all-CONNECTED / partial / all-FAILED state
     // recording + metric + truncation + cap) lives in
@@ -2417,17 +2558,33 @@ mod tests {
         )
         .await;
 
-        snap.counter("mc_media_server_mute_requests_total")
-            .with_labels(&[
-                ("action", "mute"),
-                ("outcome", "unknown_target"),
-                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
-            ])
-            .assert_delta(0);
+        // Per (request, named kind): no `unknown_target` cell moves for either
+        // kind, and `not_permitted` lands on each kind with its own direction.
+        for kind in MediaKindLabel::ALL {
+            for action in ["mute", "unmute"] {
+                snap.counter("mc_media_server_mute_requests_total")
+                    .with_labels(&[
+                        ("action", action),
+                        ("outcome", "unknown_target"),
+                        (MEDIA_KIND_LABEL, kind.label()),
+                        (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                    ])
+                    .assert_delta(0);
+            }
+        }
         snap.counter("mc_media_server_mute_requests_total")
             .with_labels(&[
                 ("action", "mute"),
                 ("outcome", "not_permitted"),
+                (MEDIA_KIND_LABEL, "audio"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_delta(1);
+        snap.counter("mc_media_server_mute_requests_total")
+            .with_labels(&[
+                ("action", "unmute"),
+                ("outcome", "not_permitted"),
+                (MEDIA_KIND_LABEL, "video"),
                 (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             ])
             .assert_delta(1);

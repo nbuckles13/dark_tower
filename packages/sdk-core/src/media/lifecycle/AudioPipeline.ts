@@ -330,7 +330,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       options.config.receiverState.maxReplayContextsPerSender,
       options.config.receiverState.replayWindowBits,
     );
-    this.#firstMedia = new FirstMediaObserver(options.metrics, this.#clock, (ms) => {
+    this.#firstMedia = new FirstMediaObserver(options.metrics.audio, this.#clock, (ms) => {
       this.emit('firstMediaFrame', ms);
     });
   }
@@ -449,7 +449,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     // the one sink. Registered after the playback sink, so teardown (reverse
     // order) closes every lane before the sink they write into.
     const lanes = new ReceiveLanes({
-      metrics: this.#metrics,
+      metrics: this.#metrics.audio,
       decoderFactory: this.#options.decoderFactory,
       playback,
       sampleRateHz: audio.sampleRateHz,
@@ -501,7 +501,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#teardown.register('encoder', () => encoder.close());
 
     this.#ingress = new IngressPipeline({
-      metrics: this.#metrics,
+      metrics: this.#metrics.audio,
       roster: this.#options.roster,
       lanes,
       keys: this.#options.kekSource,
@@ -693,7 +693,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    */
   setAudioMuted(muted: boolean): void {
     if (!this.#mute.setAudioMuted(muted)) return;
-    this.#metrics.muteTransition(muted ? MEDIA_MUTE_ACTIONS.Mute : MEDIA_MUTE_ACTIONS.Unmute);
+    this.#metrics.audio.muteTransition(muted ? MEDIA_MUTE_ACTIONS.Mute : MEDIA_MUTE_ACTIONS.Unmute);
     // Resuming from silence is a resume-from-empty for this stream: bump the
     // generation, which bounds a leaked transmit key across the muted window.
     if (!muted) this.#transmitKeys.rotate();
@@ -850,7 +850,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       // to tell it to send nothing would invent a stream number and a bitrate.
       if (directive.targets.length === 0) return;
       this.#egress = new EgressPipeline({
-        metrics: this.#metrics,
+        metrics: this.#metrics.audio,
         transmitKeys: this.#transmitKeys,
         kek: this.#options.kekSource,
         identity: this.#options.identity,

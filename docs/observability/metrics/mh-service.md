@@ -457,7 +457,7 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 
 **Configuration reflections (ADR-0038 step 3).**
 
-The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforced per-stream costs, each `.set()` once at startup from the ONE `PolicyLimits` / `EgressAdmission` field enforcement reads (never a second literal, never a re-conversion). They exist so the value the RUNNING process loaded is observable without its startup log line, which log rotation loses on a long-lived pod: `crates/env-tests/tests/01_mh_deployment_config.rs` compares every one against the deployed ConfigMap. **Config reflections, not signals — no alert selects on them.** Static; published once at startup; `key_custody`: `operator`; cardinality 1 each. The three `_limit`s are PRE-ALLOCATION bounds on one registration (a registration exceeding one is refused whole as `rejected_invalid`). The two costs are the divisors of `mh_media_egress_stream_ceiling`; the heavier one binds. **Why the costs are two per-kind names, not one gauge with a `media_kind` label:** `media_kind` is declared-not-carried in `docs/observability/label-taxonomy.md`, so no MH metric carries it today. If story 3 folds these into one labelled gauge, that is a RENAME — sweep `infra/grafana/dashboards/mh-media.json` (Per-Stream Egress Costs) and env-test 01's `CONFIG_GAUGES` in the same change — never a silent change.
+The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforced per-stream costs, each `.set()` once at startup from the ONE `PolicyLimits` / `EgressAdmission` field enforcement reads (never a second literal, never a re-conversion). They exist so the value the RUNNING process loaded is observable without its startup log line, which log rotation loses on a long-lived pod: `crates/env-tests/tests/01_mh_deployment_config.rs` compares every one against the deployed ConfigMap. **Config reflections, not signals — no alert selects on them.** Static; published once at startup; `key_custody`: `operator`; cardinality 1 each. The three `_limit`s are PRE-ALLOCATION bounds on one registration (a registration exceeding one is refused whole as `rejected_invalid`). The two costs are the divisors of `mh_media_egress_stream_ceiling`; the heavier one binds. **Why the costs are two names, not one gauge with a `media_kind` label:** MH is type-blind (ADR-0036 §7) and NO `mh_*` series may carry `media_kind` (`docs/observability/label-taxonomy.md`, the `media_kind` row; enforced on the stored series by `crates/env-tests/src/fixtures/metric_hygiene.rs` `Rule::MediaKindOnMh`). These are two config echoes, each named by the cost it bounds; folding them into one kind-labelled gauge is ruled out, not merely deferred.
 
 ### `mh_media_egress_streams_per_meeting_limit`
 - **Type**: Gauge
@@ -555,22 +555,21 @@ it is bounded live in the taxonomy — it is the *first* home for a label that m
 one service emits. **Which labels a given metric carries** lives here. Neither is a
 copy of the other.
 
-### Declared, not yet carried: `media_kind` and `content_kind`
+### `media_kind` is NEVER carried by MH; `content_kind` is declared, not carried
 
-Media-path counters gain two dimensions when video and content share land (**story 3**,
-not this story):
+**MH is type-blind** (ADR-0036 §7: "Any proposal that switches on media type inside MH is a
+design error to be rewritten as a behaviour"). No `mh_*` series carries `media_kind`: MH
+labels by the behaviour it was told (transport `datagram`/`stream`, a disposition, a
+reason), never by kind. MC and the client SDK carry it (story 3 R-29; values and SSoT in
+`docs/observability/label-taxonomy.md`, the `media_kind` row). The live hygiene kernel
+fails if any `mh_*` series carries the key (`crates/env-tests/src/fixtures/metric_hygiene.rs`,
+`Rule::MediaKindOnMh`, applied by `32_media_metric_hygiene.rs`); there is no source-level
+check yet (`docs/TODO.md` §Guard Coverage Gaps). MH must not import
+`common::observability::labels::MEDIA_KIND_LABEL`.
 
 | Label | State |
 |---|---|
-| `media_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
 | `content_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
-
-Both are registered in `docs/observability/label-taxonomy.md` as shared labels, which
-is where their value sets are authoritative. They are recorded here as *declared* so
-that story 3 adds a dimension to an existing scheme rather than inventing one, and so
-that a reader who greps for them today finds "not carried yet" instead of silence.
-**Do not write a dashboard query or an alert that selects on either** — the selector
-would match nothing and yield an empty series rather than an error.
 
 ### The transmit/receive convention
 

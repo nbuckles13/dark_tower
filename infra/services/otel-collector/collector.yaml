@@ -158,11 +158,18 @@ processors:
           #
           # GROUP 2 — the per-metric discriminators (global-controller's + security's),
           # the same widening applied to GC's datapoint tier
-          # (`MEDIA_DATAPOINT_EXTRA`) minus key_custody: reason, outcome,
-          # action, source, mode. `mode` (story 2 task 13) is carried only by
+          # (`MEDIA_DATAPOINT_EXTRA`) minus key_custody (which is in group 1):
+          # reason, outcome, action, source, mode, media_kind. So group 1 ∪
+          # group 2 ⊇ `MEDIA_DATAPOINT_EXTRA` (dt-guard rule 3).
+          # `mode` (story 2 task 13) is carried only by
           # `dt_client_media_capture_source` — `microphone` | `test_tone`, a
           # build-time property; its presence under `test_tone` outside dev IS
-          # the signal.
+          # the signal. `media_kind` (story 3 R-29) is the closed vocabulary
+          # {audio, video}, SSoT the `media_kind` row of
+          # `docs/observability/label-taxonomy.md`; carried by every PER-KIND
+          # client media series and absent from the session-level ones (KEK,
+          # roster, capture source). Its value rule is the exact one in block
+          # (c) below.
           #
           # Two groups rather than a flat list because the next editor must
           # know WHICH owner to consult for a given key; flattened, they edit
@@ -199,7 +206,7 @@ processors:
           # go dark. NO MERGED LIST IS CORRECT FOR BOTH QUESTIONS.
           # `dt-guard client-metrics-export` (G4) asserts this list is a SUBSET
           # of GC's two, so the two encodings cannot drift apart silently.
-          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source", "mode"])
+          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source", "mode", "media_kind"])
 
           # --- key_custody: asserted here, not accepted from a browser ---
           #
@@ -281,6 +288,25 @@ processors:
           - set(attributes["action"], "invalid") where attributes["action"] != nil and (not IsString(attributes["action"]) or not IsMatch(attributes["action"], "^[a-z_]{1,64}$"))
           - set(attributes["source"], "invalid") where attributes["source"] != nil and (not IsString(attributes["source"]) or not IsMatch(attributes["source"], "^[a-z_]{1,64}$"))
           - set(attributes["mode"], "invalid") where attributes["mode"] != nil and (not IsString(attributes["mode"]) or not IsMatch(attributes["mode"], "^[a-z_]{1,64}$"))
+
+          # --- media_kind: an EXACT value allowlist, the deliberate exception ---
+          #
+          # The header of this block argues for SHAPE over a value allowlist,
+          # because an allowlist that falls behind its vocabulary goes quiet.
+          # That failure mode does not apply here: the domain is CLOSED and
+          # two-valued, fixed by ADR-0036 and its SSoT (the `media_kind` row of
+          # `docs/observability/label-taxonomy.md`), and a third kind would be a
+          # contract change that edits this line in the same task. So the exact
+          # rule is strictly better: it bounds the distinct-value COUNT (at most
+          # audio, video, invalid), which the shape checks above cannot.
+          # GC deliberately does NOT value-check this key, so this rewrite is the
+          # only value bound and stays observable
+          # (`crates/env-tests/tests/31_gc_telemetry.rs` fires it end to end).
+          # `!= nil` keeps it from STAMPING `media_kind="invalid"` onto the
+          # kind-free session series (same reason as every rule above). The
+          # parentheses keep BOTH anchors on BOTH alternatives: unparenthesised,
+          # `^audio|video$` would admit `audio…` prefixes and `…video` suffixes.
+          - set(attributes["media_kind"], "invalid") where attributes["media_kind"] != nil and (not IsString(attributes["media_kind"]) or not IsMatch(attributes["media_kind"], "^(audio|video)$"))
 
   # ---------------------------------------------------------------------
   # COLLECTOR-CLOCK RESTAMP — the ordering authority at the trust boundary.
@@ -387,6 +413,24 @@ processors:
   # Against `max_streams: 500` that is ~9.8 concurrent runs of headroom
   # (was ~10.6). Realistic counts are well
   # below worst case, since most reject reasons never fire in a run.
+  #
+  # STORY 3 R-29 — `media_kind` MULTIPLIES THE PER-KIND STREAMS. Of the 51,
+  # the session-level (kind-free) series are 14 streams: kek_updates x 2
+  # sources + kek_retention_violations 1 + kek_retention_anomalies x 3 +
+  # kek_install_refusals x 3 + roster_key_rebinds x 2 +
+  # kek_generations_retained 1 + capture_source x 2 = 14; the per-kind
+  # series are 51 - 14 = 37 streams per kind value. Per per-run `org_id`:
+  #   - honest TODAY (audio only):      37 x 1 + 14 = 51  -> ~9.8 runs of headroom
+  #   - honest ONCE VIDEO EMITS:        37 x 2 + 14 = 88  -> ~5.7 runs
+  #   - ADVERSARIAL (audio, video and the `invalid` rewrite from a patched
+  #     client):                        37 x 3 + 14 = 125 -> ~4.0 runs
+  # Kept at 500 (operations ruling, story 3 task 2): this is a fail-closed
+  # tripwire, not a capacity estimate, and per-run orgs overlap only within
+  # `max_stale`. Because of the multiplier, every PER-KIND name a later task
+  # adds costs 2 streams per org honestly (3 adversarially), so the video
+  # tasks that add names recompute these three lines. TRIGGER: if the
+  # honest-once-video headroom drops below 3 concurrent runs, raise the cap in
+  # the task that crosses it.
   # Recompute this figure whenever a name or a label value set is added.
   delta_to_cumulative:
     max_stale: 15m

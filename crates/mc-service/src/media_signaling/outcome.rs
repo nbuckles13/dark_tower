@@ -236,7 +236,15 @@ pub enum MuteOutcome {
     ///
     /// A healthy, routine value: it is what a camera button produces.
     AppliedNoRecompose,
-    /// Identical to the report already in force. No actor hop, no recomposition.
+    /// THIS KIND's state did not move. Two sources (story 3, per kind):
+    /// - the whole-request identical repeat — the tuple short-circuit, before
+    ///   any actor hop or recomposition (counted on every named kind);
+    /// - the UNMOVED kind of a request that was applied — the actor WAS hopped
+    ///   for the other kind (a camera toggle is `unchanged` on audio; an audio
+    ///   mute is `unchanged` on video).
+    ///
+    /// Not a failure, and client-inflatable at near-zero cost via the first
+    /// source, so never a ratio denominator.
     Unchanged,
     /// The connection's mute-work rate limit was exhausted.
     ///
@@ -281,11 +289,111 @@ impl MuteOutcome {
     }
 }
 
+/// The media kind a series' subject has (`media_kind` label; story 3 OBS-A).
+///
+/// ANCHOR (DRY): the `media_kind` row of `docs/observability/label-taxonomy.md`
+/// is the single source of truth for this value set; the test
+/// `media_kind_label_matches_the_taxonomy_row` reads that row, so the two cannot
+/// drift silently. The key constant is `common::observability::labels::MEDIA_KIND_LABEL`.
+///
+/// A TELEMETRY projection, deliberately distinct from the wire
+/// `proto_gen::dark_tower::signaling::v1::MediaKind`, which has four values
+/// (`UNSPECIFIED`, `AUDIO`, `VIDEO_CAMERA`, `VIDEO_SCREEN`) against this label's
+/// two. [`Self::from_proto`] is the ONE mapping; no call site maps a wire kind
+/// to a label string on its own.
+///
+/// MC and the client SDK carry this label; MH never does (ADR-0036 §7: MH is
+/// type-blind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKindLabel {
+    /// `audio`.
+    Audio,
+    /// `video` (camera AND screen share; see [`Self::from_proto`]).
+    Video,
+}
+
+impl MediaKindLabel {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 2] = [Self::Audio, Self::Video];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+
+    /// This kind's position in [`Self::ALL`], for per-kind `[T; 2]` tallies
+    /// (read back with [`Self::of`]). Exhaustive, so the positional layout is
+    /// defined HERE and nowhere else.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Audio => 0,
+            Self::Video => 1,
+        }
+    }
+
+    /// Select this kind's value from a per-kind pair of named fields
+    /// (`kind.pick(p.audio_server_muted, p.video_server_muted)`). The ONE
+    /// kind -> field mapping, so call sites never write their own `match`.
+    #[must_use]
+    pub fn pick<T>(self, audio: T, video: T) -> T {
+        match self {
+            Self::Audio => audio,
+            Self::Video => video,
+        }
+    }
+
+    /// This kind's entry of a per-kind `[T; 2]` laid out by [`Self::index`]
+    /// (as built by [`Self::per_kind`]). Infallible: destructures, never
+    /// indexes.
+    #[must_use]
+    pub fn of<T>(self, per_kind: [T; 2]) -> T {
+        let [audio, video] = per_kind;
+        self.pick(audio, video)
+    }
+
+    /// A per-kind `[T; 2]` built from `f`, laid out by [`Self::index`].
+    #[must_use]
+    pub fn per_kind<T>(mut f: impl FnMut(Self) -> T) -> [T; 2] {
+        Self::ALL.map(&mut f)
+    }
+
+    /// The label for a wire media kind, or `None` for `UNSPECIFIED`.
+    ///
+    /// Exhaustive with no wildcard arm, so a new wire variant is a compile error
+    /// here rather than a silent mislabel.
+    #[must_use]
+    pub const fn from_proto(kind: proto_gen::dark_tower::signaling::v1::MediaKind) -> Option<Self> {
+        use proto_gen::dark_tower::signaling::v1::MediaKind;
+        match kind {
+            MediaKind::Audio => Some(Self::Audio),
+            MediaKind::VideoCamera => Some(Self::Video),
+            // DELIBERATE: screen share is `media_kind="video"` plus
+            // `content_kind="slides"` in the taxonomy. `content_kind` is
+            // declared but not carried (content share is out of story 3's
+            // scope), so a screen slot is labelled `video` and the split is
+            // left to that label when it is carried.
+            MediaKind::VideoScreen => Some(Self::Video),
+            // Rejected at every parse boundary that admits a kind; it has no
+            // honest label.
+            MediaKind::Unspecified => None,
+        }
+    }
+}
+
 /// The verb a server-mute request asked for (`mc_media_server_mute_requests_total{action}`).
 ///
 /// The label names WHAT WAS ASKED FOR, never its result (that is `outcome`).
-/// `mute` if the request asks for either kind to be server-muted, `unmute` if
-/// it asks for neither — a request carries the complete target state.
+/// PER KIND, not per request (story 3 OBS-A): the metric counts one increment
+/// per (request, named kind), and each kind's cell carries THAT kind's asked-for
+/// direction. A request `{audio: true, video: false}` therefore counts
+/// `action="mute", media_kind="audio"` AND `action="unmute",
+/// media_kind="video"` — stamping the request-level verb on the video cell would
+/// claim a video mute the request did not ask for.
 ///
 /// NOT A JOIN KEY with `dt_client_media_mute_transitions_total{action}`, whose
 /// value set is byte-identical: that series is the local user's own
@@ -295,9 +403,9 @@ impl MuteOutcome {
 /// `by(action)` across the two metric names means nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerMuteAction {
-    /// Apply a server mute (either kind).
+    /// Server-mute this kind.
     Mute,
-    /// Lift it (neither kind).
+    /// Lift (or keep lifted) this kind's server mute.
     Unmute,
 }
 
@@ -305,10 +413,10 @@ impl ServerMuteAction {
     /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
     pub const ALL: [Self; 2] = [Self::Mute, Self::Unmute];
 
-    /// The action a request's target state asks for.
+    /// The action ONE KIND's target state asks for.
     #[must_use]
-    pub fn from_request(audio_muted: bool, video_muted: bool) -> Self {
-        if audio_muted || video_muted {
+    pub fn from_muted(muted: bool) -> Self {
+        if muted {
             Self::Mute
         } else {
             Self::Unmute
@@ -357,9 +465,12 @@ impl ServerMuteAction {
 /// asking about a participant who does not exist is `not_permitted`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerMuteOutcome {
-    /// The server-mute state changed.
+    /// THIS KIND's server-mute state changed.
     Applied,
-    /// Already in the requested state.
+    /// THIS KIND was already in the requested state. When the request's other
+    /// kind was `applied`, the actor still broadcast (and, for audio,
+    /// re-rendered and re-pushed) for that other kind; only when BOTH kinds are
+    /// unchanged was nothing broadcast or pushed.
     Unchanged,
     /// The requester does not hold host authority.
     ///
@@ -697,5 +808,77 @@ mod tests {
                 "label '{label}' is used by two vocabularies"
             );
         }
+    }
+
+    /// ANCHOR (DRY) drift check: the value set is read from the taxonomy row
+    /// itself, never restated here.
+    #[test]
+    fn media_kind_label_matches_the_taxonomy_row() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/observability/label-taxonomy.md"
+        );
+        let doc = std::fs::read_to_string(path).expect("label taxonomy must be readable");
+        let rows: Vec<&str> = doc
+            .lines()
+            .filter(|l| l.trim_start().starts_with("| `media_kind` |"))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one `media_kind` row must exist in the taxonomy: {rows:?}"
+        );
+        let cell = rows[0].split('|').nth(2).expect("value cell");
+        let from_doc: HashSet<&str> = cell
+            .split('`')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, t)| t)
+            .collect();
+        assert!(
+            !from_doc.is_empty(),
+            "taxonomy row parsed no values: {cell:?}"
+        );
+        let from_code: HashSet<&str> = MediaKindLabel::ALL.iter().map(|k| k.label()).collect();
+        assert_eq!(from_code, from_doc);
+    }
+
+    #[test]
+    fn media_kind_label_projects_every_wire_kind_without_a_wildcard() {
+        use proto_gen::dark_tower::signaling::v1::MediaKind;
+        assert_eq!(
+            MediaKindLabel::from_proto(MediaKind::Audio),
+            Some(MediaKindLabel::Audio)
+        );
+        assert_eq!(
+            MediaKindLabel::from_proto(MediaKind::VideoCamera),
+            Some(MediaKindLabel::Video)
+        );
+        assert_eq!(
+            MediaKindLabel::from_proto(MediaKind::VideoScreen),
+            Some(MediaKindLabel::Video)
+        );
+        assert_eq!(MediaKindLabel::from_proto(MediaKind::Unspecified), None);
+    }
+
+    /// `index()` is a bijection onto `0..ALL.len()` and agrees with `ALL`'s
+    /// order, so `per_kind` / `of` can never alias two kinds.
+    #[test]
+    fn media_kind_index_is_a_bijection_consistent_with_all() {
+        for (i, k) in MediaKindLabel::ALL.into_iter().enumerate() {
+            assert_eq!(k.index(), i);
+            assert_eq!(k.of(MediaKindLabel::per_kind(|x| x)), k);
+            assert_eq!(k.of(MediaKindLabel::per_kind(MediaKindLabel::index)), i);
+            assert_eq!(k.pick("audio", "video"), k.label());
+        }
+    }
+
+    #[test]
+    fn server_mute_action_is_per_kind() {
+        assert_eq!(ServerMuteAction::from_muted(true), ServerMuteAction::Mute);
+        assert_eq!(
+            ServerMuteAction::from_muted(false),
+            ServerMuteAction::Unmute
+        );
     }
 }

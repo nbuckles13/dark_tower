@@ -6,8 +6,18 @@
 // media-path metric, and NOTHING mechanical enforces that in TypeScript:
 // `dt-guard`'s media-path deny is Rust-only, its metric-label scanner reads
 // `crates/`, and `ts_pii.rs` scans only `console.*` / `logger.*` call sites. So
-// the structural control is the constructor's SHAPE — two named strings, not a
-// label bag — and these assertions are what pin it.
+// the structural control is the constructors' SHAPE — two named strings (and,
+// per kind, a closed media kind), never a label bag — and these assertions are
+// what pin it.
+//
+// They are ALSO the drift guard between the two label bags in `mediaMetrics.ts`:
+// the per-kind `mediaMetricLabels` (four keys) and `MediaSessionMetrics`'
+// `#sessionLabels` literal (three keys). `dt-guard client-metrics-export` does
+// not compare them; the exact-set assertions below do.
+
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
@@ -16,48 +26,113 @@ import { ALL_REJECT_REASONS, NON_DROPPING_REASON } from '../../frame/rejectReaso
 import { loadFrameVectors } from '../../frame/__tests__/frameVectors.js';
 import {
   MEDIA_KEK_INSTALL_REFUSALS,
+  MEDIA_KIND_LABELS,
   MEDIA_ROSTER_KEY_CHANGES,
   MEDIA_KEK_RETENTION_ANOMALIES,
   MEDIA_KEK_SOURCES,
   MEDIA_MUTE_ACTIONS,
   MEDIA_SEND_DROP_REASONS,
+  MediaKindMetrics,
   MediaMetrics,
+  MediaSessionMetrics,
   mediaMetricLabels,
+  type MediaKindLabel,
 } from '../mediaMetrics.js';
 
 const IDENTITY = { clientVersion: '1.2.3', orgId: 'acme' };
+const SESSION_KEYS = ['client_version', 'key_custody', 'org_id'];
+const PER_KIND_KEYS = [...SESSION_KEYS, 'media_kind'].sort();
+const KINDS: readonly MediaKindLabel[] = Object.values(MEDIA_KIND_LABELS);
+
+/** Every PER-KIND emitter, each with the one discriminator it may add (or none). */
+const PER_KIND_EMITTERS: [string, (m: MediaKindMetrics) => void, string | null][] = [
+  ['dt_client_media_frames_sent_total', (m) => m.frameSent(), null],
+  [
+    'dt_client_media_send_dropped_total',
+    (m) => m.sendDropped(MEDIA_SEND_DROP_REASONS.EgressQueueOverflow),
+    'reason',
+  ],
+  ['dt_client_media_send_queue_depth', (m) => m.sendQueueDepth(3), null],
+  ['dt_client_media_frames_received_total', (m) => m.frameReceived(), null],
+  ['dt_client_media_frames_dropped_total', (m) => m.frameDropped('signature_invalid'), 'reason'],
+  ['dt_client_media_frames_accepted_total', (m) => m.frameAccepted(), null],
+  [
+    'dt_client_media_key_wrap_outcomes_total',
+    (m) => m.wrapOutcome('kek_generation_not_held'),
+    'outcome',
+  ],
+  ['dt_client_media_downlink_gap_frames_total', (m) => m.downlinkGapFrames(2), null],
+  ['dt_client_media_downlink_reorder_total', (m) => m.downlinkReorder(), null],
+  ['dt_client_media_undeclared_stream_id_total', (m) => m.undeclaredStreamId(), null],
+  ['dt_client_media_decoder_errors_total', (m) => m.decoderError(), null],
+  [
+    'dt_client_media_mute_transitions_total',
+    (m) => m.muteTransition(MEDIA_MUTE_ACTIONS.Mute),
+    'action',
+  ],
+  ['dt_client_media_decode_queue_dropped_total', (m) => m.decodeQueueDropped(), null],
+  ['dt_client_media_receive_source_deficit_total', (m) => m.receiveSourceDeficit(2), null],
+  ['dt_client_media_receive_slots_rejected_total', (m) => m.receiveSlotsRejected(), null],
+  ['dt_client_time_to_first_media_frame_ms', (m) => m.timeToFirstMediaFrameMs(42), null],
+];
+
+/** Every SESSION-LEVEL (kind-free) emitter. */
+const SESSION_EMITTERS: [string, (m: MediaSessionMetrics) => void, string | null][] = [
+  [
+    'dt_client_media_kek_updates_total',
+    (m) => m.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse),
+    'source',
+  ],
+  ['dt_client_media_kek_retention_violations_total', (m) => m.kekRetentionViolation(), null],
+  [
+    'dt_client_media_kek_retention_anomalies_total',
+    (m) => m.kekRetentionAnomaly(MEDIA_KEK_RETENTION_ANOMALIES.CeilingClamped),
+    'outcome',
+  ],
+  [
+    'dt_client_media_kek_install_refusals_total',
+    (m) => m.kekInstallRefused(MEDIA_KEK_INSTALL_REFUSALS.OlderGeneration),
+    'outcome',
+  ],
+  ['dt_client_media_kek_generations_retained_total', (m) => m.kekGenerationRetained(), null],
+  [
+    'dt_client_media_roster_key_rebinds_total',
+    (m) => m.rosterKeyRebind(MEDIA_ROSTER_KEY_CHANGES.Downgrade),
+    'outcome',
+  ],
+  ['dt_client_media_capture_source', (m) => m.captureSource('microphone'), 'mode'],
+];
 
 function emitEverything(metrics: MediaMetrics): void {
-  metrics.frameSent();
-  metrics.sendDropped(MEDIA_SEND_DROP_REASONS.EgressQueueOverflow);
-  metrics.sendQueueDepth(3);
-  metrics.frameReceived();
-  metrics.frameDropped('signature_invalid');
-  metrics.frameAccepted();
-  metrics.wrapOutcome('kek_generation_not_held');
-  metrics.wrapOutcome('wrap_key_id_mismatch');
-  metrics.downlinkGapFrames(2);
-  metrics.downlinkReorder();
-  metrics.undeclaredStreamId();
-  metrics.decoderError();
-  metrics.muteTransition(MEDIA_MUTE_ACTIONS.Mute);
-  metrics.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse);
-  metrics.kekUpdate(MEDIA_KEK_SOURCES.KekUpdate);
-  metrics.timeToFirstMediaFrameMs(42);
-  metrics.kekRetentionViolation();
-  metrics.kekRetentionAnomaly(MEDIA_KEK_RETENTION_ANOMALIES.FloorSubstituted);
-  metrics.kekInstallRefused(MEDIA_KEK_INSTALL_REFUSALS.ConflictingKey);
-  metrics.kekGenerationRetained();
-  metrics.rosterKeyRebind(MEDIA_ROSTER_KEY_CHANGES.Rebind);
-  metrics.decodeQueueDropped();
+  for (const [, emit] of PER_KIND_EMITTERS) emit(metrics.audio);
+  for (const [, emit] of SESSION_EMITTERS) emit(metrics.session);
 }
 
-describe('mediaMetricLabels builds the set by ALLOW-LIST', () => {
-  it('produces exactly client_version, org_id and key_custody', () => {
-    expect(mediaMetricLabels(IDENTITY)).toEqual({
+describe('the emitter tables are complete (positive control)', () => {
+  it('lists at least one emitter on each side', () => {
+    expect(PER_KIND_EMITTERS.length, 'per-kind emitter table is EMPTY').toBeGreaterThan(0);
+    expect(SESSION_EMITTERS.length, 'session emitter table is EMPTY').toBeGreaterThan(0);
+  });
+
+  it('covers every dt_client_ name in mediaMetrics.ts, each on exactly one side', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const source = readFileSync(resolve(here, '../mediaMetrics.ts'), 'utf8');
+    const named = new Set(source.match(/'dt_client_[a-z0-9_]+'/g)?.map((n) => n.slice(1, -1)));
+    expect(named.size, 'no dt_client_ literal found in mediaMetrics.ts').toBeGreaterThan(0);
+    const perKind = PER_KIND_EMITTERS.map(([n]) => n);
+    const session = SESSION_EMITTERS.map(([n]) => n);
+    expect(perKind.filter((n) => session.includes(n))).toEqual([]);
+    expect(new Set([...perKind, ...session])).toEqual(named);
+  });
+});
+
+describe('mediaMetricLabels builds the PER-KIND set by ALLOW-LIST', () => {
+  it.each(KINDS)('produces exactly the four keys for %s', (kind) => {
+    expect(mediaMetricLabels(IDENTITY, kind)).toEqual({
       client_version: '1.2.3',
       org_id: 'acme',
       key_custody: 'operator',
+      media_kind: kind,
     });
   });
 
@@ -66,37 +141,119 @@ describe('mediaMetricLabels builds the set by ALLOW-LIST', () => {
     // storage cannot read it; MC can. No metric, log, span attribute or document
     // may carry an end-to-end or zero-trust boolean, because the default
     // deployment is neither.
-    const labels = mediaMetricLabels(IDENTITY);
+    const labels = mediaMetricLabels(IDENTITY, MEDIA_KIND_LABELS.Audio);
     expect(labels.key_custody).toBe('operator');
     for (const key of Object.keys(labels)) {
       expect(key).not.toMatch(/end_to_end|e2e|zero_trust/i);
     }
   });
+
+  it('cannot inherit an ambient key from the identity object', () => {
+    // A caller holding the join label bag passes it where an identity is
+    // expected: the allow-list reads two NAMED fields, so nothing else crosses.
+    const ambient = { ...IDENTITY, meeting_id_hash: 'h', participant_id: 'p' };
+    const sink = new InMemoryMetricsSink();
+    const metrics = new MediaMetrics(ambient, sink);
+    emitEverything(metrics);
+    new MediaKindMetrics(ambient, MEDIA_KIND_LABELS.Video, sink).frameSent();
+    const keys = new Set(sink.getRecordedMetrics().flatMap((m) => Object.keys(m.labels)));
+    expect(keys.has('meeting_id_hash')).toBe(false);
+    expect(keys.has('participant_id')).toBe(false);
+  });
 });
 
-describe('every media emission carries the base set and nothing forbidden', () => {
-  it('emits label KEYS that set-equal the base set plus at most one discriminator', () => {
-    const sink = new InMemoryMetricsSink();
-    emitEverything(new MediaMetrics(IDENTITY, sink));
-    const records = sink.getRecordedMetrics();
-    expect(records.length).toBe(22);
-
-    for (const record of records) {
-      const keys = new Set(Object.keys(record.labels));
-      expect(keys.has('client_version')).toBe(true);
-      expect(keys.has('org_id')).toBe(true);
-      expect(record.labels.key_custody).toBe('operator');
-      // At most ONE bounded discriminator beyond the base three.
-      expect(keys.size).toBeLessThanOrEqual(4);
-      const extra = [...keys].filter(
-        (k) => !['client_version', 'org_id', 'key_custody'].includes(k),
-      );
-      for (const key of extra) {
-        expect(['reason', 'outcome', 'action', 'source']).toContain(key);
-      }
-    }
+describe('the media_kind vocabulary matches its single source of truth', () => {
+  it('equals the `media_kind` row of docs/observability/label-taxonomy.md', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const doc = readFileSync(
+      resolve(here, '../../../../../../docs/observability/label-taxonomy.md'),
+      'utf8',
+    );
+    const row = doc.split('\n').find((line) => line.startsWith('| `media_kind` |'));
+    expect(row, 'no `| `media_kind` |` table row in label-taxonomy.md').toBeDefined();
+    const valueCell = row!.split('|')[2] ?? '';
+    const values = [...valueCell.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    expect(values.length, 'media_kind taxonomy row has no backticked values').toBeGreaterThan(0);
+    expect(new Set(values)).toEqual(new Set(KINDS));
   });
 
+  it('never uses the collector rewrite sentinel', () => {
+    expect(KINDS).not.toContain('invalid');
+  });
+});
+
+describe('every PER-KIND emission carries exactly the four-key set plus its discriminator', () => {
+  for (const kind of KINDS) {
+    it.each(PER_KIND_EMITTERS)(`%s (${kind})`, (name, emit, discriminator) => {
+      const sink = new InMemoryMetricsSink();
+      emit(new MediaKindMetrics(IDENTITY, kind, sink));
+      const [record, ...rest] = sink.getRecordedMetrics();
+      expect(rest).toEqual([]);
+      expect(record?.name).toBe(name);
+      const expected = discriminator ? [...PER_KIND_KEYS, discriminator].sort() : PER_KIND_KEYS;
+      expect(Object.keys(record!.labels).sort()).toEqual(expected);
+      expect(record!.labels.media_kind).toBe(kind);
+      expect(record!.labels.key_custody).toBe('operator');
+    });
+  }
+
+  it('resolves DISTINCT handles per kind: an audio emission never reads as video', () => {
+    const sink = new InMemoryMetricsSink();
+    const audio = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
+    const video = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Video, sink);
+    expect(audio.labels).not.toBe(video.labels);
+    audio.frameReceived();
+    audio.frameReceived();
+    video.frameReceived();
+    const byKind = sink
+      .getRecordedMetrics()
+      .map((r) => r.labels.media_kind)
+      .reduce<Record<string, number>>(
+        (acc, k) => ({ ...acc, [String(k)]: (acc[String(k)] ?? 0) + 1 }),
+        {},
+      );
+    expect(byKind).toEqual({ audio: 2, video: 1 });
+  });
+});
+
+describe('every SESSION-LEVEL emission is kind-free', () => {
+  it.each(SESSION_EMITTERS)('%s', (name, emit, discriminator) => {
+    const sink = new InMemoryMetricsSink();
+    emit(new MediaSessionMetrics(IDENTITY, sink));
+    const [record, ...rest] = sink.getRecordedMetrics();
+    expect(rest).toEqual([]);
+    expect(record?.name).toBe(name);
+    const expected = discriminator ? [...SESSION_KEYS, discriminator].sort() : SESSION_KEYS;
+    expect(Object.keys(record!.labels).sort()).toEqual(expected);
+    expect(Object.keys(record!.labels)).not.toContain('media_kind');
+    expect(record!.labels.key_custody).toBe('operator');
+  });
+});
+
+describe('the session container', () => {
+  it('holds a kind-free session handle and an AUDIO handle only (no video yet)', () => {
+    const metrics = new MediaMetrics(IDENTITY, undefined);
+    expect(metrics.audio.kind).toBe('audio');
+    expect(Object.keys(metrics.session.labels)).not.toContain('media_kind');
+    // `in` sees accessors and inherited members, not only own enumerable keys,
+    // so a `get video()` would fail here too.
+    expect('video' in metrics).toBe(false);
+    // Behavioural form: every per-kind handle reachable from the container
+    // (own fields AND prototype getters) is the audio one. A video handle here
+    // would zero-init a media_kind="video" series and pre-empt C-B's read-back.
+    const reachable = [
+      ...Object.getOwnPropertyNames(metrics),
+      ...Object.getOwnPropertyNames(Object.getPrototypeOf(metrics)),
+    ]
+      .filter((k) => k !== 'constructor')
+      .map((k) => (metrics as unknown as Record<string, unknown>)[k])
+      .filter((v): v is MediaKindMetrics => v instanceof MediaKindMetrics);
+    expect(reachable.length, 'no per-kind handle reachable: positive control').toBeGreaterThan(0);
+    expect(reachable.map((h) => h.kind)).toEqual(reachable.map(() => 'audio'));
+  });
+});
+
+describe('every media emission carries nothing forbidden', () => {
   it('never emits meeting_id_hash, a participant id, or a stream id', () => {
     // The negative half, and the one that matters. `reason` x `meeting_id_hash`
     // is an oracle over the receiver's key state: the reject vocabulary
@@ -145,7 +302,7 @@ describe('the drop counter carries the frozen reject vocabulary', () => {
     const file = loadFrameVectors();
     const dropping = file.reject_reasons.filter((r) => r.drops_frame).map((r) => r.token);
     const sink = new InMemoryMetricsSink();
-    const metrics = new MediaMetrics(IDENTITY, sink);
+    const metrics = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
     for (const token of dropping) {
       metrics.frameDropped(token as never);
     }
@@ -161,7 +318,7 @@ describe('the drop counter carries the frozen reject vocabulary', () => {
     // `received = accepted + sum(drops by reason)` in aggregate, silently, long
     // after the label set is frozen.
     const sink = new InMemoryMetricsSink();
-    const metrics = new MediaMetrics(IDENTITY, sink);
+    const metrics = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
     metrics.wrapOutcome(NON_DROPPING_REASON);
     const dropped = sink
       .getRecordedMetrics()
@@ -227,47 +384,7 @@ describe('the send-drop vocabulary', () => {
   });
 });
 
-describe('the story-2 counters carry EXACTLY their stated label sets', () => {
-  // SET EQUALITY, not `toContain`: a later sender, meeting or stream label on
-  // any of these must be a red build rather than a silent ADR-0036 §11
-  // violation. Each row names the one discriminator it may carry, or none.
-  const BASE = ['client_version', 'key_custody', 'org_id'];
-  const cases: [string, (m: MediaMetrics) => void, string | null][] = [
-    ['dt_client_media_kek_retention_violations_total', (m) => m.kekRetentionViolation(), null],
-    [
-      'dt_client_media_kek_retention_anomalies_total',
-      (m) => m.kekRetentionAnomaly(MEDIA_KEK_RETENTION_ANOMALIES.CeilingClamped),
-      'outcome',
-    ],
-    [
-      'dt_client_media_kek_install_refusals_total',
-      (m) => m.kekInstallRefused(MEDIA_KEK_INSTALL_REFUSALS.OlderGeneration),
-      'outcome',
-    ],
-    [
-      'dt_client_media_roster_key_rebinds_total',
-      (m) => m.rosterKeyRebind(MEDIA_ROSTER_KEY_CHANGES.Downgrade),
-      'outcome',
-    ],
-    ['dt_client_media_kek_generations_retained_total', (m) => m.kekGenerationRetained(), null],
-    ['dt_client_media_decode_queue_dropped_total', (m) => m.decodeQueueDropped(), null],
-    // Story 2 task 13.
-    ['dt_client_media_capture_source', (m) => m.captureSource('microphone'), 'mode'],
-    ['dt_client_media_receive_source_deficit_total', (m) => m.receiveSourceDeficit(2), null],
-    ['dt_client_media_receive_slots_rejected_total', (m) => m.receiveSlotsRejected(), null],
-  ];
-
-  it.each(cases)('%s', (name, emit, discriminator) => {
-    const sink = new InMemoryMetricsSink();
-    emit(new MediaMetrics(IDENTITY, sink));
-    const [record, ...rest] = sink.getRecordedMetrics();
-    expect(rest).toEqual([]);
-    expect(record?.name).toBe(name);
-    const expected = discriminator ? [...BASE, discriminator].sort() : BASE;
-    expect(Object.keys(record!.labels).sort()).toEqual(expected);
-    expect(record!.labels.key_custody).toBe('operator');
-  });
-
+describe('story-2 vocabularies', () => {
   it('keeps the story-2 outcome vocabularies pairwise DISJOINT', () => {
     // All ride `outcome`, a per-metric vocabulary with no cross-metric
     // aggregation contract. Disjoint values mean a mistaken `sum by(outcome)`
@@ -283,7 +400,7 @@ describe('the story-2 counters carry EXACTLY their stated label sets', () => {
 
   it('carries both KEK arrival sources on the one counter', () => {
     const sink = new InMemoryMetricsSink();
-    const m = new MediaMetrics(IDENTITY, sink);
+    const m = new MediaSessionMetrics(IDENTITY, sink);
     m.kekUpdate(MEDIA_KEK_SOURCES.JoinResponse);
     m.kekUpdate(MEDIA_KEK_SOURCES.KekUpdate);
     expect(sink.getRecordedMetrics().map((r) => r.labels.source)).toEqual([
@@ -296,7 +413,7 @@ describe('the story-2 counters carry EXACTLY their stated label sets', () => {
 describe('story 2 task 13 media metrics', () => {
   it('capture_source is a presence gauge: value 1, the active mode only', () => {
     const sink = new InMemoryMetricsSink();
-    new MediaMetrics(IDENTITY, sink).captureSource('microphone');
+    new MediaSessionMetrics(IDENTITY, sink).captureSource('microphone');
     const records = sink.getRecordedMetrics();
     expect(records).toHaveLength(1);
     expect(records[0]?.value).toBe(1);
@@ -305,7 +422,7 @@ describe('story 2 task 13 media metrics', () => {
 
   it('the deficit counter adds the COUNT, and 0 is a legal zero-initialisation', () => {
     const sink = new InMemoryMetricsSink();
-    const m = new MediaMetrics(IDENTITY, sink);
+    const m = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
     m.receiveSourceDeficit(0);
     m.receiveSourceDeficit(3);
     expect(sink.getRecordedMetrics().map((r) => r.value)).toEqual([0, 3]);

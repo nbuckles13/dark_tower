@@ -22,6 +22,7 @@ type IntervalHandle = ReturnType<typeof setInterval>;
 
 /** Start both signals. Returns the disposer, which stops the timer. */
 export function startIntervalSignals(options: {
+  /** Session handle for the capture source (kind-free); audio handle for the deficit. */
   readonly metrics: MediaMetrics;
   readonly mode: MediaCaptureSourceMode;
   readonly intervalMs: number;
@@ -31,16 +32,16 @@ export function startIntervalSignals(options: {
   readonly clearInterval: (handle: IntervalHandle) => void;
 }): () => void {
   const { metrics, mode, sample } = options;
-  metrics.captureSource(mode);
-  metrics.receiveSourceDeficit(0);
+  metrics.session.captureSource(mode);
+  metrics.audio.receiveSourceDeficit(0);
   let previous = sample();
   let stopped = false;
   const handle = options.setInterval(() => {
     if (stopped) return;
     const current = sample();
     const deficit = receiveSourceDeficit(previous, current);
-    if (deficit > 0) metrics.receiveSourceDeficit(deficit);
-    metrics.captureSource(mode);
+    if (deficit > 0) metrics.audio.receiveSourceDeficit(deficit);
+    metrics.session.captureSource(mode);
     previous = current;
   }, options.intervalMs);
   return () => {

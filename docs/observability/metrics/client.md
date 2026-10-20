@@ -385,22 +385,45 @@ it is bounded live in the taxonomy — it is the *first* home for a label that m
 one service emits. **Which labels a given metric carries** lives here. Neither is a
 copy of the other.
 
-### Declared, not yet carried: `media_kind` and `content_kind`
+### `media_kind` — per-kind series carry it, session-level series do not (story 3 R-29)
 
-Media-path counters gain two dimensions when video and content share land (**story 3**,
-not this story):
+What the label is and its value set (`audio`, `video`) live in
+`docs/observability/label-taxonomy.md` (the `media_kind` row). Which client series carry it
+lives here:
+
+| Class | Label set | Series |
+|---|---|---|
+| **Per-kind** | `client_version`, `org_id`, `key_custody=operator`, **`media_kind`** (+ own discriminator) | `frames_sent`, `send_dropped`, `send_queue_depth`, `frames_received`, `frames_accepted`, `frames_dropped`, `key_wrap_outcomes`, `downlink_gap_frames`, `downlink_reorder`, `undeclared_stream_id`, `decoder_errors`, `mute_transitions`, `decode_queue_dropped`, `receive_source_deficit`, `receive_slots_rejected` (all `dt_client_media_*`), and `dt_client_time_to_first_media_frame_ms` |
+| **Kind-free (session-level)** | `client_version`, `org_id`, `key_custody=operator` (+ own discriminator), **no `media_kind` key at all** | `dt_client_media_kek_updates_total`, `_kek_retention_violations_total`, `_kek_retention_anomalies_total`, `_kek_install_refusals_total`, `_kek_generations_retained_total`, `_roster_key_rebinds_total`, `dt_client_media_capture_source` |
+
+**Why the session-level series are kind-free.** A KEK arrival, a retention anomaly, an
+install refusal, a retained generation and a roster rebind each happen ONCE per session
+for every kind together; labelling them per kind would count one event twice.
+`capture_source` is a build-time property of the bundle. The split is by TYPE in the
+SDK: per-kind series are methods of `MediaKindMetrics` (constructed with a kind), the
+session series of `MediaSessionMetrics` (which takes no kind), so emitting either on the
+wrong side does not compile.
+
+**Today every per-kind series reads `media_kind="audio"`.** No video handle is
+constructed yet; the video tasks (C-A2, C-B) add it, and C-B's video read-back must be
+baseline -> rise, not presence. **Cardinality:** each per-kind series doubles (x2) once
+video emits; a patched client can add a third value, `invalid`, via the collector's
+exact rewrite (`collector.yaml` `delta_to_cumulative` figure).
+
+**Pipeline.** GC admits the key on datapoints only (`MEDIA_DATAPOINT_EXTRA`; stripped on
+spans and exemplars); the collector keeps it (`keep_keys` group 2) and rewrites any value
+other than exactly `audio`/`video` to `invalid`. Proven end to end by
+`crates/env-tests/tests/31_gc_telemetry.rs` (value rule) and the R-29 step of
+`packages/web-app/e2e/multi-party-hear.spec.ts` (audio read-back).
+
+### Declared, not yet carried: `content_kind`
 
 | Label | State |
 |---|---|
-| `media_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
 | `content_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
 
-Both are registered in `docs/observability/label-taxonomy.md` as shared labels, which
-is where their value sets are authoritative. They are recorded here as *declared* so
-that story 3 adds a dimension to an existing scheme rather than inventing one, and so
-that a reader who greps for them today finds "not carried yet" instead of silence.
-**Do not write a dashboard query or an alert that selects on either** — the selector
-would match nothing and yield an empty series rather than an error.
+**Do not write a dashboard query or an alert that selects on it** — the selector would
+match nothing and yield an empty series rather than an error.
 
 ### The transmit/receive convention
 
@@ -425,8 +448,10 @@ specifically **no meeting, participant or stream dimension, hashed or otherwise*
 
 Plus one **fixed non-identity** label: `key_custody=operator` (ADR-0036 §4). It is not a
 dimension in the cardinality sense, having exactly one value by construction, and R-26
-requires it. The media-path label set is therefore *three* labels; describing it as
-"only `client_version` and `org_id`" would be false against the wire.
+requires it. Per-kind series add the bounded non-identity **`media_kind`** (story 3); the
+media-path label set is therefore *four* labels on a per-kind series and *three* on a
+session-level one; describing it as "only `client_version` and `org_id`" would be false
+against the wire.
 
 **Why a hash does not help, stated because it is the obvious-looking escape hatch.** A
 hashed meeting id has **identical cardinality and identical per-meeting aggregation** to
@@ -438,9 +463,10 @@ the join-flow implicit label set into the media module, so `meeting_id_hash` wou
 attach to every media metric **by default** if the media set were built by spreading the
 join set and pruning it. It is not: the media set is built by **allow-list** in
 `packages/sdk-core/src/media/setup/mediaMetrics.ts`. Stronger than a policy, the code
-makes the leak **unrepresentable**: `mediaMetricLabels(identity: MediaMetricIdentity)`
-takes two named strings (`clientVersion`, `orgId`) — there is no `MetricLabels` bag at
-that boundary, so `meeting_id_hash` is not *excluded* from the set, it is a value a
+makes the leak **unrepresentable**: `mediaMetricLabels(identity: MediaMetricIdentity, kind: MediaKindLabel)`
+takes two named strings (`clientVersion`, `orgId`) and a closed two-value union — there
+is no `MetricLabels` bag at that boundary (the kind-free session bag is likewise an
+object literal of the same named values), so `meeting_id_hash` is not *excluded* from the set, it is a value a
 caller cannot pass even by mistake, because no parameter could carry it. That is a type,
 not a filter: a filter (`pick(labels, [...])` over an ambient bag) is a control that has
 to *notice*, and it fails open the moment a caller reaches the sink by a path that skips
@@ -472,7 +498,8 @@ exported names, identity-shaped keys, and the export decision for every
 `dt_client_*` literal in non-test sdk-core — see the block at the top of this file).
 
 **Every metric in this section carries `client_version`, `org_id` and
-`key_custody=operator`, and nothing else beyond its own bounded discriminator.**
+`key_custody=operator`, plus `media_kind` on the per-kind series (§`media_kind` above),
+and nothing else beyond its own bounded discriminator.**
 No meeting, participant, or stream dimension, hashed or otherwise. See
 §Naming convention for the two label sets and why the join set is not this one.
 
@@ -527,13 +554,13 @@ the comment's reader.
 - **Type**: Counter
 - **Description**: Datagrams that left the device on the media datagram path — **one increment per target handler per captured frame**, not one per frame. A sender whose edges span two handlers (ADR-0036 §9; story 2 task 20) advances this twice for one captured frame.
 - **THE NAME SAYS FRAMES; THE VALUE COUNTS DATAGRAMS — and that matches `dt_client_media_frames_received_total`**, which has counted datagrams-at-the-wire since story 1 (stated in `docs/runbooks/client-dev-local.md`'s green-signal table). The divergence is a **family convention documented on both sides**, not a defect on one: sent and received are in the SAME unit, so the `sent`/`received` pair and every cross-end comparison against `mh_media_*` stay unit-comparable — a two-handler sender's datagrams are split across two handlers, and each handler sees only its own, so the aggregate still reconciles. Do not "fix" either name without moving both.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **Usage**: the denominator for the send-drop ratio — **and the unit is the reason it is correct.** `dt_client_media_send_dropped_total` is raised inside the per-lane send path (`packages/sdk-core/src/media/pipeline/egress.ts`), so it is per-send-attempt by construction. Counting *frames* here while counting *attempts* there would make one captured frame that succeeded on handler A and was refused on handler B read as **50% loss on a sender that reached handler A perfectly**. Both sides count datagrams, so the ratio is a real loss fraction. Any future change to either counting point must move both or the ratio silently stops meaning loss.
 
 ### `dt_client_media_send_dropped_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: `reason` — a NEW bounded vocabulary, **not** the frame reject
+- **Labels**: per-kind base (incl. `media_kind`) + `reason` — a NEW bounded vocabulary, **not** the frame reject
   taxonomy.
 - **Permitted values**:
 
@@ -567,7 +594,7 @@ the comment's reader.
   application egress lanes — one lane per target handler (story 2 task 20: a
   sender sends to every handler owning one of its edges), each bounded
   independently.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **Usage**: read against the configured bound (default 10 frames = 200 ms at
   20 ms/frame). The application bound trips BEFORE the transport high-water mark
   — asserted at setup — so a rising depth here is back-pressure we can count
@@ -591,7 +618,7 @@ the comment's reader.
 - **Type**: Counter
 - **Description**: Datagrams received on the media path, counted **at the wire**
   before any parse or verification.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **Usage**: the left-hand side of the accounting identity above, and the signal
   that distinguishes "nothing arriving" from "arriving and failing". See the
   counting-point migration note.
@@ -599,7 +626,7 @@ the comment's reader.
 ### `dt_client_media_frames_dropped_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: `reason` — the frozen frame-reject vocabulary, whose SSoT is
+- **Labels**: per-kind base (incl. `media_kind`) + `reason` — the frozen frame-reject vocabulary, whose SSoT is
   `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Membership of
   THIS counter is carried by `drops_frame`: seventeen of the eighteen tokens.
   `wrap_key_id_mismatch` is the only `false` and **must never appear here**: the
@@ -686,7 +713,7 @@ the comment's reader.
 - **Type**: Counter
 - **Description**: Frames that completed the receive path — verified, replay-
   checked, decrypted — and were handed to the audio decoder.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **NAMED `accepted`, NOT `played`.** A frame handed to a decoder is not played.
   Silent audio with this counter climbing means the fault is downstream of the
   handoff — the decoder, the output device, or a suspended audio context — and
@@ -695,7 +722,7 @@ the comment's reader.
 ### `dt_client_media_key_wrap_outcomes_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: `outcome` — the NON-DROPPING wrapped-key outcomes (no count is
+- **Labels**: per-kind base (incl. `media_kind`) + `outcome` — the NON-DROPPING wrapped-key outcomes (no count is
   restated here: the list below is the operator-facing artifact, and a second
   encoding of its length only rots). The frame was ACCEPTED in every case; none
   ever reaches the drop counter.
@@ -784,7 +811,7 @@ the comment's reader.
 - **Type**: Counter
 - **Description**: Frames MISSING between each media handler's egress and this
   client's ingress, measured as gaps in the relay hop sequence.
-- **Labels**: base only. `stream_id` is bounded internal state and is **never** a
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`). `stream_id` is bounded internal state and is **never** a
   label.
 - **Increments by the SIZE of each gap, not by one per gap event** — a counter of
   missing numbers is comparable against `dt_client_media_frames_received_total`
@@ -813,7 +840,7 @@ the comment's reader.
 - **Type**: Counter
 - **Description**: Datagrams arriving at or below the running hop-sequence
   high-water mark.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **Usage**: the subtrahend in `gap_frames - reorder`. Kept separate from the gap
   counter so the subtraction is possible at all.
 
@@ -822,7 +849,7 @@ the comment's reader.
 - **Type**: Counter
 - **Description**: Frames arriving on a relay `stream_id` this client never
   declared in its `ReceiveCapability`.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **Usage**: the relay region is UNAUTHENTICATED — a media handler writes
   `stream_id` freely and nobody signs it — so an undeclared value creates NO
   receiver state and is counted here instead. The frame itself is still verified
@@ -837,7 +864,7 @@ the comment's reader.
   event-once per decoder instance. A fault class affecting every lane (a codec
   or platform fault) can therefore advance this up to N times for N active
   senders, and its magnitude is **not comparable with pre-story-2 history**.
-- **Labels**: base only. **No `reason`** — `AudioDecoder` provides no bounded
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`). **No `reason`** — `AudioDecoder` provides no bounded
   one, and an unbounded label here would be the cardinality hazard §11 exists to
   prevent.
 - **Usage**: the ONLY counter covering the accepted→audible segment, which the
@@ -850,7 +877,7 @@ the comment's reader.
 - **Description**: Frames evicted from a per-sender decode lane's bounded pending
   queue while that lane's decoder is being created or replaced (overflow drops
   the oldest) — **one increment per evicted frame**.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **ACCOUNTING BOUNDARY — POST-ACCEPT, and deliberately NOT a
   `frames_dropped_total{reason}` value.** Every frame counted here was already
   counted on `dt_client_media_frames_accepted_total`, so it sits DOWNSTREAM of
@@ -870,7 +897,7 @@ the comment's reader.
 ### `dt_client_media_mute_transitions_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: `action` — `mute`, `unmute`.
+- **Labels**: per-kind base (incl. `media_kind`) + `action` — `mute`, `unmute`.
 - **Usage**: client mute is enforced at CAPTURE and does not depend on the server
   honouring it; MC keeps the send directive active throughout. This counter, not
   frame absence, is how mute state is observed — *muted*, *silent* and *the
@@ -879,7 +906,7 @@ the comment's reader.
 ### `dt_client_media_kek_updates_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: `source` — `join_response` (the KEK carried on the join
+- **Labels**: session base (kind-free; see §`media_kind`) + `source` — `join_response` (the KEK carried on the join
   response, including a reconnect re-issue) or `kek_update` (a KEK pushed over
   signaling, which only a rotation sends). **A reconnect re-issue counts as
   `join_response`, merged with a first join; a rotation's CAUSE is not
@@ -918,7 +945,7 @@ the comment's reader.
 - **Description**: The KEK holder would have retained more than one previous
   generation; the retention guard (run after every install) trimmed and zeroized
   the excess.
-- **Labels**: base only.
+- **Labels**: session base only (`client_version`, `org_id`, `key_custody`) — **kind-free** (session-level; see §`media_kind`).
 - **Fleet contract: reads zero forever; alertable at `> 0`** — the same contract
   form as `dt_client_media_send_dropped_total{reason="transport_send_refused"}`.
 - **A ZERO-FOREVER TRIPWIRE AGAINST A FUTURE REFACTOR — NOT A DETECTOR FOR A LIVE
@@ -950,7 +977,7 @@ the comment's reader.
 ### `dt_client_media_kek_retention_anomalies_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: `outcome` — this metric's own domain, exactly
+- **Labels**: session base (kind-free; see §`media_kind`) + `outcome` — this metric's own domain, exactly
   `floor_substituted`, `ceiling_clamped`, `below_rewrap_latency`. `outcome` is a
   per-metric vocabulary (`docs/observability/label-taxonomy.md`); never
   aggregate it across metric names.
@@ -997,7 +1024,7 @@ the comment's reader.
 ### `dt_client_media_kek_install_refusals_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: `outcome` — this metric's own domain, exactly `conflicting_key`,
+- **Labels**: session base (kind-free; see §`media_kind`) + `outcome` — this metric's own domain, exactly `conflicting_key`,
   `older_generation`, `malformed`. **`outcome`, not `reason`**: `reason` is
   reserved for per-FRAME drops with exactly two homes
   (`docs/observability/label-taxonomy.md`), and a third family there would break
@@ -1045,7 +1072,7 @@ the comment's reader.
   join, nor on an idempotent (same generation, same bytes) or refused install.
   The increment lands on the install, not on first use of the previous
   generation.
-- **Labels**: base only.
+- **Labels**: session base only (`client_version`, `org_id`, `key_custody`) — **kind-free** (session-level; see §`media_kind`).
 - **Fleet signal is the PAIR**: `dt_client_media_kek_updates_total{source="kek_update"}`
   rising while this stays flat means rotations are happening and nothing is
   being retained — an audio gap at every rotation. **Neither series alone says
@@ -1064,7 +1091,7 @@ the comment's reader.
 - **Description**: Changes to a LIVE sender's roster key — **one increment per
   event, not per purged key**. A first binding (new sender, or keyless→key) and
   an equal-bytes update are not counted.
-- **Labels**: `outcome` — a per-metric vocabulary, two values that point at
+- **Labels**: session base (kind-free; see §`media_kind`) + `outcome` — a per-metric vocabulary, two values that point at
   DIFFERENT fixes and carry DIFFERENT contracts:
   - `rebind` — the live `sender_id` bound to DIFFERENT, well-formed key bytes.
     MC never legitimately rebinds a LIVE id. It DOES reissue an id to a new
@@ -1114,7 +1141,7 @@ the comment's reader.
   a `test_tone` series outside a dev environment means a test-tone build
   (story 2 R-7, Vite build-time define `__DT_TEST_TONE__`) is serving real
   users, whose microphones are then not being sent at all.
-- **Labels**: base + `mode` — `microphone` | `test_tone`, a closed, bounded,
+- **Labels**: session base (kind-free; see §`media_kind`) + `mode` — `microphone` | `test_tone`, a closed, bounded,
   identity-free vocabulary (`MediaCaptureSourceMode` in
   `packages/sdk-core/src/media/setup/mediaMetrics.ts`). The value is a
   **build-time** property of the bundle, not per user. The `test_tone` token
@@ -1172,7 +1199,7 @@ the comment's reader.
   `getMetricExportIntervalMs()`). Premise: the encoder runs with DTX off
   (`lifecycle/muteState.ts`), so a live, unmuted sender always produces frames
   and zero decoded frames is a real fault, not silence.
-- **Labels**: base only. **No sender, slot or mode label** — ever.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`). **No sender, slot or mode label** — ever.
 - **A counter, not a gauge — deliberately.** N browsers with identical label sets
   (no per-browser label, ADR-0036 §11) write one stream identity, so a gauge is
   last-writer-wins at the collector: one healthy browser's `0` would erase a
@@ -1198,7 +1225,7 @@ the comment's reader.
   the field (cap unknown) the SDK declares anyway and MC's
   `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`
   counts it instead.
-- **Labels**: base only.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
 - **Reads zero on a correctly configured deployment**: N is
   `VITE_DT_RECEIVE_SLOTS` (a build-time client knob outside `dt-guard
   env-config`'s reach), and the fix for a non-zero reading is to lower it or
@@ -1213,9 +1240,11 @@ the comment's reader.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Histogram
 - **Description**: Wall-clock ms from media pipeline start to the first media
-  frame arriving at the wire.
-- **Labels**: the **media-path** set (`client_version`, `org_id`,
-  `key_custody`). **NOT a frozen-roster member**, notwithstanding its
+  frame **of that kind** arriving at the wire. **Unit: one sample per kind per
+  session** — once video emits, one join yields one `audio` and one `video` sample,
+  never two samples of one quantity; read it `by (media_kind)`.
+- **Labels**: the **media-path per-kind** set (`client_version`, `org_id`,
+  `key_custody`, `media_kind`). **NOT a frozen-roster member**, notwithstanding its
   name's resemblance to `dt_client_time_to_first_mh_connected_ms` — the
   difference is what it observes, not what it is called.
 - **Buckets**: TBD (deferred with the media dashboards).

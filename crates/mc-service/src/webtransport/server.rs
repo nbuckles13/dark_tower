@@ -13,6 +13,7 @@ use crate::actors::{MediaRoutingDeps, MeetingControllerActorHandle};
 use crate::auth::McJwtValidator;
 use crate::grpc::MhRegistrationClient;
 use crate::media_routing::PolicyGenerations;
+use crate::media_signaling::MediaKindLabel;
 use crate::observability::metrics;
 use crate::redis::MhAssignmentStore;
 
@@ -101,11 +102,19 @@ impl WebTransportServer {
         // `ClientMediaConfig` every connection's capability parse compares a
         // declaration against — so the published cap and the enforced cap are
         // one value, not a config read and a parallel constant.
-        metrics::set_receive_slot_cap(client_media_config.max_receive_slots);
-        // Present at zero from process start (O-13): absent must mean "not up
-        // or not scraped", never "nobody is muted". The controller's health walk
-        // then keeps it recomputed from live state.
-        metrics::set_server_muted_sources(0);
+        //
+        // AUDIO ONLY today: MC has one cap, and it bounds audio slots. The
+        // `media_kind="video"` series is published when MC-A introduces the
+        // per-kind cap; it is NOT zero-initialised before then, because a video
+        // reading of 0 is the operator's confirmation that the R-26 video-off
+        // lever applied.
+        metrics::set_receive_slot_cap(MediaKindLabel::Audio, client_media_config.max_receive_slots);
+        // Present at zero from process start (O-13), for EVERY kind: absent must
+        // mean "not up or not scraped", never "nobody is muted". The
+        // controller's health walk then keeps it recomputed from live state.
+        for kind in MediaKindLabel::ALL {
+            metrics::set_server_muted_sources(kind, 0);
+        }
         // Same discipline: the published settle window is the enforced one.
         metrics::set_connect_settle_window(client_media_config.connect_settle_window);
 

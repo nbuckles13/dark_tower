@@ -20,8 +20,9 @@ use crate::media_routing::{
     divergence_magnitude, FloorAdoption, PolicyPushOutcome, SettleOutcome, Unapplied,
 };
 use crate::media_signaling::{
-    slot_state_label, CapabilityOutcome, DirectiveOutcome, MuteOutcome, RefusalReplySurface,
-    ServerMuteAction, ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome,
+    slot_state_label, CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome,
+    RefusalReplySurface, ServerMuteAction, ServerMuteOutcome, SlotViewEmission,
+    UnmuteRequestOutcome,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -647,6 +648,16 @@ pub fn record_receive_capability(outcome: CapabilityOutcome) {
 /// (stream channel FULL). The counter is deliberately NOT moved below the send: that would
 /// conflate composition failure with delivery failure and destroy the
 /// disjoint-by-construction property.
+///
+/// # Deliberately KIND-FREE — do not "fix" this by adding `media_kind`
+///
+/// A `SendDirective` is composed per PARTICIPANT across all of its streams, and
+/// its failure outcomes (`assignment_failed`, `meeting_state_unavailable`,
+/// `handler_url_unresolved`, `unknown_stream_number`,
+/// `transport_mode_unspecified`) occur before any stream exists, so a kind label
+/// would have no honest value. The per-kind split of directive activity lives on
+/// `mc_media_send_targets_total{media_kind}` (per stream) and, from MC-A, on
+/// `mc_media_send_directive_withdrawals_total{media_kind, reason}`.
 pub fn record_send_directive(outcome: DirectiveOutcome) {
     counter!(
         "mc_media_send_directives_total",
@@ -659,25 +670,34 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 /// Record one slot state conveyed to a subscriber.
 ///
 /// Metric: `mc_media_slot_states_total`
-/// Labels: `slot_state`, `key_custody`
-/// Cardinality: bounded by the proto `SlotState` enum
+/// Labels: `slot_state`, `media_kind`, `key_custody`
+/// Cardinality: bounded by the proto `SlotState` enum x `MediaKindLabel::ALL` (2)
+///
+/// `kind` is the DECLARED slot's kind (`DeclaredSlot::kind_label`, projected at
+/// parse), never a frame's: the subject of a slot state is the slot. Both kinds
+/// are zero-initialised at boot; `media_kind="video"` rises only once MC fills
+/// video slots (MC-A), so a video read-back must be a baseline-to-rise check.
 ///
 /// The bucketed slot-state signal ADR-0036 §11 mandates, joined to no identity:
 /// it answers *how many and how bad*, and MC's own assignment state answers
 /// *who*, at investigation time, in a system that legitimately holds that
 /// mapping.
 ///
-/// The label domain **mirrors the wire enum exhaustively** — every named
+/// The `slot_state` label domain **mirrors the wire enum exhaustively** — every named
 /// `SlotState` variant, not only the ones reachable today (`active`,
 /// `source_muted`, `fewer_sources_than_slots`). A hand-picked subset needs
 /// editing every time §7 makes `switch_pending` live, and a
 /// `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
 /// visible rather than absent. Keeping the vocabulary identical to the wire's is
 /// also what makes this distribution comparable with the client's.
-pub fn record_slot_state(state: proto_gen::dark_tower::signaling::v1::SlotState) {
+pub fn record_slot_state(
+    kind: MediaKindLabel,
+    state: proto_gen::dark_tower::signaling::v1::SlotState,
+) {
     counter!(
         "mc_media_slot_states_total",
         "slot_state" => slot_state_label(state),
+        MEDIA_KIND_LABEL => kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
@@ -716,6 +736,10 @@ pub fn record_slot_view_emission(outcome: SlotViewEmission) {
 /// connected is never unreachable (it is counted on
 /// `mc_media_not_yet_connected_senders_total` instead). No sender, meeting or
 /// handler identity, ever.
+///
+/// Deliberately KIND-FREE: unreachability is a property of a SENDER relative to
+/// a subscriber's connected handlers, not of a media kind — every stream of an
+/// unreachable sender is unreachable together.
 pub fn record_unreachable_senders(count: usize) {
     if count == 0 {
         return;
@@ -743,6 +767,10 @@ pub fn record_unreachable_senders(count: usize) {
 /// through the state — so persistence, not rate, is the fault signal.
 /// Emission-weighted; mixes the subscriber's own contribution (at most 1) with
 /// its peers'.
+///
+/// Deliberately KIND-FREE, for the same reason as
+/// `mc_media_unreachable_senders_total`: "not yet connected" is a property of a
+/// participant's connection, not of a kind.
 pub fn record_not_yet_connected_senders(count: usize) {
     if count == 0 {
         return;
@@ -755,23 +783,31 @@ pub fn record_not_yet_connected_senders(count: usize) {
     .increment(count);
 }
 
-/// Record the targets on an emitted `SendDirective`, summed over its streams.
+/// Record the targets on ONE stream of an emitted `SendDirective`.
 ///
 /// Metric: `mc_media_send_targets_total`
-/// Labels: `key_custody` (1)
-/// Cardinality: 1
+/// Labels: `media_kind`, `key_custody`
+/// Cardinality: 2 (`MediaKindLabel::ALL`)
 ///
-/// Mean targets per sender = this / `mc_media_send_directives_total{outcome="emitted"}`.
+/// Counted PER STREAM, labelled with that stream's kind (story 3 OBS-A) — never
+/// summed across a directive's streams, which would put video targets on an
+/// audio series. The per-stream counts sum to exactly the old per-directive
+/// total, so the all-kinds rate is unchanged.
+///
+/// Mean targets per sender = `sum(this)` / `mc_media_send_directives_total{outcome="emitted"}`.
+/// The directives counter is kind-free, so a per-kind version of that ratio
+/// needs `ignoring(media_kind)` / `on()` on the division.
 /// The co-location objective (fewest send targets per sender) made
 /// observable: ~1 in an all-connected meeting, rising only with genuinely
 /// partial connectivity.
-pub fn record_send_targets(count: usize) {
+pub fn record_send_targets(kind: MediaKindLabel, count: usize) {
     if count == 0 {
         return;
     }
     let count = u64::try_from(count).unwrap_or(u64::MAX);
     counter!(
         "mc_media_send_targets_total",
+        MEDIA_KIND_LABEL => kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(count);
@@ -943,31 +979,54 @@ pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
     .increment(1);
 }
 
-/// Publish the configured receive-slot cap.
+/// Publish the configured receive-slot cap for one kind.
 ///
 /// Metric: `mc_media_receive_slot_cap`
-/// Labels: `key_custody` (1)
-/// Cardinality: 1
+/// Labels: `media_kind`, `key_custody`
+/// Cardinality: 2 (`MediaKindLabel::ALL`); only `audio` is published today
+///
+/// Today MC has ONE cap and publishes it as `media_kind="audio"`. The
+/// `media_kind="video"` series appears when MC-A introduces the per-kind cap
+/// (`MC_MAX_VIDEO_RECEIVE_SLOTS`); it is deliberately NOT zero-initialised
+/// before then, because a video reading of `0` is how an operator confirms the
+/// R-26 video-off lever applied, and publishing one early would be a lie.
 ///
 /// A CONFIG ECHO, not a utilisation gauge: set once at boot from
 /// `ClientMediaConfig::max_receive_slots`, the SAME field the capability parse
 /// compares a declaration against, so the published value cannot drift from the
 /// enforced one. There is no numerator to divide it by.
-pub fn set_receive_slot_cap(cap: u8) {
+pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
     // `u8` by type, so the conversion is total and exact.
     let value = f64::from(cap);
     gauge!(
         "mc_media_receive_slot_cap",
+        MEDIA_KIND_LABEL => kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(value);
 }
 
-/// Record the disposition of one client `MuteRequest`.
+/// Record the disposition of one client `MuteRequest` FOR ONE NAMED KIND.
 ///
 /// Metric: `mc_media_mute_requests_total`
-/// Labels: `outcome`, `key_custody`
-/// Cardinality: bounded by `MuteOutcome::ALL`
+/// Labels: `outcome`, `media_kind`, `key_custody`
+/// Cardinality: `MuteOutcome::ALL` x `MediaKindLabel::ALL` (2), zero-initialised
+///
+/// # Counting unit: one increment per (request, named kind)
+///
+/// Not per request (story 3 OBS-A). Request-level outcomes (`unchanged` on an
+/// identical repeat, `rate_limited`, `actor_unavailable`) count once per named
+/// kind. `unchanged` ALSO comes per kind from an applied request: the kind whose
+/// flag did not move (the actor was hopped for the other kind). So `unchanged`
+/// means "this kind's state did not move", not "a pure no-op repeat". The
+/// success outcomes are derived per kind (`applied` only for an audio
+/// flag that moved on a declared connection — video never recomposes the slot
+/// view, so video's success is `applied_no_recompose`). Which kinds a request
+/// names is `named_kinds` in `webtransport/connection.rs`: INTERIM, while P1's
+/// shim reads an absent field as `false`, every request names BOTH kinds, so
+/// the per-outcome rate is about double the pre-story-3 per-request rate. That
+/// is a counting-unit change, not a traffic change. MC-B narrows it to present
+/// fields.
 ///
 /// Answers *"is client mute being applied, and when it is not, why?"*, and it is
 /// the only visibility into the mute-work rate limiter. Mute is the one
@@ -978,7 +1037,9 @@ pub fn set_receive_slot_cap(cap: u8) {
 /// composition; see the note below on why this is not a meeting-wide signal.
 ///
 /// The success set is `{applied, applied_no_recompose}`. **`unchanged` is not a
-/// failure** — it is an identical repeat that MC correctly did no work for — and
+/// failure** — this kind did not move, whether from an identical repeat (no
+/// work) or as the unmoved kind of an applied request — and it is
+/// client-inflatable via the repeat source, so never a denominator; and
 /// `applied_no_recompose` is likewise routine, being what an ordinary camera
 /// button produces. So the failure predicate is
 /// `outcome=~"rate_limited|actor_unavailable"`, NOT `outcome!="applied"`.
@@ -994,10 +1055,11 @@ pub fn set_receive_slot_cap(cap: u8) {
 /// remains on the SHARED meeting actor is one `GetState` roster snapshot per
 /// composition — a queue slot, not head-of-line blocking. Do not route a
 /// meeting-wide latency investigation here.
-pub fn record_mute_request(outcome: MuteOutcome) {
+pub fn record_mute_request(kind: MediaKindLabel, outcome: MuteOutcome) {
     counter!(
         "mc_media_mute_requests_total",
         "outcome" => outcome.label(),
+        MEDIA_KIND_LABEL => kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
@@ -1007,11 +1069,25 @@ pub fn record_mute_request(outcome: MuteOutcome) {
 // Server mute and meeting teardown (story 2 task 12; R-8..R-11, R-20)
 // ============================================================================
 
-/// Record the disposition of one `ServerMuteRequest`.
+/// Record the disposition of one `ServerMuteRequest` FOR ONE NAMED KIND.
 ///
 /// Metric: `mc_media_server_mute_requests_total`
-/// Labels: `action` (`ServerMuteAction::ALL`), `outcome` (`ServerMuteOutcome::ALL`), `key_custody`
-/// Cardinality: 12 (2 x 6), zero-initialised as the FULL cross product
+/// Labels: `action` (`ServerMuteAction::ALL`), `outcome` (`ServerMuteOutcome::ALL`),
+/// `media_kind` (`MediaKindLabel::ALL`), `key_custody`
+/// Cardinality: 24 (2 x 6 x 2), zero-initialised as the FULL cross product
+///
+/// # Counting unit: one increment per (request, named kind)
+///
+/// Request-level refusals (`not_permitted`, `unknown_target`, `rate_limited`,
+/// `actor_unavailable`) count once per named kind; `applied` / `unchanged` are
+/// per kind, from the actor's per-kind decision. `unchanged` means THIS kind
+/// was already in the requested state: if the other kind was `applied`, the
+/// actor still broadcast (and, for audio, pushed) for that kind. `action` is THAT KIND's
+/// asked-for direction (`ServerMuteAction::from_muted`): a request
+/// `{audio: true, video: false}` counts `action="mute", media_kind="audio"`
+/// plus `action="unmute", media_kind="video"`. INTERIM, while P1's shim reads
+/// an absent field as `false`, every request names both kinds
+/// (`webtransport/connection.rs:named_kinds`); MC-B narrows that.
 ///
 /// Counted SEPARATELY from `mc_media_mute_requests_total` — see
 /// `ServerMuteOutcome`'s type doc for the decider/enforcement/remedy split, the
@@ -1019,11 +1095,16 @@ pub fn record_mute_request(outcome: MuteOutcome) {
 /// belongs in a denominator. No meeting, participant or sender identity: those
 /// are in the `mc.webtransport.connection` decision log, where identity is
 /// legitimate.
-pub fn record_server_mute_request(action: ServerMuteAction, outcome: ServerMuteOutcome) {
+pub fn record_server_mute_request(
+    kind: MediaKindLabel,
+    action: ServerMuteAction,
+    outcome: ServerMuteOutcome,
+) {
     counter!(
         "mc_media_server_mute_requests_total",
         "action" => action.label(),
         "outcome" => outcome.label(),
+        MEDIA_KIND_LABEL => kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
@@ -1036,6 +1117,14 @@ pub fn record_server_mute_request(action: ServerMuteAction, outcome: ServerMuteO
 /// Cardinality: 5
 ///
 /// One increment per REQUEST, never per host relayed to.
+///
+/// # Deliberately KIND-FREE (story 3 OBS-A, decision D2)
+///
+/// Unlike the two mute counters, this one carries no `media_kind`.
+/// `UnmuteRequest` carries plain `bool`s with no presence, its outcome
+/// (`relayed`, `not_server_muted`, `no_host_connected`, …) is decided ONCE per
+/// request across kinds, and a request with both flags false is legal on the
+/// wire — so a per-kind count would either drop that request or invent a kind.
 pub fn record_unmute_request(outcome: UnmuteRequestOutcome) {
     counter!(
         "mc_media_unmute_requests_total",
@@ -1066,12 +1155,20 @@ pub fn record_refusal_reply_suppressed(surface: RefusalReplySurface) {
     .increment(1);
 }
 
-/// Publish how many participants MC believes are SERVER-muted right now,
-/// summed across this pod's meetings.
+/// Publish how many (participant, kind) sources MC believes are SERVER-muted
+/// right now for ONE kind, summed across this pod's meetings.
 ///
 /// Metric: `mc_media_server_muted_sources`
-/// Labels: `key_custody` (1)
-/// Cardinality: 1
+/// Labels: `media_kind`, `key_custody`
+/// Cardinality: 2 (`MediaKindLabel::ALL`), both present at zero from start
+///
+/// A participant server-muted on both kinds is one source per kind, so it reads
+/// `1` on each series. `sum(mc_media_server_muted_sources)` across kinds is
+/// therefore NOT "participants muted". **`{media_kind="audio"}` is TODAY's
+/// reading comparable with MH's `server_muted` drops**: `reconcile_media` tells
+/// MH only the audio-server-muted senders, so a video-only server mute raises
+/// the `video` series while MH drops nothing. It becomes the sum across kinds
+/// when MC-A adds per-stream DROP_AT_INGRESS dispositions for video.
 ///
 /// A STATE level, not an event rate: a mute applied yesterday is still here.
 /// Recomputed and `set` from live state (the meeting-actor census), never
@@ -1079,7 +1176,7 @@ pub fn record_refusal_reply_suppressed(surface: RefusalReplySurface) {
 /// exit path. Present at zero from process start. Pod-level and identity-free
 /// by design (ADR-0036 §11): it answers "is any mute in force on this MC pod",
 /// NOT "in this meeting".
-pub fn set_server_muted_sources(total: u64) {
+pub fn set_server_muted_sources(kind: MediaKindLabel, total: u64) {
     #[expect(
         clippy::cast_precision_loss,
         reason = "a participant count; exact in f64 far beyond any roster cap"
@@ -1087,6 +1184,7 @@ pub fn set_server_muted_sources(total: u64) {
     let value = total as f64;
     gauge!(
         "mc_media_server_muted_sources",
+        MEDIA_KIND_LABEL => kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(value);
@@ -1397,7 +1495,9 @@ pub fn record_display_name_resolution(outcome: &str) {
 // definitions moved rather than being copied. Re-exported so MC's existing
 // call sites — qualified (`actors/meeting.rs`) and unqualified (below) — keep
 // resolving through this module unchanged.
-pub use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
+pub use common::observability::labels::{
+    KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL,
+};
 
 /// Record that a meeting KEK was generated.
 ///
@@ -1974,15 +2074,19 @@ pub fn zero_initialize_counters() {
     for o in DirectiveOutcome::ALL {
         counter!("mc_media_send_directives_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    for o in MuteOutcome::ALL {
-        counter!("mc_media_mute_requests_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    for k in MediaKindLabel::ALL {
+        for o in MuteOutcome::ALL {
+            counter!("mc_media_mute_requests_total", "outcome" => o.label(), MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
     }
-    // The FULL action x outcome cross product, unreachable cells included (a
+    // The FULL kind x action x outcome cross product, unreachable cells included (a
     // non-host never reaches `unknown_target`, and that cell staying at zero is
     // what the R-8 ordering test reads — absent would prove nothing).
-    for a in ServerMuteAction::ALL {
-        for o in ServerMuteOutcome::ALL {
-            counter!("mc_media_server_mute_requests_total", "action" => a.label(), "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    for k in MediaKindLabel::ALL {
+        for a in ServerMuteAction::ALL {
+            for o in ServerMuteOutcome::ALL {
+                counter!("mc_media_server_mute_requests_total", "action" => a.label(), "outcome" => o.label(), MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+            }
         }
     }
     for o in UnmuteRequestOutcome::ALL {
@@ -2010,8 +2114,11 @@ pub fn zero_initialize_counters() {
     for o in SlotViewEmission::ALL {
         counter!("mc_media_slot_view_emissions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    for s in SLOT_STATES {
-        counter!("mc_media_slot_states_total", "slot_state" => slot_state_label(*s), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    for k in MediaKindLabel::ALL {
+        for s in SLOT_STATES {
+            counter!("mc_media_slot_states_total", "slot_state" => slot_state_label(*s), MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
+        counter!("mc_media_send_targets_total", MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
     // key_custody-only media counters (cardinality 1)
     counter!("mc_media_unreachable_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
@@ -2020,7 +2127,6 @@ pub fn zero_initialize_counters() {
         .increment(0);
     counter!("mc_media_not_yet_connected_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
-    counter!("mc_media_send_targets_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     counter!("mc_mh_notifications_without_connection_id_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
     for r in EdgeMove::ALL {
@@ -2187,6 +2293,23 @@ mod tests {
         present_at_zero(
             r#"mc_media_send_directives_total{outcome="emitted",key_custody="operator"}"#,
         );
+        // Every per-kind family is zero-initialised for BOTH kinds, so `rate()`
+        // has a series before the first event (story 3 OBS-A).
+        for kind in MediaKindLabel::ALL {
+            let k = kind.label();
+            present_at_zero(&format!(
+                r#"mc_media_send_targets_total{{media_kind="{k}",key_custody="operator"}}"#
+            ));
+            present_at_zero(&format!(
+                r#"mc_media_slot_states_total{{slot_state="active",media_kind="{k}",key_custody="operator"}}"#
+            ));
+            present_at_zero(&format!(
+                r#"mc_media_mute_requests_total{{outcome="applied",media_kind="{k}",key_custody="operator"}}"#
+            ));
+            present_at_zero(&format!(
+                r#"mc_media_server_mute_requests_total{{action="mute",outcome="unknown_target",media_kind="{k}",key_custody="operator"}}"#
+            ));
+        }
 
         // Series-count ceiling (security): a future enum variant can't silently
         // multiply the cross-product unnoticed. Count zero-init'd `_total` lines.
@@ -2759,23 +2882,101 @@ mod tests {
         }
     }
 
-    /// `mc_media_server_mute_requests_total`: every (action, outcome) cell
-    /// records under its own labels and no other.
+    /// `mc_media_server_mute_requests_total`: every (kind, action, outcome)
+    /// cell records under its own labels, and the other kind's cell does not
+    /// move.
     #[test]
-    fn record_server_mute_request_covers_every_action_and_outcome() {
-        for action in ServerMuteAction::ALL {
-            for outcome in ServerMuteOutcome::ALL {
+    fn record_server_mute_request_covers_every_kind_action_and_outcome() {
+        for kind in MediaKindLabel::ALL {
+            let other = if kind == MediaKindLabel::Audio {
+                MediaKindLabel::Video
+            } else {
+                MediaKindLabel::Audio
+            };
+            for action in ServerMuteAction::ALL {
+                for outcome in ServerMuteOutcome::ALL {
+                    let snap = MetricAssertion::snapshot();
+                    record_server_mute_request(kind, action, outcome);
+                    snap.counter("mc_media_server_mute_requests_total")
+                        .with_labels(&[
+                            ("action", action.label()),
+                            ("outcome", outcome.label()),
+                            (MEDIA_KIND_LABEL, kind.label()),
+                            (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                        ])
+                        .assert_delta(1);
+                    snap.counter("mc_media_server_mute_requests_total")
+                        .with_labels(&[
+                            ("action", action.label()),
+                            ("outcome", outcome.label()),
+                            (MEDIA_KIND_LABEL, other.label()),
+                        ])
+                        .assert_delta(0);
+                }
+            }
+        }
+    }
+
+    /// `mc_media_mute_requests_total`: per (kind, outcome).
+    #[test]
+    fn record_mute_request_covers_every_kind_and_outcome() {
+        for kind in MediaKindLabel::ALL {
+            for outcome in MuteOutcome::ALL {
                 let snap = MetricAssertion::snapshot();
-                record_server_mute_request(action, outcome);
-                snap.counter("mc_media_server_mute_requests_total")
+                record_mute_request(kind, outcome);
+                snap.counter("mc_media_mute_requests_total")
                     .with_labels(&[
-                        ("action", action.label()),
                         ("outcome", outcome.label()),
+                        (MEDIA_KIND_LABEL, kind.label()),
                         (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
                     ])
                     .assert_delta(1);
             }
         }
+    }
+
+    /// `mc_media_slot_states_total` carries the slot's kind.
+    #[test]
+    fn record_slot_state_carries_the_kind() {
+        use proto_gen::dark_tower::signaling::v1::SlotState;
+        for kind in MediaKindLabel::ALL {
+            let snap = MetricAssertion::snapshot();
+            record_slot_state(kind, SlotState::Active);
+            snap.counter("mc_media_slot_states_total")
+                .with_labels(&[
+                    ("slot_state", "active"),
+                    (MEDIA_KIND_LABEL, kind.label()),
+                    (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                ])
+                .assert_delta(1);
+        }
+    }
+
+    /// `mc_media_send_targets_total` is per stream kind; zero is not recorded.
+    #[test]
+    fn record_send_targets_is_per_kind() {
+        let snap = MetricAssertion::snapshot();
+        record_send_targets(MediaKindLabel::Audio, 2);
+        record_send_targets(MediaKindLabel::Video, 0);
+        snap.counter("mc_media_send_targets_total")
+            .with_labels(&[(MEDIA_KIND_LABEL, "audio")])
+            .assert_delta(2);
+        snap.counter("mc_media_send_targets_total")
+            .with_labels(&[(MEDIA_KIND_LABEL, "video")])
+            .assert_delta(0);
+    }
+
+    /// `mc_media_receive_slot_cap` is published per kind.
+    #[test]
+    fn set_receive_slot_cap_publishes_the_kind() {
+        let snap = MetricAssertion::snapshot();
+        set_receive_slot_cap(MediaKindLabel::Audio, 4);
+        snap.gauge("mc_media_receive_slot_cap")
+            .with_labels(&[
+                (MEDIA_KIND_LABEL, "audio"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
+            .assert_value(4.0);
     }
 
     /// `mc_media_unmute_requests_total`.
@@ -2812,10 +3013,17 @@ mod tests {
     #[test]
     fn set_server_muted_sources_publishes_the_level() {
         let snap = MetricAssertion::snapshot();
-        set_server_muted_sources(3);
+        set_server_muted_sources(MediaKindLabel::Audio, 3);
+        set_server_muted_sources(MediaKindLabel::Video, 1);
         snap.gauge("mc_media_server_muted_sources")
-            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .with_labels(&[
+                (MEDIA_KIND_LABEL, "audio"),
+                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            ])
             .assert_value(3.0);
+        snap.gauge("mc_media_server_muted_sources")
+            .with_labels(&[(MEDIA_KIND_LABEL, "video")])
+            .assert_value(1.0);
     }
 
     /// `mc_media_end_meeting_total`.

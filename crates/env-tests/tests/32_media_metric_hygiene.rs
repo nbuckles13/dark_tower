@@ -26,6 +26,18 @@
 //! different axes, and this one is narrow on the overclaim axis (scraped Rust
 //! service metric labels only; not dashboards, not docs, not log fields).
 //!
+//! # MH is type-blind (ADR-0036 §7; story 3 R-29)
+//!
+//! `check_series` also carries `Rule::MediaKindOnMh`: no `mh_*` series may carry
+//! `media_kind`. Its FIRES half is the kernel fixtures
+//! (`mh_media_kind_fires_on_*`); this live fetch is its APPLIES half, and the MH
+//! anchor plus the eager-admission presence checks below are its positive
+//! control (they prove `mh_*` series are in the inspected set, each with its own
+//! `TRIAGE_SCRAPE` failure, distinct from the content failure). Residual, stated:
+//! no live `mh_*` series carries `media_kind` today, so this leg is a regression
+//! net, not a demonstrated fire. There is no source-level counterpart yet
+//! (`docs/TODO.md` §Guard Coverage Gaps).
+//!
 //! # MH gates, MC is recorded — do NOT "fix" this into symmetry
 //!
 //! `resolve_media_handles()` runs unconditionally at MH startup and resolves the
@@ -206,16 +218,20 @@ async fn media_metric_labels_carry_no_meeting_identifier_and_no_overclaim() {
     // MC is RECORDED, not gated. Its media metrics are lazily created, so
     // absence on an idle cluster is expected and must never fail the run.
     let mc_media_present = series.iter().any(|s| s.name.starts_with("mc_media_"));
+    let mh_series = series
+        .iter()
+        .filter(|s| s.name.starts_with(metric_hygiene::MH_SERIES_PREFIX))
+        .count();
     eprintln!(
         "metric-hygiene: inspected {} series across jobs [{JOBS}]; \
-         mc_media_* present: {mc_media_present}",
+         mc_media_* present: {mc_media_present}; mh_* series checked for media_kind: {mh_series}",
         series.len()
     );
 
     let violations = check_series(&series);
     assert!(
         violations.is_empty(),
-        "{TRIAGE_VIOLATION}: {} ADR-0036 §11 violation(s) in scraped metrics.\n{}\n\n\
+        "{TRIAGE_VIOLATION}: {} ADR-0036 §11 / §7 violation(s) in scraped metrics.\n{}\n\n\
          This is a POLICY violation, not a test defect — the assertion has no \
          carve-outs by design, so there is no legitimate series it can red on. \
          Fix the METRIC, never the assertion: remove the label from the emitting \
