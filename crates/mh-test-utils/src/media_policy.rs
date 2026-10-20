@@ -98,6 +98,9 @@ pub fn register_request(
         // Nobody server-muted: the pre-R-9 wire. A server-mute test mutates
         // the returned value so the mute is visible at the assertion site.
         server_muted_sources: Vec::new(),
+        // Story 3: empty selects MH's transitional story-2 reading
+        // (internal.proto `server_muted_sources`).
+        source_streams: Vec::new(),
     }
 }
 

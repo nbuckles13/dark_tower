@@ -148,6 +148,8 @@ message JoinRequest {
   string correlation_id = 5;              // ADR-0023 session recovery
   string binding_token = 6;               // ADR-0023 session recovery
   bytes identity_public_key = 7;          // raw Ed25519, 32 bytes (ADR-0036 §4)
+  repeated MediaKind publish_kinds = 8;   // story 3: fixed publish set; empty = publishes nothing
+  ReceiveCapability receive_capability = 9; // story 3: initial declaration; absent = zero slots
 }
 
 message ParticipantCapabilities {
@@ -164,8 +166,18 @@ enum Codec {
   CODEC_VP9 = 2;
   CODEC_AV1 = 3;
   CODEC_H264 = 4;
+  CODEC_VP8 = 5;                          // story 3: the only video codec MC directs
 }
 ```
+
+**Story 3 join rules (R-2, R-22).** `publish_kinds` is fixed for the membership
+(a reconnect presenting a different set is refused and counted); UNSPECIFIED,
+`VIDEO_SCREEN`, unknown and duplicate values are rejected and counted, never
+ignored; a join that would neither publish nor receive — judged on the
+declaration as sent, before truncation — is refused generically and counted. A
+`supported_header_versions` list lacking 3 is refused at join. The normative text
+is on the fields in `signaling.proto`; this paragraph summarises it and the proto
+wins on any disagreement.
 
 `video_codecs`/`audio_codecs` collapse into one `supported_codecs` list: media
 kind is a property of the codec's own identity, so encoding it a second time
@@ -189,7 +201,9 @@ message JoinResponse {
   bytes meeting_kek = 9;                        // AES-256, exactly 32 bytes
   uint32 kek_generation = 10;                   // u16 semantics
   uint32 kek_rotation_debounce_seconds = 11;    // W (story 2); 0/absent = older MC
-  optional uint32 max_receive_slots = 12;       // server cap on slots per ReceiveCapability; absent = unknown
+  optional uint32 max_receive_slots = 12;       // SUPERSEDED -- deleted by MC-B
+  optional uint32 max_audio_receive_slots = 13; // story 3: per-kind cap, informational
+  optional uint32 max_video_receive_slots = 14; // story 3: per-kind cap, informational; 0 = video off
 }
 
 message Participant {
@@ -214,6 +228,14 @@ client can show it and refuse an over-cap declaration before sending. The
 stays the enforcer (whole-declaration rejection, never a clamp), MC always sets
 it so absent means an older MC and "cap unknown", a present 0 is a contract
 violation the client surfaces loudly, and the value is per session.
+
+> **Superseded 2026-10-13 (story 3, R-1).** The single total cap and its
+> whole-declaration rejection are replaced by **per-kind** caps,
+> `max_audio_receive_slots` / `max_video_receive_slots`, which are
+> informational: MC **truncates** each kind to its cap and reports every excess
+> slot `SLOT_STATE_UNAVAILABLE`, never failing the join. `max_receive_slots` stays
+> on the wire, marked superseded, until MC-B deletes it. The normative rules are
+> on the three fields in `signaling.proto`.
 
 **`sender_id` (ADR-0036 §2).** The joiner's per-meeting numeric sender id, and the
 first half of the attribution chain. A `uint32` on the wire carrying 16-bit
@@ -327,6 +349,7 @@ message EncodingParameters {
   uint32 width = 3;
   uint32 height = 4;
   uint32 frame_rate = 5;
+  optional uint32 min_keyframe_interval_ms = 6; // story 3: video only, required on video
 }
 ```
 
@@ -351,7 +374,7 @@ rate-limited.
 
 ```protobuf
 message ReceiveCapability {
-  repeated ReceiveSlot slots = 1;     // capped by server-side configuration; cap advertised on JoinResponse.max_receive_slots
+  repeated ReceiveSlot slots = 1;     // capped per kind; over-cap slots truncate to UNAVAILABLE (story 3)
 }
 
 message ReceiveSlot {
@@ -375,6 +398,13 @@ which release profiles compile out; not clamp-or-truncate). It is the same value
 space as the frame's relay-region stream id, which is what lets a receiver
 validate an arriving `stream_id` against its own declared slots.
 
+> **Superseded in part 2026-10-13 (story 3).** The slot **cap** no longer
+> rejects: an over-cap declaration is truncated per kind to `UNAVAILABLE` slots
+> (range and duplicate violations still reject). And the relay `stream_id` equals
+> the slot id on the **downlink** only — relay ids are hop-local, and on the
+> uplink the field carries the publisher's `SendStream.stream_number`
+> (ADR-0036 §2 *Header v3*).
+
 #### StreamAssignments (Server → Client)
 
 ```protobuf
@@ -383,14 +413,19 @@ message StreamAssignments {
 }
 
 message StreamAssignment {
-  uint32 slot_id = 1;
-  optional uint32 sender_id = 2;
-  MediaKind media_kind = 3;
-  string media_handler_url = 4;
-  SlotState slot_state = 5;
-  optional uint64 switch_command_id = 6;   // iff slot_state == SWITCH_PENDING
+  reserved 1, 2, 3, 4, 5;                  // pre-ADR-0036 layout-form fields
+  uint32 slot_id = 6;
+  optional uint32 sender_id = 7;           // absent on a video ACTIVE slot (story 3)
+  MediaKind media_kind = 8;
+  string media_handler_url = 9;
+  SlotState slot_state = 10;
+  optional uint64 switch_command_id = 11;  // iff slot_state == SWITCH_PENDING
 }
 ```
+
+> **Corrected 2026-10-13.** The block above previously showed tags 1–6; the
+> proto has used fresh tags 6–11 (with 1–5 reserved) since the ADR-0036 reshape.
+> `signaling.proto` is authoritative.
 
 **Attribution chain**: an arriving frame's key id yields `sender_id`, `sender_id`
 yields the roster entry, and the roster entry's `identity_public_key` verifies the
@@ -403,18 +438,17 @@ mis-map either.
 indistinguishable to a client — all present as no media — and render completely
 differently.
 
-```protobuf
-enum SlotState {
-  SLOT_STATE_UNSPECIFIED = 0;
-  SLOT_STATE_ACTIVE = 1;                        // steady
-  SLOT_STATE_SOURCE_MUTED = 2;                  // steady: present, far-end muted
-  SLOT_STATE_WITHHELD_BY_CONGESTION = 3;        // transient; the only MH-observed one
-  SLOT_STATE_FEWER_SOURCES_THAN_SLOTS = 4;      // steady
-  SLOT_STATE_ZERO_REQUESTED = 5;                // steady
-  SLOT_STATE_SOURCE_UNREACHABLE = 6;            // structurally persistent
-  SLOT_STATE_SWITCH_PENDING = 7;                // transient; carries command id
-}
-```
+The enum's values and their per-state rules — including which states name a
+sender — are specified once, at `SlotState` and `StreamAssignment.sender_id` in
+`proto/dark_tower/signaling/v1/signaling.proto`, with the design table in
+ADR-0036 §6 (2026-10-13 amendment). They are deliberately not re-listed here.
+
+> **Superseded 2026-10-13 (story 3, R-4/R-5).** This section previously listed
+> the seven story-1 states as a code block. Slot state is now a **flat** enum:
+> `AVATAR_NO_VIDEO`, `UNAVAILABLE`, `AVATAR_CLIENT_MUTED` and
+> `AVATAR_SERVER_MUTED` are added, `SOURCE_MUTED` is superseded (deleted by MC-B),
+> `ZERO_REQUESTED` is reserved, and a live video slot names no sender. The listing
+> was replaced by the pointer above so the contract has one home.
 
 Switch completion is reported **by command identifier, never by state
 description**: if MC switches a slot to B, reverts to A, then switches to B again,
@@ -463,15 +497,22 @@ that bound — turning "hold the meeting's audio floor" into a one-line client p
 
 **`header_version` is meeting-wide and MC-directed**, because it sits in the signed
 publisher region: a relay cannot translate between header versions without breaking
-verification. MC selects one version for the whole meeting from participants'
-declared `supported_header_versions`, applying a server-side allowlist and a
-minimum floor. A declaration is an upper bound on what a client can do, never a
-lower bound on what the meeting accepts; a client declaring nothing at or above the
-floor is rejected at join rather than the meeting being downgraded, and an empty
-list is not "accept anything". **Enforcement is not yet allocated to a story
-task** (neither task 14 nor task 10 carries the allowlist/floor); it is latent
-while only header version 2 exists and is tracked in `docs/TODO.md`. Do not read
-it as covered.
+verification.
+
+> **Superseded 2026-10-13 (story 3, R-22).** This paragraph previously required a
+> server-side allowlist and a minimum version floor, and recorded that no task owned
+> their enforcement. Header v3 is the **only** version: there is no allowlist and no
+> floor. A join whose `supported_header_versions` lacks 3 is refused at join,
+> generically and counted (owner MC-A), and MC sets `header_version` by derivation
+> from `PROTOCOL_VERSION`. Normative text: `ParticipantCapabilities.supported_header_versions`
+> and `SendDirective.header_version` in `signaling.proto`.
+
+**Story 3 directive rules (R-8, R-16, R-17).** MC directs a kind only while it is
+watched and not server-muted; a withdrawn or never-watched stream stays listed
+with an **empty** target set, and a kind not published is never listed. Video is
+`stream_number` 1 (`MEDIA_KIND_VIDEO_CAMERA`, `CODEC_VP8`,
+`TRANSPORT_MODE_STREAM_PER_GROUP`), audio stays 0, and `stream_number` is also the
+uplink relay id. Normative text: `SendStream` and `SendDirective` in `signaling.proto`.
 
 #### MeetingKekUpdate (Server → Client)
 
@@ -479,6 +520,7 @@ it as covered.
 message MeetingKekUpdate {
   bytes meeting_kek = 1;              // AES-256, exactly 32 bytes
   uint32 kek_generation = 2;          // u16 semantics
+  uint32 kek_rotation_debounce_seconds = 3; // W; rules at JoinResponse field 11
 }
 ```
 
@@ -504,6 +546,16 @@ dependent on the server honouring it. MC keeps the send directive active while a
 client reports itself muted, which is what makes unmute instantaneous and keeps
 *"MC has not asked you to send"* distinguishable from *"you have muted yourself"*.
 
+> **Superseded 2026-10-13 (story 3, R-15–R-18).** Mute is now **four independent
+> controls** (client/server × audio/video). The per-kind fields of `MuteRequest`
+> and `ServerMuteRequest` are `optional bool`: absent means that kind is
+> unchanged, and both absent is rejected and counted. Server mute **withdraws**
+> that kind's directive (capture stops) with MH's ingress drop as the backstop;
+> "MC keeps the send directive active" above now holds only for client mute, and
+> only as a MAY. A server unmute can resume a participant's camera or mic unless
+> they are client-muted, with a non-suppressible notice. Normative text: the mute
+> section of `signaling.proto` and ADR-0036 §5 (2026-10-13 amendment).
+
 
 #### StreamQualityUpdate (Bidirectional)
 ```protobuf
@@ -527,6 +579,22 @@ message StreamQualityUpdate {
    `MhJwtValidator::validate_meeting_token`
 3. Client opens streams for each media stream
 
+**The client↔MH bidirectional control stream.** The client opens one bidi stream
+and sends `MhClientMessage{connect_request: MhConnectRequest}` as its first
+length-framed message (4-byte big-endian length prefix, then the protobuf bytes,
+bounded by MH's maximum message size). From story 3 the same stream carries, after
+the connect message:
+
+- **client → MH**: `MhClientMessage{recovery_request: RecoveryRequest}` — a
+  receiver asking its handler to restore decodability on one of its slots;
+- **MH → client**, on the stream's send half: `MhServerMessage{keyframe_request:
+  KeyframeRequest}` — MH asking a publisher for a keyframe on one stream.
+
+Same framing and size bound in both directions; MH sets no trace context. The
+rules for both messages (counter-based coalescing, the publisher's bounds, MH's
+remap and aggregation) are normative on the messages in `signaling.proto` and in
+ADR-0036 §1 (2026-10-13 amendment).
+
 > **Superseded 2026-09-01.** This step previously read "receives `media_handler_url`
 > and `connection_token`". There is no `connection_token`: the client authenticates
 > to the Media Handler with the meeting JWT, not a second credential. The
@@ -539,7 +607,12 @@ message StreamQualityUpdate {
 
 ### 3.2 Media Protocol
 
-**Frame Format** (Binary):
+**Frame Format** (Binary): **see ADR-0036 §2 *Header v3*, the normative layout.**
+
+> **Superseded.** The 42-byte layout below is the pre-ADR-0036 (ADR-0028 §4)
+> header and has not described the wire since the ADR-0036 frame header v2; it is
+> kept only so the change is visible. Do not implement from it. The frame format
+> has exactly one specification, ADR-0036 §2, and one cross-language vectors file.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -571,7 +644,7 @@ message StreamQualityUpdate {
 Total header size: 42 bytes
 ```
 
-**Note**: User ID (8 bytes) identifies the participant, Stream ID (4 bytes) is chosen by the subscriber for local routing.
+**Note** (superseded with the layout above): User ID (8 bytes) identifies the participant, Stream ID (4 bytes) is chosen by the subscriber for local routing.
 
 ### 3.3 Flow Control
 
@@ -604,6 +677,17 @@ read nor authenticate a publisher's stream number, and it is bounded per meeting
 The response carries `accepted` (received-and-parsed
 only — **not** evidence of application), the **applied** generation, `handler_id`,
 `process_start_epoch_ms`, and the echoed `transport_mode`.
+
+> **Superseded in part 2026-10-13 (story 3, R-16/R-17/R-20).** The request gains
+> `source_streams`: every source stream MH may receive, as (sender, stream,
+> transport, disposition FORWARD / PAUSED / DROP_AT_INGRESS). MH attributes each
+> ingress frame by (connection-bound sender, uplink relay id) against it, and
+> per-kind server mute holds in slot terms. The response echoes
+> `applied_source_streams` per stream. `EgressStream.transport_mode`,
+> `server_muted_sources` and the single `transport_mode` echo are superseded and
+> deleted by MC-B; "server mute is sender-scoped because the Media Handler can
+> neither read nor authenticate a publisher's stream number" above is superseded
+> by the slot-terms property stated at `MutedSource` in `internal.proto`.
 
 > **Superseded 2026-09-01 — three RPCs retired.** This section previously
 > specified `RegisterParticipant`/`RegisterParticipantResponse{connection_token}`

@@ -44,6 +44,12 @@ enum Codec {
   CODEC_VP9 = 2;
   CODEC_AV1 = 3;
   CODEC_H264 = 4;
+  // The only video codec MC directs in story 3 (ADR-0036 §5). A client
+  // declares it in `ParticipantCapabilities.supported_codecs` only after BOTH
+  // `VideoEncoder.isConfigSupported` and `VideoDecoder.isConfigSupported`
+  // pass for the directed profile; a client that cannot encode or decode it
+  // fails loudly at media start (story 3 R-8).
+  CODEC_VP8 = 5;
 }
 
 // How a media stream is carried on the wire (ADR-0036 §1, §5).
@@ -76,61 +82,92 @@ enum TransportMode {
 //
 // OBSERVABILITY (ADR-0036 §11): a slot is a stream identity. Slot state may be
 // aggregated into a bounded counter; it MUST NOT be joined to a slot id,
-// sender id or meeting id in a metric label or span attribute.
+// sender id or meeting id in a metric label or span attribute. Telemetry
+// labels follow these wire names, lower-snake without the prefix (`active`,
+// never "live"); the bounded label set is MC's `slot_state_label`, not a
+// count restated here.
+//
+// A FLAT ENUM (story 3 wire freeze, ADR-0036 §6): one value per thing a
+// receiver renders, so "live plus a reason" is unrepresentable and each value
+// maps one-to-one onto telemetry. A slot is live (`ACTIVE`), an avatar for a
+// named participant with a reason (`AVATAR_*`), or one of the sourceless
+// states (`FEWER_SOURCES_THAN_SLOTS`, `UNAVAILABLE`).
+//
+// RETAINED, NEVER EMITTED: `WITHHELD_BY_CONGESTION`, `SOURCE_UNREACHABLE` and
+// `SWITCH_PENDING`. A consumer that receives one, or any number it does not
+// name (an open enum decodes unknown values as integers), MUST fail closed
+// (render nothing from the slot) AND count it, never guess.
 enum SlotState {
   SLOT_STATE_UNSPECIFIED = 0;
-  // Steady: a source is assigned and producing.
+  // Steady: live. A source is assigned and real media should be arriving.
+  //
+  // VIDEO: MC does NOT name the source (`StreamAssignment.sender_id` absent);
+  // the client attributes live video from the frame's signature-verified
+  // key-id sender, which avoids racing the new source's keyframe. AUDIO: MC
+  // names the source. A live slot with no decoded frame yet keeps showing what
+  // it showed before (no spinner for a steady state).
   SLOT_STATE_ACTIVE = 1;
-  // Steady: the source is present but muted, so no media reaches this slot.
-  // Covers BOTH mute paths: CLIENT mute (§5 -- the source muted itself at
-  // capture, so nothing leaves its device) AND SERVER mute (§7 -- a host muted
-  // it and MH drops its frames at ingress). The receiver renders a placeholder
-  // from this state, never from a substitute frame.
+  // SUPERSEDED -- deleted by MC-B, then reserved by number and name. Replaced
+  // by `SLOT_STATE_AVATAR_CLIENT_MUTED` and `SLOT_STATE_AVATAR_SERVER_MUTED`.
   //
-  // This state deliberately does NOT distinguish the two, and no enum value
-  // will be added to do so. The CAUSE and WHO MUTED WHOM are carried on
-  // `ParticipantMuteUpdate`; a client that needs "muted by host" reads it
-  // there. Splitting the slot state would put a moderation fact on a per-slot
-  // rendering signal and make every consumer handle two values that render
-  // identically.
+  // Was: "the source is present but muted", covering both mute paths in one
+  // value. Its former paragraph promising that no enum value would ever be
+  // added to distinguish client from server mute is deleted (2026-10-13):
+  // story 3 R-4 renders the two distinctly, so the cause now rides the slot.
+  // MC still emits it for both mute causes until MC-B replaces it with the two
+  // avatar states.
   SLOT_STATE_SOURCE_MUTED = 2;
-  // Transient, and the only genuinely MH-observed state.
+  // RETAINED, NEVER EMITTED: congestion withholding is not built. Consumers
+  // fail closed and count (enum header).
   SLOT_STATE_WITHHELD_BY_CONGESTION = 3;
-  // Steady: the meeting has fewer sources than the subscriber requested slots.
+  // Steady: the meeting has fewer eligible sources than the subscriber's
+  // slots of this kind. No sender, no url.
   SLOT_STATE_FEWER_SOURCES_THAN_SLOTS = 4;
-  // Steady: the subscriber requested zero of this kind.
-  //
-  // RETAINED IN THE VOCABULARY, NOT EMITTED IN STORY 2 -- and MC MUST NOT
-  // fabricate a carrier for it. The state rides a `StreamAssignment` whose
-  // `slot_id` ECHOES a `ReceiveSlot.slot_id` the subscriber chose; a subscriber
-  // who declared a slot of this kind did not request zero of it, and one who
-  // declared none chose no id to echo. Inventing a `slot_id` (e.g. 0) to carry
-  // this state would break the echo property on a published contract. So in
-  // story 2 a zero-slot declaration yields no assignment for that kind, and a
-  // declared-but-unfilled slot is `SLOT_STATE_FEWER_SOURCES_THAN_SLOTS`.
-  //
-  // KEPT RATHER THAN RESERVED because per-kind slot declarations (story 3,
-  // video) make it naturally emittable: a subscriber declaring audio slots
-  // and zero video slots has requested zero of a kind while still owning
-  // echoable ids for the other. Reserving it now would force a re-add then.
-  SLOT_STATE_ZERO_REQUESTED = 5;
-  // Structurally persistent, unlike the transient states above (ADR-0036 §9):
-  // the subscriber PINNED a source with which it shares NO CONNECTED HANDLER,
-  // and there is no cross-handler forwarding.
-  //
-  // RETAINED, NOT EMITTED IN STORY 2: under static fill no client pins, so the
-  // pinned-unreachable case cannot arise. A roster participant sharing no
-  // connected handler with the subscriber consumes NO slot and is reported per
-  // subscriber on `StreamAssignments.unreachable_sender_ids` instead -- never
-  // as an empty slot in this state.
+
+  // Was `SLOT_STATE_ZERO_REQUESTED` ("the subscriber requested zero of this
+  // kind"). RESERVED 2026-10-13 because it is UNEMITTABLE: the state would
+  // ride a `StreamAssignment` whose `slot_id` ECHOES a `ReceiveSlot.slot_id`
+  // the subscriber chose, and a subscriber declaring zero slots of a kind owns
+  // no slot id of that kind to echo. Inventing one (e.g. 0) would break the
+  // echo property. The earlier "kept rather than reserved, per-kind
+  // declarations make it emittable" reasoning was wrong: owning ids of the
+  // OTHER kind does not give this kind an id. A zero-slot declaration of a
+  // kind yields no assignment of that kind.
+  reserved 5;
+  reserved "SLOT_STATE_ZERO_REQUESTED";
+
+  // RETAINED, NEVER EMITTED. Was the pinned-unreachable state (ADR-0036 §9);
+  // no client pins under static fill. Unreachability stays per subscriber on
+  // `StreamAssignments.unreachable_sender_ids` (story 2 R-33), and an
+  // unreachable participant consumes no slot. Consumers fail closed and count.
   SLOT_STATE_SOURCE_UNREACHABLE = 6;
-  // Transient: a source switch has been commanded and is waiting on the new
-  // source's next independently-decodable frame (ADR-0036 §7). Carries the
-  // requesting command identifier in
-  // `StreamAssignment.switch_command_id` — completion is reported by command
+  // RETAINED, NEVER EMITTED. "Pending" (source assigned, no group start yet) is
+  // MH-INTERNAL: it persists with no give-up timeout while the source stays
+  // assigned and is visible only as an MH metric. The MH-to-MC
+  // switch-completion report it would need is deferred to story 5 (dynamic
+  // selection). When emitted, it carries the requesting command id in
+  // `StreamAssignment.switch_command_id`: completion is reported by command
   // id, never by state description, because "A to B complete" is ambiguous
   // when a slot has switched to B, reverted to A, and switched to B again.
+  // Consumers fail closed and count until then.
   SLOT_STATE_SWITCH_PENDING = 7;
+  // Steady avatar: the named participant publishes no video. VIDEO SLOTS ONLY
+  // -- audio slots take audio publishers only, so a participant without audio
+  // has no audio representation. Video slots take any participant sharing a
+  // connected handler with the subscriber, receive-only participants included.
+  SLOT_STATE_AVATAR_NO_VIDEO = 8;
+  // Steady and permanent for the declaration: this declared slot is over MC's
+  // per-kind cap (`JoinResponse.max_audio_receive_slots` /
+  // `max_video_receive_slots`) and was TRUNCATED. No sender, no url; echoes the
+  // declared `slot_id`. Changes only on a redeclaration. A video cap of 0 makes
+  // every video slot UNAVAILABLE (the video-off lever, story 3 R-26).
+  // Truncation never fails a join (supersedes story 2 R-1's reject rule).
+  SLOT_STATE_UNAVAILABLE = 9;
+  // Steady avatar: the named participant client-muted this kind. Both kinds.
+  SLOT_STATE_AVATAR_CLIENT_MUTED = 10;
+  // Steady avatar: the named participant is server-muted for this kind. Both
+  // kinds. WINS over `SLOT_STATE_AVATAR_CLIENT_MUTED` when both hold.
+  SLOT_STATE_AVATAR_SERVER_MUTED = 11;
 }
 
 // ============================================================================
@@ -172,29 +209,24 @@ message ParticipantCapabilities {
   //
   // The header version is meeting-wide and MC-directed: it sits in the signed
   // publisher region, so a relay cannot translate between versions, and MC
-  // therefore selects one version for the whole meeting from the participants'
-  // declarations and carries it in the send directive.
+  // carries the one version in the send directive.
   //
-  // SECURITY — this is a negotiation surface, and header v2 is the version
-  // carrying the signature and the key-bearing flag. MC MUST select from a
-  // server-side allowlist with a configured minimum version floor. A
-  // declaration is an upper bound on what a client can do, never a lower bound
-  // on what the meeting accepts: a client declaring nothing at or above the
-  // floor is REJECTED AT JOIN, never accommodated by lowering the meeting. An
-  // empty list is NOT "accept anything" — fail closed. Otherwise one patched
-  // client declaring only version 1 drags the whole meeting onto a header with
-  // no sender-authentication or key-carriage guarantees.
+  // SECURITY — a negotiation surface. Header v3 is the ONLY version (story 3
+  // R-22; v2 is an intentional wire break with no dual decode). A join whose
+  // list lacks 3 is REFUSED AT JOIN, before admission (no slot, sender id or
+  // roster entry is allocated), with the existing generic join-refusal shape,
+  // no version echoed, and counted at MC: the operator-queryable signal for an
+  // old SDK meeting a new MC. Owner: MC-A. There is NO allowlist and NO floor
+  // machinery (no production clients exist): a single accepted version needs
+  // neither. An empty list lacks 3 and is refused — fail closed, never
+  // "accept anything".
   //
   // The list is unbounded on this wire; the proto does not enforce a cap.
   // Server-side configuration caps it.
   //
-  // ENFORCEMENT NOT YET ALLOCATED TO A TASK. The allowlist, the minimum floor
-  // and the below-floor join rejection above are REQUIRED but no current story
-  // task carries them — neither task 14 nor task 10's prompt mentions a version
-  // floor or an allowlist, and this is latent only because PROTOCOL_VERSION is
-  // 2 with no v1 downgrade path. Tracked in `docs/TODO.md` (filed by
-  // operations, Gate 3); a task must own it before a second header version
-  // exists. Do NOT read this obligation as covered.
+  // (2026-10-13: the former "ENFORCEMENT NOT YET ALLOCATED" paragraph and the
+  // allowlist-plus-minimum-floor rule are deleted; the v3-only refusal above
+  // replaces both, and the `docs/TODO.md` entry that tracked them is closed.)
   //
   // ANCHOR (DRY): the cross-language single source of truth for the header
   // version is `proto/test-vectors/frame-v2.vectors.json` (story task 8);
@@ -245,6 +277,35 @@ message JoinRequest {
   // per-participant identifier for the meeting's lifetime. Never a metric
   // label, never a span attribute, never a per-frame log dimension.
   bytes identity_public_key = 7;
+
+  // What this participant publishes (story 3 R-2): any subset of
+  // {`MEDIA_KIND_AUDIO`, `MEDIA_KIND_VIDEO_CAMERA`}. EMPTY means it publishes
+  // nothing (receive-only). FIXED FOR THE MEMBERSHIP: camera off is mute, not a
+  // capability change, and a reconnect presenting a different publish SET
+  // (order-insensitive) is refused and counted -- otherwise a participant could
+  // slip out from under a mute by rejoining with a different set.
+  //
+  // MC VALIDATES FIRST, and rejects (generic, counted) -- never ignores -- a set
+  // containing `MEDIA_KIND_UNSPECIFIED`, `MEDIA_KIND_VIDEO_SCREEN` (a kind this
+  // story does not serve), an unknown value (the enum is open, so an unknown
+  // number decodes as an integer), or a duplicate.
+  //
+  // THEN THE NEITHER-PUBLISH-NOR-RECEIVE REFUSAL: a join with no publish kinds
+  // and no slots in `receive_capability` AS SENT -- judged before per-kind
+  // truncation -- is refused at join with a generic, counted reason, never
+  // admitted to a silent empty meeting. Truncation itself never fails a join
+  // (`SLOT_STATE_UNAVAILABLE`).
+  repeated MediaKind publish_kinds = 8;
+
+  // The INITIAL receive declaration, carried on the join so the
+  // neither-publish-nor-receive check above runs at join. ABSENT means zero
+  // slots of each kind -- not an error by itself; the participant is admitted
+  // if it publishes something. Same validation as the post-join path.
+  //
+  // The post-join `ClientMessage.receive_capability` stays the REDECLARATION
+  // path; a redeclaration that would leave the participant neither publishing
+  // nor receiving is refused (generic, counted).
+  ReceiveCapability receive_capability = 9;
 }
 
 // Information about the media server.
@@ -281,6 +342,30 @@ message EncodingParameters {
   uint32 width = 3;
   uint32 height = 4;
   uint32 frame_rate = 5;
+
+  // The minimum interval between REQUEST-DRIVEN keyframes the publisher may
+  // produce on this stream, in milliseconds (story 3 R-11, R-23). There is no
+  // keyframe interval: keyframes are produced on demand (`KeyframeRequest`),
+  // and this is the bound on how often a request can be honoured.
+  //
+  // VIDEO ONLY, AND REQUIRED ON VIDEO: a client REFUSES a video stream
+  // directed without it. The client enforces max(directed value, its compiled
+  // 100 ms floor), so neither an absent nor a tiny directed value can raise its
+  // keyframe rate. Audio ignores it (every audio frame is independently
+  // decodable); MC leaves it absent on audio.
+  //
+  // THE SINGLE NORMATIVE HOME for its source: the shared `media-codec-profile`
+  // key `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (range 100..=10000, default
+  // 500), read by MC AND MH -- not an MC-only key. MC directs it here and
+  // publishes the same parsed value as the gauge
+  // `mc_media_video_keyframe_min_interval_seconds`; MH reads it to validate
+  // `MH_KEYFRAME_REQUEST_RETRY_MS` (see `MhServerMessage`). It is
+  // server-configured, never client-reported: a client-reported value would let
+  // a patched client suppress the keyframe-storm alert. Other sites name the
+  // key and point here.
+  //
+  // NOT IDENTITY OR KEY MATERIAL: a configuration value, safe to log.
+  optional uint32 min_keyframe_interval_ms = 6;
 }
 
 // Media stream information.
@@ -566,6 +651,13 @@ message JoinResponse {
   // rather than a category -- the log line, not a label.
   uint32 kek_rotation_debounce_seconds = 11;
 
+  // SUPERSEDED -- deleted by MC-B, then reserved by tag and name. Replaced by
+  // the per-kind `max_audio_receive_slots` / `max_video_receive_slots` below:
+  // story 3 caps each kind separately and TRUNCATES an over-cap declaration to
+  // `SLOT_STATE_UNAVAILABLE` rather than rejecting it, so the "rejected WHOLE"
+  // rule below no longer describes MC once MC-A lands. Kept, unchanged, until
+  // MC-B so nothing a consumer reads today is removed.
+  //
   // MC's cap on the TOTAL number of slots one `ReceiveCapability` declaration
   // may carry, across all media kinds -- `MC_MAX_RECEIVE_SLOTS`. THE canonical
   // statement of this field's rules. It is the same
@@ -603,6 +695,29 @@ message JoinResponse {
   // shown in the clear by the redacting `Debug`. OBSERVABILITY: a log value,
   // never a metric label -- MC already publishes it as a gauge.
   optional uint32 max_receive_slots = 12;
+
+  // MC's per-kind receive-slot caps (story 3 R-1, R-23):
+  // `MC_MAX_AUDIO_RECEIVE_SLOTS` and `MC_MAX_VIDEO_RECEIVE_SLOTS`, in MC's own
+  // ConfigMap so the video-off lever (a video cap of 0) rolls MC only. THE
+  // canonical statement of these two fields' rules.
+  //
+  // INFORMATIONAL, for runtime readability of the effective caps. MC
+  // TRUNCATES: a declaration with more slots of a kind than its cap keeps the
+  // first `cap` slots of that kind IN DECLARATION ORDER, and every excess slot
+  // is reported `SLOT_STATE_UNAVAILABLE` -- visible, never a silent
+  // participant, never a join failure. A client therefore needs no
+  // pre-check and MUST NOT shrink its declaration from these values.
+  //
+  // 0 is LEGAL for either kind (a video cap of 0 disables video, R-26).
+  // Absent means an MC that does not send them; the caps are then unknown,
+  // which costs a client nothing because truncation is reported per slot.
+  // Per session, as `max_receive_slots`: use the latest received, never cache
+  // across joins.
+  //
+  // NOT IDENTITY OR KEY MATERIAL: bounded configuration values, safe to log.
+  // OBSERVABILITY: log values, never metric labels.
+  optional uint32 max_audio_receive_slots = 13;
+  optional uint32 max_video_receive_slots = 14;
 }
 
 // Reason for participant leaving.
@@ -644,14 +759,54 @@ enum LeaveReason {
 //
 // "Host mute" is deliberately avoided as a term: it presumes a role model this
 // system has not defined.
+//
+// FOUR INDEPENDENT CONTROLS (story 3 R-15, ADR-0036 §5 amendment 2026-10-13):
+// client audio, client video, server audio, server video. They compose: a
+// request about one kind never changes the other kind's state, and client and
+// server mute of one kind are independent. Server mute of a kind WITHDRAWS
+// that kind's send directive (capture stops; for video the camera light goes
+// off) AND MH keeps dropping that stream at ingress as the backstop against a
+// patched client. Client mute MAY leave the directive in place, and nothing of
+// that kind leaves the device (no silence, no DTX, no video). Any video mute
+// stops the camera track; an audio client mute keeps the mic open and only
+// stops sending. A server unmute restores capture unless the participant is
+// client-muted (see `ParticipantMuteUpdate` for the notice it requires).
+//
+// PER-KIND FIELDS ARE `optional bool` on both request messages. ABSENT means
+// "that kind is unchanged"; a request with BOTH absent is rejected and
+// counted. TAG-COMPATIBLE BUT NOT SEMANTICS-COMPATIBLE with a pre-optional
+// encoder: a proto3 implicit-presence `bool` omits `false` from the wire, so an
+// old sender's `false` (an unmute) is indistinguishable from absent and reads
+// as "unchanged". Senders MUST set every kind they mean to change, including
+// an explicit `false`.
+//
+// INTERIM UNTIL MC-B (2026-10-20): MC still reads an ABSENT kind as `false` on
+// both messages (`crates/mc-service/src/webtransport/connection.rs`,
+// `handle_mute_request` / `handle_server_mute_request`), so "absent =
+// unchanged" is NOT in force yet. Until MC-B lands, senders MUST set BOTH
+// kinds on every request.
 
 // Request to update client-mute status (informational, not enforced by MH).
+//
+// The participant's own client mute, per kind. Absent = unchanged (see the
+// section header for presence rules).
 message MuteRequest {
-  bool audio_muted = 1;
-  bool video_muted = 2;
+  optional bool audio_muted = 1;
+  optional bool video_muted = 2;
 }
 
 // Notification of participant mute state change.
+//
+// SELF COPY AND RESUMED CAPTURE (story 3 R-18). A participant learns its OWN
+// server-mute state ONLY from its own copy of this message. So when a server
+// unmute will restore capture, MC MUST send the participant's self update
+// BEFORE the send-directive change that restores capture, on the same
+// MC-to-client signalling stream, in order. FAIL-SAFE: a client MUST NOT
+// resume capture on a server-unmute path without showing the non-suppressible
+// "a host resumed your camera/microphone" notice, even if that order is
+// violated (a directive restoring a kind the client last saw server-muted
+// shows the notice whatever arrived first). A host action CAN resume a
+// participant's camera or mic unless the participant is client-muted.
 message ParticipantMuteUpdate {
   string participant_id = 1;
   bool audio_self_muted = 2; // Informational: participant muted themselves
@@ -670,10 +825,21 @@ message ParticipantMuteUpdate {
 // Enforced by MC and MH, unlike `MuteRequest`, which the client enforces at
 // capture. Renamed from the pre-ADR-0036 `HostMuteRequest`; same message, same
 // tag, no behaviour change.
+//
+// Host-only, requester taken from the connection, refused generically and
+// counted, rate-bounded (story 2 R-8; story 3 R-15 extends it per kind).
+//
+// Per-kind fields are `optional bool` (story 3 R-15; presence rules at the
+// section header). THE DEFECT THIS FIXES: MC's
+// `crates/mc-service/src/media_signaling/outcome.rs::ServerMuteAction::from_request`
+// folds both fields into ONE Mute/Unmute action, so `{audio: true, video:
+// false}` mutes both kinds and `{false, false}` is the only unmute. MC-B
+// replaces it with per-kind actions (absent = unchanged, both absent rejected
+// and counted).
 message ServerMuteRequest {
   string participant_id = 1;
-  bool audio_muted = 2;
-  bool video_muted = 3;
+  optional bool audio_muted = 2;
+  optional bool video_muted = 3;
 
   // Optional reason shown to the participant.
   //
@@ -781,19 +947,23 @@ message ReceiveSlot {
   // containing duplicates, never last-write-wins — a duplicate means "two
   // sources into one slot".
   //
-  // A `uint32` on the wire carrying 16-bit semantics: this is the same value
-  // space as the frame's relay-region stream id, which is what lets a receiver
-  // validate an arriving `stream_id` against its own declared slots.
+  // A `uint32` on the wire carrying 16-bit semantics: this is the value MH
+  // writes into the frame's relay-region `stream_id` ON THE DOWNLINK, which is
+  // what lets a receiver validate an arriving `stream_id` against its own
+  // declared slots. RELAY IDS ARE HOP-LOCAL (ADR-0036 §2, amendment
+  // 2026-10-13): on the uplink the same 16-bit relay field carries the
+  // publisher's `SendStream.stream_number` (MC's send id); on the downlink MH
+  // rewrites it to this subscriber's `slot_id`. It is not merely
+  // "subscriber-scoped" on every hop.
   // ANCHOR (DRY): `crates/media-protocol/src/frame.rs::STREAM_ID_FIELD_BYTES`
-  // = 2. This is also NOT `SendStream.stream_number`, the 8-bit key-id stream
-  // field — the file's other numeric stream-ish identifier — which lives in the
+  // = 2. This is also NOT the 8-bit key-id `stream` field, which lives in the
   // signed key id, not the relay region (the reciprocal of the disclaimer on
-  // that field). This is NOT `sender_id`'s bound either: that one is an
-  // allocation bound
-  // (key-id derived, never reissued within one KEK generation), this one is a
-  // validation bound (relay-region derived, per-subscriber, freely reusable
-  // across declarations). Do NOT introduce a shared `MAX_16BIT_ID` constant or
-  // a shared `validate_16bit_id()` helper — collapsing them silently loses
+  // `SendStream.stream_number`). This is NOT `sender_id`'s bound either:
+  // that one is an allocation bound (key-id derived, never reissued within
+  // one KEK generation), this one is a validation bound (relay-region
+  // derived, per-subscriber, freely reusable across declarations). Do NOT
+  // introduce a shared `MAX_16BIT_ID` constant or a shared
+  // `validate_16bit_id()` helper — collapsing them silently loses
   // `sender_id`'s per-generation non-reissue invariant.
   //
   // SECURITY: client-controlled input that MC forwards into the relay-region
@@ -841,9 +1011,13 @@ message ReceiveCapability {
   // The declared slots.
   //
   // Unbounded on this wire; the proto does not enforce a cap. Slot count is
-  // capped by server-side configuration (ADR-0036 §6): MC rejects a
-  // declaration exceeding it, and the cap is advertised on
-  // `JoinResponse.max_receive_slots`.
+  // capped PER KIND by server-side configuration (ADR-0036 §6, amendment
+  // 2026-10-13): MC TRUNCATES each kind to its cap and reports every excess
+  // slot `SLOT_STATE_UNAVAILABLE`, never rejecting the declaration for its
+  // count; the caps are advertised on `JoinResponse.max_audio_receive_slots`
+  // / `max_video_receive_slots`. (Was: "MC rejects a declaration exceeding
+  // it", against the single `JoinResponse.max_receive_slots`; superseded by
+  // story 3 R-1 once MC-A lands.)
   repeated ReceiveSlot slots = 1;
 }
 
@@ -878,12 +1052,27 @@ message SendTarget {
 // counters per frame. A stream sent to several targets is encoded and
 // encrypted ONCE and transmitted N times.
 message SendStream {
-  // The publisher's stream index.
+  // The publisher's stream index -- MC's SEND ID for this stream. THE single
+  // source of truth for stream numbers: video is 1 (`MEDIA_KIND_VIDEO_CAMERA`,
+  // `CODEC_VP8`, `TRANSPORT_MODE_STREAM_PER_GROUP`), audio stays 0. Each
+  // independent stream (simulcast layers later) gets its own number.
   //
   // A `uint32` on the wire carrying 8-BIT semantics: the 64-bit SFrame key id
   // allots 8 bits to the stream. ANCHOR (DRY): the layout is documented at
-  // `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`. This is NOT
-  // `ReceiveSlot.slot_id`, which is 16-bit and lives in the relay region.
+  // `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`.
+  //
+  // IT IS ALSO THE UPLINK RELAY ID (story 3 wire freeze; ADR-0036 §2, relay
+  // ids are hop-local): the publisher stamps this value into the frame's
+  // 16-bit relay-region `stream_id` on every frame it sends to a handler,
+  // through one function for both kinds, and MH attributes the frame by
+  // (connection-bound sender, this id) against MC's
+  // `dark_tower.internal.v1.SourceStream` list. Two fields, one value: the
+  // 8-bit key-id field and the 16-bit relay field. The relay copy is
+  // publisher-set, UNAUTHENTICATED at MH, and never cross-checked against the
+  // key id; a signed header copy was considered and dropped, because the
+  // publisher sets both label and key id, so signing protected nothing. On the
+  // DOWNLINK MH rewrites the relay field to the subscriber's
+  // `ReceiveSlot.slot_id`, which is 16-bit and subscriber-scoped.
   //
   // MC MUST enforce the range with `u8::try_from` and fail closed; the proto
   // cannot. Enforcement owner: story task 14.
@@ -926,20 +1115,37 @@ message SendStream {
   // AN EMPTY TARGET SET MEANS SEND NOTHING — MC turns off publishers nobody
   // watches. Resuming from empty is a keyframe event, and the sender rotates its
   // transmit key at that point (ADR-0036 §4).
+  //
+  // WITHDRAWAL IS AN EMPTY SET, NEVER REMOVAL (story 3 R-8, R-16, R-17). MC
+  // directs a kind only while at least one subscriber holds the stream in a
+  // slot of that kind AND the kind is not server-muted. A withdrawn stream,
+  // and a published-but-never-watched one, stays LISTED with an EMPTY target
+  // set; a kind the participant does not publish is NEVER listed. A video
+  // withdrawal stops capture (the camera light goes off). Every start or
+  // resume begins with a keyframe.
   repeated SendTarget targets = 4;
 }
 
 // What MC directs this client to produce, and where (ADR-0036 §5).
 //
-// MC keeps a send directive active while a client reports itself client-muted:
-// the client suppresses locally and MC does not withdraw the instruction,
-// which is what makes unmute instantaneous and keeps "MC has not asked you to
-// send" distinguishable from "you have muted yourself".
+// CLIENT MUTE MAY STAY DIRECTED: the directive is blind to client mute; the
+// client suppresses locally (nothing of that kind leaves the device) and MC
+// MAY leave the instruction in place, which keeps "MC has not asked you to
+// send" distinguishable from "you have muted yourself". SERVER MUTE WITHDRAWS:
+// a server-muted kind's stream is listed with an empty target set (capture
+// stops), with MH's ingress drop as the backstop.
+//
+// (Corrected 2026-10-13. Was: "MC keeps a send directive active while a
+// client reports itself client-muted ... which is what makes unmute
+// instantaneous". The client-mute half still holds as a MAY; it never applied
+// to server mute, and story 3 R-8 also withdraws an UNWATCHED kind, so an
+// active directive is no longer implied by "not client-muted".)
 message SendDirective {
   repeated SendStream streams = 1;
 
   // The meeting-wide frame header version every stream in this directive must
-  // use (ADR-0036 §2). A `uint32` carrying u8 semantics; the value is 2 today.
+  // use (ADR-0036 §2). A `uint32` carrying u8 semantics. Header v3 is the ONLY
+  // version once P2 flips `PROTOCOL_VERSION` (the value is 2 until then).
   //
   // Meeting-wide and MC-directed because the version sits in the SIGNED
   // publisher region: a relay cannot translate between header versions without
@@ -948,14 +1154,17 @@ message SendDirective {
   // arises. The signed field is also proof the publisher used the version MC
   // directed, which is what makes a downgrade detectable.
   //
-  // MC MUST set this BY DERIVATION, never as a literal `2`, and MUST NOT emit
-  // a version below the configured floor even as a policy downgrade.
-  // ANCHOR (DRY): cross-language source of truth is
-  // `proto/test-vectors/frame-v2.vectors.json` (story task 8); the Rust-side
-  // derivation is `crates/media-protocol/src/frame.rs::PROTOCOL_VERSION`. See
-  // `ParticipantCapabilities.supported_header_versions` for the floor rule and
-  // `docs/TODO.md` §Media Path Obligations for the precedence rule between
-  // the two anchors.
+  // MC MUST set this BY DERIVATION from
+  // `crates/media-protocol/src/frame.rs::PROTOCOL_VERSION`, never as a literal.
+  // There is no floor and no allowlist: one version exists, and a join not
+  // declaring it is refused (see
+  // `ParticipantCapabilities.supported_header_versions`). (2026-10-13: the
+  // former "MUST NOT emit a version below the configured floor" language is
+  // deleted with the floor.)
+  // ANCHOR (DRY): cross-language source of truth is the frame vectors file
+  // (`proto/test-vectors/frame-v2.vectors.json` today; P2 regenerates it for
+  // v3); see `docs/TODO.md` §Media Path Obligations for the precedence rule
+  // between the two anchors.
   uint32 header_version = 2;
 }
 
@@ -1007,7 +1216,8 @@ message StreamAssignment {
   reserved "stream_id", "user_id", "media_type", "slot_index";
 
   // Which of the subscriber's declared slots this fills. Echoes the
-  // `ReceiveSlot.slot_id` the subscriber chose; see that field for the full
+  // `ReceiveSlot.slot_id` the subscriber chose (including on
+  // `SLOT_STATE_UNAVAILABLE`); see that field for the full
   // scoping, range, validation AND observability rules — this is a published
   // message, so it is the surface a well-meant "assignments per slot" label
   // would come from.
@@ -1016,9 +1226,16 @@ message StreamAssignment {
   // The source participant. See `JoinResponse.sender_id` for the full range,
   // allocation, fail-closed AND observability rules.
   //
-  // Absent when no source is assigned — which is the normal case for
-  // `SLOT_STATE_ZERO_REQUESTED`, `SLOT_STATE_FEWER_SOURCES_THAN_SLOTS` and
-  // `SLOT_STATE_SOURCE_UNREACHABLE`. Absent MUST NOT be coerced to 0.
+  // PRESENCE BY STATE (story 3 R-5, wire freeze):
+  //   - ABSENT on a VIDEO `SLOT_STATE_ACTIVE` slot: MC never names the live
+  //     video source. The client attributes live video from the frame's
+  //     signature-verified key-id sender, which avoids racing the new
+  //     source's keyframe (and active-speaker switching later).
+  //   - PRESENT on an AUDIO `SLOT_STATE_ACTIVE` slot and on every `AVATAR_*`
+  //     state (the avatar is FOR a named participant).
+  //   - ABSENT on `SLOT_STATE_FEWER_SOURCES_THAN_SLOTS` and
+  //     `SLOT_STATE_UNAVAILABLE` (no source).
+  // Absent MUST NOT be coerced to 0.
   optional uint32 sender_id = 7;
 
   MediaKind media_kind = 8;
@@ -1343,17 +1560,139 @@ message MhConnectRequest {
   string join_token = 1; // Meeting JWT; same semantics as JoinRequest.join_token.
 }
 
+// ============================================================================
+// Keyframe and recovery requests on the client<->MH bidi stream (story 3)
+// ============================================================================
+//
+// There is NO KEYFRAME INTERVAL (ADR-0036 §1/§7, amendment 2026-10-13):
+// keyframes are produced on demand. Both messages below ride the client-opened
+// MH bidi control stream AFTER `MhConnectRequest`, with the same 4-byte
+// big-endian length prefix and the same per-message size bound as
+// `MhClientMessage`: `RecoveryRequest` on its receive half (client to MH),
+// `KeyframeRequest` on its send half (MH to client). Fixed scalars only: no
+// strings, no URL, no sender identity in the MH-to-client direction.
+//
+// GoP COUNTER: the 32-bit `gop_counter` of the v3 frame header (ADR-0036 §2),
+// per (sender, stream), incremented on every independently-decodable frame and
+// carried by every frame of the group. COUNTER-BASED COALESCING is what makes
+// stale, repeated, multi-receiver and multi-handler requests yield ONE keyframe
+// that reaches every target.
+//
+// OBSERVABILITY (ADR-0036 §11, story 3 R-30): every `gop_counter`,
+// `stream_number`, `slot_id` and `sender_id` field below is stream identity --
+// the rules at `dark_tower.internal.v1.SubscriberSlot` apply. Never a log
+// field, metric label, span attribute or test-bus value.
+
+// A receiver's request to its handler to restore decodability on one of its
+// slots (story 3 R-13): the same counter-based request as `KeyframeRequest`,
+// client to MH instead of MH to client.
+//
+// Sent when a slot loses decodability (failed verify or decrypt, decoder
+// error, local drop, abandoned group). NOT a token-refresh or reconnect
+// variant: it carries no credential, and the read-once rule at
+// `dark_tower.internal.v1.NotifyParticipantConnectedRequest.participant_id` is
+// untouched by it.
+//
+// MH RULES (MH-B). Per-connection rate bound
+// `MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC`, applied before any parse or
+// work. MH resolves `slot_id` only within THIS subscriber connection's own
+// edges, then:
+//   - `sender_id` not the slot's current source sender -> `source_mismatch`;
+//   - `gop_counter` EQUAL to MH's newest counter for that source stream ->
+//     forwarded; LOWER -> `stale` (a newer group is already in flight);
+//     HIGHER -> `counter_ahead` (refused: MH never saw that group). No
+//     clamping in either direction.
+// MH NEVER forwards this message verbatim: it re-sends upstream as its own
+// `KeyframeRequest`, with the source's `stream_number` and MH's newest
+// counter (fields are REMAPPED), aggregated to at most one per source stream
+// per `MH_KEYFRAME_REQUEST_AGGREGATION_MS` (default 100 ms). That 100 ms is a
+// different value from the client's compiled 100 ms keyframe floor
+// (`EncodingParameters.min_keyframe_interval_ms`); the two are unrelated and
+// MUST NOT share a constant.
+message RecoveryRequest {
+  // The receiver's DOWNLINK relay id: its own `ReceiveSlot.slot_id`, as MH
+  // writes it into the relay region on this hop. Never a publisher stream
+  // number.
+  uint32 slot_id = 1;
+
+  // The sender the receiver believes holds that slot: the slot's
+  // signature-verified key-id sender. A STALENESS GUARD ONLY
+  // (`source_mismatch`): it narrows matching and is NEVER authority -- never
+  // used to choose a source or publisher, and never forwarded upstream. Zero
+  // never matches a source (`JoinResponse.sender_id`).
+  uint32 sender_id = 2;
+
+  // The newest GoP counter the receiver has seen on that slot. 0 is legal
+  // (a sender's first group).
+  uint32 gop_counter = 3;
+}
+
 // Wrapper envelope for client→MH messages (parallel to ClientMessage for MC).
 message MhClientMessage {
   // Variant tags stay below 20; tags 20+ are envelope-level.
+  //
+  // `connect_request` is the FIRST framed message on the bidi stream and only
+  // the first; any other variant first is an invalid connect. After it, the
+  // stream carries `recovery_request` (story 3 R-13).
   oneof message {
     MhConnectRequest connect_request = 1;
+    RecoveryRequest recovery_request = 2;
   }
 
   // W3C Trace Context (see ClientMessage::trace_parent for format,
   // parser, and validation boundary). Same envelope-level placement
   // pattern — available across all current and future MhClientMessage
   // variants without per-variant changes.
+  string trace_parent = 20;
+  string trace_state = 21;
+}
+
+// MH's request that a publisher produce a keyframe on ONE of its streams
+// (story 3 R-10, R-11).
+//
+// PUBLISHER RULES (the client; this message is UNTRUSTED input to it). The
+// publisher produces a keyframe for a request only if ALL hold:
+//   - `gop_counter` is AT LEAST its current counter for that stream (stale or
+//     back-to-back requests coalesce into one keyframe reaching every target);
+//   - the named stream is one it is CURRENTLY SENDING TO THAT HANDLER;
+//   - at most once per max(directed
+//     `EncodingParameters.min_keyframe_interval_ms`, compiled 100 ms
+//     floor), deferring at most one in-interval request per stream rather
+//     than refusing it.
+// ONLY THE NAMED STREAM keys (room for simulcast, where a request for one
+// encoding must not key every encoding). A request NEVER starts capture and
+// never makes a muted or undirected stream send. Refused and malformed
+// requests are counted by reason. A compromised MH can therefore at most drive
+// a publisher's keyframes at that bound.
+//
+// MH RULES (MH-B). MH requests only after it has received at least one frame
+// from that source stream, carrying the newest counter it has seen, and
+// retries every `MH_KEYFRAME_REQUEST_RETRY_MS` (default 500, range 100..=10000)
+// until a group start arrives. MH refuses to boot unless that retry is at
+// least `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (fail closed; a faster retry is
+// wasted). Every request MH sends, its own or a remapped `RecoveryRequest`,
+// passes one per-source-stream aggregator.
+message KeyframeRequest {
+  // The publisher's UPLINK relay id for the stream to key: MC's send id,
+  // `SendStream.stream_number` (the SSoT). NOT a slot id.
+  uint32 stream_number = 1;
+
+  // The newest GoP counter MH has seen on that stream.
+  uint32 gop_counter = 2;
+}
+
+// Wrapper envelope for MH→client messages, written on the send half of the
+// client-opened MH bidi stream (parallel to `ServerMessage` for MC). Same
+// framing and size bound as `MhClientMessage`.
+message MhServerMessage {
+  // Variant tags stay below 20; tags 20+ are envelope-level.
+  oneof message {
+    KeyframeRequest keyframe_request = 1;
+  }
+
+  // W3C Trace Context, same placement as `MhClientMessage`. MH sets NONE:
+  // keyframe requests carry no trace context and nothing is logged per
+  // request.
   string trace_parent = 20;
   string trace_state = 21;
 }

@@ -686,9 +686,10 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * Set client mute.
    *
    * Local first, always: the state changes before MC is told, and unmute resumes
-   * capture with NO server round trip. MC keeps the send directive active
-   * throughout, so "MC has not asked you to send" and "you have muted yourself"
-   * stay distinguishable.
+   * capture with NO server round trip while the kind is still directed. MC MAY
+   * leave the send directive in place under client mute (signaling.proto
+   * `SendDirective`; ADR-0036 §5, correction 2026-10-13), so "MC has not asked
+   * you to send" and "you have muted yourself" stay distinguishable.
    */
   setAudioMuted(muted: boolean): void {
     if (!this.#mute.setAudioMuted(muted)) return;

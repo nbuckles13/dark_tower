@@ -76,10 +76,12 @@ export interface KeyIdParts {
   /**
    * Sender-scoped stream number.
    *
-   * NOT the relay `stream_id`: that one is subscriber-scoped, two bytes wide,
-   * rewritten by a media handler per subscriber, and authenticated by nobody.
-   * This one is sender-scoped, one byte, and cryptographically bound through the
-   * key derivation.
+   * NOT the relay `stream_id`: that one is two bytes wide, hop-local and
+   * authenticated by nobody (ADR-0036 §2) — on the uplink the publisher stamps
+   * it with this same value (MC's send id, `SendStream.stream_number`), on the
+   * downlink a media handler rewrites it to the subscriber's slot id. This one
+   * is sender-scoped, one byte, and cryptographically bound through the key
+   * derivation; the relay copy is never cross-checked against it.
    */
   readonly stream: bigint;
   /**

@@ -283,6 +283,7 @@ mod tests {
             handler_id: handler_id.to_string(),
             process_start_epoch_ms: 0,
             transport_mode: transport_mode as i32,
+            applied_source_streams: Vec::new(),
         }
     }
 

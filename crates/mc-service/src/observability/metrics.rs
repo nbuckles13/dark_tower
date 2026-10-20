@@ -667,8 +667,8 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 /// *who*, at investigation time, in a system that legitimately holds that
 /// mapping.
 ///
-/// The label domain **mirrors the wire enum exhaustively** — all eight
-/// `SlotState` variants, not the three reachable today (`active`,
+/// The label domain **mirrors the wire enum exhaustively** — every named
+/// `SlotState` variant, not only the ones reachable today (`active`,
 /// `source_muted`, `fewer_sources_than_slots`). A hand-picked subset needs
 /// editing every time §7 makes `switch_pending` live, and a
 /// `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
@@ -1741,9 +1741,10 @@ const fn slot_actor_type(v: McActorType) -> usize {
     }
 }
 
-/// `mc_media_slot_states_total{slot_state}` domain — all eight wire `SlotState`
-/// variants (label via the pub `slot_state_label`). Proto enum, enumerated
-/// in-domain with a witness so a regen adding a variant fails to compile here.
+/// `mc_media_slot_states_total{slot_state}` domain — every named wire
+/// `SlotState` variant (label via the pub `slot_state_label`; `ZERO_REQUESTED`
+/// is reserved, so absent). Proto enum, enumerated in-domain with a witness so
+/// a regen adding a variant fails to compile here.
 const SLOT_STATES: &[proto_gen::dark_tower::signaling::v1::SlotState] = {
     use proto_gen::dark_tower::signaling::v1::SlotState;
     &[
@@ -1752,9 +1753,12 @@ const SLOT_STATES: &[proto_gen::dark_tower::signaling::v1::SlotState] = {
         SlotState::SourceMuted,
         SlotState::WithheldByCongestion,
         SlotState::FewerSourcesThanSlots,
-        SlotState::ZeroRequested,
         SlotState::SourceUnreachable,
         SlotState::SwitchPending,
+        SlotState::AvatarNoVideo,
+        SlotState::Unavailable,
+        SlotState::AvatarClientMuted,
+        SlotState::AvatarServerMuted,
     ]
 };
 
@@ -1767,9 +1771,12 @@ const fn slot_slot_state(v: proto_gen::dark_tower::signaling::v1::SlotState) -> 
         SlotState::SourceMuted => 2,
         SlotState::WithheldByCongestion => 3,
         SlotState::FewerSourcesThanSlots => 4,
-        SlotState::ZeroRequested => 5,
-        SlotState::SourceUnreachable => 6,
-        SlotState::SwitchPending => 7,
+        SlotState::SourceUnreachable => 5,
+        SlotState::SwitchPending => 6,
+        SlotState::AvatarNoVideo => 7,
+        SlotState::Unavailable => 8,
+        SlotState::AvatarClientMuted => 9,
+        SlotState::AvatarServerMuted => 10,
     }
 }
 

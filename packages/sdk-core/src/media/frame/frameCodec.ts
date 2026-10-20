@@ -154,7 +154,9 @@ export interface DecodedFrame {
   readonly wrappedTransmitKey: WrappedTransmitKey | null;
   readonly extensions: readonly FrameExtension[];
   /**
-   * Which of the subscriber's slots this frame fills.
+   * The hop-local relay stream id (ADR-0036 §2). On a RECEIVED frame
+   * (downlink): which of the subscriber's slots this frame fills. On a SENT
+   * frame (uplink): the publisher's send id, `SendStream.stream_number`.
    *
    * UNAUTHENTICATED. A media handler writes this freely and nobody signs it. A
    * receiver must validate it against its own declared slots before acting on it

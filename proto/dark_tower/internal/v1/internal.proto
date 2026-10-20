@@ -147,11 +147,22 @@ import "dark_tower/signaling/v1/signaling.proto";
 // alone, need no external state, and stay IMMEDIATE HARD REJECTS: the
 // cross-meeting / structurally-unresolvable half of this very check; duplicate
 // `egress_stream_id`; duplicate `(subscriber.sender_id, subscriber.slot_id)`;
-// duplicate `server_muted_sources[].sender_id`; the candidate-per-egress,
-// egress-per-meeting and muted-sources-per-meeting count bounds;
-// `transport_mode == TRANSPORT_MODE_UNSPECIFIED`; and heterogeneous transport
-// modes across egress streams. The security-load-bearing rejects are in that
-// list, and "the sender_id rule says defer" must not be read onto them.
+// the candidate-per-egress and egress-per-meeting count bounds; and, from
+// story 3 (`SourceStream`): a duplicate `(sender_id, stream_number)` in
+// `source_streams`; an UNSPECIFIED `disposition` or `transport_mode` on a
+// `SourceStream`; a candidate absent from `source_streams`; an egress whose
+// candidates declare different transport modes
+// (`rejected_transport_inconsistent`); and a `source_streams` count over
+// `MH_MAX_SOURCE_STREAMS_PER_MEETING`. The security-load-bearing rejects are
+// in that list, and "the sender_id rule says defer" must not be read onto
+// them.
+//
+// SUPERSEDED entries of that list, kept while their fields exist and deleted
+// by MC-B with them: duplicate `server_muted_sources[].sender_id` and the
+// muted-sources-per-meeting bound (`MH_MAX_MUTED_SOURCES_PER_MEETING`);
+// `EgressStream.transport_mode == TRANSPORT_MODE_UNSPECIFIED`. RETIRED by
+// MH-A1: "heterogeneous transport modes across egress streams" -- one meeting
+// legally mixes DATAGRAM audio and STREAM_PER_GROUP video (story 3 R-20).
 //
 // NO SINGLE-MEETING TEST CAN CATCH A GLOBAL INDEX. A multi-party meeting is
 // still ONE meeting: however many participants it has, a correctly
@@ -187,7 +198,13 @@ message SubscriberSlot {
 // `media_kind` and `EncodingParameters`, and ADR-0036 §7 makes MH type-blind --
 // media kind on this contract is knowledge MH has no legitimate source for, and
 // a new media kind must cost zero MH changes. MH is told what a stream DOES
-// (`supersede_on_independent_frame`, `transport_mode`), never what it IS.
+// (`supersede_on_independent_frame`, and its `SourceStream`'s
+// `transport_mode` and `disposition`), never what it IS.
+//
+// EVERY CANDIDATE MUST BE DECLARED: its (`sender_id`, `stream_number`) MUST
+// appear in `RegisterMeetingRequest.source_streams`, which supplies the edge's
+// transport; an undeclared candidate is an immediate hard reject
+// (`rejected_transport_inconsistent`; list at `SubscriberSlot`).
 //
 // OBSERVABILITY (ADR-0036 §11): as `SubscriberSlot` -- never a label, never a
 // span attribute, never a per-frame log dimension.
@@ -211,8 +228,13 @@ message CandidateSource {
   // `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`
   // (`sender_id` 16 | `stream` 8 | `generation` 40).
   //
-  // This is NOT `SubscriberSlot.slot_id`, which is 16-bit and lives in the
-  // relay region rather than in the signed key id.
+  // Also the publisher's UPLINK RELAY ID: relay ids are hop-local (ADR-0036
+  // §2, amendment 2026-10-13), and on the uplink the publisher stamps this
+  // value into the 16-bit relay-region `stream_id`. Two fields, one value:
+  // the 8-bit key-id field and the 16-bit relay field. The relay copy is
+  // publisher-set, unauthenticated at MH and never cross-checked against the
+  // key id. This is NOT `SubscriberSlot.slot_id`, which is the DOWNLINK value
+  // of that same relay field (MH rewrites it per subscriber).
   uint32 stream_number = 2;
 }
 
@@ -249,7 +271,8 @@ message EgressStream {
 
   // Who receives this stream, and in which of their slots. MH writes
   // `subscriber.slot_id` into the frame's relay-region `stream_id` for this
-  // egress. ANCHOR (DRY):
+  // egress -- the DOWNLINK value of a hop-local field whose uplink value is the
+  // publisher's `CandidateSource.stream_number`. ANCHOR (DRY):
   // `crates/media-protocol/src/frame.rs::STREAM_ID_FIELD_BYTES` = 2.
   SubscriberSlot subscriber = 2;
 
@@ -280,6 +303,10 @@ message EgressStream {
   // the reciprocal of that disclaimer.
   //
   // MH derives no priority from media type; it has no media type (§7).
+  //
+  // A LOWER NUMBER IS A HIGHER PRIORITY. MC assigns audio edges 1 and video
+  // edges 2 (story 3 R-20: video is prioritised below audio by MC's
+  // assignment, which keeps MH type-blind). MC never assigns 0.
   uint32 priority_group = 4;
 
   // Whether a superseding frame permits discarding queued frames for this
@@ -288,7 +315,7 @@ message EgressStream {
   //
   // FALSE for every audio egress stream -- every frame forwards. "Every
   // audio frame forwards" is a consequence of this flag, not of MH knowing the
-  // stream is audio.
+  // stream is audio. TRUE for every video egress stream (story 3).
   //
   // ANCHOR (DRY):
   // `crates/media-protocol/src/frame.rs::FLAG_INDEPENDENTLY_DECODABLE` (bit 0,
@@ -299,6 +326,10 @@ message EgressStream {
   // `signaling.proto`; see docs/TODO.md §Media Path Obligations item (d).
   bool supersede_on_independent_frame = 5;
 
+  // SUPERSEDED -- deleted by MC-B; an edge's mode derives from its candidate's
+  // `SourceStream`. MC-A stops writing it; until MC-B deletes it, the text
+  // below describes the story-2 reading only.
+  //
   // How MH carries this egress stream to its subscriber (ADR-0036 §1, §5).
   //
   // The signalling enum, IMPORTED -- not a parallel `internal.v1` copy.
@@ -330,6 +361,9 @@ message EgressStream {
 // would make one meeting-wide rule N per-edge copies that can disagree.
 message SelectionRules {}
 
+// SUPERSEDED by `source_streams` -- deleted by MC-B. Read only through the
+// transitional path stated at `RegisterMeetingRequest.server_muted_sources`.
+//
 // One server-muted source (ADR-0036 §7 "Server mute is enforced at MH ingress";
 // story 2 R-9). MH drops every frame this sender publishes, at ingress, before
 // any forwarding decision -- counted under its own reason.
@@ -346,27 +380,136 @@ message SelectionRules {}
 // `crates/mh-service/src/media/forward.rs::forward_one`, which tests the
 // spawn-bound sender against the muted set BEFORE decode and before fan-out.
 //
-// PER-STREAM (AND PER-KIND) INGRESS MUTE IS FORECLOSED -- a security property,
-// not a missing feature. Every stream indicator MH can read at ingress is one the
-// muted party controls. The publisher's true stream number sits inside the opaque
-// SFrame key id MH never parses (type-blind §7, keyless §4). The only per-frame
-// field MH CAN read is the relay region, and it is OUTSIDE the publisher's signed
-// span and rewritten hop-by-hop by relays, so it carries no authenticated stream
-// identity and the muted publisher can set it to any value on the frames MH
-// evaluates at ingress. Keying an ingress mute on either would let the muted party
-// choose the very value the mute tests -- self-selectable evasion, not merely
-// unimplementable. Per-kind mute therefore moves to MC's egress edge set (where
-// the EDGE, not the frame, names the kind) when video lands (story 3).
+// PER-KIND SERVER MUTE HOLDS IN SLOT TERMS -- THE SINGLE HOME OF THIS
+// REASONING (`crates/mh-service/src/media/forward.rs` points here).
+//
+// > CORRECTION (2026-10-13, story 3). This block previously read "PER-STREAM
+// > (AND PER-KIND) INGRESS MUTE IS FORECLOSED -- a security property, not a
+// > missing feature", and concluded that per-kind mute must move to MC's
+// > egress edge set. The INSIGHT it rested on is retained: every stream
+// > indicator MH can read at ingress is one the muted party controls. The
+// > publisher's true stream number sits inside the opaque SFrame key id MH
+// > never parses (type-blind §7, keyless §4), and the relay-region
+// > `stream_id` is outside the signed span, so the muted publisher can set it
+// > to any value. What is SUPERSEDED is the conclusion that this forecloses a
+// > per-kind ingress mute: it forecloses only a mute stated as "MH identifies
+// > the frame's stream". Stated in SLOT terms, the property holds.
+//
+// THE PROPERTY (story 3 R-16): nothing from a sender whose kind is
+// server-muted reaches a subscriber's slot of that kind, however the client
+// labels or transports it. Stream ids are hop-local (ADR-0036 §2): the
+// publisher stamps the uplink relay `stream_id` with MC's send id, and MH
+// attributes each frame by (connection-bound sender, that id) against
+// `source_streams` (attribution rule at `SourceStream`). The muted party
+// chooses that label and MH does not authenticate it. What the label CANNOT
+// do:
+//   (a) EVERY declared stream of a server-muted kind is DROP_AT_INGRESS (MC
+//       MUST set it on each one, simulcast layers included), so frames
+//       attributed to any of them never forward: that kind has no live route
+//       from this sender.
+//   (b) A frame relabelled onto any OTHER declared stream of the sender must
+//       also match that stream's declared transport, and reaches only that
+//       stream's slots, which are of a kind not server-muted.
+//   (c) Receivers decode by SLOT kind, never by frame (story 3 R-5), so a
+//       relabelled frame cannot render as the muted kind. (c) is a
+//       LOAD-BEARING receiver dependency of this property, not an
+//       independent defence: a receiver that took the kind from the frame
+//       would reopen it.
+// SIGNING THE LABEL WAS CONSIDERED AND DROPPED: the publisher sets both the
+// label and the key id, so a signed header copy of the stream number would
+// protect nothing. Do not re-add it.
 //
 // OBSERVABILITY (ADR-0036 §11): as `SubscriberSlot` -- never a label, never a
 // span attribute, never a per-frame log dimension.
 message MutedSource {
+  // SUPERSEDED with the message (deleted by MC-B).
+  //
   // The muted publisher. MEETING-SCOPED, with the malformed-rejects /
   // not-yet-connected-holds rules stated once at `SubscriberSlot.sender_id`;
   // they apply identically here and are deliberately not restated. A muted
   // `sender_id` not yet connected is HELD (it stays muted when it attaches),
   // which is the safe direction.
   uint32 sender_id = 1;
+}
+
+// What MH does with one declared source stream (story 3 R-16, R-17).
+//
+// BEHAVIOUR NAMES, deliberately: MH learns neither the stream's media kind
+// nor the moderation fact behind it (type-blind §7). Client mute and server
+// mute reach MH only through these values, from MC's policy -- MC is the
+// single source of truth for both.
+enum SourceDisposition {
+  // REJECTS the registration (immediate hard reject, list at
+  // `SubscriberSlot`). Never a default.
+  SOURCE_DISPOSITION_UNSPECIFIED = 0;
+  // Forward along this stream's edges.
+  SOURCE_DISPOSITION_FORWARD = 1;
+  // Client mute (R-17). A switch to a paused source completes AT ONCE as
+  // "forward nothing", cancelling any pending keyframe wait and stopping
+  // forwarding of the previous source. NO INGRESS DROP: frames that arrive
+  // are forwarded normally (counted as paused-source arrivals, not drops), so
+  // a resume keyframe that beats MC's update still reaches subscribers.
+  SOURCE_DISPOSITION_PAUSED = 2;
+  // Server mute (R-16). Implies paused. Frames attributed to this stream DROP
+  // BEFORE ANY FORWARDING DECISION, counted `server_muted`. The backstop
+  // against a patched client behind the directive withdrawal. MC sets it on
+  // EVERY declared stream of the muted kind (property (a) at `MutedSource`).
+  SOURCE_DISPOSITION_DROP_AT_INGRESS = 3;
+}
+
+// One stream a publisher may send to this handler, as MC declares it (story 3
+// R-16, R-17, R-20). Replaces the sender-only `MutedSource`.
+//
+// ATTRIBUTION (R-20). MH attributes every ingress frame to exactly one
+// declared stream by looking up (connection-bound sender, UPLINK relay-region
+// `stream_id`) in `source_streams`. No payload parse; MH never distinguishes
+// audio from video. An unknown id drops as `unmatched_stream` (the relay field
+// is 16 bits and send ids are 8, so an id above 255 can never match and is
+// never truncated); a declared id arriving on a transport other than its
+// `transport_mode` drops as `transport_mismatch`. The two reasons stay
+// separate: their remedies differ (declaration drift vs. sender or contract
+// fault). An attributed frame forwards only along that stream's edges, so
+// audio never reaches a video slot and video never an audio slot. An edge's
+// transport derives from its candidate's `SourceStream`. The label is
+// publisher-set and unauthenticated; why per-kind server mute still holds,
+// and why a signed copy of the label was dropped, is stated once at
+// `MutedSource`.
+//
+// Plain scalars and an allowlisted enum only (file-header rule; no key
+// material).
+//
+// OBSERVABILITY (ADR-0036 §11): as `SubscriberSlot` -- never a label, never a
+// span attribute, never a per-frame log dimension.
+message SourceStream {
+  // The publisher. MEETING-SCOPED; rules stated once at
+  // `SubscriberSlot.sender_id` and not restated.
+  uint32 sender_id = 1;
+
+  // The publisher's stream: MC's send id and the uplink relay id. SSoT:
+  // `dark_tower.signaling.v1.SendStream.stream_number` (8-bit; key-id layout
+  // ANCHOR (DRY) `crates/media-protocol/src/frame.rs::KEY_ID_BYTES`). Audio 0,
+  // video 1 today; MH does not depend on the numbers.
+  uint32 stream_number = 2;
+
+  // The transport this stream arrives on and its edges leave on. UNSPECIFIED
+  // REJECTS the registration. Every candidate of one egress must declare the
+  // same mode (`rejected_transport_inconsistent`).
+  dark_tower.signaling.v1.TransportMode transport_mode = 3;
+
+  // What MH does with it. UNSPECIFIED rejects. A disposition change IS an
+  // assignment-output change: MC MUST advance `policy_generation`.
+  SourceDisposition disposition = 4;
+}
+
+// MH's per-stream echo of the transport it APPLIED (story 3; replaces the
+// single `RegisterMeetingResponse.transport_mode`). Field meanings as
+// `SourceStream`, whose rules are not restated.
+//
+// OBSERVABILITY (ADR-0036 §11): as `SubscriberSlot`.
+message SourceStreamEcho {
+  uint32 sender_id = 1;
+  uint32 stream_number = 2;
+  dark_tower.signaling.v1.TransportMode transport_mode = 3;
 }
 
 // ============================================================================
@@ -567,6 +710,30 @@ message RegisterMeetingRequest {
   // in the log line and in the metric's VALUE, never in a label.
   uint64 policy_generation = 6;
 
+  // SUPERSEDED by `source_streams` -- deleted by MC-B.
+  //
+  // TRANSITIONAL READING (story 3; read only by the transitional path, deleted
+  // by MC-B with the superseded proto fields). This is the ONE statement of
+  // that path; `source_streams` cross-references it.
+  //   - EMPTY `source_streams` (an MC before MC-A): MH treats the registration
+  //     as declaring stream 0 DATAGRAM for every connection-bound sender,
+  //     whether or not this registration names it (so an unwatched sender's
+  //     frames still drop as `no_subscriber`, never `unmatched_stream`), with
+  //     each sender in this set DROP_AT_INGRESS. That reproduces story-2
+  //     behaviour exactly.
+  //     After MC-B, an empty `source_streams` with egress streams rejects as
+  //     `rejected_transport_inconsistent` (every candidate is undeclared).
+  //   - NON-EMPTY `source_streams` AND a non-empty set here (MC-A keeps writing
+  //     this set until MC-B): a sender in this set is DROP_AT_INGRESS for EVERY
+  //     one of its streams, whatever `source_streams` says. The two fields
+  //     combine as a UNION, the more restrictive wins, and neither un-mutes the
+  //     other -- fail-closed, and story-2 behaviour in the overlap. Frames from
+  //     a union-muted sender count as `server_muted` (the sender-level
+  //     shortcut), including frames that cannot be attributed to a declared
+  //     stream; they never count as `unmatched_stream`. (Gap-filled 2026-10-20
+  //     at the request of security, agreed by media-handler: the story defines
+  //     MH's reading only for an empty `source_streams`.)
+  //
   // The server-muted sources THIS HANDLER MUST ENFORCE (ADR-0036 §7; story 2
   // R-9). MEETING-LEVEL, not per-egress: a mute silences a publisher for EVERY
   // subscriber, so it is a property of the source, not of one edge -- the same
@@ -613,6 +780,34 @@ message RegisterMeetingRequest {
   // Both rejects are in the IMMEDIATE HARD REJECTS list at `SubscriberSlot`.
   // Enforcement owner: the MH server-mute task.
   repeated MutedSource server_muted_sources = 7;
+
+  // Every stream MH may receive for this meeting on this handler, with what
+  // to do with it (story 3 R-16, R-17, R-20). Entry rules and the attribution
+  // rule: `SourceStream`.
+  //
+  // ABSENCE MEANS UNDECLARED, and an undeclared stream's frames drop as
+  // `unmatched_stream` -- THE OPPOSITE of the old muted set, where absence
+  // meant "forward". So MC MUST list every stream published by every
+  // participant that can send to this handler, WATCHED OR NOT, which covers
+  // every candidate in this handler's egresses (an undeclared candidate is a
+  // hard reject). SCOPED PER HANDLER like the old muted set: an entry for a
+  // sender never attached here is harmlessly held.
+  //
+  // FULL SNAPSHOT, as `server_muted_sources` below it: rides every
+  // registration (survives a re-assert and an MH restart), swapped atomically
+  // with the rest of the snapshot, and any change to it -- a disposition
+  // included -- advances `policy_generation`.
+  //
+  // IMMEDIATE HARD REJECTS (whole registration, before building any table;
+  // list at `SubscriberSlot`): duplicate (sender_id, stream_number);
+  // UNSPECIFIED disposition or transport; an undeclared candidate; an egress
+  // whose candidates declare different modes
+  // (`rejected_transport_inconsistent`); a count over
+  // `MH_MAX_SOURCE_STREAMS_PER_MEETING` (replaces
+  // `MH_MAX_MUTED_SOURCES_PER_MEETING`), checked before any per-element work.
+  //
+  // EMPTY LIST: the transitional reading at `server_muted_sources`.
+  repeated SourceStream source_streams = 8;
 }
 
 // Response to meeting registration (ADR-0036 §8).
@@ -677,6 +872,9 @@ message RegisterMeetingResponse {
   //   match | generation_mismatch | no_applied_generation |
   //   transport_mode_mismatch | handler_id_mismatch
   //
+  // From story 3, `transport_mode_mismatch` also carries every per-stream
+  // disagreement in `applied_source_streams` (no new value).
+  //
   // The set is FIVE, and each value exists because some field on this response
   // can fail in a way MC must act on. `no_applied_generation` is the
   // pre-contract-handler case, and its CONSTRUCTIBILITY is the entire reason
@@ -735,6 +933,11 @@ message RegisterMeetingResponse {
   // OBSERVABILITY: not label material -- unbounded, one new series per restart.
   uint64 process_start_epoch_ms = 4;
 
+  // SUPERSEDED -- deleted by MC-B. Replaced by the per-stream
+  // `applied_source_streams`; the scope limit below has expired (video landed
+  // in story 3) exactly as it said it would, and MH-A1 retires the
+  // homogeneous-mode reject.
+  //
   // The transport mode MH APPLIED to every egress stream of
   // `applied_generation` -- ADR-0036 §8's two-ends-must-agree echo. MC compares
   // it against what it declared and fails loud on mismatch. The cautionary
@@ -772,6 +975,22 @@ message RegisterMeetingResponse {
   // contract change, which the reject forces to happen loudly. Enforcement
   // owner: story task 5. Recorded in docs/TODO.md §Media Path Obligations.
   dark_tower.signaling.v1.TransportMode transport_mode = 5;
+
+  // The per-stream two-ends-must-agree echo (ADR-0036 §8; story 3 R-20): one
+  // entry per `SourceStream` of `applied_generation`, with the transport MH
+  // APPLIED. BUILT FROM THE APPLIED SNAPSHOT, never the received one -- the
+  // same "applied, never received" rule as `applied_generation`, for the same
+  // reason. The legacy path (`RegisterMeetingRequest.server_muted_sources`)
+  // echoes the entries it synthesized.
+  //
+  // MC COMPARES PER STREAM, keyed by (sender_id, stream_number), order
+  // irrelevant, UNCONDITIONALLY. A sent stream MISSING from the echo, echoed
+  // `TRANSPORT_MODE_UNSPECIFIED`, or echoed with a different mode is a
+  // MISMATCH -- the UNSPECIFIED-is-a-mismatch-not-a-skip rule above carries
+  // over unchanged, for the same fail-open hazard. PER STREAM, NOT PER-MODE
+  // COUNTS: counts read green on a swap (audio echoed as stream-per-group and
+  // video as datagram).
+  repeated SourceStreamEcho applied_source_streams = 6;
 }
 
 // Request to release a meeting's resources on a media handler (MC->MH;

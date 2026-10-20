@@ -234,7 +234,9 @@ impl AudioEncoding {
         match codec {
             Codec::Unspecified => return Err(AudioEncodingError::CodecUnspecified),
             Codec::Opus => {}
-            Codec::Vp9 | Codec::Av1 | Codec::H264 => return Err(AudioEncodingError::CodecNotAudio),
+            Codec::Vp8 | Codec::Vp9 | Codec::Av1 | Codec::H264 => {
+                return Err(AudioEncodingError::CodecNotAudio)
+            }
         }
         if !(AUDIO_BITRATE_MIN_BPS..=AUDIO_BITRATE_MAX_BPS).contains(&max_bitrate_bps) {
             return Err(AudioEncodingError::BitrateOutOfBand);
@@ -282,6 +284,9 @@ impl AudioEncoding {
             width: 0,
             height: 0,
             frame_rate: self.frame_rate_hz,
+            // Video only (signaling.proto `EncodingParameters`); audio ignores
+            // it, so it stays absent here.
+            min_keyframe_interval_ms: None,
         }
     }
 

@@ -69,15 +69,13 @@ use proto_gen::dark_tower::internal::v1::{
     CandidateSource, DisconnectReason, EgressStream, EndMeetingRequest, EndMeetingResponse,
     MutedSource, NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
     NotifyParticipantDisconnectedRequest, RegisterMeetingRequest, RegisterMeetingResponse,
-    SelectionRules, SubscriberSlot,
+    SelectionRules, SourceDisposition, SourceStream, SourceStreamEcho, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use proto_gen::Message;
 
-fn roundtrip<T: Message + Default>(msg: &T) -> T {
-    let bytes = msg.encode_to_vec();
-    T::decode(&bytes[..]).expect("decodes")
-}
+mod common;
+use common::{roundtrip, top_level_field_numbers, UNKNOWN_ENUM_VALUE};
 
 /// The CONSTRUCTIVE half of ADR-0036 §6 make-conflicts-unrepresentable.
 ///
@@ -116,6 +114,7 @@ fn egress_stream_carries_edge_and_behaviours_in_one_message() {
         selection_rules: Some(SelectionRules {}),
         policy_generation: 7,
         server_muted_sources: vec![],
+        source_streams: Vec::new(),
     };
 
     let decoded = roundtrip(&req);
@@ -151,6 +150,7 @@ fn empty_egress_stream_set_is_legal_and_survives() {
         selection_rules: None,
         policy_generation: 1,
         server_muted_sources: vec![],
+        source_streams: Vec::new(),
     };
 
     let decoded = roundtrip(&req);
@@ -174,6 +174,7 @@ fn selection_rules_presence_is_distinguishable_from_absence() {
         selection_rules: None,
         policy_generation: 1,
         server_muted_sources: vec![],
+        source_streams: Vec::new(),
     };
 
     let absent = roundtrip(&base);
@@ -211,6 +212,7 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         selection_rules: None,
         policy_generation: 7,
         server_muted_sources: vec![],
+        source_streams: Vec::new(),
     });
 
     let echoed = roundtrip(&RegisterMeetingResponse {
@@ -219,6 +221,7 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         handler_id: "mh-1".to_string(),
         process_start_epoch_ms: 1_756_684_800_000,
         transport_mode: TransportMode::Datagram as i32,
+        applied_source_streams: Vec::new(),
     });
 
     assert_eq!(sent.policy_generation, 7);
@@ -249,6 +252,7 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
         handler_id: String::new(),
         process_start_epoch_ms: 0,
         transport_mode: TransportMode::Unspecified as i32,
+        applied_source_streams: Vec::new(),
     });
 
     assert!(zeroed.accepted, "`accepted` means received-and-parsed only");
@@ -267,6 +271,7 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
         handler_id: "mh-1".to_string(),
         process_start_epoch_ms: 1,
         transport_mode: TransportMode::Datagram as i32,
+        applied_source_streams: Vec::new(),
     });
     assert_ne!(zeroed, populated);
 }
@@ -388,48 +393,6 @@ fn default_response_decodes_to_the_fail_closed_reading() {
 // Story 2: server mute on the snapshot (R-9) and meeting teardown (R-20)
 // ---------------------------------------------------------------------------
 
-/// Top-level field numbers present in an encoded message, in wire order.
-///
-/// Derived from the bytes rather than compared against a golden vector, so the
-/// assertion below cannot be satisfied by a stale expectation. Handles the two
-/// wire types `RegisterMeetingRequest` uses at top level (varint and
-/// length-delimited) and fails loudly on anything else rather than guessing.
-fn top_level_field_numbers(mut bytes: &[u8]) -> Vec<u64> {
-    /// `None` on a truncated or over-long (more than 64-bit) varint.
-    fn varint(buf: &mut &[u8]) -> Option<u64> {
-        let mut value = 0u64;
-        for shift in (0..64).step_by(7) {
-            let (byte, rest) = buf.split_first()?;
-            *buf = rest;
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Some(value);
-            }
-        }
-        None
-    }
-    let mut fields = Vec::new();
-    while !bytes.is_empty() {
-        let key = varint(&mut bytes).expect("valid field key");
-        let wire_type = key & 0x7;
-        assert!(
-            wire_type == 0 || wire_type == 2,
-            "unexpected wire type {wire_type} at top level"
-        );
-        fields.push(key >> 3);
-        if wire_type == 0 {
-            varint(&mut bytes).expect("valid varint field value");
-        } else {
-            let len = usize::try_from(varint(&mut bytes).expect("valid length prefix"))
-                .expect("length fits usize");
-            bytes = bytes
-                .get(len..)
-                .expect("length-delimited field within buffer");
-        }
-    }
-    fields
-}
-
 fn populated_request(muted: Vec<MutedSource>) -> RegisterMeetingRequest {
     RegisterMeetingRequest {
         meeting_id: "meeting-1".to_string(),
@@ -452,6 +415,7 @@ fn populated_request(muted: Vec<MutedSource>) -> RegisterMeetingRequest {
         selection_rules: None,
         policy_generation: 4,
         server_muted_sources: muted,
+        source_streams: Vec::new(),
     }
 }
 
@@ -700,4 +664,221 @@ fn connection_id_is_opaque_and_not_required_to_be_a_uuid() {
         connection_id: opaque.to_string(),
     });
     assert_eq!(out.connection_id, opaque);
+}
+
+// ---------------------------------------------------------------------------
+// Story 3: per-stream source declarations and the per-stream echo (R-16, R-17,
+// R-20)
+// ---------------------------------------------------------------------------
+//
+// What these do NOT assert: MH's immediate hard rejects (duplicate
+// (sender, stream), UNSPECIFIED disposition or transport, undeclared candidate,
+// mixed candidate modes, the count bound), the transitional union with
+// `server_muted_sources`, and MC's per-stream echo comparison. Those are runtime
+// behaviours owned by MH-A1 and MC-A. What is locked here is that every input
+// those rules read is REPRESENTABLE and survives the wire as written -- in
+// particular that the wire does not dedupe, reorder or default anything the
+// rejects need to see.
+
+fn source(sender_id: u32, stream_number: u32, mode: TransportMode, d: i32) -> SourceStream {
+    SourceStream {
+        sender_id,
+        stream_number,
+        transport_mode: mode as i32,
+        disposition: d,
+    }
+}
+
+/// Every disposition, UNSPECIFIED included (MH must SEE it to reject it),
+/// survives by value AND order, and a duplicate (sender, stream) survives too:
+/// the duplicate reject needs both entries on the wire.
+#[test]
+fn source_streams_roundtrip_every_disposition_in_order_with_duplicates() {
+    let streams = vec![
+        source(
+            2,
+            0,
+            TransportMode::Datagram,
+            SourceDisposition::Forward as i32,
+        ),
+        source(
+            2,
+            1,
+            TransportMode::StreamPerGroup,
+            SourceDisposition::Paused as i32,
+        ),
+        source(
+            3,
+            0,
+            TransportMode::Datagram,
+            SourceDisposition::DropAtIngress as i32,
+        ),
+        source(
+            3,
+            1,
+            TransportMode::Unspecified,
+            SourceDisposition::Unspecified as i32,
+        ),
+        source(
+            3,
+            1,
+            TransportMode::StreamPerGroup,
+            SourceDisposition::Forward as i32,
+        ),
+    ];
+    let decoded = roundtrip(&RegisterMeetingRequest {
+        source_streams: streams.clone(),
+        ..populated_request(Vec::new())
+    });
+    assert_eq!(decoded.source_streams, streams);
+    // The additive field does not disturb the policy it rides with.
+    assert_eq!(decoded.policy_generation, 4);
+    assert_eq!(decoded.egress_streams.len(), 1);
+}
+
+/// The disposition numbers are frozen, and UNSPECIFIED is the fail-closed zero.
+#[test]
+fn source_disposition_numbers_are_pinned() {
+    assert_eq!(SourceDisposition::Unspecified as i32, 0);
+    assert_eq!(SourceDisposition::Forward as i32, 1);
+    assert_eq!(SourceDisposition::Paused as i32, 2);
+    assert_eq!(SourceDisposition::DropAtIngress as i32, 3);
+}
+
+/// Open enum: an unknown disposition decodes as its integer for MH to reject,
+/// never as a named value and never as a decode failure.
+#[test]
+fn unknown_source_disposition_decodes_as_an_open_integer() {
+    let decoded = roundtrip(&RegisterMeetingRequest {
+        source_streams: vec![source(2, 0, TransportMode::Datagram, UNKNOWN_ENUM_VALUE)],
+        ..populated_request(Vec::new())
+    });
+    assert_eq!(decoded.source_streams[0].disposition, UNKNOWN_ENUM_VALUE);
+    assert!(SourceDisposition::try_from(UNKNOWN_ENUM_VALUE).is_err());
+}
+
+/// An EMPTY `source_streams` emits no field 8: byte-identical to an MC that
+/// never heard of the field, which is what the transitional reading at
+/// `server_muted_sources` keys on.
+#[test]
+fn empty_source_streams_emit_no_field_8_and_a_populated_list_does() {
+    let empty = top_level_field_numbers(&populated_request(Vec::new()).encode_to_vec());
+    assert!(
+        !empty.contains(&8),
+        "empty list must emit no field 8: {empty:?}"
+    );
+    assert!(
+        empty.contains(&4),
+        "positive control: the walker sees the edges"
+    );
+
+    let populated = top_level_field_numbers(
+        &RegisterMeetingRequest {
+            source_streams: vec![source(
+                2,
+                0,
+                TransportMode::Datagram,
+                SourceDisposition::Forward as i32,
+            )],
+            ..populated_request(Vec::new())
+        }
+        .encode_to_vec(),
+    );
+    assert!(populated.contains(&8), "a populated list must emit field 8");
+}
+
+fn echo(sender_id: u32, stream_number: u32, mode: TransportMode) -> SourceStreamEcho {
+    SourceStreamEcho {
+        sender_id,
+        stream_number,
+        transport_mode: mode as i32,
+    }
+}
+
+fn response_with(echoes: Vec<SourceStreamEcho>) -> RegisterMeetingResponse {
+    RegisterMeetingResponse {
+        accepted: true,
+        applied_generation: 4,
+        handler_id: "mh-1".to_string(),
+        process_start_epoch_ms: 1,
+        transport_mode: TransportMode::Unspecified as i32,
+        applied_source_streams: echoes,
+    }
+}
+
+/// THE SWAP CASE the per-stream echo exists for: two echoes whose per-MODE
+/// COUNTS match the correct echo (one datagram, one stream-per-group) but whose
+/// per-STREAM modes are swapped. On the wire the two are different values, so
+/// a per-stream comparison can tell them apart where counts cannot.
+#[test]
+fn a_swapped_echo_is_distinct_per_stream_though_its_mode_counts_match() {
+    let correct = roundtrip(&response_with(vec![
+        echo(2, 0, TransportMode::Datagram),
+        echo(2, 1, TransportMode::StreamPerGroup),
+    ]));
+    let swapped = roundtrip(&response_with(vec![
+        echo(2, 0, TransportMode::StreamPerGroup),
+        echo(2, 1, TransportMode::Datagram),
+    ]));
+
+    let counts = |r: &RegisterMeetingResponse| {
+        let mut modes: Vec<i32> = r
+            .applied_source_streams
+            .iter()
+            .map(|e| e.transport_mode)
+            .collect();
+        modes.sort_unstable();
+        modes
+    };
+    assert_eq!(counts(&correct), counts(&swapped), "counts read green");
+    assert_ne!(
+        correct.applied_source_streams, swapped.applied_source_streams,
+        "per stream, the swap is visible"
+    );
+    // An UNSPECIFIED echo survives as itself (a mismatch for MC, never a skip).
+    let unspecified = roundtrip(&response_with(vec![echo(2, 0, TransportMode::Unspecified)]));
+    assert_eq!(
+        unspecified.applied_source_streams[0].transport_mode,
+        TransportMode::Unspecified as i32
+    );
+}
+
+/// An EMPTY echo emits no field 6, so it is byte-identical to an MH that never
+/// heard of the field -- for MC that is "every sent stream missing", a
+/// mismatch, which only works if empty stays empty on the wire.
+#[test]
+fn empty_echo_emits_no_field_6_and_a_populated_one_does() {
+    let empty = top_level_field_numbers(&response_with(Vec::new()).encode_to_vec());
+    assert!(
+        !empty.contains(&6),
+        "empty echo must emit no field 6: {empty:?}"
+    );
+    assert!(
+        empty.contains(&2),
+        "positive control: applied_generation present"
+    );
+
+    let populated = top_level_field_numbers(
+        &response_with(vec![echo(2, 0, TransportMode::Datagram)]).encode_to_vec(),
+    );
+    assert!(populated.contains(&6));
+}
+
+/// Frozen tag numbers of the new internal messages, read from the bytes (a
+/// round trip through one codegen cannot catch a wrong tag).
+#[test]
+fn source_stream_and_echo_frozen_tags_are_on_the_wire() {
+    let stream = top_level_field_numbers(
+        &source(
+            1,
+            1,
+            TransportMode::Datagram,
+            SourceDisposition::Forward as i32,
+        )
+        .encode_to_vec(),
+    );
+    assert_eq!(stream, vec![1, 2, 3, 4]);
+
+    let echoed = top_level_field_numbers(&echo(1, 1, TransportMode::Datagram).encode_to_vec());
+    assert_eq!(echoed, vec![1, 2, 3]);
 }

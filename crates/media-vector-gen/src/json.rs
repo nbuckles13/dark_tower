@@ -115,7 +115,8 @@ pub struct KeyIdLayout {
     /// Width of `sender_id` in bits.
     pub sender_id_bits: u32,
     /// Width of the sender-scoped `stream` in bits. **Not** the relay
-    /// `stream_id`, which is subscriber-scoped and two bytes wide.
+    /// `stream_id` (hop-local, 16-bit, unauthenticated; see
+    /// `media_protocol::frame::KEY_ID_SENDER_ID_BITS`).
     pub stream_bits: u32,
     /// Width of `generation` in bits.
     pub generation_bits: u32,

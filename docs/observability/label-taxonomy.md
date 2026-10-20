@@ -640,7 +640,7 @@ The three exemptions:
 - `org_id`: the tenant. GC overwrites the client-sent value from the authenticated claims (R3 permits
   it; `crates/gc-service/src/services/telemetry_filter.rs::stamp_org_id`). A tenant is not a meeting
   or participant identity.
-- `slot_state`: the bounded eight-value state vocabulary from
+- `slot_state`: the bounded state vocabulary (mirrors the wire `SlotState` enum exhaustively) from
   `crates/mc-service/src/media_signaling/assignments.rs::slot_state_label`. It carries no slot index.
 
 **`meeting` overlaps `MEETING_ID_SUBSTRINGS`** in the hygiene kernel (R1). Both fire on

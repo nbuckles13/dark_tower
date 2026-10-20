@@ -104,8 +104,8 @@ pub fn mute_frame(audio_muted: bool, video_muted: bool) -> bytes::BytesMut {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted,
-            video_muted,
+            audio_muted: Some(audio_muted),
+            video_muted: Some(video_muted),
         })),
     })
 }
@@ -519,6 +519,8 @@ async fn try_join_with_role(
             correlation_id: String::new(),
             binding_token: String::new(),
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     }))
     .await
@@ -561,8 +563,8 @@ pub fn server_mute_frame(target: &str, audio_muted: bool) -> bytes::BytesMut {
         message: Some(client_message::Message::ServerMuteRequest(
             proto_gen::dark_tower::signaling::v1::ServerMuteRequest {
                 participant_id: target.to_string(),
-                audio_muted,
-                video_muted: false,
+                audio_muted: Some(audio_muted),
+                video_muted: Some(false),
                 reason: String::new(),
             },
         )),

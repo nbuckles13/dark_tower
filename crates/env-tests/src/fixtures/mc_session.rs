@@ -183,6 +183,10 @@ pub fn join_request(meeting_id: &str, join_token: &str, participant_name: &str) 
         correlation_id: String::new(),
         binding_token: String::new(),
         identity_public_key: sample_identity_public_key(),
+        // Story 3 join declarations: absent, the pre-story-3 wire, until
+        // MC-A's env-tests set them.
+        publish_kinds: Vec::new(),
+        receive_capability: None,
     }
 }
 

@@ -2,7 +2,8 @@
 
 **Status**: Accepted.
 
-**Date**: 2026-08-23 (revised 2026-08-27)
+**Date**: 2026-08-23 (revised 2026-08-27; amended 2026-10-13 for story 3, *See each other* — dated
+blocks below)
 
 **Deciders**: media-handler, meeting-controller, protocol, client, security, test, observability,
 operations. **auth-controller** reviewed §3 and §4 after the debate closed and corrected the
@@ -34,6 +35,11 @@ publisher produces — one encoding of one source, the unit a send directive nam
 a subscriber's receive position, identified by the stream id in the relay region (§2, §6). Where the
 distinction matters the text says which; where it says "per (connection, stream)" it means the
 **media stream**, never the QUIC stream.
+
+> **Amendment (2026-10-13, story 3).** "A slot is ... identified by the stream id in the relay
+> region" is true of the **downlink** only. Relay ids are **hop-local** (§2 *Header v3*): on the
+> uplink the relay `stream_id` carries the publisher's media-stream number (MC's send id), on the
+> downlink MH rewrites it to the subscriber's slot id.
 
 **How to read this document.** Sections 1–11 are prescriptive: they state what to build. A *Why*
 subsection appears only where the reasoning constrains implementation — where someone who knew only
@@ -107,6 +113,45 @@ share of it, and stream priority does not apply to datagrams at all. A video key
 starve audio, and it manifests as silent sender-side datagram drop rather than as delay. The
 guarantee is bounded head-of-line blocking. Nothing more.
 
+> **Amendment (2026-10-13, story 3 — on-demand keyframes; R-9, R-10, R-12, R-13, R-21).** The
+> text above assumes a periodic keyframe: the transport-parameter row's "five video slots at a
+> one-second keyframe cadence", "churn drops by the keyframe interval", and the closing paragraph's
+> "it also couples two parameters ... a shorter keyframe cadence improves switch latency and
+> worsens stream churn". Those sentences are kept so the change is visible; **there is no keyframe
+> interval any more.** What replaces them:
+>
+> - **Keyframes are produced on demand.** MH requests one from a publisher over the publisher's
+>   existing authenticated client↔MH connection, only after it has received at least one frame
+>   from that source stream, carrying the newest GoP counter it has seen (§2 *Header v3*), and
+>   retries at a configured interval until a group start arrives. A receiver whose slot loses
+>   decodability sends its handler a **recovery request** carrying the newest counter it saw on
+>   that slot; MH remaps it to the source stream (fields are remapped, never forwarded verbatim)
+>   and aggregates to at most one request per source stream per configured interval. The
+>   publisher produces a keyframe only for a request whose counter is **at least its current
+>   counter**, so stale, repeated, multi-receiver and multi-handler requests coalesce into one
+>   keyframe that reaches every target. Message shapes and the publisher's and MH's rules live at
+>   `signaling.proto` `KeyframeRequest` / `RecoveryRequest`; they are not restated here.
+> - **Switch latency is a request round trip plus encode**, and the stream-open rate follows
+>   keyframes **actually produced**, not a cadence. A publisher bounds its own rate at
+>   max(MC-directed minimum keyframe interval, a compiled client floor), so no subscriber churn,
+>   mute toggling, reconnect loop or compromised handler can raise it above that bound (§5).
+> - **Every hop abandons per destination.** A hop that cannot keep up with one destination — the
+>   publisher toward one of its handlers, MH toward one subscriber — abandons the current group
+>   **for that destination only**, with a capped per-destination backlog and a stream reset past
+>   the cap (a half-written frame is never left looking complete). It never stalls the encoder,
+>   the source's other destinations, or anyone's audio. **Recovery comes only from the next hop's
+>   ordinary keyframe request**; the publisher never keys itself on abandonment. An ended or reset
+>   source ends every downstream stream. Repeated recovery on a path below the fixed bitrate is
+>   accepted in story 3, counted, and bounded by the minimum keyframe interval.
+> - **MH forwards video cut-through.** It reads the frame header (the maximum payload is enforced
+>   against the length field before anything is accepted), writes a per-subscriber rewritten
+>   header, then passes payload bytes to each subscriber as they arrive — holding per incoming
+>   stream only a header and the chunk in flight. A publisher that stalls mid-frame is reset
+>   downstream after a configured bound, counted.
+>
+> The transport parameters table's *slow subscriber* reasoning stands unchanged: the application
+> bound must still trip well before the transport ceiling.
+
 ---
 
 ## 2. Frame format
@@ -138,6 +183,13 @@ PAYLOAD                   SFrame object: key id and authentication tag in its ow
 SIGNATURE                 Ed25519 over publisher region and payload (§3)
 ```
 
+> **Correction (2026-10-13, story 3).** The relay-region line above reads "stream id — which of
+> the subscriber's slots this frame fills". That is the **downlink** meaning only. Relay ids are
+> **hop-local**: on the uplink the publisher stamps the relay `stream_id` with its media-stream
+> number (MC's send id, `SendStream.stream_number`), which is MH's — unauthenticated — attribution
+> label; on the downlink MH rewrites it to the subscriber's slot id. The diagram is kept; the
+> normative layout is now the *Header v3* table at the end of this section.
+
 **The version is meeting-wide and MC-directed.** Because it sits in the publisher region it is
 signed, so **MH cannot rewrite it** — a relay cannot translate between header versions without
 breaking verification. Rather than weaken that, MC selects one version for the whole meeting from the
@@ -150,6 +202,14 @@ Two consequences. A mid-meeting joiner supporting only a lower version forces ei
 downgrade or exclusion, and that is MC's policy call. And a version change lands on a
 **transmit-key generation boundary**, because versions may differ in what the signature and
 associated data cover — and a sender rotates generations freely (§4), so no coordination is needed.
+
+> **Correction (2026-10-13, story 3; R-22).** The downgrade-or-exclusion choice above no longer
+> exists. **Header v3 is the only version**: there is no allowlist, no floor and no dual decode,
+> and no production clients exist to accommodate. A join whose declared header versions lack 3 is
+> refused at join, before admission, generically and counted at MC (MC-A;
+> `ParticipantCapabilities.supported_header_versions`); a frame of any other version is a decode
+> reject (`unknown_version`). The version field stays signed and MC-directed, and the
+> generation-boundary rule is moot while one version exists.
 
 **Two sequence numbers, because they answer different questions.**
 
@@ -271,6 +331,143 @@ Vectors are the **cheap, fast** gate, not the only one: end-to-end tests with re
 validate the same agreement against a running system, and catch what vectors cannot — that both
 implementations are wired into the paths they are supposed to serve. Vectors fail in seconds and
 localise the defect; end-to-end tests prove the composition. Both, for different reasons.
+
+### Header v3 — the normative layout (amendment 2026-10-13, story 3; R-9, R-22)
+
+> **Amendment (2026-10-13).** Version 3 adds **one** field, a 32-bit `gop_counter`, to the
+> publisher region, growing the fixed prefix from 10 to 14 bytes, and adds one decode reject
+> (`key_bearing_discardable`). It **replaces v2 as an intentional wire break of the frame header**
+> with no dual decode; v3 is the only version. This subsection is the complete specification: the
+> TypeScript codec (C-v3) and the Rust codec and vector generator (P2) are each written from it,
+> not from one another. Where this prose and the v3 cross-language vectors file P2 generates
+> disagree, **the vectors file wins** — and a vector contradicting a recorded ruling is a defect to
+> escalate, not to conform to (`docs/TODO.md` §Media Path Obligations).
+
+**Encoding.** Every multi-byte integer is unsigned and **big-endian**. Nothing is padded or aligned.
+
+**Fixed prefix — 14 bytes, absolute offsets, present on every frame.**
+
+| Offset | Size | Field | Region | Rule |
+|---:|---:|---|---|---|
+| 0 | 1 | `version` | publisher | `= 3`; any other value rejects `unknown_version` |
+| 1 | 1 | `flags` | publisher | bits below; legal mask `0x07` |
+| 2 | 4 | `payload_length` | publisher | bytes of payload; `≤ MAX_PAYLOAD_BYTES` (1 048 576) |
+| 6 | 4 | `stream_sequence` | publisher | per (sender, stream); the AEAD nonce input (§4) |
+| 10 | 4 | `gop_counter` | publisher | **new in v3**; rules below |
+
+**Flags.**
+
+| Bit | Value | Meaning |
+|---:|---:|---|
+| 0 | `0x01` | independently decodable — this frame starts a group |
+| 1 | `0x02` | discardable — publisher-declared, untrusted (§7) |
+| 2 | `0x04` | key-bearing — the wrapped transmit key follows the fixed prefix |
+| 3–7 | `0xF8` | undefined: any set bit rejects `reserved_flag_bit_set` |
+
+Key-bearing **and** discardable together reject `key_bearing_discardable`: a frame carrying a new
+key must never be droppable, or a receiver that dropped it could not open what follows (§4).
+
+**After the prefix, a cursor.** Each block below starts where the previous one ended; nothing is
+located by a recomputed absolute offset. With `cursor = 14`:
+
+| Block | Size | Present | Contents |
+|---|---:|---|---|
+| wrapped transmit key | 50 | iff key-bearing | `kek_generation` (2) ‖ wrapped key (32) ‖ wrap tag (16) |
+| `ext_length` | 2 | always | length of the extension region in bytes; `≤ MAX_EXT_BYTES` |
+| extensions | `ext_length` | always (may be 0 bytes) | TLV entries, grammar below |
+| *end of publisher region* | | | |
+| relay `stream_id` | 2 | always | hop-local relay id, below |
+| relay `hop_sequence` | 4 | always | per (connection, media stream), counts what the transmitter sent |
+| payload | `payload_length` | always | the SFrame object (key id and tag in its own clear header) |
+| signature | 64 | always | Ed25519 |
+
+The wrapped key is AES-256-GCM: the 32-byte ciphertext of the transmit key followed by its
+16-byte tag, under the meeting KEK of generation `kek_generation`. Its nonce and associated data
+are specified once, in §4 *In-band key carriage*, and not restated here.
+
+**Extensions.** `entry := ext_type (1) | value_len (1) | value (value_len)`. Every type must be in
+the registry (unknown types reject, never skip); types strictly ascending (no repeats); each
+`value_len` equals the registry's declared length (no zero-length entries); each value lies in the
+registry's accepted set; the region is consumed exactly. Any violation rejects
+`extensions_malformed`. The registry today is one entry — type `0x01` (salience), length 1,
+accepted `0..=100` — so `MAX_EXT_BYTES = 3`, derived as the sum of every registry entry's size.
+The normative registry and grammar are `crates/media-protocol/src/extensions.rs::EXT_REGISTRY`
+and its module doc, pinned cross-language in the vectors file's `extension_registry`; adding a
+type is a header-version bump.
+
+**Regions.** The **publisher region** is everything before the relay region: the fixed prefix,
+the wrapped key when present, `ext_length` and the extensions. It is the **AEAD associated data**
+(§4). The **signed input** is publisher region ‖ payload — the relay region is excluded from both,
+because MH rewrites it.
+
+**Frame extent.** `frame_len = 14 + (key-bearing ? 50 : 0) + 2 + ext_length + 6 + payload_length +
+64`. It is knowable once the bytes through `ext_length` are present; the largest header a reader
+ever needs before knowing it is `MAX_HEADER_BYTES = 14 + 50 + 2 + MAX_EXT_BYTES + 6`. A **stream
+reader** (video) consumes exactly `frame_len` bytes per frame, the next frame starting at the next
+byte, and checks `payload_length ≤ MAX_PAYLOAD_BYTES` and `ext_length ≤ MAX_EXT_BYTES` **before
+allocating** from either; a shortfall on a stream is "need more bytes", never a reject. A
+**datagram** (audio) must contain exactly one frame: bytes beyond `frame_len` reject
+`trailing_bytes`, which is therefore a datagram-only reason.
+
+**Decode order — normative.** Checks run in this order; the first failure is the reported reason.
+"Shortfall" means the bytes are not yet present: on a stream it is incomplete (not a reject), on a
+datagram it rejects with the reason shown.
+
+| Step | Check | Reject token |
+|---:|---|---|
+| 1 | `version` byte present | shortfall → `truncated` |
+| 2 | `version == 3` — terminal even on a one-byte buffer | `unknown_version` |
+| 3 | the 14-byte fixed prefix present | shortfall → `truncated` |
+| 4 | no flag bit outside `0x07` | `reserved_flag_bit_set` |
+| 5 | not (key-bearing **and** discardable) — **new** | `key_bearing_discardable` |
+| 6 | `payload_length ≤ MAX_PAYLOAD_BYTES`, before anything is sized from it | `payload_length_exceeds_max` |
+| 7 | `stream_sequence` read; every value accepted | — |
+| 8 | `gop_counter` read; **every u32 accepted**, 0 and `u32::MAX` included — **new** | — |
+| 9 | if key-bearing, the 50-byte wrapped key present | shortfall → `truncated` |
+| 10 | `ext_length` present, then `ext_length ≤ MAX_EXT_BYTES` (limit before availability) | shortfall → `truncated`; `extensions_too_large` |
+| 11 | extension region present, then its grammar | shortfall → `truncated`; `extensions_malformed` |
+| 12 | relay region present | shortfall → `truncated` |
+| 13 | body present, by this arithmetic: `remaining = len − payload_start`; if `remaining < 64` the signature is short; else if `payload_length > remaining − 64` the payload is short | shortfall → `truncated` (signature) / `payload_length_exceeds_available` (payload) |
+| 14 | datagram only: no byte after the signature | `trailing_bytes` |
+
+That is the **closed codec reject vocabulary**: `unknown_version`, `reserved_flag_bit_set`,
+`key_bearing_discardable`, `payload_length_exceeds_max`, `payload_length_exceeds_available`,
+`truncated`, `extensions_too_large`, `extensions_malformed`, `trailing_bytes`. Verification and
+decryption reasons belong to the receiver, not the codec. **Why step 5 sits there:** it is a
+grammar check on the flag byte alone, so it is decidable — and terminal — as soon as the prefix is
+present, like step 4; it follows step 4 so a byte that sets an undefined bit reports the broader
+`reserved_flag_bit_set`, and it precedes every length check so no allocation or cursor work
+happens for a frame that can never be legal. `gop_counter` has no check because no value is
+illegal on the wire; its rules bind the sender. **Step 13 is arithmetic, not "are the 64 bytes at
+`payload_start + payload_length` present":** a datagram carrying the whole payload but only 10 of
+the 64 signature bytes reports `payload_length_exceeds_available`, as both codecs do.
+
+**Encode side.** An encoder MUST refuse to produce any frame this decoder would reject: in
+particular key-bearing **and** discardable, `payload_length > MAX_PAYLOAD_BYTES`, an extension
+region over `MAX_EXT_BYTES` or outside the registry grammar, and a key-bearing flag that disagrees
+with the presence of the wrapped key.
+
+**`gop_counter` rules.** Per (sender, media stream). It **increments on every independently
+decodable frame** — so on every audio frame, with no per-kind branch — and every frame of a group
+carries its group-starting frame's value. It **never resets while the sender id lives** (it may
+restart on a story 2 R-16 sender-id reissue). It **never wraps**: at `u32::MAX` the sender stops
+that stream, counts it, and resumes only under a fresh stream number or sender id. It is stream
+identity: never a log field, metric label, span attribute or test-bus value (§11).
+
+**Relay ids are hop-local.** The relay `stream_id` is 16 bits; its meaning depends on the hop.
+**Uplink** (publisher → MH): the publisher stamps MC's send id for that stream
+(`SendStream.stream_number`; audio 0, video 1 today), through one function for both kinds. It is
+**MH's attribution label** — publisher-set and **unauthenticated**, never cross-checked against the
+key id (§7). **Downlink** (MH → subscriber): MH rewrites it to the subscriber's slot id, which the
+receiver validates against its own declared slots. The uplink `hop_sequence` is carried and not
+validated by MH. Do not conflate the 16-bit relay field with the key id's 8-bit `stream` field:
+on the uplink they carry the same value in two fields of different width and different trust.
+
+**Version.** v3 is the only version. A frame of any other version rejects `unknown_version`; a
+join not declaring 3 is refused (§2 above). v2 is an intentional wire break with no dual decode,
+cut over atomically with the TypeScript and Rust codecs (P2). The v2 vectors file
+(`proto/test-vectors/frame-v2.vectors.json`) governs only until P2 replaces it with the v3 vectors
+file it generates.
 
 ---
 
@@ -408,6 +605,13 @@ nonce is derived, not carried).
 | Video | the first **N** frames of every group, N small and configured (default 3) | a group is a QUIC stream and a switch lands on a group start (§7), so a subscriber's first frame from a new source is key-bearing by construction. Streams are reliable, so N=1 would suffice; N>1 is cheap insurance against a reader that starts one frame late |
 | Audio | **every frame** | audio switching is instantaneous and autonomous at MH (§7), so a receiver's first frame from a newly selected speaker must be decryptable with no wait at all. Every-other-frame would save half the bytes for a 20 ms worst-case hole on every speaker change; every frame is the deterministic rule and the difference is small |
 
+> **Amendment (2026-10-13, story 3; R-14).** The video row's "the first **N** frames of every
+> group" becomes **the first N frames after ANY transmit-key change** — a rotation every T, a group
+> start, or a KEK receipt (*Rotation* below) — N configured, default 3. A **key-bearing frame is
+> never discardable**: the header rejects the combination (`key_bearing_discardable`, §2 *Header
+> v3*). Because a mid-group rotation carries its key in-band on the next N frames, **neither T nor
+> a leave-triggered KEK rotation forces a keyframe**. The audio row is unchanged.
+
 **Cost, stated plainly.** On audio this adds ~50 bytes to the ~174 of §3, so a 20 ms Opus stream
 goes from ~70 kbps to roughly **90 kbps**; five audio slots is about 450 kbps per subscriber, still
 small against video. The cost is bandwidth only — a receiver holding the key does no per-frame
@@ -493,6 +697,17 @@ requires. Nothing needs to coordinate which stream numbers are live.
 | MH failover or reassignment | **Not a trigger.** MH never held keys. |
 
 > **Correction (2026-09-22, story 2 planning).** The leave row previously read 'bounded by W and by nothing else'. That reasoning tracked only the wrapped key and missed the cached plaintext: receivers cache the unwrapped transmit key, so a leaver continued to decrypt after the rotation until each sender's next generation bump — a bound of W plus one transmit-key interval, with that interval unconfigured anywhere in the tree. A reader who trusted the original would have stated an exposure window shorter than the one the system delivered. The fix is the new trigger row rather than a weaker claim, because sender rotation is free and restores the bound as written.
+
+> **Amendment (2026-10-13, story 3; R-14).** The *Transmit-key cadence* row's video half — "on
+> every video group" — becomes: **video transmit keys rotate every T** (a period configured
+> separately from audio's), **at every group start, and on every KEK receipt**. With no keyframe
+> interval (§1) a group can be arbitrarily long, so "every group" alone would leave a leaked video
+> key unbounded in time; T restores the bound. The *Meeting KEK rotated* row applies to video
+> exactly as to audio, so **the leaver bound W holds for video**. Neither T nor a KEK rotation
+> forces a keyframe: the new key rides the next N frames (cadence amendment above). **All nonce and
+> replay invariants hold per (KEK generation, sender, stream)** — the scope of the 2026-09-26
+> amendment, with the media stream made explicit because video and audio are now separate streams
+> of one sender. A replayed earlier video group is rejected, never re-rendered.
 
 **Rate-limit rotation per participant and evict flappers.** A client in a reconnect loop must not be
 able to force a KEK rotation per cycle; the leave debounce covers that, and the per-sender generation
@@ -675,6 +890,12 @@ a local decision rather than a round trip — and it keeps two different states 
 *"MC has not asked you to send"* and *"you have muted yourself"* have different resumption costs and
 should not collapse into one.
 
+> **Correction (2026-10-13, story 3; R-8, R-15–R-18).** "MC keeps the send directive active while a
+> client reports itself muted" is now a **MAY**, and only for **client** mute: the directive stays
+> blind to client mute and MC may leave it in place. It never applied to server mute, and the
+> directive is now also withdrawn when **nobody watches** the stream (R-8), so an active directive
+> no longer follows from "not client-muted". The sentence is kept above so the change is visible.
+
 Muting **signals out of band** rather than transmitting substitute media. Audio simply stops; there
 is no keyframe to resume from, so restart is immediate. Video stops and the receiver renders a
 placeholder from the slot state (§6), not from a frame — sending encoded black or an avatar burns
@@ -684,6 +905,40 @@ would also be defensible; sending nothing is better.
 *Muted*, *silent*, and *the network died* are indistinguishable to MH, which is exactly why the mute
 signal must travel out of band rather than be inferred from absence. **NAT bindings are kept alive by
 QUIC's connection-level keepalive** (§1), not by media flow, so a long mute does not cost the path.
+
+> **Amendment (2026-10-13, story 3 — four mute controls; R-8, R-15, R-16, R-17, R-18).** The
+> table's server-mute row ("enforced at MH, at ingress") gains a first line of enforcement.
+>
+> - **Four independent controls** — client audio, client video, server audio, server video. They
+>   compose: a request about one kind never changes the other kind, and client and server mute of
+>   one kind are independent. Server mute and unmute are host-only, refused generically and
+>   counted, rate-bounded.
+> - **Server mute withdraws the directive.** While a kind is server-muted its stream is directed
+>   with an **empty target set**, so capture stops (for video the camera light goes off), **and**
+>   MH keeps dropping that stream at ingress as the **backstop** against a patched client (§7).
+> - **Client mute MAY stay directed**, and nothing of that kind leaves the device — no silence, no
+>   DTX, no video. MH learns client mute only through MC's policy, as a *paused* source (§7).
+> - **Devices.** Any video mute, client or server, stops the camera track. An audio client mute
+>   keeps the microphone open and only stops sending.
+> - **Directives follow watchers.** MC directs a kind only while at least one subscriber holds it
+>   in a slot of that kind and it is not server-muted; withdrawal is an empty target set, never
+>   removal from the directive, and a kind the participant does not publish is never listed. Every
+>   start or resume begins with a keyframe.
+> - **A host action can resume a participant's camera or microphone.** A server unmute restores
+>   capture **unless the participant is client-muted**, and the participant is shown a
+>   **non-suppressible notice** at that moment, able to client-mute at once.
+> - **Ordering obligation and fail-safe.** A participant learns its own server-mute state only from
+>   its own copy of the mute notification, so MC MUST send that self copy **before** the directive
+>   change that restores capture, on the same MC-to-client signalling stream, in order. Whatever
+>   the order actually observed, a client MUST NOT resume capture on a server-unmute path without
+>   showing the notice.
+> - **Keyframe requests cannot defeat any of this.** A keyframe request (§1) never starts capture
+>   and never makes a muted or undirected stream send; a publisher honours one only for a stream it
+>   is currently sending to that handler, at most once per max(directed minimum interval, compiled
+>   floor).
+>
+> Wire homes: `signaling.proto` mute section, `SendDirective`, `SendStream.targets`,
+> `ParticipantMuteUpdate`.
 
 ---
 
@@ -713,6 +968,48 @@ Slot count is capped server-side by configuration.
 *Withheld by congestion*, *fewer sources*, and *source unreachable* are indistinguishable to a client
 — all present as no media — and render completely differently. A naive client shows the same spinner
 for a bandwidth problem, an under-filled grid, and a participant it can never see.
+
+> **Amendment (2026-10-13, story 3 — flat slot states; R-1, R-3, R-4, R-5).** The table above is
+> superseded by a **flat** state set: one value per thing a receiver renders, so "live plus a
+> reason" is unrepresentable and each value maps one-to-one onto telemetry. The wire home is
+> `signaling.proto` `SlotState` and `StreamAssignment.sender_id`.
+>
+> | State | Names a sender? | Character |
+> |---|---|---|
+> | Active (live) | **video: no** — the client attributes from the verified key-id sender; audio: yes | steady |
+> | Avatar — no video (participant publishes none; video slots only) | yes | steady |
+> | Avatar — client-muted (both kinds) | yes | steady |
+> | Avatar — server-muted (both kinds; **wins** over client-muted) | yes | steady |
+> | Fewer sources than slots | no | steady |
+> | Unavailable (declared slot over the per-kind cap) | no | permanent for the declaration |
+>
+> - *Source present, far-end muted* is **superseded** by the two muted avatars and deleted by MC-B.
+>   *Zero requested* is **reserved**: a subscriber declaring zero of a kind owns no slot id of that
+>   kind to echo, so the state is unemittable.
+> - *Withheld by congestion*, *source unreachable* and *switch pending* are **retained but never
+>   emitted**; a client receiving one fails closed and counts it. Congestion withholding is not
+>   built; unreachability stays a per-subscriber list rather than a slot (§9, story 2 R-33);
+>   pending is MH-internal (below).
+> - **Truncation, not rejection.** Slot count is capped **per kind** server-side. A declaration
+>   over a kind's cap keeps the first `cap` slots of that kind in declaration order, and each
+>   excess slot reports *Unavailable* — visible, never a silent participant, never a join failure.
+>   This supersedes the reject-the-declaration rule and story 2 R-1's fail-loudly rule. A video cap
+>   of 0 makes every video slot Unavailable: the operator's video-off lever.
+> - **MC never names the live video source.** Naming it would race the new source's keyframe (and
+>   active-speaker switching later). Video slots take any participant sharing a connected handler
+>   with the subscriber, receive-only participants included as *no video*.
+> - **Pending is MH-internal.** "Source assigned, no group start yet" persists with **no give-up
+>   timeout** while the source stays assigned, and is visible only as an MH metric. The MH-to-MC
+>   switch-completion report is deferred to story 5. This closes the Open Item *"The
+>   switch-abandonment bound is unspecified"*.
+> - **Video decode-before-active.** Video is verified first. A frame whose signature verifies
+>   against a rostered sender may be decrypted and decoded **whatever the slot's state**, so it is
+>   ready when the slot turns active; it is **rendered only in an Active slot**, attributed to the
+>   verified key-id sender, and never shown in an avatar slot. On active→avatar the slot switches
+>   at once and trailing frames are ignored; on avatar→active it keeps the avatar until the first
+>   frame decodes. Self frames, and video frames from a sender server-muted for video, are
+>   dropped (the latter is the receiver-side signal that MH's video ingress drop failed). **Audio keeps drop-before-open** for
+>   unassigned senders. Media kind is taken from the slot, never the frame.
 
 ### Why capability, not layout
 
@@ -789,6 +1086,10 @@ the next group; and it sets stream-open rate, since a group is a stream (§1). S
 the first and worsens the second. Under per-frame streams these were independent; they no longer are,
 and the value should be chosen knowing both.
 
+> **Correction (2026-10-13, story 3).** There is no keyframe cadence to choose (§1 amendment). A
+> switch waits for a keyframe **requested** from B — a request round trip plus encode — and stream
+> opens follow keyframes actually produced. The paragraph above is kept so the change is visible.
+
 Because MC turns off publishers nobody watches (§5), **B may not be sending at all**, so the switch
 is two phases:
 
@@ -809,6 +1110,16 @@ up to one keyframe interval.
 | B departs before producing a usable frame | Abandon and retain A; the slot must not go dark |
 | B never produces one | Bounded wait, then a defined slot state — **this bound is an open item** |
 | A second switch arrives for the same slot | Supersedes the pending one; the superseded command is reported abandoned |
+
+> **Amendment (2026-10-13, story 3; R-4, R-10).** The *B never produces one* row's "bounded wait
+> ... **this bound is an open item**" is resolved: **there is no give-up timeout** while B stays
+> assigned. MH holds A (or, for a first source, forwards nothing — a subscriber's first forwarded
+> frame from any source is a group start) and requests a keyframe from B once it has seen at least
+> one frame from B, retrying until a group start arrives; a source never seen waits silently,
+> which MC's "watched implies directed" makes finite. A switch to a **paused** (client-muted)
+> source completes at once as "forward nothing", cancelling the keyframe wait. "Pending" is
+> MH-internal and visible only as an MH metric; MH's completion report to MC, described in the
+> paragraphs below, is **deferred to story 5**, which needs it for dynamic selection.
 
 **MH reports completion to MC by command identifier, never by state description.** If MC switches a
 slot to B, reverts to A, then switches to B again, a report reading *"A→B complete"* is ambiguous
@@ -839,6 +1150,34 @@ is a real addition to the selection rule model rather than a property that falls
 
 v1 does not ship asymmetric permissions. Nothing in the edge model precludes them, but the selector
 must be designed knowing that per-subscriber exclusions are where they will land.
+
+> **Amendment (2026-10-13, story 3 — per-kind server mute in slot terms; R-16, R-20).** Server mute
+> is now **per kind**. MC's registration snapshot declares every source stream with a behaviour —
+> forward, paused (client mute), or drop at ingress (server mute) — replacing the sender-only muted
+> set (`internal.proto` `SourceStream`, `SourceDisposition`).
+>
+> - **Attribution.** MH attributes every ingress frame to exactly one declared stream by
+>   (connection-bound sender, **uplink relay id**) — the hop-local id the publisher stamps with
+>   MC's send id (§2 *Header v3*) — looked up in MC's declared list, with the arrival transport
+>   checked for consistency. MH never parses the payload and never distinguishes audio from video.
+>   An unknown id drops as an unmatched stream; a declared id on the wrong transport drops as a
+>   transport mismatch; an attributed frame forwards only along that stream's edges. An edge's
+>   transport derives from its candidate's declared stream. **Each independent stream — simulcast
+>   layers later — gets its own id.**
+> - **The label is unverified and publisher-set.** MH does not authenticate it, and a signed copy
+>   was considered and dropped: the publisher sets both label and key id, so signing protects
+>   nothing.
+> - **The property is stated in slot terms, never as MH identifying a frame's true stream:** nothing
+>   from a sender whose kind is server-muted reaches a subscriber's slot of that kind. Every declared
+>   stream of a server-muted kind is dropped at ingress (MC sets DROP_AT_INGRESS on each, simulcast
+>   layers included), so that kind has no live route; a frame relabelled onto any other declared
+>   stream of the sender must match that stream's declared transport, and reaches only that
+>   stream's slots, which are of a kind not server-muted; and receivers decode by slot kind, never by frame (§6), which is a
+>   load-bearing receiver dependency. The single home of this reasoning, including the dated
+>   correction of the earlier "per-kind ingress mute is foreclosed" text, is `internal.proto`
+>   `MutedSource`.
+> - **Priority.** MC assigns audio edges priority group 1 and video edges 2 (lower is higher), and
+>   video edges supersede on an independently-decodable frame — behaviours, not media types.
 
 ---
 
@@ -964,6 +1303,12 @@ a thousand concurrent meetings, into a hash-map insert.
   declared once by MC and echoed by MH. The cautionary precedent is a capacity value advertised to GC
   and enforced nowhere — declared in one place, assumed in another, verified nowhere.
 
+> **Amendment (2026-10-13, story 3).** Transport mode is now declared **per source stream** in the
+> snapshot and echoed **per stream** from the applied snapshot (`applied_source_streams`); MC
+> compares per stream, unconditionally, and per-mode counts are not a substitute (a swap reads green
+> on counts). The single per-meeting echo and the edge-level transport field are superseded and
+> deleted by MC-B. Server mute in the snapshot is the per-stream disposition of §7's amendment.
+
 **Deferred with a trigger**: a streaming channel carrying deltas, when sub-cadence recovery becomes a
 requirement or meeting size × structural churn makes full-snapshot re-assert too costly. The delta
 capability is unused at v1 sizes, which is why streaming's only present gain would be sub-cadence
@@ -1065,6 +1410,15 @@ with zero syscalls. Absolute numbers are not meaningful on a shared laptop; delt
   syscalls**.
 - **The measurement seam**: first-media-received on the client, forward histograms on MH, sampled
   from the start.
+
+> **Amendment (2026-10-13, story 3 — client video pipelines; R-6).** The client gains a gate of its
+> own: **one video decode pipeline (jitter buffer plus decoder) per video slot**, M in total. A new
+> source on a slot **reuses that slot's pipeline** — no new decoder and **no jitter-buffer flush**:
+> the old source's remaining frames play out, then the new source's from its keyframe, with its
+> timestamps **re-based onto the current playout timeline** so relative delay is unchanged. A fault
+> on one slot never stalls or corrupts another slot or audio. **Decode resources are bounded by M**,
+> never by sender count; decoded video above the configured receive bounds is dropped and counted.
+> Deadline logic in these tests runs on an injected clock, as everywhere in this section.
 
 ---
 
@@ -1283,6 +1637,8 @@ answer to deferring performance work.
 - **Historical per-meeting debugging has no retention posture.** §11 accepts the in-memory metadata leak and bounds live per-participant resolution to an auto-expiring ring buffer, which serves debugging a meeting while it runs and cannot serve debugging one after it has ended. Operations will need the latter. Retaining per-meeting, per-participant quality data is exactly what §11 forbids, because the time-ordered per-stream record is the voice-activity trace; a decision is needed on the aggregation floor, the store, the retention period, access control, the widened adversary set (storage, backups, time), and the interaction with §4's guest pseudonymity. Recorded as open; it is a §11 amendment and belongs to its own debate.
 - **The switch-abandonment bound is unspecified** (§7): how long MH waits for a source that never
   produces a usable frame, and what the slot becomes when it gives up.
+  **CLOSED 2026-10-13 (story 3):** there is no give-up timeout while the source stays assigned;
+  pending is MH-internal. See §6's and §7's 2026-10-13 amendments.
 - **The shared-atomic contention benchmark is unresolved.** Named at the outset as the item most
   likely to be wrong in the telemetry design; a falsifiable prior exists and it runs with the fan-out
   spike. Reported open rather than absorbed, because everything around it converged and it did not.
@@ -1405,6 +1761,11 @@ delimits frames sharing a group's stream.
 Flags decode rejects any bit beyond those defined. A maximum-payload constant is enforced
 pre-allocation in both languages. Decode slices rather than copies.
 
+> **Correction (2026-10-13, story 3).** "Version 2" above is superseded: the frame header is
+> **version 3**, the only version, specified normatively in §2 *Header v3* — not re-tabulated here.
+> v3 adds the 32-bit `gop_counter` to the publisher region (fixed prefix 10 → 14 bytes) and the
+> `key_bearing_discardable` decode reject; relay ids are hop-local.
+
 **Signalling contract** — delete the layout messages, the duplicate media-type enums, and the
 single-key encryption message. Add: a receive-capability declaration with per-slot media kind and
 optional pin; a slot-state enum with the seven states of §6; a send directive listing streams to
@@ -1415,6 +1776,16 @@ generation on rotation. The roster gains, per participant, an AC-attested identi
 client-validated, never trusted from MC. **No key material rides on the roster.** The existing host-mute request message is **renamed to
 server mute** per §5's terminology; it is the same message, and the rename should land with the other
 signalling changes rather than separately.
+
+> **Amendment (2026-10-13, story 3 — signalling delta; wire home `signaling.proto`).** The join
+> carries the participant's fixed publish set and its initial receive declaration; the join
+> response carries per-kind slot caps (the single total cap is superseded). VP8 joins the codec
+> vocabulary, and a video stream's encoding parameters carry a required minimum keyframe interval.
+> Per-kind mute fields gain explicit presence (absent = unchanged). The slot-state enum is flat
+> (§6 amendment): four new values, one superseded, one reserved. A join not declaring header v3 is
+> refused. The client↔MH bidirectional stream carries a recovery request (client to MH) and, in a
+> new MH-to-client envelope, a keyframe request (MH to client), with the same framing as the
+> connect message.
 
 **Internal contract** — delete the routing RPC and its transcode and mix options, which describe a
 transcoding-mixer relay that cannot exist under end-to-end encryption and is called from nowhere.
@@ -1428,10 +1799,20 @@ releases a handler's routing state and edge budget and carries no policy. Its re
 handler identifier, a process-start epoch, and the **applied** generation. A slot-state notification
 carries §6's states plus §7's switch-completion reports keyed by command identifier, debounced by MH.
 
+> **Correction (2026-10-13, story 3 — internal delta; wire home `internal.proto`).** "Server mute
+> rides the snapshot as a meeting-level, sender-scoped set: MH cannot read or authenticate a
+> publisher's stream number, so a per-stream mute would be enforced nowhere" is superseded. The
+> snapshot now declares every **source stream** — (sender, stream, transport, disposition: forward,
+> paused, drop at ingress) — and per-kind server mute holds in slot terms (§7 amendment). Transport
+> is declared per source stream and echoed per stream; the edge-level transport field, the single
+> transport echo and the sender-only muted set are superseded and deleted by MC-B. The slot-state
+> notification and switch-completion report remain unbuilt; the report is deferred to story 5.
+
 **Transmit keys ride in frames, not in signalling.** The publisher region gains a **key-bearing**
 flag and, when set, a fixed-size wrapped transmit key — AES-256-GCM under the meeting KEK, nonce
 derived from the key id, key id as associated data, carrying the KEK generation — on the first N
 frames of every video group and on every audio frame (§4). It is signed; MH forwards it unchanged.
+*(2026-10-13: for video, "the first N frames after any transmit-key change" — §4 amendment.)*
 **No key material crosses the MC→MH contract**, and the credential-leak guard covers KEK and
 transmit-key material **in logs**.
 
@@ -1473,12 +1854,13 @@ Each story ends in something a person can demonstrate in a browser:
 
 1. **Hear yourself** — single-client audio loopback through the handler. *(delivered — `docs/user-stories/2026-08-27-hear-yourself-through-handler.md`)*
 2. **Hear each other** — **N+1 participants hear each other**, where **N = a configurable number of client audio receive slots** (N may be 1 or larger); a static fill (join-order), *not* speaker-based selection; plus **server mute** and **KEK rotation on leave**. Enabled by story 1's deliberately general N=1 assignment. *(planned — `docs/user-stories/2026-09-21-hear-each-other.md`; scope re-confirmed 2026-09-22: loopback removed outright; participants may span the meeting's handler set with the N+1 rule applied within a handler and cross-handler peers reported unreachable per §9 — no cascade and no client multi-handler send, which stay in story 6; attestation stays out.)*
-3. **See each other** — video.
-4. **Survive a handler restart** — §8 periodic re-assert of policy.
-5. **A crowded room picks the right speakers** — **dynamic (active-speaker) selection**, replacing story 2's static fill when there are more senders than a receiver's slots.
+3. **See each other** — video. *(planned — `docs/user-stories/2026-10-07-see-each-other.md`: independent N audio and M video slots, on-demand keyframes, four mute controls, flat slot states, header v3. Its profile-derived stream cost — MH deriving both egress costs from the shared `media-codec-profile` — is **interim**, pending the adaptive-capacity story below.)*
+4. **Survive a handler restart** — §8 periodic re-assert of policy. *(2026-10-13: gains resume and keyframe jitter after a mass reconnect, moved from story 3.)*
+5. **A crowded room picks the right speakers** — **dynamic (active-speaker) selection**, replacing story 2's static fill when there are more senders than a receiver's slots. *(2026-10-13: a dynamic switch keeps the old source directed until MH confirms the swap landed on the new source's keyframe, which needs the MH-to-MC switch-completion report deferred from story 3 R-4.)*
 6. **Two handlers, one meeting** — cross-handler forwarding.
 7. **Historical meeting debug** — per-meeting/per-client quality records with a retention posture (a §11 amendment).
 8. **Performance** — targets, benchmarks, tuning (the Tier-2 regression benchmark and the three experiments).
+9. **Adaptive capacity** *(added 2026-10-13; position in the arc not yet scheduled)* — MH monitors its own fullness; per-stream profiles from 90p to 4K under user and org limits; GC places on live headroom; consider a client-count resource model (like `MH_MAX_CONNECTIONS`) in place of the bitrate budget, since slot caps bound per-client egress. Replaces story 3's interim profile-derived stream cost.
 
 **Re-scopes from the original plan (recorded so the reasoning isn't lost):**
 - **Attestation was pulled out of story 2 into its own story.** Story 1 publishes the client's Ed25519 `identity_public_key` on the roster **unverified** (trust-on-first-use). Binding it to an authenticated identity via a `cnf` thumbprint is only as meaningful as the identity it binds to — under the current **operator key-custody** model (MC holds the KEK; §4 / ADR-0024 §5.7 risk acceptance) and largely pseudonymous participants, its marginal value is mostly semantic. It earns its keep once there is a genuine notion of identity to bind to, and/or a move toward removing operator key custody, for which it is the foundation. Sequenced then, not bundled into the first multi-party story.

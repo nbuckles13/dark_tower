@@ -120,6 +120,8 @@ async fn open_bi_send_join(
             // this test exercises the join path, not attribution, and MC performs
             // no attestation check this story.
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     };
     let encoded = msg.encode_to_vec();
@@ -413,8 +415,8 @@ async fn accept_loop_records_session_join_failure_internal_for_wrong_first_messa
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted: true,
-            video_muted: false,
+            audio_muted: Some(true),
+            video_muted: Some(false),
         })),
     };
     let encoded = mute_msg.encode_to_vec();

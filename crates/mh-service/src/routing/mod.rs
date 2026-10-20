@@ -17,6 +17,14 @@
 //! | `egress_stream_id` | one registration | `internal.proto::EgressStream.egress_stream_id` |
 //! | `stream_number` | one sender | `signaling.proto::SendStream.stream_number` |
 //!
+//! The frame's relay-region `stream_id` is **hop-local** (ADR-0036 §2,
+//! amendment 2026-10-13) and carries two of these identifiers on different
+//! hops: on the UPLINK it is the publisher's `stream_number` (MC's send id,
+//! publisher-set, unauthenticated, never cross-checked against the key id), on
+//! the DOWNLINK MH writes the subscriber's `slot_id`. It is not merely
+//! subscriber-scoped. Attribution by (connection-bound sender, uplink id) is
+//! stated at `internal.proto::SourceStream`.
+//!
 //! `sender_id` is the load-bearing case. It is a **16-bit per-meeting ordinal**
 //! (the `SFrame` key id is `sender_id`(16) | `stream`(8) | `generation`(40)), so
 //! `sender_id` 5 exists *concurrently in every meeting on this handler*. A flat
@@ -197,8 +205,10 @@ impl SlotId {
 /// the same sender** — the same bug class as an over-wide `sender_id`, one
 /// scope down.
 ///
-/// This is NOT [`SlotId`], which is 16-bit and lives in the relay region rather
-/// than in the signed key id.
+/// This is NOT [`SlotId`]. Both values travel in the 16-bit relay-region
+/// `stream_id`, on different hops: this one on the uplink (the publisher's
+/// label), the slot id on the downlink. Only this one also lives in the signed
+/// key id, and the relay copy is never cross-checked against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamNumber(u8);
 

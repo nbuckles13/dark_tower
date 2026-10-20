@@ -323,6 +323,52 @@ async fn empty_envelope_oneof_rejected_on_wt_accept_path() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn recovery_request_as_first_message_rejected_on_wt_accept_path() {
+    // A known non-connect variant (story 3 `RecoveryRequest`) as the FIRST
+    // framed message is not a connect (signaling.proto `MhClientMessage`):
+    // the same generic invalid-connect reject as an empty oneof, with no JWT
+    // ever extracted, so no validation counter moves.
+    use prost::Message;
+    use proto_gen::dark_tower::signaling::v1::{
+        mh_client_message, MhClientMessage, RecoveryRequest,
+    };
+
+    let mc_client = make_mc_client();
+    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+
+    let snap = MetricAssertion::snapshot();
+    let envelope = MhClientMessage {
+        message: Some(mh_client_message::Message::RecoveryRequest(
+            RecoveryRequest {
+                slot_id: 0,
+                sender_id: 1,
+                gop_counter: 0,
+            },
+        )),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    };
+    let encoded = envelope.encode_to_vec();
+
+    let (_conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
+    write_framed(&mut send, &encoded)
+        .await
+        .expect("failed to write recovery-request-first envelope");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    snap.counter("mh_webtransport_connections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(1);
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[("result", "failure")])
+        .assert_delta(0);
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[("result", "success")])
+        .assert_delta(0);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn expired_meeting_jwt_rejected_on_wt_accept_path() {
     let mc_client = make_mc_client();
     let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;

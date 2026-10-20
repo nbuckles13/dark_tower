@@ -177,6 +177,7 @@ pub fn probe_registration(
         selection_rules: None,
         policy_generation: generation,
         server_muted_sources: Vec::new(),
+        source_streams: Vec::new(),
     }
 }
 

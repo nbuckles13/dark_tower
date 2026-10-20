@@ -233,8 +233,6 @@ function mapSlotState(state: SlotState): StreamAssignmentEvent['slotState'] {
       return 'withheld_congestion';
     case SlotState.FEWER_SOURCES_THAN_SLOTS:
       return 'fewer_sources';
-    case SlotState.ZERO_REQUESTED:
-      return 'zero_requested';
     case SlotState.SOURCE_UNREACHABLE:
       return 'source_unreachable';
     case SlotState.SWITCH_PENDING:
@@ -741,9 +739,11 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    *
    * INFORMATIONAL. Client mute is enforced at capture and must not depend on the
    * server honouring it; this report is what keeps MC's view accurate and what
-   * lets other participants render the state, and MC KEEPS THE SEND DIRECTIVE
-   * ACTIVE regardless — which is what makes unmute instantaneous and keeps "MC
-   * has not asked you to send" distinguishable from "you have muted yourself".
+   * lets other participants render the state. MC MAY leave the send directive
+   * in place under client mute, which keeps "MC has not asked you to send"
+   * distinguishable from "you have muted yourself"; a server mute or an
+   * unwatched kind withdraws it (signaling.proto `SendDirective`; ADR-0036 §5,
+   * correction 2026-10-13).
    *
    * @throws {SignalingError} `Transport` if called before join settled or after teardown.
    */
