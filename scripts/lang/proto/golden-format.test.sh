@@ -40,7 +40,7 @@ GOLDEN="scripts/lang/proto/fixtures/golden-format.proto"
 MESSY="scripts/lang/proto/fixtures/golden-format.messy.proto"
 # The buf version that produced the committed golden. Sidecar constant, NOT inside the golden (see header).
 # Bump this AS PART OF regenerating the golden in the buf-bump ceremony.
-BUF_GOLDEN_VERSION="1.72.0"
+BUF_GOLDEN_VERSION="1.74.0"
 
 # (0) FAIL-CLOSED PREFLIGHT FIRST — the golden-poisoning gate. A stale/absent toolchain or a running buf !=
 #     the lockfile pin reds HERE with the version token, so the golden check below only ever runs under a
