@@ -601,7 +601,7 @@ tasks:
   slug: 2026-10-20-story3-protocol-contract
   tag: story-2026-10-07-see-each-other-task-1
 - id: 2
-  status: pending
+  status: completed
   specialist: observability
   deps:
   - 1
@@ -649,6 +649,7 @@ tasks:
     - The telemetry_filter / GC proxy edit keeps the user-JWT gate, PII drop and size/rate caps intact. No new label passes the filter unbounded.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-20-media-kind-label-split
   tag: story-2026-10-07-see-each-other-task-2
 - id: 3
   status: pending
