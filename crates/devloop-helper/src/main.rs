@@ -1069,17 +1069,6 @@ mod concurrency_tests {
             read_all_ndjson(&mut BufReader::new(&client))
         }
 
-        /// Spawn a request on a background thread; return the join handle.
-        fn spawn_request(&self, json: String) -> std::thread::JoinHandle<Vec<String>> {
-            let sock_path = self.sock_path.clone();
-            std::thread::spawn(move || {
-                let mut client = UnixStream::connect(&sock_path).unwrap();
-                writeln!(client, "{json}").unwrap();
-                client.shutdown(std::net::Shutdown::Write).unwrap();
-                read_all_ndjson(&mut BufReader::new(&client))
-            })
-        }
-
         fn read_audit_log(&self) -> Vec<serde_json::Value> {
             let contents = fs::read_to_string(&self.log_path).unwrap_or_default();
             contents
@@ -1251,7 +1240,7 @@ mod concurrency_tests {
     // --- Test (a): concurrent reads during long-running write ---
 
     #[test]
-    fn test_concurrent_status_during_long_write() {
+    fn test_status_does_not_block_on_write() {
         let h = TestHelperWithCtx::start();
         // Spawn a 10s TestSleep write directly (TestSleep has no parse arm).
         let write_handle = spawn_test_sleep_write(Arc::clone(&h.ctx), 10);
@@ -1267,38 +1256,26 @@ mod concurrency_tests {
         }
         assert!(claimed, "write did not claim the slot in time");
 
-        // Issue 5 parallel status requests via socket.
-        let status_json = h.status_json();
-        let start = Instant::now();
-        let handles: Vec<_> = (0..5)
-            .map(|_| h.helper.spawn_request(status_json.clone()))
-            .collect();
-
-        let results: Vec<Vec<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let total_elapsed = start.elapsed();
-
-        // Each status returned in well under the spec's 5s ceiling. Tighter
-        // bound: 2s for slow CI (per Test #8).
-        assert!(
-            total_elapsed < Duration::from_secs(2),
-            "status calls took {:?}, expected <2s",
-            total_elapsed
+        // No wall clock: status snapshots the busy hint first, so a status that
+        // waited on the write would report busy=false. busy=true plus the write
+        // still holding the slot afterwards proves the read did not block.
+        let lines = h.helper.request(&h.status_json());
+        let result = TestHelperWithCtx::parse_result(&lines);
+        let data = result.data.expect("status data missing");
+        assert_eq!(data["busy"], serde_json::Value::Bool(true), "got: {data}");
+        let in_flight = &data["in_flight"];
+        assert_eq!(in_flight["op"], "test-sleep", "got: {data}");
+        assert_eq!(
+            in_flight["args"][0], "10",
+            "in_flight.args mismatch: {data}"
         );
-
-        for lines in &results {
-            let result = TestHelperWithCtx::parse_result(lines);
-            let data = result.data.expect("status data missing");
-            assert_eq!(data["busy"], serde_json::Value::Bool(true), "got: {data}");
-            let in_flight = &data["in_flight"];
-            assert_eq!(in_flight["op"], "test-sleep", "got: {data}");
-            assert_eq!(
-                in_flight["args"][0], "10",
-                "in_flight.args mismatch: {data}"
-            );
-            // started_at parses as RFC3339.
-            let started_at = in_flight["started_at"].as_str().unwrap();
-            chrono::DateTime::parse_from_rfc3339(started_at).expect("started_at not RFC3339");
-        }
+        // started_at parses as RFC3339.
+        let started_at = in_flight["started_at"].as_str().unwrap();
+        chrono::DateTime::parse_from_rfc3339(started_at).expect("started_at not RFC3339");
+        assert!(
+            h.ctx.snapshot_busy().is_some(),
+            "write finished before status returned"
+        );
 
         // Cancel the write to clean up quickly.
         let cancel = h.helper.request(&h.cancel_json());
