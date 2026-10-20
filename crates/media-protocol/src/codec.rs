@@ -933,13 +933,14 @@ pub fn peek_frame_len(data: &[u8]) -> Result<Option<usize>, DecodeError> {
 
 /// Rewrite the relay region of `frame` in place.
 ///
-/// This is the relay's per-subscriber rewrite (§2): six bytes at an offset
-/// **derived from the frame's own header**, never precomputed. The offset is
-/// not a constant — it moves with the key-bearing flag and the extension
-/// length, both of which a publisher controls — so a hardcoded offset would let
-/// one participant's extension byte cause the relay to overwrite three bytes of
-/// another participant's *signed* publisher region, failing verification at
-/// every receiver.
+/// This is the relay's per-subscriber rewrite (§2): the hop-local `stream_id`
+/// becomes the subscriber's slot id (the uplink value was the publisher's send
+/// id). Six bytes at an offset **derived from the frame's own header**, never
+/// precomputed. The offset is not a constant — it moves with the key-bearing
+/// flag and the extension length, both of which a publisher controls — so a
+/// hardcoded offset would let one participant's extension byte cause the relay
+/// to overwrite three bytes of another participant's *signed* publisher region,
+/// failing verification at every receiver.
 ///
 /// The full header is validated to the same standard as decode before any byte
 /// is written: a relay must not write into a frame it has not validated.
@@ -1009,7 +1010,9 @@ pub struct MediaFrameParts<'a> {
     pub wrapped_transmit_key: Option<WrappedTransmitKey<'a>>,
     /// Extensions, in any order: they are emitted canonically.
     pub extensions: &'a [Extension<'a>],
-    /// Relay region: subscriber slot.
+    /// Relay region: hop-local stream id — the publisher's send id
+    /// (`SendStream.stream_number`) on the uplink, the subscriber's slot id
+    /// on the downlink (ADR-0036 §2).
     pub stream_id: u16,
     /// Relay region: per (connection, media stream) transmit count.
     pub hop_sequence: u32,

@@ -19,7 +19,8 @@
 //!
 //! # What this never emits
 //!
-//! `SLOT_STATE_ZERO_REQUESTED` (MC never fabricates a `slot_id` to carry it) and
+//! `SLOT_STATE_ZERO_REQUESTED` (reserved in the proto 2026-10-13 as
+//! unemittable: no declared slot id to echo) and
 //! `SLOT_STATE_SOURCE_UNREACHABLE` (reserved for a pinned source with which the
 //! subscriber shares no connected handler, which static fill cannot produce). A
 //! participant the subscriber shares NO connected handler with consumes no slot
@@ -98,7 +99,7 @@ pub struct SlotComposition {
 
 /// Bounded metric-label form for a slot state.
 ///
-/// Exhaustive over **all eight** proto variants, not the three reachable today.
+/// Exhaustive over **every** proto variant, not only the ones reachable today.
 /// A wire-vocabulary mirror is supposed to cover states it does not yet emit:
 /// a hand-picked subset needs editing every time §7 makes `switch_pending` live,
 /// and a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
@@ -112,9 +113,12 @@ pub fn slot_state_label(state: SlotState) -> &'static str {
         SlotState::SourceMuted => "source_muted",
         SlotState::WithheldByCongestion => "withheld_by_congestion",
         SlotState::FewerSourcesThanSlots => "fewer_sources_than_slots",
-        SlotState::ZeroRequested => "zero_requested",
         SlotState::SourceUnreachable => "source_unreachable",
         SlotState::SwitchPending => "switch_pending",
+        SlotState::AvatarNoVideo => "avatar_no_video",
+        SlotState::Unavailable => "unavailable",
+        SlotState::AvatarClientMuted => "avatar_client_muted",
+        SlotState::AvatarServerMuted => "avatar_server_muted",
     }
 }
 
@@ -403,8 +407,8 @@ mod tests {
 
     #[test]
     fn a_zero_slot_declaration_yields_no_assignments() {
-        // `slot_id` echoes a slot the subscriber CHOSE, so there is no slot to
-        // carry ZERO_REQUESTED and MC never fabricates one.
+        // `slot_id` echoes a slot the subscriber CHOSE, so a zero-slot
+        // declaration has no id to echo (why ZERO_REQUESTED is reserved).
         let composition = compose(&[2], &[], &SourceMuteView::default());
         assert!(composition.assignments.assignments.is_empty());
         assert!(composition.slot_states.is_empty());
@@ -428,9 +432,10 @@ mod tests {
     }
 
     /// No declared slot, of any shape, ever carries a state MC does not emit
-    /// this story.
+    /// this story. (`ZERO_REQUESTED` is reserved in the proto and so is no
+    /// longer representable.)
     #[test]
-    fn zero_requested_and_source_unreachable_are_never_emitted() {
+    fn source_unreachable_is_never_emitted() {
         for others in [&[][..], &[2][..], &[2, 3, 4][..]] {
             let composition = compose(
                 others,
@@ -442,7 +447,6 @@ mod tests {
                 &SourceMuteView::from_pairs(vec![(sender(2), true)]),
             );
             for state in &composition.slot_states {
-                assert_ne!(*state, SlotState::ZeroRequested);
                 assert_ne!(*state, SlotState::SourceUnreachable);
             }
         }
@@ -512,13 +516,26 @@ mod tests {
             SlotState::SourceMuted,
             SlotState::WithheldByCongestion,
             SlotState::FewerSourcesThanSlots,
-            SlotState::ZeroRequested,
             SlotState::SourceUnreachable,
             SlotState::SwitchPending,
+            SlotState::AvatarNoVideo,
+            SlotState::Unavailable,
+            SlotState::AvatarClientMuted,
+            SlotState::AvatarServerMuted,
         ];
         let labels: std::collections::HashSet<&str> =
             all.iter().map(|s| slot_state_label(*s)).collect();
         assert_eq!(labels.len(), all.len());
+        // Labels follow the WIRE names: derived from the generated artifact,
+        // not restated from memory, so a typo'd label cannot pass.
+        for state in all {
+            let wire = state
+                .as_str_name()
+                .strip_prefix("SLOT_STATE_")
+                .unwrap()
+                .to_ascii_lowercase();
+            assert_eq!(slot_state_label(state), wire, "{state:?}");
+        }
     }
 
     /// The slot's handler address IS the handler carrying this subscriber's

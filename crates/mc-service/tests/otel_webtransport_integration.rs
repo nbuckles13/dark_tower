@@ -105,6 +105,8 @@ async fn join_with_trace(
             // this test exercises the join path, not attribution, and MC performs
             // no attestation check this story.
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     };
     send.write_all(&encode_framed(&client_msg))

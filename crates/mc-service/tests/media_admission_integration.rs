@@ -140,6 +140,8 @@ async fn join_keep_open(
             correlation_id: String::new(),
             binding_token: String::new(),
             identity_public_key,
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     };
     send.write_all(&encode_framed(&msg))

@@ -472,6 +472,8 @@ impl MediaHandlerService for MediaHandlerStub {
             handler_id: self.handler_id.clone(),
             process_start_epoch_ms: self.process_start_epoch_ms,
             transport_mode: transport_mode as i32,
+            // Story 3 per-stream echo: not stubbed until MC-A compares it.
+            applied_source_streams: Vec::new(),
         }))
     }
 

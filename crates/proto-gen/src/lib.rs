@@ -107,6 +107,10 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinRequest {
             // Public key: not a secret, but length is the useful fact and a
             // 32-byte blob is noise in a log line.
             .field("identity_public_key_len", &self.identity_public_key.len())
+            // Story 3 join declarations: closed enum values and slot ids, no
+            // credential or PII -- in the clear for join-refusal triage.
+            .field("publish_kinds", &self.publish_kinds)
+            .field("receive_capability", &self.receive_capability)
             .finish()
     }
 }
@@ -148,6 +152,9 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinResponse {
             // material -- in the clear, so an operator triaging "hears nobody"
             // can see the cap the client was told.
             .field("max_receive_slots", &self.max_receive_slots)
+            // Story 3 per-kind caps: configuration values, in the clear.
+            .field("max_audio_receive_slots", &self.max_audio_receive_slots)
+            .field("max_video_receive_slots", &self.max_video_receive_slots)
             .finish()
     }
 }

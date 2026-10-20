@@ -81,6 +81,8 @@ fn join_frame(meeting_id: &str, join_token: &str) -> Vec<u8> {
             // this test exercises the join path, not attribution, and MC performs
             // no attestation check this story.
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     })
 }

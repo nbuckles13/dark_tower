@@ -1473,7 +1473,14 @@ async fn handle_mute_request(
     // `UpdateSelfMute` has no `respond_to`, so the caller cannot learn that
     // nothing changed and would proceed to a full roster read regardless. The
     // idempotence guard fixes the wire lie; this fixes the cost.
-    let reported = (request.audio_muted, request.video_muted);
+    //
+    // INTERIM (story 3 P1): the per-kind fields became `optional bool`; absent
+    // reads as `false`, byte-for-byte today's semantics (proto3 omitted `false`
+    // from the wire). MC-B replaces this with absent = unchanged, both-absent
+    // rejected and counted.
+    let audio_muted = request.audio_muted.unwrap_or(false);
+    let video_muted = request.video_muted.unwrap_or(false);
+    let reported = (audio_muted, video_muted);
     if media.last_reported_mute == Some(reported) {
         metrics::record_mute_request(MuteOutcome::Unchanged);
         return;
@@ -1521,11 +1528,7 @@ async fn handle_mute_request(
 
     if let Err(e) = media
         .meeting_handle
-        .update_self_mute(
-            media.participant_id.clone(),
-            request.audio_muted,
-            request.video_muted,
-        )
+        .update_self_mute(media.participant_id.clone(), audio_muted, video_muted)
         .await
     {
         debug!(
@@ -1552,7 +1555,7 @@ async fn handle_mute_request(
     // report before any declaration, is recorded by the actor and re-emits
     // nothing: the slot view reads only audio mute. A camera button produces
     // `applied_no_recompose`, which is routine.
-    if media.declaration.is_none() || previously_audio_muted == request.audio_muted {
+    if media.declaration.is_none() || previously_audio_muted == audio_muted {
         metrics::record_mute_request(MuteOutcome::AppliedNoRecompose);
         return;
     }
@@ -1595,7 +1598,12 @@ async fn handle_server_mute_request(
     participant_handle: &ParticipantActorHandle,
     media: &mut MediaSignalingContext,
 ) {
-    let action = ServerMuteAction::from_request(request.audio_muted, request.video_muted);
+    // INTERIM (story 3 P1): absent reads as `false`, today's semantics. MC-B
+    // replaces this with per-kind actions (absent = unchanged, both-absent
+    // rejected and counted).
+    let audio_muted = request.audio_muted.unwrap_or(false);
+    let video_muted = request.video_muted.unwrap_or(false);
+    let action = ServerMuteAction::from_request(audio_muted, video_muted);
 
     // 1. Authority.
     if !media.is_host {
@@ -1635,8 +1643,8 @@ async fn handle_server_mute_request(
         .server_mute(
             target.clone(),
             media.participant_id.clone(),
-            request.audio_muted,
-            request.video_muted,
+            audio_muted,
+            video_muted,
         )
         .await
     {
@@ -1665,8 +1673,8 @@ async fn handle_server_mute_request(
                 target_participant_id = %target,
                 action = action.label(),
                 outcome = outcome.label(),
-                audio_muted = request.audio_muted,
-                video_muted = request.video_muted,
+                audio_muted = audio_muted,
+                video_muted = video_muted,
                 "Server mute decision"
             );
         }
@@ -2132,6 +2140,10 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         // declaration whole. Always set, so absence on the wire means an older
         // MC. `u8` widened by `u32::from`: total, never `as`.
         max_receive_slots: Some(u32::from(media.max_receive_slots)),
+        // Story 3 per-kind caps: not sent until MC-A introduces them (absent =
+        // unknown, which the proto defines as harmless).
+        max_audio_receive_slots: None,
+        max_video_receive_slots: None,
     }
 }
 
@@ -2329,8 +2341,8 @@ mod tests {
             message: Some(client_message::Message::ServerMuteRequest(
                 v1::ServerMuteRequest {
                     participant_id: target.to_string(),
-                    audio_muted: true,
-                    video_muted: false,
+                    audio_muted: Some(true),
+                    video_muted: Some(false),
                     reason: String::new(),
                 },
             )),

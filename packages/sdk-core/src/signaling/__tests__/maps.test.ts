@@ -92,6 +92,10 @@ describe('codecMap — the one wire-keyed codec oracle (ADR-0036 §5)', () => {
     // Zero is not a silent Opus. On receipt it is a protocol violation, and
     // the oracle must surface that as null rather than picking a codec.
     expect(fromWireCodec(Codec.UNSPECIFIED)).toBeNull();
+    // CODEC_VP8 has no public member until C-A2's VP8 probe gate: a received
+    // VP8 stays unrepresentable rather than mapping to a codec the SDK has
+    // not proven it can encode and decode.
+    expect(fromWireCodec(Codec.VP8)).toBeNull();
   });
 
   it('collapses an out-of-range wire codec to null', () => {

@@ -302,6 +302,24 @@ describe('stream assignments', () => {
     await waitFor(() => seen.length > 0);
     expect(seen[0]?.assignments[0]?.slotState).toBe('unspecified');
   });
+
+  // Durable: the reserved former ZERO_REQUESTED number fails closed.
+  // Interim (C-A1 WILL CHANGE these four rows): the story-3 values 8..11 fall
+  // to the fail-closed default until C-A1 maps them.
+  it.each([
+    ['reserved 5 (former ZERO_REQUESTED)', 5 as SlotState],
+    ['AVATAR_NO_VIDEO (C-A1 will map)', SlotState.AVATAR_NO_VIDEO],
+    ['UNAVAILABLE (C-A1 will map)', SlotState.UNAVAILABLE],
+    ['AVATAR_CLIENT_MUTED (C-A1 will map)', SlotState.AVATAR_CLIENT_MUTED],
+    ['AVATAR_SERVER_MUTED (C-A1 will map)', SlotState.AVATAR_SERVER_MUTED],
+  ])('maps %s to unspecified', async (_label, state) => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: StreamAssignmentsEvent[] = [];
+    rig.client.on('streamAssignments', (e) => seen.push(e));
+    rig.deliver(framedStreamAssignments({ slotState: state }));
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]?.assignments[0]?.slotState).toBe('unspecified');
+  });
 });
 
 describe('client sends', () => {

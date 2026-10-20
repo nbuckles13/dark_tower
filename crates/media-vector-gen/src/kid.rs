@@ -39,10 +39,10 @@ pub struct KeyIdParts {
     pub sender_id: u64,
     /// Sender-scoped stream number.
     ///
-    /// **Not** the relay `stream_id`: that is subscriber-scoped, two bytes wide,
-    /// rewritten by a media handler and authenticated by nobody. This one is
-    /// sender-scoped, one byte, and cryptographically bound via the key
-    /// derivation.
+    /// **Not** the relay `stream_id` (hop-local, 16-bit, unauthenticated; see
+    /// `media_protocol::frame::KEY_ID_SENDER_ID_BITS`'s "Do not conflate"
+    /// paragraph). This one is sender-scoped, one byte, and cryptographically
+    /// bound via the key derivation.
     pub stream: u64,
     /// Monotonic for one holder of `sender_id` across its membership, and never
     /// reset by that holder. NOT monotonic per `sender_id` across a meeting: a

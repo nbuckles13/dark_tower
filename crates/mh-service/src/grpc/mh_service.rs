@@ -133,6 +133,9 @@ impl MhMediaService {
             transport_mode: snapshot
                 .transport_mode_for(meeting)
                 .unwrap_or(TransportMode::Unspecified) as i32,
+            // Story 3 per-stream echo: MH-A1 builds it from the applied
+            // snapshot. Empty until then.
+            applied_source_streams: vec![],
         }
     }
 }
@@ -567,6 +570,7 @@ mod tests {
             selection_rules: None,
             policy_generation: 0,
             server_muted_sources: Vec::new(),
+            source_streams: Vec::new(),
         })
     }
 

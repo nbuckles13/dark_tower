@@ -1136,12 +1136,14 @@ never "nobody is muted".
    that dimension); the meeting-scoped question is answered by MC's decision
    log (target `mc.webtransport.connection`, one INFO line per decided server-mute request, naming requester, target, action and outcome).
 
-**Sender-scoped, and per-stream ingress mute is foreclosed.** MH binds the
-sender per connection and never reads the stream number (inside the opaque
-`SFrame` key id); the only stream indicator readable at ingress is the relay
-region, which the muted publisher writes. Keying a mute on either would be
-self-selectable evasion, so per-kind mute (video) moves to MC's egress edge
-set. Single home of the reasoning: `internal.proto` `MutedSource`.
+**Sender-scoped today; per-kind from MH-A1.** MH binds the sender per
+connection and drops every stream of a muted sender (the transitional reading
+at `internal.proto` `server_muted_sources`). Per-kind mute arrives with MH-A1
+as `SourceStream` DROP_AT_INGRESS dispositions and holds in slot terms.
+> **Corrected 2026-10-13.** This paragraph said per-stream ingress mute was
+> foreclosed and per-kind mute would move to MC's egress edge set; that
+> conclusion is superseded. Single home of the reasoning: `internal.proto`
+> `MutedSource`.
 
 **Who can set it.** A patched CLIENT changes nothing observable: the sender is
 bound at spawn after the JWT gate and the frame carries no sender id, so no

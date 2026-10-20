@@ -2039,9 +2039,13 @@ degradation, and it is also why the failure has no other symptom.
 **3. `mc_media_slot_states_total{slot_state}` — are the slots MC filled actually
 carrying anything?** Note the label is **`slot_state`**, not `outcome` — this is
 the one of the three that is not an outcome vocabulary. Its domain mirrors the
-wire `SlotState` enum **exhaustively (all eight variants, not the three reachable
-today)**, which is what makes MC's distribution directly comparable with the
-client's.
+wire `SlotState` enum **exhaustively (every named variant, not only the ones
+reachable today)**, which is what makes MC's distribution directly comparable
+with the client's. `avatar_no_video`, `unavailable`, `avatar_client_muted` and
+`avatar_server_muted` are in the domain from story 3 P1 (zero-initialised) but
+are not emitted until MC-A: a non-zero value for any of them before MC-A ships is
+an MC defect. `zero_requested` is reserved in the proto and gone from the domain,
+so a dashboard series for it is pre-deploy history.
 
 ```promql
 sum by (slot_state) (rate(mc_media_slot_states_total[5m]))

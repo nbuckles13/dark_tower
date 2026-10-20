@@ -323,6 +323,10 @@ impl MhClient {
             // ordered; a change to it changed the assignment, so the generation
             // above already advanced for it.
             server_muted_sources: build_muted_sources(programming.assignment),
+            // Story 3 per-stream declarations: MC-A emits them. Empty selects
+            // MH's transitional story-2 reading (internal.proto
+            // `server_muted_sources`).
+            source_streams: vec![],
         };
 
         let grpc_request = self.add_auth(request)?;
@@ -759,6 +763,7 @@ mod tests {
             selection_rules: None,
             policy_generation: p.policy_generation.get(),
             server_muted_sources: Vec::new(),
+            source_streams: Vec::new(),
         };
         // `RegisterMeetingRequest` has no bytes-typed field at all, so this is
         // structural rather than a scan: there is nowhere for a key to go.

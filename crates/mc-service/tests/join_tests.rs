@@ -202,6 +202,8 @@ async fn join_and_read_response(
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     };
 
@@ -258,6 +260,8 @@ async fn join_keep_open(
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     };
 
@@ -511,8 +515,8 @@ async fn test_join_wrong_first_message_returns_invalid_request() {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted: true,
-            video_muted: false,
+            audio_muted: Some(true),
+            video_muted: Some(false),
         })),
     };
 
@@ -866,6 +870,8 @@ async fn test_participant_joined_notification_via_bridge() {
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     };
     send1
@@ -920,6 +926,8 @@ async fn test_participant_joined_notification_via_bridge() {
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
+            publish_kinds: Vec::new(),
+            receive_capability: None,
         })),
     };
     send2

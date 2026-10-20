@@ -170,7 +170,12 @@ export interface EgressPipelineOptions {
   readonly maxQueueFrames: number;
   /** The publisher's stream index from the send directive (8-bit semantics). */
   readonly streamNumber: number;
-  /** The relay-region `stream_id` to stamp. Subscriber-scoped; rewritten by MH. */
+  /**
+   * The relay-region `stream_id` to stamp: hop-local (ADR-0036 §2), so on this
+   * uplink hop it is MC's send id (`SendStream.stream_number`), which MH uses as
+   * its attribution label; MH rewrites it to each subscriber's slot id. (The
+   * caller passing a slot id today is C-A1's stamping fix.)
+   */
   readonly streamId: number;
   /**
    * Resolves the datagram channel for a media-handler URL, or `undefined`.

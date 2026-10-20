@@ -27,6 +27,14 @@
 //! **relay region** is excluded from both, because a media handler rewrites it
 //! per subscriber.
 //!
+//! **Relay ids are hop-local** (ADR-0036 §2, amendment 2026-10-13). On the
+//! UPLINK the publisher stamps `stream_id` with MC's send id
+//! (`signaling.proto::SendStream.stream_number`), and MH attributes the frame
+//! by (connection-bound sender, that id) — a publisher-set, unauthenticated
+//! label, never cross-checked against the key id. On the DOWNLINK MH rewrites
+//! it to the receiving subscriber's `ReceiveSlot.slot_id`. MH never
+//! distinguishes audio from video.
+//!
 //! # This crate holds no keys and performs no cryptography
 //!
 //! Decoding does **not** verify the signature and does **not** decrypt. The
@@ -41,10 +49,13 @@
 //! 1. **The relay region is unauthenticated by design.** `stream_id` and
 //!    `hop_sequence` are 6 bytes per frame that a compromised media handler
 //!    writes freely and nobody authenticates (§2). That is accepted and
-//!    bounded — but the bound only exists if the **receiver validates
-//!    `stream_id` against its own declared slots (§6) and rejects unknown
-//!    ones.** Without that check a relay gains 16 free bits per frame and can
-//!    place a frame in a slot the subscriber never assigned.
+//!    bounded — but the bound only exists if the **receiver validates the
+//!    downlink `stream_id` against its own declared slots (§6) and rejects
+//!    unknown ones.** Without that check a relay gains 16 free bits per frame
+//!    and can place a frame in a slot the subscriber never assigned. (The
+//!    uplink value is the publisher's own label, so on that hop the field is
+//!    publisher-controlled rather than relay-controlled; per-kind server mute
+//!    still holds, stated in slot terms at `internal.proto::MutedSource`.)
 //! 2. **`Ok(None)` from [`crate::codec::decode_stream_frame`] obligates the
 //!    caller.** A peer that opens a stream and stalls mid-frame produces
 //!    `Ok(None)` forever: no reject reason, no counter, no timeout. A caller
@@ -123,10 +134,13 @@ pub const KEY_ID_BYTES: usize = 8;
 /// single source of truth for a value another crate computes with.
 ///
 /// **Do not conflate with [`STREAM_ID_FIELD_BYTES`].** That is the *relay*
-/// `stream_id`: subscriber-scoped, two bytes, rewritten per subscriber by a
-/// media handler, authenticated by nobody. This layout's `stream` is
-/// sender-scoped, one byte, and cryptographically bound through the key
-/// derivation. Different scope, different width, different trust. The
+/// `stream_id`: two bytes, hop-local, authenticated by nobody — on the uplink
+/// the publisher stamps it with the same value as this layout's `stream`
+/// (MC's send id), on the downlink a media handler rewrites it to the
+/// subscriber's slot id. This layout's `stream` is sender-scoped, one byte,
+/// and cryptographically bound through the key derivation; the relay copy is
+/// never cross-checked against it. Different width, different trust, and
+/// equal values on the uplink only by the publisher's say-so. The
 /// `KEY_ID_` prefix on all three constants exists so a reader at a call site
 /// sees which namespace they are in without looking up the declaration.
 ///
@@ -186,7 +200,9 @@ pub const KEK_GENERATION_FIELD_BYTES: usize = 2;
 pub const WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES: usize = 32;
 /// Width of the extension-region length field.
 pub const EXT_LENGTH_FIELD_SIZE: usize = 2;
-/// Width of the relay `stream_id` field.
+/// Width of the relay `stream_id` field. Hop-local: the publisher's send id
+/// (`SendStream.stream_number`, 8-bit in the key id) on the uplink, the
+/// subscriber's 16-bit `ReceiveSlot.slot_id` on the downlink.
 pub const STREAM_ID_FIELD_BYTES: usize = 2;
 /// Width of the relay `hop_sequence` field.
 pub const HOP_SEQUENCE_FIELD_BYTES: usize = 4;
@@ -646,7 +662,10 @@ impl<'a> MediaFrameView<'a> {
         self.extensions
     }
 
-    /// Which of the subscriber's slots this frame fills.
+    /// The hop-local relay stream id. On the DOWNLINK: which of the
+    /// subscriber's slots this frame fills. On the UPLINK: the publisher's
+    /// send id (`SendStream.stream_number`), MH's attribution label —
+    /// publisher-set and never cross-checked against the key id.
     ///
     /// **Relay region: unauthenticated.** A receiver must validate this
     /// against its own declared slots (§6) and reject unknown values; see the

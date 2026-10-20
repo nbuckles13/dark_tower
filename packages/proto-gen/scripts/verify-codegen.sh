@@ -83,6 +83,56 @@ assert_not_generated() {
   echo "verify-codegen: OK — ${symbol} absent from ${file}"
 }
 
+# Member-scoped enum oracle (story 3). A reserved enum VALUE cannot be checked
+# by `assert_not_generated`: the enum itself still exists, and a file-wide grep
+# for the member name would also hit doc comments that cite it. These helpers
+# extract ONE `export enum <Enum> {` ... `}` block and match a member
+# DECLARATION (`  NAME = n,`) inside it only, so comment text never satisfies
+# them. The extraction is checked by a POSITIVE CONTROL member that must be
+# found in the same block, so a broken extraction (renamed enum, changed
+# layout, empty block) fails loudly instead of reporting a false "absent".
+enum_block() {
+  local path="$1"
+  local enum="$2"
+  awk -v start="^export enum ${enum} [{]" '
+    $0 ~ start { inside = 1 }
+    inside { print }
+    inside && /^}/ { exit }
+  ' "${path}"
+}
+
+assert_enum_member() {
+  local file="$1"
+  local enum="$2"
+  local member="$3"
+  local path="${OUT_DIR}/${file}"
+  if [[ ! -f "${path}" ]]; then
+    echo "verify-codegen: FAIL — expected file not produced: ${path}" >&2
+    exit 1
+  fi
+  if ! enum_block "${path}" "${enum}" | grep -qE "^[[:space:]]+${member} = [0-9]+,"; then
+    echo "verify-codegen: FAIL — enum ${enum} has no member '${member}': ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — ${enum}.${member} in ${file}"
+}
+
+assert_enum_member_absent() {
+  local file="$1"
+  local enum="$2"
+  local member="$3"
+  local control="$4"
+  local path="${OUT_DIR}/${file}"
+  # Positive control first: the same extraction must find a member that IS
+  # declared, or the absence below proves nothing.
+  assert_enum_member "${file}" "${enum}" "${control}"
+  if enum_block "${path}" "${enum}" | grep -qE "^[[:space:]]+${member} = [0-9]+,"; then
+    echo "verify-codegen: FAIL — reserved '${enum}.${member}' still generated: ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — ${enum}.${member} absent from ${file}"
+}
+
 assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "JoinRequest"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "FastHeartbeatResponse"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "ComprehensiveHeartbeatResponse"
@@ -182,6 +232,45 @@ for symbol in \
   VideoMetadata \
   SimulcastLayer; do
   assert_not_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
+done
+
+# Story 3 (see-each-other) — the additive signalling wire: join declarations
+# and per-kind caps, the minimum keyframe interval, and the MH bidi-stream
+# keyframe/recovery messages. Field names in protoc-gen-es casing, read from a
+# regenerated output.
+for symbol in \
+  publishKinds \
+  maxAudioReceiveSlots \
+  maxVideoReceiveSlots \
+  minKeyframeIntervalMs \
+  MhServerMessage \
+  KeyframeRequest \
+  RecoveryRequest \
+  keyframeRequest \
+  recoveryRequest; do
+  assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
+done
+assert_enum_member "dark_tower/signaling/v1/signaling_pb.ts" Codec VP8
+for member in AVATAR_NO_VIDEO UNAVAILABLE AVATAR_CLIENT_MUTED AVATAR_SERVER_MUTED; do
+  assert_enum_member "dark_tower/signaling/v1/signaling_pb.ts" SlotState "${member}"
+done
+# Superseded-but-present until MC-B deletes it: still a PRESENCE assert, so a
+# premature deletion fails here rather than in a consumer.
+assert_enum_member "dark_tower/signaling/v1/signaling_pb.ts" SlotState SOURCE_MUTED
+# Reserved by number and name in this story: the one member-scoped absence.
+assert_enum_member_absent "dark_tower/signaling/v1/signaling_pb.ts" SlotState ZERO_REQUESTED ACTIVE
+
+# Story 3 — the internal per-stream source declarations and echo.
+for symbol in \
+  SourceStream \
+  SourceStreamEcho \
+  SourceDisposition \
+  sourceStreams \
+  appliedSourceStreams; do
+  assert_generated "dark_tower/internal/v1/internal_pb.ts" "${symbol}"
+done
+for member in FORWARD PAUSED DROP_AT_INGRESS; do
+  assert_enum_member "dark_tower/internal/v1/internal_pb.ts" SourceDisposition "${member}"
 done
 
 echo "verify-codegen: all checks passed"

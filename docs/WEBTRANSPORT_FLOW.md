@@ -250,7 +250,51 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
     │                                                │
 ```
 
+> **Corrected 2026-10-13.** Steps 5–7 are schematic. The client authenticates by
+> opening a **bidirectional stream** and sending `MhClientMessage{connect_request:
+> MhConnectRequest{join_token}}` as its first length-framed message; MH validates
+> the meeting JWT (ADR-0020) locally against AC's JWKS. Tokens are not looked up
+> in Redis.
+
+#### 2.1.1 The client↔MH control stream (story 3)
+
+The connect stream stays open for the life of the connection and carries
+length-framed protobuf in **both** directions — a 4-byte big-endian length prefix,
+then the message bytes, bounded by MH's maximum message size:
+
+```
+Client                                         Media Handler
+  │ MhClientMessage{connect_request}  (first, once) │
+  │────────────────────────────────────────────────>│
+  │ MhClientMessage{recovery_request}  (any time)   │
+  │────────────────────────────────────────────────>│
+  │            MhServerMessage{keyframe_request}    │
+  │<────────────────────────────────────────────────│
+```
+
+- `RecoveryRequest{slot_id, sender_id, gop_counter}` — a receiver whose slot lost
+  decodability asks its handler for a fresh group. `slot_id` is the receiver's
+  downlink relay id; `sender_id` is a staleness guard only. MH remaps it to the
+  source stream and aggregates; it never forwards the message verbatim.
+- `KeyframeRequest{stream_number, gop_counter}` — MH asks a publisher for a
+  keyframe on one stream (`stream_number` = the publisher's uplink relay id, MC's
+  send id). The publisher honours it only under the bounds stated on the message.
+
+Any message other than `connect_request` as the first message is an invalid
+connect. The rules for both requests are normative in `signaling.proto` and in
+ADR-0036 §1 (2026-10-13 amendment); they are not restated here.
+
 ### 2.2 Media Transport via QUIC Datagrams
+
+> **Superseded in part (ADR-0036 §1).** "All media frames are sent using QUIC
+> datagrams" is true of **audio** only: video is carried one group of pictures per
+> unidirectional QUIC stream (`TRANSPORT_MODE_STREAM_PER_GROUP`), and MC assigns
+> the transport per stream. In the diagram below, `stream_id` is the relay-region
+> id, which is **hop-local** (ADR-0036 §2 *Header v3*): on the uplink it is the
+> publisher's MC send id (audio 0, video 1), on the downlink the receiver's slot
+> id; and no frame carries a `sender_id` field — the sender is bound to the
+> connection at MH and named inside the SFrame key id. The diagram's values are
+> illustrative only.
 
 **All media frames are sent using QUIC datagrams**, not streams. This provides:
 - Lower latency (no head-of-line blocking)
@@ -308,7 +352,13 @@ transport_config.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
 
 ### 2.4 Media Frame Format
 
-After the header, each frame follows the format defined in API_CONTRACTS.md:
+**The frame format is specified once, in ADR-0036 §2 *Header v3*** (normative
+table, decode order and reject vocabulary), with the cross-language vectors file
+winning over prose.
+
+> **Superseded.** The 42-byte layout below is the pre-ADR-0036 (ADR-0028 §4)
+> header and does not describe the wire. It is kept only so the change is
+> visible; do not implement from it.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -336,7 +386,7 @@ After the header, each frame follows the format defined in API_CONTRACTS.md:
 Total header size: 42 bytes
 ```
 
-**Stream ID Semantics**:
+**Stream ID Semantics** (superseded with the layout above):
 - **User ID (8 bytes)**: Assigned by Meeting Controller when participant joins. This is a random 64-bit number that uniquely identifies the participant within the meeting. Shared with all participants via roster distribution.
 - **Stream ID (4 bytes)**: Chosen by the subscriber for their own local bookkeeping. The Meeting Controller maintains a mapping between subscriber's local stream_id and the actual media source.
 
@@ -540,7 +590,8 @@ Client-side JavaScript for sending media via datagrams:
 // Get datagram writer
 const datagramWriter = transport.datagrams.writable.getWriter();
 
-// Encode media frame (media-protocol v2 header — ADR-0036 §2 + Appendix).
+// Encode media frame (media-protocol v2 header — ADR-0036 §2 + Appendix;
+// header v3, landed by P2, adds a 32-bit gopCounter to the publisher region).
 // The header splits into a publisher region (signed and used as the AEAD
 // associated data) and a relay region the media handler rewrites per
 // subscriber. There is no media-type field: the independently-decodable flag
@@ -550,7 +601,8 @@ const encodedFrame = encodeMediaFrame({
   streamSequence: streamSequence++,   // per (sender, stream); NEVER reset — AEAD nonce input
   wrappedTransmitKey: wrapped,        // present iff keyBearing (§4)
   extensions: [],                     // publisher-set TLV (§7); audio carries none today
-  streamId,                           // relay region: subscriber slot
+  streamId,                           // relay region, hop-local: on this uplink, MC's send id
+                                      // (SendStream.stream_number); MH rewrites it to the slot id
   hopSequence: hopSequence++,         // relay region: per (connection, media stream)
   payload: sframeObject,              // opaque SFrame object
   signature                           // Ed25519 over publisher region then payload (§3)
@@ -580,7 +632,15 @@ All WebTransport connections use TLS 1.3:
 - Single-use for media connections
 - Cryptographically signed (HMAC-SHA256)
 
-### 3. E2E Encryption
+### 3. Media Encryption
+
+> **Corrected 2026-10-13.** This section was headed "E2E Encryption" and ended
+> "Server cannot decrypt media content". Both overstate: under ADR-0036 §4 media
+> is encrypted between clients, and **MH, transport and storage cannot read it;
+> MC can**, because MC issues the meeting KEK. That is accepted operator custody
+> (`key_custody=operator`), and nothing may describe it as end-to-end against the
+> operator or as zero-trust. The original text is kept below so the change is
+> visible.
 
 Media payloads are encrypted client-side before transmission:
 

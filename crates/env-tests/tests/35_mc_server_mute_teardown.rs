@@ -107,8 +107,8 @@ fn server_mute(target: &str, audio_muted: bool) -> ClientMessage {
         message: Some(client_message::Message::ServerMuteRequest(
             ServerMuteRequest {
                 participant_id: target.to_string(),
-                audio_muted,
-                video_muted: false,
+                audio_muted: Some(audio_muted),
+                video_muted: Some(false),
                 reason: String::new(),
             },
         )),

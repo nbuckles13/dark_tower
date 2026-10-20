@@ -1361,7 +1361,7 @@ client-side reading:
 
 | `dt_client_media_receive_source_deficit_total` | slot rows' `data-slot-state` | Meaning |
 |---|---|---|
-| flat | only `source_muted`, `fewer_sources` or `zero_requested`, **and the roster agrees** — those peers really are muted, there really are fewer unmuted peers than slots, or you declared zero slots | **Correct behaviour.** Silence is what the wire says. Stop. |
+| flat | only `source_muted` or `fewer_sources`, **and the roster agrees** — those peers really are muted, or there really are fewer unmuted peers than slots (declaring zero slots of a kind yields no slot rows of that kind at all; MC never sends a zero-requested state, which the proto reserved 2026-10-13) | **Correct behaviour.** Silence is what the wire says. Stop. |
 | flat | `fewer_sources` **while the roster shows unmuted peers you should hear** | Those peers are unreachable from you: you share no CONNECTED handler, so MC names them in `unreachable_sender_ids` instead of a slot. A connectivity fault — [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster). |
 | flat | `awaiting-assignment` on every slot, or a media error naming the slot cap | MC never assigned your slots — F18 (receive-slot cap), or MC signalling (§4.1). |
 | flat | `unspecified`, or any token MC does not emit today | An MC defect — [`mc-incident-response.md` §Client media signalling](mc-incident-response.md#client-media-signalling--where-to-look-no-scenario-number-yet) lists which slot states are reachable. File against `meeting-controller`. |

@@ -2,7 +2,7 @@
 //!
 //! These assert the *contract*, not behaviour: every message the media path
 //! adds must survive an encode/decode round trip with its fields intact, the
-//! seven slot states must be distinguishable on the wire, and the redacting
+//! named slot states must be distinguishable on the wire, and the redacting
 //! `Debug` impls must not print secrets. Pure encode/decode — fixed inputs, no
 //! timing, no clock, deterministic.
 //!
@@ -20,10 +20,14 @@
 use proto_gen::dark_tower::signaling::v1::*;
 use proto_gen::Message;
 
-fn roundtrip<T: Message + Default>(msg: &T) -> T {
-    let bytes = msg.encode_to_vec();
-    T::decode(bytes.as_slice()).expect("decode must succeed for a message we just encoded")
-}
+mod common;
+use common::{roundtrip, top_level_field_numbers, UNKNOWN_ENUM_VALUE};
+
+/// The number `SLOT_STATE_ZERO_REQUESTED` occupied before it was reserved
+/// (`signaling.proto`, `reserved 5; reserved "SLOT_STATE_ZERO_REQUESTED";` in
+/// `SlotState`). A raw literal on purpose: the name no longer exists in
+/// generated code, which is what the reservation tests below prove.
+const RESERVED_SLOT_STATE_ZERO_REQUESTED: i32 = 5;
 
 // ---------------------------------------------------------------------------
 // Receive capability (§6)
@@ -73,6 +77,7 @@ fn send_directive_roundtrips_encoding_targets_and_header_version() {
                 width: 0,
                 height: 0,
                 frame_rate: 0,
+                min_keyframe_interval_ms: None,
             }),
             targets: vec![
                 SendTarget {
@@ -167,8 +172,8 @@ fn assignment_without_a_source_keeps_sender_absent() {
     // The states that mean "no source" must be expressible without inventing a
     // sender id. Absent stays absent — never coerced to 0.
     for state in [
-        SlotState::ZeroRequested,
         SlotState::FewerSourcesThanSlots,
+        SlotState::Unavailable,
         SlotState::SourceUnreachable,
     ] {
         let out = roundtrip(&StreamAssignment {
@@ -187,18 +192,23 @@ fn assignment_without_a_source_keeps_sender_absent() {
 }
 
 #[test]
-fn slot_state_has_seven_distinct_states_plus_unspecified() {
-    // ADR-0036 §6 names seven states, and they are on the wire because absence
-    // of frames is not a signal. buf STANDARD requires the zero value to be
-    // UNSPECIFIED, so the enum carries eight values.
+fn every_named_slot_state_is_distinct_and_the_story_3_values_are_pinned() {
+    // ADR-0036 §6 states are on the wire because absence of frames is not a
+    // signal. The flat enum (story 3 wire freeze) must keep every NAMED value
+    // distinct, never collide with the fail-closed zero, and carry the four
+    // frozen story-3 numbers exactly -- a renumber would silently re-point a
+    // published value.
     let states = [
         SlotState::Active,
         SlotState::SourceMuted,
         SlotState::WithheldByCongestion,
         SlotState::FewerSourcesThanSlots,
-        SlotState::ZeroRequested,
         SlotState::SourceUnreachable,
         SlotState::SwitchPending,
+        SlotState::AvatarNoVideo,
+        SlotState::Unavailable,
+        SlotState::AvatarClientMuted,
+        SlotState::AvatarServerMuted,
     ];
 
     let mut seen: Vec<i32> = states.iter().map(|s| *s as i32).collect();
@@ -206,14 +216,22 @@ fn slot_state_has_seven_distinct_states_plus_unspecified() {
     seen.dedup();
     assert_eq!(
         seen.len(),
-        7,
-        "the seven §6 states must be distinct on the wire"
+        states.len(),
+        "every named slot state must be distinct on the wire"
     );
     assert!(
         !seen.contains(&(SlotState::Unspecified as i32)),
         "no real state may collide with the fail-closed zero value"
     );
     assert_eq!(SlotState::Unspecified as i32, 0);
+    assert_eq!(SlotState::AvatarNoVideo as i32, 8);
+    assert_eq!(SlotState::Unavailable as i32, 9);
+    assert_eq!(SlotState::AvatarClientMuted as i32, 10);
+    assert_eq!(SlotState::AvatarServerMuted as i32, 11);
+    assert!(
+        !seen.contains(&RESERVED_SLOT_STATE_ZERO_REQUESTED),
+        "no named state may occupy the reserved number"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +253,7 @@ fn media_stream_roundtrips_on_the_retyped_fresh_tags() {
             width: 1280,
             height: 720,
             frame_rate: 30,
+            min_keyframe_interval_ms: None,
         }),
     });
     assert_eq!(out.stream_id, "s-1");
@@ -254,6 +273,7 @@ fn publish_stream_roundtrips_on_the_retyped_fresh_tags() {
             width: 0,
             height: 0,
             frame_rate: 0,
+            min_keyframe_interval_ms: None,
         }),
     });
     assert_eq!(out.stream_id, "s-2");
@@ -279,6 +299,8 @@ fn join_request_roundtrips_raw_identity_public_key() {
         correlation_id: String::new(),
         binding_token: String::new(),
         identity_public_key: key.clone(),
+        publish_kinds: Vec::new(),
+        receive_capability: None,
     });
 
     assert_eq!(out.identity_public_key, key);
@@ -311,6 +333,8 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
         kek_generation: 65535,
         kek_rotation_debounce_seconds: 0,
         max_receive_slots: Some(8),
+        max_audio_receive_slots: None,
+        max_video_receive_slots: None,
     });
 
     assert_eq!(out.sender_id, Some(65535));
@@ -482,8 +506,8 @@ fn server_mute_request_roundtrips_through_the_client_envelope() {
         message: Some(client_message::Message::ServerMuteRequest(
             ServerMuteRequest {
                 participant_id: "p-2".to_string(),
-                audio_muted: true,
-                video_muted: false,
+                audio_muted: Some(true),
+                video_muted: Some(false),
                 reason: "policy".to_string(),
             },
         )),
@@ -494,7 +518,8 @@ fn server_mute_request_roundtrips_through_the_client_envelope() {
     match roundtrip(&envelope).message {
         Some(client_message::Message::ServerMuteRequest(m)) => {
             assert_eq!(m.participant_id, "p-2");
-            assert!(m.audio_muted);
+            assert_eq!(m.audio_muted, Some(true));
+            assert_eq!(m.video_muted, Some(false));
         }
         other => panic!("expected ServerMuteRequest, got {other:?}"),
     }
@@ -840,4 +865,454 @@ fn debug_shows_the_receive_slot_cap_in_the_clear() {
         !rendered.contains("195, 195"),
         "KEK bytes must not be printed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Story 3 (see-each-other): per-kind mute presence (R-15)
+// ---------------------------------------------------------------------------
+
+/// Four (audio, video) combinations that together cover all three presence
+/// states for each kind -- absent (= that kind unchanged), present-true,
+/// present-false -- survive the wire on BOTH request messages. `Some(false)`
+/// is the cell an implicit-presence `bool` could not carry -- it is an unmute,
+/// and it must never collapse into "unchanged".
+#[test]
+fn per_kind_mute_presence_survives_on_both_requests() {
+    let cells = [
+        (None, None),
+        (Some(true), None),
+        (None, Some(false)),
+        (Some(false), Some(true)),
+    ];
+    for (audio, video) in cells {
+        let client = roundtrip(&MuteRequest {
+            audio_muted: audio,
+            video_muted: video,
+        });
+        assert_eq!((client.audio_muted, client.video_muted), (audio, video));
+
+        let server = roundtrip(&ServerMuteRequest {
+            participant_id: "p-2".to_string(),
+            audio_muted: audio,
+            video_muted: video,
+            reason: String::new(),
+        });
+        assert_eq!((server.audio_muted, server.video_muted), (audio, video));
+    }
+}
+
+/// Presence is ON THE WIRE, not only in the Rust type: an explicit `false`
+/// emits its tag and an absent kind emits nothing. Checked from the bytes.
+#[test]
+fn explicit_false_emits_its_tag_and_absent_emits_none() {
+    let fields = top_level_field_numbers(
+        &MuteRequest {
+            audio_muted: Some(false),
+            video_muted: None,
+        }
+        .encode_to_vec(),
+    );
+    assert_eq!(fields, vec![1], "present-false audio (tag 1) only");
+
+    let fields = top_level_field_numbers(
+        &ServerMuteRequest {
+            participant_id: "p".to_string(),
+            audio_muted: None,
+            video_muted: Some(false),
+            reason: String::new(),
+        }
+        .encode_to_vec(),
+    );
+    assert_eq!(fields, vec![1, 3], "participant_id and present-false video");
+}
+
+/// Tag-compatible with a pre-optional encoder: an old `bool audio_muted = 1`
+/// set to `true` is the bytes `08 01`, and decodes as `Some(true)`.
+#[test]
+fn old_shape_true_decodes_as_present_true() {
+    let old_true_audio = [0x08u8, 0x01];
+    let out = MuteRequest::decode(&old_true_audio[..]).expect("old bytes decode");
+    assert_eq!(out.audio_muted, Some(true));
+    assert_eq!(out.video_muted, None);
+}
+
+/// NOT semantics-compatible: an old encoder OMITS `false` (implicit presence),
+/// so an old sender's UNMUTE arrives as no bytes at all and decodes as
+/// "unchanged". This pins the hazard the proto comment names -- a pre-P1
+/// client's unmute reads as unchanged once MC-B honours absence -- so nobody
+/// "fixes" it by guessing.
+#[test]
+fn old_shape_false_is_indistinguishable_from_absent() {
+    let old_false_both: [u8; 0] = [];
+    let out = MuteRequest::decode(&old_false_both[..]).expect("empty decodes");
+    assert_eq!(out.audio_muted, None);
+    assert_eq!(out.video_muted, None);
+    assert_eq!(out, MuteRequest::default());
+}
+
+// ---------------------------------------------------------------------------
+// Story 3: slot-state vocabulary (R-4, R-5) and open enums
+// ---------------------------------------------------------------------------
+
+/// `SLOT_STATE_ZERO_REQUESTED` is reserved by number AND name: its number no
+/// longer converts to a named value, its name no longer parses, and a raw 5 on
+/// the wire survives as the integer for a consumer to reject (fail closed).
+#[test]
+fn reserved_zero_requested_is_not_a_named_value() {
+    assert!(SlotState::try_from(RESERVED_SLOT_STATE_ZERO_REQUESTED).is_err());
+    assert_eq!(SlotState::from_str_name("SLOT_STATE_ZERO_REQUESTED"), None);
+
+    let out = roundtrip(&StreamAssignment {
+        slot_id: 1,
+        slot_state: RESERVED_SLOT_STATE_ZERO_REQUESTED,
+        ..Default::default()
+    });
+    assert_eq!(out.slot_state, RESERVED_SLOT_STATE_ZERO_REQUESTED);
+    assert!(SlotState::try_from(out.slot_state).is_err());
+}
+
+/// Every enum is OPEN in proto3: an unknown number decodes as its integer, never
+/// as a decode error and never as a named value. Consumers are told to reject
+/// (and count) it; this pins that there is something to reject. One test per
+/// story-3 surface: a slot state, a packed repeated `MediaKind`, a `Codec`.
+#[test]
+fn unknown_enum_values_decode_as_open_integers() {
+    let assignment = roundtrip(&StreamAssignment {
+        slot_state: UNKNOWN_ENUM_VALUE,
+        ..Default::default()
+    });
+    assert_eq!(assignment.slot_state, UNKNOWN_ENUM_VALUE);
+    assert!(SlotState::try_from(assignment.slot_state).is_err());
+
+    let join = roundtrip(&JoinRequest {
+        publish_kinds: vec![MediaKind::Audio as i32, UNKNOWN_ENUM_VALUE],
+        ..Default::default()
+    });
+    assert_eq!(
+        join.publish_kinds,
+        vec![MediaKind::Audio as i32, UNKNOWN_ENUM_VALUE]
+    );
+    assert!(MediaKind::try_from(join.publish_kinds[1]).is_err());
+
+    let encoding = roundtrip(&EncodingParameters {
+        codec: UNKNOWN_ENUM_VALUE,
+        ..Default::default()
+    });
+    assert_eq!(encoding.codec, UNKNOWN_ENUM_VALUE);
+    assert!(Codec::try_from(encoding.codec).is_err());
+}
+
+/// `StreamAssignment.sender_id` presence per state (R-5): absent on a video
+/// ACTIVE slot and on the sourceless states, present on audio ACTIVE and every
+/// avatar. Each survives the wire as written, never coerced to 0.
+#[test]
+fn stream_assignment_sender_presence_survives_per_state() {
+    let cases = [
+        (MediaKind::VideoCamera, SlotState::Active, None),
+        (MediaKind::Audio, SlotState::Active, Some(7)),
+        (MediaKind::VideoCamera, SlotState::AvatarNoVideo, Some(7)),
+        (
+            MediaKind::VideoCamera,
+            SlotState::AvatarClientMuted,
+            Some(7),
+        ),
+        (MediaKind::Audio, SlotState::AvatarServerMuted, Some(7)),
+        (MediaKind::VideoCamera, SlotState::Unavailable, None),
+        (MediaKind::Audio, SlotState::FewerSourcesThanSlots, None),
+    ];
+    for (kind, state, sender) in cases {
+        let out = roundtrip(&StreamAssignment {
+            slot_id: 4,
+            sender_id: sender,
+            media_kind: kind as i32,
+            media_handler_url: String::new(),
+            slot_state: state as i32,
+            switch_command_id: None,
+        });
+        assert_eq!(out.sender_id, sender, "{kind:?} {state:?}");
+        assert_eq!(out.slot_state, state as i32);
+        assert_eq!(
+            out.slot_id, 4,
+            "UNAVAILABLE echoes the declared slot id too"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 3: join declarations and caps (R-1, R-2, R-23)
+// ---------------------------------------------------------------------------
+
+/// The publish set survives by value AND order, duplicates included: MC must
+/// SEE a duplicate to reject and count it, so the wire must not dedupe.
+#[test]
+fn publish_kinds_keep_order_and_duplicates() {
+    let kinds = vec![
+        MediaKind::VideoCamera as i32,
+        MediaKind::Audio as i32,
+        MediaKind::Audio as i32,
+    ];
+    let out = roundtrip(&JoinRequest {
+        publish_kinds: kinds.clone(),
+        ..Default::default()
+    });
+    assert_eq!(out.publish_kinds, kinds);
+
+    let empty = roundtrip(&JoinRequest::default());
+    assert!(empty.publish_kinds.is_empty(), "empty = publishes nothing");
+}
+
+/// `JoinRequest.receive_capability` ABSENT (zero slots of each kind) is
+/// distinguishable from PRESENT-BUT-EMPTY, and a populated declaration
+/// survives.
+#[test]
+fn join_receive_capability_absent_empty_and_populated_are_distinct() {
+    let absent = roundtrip(&JoinRequest::default());
+    assert_eq!(absent.receive_capability, None);
+
+    let empty = roundtrip(&JoinRequest {
+        receive_capability: Some(ReceiveCapability::default()),
+        ..Default::default()
+    });
+    assert_eq!(empty.receive_capability, Some(ReceiveCapability::default()));
+
+    let populated = roundtrip(&JoinRequest {
+        receive_capability: Some(ReceiveCapability {
+            slots: vec![
+                ReceiveSlot {
+                    slot_id: 0,
+                    media_kind: MediaKind::Audio as i32,
+                    pinned_sender_id: None,
+                },
+                ReceiveSlot {
+                    slot_id: 1,
+                    media_kind: MediaKind::VideoCamera as i32,
+                    pinned_sender_id: None,
+                },
+            ],
+        }),
+        ..Default::default()
+    });
+    let slots = populated.receive_capability.expect("present").slots;
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[1].media_kind, MediaKind::VideoCamera as i32);
+}
+
+/// The per-kind caps survive absent / present-0 / present-n, independently. 0
+/// is LEGAL (the video-off lever) and must stay distinct from absent. (Tag
+/// numbers are pinned from the bytes in `story_3_frozen_tags_are_on_the_wire`;
+/// a round trip through one codegen cannot catch a wrong tag.)
+#[test]
+fn per_kind_receive_caps_absent_zero_and_value_are_distinct() {
+    for (audio, video) in [(None, None), (Some(8), Some(0)), (Some(0), Some(4))] {
+        let out = roundtrip(&JoinResponse {
+            participant_id: "p-1".to_string(),
+            max_audio_receive_slots: audio,
+            max_video_receive_slots: video,
+            ..Default::default()
+        });
+        assert_eq!(out.max_audio_receive_slots, audio);
+        assert_eq!(out.max_video_receive_slots, video);
+    }
+}
+
+/// The redacting `Debug` impls are hand-maintained field lists: the new
+/// non-secret fields must render in the clear, and the secrets beside them
+/// must stay redacted.
+#[test]
+fn debug_shows_story_3_join_fields_in_the_clear() {
+    let response = JoinResponse {
+        meeting_kek: vec![0xC3u8; 32],
+        max_audio_receive_slots: Some(8),
+        max_video_receive_slots: Some(4),
+        ..Default::default()
+    };
+    let rendered = format!("{response:?}");
+    assert!(rendered.contains("max_audio_receive_slots: Some(8)"));
+    assert!(rendered.contains("max_video_receive_slots: Some(4)"));
+    assert!(
+        !rendered.contains("195, 195"),
+        "KEK bytes must not be printed"
+    );
+
+    let request = JoinRequest {
+        join_token: "eyJ.super-secret-jwt".to_string(),
+        publish_kinds: vec![MediaKind::Audio as i32],
+        ..Default::default()
+    };
+    let rendered = format!("{request:?}");
+    assert!(rendered.contains("publish_kinds: [1]"));
+    assert!(rendered.contains("receive_capability: None"));
+    assert!(!rendered.contains("super-secret-jwt"));
+}
+
+// ---------------------------------------------------------------------------
+// Story 3: video encoding (R-8, R-11, R-23)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vp8_is_codec_5() {
+    assert_eq!(Codec::Vp8 as i32, 5);
+    assert_eq!(Codec::from_str_name("CODEC_VP8"), Some(Codec::Vp8));
+}
+
+/// `min_keyframe_interval_ms` absent / present-0 / present-500 are three
+/// distinct observables: absent is what a client must REFUSE on a video
+/// stream, so it must never decode as a present value.
+#[test]
+fn min_keyframe_interval_absent_zero_and_value_are_distinct() {
+    for value in [None, Some(0), Some(500)] {
+        let out = roundtrip(&EncodingParameters {
+            codec: Codec::Vp8 as i32,
+            max_bitrate_bps: 800_000,
+            width: 640,
+            height: 360,
+            frame_rate: 30,
+            min_keyframe_interval_ms: value,
+        });
+        assert_eq!(out.min_keyframe_interval_ms, value);
+        assert_eq!(out.codec, Codec::Vp8 as i32);
+        assert_eq!(out.frame_rate, 30, "the additive field leaves neighbours");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 3: keyframe and recovery requests on the MH bidi stream (R-10, R-13)
+// ---------------------------------------------------------------------------
+
+/// `MhServerMessage` (new) carries `KeyframeRequest` at tag 1 and the
+/// envelope trace fields at 20/21; the GoP counter's full u32 range survives,
+/// 0 included.
+#[test]
+fn keyframe_request_roundtrips_through_the_mh_server_envelope() {
+    for gop_counter in [0, u32::MAX] {
+        let envelope = MhServerMessage {
+            message: Some(mh_server_message::Message::KeyframeRequest(
+                KeyframeRequest {
+                    stream_number: 1,
+                    gop_counter,
+                },
+            )),
+            trace_parent: "00-trace".to_string(),
+            trace_state: "k=v".to_string(),
+        };
+        let bytes = envelope.encode_to_vec();
+        assert_eq!(top_level_field_numbers(&bytes), vec![1, 20, 21]);
+        match roundtrip(&envelope).message {
+            Some(mh_server_message::Message::KeyframeRequest(k)) => {
+                assert_eq!(k.stream_number, 1);
+                assert_eq!(k.gop_counter, gop_counter);
+            }
+            other => panic!("expected KeyframeRequest, got {other:?}"),
+        }
+    }
+}
+
+/// `MhClientMessage.recovery_request` (tag 2) carries all three fields; the
+/// GoP counter's full range survives, 0 included (a legal first group).
+#[test]
+fn recovery_request_roundtrips_through_the_mh_client_envelope() {
+    for gop_counter in [0, u32::MAX] {
+        let envelope = MhClientMessage {
+            message: Some(mh_client_message::Message::RecoveryRequest(
+                RecoveryRequest {
+                    slot_id: 65535,
+                    sender_id: 9,
+                    gop_counter,
+                },
+            )),
+            trace_parent: "00-trace".to_string(),
+            trace_state: "k=v".to_string(),
+        };
+        assert_eq!(
+            top_level_field_numbers(&envelope.encode_to_vec()),
+            vec![2, 20, 21]
+        );
+        let out = roundtrip(&envelope);
+        assert_eq!(out.trace_parent, "00-trace");
+        match out.message {
+            Some(mh_client_message::Message::RecoveryRequest(r)) => {
+                assert_eq!(r.slot_id, 65535);
+                assert_eq!(r.sender_id, 9);
+                assert_eq!(r.gop_counter, gop_counter);
+            }
+            other => panic!("expected RecoveryRequest, got {other:?}"),
+        }
+    }
+}
+
+/// The connect variant is unchanged by the new sibling: still tag 1, still the
+/// first framed message a handler reads.
+#[test]
+fn mh_connect_request_keeps_tag_1() {
+    let envelope = MhClientMessage {
+        message: Some(mh_client_message::Message::ConnectRequest(
+            MhConnectRequest {
+                join_token: "jwt".to_string(),
+            },
+        )),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    };
+    assert_eq!(top_level_field_numbers(&envelope.encode_to_vec()), vec![1]);
+    assert!(matches!(
+        roundtrip(&envelope).message,
+        Some(mh_client_message::Message::ConnectRequest(_))
+    ));
+}
+
+/// The story's FROZEN tag numbers, read from the encoded BYTES. A round trip
+/// through one prost codegen cannot catch a wrong tag in the `.proto` (encode
+/// and decode agree with each other), and `buf breaking` only guards a tag
+/// after it has landed -- so on the landing commit this is the only check.
+/// Present-0 values are used where possible, which also proves explicit
+/// presence emits the tag.
+#[test]
+fn story_3_frozen_tags_are_on_the_wire() {
+    let join = top_level_field_numbers(
+        &JoinRequest {
+            publish_kinds: vec![MediaKind::Audio as i32],
+            receive_capability: Some(ReceiveCapability::default()),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    assert_eq!(join, vec![8, 9]);
+
+    let caps = top_level_field_numbers(
+        &JoinResponse {
+            max_audio_receive_slots: Some(0),
+            max_video_receive_slots: Some(0),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    assert_eq!(caps, vec![13, 14]);
+
+    let encoding = top_level_field_numbers(
+        &EncodingParameters {
+            min_keyframe_interval_ms: Some(0),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    assert_eq!(encoding, vec![6]);
+
+    let keyframe = top_level_field_numbers(
+        &KeyframeRequest {
+            stream_number: 1,
+            gop_counter: 1,
+        }
+        .encode_to_vec(),
+    );
+    assert_eq!(keyframe, vec![1, 2]);
+
+    let recovery = top_level_field_numbers(
+        &RecoveryRequest {
+            slot_id: 1,
+            sender_id: 1,
+            gop_counter: 1,
+        }
+        .encode_to_vec(),
+    );
+    assert_eq!(recovery, vec![1, 2, 3]);
 }

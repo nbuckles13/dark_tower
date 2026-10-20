@@ -2273,9 +2273,10 @@ impl MeetingActor {
 
         // Story 2 is audio-only, and MH mute is SENDER-scoped (it drops every
         // stream of the sender), so only the audio flag feeds MH. Per-kind mute
-        // moves to MC's egress edge set when video lands (story 3); a
-        // video-only server mute is recorded and broadcast but changes nothing
-        // MH enforces.
+        // arrives as `SourceStream` DROP_AT_INGRESS dispositions (MC-A;
+        // reasoning at `internal.proto` `MutedSource`, corrected 2026-10-13);
+        // until then a video-only server mute is recorded and broadcast but
+        // changes nothing MH enforces.
         if audio_changed {
             self.publish_mute_census();
             self.reconcile_media(Affected::HoldersOf(sender)).await;

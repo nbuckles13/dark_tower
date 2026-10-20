@@ -12,10 +12,12 @@
 //     directive. Resuming is a server round trip.
 //   * **"you have muted yourself"** — client mute. Resuming is a LOCAL decision.
 //
-// They have different resumption costs, so they are separate fields here and MC
-// keeps the send directive ACTIVE while a client reports itself muted. The
-// client suppresses locally; MC does not withdraw the instruction. That is what
-// makes unmute instantaneous.
+// They have different resumption costs, so they are separate fields here. MC
+// MAY leave the send directive in place while a client reports itself muted;
+// the client suppresses locally. A server mute or an unwatched kind withdraws
+// the directive, so a client-unmute resumes locally only while the kind is
+// still directed (signaling.proto `SendDirective`; ADR-0036 §5, correction
+// 2026-10-13).
 //
 // ---------------------------------------------------------------------------
 // ENFORCED AT CAPTURE, AND THE SIGNAL IS INFORMATIONAL

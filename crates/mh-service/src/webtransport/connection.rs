@@ -269,12 +269,26 @@ pub async fn handle_connection(
     // `set_remote_parent`).
     common::observability::otel::set_remote_parent(&tracing::Span::current(), parent_cx);
 
-    // Decode failure, empty oneof, and unknown variant all collapse to a single
-    // generic client-facing error: in all three the JWT was never extracted, so
-    // validation never ran — splitting labels here would be a distinction without
-    // a difference for the accept_loop's status=error observable.
+    // Decode failure, empty oneof, a non-connect variant first, and unknown
+    // variant all collapse to a single generic client-facing error: in all four
+    // the JWT was never extracted, so validation never ran — splitting labels
+    // here would be a distinction without a difference for the accept_loop's
+    // status=error observable.
     let token = match envelope.message {
         Some(mh_client_message::Message::ConnectRequest(req)) => req.join_token,
+        // A post-connect variant as the FIRST message is not a connect: the
+        // same generic invalid-connect reject. Reading `RecoveryRequest` after
+        // a connect is MH-B's.
+        Some(mh_client_message::Message::RecoveryRequest(_)) => {
+            warn!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                "MhClientMessage first message is not a connect request"
+            );
+            return Err(MhError::WebTransportError(
+                "Invalid connect message".to_string(),
+            ));
+        }
         None => {
             warn!(
                 target: "mh.webtransport.connection",

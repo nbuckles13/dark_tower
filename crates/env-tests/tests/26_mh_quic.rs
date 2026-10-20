@@ -1327,6 +1327,9 @@ impl<'a> Injection<'a> {
                     sender_id: *sender_id,
                 })
                 .collect(),
+            // Story 3: empty selects MH's transitional story-2 reading
+            // (internal.proto `server_muted_sources`).
+            source_streams: Vec::new(),
         };
         self.client
             .register_meeting(mh_grpc::authed(self.token, request))

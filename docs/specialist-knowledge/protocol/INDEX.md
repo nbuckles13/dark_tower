@@ -32,8 +32,9 @@ All shapes in `internal.proto`. No-key-material rule → its header + `scripts/g
 - `sender_id`-is-meeting-scoped MUST (no global index; malformed rejects, not-yet-connected holds) → `SubscriberSlot`; key-id-pair source ref, not `MediaStream` (§7 type-blind) → `CandidateSource`
 - Output-derived generation, three-"generation" trap list, task-5/6 ordering constraint → `RegisterMeetingRequest.policy_generation`
 - **Applied**-never-received echo, zero=nothing-applied, all-edges-or-none, canonical `outcome` label set → `RegisterMeetingResponse.applied_generation`
+- Story 3: per-stream declarations, dispositions, attribution rule → `SourceStream`/`SourceDisposition`; transitional empty-list + union mute reading → `RegisterMeetingRequest.server_muted_sources`; per-stream echo → `applied_source_streams`; per-kind mute in slot terms (single home) → `MutedSource`
 - UNSPECIFIED echo is a mismatch NOT a skip; expires at video → `.transport_mode`; restart detection, per-process → `.process_start_epoch_ms`
-- Wire-shape tests + "what these do NOT assert" header → `crates/proto-gen/tests/internal_roundtrip.rs`; runtime MUSTs no story-1 test can catch → `docs/TODO.md` §Media Path Obligations
+- Wire-shape tests + "what these do NOT assert" header → `crates/proto-gen/tests/internal_roundtrip.rs` (shared byte walker `tests/common/mod.rs`); runtime MUSTs → `docs/TODO.md` §Media Path Obligations
 
 ## gRPC Endpoints (server + client per RPC)
 - GC→MC AssignMeetingWithMh → `crates/gc-service/src/services/mc_client.rs`; GC MH selection → `services/mh_selection.rs`; MC server + MediaCoordinationService → `crates/mc-service/src/grpc/mc_service.rs`, `media_coordination.rs`; MH→MC client → `crates/mh-service/src/grpc/mc_client.rs`
@@ -45,13 +46,14 @@ All shapes in `internal.proto`. No-key-material rule → its header + `scripts/g
 
 ## ADR-0036 Media Contract (signaling.proto)
 All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
-- Vocabulary: `MediaKind`, `Codec`, `TransportMode`, `SlotState` (7 §6 states + UNSPECIFIED)
+- Vocabulary: `MediaKind`, `Codec` (VP8 = story-3 video), `TransportMode`, `SlotState` (flat enum; ZERO_REQUESTED reserved, SOURCE_MUTED superseded, retained-never-emitted fail closed)
 - Receive capability, per-slot optional pin, slot-id scoping → `ReceiveCapability`/`ReceiveSlot`
 - Send directive (transport mode, NOT §7 priority group) → `SendDirective`/`SendTarget`
 - Slot assignment, attribution chain, switch-pending command id → `StreamAssignment`
 - `sender_id` contract (1..=65535, zero invalid) → `JoinResponse.sender_id`; meeting KEK + generation → `JoinResponse.meeting_kek`, `MeetingKekUpdate`
-- W carried on the wire, retention `min(W/2, ceiling)` derived at client → `JoinResponse.kek_rotation_debounce_seconds`; per-subscriber cross-handler set → `StreamAssignments.unreachable_sender_ids`; ZERO_REQUESTED/SOURCE_UNREACHABLE retained-unemitted → `SlotState`
-- Roster identity key (no attestation yet) → `Participant.identity_public_key`; client- vs server-mute (§5) → `MuteRequest`/`ServerMuteRequest`
+- W carried on the wire, retention `min(W/2, ceiling)` derived at client → `JoinResponse.kek_rotation_debounce_seconds`; per-subscriber cross-handler set → `StreamAssignments.unreachable_sender_ids`; SOURCE_UNREACHABLE retained-unemitted → `SlotState`
+- Roster identity key → `Participant.identity_public_key`; four mute controls + `optional bool` presence → Mute-state section header; self-copy-before-directive → `ParticipantMuteUpdate`. Story-3 join → `JoinRequest.publish_kinds`; per-kind caps/truncation → `JoinResponse.max_audio_receive_slots`; min keyframe interval SSoT → `EncodingParameters.min_keyframe_interval_ms`; hop-local relay id → `SendStream.stream_number`; sender presence per state → `StreamAssignment.sender_id`
+- MH bidi stream: `RecoveryRequest` (client→MH), `MhServerMessage.KeyframeRequest` (MH→client), rules in the section above `RecoveryRequest`
 - Redacting `Debug` → `crates/proto-gen/build.rs`, `src/lib.rs`; wire-shape tests → `crates/proto-gen/tests/signaling_roundtrip.rs`
 - Codegen oracle (presence + absence, both protos) → `packages/proto-gen/scripts/verify-codegen.sh`; SDK codec vocabulary → `packages/sdk-core/src/signaling/codecMap.ts`
 

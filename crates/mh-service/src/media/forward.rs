@@ -199,16 +199,15 @@ pub fn forward_one(
     // Nothing read from the frame participates — frame header v2 carries no
     // sender id, and this path never parses the SFrame key id. So a PATCHED
     // CLIENT changes nothing observable: there is no client-reachable input
-    // to this decision. Exact while meetings are audio-only (one stream per
-    // sender).
+    // to this decision. Exact under the transitional union reading
+    // (`internal.proto` `server_muted_sources`): a muted sender drops on every
+    // stream.
     //
-    // PER-STREAM INGRESS MUTE IS FORECLOSED, not merely unimplemented. The
-    // publisher's real stream number is inside the opaque key id MH never
-    // reads (type-blind §7, keyless §4), and the only stream indicator MH CAN
-    // read here — the relay region — is written by the muted publisher
-    // itself. Keying a mute on either is self-selectable evasion. Per-kind
-    // mute moves to MC's egress edge set when video lands (`internal.proto`
-    // `MutedSource`, the single home of this reasoning).
+    // PER-KIND MUTE HOLDS IN SLOT TERMS — the reasoning, and the 2026-10-13
+    // correction of this paragraph's former "per-stream ingress mute is
+    // FORECLOSED" text, live once at `internal.proto` `MutedSource`. MH-A1
+    // replaces this sender-level check with per-stream attribution against
+    // `source_streams`.
     //
     // WHO CAN SET IT: `RegisterMeeting` authorizes on scope alone, so any
     // holder of `service.write.mh` can set or clear a mute — bounded as
