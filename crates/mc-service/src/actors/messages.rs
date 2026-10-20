@@ -5,6 +5,7 @@
 
 use super::participant::ParticipantActorHandle;
 use crate::errors::McError;
+use crate::media_signaling::MediaKindLabel;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -601,14 +602,35 @@ pub struct KekPush {
     pub kek_rotation_debounce_seconds: u32,
 }
 
-/// A server-mute request the meeting actor ACTED on.
+/// A server-mute request the meeting actor ACTED on, PER KIND (story 3 OBS-A).
+///
+/// Each kind reports whether ITS flag changed, so the per-kind
+/// `mc_media_server_mute_requests_total{media_kind, outcome}` cell is honest: a
+/// request that changes only audio is `applied` for audio and `unchanged` for
+/// video. The whole-request "nothing changed" case is DERIVED from the same two
+/// flags ([`Self::is_unchanged`]), never a separate comparison, so the two
+/// cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServerMuteDecision {
-    /// The server-mute state changed and was broadcast (and, for audio,
-    /// re-rendered and re-pushed).
-    Applied,
-    /// Already in the requested state. Nothing broadcast, nothing pushed.
-    Unchanged,
+pub struct ServerMuteDecision {
+    /// Per kind, indexed by [`MediaKindLabel::index`]: did that kind's
+    /// server-mute flag change? (Audio: broadcast, re-rendered, re-pushed.
+    /// Video: broadcast.)
+    pub changed: [bool; 2],
+}
+
+impl ServerMuteDecision {
+    /// Did `kind`'s flag change?
+    #[must_use]
+    pub fn changed(self, kind: MediaKindLabel) -> bool {
+        kind.of(self.changed)
+    }
+
+    /// Already in the requested state on both kinds: nothing broadcast,
+    /// nothing pushed.
+    #[must_use]
+    pub fn is_unchanged(self) -> bool {
+        !self.changed.contains(&true)
+    }
 }
 
 /// Why the meeting actor refused a server-mute request.

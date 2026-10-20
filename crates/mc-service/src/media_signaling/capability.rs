@@ -21,7 +21,7 @@
 //! Keep it that way: if a future check needs meeting state, it belongs in the
 //! composition step, not here.
 
-use super::outcome::CapabilityOutcome;
+use super::outcome::{CapabilityOutcome, MediaKindLabel};
 use proto_gen::dark_tower::signaling::v1::{MediaKind, ReceiveCapability};
 use std::collections::HashSet;
 use std::num::NonZeroU16;
@@ -101,6 +101,11 @@ pub struct DeclaredSlot {
     /// What this slot can decode. Never `MEDIA_KIND_UNSPECIFIED` — that is a
     /// rejection, so this field cannot hold it.
     pub media_kind: MediaKind,
+    /// The slot's `media_kind` METRIC label, projected from `media_kind` once,
+    /// here, at parse. Parse rejects `UNSPECIFIED` before this is computed, so
+    /// the projection is total at this point and no recorder ever performs a
+    /// fallible lookup (a missed lookup there would be a silent drop).
+    pub kind_label: MediaKindLabel,
     /// The optional pin. Shape-validated; never used to resolve a source.
     pub pinned_sender_id: Option<PinnedSenderId>,
 }
@@ -216,9 +221,11 @@ impl ReceiveCapabilityDeclaration {
             // can send.
             let media_kind = MediaKind::try_from(slot.media_kind)
                 .map_err(|_| CapabilityOutcome::MediaKindUnspecified)?;
-            if media_kind == MediaKind::Unspecified {
+            // `from_proto` is `None` exactly for `UNSPECIFIED`, so this one
+            // check is both the rejection and the label projection.
+            let Some(kind_label) = MediaKindLabel::from_proto(media_kind) else {
                 return Err(CapabilityOutcome::MediaKindUnspecified);
-            }
+            };
 
             // The one place MC receives an attacker-supplied sender id. Zero is
             // reserved-invalid, so `Some(0)` is rejected like any other
@@ -239,6 +246,7 @@ impl ReceiveCapabilityDeclaration {
             slots.push(DeclaredSlot {
                 slot_id,
                 media_kind,
+                kind_label,
                 pinned_sender_id,
             });
         }
@@ -278,6 +286,7 @@ mod tests {
         assert_eq!(declaration.slots().len(), 1);
         assert_eq!(declaration.slots()[0].slot_id.get(), 0);
         assert_eq!(declaration.slots()[0].media_kind, MediaKind::Audio);
+        assert_eq!(declaration.slots()[0].kind_label, MediaKindLabel::Audio);
         assert!(declaration.slots()[0].pinned_sender_id.is_none());
     }
 
@@ -298,6 +307,28 @@ mod tests {
             .map(|s| s.slot_id.get())
             .collect();
         assert_eq!(ids, vec![3, 0, 1]);
+    }
+
+    /// The metric kind is projected at parse: camera AND screen slots are
+    /// `video`, so a screen slot (accepted today) is never dropped from the
+    /// slot-state counter.
+    #[test]
+    fn kind_label_is_projected_at_parse() {
+        let declaration = parse(vec![
+            slot(0, MediaKind::Audio, None),
+            slot(1, MediaKind::VideoCamera, None),
+            slot(2, MediaKind::VideoScreen, None),
+        ])
+        .unwrap();
+        let kinds: Vec<MediaKindLabel> = declaration.slots().iter().map(|s| s.kind_label).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MediaKindLabel::Audio,
+                MediaKindLabel::Video,
+                MediaKindLabel::Video
+            ]
+        );
     }
 
     #[test]

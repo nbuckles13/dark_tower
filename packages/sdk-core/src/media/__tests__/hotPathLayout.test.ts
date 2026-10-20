@@ -149,7 +149,7 @@ describe('media hot-path layout (ADR-0036 §11)', () => {
     expect(
       offenders,
       `these files name a dt_client_ metric outside ${METRIC_HOME}; media labels must be built ` +
-        `by mediaMetricLabels, which takes two named strings and therefore cannot inherit a ` +
+        `by mediaMetrics.ts from two named strings and a closed media kind, and therefore cannot inherit a ` +
         `meeting, participant or stream dimension`,
     ).toEqual([]);
   });

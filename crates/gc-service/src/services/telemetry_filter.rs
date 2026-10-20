@@ -25,10 +25,15 @@
 //!
 //! It bounds neither the value domain nor the distinct-value COUNT of any other
 //! key. The bounded-cardinality property of
-//! `reason`/`outcome`/`action`/`source`/`mode` comes from the SDK types in
-//! `packages/sdk-core/src/media/setup/mediaMetrics.ts` and holds for an HONEST
-//! client only: a patched client can inflate their distinct-value count, and the
-//! collector's charset regex bounds bytes and charset, not count.
+//! `reason`/`outcome`/`action`/`source`/`mode`/`media_kind` comes from the SDK
+//! types in `packages/sdk-core/src/media/setup/mediaMetrics.ts` and holds for an
+//! HONEST client only at this hop. Downstream the collector bounds them
+//! differently: for the first five its charset regex bounds bytes and charset,
+//! not count, so a patched client can inflate their distinct-value count; for
+//! `media_kind` its EXACT `^(audio|video)$` rewrite to `invalid` does bound the
+//! distinct-value count (at most three values reach a stored series). GC
+//! deliberately applies no value rule to `media_kind` — see
+//! [`MEDIA_DATAPOINT_EXTRA`].
 //!
 //! Traversal is strictly fixed-depth over the structural message tree. The value
 //! checks read a value's discriminant (and, for the two keys above, a short
@@ -48,7 +53,7 @@
 //! forwards ONLY the re-encoded bytes — the original body is never proxied.
 
 use crate::observability::metrics;
-use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
+use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -88,8 +93,8 @@ pub const ALLOWLIST: [&str; 12] = [
 /// The keys additionally admitted on metric **datapoint** attributes only.
 ///
 /// A DELTA, never a second full list: the union with [`ALLOWLIST`] is computed
-/// in [`key_allowed`] and is deliberately never written down. A 17-key array
-/// would be a straight copy of the base 12 and would silently diverge the first
+/// in [`key_allowed`] and is deliberately never written down. A merged array
+/// would be a straight copy of the base list and would silently diverge the first
 /// time someone adds a 13th base key to one array and not the other.
 ///
 /// Without these, `MCMediaMissingKeyMaterial` cannot match: its numerator
@@ -109,13 +114,31 @@ pub const ALLOWLIST: [&str; 12] = [
 /// Deliberately NOT mirrored as a Rust enum here: that would be a fourth,
 /// unguarded copy of a TypeScript-owned vocabulary whose own SSoT is a Guarded
 /// Shared Area.
-pub const MEDIA_DATAPOINT_EXTRA: [&str; 6] = [
+///
+/// `media_kind` ([`MEDIA_KIND_LABEL`], story 3 R-29) is the closed vocabulary
+/// {`audio`, `video`}. Its single source of truth is the `media_kind` row of
+/// `docs/observability/label-taxonomy.md` (§"Carried: `media_kind`, by MC and
+/// the client SDK only"); the SDK's `MediaKindLabel` is its client code home.
+/// It is the one key story 3 adds. Like the five discriminators above — NOT
+/// like `key_custody`, whose value GC checks in `custody_value_ok` — GC bounds
+/// only its KEY and its value SHAPE (scalar). The content bound is the
+/// collector's EXACT `^(audio|video)$` rewrite to `invalid` on the metrics
+/// path, and that collector rule is the ONLY value bound. GC deliberately does
+/// NOT drop a bad value: a drop here would strip `media_kind="bogus"` before
+/// the collector saw it, making the collector rule dead and its rewrite
+/// unobservable (`crates/env-tests/tests/31_gc_telemetry.rs` proves the
+/// rewrite fires end to end, and `media_kind_value_is_not_checked_here` below
+/// pins this side). GC -> collector is the only metrics path, so the pipeline
+/// as a whole stays bounded. Not mirrored as a Rust enum here either: GC does
+/// not import MC's `MediaKindLabel`.
+pub const MEDIA_DATAPOINT_EXTRA: [&str; 7] = [
     "reason",
     "outcome",
     "action",
     "source",
     "mode",
     KEY_CUSTODY_LABEL,
+    MEDIA_KIND_LABEL,
 ];
 
 /// Which key tier applies at a given call site.
@@ -1216,10 +1239,10 @@ mod tests {
     // ---- Media datapoint tier (blocker 2) ----------------------------------
 
     #[test]
-    fn media_datapoint_extra_has_exactly_6_keys() {
+    fn media_datapoint_extra_has_exactly_7_keys() {
         // The one deliberate length literal: the tripwire that makes adding a
         // key a conscious edit. Everything else derives from the const.
-        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 6);
+        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 7);
     }
 
     /// The media-key fixtures below must cover the const EXACTLY, so a seventh
@@ -1241,6 +1264,7 @@ mod tests {
             string_attr("source", "join_response"),
             string_attr("mode", "test_tone"),
             string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            string_attr(MEDIA_KIND_LABEL, "audio"),
         ]
     }
 
@@ -1255,6 +1279,7 @@ mod tests {
             string_attr("source", "join_response"),
             string_attr("mode", "test_tone"),
             string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            string_attr(MEDIA_KIND_LABEL, "video"),
         ];
         assert_fixture_covers_media_keys(&media);
         let mut attrs = media;
@@ -1272,6 +1297,7 @@ mod tests {
             ("source", "join_response"),
             ("mode", "test_tone"),
             (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+            (MEDIA_KIND_LABEL, "video"),
             ("client_version", "0.0.0"),
         ] {
             assert!(
@@ -1368,6 +1394,24 @@ mod tests {
                 .any(|kv| MEDIA_DATAPOINT_EXTRA.contains(&kv.key.as_str())),
             "exemplars take the BASE tier; got {:?}",
             pairs(&ex.filtered_attributes)
+        );
+    }
+
+    #[test]
+    fn media_kind_value_is_not_checked_here() {
+        // Pins the "GC bounds only the key" half of the split documented on
+        // MEDIA_DATAPOINT_EXTRA: an out-of-vocabulary value survives
+        // byte-identical, because the collector's exact rewrite to `invalid` is
+        // the only value bound and must be able to fire. A GC value rule added
+        // later would make that collector rule dead; this test fails first.
+        let mut req = sum_req_with(vec![string_attr(MEDIA_KIND_LABEL, "bogus")]);
+        let counts = filter_metrics(&mut req, TEST_ORG);
+
+        assert_eq!(counts.datapoint, 0, "nothing may be dropped");
+        assert!(
+            pairs(sum_dp_attrs(&req)).contains(&(MEDIA_KIND_LABEL, "bogus".to_string())),
+            "media_kind must survive with its value byte-identical; got {:?}",
+            pairs(sum_dp_attrs(&req))
         );
     }
 

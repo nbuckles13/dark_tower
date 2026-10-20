@@ -30,7 +30,7 @@
 //! one-line client patch. The field does not exist on `SendDirective`,
 //! `SendStream` or `SendTarget`, so this is structural rather than observed.
 
-use super::outcome::DirectiveOutcome;
+use super::outcome::{DirectiveOutcome, MediaKindLabel};
 use crate::media_admission::SenderId;
 use crate::media_routing::{
     HandlerId, MeetingAssignment, MeetingHandlers, MAIN_AUDIO_STREAM_NUMBER,
@@ -387,17 +387,26 @@ fn header_version() -> u32 {
 /// empty. That means send nothing."), reported as
 /// [`DirectiveOutcome::EmittedEmptyTargets`] rather than as a failure.
 ///
+/// The third element is each stream's `media_kind` metric label, PARALLEL to
+/// `SendDirective.streams` (same length, same order): the typed kind is
+/// projected HERE, once, from the policy's `MediaKind`, so the recorder never
+/// re-derives it from the wire `i32` (the same shape as
+/// `SlotComposition.slot_states`).
+///
 /// # Errors
 ///
 /// A [`DirectiveOutcome`] failure variant. Every one fails closed: an unknown
 /// stream number is not assumed to be audio, and an unspecified transport mode
-/// is not defaulted to datagram.
+/// is not defaulted to datagram. A policy kind with no `media_kind` label
+/// (`UNSPECIFIED`) is an MC defect reported as
+/// [`DirectiveOutcome::UnknownStreamNumber`] — counted on
+/// `mc_media_send_directives_total`, never skipped.
 pub fn build_send_directive(
     publisher: SenderId,
     assignment: &MeetingAssignment,
     meeting_handlers: &MeetingHandlers,
     policy: &MediaStreamPolicy,
-) -> Result<(SendDirective, DirectiveOutcome), DirectiveOutcome> {
+) -> Result<(SendDirective, DirectiveOutcome, Vec<MediaKindLabel>), DirectiveOutcome> {
     // stream number -> targets, ordered so an unchanged meeting produces an
     // unchanged directive. `BTreeMap` over the handler id keeps target order
     // deterministic for the same reason the assignment sorts its streams:
@@ -425,10 +434,14 @@ pub fn build_send_directive(
     }
 
     let mut streams = Vec::with_capacity(by_stream.len());
+    let mut stream_kinds = Vec::with_capacity(by_stream.len());
     let mut any_target = false;
 
     for (stream, handlers) in by_stream {
         let Some((media_kind, encoding)) = policy.lookup(stream) else {
+            return Err(DirectiveOutcome::UnknownStreamNumber);
+        };
+        let Some(kind_label) = MediaKindLabel::from_proto(media_kind) else {
             return Err(DirectiveOutcome::UnknownStreamNumber);
         };
 
@@ -456,6 +469,7 @@ pub fn build_send_directive(
             encoding: Some(encoding.to_proto()),
             targets,
         });
+        stream_kinds.push(kind_label);
     }
 
     let outcome = if any_target {
@@ -470,6 +484,7 @@ pub fn build_send_directive(
             header_version: header_version(),
         },
         outcome,
+        stream_kinds,
     ))
 }
 
@@ -524,7 +539,7 @@ mod tests {
     #[test]
     fn a_held_publisher_is_directed_to_one_audio_stream_on_one_datagram_target() {
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, outcome) = build_send_directive(
+        let (directive, outcome, stream_kinds) = build_send_directive(
             sender(1),
             &assignment,
             &urls,
@@ -535,6 +550,8 @@ mod tests {
         assert_eq!(outcome, DirectiveOutcome::Emitted);
         assert_eq!(directive.header_version, u32::from(PROTOCOL_VERSION));
         assert_eq!(directive.streams.len(), 1);
+        // The per-stream labels are PARALLEL to the streams.
+        assert_eq!(stream_kinds, vec![MediaKindLabel::Audio]);
 
         let stream = &directive.streams[0];
         assert_eq!(stream.stream_number, u32::from(MAIN_AUDIO_STREAM_NUMBER));
@@ -566,7 +583,7 @@ mod tests {
         // send nothing"), not a failure — so the outcome must sit in the success
         // set, or an `outcome != "emitted"` alert would page on a legal state.
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, outcome) = build_send_directive(
+        let (directive, outcome, _) = build_send_directive(
             sender(9),
             &assignment,
             &urls,
@@ -599,7 +616,7 @@ mod tests {
         // group could promote itself past the salience bound §7 relies on.
         // This test documents the property; the proto enforces it.
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, _) = build_send_directive(
+        let (directive, _, _) = build_send_directive(
             sender(1),
             &assignment,
             &urls,
@@ -627,6 +644,29 @@ mod tests {
         assert_eq!(
             StreamNumber::from_wire(u32::MAX),
             Err(DirectiveOutcome::UnknownStreamNumber)
+        );
+    }
+
+    /// Every kind the policy can name projects to a label, so the composition's
+    /// `UnknownStreamNumber` fallback for an unlabelled kind is never reached by
+    /// a configured stream. Pinned over the whole 8-bit stream-number domain so
+    /// a new policy entry with an unlabelled kind reds.
+    #[test]
+    fn every_policy_kind_projects_to_a_label() {
+        let policy = MediaStreamPolicy::new(encoding());
+        let mut seen = 0;
+        for n in 0..=u8::MAX {
+            if let Some((kind, _)) = policy.lookup(StreamNumber::from_u8(n)) {
+                seen += 1;
+                assert!(
+                    MediaKindLabel::from_proto(kind).is_some(),
+                    "policy stream {n} names kind {kind:?}, which has no media_kind label"
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "positive control: the policy names at least one stream"
         );
     }
 
@@ -713,7 +753,7 @@ mod tests {
         // that rejected EVERY hand-built assignment would pass both and prove
         // nothing about the two specific guards.
         let assignment = assignment_with(MAIN_AUDIO_STREAM_NUMBER, TransportMode::Datagram);
-        let (directive, outcome) = build_send_directive(
+        let (directive, outcome, _) = build_send_directive(
             sender(1),
             &assignment,
             &urls_for_mh0(),
@@ -798,8 +838,8 @@ mod tests {
         use prost::Message;
         let (assignment, urls) = two_party(&["mh-1", "mh-0", "mh-2"]);
         let policy = MediaStreamPolicy::new(encoding());
-        let (a, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
-        let (b, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
+        let (a, _, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
+        let (b, _, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
         assert_eq!(a.encode_to_vec(), b.encode_to_vec());
     }
 
@@ -811,7 +851,7 @@ mod tests {
         let mut table = SlotTable::new();
         table.admit_on(sender(1), &set, &["mh-0"]);
         table.set_demand(sender(1), vec![0]);
-        let (directive, outcome) = build_send_directive(
+        let (directive, outcome, _) = build_send_directive(
             sender(1),
             &table
                 .render(set.ids(), &std::collections::BTreeSet::new())
@@ -853,7 +893,7 @@ mod tests {
             .map(|(id, _)| urls.url_of(id).unwrap().to_string())
             .collect();
 
-        let (directive, outcome) = build_send_directive(
+        let (directive, outcome, _) = build_send_directive(
             sender(1),
             &assignment,
             &urls,
@@ -891,7 +931,7 @@ mod tests {
         for s in [1, 2, 3] {
             table.set_demand(sender(s), vec![0, 1]);
         }
-        let (directive, outcome) = build_send_directive(
+        let (directive, outcome, _) = build_send_directive(
             sender(1),
             &table
                 .render(set.ids(), &std::collections::BTreeSet::new())
@@ -933,8 +973,8 @@ mod tests {
         let (ascending, urls_a) = two_party(&["mh-0", "mh-1"]);
         let (inverted, urls_b) = two_party(&["mh-1", "mh-0"]);
 
-        let (a, _) = build_send_directive(sender(1), &ascending, &urls_a, &policy).unwrap();
-        let (b, _) = build_send_directive(sender(1), &inverted, &urls_b, &policy).unwrap();
+        let (a, _, _) = build_send_directive(sender(1), &ascending, &urls_a, &policy).unwrap();
+        let (b, _, _) = build_send_directive(sender(1), &inverted, &urls_b, &policy).unwrap();
 
         // Byte-identical AND non-empty naming mh-0: equality alone is green when
         // both sides are empty, so the literal is what gives this teeth.

@@ -216,6 +216,29 @@ export class MediaMetrics {
     this.#sink?.counter('dt_client_media_roster_key_rebinds_total', { ...this.#base, outcome: outcome });
   }
 }
+
+// The kind-free session bag behind the two declared wrappers (story 3 OBS-A).
+export class MediaSessionMetrics {
+  readonly #sink: MetricsSink | undefined;
+  readonly #sessionLabels: MetricLabels;
+
+  constructor(identity: { clientVersion: string; orgId: string }, sink: MetricsSink | undefined) {
+    this.#sessionLabels = {
+      client_version: identity.clientVersion,
+      org_id: identity.orgId,
+      key_custody: KEY_CUSTODY,
+    };
+    this.#sink = sink;
+  }
+
+  #sessionCounter(name: string, labels: MetricLabels = {}): void {
+    this.#sink?.counter(name, { ...this.#sessionLabels, ...labels });
+  }
+
+  #sessionGauge(name: string, labels: MetricLabels, value: number): void {
+    this.#sink?.gauge(name, { ...this.#sessionLabels, ...labels }, value);
+  }
+}
 "#
             .into(),
         );

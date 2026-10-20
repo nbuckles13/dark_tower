@@ -41,7 +41,7 @@
 //! access to mute state at all; this module is the only one that reads it.
 
 use super::capability::{ReceiveCapabilityDeclaration, SlotId};
-use super::outcome::DirectiveOutcome;
+use super::outcome::{DirectiveOutcome, MediaKindLabel};
 use crate::media_admission::SenderId;
 use crate::media_routing::{HandlerId, MeetingAssignment, MeetingHandlers};
 use proto_gen::dark_tower::signaling::v1::{
@@ -90,11 +90,14 @@ impl SourceMuteView {
 pub struct SlotComposition {
     /// The wire message.
     pub assignments: StreamAssignments,
-    /// Per-slot states, in the same order, for the bounded slot-state counter.
+    /// Per-slot `(kind, state)`, in the same order, for the bounded slot-state
+    /// counter.
     ///
     /// Read off the assignments themselves rather than tracked in parallel, so
-    /// the metric and the wire cannot disagree about what MC said.
-    pub slot_states: Vec<SlotState>,
+    /// the metric and the wire cannot disagree about what MC said. The kind is
+    /// the DECLARED slot's kind (never a frame's), carried as a pair so the
+    /// recorder cannot be handed a state without its kind.
+    pub slot_states: Vec<(MediaKindLabel, SlotState)>,
 }
 
 /// Bounded metric-label form for a slot state.
@@ -196,7 +199,7 @@ pub fn build_stream_assignments(
             Some((_, None)) | None => (None, String::new(), SlotState::FewerSourcesThanSlots),
         };
 
-        slot_states.push(slot_state);
+        slot_states.push((slot.kind_label, slot_state));
         assignments.push(StreamAssignment {
             slot_id: u32::from(slot.slot_id.get()),
             sender_id,
@@ -446,7 +449,7 @@ mod tests {
                 ],
                 &SourceMuteView::from_pairs(vec![(sender(2), true)]),
             );
-            for state in &composition.slot_states {
+            for (_, state) in &composition.slot_states {
                 assert_ne!(*state, SlotState::SourceUnreachable);
             }
         }
@@ -497,8 +500,28 @@ mod tests {
             .iter()
             .map(|a| a.slot_state)
             .collect();
-        let from_metric: Vec<i32> = composition.slot_states.iter().map(|s| *s as i32).collect();
+        let from_metric: Vec<i32> = composition
+            .slot_states
+            .iter()
+            .map(|(_, s)| *s as i32)
+            .collect();
         assert_eq!(from_wire, from_metric);
+        let kinds_from_wire: Vec<Option<MediaKindLabel>> = composition
+            .assignments
+            .assignments
+            .iter()
+            .map(|a| {
+                MediaKind::try_from(a.media_kind)
+                    .ok()
+                    .and_then(MediaKindLabel::from_proto)
+            })
+            .collect();
+        let kinds_from_metric: Vec<Option<MediaKindLabel>> = composition
+            .slot_states
+            .iter()
+            .map(|(k, _)| Some(*k))
+            .collect();
+        assert_eq!(kinds_from_wire, kinds_from_metric);
     }
 
     #[test]

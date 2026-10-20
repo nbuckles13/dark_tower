@@ -7,7 +7,7 @@
 //   * WHICH RECEIVE SLOTS TO DECLARE — N against the cap MC advertised;
 //   * WHAT FEEDS THE SEND PATH — the one capture-source substitution point.
 
-import type { MediaMetrics } from '../media/setup/mediaMetrics.js';
+import type { MediaKindMetrics } from '../media/setup/mediaMetrics.js';
 import { createMicrophoneCapture, createTestToneCapture } from '../media/setup/capture.js';
 import { testToneFrequencyHz } from '../media/setup/testTone.js';
 import type { CaptureSourceFactory } from '../media/setup/seams.js';
@@ -47,7 +47,7 @@ export function receiveSlotIdsToDeclare(args: {
   readonly count: number;
   readonly source: ReceiveSlotsSource;
   readonly cap: ReceiveSlotCap;
-  readonly metrics: MediaMetrics;
+  readonly metrics: MediaKindMetrics;
 }): number[] {
   const { count, source, cap, metrics } = args;
   const declared = Array.from({ length: count }, (_, i) => i);

@@ -219,7 +219,11 @@ async fn a_solo_participant_hears_nothing_and_is_told_to_send_nothing() {
         assert!(s.media_handler_url.is_empty());
     }
     snap.counter("mc_media_slot_states_total")
-        .with_labels(&[("slot_state", "active"), ("key_custody", "operator")])
+        .with_labels(&[
+            ("slot_state", "active"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
         .assert_delta(0);
 }
 
@@ -259,10 +263,18 @@ async fn mute_unmute_cycle_leaves_the_send_directive_untouched() {
         .with_labels(&[("outcome", "emitted"), ("key_custody", "operator")])
         .assert_delta(0);
     snap.counter("mc_media_slot_states_total")
-        .with_labels(&[("slot_state", "source_muted"), ("key_custody", "operator")])
+        .with_labels(&[
+            ("slot_state", "source_muted"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
         .assert_delta(1);
     snap.counter("mc_media_slot_states_total")
-        .with_labels(&[("slot_state", "active"), ("key_custody", "operator")])
+        .with_labels(&[
+            ("slot_state", "active"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
         .assert_delta(1);
 }
 
@@ -313,9 +325,23 @@ async fn a_repeated_identical_mute_report_does_no_work() {
         a.write(mute_frame(true, false)).await;
     }
     b.expect_no_media().await;
+    // One increment per (request, named kind); the interim names both kinds.
+    // Audio: the 4 repeats. Video: the 4 repeats plus the first report, whose
+    // video flag did not move.
     snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "unchanged"), ("key_custody", "operator")])
+        .with_labels(&[
+            ("outcome", "unchanged"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
         .assert_delta(4);
+    snap.counter("mc_media_mute_requests_total")
+        .with_labels(&[
+            ("outcome", "unchanged"),
+            ("media_kind", "video"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(5);
 
     a.write(mute_frame(false, false)).await;
     let unmuted = b.expect_assignments().await;
@@ -341,17 +367,28 @@ async fn a_video_only_mute_is_recorded_but_never_re_emitted() {
         SlotState::SourceMuted as i32
     );
 
-    snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[
-            ("outcome", "applied_no_recompose"),
+    // Per kind: the two camera toggles are video `applied_no_recompose`
+    // (video never recomposes) and audio `unchanged`; the audio mute is audio
+    // `applied` and video `unchanged`. Video is never `applied`.
+    let mute = |outcome: &'static str, kind: &'static str| {
+        snap.counter("mc_media_mute_requests_total").with_labels(&[
+            ("outcome", outcome),
+            ("media_kind", kind),
             ("key_custody", "operator"),
         ])
-        .assert_delta(2);
-    snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "applied"), ("key_custody", "operator")])
-        .assert_delta(1);
+    };
+    mute("applied_no_recompose", "video").assert_delta(2);
+    mute("unchanged", "video").assert_delta(1);
+    mute("applied", "video").assert_delta(0);
+    mute("applied", "audio").assert_delta(1);
+    mute("unchanged", "audio").assert_delta(2);
+    mute("applied_no_recompose", "audio").assert_delta(0);
     snap.counter("mc_media_slot_states_total")
-        .with_labels(&[("slot_state", "active"), ("key_custody", "operator")])
+        .with_labels(&[
+            ("slot_state", "active"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
         .assert_delta(0);
 }
 
@@ -390,17 +427,22 @@ async fn mute_work_is_rate_limited_and_the_limit_is_not_permanent() {
     );
 
     let remaining = TOGGLES - applied;
-    snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "applied"), ("key_custody", "operator")])
-        .assert_delta(applied);
-    let rate_limited = snap
-        .counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "rate_limited"), ("key_custody", "operator")])
-        .delta();
-    let unchanged = snap
-        .counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "unchanged"), ("key_custody", "operator")])
-        .delta();
+    let mute = |outcome: &'static str, kind: &'static str| {
+        snap.counter("mc_media_mute_requests_total").with_labels(&[
+            ("outcome", outcome),
+            ("media_kind", kind),
+            ("key_custody", "operator"),
+        ])
+    };
+    mute("applied", "audio").assert_delta(applied);
+    let rate_limited = mute("rate_limited", "audio").delta();
+    let unchanged = mute("unchanged", "audio").delta();
+    // Request-level outcomes count once per named kind (the interim names both),
+    // so video mirrors audio's `rate_limited`; video's flag never moves, so
+    // every served request is video `unchanged` and none is video `applied`.
+    mute("rate_limited", "video").assert_delta(rate_limited);
+    mute("unchanged", "video").assert_delta(unchanged + applied);
+    mute("applied", "video").assert_delta(0);
     assert_eq!(
         rate_limited + unchanged,
         remaining,

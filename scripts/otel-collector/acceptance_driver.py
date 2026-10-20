@@ -40,6 +40,13 @@ def counter(name, labels, value, start, end):
         "attributes": attrs(labels), "startTimeUnixNano": str(start), "timeUnixNano": str(end), "asInt": str(value)}]}}
 
 
+def mk_int_counter(name, labels, value, start, end):
+    """A counter whose `media_kind` is an INT, not a string (the IsString arm)."""
+    c = counter(name, labels, value, start, end)
+    c["sum"]["dataPoints"][0]["attributes"].append({"key": "media_kind", "value": {"intValue": "7"}})
+    return c
+
+
 def histogram(name, labels, observation, start, end):
     buckets = [0] * (len(BOUNDS) + 1)
     idx = next((i for i, b in enumerate(BOUNDS) if observation <= b), len(BOUNDS))
@@ -193,6 +200,14 @@ def filtering():
         counter("dt_client_media_frames_dropped_total", dict(BASE, org_id="filt-real", reason="kek_generation_stale"), 1, t0, t1),
         counter("dt_client_media_send_dropped_total",
                 dict(BASE, org_id="filt-forge", key_custody="end_to_end", reason="0f8fad5b-d9cb-469f-a165-70867728950e"), 4, t0, t1),
+        # story 3 R-29: the EXACT media_kind value rule (per-kind names; the
+        # kind-free session name proves the nil-guard does not stamp the key).
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-audio", media_kind="audio"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-bogus", media_kind="bogus"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-prefix", media_kind="audio_x"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-suffix", media_kind="xvideo"), 1, t0, t1),
+        mk_int_counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-int"), 1, t0, t1),
+        counter("dt_client_media_kek_retention_violations_total", dict(BASE, org_id="mk-sessionfree"), 1, t0, t1),
     ])
     settle()
     t = scrape()
@@ -227,11 +242,19 @@ def filtering():
     _, labels = value(t, "dt_client_media_key_wrap_outcomes_total", {"org_id": "filt-anchor"})
     check("(anchor) legal substring + illegal surroundings rewritten", (labels or {}).get("outcome"), "invalid")
     _, labels = value(t, "dt_client_media_frames_received_total", {"org_id": "filt-nil"})
-    check("(nil-guard) never-sent labels stay absent", sorted(k for k in (labels or {}) if k in ("reason", "outcome", "action", "source")), [])
+    check("(nil-guard) never-sent labels stay absent", sorted(k for k in (labels or {}) if k in ("reason", "outcome", "action", "source", "mode", "media_kind")), [])
     check("(real) client_version 0.0.0 survives", (labels or {}).get("client_version"), "0.0.0")
     _, labels = value(t, "dt_client_media_frames_dropped_total", {"org_id": "filt-real"})
     check("(real) token kek_generation_stale survives", (labels or {}).get("reason"), "kek_generation_stale")
     check("(real) no_kek_for_generation survives", value(t, "dt_client_media_frames_dropped_total", {"org_id": "filt"})[1].get("reason"), "no_kek_for_generation")
+    for org, want in (("mk-audio", "audio"), ("mk-bogus", "invalid"), ("mk-prefix", "invalid"),
+                      ("mk-suffix", "invalid"), ("mk-int", "invalid")):
+        _, labels = value(t, "dt_client_media_frames_sent_total", {"org_id": org})
+        check(f"(media_kind exact) {org}", (labels or {}).get("media_kind"), want)
+    check("(media_kind exact) bogus never stored", 'media_kind="bogus"' in t, False)
+    v, labels = value(t, "dt_client_media_kek_retention_violations_total", {"org_id": "mk-sessionfree"})
+    check("(media_kind nil-guard) kind-free series arrives", v, 1.0)
+    check("(media_kind nil-guard) kind-free series carries no media_kind", "media_kind" in (labels or {}), False)
     check("names verbatim (no unit suffix)", "dt_client_time_to_first_media_frame_ms_milliseconds" in t, False)
     check("names verbatim (no doubled _total)", "_total_total" in t, False)
 

@@ -301,8 +301,11 @@ export {
   MEDIA_KEK_RETENTION_ANOMALIES,
   MEDIA_KEK_SOURCES,
   MEDIA_MUTE_ACTIONS,
+  MEDIA_KIND_LABELS,
   MEDIA_SEND_DROP_REASONS,
+  MediaKindMetrics,
   MediaMetrics,
+  MediaSessionMetrics,
   mediaMetricLabels,
 } from './media/setup/mediaMetrics.js';
 export type {
@@ -310,6 +313,7 @@ export type {
   MediaKekRetentionAnomaly,
   MediaKekSource,
   MediaCaptureSourceMode,
+  MediaKindLabel,
   MediaMetricIdentity,
   MediaMuteAction,
   MediaSendDropReason,

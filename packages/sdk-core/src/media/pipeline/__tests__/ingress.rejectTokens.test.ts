@@ -34,7 +34,7 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { ReplayWindow, TransmitKeyCache } from '../../frame/receivePath.js';
 import { hexToBytes } from '../../frame/hex.js';
 import { emptyKekHolder, gateFor } from '../../__tests__/helpers.js';
-import { MediaMetrics } from '../../setup/mediaMetrics.js';
+import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
 import { FirstMediaObserver } from '../../setup/measurement.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import { HopSequenceMonitor } from '../hopSequenceMonitor.js';
@@ -57,7 +57,11 @@ function makeIngress(): {
   hopMonitor: HopSequenceMonitor;
 } {
   const sink = new InMemoryMetricsSink();
-  const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
+  const metrics = new MediaKindMetrics(
+    { clientVersion: '0.0.0-test', orgId: 'demo' },
+    MEDIA_KIND_LABELS.Audio,
+    sink,
+  );
   const kek = emptyKekHolder();
   // ONE MONITOR PER TRANSPORT. These harnesses model a single transport, so one
   // monitor per harness — created here rather than shared at module scope,

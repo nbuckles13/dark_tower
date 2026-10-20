@@ -1,7 +1,10 @@
 // File: packages/web-app/e2e/multi-party-hear.spec.ts
 //
 // Story 2 S1 — HEAR BY CONTENT (R-1, R-2, R-30, R-31; ADR-0036 §5, §6, §9), plus
-// the R-27 client-metrics read-back that needs a multi-party meeting.
+// the R-27 client-metrics read-back that needs a multi-party meeting, plus story 3
+// R-29: the received-frames counter reaches Prometheus split by
+// `media_kind="audio"` (all three hops carry the label) and nothing arrives
+// kind-less.
 //
 // Four participants (N = SUITE_RECEIVE_SLOTS = 3), every one connected to every
 // handler MC offers. Each receiver, for each other sender — all 12 ordered pairs
@@ -29,6 +32,7 @@ import { cohortSize, SUITE_RECEIVE_SLOTS } from './cohort.js';
 import { bootstrapMeeting, flushTelemetry, waitForFirstMediaFrame } from './fixtures.js';
 import {
   clientCounterByInstance,
+  expectClientCounterNotAbove,
   loadedAlertClientNames,
   mhAdmissionRejectionsByInstance,
   waitForClientCounterAbove,
@@ -57,6 +61,11 @@ test.describe('story 2 S1: N+1 participants hear each other by content', () => {
       // R-27 part 1 / part 2 baselines, before any member exports media counts.
       const sentBaseline = await clientCounterByInstance('sent');
       const receivedBaseline = await clientCounterByInstance('received');
+      // R-29 baselines (story 3 OBS-A), same moment: a delta, never bare presence,
+      // because Prometheus outlives runs and an earlier run's series would make
+      // "present" pass vacuously.
+      const receivedAudioBaseline = await clientCounterByInstance('received_audio');
+      const receivedKindlessBaseline = await clientCounterByInstance('received_kindless');
 
       const members: JoinedMember[] = [];
       for (const member of opened) members.push(await joinMember(member, meetingCode));
@@ -115,6 +124,23 @@ test.describe('story 2 S1: N+1 participants hear each other by content', () => {
         // reasons within the SDK vocabulary; tests/clientMetricNames.test.ts), by
         // part 1's proof that the exporter passes emitter literals through
         // verbatim, and by the loaded-rule equality above.
+      });
+
+      await test.step('R-29: received frames carry media_kind="audio" end to end', async () => {
+        await waitForClientCounterAbove(
+          'received_audio',
+          receivedAudioBaseline,
+          'R-29: the received-frames counter this meeting drove never reached Prometheus with ' +
+            'media_kind="audio". EMPTY means media_kind was stripped (GC MEDIA_DATAPOINT_EXTRA / ' +
+            'collector keep_keys) or rewritten to invalid (collector value rule).',
+        );
+        // The absence half, over the SAME window the audio arm just proved live.
+        await expectClientCounterNotAbove(
+          'received_kindless',
+          receivedKindlessBaseline,
+          'R-29: received frames reached Prometheus WITHOUT media_kind — some SDK path still ' +
+            'emits the pre-split label bag, or a hop dropped the key.',
+        );
       });
     } finally {
       await closeMembers(opened);

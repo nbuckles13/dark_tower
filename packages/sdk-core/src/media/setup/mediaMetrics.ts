@@ -15,12 +15,26 @@
 // media-path deny is Rust-only, its metric-label scanner reads `crates/`, and
 // `ts_pii.rs` scans only `console.*` / `logger.*` call sites).
 //
-// So this is structural rather than disciplined: {@link MediaMetrics}'s
-// constructor takes TWO STRINGS, not a `MetricLabels` bag. There is no spread to
-// inherit from and nothing to prune, so `meeting_id_hash` is not merely absent —
-// it is UNREPRESENTABLE at this boundary. A deletion-based helper
-// (`{...labels, meeting_id_hash: undefined}`) would be one refactor away from
-// re-inheriting a newly-added join label; an allow-list cannot be.
+// So this is structural rather than disciplined: {@link MediaKindMetrics}'s and
+// {@link MediaSessionMetrics}' constructors take TWO NAMED STRINGS (plus, for the
+// per-kind handle, a closed `MediaKindLabel` union value), never a
+// `MetricLabels` bag. There is no spread to inherit from and nothing to prune,
+// so `meeting_id_hash` is not merely absent — it is UNREPRESENTABLE at this
+// boundary. A deletion-based helper (`{...labels, meeting_id_hash: undefined}`)
+// would be one refactor away from re-inheriting a newly-added join label; an
+// allow-list cannot be.
+//
+// ---------------------------------------------------------------------------
+// PER-KIND HANDLES AND SESSION-LEVEL HANDLES ARE DIFFERENT TYPES
+// ---------------------------------------------------------------------------
+//
+// Every media series whose subject has a media kind carries `media_kind`
+// (`audio` | `video`); the session-level series (KEK lifecycle, roster key
+// changes, capture source) do NOT, because one session event labelled per kind
+// would be counted twice. The split is by TYPE: {@link MediaKindMetrics} has no
+// session method and {@link MediaSessionMetrics} takes no kind, so emitting a
+// session series per kind (or a per-kind series kind-free) is a compile error,
+// not a review catch. Catalog: `docs/observability/metrics/client.md`.
 //
 // `MediaTransport`'s `#emitMetric` DOES spread the join set. That is legal for
 // exactly one grandfathered metric and is annotated at that site; see
@@ -313,7 +327,7 @@ export type ReportableWrapOutcome = Exclude<WrapOutcome, 'absent' | 'cached' | '
  */
 export type MediaCaptureSourceMode = 'microphone' | 'test_tone';
 
-/** The identity dimensions a media metric may carry. Two strings; nothing else. */
+/** The identity dimensions a media metric may carry. Two named strings; nothing else. */
 export interface MediaMetricIdentity {
   /** SDK build version. */
   readonly clientVersion: string;
@@ -332,34 +346,73 @@ export interface MediaMetricIdentity {
 }
 
 /**
- * Build the media-path label set BY ALLOW-LIST.
+ * The `media_kind` label vocabulary — closed, two values.
+ *
+ * ANCHOR (DRY): the `media_kind` row of the label taxonomy
+ * (`docs/observability/label-taxonomy.md`) is the single source of truth; this
+ * is its client code home, and `__tests__/mediaMetrics.test.ts` fails if the two
+ * disagree. MC's Rust home is `MediaKindLabel` in
+ * `crates/mc-service/src/media_signaling/outcome.rs`; the collector bounds the
+ * value with an EXACT `^(audio|video)$` rewrite to `invalid`
+ * (`infra/services/otel-collector/collector.yaml`). Deliberately NOT the
+ * generated proto `MediaKind` (four wire values incl. unspecified and screen),
+ * and NOT `events.ts`'s `'audio' | 'video' | 'other'` wire projection.
+ *
+ * `invalid` is the collector's reserved rewrite sentinel and must never become a
+ * value here.
+ */
+export const MEDIA_KIND_LABELS = {
+  Audio: 'audio',
+  Video: 'video',
+} as const;
+
+/** One of {@link MEDIA_KIND_LABELS}. Derived, never retyped at a call site. */
+export type MediaKindLabel = (typeof MEDIA_KIND_LABELS)[keyof typeof MEDIA_KIND_LABELS];
+
+/**
+ * Build a PER-KIND media-path label set BY ALLOW-LIST.
  *
  * The complete set, and there is no path by which it grows: `client_version`,
- * `org_id`, `key_custody`. Callers pass two named strings, so no ambient label
- * bag can reach a media metric.
+ * `org_id`, `key_custody`, `media_kind`. Callers pass two named strings and a
+ * closed-union kind, so no ambient label bag can reach a media metric.
+ *
+ * The returned object literal must stay SPREAD-FREE: `dt-guard
+ * client-metrics-export` resolves `this.#base` to exactly these keys and fails
+ * closed on anything it cannot read.
  */
-export function mediaMetricLabels(identity: MediaMetricIdentity): MetricLabels {
+export function mediaMetricLabels(
+  identity: MediaMetricIdentity,
+  kind: MediaKindLabel,
+): MetricLabels {
   return {
     client_version: identity.clientVersion,
     org_id: identity.orgId,
     key_custody: KEY_CUSTODY,
+    media_kind: kind,
   };
 }
 
 /**
- * Cached metric handles for the media path.
+ * Cached PER-KIND metric handles for the media path.
  *
- * Constructed ONCE at pipeline setup. The hot path calls the methods below and
- * never names a metric or builds a label object.
+ * Constructed ONCE per kind at pipeline setup. The hot path calls the methods
+ * below and never names a metric or builds a label object.
  */
-export class MediaMetrics {
+export class MediaKindMetrics {
   readonly #sink: MetricsSink | undefined;
+  readonly #kind: MediaKindLabel;
   /** Resolved once. Every emission below spreads THIS, never any other set. */
   readonly #base: MetricLabels;
 
-  constructor(identity: MediaMetricIdentity, sink: MetricsSink | undefined) {
-    this.#base = mediaMetricLabels(identity);
+  constructor(identity: MediaMetricIdentity, kind: MediaKindLabel, sink: MetricsSink | undefined) {
+    this.#kind = kind;
+    this.#base = mediaMetricLabels(identity, kind);
     this.#sink = sink;
+  }
+
+  /** The kind every series of this handle carries. */
+  get kind(): MediaKindLabel {
+    return this.#kind;
   }
 
   /** The base label set, exposed for assertion in tests. Never mutated. */
@@ -525,71 +578,6 @@ export class MediaMetrics {
     this.#sink?.counter('dt_client_media_mute_transitions_total', { ...this.#base, action });
   }
 
-  /** A meeting KEK arrived through the KEK-source seam. Never the key itself. */
-  kekUpdate(source: MediaKekSource): void {
-    this.#sink?.counter('dt_client_media_kek_updates_total', { ...this.#base, source });
-  }
-
-  /**
-   * The KEK holder would have retained more than one previous generation.
-   *
-   * A TRIPWIRE for a state no production path can reach: reads zero forever, and
-   * alertable at `> 0`. It watches for the refactor most likely to remove its own
-   * call site, which is why a test pins that the call site is on the live
-   * install path. A counter rather than a gauge: with N browsers at one stream
-   * identity a gauge is last-writer-wins and hides the rare value that matters.
-   */
-  kekRetentionViolation(): void {
-    this.#sink?.counter('dt_client_media_kek_retention_violations_total', this.#base);
-  }
-
-  /**
-   * A KEK message's W produced a non-nominal retention window. One per message.
-   *
-   * `floor_substituted` is the one-version MC rollback detector — the only
-   * cluster-visible evidence of it, since the WARN log reaches a browser console
-   * no operator has.
-   */
-  kekRetentionAnomaly(outcome: MediaKekRetentionAnomaly): void {
-    this.#sink?.counter('dt_client_media_kek_retention_anomalies_total', {
-      ...this.#base,
-      outcome,
-    });
-  }
-
-  /** A delivered KEK was refused. Never the key, never its generation. */
-  kekInstallRefused(outcome: MediaKekInstallRefusal): void {
-    this.#sink?.counter('dt_client_media_kek_install_refusals_total', {
-      ...this.#base,
-      outcome,
-    });
-  }
-
-  /**
-   * An install demoted the previous current generation and RETAINED it.
-   *
-   * The opposite tripwire to {@link kekRetentionViolation}: that one watches for
-   * retaining too MANY, a state no path reaches; this one is what goes flat when a
-   * refactor retains NONE, whose only other symptom is an audio gap at every
-   * rotation. Read against `kek_updates_total{source="kek_update"}`. Not
-   * incremented by a first install or by an idempotent or refused one.
-   */
-  kekGenerationRetained(): void {
-    this.#sink?.counter('dt_client_media_kek_generations_retained_total', this.#base);
-  }
-
-  /**
-   * A roster update changed a live sender's key: a `rebind` to different bytes,
-   * or a `downgrade` to none. ONE increment per EVENT, not per purged key. No
-   * sender dimension.
-   */
-  rosterKeyRebind(outcome: MediaRosterKeyChange): void {
-    this.#sink?.counter('dt_client_media_roster_key_rebinds_total', {
-      ...this.#base,
-      outcome,
-    });
-  }
-
   /**
    * A frame was evicted from a decode lane's bounded pending queue.
    *
@@ -608,21 +596,6 @@ export class MediaMetrics {
    */
   decodeQueueDropped(): void {
     this.#sink?.counter('dt_client_media_decode_queue_dropped_total', this.#base);
-  }
-
-  // ------------------------------------------------------ story 2 task 13 ---
-
-  /**
-   * The active capture source, as a presence gauge: value `1` for the ACTIVE
-   * mode only. Never a `0`-valued series for the other mode — the signal is the
-   * series' presence, and a zero series would make presence lie.
-   *
-   * Re-set on every export-interval tick by the pipeline (the SDK exports DELTA,
-   * and a last-value gauge is exported only for an interval it was recorded in);
-   * the pipeline stops calling it at teardown so the series is not pinned.
-   */
-  captureSource(mode: MediaCaptureSourceMode): void {
-    this.#sink?.gauge('dt_client_media_capture_source', { ...this.#base, mode }, 1);
   }
 
   /**
@@ -645,7 +618,9 @@ export class MediaMetrics {
   }
 
   /**
-   * Time from media start to the first media frame arriving at the wire.
+   * Time from media start to the first media frame OF THIS KIND arriving at the
+   * wire. One sample per kind per session: a join that receives both audio and
+   * video records one sample on each handle, never two on one.
    *
    * OBSERVED, NEVER GATED (ADR-0036 §10). No test asserts a wall-clock threshold
    * against it: asserting an end-to-end latency target on a local cluster
@@ -655,5 +630,141 @@ export class MediaMetrics {
    */
   timeToFirstMediaFrameMs(ms: number): void {
     this.#sink?.histogram('dt_client_time_to_first_media_frame_ms', this.#base, ms);
+  }
+}
+
+/**
+ * Cached SESSION-LEVEL (kind-free) metric handles.
+ *
+ * KEK lifecycle, roster key changes and the capture source are properties of the
+ * session, not of a media kind: one KEK install serves every kind, so labelling
+ * these per kind would count one event twice. This type takes no kind, so a
+ * session series cannot be built with one.
+ */
+export class MediaSessionMetrics {
+  readonly #sink: MetricsSink | undefined;
+  /**
+   * The kind-free label set, built BY ALLOW-LIST from two named strings.
+   *
+   * RESTATES three of {@link mediaMetricLabels}' four keys. A literal rather than
+   * a derivation because `dt-guard client-metrics-export` resolves this bag only
+   * from an object-literal assignment (and only through the two declared
+   * wrappers below); Rule 1 does NOT compare the two bags. The drift guard is
+   * `__tests__/mediaMetrics.test.ts`'s exact four-key (per-kind) and three-key
+   * (session) set assertions.
+   */
+  readonly #sessionLabels: MetricLabels;
+
+  constructor(identity: MediaMetricIdentity, sink: MetricsSink | undefined) {
+    this.#sessionLabels = {
+      client_version: identity.clientVersion,
+      org_id: identity.orgId,
+      key_custody: KEY_CUSTODY,
+    };
+    this.#sink = sink;
+  }
+
+  /** The kind-free label set, exposed for assertion in tests. Never mutated. */
+  get labels(): MetricLabels {
+    return this.#sessionLabels;
+  }
+
+  /** The ONE counter path for session series (a `dt-guard` declared wrapper). */
+  #sessionCounter(name: string, labels: MetricLabels = {}): void {
+    this.#sink?.counter(name, { ...this.#sessionLabels, ...labels });
+  }
+
+  /** The ONE gauge path for session series (a `dt-guard` declared wrapper). */
+  #sessionGauge(name: string, labels: MetricLabels, value: number): void {
+    this.#sink?.gauge(name, { ...this.#sessionLabels, ...labels }, value);
+  }
+
+  /** A meeting KEK arrived through the KEK-source seam. Never the key itself. */
+  kekUpdate(source: MediaKekSource): void {
+    this.#sessionCounter('dt_client_media_kek_updates_total', { source });
+  }
+
+  /**
+   * The KEK holder would have retained more than one previous generation.
+   *
+   * A TRIPWIRE for a state no production path can reach: reads zero forever, and
+   * alertable at `> 0`. It watches for the refactor most likely to remove its own
+   * call site, which is why a test pins that the call site is on the live
+   * install path. A counter rather than a gauge: with N browsers at one stream
+   * identity a gauge is last-writer-wins and hides the rare value that matters.
+   */
+  kekRetentionViolation(): void {
+    this.#sessionCounter('dt_client_media_kek_retention_violations_total');
+  }
+
+  /**
+   * A KEK message's W produced a non-nominal retention window. One per message.
+   *
+   * `floor_substituted` is the one-version MC rollback detector — the only
+   * cluster-visible evidence of it, since the WARN log reaches a browser console
+   * no operator has.
+   */
+  kekRetentionAnomaly(outcome: MediaKekRetentionAnomaly): void {
+    this.#sessionCounter('dt_client_media_kek_retention_anomalies_total', { outcome });
+  }
+
+  /** A delivered KEK was refused. Never the key, never its generation. */
+  kekInstallRefused(outcome: MediaKekInstallRefusal): void {
+    this.#sessionCounter('dt_client_media_kek_install_refusals_total', { outcome });
+  }
+
+  /**
+   * An install demoted the previous current generation and RETAINED it.
+   *
+   * The opposite tripwire to {@link kekRetentionViolation}: that one watches for
+   * retaining too MANY, a state no path reaches; this one is what goes flat when a
+   * refactor retains NONE, whose only other symptom is an audio gap at every
+   * rotation. Read against `kek_updates_total{source="kek_update"}`. Not
+   * incremented by a first install or by an idempotent or refused one.
+   */
+  kekGenerationRetained(): void {
+    this.#sessionCounter('dt_client_media_kek_generations_retained_total');
+  }
+
+  /**
+   * A roster update changed a live sender's key: a `rebind` to different bytes,
+   * or a `downgrade` to none. ONE increment per EVENT, not per purged key. No
+   * sender dimension.
+   */
+  rosterKeyRebind(outcome: MediaRosterKeyChange): void {
+    this.#sessionCounter('dt_client_media_roster_key_rebinds_total', { outcome });
+  }
+
+  /**
+   * The active capture source, as a presence gauge: value `1` for the ACTIVE
+   * mode only. Never a `0`-valued series for the other mode — the signal is the
+   * series' presence, and a zero series would make presence lie.
+   *
+   * Re-set on every export-interval tick by the pipeline (the SDK exports DELTA,
+   * and a last-value gauge is exported only for an interval it was recorded in);
+   * the pipeline stops calling it at teardown so the series is not pinned.
+   */
+  captureSource(mode: MediaCaptureSourceMode): void {
+    this.#sessionGauge('dt_client_media_capture_source', { mode }, 1);
+  }
+}
+
+/**
+ * The handles one media session uses: the kind-free session set and one
+ * per-kind set per kind the session runs.
+ *
+ * AUDIO ONLY IN THIS TASK. No video handle is constructed: a constructed handle
+ * zero-initialises its series (e.g. `receiveSlotsRejected(0)`), and a
+ * `media_kind="video"` series appearing before video flows would let the video
+ * read-back (story 3 C-B) pass vacuously. The tasks that add video emitters
+ * (C-A2, C-B) add the `video` member.
+ */
+export class MediaMetrics {
+  readonly session: MediaSessionMetrics;
+  readonly audio: MediaKindMetrics;
+
+  constructor(identity: MediaMetricIdentity, sink: MetricsSink | undefined) {
+    this.session = new MediaSessionMetrics(identity, sink);
+    this.audio = new MediaKindMetrics(identity, MEDIA_KIND_LABELS.Audio, sink);
   }
 }

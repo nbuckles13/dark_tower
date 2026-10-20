@@ -84,6 +84,7 @@ import {
   KEK_GENERATIONS_RETAINED,
   KEK_UPDATES,
   KEK_UPDATE_SOURCE,
+  MEDIA_KIND_AUDIO,
   RECEIVED_COUNTER,
   SEND_COUNTER,
   clientNamesIn,
@@ -416,15 +417,25 @@ export async function diagnoseMissingSender(
 
 const SENT_SUM_PROMQL = `sum by (instance) (${SEND_COUNTER})`;
 const RECEIVED_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER})`;
+// Story 3 OBS-A (R-29): the same counter split by `media_kind`. The audio arm
+// proves all three hops carry the label (SDK emission, GC datapoint tier,
+// collector keep_keys + exact value rule); the KIND-LESS arm (`media_kind=""`
+// matches series WITHOUT the label) must NOT rise, which proves no SDK path still
+// emits the pre-split three-key bag.
+const RECEIVED_AUDIO_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind="${MEDIA_KIND_AUDIO}"})`;
+const RECEIVED_KINDLESS_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind=""})`;
 const KEK_UPDATES_SUM_PROMQL = `sum by (instance) (${KEK_UPDATES}{source="${KEK_UPDATE_SOURCE}"})`;
 const KEK_RETAINED_SUM_PROMQL = `sum by (instance) (${KEK_GENERATIONS_RETAINED})`;
 
 /** Which client counter a read-back is about. */
-export type ClientCounter = 'sent' | 'received' | 'kek_update' | 'kek_retained';
+export type ClientCounter =
+  'sent' | 'received' | 'received_audio' | 'received_kindless' | 'kek_update' | 'kek_retained';
 
 const CLIENT_COUNTER_PROMQL: Record<ClientCounter, string> = {
   sent: SENT_SUM_PROMQL,
   received: RECEIVED_SUM_PROMQL,
+  received_audio: RECEIVED_AUDIO_SUM_PROMQL,
+  received_kindless: RECEIVED_KINDLESS_SUM_PROMQL,
   kek_update: KEK_UPDATES_SUM_PROMQL,
   kek_retained: KEK_RETAINED_SUM_PROMQL,
 };
@@ -457,6 +468,27 @@ export async function waitForClientCounterAbove(
       `Prometheus: check the SDK export (flushMetrics), GC's /api/v1/telemetry proxy, the ` +
       `collector's Prometheus exporter (add_metric_suffixes) and its scrape job.`,
   );
+}
+
+/**
+ * Throw unless the client counter is still AT OR BELOW `baseline` on every
+ * instance — the absence half of a read-back. Run it AFTER a positive rise in the
+ * same window (e.g. {@link waitForClientCounterAbove} on a sibling selector), so
+ * "did not rise" is judged over a window in which the pipe demonstrably carried
+ * data rather than over an idle one.
+ */
+export async function expectClientCounterNotAbove(
+  which: ClientCounter,
+  baseline: InstanceCounters,
+  why: string,
+): Promise<void> {
+  const current = await promInstantByInstance(CLIENT_COUNTER_PROMQL[which]);
+  if (anyInstanceExceedsBaseline(baseline, current)) {
+    throw new Error(
+      `${CLIENT_COUNTER_PROMQL[which]} ROSE above baseline ${formatInstanceMap(baseline)} ` +
+        `(now ${formatInstanceMap(current)}). ${why}`,
+    );
+  }
 }
 
 interface PromRulesResponse {

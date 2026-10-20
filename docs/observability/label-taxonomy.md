@@ -110,29 +110,55 @@ close.
 
 **`ac_rate_limit_decisions_total{action}` does not satisfy this definition and is not blessed by it.** Its values are `{allowed, rejected}` — a decision reached, which is `outcome`'s meaning — and its own catalog row calls them "Rate limit decision". It predates this row, and after MC lands it is **one non-conforming instance against two conforming ones**. It is recorded under §Non-canonical aliases and migrates under that section's coordinated-migration process; it is **not** evidence that `action` may carry result values, and a new metric must not cite it as precedent. Widening this row to accommodate it was considered and rejected: a definition covering both "what was asked" and "what happened" excludes nothing, which would make `action` the bucket a new metric reaches for instead of choosing between `operation` and `outcome`.
 
-### Declared, not yet carried: `media_kind` and `content_kind` `[reviewer-only]`
+### Carried: `media_kind`, by MC and the client SDK only; declared, not yet carried: `content_kind` `[reviewer-only]`
 
-Registered here **at declaration** rather than at first emission, because §Adding a new
-shared label fires on intent: both are multi-service by construction — MH, MC and the
-client SDK will all carry them — so the "add here before the second service" rule
-applies now, not in story 3.
+Registered here at declaration (story 2) because §Adding a new shared label fires on
+intent. Story 3 (task 2, R-29) made `media_kind` CARRIED; `content_kind` is still only
+declared.
 
-| Label | Bounded values | Emitted today? | Lands with |
+| Label | Bounded values | Emitted today? | Carried by |
 |---|---|---|---|
-| `media_kind` | `audio`, `video` | **No** | Story 3 (video) |
-| `content_kind` | `main`, `slides` | **No** | Story 3 (content share) |
+| `media_kind` | `audio`, `video` | **Yes** (story 3) | MC (`mc_media_*` series whose subject has a kind) and the client SDK (per-kind `dt_client_media_*` series) — **never MH** |
+| `content_kind` | `main`, `slides` | **No** | Not yet (content share is out of story 3's scope) |
+
+**This row is the single source of truth for the `media_kind` value set.** Its code
+homes are the SDK's `MediaKindLabel` union (`packages/sdk-core/src/media/setup/mediaMetrics.ts`)
+and MC's `MediaKindLabel` enum (`crates/mc-service/src/media_signaling/outcome.rs`, `ALL` +
+`label()`), whose unit tests each parse the row above; the key spelling lives in
+`crates/common/src/observability/labels.rs::MEDIA_KIND_LABEL`. On the client pipeline
+GC admits the KEY only (`MEDIA_DATAPOINT_EXTRA`), and the collector's EXACT
+`^(audio|video)$` rule rewrites anything else to `invalid` — so a stored client series
+carries at most `audio`, `video` or `invalid` (`invalid` = a patched client).
 
 Both value sets are **closed and enumerable**, which is the property that makes them
 admissible: each is a small fixed set fixed by the media pipeline's own type system, not
 a free-form string, so neither can grow unboundedly at runtime. Adding a value is a
-protocol change, not a call-site decision.
+protocol change, not a call-site decision. Screen share is `media_kind="video"` with
+`content_kind="slides"` once content share lands; MC maps the wire's `VIDEO_SCREEN` to
+`video` today.
 
-**They are declared, not carried.** No metric emits either label today. Do not write a
-dashboard query or an alert selecting on them — an unmatched selector yields an empty
-series rather than an error, so it fails silently. Which metrics will carry them is
-recorded in the per-service catalogs (`docs/observability/metrics/*.md` §Media-path
-label conventions), which is the home for *which labels a metric carries*; this section
-is the home for *what the label is and what values it may take*.
+**MH is type-blind and NEVER carries `media_kind`** (ADR-0036 §7: "Any proposal that
+switches on media type inside MH is a design error to be rewritten as a behaviour").
+MH labels by the behaviour it was told — transport `datagram`/`stream`, a disposition, a
+reason — never by kind. The live hygiene kernel enforces it on the stored series
+(`crates/env-tests/src/fixtures/metric_hygiene.rs`, `Rule::MediaKindOnMh`, applied by
+`32_media_metric_hygiene.rs`); there is no source-level check yet (`docs/TODO.md`
+§Guard Coverage Gaps).
+
+**Kind-free on purpose.** A series whose subject has no kind does not carry the label,
+because a per-kind split would double-count one event or invent a value: the client's
+session-level KEK, roster and capture-source series; MC's `mc_media_send_directives_total`
+(composed per participant before any stream exists), `mc_media_unreachable_senders_total`
+and `mc_media_not_yet_connected_senders_total` (properties of a sender relative to a
+subscriber), and `mc_media_unmute_requests_total` (no per-kind presence on the wire). The
+per-series lists and reasons are in the catalogs.
+
+**`content_kind` is declared, not carried.** No metric emits it. Do not write a dashboard
+query or an alert selecting on it — an unmatched selector yields an empty series rather
+than an error, so it fails silently. Which metrics carry a label is recorded in the
+per-service catalogs (`docs/observability/metrics/*.md`), which is the home for *which
+labels a metric carries*; this section is the home for *what the label is and what values
+it may take*.
 
 ### Non-canonical aliases (flagged by reviewers, not the guard) `[reviewer-only]`
 
@@ -619,7 +645,7 @@ matcher that drifts goes red in whichever crate drifted. Add a row here, never t
 
 ```identity-label-cases
 fire = participant_id, meeting_id_hash, stream_id, key_id, kek_id, meetingId, session.id, slot_index, slot_id, x_sender_idx, user, frame_hash, user-id, key-id, sender-id, frame-hash
-pass = key_custody, org_id, slot_state, client_version, reason, outcome, action, source, mode, trigger, payload_kind, instance, job, le, otel_scope_name, otel_scope_version, valid, monkey_business, direction, status
+pass = key_custody, org_id, slot_state, media_kind, client_version, reason, outcome, action, source, mode, trigger, payload_kind, instance, job, le, otel_scope_name, otel_scope_version, valid, monkey_business, direction, status
 ```
 
 **Matcher semantics.**

@@ -41,7 +41,7 @@
 // them, and the collapse reintroduces the forbidden label. That is why the
 // boundary is written here, where the collapse would be attempted.
 
-import type { MediaMetrics } from './mediaMetrics.js';
+import type { MediaKindMetrics } from './mediaMetrics.js';
 
 /**
  * First-media-received measurement.
@@ -51,7 +51,7 @@ import type { MediaMetrics } from './mediaMetrics.js';
  * startup measurement into a per-frame one.
  */
 export class FirstMediaObserver {
-  readonly #metrics: MediaMetrics;
+  readonly #metrics: MediaKindMetrics;
   readonly #clock: () => number;
   readonly #onObserved: ((elapsedMs: number) => void) | undefined;
 
@@ -64,7 +64,7 @@ export class FirstMediaObserver {
    * so an embedder and the metric can never disagree about the number.
    */
   constructor(
-    metrics: MediaMetrics,
+    metrics: MediaKindMetrics,
     clock: () => number,
     onObserved?: (elapsedMs: number) => void,
   ) {

@@ -420,9 +420,10 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
    * and `mh_index_bucket` are not crypto-layer discriminators and reveal no
    * receiver key state.
    *
-   * EVERY NEW MEDIA EMISSION goes through `mediaMetricLabels` in
-   * `setup/mediaMetrics.ts`, which builds `{client_version, org_id, key_custody}`
-   * by allow-list from two named strings — so there is no set to inherit and
+   * EVERY NEW MEDIA EMISSION goes through `setup/mediaMetrics.ts`, which builds
+   * `{client_version, org_id, key_custody, media_kind}` (per-kind series) or
+   * `{client_version, org_id, key_custody}` (session series) by allow-list from
+   * two named strings and a closed media kind — so there is no set to inherit and
    * nothing to prune. Nothing mechanical enforces this in TypeScript.
    */
   #emitMetric(status: 'success' | 'failure', index: number): void {

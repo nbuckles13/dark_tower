@@ -137,7 +137,7 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
   pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
 
   const egress = new EgressPipeline({
-    metrics,
+    metrics: metrics.audio,
     transmitKeys: new TransmitKeyManager(SENDER_ID),
     kek: kekSource,
     identity,

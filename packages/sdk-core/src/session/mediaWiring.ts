@@ -8,7 +8,7 @@
 import type { KekHolderObserver } from '../media/setup/kekSource.js';
 import type { AudioPipeline, AudioSendDirective } from '../media/lifecycle/AudioPipeline.js';
 import type { SendDirectiveEvent } from '../signaling/events.js';
-import { MEDIA_ROSTER_KEY_CHANGES, type MediaMetrics } from '../media/setup/mediaMetrics.js';
+import { MEDIA_ROSTER_KEY_CHANGES, type MediaSessionMetrics } from '../media/setup/mediaMetrics.js';
 import type { TransmitKeyInvalidationListener } from '../media/setup/rosterKeys.js';
 
 /**
@@ -21,7 +21,7 @@ import type { TransmitKeyInvalidationListener } from '../media/setup/rosterKeys.
  * counted.
  */
 export function kekObserver(
-  metrics: MediaMetrics,
+  metrics: MediaSessionMetrics,
   warn: (message: string) => void = (message) => console.warn('[dt-media-kek]', message),
 ): KekHolderObserver {
   return {
@@ -49,7 +49,7 @@ export interface TransmitKeyPurger {
  * is still counted, and simply has no transmit-key cache to purge.
  */
 export function rosterInvalidationListener(
-  metrics: () => MediaMetrics | undefined,
+  metrics: () => MediaSessionMetrics | undefined,
   pipeline: () => TransmitKeyPurger | undefined,
 ): TransmitKeyInvalidationListener {
   return (senderId, cause) => {

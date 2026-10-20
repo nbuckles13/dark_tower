@@ -106,7 +106,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
   const warnings: string[] = [];
   const holder = new MeetingKekHolder({
     rewrapLatencyMs: T,
-    observer: kekObserver(metrics, (m) => warnings.push(m)),
+    observer: kekObserver(metrics.session, (m) => warnings.push(m)),
     clock: sched.clock,
     setTimeout: sched.setTimeout,
     clearTimeout: sched.clearTimeout,
@@ -126,7 +126,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
   // The SAME wiring the session installs, from the SAME module.
   roster.setTransmitKeyInvalidationListener(
     rosterInvalidationListener(
-      () => metrics,
+      () => metrics.session,
       () => ref.pipeline,
     ),
   );
@@ -1031,6 +1031,8 @@ describe('every media metric stays aggregate across senders', () => {
       // Story 2 task 13: `dt_client_media_capture_source{mode}` — build-time,
       // identity-free, datapoint-only (GC MEDIA_DATAPOINT_EXTRA / keep_keys).
       'mode',
+      // Story 3 OBS-A: the closed `media_kind` {audio, video} on per-kind series.
+      'media_kind',
     ]);
     const FORBIDDEN = /sender|meeting|stream|participant|slot/;
     for (const m of recorded) {

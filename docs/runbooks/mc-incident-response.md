@@ -1986,7 +1986,7 @@ sum by (outcome) (rate(mc_media_receive_capability_declarations_total{outcome!~"
 Every rejection token names a **client** defect, so a rise is a client
 fleet problem and points at a client release, not an MC deploy:
 `duplicate_slot_id`, `slot_count_over_cap` (the client asked for more slots than
-`MC_MAX_RECEIVE_SLOTS` — compare its configured N with the `mc_media_receive_slot_cap`
+`MC_MAX_RECEIVE_SLOTS` — compare its configured N with the `mc_media_receive_slot_cap{media_kind="audio"}`
 gauge; a cap below legitimate clients' N is a configuration mismatch. A current SDK refuses an
 over-cap N LOCALLY — it reads the cap off `JoinResponse.max_receive_slots` — and counts it on
 `dt_client_media_receive_slots_rejected_total`, so an MC-side `slot_count_over_cap` means an SDK
@@ -2063,9 +2063,13 @@ named in `StreamAssignments.unreachable_sender_ids` instead (see Scenario 18 and
 defect** — that value should never reach the wire — and is visible here
 precisely because the vocabulary was not pruned to the reachable subset.
 
-**4. `mc_media_mute_requests_total{outcome}` — is client mute landing, and is one
+**4. `mc_media_mute_requests_total{outcome, media_kind}` — is client mute landing, and is one
 connection driving meeting-wide work?** Note the failure predicate is stated
-**positively**, unlike the two above:
+**positively**, unlike the two above. **Counting unit (story 3): one increment per
+(request, named kind)** — until MC-B every request names both kinds, so rates are
+roughly double what they read before story 3; that is the counting unit, not traffic.
+Request-level outcomes (`unchanged`, `rate_limited`, `actor_unavailable`) land once
+on each kind:
 
 ```promql
 # POSITIVE form on purpose. Do NOT "harmonise" this to outcome!~"..." to match
@@ -2077,8 +2081,8 @@ sum by (outcome) (rate(mc_media_mute_requests_total{outcome=~"rate_limited|actor
 | Token | Meaning |
 |---|---|
 | `applied` | The audio flag moved on a declared connection; the meeting actor re-emits the changed slot view to the subscribers HOLDING this source. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
-| `applied_no_recompose` | Reported, nothing to re-convey — no declaration yet, or a **video-only** change. **Expect this to be the largest bucket** once clients wire camera buttons: it is what an ordinary camera button produces, and it is healthy. |
-| `unchanged` | Identical to the report already in force; MC correctly did nothing. **Not a denominator — see below.** |
+| `applied_no_recompose` | Reported, nothing to re-convey — the audio flag moved before any declaration (`media_kind="audio"`), or the **video** flag moved (`media_kind="video"`; video never recomposes). A camera button is `{media_kind="video", outcome="applied_no_recompose"}` plus `unchanged` on audio, and it is healthy. `applied` never occurs on `video`. |
+| `unchanged` | This kind's state did not move: the whole-request identical repeat (no actor hop), or the unmoved kind of an applied request (a camera toggle is `unchanged` on audio). **Not a denominator — see below.** |
 | `rate_limited` | The per-connection mute-work token bucket is exhausted (burst 8, sustained 4/s — `MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
 | `actor_unavailable` | Environmental and terminal. Pairs with `meeting_state_unavailable` above — check actor health, Scenarios 1 and 2. |
 
@@ -2164,11 +2168,13 @@ any `composition_failed`; `client` for the capability rejection tokens and for a
 sustained `rate_limited` (a repeat loop in the SDK's mute path). For "I can hear
 some people but not others", go to Scenario 18 first.
 
-**6. `mc_media_server_mute_requests_total{action,outcome}` and
+**6. `mc_media_server_mute_requests_total{action,outcome,media_kind}` and
 `mc_media_unmute_requests_total{outcome}` — did a host's server mute (or a
 participant's request to be unmuted) land?** Both are client-facing signalling:
-the first counts a host's `ServerMuteRequest` dispositions, the second a muted
-participant's `UnmuteRequest` relays to the host. An unmute REQUEST never lifts
+the first counts a host's `ServerMuteRequest` dispositions **once per (request,
+named kind)**, with `action` that KIND's direction (muting audio while leaving video
+unmuted counts `mute`/audio and `unmute`/video); the second, kind-free, counts a
+muted participant's `UnmuteRequest` relays to the host once per request. An unmute REQUEST never lifts
 a mute — only a host's server-unmute does — so `relayed` rising with the
 participant still muted is correct behaviour, not a fault. A
 `participant_update_muted` drop on counter 5 is the one drop here with no
@@ -2460,7 +2466,7 @@ all" in a meeting larger than the listener's slot count lands here far more ofte
 fault.
 
 - **Slot-cap rejection.** The client's receive-slot count N exceeded MC's cap, and MC rejected the
-  **whole** declaration. The listener hears nobody. Read `mc_media_receive_slot_cap` beside
+  **whole** declaration. The listener hears nobody. Read `mc_media_receive_slot_cap{media_kind="audio"}` beside
   `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`. A rising over-cap
   rate with the cap below the client's configured N is a configuration mismatch, not a key fault.
   Client side: `client-dev-local.md` F18.
@@ -2468,7 +2474,7 @@ fault.
   senders than slots, the earliest joiners hold the slots, and a later joiner is inaudible to that
   listener until a slot frees, which happens when someone leaves. That is designed behaviour, not a
   fault. Read effective N (the client's declared slot count, on the UI's slot rows and the E2E bus
-  `receiveSlots.declared`) and `mc_media_receive_slot_cap`. If the number of other senders the
+  `receiveSlots.declared`) and `mc_media_receive_slot_cap{media_kind="audio"}`. If the number of other senders the
   listener shares a handler with exceeds N, the unheard participants are the latest joiners. Nothing
   drops, nothing is counted as a drop, and `mc_media_slot_states_total{slot_state="active"}` is
   healthy. Client side: `client-dev-local.md` F17. Speaker-based selection, story 5, replaces static
@@ -3119,7 +3125,7 @@ shows the reporter and the silent peer with **disjoint** connected sets, or one 
 reporter's slots are all full with earlier joiners: the N+2th sender gets no slot, is NOT in the
 unreachable set ("no slot" is not "unreachable"), and the reporter's slots show `ACTIVE` for the
 earliest joiners. **Remedy: raise the client's N** (`VITE_DT_RECEIVE_SLOTS`), within
-`MC_MAX_RECEIVE_SLOTS` (published as `mc_media_receive_slot_cap`). A declaration above the cap is
+`MC_MAX_RECEIVE_SLOTS` (published as `mc_media_receive_slot_cap{media_kind="audio"}`). A declaration above the cap is
 rejected whole and counted as `slot_count_over_cap` — see the client media signalling section. A
 current SDK refuses such an N itself (the cap is advertised on `JoinResponse.max_receive_slots`) and
 counts it on `dt_client_media_receive_slots_rejected_total` instead, so a flat MC over-cap rate does
@@ -3407,10 +3413,12 @@ reconnect within grace, and does not survive a fresh join.
 **Step 1 — did the host's request land?**
 
 ```promql
-sum by (action, outcome) (increase(mc_media_server_mute_requests_total[15m]))
+sum by (action, outcome, media_kind) (increase(mc_media_server_mute_requests_total[15m]))
 ```
 
-`applied` is the success. `unchanged` is a repeat of the current state (no push). `not_permitted`
+One increment per (request, named kind), `action` being that kind's direction — so one
+host request muting audio reads `mute/applied/audio` plus `unmute/unchanged/video` (or
+`applied`, if video had been server-muted). `applied` is the success. `unchanged` means THIS kind was already in the requested state; the request's other kind may still have been applied and pushed. `not_permitted`
 means the requester was not a host — refused BEFORE the target was looked at, so a non-host learns
 nothing. `unknown_target` (host only) means the named participant is not in the meeting.
 `rate_limited` is the per-connection bound. The `mc.webtransport.connection` INFO line
@@ -3421,14 +3429,17 @@ request refused" tells them apart). Refusal replies are rate-limited, and a supp
 on `mc_media_refusal_replies_suppressed_total{surface="server_mute"}`, so a looping client may see no
 error at all.
 
-**Step 2 — does MC believe a mute is in force?** `mc_media_server_muted_sources` is the number of
-participants MC holds server-muted, summed across this pod's meetings. It is identity-free by
+**Step 2 — does MC believe a mute is in force?** `mc_media_server_muted_sources{media_kind}` is the
+number of server-muted (participant, kind) SOURCES MC holds, per kind, summed across this pod's
+meetings — a participant muted on both kinds is 1 on `audio` and 1 on `video`, not 2 participants. It is identity-free by
 design (ADR-0036 §11): it answers "is any mute in force on this MC pod", never "in THIS meeting";
 use the Step 1 log line for that.
 
 **Step 3 — is MH dropping?** `mh_media_frames_dropped_total{reason="server_muted"}` on the handlers.
-Compare **fleet-aggregate and directionally only**: `sum(mc_media_server_muted_sources)` across MC
-instances against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH
+Compare **fleet-aggregate and directionally only**: `sum(mc_media_server_muted_sources{media_kind="audio"})`
+across MC instances — **audio only, today**: MC tells MH only the audio-server-muted senders, so a
+video-only server mute raises the `video` gauge while MH drops nothing (not a disagreement). It
+becomes the sum across kinds when MC-A adds per-stream `DROP_AT_INGRESS` for video. Compare it against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH
 instances. Never divide a level by a rate, and never compare per instance (MC and MH meeting sets
 do not nest). A gauge above zero with a flat drop rate is only a candidate disagreement, and only
 after excluding a muted source that is silent, disconnected, in grace or not yet on that handler —

@@ -21,13 +21,14 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ALL_REJECT_REASONS } from '@darktower/sdk-core';
+import { ALL_REJECT_REASONS, MEDIA_KIND_LABELS } from '@darktower/sdk-core';
 import {
   ALL_ASSERTED_CLIENT_NAMES,
   MISSING_KEY_MATERIAL_ALERT,
   MISSING_KEY_MATERIAL_SELECTED_NAMES,
   clientNamesIn,
   reasonAlternationIn,
+  MEDIA_KIND_AUDIO,
 } from '../e2e/clientMetricNames.js';
 
 const REPO = resolve(__dirname, '../../..');
@@ -136,5 +137,14 @@ describe(`${MISSING_KEY_MATERIAL_ALERT} <-> clientMetricNames <-> emitter`, () =
     const emitter = readFileSync(EMITTER, 'utf8');
     const missing = ALL_ASSERTED_CLIENT_NAMES.filter((n) => !emitter.includes(`'${n}'`));
     expect(missing, `emitter-drift: not registered in ${EMITTER}`).toEqual([]);
+  });
+});
+
+describe('the R-29 media_kind read-back value', () => {
+  it('is a value of the SDK media_kind vocabulary, and is `audio`', () => {
+    // Imported, not retyped; pinned so a rename on the SDK side cannot silently
+    // retarget the read-back to a kind that does not flow yet.
+    expect(Object.values(MEDIA_KIND_LABELS)).toContain(MEDIA_KIND_AUDIO);
+    expect(MEDIA_KIND_AUDIO).toBe('audio');
   });
 });

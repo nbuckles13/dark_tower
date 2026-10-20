@@ -13,7 +13,7 @@
 // emitter's literals (`packages/sdk-core/src/media/setup/mediaMetrics.ts`) —
 // fail-closed. The live read-back ties them to the rule Prometheus LOADED.
 
-import { MEDIA_KEK_SOURCES } from '@darktower/sdk-core';
+import { MEDIA_KEK_SOURCES, MEDIA_KIND_LABELS } from '@darktower/sdk-core';
 
 /** The alert whose selector the R-27 exactness read-back checks. */
 export const MISSING_KEY_MATERIAL_ALERT = 'MCMediaMissingKeyMaterial';
@@ -36,6 +36,13 @@ export const KEK_UPDATES = 'dt_client_media_kek_updates_total';
 
 /** The `source` label value of a rotation push — imported, never retyped. */
 export const KEK_UPDATE_SOURCE = MEDIA_KEK_SOURCES.KekUpdate;
+
+/**
+ * The `media_kind` label value the R-29 read-back selects (story 3 OBS-A) —
+ * imported from the SDK's vocabulary, never retyped. Only `audio` flows today;
+ * the `video` read-back is story 3 C-B's, once video emits.
+ */
+export const MEDIA_KIND_AUDIO = MEDIA_KIND_LABELS.Audio;
 
 /** Previous KEK generations demoted and retained — a COUNTER (S6 asserts a delta). */
 export const KEK_GENERATIONS_RETAINED = 'dt_client_media_kek_generations_retained_total';

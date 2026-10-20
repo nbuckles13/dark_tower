@@ -53,7 +53,7 @@ import type { Bytes } from '../frame/hex.js';
 import type { TransmitKeyManager } from '../lifecycle/transmitKeys.js';
 import type { KekWrapSource } from '../setup/kekSource.js';
 import type { MeetingIdentity } from '../setup/identity.js';
-import { MEDIA_SEND_DROP_REASONS, type MediaMetrics } from '../setup/mediaMetrics.js';
+import { MEDIA_SEND_DROP_REASONS, type MediaKindMetrics } from '../setup/mediaMetrics.js';
 import type { EncodedAudioFrame } from '../setup/seams.js';
 import { BoundedDropOldestQueue } from './egressQueue.js';
 
@@ -146,7 +146,7 @@ export interface DatagramSender {
 
 /** Construction options for {@link EgressPipeline}. */
 export interface EgressPipelineOptions {
-  readonly metrics: MediaMetrics;
+  readonly metrics: MediaKindMetrics;
   readonly transmitKeys: TransmitKeyManager;
   readonly kek: KekWrapSource;
   /**
@@ -206,7 +206,7 @@ export interface EgressPipelineOptions {
  * transport applies back-pressure to the QUEUE rather than to the encoder.
  */
 export class EgressPipeline {
-  readonly #metrics: MediaMetrics;
+  readonly #metrics: MediaKindMetrics;
   readonly #transmitKeys: TransmitKeyManager;
   readonly #kek: KekWrapSource;
   readonly #identity: MeetingIdentity;
