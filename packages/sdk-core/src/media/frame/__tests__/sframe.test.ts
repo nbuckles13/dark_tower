@@ -181,9 +181,9 @@ describe('the KEK wrap', () => {
     expect(bytesToHex(wrapNonce(KID))).toBe('000000000102030405060708');
   });
 
-  it('rejects a key id of the wrong width', () => {
+  it('rejects a key id of the wrong width', async () => {
     expect(() => wrapNonce(new Uint8Array(4))).toThrow(/8 bytes/);
-    expect(
+    await expect(
       unwrapTransmitKey({
         kek: KEY,
         keyId: new Uint8Array(4),
