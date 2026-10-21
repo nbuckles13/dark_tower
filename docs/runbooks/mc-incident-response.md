@@ -1969,7 +1969,7 @@ meeting, participant or stream identity.
 
 ```bash
 kubectl port-forward -n dark-tower deployment/mc-0 8080:8081 &
-curl -s http://localhost:8080/metrics | grep -E 'mc_media_(receive_capability_declarations|send_directives|slot_states|slot_view_emissions|unreachable_senders|mute_requests|server_mute_requests|unmute_requests)_total|mc_media_receive_slot_cap|mc_participant_outbound_messages_dropped_total'
+curl -s http://localhost:8080/metrics | grep -E 'mc_media_(receive_capability_declarations|send_directives|send_directive_withdrawals|slot_states|slot_view_emissions|unreachable_senders|mute_requests|server_mute_requests|unmute_requests)_total|mc_media_receive_slot_cap|mc_participant_outbound_messages_dropped_total'
 kill %1
 # Repeat for mc-1 -- a symptom on one instance says nothing about the other.
 ```
@@ -1991,7 +1991,13 @@ gauge; a cap below legitimate clients' N is a configuration mismatch. A current 
 over-cap N LOCALLY — it reads the cap off `JoinResponse.max_receive_slots` — and counts it on
 `dt_client_media_receive_slots_rejected_total`, so an MC-side `slot_count_over_cap` means an SDK
 predating that field or a client ignoring it; for "hears nobody" with this rate flat, read the
-client counter and `docs/runbooks/client-dev-local.md` F18), `slot_id_out_of_range`, `pinned_sender_id_zero`,
+client counter and `docs/runbooks/client-dev-local.md` F18. **(Corrected 2026-10-21, story 3 OPS-A,
+R-1: all of this holds only until MC-A and C-A1.** From MC-A, each kind is **truncated** to its own
+cap (`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`). The excess slots report
+`unavailable` on `mc_media_slot_states_total`, so an over-cap declaration is never rejected and never
+a join failure. C-A1 retires the client's local refusal and its counter. A reader who trusted
+"over-cap is refused" after MC-A would look for a rejection that cannot happen, and would miss the
+`unavailable` slots that are the real reading.) `slot_id_out_of_range`, `pinned_sender_id_zero`,
 `pinned_sender_id_out_of_range`, `declaration_budget_exhausted` (the client blew
 `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` on one connection — a re-declaration
 loop). `media_kind_unspecified` most often means a **version-skewed** client, not
@@ -2004,22 +2010,61 @@ Do **not** build a ratio whose denominator includes `accepted_unchanged`: it is
 client-inflatable at near-zero server cost, so any such ratio is evadable. Use
 `accepted` alone.
 
-**2. `mc_media_send_directives_total{outcome}` — is MC telling clients to send?**
-This is the one that answers "why is this participant silent". Failure predicate:
+<a id="send-directive-wiring"></a>
+
+**2. `mc_media_send_directives_total{outcome}`: is MC telling clients to send?**
+This is the one that answers "why is this participant silent".
+
+> **A WITHDRAWAL IS HEALTHY. Do not read one as a media failure.** *(Rewritten 2026-10-21, story 3
+> OPS-A, R-31.)* Story 3 makes withdrawal routine. MC directs a published kind only while at least
+> one subscriber holds it in a slot and it is not server-muted for that kind (R-8). It
+> **withdraws** the kind (lists it with an EMPTY target set, never removes it) when the last
+> watcher leaves (R-8) and when that kind is server-muted (R-16). An unwatched publisher, a solo
+> participant, a muted camera and the [video-off lever](mc-deployment.md#video-off-lever) all
+> produce withdrawals. A reader who treated a withdrawal or an empty target set as "MC stopped
+> telling clients to send" would chase a healthy meeting. They would also page on every
+> participant nobody happens to be watching.
+
+**Directive composition** stays on this counter, and its outcome vocabulary is unchanged by story 3.
+The counter stays kind-free: a directive is composed per participant across all its streams, and
+its failures occur before any stream exists. Failure predicate:
 
 ```promql
 # NOT outcome!="emitted" -- `emitted_empty_targets` is a specified success
-# per ADR-0036 §5, and ROUTINE since story 2: anyone nobody holds in a slot
-# (a solo participant included) is directed to send nothing.
+# per ADR-0036 §5, and ROUTINE: anyone nobody holds in a slot (a solo
+# participant included), or whose every published kind is withdrawn, is
+# directed to send nothing.
 sum by (outcome) (rate(mc_media_send_directives_total{outcome!~"emitted|emitted_empty_targets"}[5m]))
 ```
 
-| Token | What it means | Where to go |
-|---|---|---|
-| `meeting_state_unavailable` | MC could not get the meeting actor handle. | Actor health — Scenario 1 (mailbox depth) and Scenario 2 (actor panics). |
-| `assignment_failed` | MC could not render the meeting's slot table into a forwarding assignment. | File against `meeting-controller`; also read the `Forwarding assignment could not be rendered` ERROR at `mc.register_meeting.trigger`. |
-| `handler_url_unresolved` | **MC-internal defect since story 2** — every url comes from one frozen handler set, so a miss cannot happen by construction. Fails closed: nothing is sent to that participant. | File against `meeting-controller`. |
-| `unknown_stream_number`, `transport_mode_unspecified` | **MC-internal defects**, fail-closed. Not operator-actionable. | File against `meeting-controller`; these are diagnostics, not pageable. |
+**Every token, partitioned.** Use this partition and nothing coarser:
+
+| Token | Class | What it means | Where to go |
+|---|---|---|---|
+| `emitted` | **normal** | Composed with at least one target. A participant whose video is withdrawn but whose audio is directed still reads `emitted`, because the directive spans both kinds. | — |
+| `emitted_empty_targets` | **normal** | Composed with no target on any kind: send nothing. Routine for a solo participant, a participant nobody watches, and a participant whose every published kind is withdrawn. | — |
+| `meeting_state_unavailable` | **fault** (environmental) | MC could not get the meeting actor handle. | Actor health: Scenario 1 (mailbox depth) and Scenario 2 (actor panics). |
+| `assignment_failed` | **fault** (environmental) | MC could not render the meeting's slot table into a forwarding assignment. | File against `meeting-controller`. Also read the `Forwarding assignment could not be rendered` ERROR at `mc.register_meeting.trigger`. |
+| `handler_url_unresolved` | **fault** (MC defect) | **MC-internal defect since story 2.** Every url comes from one frozen handler set, so a miss cannot happen by construction. It fails closed: nothing is sent to that participant. | File against `meeting-controller`. |
+| `unknown_stream_number`, `transport_mode_unspecified` | **fault** (MC defect) | **MC-internal defects**, fail-closed. Not operator-actionable. | File against `meeting-controller`. These are diagnostics and not pageable. |
+
+**Withdrawals: `mc_media_send_directive_withdrawals_total{media_kind, reason}`.** This is the
+per-kind, per-cause record of a published kind being directed to send nothing. `reason="unwatched"`
+is shipped by MC-A and `reason="server_muted"` by MC-B. Until they land the series is absent, and
+story 2's only withdrawal (an unwatched audio publisher) reads as `emitted_empty_targets` above.
+**Every reason is normal:**
+
+| `reason` | Class | What it means | Read it against |
+|---|---|---|---|
+| `unwatched` | **normal** | The last subscriber holding this publisher's kind in a slot left or re-declared (R-8). A new watcher restores the directive within the same structural change. | Roster churn. A sustained high rate with a stable roster is a slot-fill question (Scenario 18), not a directive fault. |
+| `server_muted` | **normal** (moderation) | A host server-muted that kind (R-16). Capture stops, and for video the camera light goes off. | `mc_media_server_mute_requests_total{action="mute",outcome="applied",media_kind="<same kind>"}` (Scenario 21). The `action` matcher matters: the counter counts per kind, so an applied unmute of the same kind would otherwise match. |
+
+The faults are a **missing** withdrawal and a withdrawal that did not take, never the existence of
+one. "Camera light still on after server mute" and "client sending while muted" are client-side
+and MH-side signals, triaged in Scenario 21 and MH Scenario 19 and extended to video by OPS-B.
+They are not read off this counter. **OBS-B writes the alert rule for the fault tokens above**, and
+no rule is written here (`docs/TODO.md` §Media Path Obligations, "`mc_media_send_directives_total`
+has no alert rule …").
 
 **Where the logs are.** Since story 2 the MEETING ACTOR composes every
 participant's view, so every composition failure logs at **ERROR** on
@@ -2052,7 +2097,20 @@ sum by (slot_state) (rate(mc_media_slot_states_total[5m]))
 ```
 
 `active` is the healthy value. `source_muted` is a source's mute — client OR
-server mute (one wire state for both) — and is normal. `fewer_sources_than_slots`
+server mute (one wire state for both) — and is normal. **(Corrected 2026-10-21, story 3 OPS-A.)
+That sentence holds only until MC-A.** From MC-A nothing emits `source_muted`: a muted occupant is
+`avatar_client_muted` or `avatar_server_muted` (server wins when both), per kind, and a video slot
+whose occupant publishes no video is `avatar_no_video`, all normal. MC-B removes `source_muted`
+from the vocabulary. A reader who kept treating `source_muted` as the mute signal after MC-A would
+read a flat series as "nobody is muted". The `slot_state` label tokens you query come from
+`slot_state_label()` (`crates/mc-service/src/media_signaling/assignments.rs`), and their wire
+source is `SlotState` in `proto/dark_tower/signaling/v1/signaling.proto`. The tokens emitted from
+MC-A are `active`, `fewer_sources_than_slots`, `avatar_no_video`, `unavailable`,
+`avatar_client_muted` and `avatar_server_muted`. `switch_pending`, `withheld_by_congestion` and
+`source_unreachable` are retained in the vocabulary but never emitted. Consumers treat them
+fail-closed, and a non-zero value for any of them is an MC defect. `zero_requested` is reserved,
+and unreachable peers stay on `unreachable_sender_ids`. `unavailable` is normal too: it is a slot truncated by a per-kind cap
+(R-1), never a join failure. `fewer_sources_than_slots`
 means the subscriber declared more slots than there are senders it shares a
 CONNECTED handler with to fill them — normal in a meeting smaller than N, ALWAYS
 the state of a solo participant (loopback is removed, R-3), and the state of every
@@ -2294,9 +2352,9 @@ sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 
 | `outcome` | Means | First move |
 |---|---|---|
-| `generation_mismatch` | MH echoed an **older** generation than MC sent. The apply path ran and did not take effect — a full session-actor mailbox, or an apply error. | Open **MH**. Read `mh_media_policy_applies_total{outcome}`; `apply_failed` and `rejected_invalid` are the two that produce this. |
+| `generation_mismatch` | MH echoed an **older** generation than MC sent. The apply path ran and did not take effect — a full session-actor mailbox, or an apply error. | Open **MH**. Read `mh_media_policy_applies_total{outcome}`; `apply_failed` is the one that produces this. *(Corrected 2026-10-21, story 3 OPS-A: this said `rejected_invalid` produces it too. It does not. MH answers `rejected_invalid` with a gRPC `invalid_argument`, so MC records `mc_register_meeting_total{status="error"}` and the WARN "RegisterMeeting RPC failed" (target `mc.grpc.mh_client`), and no push outcome at all. For that, see [Scenario 12](#scenario-12-registermeeting-coordination-failures).)* |
 | `no_applied_generation` | MH echoed **nothing**. Either an MH build that predates the applied-generation echo (a rollout skew), or the apply never ran at all. | Confirm the MH image first — `kubectl get deploy -n dark-tower mh-0 mh-1 -o jsonpath='{.items[*].spec.template.spec.containers[*].image}'`. A skew is the cheap explanation and it clears itself on rollout completion. |
-| `transport_mode_mismatch` | **A DIFFERENT FAILURE, BUT IT PAGES HERE AND THIS IS YOUR RUNBOOK.** §8's separate "any two-ends-must-agree configuration is echoed back with a loud mismatch" check: MC declared a transport mode, MH echoed a different one. Not generation divergence, and the remedy below is not the rejoin. It is routed here because nothing else pages on it and a page with no runbook is worse than a page in an imperfect one. | Compare MC's declared transport mode against MH's applied one — a configuration disagreement, not a policy-apply failure, so **the resolution steps below do not apply**: a rejoin re-sends the same disagreeing declaration. **A REMEDY ALREADY EXISTS — go to [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures) FIRST**, which carries it along with the trap: **roll MH FORWARD; do NOT roll MC back.** Rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole rather than a fix, and it is the intuitive move when two ends disagree about a version-skewed value. Escalate to `meeting-controller` and `media-handler` together only if that does not resolve it; the value is asserted on one side and enforced on the other. |
+| `transport_mode_mismatch` | **A DIFFERENT FAILURE, BUT IT PAGES HERE AND THIS IS YOUR RUNBOOK.** §8's separate "any two-ends-must-agree configuration is echoed back with a loud mismatch" check. It is not generation divergence, and the remedy below is not the rejoin. It is routed here because nothing else pages on it, and a page with no runbook is worse than a page in an imperfect one. **Meaning before MC-A:** MC declared one transport mode and MH echoed a different one in the single superseded `RegisterMeetingResponse.transport_mode`. **Meaning from MC-A (story 3), widened:** any per-stream disagreement between MC's declared `SourceStream`s and MH's `applied_source_streams`. A declared stream is absent from the echo, is echoed UNSPECIFIED, or is echoed with a different mode. All three arms land on this one token. The arm (`absent_from_echo`, `echoed_unspecified`, `mode_differs`) and the `stream_number` are fields on MC's confirm-failure log line, never labels. | **Fork on that log line's arm.** The per-arm actions have one home, the arm table in [`mh-deployment.md` §Mixed-Transport Rollback Hazard](mh-deployment.md#mixed-transport-rollback-hazard), which links back to this row. **The resolution steps below do not apply**, because a rejoin re-sends the same disagreeing declaration. Whatever the arm, the trap is the same as in [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures): **roll MH FORWARD; do NOT roll MC back.** Rolling MC back is the intuitive move when two ends disagree about a version-skewed value, and it is never the fix. Before story 3 it returns MC to `policy_generation: 0` registrations, which MH installs nothing for. Across the story-3 cutover it is a partial rollback that silences audio (`mh-deployment.md` §Story 3 cutover). The MH-side counterparts are in the hazard section. |
 | *anything else* | **A NEW OUTCOME VALUE.** The selector is negated (`outcome!~"match\|handler_id_mismatch"`), so an outcome added after this runbook was written pages here rather than falling silently outside the alert — deliberately. | You are the first responder to see it. Read `PolicyPushOutcome` in `crates/mc-service/src/media_routing/confirm.rs` for what the emitting site means by it, then **add a row to this table**. Do not narrow the selector to make the page stop. |
 | `handler_id_mismatch` | **Diagnostic, not an incident.** `MH_HANDLER_ID` is per-incarnation today, so an ordinary MH pod restart produces this outcome by construction. | Ignore unless it persists with no MH restart. The alert deliberately excludes it for this reason. |
 
@@ -2326,8 +2384,9 @@ Step 3 — **confirm MH's side of the story.**
 sum by(outcome) (increase(mh_media_policy_applies_total[15m]))
 ```
 
-`applied` is the healthy outcome. `apply_failed` and `rejected_invalid` are the two that produce
-`generation_mismatch` on MC's side; `rejected_stale` is MH correctly refusing an out-of-order
+`applied` is the healthy outcome. `apply_failed` is the one that produces
+`generation_mismatch` on MC's side (`rejected_invalid` is an RPC error that lands on
+`mc_register_meeting_total{status="error"}`, not here; Scenario 12. Corrected 2026-10-21); `rejected_stale` is MH correctly refusing an out-of-order
 generation and is not a fault. If MH shows `applied` for the generation MC sent, the divergence is
 in the response path, not the apply path.
 
@@ -2469,7 +2528,12 @@ fault.
   **whole** declaration. The listener hears nobody. Read `mc_media_receive_slot_cap{media_kind="audio"}` beside
   `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`. A rising over-cap
   rate with the cap below the client's configured N is a configuration mismatch, not a key fault.
-  Client side: `client-dev-local.md` F18.
+  Client side: `client-dev-local.md` F18. *(Corrected 2026-10-21, story 3 OPS-A, R-1: this arm holds
+  only until MC-A and C-A1. From MC-A each kind is truncated to its own cap
+  (`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`), and the excess slots show
+  `unavailable`. It is never a whole-declaration rejection, so the listener hears up to the cap,
+  never nobody, and `unavailable` on `mc_media_slot_states_total` is the reading. A reader who
+  trusted this arm on a story-3 build would look for a rejection that cannot happen.)*
 - **Static fill.** Slots fill in **join order** and are never reselected (story 2 R-2, R-4). With more
   senders than slots, the earliest joiners hold the slots, and a later joiner is inaudible to that
   listener until a slot frees, which happens when someone leaves. That is designed behaviour, not a
@@ -3129,7 +3193,12 @@ earliest joiners. **Remedy: raise the client's N** (`VITE_DT_RECEIVE_SLOTS`), wi
 rejected whole and counted as `slot_count_over_cap` — see the client media signalling section. A
 current SDK refuses such an N itself (the cap is advertised on `JoinResponse.max_receive_slots`) and
 counts it on `dt_client_media_receive_slots_rejected_total` instead, so a flat MC over-cap rate does
-not rule this arm out.
+not rule this arm out. *(Corrected 2026-10-21, story 3 OPS-A, R-1: the cap and rejection text
+holds only until MC-A and C-A1. From MC-A the cap is per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS` for
+this audio arm), and an over-cap declaration is truncated: the excess slots show `unavailable`,
+never a rejection. C-A1 retires the client's local refusal and its counter, and renames
+`VITE_DT_RECEIVE_SLOTS` to the per-kind `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`.
+The remedy, raising N within the audio cap, is unchanged.)*
 
 **(c) MH refused the WHOLE snapshot on a policy bound — a REAL fault.** MC co-locates edges: in an
 all-connected meeting **every** edge lands on ONE handler while the other carries none, and MC does
@@ -3452,6 +3521,9 @@ snapshot as every other policy change, so a push that is failing fails for the m
 **Not a mute problem**: a participant who muted THEMSELF (client mute, enforced at capture, ADR-0036
 §5) — `mc_media_mute_requests_total`. `slot_state="source_muted"` covers both self and server mute
 by design, so it cannot tell them apart; the `ParticipantMuteUpdate` a client receives can.
+*(Corrected 2026-10-21, story 3 OPS-A: true until MC-A. From MC-A the slot state itself tells them
+apart, per kind: `avatar_client_muted` versus `avatar_server_muted`, server winning when both, and
+`source_muted` is no longer emitted. MC-B removes it.)*
 
 **Escalation**: the routing for "applied at MC, confirmed, MH still forwards" (MH defect) and "applied
 at MC, not confirmed" (push path) is decided in one place, MH Scenario 19 Arms 3 and 4. Route from

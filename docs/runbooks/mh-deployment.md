@@ -19,13 +19,14 @@ For active-incident triage (e.g. "an alert is firing right now"), see the compan
 ## Table of Contents
 
 1. [Deployment Procedure](#deployment-procedure)
-2. [Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination](#post-deploy-monitoring-checklist-mh-webtransport--mcmh-coordination)
-3. [Required environment keys](#required-environment-keys)
-4. [Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)
-5. [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply)
-6. [Rollout With Media Flowing](#rollout-with-media-flowing) (including [Operator levers](#operator-levers-there-are-none-for-media))
-7. [Rollback](#rollback)
-8. [References](#references)
+2. [Story 3 cutover (see each other): order, skew detection, rollback](#story-3-cutover-see-each-other-order-skew-detection-rollback)
+3. [Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination](#post-deploy-monitoring-checklist-mh-webtransport--mcmh-coordination)
+4. [Required environment keys](#required-environment-keys)
+5. [Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)
+6. [Both pods CrashLoop immediately after apply](#both-pods-crashloop-immediately-after-apply)
+7. [Rollout With Media Flowing](#rollout-with-media-flowing) (including [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) and [Operator levers](#operator-levers-for-media-video-off-and-nothing-else))
+8. [Rollback](#rollback)
+9. [References](#references)
 
 ---
 
@@ -41,7 +42,24 @@ kubectl apply -k infra/kubernetes/overlays/kind/services/mh-service/
 
 Pre-deployment checks: GC reachable, MC reachable, JWKS endpoint reachable, MH WebTransport TLS secret provisioned. Post-rollout, run the post-deploy monitoring checklist below.
 
-> **STOP — DEPLOY ORDER IS FORCED. MC FIRST, THEN MH.** Since
+> **STOP — THE STORY 3 ("see each other") CUTOVER HAS ITS OWN ORDER: config → MH → MC → browser
+> SDK, and rolling back across it means ALL of them together.** Read
+> [Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback) before you apply any
+> build that contains story 3. It is the deploy-order authority for that cutover. The banner below
+> covers an older contract and is scoped to it.
+>
+> **Corrected 2026-10-21 (story 3 OPS-A, R-25).** The banner below used to read as the standing
+> deploy order for every MH deploy. Story 3's cutover puts **MH before MC**. A reader who trusted the
+> old banner would apply MC first, and a story-3 MC that emits a video egress stream against a
+> story-2 MH has its **whole registration rejected**, which silences the meeting's **audio**, not
+> just its video ([Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard)). The
+> `sender_id` contract below is satisfied by every build that contains story 3. It still binds
+> only against builds that predate the contract (story 2 task 20 and earlier). Those builds are on
+> the far side of the story-3 cutover, and the all-together rule already covers them. The two orders
+> never meet: within the v3 era there is no forced MC/MH order (R-25), and across the cutover
+> nothing rolls alone.
+>
+> **(Pre-story-3 builds only) DEPLOY ORDER IS FORCED. MC FIRST, THEN MH.** Since
 > `NotifyParticipantConnectedResponse` gained `sender_id`, a new MH against an
 > old MC **declines every media session**: a total media outage for the skew
 > window, not a degradation. **"MC reachable" above does not cover this** — an
@@ -61,6 +79,126 @@ Pre-deployment checks: GC reachable, MC reachable, JWKS endpoint reachable, MH W
 > below. It is stated there under Rollback because that is where the sibling
 > `no_applied_generation` carve-out lives; it is repeated here because a forward
 > deploy never reaches that section.
+
+---
+
+## Story 3 cutover (see each other): order, skew detection, rollback
+
+**Written before the code lands** (story 3 R-25, confirmed by the user 2026-10-08). The story-3
+code tasks (MH-A1, MH-A2, MH-B, MC-A, MC-B, P2, C-A1, C-A2) land on one branch and ship as
+**one coordinated release**. This section is the deploy-order authority for moving from the last
+build without story 3 to a build that contains it, and back. `mc-deployment.md` §"Story 3
+cutover" carries the MC view and links here rather than repeating the table.
+
+### Why it is all-or-nothing, stated from code
+
+- MH ingress calls `decode_datagram` on every audio frame (`crates/mh-service/src/media/forward.rs`).
+  The codec rejects every version other than `PROTOCOL_VERSION`
+  (`crates/media-protocol/src/frame.rs`) as `unknown_version` (`crates/media-protocol/src/codec.rs`).
+- After P2, `PROTOCOL_VERSION` is 3 and is the **only** version. The v2 path is deleted in Rust,
+  in TypeScript and in the vectors. There is no allowlist and no floor (R-22).
+- The SDK encodes whatever `SendDirective.header_version` MC directs, and MC derives that from
+  `PROTOCOL_VERSION`. Once C-A1 lands, the SDK **refuses** a directive whose `header_version` is
+  not 3. MC-B also deletes the superseded proto fields within the story.
+
+So a pre-story MH, MC or SDK, rolled forward or back **alone** against the other two, silences
+audio. The failure is loud and counted, but it is **total**. One-component, one-version rollback
+is safe only **within the v3 era**: between two builds that both contain story 3 (R-25).
+
+### Forward order: config → MH → MC → browser SDK
+
+| Step | What | Gate before the next step |
+|---|---|---|
+| (a) **Config** | The shared `media-codec-profile` ConfigMap (generator-only base `infra/services/media-codec-profile/`, required on mc-0, mc-1, mh-0 and mh-1), the new required MC and MH keys, and the retiring keys flipped to `optional: true` with RETIRED banners. All of it landed with INF-A, ahead of the code. Current images ignore every new key, so applying it alone changes no behaviour. **It does still roll all four pods**, because the pod templates change, and an MH roll sheds that pod's sessions ([Rollout With Media Flowing](#rollout-with-media-flowing)). | Both MC and MH pods Ready. No `CreateContainerConfigError` ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)). |
+| (b) **MH** | The story-3 MH image. | MH's per-stream apply-time transport check is live. It ships with MH-A1: `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}` is **present** on both pods. **Presence is the gate, not zero.** The series **rises** while the old MC is still up, because the shipped MH refuses each of the old MC's egress-bearing registrations (the skew table's old-MC row). That is expected until step (c). If the series is absent, that MH predates MH-A1, so do not roll MC. |
+| (c) **MC** | The story-3 MC image. | `mc_session_join_failures_total{error_type="header_version_unsupported"}` is present on both pods (shipped by MC-A), and `mc_media_policy_pushes_total{outcome="transport_mode_mismatch"}` is flat. |
+| (d) **Browser SDK / web-app bundle** | A **separately named step**. Kind's `infra/kind/scripts/deploy.sh` does NOT deploy it. The bundle is served by the Vite dev server (`scripts/dev-web.sh`, restarted from the new tree) or by a built bundle, and browsers holding the old bundle must reload. | Old-bundle joins (the first row of the skew table below) fall to zero as users reload. |
+
+**Why MH goes before MC inside the cutover.** MH's apply-time per-stream transport check and its
+`applied_source_streams` echo (both MH-A1) must be live before any MC emits a video egress stream.
+A story-2 MH hard-rejects a registration whose egress streams do not all share one transport
+(`PolicyRejection::HeterogeneousTransportModes`, `crates/mh-service/src/routing/mod.rs`, counted
+`mh_media_policy_applies_total{outcome="rejected_invalid"}`). It rejects the **whole**
+registration, so the meeting's **audio** goes dark, not just its video. Nothing re-pushes a
+rejected registration until the meeting's next structural change (there is no re-assert cadence
+before story 4). See [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard).
+
+**The window between steps is a media outage in any order. Announce it.** A v2 component and a
+v3 component cannot exchange audio, so no order keeps audio up between (b) and (d). The order
+decides **whether the window's failures clear by themselves when the next component lands.**
+- **With MH first:** the shipped MH refuses each of the old MC's egress-bearing registrations
+  **whole**, as `rejected_transport_inconsistent`. A registration without `source_streams` is a
+  reject once MC-B lands, and MC-B is part of the release. That refusal **clears at step (c)**,
+  because the new MC pods re-register every meeting they serve. Every other skew in the window is
+  a per-frame or per-join refusal that clears when the last component lands.
+- **With MC first:** a story-2 MH rejects whole registrations, and **those do not clear on their
+  own**. Nothing re-pushes until each meeting's next structural change, because there is no
+  re-assert cadence before story 4.
+- MH-A1's transitional path, which accepts a registration with no `source_streams`, exists **only
+  at intermediate branch commits** before MC-B. It is never in a shipped build, so do not expect it
+  during a release cutover.
+
+**On Kind the cutover is ONE converge, not four steps.** `deploy.sh` applies the whole environment
+root in a single `kubectl apply -k` (`apply_env_root`) and then waits for every workload
+(`wait_for_env_root`). The profile, MC and MH roll together, and **nothing in the tree sequences
+MH before MC**: there is no flag for it, and none should be invented here. Run the Kind cutover
+with no live meetings, which is the normal state of a devloop cluster. A meeting that registered
+mid-converge and was refused recovers with a rejoin. Step (d) still follows as its own action.
+The config → MH → MC sequence above is the order to follow when rolling **by hand or in a non-Kind
+environment**. There, apply each stage's ConfigMaps and Deployments together and hold at each gate.
+
+### Skew detection, one row per one-component skew across the cutover
+
+Every row is refused and counted somewhere an operator can query. None relies on a browser
+console.
+
+| Skew | What happens | Counted on | Shipped by |
+|---|---|---|---|
+| **Old SDK → new MC** | The join is refused before admission, because `ParticipantCapabilities.supported_header_versions` (signaling.proto) lacks 3 (an empty list included). The refusal uses the generic join-refusal shape and echoes no version. | `mc_session_join_failures_total{error_type="header_version_unsupported"}` | MC-A |
+| **v3 frames → old MH**, and **v2 frames → new MH** | Every frame is dropped at MH ingress. Audio is **totally** silent on that handler. | `mh_media_frames_dropped_total{direction="ingress",reason="unknown_version"}` | live today (codec token, `crates/media-protocol/src/codec.rs`) |
+| **Old MC directs `header_version` 2 → v3 SDK** | The SDK refuses the directive and sends nothing for that kind. | The exported client directive-fault series, under its header-version-refused reason. Its series and token names are fixed by C-A1 in `docs/observability/metrics/client.md`; this runbook does not pre-empt them. | C-A1 |
+| **New MC → story-2 MH** (video egress) | The whole registration is rejected, so the meeting's audio goes dark too. A story-2 MH that ACCEPTS a registration (an audio-only meeting, one transport) echoes no `applied_source_streams`; from MC-A that reads `transport_mode_mismatch`, arm `absent_from_echo`. | MH: `mh_media_policy_applies_total{outcome="rejected_invalid"}`. MC: the RPC fails, so nothing lands on `mc_media_policy_pushes_total`. Read `mc_register_meeting_total{status="error"}` and the WARN "RegisterMeeting RPC failed" (target `mc.grpc.mh_client`). | live today; see [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) |
+| **Old MC → new MH** (registration) | The old MC sends no `source_streams`, so the shipped MH refuses every egress-bearing registration **whole** (audio dark). It clears when the new MC re-registers. Both the forward order (between steps b and c) and the reversed by-hand rollback pass through this. | MH: `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}`. This is also A8's selector, so A8 can fire if the window is held past its `for: 15m`. MC: the old MC's RegisterMeeting fails, read as above. | MH-A1 + MC-B |
+
+The receiver-side `dt_client_media_frames_dropped_total{reason="unknown_version"}` also moves on
+the first three rows' media path. It is the one detector that survives a rollback, and it is
+re-scoped in [Rollback for the media path](#rollback-for-the-media-path).
+
+### Rollback: three layers
+
+1. **CONFIG rollback is safe.** ConfigMaps are content-addressed (ADR-0038 §2), so
+   `kubectl rollout undo` lands each pod template on the previous hash-suffixed generation. That
+   generation holds every key its revision references, and nothing in this tree prunes
+   generations (`deploy.sh` `prune_superseded_images()` touches images only). The retiring keys'
+   `optional: true` refs cover a partial revert. **Undo exactly the Deployments the change
+   rolled.** A `media-codec-profile` change rolled mc-0, mc-1, mh-0 and mh-1, so its undo must
+   undo all four. Otherwise MC directs one profile while MH costs against another. An MH-only
+   ConfigMap change undoes mh-0 and mh-1, and an MC-only one undoes mc-0 and mc-1. **On Kind an
+   undo is transient**: the next `deploy.sh` converges back to the tree. The durable rollback is a
+   tree revert plus `deploy.sh`.
+2. **WITHIN the v3 era, one component by one version holds** (R-25): MH, MC or the SDK, between
+   builds that both contain story 3, with the other components and the ConfigMaps in place. It
+   starts, serves and never degrades audio. Video may be absent.
+3. **ACROSS the cutover, roll back everything together.** MH, MC, the SDK bundle and the config
+   go back as one action. No step proposes a v2 component serving beside a v3 one. The window is
+   an outage, not a mode.
+   - **On Kind:** check out the last commit without story 3 and run `deploy.sh`. It **rebuilds**
+     every first-party image from that tree (`build_first_party_images`) and re-applies that
+     tree's ConfigMaps, so it neither depends on nor needs retained images. Do NOT reach for
+     `kubectl rollout undo` here. Undo can only land on a revision whose image is still on the
+     node, which means the deployed one or the previous rollout-history revision. Older revisions
+     are still in rollout history (no `revisionHistoryLimit` is set, so the default of 10
+     applies), but their images were removed by `prune_superseded_images()`. The pods are
+     `imagePullPolicy: Never`, so an undo to one of them stalls in `ErrImageNeverPull`. Once
+     anything has rolled since the cutover, the reachable revision is not the pre-story build. **Then roll back the SDK bundle**: restart
+     `scripts/dev-web.sh` (or rebuild the bundle) from the same commit, and have users reload.
+   - **By hand or outside Kind**, if the steps cannot be one action: reverse the forward order
+     (SDK bundle, MC, MH, then the config) and treat the whole window as a media outage. Every
+     skew you pass through is a row of the table above.
+   - **Do not run the retired-key deletion while this rollback is still possible.** A pre-story
+     image hard-reads those keys. The trigger is in `docs/TODO.md` §Media Path Obligations,
+     "Delete the story-3 retired config keys", condition (b).
+   - Schema: none. Story 3 has no migration.
 
 ---
 
@@ -366,6 +504,10 @@ The 20%/5m JWT floor is intentionally looser than the existing `MHHighJwtValidat
 # per-instance Deployments, `mh-0` and `mh-1`, each with its own NodePort
 # Service and Kind port mapping. There is NO Deployment named `mh-service`;
 # targeting one returns NotFound.
+#
+# WITHIN THE v3 ERA ONLY (both builds contain story 3, or neither does). Across
+# the story-3 cutover an MH-only undo silences all audio: roll MH, MC, the SDK
+# bundle and the config back together -- see "Story 3 cutover" above.
 kubectl rollout undo deployment/mh-0 -n dark-tower
 kubectl rollout undo deployment/mh-1 -n dark-tower
 
@@ -382,6 +524,18 @@ kubectl rollout undo deployment/mh-1 -n dark-tower
 
 #### Cross-service ordering: MC and MH are coupled by the sender_id binding contract
 
+> **Scope (corrected 2026-10-21, story 3 OPS-A, R-25): this section binds ONLY against builds that
+> predate the `sender_id` contract.** Every build that contains story 3 sets the field, so within
+> the v3 era this section imposes no order. Its "forward MC first / back MH first" rule is
+> **superseded for the story-3 cutover** by
+> [Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback): forward
+> config → MH → MC → SDK, and rollback across the cutover is all components together. A reader who
+> applied this section's "MC first" to the story-3 deploy would put a video-emitting MC in front of
+> a story-2 MH, and that MH rejects the meeting's whole registration, audio included. A reader who
+> applied "back: MH first" across the cutover would roll MH alone onto a pre-v3 build, which drops
+> every v3 frame as `unknown_version`. Both are total, not partial. The text below is kept
+> unchanged for pre-story-3 history.
+
 Since `NotifyParticipantConnectedResponse` gained `sender_id`, **MC and MH are a
 two-sided contract and the deploy order is forced.** The field is a bare `uint32`,
 not `optional`, so an MC that does not set it is indistinguishable on the wire from
@@ -396,10 +550,12 @@ fail-closed, which is correct, but it also makes it **total** rather than partia
 This pair sits inside a three-service order since story 2 task 12: **forward
 GC → MC → MH; rollback MH → MC → GC** (`mc-deployment.md` §Coordination). GC
 goes before MC because an MC that ends meetings needs GC's revive of an ended
-assignment. Where any other ordering note appears to conflict with this
-section — including the `EndMeeting` rollout-order note below, written for the
-release that introduced the RPC — **this section wins**: its skew is a total
-blackout, theirs a counted degradation.
+assignment. Where any other **pre-story-3** ordering note appears to conflict
+with this section — including the `EndMeeting` rollout-order note below, written
+for the release that introduced the RPC — **this section wins**: its skew is a
+total blackout, theirs a counted degradation. For the story-3 cutover the
+precedence is reversed: the story-3 cutover section wins over this one (scope
+note above). Story 3 makes no GC change, so GC is not part of that cutover.
 
 > **DO NOT roll MC back alone after this contract has landed.** `kubectl rollout
 > undo deployment/mc-0` returns MC to a binary that never sets `sender_id`, so a
@@ -478,6 +634,12 @@ and the manifests orderable rather than independent:
 - **Backward — the image may roll back alone.** This is the normal rollback and
   the two `kubectl rollout undo` commands above are the whole of it. Older MH
   code ignores environment variables it does not read, so extra keys are inert.
+  **Except across the story-3 cutover** (corrected 2026-10-21, R-25). An MH
+  image rolled back alone to a pre-story-3 build drops every v3 frame as
+  `unknown_version` and so silences all audio. There, MH, MC and the SDK roll
+  back together:
+  [Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback).
+  "The image may roll back alone" holds within the v3 era, one version back.
 - **Backward — the manifests must NOT roll back alone.** Reverting the ConfigMap
   to an earlier state while the new image is running strips variables that image
   requires (the ADR-0036 §1 transport parameters, and since story 2 the
@@ -523,10 +685,16 @@ MH refuses to start if any of these is missing or invalid. There is no default
 for any of them: a value nobody chose, running forever because nothing failed,
 is the defect this list exists to prevent.
 
+**Story 3's keys (marked *story 3*) work in two layers.** Both MH Deployments hold hard refs to
+them, so an absent key is a `CreateContainerConfigError` (kubelet, empty logs) **today**, while
+the current image ignores the value. MH's own refusal to start on a missing or out-of-bounds
+value arrives with the task named in each row. The cutover order that lands these keys before
+the images is in [Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback).
+
 The **Enforced by** column is the load-bearing one. Several keys begin `MH_MAX_`
 and mean unrelated things — the transport bound, the connection guard, the
-retired stream count below, and (since story 2) the registered-meeting cap, the
-muted-source bound and the ADR-0036 §8 policy bounds; the layer that enforces
+retired stream count below, (since story 2) the registered-meeting cap and the
+ADR-0036 §8 policy bounds, and (since story 3) the source-stream bound; the layer that enforces
 a bound is what tells them apart, and it is also what tells you where to look
 when one trips. (Stated without a count deliberately: a restated count here is
 what this story's configuration task found false.)
@@ -538,16 +706,23 @@ what this story's configuration task found false.)
 | `MH_KEEPALIVE_INTERVAL_MS` | ConfigMap `mh-service-config` | `10000` | QUIC connection-level keepalive. **Enforced by quinn.** This is what refreshes the NAT binding of a **muted** participant, who by definition sends no media — without it an intermediary can reap the path and unmute is not instantaneous. Validated at startup to sit at or below one third of MH's 30 s idle timeout, so one lost keepalive is not fatal. |
 | `MH_MAX_CONNECTIONS` | ConfigMap `mh-service-config` | `500` | Maximum concurrent WebTransport connections. **Enforced by mh-service itself**, at accept, before allocating handler resources. A **resource-exhaustion guard, never a capacity figure, never advertised to GC.** It sits far above expected peak, so rejections attributed to it mean a connection **flood or leak** — not demand that has outgrown the deployment. Scaling out is the wrong response. Visible as `mh_webtransport_connections_total{status="rejected"}`. |
 | `MH_TERMINATION_GRACE_SECONDS` | **Not a ConfigMap key** — written into each Deployment's env at build time by the kustomize `replacements:` block | `35` | The pod's own termination grace, from which MH derives its post-cancellation settle window. **Enforced by mh-service** at startup (it refuses to start if the grace leaves no room for the shutdown margin). **Never hand-type this.** It is derived from that instance's own `spec.template.spec.terminationGracePeriodSeconds`, so the two cannot drift; the literal in the deployment file is a `"0"` sentinel. |
-| `MH_EGRESS_BUDGET_BPS` | ConfigMap `mh-service-config`; Kind value from `infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml` | the patch (the base `config.env` value is a deliberately unsized placeholder) | Egress bandwidth budget, **bits** per second. A **capacity** figure: MH derives ONE egress stream ceiling from it (budget ÷ the heavier per-stream cost), **enforces it at stream admission** (`rejected_stream_ceiling`), **advertises it to GC as `max_streams`** (placement stays soft), and publishes it as `mh_media_egress_stream_ceiling`. MH refuses to start if the ceiling is below 2 (remedy: RAISE this key; never lower the floor) or above `MH_MAX_TOTAL_EGRESS_EDGES`. **Not a kill switch** — see [Operator levers](#operator-levers-there-are-none-for-media). Exhaustion: `mh-incident-response.md` Scenario 18. |
-| `MH_STREAM_COST_AUDIO_BPS` | ConfigMap `mh-service-config` | `config.env` | Per-stream audio cost, bits/s; a divisor of the ceiling. The heavier of the two costs binds (MH stays type-blind). Published as `mh_media_stream_cost_audio_bytes_per_second`. |
-| `MH_STREAM_COST_VIDEO_BPS` | ConfigMap `mh-service-config` | `config.env` | Per-stream video cost, bits/s; the other divisor. Published as `mh_media_stream_cost_video_bytes_per_second`. |
+| `MH_EGRESS_BUDGET_BPS` | ConfigMap `mh-service-config`; Kind value from `infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml` | the patch (the base `config.env` value is a deliberately unsized placeholder) | Egress bandwidth budget, **bits** per second. A **capacity** figure: MH derives ONE egress stream ceiling from it (budget ÷ the heavier per-stream cost), **enforces it at stream admission** (`rejected_stream_ceiling`), **advertises it to GC as `max_streams`** (placement stays soft), and publishes it as `mh_media_egress_stream_ceiling`. MH refuses to start if the ceiling is below 2 (remedy: RAISE this key; never lower the floor) or above `MH_MAX_TOTAL_EGRESS_EDGES`. **Not a kill switch** — see [Operator levers](#operator-levers-for-media-video-off-and-nothing-else). Exhaustion: `mh-incident-response.md` Scenario 18. |
 | `MH_EGRESS_REJECTION_RATIO_THRESHOLD` | ConfigMap `mh-service-config` | `config.env` | The ONE threshold for the admission rejection ratio, `0.0..=1.0`. **Read by** mh-service's debugging WARN and — through the `mh_media_stream_admission_rejection_ratio_threshold` gauge, never as a PromQL literal — by `MHMediaEgressBudgetExhausted`. Tuning it to quiet that alert is the wrong response. |
 | `MH_MAX_REGISTERED_MEETINGS` | ConfigMap `mh-service-config` | `config.env` | Registration cap — a **resource-exhaustion guard, never capacity, never advertised to GC.** Enforced by mh-service when a NEW meeting registers; refusals count as `mh_media_policy_applies_total{outcome="rejected_meeting_cap"}`. `0` and values above its hard ceiling in code refuse to start. Raising it only postpones a leak (Scenario 18 Arm C). |
 | `MH_MAX_EGRESS_STREAMS_PER_MEETING` | ConfigMap `mh-service-config` | `config.env` | ADR-0036 §8 pre-allocation bound on ONE registration. Enforced by mh-service before allocation; a registration exceeding it is refused **whole** as `rejected_invalid`. Resource guard, never capacity. |
 | `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS` | ConfigMap `mh-service-config` | `config.env` | §8 pre-allocation bound, same enforcement and refusal as the row above. |
-| `MH_MAX_MUTED_SOURCES_PER_MEETING` | ConfigMap `mh-service-config` | `config.env` | Bound on a registration's server-muted set, same enforcement and refusal as the rows above — so an over-bound muted set leaves the PREVIOUS policy (without the mute) live (Scenario 19 Arm 4). |
 | `MH_MAX_TOTAL_EGRESS_EDGES` | ConfigMap `mh-service-config` | `config.env` | Aggregate installed-edge **backstop**. Enforced by mh-service at apply (`apply_failed`, `reason=total_egress_edge_cap_exceeded` on the WARN). MH refuses to start with the stream ceiling above it, so the ceiling always binds first; reaching this means the ceiling did not bind. |
 | `MH_POLICY_APPLY_TIMEOUT_MS` | ConfigMap `mh-service-config` | `config.env` | How long a registration waits for the session actor to apply its policy; expiry is `apply_failed` with the prior generation live. Resource guard. |
+| `MH_MAX_SOURCE_STREAMS_PER_MEETING` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | Pre-allocation bound on a registration's `source_streams`: every stream published in the meeting, watched or not, so it is NOT sized against egresses. **Enforced by mh-service once MH-A1 lands**, which refuses an over-limit registration **whole** as `rejected_invalid`, taking the meeting's media dark on that handler, audio included. MH refuses to boot if it is below `MH_MAX_EGRESS_STREAMS_PER_MEETING`. Hard ceiling: `crates/mh-service/src/config.rs`. Replaces the retired muted-sources bound (below). |
+| `MH_KEYFRAME_REQUEST_RETRY_MS` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | How often MH repeats a keyframe request while a subscriber edge waits for a group start (R-10). Bounds: `crates/mh-service/src/config.rs`, landing with **MH-B**. **MH refuses to boot unless it is ≥ `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS`** (profile), because a retry faster than the publisher's minimum interval is wasted. Raising the profile value above it is therefore a same-deploy change to both, and that deploy rolls MC and MH. |
+| `MH_KEYFRAME_REQUEST_AGGREGATION_MS` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | At most one keyframe or recovery request per source stream per window reaches the publisher (R-13). Bounds land with **MH-B**. **MH refuses to boot if it exceeds `MH_KEYFRAME_REQUEST_RETRY_MS`.** It is deliberately not checked against the profile's minimum interval. |
+| `MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | Per receiving connection rate limit on client recovery requests, applied before aggregation (R-13). Bounds land with **MH-B**. Over-limit requests are counted. |
+| `MH_STREAM_OPENS_PER_CONNECTION_PER_SEC` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | Per-connection RATE of incoming unidirectional stream opens (R-21). This is NOT `MH_MAX_CONCURRENT_UNI_STREAMS`, which is a quinn concurrency cap. Bounds land with **MH-A2**. Over-limit opens are dropped and counted. |
+| `MH_EGRESS_STREAM_BACKLOG_BYTES` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | Backlog cap per subscriber egress (group) stream (R-12, R-21). Past it MH **resets** that subscriber's group stream, never finishes it, and counts the reset. Recovery comes from the next keyframe request. Bounds land with **MH-A2**, and it enters MH's boot-time memory check (next row). |
+| `MH_STREAM_MID_FRAME_STALL_MS` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | A publisher stalled mid-frame for longer than this is reset downstream, counted (R-21). Bounds land with **MH-A2**. |
+| `MH_POD_MEMORY_LIMIT_BYTES` *(story 3)* | **Not a ConfigMap key**: a downward-API `resourceFieldRef` to this container's `resources.limits.memory` (`divisor: "1"`) in `mh-{0,1}-deployment.yaml` | the container's memory limit (never restated) | The input to MH's boot-time memory check, from **MH-A2** (the formula is stated once, in `infra/services/mh-service/config.env` at `MH_MAX_CONNECTIONS`), so that exhaustion is a counted reset and never an OOM kill. **The limit must stay declared.** If it were absent, Kubernetes would resolve the variable to the node's allocatable memory and the check would pass vacuously. `dt-guard kustomize` (`crates/dt-guard/src/kustomize_resource_field_refs.rs`) fails any `resourceFieldRef` whose container does not declare the resource, over the base and the rendered Kind root. |
+| `MEDIA_VIDEO_MAX_BITRATE_BPS`, `MEDIA_VIDEO_FRAME_RATE_HZ`, `MEDIA_AUDIO_MAX_BITRATE_BPS`, `MEDIA_AUDIO_FRAME_RATE_HZ` *(story 3)* | ConfigMap **`media-codec-profile`** (`infra/services/media-codec-profile/profile.env`), shared with MC | `profile.env` | MH derives **both** per-stream egress costs from these once MH-A1 lands: bitrate plus code-derived per-frame overhead × frame rate, with no headroom knob. Raising either video value **lowers every MH's stream ceiling**. MH-A1 also refuses to boot on an audio bitrate outside its supported band or an audio frame rate other than the one its frame duration implies (constants in `crates/mh-service/src/config.rs`). Read the result on `mh_media_egress_stream_ceiling`. **Editing the profile rolls MC and MH together** ([Operator levers](#operator-levers-for-media-video-off-and-nothing-else)). |
+| `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` *(story 3)* | ConfigMap **`media-codec-profile`** | `profile.env` | The publisher's minimum interval between request-driven keyframes. It is a **profile** key, not an MC key. MH reads it once MH-B lands, to validate `MH_KEYFRAME_REQUEST_RETRY_MS` at boot (row above). |
 
 The ConfigMap comments in `infra/services/mh-service/config.env` carry each key's value, derivation
 and remedy; the value column above cites that file rather than restating numbers that live there.
@@ -555,12 +730,18 @@ Each key is also reflected as a gauge MH publishes from the value it loaded
 (`docs/observability/metrics/mh-service.md` §Egress Admission Metrics), which
 `crates/env-tests/tests/01_mh_deployment_config.rs` compares against the deployed ConfigMap.
 
-One non-required key is listed **for contrast only**, because without it there is
-no way to see why the two `MH_MAX_` keys above are not it:
+**Retired keys** are listed **for contrast only**. Each still has a key and an `optional: true` ref
+(step 1 of the two-deploy retirement). Deleting a key and its refs together is step 2, scheduled in
+`docs/TODO.md` §Media Path Obligations, "Delete the story-3 retired config keys". That entry's
+trigger includes the story-3 cutover's rollback window having closed. **Do not tune them, and do not
+delete them by hand.** The method is [`MH_MAX_STREAMS`: the rule applied, over two
+deploys](#mh_max_streams-the-rule-applied-over-two-deploys).
 
 | Key | Source | Kind value | What it bounds — and who enforces it |
 |---|---|---|---|
-| `MH_MAX_STREAMS` *(RETIRED — pending removal; not required)* | ConfigMap `mh-service-config` | `config.env` | **Retired by story 2.** Superseded by the stream ceiling MH derives from `MH_EGRESS_BUDGET_BPS`, which is what MH advertises to GC as of story 2 task 8. **Nothing reads this key any more** — editing it changes nothing, and the startup log's `egress_stream_ceiling` is the value GC places against. **The key and both `configMapKeyRef` entries deliberately remain.** Do not tune it, and do not delete it by hand. The retirement and its ordering are in [`MH_MAX_STREAMS`: the rule applied, over two deploys](#mh_max_streams-the-rule-applied-over-two-deploys). |
+| `MH_MAX_STREAMS` *(RETIRED by story 2 — step 1 done in story 3; not required)* | ConfigMap `mh-service-config` | `config.env` | **Retired by story 2.** Superseded by the stream ceiling MH derives from `MH_EGRESS_BUDGET_BPS`, which is what MH advertises to GC as of story 2 task 8. **Nothing reads this key any more** — editing it changes nothing, and the startup log's `egress_stream_ceiling` is the value GC places against. **The key and both `configMapKeyRef` entries deliberately remain.** Do not tune it, and do not delete it by hand. The retirement and its ordering are in [`MH_MAX_STREAMS`: the rule applied, over two deploys](#mh_max_streams-the-rule-applied-over-two-deploys). |
+| `MH_STREAM_COST_AUDIO_BPS`, `MH_STREAM_COST_VIDEO_BPS` *(RETIRED by story 3)* | ConfigMap `mh-service-config` | `config.env` | Superseded by the costs MH derives from `media-codec-profile`, with no headroom knob (row above). **Until MH-A1 lands the current image still reads both as required.** The ceiling divides by the larger, so the video key is the operative one, and they are published as `mh_media_stream_cost_{audio,video}_bytes_per_second`. MH-A1 removes the reads. After that, nothing reads them. |
+| `MH_MAX_MUTED_SOURCES_PER_MEETING` *(RETIRED by story 3)* | ConfigMap `mh-service-config` | `config.env` | Superseded by `MH_MAX_SOURCE_STREAMS_PER_MEETING`. **Until MH-A1 lands the current image still reads it** as the bound on `server_muted_sources`, still refuses to boot if it is below `MH_MAX_EGRESS_STREAMS_PER_MEETING`, and still refuses an over-bound muted set whole (Scenario 19 Arm 4). Keep it at least that value until the read is gone. |
 
 Table contributed at the request of the observability review, which found that
 this runbook — unlike GC's, AC's and MC's — had no configuration section at all.
@@ -788,7 +969,7 @@ decision made in two halves.
 
 When an MH pod goes not-ready during a rollout:
 
-- **Every participant whose media session is on that pod loses audio at that moment.** Signalling is
+- **Every participant whose media session is on that pod loses audio, and from story 3 video too, at that moment.** Signalling is
   unaffected — the client stays joined, the roster is intact, the UI shows a healthy meeting. Only
   the media stops.
 - **In this build they do not get it back on their own.** The §8 recovery this decision leans on —
@@ -821,6 +1002,69 @@ the shedding stays, the "does not come back on its own" clause goes.
 > which is why Scenario 17's rung 1 asks about the connection first — a shed shows as connection
 > failure, a stale-policy fault leaves a healthy connection.
 
+### Mixed-Transport Rollback Hazard
+
+**The hazard: an MC that emits a video egress stream against an MH that does not accept it.**
+Story 3 puts datagram audio and stream-per-group video in one meeting's registration (R-20).
+ADR-0036 §8 requires every two-ends-must-agree setting to be echoed back with a loud mismatch, and
+the transport is one of them. Two builds disagree about it when MH is older than MC, or when the
+order is wrong in either direction (a forward deploy that put MC first, or a rollback that took MH
+back alone).
+Deploy order: [Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback).
+
+**MC side: it pages.** `mc_media_policy_pushes_total{outcome="transport_mode_mismatch"}` fires
+`MCMediaGenerationDivergence`, triaged in
+[`mc-incident-response.md` Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence),
+whose `transport_mode_mismatch` row links back here. Once MC-A lands, the token's meaning **widens
+to any per-stream echo disagreement**. MC compares each declared `SourceStream` against MH's
+`RegisterMeetingResponse.applied_source_streams`, and three arms map to this one token, with no new
+outcome value. **Fork on MC's confirm-failure log line**, which carries the arm and the
+`stream_number` as log fields, never as labels:
+
+| Arm (log field, from MC-A) | Means | Do |
+|---|---|---|
+| `absent_from_echo` | The MH that answered never echoed that stream. It is an older or mis-ordered MH build that predates the per-stream echo. | **Roll MH FORWARD.** Do NOT roll MC back. Across the story-3 cutover that is a partial rollback (above), and within the v3 era it does not remove the old MH. |
+| `echoed_unspecified` | MH echoed the stream with no transport. This is a contract fault. | Escalate to `media-handler` and `meeting-controller` together. |
+| `mode_differs` | MH applied a different transport than MC declared. This is configuration or contract drift between the two builds, not a version skew. | Compare MC's declared transport for that `stream_number` with MH's applied one. Escalate to both specialists. A rejoin re-sends the same declaration and will not clear it. |
+
+Before MC-A, MC compares the single superseded `RegisterMeetingResponse.transport_mode`, and the
+token keeps its story-2 meaning (MC Scenario 15's row).
+
+**MH side: warning A8 (`for: 15m`), written by OBS-B.**
+`mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}` (MH-A1) means MH refused
+a whole registration. It has two arms, and their remedies differ:
+- **One egress's candidates' declared streams differ in transport.** This is a contract fault in
+  MC's render. Escalate to `meeting-controller` and `media-handler`.
+- **A candidate names a stream absent from `source_streams`.** This includes an absent or empty
+  `source_streams` from an MC that predates it, once MC-B lands. It is MC/MH declaration drift:
+  check the MC build first, then roll MH and MC to matching builds. **During the story-3 cutover
+  window (steps b to c), this arm from the still-old MC is the expected skew, not a fault**. It
+  clears at step (c), and A8 may fire if the window is held past 15 minutes.
+
+There is no per-egress transport any more: `EgressStream.transport_mode` is removed (wire-freeze
+Amendment 1), and an edge's transport derives from its candidate's declared `SourceStream`. Two MH ingress drop
+reasons separate the per-frame causes, and their remedies differ:
+
+| `mh_media_frames_dropped_total{direction="ingress", reason=…}` (MH-A1) | Means | Remedy |
+|---|---|---|
+| `transport_mismatch` | The frame matched a declared stream, keyed by (connection-bound sender, uplink relay `stream_id` = the publisher-stamped `SendStream.stream_number`), but arrived on the other transport. | A **sender or contract fault**: a client sending video as datagrams or audio on a stream. Route to `client`, with `media-handler`. |
+| `unmatched_stream` | No declared stream matches (sender, uplink `stream_id`). | **MC/MH declaration drift**: MC did not list a stream the publisher is sending. At intermediate branch commits before MC-B (never in a shipped build), that includes a story-2 MC registering on MH-A1's transitional no-`source_streams` path. Route to `meeting-controller`, and check the MC build first. |
+
+**Against a story-2 MH (before MH-A1)** none of these exist. The registration is rejected **whole**
+as `mh_media_policy_applies_total{outcome="rejected_invalid"}`
+(`PolicyRejection::HeterogeneousTransportModes`), and the meeting's **audio** goes dark with it. MH
+answers with a gRPC error (`invalid_argument`), so MC never reaches its echo check and **nothing
+lands on `mc_media_policy_pushes_total`**. MC's reading is `mc_register_meeting_total{status="error"}`
+and the WARN "RegisterMeeting RPC failed" (target `mc.grpc.mh_client`). A story-2 MH that accepts
+(an audio-only meeting) echoes no `applied_source_streams`, which reads as `absent_from_echo` above.
+The remedy is the same: roll MH forward.
+
+**Consistent with MC Scenario 12's trap** ("roll MH FORWARD; do NOT roll MC back",
+[`mc-incident-response.md` Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures)).
+Rolling MC back is never the fix for a transport disagreement. Before the cutover it returns MC to
+registrations MH installs nothing for. Across the cutover it is a partial rollback that silences
+audio. Within the v3 era it leaves the disagreeing MH in place.
+
 ### Scaling MH to zero is NOT a media kill switch
 
 If you need to stop media, **scaling `mh-0` / `mh-1` to zero replicas is the wrong lever, and it is
@@ -839,14 +1083,59 @@ was aimed at, including meetings that were not affected by whatever prompted the
 |---|---|---|
 | Scale MH to 0 | media on affected meetings | **every new meeting, fleet-wide**, plus media on **every** existing meeting (whose joins still succeed, silently) |
 
-**There is no finer-grained lever in this build.** There is no per-meeting media disable, no feature
-flag, and no runtime toggle. If media must be stopped, the only correct action is a **redeploy** of
-the previous image — which is the rollback path below, and which keeps joins working.
+**There is no finer-grained lever for media as a whole.** There is no per-meeting media disable, no
+feature flag, and no runtime toggle. If media must be stopped, the only correct action is a
+**rollback** ([below](#rollback-for-the-media-path)): within the v3 era, one component one version
+back; across the story-3 cutover, **all components together**, never an MH-only redeploy. It keeps
+joins working.
+**Video alone has a lever** (story 3, R-26): `MC_MAX_VIDEO_RECEIVE_SLOTS=0`, an MC roll that never
+touches MH ([Operator levers](#operator-levers-for-media-video-off-and-nothing-else)).
+*(Corrected 2026-10-21, story 3 OPS-A: this paragraph said there was no finer-grained lever at all.)*
 
-### Operator levers: there are none for media
+<a id="operator-levers-there-are-none-for-media"></a>
 
-**This story adds zero operator-reachable media levers.**
+### Operator levers for media: video off, and nothing else
 
+> **Corrected 2026-10-21 (story 3 OPS-A, R-26).** This section was titled "there are none for
+> media" and opened "This story adds zero operator-reachable media levers". Story 3 makes that
+> false for video. A reader who trusted it during a video-only incident would roll back, and
+> across the story-3 cutover a rollback is all-components-together and silences audio for the
+> whole window. They would skip the one lever that turns video off and leaves audio untouched. The
+> old anchor (`#operator-levers-there-are-none-for-media`) still resolves here.
+
+- **`MC_MAX_VIDEO_RECEIVE_SLOTS=0` disables video (R-26).** Every declared video slot is
+  truncated to `SLOT_STATE_UNAVAILABLE` (R-1). No publisher is watched, so no camera is directed
+  to send. **Audio is unaffected.** It applies to declarations made after the new MC pods are up.
+  This takes effect once MC-A lands; the current MC image ignores the key. Confirm it on
+  `mc_media_receive_slot_cap{media_kind="video"}` reading 0 on both MC pods.
+  - **Its cost.** The key lives in `infra/services/mc-service/config.env` **only**, never in
+    `media-codec-profile`, so pulling it **never rolls MH** and never sheds an MH session. The MC
+    ConfigMap is content-addressed (ADR-0038 §2), so the change **rolls both MC pods**. It is
+    **not a hot toggle**: it costs one MC restart for every meeting on each pod. Procedure:
+    `mc-deployment.md` §"Video-off lever".
+  - **Its blast radius.** It is fleet-wide across every meeting served by those MC pods. No
+    per-meeting or per-participant form exists. Video comes back with the reverse edit, at the
+    cost of another MC roll. Restoring it lets directives resume. **A host's server unmute can
+    resume a participant's camera or microphone** (R-18), at any time, unless the participant has
+    client-muted that kind. The participant is shown a non-suppressible notice at that moment and
+    can client-mute at once. The lever does not change that.
+  - **For a video-only incident, pull this lever BEFORE any rollback.** It does not cross the v3
+    wire break. A rollback across the story-3 cutover takes MH, MC and the SDK back together and
+    silences audio for its window
+    ([Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback)).
+  - **Verification of the lever itself** is MC's and test's. Neither artifact is in the tree yet,
+    and both are planned in `docs/user-stories/2026-10-07-see-each-other.md`:
+    - MC-A adds an integration test under `crates/mc-service/tests/` (in the story's MC-A test
+      list, R-26). With the cap at 0, every video slot is UNAVAILABLE, no video targets exist, and
+      audio is identical to a run without video.
+    - T-B's manual test plan, step (8) "Video cap 0".
+    It is deliberately not an env-test, because it needs MC restarted mid-suite.
+- **Beside it, the cost of a `media-codec-profile` change.** It is a coordinated MC+MH roll: the
+  profile is referenced by mc-0, mc-1, mh-0 and mh-1, so any edit rolls all four, and **MH sheds
+  every session on each pod**. It is a capacity change too, because MH derives its stream costs
+  from the profile. See the header of `infra/services/media-codec-profile/profile.env`, which is
+  where the membership rule lives (only values both services must agree on, a header rule and not
+  a guard). It is not a lever.
 - **Lowering `MH_EGRESS_BUDGET_BPS` is not a kill switch.** It starves GC placement and produces a
   new-meeting outage plus silent media in existing meetings, by the same mechanism as
   [scaling MH to zero](#scaling-mh-to-zero-is-not-a-media-kill-switch). Two facts that section does
@@ -857,40 +1146,62 @@ the previous image — which is the rollback path below, and which keeps joins w
     meetings, not the lower budget: their rejoins re-register against the lowered ceiling and are
     refused.
 - **Server mute is a host control with no operator-facing API or tooling.** But it is carried on the
-  controller-to-handler contract, and is therefore reachable by a holder of those service credentials.
-  That path is unsupported, untooled, and MH 19's second triage arm
+  controller-to-handler registration contract, and is therefore reachable by **any holder of the
+  service credential that contract accepts** (the MC service credential, scope `service.write.mh`).
+  It is never "impossible". From story 3 it is **per kind**: once MH-A1 lands, a registration that
+  sets a stream's disposition to `DROP_AT_INGRESS` mutes that stream (audio or video), and one that
+  clears it unmutes. That path is unsupported, untooled, and MH 19's second triage arm
   ([`mh-incident-response.md` Scenario 19](mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress)).
 
-The only supported remedy for bad media-path behaviour is a **rollback** (a redeploy of the previous image, below). It is a remedy, not a media stop control: it sheds sessions, and meetings resume on the rolled-back build.
+Beyond the video-off lever, the only supported remedy for bad media-path behaviour is a **rollback**
+(below). It is a remedy, not a media stop control: it sheds sessions, and meetings resume on the
+rolled-back build.
 
 ### Rollback for the media path
 
-| Property | Value |
-|---|---|
-| **Mechanism** | Redeploy only — `kubectl rollout undo` |
-| **Schema change** | None |
-| **Data change** | None |
-| **Feature flag** | None |
-| **MTTR** | **One rollout** |
-| **Partial rollback** | Not available; there is no finer-grained control |
+> **Corrected 2026-10-21 (story 3 OPS-A, R-25).** This section read "Redeploy only — `kubectl
+> rollout undo`" of mh-0/mh-1 alone, with "Partial rollback: Not available". Applied across the
+> story-3 cutover, an MH-only undo lands a v2 MH under v3 clients and MC: it drops every frame as
+> `unknown_version` and **silences all audio**. Which rollback applies depends on which side of
+> the cutover the two builds are on.
+
+| Property | Within the v3 era (both builds contain story 3) | Across the story-3 cutover |
+|---|---|---|
+| **Mechanism** | `kubectl rollout undo` of mh-0 AND mh-1 (below). One component, one version back (R-25). | **All together**: MH, MC, the SDK bundle and the config ([Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback), layer 3). Never an MH-only undo. |
+| **Schema change** | None | None |
+| **Data change** | None | None |
+| **Feature flag** | None. For a video-only problem, the [video-off lever](#operator-levers-for-media-video-off-and-nothing-else) comes first. | None |
+| **MTTR** | One MH rollout | One converge on Kind (`deploy.sh` from the pre-story commit), plus the bundle and user reloads |
+| **Partial rollback** | Video only, via the video-off lever (an MC roll, not an MH roll) | Not available |
 
 ```bash
-# --- WSL2 ---
+# --- WSL2 --- WITHIN THE v3 ERA ONLY. Across the story-3 cutover, see the cutover section.
 kubectl rollout undo deployment/mh-0 -n dark-tower
 kubectl rollout undo deployment/mh-1 -n dark-tower
 kubectl rollout status deployment/mh-0 -n dark-tower --timeout=180s
 kubectl rollout status deployment/mh-1 -n dark-tower --timeout=180s
+# On Kind this undo is transient: the next deploy.sh converges back to the tree.
+# The durable rollback is a tree revert + deploy.sh.
 ```
 
 **The rollback itself sheds media sessions**, by the same mechanism as the rollout that prompted it.
 That is the cost of the redeploy-only lever and it is unavoidable here: participants on the affected
 pods rejoin. Say so when you announce the rollback, rather than discovering it in the user reports.
 
-**One version-skew detector survives a rollback**, and it is the only one: if the rolled-back image
-speaks an older frame version than clients are sending, receivers count
-`dt_client_media_frames_dropped_total{reason="unknown_version"}`. That token is emitted individually
-rather than collapsed into a generic decode-reject bucket **specifically** so a version-skewed
-rollback is detectable. If you see it rising after a rollback, the rollback went back too far.
+**The version-skew detector that survives a rollback.** If a rolled-back component speaks a frame
+version its peers do not, the receiving side counts it individually, never collapsed into a
+generic decode reject, **specifically** so a version-skewed rollback is detectable. This agrees
+with the [skew table](#skew-detection-one-row-per-one-component-skew-across-the-cutover):
+
+- **At MH:**
+  `mh_media_frames_dropped_total{direction="ingress",reason="unknown_version"}`. An MH rolled back
+  alone across the cutover counts every v3 frame here. A v3 MH under a rolled-back MC whose clients
+  still send v2 counts the reverse.
+- **At the receiving client:** `dt_client_media_frames_dropped_total{reason="unknown_version"}` (exported).
+
+Within the v3 era, both read zero: there is only one version. **If either rises after a rollback,
+the rollback crossed the cutover with only part of the set.** Finish it: roll the rest of the set
+back with it, or roll the stray component forward. Never leave the set mixed.
 
 ### Post-rollout verification, media path
 
@@ -933,7 +1244,7 @@ regression.
 
 For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For other rollback scenarios (general service restore, configuration regression), follow the same `kubectl rollout undo` pattern; deeper operational steps will be filled in alongside the deployment-procedure stub.
 
-**`EndMeeting` rollout order (story 2 R-20, R-24).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: a `rollout undo` points each pod template back at the previous hash-suffixed ConfigMap generation, which still exists because nothing prunes generations ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
+**`EndMeeting` rollout order (story 2 R-20, R-24; holds within an era, never across the story-3 cutover, where everything rolls back together — corrected 2026-10-21).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: a `rollout undo` points each pod template back at the previous hash-suffixed ConfigMap generation, which still exists because nothing prunes generations ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
 
 **`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. There is **no hard ordering either way**, but rolling MH back alone (or an MH pod left on the old image) **degrades** MC to the legacy per-(participant, handler) key: a stale disconnect can then remove a live connection, silencing that participant for the peers routed through that handler until it rejoins. Signalled by `mc_mh_notifications_without_connection_id_total` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
 
@@ -942,6 +1253,7 @@ For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criter
 ## References
 
 - **User story**: `docs/user-stories/2026-04-12-mh-quic-connection.md` (R-36, §operations)
+- **Story 3 cutover**: `docs/user-stories/2026-10-07-see-each-other.md` (R-23, R-25, R-26; Design §Wire freeze)
 - **Companion runbook (active incidents)**: `docs/runbooks/mh-incident-response.md`
 - **MC-side post-deploy checklist (companion)**: `docs/runbooks/mc-deployment.md` §"Post-Deploy Monitoring Checklist: MC↔MH Coordination (RegisterMeeting + Notifications)"
 - **Metrics catalog**: `docs/observability/metrics/mh-service.md`, `docs/observability/metrics/mc-service.md`

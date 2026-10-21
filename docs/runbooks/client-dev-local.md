@@ -1359,6 +1359,15 @@ exactly this: silence, with no error on any path.
 that somebody holds you. Whether anybody is being sent TO you is a separate fact, and it has a
 client-side reading:
 
+> **Corrected 2026-10-21 (story 3 OPS-A): the table below holds until MC-A and C-A1.** From MC-A,
+> MC no longer emits `source_muted`. A muted peer's slot is `avatar_client_muted` or
+> `avatar_server_muted` (server wins when both), per kind. A video slot whose occupant publishes no
+> video is `avatar_no_video`, and a slot over a per-kind cap is `unavailable` (R-1). **All four are
+> correct behaviour**, the story-3 counterparts of row 1. Do NOT route them by row 4 ("any token MC
+> does not emit today") to an MC defect. Row 4 still applies to `unspecified` and to the
+> never-emitted `switch_pending`, `withheld_by_congestion` and `source_unreachable`. C-A1 rewrites
+> this table along with the client's slot-state vocabulary.
+
 | `dt_client_media_receive_source_deficit_total` | slot rows' `data-slot-state` | Meaning |
 |---|---|---|
 | flat | only `source_muted` or `fewer_sources`, **and the roster agrees** — those peers really are muted, or there really are fewer unmuted peers than slots (declaring zero slots of a kind yields no slot rows of that kind at all; MC never sends a zero-requested state, which the proto reserved 2026-10-13) | **Correct behaviour.** Silence is what the wire says. Stop. |
@@ -1564,6 +1573,16 @@ is inaudible to you until someone you can hear leaves.** That is the designed be
 replaces static fill.
 
 ### F18 — "I hear nobody", and the media error names the receive-slot cap
+
+> **Corrected 2026-10-21 (story 3 OPS-A, R-1): this entry describes builds before MC-A and C-A1.**
+> Story 3 supersedes "an over-cap receive declaration fails loudly". Each kind (audio and video)
+> has its own server-side cap (`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`). From
+> MC-A an over-cap declaration is **truncated** to the cap, and each excess slot shows the
+> permanent `unavailable` state. It is visible, never a silent participant and **never a join or
+> media-start failure**. C-A1 deletes the SDK's local refusal and its counter, and rewrites this
+> entry together with the slot env-var rename. A reader who trusted the text below on a story-3
+> build would wait for a media error that never comes, and would miss the `unavailable` slot rows
+> that are the actual reading. On a story-3 build, an over-cap N hears up to the cap.
 
 **Symptom.** Start audio fails and the in-meeting view shows a `media-error` like
 `SIGNALING: this client is configured to receive 5 audio slots, but the meeting controller allows
