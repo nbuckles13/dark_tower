@@ -886,7 +886,7 @@ tasks:
   slug: 2026-10-21-c-v3-ts-frame-codec
   tag: story-2026-10-07-see-each-other-task-5
 - id: 6
-  status: pending
+  status: completed
   specialist: protocol
   deps:
   - 1
@@ -948,6 +948,7 @@ tasks:
     - The generator and the TS codec stay independently authored.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-21-frame-header-v3-cutover
   tag: story-2026-10-07-see-each-other-task-6
 - id: 7
   status: pending
