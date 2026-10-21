@@ -71,12 +71,16 @@ impl FrameShape {
     pub const ALL: [Self; 3] = [Self::Minimal, Self::KeyBearing, Self::WithExtensions];
 }
 
+/// The uplink relay id every fixture frame carries: the audio send id MC
+/// declares (`SendStream.stream_number`). One home for the test binaries.
+pub const UPLINK_AUDIO_SEND_ID: u16 = 0;
+
 /// One well-formed audio datagram in the minimal shape.
 ///
 /// `stream_id` and `hop_sequence` are set to values a *publisher* would write
-/// on its uplink, deliberately different from what MH must rewrite them to, so
-/// a forward path that forgot to rewrite fails the assertion instead of
-/// accidentally passing.
+/// on its uplink. The hop sequence is deliberately different from anything MH
+/// writes; the stream id is the audio send id, so a suite asserting the
+/// rewrite must use a non-zero downlink slot for a forgotten rewrite to fail.
 #[must_use]
 pub fn audio_datagram(stream_sequence: u32, marker: u8) -> Bytes {
     audio_datagram_shaped(stream_sequence, marker, FrameShape::Minimal)
@@ -90,6 +94,20 @@ pub fn audio_datagram(stream_sequence: u32, marker: u8) -> Bytes {
 #[must_use]
 pub fn audio_datagram_shaped(stream_sequence: u32, marker: u8, shape: FrameShape) -> Bytes {
     let payload = vec![marker; FIXTURE_PAYLOAD_BYTES];
+    datagram_with(stream_sequence, UPLINK_AUDIO_SEND_ID, &payload, shape)
+}
+
+/// One well-formed datagram carrying `uplink_id` in its relay-region
+/// `stream_id` and `payload` verbatim (story 3 attribution suites: a
+/// relabelled frame, or a payload whose leading `SFrame` key id disagrees
+/// with the label). MH never reads the payload; the bytes only have to survive
+/// the relay.
+#[must_use]
+pub fn labelled_datagram(stream_sequence: u32, uplink_id: u16, payload: &[u8]) -> Bytes {
+    datagram_with(stream_sequence, uplink_id, payload, FrameShape::Minimal)
+}
+
+fn datagram_with(stream_sequence: u32, uplink_id: u16, payload: &[u8], shape: FrameShape) -> Bytes {
     let signature = fixture_signature();
 
     // Synthetic, not key material: fixed patterns, never CSPRNG output, and
@@ -126,13 +144,16 @@ pub fn audio_datagram_shaped(stream_sequence: u32, marker: u8, shape: FrameShape
             FrameShape::WithExtensions => &extensions,
             FrameShape::Minimal | FrameShape::KeyBearing => &[],
         },
-        // Deliberately NOT the real audio send id (0), unlike the env-tests
-        // twin's `AUDIO_SEND_ID`: the forward-integration suite asserts the
-        // rewrite to `MAIN_AUDIO_SLOT` (0), which an uplink 0 would make
-        // vacuous. MH-A1 reworks this fixture together with attribution.
-        stream_id: 0xFFFF,
+        // The UPLINK relay id is the publisher's audio send id (MC's
+        // `stream_number`, 0), exactly as the SDK and the env-tests twin's
+        // `AUDIO_SEND_ID` stamp it: MH attributes ingress by (bound sender,
+        // this id) against the declared source streams (story 3 R-20), so any
+        // other value is `unmatched_stream`. A suite asserting the DOWNLINK
+        // rewrite uses a non-zero subscriber slot so the rewrite stays
+        // observable ([`UPLINK_AUDIO_SEND_ID`]).
+        stream_id: uplink_id,
         hop_sequence: 0xDEAD_BEEF,
-        payload: &payload,
+        payload,
         signature: &signature,
     };
     encode_frame(&parts).expect("fixture frame must encode")

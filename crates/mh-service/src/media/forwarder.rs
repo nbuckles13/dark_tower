@@ -220,7 +220,6 @@ impl ConnectionForwarder {
     pub(crate) fn parts(&mut self) -> ForwardParts<'_> {
         ForwardParts {
             meeting: &self.meeting,
-            sender: self.sender,
             streams: &mut self.streams,
             arena: &mut self.arena,
             handles: &self.handles,
@@ -231,7 +230,6 @@ impl ConnectionForwarder {
 /// The disjoint borrows [`crate::media::forward::forward_one`] needs.
 pub(crate) struct ForwardParts<'a> {
     pub(crate) meeting: &'a MeetingKey,
-    pub(crate) sender: SenderId,
     pub(crate) streams: &'a mut Vec<StreamForwarder>,
     pub(crate) arena: &'a mut BytesMut,
     pub(crate) handles: &'a MediaMetricHandles,

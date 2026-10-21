@@ -152,10 +152,11 @@ spec:
         # media-codec-profile) and MH_MAX_MUTED_SOURCES_PER_MEETING (superseded
         # by MH_MAX_SOURCE_STREAMS_PER_MEETING). Step 1 of the two-deploy
         # retirement: `optional: true`, keys kept in mh-service-config. The
-        # current image still READS all three as required, so the flag
-        # loosens nothing until MH-A1 removes the reads; then a later deploy
-        # deletes keys and refs together (docs/TODO.md §Media Path
-        # Obligations, "Delete the story-3 retired config keys").
+        # current image no longer reads any of the three; the PREVIOUS image
+        # reads all three as required, so step 2 (delete keys and refs
+        # together) waits until the rollback floor is at or past the image
+        # that removed the reads (docs/TODO.md §Media Path Obligations,
+        # "Delete the story-3 retired config keys").
         - name: MH_STREAM_COST_AUDIO_BPS
           valueFrom:
             configMapKeyRef:
@@ -209,8 +210,8 @@ spec:
               name: mh-service-config
               key: MH_POLICY_APPLY_TIMEOUT_MS
         # Source-stream bound (story 3), replacing the retired muted bound.
-        # HARD ref: required read once MH-A1 lands; the current image ignores
-        # it. Same per-workload rule as above.
+        # HARD ref: a required read (no code default). Same per-workload rule
+        # as above.
         - name: MH_MAX_SOURCE_STREAMS_PER_MEETING
           valueFrom:
             configMapKeyRef:
@@ -254,12 +255,13 @@ spec:
         # reads from the SHARED `media-codec-profile` generator in the sibling
         # base infra/services/media-codec-profile/ — their single home, also
         # read by MC. MH derives both per-stream egress costs from the four
-        # bitrate/frame-rate keys (MH-A1) and validates
+        # bitrate/frame-rate keys (required reads) and validates
         # MH_KEYFRAME_REQUEST_RETRY_MS against the minimum keyframe interval
         # (MH-B). Kustomize rewrites this name to the generator's hashed name in
         # the environment-root render, so a profile edit rolls mc-0, mc-1,
         # mh-0 and mh-1 together — and an MH roll sheds every media session on
-        # the pod. HARD refs; the current image ignores them.
+        # the pod. HARD refs; the current image reads the four cost inputs
+        # (MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS from MH-B).
         - name: MEDIA_VIDEO_MAX_BITRATE_BPS
           valueFrom:
             configMapKeyRef:

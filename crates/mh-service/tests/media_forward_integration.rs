@@ -45,8 +45,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const MEETING: &str = "meeting-forward";
-/// The slot MC assigns a participant's own audio in the loopback shape.
-const MAIN_AUDIO_SLOT: u32 = 0;
+/// The subscriber slot every edge in this file lands in. NON-ZERO on purpose:
+/// the fixture's uplink relay id is the audio send id 0
+/// (`common::media_frame::UPLINK_AUDIO_SEND_ID`), so a downlink slot of 0
+/// would make the rewrite assertion vacuous.
+const MAIN_AUDIO_SLOT: u32 = 3;
+
+const _: () = assert!(
+    MAIN_AUDIO_SLOT != common::media_frame::UPLINK_AUDIO_SEND_ID as u32,
+    "the downlink slot must differ from the uplink id, or a missed rewrite passes"
+);
 
 /// A counting allocator, armed only around the steady-state measurement.
 ///

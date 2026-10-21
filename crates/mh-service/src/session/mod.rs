@@ -506,16 +506,16 @@ impl SessionManagerActor {
             // identity ADR-0036 §11 bars, and the back door that opened when
             // StreamTelemetry was deleted.
             //
-            // The server-muted set is part of that policy (`internal.proto`
-            // field 7: a mute change IS an assignment-output change and MUST
-            // advance the generation), so a mute or unmute re-sent at an
-            // unchanged generation is exactly the contract violation this
+            // The declared source streams are part of that policy
+            // (`internal.proto` field 8: any change to them — a disposition
+            // included — IS an assignment-output change and MUST advance the
+            // generation), so a mute, unmute or client-mute toggle re-sent at
+            // an unchanged generation is exactly the contract violation this
             // detects — and exactly the one that silently never takes effect.
-            // Counts only, never which sender.
+            // Counts only, never which sender or stream.
             if let Some(current) = snapshot.routes_for(&policy.meeting) {
                 if current.edges() != policy.edges.as_slice()
-                    || current.transport_mode() != policy.transport_mode
-                    || !current.server_muted_matches(&policy.server_muted)
+                    || !current.declarations_match(&policy.declarations)
                 {
                     tracing::warn!(
                         target: "mh.session.policy",
@@ -523,8 +523,8 @@ impl SessionManagerActor {
                         generation = policy.generation,
                         installed_edge_count = current.edge_count(),
                         received_edge_count = policy.edges.len(),
-                        installed_muted_count = current.server_muted_count(),
-                        received_muted_count = policy.server_muted.len(),
+                        installed_source_stream_count = current.declared_count(),
+                        received_source_stream_count = policy.declarations.declared_count(),
                         "Re-assert at an unchanged policy_generation carries DIFFERENT policy; \
                          honouring the generation and not swapping (ADR-0036 §8). MC's \
                          generation must derive from assignment-output change"
@@ -1209,7 +1209,7 @@ impl SessionManagerActor {
 /// A subscriber, addressable only within one meeting.
 ///
 /// **Unconstructible without a [`MeetingKey`]**, for the same reason
-/// [`crate::routing::RoutingSnapshot::for_each_source`] takes one: a
+/// [`crate::routing::RoutingSnapshot::attribute`] takes one: a
 /// `sender_id` is a 16-bit **per-meeting ordinal**, so `sender_id` 5 exists
 /// concurrently in every meeting on this handler and a flat
 /// `HashMap<SenderId, _>` would be a cross-meeting media-crossing primitive.

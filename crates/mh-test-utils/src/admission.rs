@@ -57,6 +57,6 @@ pub fn fixture_policy_limits() -> mh_service::config::PolicyLimits {
         max_total_egress_edges: 65_536,
         policy_apply_timeout_ms: 1_000,
         max_registered_meetings: 8_192,
-        max_muted_sources_per_meeting: 512,
+        max_source_streams_per_meeting: 1_024,
     }
 }

@@ -92,34 +92,32 @@ const PRE_ALLOCATION_CONSEQUENCE: &str =
 
 /// Hard ceiling for `MH_MAX_EGRESS_STREAMS_PER_MEETING` (per-meeting bound on
 /// `RegisterMeetingRequest.egress_streams`).
-pub const MAX_EGRESS_STREAMS_PER_MEETING_CEILING: usize = 8_192;
+///
+/// 4096 (story 3; was 8192) so that it does not exceed
+/// [`MAX_SOURCE_STREAMS_PER_MEETING_CEILING`]: load refuses a source-stream
+/// bound below the egress bound, so an egress value above the source ceiling
+/// could never be paired with a legal source value — a configuration no
+/// operator could fix. The deployed value is far below either.
+pub const MAX_EGRESS_STREAMS_PER_MEETING_CEILING: usize = 4_096;
 
-/// Hard ceiling for `MH_MAX_MUTED_SOURCES_PER_MEETING` (per-meeting bound on
-/// `RegisterMeetingRequest.server_muted_sources`, story 2 R-9).
+/// Hard ceiling for `MH_MAX_SOURCE_STREAMS_PER_MEETING` (per-meeting bound on
+/// `RegisterMeetingRequest.source_streams`, story 3; it also bounds the
+/// superseded `server_muted_sources` now that that field's own key is unread).
 ///
 /// A fat-finger bound on the KEY, on the same footing as the §8 ceilings: a
 /// `> 0` check alone would let a copy-pasted huge value silently turn this
 /// PRE-ALLOCATION guard back into an attacker-sized allocation.
-///
-/// DERIVED from the egress-stream ceiling, never a literal, because the
-/// deployed relation is `MH_MAX_MUTED_SOURCES_PER_MEETING >=
-/// MH_MAX_EGRESS_STREAMS_PER_MEETING` (a legitimate per-handler muted set can
-/// never name more senders than the streams they source there — see
-/// `infra/services/mh-service/config.env`). A muted ceiling BELOW the egress
-/// ceiling would make some egress value MH accepts impossible to pair with a
-/// legal muted value; boot would then refuse on
-/// [`ConfigError::MutedSourceBoundBelowEgressBound`] for a configuration no
-/// operator can fix. Equal is the tightest value that cannot.
-pub const MAX_MUTED_SOURCES_PER_MEETING_CEILING: usize = MAX_EGRESS_STREAMS_PER_MEETING_CEILING;
+pub const MAX_SOURCE_STREAMS_PER_MEETING_CEILING: usize = 4_096;
 
-// INERT TODAY, deliberately: while the ceiling above is DEFINED as the egress
-// ceiling this is `A >= A` and cannot fail. It is a tripwire for the edit that
-// replaces that derivation with an independent literal — then it fires if the
-// literal is below the egress ceiling. Not a live check of anything now; do not
-// read it as one, and do not delete it as dead.
+// The pairing tripwire: load refuses `MH_MAX_SOURCE_STREAMS_PER_MEETING <
+// MH_MAX_EGRESS_STREAMS_PER_MEETING`
+// ([`ConfigError::SourceStreamBoundBelowEgressBound`]), so a source ceiling
+// BELOW the egress ceiling would make some egress value MH accepts impossible
+// to pair with a legal source value. This fires on the edit that raises one
+// ceiling without the other.
 const _: () = assert!(
-    MAX_MUTED_SOURCES_PER_MEETING_CEILING >= MAX_EGRESS_STREAMS_PER_MEETING_CEILING,
-    "the muted-source ceiling must admit every muted value the egress ceiling can require"
+    MAX_SOURCE_STREAMS_PER_MEETING_CEILING >= MAX_EGRESS_STREAMS_PER_MEETING_CEILING,
+    "the source-stream ceiling must admit every source value the egress ceiling can require"
 );
 
 /// Hard ceiling for `MH_MAX_CANDIDATE_SOURCES_PER_EGRESS` (per-egress-stream
@@ -288,30 +286,33 @@ pub const MAX_POLICY_APPLY_TIMEOUT_MS: u64 = 10_000;
 // bit values are retained on [`EgressAdmission`] for the provenance log line
 // ONLY.
 
-/// Egress streams for `peers + 1` participants who all hear each other: each of
-/// the `peers + 1` subscribers receives every one of its `peers` peers.
+/// Egress streams for a meeting of `participants` who each hold
+/// `audio_slots` audio and `video_slots` video receive slots, all filled:
+/// `P x (N + M)` (story 3; each subscriber's N audio plus M video slots are
+/// one egress stream each).
 ///
-/// ANCHOR (DRY): the same formula, in the same shape and with the same parameter
-/// meaning, is `required_edges(n)` in
+/// ANCHOR (DRY): the same formula, in the same shape and with the same
+/// parameter meaning, is `required_edges(p, n, m)` in
 /// `crates/env-tests/tests/01_mh_deployment_config.rs`, and the Kind budget
 /// patch (`infra/kubernetes/overlays/kind/services/mh-service/
 /// configmap-egress-budget-patch.yaml`) states it in prose. They cannot share a
 /// home: env-tests links no service crate (ADR-0028 black-box layering). The
 /// env-test compares the published `mh_media_egress_stream_ceiling_recommended_min`
-/// against its own `required_edges(DEMO_N)`, so the agreement is CHECKED, not
-/// merely anchored.
+/// against its own `required_edges` of the same demo constants, so the
+/// agreement is CHECKED, not merely anchored.
 #[must_use]
-pub const fn all_hear_all_streams(peers: u64) -> u64 {
-    (peers + 1) * peers
+pub const fn demo_streams(participants: u64, audio_slots: u64, video_slots: u64) -> u64 {
+    participants * (audio_slots + video_slots)
 }
 
 /// REFUSE-BOOT floor on the derived egress stream ceiling.
 ///
 /// Requirement: the smallest meeting story 2 defines — two participants, each
-/// hearing the other — must be admissible. A ceiling of 0 is caught loudly
-/// elsewhere (GC rejects a zero `max_streams` at register); a ceiling of exactly
-/// 1 passes every other validation, boots, gets placed, and then rejects nearly
-/// everything it is handed — the black-hole-reporting-healthy shape.
+/// hearing the other (one audio slot, no video) — must be admissible. A
+/// ceiling of 0 is caught loudly elsewhere (GC rejects a zero `max_streams` at
+/// register); a ceiling of exactly 1 passes every other validation, boots,
+/// gets placed, and then rejects nearly everything it is handed — the
+/// black-hole-reporting-healthy shape.
 ///
 /// **A code constant, not a config knob, and never to be lowered to quiet a
 /// refusing pod.** The remedy for a refusal is a real `MH_EGRESS_BUDGET_BPS`.
@@ -320,18 +321,23 @@ pub const fn all_hear_all_streams(peers: u64) -> u64 {
 /// two different consequences: below THIS, MH refuses to start; below THAT, MH
 /// boots, serves and nudges. A deliberately small deployment below the
 /// recommended minimum must boot. Asserted below and in the unit tests.
-pub const MIN_EGRESS_STREAM_CEILING: u64 = all_hear_all_streams(1);
+pub const MIN_EGRESS_STREAM_CEILING: u64 = demo_streams(2, 1, 0);
 
-/// Peers each participant hears in the demo meeting the advisory minimum is
-/// sized for (story 2: N+1 participants all hearing each other, N = 5).
-const RECOMMENDED_MIN_DEMO_PEERS: u64 = 5;
+/// Participants in the demo meeting the advisory minimum is sized for (story
+/// 3: P = 6, i.e. N + 1 with N = 5).
+const DEMO_PARTICIPANTS: u64 = 6;
+/// Audio receive slots each demo participant fills (N = 5: everyone else).
+const DEMO_AUDIO_SLOTS: u64 = 5;
+/// Video receive slots each demo participant fills (M = 4, MC's default video
+/// slot cap).
+const DEMO_VIDEO_SLOTS: u64 = 4;
 
 /// ADVISORY recommended minimum for the derived egress stream ceiling.
 ///
-/// Requirement: one full all-hear-all meeting at the story-2 demo size fits on
-/// one handler. It is the same anchor the Kind budget is sized against, so one
-/// requirement drives both (see [`all_hear_all_streams`] for the sibling
-/// encodings).
+/// Requirement: one full see-and-hear meeting at the story-3 demo size
+/// (`P x (N + M)` = 6 x (5 + 4)) fits on one handler. It is the same anchor
+/// the Kind budget is sized against, so one requirement drives both (see
+/// [`demo_streams`] for the sibling encodings).
 ///
 /// **Advisory only.** Nothing enforces or alerts on it — a placeholder budget is
 /// a configuration state, not an incident. Below it MH boots, serves, and emits
@@ -340,12 +346,97 @@ const RECOMMENDED_MIN_DEMO_PEERS: u64 = 5;
 /// (suffix descriptive, deliberately not `_threshold`) for the dashboard
 /// comparison and the runbook's first triage step. Never an alert input.
 pub const EGRESS_STREAM_CEILING_RECOMMENDED_MIN: u64 =
-    all_hear_all_streams(RECOMMENDED_MIN_DEMO_PEERS);
+    demo_streams(DEMO_PARTICIPANTS, DEMO_AUDIO_SLOTS, DEMO_VIDEO_SLOTS);
 
 const _: () = assert!(
     MIN_EGRESS_STREAM_CEILING < EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
     "the refuse-boot floor and the advisory recommended minimum must never merge"
 );
+
+// -----------------------------------------------------------------------------
+// Derived per-stream egress costs (story 3 R-24; ADR-0036 §11 "derive rather
+// than guard")
+// -----------------------------------------------------------------------------
+//
+// cost = MAX_BITRATE_BPS + per-frame overhead bits x FRAME_RATE_HZ, for audio
+// and video, from the shared `media-codec-profile`
+// (`infra/services/media-codec-profile/profile.env`). The overhead is derived
+// from `media-protocol` size constants, never a literal. NO HEADROOM KNOB.
+//
+// INTERIM: this bitrate-derived model is replaced by the adaptive-capacity
+// story (docs/decisions/adr-0036-media-flow.md, "Addendum — Planned Story
+// Arc", "Adaptive capacity"). Do not tune it as if it were the long-term
+// design.
+
+/// Non-payload bytes on every audio frame: the `SFrame` object's own overhead,
+/// the v3 header without the extension region ([`NOMINAL_HEADER_BYTES`]: the
+/// 14-byte publisher prefix, the wrapped transmit key, the extension-length
+/// field and the relay region), and the Ed25519 signature.
+///
+/// The ONE enumeration of a frame's non-payload regions in this crate:
+/// [`NOMINAL_AUDIO_FRAME_BYTES`] (the datagram-buffer sizing input) is built on
+/// it, and both derived costs read it, so a header-layout change moves the
+/// buffer sizing and both costs together.
+///
+/// The wrapped transmit key is unconditional because ADR-0036 §4 carries one
+/// on EVERY audio frame. The extension region is excluded (an audio frame
+/// carries none; the salience TLV is the video selector input, and at most a
+/// few bytes — bitrate-dominated).
+pub const AUDIO_FRAME_OVERHEAD_BYTES: usize = media_protocol::frame::SFRAME_OBJECT_OVERHEAD_BYTES
+    + NOMINAL_HEADER_BYTES
+    + media_protocol::frame::SIGNATURE_SIZE;
+
+/// Non-payload bytes on a video frame: [`AUDIO_FRAME_OVERHEAD_BYTES`] without
+/// the wrapped transmit key, which video carries only on the first N frames
+/// after a key change (ADR-0036 §4 amendment) and so amortises to zero at the
+/// frame rate. The extension region is excluded as for audio — at most a few
+/// bytes per frame against a bitrate of hundreds of kbps (bitrate-dominated).
+pub const VIDEO_FRAME_OVERHEAD_BYTES: usize =
+    AUDIO_FRAME_OVERHEAD_BYTES - media_protocol::frame::WRAPPED_TRANSMIT_KEY_SIZE;
+
+/// Derived per-stream egress cost in BITS per second:
+/// `max_bitrate_bps + overhead_bytes x 8 x frame_rate_hz`.
+///
+/// `None` on overflow (refused at load as an out-of-range profile value, never
+/// wrapped into a small cost that would over-admit).
+#[must_use]
+pub const fn derived_stream_cost_bps(
+    max_bitrate_bps: u64,
+    frame_rate_hz: u64,
+    overhead_bytes: usize,
+) -> Option<u64> {
+    let overhead = overhead_bytes as u64;
+    let Some(per_frame_bits) = overhead.checked_mul(8) else {
+        return None;
+    };
+    let Some(overhead_bps) = per_frame_bits.checked_mul(frame_rate_hz) else {
+        return None;
+    };
+    max_bitrate_bps.checked_add(overhead_bps)
+}
+
+/// The audio frame rate MH's compiled datagram buffer is sized for:
+/// `1000 / AUDIO_FRAME_DURATION_MS` (50 Hz at 20 ms frames). MH refuses to boot
+/// if `MEDIA_AUDIO_FRAME_RATE_HZ` differs (ADR-0036 §11 startup-validation
+/// fallback): the buffer is sized in frames of this duration at compile time.
+pub const REQUIRED_AUDIO_FRAME_RATE_HZ: u64 = 1000 / AUDIO_FRAME_DURATION_MS as u64;
+
+/// The shared `media-codec-profile` values MH reads (story 3 R-23, R-24).
+///
+/// Required reads, startup-validated. `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS`
+/// is not read here (MH-B reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaCodecProfile {
+    /// `MEDIA_AUDIO_MAX_BITRATE_BPS`, inside the compiled envelope
+    /// `SUPPORTED_AUDIO_BITRATE_FLOOR_BPS..=SUPPORTED_AUDIO_BITRATE_CEILING_BPS`.
+    pub audio_max_bitrate_bps: u64,
+    /// `MEDIA_AUDIO_FRAME_RATE_HZ`, exactly [`REQUIRED_AUDIO_FRAME_RATE_HZ`].
+    pub audio_frame_rate_hz: u64,
+    /// `MEDIA_VIDEO_MAX_BITRATE_BPS`, non-zero.
+    pub video_max_bitrate_bps: u64,
+    /// `MEDIA_VIDEO_FRAME_RATE_HZ`, non-zero.
+    pub video_frame_rate_hz: u64,
+}
 
 // =============================================================================
 // QUIC transport parameters (ADR-0036 §1)
@@ -546,10 +637,8 @@ const _: () = assert!(
 /// chain is one chain (§3's "80-byte Opus frame (32 kbps, 20 ms)" is the
 /// payload term here). Recorded so the 15-byte delta reads as rounding rather
 /// than as a defect in either place.
-pub const NOMINAL_AUDIO_FRAME_BYTES: usize = NOMINAL_OPUS_PAYLOAD_BYTES
-    + media_protocol::frame::SFRAME_OBJECT_OVERHEAD_BYTES
-    + NOMINAL_HEADER_BYTES
-    + media_protocol::frame::SIGNATURE_SIZE;
+pub const NOMINAL_AUDIO_FRAME_BYTES: usize =
+    NOMINAL_OPUS_PAYLOAD_BYTES + AUDIO_FRAME_OVERHEAD_BYTES;
 
 /// Bound on MH's own application-level per-connection egress queue, in frames.
 ///
@@ -931,11 +1020,12 @@ pub struct PolicyLimits {
     /// (`MH_MAX_REGISTERED_MEETINGS`, story 2 R-21). Refuses only a NEW
     /// meeting id; a re-registration of a held meeting is never refused.
     pub max_registered_meetings: usize,
-    /// Max `server_muted_sources` in one registration
-    /// (`MH_MAX_MUTED_SOURCES_PER_MEETING`, story 2 R-9). A PRE-ALLOCATION
-    /// bound checked before any per-element work, like the two above it.
-    /// Load refuses a value below `max_egress_streams_per_meeting`.
-    pub max_muted_sources_per_meeting: usize,
+    /// Max `source_streams` in one registration
+    /// (`MH_MAX_SOURCE_STREAMS_PER_MEETING`, story 3). A PRE-ALLOCATION bound
+    /// checked before any per-element work, like the two above it. Also bounds
+    /// the superseded `server_muted_sources`. Load refuses a value below
+    /// `max_egress_streams_per_meeting`.
+    pub max_source_streams_per_meeting: usize,
 }
 
 impl PolicyLimits {
@@ -959,7 +1049,7 @@ impl PolicyLimits {
             max_total_egress_edges: 65_536,
             policy_apply_timeout_ms: 1_000,
             max_registered_meetings: 8_192,
-            max_muted_sources_per_meeting: 512,
+            max_source_streams_per_meeting: 1_024,
         }
     }
 }
@@ -975,9 +1065,13 @@ pub struct EgressAdmission {
     /// **Log provenance only — do not compute on this field**; every consumer
     /// reads [`Self::budget_bytes_per_second`].
     pub budget_bps: u64,
-    /// `MH_STREAM_COST_AUDIO_BPS` as configured, in bits. Log provenance only.
+    /// The DERIVED audio stream cost, in bits (story 3 R-24:
+    /// `MEDIA_AUDIO_MAX_BITRATE_BPS` + [`AUDIO_FRAME_OVERHEAD_BYTES`] x 8 x
+    /// `MEDIA_AUDIO_FRAME_RATE_HZ`). Log provenance only.
     pub stream_cost_audio_bps: u64,
-    /// `MH_STREAM_COST_VIDEO_BPS` as configured, in bits. Log provenance only.
+    /// The DERIVED video stream cost, in bits (`MEDIA_VIDEO_MAX_BITRATE_BPS` +
+    /// [`VIDEO_FRAME_OVERHEAD_BYTES`] x 8 x `MEDIA_VIDEO_FRAME_RATE_HZ`). Log
+    /// provenance only.
     pub stream_cost_video_bps: u64,
     /// The budget in BYTES per second (`bits / 8`, floored). What
     /// `mh_media_egress_budget_bytes_per_second` publishes.
@@ -1038,8 +1132,7 @@ impl EgressAdmission {
             .checked_div(max_cost_bytes)
             .ok_or_else(|| {
                 ConfigError::InvalidValue(
-                    "MH_STREAM_COST_AUDIO_BPS and MH_STREAM_COST_VIDEO_BPS must not both be 0"
-                        .to_string(),
+                    "the derived audio and video stream costs must not both be 0".to_string(),
                 )
             })?;
 
@@ -1466,6 +1559,16 @@ pub struct Config {
     /// derived stream ceiling and the rejection-ratio threshold.
     pub egress_admission: EgressAdmission,
 
+    /// The shared `media-codec-profile` values MH reads (story 3), from which
+    /// both per-stream egress costs are derived.
+    pub media_codec_profile: MediaCodecProfile,
+
+    /// Retired keys (two-deploy retirement, step 1) that are still SET in this
+    /// process's environment and that this image IGNORES. Present on purpose
+    /// during step 1; `main` logs it at INFO, naming the keys and never their
+    /// values, so nobody tunes a key believing it still applies.
+    pub retired_keys_present: Vec<&'static str>,
+
     /// Fraction of forwarded frames whose latency is observed into
     /// `mh_media_forward_latency_seconds` (env
     /// `MH_MEDIA_LATENCY_SAMPLE_RATIO`, optional, default
@@ -1545,6 +1648,8 @@ impl fmt::Debug for Config {
             .field("drain_window_source", &self.drain_window_source)
             .field("policy_limits", &self.policy_limits)
             .field("egress_admission", &self.egress_admission)
+            .field("media_codec_profile", &self.media_codec_profile)
+            .field("retired_keys_present", &self.retired_keys_present)
             .field(
                 "media_latency_sample_ratio",
                 &self.media_latency_sample_ratio,
@@ -1630,8 +1735,10 @@ pub enum ConfigError {
     #[error(
         "Derived egress STREAM ceiling {ceiling} is below the refuse-boot floor of {floor} \
          (two participants hearing each other). ceiling = MH_EGRESS_BUDGET_BPS \
-         ({budget_bps} bit/s) / max(MH_STREAM_COST_AUDIO_BPS, MH_STREAM_COST_VIDEO_BPS) \
-         ({max_stream_cost_bps} bit/s), converted to bytes and floored. A handler this small \
+         ({budget_bps} bit/s) / max(derived audio cost, derived video cost) \
+         ({max_stream_cost_bps} bit/s; each MEDIA_*_MAX_BITRATE_BPS plus per-frame overhead x \
+         MEDIA_*_FRAME_RATE_HZ from the shared media-codec-profile), converted to bytes and \
+         floored. A handler this small \
          would boot, be placed by GC, and then reject nearly every stream. Remediation: RAISE \
          MH_EGRESS_BUDGET_BPS in infra/services/mh-service/config.env. NEVER lower the \
          floor (a code constant) to quiet this refusal"
@@ -1663,27 +1770,64 @@ pub enum ConfigError {
         max_total_egress_edges: u64,
     },
 
-    /// The muted-source bound is below the egress-stream bound (story 2 R-9).
+    /// The source-stream bound is below the egress-stream bound (story 3;
+    /// the floor is carried over from the retired muted-source bound).
     ///
-    /// A legitimate per-handler muted set names at most the senders sourcing
-    /// this handler's egress streams, so it is bounded by the egress-stream
-    /// bound. Configured below it, a legitimate large-meeting snapshot is
-    /// rejected WHOLE — that meeting loses every edge, not just its mute — and
-    /// the symptom is a rejected registration, which is not mute-shaped.
-    /// Refused at boot so the inversion is a loud crash, never a runtime outage.
+    /// Configured below it, a large registration can be rejected WHOLE — that
+    /// meeting loses every edge — and the symptom is a rejected registration.
+    /// Refused at boot so the inversion is a loud crash, never a runtime
+    /// outage. A floor only: it does not guarantee a legitimate registration
+    /// fits (see `infra/services/mh-service/config.env` for the sizing).
     #[error(
-        "MH_MAX_MUTED_SOURCES_PER_MEETING ({muted}) is below MH_MAX_EGRESS_STREAMS_PER_MEETING \
-         ({egress}). The muted bound must be AT LEAST the egress bound, or a legitimate \
-         registration naming more muted senders than it admits is rejected whole and the \
-         meeting loses all its edges. Remediation: raise MH_MAX_MUTED_SOURCES_PER_MEETING to at \
-         least {egress}, or lower MH_MAX_EGRESS_STREAMS_PER_MEETING, in \
-         infra/services/mh-service/config.env"
+        "MH_MAX_SOURCE_STREAMS_PER_MEETING ({sources}) is below MH_MAX_EGRESS_STREAMS_PER_MEETING \
+         ({egress}). The source-stream bound must be AT LEAST the egress bound. Remediation: \
+         raise MH_MAX_SOURCE_STREAMS_PER_MEETING to at least {egress}, or lower \
+         MH_MAX_EGRESS_STREAMS_PER_MEETING, in infra/services/mh-service/config.env"
     )]
-    MutedSourceBoundBelowEgressBound {
-        /// The configured `MH_MAX_MUTED_SOURCES_PER_MEETING`.
-        muted: u64,
+    SourceStreamBoundBelowEgressBound {
+        /// The configured `MH_MAX_SOURCE_STREAMS_PER_MEETING`.
+        sources: u64,
         /// The configured `MH_MAX_EGRESS_STREAMS_PER_MEETING`.
         egress: u64,
+    },
+
+    /// `MEDIA_AUDIO_MAX_BITRATE_BPS` is outside the bitrate envelope MH's
+    /// datagram send buffer is sized for at compile time.
+    #[error(
+        "MEDIA_AUDIO_MAX_BITRATE_BPS={value} is outside MH's compiled audio bitrate envelope \
+         {floor}..={ceiling}: the datagram send buffer is sized in frames at compile time \
+         against that range (ADR-0036 §1/§11), so MH refuses to boot rather than run a latency \
+         ceiling it did not choose. The key is in the SHARED media-codec-profile ConfigMap \
+         (infra/services/media-codec-profile/profile.env), which every MH and MC pod reads: \
+         remediation is to REVERT that ConfigMap (a change rolls MC and MH together), or ship \
+         an MH build whose envelope covers the new value"
+    )]
+    AudioBitrateOutsideEnvelope {
+        /// The configured value.
+        value: u64,
+        /// The compiled floor (`SUPPORTED_AUDIO_BITRATE_FLOOR_BPS`).
+        floor: u64,
+        /// The compiled ceiling (`SUPPORTED_AUDIO_BITRATE_CEILING_BPS`).
+        ceiling: u64,
+    },
+
+    /// `MEDIA_AUDIO_FRAME_RATE_HZ` does not match the frame duration MH's
+    /// datagram send buffer is sized in.
+    #[error(
+        "MEDIA_AUDIO_FRAME_RATE_HZ={value} must equal {required} (1000 / AUDIO_FRAME_DURATION_MS \
+         = 1000 / {frame_duration_ms}): MH sizes its datagram send buffer in frames of that \
+         duration at compile time (ADR-0036 §1/§11). The key is in the SHARED \
+         media-codec-profile ConfigMap (infra/services/media-codec-profile/profile.env), which \
+         every MH and MC pod reads: remediation is to REVERT that ConfigMap (a change rolls MC \
+         and MH together)"
+    )]
+    AudioFrameRateMismatch {
+        /// The configured value.
+        value: u64,
+        /// The only accepted value.
+        required: u64,
+        /// The compiled audio frame duration, in milliseconds.
+        frame_duration_ms: u64,
     },
 
     /// The keepalive interval is too close to the idle timeout.
@@ -1712,6 +1856,84 @@ pub enum ConfigError {
         /// The largest keepalive the ratio permits, in milliseconds.
         max_allowed_ms: u64,
     },
+}
+
+/// Keys this image no longer reads, kept in the `ConfigMap` (with `optional:
+/// true` refs) for the two-deploy retirement: the previous image reads them as
+/// REQUIRED, so deleting them before the rollback floor passes this image
+/// would crash-loop a rollback. Scheduled removal: `docs/TODO.md` §Media Path
+/// Obligations, "Delete the story-3 retired config keys".
+pub const RETIRED_KEYS: [&str; 3] = [
+    "MH_STREAM_COST_AUDIO_BPS",
+    "MH_STREAM_COST_VIDEO_BPS",
+    "MH_MAX_MUTED_SOURCES_PER_MEETING",
+];
+
+/// Read and validate the shared `media-codec-profile` (story 3 R-23).
+///
+/// The key literals stay at each `MissingEnvVar` construction: `dt-guard
+/// env-config` rule 1 keys on them.
+fn parse_media_codec_profile(
+    vars: &HashMap<String, String>,
+) -> Result<MediaCodecProfile, ConfigError> {
+    let audio_max_bitrate_bps: u64 = parse_required_number(
+        "MEDIA_AUDIO_MAX_BITRATE_BPS",
+        vars.get("MEDIA_AUDIO_MAX_BITRATE_BPS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_AUDIO_MAX_BITRATE_BPS".to_string()))?,
+    )?;
+    let audio_frame_rate_hz: u64 = parse_required_number(
+        "MEDIA_AUDIO_FRAME_RATE_HZ",
+        vars.get("MEDIA_AUDIO_FRAME_RATE_HZ")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_AUDIO_FRAME_RATE_HZ".to_string()))?,
+    )?;
+    let video_max_bitrate_bps: u64 = parse_required_number(
+        "MEDIA_VIDEO_MAX_BITRATE_BPS",
+        vars.get("MEDIA_VIDEO_MAX_BITRATE_BPS")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_VIDEO_MAX_BITRATE_BPS".to_string()))?,
+    )?;
+    let video_frame_rate_hz: u64 = parse_required_number(
+        "MEDIA_VIDEO_FRAME_RATE_HZ",
+        vars.get("MEDIA_VIDEO_FRAME_RATE_HZ")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_VIDEO_FRAME_RATE_HZ".to_string()))?,
+    )?;
+
+    // The audio envelope MH's datagram send buffer is sized for at compile
+    // time (ADR-0036 §11 startup-validation fallback).
+    let floor = SUPPORTED_AUDIO_BITRATE_FLOOR_BPS as u64;
+    let ceiling = SUPPORTED_AUDIO_BITRATE_CEILING_BPS as u64;
+    if !(floor..=ceiling).contains(&audio_max_bitrate_bps) {
+        return Err(ConfigError::AudioBitrateOutsideEnvelope {
+            value: audio_max_bitrate_bps,
+            floor,
+            ceiling,
+        });
+    }
+    if audio_frame_rate_hz != REQUIRED_AUDIO_FRAME_RATE_HZ {
+        return Err(ConfigError::AudioFrameRateMismatch {
+            value: audio_frame_rate_hz,
+            required: REQUIRED_AUDIO_FRAME_RATE_HZ,
+            frame_duration_ms: AUDIO_FRAME_DURATION_MS as u64,
+        });
+    }
+    reject_zero(
+        "MEDIA_VIDEO_MAX_BITRATE_BPS",
+        video_max_bitrate_bps,
+        "the derived video stream cost would ignore the bitrate MC directs (shared \
+         media-codec-profile: revert that ConfigMap, it rolls MC and MH together)",
+    )?;
+    reject_zero(
+        "MEDIA_VIDEO_FRAME_RATE_HZ",
+        video_frame_rate_hz,
+        "the derived video stream cost would ignore per-frame overhead (shared \
+         media-codec-profile: revert that ConfigMap, it rolls MC and MH together)",
+    )?;
+
+    Ok(MediaCodecProfile {
+        audio_max_bitrate_bps,
+        audio_frame_rate_hz,
+        video_max_bitrate_bps,
+        video_frame_rate_hz,
+    })
 }
 
 impl Config {
@@ -2012,10 +2234,10 @@ impl Config {
         let raw_max_registered_meetings = vars
             .get("MH_MAX_REGISTERED_MEETINGS")
             .ok_or_else(|| ConfigError::MissingEnvVar("MH_MAX_REGISTERED_MEETINGS".to_string()))?;
-        let raw_max_muted_sources =
-            vars.get("MH_MAX_MUTED_SOURCES_PER_MEETING")
+        let raw_max_source_streams =
+            vars.get("MH_MAX_SOURCE_STREAMS_PER_MEETING")
                 .ok_or_else(|| {
-                    ConfigError::MissingEnvVar("MH_MAX_MUTED_SOURCES_PER_MEETING".to_string())
+                    ConfigError::MissingEnvVar("MH_MAX_SOURCE_STREAMS_PER_MEETING".to_string())
                 })?;
 
         let policy_limits = PolicyLimits {
@@ -2068,24 +2290,25 @@ impl Config {
                     "the guard would stop bounding the handler's registration map",
                 )?,
             )?,
-            max_muted_sources_per_meeting: bound_to_usize(
-                "MH_MAX_MUTED_SOURCES_PER_MEETING",
+            max_source_streams_per_meeting: bound_to_usize(
+                "MH_MAX_SOURCE_STREAMS_PER_MEETING",
                 parse_bounded(
-                    "MH_MAX_MUTED_SOURCES_PER_MEETING",
-                    raw_max_muted_sources,
-                    MAX_MUTED_SOURCES_PER_MEETING_CEILING as u64,
-                    "every registration naming a server-muted source would be rejected whole",
+                    "MH_MAX_SOURCE_STREAMS_PER_MEETING",
+                    raw_max_source_streams,
+                    MAX_SOURCE_STREAMS_PER_MEETING_CEILING as u64,
+                    "every registration declaring a source stream would be rejected whole",
                     PRE_ALLOCATION_CONSEQUENCE,
                 )?,
             )?,
         };
-        // Cross-key relation (story 2 R-9): refuse to boot rather than reject
-        // legitimate large-meeting snapshots whole at runtime.
-        if policy_limits.max_muted_sources_per_meeting
+        // Cross-key relation (carried over from the retired muted-source
+        // bound): refuse to boot rather than reject large snapshots whole at
+        // runtime. A floor, not a sizing guarantee — see config.env.
+        if policy_limits.max_source_streams_per_meeting
             < policy_limits.max_egress_streams_per_meeting
         {
-            return Err(ConfigError::MutedSourceBoundBelowEgressBound {
-                muted: policy_limits.max_muted_sources_per_meeting as u64,
+            return Err(ConfigError::SourceStreamBoundBelowEgressBound {
+                sources: policy_limits.max_source_streams_per_meeting as u64,
                 egress: policy_limits.max_egress_streams_per_meeting as u64,
             });
         }
@@ -2104,28 +2327,35 @@ impl Config {
             egress_budget_bps,
             "the derived stream ceiling would be 0 and MH would admit no stream at all",
         )?;
-        let stream_cost_audio_bps: u64 = parse_required_number(
-            "MH_STREAM_COST_AUDIO_BPS",
-            vars.get("MH_STREAM_COST_AUDIO_BPS").ok_or_else(|| {
-                ConfigError::MissingEnvVar("MH_STREAM_COST_AUDIO_BPS".to_string())
-            })?,
-        )?;
-        reject_zero(
-            "MH_STREAM_COST_AUDIO_BPS",
-            stream_cost_audio_bps,
-            "a free stream cannot be budgeted — it is the divisor of the stream ceiling",
-        )?;
-        let stream_cost_video_bps: u64 = parse_required_number(
-            "MH_STREAM_COST_VIDEO_BPS",
-            vars.get("MH_STREAM_COST_VIDEO_BPS").ok_or_else(|| {
-                ConfigError::MissingEnvVar("MH_STREAM_COST_VIDEO_BPS".to_string())
-            })?,
-        )?;
-        reject_zero(
-            "MH_STREAM_COST_VIDEO_BPS",
-            stream_cost_video_bps,
-            "a free stream cannot be budgeted — it is the divisor of the stream ceiling",
-        )?;
+        // The shared media-codec-profile (story 3 R-23, R-24): four REQUIRED
+        // reads, from which both per-stream costs are DERIVED (the retired
+        // `MH_STREAM_COST_*` keys are no longer read; see `retired_keys_present`).
+        let media_codec_profile = parse_media_codec_profile(vars)?;
+        let stream_cost_audio_bps = derived_stream_cost_bps(
+            media_codec_profile.audio_max_bitrate_bps,
+            media_codec_profile.audio_frame_rate_hz,
+            AUDIO_FRAME_OVERHEAD_BYTES,
+        )
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "the audio stream cost derived from MEDIA_AUDIO_MAX_BITRATE_BPS and \
+                 MEDIA_AUDIO_FRAME_RATE_HZ overflows"
+                    .to_string(),
+            )
+        })?;
+        let stream_cost_video_bps = derived_stream_cost_bps(
+            media_codec_profile.video_max_bitrate_bps,
+            media_codec_profile.video_frame_rate_hz,
+            VIDEO_FRAME_OVERHEAD_BYTES,
+        )
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "the video stream cost derived from MEDIA_VIDEO_MAX_BITRATE_BPS and \
+                 MEDIA_VIDEO_FRAME_RATE_HZ overflows; the shared media-codec-profile ConfigMap \
+                 carries an implausible value — revert it (it rolls MC and MH together)"
+                    .to_string(),
+            )
+        })?;
         let rejection_ratio_threshold = parse_unit_ratio(
             "MH_EGRESS_REJECTION_RATIO_THRESHOLD",
             vars.get("MH_EGRESS_REJECTION_RATIO_THRESHOLD")
@@ -2238,6 +2468,12 @@ impl Config {
             register_meeting_timeout_seconds,
             max_connections,
             quic_transport,
+            media_codec_profile,
+            retired_keys_present: RETIRED_KEYS
+                .iter()
+                .copied()
+                .filter(|key| vars.contains_key(*key))
+                .collect(),
             termination_grace_seconds,
             drain_window,
             drain_window_source,
@@ -2341,20 +2577,27 @@ mod tests {
             ("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "1000".to_string()),
             // Registered-meeting cap (story 2 R-21), the deployed value.
             ("MH_MAX_REGISTERED_MEETINGS".to_string(), "8192".to_string()),
-            // Muted-source bound (story 2 R-9), the deployed value.
+            // Source-stream bound (story 3), the deployed value.
             (
-                "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
-                "512".to_string(),
+                "MH_MAX_SOURCE_STREAMS_PER_MEETING".to_string(),
+                "1024".to_string(),
             ),
             // Egress-budget chain (story 2 R-19). The BASE ConfigMap's
             // deliberately unsized placeholder budget — it must boot (above the
             // refuse-boot floor) and nudge (below the recommended minimum).
             ("MH_EGRESS_BUDGET_BPS".to_string(), "10000000".to_string()),
-            ("MH_STREAM_COST_AUDIO_BPS".to_string(), "90000".to_string()),
+            // The shared media-codec-profile, production defaults from
+            // `infra/services/media-codec-profile/profile.env`.
             (
-                "MH_STREAM_COST_VIDEO_BPS".to_string(),
-                "2500000".to_string(),
+                "MEDIA_AUDIO_MAX_BITRATE_BPS".to_string(),
+                "48000".to_string(),
             ),
+            ("MEDIA_AUDIO_FRAME_RATE_HZ".to_string(), "50".to_string()),
+            (
+                "MEDIA_VIDEO_MAX_BITRATE_BPS".to_string(),
+                "800000".to_string(),
+            ),
+            ("MEDIA_VIDEO_FRAME_RATE_HZ".to_string(), "30".to_string()),
             (
                 "MH_EGRESS_REJECTION_RATIO_THRESHOLD".to_string(),
                 "0.05".to_string(),
@@ -2362,25 +2605,27 @@ mod tests {
         ])
     }
 
-    /// Every key story 2 makes REQUIRED: task 8's four new egress-chain keys
-    /// and four flipped §8 bounds, task 11's registered-meeting cap, and task
-    /// 10's muted-source bound. One list, iterated by both the absence and the
-    /// malformed-value tests, so neither can cover a subset.
-    const STORY2_REQUIRED_KEYS: [&str; 10] = [
+    /// Every key stories 2 and 3 make REQUIRED: the egress-chain keys, the
+    /// §8 bounds, the registered-meeting cap, the source-stream bound and the
+    /// four `media-codec-profile` keys. One list, iterated by both the absence
+    /// and the malformed-value tests, so neither can cover a subset.
+    const STORY2_REQUIRED_KEYS: [&str; 12] = [
         "MH_EGRESS_BUDGET_BPS",
-        "MH_STREAM_COST_AUDIO_BPS",
-        "MH_STREAM_COST_VIDEO_BPS",
         "MH_EGRESS_REJECTION_RATIO_THRESHOLD",
         "MH_MAX_EGRESS_STREAMS_PER_MEETING",
         "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
         "MH_MAX_TOTAL_EGRESS_EDGES",
         "MH_POLICY_APPLY_TIMEOUT_MS",
         "MH_MAX_REGISTERED_MEETINGS",
-        "MH_MAX_MUTED_SOURCES_PER_MEETING",
+        "MH_MAX_SOURCE_STREAMS_PER_MEETING",
+        "MEDIA_AUDIO_MAX_BITRATE_BPS",
+        "MEDIA_AUDIO_FRAME_RATE_HZ",
+        "MEDIA_VIDEO_MAX_BITRATE_BPS",
+        "MEDIA_VIDEO_FRAME_RATE_HZ",
     ];
 
-    /// Derive with the base costs and a budget chosen so the ceiling is
-    /// exactly `ceiling` (budget = ceiling × the video cost).
+    /// Derive with fixed costs and a budget chosen so the ceiling is exactly
+    /// `ceiling` (budget = ceiling × the larger cost).
     fn derive_ceiling(ceiling: u64) -> Result<EgressAdmission, ConfigError> {
         EgressAdmission::derive(ceiling * 2_500_000, 90_000, 2_500_000, 0.05, 65_536)
     }
@@ -2995,7 +3240,7 @@ mod tests {
         assert_eq!(config.region, "eu-west-1");
         assert_eq!(config.gc_grpc_url, "http://gc:50051");
         assert_eq!(
-            config.egress_admission.stream_ceiling, 4,
+            config.egress_admission.stream_ceiling, 12,
             "MH_MAX_STREAMS is retired: the advertised ceiling is derived from the budget"
         );
         assert_eq!(config.handler_id, "mh-custom-001");
@@ -3376,10 +3621,10 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_cost_refuses_to_boot_before_the_derivation_divides() {
+    fn a_zero_budget_or_video_profile_value_refuses_to_boot() {
         for key in [
-            "MH_STREAM_COST_AUDIO_BPS",
-            "MH_STREAM_COST_VIDEO_BPS",
+            "MEDIA_VIDEO_MAX_BITRATE_BPS",
+            "MEDIA_VIDEO_FRAME_RATE_HZ",
             "MH_EGRESS_BUDGET_BPS",
         ] {
             let mut vars = base_vars();
@@ -3417,14 +3662,9 @@ mod tests {
     /// consequences and must never merge: a deployment between them boots.
     #[test]
     fn the_refuse_boot_floor_never_merges_with_the_recommended_min() {
-        // Two participants hearing each other; N+1 = 6 hearing N = 5. The
-        // ordering itself is a compile-time assertion next to the constants.
-        assert_eq!(MIN_EGRESS_STREAM_CEILING, all_hear_all_streams(1));
+        // Two participants each hearing the other (one audio slot, no video).
+        assert_eq!(MIN_EGRESS_STREAM_CEILING, demo_streams(2, 1, 0));
         assert_eq!(MIN_EGRESS_STREAM_CEILING, 2, "the floor is 2, not 1");
-        assert_eq!(
-            EGRESS_STREAM_CEILING_RECOMMENDED_MIN,
-            all_hear_all_streams(5)
-        );
         let between = derive_ceiling(EGRESS_STREAM_CEILING_RECOMMENDED_MIN - 1).unwrap();
         assert!(between.below_recommended_min(), "boots, and is nudged");
         let at = derive_ceiling(EGRESS_STREAM_CEILING_RECOMMENDED_MIN).unwrap();
@@ -3434,19 +3674,163 @@ mod tests {
         );
     }
 
-    /// The BASE `ConfigMap` placeholder boots and nudges; the KIND overlay budget
-    /// boots, clears the recommended minimum, and fits the edge bound.
+    /// The recommended minimum is the story-3 demo, `P x (N + M)` with P = 6,
+    /// N = 5, M = 4. The literal is deliberate: a test written against the
+    /// same constants as the code passes whatever they become.
     #[test]
-    fn the_deployed_budgets_boot_base_nudges_and_kind_does_not() {
-        let base = Config::from_vars(&base_vars()).expect("base placeholder must boot");
-        assert_eq!(base.egress_admission.stream_ceiling, 4);
-        assert!(base.egress_admission.below_recommended_min());
+    fn recommended_min_is_the_story_3_demo_of_54_streams() {
+        assert_eq!(EGRESS_STREAM_CEILING_RECOMMENDED_MIN, 54);
+        assert_eq!(EGRESS_STREAM_CEILING_RECOMMENDED_MIN, 6 * (5 + 4));
+    }
 
+    /// The per-frame overheads, spelled out from the v3 layout so the test is
+    /// not a re-run of the production sum: header = 14-byte prefix + 50-byte
+    /// wrapped key + 2-byte extension length + 6-byte relay region = 72, plus
+    /// 24 bytes of `SFrame` overhead and the 64-byte signature.
+    #[test]
+    fn the_per_frame_overheads_are_the_v3_non_payload_regions() {
+        assert_eq!(AUDIO_FRAME_OVERHEAD_BYTES, 14 + 50 + 2 + 6 + 24 + 64);
+        assert_eq!(AUDIO_FRAME_OVERHEAD_BYTES, 160);
+        // Video: the wrapped key amortises to zero.
+        assert_eq!(VIDEO_FRAME_OVERHEAD_BYTES, 160 - 50);
+        // The one enumeration: the buffer sizing input is built on it.
+        assert_eq!(
+            NOMINAL_AUDIO_FRAME_BYTES,
+            NOMINAL_OPUS_PAYLOAD_BYTES + AUDIO_FRAME_OVERHEAD_BYTES
+        );
+    }
+
+    /// The derived audio cost at the profile (48 kbps, 50 Hz): about 112 kbps,
+    /// pinned exactly. (The story's "about 90 kbps" was the ADR's estimate at
+    /// the NOMINAL bitrate; the formula at the profile's MAX bitrate, with the
+    /// wrapped key on every audio frame, is this.)
+    #[test]
+    fn the_derived_audio_cost_is_pinned() {
+        let expected = 48_000 + 160 * 8 * 50;
+        assert_eq!(expected, 112_000);
+        assert_eq!(
+            derived_stream_cost_bps(48_000, 50, AUDIO_FRAME_OVERHEAD_BYTES),
+            Some(expected)
+        );
+        let config = Config::from_vars(&base_vars()).unwrap();
+        assert_eq!(config.egress_admission.stream_cost_audio_bps, 112_000);
+        assert_eq!(
+            config.egress_admission.stream_cost_audio_bytes_per_second,
+            14_000
+        );
+    }
+
+    /// The derived video cost at the Kind test profile (320x180, 15 fps,
+    /// 250 kbps — about 0.265 Mbps) and at production defaults (640x360,
+    /// 30 fps, 800 kbps — about 0.83 Mbps).
+    #[test]
+    fn the_derived_video_cost_is_pinned_at_kind_and_production_profiles() {
+        let kind = 250_000 + 110 * 8 * 15;
+        assert_eq!(kind, 263_200);
+        assert_eq!(
+            derived_stream_cost_bps(250_000, 15, VIDEO_FRAME_OVERHEAD_BYTES),
+            Some(kind)
+        );
+        let production = 800_000 + 110 * 8 * 30;
+        assert_eq!(production, 826_400);
+        assert_eq!(
+            derived_stream_cost_bps(800_000, 30, VIDEO_FRAME_OVERHEAD_BYTES),
+            Some(production)
+        );
+        let config = Config::from_vars(&base_vars()).unwrap();
+        assert_eq!(config.egress_admission.stream_cost_video_bps, production);
+        // Overflow refuses rather than wrapping into a small cost.
+        assert_eq!(
+            derived_stream_cost_bps(u64::MAX, 30, VIDEO_FRAME_OVERHEAD_BYTES),
+            None
+        );
+    }
+
+    /// The BASE `ConfigMap` placeholder (`MH_EGRESS_BUDGET_BPS=10000000`) yields
+    /// a ceiling below the recommended minimum of 54, so the configure-me nudge
+    /// fires — and above the refuse-boot floor, so it boots.
+    /// `infra/services/mh-service/config.env` cites this test by name.
+    #[test]
+    fn base_placeholder_budget_is_below_recommended_min() {
+        let base = Config::from_vars(&base_vars()).expect("base placeholder must boot");
+        assert_eq!(base.egress_admission.budget_bps, 10_000_000);
+        assert!(u64::from(base.egress_admission.stream_ceiling) < 54);
+        assert!(u64::from(base.egress_admission.stream_ceiling) >= MIN_EGRESS_STREAM_CEILING);
+        assert!(base.egress_admission.below_recommended_min());
+        // 1_250_000 B/s over the production video cost of 103_300 B/s.
+        assert_eq!(base.egress_admission.stream_ceiling, 12);
+    }
+
+    /// The KIND overlay budget (`infra/kubernetes/overlays/kind/services/
+    /// mh-service/configmap-egress-budget-patch.yaml`) at the production
+    /// profile: boots, clears the recommended minimum, stays inside S9's
+    /// feasible window (env-test 01 enforces the window on the live cluster).
+    #[test]
+    fn the_kind_budget_boots_and_clears_the_recommended_min() {
         let mut vars = base_vars();
-        vars.insert("MH_EGRESS_BUDGET_BPS".to_string(), "100000000".to_string());
+        vars.insert("MH_EGRESS_BUDGET_BPS".to_string(), "82640000".to_string());
         let kind = Config::from_vars(&vars).expect("Kind budget must boot");
-        assert_eq!(kind.egress_admission.stream_ceiling, 40);
+        assert_eq!(kind.egress_admission.stream_ceiling, 100);
         assert!(!kind.egress_admission.below_recommended_min());
+    }
+
+    /// MH refuses to boot on an audio profile outside its compiled envelope
+    /// (ADR-0036 §11 startup-validation fallback), inclusive at both ends.
+    #[test]
+    fn an_out_of_envelope_audio_profile_refuses_to_boot() {
+        for (value, ok) in [
+            ("31999", false),
+            ("32000", true),
+            ("48000", true),
+            ("48001", false),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("MEDIA_AUDIO_MAX_BITRATE_BPS".to_string(), value.to_string());
+            match Config::from_vars(&vars) {
+                Ok(_) => assert!(ok, "{value} must refuse"),
+                Err(ConfigError::AudioBitrateOutsideEnvelope { floor, ceiling, .. }) => {
+                    assert!(!ok, "{value} is inside the envelope");
+                    assert_eq!((floor, ceiling), (32_000, 48_000));
+                    let text = Config::from_vars(&vars).unwrap_err().to_string();
+                    assert!(text.contains("MEDIA_AUDIO_MAX_BITRATE_BPS"), "{text}");
+                    assert!(text.contains("media-codec-profile"), "{text}");
+                    assert!(text.contains(value), "{text}");
+                }
+                Err(other) => panic!("{value}: wrong refusal {other:?}"),
+            }
+        }
+        for value in ["25", "49", "51", "100"] {
+            let mut vars = base_vars();
+            vars.insert("MEDIA_AUDIO_FRAME_RATE_HZ".to_string(), value.to_string());
+            match Config::from_vars(&vars) {
+                Err(ConfigError::AudioFrameRateMismatch { required, .. }) => {
+                    assert_eq!(required, 1000 / 20);
+                }
+                other => panic!("{value} Hz must refuse; got {other:?}"),
+            }
+        }
+    }
+
+    /// Retired keys are ignored, and named (never valued) for the INFO line.
+    #[test]
+    fn retired_keys_are_ignored_and_reported() {
+        let config = Config::from_vars(&base_vars()).unwrap();
+        assert_eq!(config.retired_keys_present, Vec::<&str>::new());
+        let mut vars = base_vars();
+        vars.insert("MH_STREAM_COST_VIDEO_BPS".to_string(), "1".to_string());
+        vars.insert(
+            "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+            "garbage".to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("a retired key is never read");
+        assert_eq!(
+            config.retired_keys_present,
+            vec![
+                "MH_STREAM_COST_VIDEO_BPS",
+                "MH_MAX_MUTED_SOURCES_PER_MEETING"
+            ]
+        );
+        assert_eq!(config.egress_admission.stream_cost_video_bps, 826_400);
     }
 
     #[test]
@@ -3481,7 +3865,7 @@ mod tests {
         vars.insert("MH_POLICY_APPLY_TIMEOUT_MS".to_string(), "250".to_string());
         vars.insert("MH_MAX_REGISTERED_MEETINGS".to_string(), "300".to_string());
         vars.insert(
-            "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+            "MH_MAX_SOURCE_STREAMS_PER_MEETING".to_string(),
             "96".to_string(),
         );
 
@@ -3491,40 +3875,71 @@ mod tests {
         assert_eq!(config.policy_limits.max_total_egress_edges, 1024);
         assert_eq!(config.policy_limits.policy_apply_timeout_ms, 250);
         assert_eq!(config.policy_limits.max_registered_meetings, 300);
-        assert_eq!(config.policy_limits.max_muted_sources_per_meeting, 96);
+        assert_eq!(config.policy_limits.max_source_streams_per_meeting, 96);
     }
 
-    /// The muted-source bound below the egress-stream bound refuses to boot
-    /// (story 2 R-9): at runtime that inversion would reject a legitimate
-    /// large-meeting snapshot WHOLE, costing the meeting every edge. Equal is
-    /// accepted — it is the deployed shape.
+    /// The source-stream bound below the egress-stream bound refuses to boot
+    /// (the floor carried over from the retired muted bound). Equal is
+    /// accepted.
     #[test]
-    fn test_muted_bound_below_egress_bound_refuses_boot() {
+    fn test_source_stream_bound_below_egress_bound_refuses_boot() {
         let mut vars = base_vars();
         vars.insert(
-            "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+            "MH_MAX_SOURCE_STREAMS_PER_MEETING".to_string(),
             "511".to_string(),
         );
         let err = Config::from_vars(&vars).unwrap_err();
         assert!(
             matches!(
                 err,
-                ConfigError::MutedSourceBoundBelowEgressBound {
-                    muted: 511,
+                ConfigError::SourceStreamBoundBelowEgressBound {
+                    sources: 511,
                     egress: 512
                 }
             ),
             "got: {err}"
         );
         let text = err.to_string();
-        assert!(text.contains("MH_MAX_MUTED_SOURCES_PER_MEETING"));
+        assert!(text.contains("MH_MAX_SOURCE_STREAMS_PER_MEETING"));
         assert!(text.contains("MH_MAX_EGRESS_STREAMS_PER_MEETING"));
 
         vars.insert(
-            "MH_MAX_MUTED_SOURCES_PER_MEETING".to_string(),
+            "MH_MAX_SOURCE_STREAMS_PER_MEETING".to_string(),
             "512".to_string(),
         );
         assert!(Config::from_vars(&vars).is_ok(), "equal bounds are legal");
+    }
+
+    /// `MH_MAX_SOURCE_STREAMS_PER_MEETING` bounds: 0 and 4097 refuse, 1 (with
+    /// the egress bound lowered to pair) and 4096 boot.
+    #[test]
+    fn the_source_stream_bound_is_one_to_4096() {
+        for (sources, egress, ok) in [
+            ("0", "1", false),
+            ("1", "1", true),
+            ("4096", "512", true),
+            ("4097", "512", false),
+        ] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MH_MAX_SOURCE_STREAMS_PER_MEETING".to_string(),
+                sources.to_string(),
+            );
+            vars.insert(
+                "MH_MAX_EGRESS_STREAMS_PER_MEETING".to_string(),
+                egress.to_string(),
+            );
+            let result = Config::from_vars(&vars);
+            assert_eq!(result.is_ok(), ok, "{sources}: {result:?}");
+            if let Err(e) = result {
+                assert!(
+                    e.to_string().contains("MH_MAX_SOURCE_STREAMS_PER_MEETING"),
+                    "{e}"
+                );
+            }
+        }
+        assert_eq!(MAX_SOURCE_STREAMS_PER_MEETING_CEILING, 4_096);
+        assert_eq!(MAX_EGRESS_STREAMS_PER_MEETING_CEILING, 4_096);
     }
 
     /// Zero is rejected, not clamped.
@@ -3540,7 +3955,7 @@ mod tests {
             "MH_MAX_TOTAL_EGRESS_EDGES",
             "MH_POLICY_APPLY_TIMEOUT_MS",
             "MH_MAX_REGISTERED_MEETINGS",
-            "MH_MAX_MUTED_SOURCES_PER_MEETING",
+            "MH_MAX_SOURCE_STREAMS_PER_MEETING",
         ] {
             let mut vars = base_vars();
             vars.insert(key.to_string(), "0".to_string());
@@ -3580,8 +3995,8 @@ mod tests {
                 MAX_REGISTERED_MEETINGS_CEILING + 1,
             ),
             (
-                "MH_MAX_MUTED_SOURCES_PER_MEETING",
-                MAX_MUTED_SOURCES_PER_MEETING_CEILING + 1,
+                "MH_MAX_SOURCE_STREAMS_PER_MEETING",
+                MAX_SOURCE_STREAMS_PER_MEETING_CEILING + 1,
             ),
         ];
         for (key, value) in cases {

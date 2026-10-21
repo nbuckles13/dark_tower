@@ -7,15 +7,16 @@
 //!
 //! # What this function may read
 //!
-//! `payload_length` and nothing else (ADR-0036 §7 keeps MH type-blind and §4
-//! keeps it keyless). Nothing here calls `wrapped_transmit_key()`,
-//! `expose_wrapped_key()` or `expose_wrap_tag()`, and nothing inspects the
-//! payload's first 8 bytes — the `SFrame` key id. `rewrite_relay_region` reads
-//! the key-bearing *flag* internally to derive its offset and never hands MH
-//! the key material; reading a flag is not parsing the field, so the
-//! credential-leak scope trigger in `docs/TODO.md` §Media Path Obligations does
-//! not fire. Recorded so the next reader can check the claim rather than trust
-//! it.
+//! `payload_length` and the relay-region `stream_id` (the publisher's uplink
+//! label, for attribution — publisher-set and unauthenticated at MH), and
+//! nothing else (ADR-0036 §7 keeps MH type-blind and §4 keeps it keyless).
+//! Nothing here calls `wrapped_transmit_key()`, `expose_wrapped_key()` or
+//! `expose_wrap_tag()`, and nothing inspects the payload's first 8 bytes —
+//! the `SFrame` key id. `rewrite_relay_region` reads the key-bearing *flag*
+//! internally to derive its offset and never hands MH the key material;
+//! reading a flag is not parsing the field, so the credential-leak scope
+//! trigger in `docs/TODO.md` §Media Path Obligations does not fire. Recorded
+//! so the next reader can check the claim rather than trust it.
 //!
 //! # Decode THEN rewrite, and why that is two parses on purpose
 //!
@@ -49,11 +50,12 @@ use crate::media::forwarder::{ConnectionForwarder, ForwardParts};
 use crate::media::queue::{depth_as_gauge, SharedQueue};
 use crate::observability::metrics::{MediaDirection, MediaDropReason, MediaLatencyPhase};
 use crate::observability::per_frame_trace;
-use crate::routing::{EgressEdge, RoutingSnapshot};
+use crate::routing::{Attribution, EgressEdge, RoutingSnapshot, SourceEdges};
 use crate::session::LocalSubscriberSnapshot;
 use bytes::{Bytes, BytesMut};
 use core::fmt;
 use media_protocol::codec::{decode_datagram, rewrite_relay_region};
+use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::time::Instant;
 
 /// A datagram accepted off the transport, waiting to be forwarded.
@@ -158,28 +160,33 @@ impl ForwardOutcome {
     }
 }
 
-/// Forward one datagram to every egress edge its publisher feeds.
+/// Forward one datagram to every egress edge of the source stream it is
+/// attributed to.
 ///
 /// # Fail-closed, with a distinct token per cause
 ///
 /// There is **no** "no edges, so echo it back to the sender" fallback. Loopback
 /// is an installed policy edge from `RegisterMeeting` or it does not happen.
-/// The three ways a frame reaches nobody are separately counted because they
-/// have three different owners: `no_policy` is the control plane's, and its
-/// remedy is upstream of this handler; `no_subscriber` is MC's assignment; and
-/// `no_local_subscriber` is this handler's own connection state.
+/// The three ways an attributed frame reaches nobody are separately counted
+/// because they have three different owners: `no_policy` is the control
+/// plane's, and its remedy is upstream of this handler; `no_subscriber` is MC's
+/// assignment; and `no_local_subscriber` is this handler's own connection
+/// state.
 ///
-/// A fourth drop is not a routing failure at all: `server_muted` is the
-/// control plane's deliberate instruction (see the first check in the body).
+/// Three drops are attribution outcomes, not routing failures: `server_muted`
+/// (the control plane's deliberate instruction), `unmatched_stream` and
+/// `transport_mismatch` (the frame matches no declared stream, or not on this
+/// transport — story 3 R-20). Every one is Ingress-direction and consumes no
+/// hop number, so `forwarded{ingress} + dropped{ingress}` counts every frame.
 ///
 /// # The routing table is re-read per frame and nothing is cached
 ///
 /// `RoutingTable::load()` is a plain atomic returning an `Arc` with no guard
-/// lifetime, so this costs one `HashMap` probe on an `Arc<str>` key per frame —
-/// no allocation, no lock, no await held. Caching the edge list would be a
+/// lifetime, so this costs a few `HashMap` probes per frame — no allocation, no
+/// lock, no await held. Caching the attribution or the edge list would be a
 /// server-mute bypass with a staleness window: ADR-0036 §7 enforces server mute
-/// and participant removal *through this lookup*, so an edge list that outlives
-/// a policy change keeps forwarding a muted publisher.
+/// and participant removal *through this lookup*, so an answer that outlives a
+/// policy change keeps forwarding a muted publisher.
 ///
 /// The per-frame `meetings.get(meeting)` is **not** a hash-collision denial-of-
 /// service vector: the `MeetingKey` is bound at spawn from the JWT-gated accept
@@ -191,23 +198,28 @@ pub fn forward_one(
     subscribers: &LocalSubscriberSnapshot,
     frame: IngressFrame,
 ) -> ForwardOutcome {
-    // SERVER MUTE (ADR-0036 §7 "Server mute is enforced at MH ingress"; story
-    // 2 R-9) — FIRST, before the sampler, before decode, before fan-out.
+    // SERVER MUTE, SENDER LEVEL (ADR-0036 §7; story 2 R-9; story 3 R-16) —
+    // FIRST, before the sampler, before decode, before attribution.
     //
-    // SENDER-SCOPED, on `forwarder.sender()`: the publisher bound at spawn,
-    // after the JWT gate, from MC's `NotifyParticipantConnectedResponse`.
-    // Nothing read from the frame participates — the frame header carries no
-    // sender id, and this path never parses the SFrame key id. So a PATCHED
-    // CLIENT changes nothing observable: there is no client-reachable input
-    // to this decision. Exact under the transitional union reading
-    // (`internal.proto` `server_muted_sources`): a muted sender drops on every
-    // stream.
+    // On `forwarder.sender()`: the publisher bound at spawn, after the JWT
+    // gate, from MC's `NotifyParticipantConnectedResponse`. Nothing read from
+    // the frame participates, so a PATCHED CLIENT changes nothing observable
+    // here: every frame of a sender whose every declared stream is
+    // DROP_AT_INGRESS (or who is union-muted) counts `server_muted`, including
+    // frames that cannot be decoded or attributed — MH runbook scenario 19's
+    // signal stays right. The non-vacuity rule (a sender with no declared
+    // stream is NOT muted) lives with the set, in `routing`.
     //
-    // PER-KIND MUTE HOLDS IN SLOT TERMS — the reasoning, and the 2026-10-13
+    // PER-KIND MUTE HOLDS IN SLOT TERMS, after attribution below. The uplink
+    // relay label the attribution reads is publisher-set and unauthenticated
+    // at MH, and MH never reads the `SFrame` key id; signing the label would
+    // protect nothing, because the publisher sets both the label and the key
+    // id. What holds instead: a server-muted stream has no live route, and a
+    // frame relabelled onto another declared stream must also match that
+    // stream's declared transport and reaches only that stream's slots, where
+    // receivers decode by slot kind. The full statement, and the 2026-10-13
     // correction of this paragraph's former "per-stream ingress mute is
-    // FORECLOSED" text, live once at `internal.proto` `MutedSource`. MH-A1
-    // replaces this sender-level check with per-stream attribution against
-    // `source_streams`.
+    // foreclosed" text, live once at `internal.proto` `MutedSource`.
     //
     // WHO CAN SET IT: `RegisterMeeting` authorizes on scope alone, so any
     // holder of `service.write.mh` can set or clear a mute — bounded as
@@ -218,20 +230,15 @@ pub fn forward_one(
     // credential leaves nothing but this counter.
     //
     // NO POLICY is fail-closed by construction: `is_server_muted` reads
-    // `false` for an absent meeting, and that same frame then resolves no
-    // edges below and drops as `no_policy`.
+    // `false` for an absent meeting, and `attribute` below then answers
+    // `NoPolicy`.
     //
     // THE COUNTER IS THE ONLY RECORD: no log, span, macro or per-frame trace
     // (the forward-path deny scope; a per-frame record would name a moderated
-    // participant). Ingress-direction token, so `forwarded{ingress} +
-    // dropped{ingress}` still counts every datagram, and no hop number is
-    // consumed — the subscriber sees no gap it would read as loss.
+    // participant). No hop number is consumed — the subscriber sees no gap it
+    // would read as loss.
     if snapshot.is_server_muted(forwarder.meeting(), forwarder.sender()) {
-        forwarder
-            .handles()
-            .dropped(MediaDropReason::ServerMuted)
-            .increment(1);
-        return ForwardOutcome::rejected(MediaDropReason::ServerMuted);
+        return drop_at_ingress(forwarder, MediaDropReason::ServerMuted);
     }
 
     // MEASUREMENT clock (`std::time::Instant`): real elapsed time. A read here
@@ -247,94 +254,142 @@ pub fn forward_one(
     }
 
     // Decode first: this is the only entry point that rejects `trailing_bytes`,
-    // and the only place a codec token may originate in MH. The borrow of
-    // `payload` ends with this block so the buffer can be rewritten below.
-    if let Err(error) = decode_datagram(&frame.payload) {
-        // `RejectReason::as_str()` and nothing else crosses out of `media/`.
-        // `DecodeError`'s `Display` carries per-frame scalars — declared and
-        // available payload sizes — and the time-ordered sequence of per-frame
-        // sizes for one stream is the voice-activity trace (ADR-0036 §11).
-        if let Some(counter) = forwarder.handles().codec_dropped(error.reason()) {
-            counter.increment(1);
+    // and the only place a codec token may originate in MH. The relay-region
+    // `stream_id` — the uplink label attribution keys on — is read through the
+    // codec's own view, never at a local offset. The borrow of `payload` ends
+    // with this block so the buffer can be rewritten below.
+    let uplink_id = match decode_datagram(&frame.payload) {
+        Ok(view) => view.stream_id(),
+        Err(error) => {
+            // `RejectReason::as_str()` and nothing else crosses out of `media/`.
+            // `DecodeError`'s `Display` carries per-frame scalars — declared and
+            // available payload sizes — and the time-ordered sequence of
+            // per-frame sizes for one stream is the voice-activity trace
+            // (ADR-0036 §11).
+            if let Some(counter) = forwarder.handles().codec_dropped(error.reason()) {
+                counter.increment(1);
+            }
+            // Size and a bounded token, never `DecodeError`'s `Display`.
+            // Compiled out unless the `per-frame-trace` feature is on, which is
+            // a `compile_error!` in a release build.
+            per_frame_trace::record(frame.payload.len(), error.reason().as_str());
+            return ForwardOutcome {
+                delivered: 0,
+                dropped: 0,
+                rejected: None,
+            };
         }
-        // Size and a bounded token, never `DecodeError`'s `Display` — that
-        // carries the declared and available per-frame sizes together, and a
-        // sibling formatting it would rebuild the voice-activity trace by a
-        // route the directory-scoped deny cannot see. Compiled out unless the
-        // `per-frame-trace` feature is on, which is a `compile_error!` in a
-        // release build.
-        per_frame_trace::record(frame.payload.len(), error.reason().as_str());
-        return ForwardOutcome {
-            delivered: 0,
-            dropped: 0,
-            rejected: None,
-        };
+    };
+
+    // ATTRIBUTION (story 3 R-20): (bound sender, uplink id, arrival transport)
+    // against the meeting's declared source streams. The match is exhaustive:
+    // every non-`Route` arm records exactly one Ingress drop.
+    let reason = match snapshot.attribute(
+        forwarder.meeting(),
+        forwarder.sender(),
+        uplink_id,
+        TransportMode::Datagram,
+    ) {
+        Attribution::Route { paused, edges } => {
+            let outcome = fan_out(
+                forwarder,
+                subscribers,
+                edges,
+                paused,
+                frame.payload,
+                popped_at,
+                sampled,
+            );
+            // Processing latency is observed for frames that reached at least
+            // one edge decision — never for a frame delivered nowhere
+            // (`no_subscriber`), exactly as before attribution existed.
+            if sampled && outcome.rejected.is_none() {
+                observe(
+                    forwarder,
+                    MediaLatencyPhase::Processing,
+                    Instant::now().saturating_duration_since(popped_at),
+                );
+            }
+            return outcome;
+        }
+        Attribution::NoPolicy => MediaDropReason::NoPolicy,
+        Attribution::ServerMuted => MediaDropReason::ServerMuted,
+        Attribution::Unmatched => MediaDropReason::UnmatchedStream,
+        Attribution::TransportMismatch => MediaDropReason::TransportMismatch,
+    };
+    drop_traced(forwarder, reason, frame.payload.len())
+}
+
+/// Count one Ingress-direction drop for a frame that reached no edge.
+fn drop_at_ingress(forwarder: &ConnectionForwarder, reason: MediaDropReason) -> ForwardOutcome {
+    forwarder.handles().dropped(reason).increment(1);
+    ForwardOutcome::rejected(reason)
+}
+
+/// [`drop_at_ingress`], plus the (compiled-out by default) per-frame trace.
+fn drop_traced(
+    forwarder: &ConnectionForwarder,
+    reason: MediaDropReason,
+    len: usize,
+) -> ForwardOutcome {
+    per_frame_trace::record(len, reason.as_str());
+    drop_at_ingress(forwarder, reason)
+}
+
+/// Fan an attributed frame out along its source stream's edges.
+///
+/// `forwarded{ingress}` is incremented exactly ONCE per frame here, never per
+/// edge — including the `no_subscriber` arm, where the frame was ingested and
+/// delivered nowhere — and the paused-arrivals overlay increments at exactly
+/// the same point, so paused ⊆ `forwarded{ingress}`. The paused counter is
+/// NOT a drop: a PAUSED stream forwards normally (R-17).
+fn fan_out(
+    forwarder: &mut ConnectionForwarder,
+    subscribers: &LocalSubscriberSnapshot,
+    edges: SourceEdges<'_>,
+    paused: bool,
+    payload: Bytes,
+    popped_at: Instant,
+    sampled: bool,
+) -> ForwardOutcome {
+    let mut parts = forwarder.parts();
+    parts
+        .handles
+        .forwarded(MediaDirection::Ingress)
+        .increment(1);
+    if paused {
+        parts.handles.paused_source_frames().increment(1);
     }
 
-    let payload = frame.payload;
-    let outcome = {
-        let mut parts = forwarder.parts();
-        let mut delivered = 0_usize;
-        let mut dropped = 0_usize;
-
-        // Single-pass fan-out. Each edge is held back one iteration so the LAST
-        // edge can consume the ingress buffer itself (zero copy) while every
-        // earlier edge takes an arena copy — without a second traversal and
-        // without knowing N in advance. For the loopback N=1 shape the single
-        // edge IS the last edge, so the whole path is zero-copy.
-        let mut pending: Option<PendingEdge> = None;
-        let visited = snapshot.for_each_source(parts.meeting, parts.sender, |edge| {
-            if let Some(previous) = pending.take() {
-                match deliver(
-                    &mut parts,
-                    subscribers,
-                    previous,
-                    FrameSource::Borrowed(&payload),
-                    popped_at,
-                    sampled,
-                ) {
-                    Delivery::Delivered => delivered += 1,
-                    Delivery::Dropped => dropped += 1,
-                }
-            }
-            pending = Some(PendingEdge::from(edge));
-        });
-
-        if visited == 0 {
-            // Only reached on the drop path, so the extra probe costs the happy
-            // path nothing. The distinction is worth a probe: "MC never
-            // programmed this handler" and "MC programmed it and this publisher
-            // feeds nothing" are different incidents with different owners.
-            let reason = if snapshot.routes_for(parts.meeting).is_none() {
-                MediaDropReason::NoPolicy
-            } else {
-                // Ingested successfully, delivered nowhere: the ingress
-                // attempts sum stays whole (`forwarded{ingress} +
-                // dropped{ingress reasons}` = every datagram received) while
-                // the drop is attributed to the egress-side cause it has.
-                parts
-                    .handles
-                    .forwarded(MediaDirection::Ingress)
-                    .increment(1);
-                MediaDropReason::NoSubscriber
-            };
-            parts.handles.dropped(reason).increment(1);
-            per_frame_trace::record(payload.len(), reason.as_str());
-            return ForwardOutcome::rejected(reason);
-        }
-
+    if edges.is_empty() {
+        // Ingested successfully, delivered nowhere: the ingress attempts sum
+        // stays whole while the drop is attributed to the egress-side cause it
+        // has (MC programmed this handler, and nobody watches this stream).
         parts
             .handles
-            .forwarded(MediaDirection::Ingress)
+            .dropped(MediaDropReason::NoSubscriber)
             .increment(1);
-        per_frame_trace::record(payload.len(), per_frame_trace::FORWARDED);
+        per_frame_trace::record(payload.len(), MediaDropReason::NoSubscriber.as_str());
+        return ForwardOutcome::rejected(MediaDropReason::NoSubscriber);
+    }
+    per_frame_trace::record(payload.len(), per_frame_trace::FORWARDED);
 
-        if let Some(last) = pending.take() {
+    let mut delivered = 0_usize;
+    let mut dropped = 0_usize;
+
+    // Single-pass fan-out. Each edge is held back one iteration so the LAST
+    // edge can consume the ingress buffer itself (zero copy) while every
+    // earlier edge takes an arena copy — without a second traversal and
+    // without knowing N in advance. For the loopback N=1 shape the single
+    // edge IS the last edge, so the whole path is zero-copy.
+    let mut pending: Option<PendingEdge> = None;
+    for edge in edges {
+        if let Some(previous) = pending.take() {
             match deliver(
                 &mut parts,
                 subscribers,
-                last,
-                FrameSource::Owned(payload),
+                previous,
+                FrameSource::Borrowed(&payload),
                 popped_at,
                 sampled,
             ) {
@@ -342,23 +397,27 @@ pub fn forward_one(
                 Delivery::Dropped => dropped += 1,
             }
         }
-
-        ForwardOutcome {
-            delivered,
-            dropped,
-            rejected: None,
+        pending = Some(PendingEdge::from(edge));
+    }
+    if let Some(last) = pending.take() {
+        match deliver(
+            &mut parts,
+            subscribers,
+            last,
+            FrameSource::Owned(payload),
+            popped_at,
+            sampled,
+        ) {
+            Delivery::Delivered => delivered += 1,
+            Delivery::Dropped => dropped += 1,
         }
-    };
-
-    if sampled {
-        observe(
-            forwarder,
-            MediaLatencyPhase::Processing,
-            Instant::now().saturating_duration_since(popped_at),
-        );
     }
 
-    outcome
+    ForwardOutcome {
+        delivered,
+        dropped,
+        rejected: None,
+    }
 }
 
 /// The fields of an [`EgressEdge`] the fan-out needs, copied out so the closure

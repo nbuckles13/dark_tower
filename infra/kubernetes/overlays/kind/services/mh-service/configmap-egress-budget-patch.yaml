@@ -9,22 +9,31 @@
 #
 # SIZED AGAINST A STATED REQUIREMENT — this is the only place the sizing lives.
 #
-#   Requirement: N+1 participants all hearing each other is (N+1) x N egress
-#   edges, one egress stream per edge. The test suite is locked at N = 3
-#   (12 edges); the budget is sized for the demo at N = 5 (30 edges on one
-#   handler), so the suite runs with headroom rather than at the edge.
+#   Requirement: P participants each filling N audio plus M video receive
+#   slots is P x (N + M) egress edges, one egress stream per edge. The
+#   recommended minimum MH publishes (`mh_media_egress_stream_ceiling_
+#   recommended_min`) is that formula at the story-3 demo size, and this
+#   budget must clear it.
 #
 #   Formula: MH derives its stream ceiling as
-#       ceiling = MH_EGRESS_BUDGET_BPS / max(MH_STREAM_COST_AUDIO_BPS,
-#                                            MH_STREAM_COST_VIDEO_BPS)
-#   rounded down. It divides by the VIDEO cost even though story 2 sends only
-#   audio: the larger cost is used so MH stays type-blind.
-#   (Story 3: once MH-A1 lands, the two costs are DERIVED by MH from the shared
-#   media-codec-profile instead of the two retired keys; the formula keeps this
-#   shape, and INF-C re-sizes this value against MH's published derived
-#   ceiling.)
+#       ceiling = MH_EGRESS_BUDGET_BPS / max(derived audio cost,
+#                                            derived video cost)
+#   rounded down, where each derived cost is MEDIA_*_MAX_BITRATE_BPS plus a
+#   per-frame overhead (derived in MH code from the frame layout) x
+#   MEDIA_*_FRAME_RATE_HZ, both read from the media-codec-profile Kind runs
+#   (`EgressAdmission` in crates/mh-service/src/config.rs). It divides by the
+#   larger cost so MH stays type-blind. No cost or ceiling figure is restated
+#   here: read the effective ceiling from `mh_media_egress_stream_ceiling`.
+#
+#   RE-SIZED when MH began deriving the costs (the derived video cost is far
+#   below the retired configured one), so that the derived ceiling stays where
+#   the S9 window below needs it; INF-C re-sizes it again when Kind moves to the
+#   lower test codec profile. BUDGET AND IMAGE ROLL BACK TOGETHER: an image
+#   that predates the derivation divides this budget by the retired
+#   `MH_STREAM_COST_VIDEO_BPS` instead, which puts its ceiling below the demo
+#   requirement — roll this patch back with such an image.
 #   So this value must satisfy, against the DEPLOYED costs, a TWO-SIDED window:
-#     lower:  ceiling >= (N+1) x N  with N = 5            (the demo requirement)
+#     lower:  ceiling >= P x (N + M) at the demo size     (the demo requirement)
 #     upper:  2 x ceiling < MAX_S9_PARTICIPANTS x slot_cap (the S9 exhaustion
 #             test, 28_mh_egress_admission.rs, must still be able to drive a
 #             registration past the ceiling at an affordable meeting size;
@@ -56,8 +65,9 @@
 #
 # That relationship is ENFORCED, not asserted here: see
 #   crates/env-tests/tests/01_mh_deployment_config.rs::test_kind_egress_stream_ceiling_meets_demo_requirement
-# which reads the budget and both costs from the LIVE ConfigMap and fails if the
-# derived ceiling falls outside that window (either side). No ceiling literal is written
+# which reads the budget and the codec profile from the LIVE ConfigMaps,
+# derives the costs independently of MH's code, and fails if the derived
+# ceiling falls outside that window (either side). No ceiling literal is written
 # here on purpose — a restated result goes stale the moment either cost moves;
 # the test does not.
 #
@@ -86,4 +96,4 @@ metadata:
   name: mh-service-config
   namespace: dark-tower
 data:
-  MH_EGRESS_BUDGET_BPS: "250000000"
+  MH_EGRESS_BUDGET_BPS: "82640000"

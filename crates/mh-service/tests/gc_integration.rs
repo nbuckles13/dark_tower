@@ -233,6 +233,13 @@ fn test_config(gc_url: &str) -> Config {
             mh_test_utils::admission::fixture_policy_limits().max_total_egress_edges,
         )
         .expect("fixture budget derives a valid ceiling"),
+        media_codec_profile: mh_service::config::MediaCodecProfile {
+            audio_max_bitrate_bps: 48_000,
+            audio_frame_rate_hz: 50,
+            video_max_bitrate_bps: 800_000,
+            video_frame_rate_hz: 30,
+        },
+        retired_keys_present: Vec::new(),
         media_latency_sample_ratio: mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO,
         media_latency_sample_ratio_source: mh_service::config::ValueSource::Default,
         otel_enabled: false,

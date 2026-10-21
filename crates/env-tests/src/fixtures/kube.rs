@@ -63,6 +63,12 @@ pub fn configmap_name_for(instance: &str, base: &str) -> String {
         .unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
 }
 
+/// The GENERATOR BASE NAME of the shared media codec profile (story 3),
+/// read by MC and MH. Its live name is `media-codec-profile-<hash>`
+/// (ADR-0038 §2), resolved from a pod spec with [`configmap_name_for`] /
+/// [`configmap_name_for_all`]. One home for the deployment-config suites.
+pub const PROFILE_CONFIGMAP: &str = "media-codec-profile";
+
 /// [`configmap_name_for`] over SEVERAL instances that must share one
 /// generation (e.g. both MH instances read `mh-service-config`). Resolving from
 /// one instance and checking another would blame the wrong thing mid-rollout,

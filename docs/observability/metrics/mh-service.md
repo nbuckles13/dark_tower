@@ -277,7 +277,8 @@ because story task 21's media metrics need a section to extend.
 | `applied` | The live forward path reflects the generation MC sent — a fresh install, **or** an idempotent re-assert of an already-installed generation (no snapshot swap). | Nothing. This is health. |
 | `rejected_stale` | Nothing installed because MH is already ahead: (1) a generation strictly lower than the installed one was ignored; or (2, rare) an `EndMeeting` released the meeting between the apply being queued and run, while the carrying RPC was still waiting (MC's quiesce prevents this). | (1) Investigate reordering or retry on the MC→MH path. Policy is not rolled back. (2) No remedy on MH; cross-check `mc_media_push_quiesce_total{outcome="timed_out"}` on MC. |
 | `no_generation` | `policy_generation` was 0 — MC named no generation. | **See the window note below.** Today: nothing. |
-| `rejected_invalid` | The policy failed structural validation (duplicate `egress_stream_id`, duplicate subscriber slot, malformed identifier, count bound, unspecified or heterogeneous transport mode). | MC sent bad policy; the remedy is upstream in MC's assignment computation. |
+| `rejected_invalid` | The policy failed structural validation (duplicate `egress_stream_id`, duplicate subscriber slot, malformed identifier, a count bound — including `source_streams` over `MH_MAX_SOURCE_STREAMS_PER_MEETING` —, a duplicate `(sender_id, stream_number)` in `source_streams`, an UNSPECIFIED or unknown `SourceStream` transport or disposition, or — on the transitional reading only — an unspecified egress transport mode). | MC sent bad policy; the remedy is upstream in MC's assignment computation. |
+| `rejected_transport_inconsistent` | Every field parsed, but the registration's egress set contradicts its declared source streams (story 3 R-20): an egress candidate names a stream absent from `source_streams`, or one egress's candidates declare different transport modes (or, on the transitional reading, an egress's superseded transport is not DATAGRAM). Refused whole; **the prior generation stays live.** MC sees the same `invalid_argument` status as `rejected_invalid`. | Declaration drift inside MC's own computation — its declaration and its assignment disagree. Upstream in MC. Consumer: observability's MH transport-inconsistency alert (A8, OBS-B); no threshold here. |
 | `apply_failed` | MH could not install it: config-apply mailbox full, apply timed out, session actor gone, or the aggregate egress-edge bound. **The prior generation stays live.** | MH-side. Read the `reason` field on the accompanying `mh.session.policy` WARN log line to tell the causes apart — it is deliberately not a label. |
 | `rejected_stream_ceiling` | Installing would take this handler's installed egress streams above its derived egress **stream** ceiling (story 2 R-19) — a **capacity** refusal. **The prior generation stays live.** | Capacity, not an MC bug and not an MH fault: see [Egress Admission Metrics](#egress-admission-metrics). The same event is counted on `mh_media_stream_admission_total{outcome="rejected_stream_ceiling"}`. Deliberately NOT folded into `apply_failed`: under a small placeholder budget it is expected, and the deploy bake gate in `docs/runbooks/mh-deployment.md` alerts on `apply_failed`. |
 | `rejected_meeting_cap` | A NEW meeting id would take this handler past `MH_MAX_REGISTERED_MEETINGS` (story 2 R-21) — a **resource-exhaustion** refusal, never capacity. Nothing upserted, promoted or applied; the RPC answers `RESOURCE_EXHAUSTED`. A re-registration of an already-held meeting is never refused. | Which meetings are held and why they were not released: compare `mh_media_registered_meetings` with `mh_media_registered_meetings_limit`, then tell leaked registrations (an `EndMeeting` that never arrived — occupancy rising with uptime) from an empty-meeting flood or genuine load. Not `rejected_stream_ceiling` (capacity) and not `apply_failed` (MH internals). MC sees only a generic push failure, so this outcome is the discriminator. See the meeting-cap arm in `docs/runbooks/mh-incident-response.md`. |
@@ -404,14 +405,14 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 
 ### `mh_media_egress_stream_ceiling`
 - **Type**: Gauge
-- **Description**: The derived egress **stream** ceiling: `budget_bytes / max(cost_audio_bytes, cost_video_bytes)`. The worst-case cost keeps MH type-blind (ADR-0036 §7).
+- **Description**: The derived egress **stream** ceiling: `budget_bytes / max(cost_audio_bytes, cost_video_bytes)`, both costs DERIVED from the shared `media-codec-profile` (story 3 R-24; see `mh_media_stream_cost_*` below). The worst-case cost keeps MH type-blind (ADR-0036 §7).
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: The same field enforced at admission and advertised to GC as `max_streams`, so it explains a GC placement decision directly. MH refuses to start when it is below `MIN_EGRESS_STREAM_CEILING` (`crates/mh-service/src/config.rs`; two participants hearing each other) or above `MH_MAX_TOTAL_EGRESS_EDGES`. `crates/env-tests/tests/01_mh_deployment_config.rs` asserts that the running pods publish the value the deployed ConfigMap derives.
 
 ### `mh_media_egress_stream_ceiling_recommended_min`
 - **Type**: Gauge
-- **Description**: The ADVISORY recommended minimum for the ceiling: one full all-hear-all meeting at the story-2 demo size — `EGRESS_STREAM_CEILING_RECOMMENDED_MIN` = `all_hear_all_streams(RECOMMENDED_MIN_DEMO_PEERS)` in `crates/mh-service/src/config.rs` (the value is published here; this entry does not restate it).
+- **Description**: The ADVISORY recommended minimum for the ceiling: one full see-and-hear meeting at the story-3 demo size, `P x (N + M)` — `EGRESS_STREAM_CEILING_RECOMMENDED_MIN` = `demo_streams(DEMO_PARTICIPANTS, DEMO_AUDIO_SLOTS, DEMO_VIDEO_SLOTS)` in `crates/mh-service/src/config.rs` (the value is published here; this entry does not restate it).
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: The dashboard comparison and the first triage step: is the ceiling below this because the budget is still the unsized placeholder? **Advisory only — never an alert input.** A deployment below it boots, serves, and logs an INFO "configure me" nudge naming `MH_EGRESS_BUDGET_BPS` at startup. It is a code constant that must never merge with the refuse-boot floor `MIN_EGRESS_STREAM_CEILING` (a compile-time assertion in `config.rs` keeps them apart).
@@ -457,7 +458,7 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 
 **Configuration reflections (ADR-0038 step 3).**
 
-The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforced per-stream costs, each `.set()` once at startup from the ONE `PolicyLimits` / `EgressAdmission` field enforcement reads (never a second literal, never a re-conversion). They exist so the value the RUNNING process loaded is observable without its startup log line, which log rotation loses on a long-lived pod: `crates/env-tests/tests/01_mh_deployment_config.rs` compares every one against the deployed ConfigMap. **Config reflections, not signals — no alert selects on them.** Static; published once at startup; `key_custody`: `operator`; cardinality 1 each. The three `_limit`s are PRE-ALLOCATION bounds on one registration (a registration exceeding one is refused whole as `rejected_invalid`). The two costs are the divisors of `mh_media_egress_stream_ceiling`; the heavier one binds. **Why the costs are two names, not one gauge with a `media_kind` label:** MH is type-blind (ADR-0036 §7) and NO `mh_*` series may carry `media_kind` (`docs/observability/label-taxonomy.md`, the `media_kind` row; enforced on the stored series by `crates/env-tests/src/fixtures/metric_hygiene.rs` `Rule::MediaKindOnMh`). These are two config echoes, each named by the cost it bounds; folding them into one kind-labelled gauge is ruled out, not merely deferred.
+The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforced per-stream costs, each `.set()` once at startup from the ONE `PolicyLimits` / `EgressAdmission` field enforcement reads (never a second literal, never a re-conversion). They exist so the value the RUNNING process loaded is observable without its startup log line, which log rotation loses on a long-lived pod: `crates/env-tests/tests/01_mh_deployment_config.rs` compares every one against the deployed ConfigMap (the two costs against an independent derivation from the live `media-codec-profile`). **Config reflections, not signals — no alert selects on them.** Static; published once at startup; `key_custody`: `operator`; cardinality 1 each. The three `_limit`s are PRE-ALLOCATION bounds on one registration (a registration exceeding one is refused whole as `rejected_invalid`). The two costs are the divisors of `mh_media_egress_stream_ceiling`; the heavier one binds. **Why the costs are two names, not one gauge with a `media_kind` label:** MH is type-blind (ADR-0036 §7) and NO `mh_*` series may carry `media_kind` (`docs/observability/label-taxonomy.md`, the `media_kind` row; enforced on the stored series by `crates/env-tests/src/fixtures/metric_hygiene.rs` `Rule::MediaKindOnMh`). These are two config echoes, each named by the cost it bounds; folding them into one kind-labelled gauge is ruled out, not merely deferred.
 
 ### `mh_media_egress_streams_per_meeting_limit`
 - **Type**: Gauge
@@ -473,9 +474,9 @@ The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforc
 - **Cardinality**: 1
 - **Usage**: Configuration reflection (see above). Static; published once at startup.
 
-### `mh_media_muted_sources_per_meeting_limit`
+### `mh_media_source_streams_per_meeting_limit`
 - **Type**: Gauge
-- **Description**: The configured `MH_MAX_MUTED_SOURCES_PER_MEETING`, read from `PolicyLimits::max_muted_sources_per_meeting`. Unit: Sources, identity.
+- **Description**: The configured `MH_MAX_SOURCE_STREAMS_PER_MEETING`, read from `PolicyLimits::max_source_streams_per_meeting` — the pre-allocation bound on `RegisterMeetingRequest.source_streams` (story 3), which also bounds the superseded `server_muted_sources`. Replaces `mh_media_muted_sources_per_meeting_limit`, whose key is no longer read. Unit: Streams, identity.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: Configuration reflection (see above). Static; published once at startup.
@@ -489,14 +490,14 @@ The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforc
 
 ### `mh_media_stream_cost_audio_bytes_per_second`
 - **Type**: Gauge
-- **Description**: The ENFORCED audio stream cost, read from `EgressAdmission::stream_cost_audio_bytes_per_second` (`MH_STREAM_COST_AUDIO_BPS`). Unit: BYTES per second: the key is bits, converted once at load with `div_ceil(8)`.
+- **Description**: The ENFORCED audio stream cost, read from `EgressAdmission::stream_cost_audio_bytes_per_second`. DERIVED at load (story 3 R-24): `MEDIA_AUDIO_MAX_BITRATE_BPS` + per-frame overhead (`AUDIO_FRAME_OVERHEAD_BYTES`, from `media-protocol` sizes, wrapped key included) x 8 x `MEDIA_AUDIO_FRAME_RATE_HZ`; the retired `MH_STREAM_COST_AUDIO_BPS` is no longer read. Unit: BYTES per second: derived in bits, converted once at load with `div_ceil(8)`.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: Configuration reflection (see above). Static; published once at startup.
 
 ### `mh_media_stream_cost_video_bytes_per_second`
 - **Type**: Gauge
-- **Description**: The ENFORCED video stream cost, read from `EgressAdmission::stream_cost_video_bytes_per_second` (`MH_STREAM_COST_VIDEO_BPS`). Unit: BYTES per second: the key is bits, converted once at load with `div_ceil(8)`.
+- **Description**: The ENFORCED video stream cost, read from `EgressAdmission::stream_cost_video_bytes_per_second`. DERIVED at load (story 3 R-24): `MEDIA_VIDEO_MAX_BITRATE_BPS` + per-frame overhead (`VIDEO_FRAME_OVERHEAD_BYTES`; the wrapped key amortises to zero) x 8 x `MEDIA_VIDEO_FRAME_RATE_HZ`; the retired `MH_STREAM_COST_VIDEO_BPS` is no longer read. Interim model: ADR-0036 addendum, "Adaptive capacity". Unit: BYTES per second, `div_ceil(8)` once at load.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: Configuration reflection (see above). Static; published once at startup.
@@ -929,8 +930,10 @@ sender; none is a bug on its own.
 | `oversize_datagram` | ingress | The received datagram's byte length exceeded the wire-format frame maximum, rejected before any parse. | A sender build defect or a hostile peer. **Not** the codec's `payload_length_exceeds_max`, which is the declared *field* exceeding the max during header validation — same constant, two checks, two tokens, and the distinction tells you whether anything was parsed at all. |
 | `stream_rate_limited` | ingress | A connection exceeded its per-connection stream creation-rate cap. | **UNREACHABLE UNTIL UNI-STREAM/VIDEO — this token cannot fire today and is not a live detector.** MH opens no unidirectional-stream accept loop and audio is one frame per datagram, so there is no stream-creation event to limit. The token is defined now so the author of the accept path inherits the spelling rather than inventing a second one; a fixed-window limiter was built for it at task 16 and **removed at review** as unreachable enforcement machinery. Same posture as `partial_frame_discard`. |
 | `no_policy` | ingress | No forwarding policy is installed for this meeting. | **The remedy is the control plane, not this handler.** Read `mh_media_policy_applies_total` and MC's `mc_media_policy_pushes_total`. |
-| `no_subscriber` | egress | A policy is installed but no egress edge names this sender. | A short in-flight tail after a sender's last subscriber leaves is healthy. **Sustained** means the client is sending against an empty edge set: MC's directive and MH's policy disagree (MC's assignment and push path), or they agree and the client is ignoring its directive (stale bundle or hostile participant). A solo participant produces NONE: MC directs it to send nothing (see above). |
+| `no_subscriber` | egress | A policy is installed and the frame was attributed to a declared source stream, but no egress edge names THAT source stream (story 3: the index is per (sender, stream), so a watched sender's unwatched other stream lands here). | A short in-flight tail after a sender's last subscriber leaves is healthy. **Sustained** means the client is sending against an empty edge set: MC's directive and MH's policy disagree (MC's assignment and push path), or they agree and the client is ignoring its directive (stale bundle or hostile participant). A solo participant produces NONE: MC directs it to send nothing (see above). |
 | `no_local_subscriber` | egress | An edge names a subscriber with no connection on this handler. | Ordinary under multi-handler assignment (§9), where a meeting's participants are spread across handlers. Sustained and unexpected means a stale assignment. |
+| `unmatched_stream` | ingress | The frame's uplink relay `stream_id` names no stream MC declared for its connection-bound sender (story 3 R-20; `internal.proto` `SourceStream`). Dropped after decode, before routing, consuming no hop number. A label above 255 lands here (never truncated). On the TRANSITIONAL reading (no `source_streams`; until MC-B), every label other than 0 lands here. | Declaration drift (MC's `source_streams` lacks a stream the client was directed to send) or a sender labelling outside its declaration — during the MC-A gap, first check that clients stamp the send id (audio 0). The label is publisher-set and unauthenticated: this counts a mismatch, it identifies no stream. Its remedy differs from `transport_mismatch`'s, which is why the two are separate. |
+| `transport_mismatch` | ingress | The uplink id names a declared stream, but the frame arrived on a transport other than that stream's declared `transport_mode` (story 3 R-20). Checked before the disposition, so a server-muted stream's wrong-transport frame counts here. | A sender fault (a client sending a stream on the wrong transport) or a client/MC transport-contract fault — not declaration drift. Zero on a healthy fleet; a patched client relabelling video onto datagrams shows here. |
 | `transport_receive_dropped` | ingress | Datagrams the QUIC connection received that **no MH reader ever saw**. Computed exactly at connection teardown as quinn's `frame_rx.datagram` minus the count the ingress loop actually read. | **The client fleet or MH session-start latency — not MH's forward path.** Read the three limitations in the blockquote below this table BEFORE acting on it: it is forensic rather than live, it is an upper bound, and it is client-influenceable. Its ordinary contributor is a client publishing before its `SendDirective` arrives, or reconnecting into a handler it already holds a directive for and racing the new connection's setup. |
 | `no_media_session` | ingress | **Not redundant with the row above — see the note beneath this table.** Datagrams received on a connection whose media session MH **declined**, so no ingress loop was ever spawned and every one was discarded. Exact in the sense that matters — there is no reader to overlap with, so the whole received count IS the loss and no differencing is needed. **"Exact" qualifies the no-reader property, not a race with the wire**: the sample is taken *after* the connection closes (deliberately — the MC-unavailable arm sleeps a jittered interval before closing, and a publishing client sends throughout, so sampling earlier would under-count by exactly the window the slowest decline arm holds open), which leaves one residue — a datagram already in flight when the close frame goes out is discarded uncounted. Bounded by one RTT, per connection, once. | **Diagnostic only; do not alert on it.** It is fully explained one entry up by `mh_media_session_starts_total{outcome="declined_*"}`, which names the cause; this token only says how much media the declined connections were carrying. A large value during an MC outage is expected, not additional signal: MH's MC-client retry budget keeps each declined publisher transmitting for tens of seconds before its close lands. |
 
@@ -1094,7 +1097,7 @@ read the drop against whether it was INTENDED.
 
 | `reason` | `direction` | Condition | What a responder does |
 |---|---|---|---|
-| `server_muted` | ingress | The frame's spawn-bound sender is in this meeting's server-muted set from the current registration snapshot (`RegisterMeetingRequest.server_muted_sources`, ADR-0036 §7). Dropped at the top of `forward_one`, before decode and before fan-out, so it consumes no hop number. | **Not a fault in either direction.** Zero while no mute is active; while a mute IS active it tracks the muted sender's full frame rate, so non-zero is healthy moderation. The diagnostic value is reading it — zero or not — against whether a mute was intended. The remedy for an unwanted mute is the control plane: read the meeting's registration snapshot (MC). |
+| `server_muted` | ingress | Server mute at ingress (ADR-0036 §7; story 3 R-16), on either path: the SENDER-LEVEL shortcut — every declared stream of the spawn-bound sender is DROP_AT_INGRESS (at least one declared), or the sender is in the superseded `server_muted_sources` (transitional / union reading) — checked at the top of `forward_one` before decode, so even an unattributable frame counts here; or, after attribution, the frame's declared stream is DROP_AT_INGRESS (per-kind mute while the other kind flows). Before fan-out either way, so it consumes no hop number. | **Not a fault in either direction.** Zero while no mute is active; while a mute IS active it tracks the muted sender's full frame rate, so non-zero is healthy moderation. The diagnostic value is reading it — zero or not — against whether a mute was intended. The remedy for an unwanted mute is the control plane: read the meeting's registration snapshot (MC). |
 
 The series is **present at zero from process start** (pre-registered by
 `resolve_media_handles`, which walks `MediaDropReason::ALL`), so **absent is
@@ -1135,10 +1138,14 @@ never "nobody is muted".
    that dimension); the meeting-scoped question is answered by MC's decision
    log (target `mc.webtransport.connection`, one INFO line per decided server-mute request, naming requester, target, action and outcome).
 
-**Sender-scoped today; per-kind from MH-A1.** MH binds the sender per
-connection and drops every stream of a muted sender (the transitional reading
-at `internal.proto` `server_muted_sources`). Per-kind mute arrives with MH-A1
-as `SourceStream` DROP_AT_INGRESS dispositions and holds in slot terms.
+**Per-kind, in slot terms (story 3).** MH binds the sender per connection and
+attributes each frame by (that sender, the uplink relay id) against MC's
+`source_streams`; a DROP_AT_INGRESS stream drops here while the sender's other
+streams flow. The relay label is publisher-set and unauthenticated at MH: a
+relabelled frame must still match a declared stream and transport, and reaches
+only that stream's slots, where receivers decode by slot kind. On the
+transitional reading (no `source_streams`) a muted sender drops on every
+stream, as in story 2.
 > **Corrected 2026-10-13.** This paragraph said per-stream ingress mute was
 > foreclosed and per-kind mute would move to MC's egress edge set; that
 > conclusion is superseded. Single home of the reasoning: `internal.proto`
@@ -1171,6 +1178,16 @@ ingress attempt, so `server_muted` enters that rule's ingress denominator
 (`forwarded{ingress} + dropped{ingress}`). A sustained mute therefore dilutes
 its `transport_receive_dropped` ratio — the fail-quiet direction; the rule's
 description says so.
+
+### `mh_media_paused_source_frames_total`
+- **Type**: Counter
+- **Description**: Frames attributed to a PAUSED (client-muted) source stream (story 3 R-17; `internal.proto` `SourceDisposition.PAUSED`). An ARRIVAL OVERLAY, not a drop: PAUSED is never dropped at ingress — a resume frame that beats MC's policy update must still reach subscribers — so these frames forward normally.
+- **Labels**: `key_custody`: `operator` (single value). No reason, no kind, no identity.
+- **Cardinality**: 1
+- **Accounting**: incremented at exactly the point `forwarded{direction="ingress"}` is, once per frame, so `paused ⊆ forwarded{ingress}` (a paused frame whose stream feeds no edge counts `forwarded{ingress}`, `no_subscriber` and this). **NOT part of the ingress accounting identity**: never add it to the received total — it would double-count.
+- **Usage**: A client sending on a stream MC believes is client-muted. Expected briefly around a mute toggle (in-flight frames, a resume that beats MC's update); SUSTAINED is a client privacy defect (sending while muted) — runbook and alert owned by OPS-B / OBS-B.
+- **Recorded in**: `observability/metrics.rs::MediaMetricHandles::paused_source_frames` (resolved once at setup; incremented in `media/forward.rs`)
+- **Dashboard**: MH Media - Paused-Source Arrivals
 
 ### `mh_media_forward_latency_seconds`
 - **Type**: Histogram

@@ -27,7 +27,8 @@
 //! describes this crate as providing.
 
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, MutedSource, RegisterMeetingRequest, SubscriberSlot,
+    CandidateSource, EgressStream, MutedSource, RegisterMeetingRequest, SourceDisposition,
+    SourceStream, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 
@@ -123,5 +124,53 @@ pub fn register_request_muted(
             sender_id: *sender_id,
         })
         .collect();
+    request
+}
+
+/// One egress stream: `subscriber`'s `slot` receives `candidate`'s stream
+/// `stream` (story 3). Its superseded `transport_mode` (field 6) is left
+/// UNSPECIFIED, exactly as an MC that declares `source_streams` writes it: the
+/// edge's transport derives from the candidate's declared `SourceStream`.
+#[must_use]
+pub fn egress_from(
+    egress_stream_id: u32,
+    subscriber_sender: u32,
+    slot: u32,
+    candidate_sender: u32,
+    stream: u32,
+) -> EgressStream {
+    let mut e = egress(egress_stream_id, subscriber_sender, slot, candidate_sender);
+    e.candidate_sources[0].stream_number = stream;
+    e.transport_mode = TransportMode::Unspecified as i32;
+    e
+}
+
+/// One declared source stream (story 3; `internal.proto` `SourceStream`).
+#[must_use]
+pub fn source_stream(
+    sender_id: u32,
+    stream_number: u32,
+    transport: TransportMode,
+    disposition: SourceDisposition,
+) -> SourceStream {
+    SourceStream {
+        sender_id,
+        stream_number,
+        transport_mode: transport as i32,
+        disposition: disposition as i32,
+    }
+}
+
+/// `register_request` with `source_streams` set to `sources` — the declared
+/// (non-transitional) reading.
+#[must_use]
+pub fn register_request_declared(
+    meeting_id: &str,
+    policy_generation: u64,
+    streams: Vec<EgressStream>,
+    sources: Vec<SourceStream>,
+) -> RegisterMeetingRequest {
+    let mut request = register_request(meeting_id, policy_generation, streams);
+    request.source_streams = sources;
     request
 }

@@ -332,6 +332,19 @@ pub enum PolicyApplyOutcome {
     /// path and fires before config-apply admission ever runs — so it has no
     /// `mh_media_stream_admission_total` counterpart.
     RejectedMeetingCap,
+    /// The registration's egress set and its declared source streams disagree
+    /// (story 3 R-20; `internal.proto` `SourceStream`): a candidate names a
+    /// stream absent from `source_streams`, or one egress's candidates declare
+    /// different transport modes (or, on the transitional reading, an egress's
+    /// superseded transport is not DATAGRAM). Refused whole; the prior
+    /// generation stays live.
+    ///
+    /// Its own value, not folded into `RejectedInvalid`, because the remedy
+    /// differs: every field parsed, but MC's declaration and MC's assignment
+    /// contradict each other — declaration drift inside one MC computation.
+    /// MC sees the same `invalid_argument` status as `rejected_invalid`.
+    /// Consumer: observability's MH transport-inconsistency alert (A8).
+    RejectedTransportInconsistent,
 }
 
 impl PolicyApplyOutcome {
@@ -351,7 +364,7 @@ impl PolicyApplyOutcome {
     /// cardinality of the `outcome` label, so a variant added to this array
     /// without the catalog and the dashboard being revisited fails to compile
     /// here first.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Applied,
         Self::RejectedStale,
         Self::NoGeneration,
@@ -359,6 +372,7 @@ impl PolicyApplyOutcome {
         Self::ApplyFailed,
         Self::RejectedStreamCeiling,
         Self::RejectedMeetingCap,
+        Self::RejectedTransportInconsistent,
     ];
 
     /// The wire label value.
@@ -372,6 +386,7 @@ impl PolicyApplyOutcome {
             Self::ApplyFailed => "apply_failed",
             Self::RejectedStreamCeiling => "rejected_stream_ceiling",
             Self::RejectedMeetingCap => "rejected_meeting_cap",
+            Self::RejectedTransportInconsistent => "rejected_transport_inconsistent",
         }
     }
 }
@@ -498,13 +513,14 @@ pub const EGRESS_BUDGET_BASIS_UNMEASURED: &str = "unmeasured";
 ///   registration cap reads, so a registered-meetings alert needs no literal.
 /// - `mh_media_egress_streams_per_meeting_limit`,
 ///   `mh_media_candidate_sources_per_egress_limit`,
-///   `mh_media_muted_sources_per_meeting_limit` — the three `PolicyLimits`
+///   `mh_media_source_streams_per_meeting_limit` — the three `PolicyLimits`
 ///   PRE-ALLOCATION bounds registration validation reads;
 /// - `mh_media_policy_apply_timeout_seconds` —
 ///   `PolicyLimits::policy_apply_timeout_ms`, in SECONDS (ms / 1000);
 /// - `mh_media_stream_cost_{audio,video}_bytes_per_second` — the ENFORCED
-///   per-stream costs (bits on the key, bytes on the gauge, `div_ceil(8)` at
-///   load), the divisors of the stream ceiling.
+///   per-stream costs, DERIVED at load from the shared `media-codec-profile`
+///   (bits derived, bytes on the gauge, `div_ceil(8)`), the divisors of the
+///   stream ceiling.
 ///
 /// These are CONFIG REFLECTIONS, not signals: no alert selects on them. They
 /// are also how env-tests read the configuration the RUNNING process loaded
@@ -562,10 +578,10 @@ pub fn publish_egress_admission(
     )
     .set(policy_limits.max_candidate_sources_per_egress as f64);
     gauge!(
-        "mh_media_muted_sources_per_meeting_limit",
+        "mh_media_source_streams_per_meeting_limit",
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
-    .set(policy_limits.max_muted_sources_per_meeting as f64);
+    .set(policy_limits.max_source_streams_per_meeting as f64);
     gauge!(
         "mh_media_policy_apply_timeout_seconds",
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
@@ -1240,7 +1256,7 @@ impl MediaLatencyPhase {
 /// **MH must also never emit the assignment-layer token `sender_not_assigned`
 /// — for a different reason.** Keylessness does not reach it: MH already
 /// observes and emits the same condition as `no_subscriber`
-/// ([`MediaDropReason::NoSubscriber`], "no egress edge names this sender").
+/// ([`MediaDropReason::NoSubscriber`], "no egress edge names this source stream").
 /// `sender_not_assigned` is the CLIENT's assignment-layer spelling of that
 /// condition, so MH re-spelling it would conflate two drops from different
 /// layers under `sum by(reason)` — the sharpest instance of the
@@ -1313,7 +1329,9 @@ pub enum MediaDropReason {
     /// No forwarding policy is installed for this meeting. The remedy is the
     /// control plane (ADR-0036 §8), not this handler.
     NoPolicy,
-    /// A policy is installed but no egress edge names this sender. The remedy
+    /// A policy is installed and the frame was attributed to a declared source
+    /// stream, but no egress edge names THAT source stream (an unwatched
+    /// stream — e.g. a watched sender's unwatched other stream). The remedy
     /// is MC's assignment.
     NoSubscriber,
     /// An edge names a subscriber with no connection on this handler.
@@ -1416,10 +1434,14 @@ pub enum MediaDropReason {
     /// Diagnostic only: no alert. It is fully explained one row up by
     /// `mh_media_session_starts_total{outcome=declined_*}`.
     NoMediaSession,
-    /// The frame's spawn-bound sender is in this meeting's server-muted set
-    /// (ADR-0036 §7 "Server mute is enforced at MH ingress"; story 2 R-9).
-    /// Dropped at the top of `forward_one`, before decode and fan-out, so it
-    /// consumes no hop number.
+    /// Server mute at MH ingress (ADR-0036 §7; story 2 R-9, story 3 R-16), on
+    /// either of two paths: the SENDER-LEVEL shortcut — every declared stream
+    /// of the spawn-bound sender is `DROP_AT_INGRESS` (or it is union-muted via
+    /// the superseded `server_muted_sources`) — checked at the top of
+    /// `forward_one`, before decode, so even an unattributable frame counts
+    /// here; or, after attribution, the frame's declared stream is
+    /// `DROP_AT_INGRESS` (per-kind mute while the other kind flows). Either way
+    /// before fan-out, so it consumes no hop number.
     ///
     /// A POLICY token, neither an MH fault nor a sender fault: a non-zero rate
     /// is healthy moderation. Its whole diagnostic value is reading it — zero
@@ -1435,6 +1457,29 @@ pub enum MediaDropReason {
     /// muted sender is deliberately given no signal and no receiver ever sees
     /// the frame).
     ServerMuted,
+    /// The frame's uplink relay `stream_id` names no stream MC declared for
+    /// its connection-bound sender (story 3 R-20; `internal.proto`
+    /// `SourceStream`). Dropped after decode, before any routing work, so it
+    /// consumes no hop number. An id above 255 lands here (send ids are 8 bits,
+    /// the relay field 16, and the id is never truncated).
+    ///
+    /// SATURATION-OR-INPUT group, not an invariant violation. Remedy:
+    /// declaration drift (MC's `source_streams` is missing a stream the client
+    /// was directed to send), or a sender labelling outside its declaration.
+    /// Under the transitional reading (no `source_streams`; deleted by MC-B)
+    /// every label other than 0 lands here — the first thing to check if a
+    /// client stamps the wrong send id. The label is publisher-set and
+    /// unauthenticated: this counts a mismatch, it does not identify a stream.
+    UnmatchedStream,
+    /// The frame's uplink id names a declared stream, but it arrived on a
+    /// transport other than that stream's declared `transport_mode` (story 3
+    /// R-20). Dropped before the disposition is read, so a server-muted
+    /// stream's wrong-transport frame counts here, not `server_muted`.
+    ///
+    /// SATURATION-OR-INPUT group. Kept separate from [`Self::UnmatchedStream`]
+    /// because the remedy differs: a sender fault or a client/MC transport
+    /// contract fault, not declaration drift.
+    TransportMismatch,
 }
 
 impl MediaDropReason {
@@ -1450,7 +1495,7 @@ impl MediaDropReason {
     /// integer was DELETED rather than updated in that same change. The written
     /// out length below is compile-checked and is the guard; prose restating it
     /// is an unchecked copy.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::IngressQueueOverflow,
         Self::EgressQueueOverflow,
         Self::TransportSendRefused,
@@ -1465,6 +1510,8 @@ impl MediaDropReason {
         Self::TransportReceiveDropped,
         Self::NoMediaSession,
         Self::ServerMuted,
+        Self::UnmatchedStream,
+        Self::TransportMismatch,
     ];
 
     /// The wire label value.
@@ -1485,6 +1532,8 @@ impl MediaDropReason {
             Self::TransportReceiveDropped => "transport_receive_dropped",
             Self::NoMediaSession => "no_media_session",
             Self::ServerMuted => "server_muted",
+            Self::UnmatchedStream => "unmatched_stream",
+            Self::TransportMismatch => "transport_mismatch",
         }
     }
 
@@ -1504,7 +1553,9 @@ impl MediaDropReason {
             | Self::NoPolicy
             | Self::TransportReceiveDropped
             | Self::NoMediaSession
-            | Self::ServerMuted => MediaDirection::Ingress,
+            | Self::ServerMuted
+            | Self::UnmatchedStream
+            | Self::TransportMismatch => MediaDirection::Ingress,
             Self::EgressQueueOverflow
             | Self::TransportSendRefused
             | Self::ConnectionClosed
@@ -1572,7 +1623,10 @@ pub struct MediaMetricHandles {
     /// Indexed by [`MediaDirection::ALL`] order.
     forwarded: [Counter; 2],
     /// Indexed by [`MediaDropReason::ALL`] order.
-    dropped: [Counter; 14],
+    dropped: [Counter; 16],
+    /// `mh_media_paused_source_frames_total`: arrivals on a PAUSED source
+    /// stream (story 3 R-17). An OVERLAY on `forwarded{ingress}`, never a drop.
+    paused_source_frames: Counter,
     /// `(reason, handle)` pairs for the codec family, built by iterating
     /// `ALL_REJECT_REASONS` rather than a hand-written token list — that const
     /// is generated by the same macro as the enum, so a ninth codec token added
@@ -1608,7 +1662,7 @@ impl MediaMetricHandles {
     /// The drop counter for one MH-local reason.
     #[must_use]
     pub fn dropped(&self, reason: MediaDropReason) -> &Counter {
-        let [ingress_overflow, egress_overflow, send_refused, closed, oversize, rate_limited, no_policy, no_subscriber, no_local, rewrite_failed, partial, receive_dropped, no_session, server_muted] =
+        let [ingress_overflow, egress_overflow, send_refused, closed, oversize, rate_limited, no_policy, no_subscriber, no_local, rewrite_failed, partial, receive_dropped, no_session, server_muted, unmatched, transport_mismatch] =
             &self.dropped;
         match reason {
             MediaDropReason::IngressQueueOverflow => ingress_overflow,
@@ -1625,6 +1679,8 @@ impl MediaMetricHandles {
             MediaDropReason::TransportReceiveDropped => receive_dropped,
             MediaDropReason::NoMediaSession => no_session,
             MediaDropReason::ServerMuted => server_muted,
+            MediaDropReason::UnmatchedStream => unmatched,
+            MediaDropReason::TransportMismatch => transport_mismatch,
         }
     }
 
@@ -1655,6 +1711,17 @@ impl MediaMetricHandles {
             MediaLatencyPhase::TransmitBuffer => transmit_buffer,
             MediaLatencyPhase::Total => total,
         }
+    }
+
+    /// The paused-source arrivals counter (`mh_media_paused_source_frames_total`).
+    ///
+    /// Incremented exactly where `forwarded{direction="ingress"}` is, for a
+    /// frame attributed to a PAUSED stream, so paused ⊆ `forwarded{ingress}`.
+    /// NOT part of the ingress accounting identity: do not add it to the
+    /// received total.
+    #[must_use]
+    pub const fn paused_source_frames(&self) -> &Counter {
+        &self.paused_source_frames
     }
 
     /// The egress-queue-depth gauge.
@@ -1746,9 +1813,17 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     );
 
+    // Unlabelled beyond `key_custody`: no reason, no kind, no identity. An
+    // arrival overlay, not a drop (story 3 R-17).
+    let paused_source_frames = counter!(
+        "mh_media_paused_source_frames_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+
     MediaMetricHandles {
         forwarded,
         dropped,
+        paused_source_frames,
         codec_dropped,
         latency,
         sample_ratio,
@@ -2225,7 +2300,8 @@ mod tests {
                 "rejected_invalid",
                 "apply_failed",
                 "rejected_stream_ceiling",
-                "rejected_meeting_cap"
+                "rejected_meeting_cap",
+                "rejected_transport_inconsistent"
             ],
             "outcome label values are wire-visible; a rename silently breaks every dashboard and alert selecting on them"
         );

@@ -33,10 +33,13 @@
 //! one threat class a keyless relay does not otherwise expose.
 //!
 //! So the snapshot is a nest of maps, every field is private, and
-//! [`RoutingSnapshot::for_each_source`] is the only lookup. It takes a
-//! [`MeetingKey`] and a [`SenderId`] together; there is no function that
-//! accepts a `SenderId` alone. **The wrong index is a missing function, not a
-//! remembered rule.**
+//! [`RoutingSnapshot::attribute`] is the only source lookup (with
+//! [`RoutingSnapshot::is_server_muted`], its first step, exposed so the
+//! datagram path can run it before decode). Both take a [`MeetingKey`] and a
+//! [`SenderId`] together; there is no function that accepts a `SenderId`
+//! alone. **The wrong index is a missing function, not a remembered rule.**
+//! The edge index is keyed by the declared SOURCE STREAM (sender, uplink id),
+//! never by the sender alone, so a frame reaches only its own stream's edges.
 //!
 //! The same discipline removed the traversal's earlier `Vec`-returning form at
 //! story task 16: an allocating traversal sitting beside a per-frame path that
@@ -74,10 +77,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use media_protocol::frame::{KEY_ID_SENDER_ID_BITS, KEY_ID_STREAM_BITS, STREAM_ID_FIELD_BYTES};
-use proto_gen::dark_tower::internal::v1::RegisterMeetingRequest;
+use proto_gen::dark_tower::internal::v1::{RegisterMeetingRequest, SourceStreamEcho};
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 
 use crate::config::PolicyLimits;
+use crate::observability::metrics::PolicyApplyOutcome;
+
+mod sources;
+pub use sources::{Declarations, Disposition, SourceDecl};
 
 // ---------------------------------------------------------------------------
 // Width derivation
@@ -233,6 +240,21 @@ impl StreamNumber {
     }
 }
 
+/// Narrow a 16-bit uplink relay `stream_id` to the 8-bit send id it carries.
+///
+/// **Rejects, never truncates.** The relay field is 16 bits and send ids are
+/// 8, so a label above 255 can never name a declared stream; an `as u8` here
+/// would alias `256` onto stream 0 and silently re-attribute the frame.
+impl TryFrom<u16> for StreamNumber {
+    type Error = IdError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        u8::try_from(value)
+            .map(Self)
+            .map_err(|_| IdError::StreamNumberOutOfRange)
+    }
+}
+
 /// The meeting a policy, a route or a lookup belongs to.
 ///
 /// `Arc<str>` rather than `String` because the key is cloned into the snapshot
@@ -329,11 +351,22 @@ pub struct EgressEdge {
     /// and that is a security property: priority groups bound how far a
     /// publisher's self-declared salience signal can promote it, so a client
     /// able to name its own group could promote itself past that bound.
+    ///
+    /// **A lower number is a higher priority** (`internal.proto`
+    /// `EgressStream.priority_group`): MC assigns audio edges 1 and video edges
+    /// 2, which keeps MH type-blind. Recorded here; the stream path (MH-A2)
+    /// maps it onto QUIC stream priority.
     pub priority_group: u32,
     /// Whether a superseding frame permits discarding queued frames for this
     /// egress. A **behaviour**, not a media type: MH is told what a stream
     /// does, never what it is (ADR-0036 §7 type-blindness).
     pub supersede_on_independent_frame: bool,
+    /// How this edge reaches its subscriber, DERIVED from its candidates'
+    /// declared `SourceStream` transport (`internal.proto`
+    /// `EgressStream.transport_mode` is superseded). `None` exactly when the
+    /// edge has no candidate — a legal edge that forwards nothing, which names
+    /// no transport rather than fabricating one.
+    pub transport: Option<TransportMode>,
 }
 
 /// A validated, ready-to-install policy for one meeting.
@@ -346,20 +379,12 @@ pub struct MeetingPolicy {
     pub meeting: MeetingKey,
     /// The generation MC asserts. `0` means "MC named no generation".
     pub generation: u64,
-    /// The single transport mode all egress streams share. `None` exactly when
-    /// there are no egress streams — an empty policy names no mode, and
-    /// fabricating one would put a mode on the §8 echo that MH never applied.
-    pub transport_mode: Option<TransportMode>,
     /// The complete egress set. Empty is legal and meaningful: "this handler
     /// forwards nothing for this meeting".
     pub edges: Vec<EgressEdge>,
-    /// The publishers THIS HANDLER must drop at ingress (ADR-0036 §7 server
-    /// mute; `internal.proto` `RegisterMeetingRequest.server_muted_sources`),
-    /// in request order, duplicate-free. Meeting-scoped like every `SenderId`.
-    /// Empty means "nobody is server-muted on this handler". A muted sender
-    /// that is not a candidate here, or not yet connected, is HELD — it is
-    /// never cross-checked against `edges`.
-    pub server_muted: Vec<SenderId>,
+    /// Every source stream MH may receive for this meeting on this handler,
+    /// with what to do with it (story 3 R-16, R-17, R-20).
+    pub declarations: Declarations,
 }
 
 /// Why a registration was refused outright.
@@ -382,22 +407,36 @@ pub enum PolicyRejection {
     /// Two egress streams targeted one `(sender, slot)` — "two sources into
     /// one slot".
     DuplicateSubscriberSlot,
-    /// An egress stream named no transport mode. `TRANSPORT_MODE_UNSPECIFIED`
-    /// is a rejection, never a datagram default.
+    /// TRANSITIONAL READING ONLY (deleted by MC-B): an egress stream named no
+    /// (or an unknown) transport mode. `TRANSPORT_MODE_UNSPECIFIED` is a
+    /// rejection, never a datagram default.
     UnspecifiedTransportMode,
-    /// `server_muted_sources` exceeded the configured per-meeting bound.
+    /// TRANSITIONAL READING ONLY (deleted by MC-B): an egress stream's
+    /// superseded `transport_mode` is not DATAGRAM, contradicting the
+    /// synthesized stream-0 DATAGRAM declaration.
+    TransitionalNonDatagramEgress,
+    /// `server_muted_sources` exceeded the configured per-meeting bound
+    /// (`MH_MAX_SOURCE_STREAMS_PER_MEETING`, since its own key's read was
+    /// removed). Superseded with the field (MC-B).
     TooManyMutedSources,
     /// A `sender_id` appeared twice in `server_muted_sources`. Rejected, not
     /// deduplicated: a duplicate means MC's set construction is broken.
     DuplicateMutedSource,
-    /// Egress streams disagreed on transport mode. The §8 echo is one field
-    /// for a per-egress property, so it is unambiguous only while a meeting's
-    /// streams are homogeneous. Echoing one of N would make the two-ends-agree
-    /// check silently meaningless, so MH rejects instead. **This scope limit
-    /// expires when video lands** (§1: audio on datagrams, video on
-    /// stream-per-group), at which point the field moves per-egress — which
-    /// this reject forces to happen loudly.
-    HeterogeneousTransportModes,
+    /// `source_streams` exceeded `MH_MAX_SOURCE_STREAMS_PER_MEETING`.
+    TooManySourceStreams,
+    /// A `(sender_id, stream_number)` appeared twice in `source_streams`.
+    DuplicateSourceStream,
+    /// A `SourceStream` named no (or an unknown) transport mode.
+    UnspecifiedSourceTransport,
+    /// A `SourceStream` named no (or an unknown) disposition.
+    UnspecifiedDisposition,
+    /// An egress candidate names a stream absent from the declarations —
+    /// `rejected_transport_inconsistent`.
+    UndeclaredCandidate,
+    /// One egress stream's candidates declare different transports —
+    /// `rejected_transport_inconsistent`. (Different EGRESSES may differ: one
+    /// meeting legally mixes DATAGRAM audio and `STREAM_PER_GROUP` video.)
+    InconsistentCandidateTransports,
 }
 
 impl From<IdError> for PolicyRejection {
@@ -420,9 +459,10 @@ impl PolicyRejection {
     /// attacker-chosen `sender_id`, `slot_id` and `stream_number` values —
     /// were unpinned in a test asserting they were pinned. Building the list
     /// from `IdError::ALL` makes that class of gap unrepresentable.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 19] = [
         Self::TooManyEgressStreams,
         Self::TooManyCandidateSources,
+        Self::TooManySourceStreams,
         Self::TooManyMutedSources,
         Self::DuplicateMutedSource,
         Self::MissingSubscriber,
@@ -433,7 +473,12 @@ impl PolicyRejection {
         Self::DuplicateEgressStreamId,
         Self::DuplicateSubscriberSlot,
         Self::UnspecifiedTransportMode,
-        Self::HeterogeneousTransportModes,
+        Self::TransitionalNonDatagramEgress,
+        Self::DuplicateSourceStream,
+        Self::UnspecifiedSourceTransport,
+        Self::UnspecifiedDisposition,
+        Self::UndeclaredCandidate,
+        Self::InconsistentCandidateTransports,
     ];
 
     /// A bounded, generic operator-facing reason.
@@ -451,6 +496,7 @@ impl PolicyRejection {
                 "server_muted_sources exceeds the configured per-meeting bound"
             }
             Self::DuplicateMutedSource => "duplicate server_muted_sources sender_id",
+            Self::TooManySourceStreams => "source_streams exceeds the configured per-meeting bound",
             Self::MissingSubscriber => "egress stream is missing its subscriber",
             Self::Id(IdError::SenderIdZero) => "sender_id 0 is reserved and never valid",
             Self::Id(IdError::SenderIdOutOfRange) => "sender_id is out of range",
@@ -462,7 +508,50 @@ impl PolicyRejection {
                 "transport_mode is required and must not be \
                  TRANSPORT_MODE_UNSPECIFIED"
             }
-            Self::HeterogeneousTransportModes => "all egress streams must share one transport_mode",
+            Self::TransitionalNonDatagramEgress => {
+                "with no source_streams, every egress stream must be DATAGRAM"
+            }
+            Self::DuplicateSourceStream => "duplicate source_streams (sender_id, stream_number)",
+            Self::UnspecifiedSourceTransport => {
+                "source_streams transport_mode is required and must be a known mode"
+            }
+            Self::UnspecifiedDisposition => {
+                "source_streams disposition is required and must be a known value"
+            }
+            Self::UndeclaredCandidate => "an egress candidate is not declared in source_streams",
+            Self::InconsistentCandidateTransports => {
+                "an egress stream's candidates declare different transport modes"
+            }
+        }
+    }
+
+    /// The `mh_media_policy_applies_total` outcome this rejection records.
+    ///
+    /// Exhaustive with no wildcard arm, so a new rejection must choose. The
+    /// two transport-consistency rejections have their own value because their
+    /// remedy differs (MC's declaration vs its egress set disagree; alert A8);
+    /// everything else is a malformed registration.
+    #[must_use]
+    pub const fn outcome(self) -> PolicyApplyOutcome {
+        match self {
+            Self::UndeclaredCandidate
+            | Self::InconsistentCandidateTransports
+            | Self::TransitionalNonDatagramEgress => {
+                PolicyApplyOutcome::RejectedTransportInconsistent
+            }
+            Self::TooManyEgressStreams
+            | Self::TooManyCandidateSources
+            | Self::MissingSubscriber
+            | Self::Id(_)
+            | Self::DuplicateEgressStreamId
+            | Self::DuplicateSubscriberSlot
+            | Self::UnspecifiedTransportMode
+            | Self::TooManyMutedSources
+            | Self::DuplicateMutedSource
+            | Self::TooManySourceStreams
+            | Self::DuplicateSourceStream
+            | Self::UnspecifiedSourceTransport
+            | Self::UnspecifiedDisposition => PolicyApplyOutcome::RejectedInvalid,
         }
     }
 }
@@ -472,17 +561,18 @@ impl MeetingPolicy {
     ///
     /// # Check order is load-bearing
     ///
-    /// The three **count bounds run first**, before anything that iterates or
+    /// The four **count bounds run first**, before anything that iterates or
     /// allocates per element. `internal.proto` requires them "before building
     /// any routing table"; that is the floor rather than the ceiling, because
     /// duplicate detection builds `HashSet`s sized by the attacker-controlled
     /// repeated field — the same allocation the bound exists to prevent, merely
     /// moved earlier than the routing table.
     ///
-    /// Order: counts -> shape -> identifier widths -> duplicates -> transport
-    /// mode, for the egress set; then the server-muted set, whose count was
-    /// already checked with the others (its dedup `HashSet` is exactly the
-    /// attacker-sized allocation the bound exists to precede).
+    /// Order: counts -> egress shape / identifier widths / duplicates -> the
+    /// muted set -> the declarations (`source_streams`, or the transitional
+    /// reading when it is empty) -> every candidate against the declarations.
+    /// Width checks (a candidate `stream_number` above 255 is
+    /// `rejected_invalid`) therefore precede the undeclared-candidate check.
     ///
     /// # Errors
     ///
@@ -501,14 +591,16 @@ impl MeetingPolicy {
                 return Err(PolicyRejection::TooManyCandidateSources);
             }
         }
-        if request.server_muted_sources.len() > limits.max_muted_sources_per_meeting {
+        if request.source_streams.len() > limits.max_source_streams_per_meeting {
+            return Err(PolicyRejection::TooManySourceStreams);
+        }
+        if request.server_muted_sources.len() > limits.max_source_streams_per_meeting {
             return Err(PolicyRejection::TooManyMutedSources);
         }
 
         let mut edges = Vec::with_capacity(request.egress_streams.len());
         let mut seen_ids = HashSet::with_capacity(request.egress_streams.len());
         let mut seen_slots = HashSet::with_capacity(request.egress_streams.len());
-        let mut transport_mode: Option<TransportMode> = None;
 
         for stream in &request.egress_streams {
             // ---- shape ---------------------------------------------------
@@ -539,33 +631,21 @@ impl MeetingPolicy {
                 return Err(PolicyRejection::DuplicateSubscriberSlot);
             }
 
-            // ---- transport mode -----------------------------------------
-            let mode = TransportMode::try_from(stream.transport_mode)
-                .unwrap_or(TransportMode::Unspecified);
-            if mode == TransportMode::Unspecified {
-                return Err(PolicyRejection::UnspecifiedTransportMode);
-            }
-            match transport_mode {
-                None => transport_mode = Some(mode),
-                Some(existing) if existing == mode => {}
-                Some(_) => return Err(PolicyRejection::HeterogeneousTransportModes),
-            }
-
             edges.push(EgressEdge {
                 egress_stream_id: stream.egress_stream_id,
                 subscriber,
                 candidates,
                 priority_group: stream.priority_group,
                 supersede_on_independent_frame: stream.supersede_on_independent_frame,
+                transport: None,
             });
         }
 
-        // ---- server-muted set (ADR-0036 §7; story 2 R-9) ---------------
+        // ---- server-muted set (superseded; transitional + UNION input) --
         // Count already bounded above. Widths through the same `SenderId`
-        // parse as every other sender field (0 and >16-bit reject); a
-        // duplicate rejects the whole registration. NO cross-check against
-        // `edges`: a muted sender with no candidate edge here, or not yet
-        // connected, is held (the safe direction, per `internal.proto`).
+        // parse as every other sender field; a duplicate rejects the whole
+        // registration. NO cross-check against `edges`: a muted sender with no
+        // candidate edge here, or not yet connected, is held.
         let mut server_muted = Vec::with_capacity(request.server_muted_sources.len());
         let mut seen_muted = HashSet::with_capacity(request.server_muted_sources.len());
         for muted in &request.server_muted_sources {
@@ -576,12 +656,41 @@ impl MeetingPolicy {
             server_muted.push(sender);
         }
 
+        // ---- declarations ------------------------------------------------
+        let declarations = if request.source_streams.is_empty() {
+            sources::transitional_story2_reading(request, server_muted)?
+        } else {
+            sources::parse_declared(request, server_muted)?
+        };
+
+        // ---- every candidate against the declarations --------------------
+        // Generic over both readings, so the rule MC-B relies on ("an empty
+        // list with egresses rejects as `rejected_transport_inconsistent`")
+        // already holds for non-empty lists and needs no new token then.
+        // ONE index, built once (O(source_streams)), so this walk is
+        // O(egress x candidates) — never x source_streams: a per-candidate
+        // linear scan would be attacker-sized work before the policy check.
+        let declared_index = declarations.build_index();
+        for edge in &mut edges {
+            let mut transport: Option<TransportMode> = None;
+            for candidate in &edge.candidates {
+                let declared = declarations
+                    .resolve(&declared_index, candidate.sender, candidate.stream)
+                    .ok_or(PolicyRejection::UndeclaredCandidate)?;
+                match transport {
+                    None => transport = Some(declared.transport),
+                    Some(existing) if existing == declared.transport => {}
+                    Some(_) => return Err(PolicyRejection::InconsistentCandidateTransports),
+                }
+            }
+            edge.transport = transport;
+        }
+
         Ok(Self {
             meeting: MeetingKey::new(&request.meeting_id),
             generation: request.policy_generation,
-            transport_mode,
             edges,
-            server_muted,
+            declarations,
         })
     }
 }
@@ -592,16 +701,27 @@ impl MeetingPolicy {
 
 /// The installed forwarding policy for **one** meeting.
 ///
-/// All fields are private. A `pub by_sender` would degrade this module's
+/// All fields are private. A `pub by_source` would degrade this module's
 /// structural guarantee back into a convention: the point is that no caller
-/// can reach a sender-keyed map except through
-/// [`RoutingSnapshot::for_each_source`], which requires a [`MeetingKey`].
+/// can reach a sender-keyed map except through [`RoutingSnapshot::attribute`]
+/// or [`RoutingSnapshot::is_server_muted`], which require a [`MeetingKey`].
+///
+/// **Every per-source-stream fact lives here** — the declarations, their
+/// index, the all-muted set, and (MH-B) any per-stream state hung off them —
+/// so it is bounded by `MH_MAX_SOURCE_STREAMS_PER_MEETING`, replaced whole on
+/// re-push, and freed when the meeting's routes are removed. Nothing keyed by
+/// sender or stream exists outside a `MeetingKey` scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingRoutes {
     generation: u64,
-    transport_mode: Option<TransportMode>,
     edges: Vec<EgressEdge>,
-    /// Ingress-side lookup: publishing sender -> indices into `edges`.
+    /// Ingress-side lookup: declared source `(sender, stream)` -> indices into
+    /// `edges`.
+    ///
+    /// Keyed by the SOURCE STREAM, not the sender: a frame attributed to one
+    /// of a sender's streams reaches only that stream's edges, so audio never
+    /// reaches a video slot and vice versa (R-20), and a relabelled frame
+    /// reaches only the slots of the stream it was relabelled onto (R-16).
     ///
     /// **INVARIANT: these indices index into THIS `MeetingRoutes.edges` and
     /// nothing else.** A shared or flattened cross-meeting edge arena is
@@ -614,30 +734,38 @@ pub struct MeetingRoutes {
     /// cross-meeting array, rebuilding the exact primitive this module exists
     /// to prevent — reached through a *performance* change nobody would think
     /// to route past a correctness constraint.
-    by_sender: HashMap<SenderId, Vec<usize>>,
-    /// Server-muted publishers (ADR-0036 §7), **inside this meeting's routes
-    /// and keyed by the scoped [`SenderId`]** for the same reason `by_sender`
-    /// is: `sender_id` 5 exists in every meeting on this handler, so a
-    /// handler-global muted set would silence an innocent sender in another
-    /// meeting. Reachable only through [`RoutingSnapshot::is_server_muted`],
-    /// which takes a [`MeetingKey`].
-    server_muted: HashSet<SenderId>,
+    by_source: HashMap<(SenderId, StreamNumber), Vec<usize>>,
+    /// The declarations this generation installed — the one owner.
+    declarations: Declarations,
+    /// `(sender, stream)` -> position in the declarations, derived from them.
+    declared_index: HashMap<(SenderId, StreamNumber), usize>,
+    /// Senders every frame of which drops `server_muted` (the shortcut),
+    /// derived from the declarations; non-vacuous (see
+    /// `Declarations::all_muted`). Keyed by the scoped [`SenderId`] inside this
+    /// meeting's routes because `sender_id` 5 exists in every meeting on this
+    /// handler: a handler-global set would silence an innocent sender in
+    /// another meeting.
+    all_muted: HashSet<SenderId>,
 }
 
 impl MeetingRoutes {
     fn build(policy: &MeetingPolicy) -> Self {
-        let mut by_sender: HashMap<SenderId, Vec<usize>> = HashMap::new();
+        let mut by_source: HashMap<(SenderId, StreamNumber), Vec<usize>> = HashMap::new();
         for (index, edge) in policy.edges.iter().enumerate() {
             for candidate in &edge.candidates {
-                by_sender.entry(candidate.sender).or_default().push(index);
+                by_source
+                    .entry((candidate.sender, candidate.stream))
+                    .or_default()
+                    .push(index);
             }
         }
         Self {
             generation: policy.generation,
-            transport_mode: policy.transport_mode,
             edges: policy.edges.clone(),
-            by_sender,
-            server_muted: policy.server_muted.iter().copied().collect(),
+            by_source,
+            declared_index: policy.declarations.build_index(),
+            all_muted: policy.declarations.all_muted(),
+            declarations: policy.declarations.clone(),
         }
     }
 
@@ -645,12 +773,6 @@ impl MeetingRoutes {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
-    }
-
-    /// The transport mode applied to every egress stream of [`Self::generation`].
-    #[must_use]
-    pub const fn transport_mode(&self) -> Option<TransportMode> {
-        self.transport_mode
     }
 
     /// How many egress edges this meeting contributes to the handler total.
@@ -665,19 +787,101 @@ impl MeetingRoutes {
         &self.edges
     }
 
-    /// Whether this installed policy's server-muted set equals `other`, as a
-    /// SET (order-insensitive). Used by the equal-generation divergence
-    /// detector, which must log counts only — never which sender.
+    /// Whether this installed policy's declarations equal `other` as SETS
+    /// (order-insensitive). Used by the equal-generation divergence detector,
+    /// which logs counts only — never which sender or stream.
     #[must_use]
-    pub fn server_muted_matches(&self, other: &[SenderId]) -> bool {
-        other.len() == self.server_muted.len()
-            && other.iter().all(|s| self.server_muted.contains(s))
+    pub fn declarations_match(&self, other: &Declarations) -> bool {
+        self.declarations.same_as(other)
     }
 
-    /// How many publishers are server-muted on this handler for this meeting.
+    /// How many source streams are declared. Counts only.
+    #[must_use]
+    pub fn declared_count(&self) -> usize {
+        self.declarations.declared_count()
+    }
+
+    /// How many publishers drop `server_muted` on every frame. Counts only.
     #[must_use]
     pub fn server_muted_count(&self) -> usize {
-        self.server_muted.len()
+        self.all_muted.len()
+    }
+
+    /// The per-stream echo, from THIS installed generation.
+    #[must_use]
+    pub fn applied_source_streams(&self) -> Vec<SourceStreamEcho> {
+        self.declarations.echo()
+    }
+
+    /// The superseded single-mode echo (field 5) for this installed policy.
+    #[must_use]
+    pub fn legacy_transport_echo(&self) -> TransportMode {
+        self.declarations.legacy_transport_echo(self.edges.len())
+    }
+}
+
+/// Which declared source stream an ingress frame belongs to, and what to do
+/// with it — the result of [`RoutingSnapshot::attribute`].
+///
+/// **Only [`Attribution::Route`] carries edges.** Every drop variant carries
+/// nothing to forward to, so a caller (the datagram path today, the stream
+/// path in MH-A2) cannot route a dropped frame by forgetting a check.
+#[must_use]
+#[derive(Debug)]
+pub enum Attribution<'a> {
+    /// No policy is installed for this meeting.
+    NoPolicy,
+    /// Drop `server_muted`: the sender-level shortcut, or the attributed
+    /// stream is `DROP_AT_INGRESS`.
+    ServerMuted,
+    /// Drop `unmatched_stream`: no declared stream of this sender carries this
+    /// uplink id.
+    Unmatched,
+    /// Drop `transport_mismatch`: declared, but on another transport.
+    TransportMismatch,
+    /// Forward along this source stream's edges (possibly none:
+    /// `no_subscriber`).
+    Route {
+        /// The stream is PAUSED (client mute): forwarded normally, counted on
+        /// the paused-arrivals overlay.
+        paused: bool,
+        /// This source stream's edges, and no other stream's.
+        edges: SourceEdges<'a>,
+    },
+}
+
+/// The egress edges one source stream feeds, within one meeting. Borrowing and
+/// non-allocating — the per-frame path walks it on every frame.
+#[derive(Debug, Clone)]
+pub struct SourceEdges<'a> {
+    edges: &'a [EgressEdge],
+    indices: std::slice::Iter<'a, usize>,
+}
+
+impl SourceEdges<'_> {
+    const EMPTY: &'static [usize] = &[];
+
+    /// Whether this source stream feeds no edge at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.indices.len() == 0
+    }
+}
+
+impl<'a> Iterator for SourceEdges<'a> {
+    type Item = &'a EgressEdge;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Resolve through the MEETING-LOCAL slice. `indexing_slicing = "deny"`
+        // forces `.get`, which is also what keeps a stale index from reading a
+        // neighbouring meeting's edge if the invariant on `by_source` is ever
+        // broken.
+        for &i in self.indices.by_ref() {
+            if let Some(edge) = self.edges.get(i) {
+                return Some(edge);
+            }
+        }
+        None
     }
 }
 
@@ -693,76 +897,103 @@ pub struct RoutingSnapshot {
 }
 
 impl RoutingSnapshot {
-    /// Visit every egress edge a sender's frames feed, **within one meeting**.
+    /// Attribute one ingress frame to a declared source stream — **the single
+    /// attribution lookup**, for the datagram path and the stream path alike
+    /// (story 3 R-20; `internal.proto` `SourceStream`).
     ///
-    /// This is the only sender lookup in the crate, and it is impossible to
-    /// call without naming a meeting. A `sender_id` valid in another meeting
-    /// does not resolve here — not because a check rejects it, but because the
-    /// lookup never leaves this meeting's routes. If you only ever look inside
-    /// one meeting, you cannot cross meetings.
+    /// The key is (`sender`, `uplink_id`): the publisher bound to the
+    /// connection at attach (JWT-gated, from MC), and the uplink relay-region
+    /// `stream_id` the publisher stamped. That label is PUBLISHER-SET AND
+    /// UNAUTHENTICATED: MH does not identify a frame's true stream, and never
+    /// reads the payload or the `SFrame` key id. What the lookup guarantees is
+    /// structural — a frame reaches only the edges of the declared stream its
+    /// label and transport match — and why that suffices for per-kind server
+    /// mute is stated once at `internal.proto` `MutedSource`.
     ///
-    /// **Borrowing and non-allocating, because the forward path calls it on
-    /// every frame** (ADR-0036 §11: zero allocation per frame). Returning
-    /// `Vec<&EgressEdge>` would heap-allocate per frame; handing out
-    /// `by_sender` would make the maps public and turn this module's structural
-    /// guarantee back into a convention. The visitor is the shape that is both.
+    /// Order, each step load-bearing:
+    /// 1. no policy for the meeting -> [`Attribution::NoPolicy`];
+    /// 2. the sender-level shortcut -> [`Attribution::ServerMuted`], FIRST, so
+    ///    a fully muted sender's frames count `server_muted` whatever their
+    ///    label or transport. The datagram path also runs it before decode
+    ///    ([`Self::is_server_muted`]); it is repeated here because the stream
+    ///    path (MH-A2) has no pre-decode check;
+    /// 3. the 16-bit label narrowed to the 8-bit send id WITHOUT truncation —
+    ///    above 255 is [`Attribution::Unmatched`], never aliased (`256` must
+    ///    not become stream 0);
+    /// 4. undeclared -> [`Attribution::Unmatched`];
+    /// 5. arrived on another transport -> [`Attribution::TransportMismatch`]
+    ///    (before the disposition, so a muted stream's wrong-transport frame
+    ///    is a mismatch — the remedy differs);
+    /// 6. `DROP_AT_INGRESS` -> [`Attribution::ServerMuted`];
+    /// 7. otherwise [`Attribution::Route`] over that stream's edges only.
     ///
-    /// The forward path **re-reads the table per frame and caches nothing**.
-    /// That is not a performance oversight: ADR-0036 §7 enforces server mute
-    /// and participant removal through this lookup, so a cached edge list that
-    /// outlives a policy change is a mute bypass with a staleness window.
-    ///
-    /// Returns the number of edges visited, so a caller can distinguish "no
-    /// edges for this sender" from "edges visited" without counting in the
-    /// closure — the two are different drop reasons on the forward path.
-    pub fn for_each_source<'a>(
-        &'a self,
+    /// Borrowing and non-allocating; re-read per frame and never cached —
+    /// server mute and participant removal are enforced through this lookup,
+    /// so a cached answer that outlives a policy change is a mute bypass.
+    pub fn attribute(
+        &self,
         meeting: &MeetingKey,
         sender: SenderId,
-        mut visit: impl FnMut(&'a EgressEdge),
-    ) -> usize {
+        uplink_id: u16,
+        arrival: TransportMode,
+    ) -> Attribution<'_> {
         let Some(routes) = self.meetings.get(meeting) else {
-            return 0;
+            return Attribution::NoPolicy;
         };
-        let Some(indices) = routes.by_sender.get(&sender) else {
-            return 0;
-        };
-        // Resolve through the MEETING-LOCAL slice. `indexing_slicing = "deny"`
-        // forces `.get`, which is also what keeps a stale index from reading a
-        // neighbouring meeting's edge if the invariant above is ever broken.
-        let mut visited = 0;
-        for &i in indices {
-            if let Some(edge) = routes.edges.get(i) {
-                visit(edge);
-                visited += 1;
-            }
+        if routes.all_muted.contains(&sender) {
+            return Attribution::ServerMuted;
         }
-        visited
+        let Ok(stream) = StreamNumber::try_from(uplink_id) else {
+            return Attribution::Unmatched;
+        };
+        let Some(declared) = routes
+            .declarations
+            .resolve(&routes.declared_index, sender, stream)
+        else {
+            return Attribution::Unmatched;
+        };
+        if declared.transport != arrival {
+            return Attribution::TransportMismatch;
+        }
+        let paused = match declared.disposition {
+            Disposition::DropAtIngress => return Attribution::ServerMuted,
+            Disposition::Paused => true,
+            Disposition::Forward => false,
+        };
+        let indices = routes
+            .by_source
+            .get(&(sender, stream))
+            .map_or(SourceEdges::EMPTY, Vec::as_slice);
+        Attribution::Route {
+            paused,
+            edges: SourceEdges {
+                edges: &routes.edges,
+                indices: indices.iter(),
+            },
+        }
     }
 
-    /// Whether `sender` is server-muted **within `meeting`** (ADR-0036 §7).
+    /// The sender-level server-mute shortcut **within `meeting`** — true when
+    /// every declared stream of `sender` is `DROP_AT_INGRESS` (at least one
+    /// declared) or the sender is union-muted.
     ///
-    /// Meeting-scoped for the same reason as [`Self::for_each_source`]: the
-    /// same `sender_id` is a different participant in every other meeting on
-    /// this handler, so there is no function taking a `SenderId` alone.
-    /// Borrowing and non-allocating — the forward path calls it on every
-    /// frame, and re-reads it per frame, so an unmute takes effect on the next
-    /// frame after the swap.
+    /// Meeting-scoped for the same reason as [`Self::attribute`]: the same
+    /// `sender_id` is a different participant in every other meeting on this
+    /// handler, so there is no function taking a `SenderId` alone.
     ///
     /// # `false` has TWO meanings — the absent-meeting arm is FAIL-OPEN
     ///
     /// `false` means "not muted" **or** "no policy is installed for this
     /// meeting". That is safe at the one current caller, `forward_one`, only
-    /// because the same absent meeting also resolves to zero edges there and
-    /// the frame is dropped as `no_policy`: nothing is forwarded either way.
-    /// Any future caller that ACTS on `false` without also failing closed on
-    /// an absent policy (e.g. by requiring [`Self::routes_for`] to be `Some`)
-    /// turns an unprogrammed handler into a mute bypass.
+    /// because it then calls [`Self::attribute`], which fails closed on an
+    /// absent policy (`no_policy`). Any future caller that ACTS on `false`
+    /// without also failing closed on an absent policy turns an unprogrammed
+    /// handler into a mute bypass.
     #[must_use]
     pub fn is_server_muted(&self, meeting: &MeetingKey, sender: SenderId) -> bool {
         self.meetings
             .get(meeting)
-            .is_some_and(|routes| routes.server_muted.contains(&sender))
+            .is_some_and(|routes| routes.all_muted.contains(&sender))
     }
 
     /// The installed routes for one meeting, if any policy is installed.
@@ -781,10 +1012,23 @@ impl RoutingSnapshot {
         self.meetings.get(meeting).map_or(0, |r| r.generation)
     }
 
-    /// The transport mode a meeting's live forward path applies.
+    /// The per-stream echo for a meeting's APPLIED policy; empty when nothing
+    /// is installed.
     #[must_use]
-    pub fn transport_mode_for(&self, meeting: &MeetingKey) -> Option<TransportMode> {
-        self.meetings.get(meeting).and_then(|r| r.transport_mode)
+    pub fn applied_source_streams_for(&self, meeting: &MeetingKey) -> Vec<SourceStreamEcho> {
+        self.meetings
+            .get(meeting)
+            .map(|r| r.applied_source_streams())
+            .unwrap_or_default()
+    }
+
+    /// The superseded single-mode echo (field 5) for a meeting's applied
+    /// policy; `Unspecified` when nothing is installed.
+    #[must_use]
+    pub fn legacy_transport_echo_for(&self, meeting: &MeetingKey) -> TransportMode {
+        self.meetings
+            .get(meeting)
+            .map_or(TransportMode::Unspecified, |r| r.legacy_transport_echo())
     }
 
     /// Egress edges across **all** meetings on this handler.
@@ -952,628 +1196,4 @@ impl RoutingTable {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    // One fixture home for all three test sites that build these messages —
-    // see `mh_test_utils::media_policy` for why.
-    use mh_test_utils::media_policy::{
-        egress, register_request as request, register_request_muted,
-    };
-    use proto_gen::dark_tower::internal::v1::{CandidateSource, EgressStream};
-
-    fn sender(v: u32) -> SenderId {
-        SenderId::from_wire(v).unwrap()
-    }
-
-    /// Collect [`RoutingSnapshot::for_each_source`] into a `Vec` **at the test
-    /// site**.
-    ///
-    /// Deliberately here and not on the type: an allocating traversal on the
-    /// snapshot is a footgun the per-frame forward path would have to remember
-    /// not to call, and this module's whole posture is that the wrong call is a
-    /// missing function. A test may allocate; the hot path may not.
-    fn sources_for<'a>(
-        snapshot: &'a RoutingSnapshot,
-        meeting: &MeetingKey,
-        sender: SenderId,
-    ) -> Vec<&'a EgressEdge> {
-        let mut out = Vec::new();
-        snapshot.for_each_source(meeting, sender, |edge| out.push(edge));
-        out
-    }
-
-    fn policy(meeting: &str, generation: u64, streams: Vec<EgressStream>) -> MeetingPolicy {
-        MeetingPolicy::from_request(
-            &request(meeting, generation, streams),
-            &PolicyLimits::for_tests(),
-        )
-        .unwrap()
-    }
-
-    // -- identifier widths ------------------------------------------------
-
-    #[test]
-    fn sender_id_rejects_zero_and_over_range_never_truncates() {
-        assert_eq!(SenderId::from_wire(0), Err(IdError::SenderIdZero));
-        assert_eq!(
-            SenderId::from_wire(65_536),
-            Err(IdError::SenderIdOutOfRange)
-        );
-        // 65536 must NOT wrap to 0, and 65537 must NOT wrap to 1.
-        assert_eq!(
-            SenderId::from_wire(65_537),
-            Err(IdError::SenderIdOutOfRange)
-        );
-        assert_eq!(SenderId::from_wire(65_535).unwrap().get(), 65_535);
-        assert_eq!(SenderId::from_wire(1).unwrap().get(), 1);
-    }
-
-    #[test]
-    fn slot_id_allows_zero_and_rejects_over_range() {
-        // Zero IS valid for a slot — two subscribers both choosing slot 0 is
-        // normal, which is why this differs from SenderId.
-        assert_eq!(SlotId::from_wire(0).unwrap().get(), 0);
-        assert_eq!(SlotId::from_wire(65_535).unwrap().get(), 65_535);
-        assert_eq!(SlotId::from_wire(65_536), Err(IdError::SlotIdOutOfRange));
-    }
-
-    #[test]
-    fn stream_number_is_eight_bit_and_rejects_never_truncates() {
-        assert_eq!(StreamNumber::from_wire(255).unwrap().get(), 255);
-        // 256 must not alias stream 0 of the same sender.
-        assert_eq!(
-            StreamNumber::from_wire(256),
-            Err(IdError::StreamNumberOutOfRange)
-        );
-    }
-
-    // -- the two-meeting acceptance pin -----------------------------------
-
-    /// **The acceptance pin for `docs/TODO.md` §Media Path Obligations (a).**
-    ///
-    /// Two meetings are registered into ONE routing table and ONE published
-    /// snapshot — two separately-constructed tables would pass vacuously and
-    /// pin nothing.
-    ///
-    /// Both arms are asserted deliberately. Without the positive arm an
-    /// implementation that resolves nothing anywhere also passes, so the
-    /// negative arm alone proves nothing.
-    ///
-    /// The corpse this test is looking for: a flat
-    /// `HashMap<SenderId, Vec<EgressEdge>>` at snapshot level instead of the
-    /// per-meeting nesting. Under that implementation meeting B's lookup for
-    /// sender 5 returns meeting A's edge, and one meeting's media reaches
-    /// another meeting's subscriber. **No other validation layer can catch
-    /// this**: loopback is one meeting with one participant, so the correct and
-    /// the leaking implementations are observationally identical everywhere
-    /// except a deliberately multi-meeting fixture.
-    #[test]
-    fn sender_id_valid_in_one_meeting_does_not_resolve_in_another() {
-        let table = RoutingTable::new();
-        table.install(&policy("meeting-a", 1, vec![egress(1, 5, 0, 5)]));
-        table.install(&policy("meeting-b", 1, vec![egress(1, 7, 0, 7)]));
-
-        let snapshot = table.load();
-        let meeting_a = MeetingKey::new("meeting-a");
-        let meeting_b = MeetingKey::new("meeting-b");
-
-        // Positive arm: sender 5 DOES resolve inside meeting A.
-        let in_a = sources_for(&snapshot, &meeting_a, sender(5));
-        assert_eq!(
-            in_a.len(),
-            1,
-            "sender 5 must resolve within its own meeting"
-        );
-        assert_eq!(in_a[0].subscriber.sender, sender(5));
-
-        // Negative arm: the same sender id resolves to NOTHING in meeting B,
-        // even though meeting B has a live policy of its own.
-        let in_b = sources_for(&snapshot, &meeting_b, sender(5));
-        assert!(
-            in_b.is_empty(),
-            "sender 5 is meeting A's ordinal; resolving it in meeting B is cross-tenant leakage"
-        );
-
-        // And meeting B's own sender still resolves, so the negative arm above
-        // is not just "meeting B is empty".
-        assert_eq!(sources_for(&snapshot, &meeting_b, sender(7)).len(), 1);
-        assert_eq!(
-            sources_for(&snapshot, &meeting_a, sender(7)),
-            Vec::<&EgressEdge>::new()
-        );
-    }
-
-    // -- structural rejects -----------------------------------------------
-
-    #[test]
-    fn duplicate_egress_stream_id_rejects_whole_registration() {
-        let req = request("m", 1, vec![egress(1, 5, 0, 5), egress(1, 6, 1, 6)]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::DuplicateEgressStreamId)
-        );
-    }
-
-    #[test]
-    fn duplicate_subscriber_slot_rejects_whole_registration() {
-        // Same (sender, slot) twice means "two sources into one slot".
-        let req = request("m", 1, vec![egress(1, 5, 3, 5), egress(2, 5, 3, 6)]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::DuplicateSubscriberSlot)
-        );
-    }
-
-    #[test]
-    fn same_slot_id_for_different_subscribers_is_legal() {
-        // The reciprocal of the previous test: slot ids are subscriber-scoped,
-        // so two subscribers both choosing slot 0 must NOT collide.
-        let req = request("m", 1, vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6)]);
-        assert!(MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()).is_ok());
-    }
-
-    #[test]
-    fn missing_subscriber_rejects() {
-        let mut stream = egress(1, 5, 0, 5);
-        stream.subscriber = None;
-        let req = request("m", 1, vec![stream]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::MissingSubscriber)
-        );
-    }
-
-    #[test]
-    fn malformed_sender_id_rejects_on_subscriber_and_on_candidate() {
-        let req = request("m", 1, vec![egress(1, 0, 0, 5)]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::Id(IdError::SenderIdZero))
-        );
-        // The candidate side is the ingress-side lookup, where a global index
-        // is most tempting — it carries the identical rule.
-        let req = request("m", 1, vec![egress(1, 5, 0, 0)]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::Id(IdError::SenderIdZero))
-        );
-    }
-
-    #[test]
-    fn over_wide_stream_number_rejects() {
-        let mut stream = egress(1, 5, 0, 5);
-        stream.candidate_sources[0].stream_number = 256;
-        let req = request("m", 1, vec![stream]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::Id(IdError::StreamNumberOutOfRange))
-        );
-    }
-
-    #[test]
-    fn unspecified_transport_mode_rejects_and_does_not_default_to_datagram() {
-        let mut stream = egress(1, 5, 0, 5);
-        stream.transport_mode = TransportMode::Unspecified as i32;
-        let req = request("m", 1, vec![stream]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::UnspecifiedTransportMode)
-        );
-    }
-
-    #[test]
-    fn unknown_transport_mode_value_rejects_rather_than_resolving() {
-        let mut stream = egress(1, 5, 0, 5);
-        stream.transport_mode = 9_999;
-        let req = request("m", 1, vec![stream]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::UnspecifiedTransportMode)
-        );
-    }
-
-    #[test]
-    fn heterogeneous_transport_modes_reject() {
-        let mut second = egress(2, 6, 0, 6);
-        second.transport_mode = TransportMode::StreamPerGroup as i32;
-        let req = request("m", 1, vec![egress(1, 5, 0, 5), second]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::HeterogeneousTransportModes)
-        );
-    }
-
-    #[test]
-    fn count_bounds_reject_before_any_per_element_work() {
-        let limits = PolicyLimits {
-            max_egress_streams_per_meeting: 1,
-            ..PolicyLimits::for_tests()
-        };
-        // Two streams that ALSO duplicate their egress_stream_id: the count
-        // bound must be what fires, proving it ran before duplicate detection
-        // allocated a HashSet sized by the repeated field.
-        let req = request("m", 1, vec![egress(1, 5, 0, 5), egress(1, 6, 1, 6)]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &limits),
-            Err(PolicyRejection::TooManyEgressStreams)
-        );
-
-        let limits = PolicyLimits {
-            max_candidate_sources_per_egress: 1,
-            ..PolicyLimits::for_tests()
-        };
-        let mut stream = egress(1, 5, 0, 5);
-        stream.candidate_sources.push(CandidateSource {
-            sender_id: 0, // malformed, but the COUNT must fire first
-            stream_number: 0,
-        });
-        let req = request("m", 1, vec![stream]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &limits),
-            Err(PolicyRejection::TooManyCandidateSources)
-        );
-    }
-
-    #[test]
-    fn empty_egress_set_is_legal_and_names_no_transport_mode() {
-        let parsed =
-            MeetingPolicy::from_request(&request("m", 1, vec![]), &PolicyLimits::for_tests())
-                .unwrap();
-        assert_eq!(parsed.edges, Vec::<EgressEdge>::new());
-        assert_eq!(
-            parsed.transport_mode, None,
-            "an empty policy applies no mode; fabricating one would put a mode on the §8 echo \
-             that MH never applied"
-        );
-    }
-
-    #[test]
-    fn reject_reasons_are_static_and_carry_no_request_data() {
-        // A bounded reason string is what keeps identities out of outbound
-        // status messages. `reason()` returning `&'static str` makes formatting
-        // request data into it impossible by construction; this walks every
-        // variant, sourced from `ALL` so the list cannot go short.
-        for rejection in PolicyRejection::ALL {
-            let reason = rejection.reason();
-            assert!(
-                !reason.is_empty(),
-                "every rejection needs an operator reason"
-            );
-            // Multi-line literals in this table have been wrong before: an
-            // embedded newline makes the outbound gRPC status multi-line and
-            // breaks line-oriented log parsing of the `reason` field.
-            assert!(
-                !reason.contains('\n'),
-                "reject reason must be a single line: {reason:?}"
-            );
-        }
-
-        // The reasons must also be DISTINCT, or an operator reading one cannot
-        // tell which check refused the registration.
-        let reasons: HashSet<&str> = PolicyRejection::ALL.iter().map(|r| r.reason()).collect();
-        assert_eq!(
-            reasons.len(),
-            PolicyRejection::ALL.len(),
-            "two rejections share a reason string"
-        );
-
-        // And every `IdError` reaches a distinct one through the `From` impl,
-        // which is the arm that was silently uncovered before.
-        for id_error in IdError::ALL {
-            assert!(PolicyRejection::ALL.contains(&PolicyRejection::from(id_error)));
-        }
-    }
-
-    // -- snapshot behaviour -----------------------------------------------
-
-    #[test]
-    fn install_publishes_generation_and_transport_mode() {
-        let table = RoutingTable::new();
-        let meeting = MeetingKey::new("m");
-        assert_eq!(table.load().generation_for(&meeting), 0);
-        assert_eq!(table.load().transport_mode_for(&meeting), None);
-
-        table.install(&policy("m", 7, vec![egress(1, 5, 0, 5)]));
-        assert_eq!(table.load().generation_for(&meeting), 7);
-        assert_eq!(
-            table.load().transport_mode_for(&meeting),
-            Some(TransportMode::Datagram)
-        );
-    }
-
-    #[test]
-    fn installing_one_meeting_leaves_another_meetings_routes_untouched() {
-        let table = RoutingTable::new();
-        table.install(&policy("a", 1, vec![egress(1, 5, 0, 5)]));
-        let a_before = Arc::clone(table.load().routes_for(&MeetingKey::new("a")).unwrap());
-
-        table.install(&policy("b", 1, vec![egress(1, 7, 0, 7)]));
-        let a_after = Arc::clone(table.load().routes_for(&MeetingKey::new("a")).unwrap());
-
-        assert!(
-            Arc::ptr_eq(&a_before, &a_after),
-            "installing meeting B must carry meeting A's routes over by pointer, not rebuild them"
-        );
-    }
-
-    #[test]
-    fn projected_total_subtracts_the_meetings_own_current_edges() {
-        let table = RoutingTable::new();
-        let three = vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6), egress(3, 7, 0, 7)];
-        table.install(&policy("m", 1, three.clone()));
-        assert_eq!(table.load().total_edges(), 3);
-
-        // An IDENTICAL re-assert must project to 3, not 6. Without the
-        // subtraction, ADR-0036 §8's <=10s re-assert cadence would trip the
-        // aggregate bound for every meeting in turn once the handler is half
-        // full — and that defect passes every single-meeting test that only
-        // ever registers once.
-        let reassert = policy("m", 2, three);
-        assert_eq!(table.load().projected_total_edges(&reassert), 3);
-
-        // A different meeting genuinely adds.
-        let other = policy("other", 1, vec![egress(1, 9, 0, 9)]);
-        assert_eq!(table.load().projected_total_edges(&other), 4);
-    }
-
-    #[test]
-    fn total_edges_tracks_replacement_not_accumulation() {
-        let table = RoutingTable::new();
-        table.install(&policy(
-            "m",
-            1,
-            vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6)],
-        ));
-        assert_eq!(table.load().total_edges(), 2);
-        table.install(&policy("m", 2, vec![egress(1, 5, 0, 5)]));
-        assert_eq!(table.load().total_edges(), 1);
-        table.install(&policy("m", 3, vec![]));
-        assert_eq!(table.load().total_edges(), 0);
-        assert_eq!(table.load().meeting_count(), 1);
-    }
-
-    // -- release (story 2 R-20) -------------------------------------------
-
-    /// Release returns the meeting's edges, leaves the other meeting's routes
-    /// untouched BY POINTER, and forgets the released meeting's generation.
-    #[test]
-    fn remove_returns_edges_forgets_generation_and_spares_other_meetings() {
-        let table = RoutingTable::new();
-        table.install(&policy(
-            "a",
-            9,
-            vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6)],
-        ));
-        table.install(&policy("b", 3, vec![egress(1, 7, 0, 7)]));
-        assert_eq!(table.load().total_edges(), 3);
-        let b_before = Arc::clone(table.load().routes_for(&MeetingKey::new("b")).unwrap());
-
-        assert!(table.remove(&MeetingKey::new("a")));
-
-        let after = table.load();
-        assert_eq!(after.total_edges(), 1, "a's two edges return to the budget");
-        assert_eq!(after.meeting_count(), 1);
-        assert_eq!(
-            after.generation_for(&MeetingKey::new("a")),
-            0,
-            "release must FORGET the applied generation, or a same-id re-create \
-             at generation 1 reads as stale forever"
-        );
-        assert!(Arc::ptr_eq(
-            &b_before,
-            after.routes_for(&MeetingKey::new("b")).unwrap()
-        ));
-    }
-
-    /// Removing an absent meeting is a no-op WITHOUT a swap, and the accounting
-    /// kernel stays consistent across install -> remove -> re-install.
-    #[test]
-    fn remove_of_an_absent_meeting_does_not_swap_and_reinstall_is_fresh() {
-        let table = RoutingTable::new();
-        table.install(&policy("a", 4, vec![egress(1, 5, 0, 5)]));
-        let before = table.load();
-        assert!(!table.remove(&MeetingKey::new("never")));
-        assert!(Arc::ptr_eq(&before, &table.load()), "no-op must not swap");
-
-        assert!(table.remove(&MeetingKey::new("a")));
-        assert_eq!(table.load().total_edges(), 0);
-        table.install(&policy("a", 1, vec![egress(1, 5, 0, 5)]));
-        assert_eq!(table.load().generation_for(&MeetingKey::new("a")), 1);
-        assert_eq!(table.load().total_edges(), 1);
-    }
-
-    // -- server mute (ADR-0036 §7; story 2 R-9) ---------------------------
-
-    #[test]
-    fn server_muted_set_parses_in_order_and_empty_means_nobody() {
-        let parsed = MeetingPolicy::from_request(
-            &register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[6, 9]),
-            &PolicyLimits::for_tests(),
-        )
-        .unwrap();
-        assert_eq!(parsed.server_muted, vec![sender(6), sender(9)]);
-
-        let none =
-            MeetingPolicy::from_request(&request("m", 1, vec![]), &PolicyLimits::for_tests())
-                .unwrap();
-        assert!(
-            none.server_muted.is_empty(),
-            "an absent field is the pre-R-9 wire: nobody muted"
-        );
-    }
-
-    #[test]
-    fn muted_count_bound_fires_before_duplicate_detection_and_width_checks() {
-        let limits = PolicyLimits {
-            max_muted_sources_per_meeting: 1,
-            ..PolicyLimits::for_tests()
-        };
-        // Over the bound AND duplicated AND malformed: the COUNT must be what
-        // fires, proving it ran before the dedup `HashSet` sized by the
-        // attacker-controlled field was allocated.
-        let req = register_request_muted("m", 1, vec![], &[0, 0]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &limits),
-            Err(PolicyRejection::TooManyMutedSources)
-        );
-        // At the bound is fine.
-        let req = register_request_muted("m", 1, vec![], &[3]);
-        assert!(MeetingPolicy::from_request(&req, &limits).is_ok());
-    }
-
-    #[test]
-    fn muted_count_bound_precedes_the_egress_shape_walk() {
-        // A malformed egress stream AND an over-limit muted set. The muted
-        // count is the THIRD check in the counts block: it runs AFTER the
-        // egress-stream count and the per-element candidate-count loop (which
-        // does touch every egress element, but allocates nothing), and BEFORE
-        // the per-element shape / width / duplicate walk and every allocation
-        // sized by a repeated field. That is what this proves — not that the
-        // muted check is first. Anyone adding an allocation to the
-        // candidate-count loop must move it after all three counts.
-        let limits = PolicyLimits {
-            max_muted_sources_per_meeting: 1,
-            ..PolicyLimits::for_tests()
-        };
-        let mut stream = egress(1, 5, 0, 5);
-        stream.subscriber = None;
-        let req = register_request_muted("m", 1, vec![stream], &[1, 2]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &limits),
-            Err(PolicyRejection::TooManyMutedSources)
-        );
-    }
-
-    #[test]
-    fn duplicate_muted_sender_rejects_whole_registration() {
-        let req = register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[6, 6]);
-        assert_eq!(
-            MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-            Err(PolicyRejection::DuplicateMutedSource)
-        );
-    }
-
-    #[test]
-    fn malformed_muted_sender_id_rejects_through_the_same_width_rule() {
-        for (value, expected) in [
-            (0, IdError::SenderIdZero),
-            (65_536, IdError::SenderIdOutOfRange),
-        ] {
-            let req = register_request_muted("m", 1, vec![], &[value]);
-            assert_eq!(
-                MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()),
-                Err(PolicyRejection::Id(expected))
-            );
-        }
-    }
-
-    #[test]
-    fn muted_sender_with_no_edge_here_is_held_not_rejected() {
-        // Sender 9 sources nothing on this handler and may not be connected:
-        // `internal.proto` says HOLD (it stays muted when it attaches).
-        let table = RoutingTable::new();
-        let req = register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[9]);
-        table.install(&MeetingPolicy::from_request(&req, &PolicyLimits::for_tests()).unwrap());
-        assert!(table
-            .load()
-            .is_server_muted(&MeetingKey::new("m"), sender(9)));
-    }
-
-    /// The two-meeting pin for the muted set (@security S-2), the exact analog
-    /// of `sender_id_valid_in_one_meeting_does_not_resolve_in_another`. A
-    /// handler-global muted set keyed on the wire integer passes every
-    /// single-meeting test and silences an innocent sender in meeting B.
-    #[test]
-    fn sender_muted_in_one_meeting_is_not_muted_in_another() {
-        let table = RoutingTable::new();
-        let limits = PolicyLimits::for_tests();
-        table.install(
-            &MeetingPolicy::from_request(
-                &register_request_muted("meeting-a", 1, vec![egress(1, 7, 0, 5)], &[5]),
-                &limits,
-            )
-            .unwrap(),
-        );
-        table.install(&policy("meeting-b", 1, vec![egress(1, 7, 0, 5)]));
-
-        let snapshot = table.load();
-        // Positive arm: muted in A.
-        assert!(snapshot.is_server_muted(&MeetingKey::new("meeting-a"), sender(5)));
-        // Negative arm: the same ordinal in B is a different participant.
-        assert!(
-            !snapshot.is_server_muted(&MeetingKey::new("meeting-b"), sender(5)),
-            "sender 5 is muted in meeting A only; muting it in B is cross-tenant"
-        );
-        // And B's sender 5 still resolves its edge, so the negative arm is
-        // not just "meeting B is empty".
-        assert_eq!(
-            sources_for(&snapshot, &MeetingKey::new("meeting-b"), sender(5)).len(),
-            1
-        );
-    }
-
-    #[test]
-    fn an_absent_meeting_reads_not_muted() {
-        // The documented fail-open arm: safe only because the forward path
-        // also finds no edges for an absent meeting (`no_policy`).
-        let table = RoutingTable::new();
-        assert!(!table
-            .load()
-            .is_server_muted(&MeetingKey::new("nowhere"), sender(1)));
-    }
-
-    #[test]
-    fn unmute_is_the_next_generation_without_the_sender() {
-        let table = RoutingTable::new();
-        let limits = PolicyLimits::for_tests();
-        let meeting = MeetingKey::new("m");
-        table.install(
-            &MeetingPolicy::from_request(
-                &register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[6]),
-                &limits,
-            )
-            .unwrap(),
-        );
-        assert!(table.load().is_server_muted(&meeting, sender(6)));
-        table.install(&policy("m", 2, vec![egress(1, 5, 0, 6)]));
-        assert!(!table.load().is_server_muted(&meeting, sender(6)));
-    }
-
-    #[test]
-    fn server_muted_matches_is_order_insensitive_set_equality() {
-        let table = RoutingTable::new();
-        table.install(
-            &MeetingPolicy::from_request(
-                &register_request_muted("m", 1, vec![], &[3, 4]),
-                &PolicyLimits::for_tests(),
-            )
-            .unwrap(),
-        );
-        let snapshot = table.load();
-        let routes = snapshot.routes_for(&MeetingKey::new("m")).unwrap();
-        assert!(routes.server_muted_matches(&[sender(4), sender(3)]));
-        assert!(!routes.server_muted_matches(&[sender(3)]));
-        assert!(!routes.server_muted_matches(&[sender(3), sender(5)]));
-        assert_eq!(routes.server_muted_count(), 2);
-    }
-
-    #[test]
-    fn multiple_candidates_all_index_the_same_edge() {
-        let mut stream = egress(1, 5, 0, 5);
-        stream.candidate_sources.push(CandidateSource {
-            sender_id: 6,
-            stream_number: 1,
-        });
-        let table = RoutingTable::new();
-        table.install(&policy("m", 1, vec![stream]));
-        let snapshot = table.load();
-        let meeting = MeetingKey::new("m");
-        assert_eq!(sources_for(&snapshot, &meeting, sender(5)).len(), 1);
-        assert_eq!(sources_for(&snapshot, &meeting, sender(6)).len(), 1);
-        assert_eq!(
-            sources_for(&snapshot, &meeting, sender(8)),
-            Vec::<&EgressEdge>::new()
-        );
-    }
-}
+mod tests;

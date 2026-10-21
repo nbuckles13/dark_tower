@@ -81,23 +81,22 @@
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::auth_client::UserRegistrationRequest;
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, JoinMeetingResponse};
+use env_tests::fixtures::injection::{
+    self, assert_mc_programmed_a_carrying_pod, injectable_handlers, Injection,
+};
 use env_tests::fixtures::mc_session::{self, connect_wt, McSession};
 use env_tests::fixtures::media::{
     assert_relayed_on_slot, bind_until_received, bind_until_received_each, drain, read_frame,
 };
 use env_tests::fixtures::metrics::poll_until_pinned_instance;
 use env_tests::fixtures::metrics::{
-    any_instance_exceeds_baseline, format_instance_map, gauge_by_instance_present,
-    instance_for_pod_ip, poll_until_any_instance_above, settled_baseline, InstanceCounters,
+    any_instance_exceeds_baseline, format_instance_map, instance_for_pod_ip,
+    poll_until_any_instance_above, settled_baseline, InstanceCounters,
 };
-use env_tests::fixtures::mh_grpc::{self, Handler, ReleaseOnDrop};
-use env_tests::fixtures::participant::{self, open_sessions, Participant};
+use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
+use env_tests::fixtures::participant::{self, open_sessions};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
-use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, EndMeetingRequest, MutedSource, RegisterMeetingRequest,
-    SubscriberSlot,
-};
+use proto_gen::dark_tower::internal::v1::EgressStream;
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
@@ -1166,14 +1165,6 @@ const PHASE_DEADLINE: Duration = Duration::from_secs(30);
 /// Bound on a pinned-pod counter becoming visible in Prometheus.
 const PINNED_METRIC_BOUND: Duration = Duration::from_secs(90);
 
-/// How far above MC's installed generation the injected policy sits. Small on
-/// purpose (@security, @paired-meeting-controller): it only has to stay above
-/// MC's own generation, which cannot move during the injection window because
-/// nothing structural changes in the meeting. If MC ever out-ran it, MC's
-/// next push would install its own (empty) muted set, forwarding would resume,
-/// and the mute assertions would go RED — the safe failure direction.
-const INJECTION_MARGIN: u64 = 16;
-
 /// Sequence-number floors separating frames by phase, so a frame still queued
 /// from an earlier phase can never be read as evidence about a later one.
 const SEQ_PRE: u32 = 1;
@@ -1195,288 +1186,14 @@ fn server_muted_promql() -> &'static str {
 /// `(subscriber << 8) | ordinal`, one candidate at stream 0, priority group 1,
 /// datagram transport.
 fn mc_shaped_edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> EgressStream {
-    EgressStream {
-        egress_stream_id: (subscriber << 8) | ordinal,
-        subscriber: Some(SubscriberSlot {
-            sender_id: subscriber,
-            slot_id: slot,
-        }),
-        candidate_sources: vec![CandidateSource {
-            sender_id: source,
-            stream_number: 0,
-        }],
-        priority_group: 1,
-        supersede_on_independent_frame: false,
-        transport_mode: TransportMode::Datagram as i32,
-    }
-}
-
-/// A test-injected policy on ONE MH pod for a meeting the REAL MC also
-/// programs, presenting MC's own `mc_id` and gRPC endpoint so MH's
-/// notifications keep reaching MC and no ownership takeover occurs.
-///
-/// # This deliberately risks an MC-side footprint — do not triage it as MC's bug
-///
-/// While an injected policy is live, MH's installed generation is ABOVE MC's.
-/// MC's floor adoption is closed after its first confirmed push
-/// (`crates/mc-service/src/grpc/mh_client.rs`, the comment on the higher-echo
-/// case), so if MC pushed for this meeting mid-window it would record
-/// `mc_media_policy_pushes_total{outcome="generation_mismatch"}`, write
-/// `mc_media_generation_divergence`, and fire `MCMediaGenerationDivergence`
-/// (`for: 0m`). The tests keep the window free of structural changes (no
-/// joins, leaves or declarations), so MC has nothing to push; and every
-/// injection ends with `EndMeeting` on the pod BEFORE any session closes.
-///
-/// MC re-programs a pod after that `EndMeeting` ONLY when that pod's MC
-/// snapshot CHANGES: MC's per-handler worker does not advance the generation
-/// for an unchanged snapshot, and a publish at its last confirmed generation
-/// sends no RPC (`crates/mc-service/src/media_routing/pusher.rs`). The
-/// carrying pod's snapshot does change as the sessions close (edges removed),
-/// so it gets a fresh install. A pod whose MC snapshot is unchanged (empty, in
-/// these meeting shapes) stays UNREGISTERED for the rest of this test-owned
-/// meeting — which is why the meeting is dedicated and disposable. Do not
-/// generalise "EndMeeting is recovered by MC's next push" to production: until
-/// story 4's re-assert cadence exists, it is false for an unchanged snapshot.
-///
-/// # If cleanup is skipped
-///
-/// `ReleaseOnDrop` releases on success and on a panic, but not on SIGKILL or a
-/// harness kill. Then this meeting id stays wedged at the injected generation
-/// on that pod — every later MC push for it refused as stale — holding its
-/// edges and a registered-meeting slot. From story 2 task 12 that is normally
-/// SELF-HEALING: the killed harness's MC sessions die with it, so once every
-/// participant has left and MC's reconnect grace expires, MC ends the meeting
-/// and its own `EndMeeting` releases the wedge, because the injection carries
-/// MC's own `mc_id`. It persists until the pod restarts only if MC never
-/// completes that `EndMeeting`. The id is a fresh GC meeting per run, so no
-/// later run reuses it. Manual recovery, if needed: `EndMeeting`
-/// for the id on the pod through the Layer-7 gRPC forward with the MC
-/// credential (`env_tests::fixtures::mh_grpc`). Not a converge
-/// (`REDEPLOY_HINT`): pods whose image/config are unchanged are not restarted,
-/// so a converge leaves the wedge in place. A later run is not blocked by it —
-/// its meeting id is fresh — unless leaked registrations reach the cap, which
-/// [`injectable_handlers`] reports as a named PRECONDITION.
-struct Injection<'a> {
-    handler: &'a Handler,
-    client: MediaHandlerServiceClient<tonic::transport::Channel>,
-    token: &'a str,
-    meeting_id: String,
-    mc_id: String,
-    mc_grpc_endpoint: String,
-    /// The generation the probe in [`Injection::open`] read back on this pod.
-    mc_generation: u64,
-}
-
-impl<'a> Injection<'a> {
-    /// Connect, record for cleanup BEFORE any call, and read MC's installed
-    /// generation with a generation-1 EMPTY registration used as a probe.
-    ///
-    /// On a pod MC has already programmed past generation 1, the probe is
-    /// refused as stale without a swap and echoes MC's live generation. But MC
-    /// pushes to each handler on its own async worker, and nothing orders this
-    /// probe after MC's push to a pod that carries NO edges: there the probe
-    /// can INSTALL (empty, generation 1) first. That is harmless ONLY because
-    /// this meeting's MC snapshot for such a pod is itself empty at generation
-    /// 1 — MC's own push then no-ops as equal and truthfully confirms `match`.
-    /// **Do not reuse this helper for a meeting shape where BOTH pods carry
-    /// edges**: a probe that won the race would swallow MC's first real push
-    /// (equal generation, no swap) while MC recorded `match` for content that
-    /// was never installed. The real precondition — that MC HAS programmed the
-    /// carrying pod past its pre-edge render — is
-    /// [`assert_mc_programmed_a_carrying_pod`], checked across both pods.
-    async fn open(
-        handler: &'a Handler,
-        token: &'a str,
-        cleanup: &ReleaseOnDrop,
-        owner: &Participant,
-    ) -> Injection<'a> {
-        let meeting_id = owner.gc.meeting_id.to_string();
-        let mc_id = owner.gc.mc_assignment.mc_id.clone();
-        let mc_grpc_endpoint = owner.gc.mc_assignment.grpc_endpoint.clone();
-        cleanup.record(&handler.grpc_url, &meeting_id, &mc_id);
-        let mut injection = Injection {
-            handler,
-            client: mh_grpc::connect(handler).await,
-            token,
-            meeting_id,
-            mc_id,
-            mc_grpc_endpoint,
-            mc_generation: 0,
-        };
-        injection.mc_generation = injection.register(1, Vec::new(), &[]).await;
-        injection
-    }
-
-    fn generation(&self, step: u64) -> u64 {
-        self.mc_generation + INJECTION_MARGIN + step
-    }
-
-    async fn register(
-        &mut self,
-        generation: u64,
-        streams: Vec<EgressStream>,
-        muted: &[u32],
-    ) -> u64 {
-        let request = RegisterMeetingRequest {
-            meeting_id: self.meeting_id.clone(),
-            mc_id: self.mc_id.clone(),
-            mc_grpc_endpoint: self.mc_grpc_endpoint.clone(),
-            egress_streams: streams,
-            selection_rules: None,
-            policy_generation: generation,
-            server_muted_sources: muted
-                .iter()
-                .map(|sender_id| MutedSource {
-                    sender_id: *sender_id,
-                })
-                .collect(),
-            // Story 3: empty selects MH's transitional story-2 reading
-            // (internal.proto `server_muted_sources`).
-            source_streams: Vec::new(),
-        };
-        self.client
-            .register_meeting(mh_grpc::authed(self.token, request))
-            .await
-            .unwrap_or_else(|s| {
-                panic!(
-                    "INJECT on {}: RegisterMeeting at generation {generation} refused ({:?}): {}",
-                    self.handler.name,
-                    s.code(),
-                    s.message()
-                )
-            })
-            .into_inner()
-            .applied_generation
-    }
-
-    /// Install at `generation` and require the synchronous echo to match.
-    async fn install(&mut self, generation: u64, streams: Vec<EgressStream>, muted: &[u32]) {
-        let applied = self.register(generation, streams, muted).await;
-        assert_eq!(
-            applied, generation,
-            "INJECT on {}: MH did not apply generation {generation} (echoed {applied})",
-            self.handler.name
-        );
-    }
-
-    /// Release, then PROVE the injected generation is gone: a generation-1
-    /// registration must now echo below it (1 if it installed, or MC's own
-    /// fresh generation if MC re-programmed first). Our probe is released
-    /// again only if it is what installed.
-    async fn release_and_prove(mut self, cleanup: &ReleaseOnDrop) {
-        let injected = self.generation(0);
-        self.end().await;
-        let echoed = self.register(1, Vec::new(), &[]).await;
-        assert!(
-            echoed < injected,
-            "CLEANUP on {}: after EndMeeting the handler still reports generation {echoed} (>= \
-             the injected {injected}) — the meeting is wedged; recover with EndMeeting or a pod \
-             restart (see Injection's docs)",
-            self.handler.name
-        );
-        if echoed == 1 {
-            self.end().await;
-        }
-        cleanup.forget(&self.meeting_id);
-    }
-
-    async fn end(&mut self) {
-        let done = self
-            .client
-            .end_meeting(mh_grpc::authed(
-                self.token,
-                EndMeetingRequest {
-                    meeting_id: self.meeting_id.clone(),
-                    mc_id: self.mc_id.clone(),
-                },
-            ))
-            .await
-            .unwrap_or_else(|s| {
-                panic!(
-                    "CLEANUP on {}: EndMeeting refused ({:?}): {}",
-                    self.handler.name,
-                    s.code(),
-                    s.message()
-                )
-            })
-            .into_inner();
-        assert!(done.acknowledged, "CLEANUP on {}", self.handler.name);
-    }
-}
-
-/// PRECONDITION: MC has programmed the pod that carries this meeting's edges.
-/// Generation 1 is MC's pre-edge render, so once edges exist the carrying
-/// pod's installed generation is at least 2 — a check the probe CAN fail,
-/// unlike a per-pod `>= 1` (see [`Injection::open`]).
-fn assert_mc_programmed_a_carrying_pod(injections: &[Injection<'_>]) {
-    let seen: Vec<(String, u64)> = injections
-        .iter()
-        .map(|i| (i.handler.name.clone(), i.mc_generation))
-        .collect();
-    assert!(
-        seen.iter().any(|(_, g)| *g >= 2),
-        "PRECONDITION: no MH pod reports an MC-programmed generation past the pre-edge render \
-         (probe echoes {seen:?}); MC has not installed this meeting's edges yet, so injecting \
-         now would race MC's first real push"
-    );
-}
-
-/// Both MH pods Layer 7 exports. Every injection in this file goes to BOTH
-/// with the same policy, so no test needs to know which pod serves which
-/// WebTransport URL.
-fn both_handlers() -> Vec<Handler> {
-    let hs = mh_grpc::handlers();
-    assert_eq!(hs.len(), 2, "PRECONDITION: Layer 7 exports two MH pods");
-    hs
-}
-
-/// [`both_handlers`], after a PRECONDITION that each pod can register one more
-/// meeting: an injection registers a NEW meeting id on BOTH pods. Pods persist
-/// across runs (ADR-0038: nothing restarts an unchanged MH), so a pod can hold
-/// registrations a killed harness never released (see [`Injection`]'s "If
-/// cleanup is skipped"). At the cap, the injection would be refused as
-/// `rejected_meeting_cap` — a confusing registration refusal rather than the
-/// named leak it is. Read from the published gauges, per pinned pod.
-async fn injectable_handlers(prom: &PrometheusClient) -> Vec<Handler> {
-    let handlers = both_handlers();
-    let registered = gauge_by_instance_present(
-        prom,
-        "mh_media_registered_meetings",
-        handlers.len(),
-        BASELINE_SETTLE_BOUND,
+    injection::edge(
+        (subscriber << 8) | ordinal,
+        subscriber,
+        slot,
+        source,
+        u32::from(env_tests::fixtures::media::AUDIO_SEND_ID),
+        TransportMode::Datagram,
     )
-    .await;
-    let limits = gauge_by_instance_present(
-        prom,
-        "mh_media_registered_meetings_limit",
-        handlers.len(),
-        BASELINE_SETTLE_BOUND,
-    )
-    .await;
-    for h in &handlers {
-        let held = instance_for_pod_ip(&registered, &h.pod_ip).map(|(_, v)| v);
-        let limit = instance_for_pod_ip(&limits, &h.pod_ip).map(|(_, v)| v);
-        let (Some(held), Some(limit)) = (held, limit) else {
-            panic!(
-                "PRECONDITION: {} (pod IP {}) publishes no mh_media_registered_meetings / \
-                 _limit series (registered: {}, limit: {}) — a scrape/startup condition.",
-                h.name,
-                h.pod_ip,
-                format_instance_map(&registered),
-                format_instance_map(&limits),
-            );
-        };
-        assert!(
-            held + 1.0 <= limit,
-            "PRECONDITION: {} holds {held}/{limit} registered meetings, so the injection's new \
-             meeting id would be refused at the registration cap. Registrations nothing \
-             releases: a meeting's MC never completed EndMeeting (a killed harness, see \
-             Injection's recovery note; compare mh_media_registered_meetings with pod uptime). \
-             An environment/leak condition, not the behaviour under test.",
-            h.name
-        );
-    }
-    handlers
 }
 
 /// S4 (story 2 R-9; ADR-0036 §7): a server-muted sender's datagrams are
@@ -1509,6 +1226,71 @@ async fn injectable_handlers(prom: &PrometheusClient) -> Vec<Handler> {
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert() {
+    server_mute_s4(Reading::Transitional).await;
+}
+
+/// S4 again, with the policy DECLARING its source streams (story 3 R-16; the
+/// story-2 spec green "with explicit `source_streams`"): the mute is A's audio
+/// stream at DROP_AT_INGRESS instead of A in the superseded
+/// `server_muted_sources`, and the unmute is that stream back at FORWARD. Same
+/// assertions, same evidence rule.
+#[tokio::test]
+#[serial_test::serial(mh_notifications)]
+async fn test_server_muted_source_stream_is_dropped_at_mh_ingress_and_survives_reassert() {
+    server_mute_s4(Reading::Declared).await;
+}
+
+/// Which reading of the registration an injection uses (story 3).
+#[derive(Debug, Clone, Copy)]
+enum Reading {
+    /// No `source_streams`: MH's transitional story-2 reading, mute via the
+    /// superseded `server_muted_sources`.
+    Transitional,
+    /// `source_streams` declares every stream; mute via DROP_AT_INGRESS.
+    Declared,
+}
+
+/// Install `edges` in `reading`, declaring each of `senders`' audio stream on
+/// the declared reading, with `muted` (if any) server-muted.
+async fn install_s4(
+    injection: &mut Injection<'_>,
+    reading: Reading,
+    generation: u64,
+    edges: Vec<EgressStream>,
+    senders: impl IntoIterator<Item = u32>,
+    muted: Option<u32>,
+) {
+    use env_tests::fixtures::media::AUDIO_SEND_ID;
+    use proto_gen::dark_tower::internal::v1::SourceDisposition;
+    match reading {
+        Reading::Transitional => {
+            let muted: Vec<u32> = muted.into_iter().collect();
+            injection.install(generation, edges, &muted).await;
+        }
+        Reading::Declared => {
+            let sources = senders
+                .into_iter()
+                .map(|sender_id| {
+                    injection::source_stream(
+                        sender_id,
+                        u32::from(AUDIO_SEND_ID),
+                        TransportMode::Datagram,
+                        if muted == Some(sender_id) {
+                            SourceDisposition::DropAtIngress
+                        } else {
+                            SourceDisposition::Forward
+                        },
+                    )
+                })
+                .collect();
+            injection
+                .install_declared(generation, edges, &[], sources)
+                .await;
+        }
+    }
+}
+
+async fn server_mute_s4(reading: Reading) {
     let cluster = cluster().await;
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
     let window = participant::settle_window(cluster).await;
@@ -1547,7 +1329,7 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
     assert_relayed_on_slot("S4 PRE", &pre[&MARK_A], b_slot, MARK_A, "A");
 
     // INJECT on both pods: the same A <-> B edges MC would program, plus A muted.
-    let handlers = injectable_handlers(&prom).await;
+    let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let edges = || {
@@ -1570,7 +1352,7 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
     .await;
     for injection in &mut injections {
         let g = injection.generation(0);
-        injection.install(g, edges(), &[a]).await;
+        install_s4(injection, reading, g, edges(), [a, b], Some(a)).await;
     }
 
     // MUTED: A sends on BOTH sessions (so both pods see muted ingress), B sends
@@ -1657,11 +1439,11 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
     // at a NEW generation still carrying it.
     for injection in &mut injections {
         let g = injection.generation(0);
-        injection.install(g, edges(), &[a]).await;
+        install_s4(injection, reading, g, edges(), [a, b], Some(a)).await;
     }
     for injection in &mut injections {
         let g = injection.generation(1);
-        injection.install(g, edges(), &[a]).await;
+        install_s4(injection, reading, g, edges(), [a, b], Some(a)).await;
     }
     muted_phase(SEQ_REASSERTED, "S4 REASSERTED").await;
     for (handler, first) in handlers.iter().zip(&after_first) {
@@ -1682,7 +1464,7 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
     // UNMUTE: the next generation without A. B hears A again, on B's slot.
     for injection in &mut injections {
         let g = injection.generation(2);
-        injection.install(g, edges(), &[]).await;
+        install_s4(injection, reading, g, edges(), [a, b], None).await;
     }
     let deadline = Instant::now() + PHASE_DEADLINE;
     let mut resumed = None;
@@ -1728,6 +1510,11 @@ async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert
 /// MC programs everything (no injection). All three participants connect to
 /// ONE handler, so both of R's edges live on one transport and a mix-up would
 /// be observable on it.
+///
+/// TRANSITIONAL READING ONLY until MC-A: driven by MC's real policy, which
+/// carries no `source_streams` before MC-A, so there is no explicit variant
+/// here (MC-A's registrations always declare them; this spec then exercises
+/// the declared reading with no edit).
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed() {
@@ -1802,6 +1589,18 @@ async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed()
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
+    edge_churn(Reading::Transitional).await;
+}
+
+/// The edge-churn spec again with every source stream DECLARED (story 3; the
+/// story-2 spec green "with explicit `source_streams`").
+#[tokio::test]
+#[serial_test::serial(mh_notifications)]
+async fn test_edge_churn_with_declared_source_streams_does_not_stall_unrelated_egress() {
+    edge_churn(Reading::Declared).await;
+}
+
+async fn edge_churn(reading: Reading) {
     let cluster = cluster().await;
     let window = participant::settle_window(cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
@@ -1823,7 +1622,7 @@ async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
         .await;
 
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
-    let handlers = injectable_handlers(&prom).await;
+    let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let mut injections = Vec::new();
@@ -1835,7 +1634,7 @@ async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
     let c_to_b = || mc_shaped_edge(b, 1, b_slot_1, c);
     for injection in &mut injections {
         let g = injection.generation(0);
-        injection.install(g, vec![a_to_b()], &[]).await;
+        install_s4(injection, reading, g, vec![a_to_b()], [a, b, c], None).await;
     }
 
     let a_conn = sessions[0][&x].connection();
@@ -1891,12 +1690,20 @@ async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
     phase(SEQ_PRE, false, "CHURN BASE").await;
     for injection in &mut injections {
         let g = injection.generation(1);
-        injection.install(g, vec![a_to_b(), c_to_b()], &[]).await;
+        install_s4(
+            injection,
+            reading,
+            g,
+            vec![a_to_b(), c_to_b()],
+            [a, b, c],
+            None,
+        )
+        .await;
     }
     phase(SEQ_CHURN_ADD, true, "CHURN ADD").await;
     for injection in &mut injections {
         let g = injection.generation(2);
-        injection.install(g, vec![a_to_b()], &[]).await;
+        install_s4(injection, reading, g, vec![a_to_b()], [a, b, c], None).await;
     }
     phase(SEQ_CHURN_REMOVE, false, "CHURN REMOVE").await;
 

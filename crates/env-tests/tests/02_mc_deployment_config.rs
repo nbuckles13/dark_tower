@@ -42,14 +42,13 @@
 use env_tests::fixtures::deployment_config::{
     check_key_ref, check_shape, cm_value, fetch_configmap, fetch_live_pod, RefKind, ValueShape,
 };
-use env_tests::fixtures::kube::{configmap_name_for, configmap_name_for_all};
+use env_tests::fixtures::kube::{configmap_name_for, configmap_name_for_all, PROFILE_CONFIGMAP};
 
 const CONTAINER: &str = "mc-service";
 const MC_INSTANCES: &[&str] = &["mc-0", "mc-1"];
 /// Generator base names; live names are hash-suffixed (ADR-0038 §2) and
 /// resolved from each pod spec.
 const MC_CONFIGMAP: &str = "mc-service-config";
-const PROFILE_CONFIGMAP: &str = "media-codec-profile";
 
 /// Every key wired into BOTH MC workloads as a HARD ref: `(key, base, shape)`.
 /// ONE table, iterated for every instance.
