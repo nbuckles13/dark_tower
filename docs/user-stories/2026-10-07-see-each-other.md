@@ -1123,7 +1123,7 @@ tasks:
   slug: 2026-10-21-story3-video-test-infra
   tag: story-2026-10-07-see-each-other-task-7
 - id: 8
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 1
@@ -1245,6 +1245,7 @@ tasks:
     - All new code sits under `media/`, inside the directory-scoped telemetry deny. Only pod-level reason-labelled counts and gauges are emitted. No GoP value, frame size, timing or sender/stream identity appears in any log, label, span or exemplar.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-21-mh-stream-attribution
   tag: story-2026-10-07-see-each-other-task-8
 - id: 9
   status: pending
